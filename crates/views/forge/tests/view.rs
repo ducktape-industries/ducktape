@@ -208,10 +208,10 @@ fn a_connected_view_reads_its_own_repo_namespace() {
         texts(&drive.frame)
     );
 
-    // the rail lists the namespace, and with nothing open the reader side
-    // invites a choice
+    // the rail names the network and lists its namespace, and with nothing
+    // open the reader side invites a choice
     let (drive, _live) = namespace("");
-    for expected in ["core", "1 repository", "No repository open"] {
+    for expected in ["duckhouse", "core", "1 repository", "No repository open"] {
         assert!(
             has_text(&drive.frame, expected),
             "missing {expected:?} in {:?}",
@@ -238,12 +238,18 @@ fn a_live_hit_re_reads_what_is_open() {
 }
 
 /// A refused read is said on the screen in the kernel's own words, not
-/// swallowed into a blank listing.
+/// swallowed into a blank listing — and the reader side does not invite a
+/// choice from a list that never came.
 #[test]
 fn a_refused_read_is_shown_where_the_listing_would_be() {
     let mut drive = Drive::boot();
     let props = request(&drive.frame, "forge.props").id;
     drive.tick(vec![item(props, &session(""))]);
+    assert!(
+        has_text(&drive.frame, "Loading repositories…"),
+        "{:?}",
+        texts(&drive.frame)
+    );
     let repo_list = drive.take("list_repos");
     drive.tick(vec![refuse(repo_list, "the node is not reachable")]);
     assert!(
@@ -253,6 +259,29 @@ fn a_refused_read_is_shown_where_the_listing_would_be() {
         ),
         "{:?}",
         texts(&drive.frame)
+    );
+    assert!(
+        !has_text(&drive.frame, "No repository open"),
+        "{:?}",
+        texts(&drive.frame)
+    );
+}
+
+/// A rail press is a person's choice: whatever a routed link parked is
+/// forgotten, so the repository it opens shows its code, not a stale item.
+#[test]
+fn a_rail_press_forgets_a_parked_link() {
+    let (mut drive, _) = namespace("duck://forge/core/7");
+    // the link opened `core` and parked item 7; before it lands, press the
+    // rail row for the same repo
+    drive.tick(press(&drive.frame, "core"));
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    assert!(
+        !reads(&drive.frame).iter().any(|(_, tag)| tag == "get_item"),
+        "no item read after the press: {:?}",
+        reads(&drive.frame)
     );
 }
 

@@ -98,9 +98,12 @@ fn picker(
 pub(super) const INSET: f32 = 20.;
 /// The repository rail's width.
 const RAIL: f32 = 240.;
-/// An item's properties stand beside its reading from this viewport width;
-/// narrower, they stack above it.
-const TWO_COLUMN: f64 = 960.;
+/// How many repositories the rail lists before it says how many more there
+/// are: with the open screen beside it, the frame's node budget is shared.
+const RAIL_ROWS: usize = 512;
+/// An item's properties stand beside its reading from this width of the
+/// repository pane (the viewport less the rail); narrower, they stack.
+const TWO_COLUMN: f64 = 720.;
 /// The item's properties column.
 const PROPERTIES: f32 = 240.;
 
@@ -131,18 +134,19 @@ impl ForgeView {
     }
 
     /// Every repository on the network, one row each, the open one chosen.
-    /// The rail is the namespace — no page introduces it.
+    /// The rail is the namespace: its head names the network, and no page
+    /// introduces it.
     fn rail(&self) -> wire::Node {
         let p = native::palette();
         let count = native::nowrap(native::caption(
             "forge/repo-count",
             host::plural(self.repos.len() as i64, "repository", "repositories"),
         ));
-        let mut content = vec![strip("forge/rail-head", "Repositories", Some(count))];
+        let mut content = vec![strip("forge/rail-head", &self.org, Some(count))];
         let status = match self.list_phase.as_str() {
-            "loading" => "Loading repositories…",
+            "ready" => "",
             "failed" => "Could not load repositories. Reconnect to retry.",
-            _ => "",
+            _ => "Loading repositories…",
         };
         let listed = !self.repos.is_empty();
         if !status.is_empty() && !listed {
@@ -162,7 +166,9 @@ impl ForgeView {
                 },
             ));
         }
-        let rows = self.repos.iter().map(|repo| {
+        // the frame has one node budget for the rail AND the open screen, so
+        // a namespace past the cap keeps its tail off the rail
+        let rows = self.repos.iter().take(RAIL_ROWS).map(|repo| {
             let key = format!("forge/repo/{}", repo.name);
             let mut row = native::list_row(
                 &key,
@@ -187,13 +193,27 @@ impl ForgeView {
                     ],
                 ),
                 repo.name == self.open_repo,
-                Some(slots::message(Message::ForgeOpenRepo(repo.name.clone()))),
+                Some(slots::message(Message::ForgePickRepo(repo.name.clone()))),
             );
             if let wire::Node::Button { label, .. } = &mut row {
                 *label = Some(repo.name.clone());
             }
             row
         });
+        let mut rows: Vec<wire::Node> = rows.collect();
+        let beyond = self.repos.len().saturating_sub(RAIL_ROWS);
+        if beyond > 0 {
+            rows.push(native::padded(
+                native::row(
+                    "forge/rail-more",
+                    [native::caption(
+                        "forge/rail-more/text",
+                        format!("{beyond} more not shown"),
+                    )],
+                ),
+                wire::Edges::all(8.),
+            ));
+        }
         content.push(native::padded(
             native::spaced(native::column("forge/repo-rows", rows), 1.),
             wire::Edges {
@@ -222,22 +242,24 @@ impl ForgeView {
         self.repo_screen()
     }
 
-    /// No repository open: a refusal if one stands, then either the push
-    /// command that makes the first repository, or the invitation to pick.
+    /// No repository open: a refusal if one stands, then what the rail's
+    /// state calls for — the push command that makes the first repository,
+    /// the invitation to pick one, or nothing while the list is still owed.
     fn welcome(&self) -> wire::Node {
         let mut content = Vec::new();
         if !self.host_error.is_empty() {
             content.push(self.unavailable("forge/error".into()));
         }
-        let none_yet = self.repos.is_empty() && self.list_phase == "ready";
+        let listed = self.list_phase == "ready";
+        let none_yet = listed && self.repos.is_empty();
         if none_yet {
             content.push(native::empty_state(
                 "forge/no-repos",
                 "No repositories yet",
-                "Push a git repository to this network to create one.",
+                host::network_intro(&self.about),
             ));
             content.push(self.push_box());
-        } else {
+        } else if listed {
             content.push(native::empty_state(
                 "forge/choose-repo",
                 "No repository open",
@@ -342,7 +364,13 @@ impl ForgeView {
             wire::Weight::Semibold,
         ))];
         if in_item {
-            let tracker = match self.tab.as_str() {
+            // the item's own kind names the tracker once it has arrived; the
+            // tab it was opened from stands in while it is still loading
+            let tab = match self.forge_item_kind.is_empty() {
+                true => self.tab.clone(),
+                false => host::kind_tab(&self.forge_item_kind),
+            };
+            let tracker = match tab.as_str() {
                 "issues" => "Issues",
                 _ => "Pull requests",
             };
@@ -529,7 +557,8 @@ impl ForgeView {
                     content.push(reading);
                     return self.item_page(content);
                 }
-                let two_column = self.viewport_width >= TWO_COLUMN;
+                let pane_width = self.viewport_width - f64::from(RAIL) - 1.;
+                let two_column = pane_width >= TWO_COLUMN;
                 let properties = native::spaced(
                     native::column("forge/item-properties", properties),
                     16.,

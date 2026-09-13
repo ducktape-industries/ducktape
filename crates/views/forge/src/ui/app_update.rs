@@ -12,6 +12,7 @@ impl super::ForgeView {
             Message::BlobArrived(next) => self.on_blob_arrived(next),
             Message::ActDone(next) => self.on_act_done(next),
             Message::ForgeOpenRepo(name) => self.on_forge_open_repo(name),
+            Message::ForgePickRepo(name) => self.on_forge_pick_repo(name),
             Message::ForgePickBranch(name) => self.on_forge_pick_branch(name),
             Message::ForgeOpenDir(path) => self.on_forge_open_dir(path),
             Message::ForgeOpenFile(path) => self.on_forge_open_file(path),
@@ -83,11 +84,11 @@ impl super::ForgeView {
         next: crate::host::RepoListItem,
     ) -> ducktape_view_guest::Task<Message> {
         self.host_error = next.error.to_owned();
+        self.list_phase = crate::host::phase_of(&next.error);
         if !(next.error).is_empty() {
             return ::ducktape_view_guest::Task::none();
         }
         self.repos = next.repos.clone();
-        self.list_phase = "ready".to_owned();
         ::ducktape_view_guest::Task::none()
     }
     fn on_repo_arrived(
@@ -298,6 +299,15 @@ impl super::ForgeView {
                 ::ducktape_view_guest::Task::none()
             }
         }
+    }
+    /// A rail press: a person's choice, so whatever a routed link parked
+    /// (an item, a note, a file) is forgotten before the repository opens.
+    fn on_forge_pick_repo(&mut self, name: String) -> ducktape_view_guest::Task<Message> {
+        self.focus_number = 0;
+        self.focus_seq = 0;
+        self.focus_path = "".to_owned();
+        self.focus_rev = "".to_owned();
+        self.on_forge_open_repo(name)
     }
     fn on_forge_open_repo(&mut self, name: String) -> ducktape_view_guest::Task<Message> {
         if !self.connected {

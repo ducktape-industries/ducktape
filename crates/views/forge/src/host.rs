@@ -162,9 +162,9 @@ pub struct DiffLine {
 pub struct Session {
     pub connected: bool,
     pub dark: bool,
-    /// the network's name — the repo crumb's root and the empty state's hero
+    /// the network's name — the repository rail's head
     pub org: String,
-    /// this account's bio, as the empty state introduces the network
+    /// this account's bio, as the empty namespace introduces the network
     pub about: String,
     /// this account's seat word on the network
     pub tier: String,
@@ -1489,9 +1489,13 @@ pub fn commit_label(rev: &str) -> String {
     rev.chars().take(12).collect()
 }
 
-/// The repository switcher's options: the forge's repositories by name.
-pub fn repo_names(repos: &[ForgeRepo]) -> Vec<String> {
-    repos.iter().map(|repo| repo.name.clone()).collect()
+/// What the empty namespace says under its title: this account's bio when
+/// it has one, else the way to a first repository.
+pub fn network_intro(about: &str) -> String {
+    match about.is_empty() {
+        true => "Push a git repository to this network to create one.".to_owned(),
+        false => about.to_owned(),
+    }
 }
 
 /// The branch selector's options: the open repo's born branches by name.

@@ -103,6 +103,7 @@ pub enum Message {
     BlobArrived(crate::host::BlobItem),
     ActDone(crate::host::ActItem),
     ForgeOpenRepo(String),
+    ForgePickRepo(String),
     ForgePickBranch(String),
     ForgeOpenDir(String),
     ForgeOpenFile(String),

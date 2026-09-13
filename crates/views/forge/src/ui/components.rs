@@ -11,16 +11,15 @@ impl ForgeView {
         let p = native::palette();
         // a crumb segment: a quiet button, tight, never underlined
         let segment = |key: String, name: &str, path: String| {
-            let mut button = subtle(key, name, Some(Message::ForgeOpenDir(path)));
-            if let wire::Node::Button { padding, .. } = &mut button {
-                *padding = Some(wire::Edges {
+            native::padded(
+                subtle(key, name, Some(Message::ForgeOpenDir(path))),
+                wire::Edges {
                     top: 2.,
                     right: 6.,
                     bottom: 2.,
                     left: 6.,
-                });
-            }
-            button
+                },
+            )
         };
         let mut root = segment("forge/tree-root".into(), "root", String::new());
         if let wire::Node::Button { label, .. } = &mut root {
@@ -43,16 +42,15 @@ impl ForgeView {
                 walked.clone(),
             ));
         }
-        let mut row = native::spaced(native::wrapped_row("forge/tree-head", crumb), 2.);
-        if let wire::Node::Linear { padding, .. } = &mut row {
-            *padding = Some(wire::Edges {
+        native::padded(
+            native::spaced(native::wrapped_row("forge/tree-head", crumb), 2.),
+            wire::Edges {
                 top: 4.,
                 right: 4.,
                 bottom: 2.,
                 left: 4.,
-            });
-        }
-        row
+            },
+        )
     }
 
     pub(super) fn code_screen(&self) -> wire::Node {
@@ -87,12 +85,12 @@ impl ForgeView {
                     } else {
                         name
                     };
-                    // a kit button centres a shrink-width child: the row
-                    // fills so the name sits at the left
-                    let line = native::row(format!("forge/tree/{}/line", entry.path), [name]);
+                    // a kit button centres a shrink-width child: the name
+                    // fills so it sits at the left
+                    let name = native::sized(name, Some(wire::Length::Fill), None);
                     let mut button = native::list_row(
                         format!("forge/tree/{}", entry.path),
-                        line,
+                        name,
                         entry.path == self.file_path,
                         Some(slots::message(route)),
                     );
@@ -446,19 +444,18 @@ impl ForgeView {
                             ))),
                             wire::ButtonPreset::Subtle,
                         );
-                        if let wire::Node::Button {
-                            label, padding, ..
-                        } = &mut comment
-                        {
+                        if let wire::Node::Button { label, .. } = &mut comment {
                             *label = Some("Comment on this line".into());
-                            *padding = Some(wire::Edges {
+                        }
+                        cells.push(native::padded(
+                            comment,
+                            wire::Edges {
                                 top: 0.,
                                 right: 6.,
                                 bottom: 0.,
                                 left: 6.,
-                            });
-                        }
-                        cells.push(comment);
+                            },
+                        ));
                     }
                     let mut row = native::padded(
                         native::sized(
