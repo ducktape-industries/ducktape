@@ -1,38 +1,71 @@
 use super::*;
-use ducktape_view_guest::slots;
+use ducktape_view_guest::{kit::Tone, slots};
 
 impl FilesView {
     pub(crate) fn view(&self) -> wire::Node {
+        native::set_dark(self.dark);
         let mut children = Vec::new();
         if *self.derived_draft_parked() {
-            children.push(native::column(
+            children.push(native::notice(
                 "FilesView/parked-draft",
-                [
-                    native::text("FilesView/draft-label", "Unsaved changes to:"),
-                    native::text("FilesView/draft-path", self.draft_path.clone()),
-                    native::text(
-                        "FilesView/draft-hint",
-                        "Return to this file to continue editing.",
+                native::spaced(
+                    native::centered_row(
+                        "FilesView/parked-draft/row",
+                        [
+                            native::sized(
+                                native::spaced(
+                                    native::column(
+                                        "FilesView/parked-draft/lines",
+                                        [
+                                            native::strong(
+                                                "FilesView/draft-label",
+                                                "Unsaved changes to:",
+                                            ),
+                                            native::wrapping(native::mono(
+                                                "FilesView/draft-path",
+                                                self.draft_path.clone(),
+                                            )),
+                                            native::caption(
+                                                "FilesView/draft-hint",
+                                                "Return to this file to continue editing.",
+                                            ),
+                                        ],
+                                    ),
+                                    2.,
+                                ),
+                                Some(wire::Length::Fill),
+                                None,
+                            ),
+                            native::button(
+                                "FilesView/discard-draft",
+                                "Discard unsaved changes",
+                                Some(slots::message(Message::DiscardDraft(self.draft_id))),
+                                wire::ButtonPreset::Secondary,
+                            ),
+                        ],
                     ),
-                    native::button(
-                        "FilesView/discard-draft",
-                        "Discard unsaved changes",
-                        Some(slots::message(Message::DiscardDraft(self.draft_id))),
-                        wire::ButtonPreset::Secondary,
-                    ),
-                ],
+                    12.,
+                ),
+                Tone::Warning,
             ));
         }
         if !self.notice.is_empty() {
-            children.push(native::text("FilesView/notice", self.notice.clone()));
+            children.push(native::notice(
+                "FilesView/notice-box",
+                native::wrapping(native::text("FilesView/notice", self.notice.clone())),
+                Tone::Neutral,
+            ));
         }
         if self.connected && self.omitted > 0 {
-            children.push(native::row(
-                "FilesView/omissions",
-                [
-                    native::text("FilesView/display-omitted", self.omitted.to_string()),
-                    native::text("FilesView/omission-label", "rows are not shown."),
-                ],
+            children.push(native::spaced(
+                native::row(
+                    "FilesView/omissions",
+                    [
+                        native::caption("FilesView/display-omitted", self.omitted.to_string()),
+                        native::caption("FilesView/omission-label", "rows are not shown."),
+                    ],
+                ),
+                4.,
             ));
         }
         let viewport = || {
@@ -50,10 +83,15 @@ impl FilesView {
             delay: None,
             child: Box::new(self.files_screen("FilesView/screen".into())),
         });
-        native::sized(
-            native::column("FilesView/root", children),
-            Some(wire::Length::Fill),
-            Some(wire::Length::Fill),
-        )
+        let mut root = native::page("FilesView/root", children);
+        if let wire::Node::Linear { padding, .. } = &mut root {
+            *padding = Some(wire::Edges {
+                top: 16.,
+                right: 20.,
+                bottom: 16.,
+                left: 20.,
+            });
+        }
+        root
     }
 }

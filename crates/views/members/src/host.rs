@@ -436,21 +436,6 @@ pub(crate) fn filter_members(rows: &[MemberRow], filter: crate::MembersFilter) -
         .collect()
 }
 
-/// Up to two initials off a label: "Reviewer Bot" → "RB", "ab12cd" → "AB".
-pub(crate) fn initials(label: &str) -> String {
-    let words: Vec<char> = label
-        .split_whitespace()
-        .filter_map(|word| word.chars().next())
-        .take(2)
-        .collect();
-    let picked: String = if words.len() >= 2 {
-        words.into_iter().collect()
-    } else {
-        label.chars().take(2).collect()
-    };
-    picked.to_uppercase()
-}
-
 /// A human is `live`/`offline` on the mesh; an agent is `active`/`paused`
 /// in the registry.
 pub(crate) fn presence_label(row: &MemberRow) -> &'static str {

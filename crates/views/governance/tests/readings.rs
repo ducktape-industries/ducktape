@@ -36,7 +36,7 @@ fn quorum_tally_counts_the_frozen_rule_not_the_electorate() {
     assert_eq!(tally_note(3, 4), "3 approvals · 1 more for quorum");
     assert_eq!(tally_note(1, 4), "1 approval · 3 more for quorum");
     assert_eq!(tally_note(4, 4), "quorum met");
-    assert_eq!(approve_label(3, 4), "Approve →");
+    assert_eq!(approve_label(3, 4), "Approve and settle");
     assert_eq!(approve_label(1, 4), "Approve");
 }
 

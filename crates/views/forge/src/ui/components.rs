@@ -1,47 +1,61 @@
-use super::forge::action;
+use super::forge::{action, primary, section, subtle};
+use super::kit::state_tone;
 use super::*;
 use crate::host;
-use ducktape_view_guest::slots;
+use ducktape_view_guest::{kit::Tone, slots};
 
 impl ForgeView {
     pub(super) fn code_screen(&self) -> wire::Node {
         let mut tree = Vec::new();
         match self.tree_phase.as_str() {
-            "loading" => tree.push(native::text(
+            "loading" => tree.push(native::secondary(
                 "forge/tree-loading",
                 "Loading repository tree…",
             )),
-            "failed" => tree.push(native::text(
+            "failed" => tree.push(native::wrapping(native::secondary(
                 "forge/tree-failed",
                 "Could not load the tree. Open the repository again to retry.",
-            )),
+            ))),
             "ready" => {
                 if !self.tree_path.is_empty() {
-                    tree.push(action(
+                    tree.push(subtle(
                         "forge/tree-root",
                         "Back to the repository root",
                         Some(Message::ForgeOpenDir(String::new())),
                     ));
                 }
                 for entry in &self.tree_entries {
-                    let route = if entry.kind == "dir" {
+                    let directory = entry.kind == "dir";
+                    let route = if directory {
                         Message::ForgeOpenDir(entry.path.clone())
                     } else {
                         Message::ForgeOpenFile(entry.path.clone())
                     };
-                    let mut button = action(
+                    let name = native::nowrap(native::text(
+                        format!("forge/tree/{}/name", entry.path),
+                        if directory {
+                            format!("{}/", entry.name)
+                        } else {
+                            entry.name.clone()
+                        },
+                    ));
+                    let name = if directory {
+                        native::weighted(name, wire::Weight::Medium)
+                    } else {
+                        name
+                    };
+                    let mut button = native::list_row(
                         format!("forge/tree/{}", entry.path),
-                        &entry.name,
-                        Some(route),
+                        name,
+                        entry.path == self.file_path,
+                        Some(slots::message(route)),
                     );
                     if let wire::Node::Button {
-                        description,
-                        checked,
-                        ..
+                        description, label, ..
                     } = &mut button
                     {
                         *description = Some(entry.path.clone());
-                        *checked = Some(entry.path == self.file_path);
+                        *label = Some(entry.name.clone());
                     }
                     tree.push(button);
                 }
@@ -51,10 +65,10 @@ impl ForgeView {
                     } else {
                         "This directory is empty."
                     };
-                    tree.push(native::text("forge/tree-empty", empty));
+                    tree.push(native::wrapping(native::secondary("forge/tree-empty", empty)));
                 }
                 if self.tree_truncated {
-                    tree.push(native::text(
+                    tree.push(native::caption(
                         "forge/tree-omitted",
                         "Some directory entries are not shown.",
                     ));
@@ -62,13 +76,16 @@ impl ForgeView {
             }
             _ => {}
         }
-        let pane = native::sized(
-            native::container(
-                "forge/tree-pane",
-                native::scroll("forge/tree-scroll", native::column("forge/tree", tree)),
+        let pane = native::pane(
+            "forge/tree-pane",
+            native::scroll(
+                "forge/tree-scroll",
+                native::padded(
+                    native::spaced(native::column("forge/tree", tree), 1.),
+                    wire::Edges::all(6.),
+                ),
             ),
-            Some(wire::Length::Fixed(self.tree_width as f32)),
-            Some(wire::Length::Fill),
+            wire::Length::Fixed(self.tree_width as f32),
         );
         let resize = wire::Node::ResizeHandle {
             key: "forge/tree-resize".into(),
@@ -78,24 +95,38 @@ impl ForgeView {
                 Some(Message::TreeResized(x, y))
             }))),
             cursor: Some(wire::mouse::Cursor::ResizingHorizontally),
-            content: Box::new(native::sized(
-                native::container("forge/tree-edge", native::text("forge/tree-grip", "⋮")),
-                Some(wire::Length::Fixed(10.)),
-                Some(wire::Length::Fill),
-            )),
+            content: Box::new(native::vertical_divider("forge/tree-edge")),
         };
-        native::sized(
-            native::row(
-                "forge/code",
-                [
-                    pane,
-                    resize,
-                    native::scroll("forge/file-scroll", self.file_screen()),
-                ],
+        let mut frame = native::card(
+            "forge/code-frame",
+            native::sized(
+                native::row(
+                    "forge/code",
+                    [
+                        pane,
+                        resize,
+                        native::scroll(
+                            "forge/file-scroll",
+                            native::padded(self.file_screen(), wire::Edges::all(16.)),
+                        ),
+                    ],
+                ),
+                Some(wire::Length::Fill),
+                Some(wire::Length::Fill),
             ),
-            Some(wire::Length::Fill),
-            Some(wire::Length::Fill),
-        )
+        );
+        if let wire::Node::Container {
+            padding,
+            clip,
+            height,
+            ..
+        } = &mut frame
+        {
+            *padding = None;
+            *clip = true;
+            *height = Some(wire::Length::Fill);
+        }
+        frame
     }
 
     fn file_screen(&self) -> wire::Node {
@@ -106,18 +137,28 @@ impl ForgeView {
             &self.tree_rev,
             &self.file_path,
         );
-        let mut content = vec![
-            native::text("forge/file-header", &path),
-            native::text("forge/code-context", "Synced from the node · view only"),
-        ];
+        let mut content = vec![native::centered_row(
+            "forge/file-head",
+            [
+                native::sized(
+                    native::wrapping(native::mono("forge/file-header", &path)),
+                    Some(wire::Length::Fill),
+                    None,
+                ),
+                native::nowrap(native::caption(
+                    "forge/code-context",
+                    "Synced from the node · view only",
+                )),
+            ],
+        )];
         if self.tree_phase == "loading" {
-            content.push(native::text(
+            content.push(native::secondary(
                 "forge/loading-tree",
                 "Loading repository tree…",
             ));
         }
         if self.tree_phase == "failed" {
-            content.push(native::text(
+            content.push(native::secondary(
                 "forge/unavailable-code",
                 "Repository code is unavailable.",
             ));
@@ -130,15 +171,19 @@ impl ForgeView {
             } else {
                 "Choose a file from the tree."
             };
-            content.push(native::text("forge/choose-file", label));
+            content.push(native::secondary("forge/choose-file", label));
         }
         if !path.is_empty() {
             match self.file_phase.as_str() {
-                "loading" => content.push(native::text("forge/loading-file", "Loading file…")),
-                "failed" => content.push(native::text("forge/file-failed", &self.file_note)),
+                "loading" => content.push(native::secondary("forge/loading-file", "Loading file…")),
+                "failed" => content.push(native::tone_text(
+                    "forge/file-failed",
+                    &self.file_note,
+                    Tone::Danger,
+                )),
                 "ready" => {
                     if self.file_binary {
-                        content.push(native::text(
+                        content.push(native::secondary(
                             "forge/binary",
                             host::binary_note(&self.file_text),
                         ));
@@ -152,7 +197,7 @@ impl ForgeView {
                             ],
                             on_event: None,
                         });
-                        content.push(native::text(
+                        content.push(native::caption(
                             "forge/picture-caption",
                             host::picture_caption(self.file_width, self.file_height),
                         ));
@@ -182,87 +227,149 @@ impl ForgeView {
                         });
                     }
                     if self.file_truncated {
-                        content.push(native::text(
+                        content.push(native::caption(
                             "forge/file-truncated",
                             "This file is larger than the 64 KiB preview limit.",
                         ));
                     }
                     if !self.file_note.is_empty() {
-                        content.push(native::text("forge/file-note", &self.file_note));
+                        content.push(native::caption("forge/file-note", &self.file_note));
                     }
                 }
                 _ => {}
             }
         }
-        native::column("forge/file", content)
+        native::spaced(native::column("forge/file", content), 10.)
     }
 
     pub(super) fn diff_screen(&self) -> wire::Node {
-        let mut content = vec![
-            native::heading("forge/diff-title", "Changes"),
-            native::text(
-                "forge/diff-count",
-                host::forge_stats(
-                    self.forge_item_files_changed,
-                    self.forge_item_additions,
-                    self.forge_item_deletions,
+        let p = native::palette();
+        let title = native::centered_row(
+            "forge/diff-head",
+            [
+                native::sized(
+                    native::heading("forge/diff-title", "Changes"),
+                    Some(wire::Length::Fill),
+                    None,
                 ),
-            ),
-        ];
+                native::secondary(
+                    "forge/diff-count",
+                    host::forge_stats(
+                        self.forge_item_files_changed,
+                        self.forge_item_additions,
+                        self.forge_item_deletions,
+                    ),
+                ),
+            ],
+        );
+        let number = |key: String, value: &str| {
+            native::sized(
+                native::nowrap(native::colored(native::mono(key, value), p.faint)),
+                Some(wire::Length::Fixed(40.)),
+                None,
+            )
+        };
         let rows = self
             .diff_rows
             .iter()
             .map(|line| {
                 let key = format!("forge/diff/{}", line.key);
                 match line.kind.as_str() {
-                    "file" => native::heading(key, &line.text),
-                    "hunk" => native::text(key, &line.text),
+                    "file" => {
+                        let mut head = native::padded(
+                            native::row(&key, [native::nowrap(native::mono(format!("{key}/text"), &line.text))]),
+                            wire::Edges {
+                                top: 4.,
+                                right: 8.,
+                                bottom: 4.,
+                                left: 8.,
+                            },
+                        );
+                        if let wire::Node::Linear { background, .. } = &mut head {
+                            *background = Some(native::rgba(p.surface_raised));
+                        }
+                        head
+                    }
+                    "hunk" => native::padded(
+                        native::row(
+                            &key,
+                            [native::nowrap(native::colored(
+                                native::mono(format!("{key}/text"), &line.text),
+                                p.link,
+                            ))],
+                        ),
+                        wire::Edges {
+                            top: 2.,
+                            right: 8.,
+                            bottom: 2.,
+                            left: 8.,
+                        },
+                    ),
                     _ => {
                         let line_number = if line.side == "old" {
                             &line.old_no
                         } else {
                             &line.new_no
                         };
+                        let (color, wash) = match line.sign.as_str() {
+                            "+" => (p.success, Some(p.success_soft)),
+                            "-" => (p.danger, Some(p.danger_soft)),
+                            _ => (p.foreground, None),
+                        };
                         let mut cells = vec![
-                            native::text(format!("{key}/old"), &line.old_no),
-                            native::text(format!("{key}/new"), &line.new_no),
-                            native::text(format!("{key}/sign"), &line.sign),
+                            number(format!("{key}/old"), &line.old_no),
+                            number(format!("{key}/new"), &line.new_no),
+                            native::sized(
+                                native::nowrap(native::colored(
+                                    native::mono(format!("{key}/sign"), &line.sign),
+                                    color,
+                                )),
+                                Some(wire::Length::Fixed(14.)),
+                                None,
+                            ),
+                            native::sized(
+                                native::nowrap(native::colored(
+                                    native::mono(format!("{key}/text"), &line.text),
+                                    color,
+                                )),
+                                Some(wire::Length::Fill),
+                                None,
+                            ),
                         ];
-                        let text = native::text_options(
-                            native::text(format!("{key}/text"), &line.text),
-                            wire::TextOptions {
-                                wrapping: Some(wire::Wrapping::None),
-                                font: Some(wire::NamedFont {
-                                    family: wire::FontFamily::Monospace,
-                                    weight: wire::Weight::Normal,
-                                    stretch: wire::FontStretch::Normal,
-                                    style: wire::FontStyle::Normal,
-                                }),
-                                ..Default::default()
-                            },
-                        );
-                        cells.push(text);
                         if !line.path.is_empty() {
-                            cells.push(action(
+                            cells.push(native::button(
                                 format!("{key}/comment"),
                                 "Comment on this line",
-                                Some(Message::ForgeCommentOpen(
+                                Some(slots::message(Message::ForgeCommentOpen(
                                     line.path.clone(),
                                     line_number.clone(),
                                     line.side.clone(),
-                                )),
+                                ))),
+                                wire::ButtonPreset::Text,
                             ));
                         }
-                        native::sized(
-                            native::row(key, cells),
-                            None,
-                            Some(wire::Length::Fixed(24.)),
-                        )
+                        let mut row = native::padded(
+                            native::sized(
+                                native::centered_row(key, cells),
+                                None,
+                                Some(wire::Length::Fixed(24.)),
+                            ),
+                            wire::Edges {
+                                top: 0.,
+                                right: 8.,
+                                bottom: 0.,
+                                left: 8.,
+                            },
+                        );
+                        if let wire::Node::Linear { background, .. } = &mut row {
+                            *background = wash.map(native::rgba);
+                        }
+                        row
                     }
                 }
             })
             .collect();
-        content.push(wire::Node::KeyedColumn {
+        let mut lines = wire::Node::KeyedColumn {
             key: "forge/diff-lines".into(),
             keys: Some(
                 self.diff_rows
@@ -280,50 +387,67 @@ impl ForgeView {
             max_width: None,
             align: None,
             virtual_row: Some(24.),
-        });
+        };
+        if let wire::Node::KeyedColumn {
+            background, border, ..
+        } = &mut lines
+        {
+            *background = Some(native::rgba(p.surface));
+            *border = Some(wire::Border {
+                color: Some(native::rgba(p.border)),
+                width: Some(1.),
+                radius: Some([native::radius::CARD as f32; 4]),
+            });
+        }
+        let mut content = vec![lines];
         if self.forge_item_diff_truncated {
-            content.push(native::text(
+            content.push(native::caption(
                 "forge/diff-truncated",
                 "This diff is truncated; open the repository locally to see the rest.",
             ));
         }
-        native::column("forge/diff", content)
+        section("forge/diff", title, content)
     }
 
     pub(super) fn merge_screen(&self) -> wire::Node {
-        let mut content = vec![native::heading("forge/merge-title", "Merge")];
+        let mut content = Vec::new();
         match self.forge_item_state.as_str() {
-            "merged" => content.push(native::text(
-                "forge/merged",
-                host::forge_merge_note(&self.forge_item_merge_oid, &self.forge_item_branches),
+            "merged" => content.push(native::notice(
+                "forge/merged-box",
+                native::wrapping(native::text(
+                    "forge/merged",
+                    host::forge_merge_note(&self.forge_item_merge_oid, &self.forge_item_branches),
+                )),
+                Tone::Success,
             )),
-            "closed" => content.push(native::text("forge/closed", "This pull request is closed.")),
+            "closed" => content.push(native::secondary(
+                "forge/closed",
+                "This pull request is closed.",
+            )),
             "open" => {
-                content.push(native::text(
+                let mut row = vec![native::badge(
                     "forge/approvals",
                     format!("{} approvals", self.forge_item_approvals),
-                ));
-                if !self.merge_conflicts.is_empty() {
-                    content.push(native::text(
-                        "forge/conflict-title",
-                        "Merge conflicts — resolve on the branch and push again:",
-                    ));
-                    for path in &self.merge_conflicts {
-                        content.push(native::text(format!("forge/conflict/{path}"), path));
-                    }
-                }
+                    if self.forge_item_approvals > 0 {
+                        Tone::Success
+                    } else {
+                        Tone::Neutral
+                    },
+                )];
                 if self.forge_item_change_requests > 0 {
-                    content.push(native::text(
+                    row.push(native::tone_text(
                         "forge/changes-requested",
                         format!(
                             "{} reviewers requested changes — merge not recommended",
                             self.forge_item_change_requests
                         ),
+                        Tone::Danger,
                     ));
                 }
+                row.push(native::spacer());
                 let available =
                     self.connected && !self.merge_busy && !self.forge_item_source_oid.is_empty();
-                content.push(action(
+                row.push(primary(
                     "forge/merge",
                     if self.merge_busy {
                         "Merging…"
@@ -332,140 +456,269 @@ impl ForgeView {
                     },
                     available.then_some(Message::ForgeMergeSubmit),
                 ));
+                content.push(native::spaced(native::centered_row("forge/merge-row", row), 10.));
+                if !self.merge_conflicts.is_empty() {
+                    let mut conflicts = vec![native::wrapping(native::text(
+                        "forge/conflict-title",
+                        "Merge conflicts — resolve on the branch and push again:",
+                    ))];
+                    for path in &self.merge_conflicts {
+                        conflicts.push(native::wrapping(native::mono(
+                            format!("forge/conflict/{path}"),
+                            path,
+                        )));
+                    }
+                    content.push(native::notice(
+                        "forge/conflicts",
+                        native::spaced(native::column("forge/conflict-list", conflicts), 4.),
+                        Tone::Warning,
+                    ));
+                }
             }
             _ => {}
         }
-        native::column("forge/merge-box", content)
+        section(
+            "forge/merge-box",
+            native::heading("forge/merge-title", "Merge"),
+            content,
+        )
     }
 
     pub(super) fn review_screen(&self) -> wire::Node {
-        let mut content = vec![native::heading("forge/reviews-title", "Reviews")];
+        let mut content = Vec::new();
         if self.forge_item_reviews.is_empty() {
-            content.push(native::text("forge/no-reviews", "No reviews yet."));
+            content.push(native::secondary("forge/no-reviews", "No reviews yet."));
         }
         for (index, review) in self.forge_item_reviews.iter().enumerate() {
             let key = format!("forge/review/{index}");
-            let mut details = vec![
-                native::heading(format!("{key}/author"), &review.author_name),
-                native::text(
+            let mut head = vec![
+                native::nowrap(native::strong(format!("{key}/author"), &review.author_name)),
+                native::badge(
                     format!("{key}/verdict"),
                     host::verdict_label(&review.verdict),
+                    state_tone(&review.verdict),
                 ),
-                native::text(format!("{key}/commit"), &review.commit),
+                native::nowrap(native::colored(
+                    native::mono(format!("{key}/commit"), &review.commit),
+                    native::palette().muted,
+                )),
                 self.finality(format!("{key}/finality"), review.created_at),
+            ];
+            if review.outdated {
+                head.push(native::badge(format!("{key}/outdated"), "outdated", Tone::Warning));
+            }
+            let mut details = vec![
+                native::spaced(native::wrapped_row(format!("{key}/head"), head), 8.),
                 self.rich_body(
                     format!("{key}/body"),
                     Message::OpenMessageLink,
                     review.blocks.clone(),
                 ),
             ];
-            if review.outdated {
-                details.push(native::text(format!("{key}/outdated"), "outdated"));
-            }
             for (index, comment) in review.comments.iter().enumerate() {
-                details.push(native::text(
-                    format!("{key}/comment/{index}/anchor"),
-                    &comment.anchor,
-                ));
-                details.push(self.rich_body(
-                    format!("{key}/comment/{index}/body"),
-                    Message::OpenMessageLink,
-                    comment.blocks.clone(),
-                ));
+                let mut boxed = native::padded(
+                    native::spaced(
+                        native::column(
+                            format!("{key}/comment/{index}"),
+                            [
+                                native::nowrap(native::mono(
+                                    format!("{key}/comment/{index}/anchor"),
+                                    &comment.anchor,
+                                )),
+                                self.rich_body(
+                                    format!("{key}/comment/{index}/body"),
+                                    Message::OpenMessageLink,
+                                    comment.blocks.clone(),
+                                ),
+                            ],
+                        ),
+                        4.,
+                    ),
+                    wire::Edges {
+                        top: 4.,
+                        right: 0.,
+                        bottom: 4.,
+                        left: 12.,
+                    },
+                );
+                if let wire::Node::Linear { border, .. } = &mut boxed {
+                    *border = Some(wire::Border {
+                        color: Some(native::rgba(native::palette().border_strong)),
+                        width: Some(1.),
+                        radius: None,
+                    });
+                }
+                details.push(boxed);
             }
-            content.push(native::column(key, details));
+            content.push(native::card(
+                key.clone(),
+                native::spaced(native::column(format!("{key}/details"), details), 8.),
+            ));
         }
         let available = self.connected && !self.review_busy;
-        content.push(native::row(
-            "forge/verdicts",
-            [
-                ("comment", "Comment"),
-                ("approve", "Approve"),
-                ("request_changes", "Request changes"),
-            ]
-            .into_iter()
-            .map(|(value, label)| {
-                let mut button = action(
-                    format!("forge/verdict/{value}"),
-                    label,
-                    available.then(|| Message::ForgeReviewPick(value.into())),
-                );
-                if let wire::Node::Button { checked, .. } = &mut button {
-                    *checked = Some(self.review_verdict == value);
-                }
-                if let wire::Node::Button { label, .. } = &mut button {
-                    *label = Some(format!("Pick {} verdict", value.replace('_', " ")));
-                }
-                button
-            }),
-        ));
+        let mut compose = vec![native::spaced(
+            native::row(
+                "forge/verdicts",
+                [
+                    ("comment", "Comment"),
+                    ("approve", "Approve"),
+                    ("request_changes", "Request changes"),
+                ]
+                .into_iter()
+                .map(|(value, label)| {
+                    let mut button = subtle(
+                        format!("forge/verdict/{value}"),
+                        label,
+                        available.then(|| Message::ForgeReviewPick(value.into())),
+                    );
+                    if let wire::Node::Button { checked, .. } = &mut button {
+                        *checked = Some(self.review_verdict == value);
+                    }
+                    if let wire::Node::Button { label, .. } = &mut button {
+                        *label = Some(format!("Pick {} verdict", value.replace('_', " ")));
+                    }
+                    button
+                }),
+            ),
+            2.,
+        )];
         let target =
             host::forge_comment_target(&self.comment_path, &self.comment_line, &self.comment_side);
         let comment_capacity = !host::forge_comment_cap_reached(&self.staged_comments);
         if !target.is_empty() {
-            content.push(native::row(
-                "forge/comment-target",
-                [
-                    native::text("forge/comment-anchor", target),
-                    action(
-                        "forge/cancel-comment",
-                        "Cancel",
-                        Some(Message::ForgeCommentCancel),
-                    ),
-                ],
-            ));
             let submit = available && comment_capacity && !self.comment_draft.is_empty();
-            content.push(self.review_input(
-                "forge/comment-body",
-                "Comment on this line…",
-                &self.comment_draft,
-                Message::CommentDraftChanged,
-                submit.then(|| Message::ForgeCommentStage(self.comment_draft.clone())),
-            ));
-            content.push(action(
-                "forge/add-comment",
-                "Add comment",
-                submit.then(|| Message::ForgeCommentStage(self.comment_draft.clone())),
+            compose.push(native::notice(
+                "forge/comment-box",
+                native::spaced(
+                    native::column(
+                        "forge/comment-form",
+                        [
+                            native::centered_row(
+                                "forge/comment-target",
+                                [
+                                    native::sized(
+                                        native::nowrap(native::mono("forge/comment-anchor", target)),
+                                        Some(wire::Length::Fill),
+                                        None,
+                                    ),
+                                    subtle(
+                                        "forge/cancel-comment",
+                                        "Cancel",
+                                        Some(Message::ForgeCommentCancel),
+                                    ),
+                                ],
+                            ),
+                            native::spaced(
+                                native::row(
+                                    "forge/comment-row",
+                                    [
+                                        self.review_input(
+                                            "forge/comment-body",
+                                            "Comment on this line…",
+                                            &self.comment_draft,
+                                            Message::CommentDraftChanged,
+                                            submit.then(|| {
+                                                Message::ForgeCommentStage(self.comment_draft.clone())
+                                            }),
+                                        ),
+                                        action(
+                                            "forge/add-comment",
+                                            "Add comment",
+                                            submit.then(|| {
+                                                Message::ForgeCommentStage(self.comment_draft.clone())
+                                            }),
+                                        ),
+                                    ],
+                                ),
+                                6.,
+                            ),
+                        ],
+                    ),
+                    6.,
+                ),
+                Tone::Accent,
             ));
         }
         if !comment_capacity {
-            content.push(native::text(
+            compose.push(native::wrapping(native::tone_text(
                 "forge/comment-limit",
                 "Comment limit reached for one review — submit this review, then start another.",
-            ));
+                Tone::Warning,
+            )));
         }
         for (index, comment) in self.staged_comments.iter().enumerate() {
             let key = format!("forge/staged/{index}");
-            content.push(native::column(
+            compose.push(native::card(
                 &key,
-                [
-                    native::text(format!("{key}/anchor"), &comment.anchor),
-                    native::text(format!("{key}/status"), "not sent yet"),
-                    native::text(format!("{key}/body"), &comment.body),
-                    action(
-                        format!("{key}/remove"),
-                        "Remove staged comment",
-                        Some(Message::ForgeCommentDrop(comment.anchor.clone())),
+                native::spaced(
+                    native::column(
+                        format!("{key}/body-column"),
+                        [
+                            native::spaced(
+                                native::centered_row(
+                                    format!("{key}/head"),
+                                    [
+                                        native::sized(
+                                            native::nowrap(native::mono(
+                                                format!("{key}/anchor"),
+                                                &comment.anchor,
+                                            )),
+                                            Some(wire::Length::Fill),
+                                            None,
+                                        ),
+                                        native::badge(
+                                            format!("{key}/status"),
+                                            "not sent yet",
+                                            Tone::Warning,
+                                        ),
+                                        subtle(
+                                            format!("{key}/remove"),
+                                            "Remove staged comment",
+                                            Some(Message::ForgeCommentDrop(comment.anchor.clone())),
+                                        ),
+                                    ],
+                                ),
+                                8.,
+                            ),
+                            native::wrapping(native::text(format!("{key}/body"), &comment.body)),
+                        ],
                     ),
-                ],
+                    4.,
+                ),
             ));
         }
         let submit = available
             && !self.forge_item_source_oid.is_empty()
             && (!self.review_draft.is_empty() || !self.staged_comments.is_empty());
-        content.push(self.review_input(
-            "forge/review-body",
-            "Leave a review…",
-            &self.review_draft,
-            Message::ReviewDraftChanged,
-            submit.then(|| Message::ForgeReviewSubmit(self.review_draft.clone())),
+        compose.push(native::spaced(
+            native::row(
+                "forge/review-row",
+                [
+                    self.review_input(
+                        "forge/review-body",
+                        "Leave a review…",
+                        &self.review_draft,
+                        Message::ReviewDraftChanged,
+                        submit.then(|| Message::ForgeReviewSubmit(self.review_draft.clone())),
+                    ),
+                    primary(
+                        "forge/submit-review",
+                        "Submit review",
+                        submit.then(|| Message::ForgeReviewSubmit(self.review_draft.clone())),
+                    ),
+                ],
+            ),
+            6.,
         ));
-        content.push(action(
-            "forge/submit-review",
-            "Submit review",
-            submit.then(|| Message::ForgeReviewSubmit(self.review_draft.clone())),
+        content.push(native::card(
+            "forge/compose",
+            native::spaced(native::column("forge/compose-column", compose), 8.),
         ));
-        native::column("forge/reviews", content)
+        section(
+            "forge/reviews",
+            native::heading("forge/reviews-title", "Reviews"),
+            content,
+        )
     }
 
     fn review_input(
@@ -483,8 +736,9 @@ impl ForgeView {
             slots::handler(Box::new(move |value| Some(route(value)))),
             submit.map(slots::message),
         );
-        if let wire::Node::Input { options, .. } = &mut input {
+        if let wire::Node::Input { options, width, .. } = &mut input {
             options.disabled = self.review_busy || !self.connected;
+            *width = Some(wire::Length::Fill);
         }
         input
     }

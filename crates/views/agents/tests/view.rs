@@ -259,11 +259,11 @@ fn a_connected_view_reads_its_own_register() {
         "2 agents · 1 working",
         "Reviewer Bot",
         "review",
-        "ACTIVE",
-        "PAUSED",
+        "active",
+        "paused",
         "eddy",
         // the count derives from the record: three skills
-        "3",
+        "3 skills",
     ] {
         assert!(
             has_text(&frame, expected),

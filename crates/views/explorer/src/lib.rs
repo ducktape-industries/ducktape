@@ -30,6 +30,8 @@ pub struct ExplorerView {
     pub(crate) viewport_width: f64,
     pub(crate) ledger_width: f64,
     pub(crate) host_error: String,
+    #[serde(default)]
+    pub(crate) dark: bool,
 }
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -69,6 +71,7 @@ impl ExplorerView {
             viewport_width: 1280.0,
             ledger_width: 340.0,
             host_error: "".to_owned(),
+            dark: false,
         }
     }
     pub(crate) fn boot() -> (Self, Task<Message>) {
@@ -211,6 +214,7 @@ impl ExplorerView {
         );
         self.loading = crate::host::loading_after(self.connected, next.connected, self.loading);
         self.connected = next.connected;
+        self.dark = next.dark;
         Task::none()
     }
     fn on_ledger_arrived(&mut self, item: crate::host::LedgerItem) -> Task<Message> {

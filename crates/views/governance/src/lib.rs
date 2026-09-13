@@ -18,6 +18,8 @@ pub struct GovernanceView {
     pub(crate) connection_serial: i64,
     pub(crate) answered: bool,
     pub(crate) host_error: String,
+    #[serde(default)]
+    pub(crate) dark: bool,
 }
 impl ::std::fmt::Debug for GovernanceView {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -47,6 +49,7 @@ impl GovernanceView {
             connection_serial: 0,
             answered: false,
             host_error: "".to_owned(),
+            dark: false,
         }
     }
     pub(crate) fn boot() -> (Self, ::ducktape_view_guest::Task<Message>) {
@@ -190,6 +193,7 @@ impl GovernanceView {
             );
             self.admin = next.admin;
             self.connected = next.connected;
+            self.dark = next.dark;
             ::ducktape_view_guest::Task::none()
         }
     }
@@ -242,166 +246,206 @@ impl GovernanceView {
 }
 impl GovernanceView {
     pub(crate) fn view(&self) -> ducktape_view_guest::wire::Node {
-        use ducktape_view_guest::{kit, wire};
-        let mut content = vec![
-            kit::row(
-                "governance/header",
-                [
-                    kit::sized(
-                        kit::container(
-                            "governance/seal",
-                            wire::Node::Surface {
-                                key: "governance/seal/svg".into(),
-                                name: "artifact_svg".into(),
-                                args: vec![wire::SurfaceValue::Str("icons/seal.svg".into())],
-                                on_event: None,
-                            },
-                        ),
-                        Some(wire::Length::Fixed(24.)),
-                        Some(wire::Length::Fixed(24.)),
-                    ),
-                    kit::heading("governance/title", "Approvals"),
-                ],
-            ),
-            kit::text(
-                "governance/summary",
-                host::proposals_summary(self.connected, &self.rows),
-            ),
-        ];
+        use ducktape_view_guest::{
+            kit::{self, Tone},
+            wire,
+        };
+        kit::set_dark(self.dark);
+        let mut content = vec![kit::centered_row(
+            "governance/header",
+            [
+                kit::sized(
+                    kit::title("governance/title", "Approvals"),
+                    Some(wire::Length::Fill),
+                    None,
+                ),
+                kit::secondary(
+                    "governance/summary",
+                    host::proposals_summary(self.connected, &self.rows),
+                ),
+            ],
+        )];
         if !self.host_error.is_empty() {
-            content.push(kit::text("governance/error", &self.host_error));
+            content.push(kit::notice(
+                "governance/error",
+                kit::wrapping(kit::text("governance/error-text", &self.host_error)),
+                Tone::Danger,
+            ));
         }
         if !self.connected {
-            content.push(kit::text("governance/disconnected", "Not connected"));
-            content.push(kit::text(
-                "governance/connect-help",
-                "Click the network name in the titlebar to pick or reconnect a network.",
+            content.push(kit::empty_state(
+                "governance/disconnected",
+                "Not connected",
+                "Choose a network from the sidebar to read what it is deciding.",
             ));
-            return kit::scroll(
-                "governance",
-                kit::padded(
-                    kit::column("governance/content", content),
-                    wire::Edges::all(22.),
-                ),
-            );
+            return kit::reading_page("governance", content);
         }
         if !self.admin {
-            content
-                .push(
-                    kit::text(
-                        "governance/standing",
-                        "Approval votes are cast by this network's validators, and this node does not hold validator standing.",
-                    ),
-                );
-            content.push(kit::text(
-                "governance/read-help",
-                "You can still read every proposal and follow its tally while it runs.",
+            content.push(kit::notice(
+                "governance/standing",
+                kit::wrapping(kit::text(
+                    "governance/standing-text",
+                    "Approval votes are cast by this network's validators, and this node does not hold validator standing. You can still read every proposal and follow its tally while it runs.",
+                )),
+                Tone::Neutral,
             ));
         }
         let open = host::open_proposals(&self.rows);
         if open > 0 {
-            content.push(kit::text(
+            content.push(kit::heading(
                 "governance/pending",
                 host::pending_label(&self.rows),
             ));
         } else if self.answered {
-            content.push(kit::text("governance/empty", "No proposals waiting."));
+            content.push(kit::empty_state(
+                "governance/empty-state",
+                "No proposals waiting.",
+                "Membership and module changes show up here when a validator opens one.",
+            ));
+            if let wire::Node::Linear { children, .. } = content.last_mut().unwrap()
+                && let Some(wire::Node::Text { key, .. }) = children.first_mut()
+            {
+                *key = "governance/empty".into();
+            }
         }
         for proposal in self.rows.iter().filter(|proposal| proposal.open) {
             content.push(self.proposal(proposal));
         }
         let settled = host::settled_proposals(&self.rows);
         if !settled.is_empty() {
-            content.push(kit::heading("governance/finalized", "RECENTLY FINALIZED"));
+            content.push(kit::heading("governance/finalized", "Recently finalized"));
+            let mut rows = Vec::new();
             for proposal in settled {
                 let key = format!("governance/settled/{}", proposal.id);
+                let passed = proposal.status.eq_ignore_ascii_case("passed")
+                    || proposal.status.eq_ignore_ascii_case("executed");
                 let mut details = vec![
-                    kit::text(format!("{key}/id"), &proposal.id),
-                    kit::text(format!("{key}/action"), &proposal.action),
-                    kit::text(format!("{key}/status"), &proposal.status),
+                    kit::sized(
+                        kit::spaced(
+                            kit::column(
+                                format!("{key}/lines"),
+                                [
+                                    kit::nowrap(kit::mono(format!("{key}/id"), &proposal.id)),
+                                    kit::wrapping(kit::secondary(
+                                        format!("{key}/action"),
+                                        &proposal.action,
+                                    )),
+                                ],
+                            ),
+                            2.,
+                        ),
+                        Some(wire::Length::Fill),
+                        None,
+                    ),
+                    kit::badge(
+                        format!("{key}/status"),
+                        &proposal.status,
+                        if passed { Tone::Success } else { Tone::Neutral },
+                    ),
                 ];
                 if proposal.settled_height > 0 {
-                    details.push(kit::text(
+                    details.push(kit::nowrap(kit::caption(
                         format!("{key}/height"),
                         host::height_label_short(proposal.settled_height),
-                    ));
+                    )));
                 }
-                content.push(kit::row(key, details));
+                rows.push(kit::divider(format!("{key}/rule")));
+                rows.push(kit::centered_row(key, details));
             }
+            rows.remove(0);
+            content.push(kit::card(
+                "governance/settled",
+                kit::spaced(kit::column("governance/settled/rows", rows), 8.),
+            ));
         }
-        kit::scroll(
-            "governance",
-            kit::padded(
-                kit::column("governance/content", content),
-                wire::Edges::all(22.),
-            ),
-        )
+        kit::reading_page("governance", content)
     }
     fn proposal(&self, proposal: &host::ProposalRow) -> ducktape_view_guest::wire::Node {
-        use ducktape_view_guest::{kit, slots, wire};
+        use ducktape_view_guest::{
+            kit::{self, Tone},
+            slots, wire,
+        };
         let key = format!("governance/proposal/{}", proposal.id);
         let available = self.voting.is_empty();
+        let met = proposal.approvals >= proposal.required_yes;
         let mut content = vec![
-            kit::heading(format!("{key}/id"), &proposal.id),
-            kit::text(format!("{key}/action"), &proposal.action),
-            kit::text(
-                format!("{key}/proposer"),
-                format!(
-                    "proposed by @{} · expires at h{}",
-                    proposal.proposer, proposal.deadline
+            kit::centered_row(
+                format!("{key}/head"),
+                [
+                    kit::sized(
+                        kit::wrapping(kit::heading(format!("{key}/action"), &proposal.action)),
+                        Some(wire::Length::Fill),
+                        None,
+                    ),
+                    kit::badge(
+                        format!("{key}/tally"),
+                        host::tally_label(proposal.approvals, proposal.required_yes),
+                        if met { Tone::Success } else { Tone::Accent },
+                    ),
+                ],
+            ),
+            kit::spaced(
+                kit::centered_row(
+                    format!("{key}/meta"),
+                    [
+                        kit::nowrap(kit::mono(format!("{key}/id"), &proposal.id)),
+                        kit::caption(
+                            format!("{key}/proposer"),
+                            format!(
+                                "proposed by @{} · expires at h{}",
+                                proposal.proposer, proposal.deadline
+                            ),
+                        ),
+                    ],
                 ),
+                10.,
             ),
         ];
         if !proposal.detail.is_empty() {
-            content.push(kit::text(format!("{key}/detail"), &proposal.detail));
+            content.push(kit::wrapping(kit::text(format!("{key}/detail"), &proposal.detail)));
         }
-        content.push(kit::text(
-            format!("{key}/tally"),
-            host::tally_label(proposal.approvals, proposal.required_yes),
-        ));
-        content.push(kit::text(
+        let mut tally = vec![kit::secondary(
             format!("{key}/quorum"),
             host::tally_note(proposal.approvals, proposal.required_yes),
-        ));
+        )];
         if proposal.rejections > 0 {
-            content.push(kit::text(
+            tally.push(kit::tone_text(
                 format!("{key}/rejections"),
                 format!("{} against", proposal.rejections),
+                Tone::Danger,
             ));
         }
+        content.push(kit::spaced(kit::centered_row(format!("{key}/votes"), tally), 10.));
         let reject = kit::button(
             format!("{key}/reject"),
             "Reject",
             available.then(|| slots::message(Message::GovVote(proposal.id.clone(), false))),
             wire::ButtonPreset::Danger,
         );
-        let mut approval = if proposal.approvals < proposal.required_yes {
+        let mut approval = if met {
+            kit::button(
+                format!("{key}/settle"),
+                "Settle",
+                available.then(|| slots::message(Message::GovExecute(proposal.id.clone()))),
+                wire::ButtonPreset::Primary,
+            )
+        } else {
             kit::button(
                 format!("{key}/approve"),
                 host::approve_label(proposal.approvals, proposal.required_yes),
                 available.then(|| slots::message(Message::GovVote(proposal.id.clone(), true))),
                 wire::ButtonPreset::Primary,
             )
-        } else {
-            kit::button(
-                format!("{key}/settle"),
-                "Settle →",
-                available.then(|| slots::message(Message::GovExecute(proposal.id.clone()))),
-                wire::ButtonPreset::Primary,
-            )
         };
         if let wire::Node::Button { label, .. } = &mut approval {
-            *label = Some(
-                if proposal.approvals < proposal.required_yes {
-                    "Approve"
-                } else {
-                    "Settle"
-                }
-                .into(),
-            );
+            *label = Some(if met { "Settle" } else { "Approve" }.into());
         }
-        content.push(kit::row(format!("{key}/actions"), [reject, approval]));
-        kit::padded(kit::column(key, content), wire::Edges::all(12.))
+        content.push(kit::divider(format!("{key}/rule")));
+        content.push(kit::spaced(
+            kit::row(format!("{key}/actions"), [kit::spacer(), reject, approval]),
+            8.,
+        ));
+        kit::card(&key, kit::spaced(kit::column(format!("{key}/body"), content), 10.))
     }
 }
 ducktape_view_guest::export_app!(

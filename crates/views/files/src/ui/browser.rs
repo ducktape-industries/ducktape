@@ -1,27 +1,27 @@
 use super::*;
-use ducktape_view_guest::slots;
+use ducktape_view_guest::{kit::Tone, slots};
 
-fn object_cells(key: &str, name: String, size: String, object: String) -> wire::Node {
+fn object_cells(key: &str, name: wire::Node, size: String, object: String) -> wire::Node {
     let cell = |field: &str, value: String, width| {
         native::sized(
-            native::text_options(
-                native::text(format!("{key}/{field}"), value),
-                wire::TextOptions {
-                    wrapping: Some(wire::Wrapping::None),
-                    ..Default::default()
-                },
-            ),
+            native::nowrap(native::colored(
+                native::mono(format!("{key}/{field}"), value),
+                native::palette().muted,
+            )),
             Some(width),
             None,
         )
     };
-    native::row(
-        key,
-        [
-            cell("name", name, wire::Length::Fill),
-            cell("size", size, wire::Length::Fixed(72.)),
-            cell("object", object, wire::Length::Fixed(92.)),
-        ],
+    native::spaced(
+        native::centered_row(
+            key,
+            [
+                native::sized(name, Some(wire::Length::Fill), None),
+                cell("size", size, wire::Length::Fixed(72.)),
+                cell("object", object, wire::Length::Fixed(92.)),
+            ],
+        ),
+        12.,
     )
 }
 
@@ -40,16 +40,23 @@ impl FilesView {
         if let wire::Node::Button { label, .. } = &mut root {
             *label = Some("Go to the duckfs root".into());
         }
-        native::row(
-            &key,
-            [
-                root,
-                native::text(format!("{key}/path"), self.path.clone()),
-                native::text(
-                    format!("{key}/count"),
-                    crate::host::fs_counts_summary(self.connected, self.listed, &self.entries),
-                ),
-            ],
+        native::spaced(
+            native::centered_row(
+                &key,
+                [
+                    root,
+                    native::sized(
+                        native::nowrap(native::mono(format!("{key}/path"), self.path.clone())),
+                        Some(wire::Length::Fill),
+                        None,
+                    ),
+                    native::secondary(
+                        format!("{key}/count"),
+                        crate::host::fs_counts_summary(self.connected, self.listed, &self.entries),
+                    ),
+                ],
+            ),
+            8.,
         )
     }
 
@@ -59,21 +66,55 @@ impl FilesView {
         open: impl Fn(String) -> Message + Clone + 'static,
         entry: crate::host::FsEntry,
     ) -> wire::Node {
-        let mut button = native::button(
-            key,
+        let name = native::nowrap(native::text(
+            format!("{key}/name"),
             format!("{}/", entry.name),
+        ));
+        let mut button = native::list_row(
+            key,
+            name,
+            entry.path == self.path,
             Some(slots::message(open(entry.path))),
-            wire::ButtonPreset::Text,
         );
-        if let wire::Node::Button { label, width, .. } = &mut button {
+        if let wire::Node::Button { label, .. } = &mut button {
             *label = Some("Open directory".into());
-            *width = Some(wire::Length::Fill);
         }
         button
     }
 
     pub(super) fn object_table_header(&self, key: String) -> wire::Node {
-        object_cells(&key, "Name".into(), "Size".into(), "Object".into())
+        let head = |field: &str, text: &str, width| {
+            native::sized(
+                native::label(format!("{key}/{field}"), text),
+                Some(width),
+                None,
+            )
+        };
+        native::padded(
+            native::column(
+                format!("{key}/box"),
+                [
+                    native::spaced(
+                        native::centered_row(
+                            &key,
+                            [
+                                head("name", "Name", wire::Length::Fill),
+                                head("size", "Size", wire::Length::Fixed(72.)),
+                                head("object", "Object", wire::Length::Fixed(92.)),
+                            ],
+                        ),
+                        12.,
+                    ),
+                    native::divider(format!("{key}/rule")),
+                ],
+            ),
+            wire::Edges {
+                top: 0.,
+                right: 10.,
+                bottom: 0.,
+                left: 10.,
+            },
+        )
     }
 
     pub(super) fn object_row(
@@ -95,25 +136,32 @@ impl FilesView {
         } else {
             entry.object
         };
-        let content = object_cells(&format!("{key}/cells"), entry.name, size, object);
+        let name = native::nowrap(native::text(
+            format!("{key}/cells/name"),
+            if directory {
+                format!("{}/", entry.name)
+            } else {
+                entry.name
+            },
+        ));
+        let name = if directory {
+            native::weighted(name, wire::Weight::Medium)
+        } else {
+            name
+        };
+        let content = object_cells(&format!("{key}/cells"), name, size, object);
         let action = if directory {
             open_directory(entry.path)
         } else {
             open_file(entry.path)
         };
-        let mut button = native::button_child(
+        let mut button = native::list_row(
             key,
             content,
+            selected && !directory,
             Some(slots::message(action)),
-            wire::ButtonPreset::Text,
         );
-        if let wire::Node::Button {
-            label,
-            checked,
-            width,
-            ..
-        } = &mut button
-        {
+        if let wire::Node::Button { label, .. } = &mut button {
             *label = Some(
                 if directory {
                     "Open directory"
@@ -122,8 +170,6 @@ impl FilesView {
                 }
                 .into(),
             );
-            *checked = Some(selected && !directory);
-            *width = Some(wire::Length::Fill);
         }
         button
     }
@@ -141,26 +187,59 @@ impl FilesView {
         } else {
             crate::host::size_label(entry.size)
         };
-        let content = native::column(
-            format!("{key}/facts"),
-            [
-                native::heading(format!("{key}/title"), "Object"),
-                native::text(
-                    format!("{key}/kind"),
-                    if directory { "DIR" } else { "FILE" },
+        let content = native::spaced(
+            native::padded(
+                native::column(
+                    format!("{key}/facts"),
+                    [
+                        native::centered_row(
+                            format!("{key}/head"),
+                            [
+                                native::sized(
+                                    native::heading(format!("{key}/title"), "Object"),
+                                    Some(wire::Length::Fill),
+                                    None,
+                                ),
+                                native::badge(
+                                    format!("{key}/kind"),
+                                    if directory { "DIR" } else { "FILE" },
+                                    Tone::Neutral,
+                                ),
+                            ],
+                        ),
+                        native::wrapping(native::strong(format!("{key}/name"), entry.name.clone())),
+                        native::wrapping(native::mono(format!("{key}/path"), entry.path.clone())),
+                        native::divider(format!("{key}/rule")),
+                        native::spaced(
+                            native::column(
+                                format!("{key}/id-block"),
+                                [
+                                    native::label(format!("{key}/id-label"), "object id"),
+                                    native::wrapping(native::mono(format!("{key}/id"), object)),
+                                ],
+                            ),
+                            3.,
+                        ),
+                        native::spaced(
+                            native::column(
+                                format!("{key}/size-block"),
+                                [
+                                    native::label(format!("{key}/size-label"), "size"),
+                                    native::mono(format!("{key}/size"), size),
+                                ],
+                            ),
+                            3.,
+                        ),
+                    ],
                 ),
-                native::text(format!("{key}/name"), entry.name.clone()),
-                native::text(format!("{key}/path"), entry.path.clone()),
-                native::text(format!("{key}/id-label"), "object id"),
-                native::text(format!("{key}/id"), object),
-                native::text(format!("{key}/size-label"), "size"),
-                native::text(format!("{key}/size"), size),
-            ],
+                wire::Edges::all(16.),
+            ),
+            10.,
         );
-        native::sized(
-            native::scroll(key, content),
-            Some(wire::Length::Fixed(self.object_width as f32)),
-            Some(wire::Length::Fill),
+        native::pane(
+            key.clone(),
+            native::scroll(format!("{key}/scroll"), content),
+            wire::Length::Fixed(self.object_width as f32),
         )
     }
 }

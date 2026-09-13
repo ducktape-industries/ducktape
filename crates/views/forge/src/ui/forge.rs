@@ -1,6 +1,7 @@
+use super::kit::state_tone;
 use super::*;
 use crate::host;
-use ducktape_view_guest::slots;
+use ducktape_view_guest::{kit::Tone, slots};
 
 pub(super) fn action(key: impl Into<String>, label: &str, message: Option<Message>) -> wire::Node {
     native::button(
@@ -9,6 +10,31 @@ pub(super) fn action(key: impl Into<String>, label: &str, message: Option<Messag
         message.map(slots::message),
         wire::ButtonPreset::Secondary,
     )
+}
+
+pub(super) fn subtle(key: impl Into<String>, label: &str, message: Option<Message>) -> wire::Node {
+    native::button(
+        key,
+        label,
+        message.map(slots::message),
+        wire::ButtonPreset::Subtle,
+    )
+}
+
+pub(super) fn primary(key: impl Into<String>, label: &str, message: Option<Message>) -> wire::Node {
+    native::button(
+        key,
+        label,
+        message.map(slots::message),
+        wire::ButtonPreset::Primary,
+    )
+}
+
+/// A titled block of an item screen.
+pub(super) fn section(key: &str, title: wire::Node, children: Vec<wire::Node>) -> wire::Node {
+    let mut items = vec![title];
+    items.extend(children);
+    native::spaced(native::column(key, items), 10.)
 }
 
 fn picker(
@@ -47,13 +73,24 @@ impl ForgeView {
             content.push(self.unavailable("forge/error".into()));
         }
         if self.open_repo.is_empty() {
-            content.push(native::heading("forge/organization", &self.org));
-            content.push(native::text("forge/about", &self.about));
-            content.push(native::text("forge/tier", &self.tier));
-            content.push(native::text(
-                "forge/repo-count",
-                host::plural(self.repos.len() as i64, "repository", "repositories"),
+            content.push(native::centered_row(
+                "forge/head",
+                [
+                    native::sized(
+                        native::title("forge/organization", &self.org),
+                        Some(wire::Length::Fill),
+                        None,
+                    ),
+                    native::badge("forge/tier", &self.tier, Tone::Neutral),
+                    native::secondary(
+                        "forge/repo-count",
+                        host::plural(self.repos.len() as i64, "repository", "repositories"),
+                    ),
+                ],
             ));
+            if !self.about.is_empty() {
+                content.push(native::wrapping(native::secondary("forge/about", &self.about)));
+            }
             if self.repos.is_empty() {
                 let label = match self.list_phase.as_str() {
                     "loading" => "Loading repositories…",
@@ -63,38 +100,80 @@ impl ForgeView {
                     }
                     _ => "",
                 };
-                content.push(native::text("forge/list-status", label));
+                content.push(native::wrapping(native::secondary("forge/list-status", label)));
                 if self.list_phase == "ready" {
                     let command = host::forge_push_command(&self.connected_rpc);
-                    content.push(native::text("forge/push-command", &command));
-                    content.push(action(
-                        "forge/copy-push",
-                        "Copy command",
-                        Some(Message::CopyToClipboard(command, "Command copied".into())),
+                    content.push(native::card(
+                        "forge/push-card",
+                        native::spaced(
+                            native::centered_row(
+                                "forge/push-row",
+                                [
+                                    native::sized(
+                                        native::wrapping(native::mono("forge/push-command", &command)),
+                                        Some(wire::Length::Fill),
+                                        None,
+                                    ),
+                                    action(
+                                        "forge/copy-push",
+                                        "Copy command",
+                                        Some(Message::CopyToClipboard(
+                                            command,
+                                            "Command copied".into(),
+                                        )),
+                                    ),
+                                ],
+                            ),
+                            12.,
+                        ),
                     ));
                 }
             }
+            let mut rows = Vec::new();
             for repo in &self.repos {
-                content.push(native::column(
-                    format!("forge/repo/{}", repo.name),
-                    [
-                        action(
-                            format!("forge/open/{}", repo.name),
-                            &repo.name,
-                            Some(Message::ForgeOpenRepo(repo.name.clone())),
-                        ),
-                        native::text(format!("forge/head/{}", repo.name), &repo.head),
-                    ],
-                ));
+                let key = format!("forge/repo/{}", repo.name);
+                let mut row = native::list_row(
+                    &key,
+                    native::centered_row(
+                        format!("{key}/line"),
+                        [
+                            native::sized(
+                                native::strong(format!("forge/open/{}", repo.name), &repo.name),
+                                Some(wire::Length::Fill),
+                                None,
+                            ),
+                            native::nowrap(native::colored(
+                                native::mono(format!("forge/head/{}", repo.name), &repo.head),
+                                native::palette().muted,
+                            )),
+                        ],
+                    ),
+                    false,
+                    Some(slots::message(Message::ForgeOpenRepo(repo.name.clone()))),
+                );
+                if let wire::Node::Button { label, .. } = &mut row {
+                    *label = Some(repo.name.clone());
+                }
+                rows.push(row);
             }
-            return native::scroll("forge/repositories", native::column("forge/list", content));
+            if !rows.is_empty() {
+                let mut card = native::card(
+                    "forge/repo-card",
+                    native::spaced(native::column("forge/repo-rows", rows), 1.),
+                );
+                if let wire::Node::Container { padding, .. } = &mut card {
+                    *padding = Some(wire::Edges::all(6.));
+                }
+                content.push(card);
+            }
+            return native::scroll(
+                "forge/repositories",
+                native::spaced(native::column("forge/list", content), 16.),
+            );
         }
         let mut header = vec![
-            action(
-                "forge/all-repos",
-                "All repos",
-                Some(Message::ForgeCloseRepo),
-            ),
+            subtle("forge/all-repos", "All repos", Some(Message::ForgeCloseRepo)),
+            native::caption("forge/crumb", "/"),
             picker(
                 "ForgeView/forge/repo-pick",
                 host::repo_names(&self.repos),
@@ -112,51 +191,46 @@ impl ForgeView {
                 Message::ForgePickBranch,
             ));
         }
-        content.push(native::row("forge/navigation", header));
         let tabs = [
             ("code", "Code"),
             ("pulls", "Pull requests"),
             ("issues", "Issues"),
         ];
-        content.push(native::row(
-            "forge/tabs",
-            tabs.into_iter().map(|(tab, label)| {
-                let mut button = action(
-                    format!("forge/tab/{tab}"),
-                    label,
-                    (self.tab != tab || self.forge_item_number > 0)
-                        .then(|| Message::SelectForgeTab(tab.into())),
+        let tab_buttons = tabs.into_iter().map(|(tab, label)| {
+            let kind = match tab {
+                "pulls" => "pr",
+                "issues" => "issue",
+                _ => "",
+            };
+            let text = if kind.is_empty() {
+                label.to_owned()
+            } else {
+                format!("{label}  {}", host::forge_open_count(&self.items, kind))
+            };
+            let mut button = subtle(
+                format!("forge/tab/{tab}"),
+                &text,
+                (self.tab != tab || self.forge_item_number > 0)
+                    .then(|| Message::SelectForgeTab(tab.into())),
+            );
+            if let wire::Node::Button { checked, label, .. } = &mut button {
+                *checked = Some(self.tab == tab);
+                *label = Some(
+                    match tab {
+                        "code" => "Browse the code",
+                        "pulls" => "Show pull requests",
+                        _ => "Show issues",
+                    }
+                    .into(),
                 );
-                if let wire::Node::Button { checked, label, .. } = &mut button {
-                    *checked = Some(self.tab == tab);
-                    *label = Some(
-                        match tab {
-                            "code" => "Browse the code",
-                            "pulls" => "Show pull requests",
-                            _ => "Show issues",
-                        }
-                        .into(),
-                    );
-                }
-                let kind = match tab {
-                    "pulls" => "pr",
-                    "issues" => "issue",
-                    _ => "",
-                };
-                if kind.is_empty() {
-                    return button;
-                }
-                native::row(
-                    format!("forge/tab-count/{tab}"),
-                    [
-                        button,
-                        native::text(
-                            format!("forge/count/{tab}"),
-                            host::forge_open_count(&self.items, kind).to_string(),
-                        ),
-                    ],
-                )
-            }),
+            }
+            button
+        });
+        header.push(native::spacer());
+        header.extend(tab_buttons);
+        content.push(native::spaced(
+            native::centered_row("forge/navigation", header),
+            6.,
         ));
         let body = if self.forge_item_number > 0 {
             self.item_screen()
@@ -169,7 +243,7 @@ impl ForgeView {
         };
         content.push(body);
         native::sized(
-            native::column("forge/root", content),
+            native::spaced(native::column("forge/root", content), 12.),
             Some(wire::Length::Fill),
             Some(wire::Length::Fill),
         )
@@ -189,63 +263,140 @@ impl ForgeView {
                         self.empty_pulls("forge/no-pulls".into())
                     });
                 }
+                let mut rows = Vec::new();
                 for item in items {
                     let key = format!("forge/item/{}", item.number);
-                    content.push(native::column(
-                        &key,
+                    let line = native::centered_row(
+                        format!("{key}/line"),
                         [
-                            action(
-                                format!("{key}/open"),
-                                &item.title,
-                                Some(Message::ForgeOpenItem(item.number)),
+                            native::sized(
+                                native::spaced(
+                                    native::column(
+                                        format!("{key}/lines"),
+                                        [
+                                            native::nowrap(native::strong(
+                                                format!("{key}/open"),
+                                                &item.title,
+                                            )),
+                                            native::spaced(
+                                                native::centered_row(
+                                                    format!("{key}/meta"),
+                                                    [
+                                                        native::nowrap(native::mono(
+                                                            format!("{key}/number"),
+                                                            format!("#{}", item.number),
+                                                        )),
+                                                        native::nowrap(native::caption(
+                                                            format!("{key}/author"),
+                                                            &item.author_name,
+                                                        )),
+                                                    ],
+                                                ),
+                                                8.,
+                                            ),
+                                        ],
+                                    ),
+                                    2.,
+                                ),
+                                Some(wire::Length::Fill),
+                                None,
                             ),
-                            native::text(format!("{key}/number"), format!("#{}", item.number)),
-                            native::text(format!("{key}/state"), &item.state),
-                            native::text(format!("{key}/author"), &item.author_name),
+                            native::badge(
+                                format!("{key}/state"),
+                                &item.state,
+                                state_tone(&item.state),
+                            ),
                         ],
-                    ));
+                    );
+                    let mut row = native::list_row(
+                        &key,
+                        line,
+                        false,
+                        Some(slots::message(Message::ForgeOpenItem(item.number))),
+                    );
+                    if let wire::Node::Button { label, .. } = &mut row {
+                        *label = Some(item.title.clone());
+                    }
+                    rows.push(row);
+                }
+                if !rows.is_empty() {
+                    let mut card = native::card(
+                        "forge/tracker-card",
+                        native::spaced(native::column("forge/tracker-rows", rows), 1.),
+                    );
+                    if let wire::Node::Container { padding, .. } = &mut card {
+                        *padding = Some(wire::Edges::all(6.));
+                    }
+                    content.push(card);
                 }
             }
             _ => {}
         }
         native::scroll(
             "forge/tracker",
-            native::column("forge/tracker-content", content),
+            native::spaced(native::column("forge/tracker-content", content), 12.),
         )
     }
 
     fn item_screen(&self) -> wire::Node {
-        let mut content = vec![action(
-            "forge/back",
-            "Back to tracker",
-            Some(Message::ForgeCloseItem),
+        let mut content = vec![native::row(
+            "forge/item-nav",
+            [subtle(
+                "forge/back",
+                "Back to tracker",
+                Some(Message::ForgeCloseItem),
+            )],
         )];
         match self.item_phase.as_str() {
             "loading" => content.push(self.loading_item("forge/item-loading".into())),
             "failed" => content.push(self.item_unavailable("forge/item-failed".into())),
             "ready" => {
-                content.extend([
-                    native::heading("forge/item-title", &self.forge_item_title),
-                    native::text("forge/item-number", format!("#{}", self.forge_item_number)),
-                    native::text("forge/item-state", &self.forge_item_state),
-                    native::text("forge/item-author", &self.forge_item_author),
-                    native::text("forge/item-branches", &self.forge_item_branches),
-                    action(
-                        "forge/copy-item",
-                        "Copy link",
-                        Some(Message::CopyToClipboard(
-                            host::duck_forge_item_link(
-                                &self.open_repo,
-                                self.forge_item_number,
-                                &self.network_chain_id,
-                            ),
-                            "Link copied".into(),
-                        )),
+                let mut meta = vec![
+                    native::badge(
+                        "forge/item-state",
+                        &self.forge_item_state,
+                        state_tone(&self.forge_item_state),
                     ),
-                ]);
+                    native::nowrap(native::mono(
+                        "forge/item-number",
+                        format!("#{}", self.forge_item_number),
+                    )),
+                    native::nowrap(native::secondary("forge/item-author", &self.forge_item_author)),
+                ];
+                if !self.forge_item_branches.is_empty() {
+                    meta.push(native::nowrap(native::mono(
+                        "forge/item-branches",
+                        &self.forge_item_branches,
+                    )));
+                }
+                meta.push(native::spacer());
+                meta.push(subtle(
+                    "forge/copy-item",
+                    "Copy link",
+                    Some(Message::CopyToClipboard(
+                        host::duck_forge_item_link(
+                            &self.open_repo,
+                            self.forge_item_number,
+                            &self.network_chain_id,
+                        ),
+                        "Link copied".into(),
+                    )),
+                ));
+                content.push(native::spaced(
+                    native::column(
+                        "forge/item-head",
+                        [
+                            native::wrapping(native::title("forge/item-title", &self.forge_item_title)),
+                            native::spaced(native::wrapped_row("forge/item-meta", meta), 8.),
+                        ],
+                    ),
+                    6.,
+                ));
                 if !self.forge_item_body.is_empty() {
-                    content
-                        .push(self.item_body("forge/item-body".into(), Message::OpenMessageLink));
+                    content.push(native::card(
+                        "forge/item-body-card",
+                        self.item_body("forge/item-body".into(), Message::OpenMessageLink),
+                    ));
                 }
                 if !self.diff_rows.is_empty() {
                     content.push(self.diff_screen());
@@ -254,27 +405,27 @@ impl ForgeView {
                     content.push(self.merge_screen());
                     content.push(self.review_screen());
                 }
-                content.push(native::heading("forge/discussion-title", "Discussion"));
+                let mut discussion = Vec::new();
                 for note in &self.linked_note {
-                    content.push(native::heading(
+                    discussion.push(native::label(
                         format!("forge/linked/{}/title", note.seq),
                         "Linked note",
                     ));
-                    content.push(self.note(format!("forge/linked/{}", note.seq), note));
+                    discussion.push(self.note(format!("forge/linked/{}", note.seq), note));
                 }
                 if self.discussion.is_empty() && !self.discussion_clipped {
-                    content.push(native::text("forge/no-discussion", "No discussion yet."));
+                    discussion.push(native::secondary("forge/no-discussion", "No discussion yet."));
                 }
                 if self.discussion_clipped {
-                    content.push(native::text(
+                    discussion.push(native::caption(
                         "forge/discussion-clipped",
                         "Older comments are not shown.",
                     ));
                 }
                 for note in &self.discussion {
-                    content.push(self.note(format!("forge/note/{}", note.seq), note));
+                    discussion.push(self.note(format!("forge/note/{}", note.seq), note));
                 }
-                content.push(wire::Node::Surface {
+                discussion.push(wire::Node::Surface {
                     key: "forge/note-composer".into(),
                     name: "forge_composer".into(),
                     args: vec![
@@ -295,35 +446,53 @@ impl ForgeView {
                     ],
                     on_event: None,
                 });
+                content.push(section(
+                    "forge/discussion",
+                    native::heading("forge/discussion-title", "Discussion"),
+                    discussion,
+                ));
             }
             _ => {}
         }
-        native::scroll(
-            "forge/item-scroll",
-            native::column("forge/item-content", content),
-        )
+        let mut column = native::spaced(native::column("forge/item-content", content), 16.);
+        if let wire::Node::Linear { max_width, .. } = &mut column {
+            *max_width = Some(920.);
+        }
+        native::scroll("forge/item-scroll", column)
     }
 
     fn note(&self, key: String, note: &host::ChatMessage) -> wire::Node {
-        native::column(
+        let human = note.avatar_kind == "human";
+        native::card(
             &key,
-            [
-                native::text(
-                    format!("{key}/avatar"),
-                    if note.avatar_kind == "human" {
-                        note.initial.clone()
-                    } else {
-                        format!("AI · {}", note.initial)
-                    },
+            native::spaced(
+                native::column(
+                    format!("{key}/body-column"),
+                    [
+                        native::spaced(
+                            native::centered_row(
+                                format!("{key}/head"),
+                                [
+                                    native::avatar(
+                                        format!("{key}/avatar"),
+                                        note.initial.clone(),
+                                        if human { Tone::Neutral } else { Tone::Agent },
+                                    ),
+                                    native::nowrap(native::strong(format!("{key}/author"), &note.author)),
+                                    native::nowrap(native::caption(format!("{key}/meta"), &note.meta)),
+                                ],
+                            ),
+                            8.,
+                        ),
+                        self.rich_body(
+                            format!("{key}/body"),
+                            Message::OpenMessageLink,
+                            note.blocks.clone(),
+                        ),
+                    ],
                 ),
-                native::heading(format!("{key}/author"), &note.author),
-                native::text(format!("{key}/meta"), &note.meta),
-                self.rich_body(
-                    format!("{key}/body"),
-                    Message::OpenMessageLink,
-                    note.blocks.clone(),
-                ),
-            ],
+                8.,
+            ),
         )
     }
 }

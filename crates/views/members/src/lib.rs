@@ -427,7 +427,7 @@ impl MembersView {
                 let content = kit::centered_row(
                     format!("{key}/details"),
                     [
-                        kit::avatar(format!("{key}/avatar"), host::initials(&member.label), tone),
+                        kit::avatar(format!("{key}/avatar"), kit::initials(&member.label), tone),
                         kit::sized(
                             kit::spaced(
                                 kit::column(
@@ -560,7 +560,7 @@ impl MembersView {
                 kit::centered_row(
                     format!("{key}/identity"),
                     [
-                        kit::avatar(format!("{key}/avatar"), host::initials(&member.label), tone),
+                        kit::avatar(format!("{key}/avatar"), kit::initials(&member.label), tone),
                         kit::wrapping(kit::heading(format!("{key}/name"), &member.label)),
                     ],
                 ),

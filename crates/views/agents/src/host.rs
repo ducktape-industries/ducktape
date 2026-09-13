@@ -1857,6 +1857,12 @@ pub fn drafts_consumed(
     write_landed || registration_landed
 }
 
+/// `3 skills` — a count with its noun.
+pub(crate) fn plural(count: i64, one: &str, many: &str) -> String {
+    let noun = if count == 1 { one } else { many };
+    format!("{count} {noun}")
+}
+
 /// `4 agents · 2 working` — the title's machine subtitle. `working` is runs
 /// in flight, not `status == active`, which is the registration default.
 pub fn agents_summary(connected: bool, rows: &[AgentRow]) -> String {

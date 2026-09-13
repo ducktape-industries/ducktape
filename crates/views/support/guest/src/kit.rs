@@ -483,6 +483,21 @@ pub fn badge(key: impl Into<String>, content: impl Into<String>, tone: Tone) -> 
     node
 }
 
+/// Up to two initials off a name: "Reviewer Bot" → "RB", "ab12cd" → "AB".
+pub fn initials(name: &str) -> String {
+    let words: Vec<char> = name
+        .split_whitespace()
+        .filter_map(|word| word.chars().next())
+        .take(2)
+        .collect();
+    let picked: String = if words.len() >= 2 {
+        words.into_iter().collect()
+    } else {
+        name.chars().take(2).collect()
+    };
+    picked.to_uppercase()
+}
+
 /// A round avatar carrying initials.
 pub fn avatar(key: impl Into<String>, initials: impl Into<String>, tone: Tone) -> Node {
     let p = palette();
