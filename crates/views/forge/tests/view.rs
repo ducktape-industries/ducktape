@@ -208,13 +208,16 @@ fn a_connected_view_reads_its_own_repo_namespace() {
         texts(&drive.frame)
     );
 
+    // the rail lists the namespace, and with nothing open the reader side
+    // invites a choice
     let (drive, _live) = namespace("");
-    assert!(has_text(&drive.frame, "core"), "{:?}", texts(&drive.frame));
-    assert!(
-        has_text(&drive.frame, "duckhouse"),
-        "{:?}",
-        texts(&drive.frame)
-    );
+    for expected in ["core", "1 repository", "No repository open"] {
+        assert!(
+            has_text(&drive.frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&drive.frame)
+        );
+    }
 }
 
 /// A forge block moves the live subscription, and the view re-reads exactly

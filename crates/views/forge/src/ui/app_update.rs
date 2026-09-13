@@ -12,7 +12,6 @@ impl super::ForgeView {
             Message::BlobArrived(next) => self.on_blob_arrived(next),
             Message::ActDone(next) => self.on_act_done(next),
             Message::ForgeOpenRepo(name) => self.on_forge_open_repo(name),
-            Message::ForgeCloseRepo => self.on_forge_close_repo(),
             Message::ForgePickBranch(name) => self.on_forge_pick_branch(name),
             Message::ForgeOpenDir(path) => self.on_forge_open_dir(path),
             Message::ForgeOpenFile(path) => self.on_forge_open_file(path),
@@ -315,36 +314,6 @@ impl super::ForgeView {
         self.item_phase = "idle".to_owned();
         self.forge_item_channel = "".to_owned();
         self.linked_note = Vec::new();
-        self.diff_rows = Vec::new();
-        self.discussion = Vec::new();
-        self.discussion_clipped = false;
-        self.merge_conflicts = Vec::new();
-        self.staged_comments = Vec::new();
-        self.tree_path = "".to_owned();
-        self.tree_rev = "".to_owned();
-        self.tree_entries = Vec::new();
-        self.tree_born = false;
-        self.tree_truncated = false;
-        self.tree_phase = "loading".to_owned();
-        self.file_path = "".to_owned();
-        self.file_text.clear();
-        self.file_note = "".to_owned();
-        self.file_phase = "idle".to_owned();
-        self.opened_dir = "".to_owned();
-        self.opened_rev = "".to_owned();
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_forge_close_repo(&mut self) -> ducktape_view_guest::Task<Message> {
-        self.open_repo = "".to_owned();
-        self.repo_phase = "idle".to_owned();
-        self.branches = Vec::new();
-        self.items = Vec::new();
-        self.tree_pick = "".to_owned();
-        self.forge_item_number = 0;
-        self.item_phase = "idle".to_owned();
-        self.forge_item_channel = "".to_owned();
-        self.linked_note = Vec::new();
-        self.focus_seq = 0;
         self.diff_rows = Vec::new();
         self.discussion = Vec::new();
         self.discussion_clipped = false;

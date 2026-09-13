@@ -5,8 +5,58 @@ use crate::host;
 use ducktape_view_guest::{kit::Tone, slots};
 
 impl ForgeView {
+    /// Where the tree pane stands: the root, then one pressable segment per
+    /// directory down to the open one.
+    fn tree_crumb(&self) -> wire::Node {
+        let p = native::palette();
+        // a crumb segment: a quiet button, tight, never underlined
+        let segment = |key: String, name: &str, path: String| {
+            let mut button = subtle(key, name, Some(Message::ForgeOpenDir(path)));
+            if let wire::Node::Button { padding, .. } = &mut button {
+                *padding = Some(wire::Edges {
+                    top: 2.,
+                    right: 6.,
+                    bottom: 2.,
+                    left: 6.,
+                });
+            }
+            button
+        };
+        let mut root = segment("forge/tree-root".into(), "root", String::new());
+        if let wire::Node::Button { label, .. } = &mut root {
+            *label = Some("Back to the repository root".into());
+        }
+        let mut crumb = vec![root];
+        let mut walked = String::new();
+        for name in self.tree_path.split('/').filter(|s| !s.is_empty()) {
+            if !walked.is_empty() {
+                walked.push('/');
+            }
+            walked.push_str(name);
+            crumb.push(native::nowrap(native::colored(
+                native::caption(format!("forge/tree-crumb/{walked}/slash"), "/"),
+                p.faint,
+            )));
+            crumb.push(segment(
+                format!("forge/tree-crumb/{walked}"),
+                name,
+                walked.clone(),
+            ));
+        }
+        let mut row = native::spaced(native::wrapped_row("forge/tree-head", crumb), 2.);
+        if let wire::Node::Linear { padding, .. } = &mut row {
+            *padding = Some(wire::Edges {
+                top: 4.,
+                right: 4.,
+                bottom: 2.,
+                left: 4.,
+            });
+        }
+        row
+    }
+
     pub(super) fn code_screen(&self) -> wire::Node {
-        let mut tree = Vec::new();
+        let mut tree = vec![self.tree_crumb()];
         match self.tree_phase.as_str() {
             "loading" => tree.push(native::secondary(
                 "forge/tree-loading",
@@ -17,13 +67,6 @@ impl ForgeView {
                 "Could not load the tree. Open the repository again to retry.",
             ))),
             "ready" => {
-                if !self.tree_path.is_empty() {
-                    tree.push(subtle(
-                        "forge/tree-root",
-                        "Back to the repository root",
-                        Some(Message::ForgeOpenDir(String::new())),
-                    ));
-                }
                 for entry in &self.tree_entries {
                     let directory = entry.kind == "dir";
                     let route = if directory {
@@ -44,9 +87,12 @@ impl ForgeView {
                     } else {
                         name
                     };
+                    // a kit button centres a shrink-width child: the row
+                    // fills so the name sits at the left
+                    let line = native::row(format!("forge/tree/{}/line", entry.path), [name]);
                     let mut button = native::list_row(
                         format!("forge/tree/{}", entry.path),
-                        name,
+                        line,
                         entry.path == self.file_path,
                         Some(slots::message(route)),
                     );
@@ -117,10 +163,7 @@ impl ForgeView {
                     [
                         pane,
                         resize,
-                        native::scroll(
-                            "forge/file-scroll",
-                            native::padded(self.file_screen(), wire::Edges::all(16.)),
-                        ),
+                        self.file_pane(),
                     ],
                 ),
                 0.,
@@ -134,7 +177,9 @@ impl ForgeView {
         split
     }
 
-    fn file_screen(&self) -> wire::Node {
+    /// The reader beside the tree: a header strip naming the open file over
+    /// its text, or the invitation to choose one.
+    fn file_pane(&self) -> wire::Node {
         let path = host::forge_file_header(
             &self.opened_dir,
             &self.opened_rev,
@@ -156,19 +201,59 @@ impl ForgeView {
                     "Choose a file from the tree.",
                 ));
             }
-            return native::column("forge/file", content);
+            return native::scroll(
+                "forge/file-scroll",
+                native::padded(native::column("forge/file", content), wire::Edges::all(8.)),
+            );
         }
-        let mut content = vec![native::centered_row(
-            "forge/file-head",
-            [
-                native::sized(
-                    native::wrapping(native::mono("forge/file-header", &path)),
-                    Some(wire::Length::Fill),
-                    None,
+        let head = native::sized(
+            native::padded(
+                native::spaced(
+                    native::centered_row(
+                        "forge/file-head",
+                        [
+                            native::sized(
+                                native::nowrap(native::mono("forge/file-header", &path)),
+                                Some(wire::Length::Fill),
+                                None,
+                            ),
+                            native::nowrap(native::caption("forge/code-context", "Read only")),
+                        ],
+                    ),
+                    12.,
                 ),
-                native::nowrap(native::caption("forge/code-context", "Read only")),
-            ],
-        )];
+                wire::Edges {
+                    top: 0.,
+                    right: 12.,
+                    bottom: 0.,
+                    left: 12.,
+                },
+            ),
+            Some(wire::Length::Fill),
+            Some(wire::Length::Fixed(32.)),
+        );
+        native::sized(
+            native::spaced(
+                native::column(
+                    "forge/file-column",
+                    [
+                        head,
+                        native::divider("forge/file-head-edge"),
+                        native::scroll(
+                            "forge/file-scroll",
+                            native::padded(self.file_body(), wire::Edges::all(12.)),
+                        ),
+                    ],
+                ),
+                0.,
+            ),
+            Some(wire::Length::Fill),
+            Some(wire::Length::Fill),
+        )
+    }
+
+    fn file_body(&self) -> wire::Node {
+        let mut content = Vec::new();
         match self.file_phase.as_str() {
             "loading" => content.push(native::secondary("forge/loading-file", "Loading file…")),
             "failed" => content.push(native::tone_text(
@@ -246,14 +331,14 @@ impl ForgeView {
                     Some(wire::Length::Fill),
                     None,
                 ),
-                native::secondary(
+                native::nowrap(native::secondary(
                     "forge/diff-count",
                     host::forge_stats(
                         self.forge_item_files_changed,
                         self.forge_item_additions,
                         self.forge_item_deletions,
                     ),
-                ),
+                )),
             ],
         );
         let number = |key: String, value: &str| {
@@ -348,17 +433,32 @@ impl ForgeView {
                             None,
                         ),
                     ];
+                    // a `+` at the end of every commentable row; the words
+                    // ride as the accessible label a test presses
                     if !line.path.is_empty() {
-                        cells.push(native::button(
+                        let mut comment = native::button(
                             format!("{key}/comment"),
-                            "Comment on this line",
+                            "+",
                             Some(slots::message(Message::ForgeCommentOpen(
                                 line.path.clone(),
                                 line_number.clone(),
                                 line.side.clone(),
                             ))),
-                            wire::ButtonPreset::Text,
-                        ));
+                            wire::ButtonPreset::Subtle,
+                        );
+                        if let wire::Node::Button {
+                            label, padding, ..
+                        } = &mut comment
+                        {
+                            *label = Some("Comment on this line".into());
+                            *padding = Some(wire::Edges {
+                                top: 0.,
+                                right: 6.,
+                                bottom: 0.,
+                                left: 6.,
+                            });
+                        }
+                        cells.push(comment);
                     }
                     let mut row = native::padded(
                         native::sized(
@@ -439,6 +539,8 @@ impl ForgeView {
         section("forge/diff", title, content)
     }
 
+    /// The merge door, as the properties rail carries it: the review tally,
+    /// the one button, and what stopped the last attempt.
     pub(super) fn merge_screen(&self) -> wire::Node {
         let mut content = Vec::new();
         match self.forge_item_state.as_str() {
@@ -455,7 +557,7 @@ impl ForgeView {
                 "This pull request is closed.",
             )),
             "open" => {
-                let mut row = vec![native::badge(
+                let mut tally = vec![native::badge(
                     "forge/approvals",
                     host::plural(self.forge_item_approvals, "approval", "approvals"),
                     if self.forge_item_approvals > 0 {
@@ -465,31 +567,41 @@ impl ForgeView {
                     },
                 )];
                 if self.forge_item_change_requests > 0 {
-                    row.push(native::tone_text(
+                    tally.push(native::badge(
                         "forge/changes-requested",
                         format!(
-                            "{} requested changes — merging is not recommended",
+                            "{} requested changes",
                             host::plural(self.forge_item_change_requests, "reviewer", "reviewers")
                         ),
                         Tone::Danger,
                     ));
                 }
-                row.push(native::spacer());
+                content.push(native::spaced(
+                    native::wrapped_row("forge/merge-tally", tally),
+                    6.,
+                ));
                 let available =
                     self.connected && !self.merge_busy && !self.forge_item_source_oid.is_empty();
-                row.push(primary(
-                    "forge/merge",
-                    if self.merge_busy {
-                        "Merging…"
-                    } else {
-                        "Merge pull request"
-                    },
-                    available.then_some(Message::ForgeMergeSubmit),
+                content.push(native::sized(
+                    primary(
+                        "forge/merge",
+                        if self.merge_busy {
+                            "Merging…"
+                        } else {
+                            "Merge pull request"
+                        },
+                        available.then_some(Message::ForgeMergeSubmit),
+                    ),
+                    Some(wire::Length::Fill),
+                    None,
                 ));
-                content.push(native::spaced(
-                    native::centered_row("forge/merge-row", row),
-                    10.,
-                ));
+                if self.forge_item_change_requests > 0 {
+                    content.push(native::wrapping(native::tone_text(
+                        "forge/merge-warning",
+                        "Merging is not recommended while changes are requested.",
+                        Tone::Danger,
+                    )));
+                }
                 if !self.merge_conflicts.is_empty() {
                     let mut conflicts = vec![native::wrapping(native::text(
                         "forge/conflict-title",
@@ -510,18 +622,14 @@ impl ForgeView {
             }
             _ => {}
         }
-        section(
+        native::card(
             "forge/merge-box",
-            native::heading("forge/merge-title", "Merge"),
-            content,
+            native::spaced(native::column("forge/merge-content", content), 10.),
         )
     }
 
     pub(super) fn review_screen(&self) -> wire::Node {
         let mut content = Vec::new();
-        if self.forge_item_reviews.is_empty() {
-            content.push(native::secondary("forge/no-reviews", "No reviews yet."));
-        }
         for (index, review) in self.forge_item_reviews.iter().enumerate() {
             let key = format!("forge/review/{index}");
             if index > 0 {
