@@ -252,7 +252,7 @@ impl Desktop {
             crate::shell::WindowKind::Console => Some(TitlebarOptions {
                 title: (!cfg!(target_os = "macos")).then(|| "Ducktape".into()),
                 appears_transparent: cfg!(target_os = "macos"),
-                ..Default::default()
+                traffic_light_position: Some(point(px(12.), px(12.))),
             }),
             crate::shell::WindowKind::Huddle => Some(TitlebarOptions {
                 title: Some("Ducktape · Huddle".into()),
@@ -1631,6 +1631,7 @@ impl DesktopWindow {
                         .text_color(ink_muted),
                     ),
             );
+        let reserve_traffic_lights = cfg!(target_os = "macos") && !window.is_fullscreen();
         let mut tabs = div()
             .id("workspace-rail")
             .flex()
@@ -1643,6 +1644,20 @@ impl DesktopWindow {
             .bg(sidebar)
             .border_r_1()
             .border_color(ink_border)
+            // Transparent macOS chrome overlays the rail. Keep its buttons
+            // above the network switcher and leave the strip draggable.
+            .when(reserve_traffic_lights, |rail| {
+                rail.child(
+                    div()
+                        .id("workspace-titlebar")
+                        .h(px(32.))
+                        .w_full()
+                        .flex_shrink_0()
+                        .on_mouse_down(MouseButton::Left, |_, window, _| {
+                            window.start_window_move()
+                        }),
+                )
+            })
             .child(network)
             .child(div().h_3().flex_shrink_0());
         for (tab, label) in navigation {
