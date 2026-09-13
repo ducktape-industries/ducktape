@@ -39,6 +39,8 @@ pub struct NodeView {
     pub(crate) live_log_filter: String,
     pub(crate) live_filter_note: String,
     pub(crate) host_error: String,
+    #[serde(default)]
+    pub(crate) dark: bool,
 }
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -75,6 +77,7 @@ impl NodeView {
             live_log_filter: "".to_owned(),
             live_filter_note: "".to_owned(),
             host_error: "".to_owned(),
+            dark: false,
         }
     }
     pub(crate) fn boot() -> (Self, Task<Message>) {
@@ -197,6 +200,7 @@ impl NodeView {
             self.connection_serial,
         );
         self.connected = next.connected;
+        self.dark = next.dark;
         self.admin = next.admin;
         self.tier = next.tier;
         self.status = next.status;

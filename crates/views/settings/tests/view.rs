@@ -301,7 +301,7 @@ fn disconnect_hides_retained_account_and_network_claims_without_losing_drafts() 
     let (frame, props, _) = connected(&facts(), 2);
     let frame = tick_native(press(&frame, "Account"));
     let frame = tick_native(type_into(&frame, "rename account…", "kept draft"));
-    assert!(has_text(&frame, "ACCOUNT KEYS"));
+    assert!(has_text(&frame, "Account keys"));
     let offline = Session {
         connected: false,
         ..facts()
@@ -311,7 +311,7 @@ fn disconnect_hides_retained_account_and_network_claims_without_losing_drafts() 
     for hidden in [
         "duck",
         "42",
-        "ACCOUNT KEYS",
+        "Account keys",
         "Rename",
         "Mint ticket",
         "Remove",
