@@ -373,21 +373,29 @@ impl MembersView {
                     MembersFilter::Validators,
                 ),
             ];
-            let tabs = filters.into_iter().map(|(key, label, description, filter)| {
+            let choices = filters.map(|(id, label, _, filter)| {
                 let count = host::filter_members(&self.rows, filter).len();
-                let mut button = kit::button(
-                    format!("members/filter/{key}"),
+                (
+                    id.to_owned(),
                     format!("{label}  {count}"),
+                    self.filter == filter,
                     Some(slots::message(Message::PickFilter(filter))),
-                    wire::ButtonPreset::Subtle,
-                );
-                if let wire::Node::Button { label, checked, .. } = &mut button {
-                    *label = Some(description.into());
-                    *checked = Some(self.filter == filter);
-                }
-                button
+                )
             });
-            roster.push(kit::spaced(kit::row("members/filters", tabs), 2.));
+            let mut strip = kit::tabs("members/filter", choices);
+            let wire::Node::Linear { children, .. } = &mut strip else {
+                unreachable!("a tab strip is a row")
+            };
+            // the strip reads as a switch, not a sentence: the name a
+            // reader hears is the filter it applies, not its count.
+            for (node, (_, _, description, _)) in children.iter_mut().zip(filters) {
+                let wire::Node::Button { label, height, .. } = node else {
+                    unreachable!("a tab is a button")
+                };
+                *label = Some(description.into());
+                *height = Some(wire::Length::Fixed(28.));
+            }
+            roster.push(strip);
             let members = host::filter_members(&self.rows, self.filter);
             if members.is_empty() && self.answered {
                 roster.push(kit::empty_state(
@@ -397,72 +405,15 @@ impl MembersView {
                 ));
             }
             let mut rows = Vec::new();
-            for member in members {
-                let key = format!("members/row/{}", member.key);
-                let tone = if member.is_agent {
-                    Tone::Agent
-                } else {
-                    Tone::Neutral
-                };
-                let mut name_line = vec![kit::nowrap(kit::strong(
-                    format!("{key}/name"),
-                    &member.label,
-                ))];
-                if member.is_this_node {
-                    name_line.push(kit::badge(format!("{key}/local"), "this node", Tone::Accent));
+            for member in &members {
+                // a hairline between rows, and none above the first: the
+                // rule separates two members, it does not frame the list.
+                if !rows.is_empty() {
+                    rows.push(kit::divider(format!("members/rule/{}", member.key)));
                 }
-                let mut meta = vec![kit::badge(format!("{key}/role"), &member.role, tone)];
-                if !member.model.is_empty() {
-                    meta.push(kit::caption(format!("{key}/model"), &member.model));
-                }
-                let live_tone = if member.live {
-                    Tone::Success
-                } else {
-                    Tone::Neutral
-                };
-                let content = kit::centered_row(
-                    format!("{key}/details"),
-                    [
-                        kit::avatar(format!("{key}/avatar"), kit::initials(&member.label), tone),
-                        kit::sized(
-                            kit::spaced(
-                                kit::column(
-                                    format!("{key}/lines"),
-                                    [
-                                        kit::spaced(
-                                            kit::centered_row(format!("{key}/name-line"), name_line),
-                                            6.,
-                                        ),
-                                        kit::spaced(
-                                            kit::centered_row(format!("{key}/meta"), meta),
-                                            6.,
-                                        ),
-                                    ],
-                                ),
-                                3.,
-                            ),
-                            Some(wire::Length::Fill),
-                            None,
-                        ),
-                        kit::badge(
-                            format!("{key}/live"),
-                            host::presence_label(&member),
-                            live_tone,
-                        ),
-                    ],
-                );
-                let mut button = kit::list_row(
-                    &key,
-                    content,
-                    self.selected == member.key,
-                    Some(slots::message(Message::OpenMember(member.key.clone()))),
-                );
-                if let wire::Node::Button { label, .. } = &mut button {
-                    *label = Some(member.label.clone());
-                }
-                rows.push(button);
+                rows.push(self.member_row(member));
             }
-            roster.push(kit::spaced(kit::column("members/rows", rows), 2.));
+            roster.push(kit::spaced(kit::column("members/rows", rows), 0.));
         }
         let mut panes = vec![kit::scroll(
             "members/roster",
@@ -519,107 +470,149 @@ impl MembersView {
             )),
         }
     }
+    /// One roster row on one line: who, what they are, and whether they are
+    /// here. The whole row presses open their record.
+    fn member_row(&self, member: &host::MemberRow) -> ducktape_view_guest::wire::Node {
+        use ducktape_view_guest::{
+            kit::{self, Tone},
+            slots, wire,
+        };
+        let key = format!("members/row/{}", member.key);
+        let mut line = vec![
+            kit::avatar(
+                format!("{key}/avatar"),
+                kit::initials(&member.label),
+                avatar_tone(member),
+            ),
+            kit::nowrap(kit::strong(format!("{key}/name"), &member.label)),
+        ];
+        if member.is_this_node {
+            line.push(kit::badge(
+                format!("{key}/local"),
+                "this node",
+                Tone::Accent,
+            ));
+        }
+        line.push(kit::badge(
+            format!("{key}/role"),
+            &member.role,
+            Tone::Neutral,
+        ));
+        if !member.model.is_empty() {
+            line.push(kit::nowrap(kit::caption(
+                format!("{key}/model"),
+                &member.model,
+            )));
+        }
+        line.push(kit::space(Some(wire::Length::Fill), None));
+        line.push(presence_chip(format!("{key}/live"), member));
+        let mut button = kit::list_row(
+            &key,
+            kit::spaced(kit::centered_row(format!("{key}/details"), line), 6.),
+            self.selected == member.key,
+            Some(slots::message(Message::OpenMember(member.key.clone()))),
+        );
+        if let wire::Node::Button { label, .. } = &mut button {
+            *label = Some(member.label.clone());
+        }
+        kit::sized(
+            button,
+            Some(wire::Length::Fill),
+            Some(wire::Length::Fixed(32.)),
+        )
+    }
     fn member_record(&self, member: &host::MemberRow) -> ducktape_view_guest::wire::Node {
         use ducktape_view_guest::{
             kit::{self, Tone},
             slots, wire,
         };
         let key = format!("members/record/{}", member.key);
-        let tone = if member.is_agent {
-            Tone::Agent
-        } else {
-            Tone::Neutral
-        };
-        let presence_tone = if member.live {
-            Tone::Success
-        } else {
-            Tone::Neutral
-        };
-        let mut details = vec![
-            kit::centered_row(
-                format!("{key}/header"),
-                [
-                    kit::sized(
-                        kit::label(format!("{key}/title"), "Member"),
-                        Some(wire::Length::Fill),
-                        None,
-                    ),
-                    kit::button(
-                        format!("{key}/close"),
-                        "Close member",
-                        Some(slots::message(Message::OpenMember(String::new()))),
-                        wire::ButtonPreset::Subtle,
-                    ),
-                ],
-            ),
-            kit::spaced(
+        let (key_name, copy_name, copied) = key_words(member);
+        let mut close = kit::button(
+            format!("{key}/close"),
+            "Close",
+            Some(slots::message(Message::OpenMember(String::new()))),
+            wire::ButtonPreset::Subtle,
+        );
+        if let wire::Node::Button { label, .. } = &mut close {
+            *label = Some("Close member".into());
+        }
+        let header = kit::sized(
+            kit::padded(
                 kit::centered_row(
-                    format!("{key}/identity"),
+                    format!("{key}/header"),
                     [
-                        kit::avatar(format!("{key}/avatar"), kit::initials(&member.label), tone),
-                        kit::wrapping(kit::heading(format!("{key}/name"), &member.label)),
-                    ],
-                ),
-                10.,
-            ),
-            kit::spaced(
-                kit::centered_row(
-                    format!("{key}/badges"),
-                    [
-                        kit::badge(format!("{key}/role"), &member.role, tone),
-                        kit::badge(
-                            format!("{key}/status"),
-                            host::presence_label(member),
-                            presence_tone,
+                        kit::avatar(
+                            format!("{key}/avatar"),
+                            kit::initials(&member.label),
+                            avatar_tone(member),
                         ),
-                    ],
-                ),
-                6.,
-            ),
-            kit::divider(format!("{key}/rule")),
-            kit::spaced(
-                kit::column(
-                    format!("{key}/key-block"),
-                    [
-                        kit::label(
-                            format!("{key}/key-label"),
-                            if member.is_agent {
-                                "agent id"
-                            } else {
-                                "public key"
-                            },
+                        kit::sized(
+                            kit::nowrap(kit::strong(format!("{key}/name"), &member.label)),
+                            Some(wire::Length::Fill),
+                            None,
                         ),
-                        kit::wrapping(kit::mono(format!("{key}/key"), &member.key)),
+                        close,
                     ],
                 ),
-                4.,
+                wire::Edges {
+                    top: 0.,
+                    right: 8.,
+                    bottom: 0.,
+                    left: 12.,
+                },
+            ),
+            Some(wire::Length::Fill),
+            Some(wire::Length::Fixed(40.)),
+        );
+        let mut copy = kit::button(
+            format!("{key}/copy"),
+            "Copy",
+            Some(slots::message(Message::CopyKey(
+                member.key.clone(),
+                copied.into(),
+            ))),
+            wire::ButtonPreset::Subtle,
+        );
+        if let wire::Node::Button { label, .. } = &mut copy {
+            *label = Some(copy_name.into());
+        }
+        let mut facts = vec![
+            kit::kv(
+                format!("{key}/role"),
+                "role",
+                kit::badge(format!("{key}/role-badge"), &member.role, Tone::Neutral),
+            ),
+            kit::kv(
+                format!("{key}/presence"),
+                "presence",
+                presence_chip(format!("{key}/status"), member),
+            ),
+            kit::kv(
+                format!("{key}/key-row"),
+                key_name,
+                kit::spaced(
+                    kit::centered_row(
+                        format!("{key}/key-cell"),
+                        [
+                            kit::wrapping(kit::mono(format!("{key}/key"), &member.key)),
+                            copy,
+                        ],
+                    ),
+                    6.,
+                ),
             ),
         ];
         if !member.model.is_empty() {
-            details.push(kit::spaced(
-                kit::column(
-                    format!("{key}/capability"),
-                    [
-                        kit::label(format!("{key}/capability-label"), "capability"),
-                        kit::text(format!("{key}/capability-value"), &member.model),
-                    ],
-                ),
-                4.,
+            facts.push(kit::kv(
+                format!("{key}/capability"),
+                "capability",
+                kit::wrapping(kit::text(format!("{key}/capability-value"), &member.model)),
             ));
         }
-        if member.is_this_node {
-            details.push(kit::button(
-                format!("{key}/copy"),
-                "Copy this node's key",
-                Some(slots::message(Message::CopyKey(
-                    member.key.clone(),
-                    "Node key copied".into(),
-                ))),
-                wire::ButtonPreset::Secondary,
-            ));
-        }
+        let mut actions = Vec::new();
         if member.is_agent {
-            details.push(kit::button(
+            actions.push(kit::button(
                 format!("{key}/status-change"),
                 if member.live {
                     "Pause agent"
@@ -631,7 +624,7 @@ impl MembersView {
                 }),
                 wire::ButtonPreset::Secondary,
             ));
-            details.push(kit::wrapping(kit::caption(
+            actions.push(kit::wrapping(kit::caption(
                 format!("{key}/owner-gate"),
                 "Pause and resume are owner-gated writes. The model accepts changes from its program account or current controller.",
             )));
@@ -649,28 +642,83 @@ impl MembersView {
             _ => None,
         };
         if let Some((action, label)) = ballot {
-            details.push(kit::button(
+            actions.push(kit::button(
                 format!("{key}/ballot"),
                 label,
                 self.acting.is_empty().then(|| {
                     slots::message(Message::OpenBallot(action.into(), member.key.clone()))
                 }),
-                wire::ButtonPreset::Primary,
+                wire::ButtonPreset::Secondary,
             ));
-            details.push(kit::caption(format!("{key}/quorum"), "Needs quorum to pass."));
+            actions.push(kit::caption(
+                format!("{key}/quorum"),
+                "Needs quorum to pass.",
+            ));
         }
-        if !self.admin && !member.is_this_node && !member.is_agent {
-            details.push(kit::wrapping(kit::caption(
+        let reads_only = !self.admin && !member.is_this_node && !member.is_agent;
+        if reads_only {
+            actions.push(kit::wrapping(kit::caption(
                 format!("{key}/validator-gate"),
                 "Only a validator node may open a membership proposal.",
             )));
         }
+        if !actions.is_empty() {
+            facts.push(kit::divider(format!("{key}/rule")));
+            facts.push(kit::spaced(
+                kit::column(format!("{key}/actions"), actions),
+                8.,
+            ));
+        }
         kit::spaced(
-            kit::padded(kit::column(key, details), wire::Edges::all(20.)),
-            14.,
+            kit::column(
+                key.clone(),
+                [
+                    header,
+                    kit::divider(format!("{key}/header-rule")),
+                    kit::padded(
+                        kit::spaced(kit::column(format!("{key}/facts"), facts), 10.),
+                        wire::Edges::all(12.),
+                    ),
+                ],
+            ),
+            0.,
         )
     }
 }
+/// The agent tone is the one mark a machine carries in the roster: it sits
+/// on the avatar, so a row reads as a person or a program at a glance.
+fn avatar_tone(member: &host::MemberRow) -> ducktape_view_guest::kit::Tone {
+    use ducktape_view_guest::kit::Tone;
+    match member.is_agent {
+        true => Tone::Agent,
+        false => Tone::Neutral,
+    }
+}
+
+/// Presence, in the vocabulary `host::presence_label` chose: a live member
+/// is a success badge, an agent's registration state a neutral one, and
+/// absence a faint caption — offline is not a state worth a colour.
+fn presence_chip(key: String, member: &host::MemberRow) -> ducktape_view_guest::wire::Node {
+    use ducktape_view_guest::kit::{self, Tone};
+    let word = host::presence_label(member);
+    match (member.is_agent, member.live) {
+        (true, _) => kit::badge(key, word, Tone::Neutral),
+        (false, true) => kit::badge(key, word, Tone::Success),
+        (false, false) => kit::nowrap(kit::caption(key, word)),
+    }
+}
+
+/// What a member's identifier is called, what its copy control is named,
+/// and what the toast says once the clipboard has it. An agent holds no
+/// node key, so its cell is an agent id.
+fn key_words(member: &host::MemberRow) -> (&'static str, &'static str, &'static str) {
+    match (member.is_this_node, member.is_agent) {
+        (true, _) => ("public key", "Copy this node's key", "Node key copied"),
+        (false, true) => ("agent id", "Copy agent id", "Agent id copied"),
+        (false, false) => ("public key", "Copy public key", "Public key copied"),
+    }
+}
+
 ducktape_view_guest::export_app!(
     MembersView,
     "Members",

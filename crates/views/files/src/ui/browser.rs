@@ -1,6 +1,33 @@
 use super::*;
 use ducktape_view_guest::{kit::Tone, slots};
 
+/// The header strip over a list of rows: captions on a 28px line, then the
+/// hairline that separates them from the rows.
+fn header_strip(key: &str, cells: impl IntoIterator<Item = wire::Node>) -> wire::Node {
+    native::spaced(
+        native::column(
+            format!("{key}/box"),
+            [
+                native::sized(
+                    native::padded(
+                        native::spaced(native::centered_row(key, cells), 12.),
+                        wire::Edges {
+                            top: 0.,
+                            right: 10.,
+                            bottom: 0.,
+                            left: 10.,
+                        },
+                    ),
+                    Some(wire::Length::Fill),
+                    Some(wire::Length::Fixed(28.)),
+                ),
+                native::divider(format!("{key}/rule")),
+            ],
+        ),
+        0.,
+    )
+}
+
 fn object_cells(key: &str, name: wire::Node, size: String, object: String) -> wire::Node {
     let cell = |field: &str, value: String, width| {
         native::sized(
@@ -40,24 +67,34 @@ impl FilesView {
         if let wire::Node::Button { label, .. } = &mut root {
             *label = Some("Go to the duckfs root".into());
         }
-        native::spaced(
+        let mut crumb = native::spaced(
             native::centered_row(
                 &key,
                 [
                     root,
-                    native::sized(
-                        native::nowrap(native::mono(format!("{key}/path"), self.path.clone())),
-                        Some(wire::Length::Fill),
-                        None,
-                    ),
-                    native::secondary(
+                    native::nowrap(native::mono(format!("{key}/path"), self.path.clone())),
+                    native::nowrap(native::secondary(
                         format!("{key}/count"),
                         crate::host::fs_counts_summary(self.connected, self.listed, &self.entries),
-                    ),
+                    )),
                 ],
             ),
-            8.,
-        )
+            6.,
+        );
+        // A deep path is cut off at the crumb's own width rather than
+        // pushing the toolbar's controls off the strip.
+        if let wire::Node::Linear {
+            width,
+            max_width,
+            clip,
+            ..
+        } = &mut crumb
+        {
+            *width = Some(wire::Length::Shrink);
+            *max_width = Some(360.);
+            *clip = true;
+        }
+        crumb
     }
 
     pub(super) fn folder_row(
@@ -82,38 +119,25 @@ impl FilesView {
         button
     }
 
+    pub(super) fn folder_table_header(&self, key: String) -> wire::Node {
+        header_strip(&key, [native::caption(format!("{key}/name"), "Folders")])
+    }
+
     pub(super) fn object_table_header(&self, key: String) -> wire::Node {
         let head = |field: &str, text: &str, width| {
             native::sized(
-                native::label(format!("{key}/{field}"), text),
+                native::caption(format!("{key}/{field}"), text),
                 Some(width),
                 None,
             )
         };
-        native::padded(
-            native::column(
-                format!("{key}/box"),
-                [
-                    native::spaced(
-                        native::centered_row(
-                            &key,
-                            [
-                                head("name", "Name", wire::Length::Fill),
-                                head("size", "Size", wire::Length::Fixed(72.)),
-                                head("object", "Object", wire::Length::Fixed(92.)),
-                            ],
-                        ),
-                        12.,
-                    ),
-                    native::divider(format!("{key}/rule")),
-                ],
-            ),
-            wire::Edges {
-                top: 0.,
-                right: 10.,
-                bottom: 0.,
-                left: 10.,
-            },
+        header_strip(
+            &key,
+            [
+                head("name", "Name", wire::Length::Fill),
+                head("size", "Size", wire::Length::Fixed(72.)),
+                head("object", "Object", wire::Length::Fixed(92.)),
+            ],
         )
     }
 
@@ -187,58 +211,86 @@ impl FilesView {
         } else {
             crate::host::size_label(entry.size)
         };
-        let content = native::spaced(
-            native::padded(
+        let fact = |scope: String, name: &str, value: wire::Node| {
+            native::spaced(
                 native::column(
-                    format!("{key}/facts"),
-                    [
-                        native::centered_row(
-                            format!("{key}/head"),
-                            [
-                                native::sized(
-                                    native::heading(format!("{key}/title"), "Object"),
-                                    Some(wire::Length::Fill),
-                                    None,
-                                ),
-                                native::badge(
-                                    format!("{key}/kind"),
-                                    if directory { "DIR" } else { "FILE" },
-                                    Tone::Neutral,
-                                ),
-                            ],
-                        ),
-                        native::wrapping(native::strong(format!("{key}/name"), entry.name.clone())),
-                        native::wrapping(native::mono(format!("{key}/path"), entry.path.clone())),
-                        native::divider(format!("{key}/rule")),
-                        native::spaced(
-                            native::column(
-                                format!("{key}/id-block"),
-                                [
-                                    native::label(format!("{key}/id-label"), "object id"),
-                                    native::wrapping(native::mono(format!("{key}/id"), object)),
-                                ],
-                            ),
-                            3.,
-                        ),
-                        native::spaced(
-                            native::column(
-                                format!("{key}/size-block"),
-                                [
-                                    native::label(format!("{key}/size-label"), "size"),
-                                    native::mono(format!("{key}/size"), size),
-                                ],
-                            ),
-                            3.,
-                        ),
-                    ],
+                    scope.clone(),
+                    [native::caption(format!("{scope}/label"), name), value],
                 ),
-                wire::Edges::all(16.),
+                2.,
+            )
+        };
+        let head = native::sized(
+            native::padded(
+                native::spaced(
+                    native::centered_row(
+                        format!("{key}/head"),
+                        [
+                            native::sized(
+                                native::heading(format!("{key}/title"), "Object"),
+                                Some(wire::Length::Fill),
+                                None,
+                            ),
+                            native::badge(
+                                format!("{key}/kind"),
+                                if directory { "Directory" } else { "File" },
+                                Tone::Neutral,
+                            ),
+                        ],
+                    ),
+                    8.,
+                ),
+                wire::Edges {
+                    top: 0.,
+                    right: 12.,
+                    bottom: 0.,
+                    left: 12.,
+                },
             ),
-            10.,
+            Some(wire::Length::Fill),
+            Some(wire::Length::Fixed(40.)),
+        );
+        let facts = native::scroll(
+            format!("{key}/scroll"),
+            native::padded(
+                native::spaced(
+                    native::column(
+                        format!("{key}/facts"),
+                        [
+                            native::wrapping(native::strong(
+                                format!("{key}/name"),
+                                entry.name.clone(),
+                            )),
+                            native::wrapping(native::mono(
+                                format!("{key}/path"),
+                                entry.path.clone(),
+                            )),
+                            fact(
+                                format!("{key}/id-block"),
+                                "Object id",
+                                native::wrapping(native::mono(format!("{key}/id"), object)),
+                            ),
+                            fact(
+                                format!("{key}/size-block"),
+                                "Size",
+                                native::mono(format!("{key}/size"), size),
+                            ),
+                        ],
+                    ),
+                    12.,
+                ),
+                wire::Edges::all(12.),
+            ),
         );
         native::pane(
             key.clone(),
-            native::scroll(format!("{key}/scroll"), content),
+            native::spaced(
+                native::column(
+                    format!("{key}/pane"),
+                    [head, native::divider(format!("{key}/rule")), facts],
+                ),
+                0.,
+            ),
             wire::Length::Fixed(self.object_width as f32),
         )
     }

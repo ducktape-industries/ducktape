@@ -211,7 +211,7 @@ impl ForgeView {
             host_error: "".to_owned(),
             sent: false,
             viewport_width: 1280.0,
-            tree_width: 258.0,
+            tree_width: 260.0,
         }
     }
     pub(crate) fn boot() -> (Self, ::ducktape_view_guest::Task<Message>) {

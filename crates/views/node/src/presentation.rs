@@ -2,32 +2,43 @@ use crate::{Message, NodeTab, NodeView, host};
 use ducktape_view_guest::{
     kit::{self, Tone},
     slots,
-    wire::{self, ButtonPreset, Length, Node},
+    wire::{self, AlignX, ButtonPreset, Length, Node},
 };
+
+/// Every tab: the state it selects, its key, its name and what a reader
+/// hears. The accessible label is what the app's own tests press.
+const TABS: [(NodeTab, &str, &str, &str); 4] = [
+    (NodeTab::Overview, "overview", "Overview", "Node overview"),
+    (
+        NodeTab::Permissions,
+        "permissions",
+        "Permissions",
+        "Node permissions",
+    ),
+    (NodeTab::Activity, "activity", "Activity", "Node activity"),
+    (NodeTab::Modules, "modules", "Modules", "Node modules"),
+];
+
+/// The console's level chips: the chip key, its name, and the level it keeps
+/// (empty for every level).
+const LEVELS: [(&str, &str, &str); 6] = [
+    ("all", "All", ""),
+    ("error", "Error", "ERROR"),
+    ("warn", "Warn", "WARN"),
+    ("info", "Info", "INFO"),
+    ("debug", "Debug", "DEBUG"),
+    ("trace", "Trace", "TRACE"),
+];
+
+/// The densities this screen is built on: a reading, a list row, a module
+/// row and a console line.
+const READING_ROW: f32 = 24.;
+const LIST_ROW: f32 = 28.;
+const MODULE_ROW: f32 = 32.;
 
 impl NodeView {
     pub(crate) fn view(&self) -> Node {
         kit::set_dark(self.dark);
-        let tabs = [
-            (NodeTab::Overview, "Overview", "Node overview"),
-            (NodeTab::Permissions, "Permissions", "Node permissions"),
-            (NodeTab::Activity, "Activity", "Node activity"),
-            (NodeTab::Modules, "Modules", "Node modules"),
-        ]
-        .map(|(tab, title, accessible)| {
-            let selected = self.node_tab == tab;
-            let mut button = kit::button(
-                format!("node/tab/{title}"),
-                title,
-                Some(slots::message(Message::SelectNodeTab(tab))),
-                ButtonPreset::Subtle,
-            );
-            if let Node::Button { label, checked, .. } = &mut button {
-                *label = Some(accessible.into());
-                *checked = Some(selected);
-            }
-            button
-        });
         let live = self.connected;
         let mut body = vec![
             kit::centered_row(
@@ -45,7 +56,7 @@ impl NodeView {
                     ),
                 ],
             ),
-            kit::spaced(kit::row("node/tabs", tabs), 2.),
+            self.tab_row(),
         ];
         if !self.host_error.is_empty() {
             body.push(kit::notice(
@@ -69,72 +80,105 @@ impl NodeView {
         kit::page("node/content", body)
     }
 
+    /// The tab row over its hairline: the kit's own switches, carrying the
+    /// labels a reader hears.
+    fn tab_row(&self) -> Node {
+        let chosen = self.node_tab;
+        let mut tabs = Self::switches(
+            "node/tab",
+            TABS.map(|(tab, id, name, _)| {
+                (
+                    id.to_owned(),
+                    name.to_owned(),
+                    tab == chosen,
+                    Some(slots::message(Message::SelectNodeTab(tab))),
+                )
+            }),
+        );
+        let Node::Linear { children, .. } = &mut tabs else {
+            unreachable!("a tab row is a row")
+        };
+        for (button, (.., accessible)) in children.iter_mut().zip(TABS) {
+            let Node::Button { label, .. } = button else {
+                unreachable!("a tab is a button")
+            };
+            *label = Some(accessible.to_owned());
+        }
+        kit::spaced(
+            kit::column("node/tabs", [tabs, kit::divider("node/tabs/rule")]),
+            6.,
+        )
+    }
+
     fn overview(&self) -> Node {
         let facts = &self.facts;
         let chain = kit::card(
             "node/chain",
-            kit::spaced(
-                kit::column(
-                    "node/chain-readings",
-                    [
-                        Self::reading(
-                            "node/height",
-                            "Height",
-                            kit::mono("node/height/value", host::height_label_short(facts.node_height)),
+            Self::readings(
+                "node/chain-readings",
+                [
+                    Self::reading(
+                        "node/height",
+                        "Height",
+                        kit::mono(
+                            "node/height/value",
+                            host::height_label_short(facts.node_height),
                         ),
-                        Self::reading(
-                            "node/checkpoint",
-                            "Checkpoint",
-                            kit::mono(
-                                "node/checkpoint/value",
-                                host::height_label_short(facts.node_checkpoint),
+                    ),
+                    Self::reading(
+                        "node/checkpoint",
+                        "Checkpoint",
+                        kit::mono(
+                            "node/checkpoint/value",
+                            host::height_label_short(facts.node_checkpoint),
+                        ),
+                    ),
+                    Self::reading(
+                        "node/finalized",
+                        "Last finalized",
+                        kit::text(
+                            "node/finalized/value",
+                            host::relative_time(facts.node_last_finalized, self.wall_now),
+                        ),
+                    ),
+                    Self::reading(
+                        "node/quorum",
+                        "Reachable / quorum",
+                        kit::mono(
+                            "node/quorum/value",
+                            host::reading_pair(
+                                &facts.node_reachable_label,
+                                &facts.node_quorum_label,
                             ),
                         ),
-                        Self::reading(
-                            "node/finalized",
-                            "Last finalized",
-                            kit::text(
-                                "node/finalized/value",
-                                host::relative_time(facts.node_last_finalized, self.wall_now),
-                            ),
+                    ),
+                    Self::reading(
+                        "node/sync",
+                        "Synchronization",
+                        kit::text("node/sync/value", &facts.sync_line),
+                    ),
+                    Self::reading(
+                        "node/phase-since",
+                        "Phase since",
+                        kit::text(
+                            "node/phase-since/value",
+                            host::relative_time(facts.node_phase_since, self.wall_now),
                         ),
-                        Self::reading(
-                            "node/quorum",
-                            "Reachable / quorum",
-                            kit::mono(
-                                "node/quorum/value",
-                                host::reading_pair(&facts.node_reachable_label, &facts.node_quorum_label),
-                            ),
-                        ),
-                        Self::reading(
-                            "node/sync",
-                            "Synchronization",
-                            kit::text("node/sync/value", &facts.sync_line),
-                        ),
-                        Self::reading(
-                            "node/phase-since",
-                            "Phase since",
-                            kit::text(
-                                "node/phase-since/value",
-                                host::relative_time(facts.node_phase_since, self.wall_now),
-                            ),
-                        ),
-                        Self::reading(
-                            "node/retries",
-                            "Sync retries",
-                            kit::mono("node/retries/value", facts.node_sync_retries.to_string()),
-                        ),
-                        Self::reading(
-                            "node/failures",
-                            "Sync failures",
-                            kit::mono("node/failures/value", facts.node_sync_failures.to_string()),
-                        ),
-                    ],
-                ),
-                10.,
+                    ),
+                    Self::reading(
+                        "node/retries",
+                        "Sync retries",
+                        kit::mono("node/retries/value", facts.node_sync_retries.to_string()),
+                    ),
+                    Self::reading(
+                        "node/failures",
+                        "Sync failures",
+                        kit::mono("node/failures/value", facts.node_sync_failures.to_string()),
+                    ),
+                ],
             ),
         );
-        let mut identity_rows = vec![
+        let identity_rows = [
             Self::copyable("node/key", "Node key", &facts.node_key),
             Self::copyable("node/root", "Root hash", &facts.node_root_hash),
             Self::copyable("node/directory", "Data directory", &self.node_data_dir),
@@ -143,33 +187,41 @@ impl NodeView {
                 "Version",
                 kit::mono("node/version/value", &facts.node_version),
             ),
+            kit::gap(4.),
+            kit::row(
+                "node/identity-actions",
+                [kit::sized(
+                    kit::button(
+                        "node/open-modules",
+                        "Installed modules",
+                        Some(slots::message(Message::OpenNodeModules)),
+                        ButtonPreset::Secondary,
+                    ),
+                    None,
+                    Some(Length::Fixed(LIST_ROW)),
+                )],
+            ),
         ];
-        identity_rows.push(kit::row(
-            "node/identity-actions",
-            [kit::button(
-                "node/open-modules",
-                "Installed modules",
-                Some(slots::message(Message::OpenNodeModules)),
-                ButtonPreset::Secondary,
-            )],
-        ));
         let identity = kit::card(
             "node/identity",
-            kit::spaced(kit::column("node/identity-readings", identity_rows), 10.),
+            Self::readings("node/identity-readings", identity_rows),
         );
         let mut peers = Vec::new();
         for peer in &self.node_peers {
             let key = format!("node/peer/{}", peer.key);
             let (status, tone) = if peer.live {
-                ("Connected", Tone::Success)
+                ("Reachable", Tone::Success)
             } else {
-                ("Disconnected", Tone::Neutral)
+                ("Unreachable", Tone::Neutral)
             };
-            peers.push(kit::centered_row(
+            if !peers.is_empty() {
+                peers.push(kit::divider(format!("{key}/rule")));
+            }
+            peers.push(Self::list_row(
                 &key,
                 [
                     kit::sized(
-                        kit::wrapping(kit::mono(format!("{key}/key"), &peer.key)),
+                        kit::nowrap(kit::mono(format!("{key}/key"), &peer.key)),
                         Some(Length::Fill),
                         None,
                     ),
@@ -181,9 +233,12 @@ impl NodeView {
         if self.node_peers.is_empty() {
             peers.push(kit::secondary("node/peers/empty", "No direct peers."));
         }
-        let mut sections = vec![
-            Self::section("node/chain-section", "node/chain-title", "Chain", chain),
-        ];
+        let mut sections = vec![Self::section(
+            "node/chain-section",
+            "node/chain-title",
+            "Chain",
+            chain,
+        )];
         if !facts.node_sync_last_error.is_empty() {
             sections.push(kit::notice(
                 "node/sync-error",
@@ -204,14 +259,11 @@ impl NodeView {
             "node/peers",
             "node/peers/title",
             "Peers",
-            kit::card(
-                "node/peers/card",
-                kit::spaced(kit::column("node/peers/list", peers), 8.),
-            ),
+            kit::spaced(kit::column("node/peers/list", peers), 0.),
         ));
         kit::scroll(
             "node/overview",
-            kit::spaced(kit::column("node/readings", sections), 20.),
+            kit::spaced(kit::column("node/readings", sections), 16.),
         )
     }
 
@@ -227,15 +279,8 @@ impl NodeView {
         } else {
             "Not available to this seat"
         };
-        let yes = |key: String, value: bool| {
-            kit::badge(
-                key,
-                if value { "Yes" } else { "No" },
-                if value { Tone::Success } else { Tone::Neutral },
-            )
-        };
         let capability = |key: &str, name: &str, tiers: [bool; 3]| {
-            kit::centered_row(
+            Self::list_row(
                 key,
                 [
                     kit::sized(
@@ -243,75 +288,83 @@ impl NodeView {
                         Some(Length::Fill),
                         None,
                     ),
-                    yes(format!("{key}/validator"), tiers[0]),
-                    yes(format!("{key}/resident"), tiers[1]),
-                    yes(format!("{key}/guest"), tiers[2]),
+                    Self::mark(format!("{key}/validator"), tiers[0]),
+                    Self::mark(format!("{key}/resident"), tiers[1]),
+                    Self::mark(format!("{key}/guest"), tiers[2]),
                 ],
             )
         };
         let standing = kit::card(
             "node/standing-card",
-            kit::spaced(
-                kit::column(
-                    "node/standing",
-                    [
-                        Self::reading(
-                            "node/tier",
-                            "Standing",
-                            kit::badge("node/tier/value", &self.tier, Tone::Accent),
-                        ),
-                        kit::wrapping(kit::secondary("node/standing-description", description)),
-                        Self::reading(
-                            "node/admin",
-                            "Node administration",
-                            kit::text("node/admin/value", admin),
-                        ),
-                        kit::wrapping(kit::caption(
-                            "node/quorum-note",
-                            "Quorum standing is granted and revoked by quorum, not by this device.",
-                        )),
-                    ],
-                ),
-                10.,
+            Self::readings(
+                "node/standing",
+                [
+                    Self::reading(
+                        "node/tier",
+                        "Standing",
+                        kit::badge("node/tier/value", &self.tier, Tone::Accent),
+                    ),
+                    Self::reading(
+                        "node/admin",
+                        "Node administration",
+                        kit::text("node/admin/value", admin),
+                    ),
+                    kit::gap(4.),
+                    kit::wrapping(kit::secondary("node/standing-description", description)),
+                    kit::wrapping(kit::caption(
+                        "node/quorum-note",
+                        "Quorum standing is granted and revoked by quorum, not by this device.",
+                    )),
+                ],
             ),
         );
-        let matrix = kit::card(
-            "node/permissions/card",
-            kit::spaced(
-                kit::column(
-                    "node/permissions/matrix",
-                    [
-                        kit::centered_row(
-                            "node/permissions/header",
-                            [
-                                kit::sized(
-                                    kit::label("node/permissions/capability", "Capability"),
-                                    Some(Length::Fill),
-                                    None,
-                                ),
-                                kit::label("node/permissions/tiers", "Validator · Resident · Guest"),
-                            ],
-                        ),
-                        kit::divider("node/permissions/rule"),
-                        capability(
-                            "node/permissions/read",
-                            "Read and verify finality",
-                            [true, true, true],
-                        ),
-                        capability(
-                            "node/permissions/propose",
-                            "Propose modules and members",
-                            [true, true, false],
-                        ),
-                        capability(
-                            "node/permissions/sign",
-                            "Sign quorum and finalize",
-                            [true, false, false],
-                        ),
-                    ],
-                ),
-                10.,
+        let matrix = kit::spaced(
+            kit::column(
+                "node/permissions/matrix",
+                [
+                    Self::list_row(
+                        "node/permissions/header",
+                        [
+                            kit::sized(
+                                kit::caption("node/permissions/capability", "Capability"),
+                                Some(Length::Fill),
+                                None,
+                            ),
+                            Self::cell(
+                                "node/permissions/header/validator",
+                                kit::caption("node/permissions/validator", "Validator"),
+                            ),
+                            Self::cell(
+                                "node/permissions/header/resident",
+                                kit::caption("node/permissions/resident", "Resident"),
+                            ),
+                            Self::cell(
+                                "node/permissions/header/guest",
+                                kit::caption("node/permissions/guest", "Guest"),
+                            ),
+                        ],
+                    ),
+                    kit::divider("node/permissions/rule"),
+                    capability(
+                        "node/permissions/read",
+                        "Read and verify finality",
+                        [true, true, true],
+                    ),
+                    kit::divider("node/permissions/rule/propose"),
+                    capability(
+                        "node/permissions/propose",
+                        "Propose modules and members",
+                        [true, true, false],
+                    ),
+                    kit::divider("node/permissions/rule/sign"),
+                    capability(
+                        "node/permissions/sign",
+                        "Sign quorum and finalize",
+                        [true, false, false],
+                    ),
+                ],
             ),
+            0.,
         );
         kit::scroll(
             "node/permissions",
@@ -333,7 +386,7 @@ impl NodeView {
                         ),
                     ],
                 ),
-                20.,
+                16.,
             ),
         )
     }
@@ -342,68 +395,52 @@ impl NodeView {
         let mut content = Vec::new();
         for module in &self.module_rows {
             let key = format!("node/module/{}", module.id);
-            let mut values = vec![
+            let (state, tone) = match (module.pending_hash.is_empty(), module.ready) {
+                (true, _) => ("Active", Tone::Neutral),
+                (false, true) => ("Swap ready", Tone::Success),
+                (false, false) => ("Swap pending", Tone::Warning),
+            };
+            if !content.is_empty() {
+                content.push(kit::divider(format!("{key}/rule")));
+            }
+            content.push(kit::sized(
                 kit::centered_row(
-                    format!("{key}/head"),
+                    &key,
                     [
-                        kit::sized(
-                            kit::heading(format!("{key}/title"), &module.id),
-                            Some(Length::Fill),
-                            None,
-                        ),
+                        kit::nowrap(kit::strong(format!("{key}/name"), &module.id)),
+                        Self::digest(&format!("{key}/root"), "root", &module.root),
+                        Self::digest(&format!("{key}/code"), "code", &module.code_hash),
+                        kit::spacer(),
                         kit::badge(format!("{key}/category"), &module.category, Tone::Neutral),
+                        kit::badge(format!("{key}/state"), state, tone),
                     ],
                 ),
-                Self::copyable(&format!("{key}/root"), "State root", &module.root),
-                Self::copyable(&format!("{key}/code"), "Active code", &module.code_hash),
-            ];
-            if !module.pending_hash.is_empty() {
-                values.extend([
-                    kit::divider(format!("{key}/pending-rule")),
-                    Self::copyable(
-                        &format!("{key}/pending"),
-                        "Pending code",
-                        &module.pending_hash,
-                    ),
-                    Self::reading(
-                        &format!("{key}/activation"),
-                        "Activation height",
-                        kit::mono(
-                            format!("{key}/activation/value"),
-                            module.activation_height.to_string(),
-                        ),
-                    ),
-                    Self::reading(
-                        &format!("{key}/readiness"),
-                        "Readiness",
-                        kit::centered_row(
-                            format!("{key}/readiness/row"),
-                            [
-                                kit::mono(
-                                    format!("{key}/readiness/value"),
-                                    module.readiness.to_string(),
-                                ),
-                                kit::badge(
-                                    format!("{key}/ready"),
-                                    if module.ready {
-                                        "Ready"
-                                    } else {
-                                        "Waiting for readiness"
-                                    },
-                                    if module.ready {
-                                        Tone::Success
-                                    } else {
-                                        Tone::Warning
-                                    },
-                                ),
-                            ],
-                        ),
-                    ),
-                ]);
+                Some(Length::Fill),
+                Some(Length::Fixed(MODULE_ROW)),
+            ));
+            if module.pending_hash.is_empty() {
+                continue;
             }
-            content.push(kit::card(
-                &key,
-                kit::spaced(kit::column(format!("{key}/values"), values), 10.),
+            content.push(Self::reading(
+                &format!("{key}/pending"),
+                "Pending code",
+                kit::centered_row(
+                    format!("{key}/pending/row"),
+                    [
+                        kit::nowrap(kit::mono(
+                            format!("{key}/pending/value"),
+                            &module.pending_hash,
+                        )),
+                        kit::caption(
+                            format!("{key}/activation"),
+                            host::height_label_short(module.activation_height),
+                        ),
+                        kit::caption(
+                            format!("{key}/readiness"),
+                            format!("{} signalled", module.readiness),
+                        ),
+                    ],
+                ),
             ));
         }
         if content.is_empty() {
@@ -415,7 +452,7 @@ impl NodeView {
         }
         kit::scroll(
             "node/modules",
-            kit::spaced(kit::column("node/module-list", content), 12.),
+            kit::spaced(kit::column("node/module-list", content), 0.),
         )
     }
 
@@ -439,32 +476,29 @@ impl NodeView {
             Some(slots::message(Message::ApplyLiveLogFilter)),
         );
         let can_retune = self.admin && !self.live_log_filter.trim().is_empty();
-        let mut content = vec![kit::row(
+        let mut content = vec![kit::centered_row(
             "node/filters",
             [
-                kit::field("node/log-filter-field", "Show lines matching", filter),
-                kit::field(
-                    "node/retune-field",
-                    "Live log filter on the node",
-                    kit::row(
-                        "node/retune",
-                        [
-                            live,
-                            kit::button(
-                                "node/retune/apply",
-                                "Retune",
-                                can_retune.then(|| slots::message(Message::ApplyLiveLogFilter)),
-                                ButtonPreset::Secondary,
-                            ),
-                        ],
+                self.level_chips(),
+                filter,
+                kit::sized(live, Some(Length::Fixed(240.)), None),
+                kit::sized(
+                    kit::button(
+                        "node/retune/apply",
+                        "Retune",
+                        can_retune.then(|| slots::message(Message::ApplyLiveLogFilter)),
+                        ButtonPreset::Secondary,
                     ),
+                    None,
+                    Some(Length::Fixed(LIST_ROW)),
                 ),
             ],
         )];
         if !self.live_filter_note.is_empty() {
             content.push(kit::caption("node/filter-note", &self.live_filter_note));
         }
-        let visible = host::visible_log(&self.log_lines, &self.node_log_filter);
+        let visible =
+            host::visible_log(&self.log_lines, &self.node_log_filter, &self.node_log_level);
         let note = host::log_note(self.log_lines.len() as i64, visible.len() as i64);
         if !note.is_empty() {
             content.push(kit::caption("node/log-note", note));
@@ -504,14 +538,14 @@ impl NodeView {
                         ),
                     ],
                 ),
-                10.,
+                8.,
             )
         });
         let mut log = kit::scroll(
             "node/logs",
             kit::padded(
-                kit::spaced(kit::column("node/log-lines", rows), 3.),
-                wire::Edges::all(10.),
+                kit::spaced(kit::column("node/log-lines", rows), 2.),
+                wire::Edges::all(8.),
             ),
         );
         if let Node::Scroll {
@@ -527,10 +561,45 @@ impl NodeView {
         }
         content.push(log);
         kit::sized(
-            kit::spaced(kit::column("node/activity", content), 12.),
+            kit::spaced(kit::column("node/activity", content), 8.),
             Some(Length::Fill),
             Some(Length::Fill),
         )
+    }
+
+    /// A row of switches at the list-row height.
+    fn switches(
+        key: &str,
+        choices: impl IntoIterator<Item = (String, String, bool, Option<u32>)>,
+    ) -> Node {
+        let mut node = kit::tabs(key, choices);
+        let Node::Linear { children, .. } = &mut node else {
+            unreachable!("a switch row is a row")
+        };
+        for button in children.iter_mut() {
+            let Node::Button { height, .. } = button else {
+                unreachable!("a switch is a button")
+            };
+            *height = Some(Length::Fixed(LIST_ROW));
+        }
+        node
+    }
+
+    /// The console's level chips, the chosen one checked.
+    fn level_chips(&self) -> Node {
+        let chosen = self.node_log_level.as_str();
+        let chips = Self::switches(
+            "node/level",
+            LEVELS.map(|(id, name, level)| {
+                (
+                    id.to_owned(),
+                    name.to_owned(),
+                    level == chosen,
+                    Some(slots::message(Message::SelectLogLevel(level.to_owned()))),
+                )
+            }),
+        );
+        kit::sized(chips, Some(Length::Shrink), None)
     }
 
     fn section(key: &str, title_key: &str, title: &str, content: Node) -> Node {
@@ -540,39 +609,115 @@ impl NodeView {
         )
     }
 
-    fn reading(key: &str, label: &str, value: Node) -> Node {
-        kit::kv(key, label, value)
+    /// The rows of a reading card: tight, because each row owns its height.
+    fn readings(key: &str, rows: impl IntoIterator<Item = Node>) -> Node {
+        kit::spaced(kit::column(key, rows), 2.)
     }
 
-    fn copyable(key: &str, label: &str, value: &str) -> Node {
-        Self::reading(
-            key,
-            label,
-            kit::centered_row(
-                format!("{key}/reading"),
-                [
-                    kit::sized(
-                        kit::wrapping(kit::mono(format!("{key}/value"), value)),
-                        Some(Length::Fill),
-                        None,
-                    ),
-                    {
-                        let mut copy = kit::button(
-                            format!("{key}/copy"),
-                            "Copy",
-                            Some(slots::message(Message::CopyToClipboard(
-                                value.into(),
-                                format!("{label} copied"),
-                            ))),
-                            ButtonPreset::Subtle,
-                        );
-                        if let Node::Button { label: accessible, .. } = &mut copy {
-                            *accessible = Some(format!("Copy {}", label.to_lowercase()));
-                        }
-                        copy
-                    },
-                ],
+    /// One reading: a fixed-width label and its value, on one 24px line.
+    fn reading(key: &str, label: &str, value: Node) -> Node {
+        kit::sized(
+            kit::aligned(kit::kv(key, label, value), AlignX::Center),
+            Some(Length::Fill),
+            Some(Length::Fixed(READING_ROW)),
+        )
+    }
+
+    /// One row of a list or a table: 28px, its children on one centre line.
+    fn list_row(key: &str, children: impl IntoIterator<Item = Node>) -> Node {
+        kit::sized(
+            kit::centered_row(key, children),
+            Some(Length::Fill),
+            Some(Length::Fixed(LIST_ROW)),
+        )
+    }
+
+    /// A digest under its name: the pair reads as one thing in a dense row.
+    fn digest(key: &str, name: &str, value: &str) -> Node {
+        kit::sized(
+            kit::spaced(
+                kit::centered_row(
+                    key,
+                    [
+                        kit::caption(format!("{key}/label"), name),
+                        kit::nowrap(kit::colored(
+                            kit::mono(format!("{key}/value"), value),
+                            kit::palette().muted,
+                        )),
+                    ],
+                ),
+                4.,
             ),
+            Some(Length::Shrink),
+            None,
+        )
+    }
+
+    /// One column of the permissions table: a fixed width, centred.
+    fn cell(key: impl Into<String>, child: Node) -> Node {
+        let mut node = kit::container(key, child);
+        let Node::Container { width, align_x, .. } = &mut node else {
+            unreachable!("a cell is a container")
+        };
+        *width = Some(Length::Fixed(72.));
+        *align_x = Some(AlignX::Center);
+        node
+    }
+
+    /// Whether a standing holds a capability.
+    fn mark(key: String, allowed: bool) -> Node {
+        let text = match allowed {
+            true => kit::tone_text(format!("{key}/mark"), "✓", Tone::Success),
+            false => kit::colored(
+                kit::text_size(
+                    kit::text(format!("{key}/mark"), "–"),
+                    kit::type_scale::SECONDARY as f32,
+                ),
+                kit::palette().faint,
+            ),
+        };
+        Self::cell(key, text)
+    }
+
+    /// A reading the reader can take with them: the value, and a ghost copy
+    /// control at the right of its row.
+    fn copyable(key: &str, label: &str, value: &str) -> Node {
+        let mut copy = kit::button(
+            format!("{key}/copy"),
+            "Copy",
+            Some(slots::message(Message::CopyToClipboard(
+                value.into(),
+                format!("{label} copied"),
+            ))),
+            ButtonPreset::Subtle,
+        );
+        let Node::Button {
+            label: accessible,
+            height,
+            ..
+        } = &mut copy
+        else {
+            unreachable!("a copy control is a button")
+        };
+        *accessible = Some(format!("Copy {}", label.to_lowercase()));
+        *height = Some(Length::Fixed(READING_ROW));
+        kit::aligned(
+            kit::kv(
+                key,
+                label,
+                kit::centered_row(
+                    format!("{key}/reading"),
+                    [
+                        kit::sized(
+                            kit::wrapping(kit::mono(format!("{key}/value"), value)),
+                            Some(Length::Fill),
+                            None,
+                        ),
+                        copy,
+                    ],
+                ),
+            ),
+            AlignX::Center,
         )
     }
 }

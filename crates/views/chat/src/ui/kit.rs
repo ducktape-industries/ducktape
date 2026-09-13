@@ -25,7 +25,10 @@ impl ChatView {
                 message.avatar_kind != "human",
             )
         } else {
-            native::space(Some(wire::Length::Fixed(24.)), Some(wire::Length::Fixed(4.)))
+            native::space(
+                Some(wire::Length::Fixed(24.)),
+                Some(wire::Length::Fixed(4.)),
+            )
         };
         let contents = self.message_contents(format!("{key}/contents"), message, surface);
         let mut row = native::row(format!("{key}/row"), [rail, contents]);
@@ -134,15 +137,21 @@ impl ChatView {
             } else {
                 Message::AddReactionAt(message.seq, reaction.emoji.clone())
             };
+            // A reaction reads as a tag: caption-sized, tight, inside a
+            // hairline. The one the reader owns carries the chosen wash the
+            // native kit paints on a checked control.
             let mut button = native::button_child(
                 format!("{key}/reaction/{}", reaction.emoji),
                 native::spaced(
-                    native::row(
+                    native::centered_row(
                         format!("{key}/reaction/{}/label", reaction.emoji),
                         [
-                            native::nowrap(native::text(
-                                format!("{key}/reaction/{}/emoji", reaction.emoji),
-                                &reaction.emoji,
+                            native::nowrap(native::text_size(
+                                native::text(
+                                    format!("{key}/reaction/{}/emoji", reaction.emoji),
+                                    &reaction.emoji,
+                                ),
+                                native::type_scale::CAPTION as f32,
                             )),
                             native::nowrap(native::caption(
                                 format!("{key}/reaction/{}/count", reaction.emoji),
@@ -153,7 +162,7 @@ impl ChatView {
                     4.,
                 ),
                 Some(slots::message(event)),
-                wire::ButtonPreset::Background,
+                wire::ButtonPreset::Subtle,
             );
             if let wire::Node::Button {
                 checked,
@@ -174,13 +183,23 @@ impl ChatView {
                 );
                 *description = Some(reaction.emoji.clone());
                 *padding = Some(wire::Edges {
-                    top: 2.,
-                    right: 8.,
-                    bottom: 2.,
-                    left: 8.,
+                    top: 1.,
+                    right: 6.,
+                    bottom: 1.,
+                    left: 6.,
                 });
             }
-            reactions.push(button);
+            let mut tag =
+                native::container(format!("{key}/reaction/{}/tag", reaction.emoji), button);
+            if let wire::Node::Container { border, width, .. } = &mut tag {
+                *border = Some(wire::Border {
+                    color: Some(native::rgba(native::palette().border)),
+                    width: Some(1.),
+                    radius: Some([native::radius::CONTROL as f32; 4]),
+                });
+                *width = Some(wire::Length::Shrink);
+            }
+            reactions.push(tag);
         }
         if !reactions.is_empty() {
             children.push(native::spaced(
@@ -373,23 +392,36 @@ impl ChatView {
         show: impl Fn() -> Message + Clone + 'static,
     ) -> wire::Node {
         let elapsed = crate::host::mmss(self.huddle_now - self.huddle_joined_at);
-        let mute = if self.call_muted { " · Muted" } else { "" };
-        native::row(
-            &key,
-            [
-                native::button(
-                    format!("{key}/show"),
-                    format!("Live {elapsed}{mute}"),
-                    Some(slots::message(show())),
-                    wire::ButtonPreset::Success,
-                ),
-                native::button(
-                    format!("{key}/leave"),
-                    "Leave huddle",
-                    Some(slots::message(leave())),
-                    wire::ButtonPreset::Subtle,
-                ),
-            ],
+        let mut children = vec![native::badge(
+            format!("{key}/live"),
+            format!("Live {elapsed}"),
+            Tone::Success,
+        )];
+        if self.call_muted {
+            children.push(native::badge(
+                format!("{key}/muted"),
+                "Muted",
+                Tone::Neutral,
+            ));
+        }
+        children.extend([
+            native::button(
+                format!("{key}/show"),
+                "Show huddle",
+                Some(slots::message(show())),
+                wire::ButtonPreset::Subtle,
+            ),
+            native::button(
+                format!("{key}/leave"),
+                "Leave huddle",
+                Some(slots::message(leave())),
+                wire::ButtonPreset::Subtle,
+            ),
+        ]);
+        native::sized(
+            native::spaced(native::centered_row(&key, children), 6.),
+            Some(wire::Length::Shrink),
+            None,
         )
     }
 

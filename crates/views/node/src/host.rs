@@ -587,13 +587,14 @@ pub fn push_logs(lines: &[LogRow], arrived: &[LogRow]) -> Vec<LogRow> {
     next
 }
 
-/// The tail of the timeline the frame draws, filtered: at most
-/// [`LOG_LINES_DRAWN`] rows, because the wire carries text and not a
-/// virtual list.
-pub fn visible_log(lines: &[LogRow], filter: &str) -> Vec<LogRow> {
+/// The tail of the timeline the frame draws, filtered by level and by text:
+/// at most [`LOG_LINES_DRAWN`] rows, because the wire carries text and not a
+/// virtual list. An empty `level` keeps every level.
+pub fn visible_log(lines: &[LogRow], filter: &str, level: &str) -> Vec<LogRow> {
     let filter = filter.trim().to_lowercase();
     let matching: Vec<LogRow> = lines
         .iter()
+        .filter(|line| level.is_empty() || line.level == level)
         .filter(|line| filter.is_empty() || line.message.to_lowercase().contains(&filter))
         .cloned()
         .collect();

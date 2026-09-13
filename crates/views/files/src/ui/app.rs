@@ -228,7 +228,7 @@ impl FilesView {
             sent: false,
             viewport_width: 1280.0,
             viewport_height: 700.0,
-            tree_width: 206.0,
+            tree_width: 240.0,
             preview_pane_height: 300.0,
             object_width: 306.0,
             derived: ::std::default::Default::default(),

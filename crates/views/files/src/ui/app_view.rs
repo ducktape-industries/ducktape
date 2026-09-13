@@ -4,6 +4,29 @@ use ducktape_view_guest::{kit::Tone, slots};
 impl FilesView {
     pub(crate) fn view(&self) -> wire::Node {
         native::set_dark(self.dark);
+        let viewport = || {
+            slots::handler::<(f32, f32), Message>(Box::new(|(width, height)| {
+                Some(Message::ViewportChanged(width.into(), height.into()))
+            }))
+        };
+        // The split runs to the edges of the content area: the screen owns
+        // its own chrome, and the sensor is layout-transparent over it.
+        wire::Node::Sensor {
+            key: "FilesView/viewport".into(),
+            reset: None,
+            on_show: Some(viewport()),
+            on_resize: Some(viewport()),
+            on_hide: None,
+            anticipate: None,
+            delay: None,
+            child: Box::new(self.files_screen("FilesView/screen".into())),
+        }
+    }
+
+    /// What the browser has to say before its rows: a draft whose network
+    /// moved under it, the last answer from a write, and the rows the
+    /// listing cap dropped.
+    pub(super) fn notices(&self) -> Vec<wire::Node> {
         let mut children = Vec::new();
         if *self.derived_draft_parked() {
             children.push(native::notice(
@@ -57,41 +80,15 @@ impl FilesView {
             ));
         }
         if self.connected && self.omitted > 0 {
-            children.push(native::spaced(
-                native::row(
-                    "FilesView/omissions",
-                    [
-                        native::caption("FilesView/display-omitted", self.omitted.to_string()),
-                        native::caption("FilesView/omission-label", "rows are not shown."),
-                    ],
-                ),
-                4.,
+            children.push(native::notice(
+                "FilesView/omissions",
+                native::wrapping(native::secondary(
+                    "FilesView/omission-label",
+                    format!("{} rows are not shown.", self.omitted),
+                )),
+                Tone::Neutral,
             ));
         }
-        let viewport = || {
-            slots::handler::<(f32, f32), Message>(Box::new(|(width, height)| {
-                Some(Message::ViewportChanged(width.into(), height.into()))
-            }))
-        };
-        children.push(wire::Node::Sensor {
-            key: "FilesView/viewport".into(),
-            reset: None,
-            on_show: Some(viewport()),
-            on_resize: Some(viewport()),
-            on_hide: None,
-            anticipate: None,
-            delay: None,
-            child: Box::new(self.files_screen("FilesView/screen".into())),
-        });
-        let mut root = native::page("FilesView/root", children);
-        if let wire::Node::Linear { padding, .. } = &mut root {
-            *padding = Some(wire::Edges {
-                top: 16.,
-                right: 20.,
-                bottom: 16.,
-                left: 20.,
-            });
-        }
-        root
+        children
     }
 }

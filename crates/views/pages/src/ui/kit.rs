@@ -66,6 +66,24 @@ fn fill(node: Node) -> Node {
     kit::sized(node, Some(Length::Fill), Some(Length::Fill))
 }
 
+/// A pane header or a toolbar: one 40px centre line inset from the left edge,
+/// with the hairline that separates it from what it heads.
+fn header_bar(key: &str, left: f32, children: impl IntoIterator<Item = Node>) -> Node {
+    kit::sized(
+        kit::padded(
+            kit::spaced(kit::centered_row(key, children), 8.),
+            wire::Edges {
+                top: 0.,
+                right: 8.,
+                bottom: 0.,
+                left,
+            },
+        ),
+        Some(Length::Fill),
+        Some(Length::Fixed(40.)),
+    )
+}
+
 fn empty_state(key: &str, title: &str, description: &str) -> Node {
     kit::empty_state(key, title, description)
 }

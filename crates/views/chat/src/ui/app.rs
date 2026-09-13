@@ -531,6 +531,41 @@ mod tests {
         });
     }
 
+    /// The stream opens on the room's beginning — and only when the beginning
+    /// is what it is showing. The intro rides inside the scroll, which keeps
+    /// the end anchor either way.
+    #[test]
+    fn the_stream_opens_with_its_intro_only_once_the_whole_history_shows() {
+        let mut state = ChatView::state();
+        state.connected = true;
+        state.active_channel = "room".into();
+        state.active_channel_name = "design".into();
+        state.messages = vec![crate::host::ChatMessage {
+            seq: 1,
+            view_key: 11,
+            ..Default::default()
+        }];
+        let intros = |state: &ChatView| {
+            let mut tree = state.view();
+            let (mut intros, mut anchored) = (0, 0);
+            tree.for_each_mut(&mut |node| match node {
+                wire::Node::Text { content, .. } if content == "This is the start of #design." => {
+                    intros += 1;
+                }
+                wire::Node::Scroll { key, anchor_y, .. } if key.ends_with("/message-stream") => {
+                    assert_eq!(*anchor_y, wire::ScrollAnchor::End);
+                    anchored += 1;
+                }
+                _ => {}
+            });
+            assert_eq!(anchored, 1, "the stream keeps one end-anchored scroll");
+            intros
+        };
+        assert_eq!(intros(&state), 1);
+        state.has_older_history = true;
+        assert_eq!(intros(&state), 0, "older history is not a beginning");
+    }
+
     #[test]
     fn reaction_menu_keeps_every_choice_in_four_native_grid_rows() {
         let mut state = ChatView::state();

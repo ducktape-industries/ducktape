@@ -548,6 +548,11 @@ fn settings_subtle(
         wire::ButtonPreset::Subtle,
     )
 }
+/// Every settings field is the same width: the reading stays a column of
+/// labels on the left and controls on the right, whatever the value is.
+const FIELD_WIDTH: f32 = 280.;
+/// The band a settings row takes above and below its content.
+const ROW_BAND: f32 = 8.;
 fn settings_input(
     key: &str,
     placeholder: &str,
@@ -555,11 +560,15 @@ fn settings_input(
     route: fn(String) -> Message,
 ) -> wire::Node {
     use ducktape_view_guest::{kit, slots};
-    kit::input(
-        key,
-        placeholder,
-        value,
-        slots::handler::<String, Message>(Box::new(move |text| Some(route(text)))),
+    kit::sized(
+        kit::input(
+            key,
+            placeholder,
+            value,
+            slots::handler::<String, Message>(Box::new(move |text| Some(route(text)))),
+            None,
+        ),
+        Some(wire::Length::Fixed(FIELD_WIDTH)),
         None,
     )
 }
@@ -576,13 +585,58 @@ fn settings_choice(
         }),
     )
 }
-/// A section: a title, a line about it, then its content in a card.
+/// One setting on its own row: what it is and why on the left, the control
+/// that changes it on the right.
+fn setting_row(key: &str, name: &str, detail: &str, note: &str, control: wire::Node) -> wire::Node {
+    use ducktape_view_guest::kit;
+    let mut lines = vec![kit::strong(format!("{key}/name"), name)];
+    if !detail.is_empty() {
+        lines.push(kit::wrapping(kit::secondary(
+            format!("{key}/detail"),
+            detail,
+        )));
+    }
+    if !note.is_empty() {
+        lines.push(kit::wrapping(kit::caption(format!("{key}/note"), note)));
+    }
+    kit::centered_row(
+        key,
+        [
+            kit::sized(
+                kit::spaced(kit::column(format!("{key}/text"), lines), 2.),
+                Some(wire::Length::Fill),
+                None,
+            ),
+            kit::sized(control, Some(wire::Length::Shrink), None),
+        ],
+    )
+}
+/// A run of settings rows: a hairline between them, every one in the same
+/// band, so the tab reads as one list and not as a stack of cards.
+fn setting_list(key: &str, rows: impl IntoIterator<Item = wire::Node>) -> wire::Node {
+    use ducktape_view_guest::kit;
+    let band = wire::Edges {
+        top: ROW_BAND,
+        right: 0.,
+        bottom: ROW_BAND,
+        left: 0.,
+    };
+    let mut children = Vec::new();
+    for (index, row) in rows.into_iter().enumerate() {
+        if index > 0 {
+            children.push(kit::divider(format!("{key}/rule/{index}")));
+        }
+        children.push(kit::padded(row, band));
+    }
+    kit::spaced(kit::column(key, children), 0.)
+}
+/// A group inside a tab: its heading, a line about it, then its body.
 fn settings_section(
     key: &str,
     title_key: &str,
     title: &str,
     help: &str,
-    content: impl IntoIterator<Item = wire::Node>,
+    body: wire::Node,
 ) -> wire::Node {
     use ducktape_view_guest::kit;
     let mut head = vec![kit::heading(title_key, title)];
@@ -594,13 +648,10 @@ fn settings_section(
             key,
             [
                 kit::spaced(kit::column(format!("{key}/head"), head), 2.),
-                kit::card(
-                    format!("{key}/card"),
-                    kit::spaced(kit::column(format!("{key}/body"), content), 12.),
-                ),
+                body,
             ],
         ),
-        10.,
+        6.,
     )
 }
 impl SettingsView {
@@ -615,16 +666,29 @@ impl SettingsView {
         ];
         let mut content = vec![
             kit::title("settings/title", "Settings"),
-            kit::tabs(
-                "settings/tab",
-                tabs.into_iter().map(|(key, label, pane)| {
-                    (
-                        key.to_owned(),
-                        label.to_owned(),
-                        self.settings_pane == pane,
-                        Some(slots::message(Message::PickSettingsPane(pane))),
-                    )
-                }),
+            kit::spaced(
+                kit::column(
+                    "settings/tabs",
+                    [
+                        kit::sized(
+                            kit::tabs(
+                                "settings/tab",
+                                tabs.into_iter().map(|(key, label, pane)| {
+                                    (
+                                        key.to_owned(),
+                                        label.to_owned(),
+                                        self.settings_pane == pane,
+                                        Some(slots::message(Message::PickSettingsPane(pane))),
+                                    )
+                                }),
+                            ),
+                            Some(wire::Length::Fill),
+                            Some(wire::Length::Fixed(28.)),
+                        ),
+                        kit::divider("settings/tab-rule"),
+                    ],
+                ),
+                6.,
             ),
         ];
         if !self.host_error.is_empty() {
@@ -651,7 +715,6 @@ impl SettingsView {
         kit::scroll("settings", page)
     }
     fn general_settings(&self) -> wire::Node {
-        use ducktape_view_guest::kit;
         let appearance = settings_choice(
             "settings/appearance",
             [
@@ -686,47 +749,34 @@ impl SettingsView {
                 ),
             ],
         );
-        kit::spaced(
-            kit::column(
-                "settings/general",
-                [
-                    settings_section(
-                        "settings/theme",
-                        "settings/theme-title",
-                        "Appearance",
-                        "How this device draws the app.",
-                        [
-                            appearance,
-                            kit::caption(
-                                "settings/appearance-source",
-                                if self.appearance == "system" {
-                                    "Following the system appearance."
-                                } else {
-                                    "Pinned for this device."
-                                },
-                            ),
-                        ],
-                    ),
-                    settings_section(
-                        "settings/notification",
-                        "settings/notification-title",
-                        "Mentions and direct messages",
-                        "",
-                        [
-                            notifications,
-                            kit::caption(
-                                "settings/notification-help",
-                                if self.desktop_notifications {
-                                    "A desktop banner when you are named, or written to directly."
-                                } else {
-                                    "Silent — the bell is the only notice."
-                                },
-                            ),
-                        ],
-                    ),
-                ],
-            ),
-            20.,
+        let source = if self.appearance == "system" {
+            "Following the system appearance."
+        } else {
+            "Pinned for this device."
+        };
+        let banner = if self.desktop_notifications {
+            "A desktop banner when you are named, or written to directly."
+        } else {
+            "Silent — the bell is the only notice."
+        };
+        setting_list(
+            "settings/general",
+            [
+                setting_row(
+                    "settings/theme",
+                    "Appearance",
+                    "How this device draws the app.",
+                    source,
+                    appearance,
+                ),
+                setting_row(
+                    "settings/notification",
+                    "Mentions and direct messages",
+                    banner,
+                    "",
+                    notifications,
+                ),
+            ],
         )
     }
     fn network_settings(&self) -> wire::Node {
@@ -766,49 +816,79 @@ impl SettingsView {
             "settings/network-name",
             &self.network_name,
             "",
-            [
-                kit::kv(
-                    "settings/network-status-row",
-                    "Status",
-                    kit::text("settings/network-status", &self.status),
+            kit::spaced(
+                kit::column(
+                    "settings/network-body",
+                    [
+                        setting_list(
+                            "settings/network-rows",
+                            [
+                                kit::kv(
+                                    "settings/network-status-row",
+                                    "Status",
+                                    kit::text("settings/network-status", &self.status),
+                                ),
+                                kit::kv(
+                                    "settings/network-rpc-row",
+                                    "Endpoint",
+                                    kit::centered_row(
+                                        "settings/network-rpc-value",
+                                        [
+                                            kit::wrapping(kit::mono(
+                                                "settings/network-rpc",
+                                                &self.connected_rpc,
+                                            )),
+                                            settings_subtle(
+                                                "settings/copy-rpc",
+                                                "Copy endpoint",
+                                                Message::CopyToClipboard(
+                                                    self.connected_rpc.clone(),
+                                                    "Endpoint copied".into(),
+                                                ),
+                                                !self.connected_rpc.is_empty(),
+                                            ),
+                                        ],
+                                    ),
+                                ),
+                                kit::kv(
+                                    "settings/members",
+                                    "Members",
+                                    kit::centered_row(
+                                        "settings/members-row",
+                                        [
+                                            kit::nowrap(kit::text(
+                                                "settings/members-count",
+                                                &self.members_line,
+                                            )),
+                                            settings_subtle(
+                                                "settings/manage-members",
+                                                "manage",
+                                                Message::ShowTab("members".into()),
+                                                true,
+                                            ),
+                                        ],
+                                    ),
+                                ),
+                                kit::kv(
+                                    "settings/node",
+                                    "Node",
+                                    kit::centered_row(
+                                        "settings/node-row",
+                                        [settings_subtle(
+                                            "settings/view-node",
+                                            "view",
+                                            Message::ShowTab("node".into()),
+                                            true,
+                                        )],
+                                    ),
+                                ),
+                            ],
+                        ),
+                        actions,
+                    ],
                 ),
-                kit::kv(
-                    "settings/network-rpc-row",
-                    "Endpoint",
-                    kit::mono("settings/network-rpc", &self.connected_rpc),
-                ),
-                kit::kv(
-                    "settings/members",
-                    "Members",
-                    kit::centered_row(
-                        "settings/members-row",
-                        [
-                            kit::nowrap(kit::text("settings/members-count", &self.members_line)),
-                            settings_subtle(
-                                "settings/manage-members",
-                                "manage",
-                                Message::ShowTab("members".into()),
-                                true,
-                            ),
-                        ],
-                    ),
-                ),
-                kit::kv(
-                    "settings/node",
-                    "Node",
-                    kit::centered_row(
-                        "settings/node-row",
-                        [settings_subtle(
-                            "settings/view-node",
-                            "view",
-                            Message::ShowTab("node".into()),
-                            true,
-                        )],
-                    ),
-                ),
-                kit::divider("settings/network-rule"),
-                actions,
-            ],
+                12.,
+            ),
         )
     }
     fn account_settings(&self) -> wire::Node {
@@ -868,12 +948,15 @@ impl SettingsView {
                 "Key on this device",
                 kit::wrapping(kit::mono("settings/seat", &self.seat_key)),
             ),
-            kit::divider("settings/identity-rule"),
-            kit::field(
-                "settings/rename-field",
-                "Rename",
+        ];
+        if self.account_exists {
+            identity.push(setting_row(
+                "settings/rename-row",
+                "Account name",
+                "What this network calls you; every device you add answers to it.",
+                "",
                 kit::row(
-                    "settings/rename-row",
+                    "settings/rename-controls",
                     [
                         settings_input(
                             "settings/rename-draft",
@@ -881,7 +964,7 @@ impl SettingsView {
                             &self.account_name_draft,
                             Message::BindAccountNameDraft,
                         ),
-                        settings_action(
+                        settings_primary(
                             "settings/rename",
                             "Rename",
                             Message::AccountRenameSubmit,
@@ -889,11 +972,11 @@ impl SettingsView {
                         ),
                     ],
                 ),
-            ),
-        ];
+            ));
+        }
+        let identity = setting_list("settings/identity-rows", identity);
         let mut content = Vec::new();
         if !self.account_exists {
-            identity.truncate(identity.len() - 2);
             content.push(settings_section(
                 "settings/identity",
                 "settings/identity-title",
@@ -906,66 +989,69 @@ impl SettingsView {
                 "settings/enrol-title",
                 "Create or join an account",
                 "An account is what the network knows you as; every device you add signs for it.",
-                [
-                    kit::field(
-                        "settings/create-field",
-                        "New account",
-                        kit::row(
+                setting_list(
+                    "settings/enrol-rows",
+                    [
+                        setting_row(
                             "settings/create-row",
-                            [
-                                settings_input(
-                                    "settings/create-draft",
-                                    "name your account…",
-                                    &self.account_create_draft,
-                                    Message::BindAccountCreateDraft,
-                                ),
-                                settings_primary(
-                                    "settings/create",
-                                    "Create account",
-                                    Message::AccountCreateSubmit,
-                                    available && !self.account_create_draft.trim().is_empty(),
-                                ),
-                            ],
+                            "New account",
+                            "This device founds it and holds its first key.",
+                            "",
+                            kit::row(
+                                "settings/create-controls",
+                                [
+                                    settings_input(
+                                        "settings/create-draft",
+                                        "name your account…",
+                                        &self.account_create_draft,
+                                        Message::BindAccountCreateDraft,
+                                    ),
+                                    settings_primary(
+                                        "settings/create",
+                                        "Create account",
+                                        Message::AccountCreateSubmit,
+                                        available && !self.account_create_draft.trim().is_empty(),
+                                    ),
+                                ],
+                            ),
                         ),
-                    ),
-                    kit::field(
-                        "settings/join-field",
-                        "Join with a ticket",
-                        kit::row(
+                        setting_row(
                             "settings/join-row",
-                            [
-                                settings_input(
-                                    "settings/join-draft",
-                                    "paste a ticket from a member device…",
-                                    &self.account_join_draft,
-                                    Message::BindAccountJoinDraft,
-                                ),
-                                settings_action(
-                                    "settings/join",
-                                    "Join",
-                                    Message::AccountKeyJoinSubmit,
-                                    available && !self.account_join_draft.trim().is_empty(),
-                                ),
-                            ],
+                            "Join with a ticket",
+                            "A device that already signs for the account mints it.",
+                            "",
+                            kit::row(
+                                "settings/join-controls",
+                                [
+                                    settings_input(
+                                        "settings/join-draft",
+                                        "paste a ticket from a member device…",
+                                        &self.account_join_draft,
+                                        Message::BindAccountJoinDraft,
+                                    ),
+                                    settings_action(
+                                        "settings/join",
+                                        "Join",
+                                        Message::AccountKeyJoinSubmit,
+                                        available && !self.account_join_draft.trim().is_empty(),
+                                    ),
+                                ],
+                            ),
                         ),
-                    ),
-                    kit::divider("settings/enrol-rule"),
-                    kit::centered_row(
-                        "settings/login-row",
-                        [
-                            kit::wrapping(kit::secondary(
-                                "settings/login-help",
-                                "Or let a passkey from another device admit this one.",
-                            )),
+                        setting_row(
+                            "settings/login-row",
+                            "Passkey",
+                            "Or let a passkey from another device admit this one.",
+                            "",
                             settings_action(
                                 "settings/login",
                                 "Log in with a passkey",
                                 Message::AccountLoginSubmit,
                                 available,
                             ),
-                        ],
-                    ),
-                ],
+                        ),
+                    ],
+                ),
             ));
         } else {
             content.push(settings_section(
@@ -1032,7 +1118,7 @@ impl SettingsView {
                     "{} — each one signs for this account.",
                     kit_plural(self.account_key_rows.len(), "key", "keys")
                 ),
-                keys,
+                setting_list("settings/keys-rows", keys),
             ));
             let mut add = vec![
                 kit::field(
@@ -1121,7 +1207,7 @@ impl SettingsView {
                 "settings/add-device",
                 "Add a device",
                 "A ticket admits one more key to this account.",
-                add,
+                kit::spaced(kit::column("settings/add-body", add), 12.),
             ));
         }
         match self.account_ceremony_phase.as_str() {
@@ -1184,28 +1270,51 @@ impl SettingsView {
     }
     fn security_settings(&self) -> wire::Node {
         use ducktape_view_guest::{kit, slots, wire};
+        let state = if self.settings_key_state.is_empty() {
+            "unknown"
+        } else {
+            &self.settings_key_state
+        };
+        let tone = match self.settings_key_state.as_str() {
+            "encrypted" => kit::Tone::Success,
+            "absent" => kit::Tone::Warning,
+            "unreadable" => kit::Tone::Danger,
+            _ => kit::Tone::Neutral,
+        };
         let mut content = vec![
             kit::kv(
                 "settings/key-state-row",
                 "Key state",
-                kit::text("settings/key-state", &self.settings_key_state),
+                kit::badge("settings/key-state", state, tone),
             ),
             kit::kv(
                 "settings/key-path-row",
                 "Key path",
                 kit::wrapping(kit::mono("settings/key-path", &self.settings_key_path)),
             ),
-            kit::divider("settings/security-rule"),
         ];
         if self.unlocked {
             content.push(kit::centered_row(
                 "settings/signing-row",
                 [
-                    kit::wrapping(kit::tone_text(
-                        "settings/signing",
-                        "Signing unlocked for this session.",
-                        kit::Tone::Success,
-                    )),
+                    kit::sized(
+                        kit::spaced(
+                            kit::column(
+                                "settings/signing-text",
+                                [
+                                    kit::strong("settings/signing-name", "Signing seat"),
+                                    kit::wrapping(kit::tone_text(
+                                        "settings/signing",
+                                        "Signing unlocked for this session.",
+                                        kit::Tone::Success,
+                                    )),
+                                ],
+                            ),
+                            2.,
+                        ),
+                        Some(wire::Length::Fill),
+                        None,
+                    ),
                     settings_action("settings/lock", "Lock", Message::LockSession, true),
                 ],
             ));
@@ -1224,14 +1333,16 @@ impl SettingsView {
             if let wire::Node::Input { secure, .. } = &mut password {
                 *secure = true;
             }
-            content.push(kit::field(
-                "settings/unlock-field",
+            content.push(setting_row(
+                "settings/unlock-row",
                 "Wallet password",
+                "Unlock this device's key for this session.",
+                "",
                 kit::row(
-                    "settings/unlock-row",
+                    "settings/unlock-controls",
                     [
-                        password,
-                        settings_primary(
+                        kit::sized(password, Some(wire::Length::Fixed(FIELD_WIDTH)), None),
+                        settings_action(
                             "settings/unlock",
                             "Unlock",
                             Message::SettingsUnlockSubmit(self.key_password.clone()),
@@ -1246,7 +1357,7 @@ impl SettingsView {
             "settings/security-title",
             "Identity key",
             "The key this device signs with, and whether it is unlocked now.",
-            content,
+            setting_list("settings/security-rows", content),
         )
     }
 }

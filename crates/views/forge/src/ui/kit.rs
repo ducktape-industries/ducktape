@@ -28,15 +28,19 @@ fn span(
     }
 }
 
-/// The tone an item or review state paints.
+/// The tone an item or review state paints. Open is live, merged wears the
+/// agent tint, and a closed item is spent — only a refused review is danger.
 pub(super) fn state_tone(state: &str) -> Tone {
     match state {
         "open" | "approve" | "approved" => Tone::Success,
-        "merged" => Tone::Accent,
-        "closed" | "request_changes" | "changes_requested" => Tone::Danger,
+        "merged" => Tone::Agent,
+        "request_changes" | "changes_requested" => Tone::Danger,
         _ => Tone::Neutral,
     }
 }
+
+/// A reading's body size: one step over the 13px chrome, at 1.5 leading.
+pub(super) const READING: f32 = 14.;
 
 impl ForgeView {
     pub(super) fn unavailable(&self, key: String) -> wire::Node {
@@ -113,6 +117,7 @@ impl ForgeView {
         key: String,
         open: impl Fn(String) -> Message + Clone + 'static,
         block: &crate::host::ChatBlock,
+        size: f32,
     ) -> wire::Node {
         let mut spans = Vec::new();
         for part in &block.spans {
@@ -147,7 +152,7 @@ impl ForgeView {
                 line_height: Some(wire::LineHeight::Relative(1.5)),
                 ..Default::default()
             },
-            size: Some(native::type_scale::BODY as f32),
+            size: Some(size),
             color: Some(native::rgba(native::palette().foreground)),
             font: Default::default(),
             width: Some(wire::Length::Fill),
@@ -164,6 +169,16 @@ impl ForgeView {
         open: impl Fn(String) -> Message + Clone + 'static,
         blocks: Vec<crate::host::ChatBlock>,
     ) -> wire::Node {
+        self.rich_blocks(key, open, blocks, native::type_scale::BODY as f32)
+    }
+
+    fn rich_blocks(
+        &self,
+        key: String,
+        open: impl Fn(String) -> Message + Clone + 'static,
+        blocks: Vec<crate::host::ChatBlock>,
+        size: f32,
+    ) -> wire::Node {
         let p = native::palette();
         let mut children = Vec::new();
         for (index, block) in blocks.iter().enumerate() {
@@ -171,10 +186,14 @@ impl ForgeView {
             match block.kind.as_str() {
                 "divider" => children.push(native::divider(key)),
                 "code" => {
-                    let code = native::wrapping(native::mono(format!("{key}/code"), block.text.clone()));
+                    let code =
+                        native::wrapping(native::mono(format!("{key}/code"), block.text.clone()));
                     let mut lines = Vec::new();
                     if !block.lang.is_empty() {
-                        lines.push(native::caption(format!("{key}/language"), block.lang.clone()));
+                        lines.push(native::caption(
+                            format!("{key}/language"),
+                            block.lang.clone(),
+                        ));
                     }
                     lines.push(code);
                     let mut boxed = native::padded(
@@ -196,9 +215,16 @@ impl ForgeView {
                 }
                 "quote" | "paragraph" => {
                     let content = if block.rich {
-                        self.rich_line(format!("{key}/text"), open.clone(), block)
+                        self.rich_line(format!("{key}/text"), open.clone(), block, size)
                     } else {
-                        native::wrapping(native::text(format!("{key}/text"), block.text.clone()))
+                        let mut plain = native::wrapping(native::text_size(
+                            native::text(format!("{key}/text"), block.text.clone()),
+                            size,
+                        ));
+                        if let wire::Node::Text { options, .. } = &mut plain {
+                            options.line_height = Some(wire::LineHeight::Relative(1.5));
+                        }
+                        plain
                     };
                     let content = if block.kind == "quote" {
                         let mut quote = native::padded(
@@ -228,11 +254,17 @@ impl ForgeView {
         }
         native::spaced(native::column(key, children), 8.)
     }
+    /// The item's own body: a reading, wider type at 1.5 leading, held to a
+    /// measure a person can track a line across.
     pub(super) fn item_body(
         &self,
         key: String,
         open: impl Fn(String) -> Message + Clone + 'static,
     ) -> wire::Node {
-        self.rich_body(key, open, self.forge_item_blocks.clone())
+        let mut body = self.rich_blocks(key, open, self.forge_item_blocks.clone(), READING);
+        if let wire::Node::Linear { max_width, .. } = &mut body {
+            *max_width = Some(720.);
+        }
+        body
     }
 }

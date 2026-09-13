@@ -78,6 +78,29 @@ fn divider(key: String, route: fn(f64, f64) -> Message) -> wire::Node {
         }),
     }
 }
+/// A section label over a list: a 28px row, the name quiet, and at most one
+/// ghost control beside it.
+fn section_row(key: String, name: &str, control: Option<wire::Node>) -> wire::Node {
+    let mut children = vec![native::sized(
+        native::nowrap(native::label(format!("{key}/label"), name)),
+        Some(wire::Length::Fill),
+        None,
+    )];
+    children.extend(control);
+    native::padded(
+        native::sized(
+            native::spaced(native::centered_row(key, children), 4.),
+            Some(wire::Length::Fill),
+            Some(wire::Length::Fixed(28.)),
+        ),
+        wire::Edges {
+            top: 0.,
+            right: 4.,
+            bottom: 0.,
+            left: 8.,
+        },
+    )
+}
 /// A pane's title row: a heading, what stands beside it, and its close.
 fn pane_header(key: String, children: impl IntoIterator<Item = wire::Node>) -> wire::Node {
     native::padded(
@@ -147,27 +170,20 @@ impl ChatView {
                 false,
             ));
         }
-        top.push(native::centered_row(
+        let mut rooms = vec![section_row(
             format!("{key}/channels-header"),
-            [
-                native::sized(
-                    native::heading(format!("{key}/channels-label"), "Channels"),
-                    Some(wire::Length::Fill),
-                    None,
-                ),
-                subtle(
-                    format!("{key}/new-channel"),
-                    if self.channel_create_open {
-                        "Close"
-                    } else {
-                        "New channel"
-                    },
-                    Message::ToggleChannelCreate,
-                    self.loading || self.busy,
-                ),
-            ],
-        ));
-        let mut rooms = Vec::new();
+            "Channels",
+            Some(subtle(
+                format!("{key}/new-channel"),
+                if self.channel_create_open {
+                    "Close"
+                } else {
+                    "New channel"
+                },
+                Message::ToggleChannelCreate,
+                self.loading || self.busy,
+            )),
+        )];
         for room in &self.rooms {
             rooms.push(self.channel_button(
                 format!("{key}/channel/{}", room.channel.id),
@@ -178,17 +194,11 @@ impl ChatView {
             ));
         }
         if !self.dm_rows.is_empty() {
-            rooms.push(native::padded(
-                native::column(
-                    format!("{key}/dm-heading-row"),
-                    [native::heading(format!("{key}/dm-heading"), "Direct messages")],
-                ),
-                wire::Edges {
-                    top: 16.,
-                    right: 0.,
-                    bottom: 4.,
-                    left: 0.,
-                },
+            rooms.push(native::gap(8.));
+            rooms.push(section_row(
+                format!("{key}/dm-heading-row"),
+                "Direct messages",
+                None,
             ));
         }
         for row in &self.dm_rows {
@@ -202,13 +212,8 @@ impl ChatView {
         }
         let children = vec![
             native::padded(
-                native::spaced(native::column(format!("{key}/sidebar-top"), top), 10.),
-                wire::Edges {
-                    top: 12.,
-                    right: 12.,
-                    bottom: 4.,
-                    left: 12.,
-                },
+                native::spaced(native::column(format!("{key}/sidebar-top"), top), 6.),
+                wire::Edges::all(8.),
             ),
             native::scroll(
                 format!("{key}/rooms"),
@@ -405,7 +410,10 @@ impl ChatView {
                 vec![native::padded(
                     native::column(
                         format!("{key}/empty-row"),
-                        [native::secondary(format!("{key}/empty"), "No messages match")],
+                        [native::secondary(
+                            format!("{key}/empty"),
+                            "No messages match",
+                        )],
                     ),
                     wire::Edges::all(16.),
                 )]
@@ -430,6 +438,49 @@ impl ChatView {
                 wire::Edges::all(8.),
             ),
         )
+    }
+    /// The head of a room's history: what the room is, and that this is where
+    /// it begins. Only the timeline carries it, and only once the whole
+    /// history is on screen.
+    fn stream_intro(&self, key: String) -> Option<wire::Node> {
+        let whole_history = !self.has_older_history && !self.messages.is_empty();
+        if !whole_history {
+            return None;
+        }
+        let direct = !self.active_dm.name.is_empty();
+        let (name, detail) = if direct {
+            (
+                self.active_dm.name.clone(),
+                format!(
+                    "This is the start of your conversation with {}.",
+                    self.active_dm.name
+                ),
+            )
+        } else {
+            (
+                format!("#{}", self.active_channel_name),
+                format!("This is the start of #{}.", self.active_channel_name),
+            )
+        };
+        Some(native::padded(
+            native::spaced(
+                native::column(
+                    key.clone(),
+                    [
+                        native::heading(format!("{key}/name"), name),
+                        native::wrapping(native::secondary(format!("{key}/detail"), detail)),
+                        native::divider(format!("{key}/rule")),
+                    ],
+                ),
+                6.,
+            ),
+            wire::Edges {
+                top: 12.,
+                right: 16.,
+                bottom: 8.,
+                left: 16.,
+            },
+        ))
     }
     fn message_list(
         &self,
@@ -486,7 +537,8 @@ impl ChatView {
                             top: 2.,
                             right: 16.,
                             bottom: 2.,
-                            left: 54.,
+                            // the message rail: the 16px inset plus avatar and gap
+                            left: 50.,
                         },
                     ));
                 }
@@ -553,10 +605,14 @@ impl ChatView {
                     tint: None,
                     radius: 0.,
                     open: target,
-                    children: vec![card, self.floating_actions(format!("{scope}/actions"), controls)],
+                    children: vec![
+                        card,
+                        self.floating_actions(format!("{scope}/actions"), controls),
+                    ],
                 };
                 children.push(hover);
-                let content = native::spaced(native::column(format!("{scope}/content"), children), 0.);
+                let content =
+                    native::spaced(native::column(format!("{scope}/content"), children), 0.);
                 rows.push(wire::Node::MouseArea {
                     key: scope,
                     on_press: None,
@@ -598,7 +654,17 @@ impl ChatView {
             align: None,
             virtual_row: Some(44.0f32),
         };
-        let mut scroll = native::scroll(key, list);
+        // The intro rides inside the scroll, above the keyed rows: the host
+        // gives a virtual column and the chrome around it one viewport, so the
+        // stream keeps the anchoring it has.
+        let intro = (surface == CopySurface::Timeline)
+            .then(|| self.stream_intro(format!("{key}/intro")))
+            .flatten();
+        let content = match intro {
+            Some(intro) => native::spaced(native::column(format!("{key}/lead"), [intro, list]), 0.),
+            None => list,
+        };
+        let mut scroll = native::scroll(key, content);
         if let wire::Node::Scroll {
             virtual_rows,
             anchor_y,
@@ -680,7 +746,7 @@ impl ChatView {
                         native::container(format!("{key}/line"), rule),
                         native::nowrap(native::colored(
                             native::caption(format!("{key}/label"), "New messages"),
-                            p.warning,
+                            p.accent_foreground,
                         )),
                     ],
                 ),
@@ -990,7 +1056,6 @@ impl ChatView {
             _ => "action-focus",
         };
         let mut children = Vec::new();
-        let mut tone = Tone::Neutral;
         match mode {
             MessageAction::Toolbar | MessageAction::More => {
                 let reaction = if thread {
@@ -1095,7 +1160,6 @@ impl ChatView {
                 });
             }
             MessageAction::Delete => {
-                tone = Tone::Danger;
                 children.push(native::centered_row(
                     format!("{key}/{prefix}confirm-row"),
                     [
@@ -1139,12 +1203,19 @@ impl ChatView {
             ),
             wire::AlignX::Right,
         ));
+        // A menu is a card over the stream; only the delete confirmation wears
+        // a tone, because only it is about to destroy something.
+        let frame_key = format!("{key}/{prefix}{focus}");
+        let menu = native::column(format!("{key}/{prefix}menu"), children);
+        let frame = match mode {
+            MessageAction::Delete => native::notice(frame_key, menu, Tone::Danger),
+            MessageAction::Toolbar
+            | MessageAction::More
+            | MessageAction::Reactions
+            | MessageAction::Editing => native::card(frame_key, menu),
+        };
         native::padded(
-            native::notice(
-                format!("{key}/{prefix}{focus}"),
-                native::column(format!("{key}/{prefix}menu"), children),
-                tone,
-            ),
+            frame,
             wire::Edges {
                 top: 4.,
                 right: 16.,

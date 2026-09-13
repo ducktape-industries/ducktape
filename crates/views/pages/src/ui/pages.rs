@@ -31,7 +31,7 @@ impl PagesView {
                 wire::Edges {
                     top: 12.,
                     right: 16.,
-                    bottom: 0.,
+                    bottom: 12.,
                     left: 16.,
                 },
             ));
@@ -44,7 +44,7 @@ impl PagesView {
             self.document_pane(),
             Message::PagesPaneResized,
         ));
-        let mut main = fill(kit::column("pages/main", body));
+        let mut main = fill(kit::spaced(kit::column("pages/main", body), 0.));
         if self.connected && self.page_delete_armed {
             main = Node::Stack {
                 padding: None,
@@ -65,27 +65,26 @@ impl PagesView {
     }
 
     fn sidebar(&self) -> Node {
-        let header_inset = wire::Edges {
-            top: 14.,
-            right: 12.,
-            bottom: 6.,
-            left: 16.,
-        };
         if !self.connected {
-            return fill(kit::column(
-                "pages/sidebar",
-                [kit::padded(
-                    kit::column(
-                        "pages/sidebar/header",
-                        [kit::heading("pages/sidebar/title", "Pages")],
-                    ),
-                    header_inset,
-                )],
+            return fill(kit::spaced(
+                kit::column(
+                    "pages/sidebar",
+                    [
+                        header_bar(
+                            "pages/sidebar/header",
+                            12.,
+                            [kit::nowrap(kit::heading("pages/sidebar/title", "Pages"))],
+                        ),
+                        kit::divider("pages/sidebar/rule"),
+                    ],
+                ),
+                0.,
             ));
         }
-        let mut rows = vec![kit::padded(
-            kit::centered_row(
+        let mut rows = vec![
+            header_bar(
                 "pages/sidebar/header",
+                12.,
                 [
                     kit::nowrap(kit::heading("pages/sidebar/title", "Pages")),
                     kit::badge(
@@ -103,16 +102,12 @@ impl PagesView {
                         },
                         Message::TogglePageCreate,
                         !self.unavailable(),
-                        if self.page_create_open {
-                            ButtonPreset::Subtle
-                        } else {
-                            ButtonPreset::Secondary
-                        },
+                        ButtonPreset::Subtle,
                     ),
                 ],
             ),
-            header_inset,
-        )];
+            kit::divider("pages/sidebar/rule"),
+        ];
         if self.page_create_open {
             rows.push(kit::padded(
                 kit::spaced(
@@ -143,9 +138,9 @@ impl PagesView {
                     6.,
                 ),
                 wire::Edges {
-                    top: 4.,
+                    top: 8.,
                     right: 12.,
-                    bottom: 8.,
+                    bottom: 12.,
                     left: 12.,
                 },
             ));
@@ -168,14 +163,14 @@ impl PagesView {
             kit::padded(
                 kit::spaced(kit::column("pages/sidebar/list", list), 1.),
                 wire::Edges {
-                    top: 0.,
-                    right: 8.,
+                    top: 6.,
+                    right: 6.,
                     bottom: 8.,
-                    left: 8.,
+                    left: 6.,
                 },
             ),
         ));
-        fill(kit::column("pages/sidebar", rows))
+        fill(kit::spaced(kit::column("pages/sidebar", rows), 0.))
     }
 
     fn document_toolbar(&self) -> Node {
@@ -184,56 +179,24 @@ impl PagesView {
         } else {
             &self.active_page_title
         };
-        let mut heading = Vec::new();
+        let mut crumb = Vec::new();
         if !self.active_page_parent.is_empty() {
-            heading.push(kit::nowrap(kit::secondary(
+            crumb.push(kit::nowrap(kit::secondary(
                 "pages/toolbar/parent",
                 &self.active_page_parent,
             )));
-            heading.push(kit::nowrap(kit::caption("pages/toolbar/crumb", "/")));
+            crumb.push(kit::nowrap(kit::caption("pages/toolbar/crumb", "/")));
         }
-        heading.push(kit::nowrap(kit::strong("pages/toolbar/title", title)));
-        let mut controls = vec![kit::sized(
-            kit::spaced(kit::centered_row("pages/toolbar/heading", heading), 6.),
-            Some(Length::Fill),
-            None,
-        )];
+        crumb.push(kit::nowrap(kit::strong("pages/toolbar/title", title)));
         let status = match self.autosave.as_str() {
             "saving" => ("Saving…", Tone::Neutral),
             "error" => ("Not saved", Tone::Danger),
             _ => ("Saved", Tone::Neutral),
         };
-        controls.push(kit::nowrap(kit::tone_text(
-            "pages/toolbar/save-status",
-            status.0,
-            status.1,
-        )));
-        controls.push(kit::sized(
-            input(
-                format!("{PAGE_KEY}/page-search"),
-                "Search pages…",
-                &self.page_search_draft,
-                Message::SearchDraftChanged,
-                Some(Message::SearchPagesSubmit),
-                !self.host_error.is_empty() || self.page_searching,
-            ),
-            Some(Length::Fixed(200.)),
-            None,
-        ));
-        let searching = !self.page_search_draft.is_empty() || !self.page_search_query.is_empty();
-        if searching {
-            controls.push(action(
-                "pages/toolbar/clear-search",
-                "Clear search",
-                Message::ClearPageSearch,
-                true,
-                ButtonPreset::Text,
-            ));
-        }
         let mut comments = named(
             kit::button(
                 "pages/toolbar/comments",
-                format!("Comments  {}", self.thread_total),
+                format!("Comments {}", self.thread_total),
                 (!self.unavailable()).then(|| slots::message(Message::ToggleBlockComments)),
                 ButtonPreset::Subtle,
             ),
@@ -242,35 +205,66 @@ impl PagesView {
         if let Node::Button { checked, .. } = &mut comments {
             *checked = Some(self.block_comments_open);
         }
-        controls.push(comments);
-        controls.push(action(
-            "pages/toolbar/link",
-            "Copy page link",
-            Message::CopyToClipboard(self.page_link.clone(), "Page link".into()),
-            !self.page_link.is_empty(),
-            ButtonPreset::Subtle,
-        ));
-        controls.push(action(
-            "pages/toolbar/menu",
-            "Page actions",
-            Message::TogglePageMenu,
-            !self.unavailable(),
-            ButtonPreset::Subtle,
-        ));
-        kit::column(
-            "pages/toolbar-bar",
-            [
-                kit::padded(
-                    kit::spaced(kit::centered_row("pages/toolbar", controls), 6.),
-                    wire::Edges {
-                        top: 8.,
-                        right: 12.,
-                        bottom: 8.,
-                        left: 16.,
-                    },
+        let controls = [
+            kit::nowrap(kit::text_size(
+                kit::tone_text("pages/toolbar/save-status", status.0, status.1),
+                kit::type_scale::CAPTION as f32,
+            )),
+            kit::sized(
+                input(
+                    format!("{PAGE_KEY}/page-search"),
+                    "Search pages…",
+                    &self.page_search_draft,
+                    Message::SearchDraftChanged,
+                    Some(Message::SearchPagesSubmit),
+                    !self.host_error.is_empty() || self.page_searching,
                 ),
-                kit::divider("pages/toolbar/rule"),
-            ],
+                Some(Length::Fixed(180.)),
+                None,
+            ),
+            comments,
+            action(
+                "pages/toolbar/link",
+                "Copy page link",
+                Message::CopyToClipboard(self.page_link.clone(), "Page link".into()),
+                !self.page_link.is_empty(),
+                ButtonPreset::Subtle,
+            ),
+            action(
+                "pages/toolbar/menu",
+                "Page actions",
+                Message::TogglePageMenu,
+                !self.unavailable(),
+                ButtonPreset::Subtle,
+            ),
+        ];
+        kit::spaced(
+            kit::column(
+                "pages/toolbar-bar",
+                [
+                    header_bar(
+                        "pages/toolbar",
+                        16.,
+                        [
+                            kit::sized(
+                                kit::spaced(kit::centered_row("pages/toolbar/heading", crumb), 6.),
+                                Some(Length::Fill),
+                                None,
+                            ),
+                            kit::sized(
+                                kit::spaced(
+                                    kit::centered_row("pages/toolbar/controls", controls),
+                                    6.,
+                                ),
+                                Some(Length::Shrink),
+                                None,
+                            ),
+                        ],
+                    ),
+                    kit::divider("pages/toolbar/rule"),
+                ],
+            ),
+            0.,
         )
     }
 
@@ -416,7 +410,7 @@ impl PagesView {
         }
         content.push(self.document_editor());
         if !self.subpages.is_empty() {
-            let mut links = vec![kit::label("pages/subpages/title", "Subpages")];
+            let mut links = vec![kit::heading("pages/subpages/title", "Subpages")];
             links.extend(self.subpages.iter().map(|page| {
                 action(
                     format!("pages/subpage/{}", page.id),
@@ -427,7 +421,7 @@ impl PagesView {
                 )
             }));
             content.push(kit::divider("pages/subpages/rule"));
-            content.push(kit::spaced(kit::column("pages/subpages", links), 2.));
+            content.push(kit::spaced(kit::column("pages/subpages", links), 4.));
         }
         let mut surface = fill(kit::padded(
             kit::container(
@@ -491,7 +485,7 @@ impl PagesView {
                             kit::sized(
                                 kit::wrapping(kit::heading(
                                     "pages/search/query",
-                                    format!("Search · {}", self.page_search_query),
+                                    format!("Results for {}", self.page_search_query),
                                 )),
                                 Some(Length::Fill),
                                 None,
@@ -561,8 +555,10 @@ impl PagesView {
                     .register(Message::DocumentCommitted, Message::DocumentTransaction),
                 )),
                 presentation: Some(Box::new(presentation)),
-                size: Some(15.),
-                line_height: Some(wire::LineHeight::Relative(1.65)),
+                size: Some(crate::markdown::BODY_SIZE),
+                line_height: Some(wire::LineHeight::Relative(
+                    crate::markdown::BODY_LINE_HEIGHT,
+                )),
                 wrapping: Some(wire::Wrapping::Word),
                 ..Default::default()
             }),

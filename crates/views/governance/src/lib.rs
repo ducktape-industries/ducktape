@@ -332,24 +332,9 @@ impl GovernanceView {
                 let key = format!("governance/settled/{}", proposal.id);
                 let passed = proposal.status.eq_ignore_ascii_case("passed")
                     || proposal.status.eq_ignore_ascii_case("executed");
-                let mut details = vec![
-                    kit::sized(
-                        kit::spaced(
-                            kit::column(
-                                format!("{key}/lines"),
-                                [
-                                    kit::nowrap(kit::mono(format!("{key}/id"), &proposal.id)),
-                                    kit::wrapping(kit::secondary(
-                                        format!("{key}/action"),
-                                        &proposal.action,
-                                    )),
-                                ],
-                            ),
-                            2.,
-                        ),
-                        Some(wire::Length::Fill),
-                        None,
-                    ),
+                let mut cells = vec![
+                    kit::nowrap(kit::mono(format!("{key}/id"), &proposal.id)),
+                    kit::spacer(),
                     kit::badge(
                         format!("{key}/status"),
                         &proposal.status,
@@ -357,19 +342,21 @@ impl GovernanceView {
                     ),
                 ];
                 if proposal.settled_height > 0 {
-                    details.push(kit::nowrap(kit::caption(
+                    cells.push(kit::nowrap(kit::caption(
                         format!("{key}/height"),
                         host::height_label_short(proposal.settled_height),
                     )));
                 }
-                rows.push(kit::divider(format!("{key}/rule")));
-                rows.push(kit::centered_row(key, details));
+                if !rows.is_empty() {
+                    rows.push(kit::divider(format!("{key}/rule")));
+                }
+                rows.push(kit::sized(
+                    kit::centered_row(key, cells),
+                    Some(wire::Length::Fill),
+                    Some(wire::Length::Fixed(28.)),
+                ));
             }
-            rows.remove(0);
-            content.push(kit::card(
-                "governance/settled",
-                kit::spaced(kit::column("governance/settled/rows", rows), 8.),
-            ));
+            content.push(kit::spaced(kit::column("governance/settled", rows), 0.));
         }
         kit::reading_page("governance", content)
     }
@@ -381,15 +368,15 @@ impl GovernanceView {
         let key = format!("governance/proposal/{}", proposal.id);
         let available = self.voting.is_empty();
         let met = proposal.approvals >= proposal.required_yes;
-        let mut content = vec![
+        // the header row: what kind of change, which proposal, where its
+        // tally stands.
+        let head = kit::sized(
             kit::centered_row(
                 format!("{key}/head"),
                 [
-                    kit::sized(
-                        kit::wrapping(kit::heading(format!("{key}/action"), &proposal.action)),
-                        Some(wire::Length::Fill),
-                        None,
-                    ),
+                    kit::badge(format!("{key}/kind"), &proposal.action, Tone::Neutral),
+                    kit::nowrap(kit::mono(format!("{key}/id"), &proposal.id)),
+                    kit::spacer(),
                     kit::badge(
                         format!("{key}/tally"),
                         host::tally_label(proposal.approvals, proposal.required_yes),
@@ -397,38 +384,40 @@ impl GovernanceView {
                     ),
                 ],
             ),
-            kit::spaced(
-                kit::centered_row(
-                    format!("{key}/meta"),
-                    [
-                        kit::nowrap(kit::mono(format!("{key}/id"), &proposal.id)),
-                        kit::caption(
-                            format!("{key}/proposer"),
-                            format!(
-                                "proposed by @{} · expires at h{}",
-                                proposal.proposer, proposal.deadline
-                            ),
-                        ),
-                    ],
-                ),
-                10.,
-            ),
-        ];
+            Some(wire::Length::Fill),
+            Some(wire::Length::Fixed(28.)),
+        );
+        // one line about the change: what it does, who opened it, when it
+        // runs out.
+        let mut about = Vec::new();
         if !proposal.detail.is_empty() {
-            content.push(kit::wrapping(kit::text(format!("{key}/detail"), &proposal.detail)));
+            about.push(kit::nowrap(kit::text(
+                format!("{key}/detail"),
+                &proposal.detail,
+            )));
         }
-        let mut tally = vec![kit::secondary(
+        about.extend([
+            kit::spacer(),
+            kit::nowrap(kit::caption(
+                format!("{key}/proposer"),
+                format!("proposed by @{}", proposal.proposer),
+            )),
+            kit::nowrap(kit::caption(
+                format!("{key}/deadline"),
+                format!("expires {}", host::height_label_short(proposal.deadline)),
+            )),
+        ]);
+        let mut actions = vec![kit::nowrap(kit::secondary(
             format!("{key}/quorum"),
             host::tally_note(proposal.approvals, proposal.required_yes),
-        )];
+        ))];
         if proposal.rejections > 0 {
-            tally.push(kit::tone_text(
+            actions.push(kit::nowrap(kit::tone_text(
                 format!("{key}/rejections"),
                 format!("{} against", proposal.rejections),
                 Tone::Danger,
-            ));
+            )));
         }
-        content.push(kit::spaced(kit::centered_row(format!("{key}/votes"), tally), 10.));
         let reject = kit::button(
             format!("{key}/reject"),
             "Reject",
@@ -453,12 +442,21 @@ impl GovernanceView {
         if let wire::Node::Button { label, .. } = &mut approval {
             *label = Some(if met { "Settle" } else { "Approve" }.into());
         }
-        content.push(kit::divider(format!("{key}/rule")));
-        content.push(kit::spaced(
-            kit::row(format!("{key}/actions"), [kit::spacer(), reject, approval]),
-            8.,
-        ));
-        kit::card(&key, kit::spaced(kit::column(format!("{key}/body"), content), 10.))
+        actions.extend([kit::spacer(), reject, approval]);
+        kit::card(
+            &key,
+            kit::spaced(
+                kit::column(
+                    format!("{key}/body"),
+                    [
+                        head,
+                        kit::centered_row(format!("{key}/about"), about),
+                        kit::centered_row(format!("{key}/actions"), actions),
+                    ],
+                ),
+                8.,
+            ),
+        )
     }
 }
 ducktape_view_guest::export_app!(

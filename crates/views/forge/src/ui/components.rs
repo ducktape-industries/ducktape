@@ -65,7 +65,10 @@ impl ForgeView {
                     } else {
                         "This directory is empty."
                     };
-                    tree.push(native::wrapping(native::secondary("forge/tree-empty", empty)));
+                    tree.push(native::wrapping(native::secondary(
+                        "forge/tree-empty",
+                        empty,
+                    )));
                 }
                 if self.tree_truncated {
                     tree.push(native::caption(
@@ -97,9 +100,10 @@ impl ForgeView {
             cursor: Some(wire::mouse::Cursor::ResizingHorizontally),
             content: Box::new(native::vertical_divider("forge/tree-edge")),
         };
-        let mut frame = native::card(
-            "forge/code-frame",
-            native::sized(
+        // the split runs to the edges of the content area: the pane's own
+        // hairline is the only frame it gets
+        let mut split = native::sized(
+            native::spaced(
                 native::row(
                     "forge/code",
                     [
@@ -111,22 +115,15 @@ impl ForgeView {
                         ),
                     ],
                 ),
-                Some(wire::Length::Fill),
-                Some(wire::Length::Fill),
+                0.,
             ),
+            Some(wire::Length::Fill),
+            Some(wire::Length::Fill),
         );
-        if let wire::Node::Container {
-            padding,
-            clip,
-            height,
-            ..
-        } = &mut frame
-        {
-            *padding = None;
+        if let wire::Node::Linear { clip, .. } = &mut split {
             *clip = true;
-            *height = Some(wire::Length::Fill);
         }
-        frame
+        split
     }
 
     fn file_screen(&self) -> wire::Node {
@@ -269,137 +266,144 @@ impl ForgeView {
                 None,
             )
         };
-        let rows = self
-            .diff_rows
-            .iter()
-            .map(|line| {
-                let key = format!("forge/diff/{}", line.key);
-                match line.kind.as_str() {
-                    "file" => {
-                        let mut head = native::padded(
-                            native::row(&key, [native::nowrap(native::mono(format!("{key}/text"), &line.text))]),
-                            wire::Edges {
-                                top: 4.,
-                                right: 8.,
-                                bottom: 4.,
-                                left: 8.,
-                            },
-                        );
-                        if let wire::Node::Linear { background, .. } = &mut head {
-                            *background = Some(native::rgba(p.surface_raised));
-                        }
-                        head
-                    }
-                    "hunk" => native::padded(
+        let render = |line: &host::DiffLine| {
+            let key = format!("forge/diff/{}", line.key);
+            match line.kind.as_str() {
+                "file" => {
+                    let mut head = native::padded(
                         native::row(
                             &key,
-                            [native::nowrap(native::colored(
-                                native::mono(format!("{key}/text"), &line.text),
-                                p.link,
+                            [native::nowrap(native::mono(
+                                format!("{key}/text"),
+                                &line.text,
                             ))],
                         ),
                         wire::Edges {
-                            top: 2.,
+                            top: 4.,
                             right: 8.,
-                            bottom: 2.,
+                            bottom: 4.,
                             left: 8.,
                         },
-                    ),
-                    _ => {
-                        let line_number = if line.side == "old" {
-                            &line.old_no
-                        } else {
-                            &line.new_no
-                        };
-                        let (color, wash) = match line.sign.as_str() {
-                            "+" => (p.success, Some(p.success_soft)),
-                            "-" => (p.danger, Some(p.danger_soft)),
-                            _ => (p.foreground, None),
-                        };
-                        let mut cells = vec![
-                            number(format!("{key}/old"), &line.old_no),
-                            number(format!("{key}/new"), &line.new_no),
-                            native::sized(
-                                native::nowrap(native::colored(
-                                    native::mono(format!("{key}/sign"), &line.sign),
-                                    color,
-                                )),
-                                Some(wire::Length::Fixed(14.)),
-                                None,
-                            ),
-                            native::sized(
-                                native::nowrap(native::colored(
-                                    native::mono(format!("{key}/text"), &line.text),
-                                    color,
-                                )),
-                                Some(wire::Length::Fill),
-                                None,
-                            ),
-                        ];
-                        if !line.path.is_empty() {
-                            cells.push(native::button(
-                                format!("{key}/comment"),
-                                "Comment on this line",
-                                Some(slots::message(Message::ForgeCommentOpen(
-                                    line.path.clone(),
-                                    line_number.clone(),
-                                    line.side.clone(),
-                                ))),
-                                wire::ButtonPreset::Text,
-                            ));
-                        }
-                        let mut row = native::padded(
-                            native::sized(
-                                native::centered_row(key, cells),
-                                None,
-                                Some(wire::Length::Fixed(24.)),
-                            ),
-                            wire::Edges {
-                                top: 0.,
-                                right: 8.,
-                                bottom: 0.,
-                                left: 8.,
-                            },
-                        );
-                        if let wire::Node::Linear { background, .. } = &mut row {
-                            *background = wash.map(native::rgba);
-                        }
-                        row
+                    );
+                    if let wire::Node::Linear { background, .. } = &mut head {
+                        *background = Some(native::rgba(p.surface_raised));
                     }
+                    head
                 }
+                "hunk" => native::padded(
+                    native::row(
+                        &key,
+                        [native::nowrap(native::colored(
+                            native::mono(format!("{key}/text"), &line.text),
+                            p.link,
+                        ))],
+                    ),
+                    wire::Edges {
+                        top: 2.,
+                        right: 8.,
+                        bottom: 2.,
+                        left: 8.,
+                    },
+                ),
+                _ => {
+                    let line_number = if line.side == "old" {
+                        &line.old_no
+                    } else {
+                        &line.new_no
+                    };
+                    let (color, wash) = match line.sign.as_str() {
+                        "+" => (p.success, Some(p.success_soft)),
+                        "-" => (p.danger, Some(p.danger_soft)),
+                        _ => (p.foreground, None),
+                    };
+                    let mut cells = vec![
+                        number(format!("{key}/old"), &line.old_no),
+                        number(format!("{key}/new"), &line.new_no),
+                        native::sized(
+                            native::nowrap(native::colored(
+                                native::mono(format!("{key}/sign"), &line.sign),
+                                color,
+                            )),
+                            Some(wire::Length::Fixed(14.)),
+                            None,
+                        ),
+                        native::sized(
+                            native::nowrap(native::colored(
+                                native::mono(format!("{key}/text"), &line.text),
+                                color,
+                            )),
+                            Some(wire::Length::Fill),
+                            None,
+                        ),
+                    ];
+                    if !line.path.is_empty() {
+                        cells.push(native::button(
+                            format!("{key}/comment"),
+                            "Comment on this line",
+                            Some(slots::message(Message::ForgeCommentOpen(
+                                line.path.clone(),
+                                line_number.clone(),
+                                line.side.clone(),
+                            ))),
+                            wire::ButtonPreset::Text,
+                        ));
+                    }
+                    let mut row = native::padded(
+                        native::sized(
+                            native::centered_row(key, cells),
+                            None,
+                            Some(wire::Length::Fixed(24.)),
+                        ),
+                        wire::Edges {
+                            top: 0.,
+                            right: 8.,
+                            bottom: 0.,
+                            left: 8.,
+                        },
+                    );
+                    if let wire::Node::Linear { background, .. } = &mut row {
+                        *background = wash.map(native::rgba);
+                    }
+                    row
+                }
+            }
+        };
+        // one block per changed file: a `file` line opens the next one, and
+        // each block wears its own hairline.
+        let mut blocks: Vec<Vec<&host::DiffLine>> = Vec::new();
+        for line in &self.diff_rows {
+            let opens_a_block = line.kind == "file" || blocks.is_empty();
+            if opens_a_block {
+                blocks.push(Vec::new());
+            }
+            blocks.last_mut().expect("a block is open").push(line);
+        }
+        let mut content: Vec<wire::Node> = blocks
+            .into_iter()
+            .map(|block| wire::Node::KeyedColumn {
+                key: format!("forge/diff-lines/{}", block[0].key),
+                keys: Some(
+                    block
+                        .iter()
+                        .map(|line| wire::ListKey::from(line.key))
+                        .collect(),
+                ),
+                children: block.into_iter().map(&render).collect(),
+                background: Some(native::rgba(p.surface)),
+                border: Some(wire::Border {
+                    color: Some(native::rgba(p.border)),
+                    width: Some(1.),
+                    radius: Some([native::radius::CONTROL as f32; 4]),
+                }),
+                spacing: None,
+                padding: None,
+                width: Some(wire::Length::Fill),
+                height: None,
+                max_width: None,
+                align: None,
+                virtual_row: Some(24.),
             })
             .collect();
-        let mut lines = wire::Node::KeyedColumn {
-            key: "forge/diff-lines".into(),
-            keys: Some(
-                self.diff_rows
-                    .iter()
-                    .map(|line| wire::ListKey::from(line.key))
-                    .collect(),
-            ),
-            children: rows,
-            background: None,
-            border: None,
-            spacing: None,
-            padding: None,
-            width: Some(wire::Length::Fill),
-            height: None,
-            max_width: None,
-            align: None,
-            virtual_row: Some(24.),
-        };
-        if let wire::Node::KeyedColumn {
-            background, border, ..
-        } = &mut lines
-        {
-            *background = Some(native::rgba(p.surface));
-            *border = Some(wire::Border {
-                color: Some(native::rgba(p.border)),
-                width: Some(1.),
-                radius: Some([native::radius::CARD as f32; 4]),
-            });
-        }
-        let mut content = vec![lines];
         if self.forge_item_diff_truncated {
             content.push(native::caption(
                 "forge/diff-truncated",
@@ -456,7 +460,10 @@ impl ForgeView {
                     },
                     available.then_some(Message::ForgeMergeSubmit),
                 ));
-                content.push(native::spaced(native::centered_row("forge/merge-row", row), 10.));
+                content.push(native::spaced(
+                    native::centered_row("forge/merge-row", row),
+                    10.,
+                ));
                 if !self.merge_conflicts.is_empty() {
                     let mut conflicts = vec![native::wrapping(native::text(
                         "forge/conflict-title",
@@ -491,6 +498,9 @@ impl ForgeView {
         }
         for (index, review) in self.forge_item_reviews.iter().enumerate() {
             let key = format!("forge/review/{index}");
+            if index > 0 {
+                content.push(native::divider(format!("{key}/edge")));
+            }
             let mut head = vec![
                 native::nowrap(native::strong(format!("{key}/author"), &review.author_name)),
                 native::badge(
@@ -505,7 +515,11 @@ impl ForgeView {
                 self.finality(format!("{key}/finality"), review.created_at),
             ];
             if review.outdated {
-                head.push(native::badge(format!("{key}/outdated"), "outdated", Tone::Warning));
+                head.push(native::badge(
+                    format!("{key}/outdated"),
+                    "outdated",
+                    Tone::Warning,
+                ));
             }
             let mut details = vec![
                 native::spaced(native::wrapped_row(format!("{key}/head"), head), 8.),
@@ -550,9 +564,9 @@ impl ForgeView {
                 }
                 details.push(boxed);
             }
-            content.push(native::card(
-                key.clone(),
-                native::spaced(native::column(format!("{key}/details"), details), 8.),
+            content.push(native::spaced(
+                native::column(format!("{key}/details"), details),
+                8.,
             ));
         }
         let available = self.connected && !self.review_busy;
@@ -597,7 +611,10 @@ impl ForgeView {
                                 "forge/comment-target",
                                 [
                                     native::sized(
-                                        native::nowrap(native::mono("forge/comment-anchor", target)),
+                                        native::nowrap(native::mono(
+                                            "forge/comment-anchor",
+                                            target,
+                                        )),
                                         Some(wire::Length::Fill),
                                         None,
                                     ),
@@ -618,14 +635,18 @@ impl ForgeView {
                                             &self.comment_draft,
                                             Message::CommentDraftChanged,
                                             submit.then(|| {
-                                                Message::ForgeCommentStage(self.comment_draft.clone())
+                                                Message::ForgeCommentStage(
+                                                    self.comment_draft.clone(),
+                                                )
                                             }),
                                         ),
                                         action(
                                             "forge/add-comment",
                                             "Add comment",
                                             submit.then(|| {
-                                                Message::ForgeCommentStage(self.comment_draft.clone())
+                                                Message::ForgeCommentStage(
+                                                    self.comment_draft.clone(),
+                                                )
                                             }),
                                         ),
                                     ],

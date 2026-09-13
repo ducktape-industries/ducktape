@@ -366,13 +366,13 @@ fn the_repository_tree_width_is_the_readers_and_its_edge_has_a_resize_cursor() {
         panic!("tree resize handle")
     };
     assert_eq!(cursor, Some(mouse::Cursor::ResizingHorizontally));
-    assert_eq!(width(&drive.frame), 258.0);
+    assert_eq!(width(&drive.frame), 260.0);
     let frame = tick_native(vec![Event::Drag {
         handler,
         dx: 42.0,
         dy: 0.0,
     }]);
-    assert_eq!(width(&frame), 300.0);
+    assert_eq!(width(&frame), 302.0);
 }
 
 #[test]

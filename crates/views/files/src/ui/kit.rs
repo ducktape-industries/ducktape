@@ -77,15 +77,10 @@ impl FilesView {
         native::heading(key, "Snapshots")
     }
     pub(super) fn empty_directory(&self, key: String) -> wire::Node {
-        native::padded(
-            native::column(
-                format!("{key}/box"),
-                [native::wrapping(native::secondary(
-                    key,
-                    "Empty directory — nothing is committed under this path.",
-                ))],
-            ),
-            wire::Edges::all(12.),
+        native::empty_state(
+            &key,
+            "Nothing here yet",
+            "Add a file or folder with the name field above.",
         )
     }
 }

@@ -16,7 +16,13 @@ impl ForgeView {
             on_hide: None,
             anticipate: None,
             delay: None,
-            child: Box::new(native::page("ForgeView/page", [content])),
+            // no inset here: the namespace and the item screens are readings
+            // that pad themselves, and the code split runs to the edges
+            child: Box::new(native::sized(
+                native::spaced(native::column("ForgeView/page", [content]), 0.),
+                Some(wire::Length::Fill),
+                Some(wire::Length::Fill),
+            )),
         }
     }
 }

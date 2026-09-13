@@ -27,11 +27,21 @@ fn action(key: impl Into<String>, label: &str, message: Option<Message>) -> Node
 }
 
 fn primary(key: impl Into<String>, label: &str, message: Option<Message>) -> Node {
-    kit::button(key, label, message.map(slots::message), ButtonPreset::Primary)
+    kit::button(
+        key,
+        label,
+        message.map(slots::message),
+        ButtonPreset::Primary,
+    )
 }
 
 fn subtle(key: impl Into<String>, label: &str, message: Option<Message>) -> Node {
-    kit::button(key, label, message.map(slots::message), ButtonPreset::Subtle)
+    kit::button(
+        key,
+        label,
+        message.map(slots::message),
+        ButtonPreset::Subtle,
+    )
 }
 
 fn field(key: &str, hint: &str, value: &str, message: fn(String) -> Message) -> Node {
@@ -93,70 +103,88 @@ fn state_tone(state: &str) -> Tone {
 }
 
 fn section(key: &str, title: &str, children: impl IntoIterator<Item = Node>) -> Node {
-    let mut items = vec![kit::label(format!("{key}/title"), title)];
+    let mut items = vec![kit::heading(format!("{key}/title"), title)];
     items.extend(children);
     kit::spaced(kit::column(key, items), 8.)
+}
+
+/// A height or a time in the data face, at caption weight: the rail every
+/// journal entry is stamped with.
+fn stamp(key: String, content: &str) -> Node {
+    kit::nowrap(kit::colored(
+        kit::text_size(kit::mono(key, content), kit::type_scale::CAPTION as f32),
+        kit::palette().muted,
+    ))
+}
+
+/// The gap that pushes what follows to the right edge of its row.
+fn filler() -> Node {
+    kit::space(Some(Length::Fill), None)
+}
+
+/// The detail rail beside a list: the reader's width, the window's own
+/// colour, clipped at its edge.
+fn detail_pane(key: &str, content: Node, width: f64) -> Node {
+    let mut node = kit::container(key, content);
+    let Node::Container {
+        width: value,
+        height,
+        clip,
+        ..
+    } = &mut node
+    else {
+        unreachable!()
+    };
+    *value = Some(Length::Fixed(width as f32));
+    *height = Some(Length::Fill);
+    *clip = true;
+    node
 }
 
 impl AgentsView {
     fn view(&self) -> Node {
         kit::set_dark(self.dark);
-        let mut header = vec![kit::sized(
-            kit::title("agents/title", "Agents"),
-            Some(Length::Fill),
-            None,
-        )];
-        if self.connected {
-            header.push(kit::nowrap(kit::secondary(
-                "agents/summary",
-                match self.panel.as_str() {
-                    "runs" => host::runs_summary(&self.runs),
-                    _ => host::agents_summary(self.connected, &self.rows),
-                },
-            )));
-            if !self.account.is_empty() {
-                header.push(primary("agents/new", "New agent", Some(Message::OpenNew)));
-            }
-        }
-        let mut content = vec![kit::centered_row("agents/header", header)];
-        if self.connected {
-            let tabs = [("registry", "Registry"), ("runs", "Runs")].map(|(panel, label)| {
-                let mut button = subtle(
-                    format!("agents/panel/{panel}"),
-                    label,
-                    Some(Message::ChoosePanel(panel.into())),
-                );
-                if let Node::Button { checked, .. } = &mut button {
-                    *checked = Some(self.panel == panel);
-                }
-                button
-            });
-            content.push(kit::spaced(kit::row("agents/tabs", tabs), 2.));
-        }
+        let mut content = vec![self.toolbar(), kit::divider("agents/toolbar-rule")];
         let note = host::pane_note(&self.panel);
         if !note.is_empty() {
-            content.push(kit::wrapping(kit::secondary("agents/about", note)));
+            content.push(kit::padded(
+                kit::row(
+                    "agents/about-row",
+                    [kit::wrapping(kit::secondary("agents/about", note))],
+                ),
+                wire::Edges {
+                    top: 8.,
+                    right: 12.,
+                    bottom: 8.,
+                    left: 12.,
+                },
+            ));
+            content.push(kit::divider("agents/about-rule"));
         }
         if !self.host_error.is_empty() {
-            content.push(kit::notice(
-                "agents/error",
-                kit::wrapping(kit::text("agents/error-text", &self.host_error)),
-                Tone::Danger,
+            content.push(kit::padded(
+                kit::row(
+                    "agents/error-row",
+                    [kit::notice(
+                        "agents/error",
+                        kit::wrapping(kit::text("agents/error-text", &self.host_error)),
+                        Tone::Danger,
+                    )],
+                ),
+                wire::Edges::all(12.),
             ));
         }
-        if !self.connected {
-            content.push(kit::empty_state(
+        content.push(match self.connected {
+            false => kit::empty_state(
                 "agents/disconnected",
                 "Not connected",
                 "Choose a network to read its agent registry.",
-            ));
-        } else {
-            let body = match self.panel.as_str() {
+            ),
+            true => match self.panel.as_str() {
                 "runs" => self.runs_panel(),
                 _ => self.registry_panel(),
-            };
-            content.push(body);
-        }
+            },
+        });
         let viewport = slots::handler::<(f32, f32), Message>(Box::new(|(w, h)| {
             Some(Message::ViewportChanged(w.into(), h.into()))
         }));
@@ -168,34 +196,75 @@ impl AgentsView {
             on_hide: None,
             anticipate: None,
             delay: None,
-            child: Box::new(kit::page("agents/root", content)),
+            child: Box::new(kit::sized(
+                kit::spaced(kit::column("agents/root", content), 0.),
+                Some(Length::Fill),
+                Some(Length::Fill),
+            )),
         }
     }
 
-    /// A list beside a rail, both inside one card: the list fills, the
-    /// rail keeps the width the reader dragged it to.
+    /// The screen's own toolbar: what this view is, which pane is on, what
+    /// the pane counts, and the one action the register offers.
+    fn toolbar(&self) -> Node {
+        let mut items = vec![kit::nowrap(kit::title("agents/title", "Agents"))];
+        if self.connected {
+            let panels = [("registry", "Registry"), ("runs", "Runs")].map(|(panel, label)| {
+                (
+                    panel.to_owned(),
+                    label.to_owned(),
+                    self.panel == panel,
+                    Some(slots::message(Message::ChoosePanel(panel.to_owned()))),
+                )
+            });
+            items.push(kit::sized(
+                kit::tabs("agents/panel", panels),
+                Some(Length::Shrink),
+                None,
+            ));
+        }
+        items.push(filler());
+        if self.connected {
+            let summary = match self.panel.as_str() {
+                "runs" => host::runs_summary(&self.runs),
+                _ => host::agents_summary(self.connected, &self.rows),
+            };
+            if !summary.is_empty() {
+                items.push(kit::nowrap(kit::secondary("agents/summary", summary)));
+            }
+            if !self.account.is_empty() {
+                items.push(primary("agents/new", "New agent", Some(Message::OpenNew)));
+            }
+        }
+        kit::sized(
+            kit::padded(
+                kit::centered_row("agents/toolbar", items),
+                wire::Edges {
+                    top: 0.,
+                    right: 12.,
+                    bottom: 0.,
+                    left: 12.,
+                },
+            ),
+            Some(Length::Fill),
+            Some(Length::Fixed(40.)),
+        )
+    }
+
+    /// A list beside a rail, flush to the edges of the content area: the
+    /// list is the surface pane, the rail keeps the width the reader
+    /// dragged it to, and a hairline is all that stands between them.
     fn split(&self, key: &str, list: Node, rail: Option<(Node, Node)>) -> Node {
-        let mut panes = vec![kit::sized(list, Some(Length::Fill), Some(Length::Fill))];
+        let mut panes = vec![kit::pane(format!("{key}/list"), list, Length::Fill)];
         if let Some((handle, pane)) = rail {
             panes.push(handle);
             panes.push(pane);
         }
-        let mut frame = kit::card(
-            format!("{key}/frame"),
-            kit::sized(kit::row(key, panes), Some(Length::Fill), Some(Length::Fill)),
-        );
-        if let Node::Container {
-            padding,
-            clip,
-            height,
-            ..
-        } = &mut frame
-        {
-            *padding = None;
-            *clip = true;
-            *height = Some(Length::Fill);
-        }
-        frame
+        kit::sized(
+            kit::spaced(kit::row(key, panes), 0.),
+            Some(Length::Fill),
+            Some(Length::Fill),
+        )
     }
 
     fn registry_panel(&self) -> Node {
@@ -214,42 +283,38 @@ impl AgentsView {
             } else {
                 &agent.owner_handle
             };
-            let mut meta = vec![
-                kit::badge(format!("{key}/capability"), &agent.capability, Tone::Agent),
-                kit::caption(
-                    format!("{key}/skills"),
-                    host::plural(agent.skills.len() as i64, "skill", "skills"),
+            let mut line = vec![
+                kit::avatar(
+                    format!("{key}/avatar"),
+                    kit::initials(&agent.name),
+                    Tone::Agent,
                 ),
-                kit::caption(format!("{key}/owner"), owner),
+                kit::nowrap(kit::strong(format!("{key}/name"), &agent.name)),
+                kit::nowrap(kit::caption(format!("{key}/owner"), owner)),
+                kit::badge(
+                    format!("{key}/capability"),
+                    &agent.capability,
+                    Tone::Neutral,
+                ),
+                filler(),
             ];
             if agent.live {
-                meta.push(kit::badge(format!("{key}/working"), "Working", Tone::Accent));
+                line.push(kit::badge(
+                    format!("{key}/working"),
+                    "Working",
+                    Tone::Accent,
+                ));
             }
-            let summary = kit::centered_row(
-                format!("{key}/summary"),
-                [
-                    kit::avatar(format!("{key}/avatar"), kit::initials(&agent.name), Tone::Agent),
-                    kit::sized(
-                        kit::spaced(
-                            kit::column(
-                                format!("{key}/lines"),
-                                [
-                                    kit::nowrap(kit::strong(format!("{key}/name"), &agent.name)),
-                                    kit::spaced(kit::centered_row(format!("{key}/meta"), meta), 8.),
-                                ],
-                            ),
-                            3.,
-                        ),
-                        Some(Length::Fill),
-                        None,
-                    ),
-                    kit::badge(
-                        format!("{key}/standing"),
-                        &agent.status,
-                        state_tone(&agent.status),
-                    ),
-                ],
-            );
+            line.push(kit::nowrap(kit::caption(
+                format!("{key}/skills"),
+                host::plural(agent.skills.len() as i64, "skill", "skills"),
+            )));
+            line.push(kit::badge(
+                format!("{key}/standing"),
+                &agent.status,
+                state_tone(&agent.status),
+            ));
+            let summary = kit::spaced(kit::centered_row(format!("{key}/summary"), line), 8.);
             let mut button = kit::list_row(
                 &key,
                 summary,
@@ -272,10 +337,10 @@ impl AgentsView {
         let rail = editor_open.then(|| {
             (
                 resize("agents/editor-resize", Message::EditorResized),
-                kit::pane(
+                detail_pane(
                     "agents/editor",
                     kit::scroll("agents/editor-scroll", self.editor()),
-                    Length::Fixed(self.editor_width as f32),
+                    self.editor_width,
                 ),
             )
         });
@@ -293,52 +358,19 @@ impl AgentsView {
         }
         for run in &self.runs {
             let key = format!("agents/run/{}", run.run_id);
-            let mut meta = vec![
-                kit::nowrap(kit::mono(format!("{key}/id"), &run.run_id)),
-                kit::caption(format!("{key}/dispatched"), &run.dispatched),
-                kit::caption(format!("{key}/actions"), format!("{} actions", run.actions)),
-            ];
-            if !run.settled.is_empty() {
-                meta.push(kit::caption(format!("{key}/settled"), &run.settled));
-            }
-            if run.pr_number > 0 {
-                meta.push(kit::badge(
-                    format!("{key}/pr"),
-                    format!("PR #{}", run.pr_number),
-                    Tone::Neutral,
-                ));
-            }
-            let summary = kit::centered_row(
-                format!("{key}/summary"),
-                [
-                    kit::sized(
-                        kit::spaced(
-                            kit::column(
-                                format!("{key}/lines"),
-                                [
-                                    kit::spaced(
-                                        kit::centered_row(
-                                            format!("{key}/head"),
-                                            [
-                                                kit::nowrap(kit::strong(
-                                                    format!("{key}/agent"),
-                                                    &run.agent_name,
-                                                )),
-                                                kit::secondary(format!("{key}/origin"), &run.origin),
-                                            ],
-                                        ),
-                                        8.,
-                                    ),
-                                    kit::spaced(kit::wrapped_row(format!("{key}/meta"), meta), 8.),
-                                ],
-                            ),
-                            3.,
-                        ),
-                        Some(Length::Fill),
-                        None,
-                    ),
-                    kit::badge(format!("{key}/state"), &run.state, state_tone(&run.state)),
-                ],
+            let summary = kit::spaced(
+                kit::centered_row(
+                    format!("{key}/summary"),
+                    [
+                        kit::nowrap(kit::mono(format!("{key}/id"), &run.run_id)),
+                        kit::badge(format!("{key}/state"), &run.state, state_tone(&run.state)),
+                        kit::nowrap(kit::strong(format!("{key}/agent"), &run.agent_name)),
+                        kit::nowrap(kit::secondary(format!("{key}/origin"), &run.origin)),
+                        filler(),
+                        kit::nowrap(kit::caption(format!("{key}/dispatched"), &run.dispatched)),
+                    ],
+                ),
+                8.,
             );
             let mut button = kit::list_row(
                 &key,
@@ -361,10 +393,10 @@ impl AgentsView {
         let rail = (!self.open_run.is_empty()).then(|| {
             (
                 resize("agents/journal-resize", Message::JournalResized),
-                kit::pane(
+                detail_pane(
                     "agents/journal",
                     kit::scroll("agents/journal-scroll", self.journal_panel()),
-                    Length::Fixed(self.journal_width as f32),
+                    self.journal_width,
                 ),
             )
         });
@@ -381,7 +413,11 @@ impl AgentsView {
                         Some(Length::Fill),
                         None,
                     ),
-                    subtle("agents/close-journal", "Close journal", Some(Message::CloseRun)),
+                    subtle(
+                        "agents/close-journal",
+                        "Close journal",
+                        Some(Message::CloseRun),
+                    ),
                 ],
             ),
             kit::spaced(
@@ -463,7 +499,7 @@ impl AgentsView {
             items.push(kit::notice(
                 "agents/live",
                 kit::spaced(kit::column("agents/live-body", live), 6.),
-                Tone::Accent,
+                Tone::Agent,
             ));
         }
         let journal_ready = self.journal.dispatch_id == self.open_run;
@@ -483,7 +519,10 @@ impl AgentsView {
         }
         let mut entries = Vec::new();
         if !journal_ready {
-            entries.push(kit::secondary("agents/journal-loading", "Reading the journal…"));
+            entries.push(kit::secondary(
+                "agents/journal-loading",
+                "Reading the journal…",
+            ));
         } else if self.journal.entries.is_empty() {
             entries.push(kit::wrapping(kit::secondary(
                 "agents/journal-empty",
@@ -492,18 +531,14 @@ impl AgentsView {
         } else {
             for (index, entry) in self.journal.entries.iter().enumerate() {
                 let key = format!("agents/entry/{index}");
-                if index > 0 {
-                    entries.push(kit::divider(format!("{key}/rule")));
-                }
-                entries.push(kit::spaced(
+                let body = kit::spaced(
                     kit::column(
-                        &key,
+                        format!("{key}/body"),
                         [
                             kit::spaced(
                                 kit::centered_row(
                                     format!("{key}/head"),
                                     [
-                                        kit::nowrap(kit::mono(format!("{key}/height"), &entry.height)),
                                         kit::sized(
                                             kit::strong(format!("{key}/kind"), &entry.kind),
                                             Some(Length::Fill),
@@ -523,6 +558,20 @@ impl AgentsView {
                         ],
                     ),
                     4.,
+                );
+                entries.push(kit::spaced(
+                    kit::row(
+                        &key,
+                        [
+                            kit::sized(
+                                stamp(format!("{key}/height"), &entry.height),
+                                Some(Length::Fixed(72.)),
+                                None,
+                            ),
+                            body,
+                        ],
+                    ),
+                    8.,
                 ));
             }
         }
@@ -699,7 +748,10 @@ impl AgentsView {
                     Tone::Neutral,
                 ));
             }
-            let mut details = vec![kit::spaced(kit::centered_row(format!("{key}/head"), head), 4.)];
+            let mut details = vec![kit::spaced(
+                kit::centered_row(format!("{key}/head"), head),
+                4.,
+            )];
             if !skill.source_prefix.is_empty() {
                 details.push(kit::wrapping(kit::mono(
                     format!("{key}/source"),
@@ -774,19 +826,22 @@ impl AgentsView {
         }
         items.push(section("agents/skills", "Skills", skills));
         let complete_record = !self.draft_name.trim().is_empty() && !capability.is_empty();
-        if self.creating {
-            items.push(primary(
+        let submit = match (self.creating, self.can_edit) {
+            (true, _) => Some(primary(
                 "agents/register",
                 "Register agent",
                 (complete_record && host::valid_agent_id(&self.draft_id))
                     .then_some(Message::SubmitRegister),
-            ));
-        } else if self.can_edit {
-            items.push(primary(
+            )),
+            (false, true) => Some(primary(
                 "agents/save",
                 "Save agent",
                 complete_record.then_some(Message::SubmitSave),
-            ));
+            )),
+            (false, false) => None,
+        };
+        if let Some(submit) = submit {
+            items.push(kit::centered_row("agents/submit-row", [filler(), submit]));
         }
         kit::spaced(
             kit::padded(
