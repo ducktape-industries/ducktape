@@ -310,29 +310,14 @@ fn the_activity_tab_streams_the_node_log_ring() {
     );
 }
 
-/// EVERY READER OF `/v1/peers` USES THE NAMES `PeerView` SERIALIZES.
-///
-/// `crates/noded/src/peers.rs` serves `peer` / `connected` / `role`; it has
-/// never served `key`, `live`, or a per-peer `height`. Reading the wrong ones
-/// does not fail — `as_str()` answers `None` and the row renders blank, zero
-/// and offline for a peer that is connected. That has already shipped twice in
-/// two different readers, so the rule is pinned at the source rather than left
-/// to a fixture that happens to carry the right keys.
 #[test]
 fn the_peers_reader_uses_the_names_the_node_serves() {
-    let source = include_str!("../src/host.rs");
-    for wrong in ["peer[\"key\"]", "peer[\"live\"]", "peer[\"height\"]"] {
-        assert!(
-            !source.contains(wrong),
-            "host.rs reads {wrong}, which `/v1/peers` does not serve — see \
-             crates/noded/src/peers.rs for the names it does"
-        );
+    let (frame, _) = connected();
+    let shown = texts(&frame);
+    for expected in ["peer-1aa…", "validator", "Connected"] {
+        assert!(has_text(&frame, expected), "missing {expected}: {shown:?}");
     }
-    assert!(
-        source.contains("peer[\"peer\"]") && source.contains("peer[\"connected\"]"),
-        "host.rs was expected to read the peers view; if it no longer does, drop \
-         this lint rather than leaving the guard vacuous"
-    );
+    assert!(!has_text(&frame, "Disconnected"), "{shown:?}");
 }
 
 /// Retuning the RUNNING node leaves as one `rpc.admin` POST on the node's

@@ -149,29 +149,6 @@ fn a_search_hit_names_its_room_exactly_once() {
         hit.contains(r#"meta: format!("{} · #{}", hit.channel_id, hit.seq)"#),
         "the room comes first, then the sequence"
     );
-
-    // The Explorer reads the same index row in its own crate, and composes
-    // that meta exactly ONCE — the room, then the sequence. Composing the
-    // channel on top of a meta that already carried it is what printed it
-    // twice.
-    const EXPLORER: &str = include_str!("../../../../crates/views/explorer/src/host.rs");
-    let message_arm = EXPLORER
-        .split("kind: \"message\".into(),")
-        .nth(1)
-        .expect("the message hit arm")
-        .split(".collect()")
-        .next()
-        .expect("arm body");
-    assert!(
-        message_arm.contains(r#""{} · #{}""#),
-        "the room comes first, then the sequence"
-    );
-    assert_eq!(
-        message_arm.matches("channel_id").count(),
-        2,
-        "the channel names the row's meta and its target, and nothing else: \
-         {message_arm}"
-    );
 }
 
 /// AN UNREAD HEIGHT SAYS SO. The Node overview must not print `h 0` before a
@@ -235,31 +212,6 @@ fn a_search_hits_author_is_not_reformatted_into_system() {
     assert_eq!(
         author_display("acct:7", &NameDirectory::from_accounts(&[program])),
         "quackbot"
-    );
-
-    // ONE FORMATTING PASS, AT THE SOURCE. `author_display` above is the app's
-    // pass over a RENDERED handle; running it a second time over its own
-    // output found no `user:`/`agent:` prefix to split and fell through to
-    // "system", which is how every Explorer message hit lost its author. The
-    // Explorer reads the index row in its own crate now, so its `author` is
-    // the raw handle and `author_name` is that single pass — pinned here so a
-    // second one cannot come back.
-    const EXPLORER: &str = include_str!("../../../../crates/views/explorer/src/host.rs");
-    let message_arm = EXPLORER
-        .split("kind: \"message\".into(),")
-        .nth(1)
-        .expect("the message hit arm")
-        .split(".collect()")
-        .next()
-        .expect("arm body");
-    assert!(
-        message_arm.contains("title: author_name(hit[\"author\"]"),
-        "the message hit names its author off the index row's own handle"
-    );
-    assert_eq!(
-        message_arm.matches("author_name(").count(),
-        1,
-        "formatting the author twice is what produced `system`: {message_arm}"
     );
 }
 

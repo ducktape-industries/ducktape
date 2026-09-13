@@ -4,7 +4,7 @@
 //! hit, and every act leaves as `op.submit` carrying the pages message.
 
 use ducktape_view_guest::testing::{
-    answer, find, has_text, item, measure, press, texts, type_into,
+    answer, find, has_text, item, measure, press, submit, texts, type_into,
 };
 use ducktape_view_guest::wire::{self, Event, Frame, Length, Node, Request};
 use pages_view::host::{
@@ -24,6 +24,37 @@ fn find_editor(node: &Node) -> Option<&Node> {
 fn boot() -> Frame {
     boot_native();
     tick_native(Vec::new())
+}
+
+#[test]
+fn search_results_show_page_titles_and_excerpts_not_internal_block_ids() {
+    let (frame, _) = connected_with_register();
+    let frame = tick_native(type_into(&frame, "Search pages…", "needle"));
+    let frame = tick_native(submit(&frame, "Search pages…"));
+    let reply = serde_json::json!({"hits": [{
+        "page_id": "gamma", "block_id": "private-block-identifier",
+        "kind": "paragraph", "text": "A matching needle excerpt"
+    }]});
+    let frame = tick_native(vec![answer(
+        request(&frame, "rpc.view").id,
+        reply.to_string().as_bytes(),
+    )]);
+    let titles = serde_json::json!({"pages": {"pages": [
+        {"id": "gamma", "title": "Search-only page title", "parent": null}
+    ], "has_more": false, "next_after": null}});
+    let frame = tick_native(vec![answer(
+        request(&frame, "rpc.view").id,
+        titles.to_string().as_bytes(),
+    )]);
+    let shown = texts(&frame);
+    assert!(has_text(&frame, "Search-only page title"), "{shown:?}");
+    assert!(has_text(&frame, "A matching needle excerpt"), "{shown:?}");
+    assert!(
+        !shown
+            .iter()
+            .any(|text| text.contains("private-block-identifier")),
+        "{shown:?}"
+    );
 }
 
 fn kinds(requests: &[Request]) -> Vec<&str> {

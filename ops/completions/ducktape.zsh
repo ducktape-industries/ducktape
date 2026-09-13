@@ -38,7 +38,7 @@ _ducktape() {
     local module_verbs=(pack update register status help)
     local module_flags=(--index --view --assets --out --after --config -n --network --json)
     local collab_verbs=(query key attach send ack help)
-    local collab_flags=(--target --node -n --network --key --trust-node --conversation --participant --existing-only --device --expect --to --kind --credential --seq --ttl-secs --state --reason)
+    local collab_flags=(--target --node -n --network --key --trust-node --channel --participant --existing-only --device --expect --to --kind --message-id --credential --seq --ttl-secs --state --reason)
 
     if (( CURRENT == 2 )); then
         compadd -- $families
