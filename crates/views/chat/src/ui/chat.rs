@@ -190,16 +190,18 @@ impl ChatView {
                 false,
             ));
         }
+        let (mark, name) = if self.channel_create_open {
+            ("✕", "Close")
+        } else {
+            ("+", "New channel")
+        };
         let mut rooms = vec![section_row(
             format!("{key}/channels-header"),
             "Channels",
-            Some(subtle(
+            Some(glyph(
                 format!("{key}/new-channel"),
-                if self.channel_create_open {
-                    "Close"
-                } else {
-                    "New channel"
-                },
+                mark,
+                name,
                 Message::ToggleChannelCreate,
                 self.loading || self.busy,
             )),
@@ -238,9 +240,9 @@ impl ChatView {
             native::scroll(
                 format!("{key}/rooms"),
                 native::padded(
-                    native::spaced(native::column(format!("{key}/room-list"), rooms), 1.),
+                    native::spaced(native::column(format!("{key}/room-list"), rooms), 2.),
                     wire::Edges {
-                        top: 0.,
+                        top: 4.,
                         right: 8.,
                         bottom: 12.,
                         left: 8.,
@@ -380,7 +382,11 @@ impl ChatView {
                     },
                 ));
             }
-            if self.selected_message_seq > 0 {
+            // an edit sits under the stream, in place of the composer's
+            // attention; every other menu floats at the pointer
+            let editing_here =
+                self.selected_message_seq > 0 && self.message_action == MessageAction::Editing;
+            if editing_here {
                 children.push(self.message_menu(key, false));
             }
         }
@@ -878,7 +884,9 @@ impl ChatView {
         if self.copy_surface == CopySurface::Thread {
             children.push(self.selection_bar(format!("{key}/copy-range"), &self.thread_messages));
         }
-        if self.thread_selected_seq > 0 {
+        let editing_here =
+            self.thread_selected_seq > 0 && self.thread_message_action == MessageAction::Editing;
+        if editing_here {
             children.push(self.message_menu(&key, true));
         }
         children.push(wire::Node::Surface {
@@ -1064,6 +1072,73 @@ impl ChatView {
             wire::Length::Fixed(self.details_width as f32),
         )
     }
+    /// Which message menu is open, and on which surface.
+    fn open_menu(&self) -> OpenMenu {
+        let timeline = self.selected_message_seq > 0 && self.message_action != MessageAction::Toolbar;
+        let thread = self.thread_selected_seq > 0 && self.thread_message_action != MessageAction::Toolbar;
+        match (timeline, thread) {
+            (true, _) => OpenMenu::Timeline(self.message_action),
+            (false, true) => OpenMenu::Thread(self.thread_message_action),
+            (false, false) => OpenMenu::None,
+        }
+    }
+    /// What closes the open menu.
+    pub(super) fn close_menu(&self) -> Message {
+        match self.open_menu() {
+            OpenMenu::Thread(_) => Message::ClearThreadMessageSelection,
+            OpenMenu::Timeline(_) | OpenMenu::None => Message::ClearMessageSelection,
+        }
+    }
+    /// The menu that floats at the pointer: the "…" list, the reaction
+    /// picker, or the delete confirmation. An edit is not one — it sits
+    /// under its stream.
+    pub(super) fn floating_menu(&self, key: &str) -> Option<wire::Node> {
+        let (mode, thread) = match self.open_menu() {
+            OpenMenu::None => return None,
+            OpenMenu::Timeline(mode) => (mode, false),
+            OpenMenu::Thread(mode) => (mode, true),
+        };
+        let size = match mode {
+            MessageAction::More => menu_size(if thread { 4 } else { 5 }),
+            MessageAction::Reactions => picker_size(crate::host::reaction_palette().len()),
+            MessageAction::Delete => (280., 96.),
+            MessageAction::Toolbar | MessageAction::Editing => return None,
+        };
+        let (x, y) = crate::host::menu_origin(
+            (self.menu_x, self.menu_y),
+            size,
+            (self.chat_viewport_width, self.chat_viewport_height),
+        );
+        let pane = if thread {
+            format!("{key}/thread-pane")
+        } else {
+            key.to_owned()
+        };
+        // a dropped shadow lifts the card off the stream; deeper on ink
+        let shade = if native::is_dark() { 0.5 } else { 0.16 };
+        Some(wire::Node::Float {
+            key: format!("{key}/floating-menu"),
+            x: wire::FloatExpression {
+                ops: vec![wire::FloatOp::Number(x)],
+            },
+            y: wire::FloatExpression {
+                ops: vec![wire::FloatOp::Number(y)],
+            },
+            scale: 1.,
+            shadow: wire::Shadow {
+                color: Some(wire::Rgba([0., 0., 0., shade])),
+                x: Some(0.),
+                y: Some(4.),
+                blur: Some(16.),
+            },
+            radius: Some([native::radius::CARD as f32; 4]),
+            content: Box::new(native::sized(
+                self.message_menu(&pane, thread),
+                Some(wire::Length::Fixed(size.0 as f32)),
+                None,
+            )),
+        })
+    }
     fn message_menu(&self, key: &str, thread: bool) -> wire::Node {
         let (seq, rev, body, mode, close) = if thread {
             (
@@ -1106,36 +1181,29 @@ impl ChatView {
                 } else {
                     Message::ArmMessageDelete(seq, body.clone(), rev)
                 };
-                // One row of glyph-and-word items that wraps inside a 300px
-                // pane; the close rides at its end.
-                let mut items = vec![glyph(
-                    format!("{key}/{prefix}thumbs-up"),
-                    "👍",
-                    "React with 👍",
-                    Message::AddReactionAt(seq, "👍".into()),
-                    self.active_channel_archived,
-                )];
-                items.push(glyph(
-                    format!("{key}/{prefix}add-reaction"),
-                    "😀 React",
-                    "Add reaction",
-                    reaction,
-                    self.active_channel_archived,
-                ));
+                // A dropdown: one item a row, the words left-aligned.
+                let mut items = Vec::new();
                 if !thread {
-                    items.push(glyph(
+                    items.push(menu_item(
                         format!("{key}/{prefix}reply"),
-                        "↩ Reply",
+                        "↩",
                         "Reply in thread",
                         Message::OpenThreadFor(seq),
                         false,
                     ));
                 }
                 items.extend([
-                    glyph(
+                    menu_item(
+                        format!("{key}/{prefix}add-reaction"),
+                        "😀",
+                        "Add reaction",
+                        reaction,
+                        self.active_channel_archived,
+                    ),
+                    menu_item(
                         format!("{key}/{prefix}copy-link"),
-                        "🔗 Link",
-                        "Copy message link",
+                        "🔗",
+                        "Copy link",
                         Message::CopyMessageLink(crate::host::duck_channel_message_link(
                             self.active_channel.clone(),
                             seq,
@@ -1143,63 +1211,48 @@ impl ChatView {
                         )),
                         false,
                     ),
-                    glyph(
+                    menu_item(
                         format!("{key}/{prefix}edit"),
-                        "✎ Edit",
+                        "✎",
                         "Edit message",
                         edit,
                         self.active_channel_archived,
                     ),
-                    glyph(
+                    menu_item(
                         format!("{key}/{prefix}delete"),
-                        "🗑 Delete",
+                        "🗑",
                         "Delete message",
                         delete,
                         self.active_channel_archived,
                     ),
-                    glyph(
-                        format!("{key}/{prefix}close"),
-                        "✕",
-                        "Cancel",
-                        close.clone(),
-                        false,
-                    ),
                 ]);
                 children.push(native::spaced(
-                    native::wrapped_row(format!("{key}/{prefix}menu-actions"), items),
-                    2.,
+                    native::column(format!("{key}/{prefix}menu-actions"), items),
+                    MENU_ITEM_GAP,
                 ));
             }
             MessageAction::Reactions => {
                 let mut choices = Vec::new();
                 for emoji in crate::host::reaction_palette() {
-                    let mut button = subtle(
+                    choices.push(emoji_cell(
                         format!("{key}/{prefix}reaction/{emoji}"),
                         &emoji,
                         Message::AddReactionAt(seq, emoji.clone()),
                         self.active_channel_archived,
-                    );
-                    if let wire::Node::Button {
-                        label,
-                        description,
-                        padding,
-                        ..
-                    } = &mut button
-                    {
-                        *label = Some("Add reaction".into());
-                        *description = Some(emoji);
-                        // eight to a row inside a 300px pane: ~30px a cell
-                        *padding = Some(wire::Edges::all(4.));
-                    }
-                    choices.push(button);
+                    ));
                 }
+                // the host cuts cells from the grid's measured width, so the
+                // grid states its width: eight cells and seven gaps
+                let columns = PICKER_COLUMNS as f32;
                 children.push(wire::Node::Grid {
                     key: format!("{key}/{prefix}reaction-grid"),
-                    columns: Some(8),
+                    columns: Some(PICKER_COLUMNS),
                     fluid: None,
-                    spacing: Some(4.),
+                    spacing: Some(PICKER_GAP),
                     padding: None,
-                    width: Some(wire::Length::Fill),
+                    width: Some(wire::Length::Fixed(
+                        columns * PICKER_CELL + (columns - 1.) * PICKER_GAP,
+                    )),
                     height: None,
                     aspect: None,
                     background: None,
@@ -1226,73 +1279,172 @@ impl ChatView {
                     ],
                     on_event: None,
                 });
+                children.push(native::aligned(
+                    native::column(
+                        format!("{key}/{prefix}close-row"),
+                        [subtle(
+                            format!("{key}/{prefix}close"),
+                            "Cancel message edit",
+                            close,
+                            self.busy,
+                        )],
+                    ),
+                    wire::AlignX::Right,
+                ));
             }
             MessageAction::Delete => {
-                children.push(native::centered_row(
-                    format!("{key}/{prefix}confirm-row"),
-                    [
-                        native::sized(
-                            native::strong(
-                                format!("{key}/{prefix}confirm"),
-                                "Delete this message?",
-                            ),
-                            Some(wire::Length::Fill),
-                            None,
+                children.push(native::strong(
+                    format!("{key}/{prefix}confirm"),
+                    "Delete this message?",
+                ));
+                children.push(native::wrapping(native::secondary(
+                    format!("{key}/{prefix}confirm-detail"),
+                    "It leaves the room for everyone.",
+                )));
+                children.push(native::aligned(
+                    native::spaced(
+                        native::row(
+                            format!("{key}/{prefix}confirm-row"),
+                            [
+                                native::spacer(),
+                                subtle(format!("{key}/{prefix}close"), "Cancel", close, false),
+                                native::button(
+                                    format!("{key}/{prefix}confirm-delete"),
+                                    "Delete",
+                                    (!self.busy).then(|| {
+                                        slots::message(if thread {
+                                            Message::DeleteThreadMessageSubmit
+                                        } else {
+                                            Message::DeleteMessageSubmit
+                                        })
+                                    }),
+                                    wire::ButtonPreset::Danger,
+                                ),
+                            ],
                         ),
-                        native::button(
-                            format!("{key}/{prefix}confirm-delete"),
-                            "Delete",
-                            (!self.busy).then(|| {
-                                slots::message(if thread {
-                                    Message::DeleteThreadMessageSubmit
-                                } else {
-                                    Message::DeleteMessageSubmit
-                                })
-                            }),
-                            wire::ButtonPreset::Danger,
-                        ),
-                    ],
+                        6.,
+                    ),
+                    wire::AlignX::Right,
                 ));
             }
         }
-        let close_in_row = matches!(mode, MessageAction::Toolbar | MessageAction::More);
-        if !close_in_row {
-            children.push(native::aligned(
-                native::column(
-                    format!("{key}/{prefix}close-row"),
-                    [subtle(
-                        format!("{key}/{prefix}close"),
-                        if mode == MessageAction::Editing {
-                            "Cancel message edit"
-                        } else {
-                            "Cancel"
-                        },
-                        close,
-                        self.busy && mode == MessageAction::Editing,
-                    )],
-                ),
-                wire::AlignX::Right,
-            ));
-        }
-        // A menu is a card over the stream; only the delete confirmation wears
-        // a tone, because only it is about to destroy something.
+        // The frame is what the host focuses when the menu opens; only the
+        // edit sits in the stream's flow and wears the stream's inset.
         let frame_key = format!("{key}/{prefix}{focus}");
-        let menu = native::column(format!("{key}/{prefix}menu"), children);
-        let frame = match mode {
-            MessageAction::Delete => native::notice(frame_key, menu, Tone::Danger),
+        let menu = native::spaced(native::column(format!("{key}/{prefix}menu"), children), 8.);
+        let mut frame = native::card(frame_key, menu);
+        if let wire::Node::Container { padding, .. } = &mut frame {
+            *padding = Some(wire::Edges::all(match mode {
+                MessageAction::Toolbar | MessageAction::More => MENU_INSET,
+                MessageAction::Reactions => PICKER_INSET,
+                MessageAction::Editing | MessageAction::Delete => 12.,
+            }));
+        }
+        match mode {
+            MessageAction::Editing => native::padded(
+                frame,
+                wire::Edges {
+                    top: 4.,
+                    right: 16.,
+                    bottom: 4.,
+                    left: 16.,
+                },
+            ),
             MessageAction::Toolbar
             | MessageAction::More
             | MessageAction::Reactions
-            | MessageAction::Editing => native::card(frame_key, menu),
-        };
-        native::padded(
-            frame,
-            wire::Edges {
-                top: 4.,
-                right: 16.,
-                bottom: 4.,
-                left: 16.,
-            },
-        )
+            | MessageAction::Delete => frame,
+        }
     }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenMenu {
+    None,
+    Timeline(MessageAction),
+    Thread(MessageAction),
+}
+const MENU_ITEM_HEIGHT: f32 = 28.;
+const MENU_ITEM_GAP: f32 = 2.;
+const MENU_INSET: f32 = 6.;
+const PICKER_COLUMNS: u32 = 8;
+const PICKER_CELL: f32 = 32.;
+const PICKER_GAP: f32 = 2.;
+const PICKER_INSET: f32 = 8.;
+/// The "…" dropdown's box for `items` rows.
+fn menu_size(items: usize) -> (f64, f64) {
+    let rows = items as f32;
+    let height = MENU_INSET * 2. + rows * MENU_ITEM_HEIGHT + (rows - 1.).max(0.) * MENU_ITEM_GAP;
+    (220., f64::from(height))
+}
+/// The reaction picker's box for `count` emoji, eight to a row.
+fn picker_size(count: usize) -> (f64, f64) {
+    let columns = PICKER_COLUMNS as f32;
+    let rows = (count as f32 / columns).ceil();
+    let width = PICKER_INSET * 2. + columns * PICKER_CELL + (columns - 1.) * PICKER_GAP;
+    let height = PICKER_INSET * 2. + rows * PICKER_CELL + (rows - 1.).max(0.) * PICKER_GAP;
+    (f64::from(width), f64::from(height))
+}
+/// One row of a dropdown: a glyph, then the words, left-aligned across the
+/// menu's width.
+fn menu_item(key: String, glyph: &str, label: &str, message: Message, disabled: bool) -> wire::Node {
+    let content = native::spaced(
+        native::centered_row(
+            format!("{key}/row"),
+            [
+                native::sized(
+                    native::nowrap(native::text(format!("{key}/glyph"), glyph)),
+                    Some(wire::Length::Fixed(20.)),
+                    None,
+                ),
+                native::nowrap(native::text(format!("{key}/label"), label)),
+            ],
+        ),
+        8.,
+    );
+    let mut button = native::button_child(
+        key,
+        content,
+        (!disabled).then(|| slots::message(message)),
+        wire::ButtonPreset::Subtle,
+    );
+    if let wire::Node::Button {
+        label: accessible,
+        width,
+        height,
+        padding,
+        ..
+    } = &mut button
+    {
+        *accessible = Some(label.into());
+        *width = Some(wire::Length::Fill);
+        *height = Some(wire::Length::Fixed(MENU_ITEM_HEIGHT));
+        *padding = Some(wire::Edges {
+            top: 0.,
+            right: 8.,
+            bottom: 0.,
+            left: 8.,
+        });
+    }
+    button
+}
+/// One cell of the reaction picker: a fixed square with the emoji centred
+/// in it, tall enough that the glyph's full height paints inside.
+fn emoji_cell(key: String, emoji: &str, message: Message, disabled: bool) -> wire::Node {
+    let mut button = subtle(key, emoji, message, disabled);
+    if let wire::Node::Button {
+        label,
+        description,
+        width,
+        height,
+        padding,
+        ..
+    } = &mut button
+    {
+        *label = Some("Add reaction".into());
+        *description = Some(emoji.into());
+        *width = Some(wire::Length::Fixed(PICKER_CELL));
+        *height = Some(wire::Length::Fixed(PICKER_CELL));
+        *padding = Some(wire::Edges::all(0.));
+    }
+    button
 }

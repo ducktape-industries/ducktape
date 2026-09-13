@@ -1955,6 +1955,21 @@ pub fn thread_width_after_delta(width: f64, delta: f64, viewport: f64, sidebar: 
     (width + delta).clamp(280.0, maximum)
 }
 
+/// Where a floating menu of `size` sits for a press at `press` inside a
+/// `viewport`: its top-left at the pointer, flipped left or up when it would
+/// run off an edge, and never past the top-left corner.
+pub fn menu_origin(press: (f64, f64), size: (f64, f64), viewport: (f64, f64)) -> (f64, f64) {
+    const GUTTER: f64 = 8.0;
+    let (px, py) = press;
+    let (w, h) = size;
+    let (vw, vh) = viewport;
+    let fits_right = px + w + GUTTER <= vw;
+    let fits_below = py + h + GUTTER <= vh;
+    let x = if fits_right { px } else { px - w };
+    let y = if fits_below { py + 4.0 } else { py - h - 4.0 };
+    (x.max(GUTTER), y.max(GUTTER))
+}
+
 pub fn block_action_menu_y(pointer_y: f64, viewport_height: f64) -> f64 {
     let below = (pointer_y - 4.0).max(0.0);
     let below_fits = below + 190.0 <= viewport_height;
@@ -2097,6 +2112,19 @@ pub fn message_target_key(messages: &[ChatMessage], target: i64, changed: bool) 
 mod tests {
     use super::*;
     use crate::CopySurface;
+
+    /// A MENU OPENS AT THE POINTER AND FLIPS AWAY FROM THE EDGE IT WOULD
+    /// CROSS: the "…" at a row's right end opens its menu to the left, a
+    /// press near the bottom opens upward, and a corner press never leaves
+    /// the screen.
+    #[test]
+    fn a_menu_opens_at_the_pointer_and_flips_away_from_the_edges() {
+        let viewport = (1000.0, 600.0);
+        assert_eq!(menu_origin((100.0, 100.0), (200.0, 150.0), viewport), (100.0, 104.0));
+        assert_eq!(menu_origin((950.0, 100.0), (200.0, 150.0), viewport), (750.0, 104.0));
+        assert_eq!(menu_origin((100.0, 550.0), (200.0, 150.0), viewport), (100.0, 396.0));
+        assert_eq!(menu_origin((2.0, 2.0), (200.0, 150.0), viewport), (8.0, 8.0));
+    }
 
     /// A ⇧-PRESS WITH NO RANGE OPEN STARTS ONE ON THE ROW IT LANDED ON, and
     /// the next widens it. A plain press never reaches here — the handler

@@ -2,6 +2,28 @@ use super::*;
 use ducktape_view_guest::kit::Tone;
 use ducktape_view_guest::slots;
 
+/// A room in the list pane: a 28px row, its content centred on the row,
+/// the name as its accessible label.
+pub(super) fn sidebar_row(mut button: wire::Node, name: String) -> wire::Node {
+    if let wire::Node::Button {
+        label,
+        height,
+        padding,
+        ..
+    } = &mut button
+    {
+        *label = Some(name);
+        *height = Some(wire::Length::Fixed(28.));
+        *padding = Some(wire::Edges {
+            top: 0.,
+            right: 8.,
+            bottom: 0.,
+            left: 8.,
+        });
+    }
+    button
+}
+
 impl ChatView {
     /// A channel in the list pane: the hash, the name, and what stands out
     /// about it. An unread room is emphasised and carries a mark.
@@ -55,11 +77,7 @@ impl ChatView {
             Some(slots::message(choose(channel.id)))
         };
         let content = native::spaced(native::centered_row(format!("{key}/row"), children), 6.);
-        let mut button = native::list_row(key, content, selected, action);
-        if let wire::Node::Button { label, .. } = &mut button {
-            *label = Some(channel.name);
-        }
-        button
+        sidebar_row(native::list_row(key, content, selected, action), channel.name)
     }
 
     pub(super) fn loading_messages(&self, key: String) -> wire::Node {

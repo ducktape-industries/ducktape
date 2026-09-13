@@ -34,11 +34,7 @@ impl ChatView {
             Some(slots::message(choose(peer.key)))
         };
         let content = native::spaced(native::centered_row(format!("{key}/row"), children), 8.);
-        let mut button = native::list_row(key, content, selected, action);
-        if let wire::Node::Button { label, .. } = &mut button {
-            *label = Some(peer.name);
-        }
-        button
+        super::components::sidebar_row(native::list_row(key, content, selected, action), peer.name)
     }
 
     pub(super) fn direct_message_header(&self, key: String) -> wire::Node {
