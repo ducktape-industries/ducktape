@@ -13,6 +13,8 @@ pub mod document_sync;
 pub mod editor;
 #[path = "../../../src/editor_binding.rs"]
 pub mod editor_binding;
+#[path = "../../../src/editor_format.rs"]
+pub mod format;
 #[path = "../../../src/editor_menu.rs"]
 pub mod editor_menu;
 #[path = "../../../src/editor_view.rs"]

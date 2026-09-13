@@ -102,22 +102,179 @@ fn slash_filter_is_removed_at_utf8_byte_columns() {
 fn menu_lifecycle_filters_at_byte_columns_and_closes_on_caret_movement() {
     let slash = doc("Title\n한글 /", 1, 8);
     let mut state = menu::Menu::default();
-    state.after_edit(&slash, true);
-    assert_eq!(state.current(&slash).unwrap().items.len(), 12);
+    state.after_edit(&slash, Some('/'));
+    assert_eq!(state.current(&slash).unwrap().items.len(), 14);
     let filter = doc("Title\n한글 /h", 1, 9);
-    state.after_edit(&filter, false);
+    state.after_edit(&filter, None);
     let view = state.current(&filter).unwrap();
-    assert_eq!(
-        view.items.iter().map(|item| item.0).collect::<Vec<_>>(),
-        vec!["h1", "h2", "h3"]
-    );
+    assert_eq!(tags(&view), vec!["h1", "h2", "h3"]);
     state.select(&filter, usize::MAX);
     assert_eq!(state.current(&filter).unwrap().selected, 2);
     state.close();
     assert!(state.current(&filter).is_none());
-    state.after_edit(&slash, true);
-    state.after_edit(&doc("Title\n한글 /hz", 1, 10), false);
+    state.after_edit(&slash, Some('/'));
+    state.after_edit(&doc("Title\n한글 /hz", 1, 10), None);
     assert!(state.current(&filter).is_none());
+}
+
+fn tags(view: &menu::MenuView) -> Vec<&str> {
+    view.items.iter().map(|item| item.0.as_str()).collect()
+}
+
+fn names() -> Vec<String> {
+    ["alice", "bob", "Carol"].map(String::from).to_vec()
+}
+
+#[test]
+fn an_at_sign_at_a_word_start_completes_a_member_name() {
+    let mut state = menu::Menu::default().with_names(&names());
+    let at = doc("Title\nping @", 1, 6);
+    state.after_edit(&at, Some('@'));
+    assert_eq!(
+        tags(&state.current(&at).unwrap()),
+        vec!["alice", "bob", "Carol"]
+    );
+    let filtered = doc("Title\nping @AR", 1, 8);
+    state.after_edit(&filtered, None);
+    let view = state.current(&filtered).unwrap();
+    assert_eq!(tags(&view), vec!["Carol"]);
+    assert_eq!(view.items[0].1, "@Carol");
+    let (decision, closed) = state.pick(&filtered, "Carol");
+    assert_eq!(
+        apply(&filtered, decision),
+        doc("Title\nping @Carol ", 1, 12)
+    );
+    assert!(!closed.is_open());
+    // an email address is prose, and a space ends the handle
+    let mut email = menu::Menu::default().with_names(&names());
+    email.after_edit(&doc("Title\nme@", 1, 3), Some('@'));
+    assert!(!email.is_open());
+    state.after_edit(&doc("Title\nping @AR x", 1, 10), None);
+    assert!(!state.is_open());
+}
+
+#[test]
+fn a_colon_completes_an_emoji_short_code_once_a_letter_narrows_it() {
+    let mut state = menu::Menu::default();
+    let colon = doc("Title\nship it :", 1, 9);
+    state.after_edit(&colon, Some(':'));
+    assert!(state.is_open());
+    assert!(
+        state.current(&colon).is_none(),
+        "nothing to show until a letter"
+    );
+    let filtered = doc("Title\nship it :roc", 1, 12);
+    state.after_edit(&filtered, None);
+    let view = state.current(&filtered).unwrap();
+    assert_eq!(tags(&view), vec!["rocket"]);
+    let (decision, closed) = state.pick(&filtered, "rocket");
+    assert_eq!(apply(&filtered, decision), doc("Title\nship it 🚀", 1, 12));
+    assert!(!closed.is_open());
+    let mut clock = menu::Menu::default();
+    clock.after_edit(&doc("Title\nat 12:", 1, 6), Some(':'));
+    assert!(!clock.is_open(), "12:30 is a time, not a picker");
+}
+
+#[test]
+fn the_slash_palette_hands_off_to_the_mention_and_emoji_pickers() {
+    let mut state = menu::Menu::default().with_names(&names());
+    let slash = doc("Title\n/men", 1, 4);
+    state.after_edit(&doc("Title\n/", 1, 1), Some('/'));
+    state.after_edit(&slash, None);
+    assert_eq!(tags(&state.current(&slash).unwrap()), vec!["mention"]);
+    let (decision, next) = state.pick(&slash, "mention");
+    let at = apply(&slash, decision);
+    assert_eq!(at, doc("Title\n@", 1, 1));
+    assert_eq!(
+        tags(&next.current(&at).unwrap()),
+        vec!["alice", "bob", "Carol"]
+    );
+}
+
+#[test]
+fn cmd_slash_opens_the_format_menu_at_the_caret_and_its_picks_wrap_the_selection() {
+    let mut selection = doc("Title\nsome words", 1, 10);
+    selection.cursor.selection = Some(editor::EditorPosition::new(1, 5));
+    let mut state = menu::Menu::default();
+    state.format(&selection);
+    let view = state.current(&selection).unwrap();
+    assert_eq!(view.line, None, "the format menu floats at the caret");
+    assert_eq!(
+        tags(&view),
+        vec![
+            "bold",
+            "italic",
+            "strike",
+            "code",
+            "highlight",
+            "link",
+            "comment",
+            "turn",
+            "clear"
+        ]
+    );
+    let (decision, closed) = state.pick(&selection, "highlight");
+    assert_eq!(apply(&selection, decision).text, "Title\nsome ==words==");
+    assert!(!closed.is_open());
+    let (decision, turning) = state.pick(&selection, "turn");
+    assert_eq!(decision, EditorDecision::Noop);
+    assert_eq!(turning.current(&selection).unwrap().items.len(), 12);
+    let intent = state.intent(&selection, "comment");
+    assert_eq!(intent.comment_line, Some(1));
+    assert_eq!(intent.anchor, Some((5, 10)));
+    let mut title = menu::Menu::default();
+    title.format(&doc("Title\nbody", 0, 2));
+    assert!(!title.is_open());
+}
+
+#[test]
+fn a_pressed_link_opens_its_popover_and_the_picks_open_copy_or_unlink() {
+    let document = doc("Title\nsee [docs](https://x.y) now", 1, 0);
+    let mut state = menu::Menu::default();
+    state.link(&document, 1, 6);
+    let view = state.current(&document).unwrap();
+    assert_eq!(view.line, Some(1));
+    assert_eq!(tags(&view), vec!["open", "copy", "unlink"]);
+    assert_eq!(state.intent(&document, "open").link, "https://x.y");
+    assert_eq!(state.intent(&document, "copy").copy, "https://x.y");
+    let (decision, closed) = state.pick(&document, "unlink");
+    assert_eq!(apply(&document, decision).text, "Title\nsee docs now");
+    assert!(!closed.is_open());
+    let mut prose = menu::Menu::default();
+    prose.link(&document, 1, 1);
+    assert!(!prose.is_open(), "no popover where no link is");
+}
+
+#[test]
+fn the_block_menu_copies_the_block_and_resets_its_formatting() {
+    let document = doc("Title\n## a **bold** heading\n```\ncode\n```", 1, 0);
+    let mut state = menu::Menu::default();
+    state.block(&document, 1);
+    assert_eq!(
+        tags(&state.current(&document).unwrap()),
+        vec![
+            "turn",
+            "comment",
+            "copy",
+            "clear",
+            "duplicate",
+            "move-up",
+            "move-down",
+            "delete"
+        ]
+    );
+    assert_eq!(
+        state.intent(&document, "copy").copy,
+        "## a **bold** heading"
+    );
+    let (decision, _) = state.pick(&document, "clear");
+    assert_eq!(
+        apply(&document, decision).text,
+        "Title\na bold heading\n```\ncode\n```"
+    );
+    state.block(&document, 2);
+    assert_eq!(state.intent(&document, "copy").copy, "```\ncode\n```");
+    assert!(!tags(&state.current(&document).unwrap()).contains(&"clear"));
 }
 
 #[test]
@@ -127,7 +284,7 @@ fn menu_lifecycle_plans_do_not_change_the_current_menu_before_commit() {
     let (decision, opened) = state.plus(&before, 2);
     assert!(state.current(&before).is_none());
     let after = apply(&before, decision);
-    assert_eq!(opened.current(&after).unwrap().items.len(), 12);
+    assert_eq!(opened.current(&after).unwrap().items.len(), 14);
     let (decision, closed) = opened.pick(&after, "h1");
     assert!(
         opened.current(&after).is_some(),
@@ -173,7 +330,8 @@ fn a_block_offers_comment_without_editing_the_document() {
     menu.block(&document, 1);
     let view = menu.current(&document).unwrap();
     assert_eq!(view.line, Some(1));
-    assert!(view.items.contains(&("comment", "Comment")));
+    assert!(view.items.contains(&("comment".into(), "Comment".into())));
+    assert_eq!(menu.intent(&document, "comment").comment_line, Some(1));
     let (decision, closed) = menu.pick(&document, "comment");
     assert!(matches!(decision, EditorDecision::Noop));
     assert!(!closed.is_open());

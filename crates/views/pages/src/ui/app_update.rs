@@ -47,6 +47,11 @@ impl PagesView {
             Message::ToggleResolvedComments => self.on_toggle_resolved_comments(),
             Message::PostThreadReply(id) => self.on_post_thread_reply(id),
             Message::PostBlockCommentSubmit => self.on_post_block_comment_submit(),
+            Message::BeginEditComment(id, text) => self.on_begin_edit_comment(id, text),
+            Message::CancelEditComment => self.on_cancel_edit_comment(),
+            Message::SubmitEditComment => self.on_submit_edit_comment(),
+            Message::DeleteCommentSubmit(id) => self.on_delete_comment_submit(id),
+            Message::CommentEditDraftChanged(value) => self.on_comment_edit_draft_changed(value),
             Message::CopyToClipboard(text, label) => self.on_copy_to_clipboard(text, label),
             Message::DocumentPointerReleased(_button) => self.on_document_pointer_released(_button),
             Message::DocumentKeyReleased(_key) => self.on_document_key_released(_key),
@@ -164,6 +169,7 @@ impl PagesView {
         self.thread_total = item.thread_total;
         self.comment_rows = item.comment_rows.clone();
         self.commented_hits = item.commented_hits.clone();
+        self.member_names = item.names.clone();
         self.threads_loading = false;
         self.document_commented =
             crate::host::commented_lines(&(item.blocks), &(item.commented_hits));
@@ -417,6 +423,9 @@ impl PagesView {
     fn on_toggle_block_comments(&mut self) -> Task<Message> {
         self.comment_anchor_y = -1.0;
         self.comment_anchor_line = 0;
+        self.comment_anchor_range = None;
+        self.comment_edit_id = "".to_owned();
+        self.comment_edit_draft = "".to_owned();
         if !(self.host_error).is_empty() {
             return Task::none();
         }
@@ -452,6 +461,9 @@ impl PagesView {
     fn on_close_block_comments(&mut self) -> Task<Message> {
         self.comment_anchor_y = -1.0;
         self.comment_anchor_line = 0;
+        self.comment_anchor_range = None;
+        self.comment_edit_id = "".to_owned();
+        self.comment_edit_draft = "".to_owned();
         self.orphaned_comment_drafts = crate::host::remember_draft(
             &(self.orphaned_comment_drafts),
             &(self.block_comment_draft),
@@ -540,7 +552,7 @@ impl PagesView {
         self.threads_loading = true;
         self.pending_comment = (self.reply_draft).trim().to_owned();
         self.reply_draft = "".to_owned();
-        crate::host::post(&(self.pending_comment), &(reply_target), &(id));
+        crate::host::post(&(self.pending_comment), &(reply_target), &(id), None);
         Task::none()
     }
     fn on_post_block_comment_submit(&mut self) -> Task<Message> {
@@ -562,7 +574,65 @@ impl PagesView {
         self.threads_loading = true;
         self.pending_comment = (self.block_comment_draft).trim().to_owned();
         self.block_comment_draft = "".to_owned();
-        crate::host::post(&(self.pending_comment), &(fresh_target), "");
+        // A selection-anchored thread pins to its text once; the next
+        // composer post is on the whole scope again.
+        let anchor = self.comment_anchor_range.take();
+        crate::host::post(&(self.pending_comment), &(fresh_target), "", anchor);
+        Task::none()
+    }
+    /// ONE COMMENT IS REWRITTEN AT A TIME: opening another box drops the last
+    /// draft, and a second press on the same comment puts the box away.
+    fn on_begin_edit_comment(&mut self, id: String, text: String) -> Task<Message> {
+        if !self.host_error.is_empty() || self.loading || self.busy || self.threads_loading {
+            return Task::none();
+        }
+        let same = self.comment_edit_id == id;
+        self.comment_edit_id = if same { String::new() } else { id };
+        self.comment_edit_draft = if same { String::new() } else { text };
+        Task::none()
+    }
+    fn on_cancel_edit_comment(&mut self) -> Task<Message> {
+        self.comment_edit_id = "".to_owned();
+        self.comment_edit_draft = "".to_owned();
+        Task::none()
+    }
+    fn on_submit_edit_comment(&mut self) -> Task<Message> {
+        let blocked = !self.host_error.is_empty()
+            || self.loading
+            || self.busy
+            || self.threads_loading
+            || self.comment_edit_id.is_empty()
+            || self.comment_edit_draft.trim().is_empty();
+        if blocked {
+            return Task::none();
+        }
+        self.busy = true;
+        self.threads_loading = true;
+        crate::host::edit_comment(&self.comment_edit_id, &self.comment_edit_draft);
+        self.comment_edit_id = "".to_owned();
+        self.comment_edit_draft = "".to_owned();
+        Task::none()
+    }
+    fn on_delete_comment_submit(&mut self, id: String) -> Task<Message> {
+        let blocked = !self.host_error.is_empty()
+            || self.loading
+            || self.busy
+            || self.threads_loading
+            || id.is_empty();
+        if blocked {
+            return Task::none();
+        }
+        self.busy = true;
+        self.threads_loading = true;
+        if self.comment_edit_id == id {
+            self.comment_edit_id = "".to_owned();
+            self.comment_edit_draft = "".to_owned();
+        }
+        crate::host::delete_comment(&id);
+        Task::none()
+    }
+    fn on_comment_edit_draft_changed(&mut self, value: String) -> Task<Message> {
+        self.comment_edit_draft = value;
         Task::none()
     }
     fn on_copy_to_clipboard(&mut self, text: String, label: String) -> Task<Message> {
@@ -670,9 +740,16 @@ impl PagesView {
         let comment_line = crate::host::navigation_comment_line(next.interaction.clone());
         self.page_refusal = "".to_owned();
         crate::host::open_link(&(crate::host::navigation_link(next.interaction.clone())));
+        crate::host::copy(
+            &crate::host::navigation_copy(next.interaction.clone()),
+            "Copied",
+        );
         if (((comment_line < 0) || self.loading) || self.busy) || (self.active_page).is_empty() {
             return Task::none();
         }
+        // A comment from the format menu pins to the words that were
+        // selected; a badge or a block menu comments on the block as a whole.
+        self.comment_anchor_range = crate::host::navigation_anchor(next.interaction.clone());
         self.orphaned_comment_drafts = crate::host::remember_draft(
             &(self.orphaned_comment_drafts),
             &(self.block_comment_draft),

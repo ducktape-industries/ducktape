@@ -688,3 +688,160 @@ fn crossing_a_placement_threshold_keeps_the_rail_and_what_is_typed_in_it() {
         "the draft survived the placement change"
     );
 }
+
+/// One comment's Edit opens a box holding its words; Save leaves as the
+/// module's own `edit_comment` on that comment's id.
+#[test]
+fn editing_a_comment_rewrites_it_in_place() {
+    let frame = page_card();
+    let frame = tick_native(press(&frame, "Edit comment"));
+    assert!(
+        has_text(&frame, "Save") && has_text(&frame, "Cancel"),
+        "the box replaces the words: {:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(type_into(&frame, "Edit comment", "the page reads better"));
+    let frame = tick_native(press(&frame, "Save"));
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op,
+        serde_json::json!({
+            "target": "pages",
+            "payload": { "edit_comment": { "comment_id": "c1", "text": "the page reads better" } }
+        })
+    );
+}
+
+/// A comment's Delete leaves as `delete_comment`; the module tombstones it and
+/// drops a thread whose last comment goes.
+#[test]
+fn deleting_a_comment_leaves_as_its_own_op() {
+    let frame = page_card();
+    let frame = tick_native(press(&frame, "Delete comment"));
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op,
+        serde_json::json!({
+            "target": "pages",
+            "payload": { "delete_comment": { "comment_id": "c1" } }
+        })
+    );
+}
+
+/// The editor node on screen, with its commit route.
+fn editor_of(frame: &Frame) -> (&wire::editor_document::EditorDocumentRef, u32) {
+    let editor = frame
+        .root
+        .as_ref()
+        .and_then(find_editor)
+        .expect("the document editor is on screen");
+    let Node::Editor {
+        document, options, ..
+    } = editor
+    else {
+        unreachable!("find_editor answers editors")
+    };
+    let binding = options.binding.as_ref().expect("editor commit route");
+    (document, binding.on_event)
+}
+
+fn transaction_id(
+    document: &wire::editor_document::EditorDocumentRef,
+) -> wire::EditorTransactionId {
+    wire::EditorTransactionId {
+        instance: 0,
+        document: document.document.clone(),
+        reset: document.reset,
+        sequence: document.revision + 1,
+        attempt: 0,
+        text_revision: document.text_revision,
+        revision: document.revision,
+    }
+}
+
+/// `Cmd+/` over a selection: the host commits the empty step with the key as
+/// its origin, and the caret carrying the selection.
+fn cmd_slash_over(frame: &Frame, line: u32, from: u32, to: u32) -> Vec<Event> {
+    use wire::keyboard::{Key, KeyState, Location, Modifiers, NativeCode, Physical};
+    let (document, handler) = editor_of(frame);
+    let key = Key::Character("/".into());
+    let mut after = document.clone();
+    after.revision += 1;
+    after.cursor = wire::EditorCursor {
+        position: wire::EditorPosition { line, column: to },
+        selection: Some(wire::EditorPosition { line, column: from }),
+    };
+    vec![Event::EditorTransaction {
+        handler,
+        event: wire::EditorTransactionEvent::Commit {
+            origin: Some(wire::EditorRequestInput::Key {
+                key: KeyState {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key: Physical::Unidentified(NativeCode::Unidentified),
+                    location: Location::Standard,
+                    modifiers: Modifiers {
+                        control: true,
+                        ..Modifiers::default()
+                    },
+                },
+                repeat: false,
+            }),
+            id: transaction_id(document),
+            before: document.clone(),
+            after,
+            patches: Vec::new(),
+            kind: wire::EditorEditKind::Cursor,
+            history: wire::EditorHistoryEffect::Native,
+            input_time_ms: 0,
+        },
+    }]
+}
+
+fn menu_pick(frame: &Frame, tag: &str) -> Vec<Event> {
+    let (document, handler) = editor_of(frame);
+    vec![Event::EditorTransaction {
+        handler,
+        event: wire::EditorTransactionEvent::Interaction {
+            id: transaction_id(document),
+            state: document.clone(),
+            action: wire::editor_presentation::EditorInteraction::MenuPick { tag: tag.into() },
+            input_time_ms: 0,
+        },
+    }]
+}
+
+/// The format menu's Comment pins the new thread to the words that were
+/// selected — the block's own text in UTF-16 units, marker dropped — and the
+/// composer's next post is on the whole block again.
+#[test]
+fn a_comment_from_the_format_menu_pins_to_the_selected_words() {
+    let (frame, _) = connected_with_register();
+    // "the first paragraph": `first` is 4..9
+    let frame = tick_native(cmd_slash_over(&frame, 1, 4, 9));
+    let (document, _) = editor_of(&frame);
+    assert_eq!(document.cursor.selection.map(|p| p.column), Some(4));
+    let frame = tick_native(menu_pick(&frame, "comment"));
+    assert!(
+        has_text(&frame, "the opening claim") && !has_text(&frame, "the page reads well"),
+        "the pick opens the block's own conversation: {:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(type_into(&frame, "Start a thread…", "first?"));
+    let frame = tick_native(press(&frame, "Post"));
+    let mint = request(&frame, "host.id");
+    let frame = tick_native(vec![answer(mint.id, b"thread-9")]);
+    let mint = request(&frame, "host.id");
+    let frame = tick_native(vec![answer(mint.id, b"comment-9")]);
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op["payload"]["add_comment"],
+        serde_json::json!({
+            "thread_id": "thread-9", "comment_id": "comment-9",
+            "target": "alpha-1", "text": "first?", "anchor": { "start": 4, "end": 9 }
+        })
+    );
+}

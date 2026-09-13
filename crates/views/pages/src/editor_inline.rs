@@ -6,22 +6,42 @@ pub enum Inline {
     Marker,
     Bold,
     Italic,
+    Strike,
+    Code,
+    Highlight,
     Link,
+    /// `@name` — a member named in the prose.
+    Mention,
 }
 
-/// Byte-ranged mirror of `chat::client::inline_spans`, minus mentions: bare
-/// `http(s)://` runs, then `**`/`__` bold, then `*`/`_` italic; unmatched or
-/// empty fences stay plain. Ranges land on char boundaries by construction —
-/// the scanner only advances through `char_indices`.
+/// The fences the inline grammar knows, longest first so `**` is never read
+/// as two `*`. Each pairs with the mark its body wears.
+const FENCES: &[(&str, Inline)] = &[
+    ("**", Inline::Bold),
+    ("__", Inline::Bold),
+    ("~~", Inline::Strike),
+    ("==", Inline::Highlight),
+    ("`", Inline::Code),
+    ("*", Inline::Italic),
+    ("_", Inline::Italic),
+];
+
+/// The bytes that can open a mark. Ordinary prose is skipped in one scan
+/// instead of retrying every delimiter at every character.
+const OPENERS: &[char] = &['*', '_', '~', '=', '`', 'h', '@'];
+
+/// Byte-ranged mirror of `chat::client::inline_spans`, minus its account
+/// tokens: bare `http(s)://` runs, then the fences above, then `@name`
+/// mentions; unmatched or empty fences stay plain. Ranges land on char
+/// boundaries by construction — the scanner only advances through
+/// `char_indices`.
 pub fn inline_marks(line: &str) -> Vec<(Range<usize>, Inline)> {
     let mut marks = Vec::new();
     let mut at = 0;
     while at < line.len() {
         let rest = &line[at..];
-        // Only these bytes can open the existing grammar. Skip ordinary prose
-        // in one scan instead of retrying every delimiter at every character.
-        if !matches!(rest.as_bytes()[0], b'*' | b'_' | b'h') {
-            let Some(next) = rest.find(['*', '_', 'h']) else {
+        if !rest.starts_with(OPENERS) {
+            let Some(next) = rest.find(OPENERS) else {
                 break;
             };
             at += next;
@@ -32,15 +52,18 @@ pub fn inline_marks(line: &str) -> Vec<(Range<usize>, Inline)> {
             at += len;
             continue;
         }
-        let fence = ["**", "__", "*", "_"]
+        if let Some(len) = mention_len(line, at) {
+            marks.push((at..at + len, Inline::Mention));
+            at += len;
+            continue;
+        }
+        let fence = FENCES
             .iter()
-            .find_map(|marker| fenced(rest, marker));
-        let Some((marker_len, inner_len)) = fence else {
+            .find_map(|(marker, kind)| fenced(rest, marker).map(|lens| (lens, *kind)));
+        let Some(((marker_len, inner_len), kind)) = fence else {
             at += rest.chars().next().map_or(1, char::len_utf8);
             continue;
         };
-        let bold = marker_len == 2;
-        let kind = if bold { Inline::Bold } else { Inline::Italic };
         let body = at + marker_len..at + marker_len + inner_len;
         marks.push((at..body.start, Inline::Marker));
         marks.push((body.clone(), kind));
@@ -84,6 +107,23 @@ pub fn document_link_at(line: &str, column: usize) -> Option<String> {
     inline_marks(line).into_iter().find_map(|(range, kind)| {
         (kind == Inline::Link && range.contains(&column)).then(|| line[range].to_owned())
     })
+}
+
+/// The whole source of the named link whose label holds `column`, and the
+/// label inside it — what "remove link" keeps.
+pub fn named_link_at(line: &str, column: usize) -> Option<(Range<usize>, Range<usize>)> {
+    named_links(line)
+        .into_iter()
+        .find(|(_, label, _)| label.contains(&column))
+        .map(|(source, label, _)| (source, label))
+}
+
+/// Whether `column` sits anywhere in a named link's source — its label,
+/// its destination or its brackets.
+pub fn inside_named_link(line: &str, column: usize) -> bool {
+    named_links(line)
+        .into_iter()
+        .any(|(source, _, _)| source.contains(&column))
 }
 
 /// CommonMark supplies source offsets and the decoded destination. Incomplete
@@ -141,4 +181,24 @@ fn url_len(rest: &str) -> Option<usize> {
     }
     let len = rest.find(char::is_whitespace).unwrap_or(rest.len());
     Some(len)
+}
+
+/// A character a mention handle is spelled with — the chat composer's rule.
+pub fn handle_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '-' | '_' | '.')
+}
+
+/// If `at` opens a mention — an `@` at a word start followed by a handle —
+/// its byte length. An `@` inside a word (an email address) is prose.
+fn mention_len(line: &str, at: usize) -> Option<usize> {
+    let rest = line[at..].strip_prefix('@')?;
+    let mid_word = line[..at]
+        .chars()
+        .next_back()
+        .is_some_and(char::is_alphanumeric);
+    if mid_word {
+        return None;
+    }
+    let handle = rest.find(|c| !handle_char(c)).unwrap_or(rest.len());
+    (handle > 0).then_some(1 + handle)
 }

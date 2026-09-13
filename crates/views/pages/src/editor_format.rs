@@ -1,0 +1,221 @@
+//! Pure inline formatting edits: the floating menu's and the shortcuts' marks
+//! over the selection, links, and the "reset formatting" strip. Every edit
+//! returns a decision the binding proposes; Commit owns history.
+use crate::editor::{self, Doc, EditorCursor, EditorDecision, EditorHistoryEffect};
+use crate::inline::{self, Inline};
+use std::ops::Range;
+
+/// A fence the reader toggles: the marker it is spelled with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wrap {
+    Bold,
+    Italic,
+    Strike,
+    Code,
+    Highlight,
+}
+
+impl Wrap {
+    pub fn marker(self) -> &'static str {
+        match self {
+            Wrap::Bold => "**",
+            Wrap::Italic => "*",
+            Wrap::Strike => "~~",
+            Wrap::Code => "`",
+            Wrap::Highlight => "==",
+        }
+    }
+
+    /// The menu tag and shortcut name each wrap answers to.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        Some(match tag {
+            "bold" => Wrap::Bold,
+            "italic" => Wrap::Italic,
+            "strike" => Wrap::Strike,
+            "code" => Wrap::Code,
+            "highlight" => Wrap::Highlight,
+            _ => return None,
+        })
+    }
+}
+
+fn finish(before: &Doc, after: Doc) -> EditorDecision {
+    if before == &after {
+        return EditorDecision::Noop;
+    }
+    editor::restore(before, &after, EditorHistoryEffect::NewGroup)
+}
+
+/// The byte span an inline edit works on: the selection, else the word under
+/// the caret, else the empty span at the caret.
+pub fn target(document: &Doc) -> Range<usize> {
+    let caret = document.offset(document.cursor.position);
+    if let Some(anchor) = document.cursor.selection {
+        let anchor = document.offset(anchor);
+        return caret.min(anchor)..caret.max(anchor);
+    }
+    let text = &document.text;
+    let is_word = |c: char| c.is_alphanumeric() || c == '\'';
+    let start = text[..caret]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| is_word(*c))
+        .last()
+        .map_or(caret, |(index, _)| index);
+    let end = text[caret..]
+        .find(|c| !is_word(c))
+        .map_or(text.len(), |offset| caret + offset);
+    start..end
+}
+
+/// The title is a page property, not prose: line 0 takes no inline marks.
+fn on_title(document: &Doc, range: &Range<usize>) -> bool {
+    document.position_at(range.start).line == 0
+}
+
+fn selected(document: &Doc, range: Range<usize>) -> Doc {
+    let mut next = document.clone();
+    next.cursor = EditorCursor {
+        position: next.position_at(range.end),
+        selection: Some(next.position_at(range.start)),
+    };
+    next
+}
+
+/// Wrap the target in `wrap`'s marker — or unwrap it when it already wears
+/// the marker, inside or just outside the selection. An empty target gets an
+/// empty pair with the caret between, so what is typed next wears the mark.
+pub fn toggle(document: &Doc, wrap: Wrap) -> EditorDecision {
+    let range = target(document);
+    if on_title(document, &range) || crosses_lines(document, &range) {
+        return EditorDecision::Noop;
+    }
+    let marker = wrap.marker();
+    let text = &document.text;
+    let body = &text[range.clone()];
+    let wrapped_inside =
+        body.len() > 2 * marker.len() && body.starts_with(marker) && body.ends_with(marker);
+    if wrapped_inside {
+        let inner = range.start + marker.len()..range.end - marker.len();
+        let mut next = document.clone();
+        next.text.replace_range(range.clone(), &text[inner.clone()]);
+        return finish(
+            document,
+            selected(&next, range.start..range.start + inner.len()),
+        );
+    }
+    // The fence around the selection must be exactly this marker: the `*`
+    // beside `**bold**` belongs to the bold fence, not to an italic one.
+    let glyph = marker.chars().next().unwrap_or_default();
+    let before = text[..range.start]
+        .strip_suffix(marker)
+        .is_some_and(|rest| !rest.ends_with(glyph));
+    let after = text[range.end..]
+        .strip_prefix(marker)
+        .is_some_and(|rest| !rest.starts_with(glyph));
+    if before && after {
+        let mut next = document.clone();
+        next.text
+            .replace_range(range.end..range.end + marker.len(), "");
+        next.text
+            .replace_range(range.start - marker.len()..range.start, "");
+        let start = range.start - marker.len();
+        return finish(document, selected(&next, start..start + body.len()));
+    }
+    let mut next = document.clone();
+    next.text.insert_str(range.end, marker);
+    next.text.insert_str(range.start, marker);
+    let start = range.start + marker.len();
+    finish(document, selected(&next, start..start + body.len()))
+}
+
+fn crosses_lines(document: &Doc, range: &Range<usize>) -> bool {
+    document.text[range.clone()].contains('\n')
+}
+
+/// `[target](url)` with `url` selected, so the destination is typed straight
+/// over it. Skipped on the title and over a link that is already named.
+pub fn link(document: &Doc) -> EditorDecision {
+    let range = target(document);
+    if on_title(document, &range) || crosses_lines(document, &range) {
+        return EditorDecision::Noop;
+    }
+    let position = document.position_at(range.start);
+    let already_named = document
+        .line(position.line as usize)
+        .is_some_and(|line| inline::inside_named_link(line, position.column as usize));
+    if already_named {
+        return EditorDecision::Noop;
+    }
+    let label = &document.text[range.clone()];
+    let mut next = document.clone();
+    next.text
+        .replace_range(range.clone(), &format!("[{label}](url)"));
+    let url = range.start + label.len() + 3;
+    finish(document, selected(&next, url..url + 3))
+}
+
+/// A named link at `column` of `line` becomes its label alone. A bare URL is
+/// its own text and has nothing to remove.
+pub fn unlink(document: &Doc, line: usize, column: usize) -> EditorDecision {
+    let Some(text) = document.line(line) else {
+        return EditorDecision::Noop;
+    };
+    let Some((source, label)) = inline::named_link_at(text, column) else {
+        return EditorDecision::Noop;
+    };
+    let base = document.offset(editor::EditorPosition::new(line, 0));
+    let label_text = text[label.clone()].to_owned();
+    let mut next = document.clone();
+    next.text
+        .replace_range(base + source.start..base + source.end, &label_text);
+    next.cursor = EditorCursor::at(line, source.start + label_text.len());
+    finish(document, next)
+}
+
+/// Strip every inline marker on `line` — bold, italic, strike, code,
+/// highlight and named-link syntax — keeping the words and the block prefix.
+pub fn clear(document: &Doc, line: usize) -> EditorDecision {
+    finish(document, cleared(document, line))
+}
+
+pub(crate) fn cleared(document: &Doc, line: usize) -> Doc {
+    let Some(text) = document.line(line) else {
+        return document.clone();
+    };
+    let mut kept = String::with_capacity(text.len());
+    let mut at = 0;
+    for (range, kind) in inline::document_marks(text) {
+        if kind != Inline::Marker {
+            continue;
+        }
+        kept.push_str(&text[at..range.start]);
+        at = range.end;
+    }
+    kept.push_str(&text[at..]);
+    if kept == text {
+        return document.clone();
+    }
+    let base = document.offset(editor::EditorPosition::new(line, 0));
+    let mut next = document.clone();
+    next.text.replace_range(base..base + text.len(), &kept);
+    let caret_line = document.cursor.position.line as usize;
+    next.cursor = match caret_line == line {
+        true => EditorCursor::at(
+            line,
+            (document.cursor.position.column as usize).min(kept.len()),
+        ),
+        false => EditorCursor {
+            position: document.cursor.position,
+            selection: None,
+        },
+    };
+    // A caret clamped into the middle of a character lands on its boundary.
+    while !next
+        .text
+        .is_char_boundary(next.offset(next.cursor.position))
+    {
+        next.cursor.position.column -= 1;
+    }
+    next
+}

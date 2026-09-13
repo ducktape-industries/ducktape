@@ -247,6 +247,9 @@ pub struct RegisterItem {
     /// resolved thread is filed away, so it is not what the page carries.
     pub thread_total: i64,
     pub commented_hits: Vec<String>,
+    /// Every named member of the network — what an `@` in the document
+    /// completes to.
+    pub names: Vec<String>,
     pub error: String,
 }
 
@@ -315,10 +318,9 @@ async fn read_register(requested: &str) -> Result<RegisterItem, String> {
     // only once the rail is.
     let threads = read_threads(&active_page, &blocks).await?;
     let commented_hits = commented_targets(&active_page, &threads);
-    let names = match threads.is_empty() {
-        true => Names::default(),
-        false => read_names().await,
-    };
+    // The directory names comment authors AND fills the `@` picker, so it is
+    // read whether or not the page has threads.
+    let names = read_names().await;
     let comment_rows: Vec<PageCommentThreadRow> = threads
         .iter()
         .map(|thread| PageCommentThreadRow {
@@ -341,6 +343,7 @@ async fn read_register(requested: &str) -> Result<RegisterItem, String> {
         document,
         comment_rows,
         commented_hits,
+        names: names.members(),
         error: String::new(),
     })
 }
@@ -593,6 +596,19 @@ impl Names {
             _ => "system".into(),
         }
     }
+
+    /// Every account's name, sorted and deduplicated, for the mention picker.
+    fn members(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .by_account
+            .values()
+            .filter(|name| !name.is_empty())
+            .cloned()
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
 }
 
 /// The identity module's page cap, restated at the read that walks it.
@@ -758,7 +774,9 @@ fn excerpt(text: &str, query: &str) -> String {
     let lowered = flat.to_lowercase();
     let hit_byte = lowered.find(&query.trim().to_lowercase()).unwrap_or(0);
     let hit = lowered[..hit_byte].chars().count();
-    let start = hit.saturating_sub(EXCERPT_CHARS / 3).min(chars.len() - EXCERPT_CHARS);
+    let start = hit
+        .saturating_sub(EXCERPT_CHARS / 3)
+        .min(chars.len() - EXCERPT_CHARS);
     let end = start + EXCERPT_CHARS;
     let head = match start > 0 {
         true => "…",
@@ -986,18 +1004,27 @@ async fn delete_page(page_id: String) -> Result<ActItem, String> {
 }
 
 /// `AddComment` — a new thread on `target`, or a reply on the open one.
-pub fn post(text: &str, target: &str, thread_id: &str) -> bool {
+/// `AddComment` — a new thread on `target` (an empty `thread_id`) or a reply.
+/// A new thread pins itself to the exact text `anchor` names, in the
+/// module's UTF-16 units; `None` is a comment on the whole block.
+pub fn post(text: &str, target: &str, thread_id: &str, anchor: Option<(u32, u32)>) -> bool {
     let (text, target, thread_id) = (
         text.trim().to_owned(),
         target.to_owned(),
         thread_id.to_owned(),
     );
+    let anchor = anchor.filter(|(start, end)| start < end && thread_id.is_empty());
     push_act(Box::pin(async move {
-        acted(post_comment(text, target, thread_id).await)
+        acted(post_comment(text, target, thread_id, anchor).await)
     }))
 }
 
-async fn post_comment(text: String, target: String, thread_id: String) -> Result<ActItem, String> {
+async fn post_comment(
+    text: String,
+    target: String,
+    thread_id: String,
+    anchor: Option<(u32, u32)>,
+) -> Result<ActItem, String> {
     if text.is_empty() || target.is_empty() {
         return Err("write a comment first".into());
     }
@@ -1007,13 +1034,50 @@ async fn post_comment(text: String, target: String, thread_id: String) -> Result
         false => thread_id,
     };
     let comment_id = mint("comment").await?;
-    submit(json!({ "add_comment": {
+    let mut add = json!({
         "thread_id": thread_id,
         "comment_id": comment_id,
         "target": target,
         "text": text,
-    } }))
-    .await?;
+    });
+    if let Some((start, end)) = anchor {
+        add["anchor"] = json!({ "start": start, "end": end });
+    }
+    submit(json!({ "add_comment": add })).await?;
+    Ok(ActItem::default())
+}
+
+/// `EditComment` — replace one comment's words.
+pub fn edit_comment(comment_id: &str, text: &str) -> bool {
+    let (comment_id, text) = (comment_id.to_owned(), text.trim().to_owned());
+    push_act(Box::pin(async move {
+        acted(rewrite_comment(comment_id, text).await)
+    }))
+}
+
+async fn rewrite_comment(comment_id: String, text: String) -> Result<ActItem, String> {
+    if comment_id.is_empty() || text.is_empty() {
+        return Err("write a comment first".into());
+    }
+    let text = bounded(&text, "comment", MAX_COMMENT_BYTES)?;
+    submit(json!({ "edit_comment": { "comment_id": comment_id, "text": text } })).await?;
+    Ok(ActItem::default())
+}
+
+/// `DeleteComment` — tombstone one comment; the module drops a thread whose
+/// last live comment goes.
+pub fn delete_comment(comment_id: &str) -> bool {
+    let comment_id = comment_id.to_owned();
+    push_act(Box::pin(
+        async move { acted(remove_comment(comment_id).await) },
+    ))
+}
+
+async fn remove_comment(comment_id: String) -> Result<ActItem, String> {
+    if comment_id.is_empty() {
+        return Err("choose a comment first".into());
+    }
+    submit(json!({ "delete_comment": { "comment_id": comment_id } })).await?;
     Ok(ActItem::default())
 }
 
@@ -1293,6 +1357,9 @@ pub struct Copy {
 }
 
 pub fn copy(text: &str, label: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
     host::notify(
         "pages.copy",
         &encode(&json!({ "text": text, "label": label })),
@@ -1561,6 +1628,17 @@ pub fn navigation_link(interaction: Vec<u8>) -> String {
     decode_navigation(&interaction).link
 }
 
+/// The text a menu pick asked to copy, or nothing.
+pub fn navigation_copy(interaction: Vec<u8>) -> String {
+    decode_navigation(&interaction).copy
+}
+
+/// The selection a comment pick anchors on — its start and end in the
+/// module's UTF-16 units — or `None` for a comment on the whole block.
+pub fn navigation_anchor(interaction: Vec<u8>) -> Option<(u32, u32)> {
+    decode_navigation(&interaction).anchor
+}
+
 /// The line a margin badge was pressed on, or `-1` when the interaction was
 /// not a badge press.
 pub fn navigation_comment_line(interaction: Vec<u8>) -> i64 {
@@ -1599,6 +1677,15 @@ pub fn opener_text(thread: &PageCommentThread) -> String {
         Some(opener) => opener.text.clone(),
         None => "This comment was deleted.".into(),
     }
+}
+
+/// The opening comment's own id — what its Edit and Delete act on.
+pub fn opener_id(thread: &PageCommentThread) -> String {
+    thread
+        .comments
+        .first()
+        .map(|opener| opener.id.clone())
+        .unwrap_or_default()
 }
 
 /// The replies under it, held to [`VISIBLE_REPLIES`] until the reader asks.

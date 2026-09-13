@@ -44,11 +44,32 @@ pub struct CommentMark {
 }
 
 /// Small read-only navigation emitted after the matching editor interaction:
-/// a link press, or a margin badge naming the line it was pressed on.
+/// a link to open, text to copy, or a comment to start on a line — with the
+/// exact selection it anchors on, in the module's UTF-16 units over the
+/// block's own text.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Navigation {
     pub link: String,
     pub comment_line: Option<u32>,
+    pub copy: String,
+    pub anchor: Option<(u32, u32)>,
+}
+
+/// A selection's byte columns on a document line as the module's comment
+/// anchor: UTF-16 units over the block's text, the marker prefix dropped.
+/// Nothing when the selection is empty or sits entirely in the marker.
+pub fn text_anchor(line: &str, columns: Option<std::ops::Range<usize>>) -> Option<(u32, u32)> {
+    let columns = columns?;
+    let (_, rest) = split_indent(line);
+    let content = parse_line(rest, 0).text;
+    let prefix = line.len() - content.len();
+    let start = columns.start.max(prefix);
+    let end = columns.end.min(line.len());
+    if start >= end || !line.is_char_boundary(start) || !line.is_char_boundary(end) {
+        return None;
+    }
+    let units = |slice: &str| slice.encode_utf16().count() as u32;
+    Some((units(&line[prefix..start]), units(&line[prefix..end])))
 }
 
 /// Two spaces per depth, matching the prefix the block fold writes.

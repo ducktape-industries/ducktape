@@ -26,8 +26,12 @@ impl PagesEditorFixture {
             max_height: Some(240.),
             options: Box::new(wire::EditorOptions {
                 binding: Some(Box::new(
-                    crate::editor_binding::keys(self.history.clone(), self.menu.clone())
-                        .register(Message::Committed, Message::DocumentTransaction),
+                    crate::editor_binding::keys(
+                        self.history.clone(),
+                        self.menu.clone(),
+                        Vec::new(),
+                    )
+                    .register(Message::Committed, Message::DocumentTransaction),
                 )),
                 presentation: Some(Box::new(presentation)),
                 ..Default::default()
