@@ -14,4 +14,3 @@ git-fetch-with-cli = true
 # wasm-modules-check` and `ops/wasm-repro-check.sh` are the proof.
 [target.'cfg(target_os = "linux")']
 rustflags = ["--cfg", "tokio_unstable"]
-

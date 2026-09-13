@@ -66,58 +66,11 @@ fn a_page_search_hit_names_the_page_it_came_from() {
     assert_eq!(hits[0].page_id, "page-1");
     assert_eq!(hits[0].kind, "Text");
 
-    // THE CALL SITES. A pure join proves nothing about what the surfaces
-    // render, and the Explorer's double print lived at ITS call site — which
-    // is the Explorer view's own crate now: it reads the index row itself and
-    // joins the titles for the same reason this one does.
-    const EXPLORER: &str = include_str!("../../../../crates/views/explorer/src/host.rs");
-    let page_arm = EXPLORER
-        .split("kind: \"page\".into(),")
-        .nth(1)
-        .expect("the page hit arm")
-        .split(".collect()")
-        .next()
-        .expect("arm body");
-    assert!(
-        page_arm.contains("titles") && page_arm.contains("snippet: text(&hit[\"text\"]),"),
-        "the Explorer heads a page hit with its page and keeps the block text as the snippet"
-    );
-    assert!(
-        !page_arm.contains("title: text(&hit[\"text\"])"),
-        "titling the row with the block text is what printed the same sentence twice"
-    );
-
-    // The palette and the pages search panel render the same hit type; #997's
-    // lesson is that a fix at one surface leaves the siblings broken.
+    // Guest search surfaces verify their own rendered replies in their wire tests.
     const PALETTE: &str = include_str!("../../shell.rs");
-    const PANEL: &str = include_str!("../../../../crates/views/pages/src/ui/rows.rs");
     assert!(
         PALETTE.contains("hit.page_title"),
         "the palette's page hit names its page"
-    );
-    struct TextValues(Vec<String>);
-    impl<'ast> syn::visit::Visit<'ast> for TextValues {
-        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-            use quote::ToTokens;
-            let kit_text = matches!(&*call.func, syn::Expr::Path(path)
-                if path.path.segments.iter().map(|part| part.ident.to_string()).collect::<Vec<_>>() == ["kit", "text"]);
-            if kit_text {
-                if let Some(value) = call.args.iter().nth(1) {
-                    self.0
-                        .push(value.to_token_stream().to_string().replace(' ', ""));
-                }
-            }
-            syn::visit::visit_expr_call(self, call);
-        }
-    }
-    use syn::visit::Visit as _;
-    let mut panel = TextValues(Vec::new());
-    panel.visit_file(&syn::parse_file(PANEL).expect("Pages composition parses"));
-    assert!(panel.0.iter().any(|value| value == "&hit.page_title"));
-    assert!(panel.0.iter().any(|value| value == "&hit.text"));
-    assert!(
-        panel.0.iter().all(|value| !value.contains("hit.block_id")),
-        "block ids identify actions, not visible search titles"
     );
 }
 

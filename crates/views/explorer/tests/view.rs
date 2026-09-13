@@ -230,6 +230,54 @@ fn a_workspace_search_reaches_its_six_sources_together() {
 }
 
 #[test]
+fn search_hits_name_the_page_author_and_room_once() {
+    const SEARCH: &str = "Search messages, pages, issues, files, runs…";
+    let (frame, _) = connected_with_ledger();
+    let frame = tick_native(type_into(&frame, SEARCH, "needle"));
+    let frame = tick_native(submit(&frame, SEARCH));
+    let events = frame.requests.iter().map(|request| {
+        let ask: serde_json::Value = serde_json::from_slice(&request.payload).unwrap();
+        let reply = match ask["target"].as_str().unwrap_or_default() {
+            "chat" => serde_json::json!({"hits": [{"author": "acct:7", "text": "Message needle", "channel_id": "room-qa", "seq": 12}]}),
+            "pages" => serde_json::json!({"hits": [{"page_id": "page-qa", "block_id": "internal-block", "text": "Page needle", "kind": "paragraph"}]}),
+            "forge" => serde_json::json!({"repos": []}),
+            "files" => serde_json::json!({"entries": []}),
+            "tasks" => serde_json::json!({"tasks": {"tasks": []}}),
+            "runs" => serde_json::json!({"runs": []}),
+            target => panic!("unexpected search target {target}"),
+        };
+        answer(request.id, reply.to_string().as_bytes())
+    }).collect();
+    let frame = tick_native(events);
+    let titles = serde_json::json!({"pages": {"pages": [{"id": "page-qa", "title": "Named QA page"}], "has_more": false}});
+    let frame = tick_native(vec![answer(
+        request(&frame, "rpc.view").id,
+        titles.to_string().as_bytes(),
+    )]);
+    let shown = texts(&frame);
+    for expected in [
+        "account 7",
+        "room-qa · #12",
+        "Message needle",
+        "Named QA page",
+        "Page needle",
+    ] {
+        assert_eq!(
+            shown
+                .iter()
+                .filter(|text| text.as_str() == expected)
+                .count(),
+            1,
+            "{expected}: {shown:?}"
+        );
+    }
+    assert!(
+        !shown.iter().any(|text| text.contains("internal-block")),
+        "{shown:?}"
+    );
+}
+
+#[test]
 fn an_empty_answer_belongs_to_its_submitted_query_and_can_be_cleared() {
     const SEARCH: &str = "Search messages, pages, issues, files, runs…";
     let (frame, _) = connected_with_ledger();
