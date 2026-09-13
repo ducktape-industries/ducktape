@@ -210,9 +210,9 @@ impl NodeView {
         for peer in &self.node_peers {
             let key = format!("node/peer/{}", peer.key);
             let (status, tone) = if peer.live {
-                ("Reachable", Tone::Success)
+                ("Connected", Tone::Success)
             } else {
-                ("Unreachable", Tone::Neutral)
+                ("Disconnected", Tone::Neutral)
             };
             if !peers.is_empty() {
                 peers.push(kit::divider(format!("{key}/rule")));
