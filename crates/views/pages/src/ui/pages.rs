@@ -14,7 +14,11 @@ impl PagesView {
                 Some(Message::SidebarResized(x, y))
             }))),
             cursor: Some(wire::mouse::Cursor::ResizingHorizontally),
-            content: Box::new(kit::vertical_divider(format!("{PAGE_KEY}/sidebar-edge"))),
+            // The page list's own border draws the edge; this is the grab strip.
+            content: Box::new(Node::Space {
+                width: Some(Length::Fixed(4.)),
+                height: Some(Length::Fill),
+            }),
         };
         let mut body = Vec::new();
         if !self.host_error.is_empty() {
@@ -83,16 +87,13 @@ impl PagesView {
             kit::centered_row(
                 "pages/sidebar/header",
                 [
-                    kit::heading("pages/sidebar/title", "Pages"),
-                    kit::sized(
-                        kit::badge(
-                            "pages/sidebar/count",
-                            self.pages.len().to_string(),
-                            Tone::Neutral,
-                        ),
-                        Some(Length::Fill),
-                        None,
+                    kit::nowrap(kit::heading("pages/sidebar/title", "Pages")),
+                    kit::badge(
+                        "pages/sidebar/count",
+                        self.pages.len().to_string(),
+                        Tone::Neutral,
                     ),
+                    kit::spacer(),
                     action(
                         "pages/sidebar/new",
                         if self.page_create_open {
@@ -738,22 +739,28 @@ impl PagesView {
         let limit =
             crate::host::comment_card_height(self.comment_anchor_y, self.pages_viewport_height)
                 as f32;
-        let mut card = modal(
-            "PagesView/root/pages/comments-card",
-            body,
-            crate::host::comments_card_width(self.pages_pane_width) as f32,
-        );
+        // The measured key is the plain frame: the card's border lives inside
+        // it, so the frame's width is the width the pane arithmetic used.
+        let mut card = kit::card("PagesView/root/pages/comments-card/card", body);
         if let Node::Container {
             clip,
+            width,
             height,
             padding,
             ..
         } = &mut card
         {
             *clip = true;
-            *height = Some(Length::Fixed(limit));
+            *width = Some(Length::Fill);
+            *height = Some(Length::Fill);
             *padding = Some(wire::Edges::all(12.));
         }
-        card
+        kit::sized(
+            kit::container("PagesView/root/pages/comments-card", card),
+            Some(Length::Fixed(
+                crate::host::comments_card_width(self.pages_pane_width) as f32,
+            )),
+            Some(Length::Fixed(limit)),
+        )
     }
 }

@@ -39,7 +39,7 @@ impl ExplorerView {
                                     host::height_label(self.head),
                                     Tone::Neutral,
                                 ),
-                                kit::secondary("explorer/sync", &self.sync_line),
+                                kit::nowrap(kit::secondary("explorer/sync", &self.sync_line)),
                             ],
                         ),
                         8.,
@@ -118,10 +118,10 @@ impl ExplorerView {
                                         Some(Length::Fill),
                                         None,
                                     ),
-                                    kit::caption(
+                                    kit::nowrap(kit::caption(
                                         format!("{key}/count"),
                                         host::plural(block.op_count, "op", "ops"),
-                                    ),
+                                    )),
                                 ],
                             ),
                             8.,

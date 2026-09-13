@@ -82,10 +82,10 @@ impl ForgeView {
                         None,
                     ),
                     native::badge("forge/tier", &self.tier, Tone::Neutral),
-                    native::secondary(
+                    native::nowrap(native::secondary(
                         "forge/repo-count",
                         host::plural(self.repos.len() as i64, "repository", "repositories"),
-                    ),
+                    )),
                 ],
             ));
             if !self.about.is_empty() {
@@ -210,8 +210,7 @@ impl ForgeView {
             let mut button = subtle(
                 format!("forge/tab/{tab}"),
                 &text,
-                (self.tab != tab || self.forge_item_number > 0)
-                    .then(|| Message::SelectForgeTab(tab.into())),
+                Some(Message::SelectForgeTab(tab.into())),
             );
             if let wire::Node::Button { checked, label, .. } = &mut button {
                 *checked = Some(self.tab == tab);

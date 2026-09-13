@@ -51,7 +51,10 @@ impl PagesView {
                             format!("{key}/head"),
                             [
                                 kit::sized(
-                                    kit::nowrap(kit::strong(format!("{key}/title"), &hit.page_title)),
+                                    kit::nowrap(kit::weighted(
+                                        kit::text(format!("{key}/title"), &hit.page_title),
+                                        wire::Weight::Medium,
+                                    )),
                                     Some(Length::Fill),
                                     None,
                                 ),
@@ -60,7 +63,13 @@ impl PagesView {
                         ),
                         6.,
                     ),
-                    kit::wrapping(kit::secondary(format!("{key}/excerpt"), &hit.text)),
+                    kit::wrapping(kit::colored(
+                        kit::text_size(
+                            kit::text(format!("{key}/excerpt"), &hit.text),
+                            kit::type_scale::SECONDARY as f32,
+                        ),
+                        kit::palette().muted,
+                    )),
                 ],
             ),
             2.,

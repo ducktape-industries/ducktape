@@ -477,17 +477,15 @@ mod tests {
                 on_press,
                 key,
                 ..
-            } => {
-                if ["Open thread", "React with 👍", "More message actions"]
-                    .contains(&label.as_str())
-                {
-                    assert!(on_press.is_some());
-                    assert!(!key.contains("/message/-1/") && !key.contains("/message/33/"));
-                    match label.as_str() {
-                        "Open thread" => threads += 1,
-                        "React with 👍" => reactions += 1,
-                        _ => menus += 1,
-                    }
+            } if ["Open thread", "React with 👍", "More message actions"]
+                .contains(&label.as_str()) =>
+            {
+                assert!(on_press.is_some());
+                assert!(!key.contains("/message/-1/") && !key.contains("/message/33/"));
+                match label.as_str() {
+                    "Open thread" => threads += 1,
+                    "React with 👍" => reactions += 1,
+                    _ => menus += 1,
                 }
             }
             _ => {}

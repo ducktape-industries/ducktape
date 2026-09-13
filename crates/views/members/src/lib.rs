@@ -332,10 +332,10 @@ impl MembersView {
                     Some(wire::Length::Fill),
                     None,
                 ),
-                kit::secondary(
+                kit::nowrap(kit::secondary(
                     "members/summary",
                     host::members_summary(self.connected, &self.rows),
-                ),
+                )),
             ],
         )];
         if !self.host_error.is_empty() {

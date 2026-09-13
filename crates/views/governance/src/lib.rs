@@ -255,14 +255,27 @@ impl GovernanceView {
             "governance/header",
             [
                 kit::sized(
+                    kit::container(
+                        "governance/seal",
+                        wire::Node::Surface {
+                            key: "governance/seal/svg".into(),
+                            name: "artifact_svg".into(),
+                            args: vec![wire::SurfaceValue::Str("icons/seal.svg".into())],
+                            on_event: None,
+                        },
+                    ),
+                    Some(wire::Length::Fixed(24.)),
+                    Some(wire::Length::Fixed(24.)),
+                ),
+                kit::sized(
                     kit::title("governance/title", "Approvals"),
                     Some(wire::Length::Fill),
                     None,
                 ),
-                kit::secondary(
+                kit::nowrap(kit::secondary(
                     "governance/summary",
                     host::proposals_summary(self.connected, &self.rows),
-                ),
+                )),
             ],
         )];
         if !self.host_error.is_empty() {

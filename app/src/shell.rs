@@ -636,50 +636,118 @@ impl DesktopWindow {
             }
             self.input_step = Some(step);
         }
-        let mut body = div().flex().flex_col().gap_3().w_full();
+        let hero = |title: &'static str, subtitle: &'static str| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(24.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.5))
+                        .text_color(colors.muted_foreground)
+                        .child(subtitle),
+                )
+        };
+        let panel = || {
+            div()
+                .border_1()
+                .border_color(colors.border)
+                .bg(colors.surface)
+                .rounded(px(design::radius::CARD as f32))
+                .overflow_hidden()
+        };
+        let hint = |text: String| {
+            div()
+                .text_size(px(12.5))
+                .text_color(colors.muted_foreground)
+                .child(text)
+        };
+        let mut body = div().flex().flex_col().gap_4().w_full();
         body = match step {
-            HubStep::Loading => body.child("Opening your workspace…"),
+            HubStep::Loading => body.child(hint("Opening your workspace…".into())),
             HubStep::Wallets => {
                 let state = &self.model.read(cx).state;
                 let selected = state.hub_wallet_selected.clone();
                 let wallets = state.hub_wallets.clone();
-                body = body.child("Choose a wallet");
+                body = body.child(hero("Welcome back", "Choose a wallet to sign in with."));
+                let mut list = panel().flex().flex_col().p_2().gap_1();
                 for wallet in wallets {
-                    body = body.child(self.action(
-                        format!("wallet/{}", wallet.name),
-                        format!("{} · {}", wallet.name, wallet.state),
-                        Message::PickWallet(wallet.name),
-                        busy,
-                    ));
+                    let picked = wallet.name == selected;
+                    list = list.child(
+                        self.action(
+                            format!("wallet/{}", wallet.name),
+                            format!("{} · {}", wallet.name, wallet.state),
+                            Message::PickWallet(wallet.name),
+                            busy,
+                        )
+                        .ghost()
+                        .w_full()
+                        .when(picked, |button| button.primary()),
+                    );
                 }
                 if !selected.is_empty() {
-                    body = body
-                        .child(self.input("unlock", "Wallet password", true, window, cx))
-                        .child(self.submit(
-                            "unlock-submit",
-                            "Unlock",
-                            busy,
-                            |this, cx| Message::UnlockSubmit(this.value("unlock", cx)),
-                            cx,
-                        ));
+                    list = list.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .p_2()
+                            .child(self.input("unlock", "Wallet password", true, window, cx))
+                            .child(
+                                self.submit(
+                                    "unlock-submit",
+                                    "Unlock",
+                                    busy,
+                                    |this, cx| Message::UnlockSubmit(this.value("unlock", cx)),
+                                    cx,
+                                )
+                                .primary()
+                                .w_full()
+                                .h_10(),
+                            ),
+                    );
                 }
-                body.child(self.action(
-                    "wallet-restore",
-                    "Restore a wallet",
-                    Message::GoRestore,
-                    busy,
-                ))
-                .child(self.action("wallet-create", "Create a wallet", Message::LoginSkip, busy))
-                .child(self.action(
-                    "wallet-networks",
-                    "Networks",
-                    Message::GoNetworks,
-                    busy,
-                ))
+                body.child(list).child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            self.action(
+                                "wallet-create",
+                                "Create a wallet",
+                                Message::LoginSkip,
+                                busy,
+                            )
+                            .outline(),
+                        )
+                        .child(
+                            self.action(
+                                "wallet-restore",
+                                "Restore a wallet",
+                                Message::GoRestore,
+                                busy,
+                            )
+                            .ghost(),
+                        )
+                        .child(
+                            self.action("wallet-networks", "Networks", Message::GoNetworks, busy)
+                                .ghost(),
+                        ),
+                )
             }
             HubStep::Password => {
                 body = body
-                    .child("Protect your wallet")
+                    .child(hero(
+                        "Protect your wallet",
+                        "A password encrypts the key on this device.",
+                    ))
                     .child(self.input("password", "Password", true, window, cx))
                     .child(self.input("password-confirm", "Confirm password", true, window, cx));
                 let problem = crate::backend::password_problem(
@@ -687,38 +755,75 @@ impl DesktopWindow {
                     &self.value("password-confirm", cx),
                 );
                 let invalid = busy || !problem.is_empty();
-                body.child(problem)
-                    .child(self.submit(
-                        "password-submit",
-                        "Create wallet",
-                        invalid,
-                        |this, cx| Message::PasswordSubmit(this.value("password", cx)),
-                        cx,
-                    ))
-                    .child(self.action("password-back", "Back", Message::GoLogin, busy))
+                body.when(!problem.is_empty(), |body| body.child(hint(problem)))
+                    .child(
+                        self.submit(
+                            "password-submit",
+                            "Create wallet",
+                            invalid,
+                            |this, cx| Message::PasswordSubmit(this.value("password", cx)),
+                            cx,
+                        )
+                        .primary()
+                        .w_full()
+                        .h_10(),
+                    )
+                    .child(
+                        self.action("password-back", "Back", Message::GoLogin, busy)
+                            .ghost(),
+                    )
             }
             HubStep::Phrase => {
-                body = body
-                    .child("Write down your recovery phrase")
-                    .child("Keep it private. This phrase can restore your wallet.");
+                body = body.child(hero(
+                    "Write down your recovery phrase",
+                    "Keep it private. This phrase can restore your wallet.",
+                ));
+                let mut words = panel().flex().flex_col().p_3().gap_1();
                 for row in crate::backend::phrase_rows() {
-                    body = body.child(
+                    let word = |number: String, text: String| {
+                        div()
+                            .flex_1()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(24.))
+                                    .text_size(px(12.))
+                                    .font_family(design::fonts::FAMILY_MONO)
+                                    .text_color(colors.muted_foreground)
+                                    .child(number),
+                            )
+                            .child(
+                                div()
+                                    .font_family(design::fonts::FAMILY_MONO)
+                                    .child(text),
+                            )
+                    };
+                    words = words.child(
                         div()
                             .flex()
-                            .justify_between()
-                            .child(format!("{} {}", row.left_number, row.left_word))
-                            .child(format!("{} {}", row.right_number, row.right_word)),
+                            .child(word(row.left_number.to_string(), row.left_word.to_string()))
+                            .child(word(row.right_number.to_string(), row.right_word.to_string())),
                     );
                 }
-                body.child(self.action(
-                    "phrase-saved",
-                    "I wrote it down",
-                    Message::PhraseWrittenDown,
-                    busy,
-                ))
+                body.child(words).child(
+                    self.action(
+                        "phrase-saved",
+                        "I wrote it down",
+                        Message::PhraseWrittenDown,
+                        busy,
+                    )
+                    .primary()
+                    .w_full()
+                    .h_10(),
+                )
             }
             HubStep::Confirm => body
-                .child(crate::backend::recovery_prompt())
+                .child(hero(
+                    "Confirm your phrase",
+                    "Type the requested words to prove the phrase is written down.",
+                ))
+                .child(hint(crate::backend::recovery_prompt()))
                 .child(self.input(
                     "phrase-answer",
                     "Requested words, separated by spaces",
@@ -726,56 +831,102 @@ impl DesktopWindow {
                     window,
                     cx,
                 ))
-                .child(self.submit(
-                    "phrase-confirm",
-                    "Confirm recovery phrase",
-                    busy,
-                    |this, cx| Message::ConfirmPhraseSubmit(this.value("phrase-answer", cx)),
-                    cx,
-                ))
-                .child(self.action(
-                    "phrase-again",
-                    "Show phrase again",
-                    Message::ShowPhraseAgain,
-                    busy,
-                )),
+                .child(
+                    self.submit(
+                        "phrase-confirm",
+                        "Confirm recovery phrase",
+                        busy,
+                        |this, cx| Message::ConfirmPhraseSubmit(this.value("phrase-answer", cx)),
+                        cx,
+                    )
+                    .primary()
+                    .w_full()
+                    .h_10(),
+                )
+                .child(
+                    self.action(
+                        "phrase-again",
+                        "Show phrase again",
+                        Message::ShowPhraseAgain,
+                        busy,
+                    )
+                    .ghost(),
+                ),
             HubStep::Restore => body
-                .child("Restore your wallet")
+                .child(hero(
+                    "Restore your wallet",
+                    "The recovery phrase rebuilds the key on this device.",
+                ))
                 .child(self.input("restore-name", "Wallet name", false, window, cx))
                 .child(self.input("restore_words", "Recovery phrase", true, window, cx))
                 .child(self.input("restore-password", "New password", true, window, cx))
-                .child(self.submit(
-                    "restore-submit",
-                    "Restore",
-                    busy,
-                    |this, cx| {
-                        Message::RestoreSubmit(
-                            this.value("restore-name", cx),
-                            this.value("restore-password", cx),
-                        )
-                    },
-                    cx,
-                ))
-                .child(self.action("restore-back", "Back", Message::GoLogin, busy)),
+                .child(
+                    self.submit(
+                        "restore-submit",
+                        "Restore",
+                        busy,
+                        |this, cx| {
+                            Message::RestoreSubmit(
+                                this.value("restore-name", cx),
+                                this.value("restore-password", cx),
+                            )
+                        },
+                        cx,
+                    )
+                    .primary()
+                    .w_full()
+                    .h_10(),
+                )
+                .child(
+                    self.action("restore-back", "Back", Message::GoLogin, busy)
+                        .ghost(),
+                ),
             HubStep::Networks => {
                 let state = &self.model.read(cx).state;
                 let networks = state.hub_networks.clone();
                 let selected = state.hub_selected.clone();
-                body = body
-                    .gap_5()
-                    .child(div().flex().flex_col().gap_2()
-                        .child(div().text_size(px(11.)).font_family(design::fonts::FAMILY_MONO).text_color(colors.muted_foreground).child("WORKSPACE / CONNECT"))
-                        .child(div().text_size(px(28.)).font_weight(FontWeight::SEMIBOLD).child("Your networks"))
-                        .child(div().text_color(colors.muted_foreground).child("Choose where your team works.")));
+                body = body.child(hero("Your networks", "Choose where your team works."));
                 let empty = networks.is_empty();
-                let mut recent = div().border_1().border_color(colors.border).bg(colors.surface)
-                    .child(div().px_4().py_3().border_b_1().border_color(colors.border).flex().justify_between()
-                        .child(div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).child("SAVED NETWORKS"))
-                        .child(div().text_size(px(11.)).font_family(design::fonts::FAMILY_MONO).text_color(colors.muted_foreground).child(format!("{:02}", networks.len()))));
+                let mut recent = panel().child(
+                    div()
+                        .px_4()
+                        .py_3()
+                        .border_b_1()
+                        .border_color(colors.border)
+                        .flex()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("Saved networks"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .font_family(design::fonts::FAMILY_MONO)
+                                .text_color(colors.muted_foreground)
+                                .child(networks.len().to_string()),
+                        ),
+                );
                 if empty {
-                    recent = recent.child(div().px_4().py_6().flex().flex_col().gap_2()
-                        .child(div().text_size(px(15.)).font_weight(FontWeight::MEDIUM).child("No networks yet"))
-                        .child(div().text_size(px(12.)).text_color(colors.muted_foreground).child("Join a network or connect to a node below.")));
+                    recent = recent.child(
+                        div()
+                            .px_4()
+                            .py_6()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("No networks yet"),
+                            )
+                            .child(hint(
+                                "Join a network or connect to a node below.".into(),
+                            )),
+                    );
                 }
                 for network in networks {
                     let label = match (network.probed, network.live) {
@@ -787,90 +938,206 @@ impl DesktopWindow {
                     recent = recent.child(
                         div()
                             .flex()
-                            .gap_2()
-                            .p_2()
-                            .child(self.action(
-                                format!("network/{}", network.id),
-                                label,
-                                Message::PickNetwork(network.id.clone()),
-                                busy,
-                            ).flex_1().when(picked, |button| button.primary()))
-                            .child(self.action(
-                                format!("forget/{}", network.id),
-                                "Forget",
-                                Message::ForgetNetworkSubmit(network.id),
-                                busy,
-                            ).ghost()),
+                            .gap_1()
+                            .px_2()
+                            .py_1()
+                            .child(
+                                self.action(
+                                    format!("network/{}", network.id),
+                                    label,
+                                    Message::PickNetwork(network.id.clone()),
+                                    busy,
+                                )
+                                .ghost()
+                                .flex_1()
+                                .when(picked, |button| button.primary()),
+                            )
+                            .child(
+                                self.action(
+                                    format!("forget/{}", network.id),
+                                    "Forget",
+                                    Message::ForgetNetworkSubmit(network.id),
+                                    busy,
+                                )
+                                .ghost(),
+                            ),
                     );
                 }
                 let no_selection = busy || selected.is_empty();
                 if !empty {
-                    recent = recent.child(div().p_3().border_t_1().border_color(colors.border).child(self.action(
-                    "network-open",
-                    "Open network",
-                    Message::OpenNetworkSubmit,
-                    no_selection,
-                    ).primary().w_full().h_10()));
+                    recent = recent.child(
+                        div()
+                            .p_3()
+                            .border_t_1()
+                            .border_color(colors.border)
+                            .child(
+                                self.action(
+                                    "network-open",
+                                    "Open network",
+                                    Message::OpenNetworkSubmit,
+                                    no_selection,
+                                )
+                                .primary()
+                                .w_full()
+                                .h_10(),
+                            ),
+                    );
                 }
                 body.child(recent)
-                .child(div().flex().flex_col().gap_3()
-                    .child(div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).child("CONNECT DIRECTLY"))
-                    .child(self.input("remote", "Remote node address", false, window, cx))
-                    .child(self.submit(
-                    "remote-connect",
-                    "Connect to node",
-                    busy || self.value("remote", cx).trim().is_empty(),
-                    |this, cx| Message::ConnectRemoteSubmit(this.value("remote", cx)),
-                    cx,
-                ).primary().w_full().h_10()))
-                .child(div().border_t_1().border_color(colors.border).pt_4().flex().flex_col().gap_2()
-                    .child(div().text_size(px(12.)).text_color(colors.muted_foreground).child("Already have an invitation?"))
-                    .child(self.action(
-                    "network-join",
-                    "Join with invitation",
-                    Message::GoJoin,
-                    busy,
-                ).outline().w_full().h_10()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("Connect directly"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div().flex_1().child(self.input(
+                                            "remote",
+                                            "Remote node address",
+                                            false,
+                                            window,
+                                            cx,
+                                        )),
+                                    )
+                                    .child(
+                                        self.submit(
+                                            "remote-connect",
+                                            "Connect",
+                                            busy || self.value("remote", cx).trim().is_empty(),
+                                            |this, cx| {
+                                                Message::ConnectRemoteSubmit(this.value("remote", cx))
+                                            },
+                                            cx,
+                                        )
+                                        .outline(),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .border_t_1()
+                            .border_color(colors.border)
+                            .pt_4()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(hint("Already have an invitation?".into()))
+                            .child(
+                                self.action(
+                                    "network-join",
+                                    "Join with invitation",
+                                    Message::GoJoin,
+                                    busy,
+                                )
+                                .outline(),
+                            ),
+                    )
             }
             HubStep::Join => body
-                .gap_5()
-                .child(div().flex().flex_col().gap_2()
-                    .child(div().text_size(px(11.)).font_family(design::fonts::FAMILY_MONO).text_color(colors.muted_foreground).child("WORKSPACE / INVITATION"))
-                    .child(div().text_size(px(28.)).font_weight(FontWeight::SEMIBOLD).child("Join your team"))
-                    .child(div().text_color(colors.muted_foreground).child("One invitation. A shared place to work.")))
-                .child(div().border_1().border_color(colors.border).bg(colors.surface).p_4().flex().flex_col().gap_3()
-                    .child(div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).child("NETWORK INVITATION"))
-                    .child(self.input("join_invite", "Invitation", true, window, cx))
-                    .child(div().text_size(px(12.)).text_color(colors.muted_foreground).child("Paste the invitation shared by a network member. It stays hidden on this screen.")))
-                .child(self.action("join-submit", "Join network", Message::JoinNetworkSubmit, busy || self.value("join_invite", cx).trim().is_empty()).primary().w_full().h_10())
-                .child(self.action("join-back", "Back to networks", Message::GoNetworks, busy).ghost().w_full())
-                .child(div().border_t_1().border_color(colors.border).pt_4().text_size(px(12.)).text_color(colors.muted_foreground).child("Your wallet identifies you. The invitation connects you to the right workspace.")),
+                .child(hero("Join your team", "One invitation. A shared place to work."))
+                .child(
+                    panel()
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("Network invitation"),
+                        )
+                        .child(self.input("join_invite", "Invitation", true, window, cx))
+                        .child(hint(
+                            "Paste the invitation shared by a network member. It stays hidden on this screen."
+                                .into(),
+                        )),
+                )
+                .child(
+                    self.action(
+                        "join-submit",
+                        "Join network",
+                        Message::JoinNetworkSubmit,
+                        busy || self.value("join_invite", cx).trim().is_empty(),
+                    )
+                    .primary()
+                    .w_full()
+                    .h_10(),
+                )
+                .child(
+                    self.action("join-back", "Back to networks", Message::GoNetworks, busy)
+                        .ghost()
+                        .w_full(),
+                )
+                .child(
+                    div()
+                        .border_t_1()
+                        .border_color(colors.border)
+                        .pt_4()
+                        .child(hint(
+                            "Your wallet identifies you. The invitation connects you to the right workspace."
+                                .into(),
+                        )),
+                ),
             HubStep::Provisioning => {
+                body = body.child(hero(
+                    "Setting up your network",
+                    "This takes a moment on first launch.",
+                ));
+                let mut steps = panel().flex().flex_col().p_3().gap_2();
                 for step in &self.model.read(cx).state.provision_steps {
-                    body = body.child(format!("{} · {}", step.label, step.state));
+                    steps = steps.child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .gap_3()
+                            .child(div().child(step.label.clone()))
+                            .child(hint(step.state.clone())),
+                    );
                 }
-                body
+                body.child(steps)
             }
             HubStep::Live => body
-                .child("Your network is ready")
-                .child(self.action(
-                    "copy-invite",
-                    "Copy invitation",
-                    Message::CopyOnboardingInvite,
-                    busy,
+                .child(hero(
+                    "Your network is ready",
+                    "Invite your team, then open the workspace.",
                 ))
-                .child(self.action(
-                    "enter-console",
-                    "Open Ducktape",
-                    Message::EnterConsole,
-                    busy,
-                )),
+                .child(
+                    self.action(
+                        "copy-invite",
+                        "Copy invitation",
+                        Message::CopyOnboardingInvite,
+                        busy,
+                    )
+                    .outline()
+                    .w_full()
+                    .h_10(),
+                )
+                .child(
+                    self.action("enter-console", "Open Ducktape", Message::EnterConsole, busy)
+                        .primary()
+                        .w_full()
+                        .h_10(),
+                ),
             HubStep::Account => {
                 let state = &self.model.read(cx).state;
                 let detail = state.ceremony_detail.clone();
                 let left = state.ceremony_left.clone();
                 let payload = state.ceremony_qr.clone();
-                body = body.child("Your account").child(detail).child(left);
+                body = body
+                    .child(hero("Your account", "One account, every device you sign in from."))
+                    .when(!detail.is_empty(), |body| body.child(hint(detail)))
+                    .when(!left.is_empty(), |body| body.child(hint(left)));
                 if !payload.is_empty() {
                     let changed = self
                         .qr
@@ -891,32 +1158,57 @@ impl DesktopWindow {
                     body = body.child(self.qr.as_ref().expect("account QR").1.clone());
                 }
                 body.child(self.input("account-name", "Account name", false, window, cx))
-                    .child(self.submit(
-                        "account-create",
-                        "Create account",
-                        busy,
-                        |this, cx| Message::WelcomeCreateSubmit(this.value("account-name", cx)),
-                        cx,
-                    ))
-                    .child(self.action(
-                        "account-login",
-                        "Sign in",
-                        Message::WelcomeLoginSubmit,
-                        busy,
-                    ))
-                    .child(self.action(
-                        "account-desktop",
-                        "Use this device",
-                        Message::WelcomeDesktop,
-                        busy,
-                    ))
-                    .child(self.action(
-                        "account-skip",
-                        "Continue without account",
-                        Message::WelcomeSkip,
-                        busy,
-                    ))
-                    .child(self.action("account-cancel", "Cancel", Message::WelcomeCancel, false))
+                    .child(
+                        self.submit(
+                            "account-create",
+                            "Create account",
+                            busy,
+                            |this, cx| {
+                                Message::WelcomeCreateSubmit(this.value("account-name", cx))
+                            },
+                            cx,
+                        )
+                        .primary()
+                        .w_full()
+                        .h_10(),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                self.action(
+                                    "account-login",
+                                    "Sign in",
+                                    Message::WelcomeLoginSubmit,
+                                    busy,
+                                )
+                                .outline(),
+                            )
+                            .child(
+                                self.action(
+                                    "account-desktop",
+                                    "Use this device",
+                                    Message::WelcomeDesktop,
+                                    busy,
+                                )
+                                .outline(),
+                            )
+                            .child(
+                                self.action(
+                                    "account-skip",
+                                    "Continue without account",
+                                    Message::WelcomeSkip,
+                                    busy,
+                                )
+                                .ghost(),
+                            )
+                            .child(
+                                self.action("account-cancel", "Cancel", Message::WelcomeCancel, false)
+                                    .ghost(),
+                            ),
+                    )
             }
         };
         div()
@@ -943,7 +1235,8 @@ impl DesktopWindow {
                             .gap_3()
                             .child(
                                 div()
-                                    .size(px(28.))
+                                    .size(px(26.))
+                                    .rounded(px(design::radius::CONTROL as f32))
                                     .bg(colors.foreground)
                                     .text_color(colors.background)
                                     .flex()
@@ -954,9 +1247,9 @@ impl DesktopWindow {
                             )
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(px(13.5))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("DUCKTAPE"),
+                                    .child("Ducktape"),
                             )
                             .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| {
                                 window.start_window_move()
@@ -984,43 +1277,39 @@ impl DesktopWindow {
                                 .mt_4()
                                 .p_3()
                                 .border_1()
+                                .rounded(px(design::radius::CONTROL as f32))
                                 .border_color(colors.destructive)
                                 .text_color(colors.destructive)
-                                .text_size(px(12.))
+                                .text_size(px(12.5))
                                 .child(error),
                         )
                     }),
             )
             .child(
                 div()
-                    .h(px(40.))
+                    .h(px(36.))
                     .px_5()
                     .flex_shrink_0()
                     .border_t_1()
                     .border_color(colors.border)
                     .flex()
                     .items_center()
-                    .justify_between()
                     .child(
                         div()
-                            .text_size(px(10.))
-                            .font_family(design::fonts::FAMILY_MONO)
+                            .text_size(px(11.5))
                             .text_color(colors.muted_foreground)
-                            .child("BUILT TO WORK TOGETHER"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(colors.muted_foreground)
-                            .child("DESKTOP"),
+                            .child("A workspace your team runs."),
                     ),
             )
             .into_any_element()
     }
 
     fn huddle(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        use gpui_kit::component::button::ButtonVariants as _;
         use gpui_kit::*;
+        let colors = gpui_kit::component::Theme::global(cx).color_tokens();
         let state = &self.model.read(cx).state;
+        let live_dot = hsla_of(design::palette(state.is_dark()).accent);
         let mute = if state.call_muted { "Unmute" } else { "Mute" };
         let camera = if state.call_camera {
             "Stop camera"
@@ -1103,14 +1392,37 @@ impl DesktopWindow {
                                             .flex_1()
                                             .p_3()
                                             .border_1()
-                                            .rounded_none()
+                                            .border_color(colors.border)
+                                            .bg(colors.surface)
+                                            .rounded(px(design::radius::CARD as f32))
                                             .flex()
                                             .flex_col()
                                             .items_center()
                                             .gap_2()
-                                            .child(row.person.initials.clone())
-                                            .child(div().truncate().child(row.person.label.clone()))
-                                            .child(caption)
+                                            .child(
+                                                div()
+                                                    .size(px(36.))
+                                                    .rounded_full()
+                                                    .bg(colors.secondary)
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .text_size(px(12.))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child(row.person.initials.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .text_size(px(12.5))
+                                                    .child(row.person.label.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.5))
+                                                    .text_color(colors.muted_foreground)
+                                                    .child(caption),
+                                            )
                                     }),
                             )
                         })
@@ -1124,33 +1436,81 @@ impl DesktopWindow {
             .flex()
             .flex_wrap()
             .gap_2()
-            .p_2()
+            .p_3()
             .flex_shrink_0()
-            .child(self.action("huddle-mute", mute, Message::ToggleCallMute, false))
-            .child(self.action("huddle-camera", camera, Message::ToggleCallCamera, false))
-            .child(self.action("huddle-screen", screen, Message::ToggleCallScreen, false))
-            .child(self.action(
-                "huddle-channel",
-                "Go to channel",
-                Message::HuddleGoChannel,
-                false,
-            ))
-            .child(self.action(
-                "huddle-leave",
-                "Leave huddle",
-                Message::LeaveHuddleHere,
-                false,
-            ));
+            .border_t_1()
+            .border_color(colors.border)
+            .child(
+                self.action("huddle-mute", mute, Message::ToggleCallMute, false)
+                    .outline(),
+            )
+            .child(
+                self.action("huddle-camera", camera, Message::ToggleCallCamera, false)
+                    .outline(),
+            )
+            .child(
+                self.action("huddle-screen", screen, Message::ToggleCallScreen, false)
+                    .outline(),
+            )
+            .child(
+                self.action(
+                    "huddle-channel",
+                    "Go to channel",
+                    Message::HuddleGoChannel,
+                    false,
+                )
+                .ghost(),
+            )
+            .child(
+                self.action(
+                    "huddle-leave",
+                    "Leave huddle",
+                    Message::LeaveHuddleHere,
+                    false,
+                )
+                .danger(),
+            );
         div()
             .size_full()
             .flex()
             .flex_col()
+            .bg(colors.background)
+            .text_color(colors.foreground)
             .child(
                 div()
-                    .p_3()
+                    .px_3()
+                    .py_2()
                     .flex_shrink_0()
-                    .child(format!("LIVE {elapsed} · {title}"))
-                    .child(div().text_xs().child(status)),
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .size(px(8.))
+                            .rounded_full()
+                            .bg(live_dot),
+                    )
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .font_family(design::fonts::FAMILY_MONO)
+                            .text_size(px(12.))
+                            .text_color(colors.muted_foreground)
+                            .child(elapsed),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(colors.muted_foreground)
+                            .child(status),
+                    ),
             )
             .child(body)
             .child(controls)
@@ -1208,12 +1568,7 @@ impl DesktopWindow {
         // The sidebar carries the network: its name, whether it is live, and
         // the way to another one. The header then only names the screen.
         let network = self
-            .action(
-                "switch-network",
-                state.network_name.clone(),
-                Message::SwitchNetwork,
-                false,
-            )
+            .action("switch-network", "", Message::SwitchNetwork, false)
             .ghost()
             .w_full()
             .h_auto()
@@ -1380,9 +1735,10 @@ impl DesktopWindow {
                 ),
             )
             .child(
-                self.action("bell", bell_label, Message::ToggleBell, !state.connected)
+                self.action("bell", "", Message::ToggleBell, !state.connected)
                     .outline()
                     .icon(gpui_kit::component::IconName::Bell)
+                    .accessibility_label(bell_label)
                     .h_8()
                     .w_8()
                     .px_0()
@@ -2324,7 +2680,9 @@ fn nav_icon(tab: ShellTab) -> gpui_kit::component::Icon {
 }
 
 pub(crate) fn run() {
-    let application = gpui_kit::application();
+    // The kit's component icons (search, bell, folder, …) are SVGs the app
+    // loads by path; without a source they draw as nothing.
+    let application = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     let (url_sender, mut urls) = mpsc::unbounded::<Vec<String>>();
     // Install before launching: macOS may deliver its initial URL before the
     // desktop actor exists. The channel keeps it until the actor can receive.

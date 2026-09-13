@@ -107,13 +107,13 @@ impl AgentsView {
             None,
         )];
         if self.connected {
-            header.push(kit::secondary(
+            header.push(kit::nowrap(kit::secondary(
                 "agents/summary",
                 match self.panel.as_str() {
                     "runs" => host::runs_summary(&self.runs),
                     _ => host::agents_summary(self.connected, &self.rows),
                 },
-            ));
+            )));
             if !self.account.is_empty() {
                 header.push(primary("agents/new", "New agent", Some(Message::OpenNew)));
             }
@@ -124,7 +124,7 @@ impl AgentsView {
                 let mut button = subtle(
                     format!("agents/panel/{panel}"),
                     label,
-                    (self.panel != panel).then(|| Message::ChoosePanel(panel.into())),
+                    Some(Message::ChoosePanel(panel.into())),
                 );
                 if let Node::Button { checked, .. } = &mut button {
                     *checked = Some(self.panel == panel);

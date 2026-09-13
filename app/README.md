@@ -177,30 +177,30 @@ The microVM shim signs the same way: `bin/duck-vz-shim/build.sh` takes
 
 ## Visual language
 
-The native shell uses gpui-kit's light and dark semantic themes over an opaque
-window. Rectangular navigation and bordered sections separate the permanent
-rail, workspace header and content. Selected navigation uses the native primary
-button variant; muted surfaces and text distinguish context from actions, and
-the destructive color identifies errors. These roles follow the active theme
-rather than a separate fixed shell palette.
+One palette drives the whole app. `crates/views/support/design` holds it as
+`design::LIGHT` / `design::DARK` (paper and ink, one amber accent): the native
+shell registers the two as gpui-kit themes (`design::kit_theme_json`) and every
+WASM view reads the same values through `ducktape_view_guest::kit::palette()`,
+switched by the `dark` fact the kernel pushes with each view's session props.
+The accent is spent in three places only — the live dot, the focus ring and the
+selection wash — so state colors (success, warning, danger, agent) read as
+state and nothing else.
 
-WASM views own layout, document presentation and interaction routes. Shared guest
-kit constructors describe semantic controls through the wire boundary; the
-native renderer applies gpui-kit's active theme and control presets. Document
-formatting, such as links and code marks, remains part of the guest presentation.
+The console is a 208px sidebar carrying the network (name, live dot, block
+height, the switch to another network) and the icon navigation, a 48px header
+naming the screen with search and notifications, and the content. WASM views
+own their layout and interaction routes and compose it from the guest kit's
+semantic pieces — `page`, `card`, `pane`, `list_row`, `kv`, `badge`, `avatar`,
+`notice`, `empty_state`, `tabs`, `field` — so a list, a record rail, a reading
+and a form look the same on every screen. The native renderer maps the wire's
+button presets onto gpui-kit variants (primary, outline, ghost, link, danger).
 
 ## Design system
 
-The native shell and wire renderer use `gpui-kit`. WASM views inherit its native
-control styling while describing layout and editor presentation through the
-shared wire vocabulary. The local `design` crate owns bundled font assets and
-the native shell's default text size.
-
-- Faces: **Geist** (UI), **Geist Mono** (machine values, metadata, field
-  labels, and badges).
-  The files are embedded from `crates/views/support/design/assets/fonts/` at build time.
-- Native shell default text size: 13.5px; native components and document
-  presentation choose their own semantic sizes.
-- Console frame: 1280×800 default, a 184px permanent rail and a 72px workspace
-  header. Content fills the remaining space; individual WASM views own their
-  sidebars and split panes.
+- Faces: **Geist** (UI), **Geist Mono** (identifiers, hashes, paths, code).
+  The files are embedded from `crates/views/support/design/assets/fonts/` at
+  build time; the kit's component icons come from `gpui_kit::assets::Assets`.
+- Type scale (`design::type_scale`): title 20, section 15, body 13.5,
+  secondary 12.5, caption 11.5, mono 12.5.
+- Radii (`design::radius`): 6px controls, 8px cards, pill badges.
+- Console frame: 1280×800 default (1040×540 minimum); launch window 480×680.

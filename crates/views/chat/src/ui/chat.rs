@@ -57,7 +57,7 @@ fn divider(key: String, route: fn(f64, f64) -> Message) -> wire::Node {
             move |(x, y)| Some(route(x, y)),
         ))),
         cursor: Some(wire::mouse::Cursor::ResizingHorizontally),
-        // An 8px grab strip with the hairline down its middle.
+        // A 10px grab strip with the hairline down its middle.
         content: Box::new({
             let mut strip = native::container(
                 format!("{key}/strip"),
@@ -70,7 +70,7 @@ fn divider(key: String, route: fn(f64, f64) -> Message) -> wire::Node {
                 ..
             } = &mut strip
             {
-                *width = Some(wire::Length::Fixed(8.));
+                *width = Some(wire::Length::Fixed(10.));
                 *height = Some(wire::Length::Fill);
                 *align_x = Some(wire::AlignX::Center);
             }

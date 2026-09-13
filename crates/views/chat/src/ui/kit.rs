@@ -188,7 +188,7 @@ impl ChatView {
             if let wire::Node::Button { label, .. } = &mut button {
                 *label = Some("Open thread".into());
             }
-            children.push(button);
+            children.push(native::row(format!("{key}/thread-row"), [button]));
         }
         if message.pending {
             children.push(native::caption(format!("{key}/pending"), &message.meta));

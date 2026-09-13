@@ -2046,19 +2046,23 @@ impl ViewTree {
                     }
                     element = element.child(layer.child(self.node(child, window, cx)));
                 }
-                element
-                    .on_hover(cx.listener(move |this, hovered, _, cx| {
-                        match hovered {
-                            true => {
-                                this.hovered.insert(route.clone());
-                            }
-                            false => {
-                                this.hovered.remove(&route);
-                            }
+                let element = element.on_hover(cx.listener(move |this, hovered, _, cx| {
+                    match hovered {
+                        true => {
+                            this.hovered.insert(route.clone());
                         }
-                        cx.notify();
-                    }))
-                    .into_any_element()
+                        false => {
+                            this.hovered.remove(&route);
+                        }
+                    }
+                    cx.notify();
+                }));
+                #[cfg(test)]
+                let element = {
+                    use gpui_kit::test::TestSupportExt as _;
+                    element.test_support()
+                };
+                element.into_any_element()
             }
             Node::Tooltip {
                 key,

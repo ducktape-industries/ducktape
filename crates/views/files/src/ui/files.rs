@@ -164,7 +164,7 @@ impl FilesView {
             children.push(native::button(
                 format!("{key}/delete"),
                 "Delete object",
-                (!(busy || !self.delete_target.is_empty()))
+                (!busy && self.delete_target.is_empty())
                     .then(|| slots::message(Message::ArmDeleteAt(self.preview_path.clone()))),
                 wire::ButtonPreset::Danger,
             ));

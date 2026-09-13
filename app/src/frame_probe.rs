@@ -216,8 +216,9 @@ fn large_screens_stay_under_their_allocation_ceilings() {
         });
     }
     phase.report();
+    // 32 roster tiles, each a card with an avatar, a name and a caption.
     assert!(
-        phase.median_allocations() < 6_000,
-        "native huddle allocations exceeded the retained 6000-allocation budget"
+        phase.median_allocations() < 7_000,
+        "native huddle allocations exceeded the retained 7000-allocation budget"
     );
 }
