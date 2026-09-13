@@ -7,6 +7,8 @@ pub enum Inline {
     Bold,
     Italic,
     Strike,
+    /// `++underlined++` — the fence Tiptap's underline mark serializes to.
+    Underline,
     Code,
     Highlight,
     Link,
@@ -20,6 +22,7 @@ const FENCES: &[(&str, Inline)] = &[
     ("**", Inline::Bold),
     ("__", Inline::Bold),
     ("~~", Inline::Strike),
+    ("++", Inline::Underline),
     ("==", Inline::Highlight),
     ("`", Inline::Code),
     ("*", Inline::Italic),
@@ -28,7 +31,7 @@ const FENCES: &[(&str, Inline)] = &[
 
 /// The bytes that can open a mark. Ordinary prose is skipped in one scan
 /// instead of retrying every delimiter at every character.
-const OPENERS: &[char] = &['*', '_', '~', '=', '`', 'h', '@'];
+const OPENERS: &[char] = &['*', '_', '~', '+', '=', '`', 'h', '@'];
 
 /// Byte-ranged mirror of `chat::client::inline_spans`, minus its account
 /// tokens: bare `http(s)://` runs, then the fences above, then `@name`

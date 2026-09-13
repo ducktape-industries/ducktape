@@ -192,7 +192,7 @@ impl BindingState {
         } else if opens_format_menu(origin) {
             self.menu.format(&after_doc);
         } else if matches!(kind, wire::EditorEditKind::Cursor) {
-            self.menu.close();
+            self.menu.moved(&after_doc);
         } else {
             let typed = matches!(kind, wire::EditorEditKind::Insert)
                 && after.text_revision != before.text_revision;
@@ -225,12 +225,13 @@ impl BindingState {
 const TRIGGERS: &[char] = &['/', '@', ':'];
 
 /// The command-key letters the binding claims besides undo/redo, with the
-/// shift they need: bold, italic, code, link, the format menu; strike and
-/// highlight on shift. Both cases are claimed — a shifted letter arrives as
-/// its capital on some platforms.
+/// shift they need: bold, italic, underline, code, link, the format menu;
+/// strike and highlight on shift. Both cases are claimed — a shifted letter
+/// arrives as its capital on some platforms.
 const COMMAND_KEYS: &[(&str, bool)] = &[
     ("b", false),
     ("i", false),
+    ("u", false),
     ("e", false),
     ("k", false),
     ("/", false),
@@ -453,6 +454,7 @@ fn shortcut(doc: &Doc, key: &str, shift: bool) -> editor::EditorDecision {
     match (key.to_ascii_lowercase().as_str(), shift) {
         ("b", false) => toggle(doc, Wrap::Bold),
         ("i", false) => toggle(doc, Wrap::Italic),
+        ("u", false) => toggle(doc, Wrap::Underline),
         ("e", false) => toggle(doc, Wrap::Code),
         ("x", true) => toggle(doc, Wrap::Strike),
         ("h", true) => toggle(doc, Wrap::Highlight),

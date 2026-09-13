@@ -205,6 +205,7 @@ fn cmd_slash_opens_the_format_menu_at_the_caret_and_its_picks_wrap_the_selection
             "bold",
             "italic",
             "strike",
+            "underline",
             "code",
             "highlight",
             "link",
@@ -225,6 +226,23 @@ fn cmd_slash_opens_the_format_menu_at_the_caret_and_its_picks_wrap_the_selection
     let mut title = menu::Menu::default();
     title.format(&doc("Title\nbody", 0, 2));
     assert!(!title.is_open());
+}
+
+#[test]
+fn a_caret_move_floats_the_format_menu_over_a_selection_and_closes_it_over_a_caret() {
+    let mut selection = doc("Title\nsome words", 1, 10);
+    selection.cursor.selection = Some(editor::EditorPosition::new(1, 5));
+    let mut state = menu::Menu::default();
+    state.moved(&selection);
+    assert_eq!(tags(&state.current(&selection).unwrap())[0], "bold");
+    let mut collapsed = selection.clone();
+    collapsed.cursor.selection = Some(collapsed.cursor.position);
+    state.moved(&collapsed);
+    assert!(!state.is_open(), "an empty selection is a caret");
+    let mut title = doc("Title\nbody", 0, 3);
+    title.cursor.selection = Some(editor::EditorPosition::new(0, 0));
+    state.moved(&title);
+    assert!(!state.is_open(), "the title takes no marks");
 }
 
 #[test]

@@ -8,7 +8,7 @@ members = ["governance", "members", "agents", "node", "explorer", "settings", "c
 futures = "0.3"
 ducktape-view-guest = { path = "support/guest" }
 design = { path = "support/design" }
-ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23" }
+ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "31cf09a8e9206eff89552e42079b0fee237c08ab" }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

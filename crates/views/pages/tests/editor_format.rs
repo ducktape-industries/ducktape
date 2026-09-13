@@ -78,6 +78,7 @@ fn every_wrap_round_trips_through_the_inline_grammar() {
         Wrap::Bold,
         Wrap::Italic,
         Wrap::Strike,
+        Wrap::Underline,
         Wrap::Code,
         Wrap::Highlight,
     ] {

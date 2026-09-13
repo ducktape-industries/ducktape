@@ -303,6 +303,7 @@ const FORMAT_ITEMS: &[(&str, &str)] = &[
     ("bold", "Bold"),
     ("italic", "Italic"),
     ("strike", "Strikethrough"),
+    ("underline", "Underline"),
     ("code", "Code"),
     ("highlight", "Highlight"),
     ("link", "Link"),
@@ -476,6 +477,19 @@ impl Menu {
 
     pub fn close(&mut self) {
         self.open = None;
+    }
+
+    /// A caret move: the format menu floats over a standing selection —
+    /// Tiptap's bubble toolbar — and nothing floats over a bare caret.
+    pub fn moved(&mut self, document: &Doc) {
+        let selecting = document
+            .cursor
+            .selection
+            .is_some_and(|anchor| anchor != document.cursor.position);
+        match selecting {
+            true => self.format(document),
+            false => self.close(),
+        }
     }
 
     pub fn is_open(&self) -> bool {

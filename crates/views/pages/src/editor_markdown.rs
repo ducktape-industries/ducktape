@@ -133,8 +133,9 @@ pub struct Style {
     pub strong: bool,
     pub emphasis: bool,
     pub link: bool,
-    /// `~~struck~~`, `` `code` ``, `==marked==`, `@name`.
+    /// `~~struck~~`, `++underlined++`, `` `code` ``, `==marked==`, `@name`.
     pub strike: bool,
+    pub underline: bool,
     pub code: bool,
     pub highlight: bool,
     pub mention: bool,
@@ -442,6 +443,10 @@ fn highlight(
             },
             Inline::Strike => Style {
                 strike: true,
+                ..style
+            },
+            Inline::Underline => Style {
+                underline: true,
                 ..style
             },
             Inline::Code => Style {
@@ -773,10 +778,13 @@ fn body_format(style: Style, ink: &Ink) -> Format {
         (false, false) => None,
     };
     let (background, plate_border) = inline_plate(style, ink);
+    // A `++run++` underlines in its own ink, like a strike does.
+    let underlined = style.underline.then(|| color.unwrap_or(ink.code_ink));
     let mut format = Format {
         color,
         font: Some(font),
         strikethrough: struck,
+        underline: underlined,
         background,
         border: plate_border,
         ..Format::default()

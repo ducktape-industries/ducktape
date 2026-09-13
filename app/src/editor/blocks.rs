@@ -11,7 +11,7 @@ use gpui_kit::{
     EventEmitter, Focusable as _, FontWeight, HighlightStyle, Hsla, InteractiveElement as _,
     IntoElement, KeyDownEvent, Keystroke, MouseButton, ParentElement as _, Pixels, Point, Render,
     ScrollHandle, SharedString, StatefulInteractiveElement as _, StrikethroughStyle, Styled as _,
-    Subscription, Window, div, point, px,
+    Subscription, UnderlineStyle, Window, div, point, px,
 };
 use std::{ops::Range, sync::Arc};
 use ui_lang_wire as wire;
@@ -611,6 +611,11 @@ impl WireEditor {
                                     thickness: px(1.),
                                     color: Some(color(ink)),
                                 }),
+                                underline: format.underline.map(|ink| UnderlineStyle {
+                                    thickness: px(1.),
+                                    color: Some(color(ink)),
+                                    wavy: false,
+                                }),
                                 ..Default::default()
                             },
                         ))
@@ -779,39 +784,19 @@ impl WireEditor {
             return;
         };
         let key = key_state(&event.keystroke);
-        if let Some(menu) = projection
+        let menu = projection
             .options
             .presentation
             .as_ref()
-            .and_then(|p| p.affordances.menu.as_ref())
-        {
-            let action = match &key.key {
-                wire::keyboard::Key::Named(wire::keyboard::Named::ArrowUp) => {
-                    Some(EditorInteraction::MenuSelect {
-                        index: menu.selected.saturating_sub(1),
-                    })
-                }
-                wire::keyboard::Key::Named(wire::keyboard::Named::ArrowDown) => {
-                    Some(EditorInteraction::MenuSelect {
-                        index: (menu.selected + 1).min(menu.items.len().saturating_sub(1) as u32),
-                    })
-                }
-                wire::keyboard::Key::Named(wire::keyboard::Named::Enter) => menu
-                    .items
-                    .get(menu.selected as usize)
-                    .map(|item| EditorInteraction::MenuPick {
-                        tag: item.tag.clone(),
-                    }),
-                wire::keyboard::Key::Named(wire::keyboard::Named::Escape) => {
-                    Some(EditorInteraction::MenuDismiss)
-                }
-                _ => None,
-            };
-            if let Some(action) = action {
-                self.interaction(action, cx);
-                cx.stop_propagation();
-                return;
-            }
+            .and_then(|p| p.affordances.menu.as_ref());
+        let selecting = self
+            .cursor
+            .selection
+            .is_some_and(|anchor| anchor != self.cursor.position);
+        if let Some(action) = menu.and_then(|menu| menu_key(&key.key, menu, selecting)) {
+            self.interaction(action, cx);
+            cx.stop_propagation();
+            return;
         }
         let command = if cfg!(target_os = "macos") {
             key.modifiers.logo
@@ -1384,6 +1369,82 @@ fn font_weight(weight: wire::Weight) -> FontWeight {
         wire::Weight::ExtraBold => FontWeight::EXTRA_BOLD,
         wire::Weight::Black => FontWeight::BLACK,
     }
+}
+
+/// While a menu floats, the keyboard walks it — unless a selection stands.
+/// The format menu over a selection is a mouse toolbar, as Tiptap's bubble
+/// menu is: arrows and Enter keep editing the selection. Escape always
+/// dismisses.
+fn menu_key(
+    key: &wire::keyboard::Key,
+    menu: &wire::editor_presentation::EditorMenu,
+    selecting: bool,
+) -> Option<EditorInteraction> {
+    use wire::keyboard::{Key, Named};
+    let last = menu.items.len().saturating_sub(1) as u32;
+    match key {
+        Key::Named(Named::Escape) => Some(EditorInteraction::MenuDismiss),
+        Key::Named(Named::ArrowUp) if !selecting => Some(EditorInteraction::MenuSelect {
+            index: menu.selected.saturating_sub(1),
+        }),
+        Key::Named(Named::ArrowDown) if !selecting => Some(EditorInteraction::MenuSelect {
+            index: (menu.selected + 1).min(last),
+        }),
+        Key::Named(Named::Enter) if !selecting => {
+            menu.items
+                .get(menu.selected as usize)
+                .map(|item| EditorInteraction::MenuPick {
+                    tag: item.tag.clone(),
+                })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn a_menu_owns_the_walking_keys_only_over_a_bare_caret() {
+    use wire::editor_presentation::{EditorMenu, EditorMenuAnchor, EditorMenuItem};
+    use wire::keyboard::{Key, Named};
+    let menu = EditorMenu {
+        anchor: EditorMenuAnchor::Caret,
+        items: vec![
+            EditorMenuItem {
+                tag: "bold".into(),
+                label: "Bold".into(),
+            },
+            EditorMenuItem {
+                tag: "italic".into(),
+                label: "Italic".into(),
+            },
+        ],
+        selected: 1,
+    };
+    let down = Key::Named(Named::ArrowDown);
+    let enter = Key::Named(Named::Enter);
+    let escape = Key::Named(Named::Escape);
+    assert_eq!(
+        menu_key(&down, &menu, false),
+        Some(EditorInteraction::MenuSelect { index: 1 }),
+        "the walk stops at the last item"
+    );
+    assert_eq!(
+        menu_key(&Key::Named(Named::ArrowUp), &menu, false),
+        Some(EditorInteraction::MenuSelect { index: 0 })
+    );
+    assert_eq!(
+        menu_key(&enter, &menu, false),
+        Some(EditorInteraction::MenuPick {
+            tag: "italic".into()
+        })
+    );
+    assert_eq!(menu_key(&down, &menu, true), None);
+    assert_eq!(menu_key(&enter, &menu, true), None);
+    assert_eq!(
+        menu_key(&escape, &menu, true),
+        Some(EditorInteraction::MenuDismiss)
+    );
+    assert_eq!(menu_key(&Key::Character("a".into()), &menu, false), None);
 }
 
 fn key_state(key: &Keystroke) -> wire::keyboard::KeyState {

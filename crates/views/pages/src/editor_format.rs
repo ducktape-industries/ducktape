@@ -11,6 +11,7 @@ pub enum Wrap {
     Bold,
     Italic,
     Strike,
+    Underline,
     Code,
     Highlight,
 }
@@ -21,6 +22,7 @@ impl Wrap {
             Wrap::Bold => "**",
             Wrap::Italic => "*",
             Wrap::Strike => "~~",
+            Wrap::Underline => "++",
             Wrap::Code => "`",
             Wrap::Highlight => "==",
         }
@@ -32,6 +34,7 @@ impl Wrap {
             "bold" => Wrap::Bold,
             "italic" => Wrap::Italic,
             "strike" => Wrap::Strike,
+            "underline" => Wrap::Underline,
             "code" => Wrap::Code,
             "highlight" => Wrap::Highlight,
             _ => return None,
