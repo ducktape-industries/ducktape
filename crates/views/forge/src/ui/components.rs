@@ -282,11 +282,13 @@ impl ForgeView {
             }
             _ => {}
         }
+        // the code body GROWS into what the header leaves, rather than
+        // taking the pane's full height and overflowing by the header's row
         let body = match code {
             true => native::sized(
                 native::spaced(native::column("forge/file-body", content), 10.),
                 Some(wire::Length::Fill),
-                Some(wire::Length::Fill),
+                Some(wire::Length::FillPortion(1)),
             ),
             false => native::scroll(
                 "forge/file-scroll",

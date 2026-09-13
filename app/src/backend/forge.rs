@@ -596,20 +596,21 @@ impl gpui_kit::Render for CodeView {
         if self.source.is_empty() {
             return div().p_3().child("This file is empty.").into_any_element();
         }
-        // the reader fills whatever height its pane gives it and scrolls
-        // inside; the pane, not the file's line count, sizes it
+        // the reader takes whatever height its pane leaves it and scrolls
+        // inside; the pane, not the file's line count, sizes it. Grown, not
+        // 100%: a percentage would count the header's row twice.
         div()
             .flex()
             .flex_col()
-            .flex_1()
+            .size_full()
             .min_h_0()
-            .w_full()
             .child(
                 gpui_kit::component::input::Editor::new(&self.state)
                     .readonly(true)
                     .bordered(false)
-                    .h(relative(1.))
-                    .aria_label(format!("Code: {}", self.path)),
+                    .aria_label(format!("Code: {}", self.path))
+                    .flex_1()
+                    .min_h_0(),
             )
             .into_any_element()
     }
