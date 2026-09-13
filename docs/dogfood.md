@@ -57,6 +57,9 @@ ducktape home, that workspace's `http_listen` in its `node.toml`, failing if
 neither resolves (the home is `$DUCKTAPE_HOME` when set, else `~/.ducktape`),
 registers a normal git remote `ducktape-dev` at `<base>/forge/ducktape`,
 fetches `origin/dev`, and reconciles it with the forge's `refs/heads/dev`.
+An HTTP 413 splits the push at ancestor commits and retries smaller portions
+of history. Accepted ancestors remain on Forge if a later push fails; rerunning
+resumes from that tip. A single oversized commit or merge fails with a diagnostic.
 It fast-forwards when possible, retains a Forge descendant, or joins equal-tree
 divergence with a two-parent bridge; differing-tree divergence fails. It reads
 the Forge ref back and verifies the selected tip. Repo creation is the first push — no separate
