@@ -607,13 +607,7 @@ impl ForgeView {
                 "Link copied".into(),
             )),
         ));
-        let mut title = native::wrapping(native::weighted(
-            native::text_size(native::text("forge/item-title", &self.forge_item_title), 20.),
-            wire::Weight::Semibold,
-        ));
-        if let wire::Node::Text { options, .. } = &mut title {
-            options.line_height = Some(wire::LineHeight::Relative(1.3));
-        }
+        let title = native::wrapping(native::title("forge/item-title", &self.forge_item_title));
         native::spaced(
             native::column(
                 "forge/item-head",
