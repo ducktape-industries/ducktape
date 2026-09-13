@@ -14,6 +14,45 @@ pub enum Inline {
     Link,
     /// `@name` — a member named in the prose.
     Mention,
+    /// `<span style="color:#rrggbb">text</span>` — Tiptap's colour mark in
+    /// the form it serializes to; the packed `0xRRGGBB`.
+    Color(u32),
+}
+
+const COLOR_OPEN: &str = "<span style=\"color:#";
+const COLOR_CLOSE: &str = "</span>";
+
+/// If `rest` opens a colour span with a non-empty body: the opener, body and
+/// closer byte lengths, and the colour.
+fn color_span(rest: &str) -> Option<(usize, usize, usize, u32)> {
+    let hex = rest.strip_prefix(COLOR_OPEN)?;
+    let digits = hex.get(..6)?;
+    if !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let rgb = u32::from_str_radix(digits, 16).ok()?;
+    let body = hex[6..].strip_prefix("\">")?;
+    let len = body.find(COLOR_CLOSE)?;
+    if len == 0 {
+        return None;
+    }
+    Some((COLOR_OPEN.len() + 8, len, COLOR_CLOSE.len(), rgb))
+}
+
+/// The colour span whose source holds `column`: its whole source and its body.
+pub fn color_span_at(line: &str, column: usize) -> Option<(Range<usize>, Range<usize>)> {
+    line.match_indices(COLOR_OPEN).find_map(|(at, _)| {
+        let (open, body, close, _) = color_span(&line[at..])?;
+        let source = at..at + open + body + close;
+        source
+            .contains(&column)
+            .then(|| (source.clone(), at + open..at + open + body))
+    })
+}
+
+/// The source of a colour span around `text`.
+pub fn color_source(rgb: u32, text: &str) -> String {
+    format!("{COLOR_OPEN}{rgb:06x}\">{text}{COLOR_CLOSE}")
 }
 
 /// The fences the inline grammar knows, longest first so `**` is never read
@@ -31,7 +70,7 @@ const FENCES: &[(&str, Inline)] = &[
 
 /// The bytes that can open a mark. Ordinary prose is skipped in one scan
 /// instead of retrying every delimiter at every character.
-const OPENERS: &[char] = &['*', '_', '~', '+', '=', '`', 'h', '@'];
+const OPENERS: &[char] = &['*', '_', '~', '+', '=', '`', 'h', '@', '<'];
 
 /// Byte-ranged mirror of `chat::client::inline_spans`, minus its account
 /// tokens: bare `http(s)://` runs, then the fences above, then `@name`
@@ -58,6 +97,14 @@ pub fn inline_marks(line: &str) -> Vec<(Range<usize>, Inline)> {
         if let Some(len) = mention_len(line, at) {
             marks.push((at..at + len, Inline::Mention));
             at += len;
+            continue;
+        }
+        if let Some((open, body, close, rgb)) = color_span(rest) {
+            let body = at + open..at + open + body;
+            marks.push((at..body.start, Inline::Marker));
+            marks.push((body.clone(), Inline::Color(rgb)));
+            marks.push((body.end..body.end + close, Inline::Marker));
+            at = body.end + close;
             continue;
         }
         let fence = FENCES

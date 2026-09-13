@@ -234,7 +234,7 @@ fn the_reserved_line_carries_the_gap_and_keeps_its_own_padding() {
 #[test]
 fn strike_code_highlight_and_mentions_paint_their_own_runs() {
     use pages_view::inline::{Inline, inline_marks};
-    let line = "a ~~gone~~ ++under++ `code` ==mark== @alice me@host.io done";
+    let line = "a ~~gone~~ ++under++ `code` ==mark== @alice me@host.io <span style=\"color:#ff0000\">red</span> done";
     let marks: Vec<_> = inline_marks(line)
         .into_iter()
         .filter(|(_, kind)| *kind != Inline::Marker)
@@ -248,6 +248,7 @@ fn strike_code_highlight_and_mentions_paint_their_own_runs() {
             ("code", Inline::Code),
             ("mark", Inline::Highlight),
             ("@alice", Inline::Mention),
+            ("red", Inline::Color(0xff0000)),
         ]
     );
     let text = format!("Title\n{line}");
@@ -284,6 +285,11 @@ fn strike_code_highlight_and_mentions_paint_their_own_runs() {
     assert!(format_of("code").background.is_some());
     assert!(format_of("mark").background.is_some());
     assert_ne!(format_of("@alice").color, format_of("done").color);
+    assert_eq!(
+        format_of("red").color,
+        Some(wire::Rgba([1.0, 0.0, 0.0, 1.0])),
+        "a colour span paints its own ink"
+    );
     let visible: String = paint
         .spans
         .iter()
@@ -291,5 +297,5 @@ fn strike_code_highlight_and_mentions_paint_their_own_runs() {
         .filter(|span| paint.formats[span.format as usize].size.unwrap_or(14.0) > 1.0)
         .map(|span| &line[span.start as usize..span.end as usize])
         .collect();
-    assert_eq!(visible, "a gone under code mark @alice me@host.io done");
+    assert_eq!(visible, "a gone under code mark @alice me@host.io red done");
 }

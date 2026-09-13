@@ -132,6 +132,36 @@ pub fn toggle(document: &Doc, wrap: Wrap) -> EditorDecision {
     finish(document, selected(&next, start..start + body.len()))
 }
 
+/// Tiptap's colour mark over the target, in the form it serializes to. A
+/// target already inside a colour span is re-tinted in place; `None` strips
+/// the span and keeps its text.
+pub fn color(document: &Doc, rgb: Option<u32>) -> EditorDecision {
+    let range = target(document);
+    if on_title(document, &range) || crosses_lines(document, &range) {
+        return EditorDecision::Noop;
+    }
+    let position = document.position_at(range.start);
+    let line_start = range.start - position.column as usize;
+    let line = document.line(position.line as usize).unwrap_or_default();
+    let existing = inline::color_span_at(line, position.column as usize);
+    let (strip, body) = match existing {
+        Some((source, body)) => (
+            line_start + source.start..line_start + source.end,
+            line_start + body.start..line_start + body.end,
+        ),
+        None => (range.clone(), range),
+    };
+    let inner = document.text[body].to_owned();
+    let replacement = match rgb {
+        Some(rgb) => inline::color_source(rgb, &inner),
+        None => inner.clone(),
+    };
+    let start = strip.start + replacement.len() - inner.len() - rgb.map_or(0, |_| "</span>".len());
+    let mut next = document.clone();
+    next.text.replace_range(strip, &replacement);
+    finish(document, selected(&next, start..start + inner.len()))
+}
+
 fn crosses_lines(document: &Doc, range: &Range<usize>) -> bool {
     document.text[range.clone()].contains('\n')
 }

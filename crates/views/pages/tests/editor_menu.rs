@@ -208,12 +208,30 @@ fn cmd_slash_opens_the_format_menu_at_the_caret_and_its_picks_wrap_the_selection
             "underline",
             "code",
             "highlight",
+            "color",
             "link",
             "comment",
             "turn",
             "clear"
         ]
     );
+    let (decision, palette) = state.pick(&selection, "color");
+    assert_eq!(decision, EditorDecision::Noop);
+    let colors = palette.current(&selection).unwrap();
+    assert_eq!(
+        colors.line, None,
+        "the palette floats where the toolbar did"
+    );
+    assert_eq!(tags(&colors)[..3], ["default", "gray", "brown"]);
+    let (decision, closed) = palette.pick(&selection, "red");
+    let red = apply(&selection, decision);
+    assert_eq!(
+        red.text,
+        "Title\nsome <span style=\"color:#d44c47\">words</span>"
+    );
+    assert!(!closed.is_open());
+    let (decision, _) = palette.pick(&red, "default");
+    assert_eq!(apply(&red, decision).text, "Title\nsome words");
     let (decision, closed) = state.pick(&selection, "highlight");
     assert_eq!(apply(&selection, decision).text, "Title\nsome ==words==");
     assert!(!closed.is_open());

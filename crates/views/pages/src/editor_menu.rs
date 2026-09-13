@@ -306,10 +306,26 @@ const FORMAT_ITEMS: &[(&str, &str)] = &[
     ("underline", "Underline"),
     ("code", "Code"),
     ("highlight", "Highlight"),
+    ("color", "Text color"),
     ("link", "Link"),
     ("comment", "Comment"),
     ("turn", "Turn into…"),
     ("clear", "Clear formatting"),
+];
+
+/// The colour submenu: the Notion palette Tiptap's template ships, as the
+/// `0xRRGGBB` each colour span is written with. Default strips the span.
+const COLORS: &[(&str, &str, Option<u32>)] = &[
+    ("default", "Default", None),
+    ("gray", "Gray", Some(0x787774)),
+    ("brown", "Brown", Some(0x9f6b53)),
+    ("orange", "Orange", Some(0xd9730d)),
+    ("yellow", "Yellow", Some(0xcb912f)),
+    ("green", "Green", Some(0x448361)),
+    ("blue", "Blue", Some(0x337ea9)),
+    ("purple", "Purple", Some(0x9065b0)),
+    ("pink", "Pink", Some(0xc14c8a)),
+    ("red", "Red", Some(0xd44c47)),
 ];
 
 /// The link popover: what a press on a link offers instead of navigating.
@@ -411,6 +427,10 @@ enum Kind {
     Format {
         line: usize,
     },
+    /// The toolbar's colour palette over the selection on `line`.
+    Color {
+        line: usize,
+    },
     /// The popover over the link at `column` of `line`.
     Link {
         line: usize,
@@ -510,6 +530,13 @@ impl Menu {
             Kind::Block { line } => (Some(line), block_items(document, line)?),
             Kind::Turn { line } => (Some(line), turn_items("")),
             Kind::Format { .. } => (None, owned(FORMAT_ITEMS)),
+            Kind::Color { .. } => (
+                None,
+                COLORS
+                    .iter()
+                    .map(|(tag, label, _)| ((*tag).to_owned(), (*label).to_owned()))
+                    .collect(),
+            ),
             Kind::Link { line, .. } => (Some(line), owned(LINK_ITEMS)),
             Kind::Mention { line, strip } => (
                 None,
@@ -575,7 +602,11 @@ impl Menu {
                 self.retain_filter(document)
             }
             Some(
-                Kind::Block { .. } | Kind::Turn { .. } | Kind::Format { .. } | Kind::Link { .. },
+                Kind::Block { .. }
+                | Kind::Turn { .. }
+                | Kind::Format { .. }
+                | Kind::Color { .. }
+                | Kind::Link { .. },
             ) => self.close(),
         }
     }
@@ -659,6 +690,13 @@ impl Menu {
             Kind::Turn { line } => (turn(document, line, tag), self.closed()),
             Kind::Block { line } => self.pick_block(document, line, tag),
             Kind::Format { line } => self.pick_format(document, line, tag),
+            Kind::Color { .. } => {
+                let rgb = COLORS
+                    .iter()
+                    .find(|(name, _, _)| *name == tag)
+                    .and_then(|(_, _, rgb)| *rgb);
+                (crate::format::color(document, rgb), self.closed())
+            }
             Kind::Link { line, column } => {
                 let decision = match tag {
                     "unlink" => crate::format::unlink(document, line, column),
@@ -723,6 +761,9 @@ impl Menu {
     fn pick_format(&self, document: &Doc, line: usize, tag: &str) -> (EditorDecision, Self) {
         if tag == "turn" {
             return (EditorDecision::Noop, self.reopen(Kind::Turn { line }));
+        }
+        if tag == "color" {
+            return (EditorDecision::Noop, self.reopen(Kind::Color { line }));
         }
         let decision = match (tag, crate::format::Wrap::from_tag(tag)) {
             (_, Some(wrap)) => crate::format::toggle(document, wrap),

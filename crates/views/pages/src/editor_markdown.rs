@@ -139,6 +139,8 @@ pub struct Style {
     pub code: bool,
     pub highlight: bool,
     pub mention: bool,
+    /// A colour span's packed `0xRRGGBB`: the ink it asks for over any other.
+    pub color: Option<u32>,
     pub commented: bool,
     /// A checked todo's content — muted and struck through.
     pub done: bool,
@@ -461,6 +463,10 @@ fn highlight(
                 mention: true,
                 ..style
             },
+            Inline::Color(rgb) => Style {
+                color: Some(rgb),
+                ..style
+            },
         };
         marks.push((shifted, Mark::Body(inline_style)));
     }
@@ -511,6 +517,12 @@ fn ink(dark: bool) -> Ink {
         tick_fill: Color(p.accent),
         tick_mark: Color(p.background),
     }
+}
+
+/// A colour span's packed `0xRRGGBB` as opaque ink.
+fn hex_color(rgb: u32) -> Color {
+    let channel = |shift: u32| ((rgb >> shift) & 0xff) as f32 / 255.0;
+    Color([channel(16), channel(8), channel(0), 1.0])
 }
 
 fn body_font(weight: Weight, style: FontStyle) -> Font {
@@ -759,12 +771,13 @@ fn body_format(style: Style, ink: &Ink) -> Format {
         true => FontStyle::Italic,
         false => FontStyle::Normal,
     };
-    let color = if style.link || style.mention {
-        Some(ink.link)
-    } else if style.done || style.quote || style.divider {
-        Some(ink.muted)
-    } else {
-        None
+    let linked = style.link || style.mention;
+    let muted = style.done || style.quote || style.divider;
+    let color = match (style.color, linked, muted) {
+        (Some(rgb), _, _) => Some(hex_color(rgb)),
+        (None, true, _) => Some(ink.link),
+        (None, false, true) => Some(ink.muted),
+        (None, false, false) => None,
     };
     let font = match style.code {
         true => code_font(),

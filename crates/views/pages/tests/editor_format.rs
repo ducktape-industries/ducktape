@@ -97,6 +97,47 @@ fn every_wrap_round_trips_through_the_inline_grammar() {
     }
 }
 
+/// Tiptap's colour mark: the span it serializes to wraps the target, a second
+/// colour re-tints that span in place, and Default strips it.
+#[test]
+fn a_colour_wraps_retints_and_strips_around_the_target() {
+    let before = selected("Title\nsome words here", 1, 5, 10);
+    let red = apply(&before, format::color(&before, Some(0xd44c47)));
+    assert_eq!(
+        red.text,
+        "Title\nsome <span style=\"color:#d44c47\">words</span> here"
+    );
+    assert_eq!(red.cursor.selection, Some(EditorPosition::new(1, 33)));
+    assert_eq!(red.cursor.position.column, 38);
+    let line = red.line_text(1);
+    let marks: Vec<_> = inline_marks(&line)
+        .into_iter()
+        .map(|(range, kind)| (line[range].to_owned(), kind))
+        .collect();
+    assert_eq!(
+        marks[1],
+        ("words".to_owned(), Inline::Color(0xd44c47)),
+        "{marks:?}"
+    );
+    assert_eq!(marks[0].1, Inline::Marker);
+    assert_eq!(marks[2].1, Inline::Marker);
+    // The caret alone inside the span is enough to re-tint the whole run.
+    let inside = doc(&red.text, 1, 34);
+    let blue = apply(&inside, format::color(&inside, Some(0x337ea9)));
+    assert_eq!(
+        blue.text,
+        "Title\nsome <span style=\"color:#337ea9\">words</span> here"
+    );
+    let plain = apply(&blue, format::color(&blue, None));
+    assert_eq!(plain.text, before.text);
+    assert_eq!(plain.cursor, before.cursor);
+    assert_eq!(
+        format::color(&doc("Title\nbody", 0, 2), Some(0xd44c47)),
+        EditorDecision::Noop,
+        "the title takes no colour"
+    );
+}
+
 #[test]
 fn the_title_and_a_multi_line_selection_take_no_marks() {
     let title = selected("Title\nbody", 0, 0, 5);
