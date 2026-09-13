@@ -1545,19 +1545,12 @@ pub fn forge_parent(path: &str) -> String {
     }
 }
 
-/// The reader header's path, gated on the directory AND revision the file
-/// was opened under: a preview opened in another directory or an older
-/// commit was retired by that move.
-pub fn forge_file_header(
-    opened_dir: &str,
-    opened_rev: &str,
-    dir: &str,
-    rev: &str,
-    path: &str,
-) -> String {
-    let same_place = opened_dir == dir;
+/// The reader header's path, gated on the revision the file was opened
+/// under: a preview opened at an older commit was retired by the branch
+/// move. Unfolding another directory in the tree retires nothing.
+pub fn forge_file_header(opened_rev: &str, rev: &str, path: &str) -> String {
     let same_commit = opened_rev == rev;
-    match same_place && same_commit {
+    match same_commit {
         true => path.to_owned(),
         false => String::new(),
     }

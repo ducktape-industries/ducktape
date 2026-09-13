@@ -118,6 +118,8 @@ impl super::ForgeView {
             ::std::convert::AsRef::as_ref(&(self.tree_path)),
         );
         self.tree_entries = Vec::new();
+        self.tree_children.clear();
+        self.tree_open.clear();
         self.tree_truncated = false;
         self.tree_phase = "loading".to_owned();
         self.focus_rev = "".to_owned();
@@ -248,6 +250,10 @@ impl super::ForgeView {
         self.tree_born = next.born;
         self.tree_entries = next.entries.clone();
         self.tree_truncated = next.truncated;
+        self.tree_children
+            .insert(next.path.clone(), next.entries.clone());
+        self.unfold_to(&next.path);
+        self.request_missing_dir();
         if (self.focus_path).is_empty() {
             return ::ducktape_view_guest::Task::none();
         }
@@ -323,6 +329,8 @@ impl super::ForgeView {
         self.tree_path = "".to_owned();
         self.tree_rev = "".to_owned();
         self.tree_entries = Vec::new();
+        self.tree_children.clear();
+        self.tree_open.clear();
         self.tree_born = false;
         self.tree_truncated = false;
         self.tree_phase = "loading".to_owned();
@@ -353,6 +361,8 @@ impl super::ForgeView {
         self.tree_path = "".to_owned();
         self.tree_rev = "".to_owned();
         self.tree_entries = Vec::new();
+        self.tree_children.clear();
+        self.tree_open.clear();
         self.tree_born = false;
         self.tree_truncated = false;
         self.tree_phase = "loading".to_owned();
@@ -378,6 +388,8 @@ impl super::ForgeView {
         self.tree_pick = name.to_owned();
         self.tree_path = "".to_owned();
         self.tree_entries = Vec::new();
+        self.tree_children.clear();
+        self.tree_open.clear();
         self.tree_truncated = false;
         self.tree_phase = "loading".to_owned();
         self.tree_rev = head.to_owned();
@@ -387,17 +399,55 @@ impl super::ForgeView {
         if (!self.connected) || (self.open_repo).is_empty() {
             return ::ducktape_view_guest::Task::none();
         }
-        self.tree_path = path.to_owned();
+        // a fold takes the directories under it along, so it reopens folded
+        let folded = !self.tree_open.contains(&path);
+        match folded {
+            true => self.tree_open.push(path),
+            false => self
+                .tree_open
+                .retain(|open| open != &path && !open.starts_with(&format!("{path}/"))),
+        }
+        self.request_missing_dir();
+        ::ducktape_view_guest::Task::none()
+    }
+    /// Unfold `dir` and every directory above it, so a listing that arrived
+    /// for a deep link is on screen.
+    fn unfold_to(&mut self, dir: &str) {
+        let mut prefix = String::new();
+        for segment in dir.split('/').filter(|segment| !segment.is_empty()) {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(segment);
+            if !self.tree_open.contains(&prefix) {
+                self.tree_open.push(prefix.clone());
+            }
+        }
+    }
+    /// Ask the host for the first unfolded directory not read yet, the root
+    /// before any other; one listing travels at a time.
+    fn request_missing_dir(&mut self) {
+        let missing = std::iter::once("")
+            .chain(self.tree_open.iter().map(String::as_str))
+            .find(|dir| !self.tree_children.contains_key(*dir))
+            .map(str::to_owned);
+        let Some(dir) = missing else {
+            return;
+        };
+        let already_asked = dir == self.tree_path && self.tree_phase == "loading";
+        if already_asked {
+            return;
+        }
+        self.tree_path = dir;
         self.tree_entries = Vec::new();
         self.tree_truncated = false;
         self.tree_phase = "loading".to_owned();
-        ::ducktape_view_guest::Task::none()
     }
     fn on_forge_open_file(&mut self, path: String) -> ducktape_view_guest::Task<Message> {
         if (!self.connected) || (self.open_repo).is_empty() {
             return ::ducktape_view_guest::Task::none();
         }
-        self.opened_dir = self.tree_path.to_owned();
+        self.opened_dir = crate::host::forge_parent(&path);
         self.opened_rev = self.tree_rev.to_owned();
         self.file_path = path.to_owned();
         self.file_text.clear();

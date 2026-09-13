@@ -2360,6 +2360,8 @@ mod close_tests {
                 assert_eq!(theme.mono_font_family.as_ref(), design::fonts::FAMILY_MONO);
                 assert_eq!(theme.radius, gpui_kit::px(design::radius::CONTROL as f32));
                 assert_eq!(theme.radius_lg, gpui_kit::px(design::radius::CARD as f32));
+                assert_eq!(theme.highlight_theme.appearance, mode);
+                assert_eq!(theme.highlight_theme.style.editor_background, Some(theme.background));
                 let background: gpui_kit::Rgba = theme.background.into();
                 let [r, g, b, _] = palette.background;
                 let close = |a: f32, b: f32| (a - b).abs() < 1.5 / 255.;
@@ -2689,8 +2691,16 @@ fn configure_native_theme(cx: &mut gpui_kit::App) {
             .load_themes_from_str(&design::kit_theme_json())
             .expect("the product theme parses");
     }
-    let light = registry.themes()[design::LIGHT_THEME].clone();
-    let dark = registry.themes()[design::DARK_THEME].clone();
+    let light = with_syntax_colors(
+        &registry.themes()[design::LIGHT_THEME],
+        registry.default_light_theme(),
+        &design::LIGHT,
+    );
+    let dark = with_syntax_colors(
+        &registry.themes()[design::DARK_THEME],
+        registry.default_dark_theme(),
+        &design::DARK,
+    );
     let theme = Theme::global_mut(cx);
     theme.light_theme = light;
     theme.dark_theme = dark;
@@ -2699,6 +2709,23 @@ fn configure_native_theme(cx: &mut gpui_kit::App) {
 }
 
 /// A palette color as the kit paints it.
+/// The product theme carrying the kit's default syntax colors for its mode.
+/// The product JSON names no highlight block, and `Theme::apply_config`
+/// keeps whatever highlight theme it last saw when a config has none — a
+/// light syntax palette and a light editor on a dark window. The editor
+/// paints on the window background, so a code reader sits flush in its pane.
+fn with_syntax_colors(
+    product: &std::rc::Rc<gpui_kit::component::ThemeConfig>,
+    defaults: &std::rc::Rc<gpui_kit::component::ThemeConfig>,
+    palette: &design::Palette,
+) -> std::rc::Rc<gpui_kit::component::ThemeConfig> {
+    let mut theme = (**product).clone();
+    let mut style = defaults.highlight.clone().unwrap_or_default();
+    style.editor_background = Some(hsla_of(palette.background));
+    theme.highlight = Some(style);
+    std::rc::Rc::new(theme)
+}
+
 fn hsla_of(color: design::Color) -> gpui_kit::Hsla {
     let [r, g, b, a] = color;
     gpui_kit::Rgba { r, g, b, a }.into()

@@ -519,7 +519,7 @@ impl CodeView {
             let mut state = gpui_kit::component::input::EditorState::new(window, cx)
                 .language(language)
                 .line_number(true);
-            state.set_value(source.clone(), window, cx);
+            state.set_value(expand_tabs(&source), window, cx);
             state
         });
         Self {
@@ -545,6 +545,33 @@ impl CodeView {
         cx.notify();
     }
 }
+/// Tabs as spaces to the next 4-column stop. Neither the editor nor the text
+/// shaper expands a tab: it draws as the font's tab glyph, one space wide,
+/// so a tab-indented file loses its indentation.
+pub(crate) fn expand_tabs(source: &str) -> String {
+    const STOP: usize = 4;
+    let mut out = String::with_capacity(source.len());
+    let mut column = 0;
+    for ch in source.chars() {
+        match ch {
+            '\t' => {
+                let width = STOP - column % STOP;
+                out.extend(std::iter::repeat_n(' ', width));
+                column += width;
+            }
+            '\n' => {
+                out.push(ch);
+                column = 0;
+            }
+            _ => {
+                out.push(ch);
+                column += 1;
+            }
+        }
+    }
+    out
+}
+
 fn language_name(path: &str) -> String {
     match code_token(path).as_str() {
         "rs" => "rust",
@@ -569,13 +596,21 @@ impl gpui_kit::Render for CodeView {
         if self.source.is_empty() {
             return div().p_3().child("This file is empty.").into_any_element();
         }
-        gpui_kit::component::input::Editor::new(&self.state)
-            .readonly(true)
-            .bordered(false)
-            .h(px(
-                (self.source.lines().count().max(1) as f32 * 20.0).min(800.0)
-            ))
-            .aria_label(format!("Code: {}", self.path))
+        // the reader fills whatever height its pane gives it and scrolls
+        // inside; the pane, not the file's line count, sizes it
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(
+                gpui_kit::component::input::Editor::new(&self.state)
+                    .readonly(true)
+                    .bordered(false)
+                    .h(relative(1.))
+                    .aria_label(format!("Code: {}", self.path)),
+            )
             .into_any_element()
     }
 }

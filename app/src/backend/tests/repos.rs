@@ -23,6 +23,14 @@ fn highlight_ranges_hold_char_boundaries_on_real_sources() {
 }
 
 #[test]
+fn forge_code_expands_tabs_to_the_next_stop() {
+    assert_eq!(expand_tabs("\tx\n\t\ty"), "    x\n        y");
+    assert_eq!(expand_tabs("ab\tc"), "ab  c");
+    assert_eq!(expand_tabs("abcd\tc"), "abcd    c");
+    assert_eq!(expand_tabs("한\tc"), "한   c");
+}
+
+#[test]
 fn forge_code_tokens_follow_the_path_and_rust_really_colors() {
     use gpui_kit::component::{
         Rope,
