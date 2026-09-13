@@ -1553,11 +1553,6 @@ impl DesktopWindow {
             (ShellTab::Governance, "Governance"),
             (ShellTab::Settings, "Settings"),
         ];
-        let title = navigation
-            .iter()
-            .find(|(tab, _)| *tab == selected_tab)
-            .map(|(_, label)| *label)
-            .expect("native navigation covers every shell tab");
         let (sidebar, popover) = {
             let theme = gpui_kit::component::Theme::global(cx);
             (theme.sidebar, theme.popover)
@@ -1571,9 +1566,18 @@ impl DesktopWindow {
         let ink_border = hsla_of(palette.sidebar_border);
         let faint = hsla_of(palette.faint);
         let live = state.connected;
+        let bell_unread = state.bell_unread;
+        // Who is signed in, as the rail's foot shows it.
+        let (who, whose_key) = crate::backend::rail_identity(
+            state.account_exists,
+            &state.account_name,
+            &state.account_number,
+            &state.signer_key,
+        );
         // The sidebar is the ink rail: it carries the network — its name,
-        // whether it is live, the way to another one — and the navigation.
-        // The header then only names the screen.
+        // whether it is live, the way to another one — the search and the
+        // bell, the navigation, and at its foot the signed-in account. There
+        // is no header: the screen is the module's own.
         let network = self
             .action("switch-network", "", Message::SwitchNetwork, false)
             .ghost()
@@ -1632,6 +1636,71 @@ impl DesktopWindow {
                     ),
             );
         let reserve_traffic_lights = cfg!(target_os = "macos") && !window.is_fullscreen();
+        let mut modifiers = Modifiers::default();
+        if cfg!(target_os = "macos") {
+            modifiers.platform = true;
+        } else {
+            modifiers.control = true;
+        }
+        let shortcut = if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl K" };
+        let ink = RailInk {
+            fg: ink_fg,
+            muted: ink_muted,
+            raised: ink_raised,
+        };
+        let search = rail_row(
+            "rail-search",
+            gpui_kit::component::Icon::new(gpui_kit::component::IconName::Search),
+            "Search",
+            ink,
+            false,
+            live,
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(11.))
+                .text_color(ink_muted)
+                .child(shortcut),
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            cx.stop_propagation();
+            this.model.update(cx, |model, cx| {
+                model.dispatch(
+                    Message::GlobalKeyPressed(KeyPress {
+                        key: "k".into(),
+                        modifiers,
+                    }),
+                    cx,
+                )
+            });
+        }));
+        let bell_label = match bell_unread {
+            0 => "Notifications".to_owned(),
+            unread => format!("Notifications ({unread})"),
+        };
+        let bell = rail_row(
+            "rail-bell",
+            gpui_kit::component::Icon::new(gpui_kit::component::IconName::Bell),
+            bell_label,
+            ink,
+            false,
+            live,
+        )
+        .when(bell_unread > 0, |row| {
+            row.child(
+                div()
+                    .flex_shrink_0()
+                    .size(px(6.))
+                    .rounded_full()
+                    .bg(accent),
+            )
+        })
+        .on_click(cx.listener(move |this, _, _, cx| {
+            cx.stop_propagation();
+            this.model
+                .update(cx, |model, cx| model.dispatch(Message::ToggleBell, cx));
+        }));
         let mut tabs = div()
             .id("workspace-rail")
             .flex()
@@ -1659,7 +1728,9 @@ impl DesktopWindow {
                 )
             })
             .child(network)
-            .child(div().h_3().flex_shrink_0());
+            .child(div().h_2().flex_shrink_0())
+            .child(search)
+            .child(bell);
         for (tab, label) in navigation {
             let section = match tab {
                 ShellTab::Chat => Some("Workspace"),
@@ -1683,35 +1754,14 @@ impl DesktopWindow {
                 );
             }
             let selected = tab == selected_tab;
-            // A nav row is its own element, not a kit button: the kit centres
-            // a button's content and a rail reads left-aligned.
-            let row = div()
-                .id(label)
-                .flex()
-                .items_center()
-                .gap_2()
-                .h(px(28.))
-                .px_2()
-                .mb_0p5()
-                .rounded(px(design::radius::CONTROL as f32))
-                .cursor_pointer()
-                .text_size(px(13.))
-                .font_weight(if selected {
-                    FontWeight::MEDIUM
-                } else {
-                    FontWeight::NORMAL
-                })
-                .text_color(if selected { ink_fg } else { ink_muted })
-                .when(selected, |row| row.bg(ink_raised))
-                .hover(move |style| style.bg(ink_raised).text_color(ink_fg))
-                .on_click(cx.listener(move |this, _, _, cx| {
+            let row = rail_row(label, nav_icon(tab), label, ink, selected, true).on_click(
+                cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.model.update(cx, |model, cx| {
                         model.dispatch(Message::SelectShellTab(tab), cx)
                     });
-                }))
-                .child(nav_icon(tab).small())
-                .child(div().flex_1().min_w_0().truncate().child(label));
+                }),
+            );
             #[cfg(test)]
             let row = {
                 use gpui_kit::test::TestSupportExt as _;
@@ -1719,82 +1769,63 @@ impl DesktopWindow {
             };
             tabs = tabs.child(row);
         }
-        let state = &self.model.read(cx).state;
-        let mut modifiers = Modifiers::default();
-        if cfg!(target_os = "macos") {
-            modifiers.platform = true;
-        } else {
-            modifiers.control = true;
-        }
-        let shortcut = if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl K" };
-        let bell_label = match state.bell_unread {
-            0 => "Notifications".to_owned(),
-            unread => format!("Notifications ({unread})"),
-        };
-        let header = div()
-            .id("workspace-header")
+        // The foot of the rail: who is signed in. Pressing it opens the
+        // account screen — a sign-in when there is no account yet.
+        let account = div()
+            .id("rail-account")
             .flex()
-            .gap_1p5()
             .items_center()
+            .gap_2()
             .h(px(40.))
-            .flex_shrink_0()
-            .px_3()
-            .border_b_1()
-            .border_color(colors.border)
-            .bg(colors.background)
+            .px_2()
+            .mt_1()
+            .rounded(px(design::radius::CONTROL as f32))
+            .cursor_pointer()
+            .hover(move |style| style.bg(ink_raised))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.model.update(cx, |model, cx| {
+                    model.dispatch(Message::OpenAccountWelcome, cx)
+                });
+            }))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .size(px(24.))
+                    .rounded_full()
+                    .bg(ink_raised)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(ink_fg)
+                    .child(crate::backend::initials_of(&who)),
+            )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(13.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(title),
-            )
-            .child(
-                self.action(
-                    "search",
-                    "Search",
-                    Message::GlobalKeyPressed(KeyPress {
-                        key: "k".into(),
-                        modifiers,
-                    }),
-                    !state.connected,
-                )
-                .outline()
-                .icon(gpui_kit::component::IconName::Search)
-                .h_7()
-                .px_2()
-                .text_size(px(12.))
-                .text_color(colors.muted_foreground)
-                .child(
-                    div()
-                        .ml_1()
-                        .text_size(px(11.))
-                        .text_color(hsla_of(palette.faint))
-                        .child(shortcut),
-                ),
-            )
-            .child(
-                self.action("bell", "", Message::ToggleBell, !state.connected)
-                    .ghost()
-                    .icon(gpui_kit::component::IconName::Bell)
-                    .accessibility_label(bell_label)
-                    .h_7()
-                    .w_7()
-                    .px_0()
-                    .text_color(colors.muted_foreground)
-                    .child(div().relative().when(state.bell_unread > 0, |element| {
-                        element.child(
-                            div()
-                                .absolute()
-                                .top(px(-10.))
-                                .right(px(-12.))
-                                .size(px(6.))
-                                .rounded_full()
-                                .bg(accent),
-                        )
-                    })),
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(ink_fg)
+                            .child(who),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(ink_muted)
+                            .child(whose_key),
+                    ),
             );
+        tabs = tabs.child(account);
+        let state = &self.model.read(cx).state;
         let error = state.error.clone();
         let toast = state.toast.clone();
         let needs_account =
@@ -1807,8 +1838,7 @@ impl DesktopWindow {
             .min_h_0()
             .h_full()
             .overflow_hidden()
-            .bg(colors.background)
-            .child(header);
+            .bg(colors.background);
         if needs_account {
             // A quiet one-line notice: the screen behind it stays the loudest thing.
             content = content.child(
@@ -2738,6 +2768,53 @@ const USERS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24
 const VOTE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 12 2 2 4-4"/><path d="M5 7c0-1.1.9-2 2-2h10a2 2 0 0 1 2 2v12H5V7Z"/><path d="M22 19H2"/></svg>"#;
 
 /// The glyph beside a tab's name in the sidebar.
+/// The ink rail's row colours.
+#[derive(Clone, Copy)]
+struct RailInk {
+    fg: gpui_kit::Hsla,
+    muted: gpui_kit::Hsla,
+    raised: gpui_kit::Hsla,
+}
+
+/// A rail row: an icon and a left-aligned label on a 28px line, the ink
+/// wash on hover and when chosen. Its own element, not a kit button: the
+/// kit centres a button's content and a rail reads left-aligned. The
+/// caller adds the click.
+fn rail_row(
+    id: impl Into<gpui_kit::ElementId>,
+    icon: gpui_kit::component::Icon,
+    label: impl Into<gpui_kit::SharedString>,
+    ink: RailInk,
+    selected: bool,
+    enabled: bool,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    use gpui_kit::component::Sizable as _;
+    use gpui_kit::*;
+    let RailInk { fg, muted, raised } = ink;
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_2()
+        .h(px(28.))
+        .px_2()
+        .mb_0p5()
+        .rounded(px(design::radius::CONTROL as f32))
+        .cursor_pointer()
+        .text_size(px(13.))
+        .font_weight(if selected {
+            FontWeight::MEDIUM
+        } else {
+            FontWeight::NORMAL
+        })
+        .text_color(if selected { fg } else { muted })
+        .when(selected, |row| row.bg(raised))
+        .when(!enabled, |row| row.opacity(0.5))
+        .hover(move |style| style.bg(raised).text_color(fg))
+        .child(icon.small())
+        .child(div().flex_1().min_w_0().truncate().child(label.into()))
+}
+
 fn nav_icon(tab: ShellTab) -> gpui_kit::component::Icon {
     use gpui_kit::component::{Icon, IconName};
     match tab {

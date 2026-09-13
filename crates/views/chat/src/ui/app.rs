@@ -116,6 +116,14 @@ pub struct ChatView {
     pub(crate) copy_head_seq: i64,
     pub(crate) copy_surface: CopySurface,
     pub(crate) chat_viewport_width: f64,
+    pub(crate) chat_viewport_height: f64,
+    /// Where the pointer last pressed, in chat-screen pixels: a message menu
+    /// opens there.
+    pub(crate) press_x: f64,
+    pub(crate) press_y: f64,
+    /// Where the open menu was anchored when it opened.
+    pub(crate) menu_x: f64,
+    pub(crate) menu_y: f64,
     pub(crate) sidebar_width: f64,
     pub(crate) details_width: f64,
     pub(crate) thread_width: f64,
@@ -139,6 +147,7 @@ pub enum Message {
     DetailsResized(f64, f64),
     ThreadResized(f64, f64),
     ChatViewportChanged(f64, f64),
+    PressedAt(f64, f64),
     SessionArrived(crate::host::SessionItem),
     SessionSettled(bool),
     SnapStream(bool),
@@ -285,6 +294,11 @@ impl ChatView {
             copy_head_seq: 0,
             copy_surface: CopySurface::Nowhere,
             chat_viewport_width: 1280.0,
+            chat_viewport_height: 800.0,
+            press_x: 0.0,
+            press_y: 0.0,
+            menu_x: 0.0,
+            menu_y: 0.0,
             sidebar_width: 236.0,
             details_width: 320.0,
             thread_width: 330.0,
@@ -303,7 +317,7 @@ impl ChatView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "97957d3d4452067dd635c9926be2ae75b13900550599c22244d9b402680b9ff5";
+        "56f3386730ee16a2e2822c9384ff066a1362aeb15ce81c9fe835d0c49068fe02";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
@@ -329,6 +343,11 @@ impl ChatView {
     fn validate_snapshot(&self) -> Result<(), String> {
         let widths = [
             self.chat_viewport_width,
+            self.chat_viewport_height,
+            self.press_x,
+            self.press_y,
+            self.menu_x,
+            self.menu_y,
             self.sidebar_width,
             self.details_width,
             self.thread_width,
@@ -508,6 +527,7 @@ mod tests {
             ..Default::default()
         };
         state.selected_message_seq = 1;
+        state.message_action = MessageAction::More;
         let mut tree = state.view();
         let mut headers = 0;
         let mut menus = 0;
@@ -642,71 +662,82 @@ mod tests {
         }
     }
 
-    /// The menu fits a 300px thread pane: one wrapping row of glyph-and-word
-    /// items, the close among them, every word short, and no separate close
-    /// row under it. The timeline's menu adds Reply; the thread's has no
-    /// thread to open.
+    /// The "…" menu is a dropdown floated where the pointer pressed: one
+    /// item a row, full-width, no close row (the backdrop closes it), and
+    /// nothing of it in the stream's flow. The timeline's menu adds Reply;
+    /// the thread's has no thread to open. One menu floats at a time.
     #[test]
-    fn the_message_menu_is_one_row_of_short_glyph_items_with_its_close_inside() {
+    fn the_message_menu_floats_at_the_press_as_a_dropdown() {
         let mut state = ChatView::state();
         state.connected = true;
         state.active_channel = "room".into();
-        state.selected_message_seq = 1;
-        state.message_action = MessageAction::More;
         state.active_thread_seq = 1;
-        state.thread_selected_seq = 1;
-        state.thread_message_action = MessageAction::More;
-        let mut tree = state.view();
-        let mut rows = Vec::new();
-        tree.for_each_mut(&mut |node| match node {
-            wire::Node::Linear {
-                key,
-                wrap,
-                children,
-                ..
-            } if key.ends_with("menu-actions") => {
-                assert!(wrap.is_some(), "{key} wraps inside a narrow pane");
-                let shown: Vec<String> = children
-                    .iter()
-                    .map(|child| match child {
-                        wire::Node::Button {
-                            content: wire::ButtonContent::Label(label),
-                            label: Some(accessible),
-                            ..
-                        } => {
-                            assert!(label.chars().count() <= 9, "{label:?} is not short");
-                            assert!(accessible.len() > label.len(), "{label:?} names itself");
-                            label.clone()
+        state.press_x = 900.0;
+        state.press_y = 300.0;
+        let menu_of = |state: &ChatView, focus: &str| -> Vec<String> {
+            let mut tree = state.view();
+            let mut floats = 0;
+            let mut items = Vec::new();
+            tree.for_each_mut(&mut |node| match node {
+                wire::Node::Float { key, content, .. } => {
+                    assert!(key.ends_with("/floating-menu"), "{key}");
+                    let mut frames = 0;
+                    content.for_each_mut(&mut |inner| {
+                        if let wire::Node::Container { key, .. } = inner
+                            && key.ends_with(focus)
+                        {
+                            frames += 1;
                         }
-                        other => panic!("a labelled button, got {other:?}"),
-                    })
-                    .collect();
-                rows.push((key.clone(), shown));
-            }
-            wire::Node::Linear { key, .. } => assert!(!key.ends_with("close-row")),
-            _ => {}
-        });
-        let [(timeline, timeline_items), (thread, thread_items)] = rows.as_slice() else {
-            panic!("one menu per pane, got {rows:?}");
+                    });
+                    assert_eq!(frames, 1, "the float carries the {focus} frame");
+                    floats += 1;
+                }
+                wire::Node::Linear { key, children, .. } if key.ends_with("menu-actions") => {
+                    for child in children {
+                        let wire::Node::Button {
+                            content: wire::ButtonContent::Child(_),
+                            label: Some(accessible),
+                            width: Some(wire::Length::Fill),
+                            ..
+                        } = child
+                        else {
+                            panic!("a full-width labelled row, got {child:?}");
+                        };
+                        items.push(accessible.clone());
+                    }
+                }
+                wire::Node::Linear { key, .. } => assert!(!key.ends_with("close-row")),
+                _ => {}
+            });
+            assert_eq!(floats, 1, "one menu floats");
+            items
         };
-        assert!(timeline.ends_with("message-menu-actions"), "{timeline}");
-        assert!(thread.ends_with("thread-menu-actions"), "{thread}");
+        let _ = state.update(Message::OpenMessageActions(1, "body".into(), 0));
         assert_eq!(
-            timeline_items,
-            &[
-                "👍",
-                "😀 React",
-                "↩ Reply",
-                "🔗 Link",
-                "✎ Edit",
-                "🗑 Delete",
-                "✕"
-            ]
+            menu_of(&state, "message-action-focus"),
+            ["Reply in thread", "Add reaction", "Copy link", "Edit message", "Delete message"]
         );
+        // a press on one of its items does not move the open menu
+        let _ = state.update(Message::PressedAt(10.0, 10.0));
+        let mut tree = state.view();
+        tree.for_each_mut(&mut |node| {
+            if let wire::Node::Float { x, .. } = node {
+                assert_eq!(x.ops, vec![wire::FloatOp::Number(900.0)]);
+            }
+        });
+        let _ = state.update(Message::ClearMessageSelection);
+        let _ = state.update(Message::OpenThreadMessageActions(1, "body".into(), 0));
         assert_eq!(
-            thread_items,
-            &["👍", "😀 React", "🔗 Link", "✎ Edit", "🗑 Delete", "✕"]
+            menu_of(&state, "thread-action-focus"),
+            ["Add reaction", "Copy link", "Edit message", "Delete message"]
         );
+        // a press at the right edge (the "…" of a row) opens leftward
+        let (x, y) = crate::host::menu_origin(
+            (1200.0, 300.0),
+            (220.0, 100.0),
+            (state.chat_viewport_width, state.chat_viewport_height),
+        );
+        assert_eq!((x, y), (980.0, 304.0));
     }
 
     #[test]

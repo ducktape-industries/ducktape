@@ -2131,6 +2131,12 @@ impl ViewTree {
                         }),
                     );
                 }
+                // A press inside a floated card is the card's: it never
+                // reaches what the card floats over (a dismissing backdrop,
+                // the document under a comment card).
+                element = element
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
                 // Authored floating rails use unit scale; their measurement is
                 // outside the translated child to avoid positional feedback.
                 div()
@@ -2482,7 +2488,10 @@ impl ViewTree {
         else {
             unreachable!()
         };
-        let mut element = div().id(key.clone()).relative();
+        // A mouse area is layout-transparent, like a sensor: a fill-sized
+        // child must not collapse inside an auto-sized wrapper.
+        let (width, height) = content_dimensions(content);
+        let mut element = dimensions(div().id(key.clone()).relative(), width, height);
         for (button, down, up) in [
             (MouseButton::Left, *on_press, *on_release),
             (MouseButton::Right, *on_right_press, *on_right_release),
@@ -2545,7 +2554,10 @@ impl ViewTree {
             let route = key.clone();
             element = element.capture_any_mouse_down(cx.listener(
                 move |this, event: &MouseDownEvent, _, cx| {
-                    if event.button != MouseButton::Left {
+                    // A right press reports its position too: a context menu
+                    // opens where the pointer is.
+                    let reported = matches!(event.button, MouseButton::Left | MouseButton::Right);
+                    if !reported {
                         return;
                     }
                     let Some(bounds) = this.bounds.get(&route) else {
@@ -3343,6 +3355,8 @@ fn content_dimensions(node: &wire::Node) -> (Option<wire::Length>, Option<wire::
         | wire::Node::Scroll { width, height, .. }
         | wire::Node::Stack { width, height, .. }
         | wire::Node::Responsive { width, height, .. } => (*width, *height),
+        // an overlay always renders full-size (see its arm)
+        wire::Node::Overlay { .. } => (Some(wire::Length::Fill), Some(wire::Length::Fill)),
         _ => (None, None),
     }
 }

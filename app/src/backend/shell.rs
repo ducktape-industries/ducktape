@@ -410,6 +410,27 @@ pub(crate) fn grouped_digits(value: i64) -> String {
     grouped
 }
 
+/// The rail's foot names who is signed in: the account by its name, else by
+/// its number; no account reads as a sign-in. The second line is the short
+/// prefix of the key this desktop signs with, or that nothing signs.
+pub fn rail_identity(
+    account_exists: bool,
+    account_name: &str,
+    account_number: &str,
+    signer_key: &str,
+) -> (String, String) {
+    let who = match (account_exists, account_name.is_empty()) {
+        (true, false) => account_name.to_owned(),
+        (true, true) => format!("Account #{account_number}"),
+        (false, _) => "Sign in".to_owned(),
+    };
+    let whose_key = match signer_key.is_empty() {
+        true => "No signing key".to_owned(),
+        false => format!("key {}", signer_key.chars().take(8).collect::<String>()),
+    };
+    (who, whose_key)
+}
+
 /// TWO uppercase letters for a 28px+ avatar plate: the initials of the first
 /// two words, else the first two alphanumerics of one word.
 pub fn initials_of(name: &str) -> String {

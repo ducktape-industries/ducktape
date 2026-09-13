@@ -5,9 +5,10 @@ impl super::ChatView {
             Message::SidebarResized(dx, _dy) => self.on_sidebar_resized(dx, _dy),
             Message::DetailsResized(dx, _dy) => self.on_details_resized(dx, _dy),
             Message::ThreadResized(dx, _dy) => self.on_thread_resized(dx, _dy),
-            Message::ChatViewportChanged(width, _height) => {
-                self.on_chat_viewport_changed(width, _height)
+            Message::ChatViewportChanged(width, height) => {
+                self.on_chat_viewport_changed(width, height)
             }
+            Message::PressedAt(x, y) => self.on_pressed_at(x, y),
             Message::SessionArrived(item) => self.on_session_arrived(item),
             Message::SessionSettled(moved_room) => self.on_session_settled(moved_room),
             Message::SnapStream(moved) => self.on_snap_stream(moved),
@@ -120,12 +121,26 @@ impl super::ChatView {
         );
         ::ducktape_view_guest::Task::none()
     }
+    /// The last press, in chat-screen pixels; it fires before the button it
+    /// landed on, so a menu that opens next knows where.
+    fn on_pressed_at(&mut self, x: f64, y: f64) -> ducktape_view_guest::Task<Message> {
+        self.press_x = x;
+        self.press_y = y;
+        ::ducktape_view_guest::Task::none()
+    }
+    /// A menu opens where the pointer pressed and stays there: a press on
+    /// one of its items must not move it out from under the release.
+    fn anchor_menu(&mut self) {
+        self.menu_x = self.press_x;
+        self.menu_y = self.press_y;
+    }
     fn on_chat_viewport_changed(
         &mut self,
         width: f64,
-        _height: f64,
+        height: f64,
     ) -> ducktape_view_guest::Task<Message> {
         self.chat_viewport_width = width;
+        self.chat_viewport_height = height;
         self.sidebar_width = crate::host::sidebar_width_after_delta(self.sidebar_width, 0.0, width);
         self.details_width = crate::host::details_width_after_delta(
             self.details_width,
@@ -639,6 +654,7 @@ impl super::ChatView {
         self.selected_message_seq = seq;
         self.selected_message_rev = rev;
         self.message_action = MessageAction::More;
+        self.anchor_menu();
         self.message_edit_draft = body.to_owned();
         ::ducktape_view_guest::widget::perform::<Message>(
             ::ducktape_view_guest::wire::WidgetCommand::Focus {
@@ -665,6 +681,7 @@ impl super::ChatView {
         self.selected_message_seq = seq;
         self.selected_message_rev = rev;
         self.message_action = MessageAction::Reactions;
+        self.anchor_menu();
         self.message_edit_draft = body.to_owned();
         ::ducktape_view_guest::widget::perform::<Message>(
             ::ducktape_view_guest::wire::WidgetCommand::Focus {
@@ -716,6 +733,7 @@ impl super::ChatView {
         self.selected_message_seq = seq;
         self.selected_message_rev = rev;
         self.message_action = MessageAction::Delete;
+        self.anchor_menu();
         self.message_edit_draft = body.to_owned();
         ::ducktape_view_guest::widget::perform::<Message>(
             ::ducktape_view_guest::wire::WidgetCommand::Focus {
@@ -742,6 +760,7 @@ impl super::ChatView {
         self.thread_selected_seq = seq;
         self.thread_selected_rev = rev;
         self.thread_message_action = MessageAction::More;
+        self.anchor_menu();
         self.thread_edit_draft = body.to_owned();
         ::ducktape_view_guest::widget::perform::<Message>(
             ::ducktape_view_guest::wire::WidgetCommand::Focus {
@@ -768,6 +787,7 @@ impl super::ChatView {
         self.thread_selected_seq = seq;
         self.thread_selected_rev = rev;
         self.thread_message_action = MessageAction::Reactions;
+        self.anchor_menu();
         self.thread_edit_draft = body.to_owned();
         ::ducktape_view_guest::widget::perform::<Message>(
             ::ducktape_view_guest::wire::WidgetCommand::Focus {
@@ -822,6 +842,7 @@ impl super::ChatView {
         self.thread_selected_seq = seq;
         self.thread_selected_rev = rev;
         self.thread_message_action = MessageAction::Delete;
+        self.anchor_menu();
         self.thread_edit_draft = body.to_owned();
         ::ducktape_view_guest::widget::perform::<Message>(
             ::ducktape_view_guest::wire::WidgetCommand::Focus {

@@ -1,7 +1,70 @@
 use super::*;
+use ducktape_view_guest::slots;
 impl super::ChatView {
     pub(crate) fn view(&self) -> wire::Node {
         native::set_dark(self.dark);
+        let node_scope = format!("{}/chat", "ChatView");
+        // Every press on the screen reports where it landed before the
+        // control under it answers, so a menu opens at the pointer.
+        let screen = wire::Node::MouseArea {
+            key: format!("{node_scope}/press-area"),
+            on_press: None,
+            on_release: None,
+            on_double_click: None,
+            on_right_press: None,
+            on_right_release: None,
+            on_middle_press: None,
+            on_middle_release: None,
+            on_enter: None,
+            on_exit: None,
+            on_move: None,
+            on_press_at: Some(slots::handler::<(f32, f32), Message>(Box::new(
+                |(x, y)| Some(Message::PressedAt(f64::from(x), f64::from(y))),
+            ))),
+            on_scroll: None,
+            content: Box::new(self.chat_screen(node_scope.clone())),
+        };
+        // A message menu stacks over the screen: a transparent backdrop
+        // that closes it on any press, then the card floated at the press.
+        // (Not an `Overlay`: its modal wrapper paints a surface at the
+        // un-translated origin, which a floated card leaves behind.)
+        let mut layers = vec![screen];
+        if let Some(menu) = self.floating_menu(&node_scope) {
+            let close = self.close_menu();
+            layers.push(wire::Node::MouseArea {
+                key: format!("{node_scope}/menu-backdrop"),
+                on_press: Some(slots::message(close.clone())),
+                on_release: None,
+                on_double_click: None,
+                on_right_press: Some(slots::message(close)),
+                on_right_release: None,
+                on_middle_press: None,
+                on_middle_release: None,
+                on_enter: None,
+                on_exit: None,
+                on_move: None,
+                on_press_at: None,
+                on_scroll: None,
+                content: Box::new(native::space(
+                    Some(wire::Length::Fill),
+                    Some(wire::Length::Fill),
+                )),
+            });
+            layers.push(menu);
+        }
+        // `under: 1`: the screen lies under the in-flow backdrop; the menu
+        // floats over both.
+        let overlay = wire::Node::Stack {
+            key: format!("{node_scope}/menu-stack"),
+            width: Some(wire::Length::Fill),
+            height: Some(wire::Length::Fill),
+            padding: None,
+            background: None,
+            border: None,
+            clip: false,
+            under: 1,
+            children: layers,
+        };
         wire::Node::Sensor {
             key: format!("{}/@sensor:906", "ChatView"),
             reset: None,
@@ -22,10 +85,7 @@ impl super::ChatView {
             on_hide: None,
             anticipate: None,
             delay: None,
-            child: Box::new({
-                let node_scope = format!("{}/chat", "ChatView");
-                self.chat_screen(node_scope.clone())
-            }),
+            child: Box::new(overlay),
         }
     }
 }
