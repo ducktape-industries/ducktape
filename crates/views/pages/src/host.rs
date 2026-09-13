@@ -549,15 +549,14 @@ fn comment_thread(thread: &Value, names: &Names) -> PageCommentThread {
         1 => "1 comment".to_string(),
         count => format!("{count} comments"),
     };
+    // A settled thread sits under the card's own "Resolved" fold and offers
+    // "Reopen": its caption need not say so a third time.
     let resolved = thread["resolved"].as_bool().unwrap_or(false);
     PageCommentThread {
         id: text_of(&thread["id"]),
         target: text_of(&thread["target"]),
         author: names.display(&text_of(&thread["opener"])),
-        meta: match resolved {
-            true => format!("{count_label} · resolved"),
-            false => count_label,
-        },
+        meta: count_label,
         resolved,
         comment_count,
         comments,
@@ -663,12 +662,14 @@ fn short_label(id: &str) -> String {
 fn page_comment(ordinal: usize, comment: &Value, names: &Names) -> PageComment {
     let ordinal = count_i64(ordinal);
     let edited = !comment["edited_at"].is_null();
+    // The caption under a reply is its author; an ordinal names nothing a
+    // reader can find. An edit is the one fact worth a word.
     PageComment {
         id: text_of(&comment["id"]),
         author: names.display(&text_of(&comment["author"])),
         meta: match edited {
-            true => format!("#{ordinal} · edited"),
-            false => format!("#{ordinal}"),
+            true => "edited".into(),
+            false => String::new(),
         },
         text: text_of(&comment["text"]),
         ordinal,
@@ -736,11 +737,39 @@ async fn read_search(query: &str) -> Result<Vec<PageSearchHit>, String> {
                     .unwrap_or_else(|| "Untitled".into()),
                 block_id: text_of(&hit["block_id"]),
                 kind: block_kind_name(&text_of(&hit["kind"])).into(),
-                text: text_of(&hit["text"]),
+                text: excerpt(&text_of(&hit["text"]), query),
                 page_id,
             }
         })
         .collect())
+}
+
+/// The most characters a search row shows of the block it hit.
+const EXCERPT_CHARS: usize = 160;
+
+/// A result row's excerpt: the block's text around the first match, on one
+/// line and bounded — a hit inside a long code block is a row, not the block.
+fn excerpt(text: &str, query: &str) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = flat.chars().collect();
+    if chars.len() <= EXCERPT_CHARS {
+        return flat;
+    }
+    let lowered = flat.to_lowercase();
+    let hit_byte = lowered.find(&query.trim().to_lowercase()).unwrap_or(0);
+    let hit = lowered[..hit_byte].chars().count();
+    let start = hit.saturating_sub(EXCERPT_CHARS / 3).min(chars.len() - EXCERPT_CHARS);
+    let end = start + EXCERPT_CHARS;
+    let head = match start > 0 {
+        true => "…",
+        false => "",
+    };
+    let tail = match end < chars.len() {
+        true => "…",
+        false => "",
+    };
+    let middle: String = chars[start..end].iter().collect();
+    format!("{head}{middle}{tail}")
 }
 
 // ---------- the block vocabulary ----------
@@ -1589,7 +1618,10 @@ pub fn reply_toggle_label(thread: &PageCommentThread, expanded: bool) -> String 
     }
     match expanded {
         true => "Fewer replies".into(),
-        false => format!("{hidden} more replies"),
+        false => match hidden {
+            1 => "1 more reply".into(),
+            hidden => format!("{hidden} more replies"),
+        },
     }
 }
 
@@ -1909,6 +1941,19 @@ mod tests {
                 "pane {pane} open {open} height {height}"
             );
         }
+    }
+
+    #[test]
+    fn a_search_excerpt_is_one_bounded_line_around_the_match() {
+        assert_eq!(excerpt("short  hit\nhere", "hit"), "short hit here");
+        let long = format!("{}NEEDLE{}", "a ".repeat(200), " b".repeat(200));
+        let shown = excerpt(&long, "needle");
+        assert!(shown.contains("NEEDLE"), "{shown}");
+        assert!(shown.starts_with('…') && shown.ends_with('…'), "{shown}");
+        assert!(shown.chars().count() <= EXCERPT_CHARS + 2, "{shown}");
+        // A match past the end still answers the head, bounded.
+        let tail = excerpt(&"x ".repeat(400), "missing");
+        assert!(!tail.starts_with('…') && tail.ends_with('…'), "{tail}");
     }
 
     #[test]

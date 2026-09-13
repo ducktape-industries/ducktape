@@ -458,51 +458,26 @@ struct Ink {
     tick_mark: Color,
 }
 
-const fn rgb8(r: u8, g: u8, b: u8) -> Color {
-    wash(r, g, b, 1.0)
-}
-
-const fn wash(r: u8, g: u8, b: u8, a: f32) -> Color {
-    Color([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a])
-}
-
-const LIGHT: Ink = Ink {
-    muted: rgb8(0x6b, 0x69, 0x62),
-    marker: rgb8(0xb3, 0xb1, 0xa8),
-    link: rgb8(0x5f, 0x7a, 0x9e),
-    // The chat message block landed here first (#927): a quiet wash with a
-    // hairline, never a dark slab — "black/26 was invisible in dark", and a
-    // dark slab swallowed its own ink here too.
-    code_ink: rgb8(0x3a, 0x38, 0x33),
-    code_plate: wash(0x3a, 0x38, 0x33, 0.05),
-    code_line: wash(0x3a, 0x38, 0x33, 0.10),
-    callout_plate: wash(0xa0, 0x5a, 0x3c, 0.06),
-    callout_line: wash(0xa0, 0x5a, 0x3c, 0.14),
-    comment_wash: wash(0xa0, 0x5a, 0x3c, 0.09),
-    rule: wash(0x3a, 0x38, 0x33, 0.16),
-    tick_fill: rgb8(0xa0, 0x5a, 0x3c),
-    tick_mark: rgb8(0xfd, 0xfd, 0xfb),
-};
-
-const DARK: Ink = Ink {
-    muted: rgb8(0xa8, 0xa6, 0x9c),
-    marker: rgb8(0x6b, 0x6a, 0x61),
-    link: rgb8(0x8f, 0xa9, 0xc9),
-    code_ink: rgb8(0xd4, 0xd2, 0xca),
-    code_plate: wash(0xd4, 0xd2, 0xca, 0.07),
-    code_line: wash(0xd4, 0xd2, 0xca, 0.12),
-    callout_plate: wash(0xc9, 0x8a, 0x63, 0.10),
-    callout_line: wash(0xc9, 0x8a, 0x63, 0.20),
-    comment_wash: wash(0xc9, 0x8a, 0x63, 0.13),
-    rule: wash(0xd4, 0xd2, 0xca, 0.18),
-    tick_fill: rgb8(0xc9, 0x8a, 0x63),
-    tick_mark: rgb8(0x1b, 0x1a, 0x16),
-};
-
-fn ink(dark: bool) -> &'static Ink {
-    match dark {
-        true => &DARK,
-        false => &LIGHT,
+/// The document ink is the shared palette, so the page reads like the rest
+/// of the app in both appearances: neutral greys for scaffolding, the one
+/// accent only where a block is chosen (a ticked todo, a commented line).
+fn ink(dark: bool) -> Ink {
+    let p = design::palette(dark);
+    Ink {
+        muted: Color(p.muted),
+        marker: Color(p.faint),
+        link: Color(p.link),
+        // A quiet raised plate inside a hairline, never a dark slab: a slab
+        // swallows its own ink in dark.
+        code_ink: Color(p.foreground),
+        code_plate: Color(p.surface_raised),
+        code_line: Color(p.border),
+        callout_plate: Color(p.surface),
+        callout_line: Color(p.border_strong),
+        comment_wash: Color(p.accent_soft),
+        rule: Color(p.border_strong),
+        tick_fill: Color(p.accent),
+        tick_mark: Color(p.background),
     }
 }
 
@@ -596,7 +571,7 @@ fn nest(mark: &Mark) -> f32 {
 }
 
 fn paint(mark: &Mark, dark: bool) -> Format {
-    let ink = ink(dark);
+    let ink = &ink(dark);
     match *mark {
         Mark::Title => Format {
             font: Some(body_font(Weight::Semibold, FontStyle::Normal)),
@@ -996,8 +971,8 @@ mod tests {
         // A filled box carries a VISIBLE mark, in the ground colour — a bare
         // fill reads as a swatch, not as a ticked box.
         let tick = format(&marks[2].1, false);
-        assert_eq!(tick.color, Some(LIGHT.tick_mark));
-        assert_eq!(tick.background.expect("a filled box"), LIGHT.tick_fill);
+        assert_eq!(tick.color, Some(ink(false).tick_mark));
+        assert_eq!(tick.background.expect("a filled box"), ink(false).tick_fill);
         assert!(tick.strikethrough.is_none());
         let Mark::Body(style) = marks[4].1 else {
             unreachable!("a body run")
@@ -1005,7 +980,7 @@ mod tests {
         assert!(style.done);
         let body = format(&marks[4].1, false);
         assert!(body.strikethrough.is_some());
-        assert_eq!(body.color, Some(LIGHT.muted));
+        assert_eq!(body.color, Some(ink(false).muted));
     }
 
     /// The owner's complaint, as arithmetic: the box was three glyphs wide by

@@ -379,11 +379,15 @@ fn a_search_reads_the_index_and_lands_its_hits() {
             .to_string()
             .into_bytes();
         let frame = tick_native(vec![answer(read.id, &hits)]);
-        assert!(
-            has_text(&frame, "channel-a · #1"),
-            "the hit names its room: {:?}",
-            texts(&frame)
-        );
+        // the hit names its room by name, never by the id the node keys it by
+        for expected in ["#general", "message 1"] {
+            assert!(
+                has_text(&frame, expected),
+                "missing {expected:?}: {:?}",
+                texts(&frame)
+            );
+        }
+        assert!(!has_text(&frame, "channel-a · #1"));
     });
 }
 

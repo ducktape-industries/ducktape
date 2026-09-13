@@ -91,14 +91,39 @@ fn resize(key: &str, message: fn(f64, f64) -> Message) -> Node {
 }
 
 /// The tone a run or agent state paints: green settled, red failed,
-/// amber running, grey otherwise.
+/// amber in flight, grey otherwise. The accent is not a state colour.
 fn state_tone(state: &str) -> Tone {
     let word = state.split(['·', ' ']).next().unwrap_or_default().trim();
-    match word {
-        "active" | "done" | "settled" | "merged" | "succeeded" => Tone::Success,
-        "failed" | "error" | "refused" => Tone::Danger,
-        "running" | "working" | "dispatched" | "pending" => Tone::Accent,
+    match word.to_ascii_lowercase().as_str() {
+        "active" | "done" | "settled" | "merged" | "succeeded" | "accepted" | "completed" => {
+            Tone::Success
+        }
+        "failed" | "error" | "refused" | "rejected" => Tone::Danger,
+        "running" | "working" | "dispatched" | "pending" | "queued" => Tone::Warning,
         _ => Tone::Neutral,
+    }
+}
+
+/// A state word as a badge spells it: `failed` reads `Failed`.
+fn sentence(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// A state badge: the word sentence-cased, toned by what it says.
+fn state_badge(key: impl Into<String>, state: &str) -> Node {
+    kit::badge(key, sentence(state), state_tone(state))
+}
+
+/// What a failure strip says above the reason a run settled with.
+fn settled_title(state: &str) -> &'static str {
+    match state {
+        "rejected" => "This run's result was rejected",
+        "failed" => "This run failed",
+        _ => "This run stopped",
     }
 }
 
@@ -269,12 +294,21 @@ impl AgentsView {
 
     fn registry_panel(&self) -> Node {
         let mut rows = Vec::new();
-        if self.rows.is_empty() && self.answered && !self.creating {
-            rows.push(kit::empty_state(
+        let no_agents = self.rows.is_empty() && !self.creating;
+        match (self.answered, no_agents) {
+            (false, _) => rows.push(kit::padded(
+                kit::row(
+                    "agents/loading-row",
+                    [kit::secondary("agents/loading", "Reading the registry…")],
+                ),
+                wire::Edges::all(16.),
+            )),
+            (true, true) => rows.push(kit::empty_state(
                 "agents/empty",
-                "No model agents configured",
-                "Models appear here with their capability and skills once someone registers one.",
-            ));
+                "No agents registered",
+                "Agents appear here with their executor and skills once someone registers one.",
+            )),
+            (true, false) => {}
         }
         for agent in &self.rows {
             let key = format!("agents/record/{}", agent.id);
@@ -299,21 +333,13 @@ impl AgentsView {
                 filler(),
             ];
             if agent.live {
-                line.push(kit::badge(
-                    format!("{key}/working"),
-                    "Working",
-                    Tone::Accent,
-                ));
+                line.push(kit::badge(format!("{key}/working"), "Working", Tone::Agent));
             }
             line.push(kit::nowrap(kit::caption(
                 format!("{key}/skills"),
                 host::plural(agent.skills.len() as i64, "skill", "skills"),
             )));
-            line.push(kit::badge(
-                format!("{key}/standing"),
-                &agent.status,
-                state_tone(&agent.status),
-            ));
+            line.push(state_badge(format!("{key}/standing"), &agent.status));
             let summary = kit::spaced(kit::centered_row(format!("{key}/summary"), line), 8.);
             let mut button = kit::list_row(
                 &key,
@@ -349,23 +375,32 @@ impl AgentsView {
 
     fn runs_panel(&self) -> Node {
         let mut rows = Vec::new();
-        if self.runs.is_empty() {
-            rows.push(kit::empty_state(
+        match (self.answered, self.runs.is_empty()) {
+            (false, _) => rows.push(kit::padded(
+                kit::row(
+                    "agents/runs-loading-row",
+                    [kit::secondary("agents/runs-loading", "Reading the runs…")],
+                ),
+                wire::Edges::all(16.),
+            )),
+            (true, true) => rows.push(kit::empty_state(
                 "agents/no-runs",
                 "No runs yet",
                 "Every dispatch of an agent lands here with its journal.",
-            ));
+            )),
+            (true, false) => {}
         }
         for run in &self.runs {
             let key = format!("agents/run/{}", run.run_id);
+            // the run's key is a machine address; the row names the agent
+            // and what it answered, and the key waits behind Run details
             let summary = kit::spaced(
                 kit::centered_row(
                     format!("{key}/summary"),
                     [
-                        kit::nowrap(kit::mono(format!("{key}/id"), &run.run_id)),
-                        kit::badge(format!("{key}/state"), &run.state, state_tone(&run.state)),
                         kit::nowrap(kit::strong(format!("{key}/agent"), &run.agent_name)),
                         kit::nowrap(kit::secondary(format!("{key}/origin"), &run.origin)),
+                        state_badge(format!("{key}/state"), &run.state),
                         filler(),
                         kit::nowrap(kit::caption(format!("{key}/dispatched"), &run.dispatched)),
                     ],
@@ -409,7 +444,10 @@ impl AgentsView {
                 "agents/journal-heading",
                 [
                     kit::sized(
-                        kit::wrapping(kit::heading("agents/journal-run", &self.open_row.run_id)),
+                        kit::wrapping(kit::heading(
+                            "agents/journal-run",
+                            host::run_title(&self.open_row),
+                        )),
                         Some(Length::Fill),
                         None,
                     ),
@@ -424,11 +462,12 @@ impl AgentsView {
                 kit::centered_row(
                     "agents/journal-standing",
                     [
-                        kit::badge(
-                            "agents/journal-state",
-                            &self.open_row.state,
-                            state_tone(&self.open_row.state),
-                        ),
+                        state_badge("agents/journal-state", &self.open_row.state),
+                        kit::nowrap(kit::secondary(
+                            "agents/journal-origin",
+                            &self.open_row.origin,
+                        )),
+                        filler(),
                         subtle(
                             "agents/receipt",
                             "Run details",
@@ -440,29 +479,19 @@ impl AgentsView {
             ),
         ];
         if self.expanded_receipt == self.open_run {
+            let facts = host::run_facts(&self.open_row).into_iter().enumerate().map(
+                |(index, (name, value, code))| {
+                    let key = format!("agents/fact/{index}");
+                    let text = match code {
+                        true => kit::mono(format!("{key}/value"), value),
+                        false => kit::text(format!("{key}/value"), value),
+                    };
+                    kit::kv(key, name, kit::wrapping(text))
+                },
+            );
             items.push(kit::card(
                 "agents/receipt-card",
-                kit::spaced(
-                    kit::column(
-                        "agents/receipt-body",
-                        [
-                            kit::kv(
-                                "agents/dispatch",
-                                "Dispatch",
-                                kit::wrapping(kit::mono("agents/dispatch-id", &self.open_run)),
-                            ),
-                            kit::kv(
-                                "agents/output",
-                                "Output",
-                                kit::wrapping(kit::mono(
-                                    "agents/output-reference",
-                                    &self.open_row.output_ref,
-                                )),
-                            ),
-                        ],
-                    ),
-                    6.,
-                ),
+                kit::spaced(kit::column("agents/receipt-body", facts), 6.),
             ));
         }
         if self.live.present {
@@ -478,7 +507,7 @@ impl AgentsView {
                                 if activity.done {
                                     Tone::Success
                                 } else {
-                                    Tone::Accent
+                                    Tone::Warning
                                 },
                             ),
                             kit::wrapping(kit::text(
@@ -513,7 +542,19 @@ impl AgentsView {
         if !self.open_row.reason.is_empty() {
             items.push(kit::notice(
                 "agents/run-reason-box",
-                kit::wrapping(kit::text("agents/run-reason", &self.open_row.reason)),
+                kit::spaced(
+                    kit::column(
+                        "agents/run-reason-body",
+                        [
+                            kit::strong(
+                                "agents/run-reason-title",
+                                settled_title(&self.open_row.state),
+                            ),
+                            kit::wrapping(kit::text("agents/run-reason", &self.open_row.reason)),
+                        ],
+                    ),
+                    4.,
+                ),
                 Tone::Danger,
             ));
         }
@@ -526,39 +567,34 @@ impl AgentsView {
         } else if self.journal.entries.is_empty() {
             entries.push(kit::wrapping(kit::secondary(
                 "agents/journal-empty",
-                "This run's journal has no entries yet — the fold may still be catching up to the chain.",
+                "This run has no journal entries yet. The node may still be catching up.",
             )));
         } else {
             for (index, entry) in self.journal.entries.iter().enumerate() {
                 let key = format!("agents/entry/{index}");
-                let body = kit::spaced(
-                    kit::column(
-                        format!("{key}/body"),
-                        [
-                            kit::spaced(
-                                kit::centered_row(
-                                    format!("{key}/head"),
-                                    [
-                                        kit::sized(
-                                            kit::strong(format!("{key}/kind"), &entry.kind),
-                                            Some(Length::Fill),
-                                            None,
-                                        ),
-                                        kit::badge(
-                                            format!("{key}/status"),
-                                            &entry.status,
-                                            state_tone(&entry.status),
-                                        ),
-                                    ],
-                                ),
-                                8.,
-                            ),
-                            kit::wrapping(kit::text(format!("{key}/summary"), &entry.summary)),
-                            places(&format!("{key}/targets"), &entry.targets),
-                        ],
-                    ),
-                    4.,
-                );
+                let mut head = vec![kit::sized(
+                    kit::strong(format!("{key}/kind"), &entry.kind),
+                    Some(Length::Fill),
+                    None,
+                )];
+                // a plain fact carries no status: no empty pill for it
+                if !entry.status.is_empty() {
+                    head.push(state_badge(format!("{key}/status"), &entry.status));
+                }
+                let mut lines = vec![kit::spaced(
+                    kit::centered_row(format!("{key}/head"), head),
+                    8.,
+                )];
+                if !entry.summary.is_empty() {
+                    lines.push(kit::wrapping(kit::text(
+                        format!("{key}/summary"),
+                        &entry.summary,
+                    )));
+                }
+                if !entry.targets.is_empty() {
+                    lines.push(places(&format!("{key}/targets"), &entry.targets));
+                }
+                let body = kit::spaced(kit::column(format!("{key}/body"), lines), 4.);
                 entries.push(kit::spaced(
                     kit::row(
                         &key,
@@ -620,11 +656,7 @@ impl AgentsView {
             ));
         }
         if !self.creating {
-            let mut standing = vec![kit::badge(
-                "agents/status",
-                &self.selected_status,
-                state_tone(&self.selected_status),
-            )];
+            let mut standing = vec![state_badge("agents/status", &self.selected_status)];
             if self.can_edit {
                 match self.selected_status.as_str() {
                     "active" => standing.push(action(
@@ -681,7 +713,7 @@ impl AgentsView {
             "Display name",
             field(
                 "agents/name",
-                "display name…",
+                "Display name",
                 &self.draft_name,
                 Message::BindDraftName,
             ),
@@ -698,7 +730,7 @@ impl AgentsView {
                     .position(|value| value == &capability)
                     .map(|index| index as u32),
                 options,
-                placeholder: Some("pick a capability…".into()),
+                placeholder: Some("Pick an executor…".into()),
                 on_select: slots::handler(Box::new(move |index: u32| {
                     choices
                         .get(index as usize)
@@ -709,8 +741,10 @@ impl AgentsView {
                 style: Default::default(),
                 settings: Default::default(),
             }
+        } else if capability.is_empty() {
+            kit::secondary("agents/capability", "No executor chosen")
         } else {
-            kit::badge("agents/capability", &capability, Tone::Agent)
+            kit::badge("agents/capability", &capability, Tone::Neutral)
         };
         items.push(section("agents/executor", "Executor", [executor]));
         let mut skills = Vec::new();
@@ -739,7 +773,7 @@ impl AgentsView {
             } else {
                 head.push(kit::badge(
                     format!("{key}/mode"),
-                    host::skill_mode(skill.always),
+                    sentence(&host::skill_mode(skill.always)),
                     Tone::Neutral,
                 ));
             }
@@ -756,7 +790,7 @@ impl AgentsView {
             if !skill.source_snapshot.is_empty() {
                 details.push(kit::wrapping(kit::caption(
                     format!("{key}/snapshot"),
-                    &skill.source_snapshot,
+                    format!("Pinned to snapshot {}", skill.source_snapshot),
                 )));
             }
             skills.push(kit::card(
@@ -774,19 +808,19 @@ impl AgentsView {
                             kit::label("agents/add-skill-title", "Add a skill"),
                             field(
                                 "agents/skill-name",
-                                "skill name (its mount directory)…",
+                                "Skill name (its mount directory)",
                                 &self.skill_name,
                                 Message::BindSkillName,
                             ),
                             field(
                                 "agents/skill-prefix",
-                                "/shared/skills/<name> when left empty",
+                                "Source path, /shared/skills/<name> when empty",
                                 &self.skill_prefix,
                                 Message::BindSkillPrefix,
                             ),
                             field(
                                 "agents/skill-snapshot",
-                                "snapshot id to pin (optional)",
+                                "Snapshot to pin (optional)",
                                 &self.skill_snapshot,
                                 Message::BindSkillSnapshot,
                             ),
@@ -796,7 +830,7 @@ impl AgentsView {
                                     Node::Toggle {
                                         key: "agents/skill-always".into(),
                                         kind: wire::ToggleKind::Checkbox,
-                                        label: "load always (persona)".into(),
+                                        label: "Load always (persona)".into(),
                                         checked: self.skill_always,
                                         on_toggle: Some(slots::handler(Box::new(|value| {
                                             Some(Message::SetSkillAlways(value))
@@ -1206,7 +1240,7 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                self.host_error = item.error.to_owned();
+                self.host_error = crate::host::fault("Could not read the session", &item.error);
             }
             if !(item.error).is_empty() {
                 return ::ducktape_view_guest::Task::none();
@@ -1270,7 +1304,7 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                self.host_error = item.error.to_owned();
+                self.host_error = crate::host::fault("Could not read the registry", &item.error);
             }
             {
                 self.answered = true;
@@ -1362,7 +1396,8 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                self.host_error = item.error.to_owned();
+                self.host_error =
+                    crate::host::fault("Could not read this run's journal", &item.error);
             }
             if (!(item.error).is_empty()) || (item.journal.dispatch_id != self.open_run) {
                 return ::ducktape_view_guest::Task::none();
@@ -1387,7 +1422,7 @@ impl AgentsView {
     fn on_act_done(&mut self, item: crate::host::ActItem) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                self.host_error = item.error.to_owned();
+                self.host_error = crate::host::fault("The change was not accepted", &item.error);
             }
             if !(item.error).is_empty() {
                 return ::ducktape_view_guest::Task::none();

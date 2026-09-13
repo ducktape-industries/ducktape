@@ -19,6 +19,26 @@ fn subtle(key: String, label: &str, message: Message, disabled: bool) -> wire::N
         wire::ButtonPreset::Subtle,
     )
 }
+/// A compact ghost control: `glyph` (an emoji, or an emoji and one word) is
+/// what shows; `label` is what a screen reader and a test press.
+fn glyph(key: String, glyph: &str, label: &str, message: Message, disabled: bool) -> wire::Node {
+    let mut button = subtle(key, glyph, message, disabled);
+    if let wire::Node::Button {
+        label: accessible,
+        padding,
+        ..
+    } = &mut button
+    {
+        *accessible = Some(label.into());
+        *padding = Some(wire::Edges {
+            top: 2.,
+            right: 6.,
+            bottom: 2.,
+            left: 6.,
+        });
+    }
+    button
+}
 fn primary(key: String, label: &str, message: Message, disabled: bool) -> wire::Node {
     native::button(
         key,
@@ -385,7 +405,7 @@ impl ChatView {
                 )),
                 wire::SurfaceValue::Str("message".into()),
                 wire::SurfaceValue::Bool(false),
-                wire::SurfaceValue::Str("Message the channel…".into()),
+                wire::SurfaceValue::Str(self.composer_hint()),
                 wire::SurfaceValue::Bool(
                     self.loading
                         || !self.connected
@@ -403,19 +423,22 @@ impl ChatView {
             Some(wire::Length::Fill),
         )
     }
+    /// The composer's placeholder names the room it posts to.
+    fn composer_hint(&self) -> String {
+        let direct = !self.active_dm.name.is_empty();
+        match direct {
+            true => format!("Message {}", self.active_dm.name),
+            false => format!("Message #{}", self.active_channel_name),
+        }
+    }
     fn search_results(&self, key: String) -> wire::Node {
         let children = match self.search_phase {
             SearchPhase::Searching => vec![self.loading_messages(format!("{key}/loading"))],
             SearchPhase::Done if self.search_hits.is_empty() => {
-                vec![native::padded(
-                    native::column(
-                        format!("{key}/empty-row"),
-                        [native::secondary(
-                            format!("{key}/empty"),
-                            "No messages match",
-                        )],
-                    ),
-                    wire::Edges::all(16.),
+                vec![native::empty_state(
+                    format!("{key}/empty"),
+                    "No messages match",
+                    "Try other words, or clear the search to see the room again.",
                 )]
             }
             SearchPhase::Done => self
@@ -566,30 +589,36 @@ impl ChatView {
             };
             let [reaction, more] = actions;
             if !message.pending && !message.deleted {
+                // The bar floats over the message, so each control is a
+                // glyph; the words ride as the accessible label.
                 let mut controls = Vec::new();
                 if !thread && message.reply_count == 0 {
-                    controls.push(subtle(
+                    controls.push(glyph(
                         format!("{scope}/thread"),
+                        "💬",
                         "Open thread",
                         Message::OpenThreadFor(message.seq),
                         false,
                     ));
                 }
-                controls.push(subtle(
+                controls.push(glyph(
                     format!("{scope}/thumbs-up"),
+                    "👍",
                     "React with 👍",
                     Message::AddReactionAt(message.seq, "👍".into()),
                     self.active_channel_archived,
                 ));
                 controls.extend([
-                    subtle(
+                    glyph(
                         format!("{scope}/react"),
+                        "😀",
                         "Manage reactions",
                         reaction,
                         self.active_channel_archived,
                     ),
-                    subtle(
+                    glyph(
                         format!("{scope}/more"),
+                        "⋯",
                         "More message actions",
                         more.clone(),
                         false,
@@ -863,7 +892,7 @@ impl ChatView {
                 )),
                 wire::SurfaceValue::Str("reply".into()),
                 wire::SurfaceValue::Bool(true),
-                wire::SurfaceValue::Str("Reply…".into()),
+                wire::SurfaceValue::Str("Reply in thread".into()),
                 wire::SurfaceValue::Bool(
                     self.thread_loading || !self.connected || !self.post_refusal.is_empty(),
                 ),
@@ -1077,38 +1106,68 @@ impl ChatView {
                 } else {
                     Message::ArmMessageDelete(seq, body.clone(), rev)
                 };
-                children.push(native::wrapped_row(
-                    format!("{key}/{prefix}menu-actions"),
-                    [
-                        subtle(
-                            format!("{key}/{prefix}add-reaction"),
-                            "Add reaction",
-                            reaction,
-                            self.active_channel_archived,
-                        ),
-                        subtle(
-                            format!("{key}/{prefix}copy-link"),
-                            "Copy message link",
-                            Message::CopyMessageLink(crate::host::duck_channel_message_link(
-                                self.active_channel.clone(),
-                                seq,
-                                self.network_chain_id.clone(),
-                            )),
-                            false,
-                        ),
-                        subtle(
-                            format!("{key}/{prefix}edit"),
-                            "Edit message",
-                            edit,
-                            self.active_channel_archived,
-                        ),
-                        subtle(
-                            format!("{key}/{prefix}delete"),
-                            "Delete message",
-                            delete,
-                            self.active_channel_archived,
-                        ),
-                    ],
+                // One row of glyph-and-word items that wraps inside a 300px
+                // pane; the close rides at its end.
+                let mut items = vec![glyph(
+                    format!("{key}/{prefix}thumbs-up"),
+                    "👍",
+                    "React with 👍",
+                    Message::AddReactionAt(seq, "👍".into()),
+                    self.active_channel_archived,
+                )];
+                items.push(glyph(
+                    format!("{key}/{prefix}add-reaction"),
+                    "😀 React",
+                    "Add reaction",
+                    reaction,
+                    self.active_channel_archived,
+                ));
+                if !thread {
+                    items.push(glyph(
+                        format!("{key}/{prefix}reply"),
+                        "↩ Reply",
+                        "Reply in thread",
+                        Message::OpenThreadFor(seq),
+                        false,
+                    ));
+                }
+                items.extend([
+                    glyph(
+                        format!("{key}/{prefix}copy-link"),
+                        "🔗 Link",
+                        "Copy message link",
+                        Message::CopyMessageLink(crate::host::duck_channel_message_link(
+                            self.active_channel.clone(),
+                            seq,
+                            self.network_chain_id.clone(),
+                        )),
+                        false,
+                    ),
+                    glyph(
+                        format!("{key}/{prefix}edit"),
+                        "✎ Edit",
+                        "Edit message",
+                        edit,
+                        self.active_channel_archived,
+                    ),
+                    glyph(
+                        format!("{key}/{prefix}delete"),
+                        "🗑 Delete",
+                        "Delete message",
+                        delete,
+                        self.active_channel_archived,
+                    ),
+                    glyph(
+                        format!("{key}/{prefix}close"),
+                        "✕",
+                        "Cancel",
+                        close.clone(),
+                        false,
+                    ),
+                ]);
+                children.push(native::spaced(
+                    native::wrapped_row(format!("{key}/{prefix}menu-actions"), items),
+                    2.,
                 ));
             }
             MessageAction::Reactions => {
@@ -1121,11 +1180,16 @@ impl ChatView {
                         self.active_channel_archived,
                     );
                     if let wire::Node::Button {
-                        label, description, ..
+                        label,
+                        description,
+                        padding,
+                        ..
                     } = &mut button
                     {
                         *label = Some("Add reaction".into());
                         *description = Some(emoji);
+                        // eight to a row inside a 300px pane: ~30px a cell
+                        *padding = Some(wire::Edges::all(4.));
                     }
                     choices.push(button);
                 }
@@ -1191,22 +1255,25 @@ impl ChatView {
                 ));
             }
         }
-        children.push(native::aligned(
-            native::column(
-                format!("{key}/{prefix}close-row"),
-                [subtle(
-                    format!("{key}/{prefix}close"),
-                    if mode == MessageAction::Editing {
-                        "Cancel message edit"
-                    } else {
-                        "Cancel"
-                    },
-                    close,
-                    self.busy && mode == MessageAction::Editing,
-                )],
-            ),
-            wire::AlignX::Right,
-        ));
+        let close_in_row = matches!(mode, MessageAction::Toolbar | MessageAction::More);
+        if !close_in_row {
+            children.push(native::aligned(
+                native::column(
+                    format!("{key}/{prefix}close-row"),
+                    [subtle(
+                        format!("{key}/{prefix}close"),
+                        if mode == MessageAction::Editing {
+                            "Cancel message edit"
+                        } else {
+                            "Cancel"
+                        },
+                        close,
+                        self.busy && mode == MessageAction::Editing,
+                    )],
+                ),
+                wire::AlignX::Right,
+            ));
+        }
         // A menu is a card over the stream; only the delete confirmation wears
         // a tone, because only it is about to destroy something.
         let frame_key = format!("{key}/{prefix}{focus}");

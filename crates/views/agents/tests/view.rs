@@ -254,13 +254,24 @@ fn a_connected_view_reads_its_own_register() {
         texts(&frame)
     );
 
-    let (frame, left) = registered("");
+    // connected but not yet answered: the wait says so
+    let props = booted();
+    let waiting = tick_native(vec![item(props, &session("", "", 0))]);
+    assert!(
+        has_text(&waiting, "Reading the registry…"),
+        "{:?}",
+        texts(&waiting)
+    );
+    assert!(!has_text(&waiting, "No agents registered"));
+
+    let (frame, left) = settle(waiting);
     for expected in [
         "2 agents · 1 working",
         "Reviewer Bot",
         "review",
-        "active",
-        "paused",
+        "Active",
+        "Paused",
+        "Working",
         "eddy",
         // the count derives from the record: three skills
         "3 skills",
@@ -272,6 +283,7 @@ fn a_connected_view_reads_its_own_register() {
         );
     }
     assert!(!has_text(&frame, "Not connected"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "Reading the registry…"));
     // no account on this device: nothing to register a new agent under
     assert!(!has_text(&frame, "New agent"), "{:?}", texts(&frame));
     // the two planes an agent record is folded from, plus the working count
@@ -356,7 +368,7 @@ fn a_reader_who_is_not_the_controller_gets_the_record_read_only() {
     );
     // the skills still read, the controls do not
     assert!(has_text(&frame, "review"));
-    assert!(has_text(&frame, "on demand"));
+    assert!(has_text(&frame, "On demand"), "{:?}", texts(&frame));
     assert!(!has_text(&frame, "Save"), "{:?}", texts(&frame));
     assert!(!has_text(&frame, "Pause"), "{:?}", texts(&frame));
     assert!(frame.requests.is_empty(), "{:?}", frame.requests);
@@ -397,14 +409,14 @@ fn a_new_agent_registers_from_the_form_once_its_id_is_a_label() {
         texts(&frame)
     );
     let frame = tick_native(type_into(&frame, AGENT_ID_HINT, "chiefduck"));
-    let frame = tick_native(type_into(&frame, "display name…", "ChiefDuck"));
+    let frame = tick_native(type_into(&frame, "Display name", "ChiefDuck"));
     let frame = tick_native(pick(&frame, CAPABILITY_PICK, "claude"));
     let frame = tick_native(type_into(
         &frame,
-        "skill name (its mount directory)…",
+        "Skill name (its mount directory)",
         "chiefduck",
     ));
-    let frame = tick_native(toggle(&frame, "load always (persona)", true));
+    let frame = tick_native(toggle(&frame, "Load always (persona)", true));
     let frame = tick_native(press(&frame, "Add skill"));
     let frame = tick_native(press(&frame, "Register agent"));
     let intent = one_intent(&frame);
@@ -465,13 +477,21 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
     for expected in [
         "2 runs · 1 in flight",
         "#general · Message 12",
-        "running",
-        "failed",
-        "h 84,912",
+        "Running",
+        "Failed",
+        "block 84,912",
     ] {
         assert!(
             has_text(&frame, expected),
             "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
+    }
+    // a run's key is a machine address: the row names the agent instead
+    for key in ["run-live", "run-gone", "dispatch-gone"] {
+        assert!(
+            !has_text(&frame, key),
+            "{key} on screen: {:?}",
             texts(&frame)
         );
     }
@@ -491,6 +511,8 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
         "{:?}",
         texts(&frame)
     );
+    // the failure strip says what happened, then why
+    assert!(has_text(&frame, "This run failed"), "{:?}", texts(&frame));
     assert!(has_text(&frame, "worker exploded"), "{:?}", texts(&frame));
 
     // the journal is this view's own read, on the same cadence as the
@@ -501,14 +523,39 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
         "{:?}",
         texts(&frame)
     );
+    for expected in ["Dispatched", "for reviewer-bot from Message 9", "Settled"] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
+    }
     assert!(
-        has_text(&frame, "for reviewer-bot from Message 9"),
-        "{:?}",
+        !has_text(&frame, "failed · worker exploded"),
+        "the outcome is a badge, the reason a sentence: {:?}",
         texts(&frame)
     );
+
+    // the receipt names the run's keys and facts, each labelled
+    let frame = tick_native(press(&frame, "Run details"));
+    for expected in [
+        "Run",
+        "run-gone",
+        "Dispatch",
+        "dispatch-gone",
+        "Executing node",
+        "ab12cd34ef56ab12…",
+        "0 actions",
+    ] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
+    }
     assert!(
-        has_text(&frame, "failed · worker exploded"),
-        "{:?}",
+        !has_text(&frame, "Output"),
+        "an empty output has no row: {:?}",
         texts(&frame)
     );
 

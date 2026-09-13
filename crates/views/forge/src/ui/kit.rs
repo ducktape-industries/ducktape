@@ -43,22 +43,15 @@ pub(super) fn state_tone(state: &str) -> Tone {
 pub(super) const READING: f32 = 14.;
 
 impl ForgeView {
+    /// The one strip every refusal lands on. The readers already phrase each
+    /// error as a sentence with its verb, so the strip carries nothing else.
     pub(super) fn unavailable(&self, key: String) -> wire::Node {
         native::notice(
             &key,
-            native::spaced(
-                native::column(
-                    format!("{key}/body"),
-                    [
-                        native::strong(format!("{key}/title"), "Unable to read Forge"),
-                        native::wrapping(native::text(
-                            format!("{key}/error"),
-                            self.host_error.clone(),
-                        )),
-                    ],
-                ),
-                2.,
-            ),
+            native::wrapping(native::text(
+                format!("{key}/error"),
+                self.host_error.clone(),
+            )),
             Tone::Danger,
         )
     }
@@ -103,13 +96,10 @@ impl ForgeView {
         ))
     }
 
-    pub(super) fn finality(&self, key: String, height: i64) -> wire::Node {
-        let label = if height > 0 {
-            format!("finalized · h {height}")
-        } else {
-            "finalized".into()
-        };
-        native::badge(key, label, Tone::Success)
+    /// A review the chain holds is final; its `created_at` is consensus
+    /// time in a unit only the network knows, so no number is shown.
+    pub(super) fn finality(&self, key: String) -> wire::Node {
+        native::badge(key, "Finalized", Tone::Success)
     }
 
     fn rich_line(

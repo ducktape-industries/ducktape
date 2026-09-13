@@ -223,6 +223,17 @@ impl super::FilesView {
             ::std::convert::AsRef::as_ref(&(self.notice)),
         );
         if !(item.error).is_empty() {
+            // a pane that never got its page would say "Reading…" forever:
+            // it closes, the notice says why, and the row presses again
+            {
+                let next = "".to_owned();
+                if ::ducktape_view_guest::state_changed!(self.preview_path, next) {
+                    self.preview_path = next;
+                    self.derived.draft_here.take();
+                    self.derived.draft_parked.take();
+                    self.derived.edit_context.take();
+                }
+            }
             return ::ducktape_view_guest::Task::none();
         }
         {
@@ -453,6 +464,9 @@ impl super::FilesView {
             &(crate::host::fs_parent(::std::convert::AsRef::as_ref(&(self.delete_target)))),
         ));
         if !(self.notice).is_empty() {
+            // the refusal is a notice behind the dialog's backdrop: the
+            // dialog closes so the reader sees it
+            self.delete_target = "".to_owned();
             return ::ducktape_view_guest::Task::none();
         }
         {

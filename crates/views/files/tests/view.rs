@@ -221,7 +221,7 @@ fn a_connected_view_lists_its_own_directory() {
     assert!(has_text(&frame, "Not connected"), "{:?}", texts(&frame));
 
     let (frame, _held) = connected_with_listing();
-    for expected in ["duckfs", "/shared", "1 file · 1 dir", "README.md", "412 KB"] {
+    for expected in ["duckfs", "/shared", "1 file, 1 folder", "README.md", "412 KB"] {
         assert!(
             has_text(&frame, expected),
             "missing {expected:?} in {:?}",
@@ -229,7 +229,7 @@ fn a_connected_view_lists_its_own_directory() {
         );
     }
     let frame = tick_native(press(&frame, "History"));
-    assert!(has_text(&frame, "h 84,912"), "{:?}", texts(&frame));
+    assert!(has_text(&frame, "block 84,912"), "{:?}", texts(&frame));
     assert!(has_text(&frame, "first commit"), "{:?}", texts(&frame));
 }
 
@@ -239,7 +239,7 @@ fn disconnect_hides_retained_listing_and_write_controls() {
     assert!(has_text(&frame, "README.md"));
     let frame = tick_native(vec![item(held.session, &session(false))]);
     assert!(has_text(&frame, "Not connected"));
-    for stale in ["README.md", "1 file · 1 dir", "+ Folder", "+ File"] {
+    for stale in ["README.md", "1 file, 1 folder", "+ Folder", "+ File"] {
         assert!(!has_text(&frame, stale), "disconnected claim: {stale}");
     }
 }
@@ -254,7 +254,7 @@ fn a_directory_opens_as_its_own_read_and_the_old_rows_go_silent() {
     let (_, params) = files_get(&frame, "ls");
     assert_eq!(params["path"], "/shared/docs");
     assert!(
-        !has_text(&frame, "1 file · 1 dir"),
+        !has_text(&frame, "1 file, 1 folder"),
         "the old tally survived the navigation: {:?}",
         texts(&frame)
     );
@@ -403,11 +403,110 @@ fn a_refused_write_is_shown_in_place_and_keeps_the_draft() {
     let submit = request(&frame, "op.submit").id;
     let frame = tick_native(vec![refuse(submit, "the local user key is locked")]);
     assert!(
-        has_text(&frame, "the local user key is locked"),
+        has_text(
+            &frame,
+            "Could not create the folder: the local user key is locked"
+        ),
         "{:?}",
         texts(&frame)
     );
     assert_eq!(name_field(&frame), "reports");
+}
+
+/// A file that is not text gets a plate that says so, never a byte count or
+/// a blank code box; a read the node refuses closes the pane and says why.
+#[test]
+fn a_binary_file_and_a_refused_read_each_say_so_in_words() {
+    let (frame, _held) = connected_with_listing();
+    let frame = tick_native(press(&frame, "Show object"));
+    assert!(has_text(&frame, "Reading the file…"), "{:?}", texts(&frame));
+    let head = files_get(&frame, "refs").0.id;
+    let frame = tick_native(vec![answer(head, &refs())]);
+    let page = files_get(&frame, "read").0.id;
+    let frame = tick_native(vec![answer(page, &read("\u{0}\u{1}bytes"))]);
+    assert!(has_text(&frame, "No preview"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, files_view::host::BINARY_PLATE),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(surface_names(&frame).is_empty(), "no code box for bytes");
+    assert!(!has_text(&frame, "Edit"), "bytes are not edited in place");
+
+    // the same file, read again, refused by the node
+    let frame = tick_native(press(&frame, "Open directory"));
+    let ls = files_get(&frame, "ls").0.id;
+    let frame = tick_native(vec![answer(ls, &listing())]);
+    let snapshots = files_get(&frame, "history").0.id;
+    let frame = tick_native(vec![answer(snapshots, &history())]);
+    let frame = tick_native(press(&frame, "Show object"));
+    let head = files_get(&frame, "refs").0.id;
+    let frame = tick_native(vec![refuse(head, "not connected to a node")]);
+    assert!(
+        has_text(&frame, "Could not read this file: not connected to a node"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(
+        !has_text(&frame, "Reading the file…"),
+        "the pane closed: {:?}",
+        texts(&frame)
+    );
+}
+
+/// The delete gate: the button arms a dialog naming the file, Cancel drops
+/// it, and the confirmed delete leaves as a signed `rm` commit.
+#[test]
+fn a_delete_is_confirmed_in_a_dialog_before_it_leaves() {
+    let (frame, _held) = connected_with_listing();
+    let frame = with_preview(&frame, "hello");
+    assert!(!has_text(&frame, "Delete this object"));
+    let frame = tick_native(press(&frame, "Delete object"));
+    assert!(has_text(&frame, "Delete this object"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Cancel"));
+    assert!(!has_text(&frame, "Delete this object"), "{:?}", texts(&frame));
+    assert!(frame.requests.is_empty(), "cancelling submits nothing");
+
+    let frame = tick_native(press(&frame, "Delete object"));
+    // the header's button is disarmed while the dialog is up: the dialog's
+    // own is the one that presses
+    let confirm = keys(&frame)
+        .into_iter()
+        .find(|key| key.ends_with("/confirm-delete/delete"))
+        .expect("the dialog's delete button");
+    let frame = tick_native(press(&frame, &confirm));
+    let head = files_get(&frame, "refs").0.id;
+    let frame = tick_native(vec![answer(head, &refs())]);
+    let op: serde_json::Value =
+        serde_json::from_slice(&request(&frame, "op.submit").payload).expect("an op decodes");
+    assert_eq!(
+        op["payload"]["commit"]["changes"][0],
+        serde_json::json!({ "rm": { "path": "/shared/README.md" } })
+    );
+}
+
+/// A snapshot's changes read as words with a tone, never the wire's letter.
+#[test]
+fn a_diff_names_its_kinds_in_words() {
+    let (frame, _held) = connected_with_listing();
+    let frame = tick_native(press(&frame, "History"));
+    let frame = tick_native(press(&frame, "Compare"));
+    let head = files_get(&frame, "refs").0.id;
+    let frame = tick_native(vec![answer(head, &refs())]);
+    let diff = files_get(&frame, "diff").0.id;
+    let frame = tick_native(vec![answer(
+        diff,
+        serde_json::json!({ "entries": [
+            { "path": "/shared/a.md", "kind": "A" },
+            { "path": "/shared/b.md", "kind": "modified" },
+        ]})
+        .to_string()
+        .as_bytes(),
+    )]);
+    for expected in ["Changes since this snapshot", "Added", "Changed"] {
+        assert!(has_text(&frame, expected), "{expected}: {:?}", texts(&frame));
+    }
+    assert!(!has_text(&frame, "A"), "{:?}", texts(&frame));
 }
 
 /// The root is nobody's to write in, and the view says so from the module's

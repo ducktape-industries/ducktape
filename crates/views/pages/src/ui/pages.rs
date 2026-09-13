@@ -200,7 +200,10 @@ impl PagesView {
         let mut comments = named(
             kit::button(
                 "pages/toolbar/comments",
-                format!("Comments {}", self.thread_total),
+                match self.thread_total {
+                    0 => "Comments".to_string(),
+                    count => format!("Comments {count}"),
+                },
                 (!self.unavailable()).then(|| slots::message(Message::ToggleBlockComments)),
                 ButtonPreset::Subtle,
             ),
@@ -631,9 +634,10 @@ impl PagesView {
             None,
         )];
         if !self.scope_pinned && !self.scope_target.is_empty() {
+            // short: it shares a 340px header line with the quote and Close
             header.push(action(
                 "pages/comments/widen",
-                "All comments on this page",
+                "All comments",
                 Message::WidenCommentScope,
                 true,
                 ButtonPreset::Text,

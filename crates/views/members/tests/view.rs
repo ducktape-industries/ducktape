@@ -4,10 +4,10 @@
 //! valset plane, and a press leaves as `op.submit` carrying the module
 //! message — or, for the clipboard, as the one intent left.
 
-use members_view::host::{Copy, Session};
-use members_view::{boot_native, tick_native};
 use ducktape_view_guest::testing::{answer, has_text, item, press, refuse, texts};
 use ducktape_view_guest::wire::{Event, Frame, Node, Request};
+use members_view::host::{Copy, Session};
+use members_view::{boot_native, tick_native};
 
 fn node_ending(frame: &Frame, suffix: &str) -> Node {
     fn find(node: &Node, suffix: &str) -> Option<Node> {
@@ -127,14 +127,14 @@ fn a_connected_view_reads_its_own_roster() {
 
     let (frame, _live) = connected_roster(true);
     for expected in [
-        "2 humans · 1 agent",
+        "2 humans, 1 agent",
         THIS_NODE,
-        "this node",
+        "This node",
         RESIDENT,
-        "validator",
-        "resident",
+        "Validator",
+        "Resident",
         "Reviewer Bot",
-        "agent",
+        "Agent",
     ] {
         assert!(
             has_text(&frame, expected),
@@ -238,9 +238,80 @@ fn a_pause_leaves_as_a_signed_runs_op() {
         })
     );
 
+    // while the kernel holds the answer the button says so and takes no
+    // second press; the refusal then reads as a sentence, verb first
+    assert!(has_text(&frame, "Sending…"), "{:?}", texts(&frame));
+    let Node::Button { on_press: None, .. } = node_ending(&frame, "/status-change") else {
+        panic!("the sending button is disabled: {:?}", texts(&frame));
+    };
     let frame = tick_native(vec![refuse(submit.id, "the local user key is locked")]);
     assert!(
-        has_text(&frame, "the local user key is locked"),
+        has_text(
+            &frame,
+            "The node refused the change: the local user key is locked"
+        ),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(has_text(&frame, "Pause agent"), "{:?}", texts(&frame));
+}
+
+/// Connected but unanswered, the list says it is reading — never a blank,
+/// never "no members" before the node has spoken.
+#[test]
+fn the_list_says_it_is_reading_until_the_roster_answers() {
+    let frame = boot();
+    let session_id = request(&frame, "members.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true, false))]);
+    assert!(
+        has_text(&frame, "Reading the roster…"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(!has_text(&frame, "No members yet"), "{:?}", texts(&frame));
+
+    let (frame, _) = connected_roster(false);
+    assert!(
+        !has_text(&frame, "Reading the roster…"),
+        "{:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(press(&frame, "Show validators only"));
+    assert!(has_text(&frame, THIS_NODE), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, RESIDENT), "{:?}", texts(&frame));
+}
+
+/// A roster refusal reads as a sentence with the kernel's reason inside it.
+#[test]
+fn a_roster_refusal_reads_as_a_sentence() {
+    let frame = boot();
+    let session_id = request(&frame, "members.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true, false))]);
+    let status = request(&frame, "rpc.status").id;
+    let frame = tick_native(vec![refuse(status, "not connected to a node")]);
+    assert!(
+        has_text(&frame, "Couldn't read the roster: not connected to a node"),
+        "{:?}",
+        texts(&frame)
+    );
+    // a refusal is not an empty network: no "appear as they join" under it
+    assert!(!has_text(&frame, "No members yet"), "{:?}", texts(&frame));
+}
+
+/// This node's validator seat has no ballot to press: the record says why.
+#[test]
+fn this_nodes_own_seat_reads_why_it_has_no_ballot() {
+    let frame = opened(true, THIS_NODE);
+    assert!(
+        !has_text(&frame, "Remove from the validator set"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(
+        has_text(
+            &frame,
+            "This node holds a validator seat. Another validator opens the ballot to remove it."
+        ),
         "{:?}",
         texts(&frame)
     );

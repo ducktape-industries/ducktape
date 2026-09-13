@@ -128,7 +128,7 @@ fn accounts() -> Vec<u8> {
 }
 
 fn refs() -> Vec<u8> {
-    serde_json::json!({ "refs": [{ "name": "main", "target": "1111222233334444" }] })
+    serde_json::json!({ "refs": [{ "name": "main", "head": "1111222233334444" }] })
         .to_string()
         .into_bytes()
 }
@@ -244,7 +244,80 @@ fn a_refused_read_is_shown_where_the_listing_would_be() {
     let repo_list = drive.take("list_repos");
     drive.tick(vec![refuse(repo_list, "the node is not reachable")]);
     assert!(
-        has_text(&drive.frame, "the node is not reachable"),
+        has_text(
+            &drive.frame,
+            "Could not read the repositories: the node is not reachable"
+        ),
+        "{:?}",
+        texts(&drive.frame)
+    );
+}
+
+/// A refused file read is a sentence in the file pane, never a blank
+/// danger strip: the loader's note is empty on a refusal, so the refusal
+/// itself is the line.
+#[test]
+fn a_refused_file_read_says_so_in_the_file_pane() {
+    let (mut drive, _) = namespace("duck://forge/core/blob/main.rs");
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    let tree = serde_json::json!({ "tree": {
+        "rev": "1111222233334444", "born": true, "truncated": false,
+        "entries": [{ "name": "main.rs", "path": "main.rs", "kind": "file" }]
+    }});
+    drive.answer("tree", tree.to_string().as_bytes());
+    // the file opens at the commit the tree answered with — one blob read
+    assert!(
+        has_text(&drive.frame, "Loading file…"),
+        "{:?}",
+        texts(&drive.frame)
+    );
+    let blob = drive.take("blob");
+    drive.tick(vec![refuse(blob, "object missing")]);
+    assert!(
+        has_text(&drive.frame, "Could not load this file: object missing"),
+        "{:?}",
+        texts(&drive.frame)
+    );
+}
+
+/// The patch is drawn per file — one row naming the file, then its hunks —
+/// never git's own `---`/`+++`/`index` bookkeeping lines.
+#[test]
+fn a_patch_opens_each_file_with_one_named_row() {
+    let drive = open_item("duck://forge/core/7");
+    let shown = texts(&drive.frame);
+    assert!(shown.iter().any(|text| text == "main.rs"), "{shown:?}");
+    assert!(
+        !shown
+            .iter()
+            .any(|text| text.starts_with("--- ") || text.starts_with("+++ ")),
+        "{shown:?}"
+    );
+    assert!(
+        shown.iter().any(|text| text == "1 file, +1 −1"),
+        "{shown:?}"
+    );
+}
+
+/// A refused patch read leaves the merge and review doors shut, and the
+/// Changes section says why instead of vanishing.
+#[test]
+fn a_refused_patch_read_is_said_under_changes() {
+    let (mut drive, _) = namespace("duck://forge/core/7");
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    drive.answer("get_item", &detail());
+    let diff = drive.take("pr_diff");
+    drive.tick(vec![refuse(diff, "the pack is gone")]);
+    drive.answer("all", &accounts());
+    assert!(
+        has_text(
+            &drive.frame,
+            "The changes could not be loaded. Open the pull request again to retry."
+        ),
         "{:?}",
         texts(&drive.frame)
     );
@@ -257,7 +330,7 @@ fn a_refused_read_is_shown_where_the_listing_would_be() {
 #[test]
 fn a_routed_link_opens_the_item_it_names() {
     let drive = open_item("duck://forge/core/7");
-    for expected in ["Bound every list", "work → main", "Mallard"] {
+    for expected in ["Bound every list", "work into main", "Mallard"] {
         assert!(
             has_text(&drive.frame, expected),
             "missing {expected:?} in {:?}",
@@ -385,7 +458,7 @@ fn a_diff_line_comment_keeps_its_anchor_and_submits_without_a_review_body() {
         "Keep this guard",
     ));
     drive.tick(press(&drive.frame, "Add comment"));
-    assert!(has_text(&drive.frame, "not sent yet"));
+    assert!(has_text(&drive.frame, "Not sent yet"));
     assert!(has_text(&drive.frame, "Keep this guard"));
     drive.tick(press(&drive.frame, "Pick approve verdict"));
     drive.tick(press(&drive.frame, "Submit review"));

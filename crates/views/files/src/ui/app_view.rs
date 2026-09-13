@@ -76,7 +76,7 @@ impl FilesView {
             children.push(native::notice(
                 "FilesView/notice-box",
                 native::wrapping(native::text("FilesView/notice", self.notice.clone())),
-                Tone::Neutral,
+                Tone::Danger,
             ));
         }
         if self.connected && self.omitted > 0 {

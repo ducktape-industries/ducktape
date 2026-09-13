@@ -642,6 +642,73 @@ mod tests {
         }
     }
 
+    /// The menu fits a 300px thread pane: one wrapping row of glyph-and-word
+    /// items, the close among them, every word short, and no separate close
+    /// row under it. The timeline's menu adds Reply; the thread's has no
+    /// thread to open.
+    #[test]
+    fn the_message_menu_is_one_row_of_short_glyph_items_with_its_close_inside() {
+        let mut state = ChatView::state();
+        state.connected = true;
+        state.active_channel = "room".into();
+        state.selected_message_seq = 1;
+        state.message_action = MessageAction::More;
+        state.active_thread_seq = 1;
+        state.thread_selected_seq = 1;
+        state.thread_message_action = MessageAction::More;
+        let mut tree = state.view();
+        let mut rows = Vec::new();
+        tree.for_each_mut(&mut |node| match node {
+            wire::Node::Linear {
+                key,
+                wrap,
+                children,
+                ..
+            } if key.ends_with("menu-actions") => {
+                assert!(wrap.is_some(), "{key} wraps inside a narrow pane");
+                let shown: Vec<String> = children
+                    .iter()
+                    .map(|child| match child {
+                        wire::Node::Button {
+                            content: wire::ButtonContent::Label(label),
+                            label: Some(accessible),
+                            ..
+                        } => {
+                            assert!(label.chars().count() <= 9, "{label:?} is not short");
+                            assert!(accessible.len() > label.len(), "{label:?} names itself");
+                            label.clone()
+                        }
+                        other => panic!("a labelled button, got {other:?}"),
+                    })
+                    .collect();
+                rows.push((key.clone(), shown));
+            }
+            wire::Node::Linear { key, .. } => assert!(!key.ends_with("close-row")),
+            _ => {}
+        });
+        let [(timeline, timeline_items), (thread, thread_items)] = rows.as_slice() else {
+            panic!("one menu per pane, got {rows:?}");
+        };
+        assert!(timeline.ends_with("message-menu-actions"), "{timeline}");
+        assert!(thread.ends_with("thread-menu-actions"), "{thread}");
+        assert_eq!(
+            timeline_items,
+            &[
+                "👍",
+                "😀 React",
+                "↩ Reply",
+                "🔗 Link",
+                "✎ Edit",
+                "🗑 Delete",
+                "✕"
+            ]
+        );
+        assert_eq!(
+            thread_items,
+            &["👍", "😀 React", "🔗 Link", "✎ Edit", "🗑 Delete", "✕"]
+        );
+    }
+
     #[test]
     fn snapshot_preserves_drafts_selection_and_subscription_identity() {
         let mut state = ChatView::state();

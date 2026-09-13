@@ -142,6 +142,22 @@ impl ForgeView {
             &self.tree_rev,
             &self.file_path,
         );
+        // no file open: the tree pane already says why when it is still
+        // loading, failed, or lists nothing, so this pane speaks only when
+        // there is something to choose
+        if path.is_empty() {
+            let choosable = self.tree_phase == "ready"
+                && (!self.tree_entries.is_empty() || self.tree_truncated);
+            let mut content = Vec::new();
+            if choosable {
+                content.push(native::empty_state(
+                    "forge/choose-file",
+                    "No file open",
+                    "Choose a file from the tree.",
+                ));
+            }
+            return native::column("forge/file", content);
+        }
         let mut content = vec![native::centered_row(
             "forge/file-head",
             [
@@ -150,99 +166,72 @@ impl ForgeView {
                     Some(wire::Length::Fill),
                     None,
                 ),
-                native::nowrap(native::caption(
-                    "forge/code-context",
-                    "Synced from the node · view only",
-                )),
+                native::nowrap(native::caption("forge/code-context", "Read only")),
             ],
         )];
-        if self.tree_phase == "loading" {
-            content.push(native::secondary(
-                "forge/loading-tree",
-                "Loading repository tree…",
-            ));
-        }
-        if self.tree_phase == "failed" {
-            content.push(native::secondary(
-                "forge/unavailable-code",
-                "Repository code is unavailable.",
-            ));
-        }
-        if path.is_empty() && self.tree_phase == "ready" {
-            let label = if !self.tree_born {
-                "This repository has no commits yet."
-            } else if self.tree_entries.is_empty() && !self.tree_truncated {
-                "This commit has no files."
-            } else {
-                "Choose a file from the tree."
-            };
-            content.push(native::secondary("forge/choose-file", label));
-        }
-        if !path.is_empty() {
-            match self.file_phase.as_str() {
-                "loading" => content.push(native::secondary("forge/loading-file", "Loading file…")),
-                "failed" => content.push(native::tone_text(
-                    "forge/file-failed",
-                    &self.file_note,
-                    Tone::Danger,
-                )),
-                "ready" => {
-                    if self.file_binary {
-                        content.push(native::secondary(
-                            "forge/binary",
-                            host::binary_note(&self.file_text),
-                        ));
-                    } else if self.file_picture {
-                        content.push(wire::Node::Surface {
-                            key: "forge/file-picture".into(),
-                            name: "picture".into(),
-                            args: vec![
-                                wire::SurfaceValue::Str("forge".into()),
-                                wire::SurfaceValue::Str(self.file_path.clone()),
-                            ],
-                            on_event: None,
-                        });
-                        content.push(native::caption(
-                            "forge/picture-caption",
-                            host::picture_caption(self.file_width, self.file_height),
-                        ));
-                    } else {
-                        let markdown = host::markdown_path(&self.file_path);
-                        content.push(wire::Node::Surface {
-                            key: "forge/file-text".into(),
-                            name: if markdown {
-                                "forge_markdown"
-                            } else {
-                                "forge_code"
-                            }
-                            .into(),
-                            args: vec![
-                                wire::SurfaceValue::Str(self.file_text.clone()),
-                                wire::SurfaceValue::Str(self.file_path.clone()),
-                                wire::SurfaceValue::Bool(self.dark),
-                            ],
-                            on_event: markdown.then(|| {
-                                slots::handler(Box::new(|value| match value {
-                                    wire::SurfaceValue::Str(link) => {
-                                        Some(Message::OpenMessageLink(link))
-                                    }
-                                    _ => None,
-                                }))
-                            }),
-                        });
-                    }
-                    if self.file_truncated {
-                        content.push(native::caption(
-                            "forge/file-truncated",
-                            "This file is larger than the 64 KiB preview limit.",
-                        ));
-                    }
-                    if !self.file_note.is_empty() {
-                        content.push(native::caption("forge/file-note", &self.file_note));
-                    }
+        match self.file_phase.as_str() {
+            "loading" => content.push(native::secondary("forge/loading-file", "Loading file…")),
+            "failed" => content.push(native::tone_text(
+                "forge/file-failed",
+                &self.file_note,
+                Tone::Danger,
+            )),
+            "ready" => {
+                if self.file_binary {
+                    content.push(native::secondary(
+                        "forge/binary",
+                        host::binary_note(&self.file_text),
+                    ));
+                } else if self.file_picture {
+                    content.push(wire::Node::Surface {
+                        key: "forge/file-picture".into(),
+                        name: "picture".into(),
+                        args: vec![
+                            wire::SurfaceValue::Str("forge".into()),
+                            wire::SurfaceValue::Str(self.file_path.clone()),
+                        ],
+                        on_event: None,
+                    });
+                    content.push(native::caption(
+                        "forge/picture-caption",
+                        host::picture_caption(self.file_width, self.file_height),
+                    ));
+                } else {
+                    let markdown = host::markdown_path(&self.file_path);
+                    content.push(wire::Node::Surface {
+                        key: "forge/file-text".into(),
+                        name: if markdown {
+                            "forge_markdown"
+                        } else {
+                            "forge_code"
+                        }
+                        .into(),
+                        args: vec![
+                            wire::SurfaceValue::Str(self.file_text.clone()),
+                            wire::SurfaceValue::Str(self.file_path.clone()),
+                            wire::SurfaceValue::Bool(self.dark),
+                        ],
+                        on_event: markdown.then(|| {
+                            slots::handler(Box::new(|value| match value {
+                                wire::SurfaceValue::Str(link) => {
+                                    Some(Message::OpenMessageLink(link))
+                                }
+                                _ => None,
+                            }))
+                        }),
+                    });
                 }
-                _ => {}
+                if self.file_truncated {
+                    content.push(native::caption(
+                        "forge/file-truncated",
+                        "This file is larger than the 64 KiB preview limit.",
+                    ));
+                }
+                if !self.file_note.is_empty() {
+                    content.push(native::caption("forge/file-note", &self.file_note));
+                }
             }
+            _ => {}
         }
         native::spaced(native::column("forge/file", content), 10.)
     }
@@ -277,13 +266,28 @@ impl ForgeView {
         let render = |line: &host::DiffLine| {
             let key = format!("forge/diff/{}", line.key);
             match line.kind.as_str() {
+                "note" => native::padded(
+                    native::row(
+                        &key,
+                        [native::nowrap(native::caption(
+                            format!("{key}/text"),
+                            &line.text,
+                        ))],
+                    ),
+                    wire::Edges {
+                        top: 2.,
+                        right: 8.,
+                        bottom: 2.,
+                        left: 8.,
+                    },
+                ),
                 "file" => {
                     let mut head = native::padded(
                         native::row(
                             &key,
-                            [native::nowrap(native::mono(
-                                format!("{key}/text"),
-                                &line.text,
+                            [native::nowrap(native::weighted(
+                                native::mono(format!("{key}/text"), &line.text),
+                                wire::Weight::Medium,
                             ))],
                         ),
                         wire::Edges {
@@ -418,6 +422,20 @@ impl ForgeView {
                 "This diff is truncated; open the repository locally to see the rest.",
             ));
         }
+        // no rows: either the patch read was refused (then nothing pins a
+        // source head and the merge and review doors stay shut) or the two
+        // tips are identical
+        if content.is_empty() {
+            let unloaded = self.forge_item_source_oid.is_empty();
+            content.push(native::wrapping(native::secondary(
+                "forge/no-diff",
+                if unloaded {
+                    "The changes could not be loaded. Open the pull request again to retry."
+                } else {
+                    "No changes between the two branches."
+                },
+            )));
+        }
         section("forge/diff", title, content)
     }
 
@@ -439,7 +457,7 @@ impl ForgeView {
             "open" => {
                 let mut row = vec![native::badge(
                     "forge/approvals",
-                    format!("{} approvals", self.forge_item_approvals),
+                    host::plural(self.forge_item_approvals, "approval", "approvals"),
                     if self.forge_item_approvals > 0 {
                         Tone::Success
                     } else {
@@ -450,8 +468,8 @@ impl ForgeView {
                     row.push(native::tone_text(
                         "forge/changes-requested",
                         format!(
-                            "{} reviewers requested changes — merge not recommended",
-                            self.forge_item_change_requests
+                            "{} requested changes — merging is not recommended",
+                            host::plural(self.forge_item_change_requests, "reviewer", "reviewers")
                         ),
                         Tone::Danger,
                     ));
@@ -520,12 +538,12 @@ impl ForgeView {
                     native::mono(format!("{key}/commit"), &review.commit),
                     native::palette().muted,
                 )),
-                self.finality(format!("{key}/finality"), review.created_at),
+                self.finality(format!("{key}/finality")),
             ];
             if review.outdated {
                 head.push(native::badge(
                     format!("{key}/outdated"),
-                    "outdated",
+                    "Outdated",
                     Tone::Warning,
                 ));
             }
@@ -697,7 +715,7 @@ impl ForgeView {
                                         ),
                                         native::badge(
                                             format!("{key}/status"),
-                                            "not sent yet",
+                                            "Not sent yet",
                                             Tone::Warning,
                                         ),
                                         subtle(
@@ -732,7 +750,11 @@ impl ForgeView {
                     ),
                     primary(
                         "forge/submit-review",
-                        "Submit review",
+                        if self.review_busy {
+                            "Sending…"
+                        } else {
+                            "Submit review"
+                        },
                         submit.then(|| Message::ForgeReviewSubmit(self.review_draft.clone())),
                     ),
                 ],

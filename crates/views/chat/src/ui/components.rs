@@ -78,17 +78,30 @@ impl ChatView {
         open: impl Fn(String, i64, i64) -> Message + Clone + 'static,
         hit: crate::host::ChatSearchHit,
     ) -> wire::Node {
+        // the room by its name; the id is what the node keys it by, not a reading
+        let room = self
+            .rooms
+            .iter()
+            .find(|room| room.channel.id == hit.channel_id)
+            .map_or_else(
+                || format!("#{}", hit.channel_id),
+                |room| format!("#{}", room.channel.name),
+            );
         let action = slots::message(open(hit.channel_id, hit.root_seq, hit.seq));
         let content = native::spaced(
             native::column(
                 format!("{key}/content"),
                 [
-                    native::centered_row(
-                        format!("{key}/byline"),
-                        [
-                            native::nowrap(native::strong(format!("{key}/author"), hit.author)),
-                            native::nowrap(native::caption(format!("{key}/meta"), hit.meta)),
-                        ],
+                    native::spaced(
+                        native::centered_row(
+                            format!("{key}/byline"),
+                            [
+                                native::nowrap(native::strong(format!("{key}/author"), hit.author)),
+                                native::nowrap(native::caption(format!("{key}/room"), room)),
+                                native::nowrap(native::caption(format!("{key}/meta"), hit.meta)),
+                            ],
+                        ),
+                        6.,
                     ),
                     native::wrapping(native::secondary(format!("{key}/text"), hit.text.clone())),
                 ],

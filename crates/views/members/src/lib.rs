@@ -181,6 +181,34 @@ mod tests {
         .unwrap();
         assert!(MembersView::restore(&bytes).is_err());
     }
+    /// A tab the roster has nobody under names the tab, not the network.
+    #[test]
+    fn an_empty_tab_names_itself() {
+        let (mut view, _) = MembersView::boot();
+        view.connected = true;
+        view.answered = true;
+        view.filter = MembersFilter::Validators;
+        view.rows.push(host::MemberRow {
+            key: "reviewer".into(),
+            is_agent: true,
+            role: "agent".into(),
+            ..Default::default()
+        });
+        let mut shown = Vec::new();
+        view.view().for_each_mut(&mut |node| {
+            if let ducktape_view_guest::wire::Node::Text { content, .. } = node {
+                shown.push(content.clone());
+            }
+        });
+        assert!(
+            shown.iter().any(|text| text == "No validators"),
+            "{shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|text| text == "No members yet"),
+            "{shown:?}"
+        );
+    }
     #[test]
     fn view_fits_default_stack() {
         let (app, _) = MembersView::boot();
@@ -207,7 +235,7 @@ impl MembersView {
         item: crate::host::SessionItem,
     ) -> ::ducktape_view_guest::Task<Message> {
         {
-            self.host_error = item.error.to_owned();
+            self.host_error = sentence("Couldn't read the session", &item.error);
             if !(item.error).is_empty() {
                 return ::ducktape_view_guest::Task::none();
             }
@@ -228,7 +256,7 @@ impl MembersView {
         item: crate::host::RosterItem,
     ) -> ::ducktape_view_guest::Task<Message> {
         {
-            self.host_error = item.error.to_owned();
+            self.host_error = sentence("Couldn't read the roster", &item.error);
             self.answered = true;
             if !(item.error).is_empty() {
                 return ::ducktape_view_guest::Task::none();
@@ -241,7 +269,7 @@ impl MembersView {
     fn on_act_done(&mut self, item: crate::host::ActItem) -> ::ducktape_view_guest::Task<Message> {
         {
             self.acting = "".to_owned();
-            self.host_error = item.error.to_owned();
+            self.host_error = sentence("The node refused the change", &item.error);
             ::ducktape_view_guest::Task::none()
         }
     }
@@ -396,12 +424,15 @@ impl MembersView {
             }
             roster.push(strip);
             let members = host::filter_members(&self.rows, self.filter);
-            if members.is_empty() && self.answered {
-                roster.push(kit::empty_state(
-                    "members/empty",
-                    "No members here yet",
-                    "Validators, residents and registered agents appear as they join.",
-                ));
+            let waiting = !self.answered;
+            if waiting {
+                roster.push(kit::secondary("members/loading", "Reading the roster…"));
+            }
+            // a refused read is the notice above, not an empty network
+            let nobody = members.is_empty() && self.answered && self.host_error.is_empty();
+            if nobody {
+                let (title, detail) = host::empty_words(self.filter);
+                roster.push(kit::empty_state("members/empty", title, detail));
             }
             let mut rows = Vec::new();
             for member in &members {
@@ -437,15 +468,14 @@ impl MembersView {
                     |(dx, dy)| Some(Message::MemberResized(dx, dy)),
                 ))),
                 cursor: Some(wire::mouse::Cursor::ResizingHorizontally),
+                // a 10px grip around the hairline: the handle is as wide
+                // as its child, and a 1px rule is nothing to grab
                 content: Box::new(kit::sized(
-                    kit::container(
+                    grip(
                         "members/divider",
-                        wire::Node::Space {
-                            width: None,
-                            height: None,
-                        },
+                        kit::vertical_divider("members/divider/rule"),
                     ),
-                    Some(wire::Length::Fixed(6.)),
+                    Some(wire::Length::Fixed(10.)),
                     Some(wire::Length::Fill),
                 )),
             });
@@ -494,13 +524,13 @@ impl MembersView {
         if member.is_this_node {
             line.push(kit::badge(
                 format!("{key}/local"),
-                "this node",
+                "This node",
                 Tone::Accent,
             ));
         }
         line.push(kit::badge(
             format!("{key}/role"),
-            &member.role,
+            host::sentence_case(&member.role),
             Tone::Neutral,
         ));
         if !member.model.is_empty() {
@@ -586,26 +616,42 @@ impl MembersView {
             kit::kv(
                 format!("{key}/role"),
                 "role",
-                kit::badge(format!("{key}/role-badge"), &member.role, Tone::Neutral),
+                kit::badge(
+                    format!("{key}/role-badge"),
+                    host::sentence_case(&member.role),
+                    Tone::Neutral,
+                ),
             ),
             kit::kv(
                 format!("{key}/presence"),
                 "presence",
                 presence_chip(format!("{key}/status"), member),
             ),
-            kit::kv(
-                format!("{key}/key-row"),
-                key_name,
-                kit::spaced(
-                    kit::centered_row(
-                        format!("{key}/key-cell"),
-                        [
-                            kit::wrapping(kit::mono(format!("{key}/key"), &member.key)),
-                            copy,
-                        ],
-                    ),
-                    6.,
+            // a 64-hex key has no room beside a 140px label in a 312px
+            // pane: the name and its copy control share a line, the key
+            // wraps at full width under them
+            kit::spaced(
+                kit::column(
+                    format!("{key}/key-row"),
+                    [
+                        kit::centered_row(
+                            format!("{key}/key-cell"),
+                            [
+                                kit::sized(
+                                    kit::nowrap(kit::secondary(
+                                        format!("{key}/key-label"),
+                                        key_name,
+                                    )),
+                                    Some(wire::Length::Fill),
+                                    None,
+                                ),
+                                copy,
+                            ],
+                        ),
+                        kit::wrapping(kit::mono(format!("{key}/key"), &member.key)),
+                    ],
                 ),
+                4.,
             ),
         ];
         if !member.model.is_empty() {
@@ -616,22 +662,27 @@ impl MembersView {
             ));
         }
         let mut actions = Vec::new();
+        // the record waits on its own write: the button says so, and no
+        // second press leaves until the kernel answers the first
+        let sending = self.acting == member.key;
+        let idle = self.acting.is_empty();
         if member.is_agent {
+            let word = match (sending, member.live) {
+                (true, _) => "Sending…",
+                (false, true) => "Pause agent",
+                (false, false) => "Resume agent",
+            };
             actions.push(kit::button(
                 format!("{key}/status-change"),
-                if member.live {
-                    "Pause agent"
-                } else {
-                    "Resume agent"
-                },
-                self.acting.is_empty().then(|| {
+                word,
+                idle.then(|| {
                     slots::message(Message::SetAgentStatus(member.key.clone(), member.live))
                 }),
                 wire::ButtonPreset::Secondary,
             ));
             actions.push(kit::wrapping(kit::caption(
                 format!("{key}/owner-gate"),
-                "Pause and resume are owner-gated writes. The model accepts changes from its program account or current controller.",
+                "Only the agent's owner or its current controller can pause or resume it.",
             )));
         }
         let ballot = match (
@@ -647,24 +698,36 @@ impl MembersView {
             _ => None,
         };
         if let Some((action, label)) = ballot {
+            let word = match sending {
+                true => "Sending…",
+                false => label,
+            };
             actions.push(kit::button(
                 format!("{key}/ballot"),
-                label,
-                self.acting.is_empty().then(|| {
+                word,
+                idle.then(|| {
                     slots::message(Message::OpenBallot(action.into(), member.key.clone()))
                 }),
                 wire::ButtonPreset::Secondary,
             ));
-            actions.push(kit::caption(
+            actions.push(kit::wrapping(kit::caption(
                 format!("{key}/quorum"),
-                "Needs quorum to pass.",
-            ));
+                "Opens a ballot the validators vote on under Governance.",
+            )));
         }
         let reads_only = !self.admin && !member.is_this_node && !member.is_agent;
         if reads_only {
             actions.push(kit::wrapping(kit::caption(
                 format!("{key}/validator-gate"),
                 "Only a validator node may open a membership proposal.",
+            )));
+        }
+        // this node's own seat: nothing to press, and the reason why
+        let own_seat = self.admin && member.is_this_node && member.role == "validator";
+        if own_seat {
+            actions.push(kit::wrapping(kit::caption(
+                format!("{key}/own-seat"),
+                "This node holds a validator seat. Another validator opens the ballot to remove it.",
             )));
         }
         if !actions.is_empty() {
@@ -690,6 +753,25 @@ impl MembersView {
         )
     }
 }
+/// A container that centres its child: the grip a hairline sits in.
+fn grip(key: &str, child: ducktape_view_guest::wire::Node) -> ducktape_view_guest::wire::Node {
+    use ducktape_view_guest::{kit, wire};
+    let mut node = kit::container(key, child);
+    if let wire::Node::Container { align_x, .. } = &mut node {
+        *align_x = Some(wire::AlignX::Center);
+    }
+    node
+}
+
+/// A kernel refusal as a person reads it: a verb, then the reason. An empty
+/// reason is no error at all.
+fn sentence(verb: &str, reason: &str) -> String {
+    match reason.is_empty() {
+        true => String::new(),
+        false => format!("{verb}: {reason}"),
+    }
+}
+
 /// The agent tone is the one mark a machine carries in the roster: it sits
 /// on the avatar, so a row reads as a person or a program at a glance.
 fn avatar_tone(member: &host::MemberRow) -> ducktape_view_guest::kit::Tone {
@@ -705,7 +787,7 @@ fn avatar_tone(member: &host::MemberRow) -> ducktape_view_guest::kit::Tone {
 /// absence a faint caption — offline is not a state worth a colour.
 fn presence_chip(key: String, member: &host::MemberRow) -> ducktape_view_guest::wire::Node {
     use ducktape_view_guest::kit::{self, Tone};
-    let word = host::presence_label(member);
+    let word = host::sentence_case(host::presence_label(member));
     match (member.is_agent, member.live) {
         (true, _) => kit::badge(key, word, Tone::Neutral),
         (false, true) => kit::badge(key, word, Tone::Success),

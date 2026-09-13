@@ -55,9 +55,12 @@ impl FilesView {
                 12.,
             ),
         );
-        if let wire::Node::Container { padding, width, .. } = &mut card {
+        if let wire::Node::Container {
+            padding, max_width, ..
+        } = &mut card
+        {
             *padding = Some(wire::Edges::all(20.));
-            *width = Some(wire::Length::Fixed(418.));
+            *max_width = Some(418.);
         }
         card
     }
@@ -71,7 +74,7 @@ impl FilesView {
     }
 
     pub(super) fn changes_heading(&self, key: String) -> wire::Node {
-        native::heading(key, "Changes vs HEAD")
+        native::heading(key, "Changes since this snapshot")
     }
     pub(super) fn snapshots_heading(&self, key: String) -> wire::Node {
         native::heading(key, "Snapshots")

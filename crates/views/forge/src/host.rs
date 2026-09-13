@@ -139,8 +139,9 @@ pub struct TreeEntry {
     pub kind: String,
 }
 
-/// One painted row of the unified patch. `kind` is `file` | `hunk` | `add`
-/// | `del` | `ctx`.
+/// One painted row of the unified patch. `kind` is `file` (one per changed
+/// file, `text` naming it) | `hunk` | `add` | `del` | `ctx` | `note` (the
+/// `\ No newline at end of file` remark).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DiffLine {
     pub key: i64,
@@ -196,11 +197,18 @@ pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
                 },
                 Err(error) => SessionItem {
                     next: Session::default(),
-                    error,
+                    error: failure("Could not read the session", &error),
                 },
             }
         })
     })
+}
+
+/// A refusal as the screen says it: what we were doing, then the kernel's
+/// own words. Every error a reader hands the view passes through here, so
+/// no strip ever shows a bare token.
+fn failure(doing: &str, error: &str) -> String {
+    format!("{doing}: {error}")
 }
 
 /// The serial every read subscription is keyed by: it moves when the
@@ -285,7 +293,7 @@ async fn load_repos() -> RepoListItem {
         },
         Err(error) => RepoListItem {
             repos: Vec::new(),
-            error,
+            error: failure("Could not read the repositories", &error),
         },
     }
 }
@@ -338,7 +346,7 @@ async fn load_repo(repo: String) -> RepoItem {
         Ok(item) => item,
         Err(error) => RepoItem {
             repo,
-            error,
+            error: failure("Could not read this repository", &error),
             ..RepoItem::default()
         },
     }
@@ -444,7 +452,7 @@ async fn load_item(repo: String, number: i64) -> ItemItem {
         Err(error) => ItemItem {
             repo,
             number,
-            error,
+            error: failure("Could not read this item", &error),
             ..ItemItem::default()
         },
     }
@@ -486,7 +494,7 @@ pub fn fold_item(
     let target_branch = detail["target_branch"].as_str().unwrap_or_default();
     let branches = match source_branch.is_empty() {
         true => String::new(),
-        false => format!("{source_branch} → {target_branch}"),
+        false => format!("{source_branch} into {target_branch}"),
     };
     let body = detail["body"].as_str().unwrap_or_default().to_owned();
     ItemItem {
@@ -568,11 +576,10 @@ fn fold_reviews(reviews: &serde_json::Value, source_oid: &str, names: &Names) ->
                     .map(|comment| {
                         let body = comment["body"].as_str().unwrap_or_default().to_owned();
                         ForgeReviewComment {
-                            anchor: format!(
-                                "{}:{} ({})",
+                            anchor: comment_anchor(
                                 comment["path"].as_str().unwrap_or_default(),
-                                comment["line"].as_i64().unwrap_or(0),
-                                comment["side"].as_str().unwrap_or_default()
+                                &comment["line"].as_i64().unwrap_or(0).to_string(),
+                                comment["side"].as_str().unwrap_or_default(),
                             ),
                             blocks: body_blocks(&body),
                             body,
@@ -633,7 +640,7 @@ async fn load_discussion(channel_id: String) -> DiscussionItem {
         Ok(item) => item,
         Err(error) => DiscussionItem {
             channel_id,
-            error,
+            error: failure("Could not read the discussion", &error),
             ..DiscussionItem::default()
         },
     }
@@ -684,7 +691,7 @@ fn fold_message(row: &serde_json::Value, names: &Names) -> ChatMessage {
         false => blocks_view(&wire, names),
     };
     let meta = match edited {
-        true => format!("#{seq} · edited"),
+        true => format!("#{seq} (edited)"),
         false => format!("#{seq}"),
     };
     ChatMessage {
@@ -792,7 +799,7 @@ async fn load_tree(repo: String, rev: String, path: String) -> TreeItem {
             repo,
             rev,
             path,
-            error,
+            error: failure("Could not read the repository tree", &error),
             ..TreeItem::default()
         },
     }
@@ -866,7 +873,7 @@ async fn load_blob(repo: String, rev: String, path: String, net: String) -> Blob
         Err(error) => BlobItem {
             repo,
             path,
-            error,
+            error: failure("Could not load this file", &error),
             ..BlobItem::default()
         },
     }
@@ -1127,6 +1134,10 @@ pub fn review_submit(
                 submit(message).await.err().unwrap_or_default()
             }
         };
+        let error = match error.is_empty() {
+            true => error,
+            false => failure("The review was not sent", &error),
+        };
         ActItem {
             kind: "review".to_owned(),
             error,
@@ -1177,7 +1188,7 @@ pub fn merge(
             Ok(item) => item,
             Err(error) => ActItem {
                 kind: "merge".to_owned(),
-                error,
+                error: failure("The merge did not go through", &error),
                 ..ActItem::default()
             },
         }
@@ -1377,8 +1388,26 @@ pub fn kind_tab(kind: &str) -> String {
 pub fn forge_merge_note(merge_oid: &str, branches: &str) -> String {
     let short: String = merge_oid.chars().take(8).collect();
     match branches.is_empty() {
-        true => format!("Merged as {short}"),
-        false => format!("Merged as {short} · {branches}"),
+        true => format!("Merged as {short}."),
+        false => format!("Merged {branches} as {short}."),
+    }
+}
+
+/// A state or seat word as a badge reads it: `open` → `Open`.
+pub fn state_label(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// The file pane's line under a failed read: the loader's note, or the
+/// refusal as a sentence.
+pub fn blob_note(note: &str, error: &str) -> String {
+    match error.is_empty() {
+        true => note.to_owned(),
+        false => error.to_owned(),
     }
 }
 
@@ -1448,7 +1477,7 @@ pub fn forge_comment_target(path: &str, line: &str, side: &str) -> String {
     if path.is_empty() {
         return String::new();
     }
-    format!("{path}:{line} ({side})")
+    comment_anchor(path, line, side)
 }
 
 /// What the branch selector reads while no branch stands at the browse's
@@ -1534,9 +1563,21 @@ pub fn forge_file_header(
     }
 }
 
-/// The PR stats line: `3 files · +12 −4`.
+/// The PR stats line: `3 files, +12 −4`.
 pub fn forge_stats(files: i64, additions: i64, deletions: i64) -> String {
-    format!("{files} files · +{additions} −{deletions}")
+    format!(
+        "{}, +{additions} −{deletions}",
+        plural(files, "file", "files")
+    )
+}
+
+/// Where a line comment sits, as a person reads it: `main.rs:12`, and the
+/// side only when it is the removed line.
+pub fn comment_anchor(path: &str, line: &str, side: &str) -> String {
+    match side {
+        "old" => format!("{path}:{line} (removed line)"),
+        _ => format!("{path}:{line}"),
+    }
 }
 
 /// Stage one line comment, or replace the one already on that line.
@@ -1558,7 +1599,7 @@ pub fn stage_forge_comment(
         return staged;
     }
     let comment = ForgeDraftComment {
-        anchor: format!("{path}:{line} ({side})"),
+        anchor: comment_anchor(&path, &line, &side),
         path,
         line,
         side,
@@ -1687,8 +1728,10 @@ pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
     let mut new_no = 0i64;
     // The path every following code row is anchored to, taken from the
     // patch's own `+++ b/…` header: a comment cannot be authored from a row
-    // that does not know its file.
+    // that does not know its file. The `--- a/…` side is held only to name
+    // a deleted file, whose head side is `/dev/null`.
     let mut path = String::new();
+    let mut old_path = String::new();
     // What the open hunk still owes on each side. A hunk header DECLARES how
     // many lines its body covers, and while either side is still owed one,
     // every line is body content — never a header. That budget is the ONLY
@@ -1699,13 +1742,18 @@ pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
     for line in diff.lines() {
         let inside_hunk_body = old_left > 0 || new_left > 0;
         if !inside_hunk_body {
-            if let Some(target) = added_side_path(line) {
-                path = target;
-                rows.push(marker_row(line));
+            if let Some(source) = removed_side_path(line) {
+                old_path = source;
                 continue;
             }
-            if is_file_header(line) {
-                rows.push(marker_row(line));
+            if let Some(target) = added_side_path(line) {
+                path = target;
+                rows.push(file_row(&old_path, &path));
+                old_path.clear();
+                continue;
+            }
+            if let Some(name) = binary_file(line) {
+                rows.push(named_file_row(&format!("{name} (binary)")));
                 continue;
             }
             if let Some(span) = hunk_span(line) {
@@ -1724,12 +1772,23 @@ pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
                 ));
                 continue;
             }
+            // `diff --git`, `index`, a mode or rename line: git's own
+            // bookkeeping between files, which the one file row already says
+            continue;
         }
         // `\ No newline at end of file` is a note ABOUT the previous line. It
         // holds no position on either side, so it consumes neither a line
         // number nor the hunk's budget.
         if line.starts_with('\\') {
-            rows.push(marker_row(line));
+            rows.push(diff_row(
+                "note",
+                String::new(),
+                String::new(),
+                "",
+                line.trim_start_matches('\\').trim(),
+                "",
+                "",
+            ));
             continue;
         }
         match line.chars().next() {
@@ -1783,31 +1842,50 @@ pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
     rows
 }
 
-/// The non-code rows: a file header, and the `\ No newline` note. Neither
-/// is a commentable position, so both carry an empty path and side.
-fn marker_row(line: &str) -> DiffLine {
-    diff_row("file", String::new(), String::new(), "", line, "", "")
+/// The one row that opens a changed file: its name, and whether it is new
+/// or gone. Not a commentable position, so it carries no path or side.
+fn file_row(old_path: &str, new_path: &str) -> DiffLine {
+    let name = match (old_path.is_empty(), new_path.is_empty()) {
+        (true, false) => format!("{new_path} (new file)"),
+        (false, false) => new_path.to_owned(),
+        (false, true) => format!("{old_path} (deleted)"),
+        (true, true) => "(unnamed file)".to_owned(),
+    };
+    named_file_row(&name)
 }
 
-fn is_file_header(line: &str) -> bool {
-    line.starts_with("diff ")
-        || line.starts_with("--- ")
-        || line.starts_with("index ")
-        || line.starts_with("new file")
-        || line.starts_with("deleted file")
+fn named_file_row(name: &str) -> DiffLine {
+    diff_row("file", String::new(), String::new(), "", name, "", "")
 }
 
 /// The head-side path a `+++ b/<path>` header names. A pure deletion writes
 /// `+++ /dev/null`, which names no file on the head side and yields an
 /// empty path — its rows are then uncommentable, which is correct.
 fn added_side_path(line: &str) -> Option<String> {
-    let target = line.strip_prefix("+++ ")?;
+    header_path(line.strip_prefix("+++ ")?, "b/")
+}
+
+/// The base-side path a `--- a/<path>` header names; a new file's is empty.
+fn removed_side_path(line: &str) -> Option<String> {
+    header_path(line.strip_prefix("--- ")?, "a/")
+}
+
+fn header_path(target: &str, marker: &str) -> Option<String> {
     if target == "/dev/null" {
         return Some(String::new());
     }
-    // git writes `b/<path>`; a patch produced without prefixes writes the
-    // path bare, so strip the marker only when it is there.
-    Some(target.strip_prefix("b/").unwrap_or(target).to_owned())
+    // git writes `a/<path>` / `b/<path>`; a patch produced without prefixes
+    // writes the path bare, so strip the marker only when it is there.
+    Some(target.strip_prefix(marker).unwrap_or(target).to_owned())
+}
+
+/// The head-side name a `Binary files a/<x> and b/<x> differ` line carries:
+/// git writes no `+++` for one, so this is its only file row.
+fn binary_file(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("Binary files ")?;
+    let (_, head) = rest.split_once(" and ")?;
+    let head = head.strip_suffix(" differ")?;
+    header_path(head, "b/")
 }
 
 fn diff_row(

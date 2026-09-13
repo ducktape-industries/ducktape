@@ -99,7 +99,7 @@ pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
                 },
                 Err(error) => SessionItem {
                     next: Session::default(),
-                    error,
+                    error: format!("Could not read the session: {error}"),
                 },
             }
         })
@@ -143,7 +143,7 @@ async fn load_listing(path: String) -> ListingItem {
     match read_listing(&path).await {
         Ok(item) => item,
         Err(error) => ListingItem {
-            error,
+            error: format!("Could not list this directory: {error}"),
             ..ListingItem::default()
         },
     }
@@ -278,7 +278,7 @@ async fn load_preview(path: String) -> PreviewItem {
         Ok(item) => item,
         Err(error) => PreviewItem {
             path,
-            error,
+            error: format!("Could not read this file: {error}"),
             ..PreviewItem::default()
         },
     }
@@ -316,16 +316,19 @@ async fn read_text(path: &str) -> Result<PreviewItem, String> {
     })
 }
 
-/// A file that is text, or the plate that says how many bytes it is not.
+/// What the binary plate says under its title.
+pub const BINARY_PLATE: &str = "This file is not text, so there is nothing to show here.";
+
+/// A file that is text, or the plate that says it is not.
 fn readable(bytes: Vec<u8>) -> (String, bool) {
-    let Ok(text) = String::from_utf8(bytes.clone()) else {
-        return (format!("{} binary bytes", bytes.len()), true);
+    let Ok(text) = String::from_utf8(bytes) else {
+        return (BINARY_PLATE.into(), true);
     };
     let control = text
         .chars()
         .any(|character| character.is_control() && !matches!(character, '\n' | '\t' | '\r'));
     match control {
-        true => (format!("{} binary bytes", bytes.len()), true),
+        true => (BINARY_PLATE.into(), true),
         false => (text, false),
     }
 }
@@ -343,10 +346,11 @@ async fn read_picture(path: &str) -> Result<PreviewItem, String> {
     let drawn = match loaded {
         Ok(drawn) => drawn,
         Err(reason) => {
+            let plate = format!("The picture could not be shown: {reason}");
             return Ok(PreviewItem {
                 path: path.to_owned(),
-                display_text: reason.clone(),
-                text: reason,
+                display_text: plate.clone(),
+                text: plate,
                 binary: true,
                 ..PreviewItem::default()
             });
@@ -396,14 +400,14 @@ async fn load_diff(from: String) -> DiffItem {
     match read_diff(&from).await {
         Ok(item) => item,
         Err(error) => DiffItem {
-            error,
+            error: format!("Could not compare the snapshots: {error}"),
             ..DiffItem::default()
         },
     }
 }
 
 async fn read_diff(from: &str) -> Result<DiffItem, String> {
-    let head = head_snapshot().await?.ok_or("nothing committed yet")?;
+    let head = head_snapshot().await?.ok_or("nothing is committed yet")?;
     let reply = files_get("diff", serde_json::json!({ "from": from, "to": head })).await?;
     let entries = reply["entries"]
         .as_array()
@@ -554,11 +558,33 @@ impl Stream for ActStream {
                 return Poll::Pending;
             };
             let (kind, _) = acts.pending.remove(index);
-            Poll::Ready(Some(ActItem {
-                kind,
-                error: answer.err().unwrap_or_default(),
-            }))
+            let error = answer
+                .err()
+                .map(|error| act_failure(&kind, &error))
+                .unwrap_or_default();
+            Poll::Ready(Some(ActItem { kind, error }))
         })
+    }
+}
+
+/// A refused write, as a sentence that says which write it was.
+pub fn act_failure(kind: &str, error: &str) -> String {
+    let verb = match kind {
+        "mkdir" => "Could not create the folder",
+        "new_file" => "Could not create the file",
+        "delete" => "Could not delete the object",
+        "save" => "Could not save the file",
+        _ => "The write was refused",
+    };
+    format!("{verb}: {error}")
+}
+
+/// A diff leaf's kind as a word: `A`/`added` → Added.
+pub fn diff_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "added" | "A" => "Added",
+        "removed" | "deleted" | "D" => "Removed",
+        _ => "Changed",
     }
 }
 
@@ -648,8 +674,8 @@ pub fn fs_child(dir: &str, name: &str) -> String {
     format!("{dir}/{name}")
 }
 
-/// `12 files · 3 dirs` — the crumb bar's subtitle, and "" whenever the rows on
-/// hand are not this path's: with the node down nobody asked, and
+/// `12 files, 3 folders` — the crumb bar's subtitle, and "" whenever the rows
+/// on hand are not this path's: with the node down nobody asked, and
 /// mid-navigation the rows still belong to the directory you left.
 pub fn fs_counts_summary(connected: bool, listed: bool, entries: &[FsEntry]) -> String {
     if !connected || !listed || entries.is_empty() {
@@ -658,9 +684,9 @@ pub fn fs_counts_summary(connected: bool, listed: bool, entries: &[FsEntry]) -> 
     let dirs = entries.iter().filter(|entry| entry.kind == "dir").count() as i64;
     let files = entries.len() as i64 - dirs;
     format!(
-        "{} · {}",
+        "{}, {}",
         plural(files, "file", "files"),
-        plural(dirs, "dir", "dirs")
+        plural(dirs, "folder", "folders")
     )
 }
 
@@ -684,7 +710,7 @@ pub fn size_label(bytes: i64) -> String {
 /// `h 84,912`; a snapshot without a height prints `h —`.
 pub fn height_label(height: i64) -> String {
     if height < 0 {
-        return "h —".into();
+        return "block —".into();
     }
     let digits = height.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
@@ -694,7 +720,7 @@ pub fn height_label(height: i64) -> String {
         }
         grouped.push(digit);
     }
-    format!("h {grouped}")
+    format!("block {grouped}")
 }
 
 pub fn picture_caption(width: i64, height: i64) -> String {
@@ -770,7 +796,9 @@ fn head_within(text: &str, limit: usize) -> (String, bool) {
     (text[..text.floor_char_boundary(limit)].to_owned(), true)
 }
 
-fn short_digest(digest: &str) -> String {
+/// The first 12 characters of a digest, with an ellipsis when it goes on —
+/// what a row cell shows; the full id belongs to the object panel.
+pub fn short_digest(digest: &str) -> String {
     let mut short: String = digest.chars().take(12).collect();
     if digest.chars().count() > 12 {
         short.push('…');

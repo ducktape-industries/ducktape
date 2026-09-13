@@ -145,7 +145,7 @@ impl super::ChatView {
         &mut self,
         item: crate::host::SessionItem,
     ) -> ducktape_view_guest::Task<Message> {
-        self.host_error = item.error.to_owned();
+        self.host_error = crate::host::failure_note("Couldn’t read the session", &item.error);
         if !(item.error).is_empty() {
             return ::ducktape_view_guest::Task::none();
         }
@@ -323,7 +323,7 @@ impl super::ChatView {
         &mut self,
         item: crate::host::RoomItem,
     ) -> ducktape_view_guest::Task<Message> {
-        self.host_error = item.error.to_owned();
+        self.host_error = crate::host::failure_note("Couldn’t read this room", &item.error);
         self.history_loading = false;
         if item.channel != self.active_channel {
             return ::ducktape_view_guest::Task::none();
@@ -396,7 +396,7 @@ impl super::ChatView {
         &mut self,
         item: crate::host::ThreadItem,
     ) -> ducktape_view_guest::Task<Message> {
-        self.host_error = item.error.to_owned();
+        self.host_error = crate::host::failure_note("Couldn’t read this thread", &item.error);
         self.thread_loading = false;
         if item.root_seq != self.active_thread_seq {
             return ::ducktape_view_guest::Task::none();
@@ -429,7 +429,7 @@ impl super::ChatView {
         &mut self,
         item: crate::host::SearchItem,
     ) -> ducktape_view_guest::Task<Message> {
-        self.host_error = item.error.to_owned();
+        self.host_error = crate::host::failure_note("Search didn’t go through", &item.error);
         if (item.query).is_empty() || (item.query != self.search_query) {
             return ::ducktape_view_guest::Task::none();
         }
@@ -448,7 +448,7 @@ impl super::ChatView {
     }
     fn on_act_done(&mut self, item: crate::host::ActItem) -> ducktape_view_guest::Task<Message> {
         self.busy = self.session_busy;
-        self.host_error = item.error.to_owned();
+        self.host_error = crate::host::failure_note("That didn’t go through", &item.error);
         self.selected_message_seq = 0;
         self.selected_message_rev = 0;
         self.message_action = MessageAction::Toolbar;

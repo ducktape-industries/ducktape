@@ -229,7 +229,11 @@ impl super::ForgeView {
         &mut self,
         next: crate::host::TreeItem,
     ) -> ducktape_view_guest::Task<Message> {
-        if (next.repo != self.open_repo) || (next.path != self.tree_path) {
+        // the listing of no repository (the reader's idle answer) names
+        // nothing: taking it would consume a parked deep link and open its
+        // file at no commit, which the tree's real answer then hides
+        let idle = next.repo.is_empty();
+        if idle || (next.repo != self.open_repo) || (next.path != self.tree_path) {
             return ::ducktape_view_guest::Task::none();
         }
         if (!(self.tree_rev).is_empty()) && (next.rev != self.tree_rev) {
@@ -255,10 +259,11 @@ impl super::ForgeView {
         &mut self,
         next: crate::host::BlobItem,
     ) -> ducktape_view_guest::Task<Message> {
-        if (next.repo != self.open_repo) || (next.path != self.file_path) {
+        let idle = next.repo.is_empty();
+        if idle || (next.repo != self.open_repo) || (next.path != self.file_path) {
             return ::ducktape_view_guest::Task::none();
         }
-        self.file_note = next.note.to_owned();
+        self.file_note = crate::host::blob_note(&next.note, &next.error);
         self.file_phase = crate::host::phase_of(::std::convert::AsRef::as_ref(&(next.error)));
         if !(next.error).is_empty() {
             return ::ducktape_view_guest::Task::none();
