@@ -126,6 +126,8 @@ pub struct ChatView {
     pub(crate) thread_edit_draft: String,
     pub(crate) host_error: String,
     pub(crate) sent: bool,
+    #[serde(default)]
+    pub(crate) dark: bool,
 }
 impl ::std::fmt::Debug for ChatView {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -294,6 +296,7 @@ impl ChatView {
             thread_edit_draft: "".to_owned(),
             host_error: "".to_owned(),
             sent: false,
+            dark: false,
         }
     }
     pub(crate) fn boot() -> (Self, ::ducktape_view_guest::Task<Message>) {
@@ -429,9 +432,9 @@ mod tests {
                 wrap,
                 children,
                 ..
-            } if key.ends_with("/actions") => {
+            } if key.ends_with("/actions/bar") => {
                 assert_eq!(*axis, wire::Axis::Row);
-                assert!(wrap.is_some());
+                assert!(wrap.is_none(), "the floating bar keeps one line");
                 assert_eq!(children.len(), 4);
                 assert!(
                     children
@@ -464,16 +467,17 @@ mod tests {
                 rows += 1;
             }
             wire::Node::Text { content, .. } if content == "New messages" => unread += 1,
+            wire::Node::Text { key, content, .. }
+                if content == "Unread" && key.contains("/channel/") =>
+            {
+                unread_rooms += 1;
+            }
             wire::Node::Button {
                 label: Some(label),
-                content,
                 on_press,
                 key,
                 ..
             } => {
-                if matches!(content, wire::ButtonContent::Label(text) if text.contains("Unread")) {
-                    unread_rooms += 1;
-                }
                 if ["Open thread", "React with 👍", "More message actions"]
                     .contains(&label.as_str())
                 {
@@ -515,8 +519,7 @@ mod tests {
                 assert_eq!(*width, Some(wire::Length::Fill));
                 headers += 1;
             }
-            wire::Node::Linear { key, children, .. } if key.ends_with("/message-action-focus") => {
-                assert!(!children.is_empty());
+            wire::Node::Container { key, .. } if key.ends_with("/message-action-focus") => {
                 menus += 1;
             }
             wire::Node::Input { key, .. } => assert!(!key.ends_with("-focus")),
@@ -597,10 +600,9 @@ mod tests {
             let mut tree = state.view();
             let mut matches = 0;
             tree.for_each_mut(&mut |node| {
-                if let wire::Node::Linear { key, children, .. } = node
+                if let wire::Node::Container { key, .. } = node
                     && key == &target
                 {
-                    assert!(!children.is_empty());
                     matches += 1;
                 }
             });

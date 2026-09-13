@@ -3564,11 +3564,13 @@ fn decoration<T: Styled>(
 fn button_style(button: Button, preset: wire::ButtonPreset) -> Button {
     match preset {
         wire::ButtonPreset::Primary => button.primary(),
-        wire::ButtonPreset::Secondary => button.secondary(),
+        // A secondary action is an outlined button: the filled grey block
+        // is reserved for `Background` (a tab, a chip).
+        wire::ButtonPreset::Secondary => button.outline(),
         wire::ButtonPreset::Success => button.success(),
         wire::ButtonPreset::Warning => button.warning(),
         wire::ButtonPreset::Danger => button.danger(),
-        wire::ButtonPreset::Text => button.text(),
+        wire::ButtonPreset::Text => button.link(),
         wire::ButtonPreset::Background => button.secondary(),
         wire::ButtonPreset::Subtle => button.ghost(),
     }

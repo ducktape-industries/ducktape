@@ -637,7 +637,7 @@ impl ::std::fmt::Debug for AppMessage {
     }
 }
 impl Ducktape {
-    fn is_dark(&self) -> bool {
+    pub(crate) fn is_dark(&self) -> bool {
         self.appearance == Appearance::Dark
     }
     pub(crate) fn initial_state() -> Self {

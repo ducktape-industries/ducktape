@@ -379,6 +379,7 @@ dependencies = [
 name = "ducktape-view-guest"
 version = "0.1.0"
 dependencies = [
+ "design",
  "futures",
  "ui-lang-wire",
  "wit-bindgen",

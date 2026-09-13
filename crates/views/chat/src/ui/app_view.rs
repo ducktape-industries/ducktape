@@ -1,6 +1,7 @@
 use super::*;
 impl super::ChatView {
     pub(crate) fn view(&self) -> wire::Node {
+        native::set_dark(self.dark);
         wire::Node::Sensor {
             key: format!("{}/@sensor:906", "ChatView"),
             reset: None,

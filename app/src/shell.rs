@@ -576,7 +576,6 @@ impl DesktopWindow {
         }
         Input::new(&self.inputs[key].state)
             .aria_label(placeholder)
-            .rounded_none()
             .into_any_element()
     }
 
@@ -591,7 +590,6 @@ impl DesktopWindow {
         let model = self.model.clone();
         gpui_kit::component::button::Button::new(key)
             .label(label)
-            .rounded_none()
             .disabled(disabled)
             .on_click(move |_, _, cx| {
                 cx.stop_propagation();
@@ -610,7 +608,6 @@ impl DesktopWindow {
         use gpui_kit::component::Disableable as _;
         gpui_kit::component::button::Button::new(key)
             .label(label)
-            .rounded_none()
             .disabled(disabled)
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
@@ -1161,7 +1158,7 @@ impl DesktopWindow {
     }
 
     fn console(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        use gpui_kit::component::{Selectable as _, button::ButtonVariants as _};
+        use gpui_kit::component::{Selectable as _, Sizable as _, button::ButtonVariants as _};
         use gpui_kit::*;
         let colors = gpui_kit::component::Theme::global(cx).color_tokens();
         let (spec, route) = self.model.read(cx).state.native_view();
@@ -1198,51 +1195,99 @@ impl DesktopWindow {
             .find(|(tab, _)| *tab == selected_tab)
             .map(|(_, label)| *label)
             .expect("native navigation covers every shell tab");
+        let (sidebar, popover) = {
+            let theme = gpui_kit::component::Theme::global(cx);
+            (theme.sidebar, theme.popover)
+        };
+        let state = &self.model.read(cx).state;
+        let palette = design::palette(state.is_dark());
+        let accent = hsla_of(palette.accent);
+        let accent_soft = hsla_of(palette.accent_soft);
+        let faint = hsla_of(palette.faint);
+        let live = state.connected;
+        // The sidebar carries the network: its name, whether it is live, and
+        // the way to another one. The header then only names the screen.
+        let network = self
+            .action(
+                "switch-network",
+                state.network_name.clone(),
+                Message::SwitchNetwork,
+                false,
+            )
+            .ghost()
+            .w_full()
+            .h_auto()
+            .px_2()
+            .py_2()
+            .justify_start()
+            .accessibility_label("Switch network")
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .size(px(8.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(if live { accent } else { faint }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .items_start()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .truncate()
+                                    .text_size(px(13.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(state.network_name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .truncate()
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(colors.muted_foreground)
+                                    .child(state.status.clone()),
+                            ),
+                    )
+                    .child(
+                        gpui_kit::component::Icon::new(
+                            gpui_kit::component::IconName::ChevronsUpDown,
+                        )
+                        .xsmall()
+                        .text_color(colors.muted_foreground),
+                    ),
+            );
         let mut tabs = div()
             .id("workspace-rail")
             .flex()
             .flex_col()
-            .gap_1()
-            .w(px(184.))
+            .gap_0p5()
+            .w(px(208.))
             .h_full()
             .flex_shrink_0()
-            .px_3()
-            .py_4()
-            .bg(colors.muted)
+            .px_2()
+            .py_2()
+            .bg(sidebar)
             .border_r_1()
             .border_color(colors.border)
-            .child(
-                div()
-                    .h_10()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .px_2()
-                    .mb_4()
-                    .child(
-                        div()
-                            .size(px(28.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(colors.foreground)
-                            .text_color(colors.background)
-                            .font_weight(FontWeight::BOLD)
-                            .child("D"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("DUCKTAPE"),
-                    ),
-            );
+            .child(network)
+            .child(div().h_2().flex_shrink_0());
         for (tab, label) in navigation {
             let section = match tab {
-                ShellTab::Chat => Some("WORKSPACE"),
-                ShellTab::Explorer => Some("NETWORK"),
-                ShellTab::Settings => Some("PREFERENCES"),
+                ShellTab::Chat => Some("Workspace"),
+                ShellTab::Explorer => Some("Network"),
                 _ => None,
             };
             if tab == ShellTab::Settings {
@@ -1251,12 +1296,12 @@ impl DesktopWindow {
             if let Some(section) = section {
                 tabs = tabs.child(
                     div()
-                        .px_3()
+                        .px_2()
                         .pt_3()
-                        .pb_2()
+                        .pb_1()
                         .flex_shrink_0()
-                        .text_size(px(10.))
-                        .font_family(design::fonts::FAMILY_MONO)
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::MEDIUM)
                         .text_color(colors.muted_foreground)
                         .child(section),
                 );
@@ -1266,11 +1311,19 @@ impl DesktopWindow {
                 self.action(label, label, Message::SelectShellTab(tab), false)
                     .ghost()
                     .selected(selected)
+                    .icon(nav_icon(tab).xsmall())
                     .w_full()
-                    .h_9()
-                    .px_3()
+                    .h_8()
+                    .px_2()
                     .justify_start()
-                    .when(selected, |button| button.primary()),
+                    .font_weight(if selected {
+                        FontWeight::MEDIUM
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .when(selected, |button| {
+                        button.bg(accent_soft).border_l_2().border_color(accent)
+                    }),
             );
         }
         let state = &self.model.read(cx).state;
@@ -1280,14 +1333,19 @@ impl DesktopWindow {
         } else {
             modifiers.control = true;
         }
+        let shortcut = if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl K" };
+        let bell_label = match state.bell_unread {
+            0 => "Notifications".to_owned(),
+            unread => format!("Notifications ({unread})"),
+        };
         let header = div()
             .id("workspace-header")
             .flex()
-            .gap_3()
+            .gap_2()
             .items_center()
-            .h(px(72.))
+            .h(px(48.))
             .flex_shrink_0()
-            .px_5()
+            .px_4()
             .border_b_1()
             .border_color(colors.border)
             .bg(colors.background)
@@ -1295,28 +1353,9 @@ impl DesktopWindow {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(colors.muted_foreground)
-                            .child(state.network_name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(22.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    ),
-            )
-            .child(
-                div()
-                    .text_size(px(10.))
-                    .font_family(design::fonts::FAMILY_MONO)
-                    .text_color(colors.muted_foreground)
-                    .child(state.status.clone()),
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
             )
             .child(
                 self.action(
@@ -1329,30 +1368,35 @@ impl DesktopWindow {
                     !state.connected,
                 )
                 .outline()
+                .icon(gpui_kit::component::IconName::Search)
                 .h_8()
-                .px_3(),
+                .px_2()
+                .child(
+                    div()
+                        .ml_1()
+                        .text_size(px(11.))
+                        .text_color(colors.muted_foreground)
+                        .child(shortcut),
+                ),
             )
             .child(
-                self.action(
-                    "bell",
-                    format!("Notifications ({})", state.bell_unread),
-                    Message::ToggleBell,
-                    !state.connected,
-                )
-                .outline()
-                .h_8()
-                .px_3(),
-            )
-            .child(
-                self.action(
-                    "switch-network",
-                    "Switch network",
-                    Message::SwitchNetwork,
-                    false,
-                )
-                .ghost()
-                .h_8()
-                .px_3(),
+                self.action("bell", bell_label, Message::ToggleBell, !state.connected)
+                    .outline()
+                    .icon(gpui_kit::component::IconName::Bell)
+                    .h_8()
+                    .w_8()
+                    .px_0()
+                    .child(div().relative().when(state.bell_unread > 0, |element| {
+                        element.child(
+                            div()
+                                .absolute()
+                                .top(px(-10.))
+                                .right(px(-12.))
+                                .size(px(7.))
+                                .rounded_full()
+                                .bg(accent),
+                        )
+                    })),
             );
         let error = state.error.clone();
         let toast = state.toast.clone();
@@ -1374,18 +1418,17 @@ impl DesktopWindow {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .px_5()
+                    .px_4()
                     .py_2()
                     .flex_shrink_0()
                     .border_b_1()
                     .border_color(colors.border)
-                    .bg(colors.muted)
+                    .bg(accent_soft)
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(12.))
-                            .text_color(colors.muted_foreground)
-                            .child("Sign in to use your account on this network"),
+                            .text_size(px(12.5))
+                            .child("Sign in to use your account on this network."),
                     )
                     .child(
                         self.action(
@@ -1395,7 +1438,7 @@ impl DesktopWindow {
                             false,
                         )
                         .primary()
-                        .h_8(),
+                        .h_7(),
                     )
                     .child(
                         self.action(
@@ -1405,7 +1448,7 @@ impl DesktopWindow {
                             false,
                         )
                         .ghost()
-                        .h_8(),
+                        .h_7(),
                     ),
             );
         }
@@ -1415,23 +1458,31 @@ impl DesktopWindow {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .px_5()
+                    .px_4()
                     .py_2()
                     .flex_shrink_0()
                     .border_b_1()
                     .border_color(colors.border)
-                    .text_color(colors.destructive)
-                    .child(div().flex_1().text_size(px(12.)).child(error))
+                    .bg(hsla_of(palette.danger_soft))
+                    .text_color(hsla_of(palette.danger))
+                    .child(
+                        gpui_kit::component::Icon::new(
+                            gpui_kit::component::IconName::TriangleAlert,
+                        )
+                        .xsmall(),
+                    )
+                    .child(div().flex_1().text_size(px(12.5)).child(error))
                     .child(
                         self.action("error-dismiss", "Dismiss", Message::DismissError, false)
                             .ghost()
-                            .h_8(),
+                            .h_7(),
                     ),
             );
         }
         content = content.child(
             div()
                 .id("workspace-content")
+                .relative()
                 .flex()
                 .flex_col()
                 .flex_1()
@@ -1439,28 +1490,33 @@ impl DesktopWindow {
                 .min_w_0()
                 .w_full()
                 .overflow_hidden()
-                .child(view),
+                .child(view)
+                .when(!toast.is_empty(), |element| {
+                    element.child(
+                        div()
+                            .absolute()
+                            .bottom_4()
+                            .right_4()
+                            .max_w(px(420.))
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .px_4()
+                            .py_2p5()
+                            .rounded(px(design::radius::CARD as f32))
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(popover)
+                            .shadow_md()
+                            .child(div().flex_1().text_size(px(12.5)).child(toast))
+                            .child(
+                                self.action("toast-dismiss", "Dismiss", Message::DismissToast, false)
+                                    .ghost()
+                                    .h_7(),
+                            ),
+                    )
+                }),
         );
-        if !toast.is_empty() {
-            content = content.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .px_5()
-                    .py_2()
-                    .flex_shrink_0()
-                    .border_t_1()
-                    .border_color(colors.border)
-                    .bg(colors.muted)
-                    .child(div().flex_1().text_size(px(12.)).child(toast))
-                    .child(
-                        self.action("toast-dismiss", "Dismiss", Message::DismissToast, false)
-                            .ghost()
-                            .h_8(),
-                    ),
-            );
-        }
         let mut root = div()
             .relative()
             .flex()
@@ -1488,53 +1544,123 @@ impl DesktopWindow {
             state.bell_open,
             state.channel_create_open,
         );
-        let mut panel = div().flex().flex_col().gap_2().w(px(600.0)).p_4();
-        let dismiss = match topmost.as_str() {
+        use gpui_kit::component::button::ButtonVariants as _;
+        use gpui_kit::component::{ActiveTheme as _, Disableable as _};
+        let colors = cx.theme().color_tokens();
+        let muted = colors.muted_foreground;
+        // A modal is one card: a title row with its close, then its body.
+        let heading = |this: &Self, title: &'static str, close: Message| {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_4()
+                .pt_3()
+                .pb_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(15.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title),
+                )
+                .child(
+                    this.action("modal-close", "Close", close, false)
+                        .ghost()
+                        .icon(gpui_kit::component::IconName::Close)
+                        .h_7()
+                        .w_7()
+                        .px_0(),
+                )
+        };
+        // A result or a notification is one full-width row: a name, then
+        // what it says, in the muted tone.
+        let row = |this: &Self, key: String, name: String, detail: String, message, disabled| {
+            this.action(key, format!("{name} {detail}"), message, disabled)
+                .ghost()
+                .w_full()
+                .h_auto()
+                .px_2()
+                .py_1p5()
+                .justify_start()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .gap_0p5()
+                        .min_w_0()
+                        .w_full()
+                        .child(
+                            div()
+                                .w_full()
+                                .truncate()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(name),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .truncate()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::NORMAL)
+                                .text_color(muted)
+                                .child(detail),
+                        ),
+                )
+        };
+        let mut body = div().flex().flex_col().gap_1().px_3().pb_3();
+        let (title, dismiss) = match topmost.as_str() {
             "palette" => {
                 let chats = state.palette_chat_hits.clone();
                 let pages = state.palette_page_hits.clone();
                 let phase = state.palette_search_phase;
                 let query = state.palette_draft.clone();
                 let empty = chats.is_empty() && pages.is_empty();
-                panel = panel.child("Search this workspace").child(self.input(
+                body = body.child(div().px_1().pb_1().child(self.input(
                     "palette-input",
                     "Search messages and pages",
                     false,
                     window,
                     cx,
-                ));
-                match phase {
-                    crate::SearchPhase::Searching => panel = panel.child("Searching…"),
-                    crate::SearchPhase::Done => {
-                        if empty {
-                            panel = panel.child("No messages or pages matched.");
-                        }
-                    }
-                    crate::SearchPhase::Idle => {
-                        if !query.trim().is_empty() {
-                            panel = panel.child("Search failed.");
-                        }
-                    }
+                )));
+                let note = match phase {
+                    crate::SearchPhase::Searching => Some("Searching…"),
+                    crate::SearchPhase::Done if empty => Some("No messages or pages matched."),
+                    crate::SearchPhase::Idle if !query.trim().is_empty() => Some("Search failed."),
+                    _ => None,
+                };
+                if let Some(note) = note {
+                    body = body.child(
+                        div()
+                            .px_2()
+                            .py_2()
+                            .text_size(px(12.5))
+                            .text_color(muted)
+                            .child(note),
+                    );
                 }
                 for hit in chats {
-                    panel = panel.child(self.action(
+                    body = body.child(row(
+                        self,
                         format!("search-chat/{}/{}", hit.channel_id, hit.seq),
-                        format!("{} · {}", hit.author, hit.text),
+                        hit.author,
+                        hit.text,
                         Message::OpenChatSearchHit(hit.channel_id, hit.seq),
                         false,
                     ));
                 }
                 for hit in pages {
-                    panel = panel.child(self.action(
+                    body = body.child(row(
+                        self,
                         format!("search-page/{}/{}", hit.page_id, hit.block_id),
-                        format!("{} · {}", hit.page_title, hit.text),
+                        hit.page_title,
+                        hit.text,
                         Message::OpenPageSearchHit(hit.page_id, hit.block_id),
                         false,
                     ));
                 }
-                panel =
-                    panel.child(self.action("search-close", "Close", Message::ClosePalette, false));
-                Message::ClosePalette
+                ("Search this workspace", Message::ClosePalette)
             }
             "bell" => {
                 let generation = state.connect_generation;
@@ -1545,84 +1671,148 @@ impl DesktopWindow {
                     &state.settings_user_key,
                 );
                 let presentations = state.bell_presentations.clone();
-                panel = panel
-                    .child("Notifications")
-                    .child(state.bell_error.clone())
-                    .child(self.action(
+                let mut actions = div().flex().items_center().gap_2().px_1().pb_1().child(
+                    self.action(
                         "bell-mark-read",
                         "Mark all read",
                         Message::MarkBellReadSubmit,
                         state.bell_marking,
-                    ));
+                    )
+                    .outline()
+                    .h_7(),
+                );
                 if !state.bell_error.is_empty() {
-                    panel =
-                        panel.child(self.action("bell-retry", "Retry", Message::ReloadBell, false));
+                    actions = actions
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(12.5))
+                                .text_color(colors.destructive)
+                                .child(state.bell_error.clone()),
+                        )
+                        .child(
+                            self.action("bell-retry", "Retry", Message::ReloadBell, false)
+                                .ghost()
+                                .h_7(),
+                        );
+                }
+                body = body.child(actions);
+                if items.is_empty() {
+                    body = body.child(
+                        div()
+                            .px_2()
+                            .py_2()
+                            .text_size(px(12.5))
+                            .text_color(muted)
+                            .child("Nothing new. Mentions and direct messages land here."),
+                    );
                 }
                 for item in items {
                     let presentation = crate::backend::bell_presentation(&item, &presentations);
                     let unavailable = !crate::backend::bell_openable(&item, &presentations);
-                    panel = panel.child(self.action(
+                    body = body.child(row(
+                        self,
                         format!("notification/{}", presentation.seq),
-                        format!("{} · {}", presentation.title, presentation.detail),
+                        presentation.title.clone(),
+                        presentation.detail.clone(),
                         Message::BellOpenItem(generation, account.clone(), presentation),
                         unavailable,
                     ));
                 }
-                panel = panel.child(self.action("bell-close", "Close", Message::CloseBell, false));
-                Message::CloseBell
+                ("Notifications", Message::CloseBell)
             }
             "channel_create" => {
                 let busy = state.mutation_phase != crate::MutationPhase::Idle;
                 let members_only = state.channel_create_members_only;
-                panel = panel
-                    .child("Create a channel")
+                body = body
+                    .gap_3()
+                    .px_4()
+                    .pb_4()
                     .child(self.input("channel-draft", "Channel name", false, window, cx))
-                    .child(self.action(
-                        "channel-private",
-                        if members_only {
-                            "Members only: on"
-                        } else {
-                            "Members only: off"
-                        },
-                        Message::ToggleChannelCreateMembersOnly,
-                        busy,
-                    ))
-                    .child(self.action(
-                        "channel-submit",
-                        "Create",
-                        Message::CreateChannelSubmit,
-                        busy,
-                    ))
-                    .child(self.action(
-                        "channel-cancel",
-                        "Cancel",
-                        Message::ToggleChannelCreate,
-                        busy,
-                    ));
-                Message::ToggleChannelCreate
+                    .child(
+                        gpui_kit::component::checkbox::Checkbox::new("channel-private")
+                            .label("Members only")
+                            .checked(members_only)
+                            .disabled(busy)
+                            .on_click({
+                                let model = self.model.clone();
+                                move |_, _, cx| {
+                                    model.update(cx, |model, cx| {
+                                        model.dispatch(
+                                            Message::ToggleChannelCreateMembersOnly,
+                                            cx,
+                                        )
+                                    })
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(muted)
+                            .child("A members-only channel is read and written by its roster alone."),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                self.action(
+                                    "channel-cancel",
+                                    "Cancel",
+                                    Message::ToggleChannelCreate,
+                                    busy,
+                                )
+                                .ghost(),
+                            )
+                            .child(
+                                self.action(
+                                    "channel-submit",
+                                    "Create channel",
+                                    Message::CreateChannelSubmit,
+                                    busy,
+                                )
+                                .primary(),
+                            ),
+                    );
+                ("Create a channel", Message::ToggleChannelCreate)
             }
             _ => return None,
         };
         let model = self.model.clone();
-        use gpui_kit::component::ActiveTheme as _;
         let panel = div()
             .id("shell-modal")
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .rounded_none()
-            .max_h(relative(0.85))
-            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .w(px(560.0))
+            .max_h(relative(0.8))
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .rounded(px(design::radius::CARD as f32 + 2.))
+            .border_1()
+            .border_color(colors.border)
+            .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(panel);
+            .child(heading(self, title, dismiss.clone()))
+            .child(
+                div()
+                    .id("shell-modal-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(body),
+            );
         Some(
             div()
                 .id("shell-scrim")
                 .absolute()
                 .inset_0()
                 .flex()
-                .items_center()
+                .items_start()
                 .justify_center()
-                .bg(rgba(0x00000066))
+                .pt(px(96.))
+                .bg(rgba(0x00000055))
                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                     model.update(cx, |model, cx| model.dispatch(dismiss.clone(), cx))
                 })
@@ -1749,18 +1939,30 @@ mod close_tests {
     use super::*;
 
     #[gpui_kit::test]
-    fn appearance_changes_keep_native_fonts_and_square_controls(cx: &mut gpui_kit::TestAppContext) {
+    fn appearance_changes_keep_native_fonts_radii_and_the_palette(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
         cx.update(|cx| {
             use gpui_kit::component::{Theme, ThemeMode};
             gpui_kit::init(cx);
-            for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            for (mode, palette) in [
+                (ThemeMode::Light, &design::LIGHT),
+                (ThemeMode::Dark, &design::DARK),
+            ] {
                 Theme::change(mode, None, cx);
                 configure_native_theme(cx);
                 let theme = Theme::global(cx);
                 assert_eq!(theme.font_family.as_ref(), design::fonts::FAMILY_UI);
                 assert_eq!(theme.mono_font_family.as_ref(), design::fonts::FAMILY_MONO);
-                assert_eq!(theme.radius, gpui_kit::px(0.));
-                assert_eq!(theme.radius_lg, gpui_kit::px(0.));
+                assert_eq!(theme.radius, gpui_kit::px(design::radius::CONTROL as f32));
+                assert_eq!(theme.radius_lg, gpui_kit::px(design::radius::CARD as f32));
+                let background: gpui_kit::Rgba = theme.background.into();
+                let [r, g, b, _] = palette.background;
+                let close = |a: f32, b: f32| (a - b).abs() < 1.5 / 255.;
+                assert!(
+                    close(background.r, r) && close(background.g, g) && close(background.b, b),
+                    "{mode:?} background follows the palette: {background:?}"
+                );
             }
         });
     }
@@ -2071,14 +2273,54 @@ mod close_tests {
     }
 }
 
+/// The product palette as the kit's light and dark themes. Registered once;
+/// every later mode change re-applies the matching one, so the kit's own
+/// controls paint with the colors the views paint with.
 fn configure_native_theme(cx: &mut gpui_kit::App) {
-    let theme = gpui_kit::component::Theme::global_mut(cx);
-    theme.font_family = design::fonts::FAMILY_UI.into();
-    theme.mono_font_family = design::fonts::FAMILY_MONO.into();
-    theme.font_size = gpui_kit::px(design::type_scale::BODY as f32);
-    theme.radius = gpui_kit::px(0.);
-    theme.radius_lg = gpui_kit::px(0.);
-    gpui_kit::component::Theme::sync_base(cx);
+    use gpui_kit::component::{Theme, ThemeRegistry};
+    let registry = ThemeRegistry::global_mut(cx);
+    let registered = registry.themes().contains_key(design::LIGHT_THEME);
+    if !registered {
+        registry
+            .load_themes_from_str(&design::kit_theme_json())
+            .expect("the product theme parses");
+    }
+    let light = registry.themes()[design::LIGHT_THEME].clone();
+    let dark = registry.themes()[design::DARK_THEME].clone();
+    let theme = Theme::global_mut(cx);
+    theme.light_theme = light;
+    theme.dark_theme = dark;
+    let mode = theme.mode;
+    Theme::change(mode, None, cx);
+}
+
+/// A palette color as the kit paints it.
+fn hsla_of(color: design::Color) -> gpui_kit::Hsla {
+    let [r, g, b, a] = color;
+    gpui_kit::Rgba { r, g, b, a }.into()
+}
+
+/// Lucide glyphs the kit's default bundle does not carry.
+const MESSAGE_SQUARE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>"#;
+const GIT_BRANCH: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>"#;
+const USERS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>"#;
+const VOTE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 12 2 2 4-4"/><path d="M5 7c0-1.1.9-2 2-2h10a2 2 0 0 1 2 2v12H5V7Z"/><path d="M22 19H2"/></svg>"#;
+
+/// The glyph beside a tab's name in the sidebar.
+fn nav_icon(tab: ShellTab) -> gpui_kit::component::Icon {
+    use gpui_kit::component::{Icon, IconName};
+    match tab {
+        ShellTab::Chat => Icon::empty().data(MESSAGE_SQUARE),
+        ShellTab::Pages => Icon::new(IconName::BookOpen),
+        ShellTab::Forge => Icon::empty().data(GIT_BRANCH),
+        ShellTab::Agents => Icon::new(IconName::Bot),
+        ShellTab::Files => Icon::new(IconName::Folder),
+        ShellTab::Explorer => Icon::new(IconName::Globe),
+        ShellTab::Node => Icon::new(IconName::HardDrive),
+        ShellTab::Members => Icon::empty().data(USERS),
+        ShellTab::Governance => Icon::empty().data(VOTE),
+        ShellTab::Settings => Icon::new(IconName::Settings),
+    }
 }
 
 pub(crate) fn run() {
