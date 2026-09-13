@@ -454,7 +454,7 @@ pub fn tally_note(approvals: i64, required: i64) -> String {
 /// The approval action distinguishes the last vote needed for quorum.
 pub fn approve_label(approvals: i64, required: i64) -> String {
     match approvals + 1 >= required {
-        true => "Approve →".into(),
+        true => "Approve (final vote)".into(),
         false => "Approve".into(),
     }
 }

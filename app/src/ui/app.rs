@@ -258,6 +258,9 @@ pub struct Ducktape {
     pub(crate) provision_progress_generation: u64,
     pub(crate) provision_progress_task: Option<::ducktape_view_guest::task::Handle>,
     pub(crate) appearance: Appearance,
+    /// What `Appearance::System` resolved to at the last sync: the OS
+    /// appearance the kit theme picked up. `is_dark` answers from it.
+    pub(crate) system_dark: bool,
     pub(crate) desktop_notifications: bool,
     pub(crate) wall_now: i64,
     pub(crate) rpc: String,
@@ -637,8 +640,12 @@ impl ::std::fmt::Debug for AppMessage {
     }
 }
 impl Ducktape {
-    fn is_dark(&self) -> bool {
-        self.appearance == Appearance::Dark
+    pub(crate) fn is_dark(&self) -> bool {
+        match self.appearance {
+            Appearance::Dark => true,
+            Appearance::Light => false,
+            Appearance::System => self.system_dark,
+        }
     }
     pub(crate) fn initial_state() -> Self {
         Self {
@@ -697,6 +704,7 @@ impl Ducktape {
             provision_progress_generation: 0,
             provision_progress_task: None,
             appearance: Appearance::System,
+            system_dark: false,
             desktop_notifications: true,
             wall_now: (crate::backend::current_wall_seconds()),
             rpc: "".to_owned(),

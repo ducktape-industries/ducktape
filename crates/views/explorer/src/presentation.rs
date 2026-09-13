@@ -1,48 +1,77 @@
 use ducktape_view_guest::{
-    kit, slots,
+    kit::{self, Tone},
+    slots,
     wire::{self, ButtonPreset, Length, Node},
 };
 
 use crate::{ExplorerView, Message, host};
 
+/// The horizontal inset every flush region shares: a toolbar, a pane header,
+/// a list row. Nothing sits on the window edge, and nothing is indented twice.
+const GUTTER: wire::Edges = wire::Edges {
+    top: 0.,
+    right: 12.,
+    bottom: 0.,
+    left: 12.,
+};
+
 impl ExplorerView {
     pub(crate) fn view(&self) -> Node {
-        let search = kit::input(
-            "explorer/search",
-            "Search messages, pages, issues, files, runs…",
-            &self.query,
-            slots::handler(Box::new(|value: String| Some(Message::BindQuery(value)))),
-            Some(slots::message(Message::SearchSubmit)),
-        );
+        kit::set_dark(self.dark);
         let can_refresh = self.connected && !self.loading;
-        let mut body = vec![
-            kit::heading("explorer/title", "Explorer"),
-            kit::row(
-                "explorer/status",
-                [
-                    kit::text("explorer/height", host::height_label(self.head)),
-                    kit::text("explorer/sync", &self.sync_line),
-                ],
-            ),
-            kit::row(
-                "explorer/toolbar",
-                [
-                    search,
-                    kit::button(
-                        "explorer/refresh",
-                        "Refresh",
-                        can_refresh.then(|| slots::message(Message::Refresh)),
-                        ButtonPreset::Secondary,
+        let toolbar = Self::bar(kit::centered_row(
+            "explorer/head",
+            [
+                kit::nowrap(kit::title("explorer/title", "Explorer")),
+                Self::height_badge(self.head),
+                kit::nowrap(kit::caption("explorer/sync", &self.sync_line)),
+                kit::spacer(),
+                kit::sized(
+                    kit::input(
+                        "explorer/search",
+                        "Search messages, pages, issues, files, runs…",
+                        &self.query,
+                        slots::handler(Box::new(|value: String| Some(Message::BindQuery(value)))),
+                        Some(slots::message(Message::SearchSubmit)),
                     ),
-                ],
-            ),
-        ];
+                    Some(Length::Fixed(320.)),
+                    None,
+                ),
+                kit::button(
+                    "explorer/refresh",
+                    "Refresh",
+                    can_refresh.then(|| slots::message(Message::Refresh)),
+                    ButtonPreset::Secondary,
+                ),
+            ],
+        ));
+        let mut body = vec![toolbar, kit::divider("explorer/head-edge")];
         if !self.host_error.is_empty() {
-            body.push(kit::text("explorer/error", &self.host_error));
+            body.push(kit::padded(
+                kit::column(
+                    "explorer/error-box",
+                    [kit::notice(
+                        "explorer/error",
+                        kit::wrapping(kit::text("explorer/error-text", &self.host_error)),
+                        Tone::Danger,
+                    )],
+                ),
+                wire::Edges::all(12.),
+            ));
         }
         let panel = match (self.connected, self.searching, self.sent_query.is_empty()) {
-            (false, _, _) => kit::text("explorer/disconnected", "Not connected"),
-            (true, true, _) => kit::text("explorer/loading-search", "Searching…"),
+            (false, _, _) => kit::empty_state(
+                "explorer/disconnected",
+                "Not connected",
+                "Choose a network from the sidebar to read its ledger.",
+            ),
+            (true, true, _) => kit::padded(
+                kit::column(
+                    "explorer/loading-box",
+                    [kit::secondary("explorer/loading-search", "Searching…")],
+                ),
+                wire::Edges::all(12.),
+            ),
             (true, false, false) => self.search_results(),
             (true, false, true) => self.ledger(),
         };
@@ -61,61 +90,83 @@ impl ExplorerView {
             on_hide: None,
             anticipate: None,
             delay: None,
-            child: Box::new(kit::padded(
-                kit::sized(
-                    kit::column("explorer/content", body),
-                    Some(Length::Fill),
-                    Some(Length::Fill),
-                ),
-                wire::Edges::all(24.),
-            )),
+            child: Box::new(Self::filling(kit::spaced(
+                kit::column("explorer/content", body),
+                0.,
+            ))),
         }
+    }
+
+    /// A 40px chrome bar: the toolbar, a pane header, the filter strip.
+    fn bar(row: Node) -> Node {
+        kit::sized(
+            kit::padded(row, GUTTER),
+            Some(Length::Fill),
+            Some(Length::Fixed(40.)),
+        )
+    }
+
+    /// A region that takes the whole content area.
+    fn filling(node: Node) -> Node {
+        kit::sized(node, Some(Length::Fill), Some(Length::Fill))
+    }
+
+    /// The head height in the data face, so the digits line up as they move.
+    fn height_badge(head: i64) -> Node {
+        let mut node = kit::badge("explorer/height", host::height_label(head), Tone::Neutral);
+        let Node::Container { content, .. } = &mut node else {
+            unreachable!()
+        };
+        let Node::Text { font, .. } = content.as_mut() else {
+            unreachable!()
+        };
+        font.monospace = true;
+        node
     }
 
     fn ledger(&self) -> Node {
         let mut rows = Vec::new();
         for block in &self.blocks {
             let key = format!("explorer/block/{}", block.height);
-            let summary = kit::column(
-                format!("{key}/summary"),
+            if !rows.is_empty() {
+                rows.push(kit::divider(format!("{key}/edge")));
+            }
+            let line = kit::centered_row(
+                format!("{key}/line"),
                 [
-                    kit::row(
-                        format!("{key}/metadata"),
-                        [
-                            kit::text(format!("{key}/height"), block.height.to_string()),
-                            kit::text(
-                                format!("{key}/count"),
-                                host::plural(block.op_count, "op", "ops"),
-                            ),
-                        ],
-                    ),
+                    kit::nowrap(kit::weighted(
+                        kit::mono(format!("{key}/height"), block.height.to_string()),
+                        wire::Weight::Medium,
+                    )),
                     kit::sized(
-                        kit::text(format!("{key}/hash"), host::hex(&block.hash)),
+                        kit::nowrap(kit::colored(
+                            kit::mono(format!("{key}/hash"), host::hex(&block.hash)),
+                            kit::palette().muted,
+                        )),
                         Some(Length::Fill),
                         None,
                     ),
+                    kit::nowrap(kit::caption(
+                        format!("{key}/count"),
+                        host::plural(block.op_count, "op", "ops"),
+                    )),
                 ],
             );
             let selected = block.height == self.selected;
-            let preset = if selected {
-                ButtonPreset::Secondary
-            } else {
-                ButtonPreset::Subtle
-            };
             let mut button = kit::sized(
-                kit::button_child(
+                kit::list_row(
                     &key,
-                    summary,
+                    line,
+                    selected,
                     Some(slots::message(Message::SelectExplorerBlock(block.height))),
-                    preset,
                 ),
                 Some(Length::Fill),
-                None,
+                Some(Length::Fixed(28.)),
             );
-            if let Node::Button { checked, label, .. } = &mut button {
-                *checked = Some(selected);
-                *label = Some("Inspect block".into());
-            }
+            let Node::Button { label, .. } = &mut button else {
+                unreachable!()
+            };
+            *label = Some("Inspect block".into());
             rows.push(button);
         }
         if rows.is_empty() {
@@ -124,15 +175,21 @@ impl ExplorerView {
             } else {
                 "No blocks carrying operations yet."
             };
-            rows.push(kit::text("explorer/empty-ledger", message));
+            rows.push(kit::padded(
+                kit::column(
+                    "explorer/empty-ledger-box",
+                    [kit::secondary("explorer/empty-ledger", message)],
+                ),
+                wire::Edges::all(12.),
+            ));
         }
-        let list = kit::sized(
-            kit::container(
-                "explorer/ledger-pane",
-                kit::scroll("explorer/blocks", kit::column("explorer/block-list", rows)),
+        let list = kit::pane(
+            "explorer/ledger-pane",
+            kit::scroll(
+                "explorer/blocks",
+                kit::spaced(kit::column("explorer/block-list", rows), 0.),
             ),
-            Some(Length::Fixed(self.ledger_width as f32)),
-            Some(Length::Fill),
+            Length::Fixed(self.ledger_width as f32),
         );
         let divider = Node::ResizeHandle {
             key: "explorer/ledger-resize".into(),
@@ -142,16 +199,20 @@ impl ExplorerView {
                 Some(Message::LedgerResized(x, y))
             }))),
             cursor: Some(wire::mouse::Cursor::ResizingHorizontally),
-            content: Box::new(Node::Space {
-                width: Some(Length::Fixed(8.)),
-                height: Some(Length::Fill),
-            }),
+            // the hairline shows; the 10px grip is what the pointer lands on
+            content: Box::new(kit::sized(
+                kit::container(
+                    "explorer/ledger-grip",
+                    kit::vertical_divider("explorer/ledger-edge"),
+                ),
+                Some(Length::Fixed(10.)),
+                Some(Length::Fill),
+            )),
         };
-        kit::sized(
+        Self::filling(kit::spaced(
             kit::row("explorer/ledger", [list, divider, self.block_details()]),
-            Some(Length::Fill),
-            Some(Length::Fill),
-        )
+            0.,
+        ))
     }
 
     fn block_details(&self) -> Node {
@@ -160,100 +221,196 @@ impl ExplorerView {
             .iter()
             .find(|block| block.height == self.selected);
         let Some(block) = block else {
-            return kit::container(
+            return kit::empty_state(
                 "explorer/selection",
-                kit::text(
-                    "explorer/select-block",
-                    "Select a block to inspect its operations and dispatch trace.",
-                ),
+                "Nothing selected",
+                "Select a block to inspect its operations and dispatch trace.",
             );
         };
+        let header = Self::bar(kit::centered_row(
+            "explorer/block-head",
+            [
+                kit::nowrap(kit::heading(
+                    "explorer/block-title",
+                    format!("Block {}", block.height),
+                )),
+                kit::spacer(),
+                kit::button(
+                    "explorer/block-hash/copy",
+                    "Copy block hash",
+                    Some(slots::message(Message::CopyToClipboard(
+                        block.hash.clone(),
+                        "Block hash copied".into(),
+                    ))),
+                    ButtonPreset::Subtle,
+                ),
+            ],
+        ));
+        let ops = host::explorer_ops_at(&self.ops, self.selected);
         let mut content = vec![
-            kit::heading("explorer/block-title", format!("Block {}", block.height)),
-            Self::digest("explorer/block-hash", "Block hash", &block.hash),
+            kit::kv(
+                "explorer/block-hash",
+                "Block hash",
+                kit::wrapping(kit::mono(
+                    "explorer/block-hash/value",
+                    host::hex(&block.hash),
+                )),
+            ),
             Self::digest("explorer/commit", "Commit", &block.commit),
+            kit::kv(
+                "explorer/block-ops",
+                "Operations",
+                kit::text(
+                    "explorer/block-ops/value",
+                    host::plural(block.op_count, "operation", "operations"),
+                ),
+            ),
         ];
-        for (index, op) in host::explorer_ops_at(&self.ops, self.selected)
-            .iter()
-            .enumerate()
-        {
-            let key = format!("explorer/operation/{index}");
-            content.push(kit::column(
-                &key,
-                [
-                    kit::heading(format!("{key}/title"), &op.target),
-                    kit::text(format!("{key}/status"), &op.disposition),
-                    Self::digest(&format!("{key}/proposer"), "Proposer", &op.proposer),
-                    Self::digest(&format!("{key}/hash"), "Op hash", &op.op_hash),
-                    kit::text(format!("{key}/payload"), &op.payload),
-                    kit::text(format!("{key}/trace"), &op.trace),
-                ],
-            ));
+        if !ops.is_empty() {
+            content.push(kit::divider("explorer/operations-edge"));
         }
-        kit::scroll(
-            "explorer/details",
-            kit::column("explorer/detail-content", content),
+        for (index, op) in ops.iter().enumerate() {
+            let key = format!("explorer/operation/{index}");
+            let applied = op.disposition.starts_with("applied") || op.disposition == "ok";
+            let disposition = if applied {
+                Tone::Success
+            } else {
+                Tone::Neutral
+            };
+            let mut lines = vec![
+                Self::operation_line(&key, index, op, disposition),
+                Self::digest(&format!("{key}/proposer"), "Proposer", &op.proposer),
+                Self::digest(&format!("{key}/hash"), "Op hash", &op.op_hash),
+            ];
+            if !op.trace.is_empty() {
+                lines.push(kit::card(
+                    format!("{key}/trace-box"),
+                    kit::wrapping(kit::mono(format!("{key}/trace"), &op.trace)),
+                ));
+            }
+            content.push(kit::spaced(kit::column(format!("{key}/body"), lines), 4.));
+        }
+        Self::filling(kit::spaced(
+            kit::column(
+                "explorer/details-body",
+                [
+                    header,
+                    kit::divider("explorer/block-edge"),
+                    kit::scroll(
+                        "explorer/details",
+                        kit::padded(
+                            kit::spaced(kit::column("explorer/detail-content", content), 8.),
+                            wire::Edges::all(12.),
+                        ),
+                    ),
+                ],
+            ),
+            0.,
+        ))
+    }
+
+    /// One operation of the block: its index, what it targeted, what it
+    /// carried, and how it landed.
+    fn operation_line(key: &str, index: usize, op: &host::ExplorerOp, disposition: Tone) -> Node {
+        kit::sized(
+            kit::centered_row(
+                format!("{key}/head"),
+                [
+                    kit::sized(
+                        kit::nowrap(kit::colored(
+                            kit::mono(format!("{key}/index"), index.to_string()),
+                            kit::palette().muted,
+                        )),
+                        Some(Length::Fixed(18.)),
+                        None,
+                    ),
+                    kit::badge(format!("{key}/target"), &op.target, Tone::Neutral),
+                    kit::sized(
+                        kit::nowrap(kit::text(format!("{key}/payload"), &op.payload)),
+                        Some(Length::Fill),
+                        None,
+                    ),
+                    kit::badge(format!("{key}/status"), &op.disposition, disposition),
+                ],
+            ),
+            Some(Length::Fill),
+            Some(Length::Fixed(28.)),
         )
     }
 
+    /// A digest row: the value in the data face, with the copy that hands the
+    /// bare key to the clipboard.
     fn digest(key: &str, label: &str, value: &str) -> Node {
-        kit::column(
+        kit::kv(
             key,
-            [
-                kit::row(
-                    format!("{key}/header"),
-                    [
-                        kit::text(format!("{key}/label"), label),
-                        kit::button(
-                            format!("{key}/copy"),
-                            format!("Copy {}", label.to_lowercase()),
-                            Some(slots::message(Message::CopyToClipboard(
-                                value.into(),
-                                format!("{label} copied"),
-                            ))),
-                            ButtonPreset::Subtle,
-                        ),
-                    ],
-                ),
-                kit::sized(
-                    kit::text(format!("{key}/value"), host::hex(value)),
-                    Some(Length::Fill),
-                    None,
-                ),
-            ],
+            label,
+            kit::centered_row(
+                format!("{key}/row"),
+                [
+                    kit::sized(
+                        kit::wrapping(kit::mono(format!("{key}/value"), host::hex(value))),
+                        Some(Length::Fill),
+                        None,
+                    ),
+                    kit::button(
+                        format!("{key}/copy"),
+                        format!("Copy {}", label.to_lowercase()),
+                        Some(slots::message(Message::CopyToClipboard(
+                            value.into(),
+                            format!("{label} copied"),
+                        ))),
+                        ButtonPreset::Subtle,
+                    ),
+                ],
+            ),
         )
     }
 
     fn search_results(&self) -> Node {
-        let mut filters = vec![kit::button(
-            "explorer/filter/all",
-            "All",
+        let mut choices = vec![(
+            "all".to_owned(),
+            "All".to_owned(),
+            self.kind == "all",
             Some(slots::message(Message::PickExplorerKind("all".into()))),
-            ButtonPreset::Secondary,
         )];
         for kind in &self.kinds {
-            let selected = kind.kind == self.kind;
-            let preset = if selected {
-                ButtonPreset::Primary
-            } else {
-                ButtonPreset::Subtle
-            };
-            filters.push(kit::button(
-                format!("explorer/filter/{}", kind.kind),
-                format!("{} ({})", kind.label, kind.count),
+            choices.push((
+                kind.kind.clone(),
+                format!("{}  {}", kind.label, kind.count),
+                kind.kind == self.kind,
                 Some(slots::message(Message::PickExplorerKind(kind.kind.clone()))),
-                preset,
             ));
         }
-        filters.push(kit::button(
-            "explorer/clear",
-            "Clear workspace search",
-            Some(slots::message(Message::ClearExplorerSearch)),
-            ButtonPreset::Subtle,
+        let filters = Self::bar(kit::centered_row(
+            "explorer/filters",
+            [
+                kit::sized(
+                    kit::tabs("explorer/filter", choices),
+                    Some(Length::Shrink),
+                    None,
+                ),
+                kit::spacer(),
+                kit::button(
+                    "explorer/clear",
+                    "Clear workspace search",
+                    Some(slots::message(Message::ClearExplorerSearch)),
+                    ButtonPreset::Text,
+                ),
+            ],
         ));
-        let mut content = vec![kit::row("explorer/filters", filters)];
+        let mut content = Vec::new();
         if !self.partial.is_empty() {
-            content.push(kit::text("explorer/partial", &self.partial));
+            content.push(kit::padded(
+                kit::column(
+                    "explorer/partial-box",
+                    [kit::notice(
+                        "explorer/partial",
+                        kit::wrapping(kit::text("explorer/partial-text", &self.partial)),
+                        Tone::Warning,
+                    )],
+                ),
+                wire::Edges::all(12.),
+            ));
         }
         let matches_kind = |hit: &&host::ExplorerHit| self.kind == "all" || hit.kind == self.kind;
         let hits: Vec<_> = self.hits.iter().filter(matches_kind).collect();
@@ -261,23 +418,68 @@ impl ExplorerView {
             && self.partial.is_empty()
             && host::search_answer_stands(&self.sent_query, &self.query, self.searching);
         if empty_answer {
-            content.push(kit::text("explorer/no-results", "No matching results."));
+            content.push(kit::empty_state(
+                "explorer/no-results-state",
+                "No matching results.",
+                "Try another word, or clear the filter above.",
+            ));
         }
         for (index, hit) in hits.iter().enumerate() {
             let key = format!("explorer/result/{index}");
-            content.push(kit::column(
-                &key,
-                [
-                    kit::heading(format!("{key}/title"), &hit.title),
-                    kit::text(format!("{key}/kind"), &hit.meta),
-                    kit::text(format!("{key}/snippet"), &hit.snippet),
-                    Self::digest(&format!("{key}/target"), "Reference", &hit.target),
-                ],
+            if index > 0 {
+                content.push(kit::divider(format!("{key}/edge")));
+            }
+            content.push(kit::sized(
+                kit::padded(
+                    kit::centered_row(
+                        format!("{key}/line"),
+                        [
+                            kit::badge(format!("{key}/kind"), &hit.kind, Tone::Neutral),
+                            kit::sized(
+                                kit::nowrap(kit::strong(format!("{key}/title"), &hit.title)),
+                                Some(Length::Fill),
+                                None,
+                            ),
+                            kit::sized(
+                                kit::nowrap(kit::secondary(format!("{key}/snippet"), &hit.snippet)),
+                                Some(Length::Fill),
+                                None,
+                            ),
+                            kit::nowrap(kit::colored(
+                                kit::mono(format!("{key}/meta"), &hit.meta),
+                                kit::palette().muted,
+                            )),
+                        ],
+                    ),
+                    GUTTER,
+                ),
+                Some(Length::Fill),
+                Some(Length::Fixed(32.)),
+            ));
+            // the reference is what a hit is good for: the id to copy
+            content.push(kit::padded(
+                Self::digest(&format!("{key}/target"), "Reference", &hit.target),
+                wire::Edges {
+                    top: 0.,
+                    right: GUTTER.right,
+                    bottom: 6.,
+                    left: GUTTER.left,
+                },
             ));
         }
-        kit::scroll(
-            "explorer/results",
-            kit::column("explorer/result-list", content),
-        )
+        Self::filling(kit::spaced(
+            kit::column(
+                "explorer/results-body",
+                [
+                    filters,
+                    kit::divider("explorer/filters-edge"),
+                    kit::scroll(
+                        "explorer/results",
+                        kit::spaced(kit::column("explorer/result-list", content), 0.),
+                    ),
+                ],
+            ),
+            0.,
+        ))
     }
 }

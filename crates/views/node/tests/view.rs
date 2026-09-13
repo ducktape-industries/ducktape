@@ -5,11 +5,11 @@
 //! `rpc.stream`, and retunes the running node's tracing filter with one
 //! `rpc.admin` POST. The clipboard is the one intent left.
 
+use ducktape_view_guest::testing::{answer, has_text, item, press, texts, type_into};
+use ducktape_view_guest::wire::{Event, Frame, Node, Request};
 use node_view::host::{Copy, Session};
 use node_view::{boot_native, tick_native};
 use serde_json::{Value, json};
-use ducktape_view_guest::testing::{answer, has_text, item, press, texts, type_into};
-use ducktape_view_guest::wire::{Event, Frame, Node, Request};
 
 // ---------- what the node answers ----------
 
@@ -185,7 +185,10 @@ fn a_connected_view_reads_the_node_for_itself() {
     }
     let mut names = Vec::new();
     surfaces(frame.root.as_ref().expect("a tree"), &mut names);
-    assert!(names.is_empty(), "the log ring is the guest's now: {names:?}");
+    assert!(
+        names.is_empty(),
+        "the log ring is the guest's now: {names:?}"
+    );
 
     // a block moved: the view reads the node again off its own subscription
     let frame = tick_native(vec![item(live[0].id, b"{}")]);
@@ -260,23 +263,32 @@ fn the_activity_tab_streams_the_node_log_ring() {
     let frame = tick_native(vec![
         item(
             stream.id,
-            log_frame(1, "2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted resident")
-                .to_string()
-                .as_bytes(),
+            log_frame(
+                1,
+                "2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted resident",
+            )
+            .to_string()
+            .as_bytes(),
         ),
         item(
             stream.id,
-            log_frame(2, "2026-07-27T09:12:45.001Z  WARN ducktape::mesh: retrying dial")
-                .to_string()
-                .as_bytes(),
+            log_frame(
+                2,
+                "2026-07-27T09:12:45.001Z  WARN ducktape::mesh: retrying dial",
+            )
+            .to_string()
+            .as_bytes(),
         ),
         // the ring replays on every re-subscribe: a cursor already held is
         // the same line, and is not listed twice
         item(
             stream.id,
-            log_frame(1, "2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted resident")
-                .to_string()
-                .as_bytes(),
+            log_frame(
+                1,
+                "2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted resident",
+            )
+            .to_string()
+            .as_bytes(),
         ),
     ]);
     let shown = texts(&frame);
@@ -291,6 +303,23 @@ fn the_activity_tab_streams_the_node_log_ring() {
     assert!(has_text(&frame, "WARN"), "{shown:?}");
     assert!(has_text(&frame, "2026-07-27T09:12:45.001Z"), "{shown:?}");
 
+    // a level chip keeps that level alone, and `All` gives the ring back
+    let frame = tick_native(press(&frame, "Info"));
+    let shown = texts(&frame);
+    assert!(
+        shown
+            .iter()
+            .any(|text| text == "ducktape::join: admitted resident"),
+        "{shown:?}"
+    );
+    assert!(
+        !shown
+            .iter()
+            .any(|text| text == "ducktape::mesh: retrying dial"),
+        "{shown:?}"
+    );
+    let frame = tick_native(press(&frame, "All"));
+
     // the filter is the view's own, over the timeline it holds
     let frame = tick_native(type_into(&frame, "filter logs…", "retrying"));
     let shown = texts(&frame);
@@ -300,7 +329,10 @@ fn the_activity_tab_streams_the_node_log_ring() {
             .any(|text| text == "ducktape::join: admitted resident"),
         "{shown:?}"
     );
-    assert!(has_text(&frame, "ducktape::mesh: retrying dial"), "{shown:?}");
+    assert!(
+        has_text(&frame, "ducktape::mesh: retrying dial"),
+        "{shown:?}"
+    );
 
     let frame = tick_native(type_into(&frame, "filter logs…", "nothing matches this"));
     assert!(

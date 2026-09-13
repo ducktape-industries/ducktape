@@ -1,5 +1,5 @@
 use super::*;
-use ducktape_view_guest::slots;
+use ducktape_view_guest::{kit::Tone, slots};
 
 fn span(
     content: String,
@@ -8,10 +8,12 @@ fn span(
     italic: bool,
 ) -> wire::RichSpan {
     let decorated = weight != wire::Weight::Normal || italic;
+    let linked = link.is_some();
     wire::RichSpan {
         content,
-        underline: link.is_some(),
+        underline: linked,
         link,
+        color: linked.then(|| native::rgba(native::palette().link)),
         font: decorated.then_some(wire::NamedFont {
             family: wire::FontFamily::SansSerif,
             weight,
@@ -26,67 +28,88 @@ fn span(
     }
 }
 
+/// The tone an item or review state paints. Open is live, merged wears the
+/// agent tint, and a closed item is spent — only a refused review is danger.
+pub(super) fn state_tone(state: &str) -> Tone {
+    match state {
+        "open" | "approve" | "approved" => Tone::Success,
+        "merged" => Tone::Agent,
+        "request_changes" | "changes_requested" => Tone::Danger,
+        _ => Tone::Neutral,
+    }
+}
+
+/// A reading's body size: one step over the 13px chrome, at 1.5 leading.
+pub(super) const READING: f32 = 14.;
+
 impl ForgeView {
     pub(super) fn unavailable(&self, key: String) -> wire::Node {
-        native::column(
+        native::notice(
             &key,
-            [
-                native::heading(format!("{key}/title"), "Unable to read Forge"),
-                native::text(format!("{key}/error"), self.host_error.clone()),
-            ],
+            native::spaced(
+                native::column(
+                    format!("{key}/body"),
+                    [
+                        native::strong(format!("{key}/title"), "Unable to read Forge"),
+                        native::wrapping(native::text(
+                            format!("{key}/error"),
+                            self.host_error.clone(),
+                        )),
+                    ],
+                ),
+                2.,
+            ),
+            Tone::Danger,
         )
     }
     pub(super) fn disconnected(&self, key: String) -> wire::Node {
-        native::column(
+        native::empty_state(
             &key,
-            [
-                native::heading(format!("{key}/title"), "Not connected"),
-                native::text(
-                    format!("{key}/detail"),
-                    "Choose a network from the workspace header to reconnect.",
-                ),
-            ],
+            "Not connected",
+            "Choose a network from the sidebar to read its repositories.",
         )
     }
 
     pub(super) fn loading_tracker(&self, key: String) -> wire::Node {
-        native::text(key, "Loading repository tracker…")
+        native::secondary(key, "Loading repository tracker…")
     }
     pub(super) fn tracker_unavailable(&self, key: String) -> wire::Node {
-        native::text(
+        native::wrapping(native::secondary(
             key,
             "Could not load this repository. Return to all repos and open it again to retry.",
-        )
+        ))
     }
     pub(super) fn empty_issues(&self, key: String) -> wire::Node {
-        native::text(
-            key,
-            "No issues — this app reads the tracker but cannot open one yet.",
+        native::empty_state(
+            format!("{key}/state"),
+            "No issues",
+            "This app reads the tracker but cannot open one yet.",
         )
     }
     pub(super) fn empty_pulls(&self, key: String) -> wire::Node {
-        native::text(
-            key,
-            "No pull requests — an agent run opens one when it delivers its work.",
+        native::empty_state(
+            format!("{key}/state"),
+            "No pull requests",
+            "An agent run opens one when it delivers its work.",
         )
     }
     pub(super) fn loading_item(&self, key: String) -> wire::Node {
-        native::text(key, "Loading tracker item…")
+        native::secondary(key, "Loading tracker item…")
     }
     pub(super) fn item_unavailable(&self, key: String) -> wire::Node {
-        native::text(
+        native::wrapping(native::secondary(
             key,
             "Could not load this item. Go back and open it again to retry.",
-        )
+        ))
     }
 
     pub(super) fn finality(&self, key: String, height: i64) -> wire::Node {
         let label = if height > 0 {
-            format!("✓ finalized · h {height}")
+            format!("finalized · h {height}")
         } else {
-            "✓ finalized".into()
+            "finalized".into()
         };
-        native::text(key, label)
+        native::badge(key, label, Tone::Success)
     }
 
     fn rich_line(
@@ -94,6 +117,7 @@ impl ForgeView {
         key: String,
         open: impl Fn(String) -> Message + Clone + 'static,
         block: &crate::host::ChatBlock,
+        size: f32,
     ) -> wire::Node {
         let mut spans = Vec::new();
         for part in &block.spans {
@@ -125,10 +149,11 @@ impl ForgeView {
             spans,
             options: wire::TextOptions {
                 wrapping: Some(wire::Wrapping::WordOrGlyph),
+                line_height: Some(wire::LineHeight::Relative(1.5)),
                 ..Default::default()
             },
-            size: None,
-            color: None,
+            size: Some(size),
+            color: Some(native::rgba(native::palette().foreground)),
             font: Default::default(),
             width: Some(wire::Length::Fill),
             align_x: None,
@@ -144,49 +169,81 @@ impl ForgeView {
         open: impl Fn(String) -> Message + Clone + 'static,
         blocks: Vec<crate::host::ChatBlock>,
     ) -> wire::Node {
+        self.rich_blocks(key, open, blocks, native::type_scale::BODY as f32)
+    }
+
+    fn rich_blocks(
+        &self,
+        key: String,
+        open: impl Fn(String) -> Message + Clone + 'static,
+        blocks: Vec<crate::host::ChatBlock>,
+        size: f32,
+    ) -> wire::Node {
+        let p = native::palette();
         let mut children = Vec::new();
         for (index, block) in blocks.iter().enumerate() {
             let key = format!("{key}/block/{index}");
             match block.kind.as_str() {
-                "divider" => children.push(wire::Node::Rule {
-                    key,
-                    axis: wire::Axis::Row,
-                    thickness: 1.,
-                    color: None,
-                    weak: false,
-                    radius: None,
-                    snap: None,
-                }),
+                "divider" => children.push(native::divider(key)),
                 "code" => {
-                    let code = native::text_options(
-                        native::text(format!("{key}/code"), block.text.clone()),
-                        wire::TextOptions {
-                            wrapping: Some(wire::Wrapping::WordOrGlyph),
-                            font: Some(wire::NamedFont {
-                                family: wire::FontFamily::Monospace,
-                                weight: wire::Weight::Normal,
-                                stretch: wire::FontStretch::Normal,
-                                style: wire::FontStyle::Normal,
-                            }),
-                            ..Default::default()
-                        },
+                    let code =
+                        native::wrapping(native::mono(format!("{key}/code"), block.text.clone()));
+                    let mut lines = Vec::new();
+                    if !block.lang.is_empty() {
+                        lines.push(native::caption(
+                            format!("{key}/language"),
+                            block.lang.clone(),
+                        ));
+                    }
+                    lines.push(code);
+                    let mut boxed = native::padded(
+                        native::spaced(native::column(&key, lines), 4.),
+                        wire::Edges::all(10.),
                     );
-                    children.push(native::column(
-                        &key,
-                        [
-                            native::text(format!("{key}/language"), block.lang.clone()),
-                            code,
-                        ],
-                    ));
+                    if let wire::Node::Linear {
+                        background, border, ..
+                    } = &mut boxed
+                    {
+                        *background = Some(native::rgba(p.surface_raised));
+                        *border = Some(wire::Border {
+                            color: Some(native::rgba(p.border)),
+                            width: Some(1.),
+                            radius: Some([native::radius::CONTROL as f32; 4]),
+                        });
+                    }
+                    children.push(boxed);
                 }
                 "quote" | "paragraph" => {
                     let content = if block.rich {
-                        self.rich_line(format!("{key}/text"), open.clone(), block)
+                        self.rich_line(format!("{key}/text"), open.clone(), block, size)
                     } else {
-                        native::text(format!("{key}/text"), block.text.clone())
+                        let mut plain = native::wrapping(native::text_size(
+                            native::text(format!("{key}/text"), block.text.clone()),
+                            size,
+                        ));
+                        if let wire::Node::Text { options, .. } = &mut plain {
+                            options.line_height = Some(wire::LineHeight::Relative(1.5));
+                        }
+                        plain
                     };
                     let content = if block.kind == "quote" {
-                        native::row(&key, [native::text(format!("{key}/quote"), "│"), content])
+                        let mut quote = native::padded(
+                            native::row(&key, [content]),
+                            wire::Edges {
+                                top: 2.,
+                                right: 0.,
+                                bottom: 2.,
+                                left: 12.,
+                            },
+                        );
+                        if let wire::Node::Linear { border, .. } = &mut quote {
+                            *border = Some(wire::Border {
+                                color: Some(native::rgba(p.border_strong)),
+                                width: Some(1.),
+                                radius: None,
+                            });
+                        }
+                        quote
                     } else {
                         content
                     };
@@ -195,13 +252,19 @@ impl ForgeView {
                 _ => {}
             }
         }
-        native::column(key, children)
+        native::spaced(native::column(key, children), 8.)
     }
+    /// The item's own body: a reading, wider type at 1.5 leading, held to a
+    /// measure a person can track a line across.
     pub(super) fn item_body(
         &self,
         key: String,
         open: impl Fn(String) -> Message + Clone + 'static,
     ) -> wire::Node {
-        self.rich_body(key, open, self.forge_item_blocks.clone())
+        let mut body = self.rich_blocks(key, open, self.forge_item_blocks.clone(), READING);
+        if let wire::Node::Linear { max_width, .. } = &mut body {
+            *max_width = Some(720.);
+        }
+        body
     }
 }

@@ -170,7 +170,7 @@ fn every_browser_split_drags_with_the_cursor_its_axis_uses() {
 
     assert_eq!(
         fixed(&frame, "/tree-pane", false),
-        Some(Length::Fixed(206.0))
+        Some(Length::Fixed(240.0))
     );
     let frame = drag(
         &frame,
@@ -181,7 +181,7 @@ fn every_browser_split_drags_with_the_cursor_its_axis_uses() {
     );
     assert_eq!(
         fixed(&frame, "/tree-pane", false),
-        Some(Length::Fixed(246.0))
+        Some(Length::Fixed(280.0))
     );
     let frame = drag(
         &frame,
@@ -271,14 +271,7 @@ fn a_directory_opens_as_its_own_read_and_the_old_rows_go_silent() {
     )]);
     let snapshots = files_get(&frame, "history").0.id;
     let frame = tick_native(vec![answer(snapshots, &history())]);
-    assert!(
-        has_text(
-            &frame,
-            "Empty directory — nothing is committed under this path."
-        ),
-        "{:?}",
-        texts(&frame)
-    );
+    assert!(has_text(&frame, "Nothing here yet"), "{:?}", texts(&frame));
 }
 
 /// A `duck://files/<path>` link is a SESSION fact, not a navigation the app

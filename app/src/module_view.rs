@@ -2851,10 +2851,10 @@ impl gpui_kit::Render for NativeModuleView {
                         "ducktape_guest",
                         format!("view{}", cx.entity().entity_id().as_u64()),
                     );
+                    // A view owns its own inset: a split pane runs to the edges.
                     gpui_kit::div()
                         .key_context(context)
                         .size_full()
-                        .p_4()
                         .child(input::Observe::new(
                             content.clone().into_any_element(),
                             self,
@@ -3885,7 +3885,7 @@ pub(crate) mod tests {
         let props = chat_facts();
         guest.redraw(&props);
         let shown = texts(&guest);
-        for expected in ["testnet", "# general", "# ops · Unread"] {
+        for expected in ["Channels", "general", "ops", "Unread"] {
             assert!(
                 shown.iter().any(|text| text == expected),
                 "missing {expected:?} in {shown:?}"
@@ -3895,7 +3895,7 @@ pub(crate) mod tests {
 
         guest.pending.push(wire::Event::Message(button_message(
             &guest,
-            "# ops · Unread",
+            "ops",
         )));
         guest.redraw(&props);
         assert_eq!(
@@ -4114,7 +4114,7 @@ pub(crate) mod tests {
         );
         guest.redraw(&props);
         let shown = texts(&guest);
-        for expected in ["Settings", "Theme"] {
+        for expected in ["Settings", "Appearance"] {
             assert!(
                 shown.iter().any(|text| text == expected),
                 "missing {expected:?} in {shown:?}"
@@ -5790,7 +5790,7 @@ pub(crate) mod tests {
             "governance" => (session_props(), "prop-1"),
             "files" => (files_facts(), "README.md"),
             "pages" => (pages_facts(), "Alpha"),
-            "chat" => (chat_facts(), "# general"),
+            "chat" => (chat_facts(), "general"),
             // forge reads its whole screen off the node; what the session
             // alone paints is the network it is reading
             _ => (forge_facts(), "duckhouse"),

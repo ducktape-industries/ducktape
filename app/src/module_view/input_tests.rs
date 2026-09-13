@@ -116,7 +116,12 @@ fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses(cx: &mut Te
         let seat = seated(&[]);
         let (view, mut native) = open(cx);
         for label in opened {
-            click_before_frame(&mut native, button(&seat, label));
+            let key = button(&seat, label);
+            // The message actions float over the card while the pointer is on it.
+            let hover = format!("{}/hover", key.rsplit_once('/').expect("scoped key").0);
+            native.update(|window, cx| window.hover(hover, cx));
+            native.update(|window, cx| window.render_frame(cx));
+            click_before_frame(&mut native, key);
             native.update(|window, cx| window.render_frame(cx));
         }
         let focus = if reacted { "reaction" } else { "action" };

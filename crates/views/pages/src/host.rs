@@ -1738,12 +1738,12 @@ pub fn comments_left_inset(pane: f64) -> f64 {
 }
 
 /// Line 0 is the page title: 22px of glyph at 1.15 between the 4px block pads
-/// `editor_markdown` gives it. A body line is 14px at 1.65 between the same.
+/// `editor_markdown` gives it. A body line is 14px at 1.5 between the same.
 const TITLE_LINE: f64 = 22.0 * 1.15 + 8.0;
-const BODY_LINE: f64 = 14.0 * 1.65 + 8.0;
+const BODY_LINE: f64 = 14.0 * 1.5 + 8.0;
 /// The card layer's own top edge, and so the origin every offset below is
-/// measured from: the 50px document header and its 1px separator.
-const LAYER_TOP: f64 = 51.0;
+/// measured from: the 40px document toolbar and its 1px separator.
+const LAYER_TOP: f64 = 41.0;
 
 /// How far the card may be pushed down and still keep its 400px body above the
 /// pane's bottom inset.
@@ -1872,17 +1872,17 @@ mod tests {
     #[test]
     fn an_inline_card_drops_into_the_gap_under_its_line_and_a_floating_one_onto_the_pointer() {
         // Beside and Squeeze put the card's top on the pointer that opened it:
-        // 51 of header and separator, measured from the layer's own corner.
-        assert_eq!(comment_card_offset(2000.0, 300.0, 900.0), 249.0);
-        assert_eq!(comment_card_offset(1000.0, 300.0, 900.0), 249.0);
+        // 41 of toolbar and separator, measured from the layer's own corner.
+        assert_eq!(comment_card_offset(2000.0, 300.0, 900.0), 259.0);
+        assert_eq!(comment_card_offset(1000.0, 300.0, 900.0), 259.0);
         // A gutter below the separator at the top, and its body above the
         // bottom inset at the other end.
         assert_eq!(comment_card_offset(2000.0, 0.0, 900.0), 16.0);
-        assert_eq!(comment_card_offset(2000.0, 5000.0, 900.0), 433.0);
+        assert_eq!(comment_card_offset(2000.0, 5000.0, 900.0), 443.0);
         // Inline, half a body line below the pointer plus half a gutter.
         assert_eq!(
             comment_card_offset(800.0, 300.0, 900.0),
-            300.0 - 51.0 + BODY_LINE / 2.0 + 8.0
+            300.0 - 41.0 + BODY_LINE / 2.0 + 8.0
         );
         // Page scope: under the title, measured from the surface's top padding.
         assert_eq!(

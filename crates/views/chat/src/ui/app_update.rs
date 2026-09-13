@@ -162,6 +162,7 @@ impl super::ChatView {
             self.connection_serial,
         );
         self.connected = next.connected;
+        self.dark = next.dark;
         self.endpoint = next.endpoint.to_owned();
         self.network_name = next.network_name.to_owned();
         self.network_chain_id = next.network_chain_id.to_owned();

@@ -382,7 +382,7 @@ fn a_search_that_lost_a_source_says_which_one_and_keeps_no_chip_for_it() {
         assert!(
             chips
                 .iter()
-                .any(|text| text.starts_with(&format!("{chip} ("))),
+                .any(|text| text.starts_with(&format!("{chip}  "))),
             "missing the {chip} chip in {chips:?}"
         );
     }

@@ -30,6 +30,7 @@ pub struct ExplorerView {
     pub(crate) viewport_width: f64,
     pub(crate) ledger_width: f64,
     pub(crate) host_error: String,
+    pub(crate) dark: bool,
 }
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -47,7 +48,8 @@ pub enum Message {
     BindQuery(String),
 }
 impl ExplorerView {
-    const SNAPSHOT_SCHEMA: &'static str = "04bc00e53f87dcbc66dc6576ac584618a68be12e5374d05e961f49caebcbc5b9";
+    const SNAPSHOT_SCHEMA: &'static str =
+        "d3ae16434f63f6c404876080e3ecf8998eb426abfa14b3744f16bcc6160a845d";
     fn state() -> Self {
         Self {
             connected: false,
@@ -69,6 +71,7 @@ impl ExplorerView {
             viewport_width: 1280.0,
             ledger_width: 340.0,
             host_error: "".to_owned(),
+            dark: false,
         }
     }
     pub(crate) fn boot() -> (Self, Task<Message>) {
@@ -211,6 +214,7 @@ impl ExplorerView {
         );
         self.loading = crate::host::loading_after(self.connected, next.connected, self.loading);
         self.connected = next.connected;
+        self.dark = next.dark;
         Task::none()
     }
     fn on_ledger_arrived(&mut self, item: crate::host::LedgerItem) -> Task<Message> {

@@ -1,4 +1,7 @@
-use ducktape_view_guest::{kit, slots};
+use ducktape_view_guest::{
+    kit::{self, Tone},
+    slots,
+};
 use wire::{ButtonPreset, Length, Node};
 
 const PAGE_KEY: &str = "PagesView/root/pages";
@@ -40,7 +43,7 @@ fn input(
     if let Node::Input { options, .. } = &mut node {
         options.disabled = disabled;
     }
-    node
+    kit::sized(node, Some(Length::Fill), None)
 }
 
 fn measured(key: &str, child: Node, change: fn(f64, f64) -> Message) -> Node {
@@ -63,17 +66,39 @@ fn fill(node: Node) -> Node {
     kit::sized(node, Some(Length::Fill), Some(Length::Fill))
 }
 
-fn empty_state(key: &str, title: &str, description: &str) -> Node {
-    kit::padded(
-        kit::column(
-            key,
-            [
-                kit::heading(format!("{key}/title"), title),
-                kit::text(format!("{key}/description"), description),
-            ],
+/// A pane header or a toolbar: one 40px centre line inset from the left edge,
+/// with the hairline that separates it from what it heads.
+fn header_bar(key: &str, left: f32, children: impl IntoIterator<Item = Node>) -> Node {
+    kit::sized(
+        kit::padded(
+            kit::spaced(kit::centered_row(key, children), 8.),
+            wire::Edges {
+                top: 0.,
+                right: 8.,
+                bottom: 0.,
+                left,
+            },
         ),
-        wire::Edges::all(24.),
+        Some(Length::Fill),
+        Some(Length::Fixed(40.)),
     )
+}
+
+fn empty_state(key: &str, title: &str, description: &str) -> Node {
+    kit::empty_state(key, title, description)
+}
+
+/// A modal card: surface, border, the card radius, a fixed width.
+fn modal(key: &str, child: Node, width: f32) -> Node {
+    let mut card = kit::card(key, child);
+    if let Node::Container {
+        padding, width: w, ..
+    } = &mut card
+    {
+        *padding = Some(wire::Edges::all(20.));
+        *w = Some(Length::Fixed(width));
+    }
+    card
 }
 
 fn overlay(
@@ -111,46 +136,45 @@ impl PagesView {
         } else {
             &self.active_page_title
         };
-        let contents = kit::column(
-            "pages/delete/content",
-            [
-                kit::heading("pages/delete/title", format!("Delete {title}?")),
-                kit::text(
-                    "pages/delete/warning",
-                    "This page and its comments will be deleted.",
-                ),
-                kit::row(
-                    "pages/delete/actions",
-                    [
-                        action(
-                            "pages/delete/cancel",
-                            "Cancel",
-                            Message::DisarmPageDelete,
-                            true,
-                            ButtonPreset::Secondary,
+        let contents = kit::spaced(
+            kit::column(
+                "pages/delete/content",
+                [
+                    kit::heading("pages/delete/title", format!("Delete {title}?")),
+                    kit::wrapping(kit::secondary(
+                        "pages/delete/warning",
+                        "This page and its comments will be deleted.",
+                    )),
+                    kit::spaced(
+                        kit::row(
+                            "pages/delete/actions",
+                            [
+                                kit::spacer(),
+                                action(
+                                    "pages/delete/cancel",
+                                    "Cancel",
+                                    Message::DisarmPageDelete,
+                                    true,
+                                    ButtonPreset::Secondary,
+                                ),
+                                action(
+                                    "pages/delete/confirm",
+                                    "Delete page",
+                                    Message::DeletePageSubmit,
+                                    !self.unavailable(),
+                                    ButtonPreset::Danger,
+                                ),
+                            ],
                         ),
-                        action(
-                            "pages/delete/confirm",
-                            "Delete page",
-                            Message::DeletePageSubmit,
-                            !self.unavailable(),
-                            ButtonPreset::Danger,
-                        ),
-                    ],
-                ),
-            ],
-        );
-        let card = kit::sized(
-            kit::padded(
-                kit::container("pages/delete/card", contents),
-                wire::Edges::all(24.),
+                        8.,
+                    ),
+                ],
             ),
-            Some(Length::Fixed(440.)),
-            None,
+            12.,
         );
         overlay(
             "pages/delete",
-            card,
+            modal("pages/delete/card", contents, 440.),
             Message::DisarmPageDelete,
             wire::AlignX::Center,
             wire::AlignY::Center,

@@ -14,7 +14,7 @@
 //! plate.
 //!
 //! The line metrics are the Pages design tokens
-//! (H1 20/1.25, H2 16/1.3, H3 14/1.35, body 14/1.65, quote 14/1.6, code 12/1.6,
+//! (H1 20/1.25, H2 16/1.3, H3 14/1.35, body 14/1.5, quote 14/1.6, code 12/1.6,
 //! callout 13/1.6), so a saved document reads at exactly the size it was typed.
 
 use ducktape_view_guest::wire::editor_presentation::EditorFormat as Format;
@@ -27,7 +27,7 @@ const TRANSPARENT: Color = Color([0.0; 4]);
 use super::inline::{Inline, document_marks};
 
 pub const BODY_SIZE: f32 = 14.0;
-pub const BODY_LINE_HEIGHT: f32 = 1.65;
+pub const BODY_LINE_HEIGHT: f32 = 1.5;
 /// Line 0 is the page title. It reads a step above H1 so the document opens on
 /// an obvious title, and it is the ONLY line whose shape is positional rather
 /// than declared by a prefix.

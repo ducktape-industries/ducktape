@@ -7,6 +7,7 @@ members = ["governance", "members", "agents", "node", "explorer", "settings", "c
 [workspace.dependencies]
 futures = "0.3"
 ducktape-view-guest = { path = "support/guest" }
+design = { path = "support/design" }
 ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a690672adeb349594ce199f2cbbd33eaaa14ea23" }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }

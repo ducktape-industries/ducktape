@@ -6,49 +6,84 @@ impl PagesView {
         } else {
             &page.title
         };
-        let label = if page.child_count > 0 {
-            format!("{}{title} · {}", page.prefix, page.child_count)
-        } else {
-            format!("{}{title}", page.prefix)
-        };
-        let preset = if selected {
-            ButtonPreset::Primary
-        } else {
-            ButtonPreset::Text
-        };
-        let mut node = action(
-            format!("{PAGE_KEY}/page/{}", page.id),
-            label,
-            Message::ChoosePage(page.id.clone()),
-            !self.unavailable(),
-            preset,
-        );
-        if let Node::Button { checked, .. } = &mut node {
-            *checked = Some(selected);
+        let key = format!("{PAGE_KEY}/page/{}", page.id);
+        let depth = page.prefix.chars().count() as f32;
+        let mut line = vec![kit::sized(
+            kit::nowrap(kit::text(format!("{key}/title"), title)),
+            Some(Length::Fill),
+            None,
+        )];
+        if page.child_count > 0 {
+            line.push(kit::caption(
+                format!("{key}/children"),
+                page.child_count.to_string(),
+            ));
         }
-        kit::sized(node, Some(Length::Fill), None)
+        let content = kit::padded(
+            kit::spaced(kit::centered_row(format!("{key}/line"), line), 6.),
+            wire::Edges {
+                top: 0.,
+                right: 0.,
+                bottom: 0.,
+                left: depth * 6.,
+            },
+        );
+        let mut node = kit::list_row(
+            key,
+            content,
+            selected,
+            (!self.unavailable()).then(|| slots::message(Message::ChoosePage(page.id.clone()))),
+        );
+        if let Node::Button { label, .. } = &mut node {
+            *label = Some(format!("{}{title}", page.prefix));
+        }
+        node
     }
 
     fn search_result(&self, hit: &crate::host::PageSearchHit) -> Node {
         let key = format!("{PAGE_KEY}/search/{}/{}", hit.page_id, hit.block_id);
-        let content = kit::column(
-            format!("{key}/content"),
-            [
-                kit::text(format!("{key}/title"), &hit.page_title),
-                kit::text(format!("{key}/kind"), &hit.kind),
-                kit::text(format!("{key}/excerpt"), &hit.text),
-            ],
+        let content = kit::spaced(
+            kit::column(
+                format!("{key}/content"),
+                [
+                    kit::spaced(
+                        kit::centered_row(
+                            format!("{key}/head"),
+                            [
+                                kit::sized(
+                                    kit::nowrap(kit::weighted(
+                                        kit::text(format!("{key}/title"), &hit.page_title),
+                                        wire::Weight::Medium,
+                                    )),
+                                    Some(Length::Fill),
+                                    None,
+                                ),
+                                kit::badge(format!("{key}/kind"), &hit.kind, Tone::Neutral),
+                            ],
+                        ),
+                        6.,
+                    ),
+                    kit::wrapping(kit::colored(
+                        kit::text_size(
+                            kit::text(format!("{key}/excerpt"), &hit.text),
+                            kit::type_scale::SECONDARY as f32,
+                        ),
+                        kit::palette().muted,
+                    )),
+                ],
+            ),
+            2.,
         );
-        kit::button_child(
+        kit::list_row(
             key,
             content,
+            false,
             (!self.unavailable()).then(|| {
                 slots::message(Message::OpenPageSearchHit(
                     hit.page_id.clone(),
                     hit.block_id.clone(),
                 ))
             }),
-            ButtonPreset::Text,
         )
     }
 
@@ -58,36 +93,73 @@ impl PagesView {
         let replying = self.reply_thread == thread.id && !thread.resolved;
         let disabled = self.unavailable() || self.threads_loading;
         let mut rows = vec![
-            kit::row(
-                format!("{key}/header"),
-                [
-                    kit::text(format!("{key}/author"), &thread.author),
-                    kit::text(format!("{key}/meta"), &thread.meta),
-                    action(
-                        format!("{key}/resolve"),
-                        if thread.resolved {
-                            "Reopen"
-                        } else {
-                            "Resolve thread"
-                        },
-                        Message::ResolveThreadSubmit(thread.id.clone(), !thread.resolved),
-                        !disabled,
-                        ButtonPreset::Text,
-                    ),
-                ],
+            kit::spaced(
+                kit::centered_row(
+                    format!("{key}/header"),
+                    [
+                        kit::avatar(
+                            format!("{key}/avatar"),
+                            kit::initials(&thread.author),
+                            Tone::Neutral,
+                        ),
+                        kit::sized(
+                            kit::spaced(
+                                kit::column(
+                                    format!("{key}/who"),
+                                    [
+                                        kit::nowrap(kit::strong(format!("{key}/author"), &thread.author)),
+                                        kit::nowrap(kit::caption(format!("{key}/meta"), &thread.meta)),
+                                    ],
+                                ),
+                                1.,
+                            ),
+                            Some(Length::Fill),
+                            None,
+                        ),
+                        action(
+                            format!("{key}/resolve"),
+                            if thread.resolved {
+                                "Reopen"
+                            } else {
+                                "Resolve thread"
+                            },
+                            Message::ResolveThreadSubmit(thread.id.clone(), !thread.resolved),
+                            !disabled,
+                            ButtonPreset::Text,
+                        ),
+                    ],
+                ),
+                8.,
             ),
-            kit::text(format!("{key}/opener"), crate::host::opener_text(thread)),
+            kit::wrapping(kit::text(
+                format!("{key}/opener"),
+                crate::host::opener_text(thread),
+            )),
         ];
         for reply in crate::host::thread_replies(thread, expanded) {
-            rows.push(kit::column(
-                format!("{key}/reply/{}", reply.id),
-                [
-                    kit::text(
-                        format!("{key}/reply/{}/meta", reply.id),
-                        format!("{} · {}", reply.author, reply.meta),
+            rows.push(kit::padded(
+                kit::spaced(
+                    kit::column(
+                        format!("{key}/reply/{}", reply.id),
+                        [
+                            kit::caption(
+                                format!("{key}/reply/{}/meta", reply.id),
+                                format!("{} · {}", reply.author, reply.meta),
+                            ),
+                            kit::wrapping(kit::text(
+                                format!("{key}/reply/{}/body", reply.id),
+                                reply.text,
+                            )),
+                        ],
                     ),
-                    kit::text(format!("{key}/reply/{}/body", reply.id), reply.text),
-                ],
+                    2.,
+                ),
+                wire::Edges {
+                    top: 0.,
+                    right: 0.,
+                    bottom: 0.,
+                    left: 36.,
+                },
             ));
         }
         let toggle = crate::host::reply_toggle_label(thread, expanded);
@@ -108,20 +180,28 @@ impl PagesView {
             ));
         }
         if replying {
-            rows.push(input(
-                format!("{PAGE_KEY}/thread-reply({})", thread.id),
-                "Reply…",
-                &self.reply_draft,
-                Message::ReplyDraftChanged,
-                Some(Message::PostThreadReply(thread.id.clone())),
-                disabled,
-            ));
-            rows.push(action(
-                format!("{key}/submit"),
-                "Post reply",
-                Message::PostThreadReply(thread.id.clone()),
-                !disabled && !self.reply_draft.trim().is_empty(),
-                ButtonPreset::Primary,
+            rows.push(kit::spaced(
+                kit::row(
+                    format!("{key}/compose"),
+                    [
+                        input(
+                            format!("{PAGE_KEY}/thread-reply({})", thread.id),
+                            "Reply…",
+                            &self.reply_draft,
+                            Message::ReplyDraftChanged,
+                            Some(Message::PostThreadReply(thread.id.clone())),
+                            disabled,
+                        ),
+                        action(
+                            format!("{key}/submit"),
+                            "Post reply",
+                            Message::PostThreadReply(thread.id.clone()),
+                            !disabled && !self.reply_draft.trim().is_empty(),
+                            ButtonPreset::Primary,
+                        ),
+                    ],
+                ),
+                6.,
             ));
         } else if !thread.resolved {
             rows.push(action(
@@ -132,6 +212,6 @@ impl PagesView {
                 ButtonPreset::Text,
             ));
         }
-        kit::padded(kit::column(key, rows), wire::Edges::all(8.))
+        kit::card(key.clone(), kit::spaced(kit::column(format!("{key}/body"), rows), 6.))
     }
 }

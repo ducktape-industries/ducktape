@@ -1,6 +1,7 @@
 use super::*;
 impl ForgeView {
     pub fn view(&self) -> wire::Node {
+        native::set_dark(self.dark);
         let viewport = || {
             ducktape_view_guest::slots::handler::<(f32, f32), Message>(Box::new(
                 |(width, height)| Some(Message::ViewportChanged(width.into(), height.into())),
@@ -15,8 +16,10 @@ impl ForgeView {
             on_hide: None,
             anticipate: None,
             delay: None,
+            // no inset here: the namespace and the item screens are readings
+            // that pad themselves, and the code split runs to the edges
             child: Box::new(native::sized(
-                content,
+                native::spaced(native::column("ForgeView/page", [content]), 0.),
                 Some(wire::Length::Fill),
                 Some(wire::Length::Fill),
             )),

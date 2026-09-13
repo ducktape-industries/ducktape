@@ -126,6 +126,7 @@ pub struct ChatView {
     pub(crate) thread_edit_draft: String,
     pub(crate) host_error: String,
     pub(crate) sent: bool,
+    pub(crate) dark: bool,
 }
 impl ::std::fmt::Debug for ChatView {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -294,6 +295,7 @@ impl ChatView {
             thread_edit_draft: "".to_owned(),
             host_error: "".to_owned(),
             sent: false,
+            dark: false,
         }
     }
     pub(crate) fn boot() -> (Self, ::ducktape_view_guest::Task<Message>) {
@@ -301,7 +303,7 @@ impl ChatView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "cf1516e075a6b4b32487abe6afbfe3678c29fde066a7987abc12f3d3b256ef2b";
+        "97957d3d4452067dd635c9926be2ae75b13900550599c22244d9b402680b9ff5";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
@@ -429,9 +431,9 @@ mod tests {
                 wrap,
                 children,
                 ..
-            } if key.ends_with("/actions") => {
+            } if key.ends_with("/actions/bar") => {
                 assert_eq!(*axis, wire::Axis::Row);
-                assert!(wrap.is_some());
+                assert!(wrap.is_none(), "the floating bar keeps one line");
                 assert_eq!(children.len(), 4);
                 assert!(
                     children
@@ -464,26 +466,25 @@ mod tests {
                 rows += 1;
             }
             wire::Node::Text { content, .. } if content == "New messages" => unread += 1,
+            wire::Node::Text { key, content, .. }
+                if content == "Unread" && key.contains("/channel/") =>
+            {
+                unread_rooms += 1;
+            }
             wire::Node::Button {
                 label: Some(label),
-                content,
                 on_press,
                 key,
                 ..
-            } => {
-                if matches!(content, wire::ButtonContent::Label(text) if text.contains("Unread")) {
-                    unread_rooms += 1;
-                }
-                if ["Open thread", "React with 👍", "More message actions"]
-                    .contains(&label.as_str())
-                {
-                    assert!(on_press.is_some());
-                    assert!(!key.contains("/message/-1/") && !key.contains("/message/33/"));
-                    match label.as_str() {
-                        "Open thread" => threads += 1,
-                        "React with 👍" => reactions += 1,
-                        _ => menus += 1,
-                    }
+            } if ["Open thread", "React with 👍", "More message actions"]
+                .contains(&label.as_str()) =>
+            {
+                assert!(on_press.is_some());
+                assert!(!key.contains("/message/-1/") && !key.contains("/message/33/"));
+                match label.as_str() {
+                    "Open thread" => threads += 1,
+                    "React with 👍" => reactions += 1,
+                    _ => menus += 1,
                 }
             }
             _ => {}
@@ -515,8 +516,7 @@ mod tests {
                 assert_eq!(*width, Some(wire::Length::Fill));
                 headers += 1;
             }
-            wire::Node::Linear { key, children, .. } if key.ends_with("/message-action-focus") => {
-                assert!(!children.is_empty());
+            wire::Node::Container { key, .. } if key.ends_with("/message-action-focus") => {
                 menus += 1;
             }
             wire::Node::Input { key, .. } => assert!(!key.ends_with("-focus")),
@@ -528,6 +528,41 @@ mod tests {
         tree.for_each_mut(&mut |node| {
             assert!(!node.key().is_some_and(|key| key.ends_with("/dm-header")))
         });
+    }
+
+    /// The stream opens on the room's beginning — and only when the beginning
+    /// is what it is showing. The intro rides inside the scroll, which keeps
+    /// the end anchor either way.
+    #[test]
+    fn the_stream_opens_with_its_intro_only_once_the_whole_history_shows() {
+        let mut state = ChatView::state();
+        state.connected = true;
+        state.active_channel = "room".into();
+        state.active_channel_name = "design".into();
+        state.messages = vec![crate::host::ChatMessage {
+            seq: 1,
+            view_key: 11,
+            ..Default::default()
+        }];
+        let intros = |state: &ChatView| {
+            let mut tree = state.view();
+            let (mut intros, mut anchored) = (0, 0);
+            tree.for_each_mut(&mut |node| match node {
+                wire::Node::Text { content, .. } if content == "This is the start of #design." => {
+                    intros += 1;
+                }
+                wire::Node::Scroll { key, anchor_y, .. } if key.ends_with("/message-stream") => {
+                    assert_eq!(*anchor_y, wire::ScrollAnchor::End);
+                    anchored += 1;
+                }
+                _ => {}
+            });
+            assert_eq!(anchored, 1, "the stream keeps one end-anchored scroll");
+            intros
+        };
+        assert_eq!(intros(&state), 1);
+        state.has_older_history = true;
+        assert_eq!(intros(&state), 0, "older history is not a beginning");
     }
 
     #[test]
@@ -597,10 +632,9 @@ mod tests {
             let mut tree = state.view();
             let mut matches = 0;
             tree.for_each_mut(&mut |node| {
-                if let wire::Node::Linear { key, children, .. } = node
+                if let wire::Node::Container { key, .. } = node
                     && key == &target
                 {
-                    assert!(!children.is_empty());
                     matches += 1;
                 }
             });

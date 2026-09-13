@@ -257,9 +257,9 @@ fn a_connected_view_reads_its_own_room() {
 
         let (frame, _live) = connected_room();
         for expected in [
-            "testnet",
             "general",
-            "# ops · Unread",
+            "ops",
+            "Unread",
             "first light",
             "second wind",
             "mallard",
@@ -286,7 +286,7 @@ fn disconnect_hides_retained_rooms_messages_and_composer() {
         let frame = tick_native(vec![item(props, &encoded(&session(false)))]);
         assert!(has_text(&frame, "Not connected"));
         assert!(!has_text(&frame, "general"));
-        assert!(!has_text(&frame, "# ops · Unread"));
+        assert!(!has_text(&frame, "Unread"));
         let mut mounted = Vec::new();
         surfaces(frame.root.as_ref().unwrap(), &mut mounted);
         assert!(mounted.is_empty(), "no disconnected composer offers a send");
@@ -368,9 +368,9 @@ fn a_reaction_leaves_as_a_signed_op_and_the_chip_does_not_wait_for_the_block() {
 fn a_search_reads_the_index_and_lands_its_hits() {
     on_a_deep_stack(|| {
         let (frame, _) = connected_room();
-        let frame = tick_native(type_into(&frame, "Search…", "  light  "));
+        let frame = tick_native(type_into(&frame, "Search messages…", "  light  "));
         assert!(frame.requests.is_empty(), "typing runs no handler");
-        let frame = tick_native(ducktape_view_guest::testing::submit(&frame, "Search…"));
+        let frame = tick_native(ducktape_view_guest::testing::submit(&frame, "Search messages…"));
         let read = request(&frame, "rpc.view");
         let ask: serde_json::Value = serde_json::from_slice(&read.payload).expect("a read decodes");
         assert_eq!(ask["target"], "chat");
@@ -391,19 +391,19 @@ fn a_search_reads_the_index_and_lands_its_hits() {
 fn a_zero_hit_search_can_be_cleared_and_never_labels_a_different_draft() {
     on_a_deep_stack(|| {
         let (frame, _) = connected_room();
-        let frame = tick_native(type_into(&frame, "Search…", "missing"));
-        let frame = tick_native(ducktape_view_guest::testing::submit(&frame, "Search…"));
+        let frame = tick_native(type_into(&frame, "Search messages…", "missing"));
+        let frame = tick_native(ducktape_view_guest::testing::submit(&frame, "Search messages…"));
         let read = request(&frame, "rpc.view").id;
         let frame = tick_native(vec![answer(read, br#"{"hits":[]}"#)]);
         assert!(has_text(&frame, "No messages match"));
-        let frame = tick_native(type_into(&frame, "Search…", "different"));
+        let frame = tick_native(type_into(&frame, "Search messages…", "different"));
         assert!(!has_text(&frame, "No messages match"));
         assert!(frame.requests.is_empty());
         let frame = tick_native(press(&frame, "Clear message search"));
         assert!(!has_text(&frame, "No messages match"));
         assert!(has_text(&frame, "first light"));
-        let frame = tick_native(type_into(&frame, "Search…", "missing"));
-        let frame = tick_native(ducktape_view_guest::testing::submit(&frame, "Search…"));
+        let frame = tick_native(type_into(&frame, "Search messages…", "missing"));
+        let frame = tick_native(ducktape_view_guest::testing::submit(&frame, "Search messages…"));
         let read = request(&frame, "rpc.view").id;
         let frame = tick_native(vec![answer(read, br#"{"hits":[]}"#)]);
         let frame = tick_native(press(&frame, "Clear message search"));
@@ -415,7 +415,7 @@ fn a_zero_hit_search_can_be_cleared_and_never_labels_a_different_draft() {
 #[test]
 fn edited_annotations_reach_author_continuation_and_thread_rows() {
     fn annotations(node: &Node) -> usize {
-        usize::from(matches!(node, Node::Text { content, .. } if content == "· edited"))
+        usize::from(matches!(node, Node::Text { content, .. } if content == "edited"))
             + node.children().iter().map(annotations).sum::<usize>()
     }
     on_a_deep_stack(|| {

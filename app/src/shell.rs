@@ -169,13 +169,16 @@ impl Desktop {
         }
     }
 
-    fn sync_appearance(&self, cx: &mut Context<Self>) {
+    fn sync_appearance(&mut self, cx: &mut Context<Self>) {
         use gpui_kit::component::{Theme, ThemeMode};
         match self.state.appearance {
             crate::Appearance::Light => Theme::change(ThemeMode::Light, None, cx),
             crate::Appearance::Dark => Theme::change(ThemeMode::Dark, None, cx),
             crate::Appearance::System => Theme::sync_system_appearance(None, cx),
         }
+        // System resolves through the kit: the palette every view paints
+        // with must follow the mode the theme actually landed on.
+        self.state.system_dark = Theme::global(cx).is_dark();
         configure_native_theme(cx);
     }
 
@@ -576,7 +579,6 @@ impl DesktopWindow {
         }
         Input::new(&self.inputs[key].state)
             .aria_label(placeholder)
-            .rounded_none()
             .into_any_element()
     }
 
@@ -591,7 +593,6 @@ impl DesktopWindow {
         let model = self.model.clone();
         gpui_kit::component::button::Button::new(key)
             .label(label)
-            .rounded_none()
             .disabled(disabled)
             .on_click(move |_, _, cx| {
                 cx.stop_propagation();
@@ -610,7 +611,6 @@ impl DesktopWindow {
         use gpui_kit::component::Disableable as _;
         gpui_kit::component::button::Button::new(key)
             .label(label)
-            .rounded_none()
             .disabled(disabled)
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
@@ -639,50 +639,118 @@ impl DesktopWindow {
             }
             self.input_step = Some(step);
         }
-        let mut body = div().flex().flex_col().gap_3().w_full();
+        let hero = |title: &'static str, subtitle: &'static str| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(24.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.5))
+                        .text_color(colors.muted_foreground)
+                        .child(subtitle),
+                )
+        };
+        let panel = || {
+            div()
+                .border_1()
+                .border_color(colors.border)
+                .bg(colors.surface)
+                .rounded(px(design::radius::CARD as f32))
+                .overflow_hidden()
+        };
+        let hint = |text: String| {
+            div()
+                .text_size(px(12.5))
+                .text_color(colors.muted_foreground)
+                .child(text)
+        };
+        let mut body = div().flex().flex_col().gap_4().w_full();
         body = match step {
-            HubStep::Loading => body.child("Opening your workspace…"),
+            HubStep::Loading => body.child(hint("Opening your workspace…".into())),
             HubStep::Wallets => {
                 let state = &self.model.read(cx).state;
                 let selected = state.hub_wallet_selected.clone();
                 let wallets = state.hub_wallets.clone();
-                body = body.child("Choose a wallet");
+                body = body.child(hero("Welcome back", "Choose a wallet to sign in with."));
+                let mut list = panel().flex().flex_col().p_2().gap_1();
                 for wallet in wallets {
-                    body = body.child(self.action(
-                        format!("wallet/{}", wallet.name),
-                        format!("{} · {}", wallet.name, wallet.state),
-                        Message::PickWallet(wallet.name),
-                        busy,
-                    ));
+                    let picked = wallet.name == selected;
+                    list = list.child(
+                        self.action(
+                            format!("wallet/{}", wallet.name),
+                            format!("{} · {}", wallet.name, wallet.state),
+                            Message::PickWallet(wallet.name),
+                            busy,
+                        )
+                        .ghost()
+                        .w_full()
+                        .when(picked, |button| button.secondary()),
+                    );
                 }
                 if !selected.is_empty() {
-                    body = body
-                        .child(self.input("unlock", "Wallet password", true, window, cx))
-                        .child(self.submit(
-                            "unlock-submit",
-                            "Unlock",
-                            busy,
-                            |this, cx| Message::UnlockSubmit(this.value("unlock", cx)),
-                            cx,
-                        ));
+                    list = list.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .p_2()
+                            .child(self.input("unlock", "Wallet password", true, window, cx))
+                            .child(
+                                self.submit(
+                                    "unlock-submit",
+                                    "Unlock",
+                                    busy,
+                                    |this, cx| Message::UnlockSubmit(this.value("unlock", cx)),
+                                    cx,
+                                )
+                                .primary()
+                                .w_full()
+                                .h_8(),
+                            ),
+                    );
                 }
-                body.child(self.action(
-                    "wallet-restore",
-                    "Restore a wallet",
-                    Message::GoRestore,
-                    busy,
-                ))
-                .child(self.action("wallet-create", "Create a wallet", Message::LoginSkip, busy))
-                .child(self.action(
-                    "wallet-networks",
-                    "Networks",
-                    Message::GoNetworks,
-                    busy,
-                ))
+                body.child(list).child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            self.action(
+                                "wallet-create",
+                                "Create a wallet",
+                                Message::LoginSkip,
+                                busy,
+                            )
+                            .outline(),
+                        )
+                        .child(
+                            self.action(
+                                "wallet-restore",
+                                "Restore a wallet",
+                                Message::GoRestore,
+                                busy,
+                            )
+                            .ghost(),
+                        )
+                        .child(
+                            self.action("wallet-networks", "Networks", Message::GoNetworks, busy)
+                                .ghost(),
+                        ),
+                )
             }
             HubStep::Password => {
                 body = body
-                    .child("Protect your wallet")
+                    .child(hero(
+                        "Protect your wallet",
+                        "A password encrypts the key on this device.",
+                    ))
                     .child(self.input("password", "Password", true, window, cx))
                     .child(self.input("password-confirm", "Confirm password", true, window, cx));
                 let problem = crate::backend::password_problem(
@@ -690,38 +758,75 @@ impl DesktopWindow {
                     &self.value("password-confirm", cx),
                 );
                 let invalid = busy || !problem.is_empty();
-                body.child(problem)
-                    .child(self.submit(
-                        "password-submit",
-                        "Create wallet",
-                        invalid,
-                        |this, cx| Message::PasswordSubmit(this.value("password", cx)),
-                        cx,
-                    ))
-                    .child(self.action("password-back", "Back", Message::GoLogin, busy))
+                body.when(!problem.is_empty(), |body| body.child(hint(problem)))
+                    .child(
+                        self.submit(
+                            "password-submit",
+                            "Create wallet",
+                            invalid,
+                            |this, cx| Message::PasswordSubmit(this.value("password", cx)),
+                            cx,
+                        )
+                        .primary()
+                        .w_full()
+                        .h_8(),
+                    )
+                    .child(
+                        self.action("password-back", "Back", Message::GoLogin, busy)
+                            .ghost(),
+                    )
             }
             HubStep::Phrase => {
-                body = body
-                    .child("Write down your recovery phrase")
-                    .child("Keep it private. This phrase can restore your wallet.");
+                body = body.child(hero(
+                    "Write down your recovery phrase",
+                    "Keep it private. This phrase can restore your wallet.",
+                ));
+                let mut words = panel().flex().flex_col().p_3().gap_1();
                 for row in crate::backend::phrase_rows() {
-                    body = body.child(
+                    let word = |number: String, text: String| {
+                        div()
+                            .flex_1()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(24.))
+                                    .text_size(px(12.))
+                                    .font_family(design::fonts::FAMILY_MONO)
+                                    .text_color(colors.muted_foreground)
+                                    .child(number),
+                            )
+                            .child(
+                                div()
+                                    .font_family(design::fonts::FAMILY_MONO)
+                                    .child(text),
+                            )
+                    };
+                    words = words.child(
                         div()
                             .flex()
-                            .justify_between()
-                            .child(format!("{} {}", row.left_number, row.left_word))
-                            .child(format!("{} {}", row.right_number, row.right_word)),
+                            .child(word(row.left_number.to_string(), row.left_word.to_string()))
+                            .child(word(row.right_number.to_string(), row.right_word.to_string())),
                     );
                 }
-                body.child(self.action(
-                    "phrase-saved",
-                    "I wrote it down",
-                    Message::PhraseWrittenDown,
-                    busy,
-                ))
+                body.child(words).child(
+                    self.action(
+                        "phrase-saved",
+                        "I wrote it down",
+                        Message::PhraseWrittenDown,
+                        busy,
+                    )
+                    .primary()
+                    .w_full()
+                    .h_8(),
+                )
             }
             HubStep::Confirm => body
-                .child(crate::backend::recovery_prompt())
+                .child(hero(
+                    "Confirm your phrase",
+                    "Type the requested words to prove the phrase is written down.",
+                ))
+                .child(hint(crate::backend::recovery_prompt()))
                 .child(self.input(
                     "phrase-answer",
                     "Requested words, separated by spaces",
@@ -729,56 +834,102 @@ impl DesktopWindow {
                     window,
                     cx,
                 ))
-                .child(self.submit(
-                    "phrase-confirm",
-                    "Confirm recovery phrase",
-                    busy,
-                    |this, cx| Message::ConfirmPhraseSubmit(this.value("phrase-answer", cx)),
-                    cx,
-                ))
-                .child(self.action(
-                    "phrase-again",
-                    "Show phrase again",
-                    Message::ShowPhraseAgain,
-                    busy,
-                )),
+                .child(
+                    self.submit(
+                        "phrase-confirm",
+                        "Confirm recovery phrase",
+                        busy,
+                        |this, cx| Message::ConfirmPhraseSubmit(this.value("phrase-answer", cx)),
+                        cx,
+                    )
+                    .primary()
+                    .w_full()
+                    .h_8(),
+                )
+                .child(
+                    self.action(
+                        "phrase-again",
+                        "Show phrase again",
+                        Message::ShowPhraseAgain,
+                        busy,
+                    )
+                    .ghost(),
+                ),
             HubStep::Restore => body
-                .child("Restore your wallet")
+                .child(hero(
+                    "Restore your wallet",
+                    "The recovery phrase rebuilds the key on this device.",
+                ))
                 .child(self.input("restore-name", "Wallet name", false, window, cx))
                 .child(self.input("restore_words", "Recovery phrase", true, window, cx))
                 .child(self.input("restore-password", "New password", true, window, cx))
-                .child(self.submit(
-                    "restore-submit",
-                    "Restore",
-                    busy,
-                    |this, cx| {
-                        Message::RestoreSubmit(
-                            this.value("restore-name", cx),
-                            this.value("restore-password", cx),
-                        )
-                    },
-                    cx,
-                ))
-                .child(self.action("restore-back", "Back", Message::GoLogin, busy)),
+                .child(
+                    self.submit(
+                        "restore-submit",
+                        "Restore",
+                        busy,
+                        |this, cx| {
+                            Message::RestoreSubmit(
+                                this.value("restore-name", cx),
+                                this.value("restore-password", cx),
+                            )
+                        },
+                        cx,
+                    )
+                    .primary()
+                    .w_full()
+                    .h_8(),
+                )
+                .child(
+                    self.action("restore-back", "Back", Message::GoLogin, busy)
+                        .ghost(),
+                ),
             HubStep::Networks => {
                 let state = &self.model.read(cx).state;
                 let networks = state.hub_networks.clone();
                 let selected = state.hub_selected.clone();
-                body = body
-                    .gap_5()
-                    .child(div().flex().flex_col().gap_2()
-                        .child(div().text_size(px(11.)).font_family(design::fonts::FAMILY_MONO).text_color(colors.muted_foreground).child("WORKSPACE / CONNECT"))
-                        .child(div().text_size(px(28.)).font_weight(FontWeight::SEMIBOLD).child("Your networks"))
-                        .child(div().text_color(colors.muted_foreground).child("Choose where your team works.")));
+                body = body.child(hero("Your networks", "Choose where your team works."));
                 let empty = networks.is_empty();
-                let mut recent = div().border_1().border_color(colors.border).bg(colors.surface)
-                    .child(div().px_4().py_3().border_b_1().border_color(colors.border).flex().justify_between()
-                        .child(div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).child("SAVED NETWORKS"))
-                        .child(div().text_size(px(11.)).font_family(design::fonts::FAMILY_MONO).text_color(colors.muted_foreground).child(format!("{:02}", networks.len()))));
+                let mut recent = panel().child(
+                    div()
+                        .px_4()
+                        .py_3()
+                        .border_b_1()
+                        .border_color(colors.border)
+                        .flex()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("Saved networks"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .font_family(design::fonts::FAMILY_MONO)
+                                .text_color(colors.muted_foreground)
+                                .child(networks.len().to_string()),
+                        ),
+                );
                 if empty {
-                    recent = recent.child(div().px_4().py_6().flex().flex_col().gap_2()
-                        .child(div().text_size(px(15.)).font_weight(FontWeight::MEDIUM).child("No networks yet"))
-                        .child(div().text_size(px(12.)).text_color(colors.muted_foreground).child("Join a network or connect to a node below.")));
+                    recent = recent.child(
+                        div()
+                            .px_4()
+                            .py_6()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("No networks yet"),
+                            )
+                            .child(hint(
+                                "Join a network or connect to a node below.".into(),
+                            )),
+                    );
                 }
                 for network in networks {
                     let label = match (network.probed, network.live) {
@@ -790,90 +941,206 @@ impl DesktopWindow {
                     recent = recent.child(
                         div()
                             .flex()
-                            .gap_2()
-                            .p_2()
-                            .child(self.action(
-                                format!("network/{}", network.id),
-                                label,
-                                Message::PickNetwork(network.id.clone()),
-                                busy,
-                            ).flex_1().when(picked, |button| button.primary()))
-                            .child(self.action(
-                                format!("forget/{}", network.id),
-                                "Forget",
-                                Message::ForgetNetworkSubmit(network.id),
-                                busy,
-                            ).ghost()),
+                            .gap_1()
+                            .px_2()
+                            .py_1()
+                            .child(
+                                self.action(
+                                    format!("network/{}", network.id),
+                                    label,
+                                    Message::PickNetwork(network.id.clone()),
+                                    busy,
+                                )
+                                .ghost()
+                                .flex_1()
+                                .when(picked, |button| button.secondary()),
+                            )
+                            .child(
+                                self.action(
+                                    format!("forget/{}", network.id),
+                                    "Forget",
+                                    Message::ForgetNetworkSubmit(network.id),
+                                    busy,
+                                )
+                                .ghost(),
+                            ),
                     );
                 }
                 let no_selection = busy || selected.is_empty();
                 if !empty {
-                    recent = recent.child(div().p_3().border_t_1().border_color(colors.border).child(self.action(
-                    "network-open",
-                    "Open network",
-                    Message::OpenNetworkSubmit,
-                    no_selection,
-                    ).primary().w_full().h_10()));
+                    recent = recent.child(
+                        div()
+                            .p_3()
+                            .border_t_1()
+                            .border_color(colors.border)
+                            .child(
+                                self.action(
+                                    "network-open",
+                                    "Open network",
+                                    Message::OpenNetworkSubmit,
+                                    no_selection,
+                                )
+                                .primary()
+                                .w_full()
+                                .h_8(),
+                            ),
+                    );
                 }
                 body.child(recent)
-                .child(div().flex().flex_col().gap_3()
-                    .child(div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).child("CONNECT DIRECTLY"))
-                    .child(self.input("remote", "Remote node address", false, window, cx))
-                    .child(self.submit(
-                    "remote-connect",
-                    "Connect to node",
-                    busy || self.value("remote", cx).trim().is_empty(),
-                    |this, cx| Message::ConnectRemoteSubmit(this.value("remote", cx)),
-                    cx,
-                ).primary().w_full().h_10()))
-                .child(div().border_t_1().border_color(colors.border).pt_4().flex().flex_col().gap_2()
-                    .child(div().text_size(px(12.)).text_color(colors.muted_foreground).child("Already have an invitation?"))
-                    .child(self.action(
-                    "network-join",
-                    "Join with invitation",
-                    Message::GoJoin,
-                    busy,
-                ).outline().w_full().h_10()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("Connect directly"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div().flex_1().child(self.input(
+                                            "remote",
+                                            "Remote node address",
+                                            false,
+                                            window,
+                                            cx,
+                                        )),
+                                    )
+                                    .child(
+                                        self.submit(
+                                            "remote-connect",
+                                            "Connect",
+                                            busy || self.value("remote", cx).trim().is_empty(),
+                                            |this, cx| {
+                                                Message::ConnectRemoteSubmit(this.value("remote", cx))
+                                            },
+                                            cx,
+                                        )
+                                        .outline(),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .border_t_1()
+                            .border_color(colors.border)
+                            .pt_4()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(hint("Already have an invitation?".into()))
+                            .child(
+                                self.action(
+                                    "network-join",
+                                    "Join with invitation",
+                                    Message::GoJoin,
+                                    busy,
+                                )
+                                .outline(),
+                            ),
+                    )
             }
             HubStep::Join => body
-                .gap_5()
-                .child(div().flex().flex_col().gap_2()
-                    .child(div().text_size(px(11.)).font_family(design::fonts::FAMILY_MONO).text_color(colors.muted_foreground).child("WORKSPACE / INVITATION"))
-                    .child(div().text_size(px(28.)).font_weight(FontWeight::SEMIBOLD).child("Join your team"))
-                    .child(div().text_color(colors.muted_foreground).child("One invitation. A shared place to work.")))
-                .child(div().border_1().border_color(colors.border).bg(colors.surface).p_4().flex().flex_col().gap_3()
-                    .child(div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).child("NETWORK INVITATION"))
-                    .child(self.input("join_invite", "Invitation", true, window, cx))
-                    .child(div().text_size(px(12.)).text_color(colors.muted_foreground).child("Paste the invitation shared by a network member. It stays hidden on this screen.")))
-                .child(self.action("join-submit", "Join network", Message::JoinNetworkSubmit, busy || self.value("join_invite", cx).trim().is_empty()).primary().w_full().h_10())
-                .child(self.action("join-back", "Back to networks", Message::GoNetworks, busy).ghost().w_full())
-                .child(div().border_t_1().border_color(colors.border).pt_4().text_size(px(12.)).text_color(colors.muted_foreground).child("Your wallet identifies you. The invitation connects you to the right workspace.")),
+                .child(hero("Join your team", "One invitation. A shared place to work."))
+                .child(
+                    panel()
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("Network invitation"),
+                        )
+                        .child(self.input("join_invite", "Invitation", true, window, cx))
+                        .child(hint(
+                            "Paste the invitation shared by a network member. It stays hidden on this screen."
+                                .into(),
+                        )),
+                )
+                .child(
+                    self.action(
+                        "join-submit",
+                        "Join network",
+                        Message::JoinNetworkSubmit,
+                        busy || self.value("join_invite", cx).trim().is_empty(),
+                    )
+                    .primary()
+                    .w_full()
+                    .h_8(),
+                )
+                .child(
+                    self.action("join-back", "Back to networks", Message::GoNetworks, busy)
+                        .ghost()
+                        .w_full(),
+                )
+                .child(
+                    div()
+                        .border_t_1()
+                        .border_color(colors.border)
+                        .pt_4()
+                        .child(hint(
+                            "Your wallet identifies you. The invitation connects you to the right workspace."
+                                .into(),
+                        )),
+                ),
             HubStep::Provisioning => {
+                body = body.child(hero(
+                    "Setting up your network",
+                    "This takes a moment on first launch.",
+                ));
+                let mut steps = panel().flex().flex_col().p_3().gap_2();
                 for step in &self.model.read(cx).state.provision_steps {
-                    body = body.child(format!("{} · {}", step.label, step.state));
+                    steps = steps.child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .gap_3()
+                            .child(div().child(step.label.clone()))
+                            .child(hint(step.state.clone())),
+                    );
                 }
-                body
+                body.child(steps)
             }
             HubStep::Live => body
-                .child("Your network is ready")
-                .child(self.action(
-                    "copy-invite",
-                    "Copy invitation",
-                    Message::CopyOnboardingInvite,
-                    busy,
+                .child(hero(
+                    "Your network is ready",
+                    "Invite your team, then open the workspace.",
                 ))
-                .child(self.action(
-                    "enter-console",
-                    "Open Ducktape",
-                    Message::EnterConsole,
-                    busy,
-                )),
+                .child(
+                    self.action(
+                        "copy-invite",
+                        "Copy invitation",
+                        Message::CopyOnboardingInvite,
+                        busy,
+                    )
+                    .outline()
+                    .w_full()
+                    .h_8(),
+                )
+                .child(
+                    self.action("enter-console", "Open Ducktape", Message::EnterConsole, busy)
+                        .primary()
+                        .w_full()
+                        .h_8(),
+                ),
             HubStep::Account => {
                 let state = &self.model.read(cx).state;
                 let detail = state.ceremony_detail.clone();
                 let left = state.ceremony_left.clone();
                 let payload = state.ceremony_qr.clone();
-                body = body.child("Your account").child(detail).child(left);
+                body = body
+                    .child(hero("Your account", "One account, every device you sign in from."))
+                    .when(!detail.is_empty(), |body| body.child(hint(detail)))
+                    .when(!left.is_empty(), |body| body.child(hint(left)));
                 if !payload.is_empty() {
                     let changed = self
                         .qr
@@ -894,32 +1161,57 @@ impl DesktopWindow {
                     body = body.child(self.qr.as_ref().expect("account QR").1.clone());
                 }
                 body.child(self.input("account-name", "Account name", false, window, cx))
-                    .child(self.submit(
-                        "account-create",
-                        "Create account",
-                        busy,
-                        |this, cx| Message::WelcomeCreateSubmit(this.value("account-name", cx)),
-                        cx,
-                    ))
-                    .child(self.action(
-                        "account-login",
-                        "Sign in",
-                        Message::WelcomeLoginSubmit,
-                        busy,
-                    ))
-                    .child(self.action(
-                        "account-desktop",
-                        "Use this device",
-                        Message::WelcomeDesktop,
-                        busy,
-                    ))
-                    .child(self.action(
-                        "account-skip",
-                        "Continue without account",
-                        Message::WelcomeSkip,
-                        busy,
-                    ))
-                    .child(self.action("account-cancel", "Cancel", Message::WelcomeCancel, false))
+                    .child(
+                        self.submit(
+                            "account-create",
+                            "Create account",
+                            busy,
+                            |this, cx| {
+                                Message::WelcomeCreateSubmit(this.value("account-name", cx))
+                            },
+                            cx,
+                        )
+                        .primary()
+                        .w_full()
+                        .h_8(),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                self.action(
+                                    "account-login",
+                                    "Sign in",
+                                    Message::WelcomeLoginSubmit,
+                                    busy,
+                                )
+                                .outline(),
+                            )
+                            .child(
+                                self.action(
+                                    "account-desktop",
+                                    "Use this device",
+                                    Message::WelcomeDesktop,
+                                    busy,
+                                )
+                                .outline(),
+                            )
+                            .child(
+                                self.action(
+                                    "account-skip",
+                                    "Continue without account",
+                                    Message::WelcomeSkip,
+                                    busy,
+                                )
+                                .ghost(),
+                            )
+                            .child(
+                                self.action("account-cancel", "Cancel", Message::WelcomeCancel, false)
+                                    .ghost(),
+                            ),
+                    )
             }
         };
         div()
@@ -946,7 +1238,8 @@ impl DesktopWindow {
                             .gap_3()
                             .child(
                                 div()
-                                    .size(px(28.))
+                                    .size(px(26.))
+                                    .rounded(px(design::radius::CONTROL as f32))
                                     .bg(colors.foreground)
                                     .text_color(colors.background)
                                     .flex()
@@ -957,9 +1250,9 @@ impl DesktopWindow {
                             )
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(px(13.5))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("DUCKTAPE"),
+                                    .child("Ducktape"),
                             )
                             .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| {
                                 window.start_window_move()
@@ -987,43 +1280,39 @@ impl DesktopWindow {
                                 .mt_4()
                                 .p_3()
                                 .border_1()
+                                .rounded(px(design::radius::CONTROL as f32))
                                 .border_color(colors.destructive)
                                 .text_color(colors.destructive)
-                                .text_size(px(12.))
+                                .text_size(px(12.5))
                                 .child(error),
                         )
                     }),
             )
             .child(
                 div()
-                    .h(px(40.))
+                    .h(px(36.))
                     .px_5()
                     .flex_shrink_0()
                     .border_t_1()
                     .border_color(colors.border)
                     .flex()
                     .items_center()
-                    .justify_between()
                     .child(
                         div()
-                            .text_size(px(10.))
-                            .font_family(design::fonts::FAMILY_MONO)
+                            .text_size(px(11.5))
                             .text_color(colors.muted_foreground)
-                            .child("BUILT TO WORK TOGETHER"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(colors.muted_foreground)
-                            .child("DESKTOP"),
+                            .child("A workspace your team runs."),
                     ),
             )
             .into_any_element()
     }
 
     fn huddle(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        use gpui_kit::component::button::ButtonVariants as _;
         use gpui_kit::*;
+        let colors = gpui_kit::component::Theme::global(cx).color_tokens();
         let state = &self.model.read(cx).state;
+        let live_dot = hsla_of(design::palette(state.is_dark()).accent);
         let mute = if state.call_muted { "Unmute" } else { "Mute" };
         let camera = if state.call_camera {
             "Stop camera"
@@ -1106,14 +1395,37 @@ impl DesktopWindow {
                                             .flex_1()
                                             .p_3()
                                             .border_1()
-                                            .rounded_none()
+                                            .border_color(colors.border)
+                                            .bg(colors.surface)
+                                            .rounded(px(design::radius::CARD as f32))
                                             .flex()
                                             .flex_col()
                                             .items_center()
                                             .gap_2()
-                                            .child(row.person.initials.clone())
-                                            .child(div().truncate().child(row.person.label.clone()))
-                                            .child(caption)
+                                            .child(
+                                                div()
+                                                    .size(px(36.))
+                                                    .rounded_full()
+                                                    .bg(colors.secondary)
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .text_size(px(12.))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child(row.person.initials.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .text_size(px(12.5))
+                                                    .child(row.person.label.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.5))
+                                                    .text_color(colors.muted_foreground)
+                                                    .child(caption),
+                                            )
                                     }),
                             )
                         })
@@ -1127,33 +1439,81 @@ impl DesktopWindow {
             .flex()
             .flex_wrap()
             .gap_2()
-            .p_2()
+            .p_3()
             .flex_shrink_0()
-            .child(self.action("huddle-mute", mute, Message::ToggleCallMute, false))
-            .child(self.action("huddle-camera", camera, Message::ToggleCallCamera, false))
-            .child(self.action("huddle-screen", screen, Message::ToggleCallScreen, false))
-            .child(self.action(
-                "huddle-channel",
-                "Go to channel",
-                Message::HuddleGoChannel,
-                false,
-            ))
-            .child(self.action(
-                "huddle-leave",
-                "Leave huddle",
-                Message::LeaveHuddleHere,
-                false,
-            ));
+            .border_t_1()
+            .border_color(colors.border)
+            .child(
+                self.action("huddle-mute", mute, Message::ToggleCallMute, false)
+                    .outline(),
+            )
+            .child(
+                self.action("huddle-camera", camera, Message::ToggleCallCamera, false)
+                    .outline(),
+            )
+            .child(
+                self.action("huddle-screen", screen, Message::ToggleCallScreen, false)
+                    .outline(),
+            )
+            .child(
+                self.action(
+                    "huddle-channel",
+                    "Go to channel",
+                    Message::HuddleGoChannel,
+                    false,
+                )
+                .ghost(),
+            )
+            .child(
+                self.action(
+                    "huddle-leave",
+                    "Leave huddle",
+                    Message::LeaveHuddleHere,
+                    false,
+                )
+                .danger(),
+            );
         div()
             .size_full()
             .flex()
             .flex_col()
+            .bg(colors.background)
+            .text_color(colors.foreground)
             .child(
                 div()
-                    .p_3()
+                    .px_3()
+                    .py_2()
                     .flex_shrink_0()
-                    .child(format!("LIVE {elapsed} · {title}"))
-                    .child(div().text_xs().child(status)),
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .size(px(8.))
+                            .rounded_full()
+                            .bg(live_dot),
+                    )
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .font_family(design::fonts::FAMILY_MONO)
+                            .text_size(px(12.))
+                            .text_color(colors.muted_foreground)
+                            .child(elapsed),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(colors.muted_foreground)
+                            .child(status),
+                    ),
             )
             .child(body)
             .child(controls)
@@ -1161,7 +1521,7 @@ impl DesktopWindow {
     }
 
     fn console(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        use gpui_kit::component::{Selectable as _, button::ButtonVariants as _};
+        use gpui_kit::component::{Sizable as _, button::ButtonVariants as _};
         use gpui_kit::*;
         let colors = gpui_kit::component::Theme::global(cx).color_tokens();
         let (spec, route) = self.model.read(cx).state.native_view();
@@ -1198,51 +1558,97 @@ impl DesktopWindow {
             .find(|(tab, _)| *tab == selected_tab)
             .map(|(_, label)| *label)
             .expect("native navigation covers every shell tab");
+        let (sidebar, popover) = {
+            let theme = gpui_kit::component::Theme::global(cx);
+            (theme.sidebar, theme.popover)
+        };
+        let state = &self.model.read(cx).state;
+        let palette = design::palette(state.is_dark());
+        let accent = hsla_of(palette.accent);
+        let ink_fg = hsla_of(palette.sidebar_foreground);
+        let ink_muted = hsla_of(palette.sidebar_muted);
+        let ink_raised = hsla_of(palette.sidebar_raised);
+        let ink_border = hsla_of(palette.sidebar_border);
+        let faint = hsla_of(palette.faint);
+        let live = state.connected;
+        // The sidebar is the ink rail: it carries the network — its name,
+        // whether it is live, the way to another one — and the navigation.
+        // The header then only names the screen.
+        let network = self
+            .action("switch-network", "", Message::SwitchNetwork, false)
+            .ghost()
+            .w_full()
+            .h_auto()
+            .px_2()
+            .py_1p5()
+            .text_color(ink_fg)
+            .accessibility_label("Switch network")
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .size(px(6.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(if live { accent } else { faint }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .items_start()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .truncate()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ink_fg)
+                                    .child(state.network_name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(ink_muted)
+                                    .child(state.status.clone()),
+                            ),
+                    )
+                    .child(
+                        gpui_kit::component::Icon::new(
+                            gpui_kit::component::IconName::ChevronsUpDown,
+                        )
+                        .xsmall()
+                        .text_color(ink_muted),
+                    ),
+            );
         let mut tabs = div()
             .id("workspace-rail")
             .flex()
             .flex_col()
-            .gap_1()
-            .w(px(184.))
+            .w(px(200.))
             .h_full()
             .flex_shrink_0()
-            .px_3()
-            .py_4()
-            .bg(colors.muted)
+            .px_2()
+            .py_2()
+            .bg(sidebar)
             .border_r_1()
-            .border_color(colors.border)
-            .child(
-                div()
-                    .h_10()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .px_2()
-                    .mb_4()
-                    .child(
-                        div()
-                            .size(px(28.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(colors.foreground)
-                            .text_color(colors.background)
-                            .font_weight(FontWeight::BOLD)
-                            .child("D"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("DUCKTAPE"),
-                    ),
-            );
+            .border_color(ink_border)
+            .child(network)
+            .child(div().h_3().flex_shrink_0());
         for (tab, label) in navigation {
             let section = match tab {
-                ShellTab::Chat => Some("WORKSPACE"),
-                ShellTab::Explorer => Some("NETWORK"),
-                ShellTab::Settings => Some("PREFERENCES"),
+                ShellTab::Chat => Some("Workspace"),
+                ShellTab::Explorer => Some("Network"),
                 _ => None,
             };
             if tab == ShellTab::Settings {
@@ -1251,27 +1657,52 @@ impl DesktopWindow {
             if let Some(section) = section {
                 tabs = tabs.child(
                     div()
-                        .px_3()
+                        .px_2()
                         .pt_3()
-                        .pb_2()
+                        .pb_1()
                         .flex_shrink_0()
-                        .text_size(px(10.))
-                        .font_family(design::fonts::FAMILY_MONO)
-                        .text_color(colors.muted_foreground)
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ink_muted)
                         .child(section),
                 );
             }
             let selected = tab == selected_tab;
-            tabs = tabs.child(
-                self.action(label, label, Message::SelectShellTab(tab), false)
-                    .ghost()
-                    .selected(selected)
-                    .w_full()
-                    .h_9()
-                    .px_3()
-                    .justify_start()
-                    .when(selected, |button| button.primary()),
-            );
+            // A nav row is its own element, not a kit button: the kit centres
+            // a button's content and a rail reads left-aligned.
+            let row = div()
+                .id(label)
+                .flex()
+                .items_center()
+                .gap_2()
+                .h(px(28.))
+                .px_2()
+                .mb_0p5()
+                .rounded(px(design::radius::CONTROL as f32))
+                .cursor_pointer()
+                .text_size(px(13.))
+                .font_weight(if selected {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(if selected { ink_fg } else { ink_muted })
+                .when(selected, |row| row.bg(ink_raised))
+                .hover(move |style| style.bg(ink_raised).text_color(ink_fg))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.model.update(cx, |model, cx| {
+                        model.dispatch(Message::SelectShellTab(tab), cx)
+                    });
+                }))
+                .child(nav_icon(tab).small())
+                .child(div().flex_1().min_w_0().truncate().child(label));
+            #[cfg(test)]
+            let row = {
+                use gpui_kit::test::TestSupportExt as _;
+                row.test_support()
+            };
+            tabs = tabs.child(row);
         }
         let state = &self.model.read(cx).state;
         let mut modifiers = Modifiers::default();
@@ -1280,14 +1711,19 @@ impl DesktopWindow {
         } else {
             modifiers.control = true;
         }
+        let shortcut = if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl K" };
+        let bell_label = match state.bell_unread {
+            0 => "Notifications".to_owned(),
+            unread => format!("Notifications ({unread})"),
+        };
         let header = div()
             .id("workspace-header")
             .flex()
-            .gap_3()
+            .gap_1p5()
             .items_center()
-            .h(px(72.))
+            .h(px(40.))
             .flex_shrink_0()
-            .px_5()
+            .px_3()
             .border_b_1()
             .border_color(colors.border)
             .bg(colors.background)
@@ -1295,28 +1731,9 @@ impl DesktopWindow {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(colors.muted_foreground)
-                            .child(state.network_name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(22.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    ),
-            )
-            .child(
-                div()
-                    .text_size(px(10.))
-                    .font_family(design::fonts::FAMILY_MONO)
-                    .text_color(colors.muted_foreground)
-                    .child(state.status.clone()),
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(title),
             )
             .child(
                 self.action(
@@ -1329,30 +1746,39 @@ impl DesktopWindow {
                     !state.connected,
                 )
                 .outline()
-                .h_8()
-                .px_3(),
+                .icon(gpui_kit::component::IconName::Search)
+                .h_7()
+                .px_2()
+                .text_size(px(12.))
+                .text_color(colors.muted_foreground)
+                .child(
+                    div()
+                        .ml_1()
+                        .text_size(px(11.))
+                        .text_color(hsla_of(palette.faint))
+                        .child(shortcut),
+                ),
             )
             .child(
-                self.action(
-                    "bell",
-                    format!("Notifications ({})", state.bell_unread),
-                    Message::ToggleBell,
-                    !state.connected,
-                )
-                .outline()
-                .h_8()
-                .px_3(),
-            )
-            .child(
-                self.action(
-                    "switch-network",
-                    "Switch network",
-                    Message::SwitchNetwork,
-                    false,
-                )
-                .ghost()
-                .h_8()
-                .px_3(),
+                self.action("bell", "", Message::ToggleBell, !state.connected)
+                    .ghost()
+                    .icon(gpui_kit::component::IconName::Bell)
+                    .accessibility_label(bell_label)
+                    .h_7()
+                    .w_7()
+                    .px_0()
+                    .text_color(colors.muted_foreground)
+                    .child(div().relative().when(state.bell_unread > 0, |element| {
+                        element.child(
+                            div()
+                                .absolute()
+                                .top(px(-10.))
+                                .right(px(-12.))
+                                .size(px(6.))
+                                .rounded_full()
+                                .bg(accent),
+                        )
+                    })),
             );
         let error = state.error.clone();
         let toast = state.toast.clone();
@@ -1369,23 +1795,24 @@ impl DesktopWindow {
             .bg(colors.background)
             .child(header);
         if needs_account {
+            // A quiet one-line notice: the screen behind it stays the loudest thing.
             content = content.child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_3()
-                    .px_5()
-                    .py_2()
+                    .gap_2()
+                    .px_3()
+                    .h(px(32.))
                     .flex_shrink_0()
                     .border_b_1()
                     .border_color(colors.border)
-                    .bg(colors.muted)
+                    .bg(hsla_of(palette.surface))
                     .child(
                         div()
                             .flex_1()
                             .text_size(px(12.))
                             .text_color(colors.muted_foreground)
-                            .child("Sign in to use your account on this network"),
+                            .child("Sign in to use your account on this network."),
                     )
                     .child(
                         self.action(
@@ -1394,8 +1821,9 @@ impl DesktopWindow {
                             Message::OpenAccountWelcome,
                             false,
                         )
-                        .primary()
-                        .h_8(),
+                        .outline()
+                        .h_6()
+                        .text_size(px(12.)),
                     )
                     .child(
                         self.action(
@@ -1405,7 +1833,9 @@ impl DesktopWindow {
                             false,
                         )
                         .ghost()
-                        .h_8(),
+                        .h_6()
+                        .text_size(px(12.))
+                        .text_color(colors.muted_foreground),
                     ),
             );
         }
@@ -1415,23 +1845,31 @@ impl DesktopWindow {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .px_5()
+                    .px_4()
                     .py_2()
                     .flex_shrink_0()
                     .border_b_1()
                     .border_color(colors.border)
-                    .text_color(colors.destructive)
-                    .child(div().flex_1().text_size(px(12.)).child(error))
+                    .bg(hsla_of(palette.danger_soft))
+                    .text_color(hsla_of(palette.danger))
+                    .child(
+                        gpui_kit::component::Icon::new(
+                            gpui_kit::component::IconName::TriangleAlert,
+                        )
+                        .xsmall(),
+                    )
+                    .child(div().flex_1().text_size(px(12.5)).child(error))
                     .child(
                         self.action("error-dismiss", "Dismiss", Message::DismissError, false)
                             .ghost()
-                            .h_8(),
+                            .h_7(),
                     ),
             );
         }
         content = content.child(
             div()
                 .id("workspace-content")
+                .relative()
                 .flex()
                 .flex_col()
                 .flex_1()
@@ -1439,28 +1877,33 @@ impl DesktopWindow {
                 .min_w_0()
                 .w_full()
                 .overflow_hidden()
-                .child(view),
+                .child(view)
+                .when(!toast.is_empty(), |element| {
+                    element.child(
+                        div()
+                            .absolute()
+                            .bottom_4()
+                            .right_4()
+                            .max_w(px(420.))
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .px_4()
+                            .py_2p5()
+                            .rounded(px(design::radius::CARD as f32))
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(popover)
+                            .shadow_md()
+                            .child(div().flex_1().text_size(px(12.5)).child(toast))
+                            .child(
+                                self.action("toast-dismiss", "Dismiss", Message::DismissToast, false)
+                                    .ghost()
+                                    .h_7(),
+                            ),
+                    )
+                }),
         );
-        if !toast.is_empty() {
-            content = content.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .px_5()
-                    .py_2()
-                    .flex_shrink_0()
-                    .border_t_1()
-                    .border_color(colors.border)
-                    .bg(colors.muted)
-                    .child(div().flex_1().text_size(px(12.)).child(toast))
-                    .child(
-                        self.action("toast-dismiss", "Dismiss", Message::DismissToast, false)
-                            .ghost()
-                            .h_8(),
-                    ),
-            );
-        }
         let mut root = div()
             .relative()
             .flex()
@@ -1488,53 +1931,125 @@ impl DesktopWindow {
             state.bell_open,
             state.channel_create_open,
         );
-        let mut panel = div().flex().flex_col().gap_2().w(px(600.0)).p_4();
-        let dismiss = match topmost.as_str() {
+        use gpui_kit::component::button::ButtonVariants as _;
+        use gpui_kit::component::{ActiveTheme as _, Disableable as _};
+        let colors = cx.theme().color_tokens();
+        let muted = colors.muted_foreground;
+        // A modal is one card: a title row with its close, then its body.
+        let heading = |this: &Self, title: &'static str, close: Message| {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_4()
+                .pt_3()
+                .pb_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(15.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title),
+                )
+                .child(
+                    this.action("modal-close", "", close, false)
+                        .ghost()
+                        .icon(gpui_kit::component::IconName::Close)
+                        .accessibility_label("Close")
+                        .h_7()
+                        .w_7()
+                        .px_0(),
+                )
+        };
+        // A result or a notification is one full-width row: a name, then
+        // what it says, in the muted tone.
+        let row = |this: &Self, key: String, name: String, detail: String, message, disabled| {
+            this.action(key, "", message, disabled)
+                .accessibility_label(format!("{name} {detail}"))
+                .ghost()
+                .w_full()
+                .h_auto()
+                .px_2()
+                .py_1p5()
+                .justify_start()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .gap_0p5()
+                        .min_w_0()
+                        .w_full()
+                        .child(
+                            div()
+                                .w_full()
+                                .truncate()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(name),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .truncate()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::NORMAL)
+                                .text_color(muted)
+                                .child(detail),
+                        ),
+                )
+        };
+        let mut body = div().flex().flex_col().gap_1().px_3().pb_3();
+        let (title, dismiss) = match topmost.as_str() {
             "palette" => {
                 let chats = state.palette_chat_hits.clone();
                 let pages = state.palette_page_hits.clone();
                 let phase = state.palette_search_phase;
                 let query = state.palette_draft.clone();
                 let empty = chats.is_empty() && pages.is_empty();
-                panel = panel.child("Search this workspace").child(self.input(
+                body = body.child(div().px_1().pb_1().child(self.input(
                     "palette-input",
                     "Search messages and pages",
                     false,
                     window,
                     cx,
-                ));
-                match phase {
-                    crate::SearchPhase::Searching => panel = panel.child("Searching…"),
-                    crate::SearchPhase::Done => {
-                        if empty {
-                            panel = panel.child("No messages or pages matched.");
-                        }
-                    }
-                    crate::SearchPhase::Idle => {
-                        if !query.trim().is_empty() {
-                            panel = panel.child("Search failed.");
-                        }
-                    }
+                )));
+                let note = match phase {
+                    crate::SearchPhase::Searching => Some("Searching…"),
+                    crate::SearchPhase::Done if empty => Some("No messages or pages matched."),
+                    crate::SearchPhase::Idle if !query.trim().is_empty() => Some("Search failed."),
+                    _ => None,
+                };
+                if let Some(note) = note {
+                    body = body.child(
+                        div()
+                            .px_2()
+                            .py_2()
+                            .text_size(px(12.5))
+                            .text_color(muted)
+                            .child(note),
+                    );
                 }
                 for hit in chats {
-                    panel = panel.child(self.action(
+                    body = body.child(row(
+                        self,
                         format!("search-chat/{}/{}", hit.channel_id, hit.seq),
-                        format!("{} · {}", hit.author, hit.text),
+                        hit.author,
+                        hit.text,
                         Message::OpenChatSearchHit(hit.channel_id, hit.seq),
                         false,
                     ));
                 }
                 for hit in pages {
-                    panel = panel.child(self.action(
+                    body = body.child(row(
+                        self,
                         format!("search-page/{}/{}", hit.page_id, hit.block_id),
-                        format!("{} · {}", hit.page_title, hit.text),
+                        hit.page_title,
+                        hit.text,
                         Message::OpenPageSearchHit(hit.page_id, hit.block_id),
                         false,
                     ));
                 }
-                panel =
-                    panel.child(self.action("search-close", "Close", Message::ClosePalette, false));
-                Message::ClosePalette
+                ("Search this workspace", Message::ClosePalette)
             }
             "bell" => {
                 let generation = state.connect_generation;
@@ -1545,84 +2060,148 @@ impl DesktopWindow {
                     &state.settings_user_key,
                 );
                 let presentations = state.bell_presentations.clone();
-                panel = panel
-                    .child("Notifications")
-                    .child(state.bell_error.clone())
-                    .child(self.action(
+                let mut actions = div().flex().items_center().gap_2().px_1().pb_1().child(
+                    self.action(
                         "bell-mark-read",
                         "Mark all read",
                         Message::MarkBellReadSubmit,
                         state.bell_marking,
-                    ));
+                    )
+                    .outline()
+                    .h_7(),
+                );
                 if !state.bell_error.is_empty() {
-                    panel =
-                        panel.child(self.action("bell-retry", "Retry", Message::ReloadBell, false));
+                    actions = actions
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(12.5))
+                                .text_color(colors.destructive)
+                                .child(state.bell_error.clone()),
+                        )
+                        .child(
+                            self.action("bell-retry", "Retry", Message::ReloadBell, false)
+                                .ghost()
+                                .h_7(),
+                        );
+                }
+                body = body.child(actions);
+                if items.is_empty() {
+                    body = body.child(
+                        div()
+                            .px_2()
+                            .py_2()
+                            .text_size(px(12.5))
+                            .text_color(muted)
+                            .child("Nothing new. Mentions and direct messages land here."),
+                    );
                 }
                 for item in items {
                     let presentation = crate::backend::bell_presentation(&item, &presentations);
                     let unavailable = !crate::backend::bell_openable(&item, &presentations);
-                    panel = panel.child(self.action(
+                    body = body.child(row(
+                        self,
                         format!("notification/{}", presentation.seq),
-                        format!("{} · {}", presentation.title, presentation.detail),
+                        presentation.title.clone(),
+                        presentation.detail.clone(),
                         Message::BellOpenItem(generation, account.clone(), presentation),
                         unavailable,
                     ));
                 }
-                panel = panel.child(self.action("bell-close", "Close", Message::CloseBell, false));
-                Message::CloseBell
+                ("Notifications", Message::CloseBell)
             }
             "channel_create" => {
                 let busy = state.mutation_phase != crate::MutationPhase::Idle;
                 let members_only = state.channel_create_members_only;
-                panel = panel
-                    .child("Create a channel")
+                body = body
+                    .gap_3()
+                    .px_4()
+                    .pb_4()
                     .child(self.input("channel-draft", "Channel name", false, window, cx))
-                    .child(self.action(
-                        "channel-private",
-                        if members_only {
-                            "Members only: on"
-                        } else {
-                            "Members only: off"
-                        },
-                        Message::ToggleChannelCreateMembersOnly,
-                        busy,
-                    ))
-                    .child(self.action(
-                        "channel-submit",
-                        "Create",
-                        Message::CreateChannelSubmit,
-                        busy,
-                    ))
-                    .child(self.action(
-                        "channel-cancel",
-                        "Cancel",
-                        Message::ToggleChannelCreate,
-                        busy,
-                    ));
-                Message::ToggleChannelCreate
+                    .child(
+                        gpui_kit::component::checkbox::Checkbox::new("channel-private")
+                            .label("Members only")
+                            .checked(members_only)
+                            .disabled(busy)
+                            .on_click({
+                                let model = self.model.clone();
+                                move |_, _, cx| {
+                                    model.update(cx, |model, cx| {
+                                        model.dispatch(
+                                            Message::ToggleChannelCreateMembersOnly,
+                                            cx,
+                                        )
+                                    })
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(muted)
+                            .child("A members-only channel is read and written by its roster alone."),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                self.action(
+                                    "channel-cancel",
+                                    "Cancel",
+                                    Message::ToggleChannelCreate,
+                                    busy,
+                                )
+                                .ghost(),
+                            )
+                            .child(
+                                self.action(
+                                    "channel-submit",
+                                    "Create channel",
+                                    Message::CreateChannelSubmit,
+                                    busy,
+                                )
+                                .primary(),
+                            ),
+                    );
+                ("Create a channel", Message::ToggleChannelCreate)
             }
             _ => return None,
         };
         let model = self.model.clone();
-        use gpui_kit::component::ActiveTheme as _;
         let panel = div()
             .id("shell-modal")
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .rounded_none()
-            .max_h(relative(0.85))
-            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .w(px(560.0))
+            .max_h(relative(0.8))
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .rounded(px(design::radius::CARD as f32 + 2.))
+            .border_1()
+            .border_color(colors.border)
+            .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(panel);
+            .child(heading(self, title, dismiss.clone()))
+            .child(
+                div()
+                    .id("shell-modal-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(body),
+            );
         Some(
             div()
                 .id("shell-scrim")
                 .absolute()
                 .inset_0()
                 .flex()
-                .items_center()
+                .items_start()
                 .justify_center()
-                .bg(rgba(0x00000066))
+                .pt(px(96.))
+                .bg(rgba(0x00000055))
                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                     model.update(cx, |model, cx| model.dispatch(dismiss.clone(), cx))
                 })
@@ -1749,18 +2328,30 @@ mod close_tests {
     use super::*;
 
     #[gpui_kit::test]
-    fn appearance_changes_keep_native_fonts_and_square_controls(cx: &mut gpui_kit::TestAppContext) {
+    fn appearance_changes_keep_native_fonts_radii_and_the_palette(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
         cx.update(|cx| {
             use gpui_kit::component::{Theme, ThemeMode};
             gpui_kit::init(cx);
-            for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            for (mode, palette) in [
+                (ThemeMode::Light, &design::LIGHT),
+                (ThemeMode::Dark, &design::DARK),
+            ] {
                 Theme::change(mode, None, cx);
                 configure_native_theme(cx);
                 let theme = Theme::global(cx);
                 assert_eq!(theme.font_family.as_ref(), design::fonts::FAMILY_UI);
                 assert_eq!(theme.mono_font_family.as_ref(), design::fonts::FAMILY_MONO);
-                assert_eq!(theme.radius, gpui_kit::px(0.));
-                assert_eq!(theme.radius_lg, gpui_kit::px(0.));
+                assert_eq!(theme.radius, gpui_kit::px(design::radius::CONTROL as f32));
+                assert_eq!(theme.radius_lg, gpui_kit::px(design::radius::CARD as f32));
+                let background: gpui_kit::Rgba = theme.background.into();
+                let [r, g, b, _] = palette.background;
+                let close = |a: f32, b: f32| (a - b).abs() < 1.5 / 255.;
+                assert!(
+                    close(background.r, r) && close(background.g, g) && close(background.b, b),
+                    "{mode:?} background follows the palette: {background:?}"
+                );
             }
         });
     }
@@ -2071,18 +2662,60 @@ mod close_tests {
     }
 }
 
+/// The product palette as the kit's light and dark themes. Registered once;
+/// every later mode change re-applies the matching one, so the kit's own
+/// controls paint with the colors the views paint with.
 fn configure_native_theme(cx: &mut gpui_kit::App) {
-    let theme = gpui_kit::component::Theme::global_mut(cx);
-    theme.font_family = design::fonts::FAMILY_UI.into();
-    theme.mono_font_family = design::fonts::FAMILY_MONO.into();
-    theme.font_size = gpui_kit::px(design::type_scale::BODY as f32);
-    theme.radius = gpui_kit::px(0.);
-    theme.radius_lg = gpui_kit::px(0.);
-    gpui_kit::component::Theme::sync_base(cx);
+    use gpui_kit::component::{Theme, ThemeRegistry};
+    let registry = ThemeRegistry::global_mut(cx);
+    let registered = registry.themes().contains_key(design::LIGHT_THEME);
+    if !registered {
+        registry
+            .load_themes_from_str(&design::kit_theme_json())
+            .expect("the product theme parses");
+    }
+    let light = registry.themes()[design::LIGHT_THEME].clone();
+    let dark = registry.themes()[design::DARK_THEME].clone();
+    let theme = Theme::global_mut(cx);
+    theme.light_theme = light;
+    theme.dark_theme = dark;
+    let mode = theme.mode;
+    Theme::change(mode, None, cx);
+}
+
+/// A palette color as the kit paints it.
+fn hsla_of(color: design::Color) -> gpui_kit::Hsla {
+    let [r, g, b, a] = color;
+    gpui_kit::Rgba { r, g, b, a }.into()
+}
+
+/// Lucide glyphs the kit's default bundle does not carry.
+const MESSAGE_SQUARE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>"#;
+const GIT_BRANCH: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>"#;
+const USERS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>"#;
+const VOTE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 12 2 2 4-4"/><path d="M5 7c0-1.1.9-2 2-2h10a2 2 0 0 1 2 2v12H5V7Z"/><path d="M22 19H2"/></svg>"#;
+
+/// The glyph beside a tab's name in the sidebar.
+fn nav_icon(tab: ShellTab) -> gpui_kit::component::Icon {
+    use gpui_kit::component::{Icon, IconName};
+    match tab {
+        ShellTab::Chat => Icon::empty().data(MESSAGE_SQUARE),
+        ShellTab::Pages => Icon::new(IconName::BookOpen),
+        ShellTab::Forge => Icon::empty().data(GIT_BRANCH),
+        ShellTab::Agents => Icon::new(IconName::Bot),
+        ShellTab::Files => Icon::new(IconName::Folder),
+        ShellTab::Explorer => Icon::new(IconName::Globe),
+        ShellTab::Node => Icon::new(IconName::HardDrive),
+        ShellTab::Members => Icon::empty().data(USERS),
+        ShellTab::Governance => Icon::empty().data(VOTE),
+        ShellTab::Settings => Icon::new(IconName::Settings),
+    }
 }
 
 pub(crate) fn run() {
-    let application = gpui_kit::application();
+    // The kit's component icons (search, bell, folder, …) are SVGs the app
+    // loads by path; without a source they draw as nothing.
+    let application = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     let (url_sender, mut urls) = mpsc::unbounded::<Vec<String>>();
     // Install before launching: macOS may deliver its initial URL before the
     // desktop actor exists. The channel keeps it until the actor can receive.

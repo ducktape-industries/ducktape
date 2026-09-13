@@ -1,7 +1,10 @@
 use super::*;
+use ducktape_view_guest::kit::Tone;
 use ducktape_view_guest::slots;
 
 impl ChatView {
+    /// One message: the avatar rail, then the byline and body. A chosen or
+    /// ranged row wears a wash instead of a caption.
     pub(super) fn message_card(
         &self,
         message: &crate::host::ChatMessage,
@@ -9,19 +12,55 @@ impl ChatView {
         plate: RowPlate,
     ) -> wire::Node {
         let key = format!("message/{surface:?}/{}", message.view_key);
-        let mut children = Vec::new();
-        match plate {
-            RowPlate::Plain => {}
-            RowPlate::Selected => {
-                children.push(native::text(format!("{key}/selected"), "Selected message"))
-            }
-            RowPlate::Ranged => children.push(native::text(
-                format!("{key}/selected"),
-                "Included in copy selection",
-            )),
+        let p = native::palette();
+        let wash = match plate {
+            RowPlate::Plain => None,
+            RowPlate::Selected => Some(p.accent_soft),
+            RowPlate::Ranged => Some(p.surface_raised),
+        };
+        let rail = if message.show_author {
+            self.principal_avatar(
+                format!("{key}/avatar"),
+                message.initial.clone(),
+                message.avatar_kind != "human",
+            )
+        } else {
+            native::space(
+                Some(wire::Length::Fixed(24.)),
+                Some(wire::Length::Fixed(4.)),
+            )
+        };
+        let contents = self.message_contents(format!("{key}/contents"), message, surface);
+        let mut row = native::row(format!("{key}/row"), [rail, contents]);
+        if let wire::Node::Linear {
+            spacing,
+            padding,
+            align,
+            ..
+        } = &mut row
+        {
+            *spacing = Some(10.);
+            *padding = Some(wire::Edges {
+                top: if message.show_author { 6. } else { 1. },
+                right: 16.,
+                bottom: 1.,
+                left: 16.,
+            });
+            *align = Some(wire::AlignX::Left);
         }
-        children.push(self.message_contents(format!("{key}/contents"), message, surface));
-        native::column(key, children)
+        let mut card = native::container(key, row);
+        if let wire::Node::Container {
+            background, border, ..
+        } = &mut card
+        {
+            *background = wash.map(|color| wire::Background::Color(native::rgba(color)));
+            *border = Some(wire::Border {
+                color: None,
+                width: None,
+                radius: Some([native::radius::CONTROL as f32; 4]),
+            });
+        }
+        card
     }
     pub(super) fn message_contents(
         &self,
@@ -32,24 +71,30 @@ impl ChatView {
         use ducktape_view_guest::slots;
         let mut children = Vec::new();
         if message.show_author {
-            let mut header = vec![
-                self.principal_avatar(
-                    format!("{key}/avatar"),
-                    message.initial.clone(),
-                    message.avatar_kind != "human",
-                ),
-                native::text(format!("{key}/author"), &message.author),
-            ];
+            let p = native::palette();
+            let mut header = vec![native::nowrap(native::strong(
+                format!("{key}/author"),
+                &message.author,
+            ))];
             if message.avatar_kind == "agent" {
-                header.push(native::text(format!("{key}/agent"), "AGENT"));
+                header.push(native::badge(format!("{key}/agent"), "Agent", Tone::Agent));
             }
             if message.height > 0 {
-                header.push(native::text(
-                    format!("{key}/height"),
-                    crate::host::height_label_short(message.height),
-                ));
+                header.push(native::nowrap(native::colored(
+                    native::text_size(
+                        native::mono(
+                            format!("{key}/height"),
+                            crate::host::height_label_short(message.height),
+                        ),
+                        native::type_scale::CAPTION as f32,
+                    ),
+                    p.faint,
+                )));
             }
-            children.push(native::row(format!("{key}/header"), header));
+            children.push(native::spaced(
+                native::centered_row(format!("{key}/header"), header),
+                6.,
+            ));
         }
         children.push(wire::Node::MouseArea {
             key: format!("{key}/select"),
@@ -74,7 +119,7 @@ impl ChatView {
             )),
         });
         if message.edited {
-            children.push(native::text(format!("{key}/edited"), "· edited"));
+            children.push(native::caption(format!("{key}/edited"), "edited"));
         }
         let run = crate::host::run_of_message(&message.id);
         if !run.is_empty() {
@@ -92,28 +137,38 @@ impl ChatView {
             } else {
                 Message::AddReactionAt(message.seq, reaction.emoji.clone())
             };
+            // A reaction reads as a tag: caption-sized, tight, inside a
+            // hairline. The one the reader owns carries the chosen wash the
+            // native kit paints on a checked control.
             let mut button = native::button_child(
                 format!("{key}/reaction/{}", reaction.emoji),
-                native::row(
-                    format!("{key}/reaction/{}/label", reaction.emoji),
-                    [
-                        native::text(
-                            format!("{key}/reaction/{}/emoji", reaction.emoji),
-                            &reaction.emoji,
-                        ),
-                        native::text(
-                            format!("{key}/reaction/{}/count", reaction.emoji),
-                            reaction.count.to_string(),
-                        ),
-                    ],
+                native::spaced(
+                    native::centered_row(
+                        format!("{key}/reaction/{}/label", reaction.emoji),
+                        [
+                            native::nowrap(native::text_size(
+                                native::text(
+                                    format!("{key}/reaction/{}/emoji", reaction.emoji),
+                                    &reaction.emoji,
+                                ),
+                                native::type_scale::CAPTION as f32,
+                            )),
+                            native::nowrap(native::caption(
+                                format!("{key}/reaction/{}/count", reaction.emoji),
+                                reaction.count.to_string(),
+                            )),
+                        ],
+                    ),
+                    4.,
                 ),
                 Some(slots::message(event)),
-                wire::ButtonPreset::Secondary,
+                wire::ButtonPreset::Subtle,
             );
             if let wire::Node::Button {
                 checked,
                 label,
                 description,
+                padding,
                 ..
             } = &mut button
             {
@@ -127,78 +182,110 @@ impl ChatView {
                     .into(),
                 );
                 *description = Some(reaction.emoji.clone());
+                *padding = Some(wire::Edges {
+                    top: 1.,
+                    right: 6.,
+                    bottom: 1.,
+                    left: 6.,
+                });
             }
-            reactions.push(button);
+            let mut tag =
+                native::container(format!("{key}/reaction/{}/tag", reaction.emoji), button);
+            if let wire::Node::Container { border, width, .. } = &mut tag {
+                *border = Some(wire::Border {
+                    color: Some(native::rgba(native::palette().border)),
+                    width: Some(1.),
+                    radius: Some([native::radius::CONTROL as f32; 4]),
+                });
+                *width = Some(wire::Length::Shrink);
+            }
+            reactions.push(tag);
         }
         if !reactions.is_empty() {
-            children.push(native::row(format!("{key}/reactions"), reactions));
+            children.push(native::spaced(
+                native::wrapped_row(format!("{key}/reactions"), reactions),
+                4.,
+            ));
         }
         if message.reply_count > 0 {
             let mut button = native::button(
                 format!("{key}/thread"),
                 crate::host::plural(message.reply_count, "reply", "replies"),
                 Some(slots::message(Message::OpenThreadFor(message.seq))),
-                wire::ButtonPreset::Secondary,
+                wire::ButtonPreset::Text,
             );
             if let wire::Node::Button { label, .. } = &mut button {
                 *label = Some("Open thread".into());
             }
-            children.push(button);
+            children.push(native::row(format!("{key}/thread-row"), [button]));
         }
         if message.pending {
-            children.push(native::text(format!("{key}/pending"), &message.meta));
+            children.push(native::caption(format!("{key}/pending"), &message.meta));
         }
-        native::column(key, children)
+        native::spaced(native::column(key, children), 3.)
     }
     pub(super) fn message_body(
         key: String,
         blocks: &[crate::host::ChatBlock],
         on_link: Option<u32>,
     ) -> wire::Node {
+        let p = native::palette();
         let mut children = Vec::new();
         for (index, block) in blocks.iter().enumerate() {
             let scope = format!("{key}/block/{index}");
             let content = match block.kind.as_str() {
-                "divider" => wire::Node::Rule {
-                    key: scope,
-                    axis: wire::Axis::Row,
-                    thickness: 1.,
-                    color: None,
-                    weak: false,
-                    radius: None,
-                    snap: None,
-                },
+                "divider" => native::divider(scope),
                 "code" => {
                     let mut children = Vec::new();
                     if !block.lang.is_empty() {
-                        children.push(native::text(format!("{scope}/language"), &block.lang));
+                        children.push(native::caption(format!("{scope}/language"), &block.lang));
                     }
                     children.push(native::text_options(
-                        native::text(format!("{scope}/code"), &block.text),
+                        native::mono(format!("{scope}/code"), &block.text),
                         wire::TextOptions {
                             wrapping: Some(wire::Wrapping::WordOrGlyph),
-                            font: Some(wire::NamedFont {
-                                family: wire::FontFamily::Monospace,
-                                weight: wire::Weight::Normal,
-                                stretch: wire::FontStretch::Normal,
-                                style: wire::FontStyle::Normal,
-                            }),
                             ..Default::default()
                         },
                     ));
-                    native::column(scope, children)
+                    let mut code = native::container(
+                        scope.clone(),
+                        native::spaced(native::column(format!("{scope}/code-lines"), children), 4.),
+                    );
+                    if let wire::Node::Container {
+                        background,
+                        border,
+                        padding,
+                        ..
+                    } = &mut code
+                    {
+                        *background = Some(wire::Background::Color(native::rgba(p.surface)));
+                        *border = Some(wire::Border {
+                            color: Some(native::rgba(p.border)),
+                            width: Some(1.),
+                            radius: Some([native::radius::CONTROL as f32; 4]),
+                        });
+                        *padding = Some(wire::Edges::all(10.));
+                    }
+                    code
                 }
                 "quote" | "paragraph" => {
                     let text = if block.rich {
                         Self::rich_line(format!("{scope}/text"), block, on_link)
                     } else {
-                        native::text(format!("{scope}/text"), &block.text)
+                        native::wrapping(native::text(format!("{scope}/text"), &block.text))
                     };
                     if block.kind == "quote" {
-                        native::row(
+                        let mut quote = native::row(
                             scope.clone(),
-                            [native::text(format!("{scope}/quote"), "│"), text],
-                        )
+                            [
+                                native::vertical_divider(format!("{scope}/bar")),
+                                native::colored(text, p.muted),
+                            ],
+                        );
+                        if let wire::Node::Linear { spacing, .. } = &mut quote {
+                            *spacing = Some(10.);
+                        }
+                        quote
                     } else {
                         text
                     }
@@ -207,13 +294,14 @@ impl ChatView {
             };
             children.push(content);
         }
-        native::column(key, children)
+        native::spaced(native::column(key, children), 6.)
     }
     pub(super) fn rich_line(
         key: String,
         block: &crate::host::ChatBlock,
         on_link: Option<u32>,
     ) -> wire::Node {
+        let p = native::palette();
         let mut spans = Vec::new();
         for part in &block.spans {
             for (content, link, weight, italic) in [
@@ -242,6 +330,7 @@ impl ChatView {
                     content: content.clone(),
                     link: link.cloned(),
                     underline: link.is_some(),
+                    color: link.is_some().then_some(native::rgba(p.link)),
                     font: decorated.then_some(wire::NamedFont {
                         family: wire::FontFamily::SansSerif,
                         weight,
@@ -277,12 +366,8 @@ impl ChatView {
         initials: String,
         agent: bool,
     ) -> wire::Node {
-        let label = if agent {
-            format!("AI · {initials}")
-        } else {
-            initials
-        };
-        native::text(key, label)
+        let tone = if agent { Tone::Agent } else { Tone::Neutral };
+        native::avatar(key, initials, tone)
     }
 
     pub(super) fn active_dm_avatar(&self, key: String) -> wire::Node {
@@ -294,10 +379,10 @@ impl ChatView {
     }
 
     pub(super) fn archived_badge(&self, key: String) -> wire::Node {
-        native::text(key, "Archived")
+        native::badge(key, "Archived", Tone::Neutral)
     }
     pub(super) fn private_badge(&self, key: String) -> wire::Node {
-        native::text(key, "Members only")
+        native::badge(key, "Members only", Tone::Neutral)
     }
 
     pub(super) fn huddle_controls(
@@ -307,23 +392,36 @@ impl ChatView {
         show: impl Fn() -> Message + Clone + 'static,
     ) -> wire::Node {
         let elapsed = crate::host::mmss(self.huddle_now - self.huddle_joined_at);
-        let mute = if self.call_muted { " · Muted" } else { "" };
-        native::row(
-            &key,
-            [
-                native::button(
-                    format!("{key}/show"),
-                    format!("LIVE · {elapsed}{mute}"),
-                    Some(slots::message(show())),
-                    wire::ButtonPreset::Secondary,
-                ),
-                native::button(
-                    format!("{key}/leave"),
-                    "Leave huddle",
-                    Some(slots::message(leave())),
-                    wire::ButtonPreset::Secondary,
-                ),
-            ],
+        let mut children = vec![native::badge(
+            format!("{key}/live"),
+            format!("Live {elapsed}"),
+            Tone::Success,
+        )];
+        if self.call_muted {
+            children.push(native::badge(
+                format!("{key}/muted"),
+                "Muted",
+                Tone::Neutral,
+            ));
+        }
+        children.extend([
+            native::button(
+                format!("{key}/show"),
+                "Show huddle",
+                Some(slots::message(show())),
+                wire::ButtonPreset::Subtle,
+            ),
+            native::button(
+                format!("{key}/leave"),
+                "Leave huddle",
+                Some(slots::message(leave())),
+                wire::ButtonPreset::Subtle,
+            ),
+        ]);
+        native::sized(
+            native::spaced(native::centered_row(&key, children), 6.),
+            Some(wire::Length::Shrink),
+            None,
         )
     }
 
@@ -336,54 +434,52 @@ impl ChatView {
             key,
             "Start a huddle",
             Some(slots::message(join())),
-            wire::ButtonPreset::Secondary,
+            wire::ButtonPreset::Subtle,
         )
     }
 
     pub(super) fn disconnected(&self, key: String) -> wire::Node {
-        native::column(
-            &key,
-            [
-                native::heading(format!("{key}/title"), "Not connected"),
-                native::text(
-                    format!("{key}/detail"),
-                    "Choose a network from the workspace header to reconnect.",
-                ),
-            ],
+        native::empty_state(
+            key,
+            "Not connected",
+            "Choose a network from the sidebar to reconnect.",
         )
     }
 
     pub(super) fn empty_messages(&self, key: String) -> wire::Node {
-        native::column(
-            &key,
-            [
-                native::heading(format!("{key}/title"), "No messages yet"),
-                native::text(
-                    format!("{key}/detail"),
-                    "Nobody has posted here. Send the first message below.",
-                ),
-            ],
+        native::empty_state(
+            key,
+            "No messages yet",
+            "Nobody has posted here. Send the first message below.",
         )
     }
 
     pub(super) fn archived_notice(&self, key: String) -> wire::Node {
-        native::text(
-            key,
-            "This channel is archived. Unarchive it from Channel details to post here again.",
+        native::notice(
+            key.clone(),
+            native::wrapping(native::text(
+                format!("{key}/text"),
+                "This channel is archived. Unarchive it from Channel details to post here again.",
+            )),
+            Tone::Neutral,
         )
     }
 
     pub(super) fn private_notice(&self, key: String) -> wire::Node {
-        native::text(
-            key,
-            "This channel is members-only and your key is not on its roster. Ask a member to add your key from Channel details.",
+        native::notice(
+            key.clone(),
+            native::wrapping(native::text(
+                format!("{key}/text"),
+                "This channel is members-only and your key is not on its roster. Ask a member to add your key from Channel details.",
+            )),
+            Tone::Warning,
         )
     }
 
     pub(super) fn name_label(&self, key: String) -> wire::Node {
-        native::text(key, "Name")
+        native::label(key, "Name")
     }
     pub(super) fn members_label(&self, key: String) -> wire::Node {
-        native::text(key, "Members")
+        native::label(key, "Members")
     }
 }

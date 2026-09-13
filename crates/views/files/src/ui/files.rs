@@ -1,5 +1,5 @@
 use super::*;
-use ducktape_view_guest::slots;
+use ducktape_view_guest::{kit::Tone, slots};
 
 fn action(key: String, label: &str, message: Message, disabled: bool) -> wire::Node {
     native::button(
@@ -10,17 +10,28 @@ fn action(key: String, label: &str, message: Message, disabled: bool) -> wire::N
     )
 }
 fn resize(key: String, vertical: bool, route: fn(f64, f64) -> Message) -> wire::Node {
-    let (cursor, width, height) = if vertical {
+    // The hairline is what shows; the 10px grip around it is what the
+    // pointer has to land on, since the handle takes its size from its child.
+    let (cursor, content) = if vertical {
         (
             wire::mouse::Cursor::ResizingVertically,
-            wire::Length::Fill,
-            wire::Length::Fixed(10.),
+            native::sized(
+                native::container(format!("{key}/grip"), native::divider(format!("{key}/edge"))),
+                Some(wire::Length::Fill),
+                Some(wire::Length::Fixed(10.)),
+            ),
         )
     } else {
         (
             wire::mouse::Cursor::ResizingHorizontally,
-            wire::Length::Fixed(10.),
-            wire::Length::Fill,
+            native::sized(
+                native::container(
+                    format!("{key}/grip"),
+                    native::vertical_divider(format!("{key}/edge")),
+                ),
+                Some(wire::Length::Fixed(10.)),
+                Some(wire::Length::Fill),
+            ),
         )
     };
     wire::Node::ResizeHandle {
@@ -31,28 +42,39 @@ fn resize(key: String, vertical: bool, route: fn(f64, f64) -> Message) -> wire::
             move |(x, y)| Some(route(x, y)),
         ))),
         cursor: Some(cursor),
-        content: Box::new(wire::Node::Space {
-            width: Some(width),
-            height: Some(height),
-        }),
+        content: Box::new(content),
     }
+}
+/// The notices that ride between the toolbar and the split, inset from the
+/// region's edges. Nothing to say draws nothing.
+fn notice_stack(key: &str, notices: Vec<wire::Node>) -> Option<wire::Node> {
+    (!notices.is_empty()).then(|| {
+        native::padded(
+            native::spaced(native::column(format!("{key}/notices"), notices), 8.),
+            wire::Edges::all(12.),
+        )
+    })
 }
 impl FilesView {
     pub(super) fn files_screen(&self, key: String) -> wire::Node {
+        let mut notices = self.notices();
         if !self.connected {
-            return self.disconnected(format!("{key}/disconnected"));
+            let mut offline = Vec::new();
+            offline.extend(notice_stack(&key, notices));
+            offline.push(self.disconnected(format!("{key}/disconnected")));
+            return native::column(format!("{key}/offline"), offline);
         }
-        let history = self.history_open;
-        let mut children = vec![
-            self.breadcrumb(format!("{key}/crumb"), Message::OpenDirAt),
-            self.toolbar(&key, history),
-        ];
         if !self.derived_refusal().is_empty() {
-            children.push(native::text(
-                format!("{key}/refusal"),
-                self.derived_refusal(),
+            notices.push(native::notice(
+                format!("{key}/refusal-box"),
+                native::wrapping(native::text(
+                    format!("{key}/refusal"),
+                    self.derived_refusal(),
+                )),
+                Tone::Danger,
             ));
         }
+        let history = self.history_open;
         let center = if history {
             self.history_panel(format!("{key}/history"))
         } else {
@@ -71,13 +93,18 @@ impl FilesView {
             ));
             panes.push(self.object_panel(format!("{key}/object-panel")));
         }
+        let mut children = vec![
+            self.toolbar(&key, history),
+            native::divider(format!("{key}/toolbar-rule")),
+        ];
+        children.extend(notice_stack(&key, notices));
         children.push(native::sized(
-            native::row(format!("{key}/panes"), panes),
+            native::spaced(native::row(format!("{key}/panes"), panes), 0.),
             Some(wire::Length::Fill),
             Some(wire::Length::Fill),
         ));
         let content = native::sized(
-            native::column(key.clone(), children),
+            native::spaced(native::column(key.clone(), children), 0.),
             Some(wire::Length::Fill),
             Some(wire::Length::Fill),
         );
@@ -113,14 +140,18 @@ impl FilesView {
         if let wire::Node::Input { options, width, .. } = &mut input {
             options.label = "New entry name".into();
             options.disabled = busy;
-            *width = Some(wire::Length::Fixed(160.));
+            *width = Some(wire::Length::Fixed(180.));
         }
+        let at_root = busy || self.path == "/";
         let mut children = vec![
-            action(
+            self.breadcrumb(format!("{key}/crumb"), Message::OpenDirAt),
+            native::button(
                 format!("{key}/parent"),
                 "Parent directory",
-                Message::OpenDirAt(crate::host::fs_parent(&self.path)),
-                busy || self.path == "/",
+                (!at_root).then(|| {
+                    slots::message(Message::OpenDirAt(crate::host::fs_parent(&self.path)))
+                }),
+                wire::ButtonPreset::Subtle,
             ),
             input,
             action(
@@ -137,58 +168,82 @@ impl FilesView {
             ),
         ];
         if busy {
-            children.push(native::text(format!("{key}/loading"), "Loading…"));
+            children.push(native::secondary(format!("{key}/loading"), "Loading…"));
         }
-        if !self.preview_path.is_empty() {
-            children.push(action(
-                format!("{key}/delete"),
-                "Delete object",
-                Message::ArmDeleteAt(self.preview_path.clone()),
-                busy || !self.delete_target.is_empty(),
-            ));
-        }
-        let mut toggle = action(
+        children.push(native::spacer());
+        let mut toggle = native::button(
             format!("{key}/history-toggle"),
             "History",
-            Message::ToggleHistory,
-            false,
+            Some(slots::message(Message::ToggleHistory)),
+            wire::ButtonPreset::Subtle,
         );
-        if let wire::Node::Button { expanded, .. } = &mut toggle {
+        if let wire::Node::Button {
+            expanded, checked, ..
+        } = &mut toggle
+        {
             *expanded = Some(history);
+            *checked = Some(history);
         }
         children.push(toggle);
-        native::row(format!("{key}/toolbar"), children)
+        native::sized(
+            native::padded(
+                native::spaced(native::centered_row(format!("{key}/toolbar"), children), 8.),
+                wire::Edges {
+                    top: 0.,
+                    right: 12.,
+                    bottom: 0.,
+                    left: 12.,
+                },
+            ),
+            Some(wire::Length::Fill),
+            Some(wire::Length::Fixed(40.)),
+        )
     }
     fn directory_tree(&self, key: &str) -> wire::Node {
-        let mut children = vec![
-            native::heading(format!("{key}/tree-title"), "duckfs"),
-            native::text(format!("{key}/tree-note"), "content-addressed · replicated"),
-        ];
+        let mut rows = Vec::new();
         if self.listed {
             if self.directories.is_empty() && self.omitted == 0 {
-                children.push(native::text(
+                rows.push(native::empty_state(
                     format!("{key}/no-folders"),
-                    "No folders here.",
+                    "No folders",
+                    "Name one above and choose + Folder.",
                 ));
             }
             for entry in &self.directories {
-                children.push(self.folder_row(
+                rows.push(self.folder_row(
                     format!("{key}/directory/{}", entry.path),
                     Message::OpenDirAt,
                     entry.clone(),
                 ));
             }
         }
-        native::sized(
-            native::container(
-                format!("{key}/tree-pane"),
-                native::scroll(
-                    format!("{key}/directories"),
-                    native::column(format!("{key}/directory-rows"), children),
+        native::pane(
+            format!("{key}/tree-pane"),
+            native::spaced(
+                native::column(
+                    format!("{key}/tree"),
+                    [
+                        self.folder_table_header(format!("{key}/tree-header")),
+                        native::scroll(
+                            format!("{key}/directories"),
+                            native::padded(
+                                native::spaced(
+                                    native::column(format!("{key}/directory-rows"), rows),
+                                    1.,
+                                ),
+                                wire::Edges {
+                                    top: 4.,
+                                    right: 2.,
+                                    bottom: 6.,
+                                    left: 2.,
+                                },
+                            ),
+                        ),
+                    ],
                 ),
+                0.,
             ),
-            Some(wire::Length::Fixed(self.tree_width as f32)),
-            Some(wire::Length::Fill),
+            wire::Length::Fixed(self.tree_width as f32),
         )
     }
     fn object_listing(&self, key: &str) -> wire::Node {
@@ -220,12 +275,17 @@ impl FilesView {
                 background: None,
                 border: None,
                 spacing: None,
-                padding: None,
+                padding: Some(wire::Edges {
+                    top: 4.,
+                    right: 2.,
+                    bottom: 6.,
+                    left: 2.,
+                }),
                 width: Some(wire::Length::Fill),
                 height: None,
                 max_width: None,
                 align: None,
-                virtual_row: Some(39.),
+                virtual_row: Some(28.),
             };
             let mut scroll = native::scroll(format!("{key}/object-scroll"), rows);
             if let wire::Node::Scroll { virtual_rows, .. } = &mut scroll {
@@ -242,85 +302,179 @@ impl FilesView {
             children.push(self.preview_panel(format!("{key}/preview-pane")));
         }
         native::sized(
-            native::column(format!("{key}/browser"), children),
+            native::spaced(native::column(format!("{key}/browser"), children), 0.),
             Some(wire::Length::Fill),
             Some(wire::Length::Fill),
         )
     }
     fn history_panel(&self, key: String) -> wire::Node {
+        let mut head = Vec::new();
         let mut children = Vec::new();
         if self.diff_from.is_empty() {
-            if !self.history.is_empty() {
-                children.push(self.snapshots_heading(format!("{key}/title")));
-            }
+            head.push(native::sized(
+                self.snapshots_heading(format!("{key}/title")),
+                Some(wire::Length::Fill),
+                None,
+            ));
             if self.history.is_empty() && self.omitted == 0 {
-                children.push(native::text(format!("{key}/empty"), "No snapshots yet."));
+                children.push(native::empty_state(
+                    format!("{key}/empty"),
+                    "No snapshots yet",
+                    "A committed write adds a snapshot here.",
+                ));
             }
             for snapshot in &self.history {
                 let scope = format!("{key}/{}", snapshot.id);
-                children.push(native::column(
+                children.push(native::card(
                     scope.clone(),
-                    [
-                        native::row(
-                            format!("{scope}/details"),
+                    native::spaced(
+                        native::column(
+                            format!("{scope}/body"),
                             [
-                                native::text(format!("{scope}/id"), &snapshot.short_id),
-                                native::text(
-                                    format!("{scope}/height"),
-                                    crate::host::height_label(snapshot.height),
+                                native::spaced(
+                                    native::centered_row(
+                                        format!("{scope}/details"),
+                                        [
+                                            native::nowrap(native::mono(
+                                                format!("{scope}/id"),
+                                                &snapshot.short_id,
+                                            )),
+                                            native::badge(
+                                                format!("{scope}/height"),
+                                                crate::host::height_label(snapshot.height),
+                                                Tone::Neutral,
+                                            ),
+                                            native::sized(
+                                                native::nowrap(native::secondary(
+                                                    format!("{scope}/author"),
+                                                    &snapshot.author,
+                                                )),
+                                                Some(wire::Length::Fill),
+                                                None,
+                                            ),
+                                            native::button(
+                                                format!("{scope}/diff"),
+                                                "Diff",
+                                                Some(slots::message(Message::ShowDiffOf(
+                                                    snapshot.id.clone(),
+                                                ))),
+                                                wire::ButtonPreset::Subtle,
+                                            ),
+                                        ],
+                                    ),
+                                    8.,
                                 ),
-                                native::text(format!("{scope}/author"), &snapshot.author),
-                                action(
-                                    format!("{scope}/diff"),
-                                    "Diff",
-                                    Message::ShowDiffOf(snapshot.id.clone()),
-                                    false,
-                                ),
+                                native::wrapping(native::text(
+                                    format!("{scope}/message"),
+                                    &snapshot.message,
+                                )),
                             ],
                         ),
-                        native::text(format!("{scope}/message"), &snapshot.message),
-                    ],
+                        6.,
+                    ),
                 ));
             }
         } else {
-            children.push(native::row(
-                format!("{key}/heading"),
-                [
-                    self.changes_heading(format!("{key}/title")),
-                    action(format!("{key}/back"), "Back", Message::CloseDiffNow, false),
-                ],
+            head.push(native::sized(
+                self.changes_heading(format!("{key}/title")),
+                Some(wire::Length::Fill),
+                None,
+            ));
+            head.push(action(
+                format!("{key}/back"),
+                "Back",
+                Message::CloseDiffNow,
+                false,
             ));
             if self.diff.is_empty() && self.diff_omitted == 0 {
-                children.push(native::text(format!("{key}/empty"), "No differences."));
+                children.push(native::empty_state(
+                    format!("{key}/empty"),
+                    "No differences",
+                    "This snapshot and HEAD hold the same files.",
+                ));
             }
             for entry in &self.diff {
-                children.push(native::row(
-                    format!("{key}/{}", entry.path),
-                    [
-                        native::text(format!("{key}/{}/kind", entry.path), &entry.kind),
-                        native::text(format!("{key}/{}/path", entry.path), &entry.path),
-                    ],
+                let tone = match entry.kind.as_str() {
+                    "added" | "A" => Tone::Success,
+                    "removed" | "deleted" | "D" => Tone::Danger,
+                    _ => Tone::Warning,
+                };
+                children.push(native::spaced(
+                    native::centered_row(
+                        format!("{key}/{}", entry.path),
+                        [
+                            native::badge(format!("{key}/{}/kind", entry.path), &entry.kind, tone),
+                            native::wrapping(native::mono(
+                                format!("{key}/{}/path", entry.path),
+                                &entry.path,
+                            )),
+                        ],
+                    ),
+                    8.,
                 ));
             }
             if self.diff_omitted > 0 {
-                children.push(native::text(
+                children.push(native::caption(
                     format!("{key}/omitted"),
                     format!("{} changes are not shown.", self.diff_omitted),
                 ));
             }
         }
-        native::scroll(key.clone(), native::column(format!("{key}/rows"), children))
+        native::sized(
+            native::spaced(
+                native::column(
+                    key.clone(),
+                    [
+                        native::sized(
+                            native::padded(
+                                native::spaced(
+                                    native::centered_row(format!("{key}/head"), head),
+                                    8.,
+                                ),
+                                wire::Edges {
+                                    top: 0.,
+                                    right: 12.,
+                                    bottom: 0.,
+                                    left: 12.,
+                                },
+                            ),
+                            Some(wire::Length::Fill),
+                            Some(wire::Length::Fixed(40.)),
+                        ),
+                        native::divider(format!("{key}/head-rule")),
+                        native::scroll(
+                            format!("{key}/scroll"),
+                            native::padded(
+                                native::spaced(native::column(format!("{key}/rows"), children), 8.),
+                                wire::Edges::all(12.),
+                            ),
+                        ),
+                    ],
+                ),
+                0.,
+            ),
+            Some(wire::Length::Fill),
+            Some(wire::Length::Fill),
+        )
     }
     fn preview_panel(&self, key: String) -> wire::Node {
         let editing = *self.derived_draft_here();
         let busy = *self.derived_loading();
         let context = self.derived_edit_context();
-        let mut header = vec![native::text(format!("{key}/path"), &self.preview_path)];
+        let mut header = vec![native::sized(
+            native::nowrap(native::mono(format!("{key}/path"), &self.preview_path)),
+            Some(wire::Length::Fill),
+            None,
+        )];
         if self.preview_truncated {
-            header.push(native::text(format!("{key}/truncated"), "first 64 KiB"));
+            header.push(native::badge(
+                format!("{key}/truncated"),
+                "first 64 KiB",
+                Tone::Warning,
+            ));
         }
         if self.preview_clipped && !editing {
-            header.push(native::text(
+            header.push(native::caption(
                 format!("{key}/clipped"),
                 "Preview shortened for display.",
             ));
@@ -338,19 +492,28 @@ impl FilesView {
             ));
         }
         if editing {
-            header.push(action(
+            header.push(native::button(
                 format!("{key}/cancel"),
                 "Cancel",
-                Message::CancelEdit(context.clone()),
-                false,
+                Some(slots::message(Message::CancelEdit(context.clone()))),
+                wire::ButtonPreset::Subtle,
             ));
-            header.push(action(
+            header.push(native::button(
                 format!("{key}/save"),
                 "Save",
-                Message::SaveEdit(context.clone()),
-                busy,
+                (!busy).then(|| slots::message(Message::SaveEdit(context.clone()))),
+                wire::ButtonPreset::Primary,
             ));
         }
+        // The delete acts on the file this pane is showing, so it lives on
+        // that pane's header and nowhere else.
+        header.push(native::button(
+            format!("{key}/delete"),
+            "Delete object",
+            (!busy && self.delete_target.is_empty())
+                .then(|| slots::message(Message::ArmDeleteAt(self.preview_path.clone()))),
+            wire::ButtonPreset::Danger,
+        ));
         let content = if editing {
             let (document, on_document) =
                 self.draft.document("app:draft".into(), Message::EditDraft);
@@ -375,20 +538,46 @@ impl FilesView {
         } else {
             self.preview_content(&key)
         };
-        native::sized(
-            native::column(
-                key.clone(),
-                [native::row(format!("{key}/toolbar"), header), content],
+        let mut pane = native::sized(
+            native::spaced(
+                native::column(
+                    key.clone(),
+                    [
+                        native::sized(
+                            native::padded(
+                                native::spaced(
+                                    native::centered_row(format!("{key}/toolbar"), header),
+                                    8.,
+                                ),
+                                wire::Edges {
+                                    top: 0.,
+                                    right: 12.,
+                                    bottom: 0.,
+                                    left: 12.,
+                                },
+                            ),
+                            Some(wire::Length::Fill),
+                            Some(wire::Length::Fixed(40.)),
+                        ),
+                        native::divider(format!("{key}/rule")),
+                        content,
+                    ],
+                ),
+                0.,
             ),
             Some(wire::Length::Fill),
             Some(wire::Length::Fixed(self.preview_pane_height as f32)),
-        )
+        );
+        if let wire::Node::Linear { background, .. } = &mut pane {
+            *background = Some(native::rgba(native::palette().surface));
+        }
+        pane
     }
     fn preview_content(&self, key: &str) -> wire::Node {
         use wire::SurfaceValue::{Bool, Str};
         let mut children = Vec::new();
         if self.preview_binary {
-            children.push(native::text(
+            children.push(native::secondary(
                 format!("{key}/binary"),
                 &self.preview_display_text,
             ));
@@ -400,7 +589,7 @@ impl FilesView {
                 args: vec![Str("files".into()), Str(self.preview_path.clone())],
                 on_event: None,
             });
-            children.push(native::text(
+            children.push(native::caption(
                 format!("{key}/caption"),
                 crate::host::picture_caption(self.preview_width, self.preview_height),
             ));
@@ -439,7 +628,10 @@ impl FilesView {
         }
         native::scroll(
             format!("{key}/scroll"),
-            native::column(format!("{key}/content"), children),
+            native::padded(
+                native::column(format!("{key}/content"), children),
+                wire::Edges::all(12.),
+            ),
         )
     }
 }

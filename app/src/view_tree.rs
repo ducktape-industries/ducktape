@@ -2046,19 +2046,23 @@ impl ViewTree {
                     }
                     element = element.child(layer.child(self.node(child, window, cx)));
                 }
-                element
-                    .on_hover(cx.listener(move |this, hovered, _, cx| {
-                        match hovered {
-                            true => {
-                                this.hovered.insert(route.clone());
-                            }
-                            false => {
-                                this.hovered.remove(&route);
-                            }
+                let element = element.on_hover(cx.listener(move |this, hovered, _, cx| {
+                    match hovered {
+                        true => {
+                            this.hovered.insert(route.clone());
                         }
-                        cx.notify();
-                    }))
-                    .into_any_element()
+                        false => {
+                            this.hovered.remove(&route);
+                        }
+                    }
+                    cx.notify();
+                }));
+                #[cfg(test)]
+                let element = {
+                    use gpui_kit::test::TestSupportExt as _;
+                    element.test_support()
+                };
+                element.into_any_element()
             }
             Node::Tooltip {
                 key,
@@ -3564,11 +3568,13 @@ fn decoration<T: Styled>(
 fn button_style(button: Button, preset: wire::ButtonPreset) -> Button {
     match preset {
         wire::ButtonPreset::Primary => button.primary(),
-        wire::ButtonPreset::Secondary => button.secondary(),
+        // A secondary action is an outlined button: the filled grey block
+        // is reserved for `Background` (a tab, a chip).
+        wire::ButtonPreset::Secondary => button.outline(),
         wire::ButtonPreset::Success => button.success(),
         wire::ButtonPreset::Warning => button.warning(),
         wire::ButtonPreset::Danger => button.danger(),
-        wire::ButtonPreset::Text => button.text(),
+        wire::ButtonPreset::Text => button.link(),
         wire::ButtonPreset::Background => button.secondary(),
         wire::ButtonPreset::Subtle => button.ghost(),
     }

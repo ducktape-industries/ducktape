@@ -36,9 +36,12 @@ pub struct NodeView {
     pub(crate) node_peers: Vec<crate::host::PeerRow>,
     pub(crate) log_lines: Vec<crate::host::LogRow>,
     pub(crate) node_log_filter: String,
+    /// the level the console keeps, "" for every level
+    pub(crate) node_log_level: String,
     pub(crate) live_log_filter: String,
     pub(crate) live_filter_note: String,
     pub(crate) host_error: String,
+    pub(crate) dark: bool,
 }
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -51,12 +54,14 @@ pub enum Message {
     SelectNodeTab(NodeTab),
     OpenNodeModules,
     NodeLogFilterChanged(String),
+    SelectLogLevel(String),
     LiveLogFilterChanged(String),
     ApplyLiveLogFilter,
     CopyToClipboard(String, String),
 }
 impl NodeView {
-    const SNAPSHOT_SCHEMA: &'static str = "c583cbb8bd8239885328e6a8867ee2664df8988d5294320887eba1b21855671e";
+    const SNAPSHOT_SCHEMA: &'static str =
+        "183d3743dd53e25b46199a2ddee2c14be32b1f904ffb5305b26795b4af98f695";
     fn state() -> Self {
         Self {
             node_data_dir: "".to_owned(),
@@ -72,9 +77,11 @@ impl NodeView {
             node_peers: Vec::new(),
             log_lines: Vec::new(),
             node_log_filter: "".to_owned(),
+            node_log_level: "".to_owned(),
             live_log_filter: "".to_owned(),
             live_filter_note: "".to_owned(),
             host_error: "".to_owned(),
+            dark: false,
         }
     }
     pub(crate) fn boot() -> (Self, Task<Message>) {
@@ -180,6 +187,7 @@ impl NodeView {
             Message::SelectNodeTab(next) => self.on_select_node_tab(next),
             Message::OpenNodeModules => self.on_open_node_modules(),
             Message::NodeLogFilterChanged(next) => self.on_node_log_filter_changed(next),
+            Message::SelectLogLevel(level) => self.on_select_log_level(level),
             Message::LiveLogFilterChanged(next) => self.on_live_log_filter_changed(next),
             Message::ApplyLiveLogFilter => self.on_apply_live_log_filter(),
             Message::CopyToClipboard(text, label) => self.on_copy_to_clipboard(text, label),
@@ -197,6 +205,7 @@ impl NodeView {
             self.connection_serial,
         );
         self.connected = next.connected;
+        self.dark = next.dark;
         self.admin = next.admin;
         self.tier = next.tier;
         self.status = next.status;
@@ -235,7 +244,11 @@ impl NodeView {
     }
     fn on_act_done(&mut self, item: crate::host::ActItem) -> Task<Message> {
         self.host_error = item.error;
-        self.live_filter_note = if self.host_error.is_empty() { item.reply } else { self.host_error.clone() };
+        self.live_filter_note = if self.host_error.is_empty() {
+            item.reply
+        } else {
+            self.host_error.clone()
+        };
         Task::none()
     }
     fn on_select_node_tab(&mut self, next: NodeTab) -> Task<Message> {
@@ -248,6 +261,10 @@ impl NodeView {
     }
     fn on_node_log_filter_changed(&mut self, next: String) -> Task<Message> {
         self.node_log_filter = next;
+        Task::none()
+    }
+    fn on_select_log_level(&mut self, level: String) -> Task<Message> {
+        self.node_log_level = level;
         Task::none()
     }
     fn on_live_log_filter_changed(&mut self, next: String) -> Task<Message> {

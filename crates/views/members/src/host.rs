@@ -436,6 +436,17 @@ pub(crate) fn filter_members(rows: &[MemberRow], filter: crate::MembersFilter) -
         .collect()
 }
 
+/// A human is `live`/`offline` on the mesh; an agent is `active`/`paused`
+/// in the registry.
+pub(crate) fn presence_label(row: &MemberRow) -> &'static str {
+    match (row.is_agent, row.live) {
+        (true, true) => "active",
+        (true, false) => "paused",
+        (false, true) => "live",
+        (false, false) => "offline",
+    }
+}
+
 pub fn member_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
     let maximum = (viewport * 0.5).clamp(260.0, 520.0);
     (width + delta).clamp(260.0, maximum)

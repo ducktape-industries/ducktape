@@ -9,4 +9,5 @@ description = "Renderer-independent WASM view execution and host protocol"
 [dependencies]
 futures.workspace = true
 ui-lang-wire.workspace = true
+design.workspace = true
 wit-bindgen = "0.61"

@@ -1,7 +1,10 @@
 use super::*;
+use ducktape_view_guest::kit::Tone;
 use ducktape_view_guest::slots;
 
 impl ChatView {
+    /// A channel in the list pane: the hash, the name, and what stands out
+    /// about it. An unread room is emphasised and carries a mark.
     pub(super) fn channel_button(
         &self,
         key: String,
@@ -10,41 +13,63 @@ impl ChatView {
         selected: bool,
         unread: bool,
     ) -> wire::Node {
-        let mut label = format!("# {}", channel.name);
+        let p = native::palette();
+        let name = if unread {
+            native::strong(format!("{key}/name"), &channel.name)
+        } else {
+            native::text(format!("{key}/name"), &channel.name)
+        };
+        let mut children = vec![
+            native::nowrap(native::colored(
+                native::text(format!("{key}/hash"), "#"),
+                p.muted,
+            )),
+            native::nowrap(name),
+        ];
+        if channel.huddle_count > 0 {
+            children.push(native::badge(
+                format!("{key}/huddle"),
+                format!("Huddle {}", channel.huddle_count),
+                Tone::Success,
+            ));
+        }
         if channel.members_only {
-            label.push_str(" · Members only");
+            children.push(native::nowrap(native::caption(
+                format!("{key}/members-only"),
+                "Members only",
+            )));
         }
         if channel.archived {
-            label.push_str(" · Archived");
-        }
-        if channel.huddle_count > 0 {
-            label.push_str(&format!(" · Huddle {}", channel.huddle_count));
+            children.push(native::nowrap(native::caption(
+                format!("{key}/archived"),
+                "Archived",
+            )));
         }
         if unread {
-            label.push_str(" · Unread");
+            children.push(native::spacer());
+            children.push(native::badge(format!("{key}/unread"), "Unread", Tone::Accent));
         }
         let action = if self.busy {
             None
         } else {
             Some(slots::message(choose(channel.id)))
         };
-        let mut button = native::button(key, label, action, wire::ButtonPreset::Secondary);
-        if let wire::Node::Button {
-            checked,
-            width,
-            label,
-            ..
-        } = &mut button
-        {
-            *checked = Some(selected);
-            *width = Some(wire::Length::Fill);
+        let content = native::spaced(native::centered_row(format!("{key}/row"), children), 6.);
+        let mut button = native::list_row(key, content, selected, action);
+        if let wire::Node::Button { label, .. } = &mut button {
             *label = Some(channel.name);
         }
         button
     }
 
     pub(super) fn loading_messages(&self, key: String) -> wire::Node {
-        native::text(key, "Loading messages…")
+        native::padded(
+            native::column(
+                key.clone(),
+                [native::caption(format!("{key}/text"), "Loading messages…")],
+            ),
+            wire::Edges::all(16.),
+        )
     }
 
     pub(super) fn search_result(
@@ -54,24 +79,25 @@ impl ChatView {
         hit: crate::host::ChatSearchHit,
     ) -> wire::Node {
         let action = slots::message(open(hit.channel_id, hit.root_seq, hit.seq));
-        let content = native::column(
-            format!("{key}/content"),
-            [
-                native::row(
-                    format!("{key}/byline"),
-                    [
-                        native::text(format!("{key}/author"), hit.author),
-                        native::text(format!("{key}/meta"), hit.meta),
-                    ],
-                ),
-                native::text(format!("{key}/text"), hit.text.clone()),
-            ],
+        let content = native::spaced(
+            native::column(
+                format!("{key}/content"),
+                [
+                    native::centered_row(
+                        format!("{key}/byline"),
+                        [
+                            native::nowrap(native::strong(format!("{key}/author"), hit.author)),
+                            native::nowrap(native::caption(format!("{key}/meta"), hit.meta)),
+                        ],
+                    ),
+                    native::wrapping(native::secondary(format!("{key}/text"), hit.text.clone())),
+                ],
+            ),
+            2.,
         );
-        let mut button =
-            native::button_child(key, content, Some(action), wire::ButtonPreset::Secondary);
-        if let wire::Node::Button { label, width, .. } = &mut button {
+        let mut button = native::list_row(key, content, false, Some(action));
+        if let wire::Node::Button { label, .. } = &mut button {
             *label = Some(hit.text);
-            *width = Some(wire::Length::Fill);
         }
         button
     }
@@ -97,16 +123,23 @@ impl ChatView {
         };
         let mut button = native::button(
             format!("{key}/remove"),
-            "Remove member",
+            "Remove",
             action,
-            wire::ButtonPreset::Secondary,
+            wire::ButtonPreset::Subtle,
         );
-        if let wire::Node::Button { description, .. } = &mut button {
+        if let wire::Node::Button {
+            description, label, ..
+        } = &mut button
+        {
+            *label = Some("Remove member".into());
             *description = Some(member.label.clone());
         }
-        native::row(
+        native::centered_row(
             &key,
-            [native::text(format!("{key}/name"), member.label), button],
+            [
+                native::wrapping(native::text(format!("{key}/name"), member.label)),
+                button,
+            ],
         )
     }
 
@@ -117,29 +150,38 @@ impl ChatView {
         open: impl Fn(String) -> Message + Clone + 'static,
         run: crate::host::LiveRunHint,
     ) -> wire::Node {
-        native::column(
-            &key,
-            [
-                native::text(format!("{key}/agent"), format!("AI · {}", run.agent)),
-                native::text(format!("{key}/status"), run.status),
-                native::row(
-                    format!("{key}/actions"),
-                    [
-                        native::button(
-                            format!("{key}/open"),
-                            "View run",
-                            Some(slots::message(open(run.dispatch_id))),
-                            wire::ButtonPreset::Secondary,
-                        ),
-                        native::button(
-                            format!("{key}/stop"),
-                            "Stop",
-                            Some(slots::message(stop(run.run_id))),
-                            wire::ButtonPreset::Secondary,
-                        ),
-                    ],
-                ),
-            ],
+        native::card(
+            key.clone(),
+            native::column(
+                format!("{key}/body"),
+                [
+                    native::centered_row(
+                        format!("{key}/byline"),
+                        [
+                            native::badge(format!("{key}/kind"), "Agent", Tone::Agent),
+                            native::nowrap(native::strong(format!("{key}/agent"), run.agent)),
+                        ],
+                    ),
+                    native::wrapping(native::secondary(format!("{key}/status"), run.status)),
+                    native::row(
+                        format!("{key}/actions"),
+                        [
+                            native::button(
+                                format!("{key}/open"),
+                                "View run",
+                                Some(slots::message(open(run.dispatch_id))),
+                                wire::ButtonPreset::Secondary,
+                            ),
+                            native::button(
+                                format!("{key}/stop"),
+                                "Stop",
+                                Some(slots::message(stop(run.run_id))),
+                                wire::ButtonPreset::Subtle,
+                            ),
+                        ],
+                    ),
+                ],
+            ),
         )
     }
 }

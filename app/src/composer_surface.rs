@@ -826,10 +826,10 @@ impl Render for ComposerView {
             .flex()
             .flex_col()
             .w_full()
-            .p(px(if self.args.compact { 8. } else { 12. }))
+            .p(px(if self.args.compact { 6. } else { 8. }))
             .border_1()
             .border_color(cx.theme().border)
-            .rounded(px(12.))
+            .rounded(px(design::radius::CARD as f32))
             .bg(cx.theme().background);
         if let Some(menu) = self.menu(cx) {
             let mut choices = div()
@@ -854,10 +854,14 @@ impl Render for ComposerView {
             plate = plate.child(choices);
         }
         plate = plate.child(
+            // Prose, not code: the composer reads in the UI face at body size.
             Editor::new(&self.editor)
                 .readonly(self.args.blocked)
                 .bordered(false)
-                .h(px((lines as f32 * 22. + 20.).clamp(44., 160.)))
+                .appearance(false)
+                .font_family(design::fonts::FAMILY_UI)
+                .text_size(px(design::type_scale::BODY as f32))
+                .h(px((lines as f32 * 20. + 16.).clamp(40., 160.)))
                 .aria_label(self.args.hint.clone()),
         );
         let mut toolbar = div().flex().items_center().gap(px(4.));

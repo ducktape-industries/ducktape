@@ -1,7 +1,9 @@
 use super::*;
+use ducktape_view_guest::kit::Tone;
 use ducktape_view_guest::slots;
 
 impl ChatView {
+    /// A direct message in the list pane: the peer's avatar and name.
     pub(super) fn direct_message(
         &self,
         key: String,
@@ -10,24 +12,37 @@ impl ChatView {
         selected: bool,
         unread: bool,
     ) -> wire::Node {
-        let agent = if peer.is_agent { "AI · " } else { "" };
-        let badge = if unread { " · Unread" } else { "" };
-        let label = format!("{agent}{}{badge}", peer.name);
+        let name = if unread {
+            native::strong(format!("{key}/name"), &peer.name)
+        } else {
+            native::text(format!("{key}/name"), &peer.name)
+        };
+        let mut children = vec![
+            self.principal_avatar(format!("{key}/avatar"), peer.initials.clone(), peer.is_agent),
+            native::nowrap(name),
+        ];
+        if peer.is_agent {
+            children.push(native::badge(format!("{key}/agent"), "Agent", Tone::Agent));
+        }
+        if unread {
+            children.push(native::spacer());
+            children.push(native::badge(format!("{key}/unread"), "Unread", Tone::Accent));
+        }
         let action = if self.busy {
             None
         } else {
             Some(slots::message(choose(peer.key)))
         };
-        let mut button = native::button(key, label, action, wire::ButtonPreset::Secondary);
-        if let wire::Node::Button { checked, width, .. } = &mut button {
-            *checked = Some(selected);
-            *width = Some(wire::Length::Fill);
+        let content = native::spaced(native::centered_row(format!("{key}/row"), children), 8.);
+        let mut button = native::list_row(key, content, selected, action);
+        if let wire::Node::Button { label, .. } = &mut button {
+            *label = Some(peer.name);
         }
         button
     }
 
     pub(super) fn direct_message_header(&self, key: String) -> wire::Node {
-        native::row(
+        native::centered_row(
             &key,
             [
                 self.active_dm_avatar(format!("{key}/avatar")),
