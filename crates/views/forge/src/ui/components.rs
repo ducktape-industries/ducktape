@@ -7,63 +7,22 @@ use ducktape_view_guest::{kit::Tone, slots};
 impl ForgeView {
     pub(super) fn code_screen(&self) -> wire::Node {
         let mut tree = Vec::new();
-        match self.tree_phase.as_str() {
-            "loading" => tree.push(native::secondary(
-                "forge/tree-loading",
-                "Loading repository tree…",
-            )),
-            "failed" => tree.push(native::wrapping(native::secondary(
+        match (self.tree_phase.as_str(), self.tree_children.get("")) {
+            ("failed", _) => tree.push(native::wrapping(native::secondary(
                 "forge/tree-failed",
                 "Could not load the tree. Open the repository again to retry.",
             ))),
-            "ready" => {
-                if !self.tree_path.is_empty() {
-                    tree.push(subtle(
-                        "forge/tree-root",
-                        "Back to the repository root",
-                        Some(Message::ForgeOpenDir(String::new())),
-                    ));
-                }
-                for entry in &self.tree_entries {
-                    let directory = entry.kind == "dir";
-                    let route = if directory {
-                        Message::ForgeOpenDir(entry.path.clone())
-                    } else {
-                        Message::ForgeOpenFile(entry.path.clone())
-                    };
-                    let name = native::nowrap(native::text(
-                        format!("forge/tree/{}/name", entry.path),
-                        if directory {
-                            format!("{}/", entry.name)
-                        } else {
-                            entry.name.clone()
-                        },
-                    ));
-                    let name = if directory {
-                        native::weighted(name, wire::Weight::Medium)
-                    } else {
-                        name
-                    };
-                    let mut button = native::list_row(
-                        format!("forge/tree/{}", entry.path),
-                        name,
-                        entry.path == self.file_path,
-                        Some(slots::message(route)),
-                    );
-                    if let wire::Node::Button {
-                        description, label, ..
-                    } = &mut button
-                    {
-                        *description = Some(entry.path.clone());
-                        *label = Some(entry.name.clone());
-                    }
-                    tree.push(button);
-                }
-                if self.tree_entries.is_empty() {
+            (_, None) => tree.push(native::secondary(
+                "forge/tree-loading",
+                "Loading repository tree…",
+            )),
+            (_, Some(root)) => {
+                self.tree_rows("", 0, &mut tree);
+                if root.is_empty() {
                     let empty = if !self.tree_born {
                         "This repository has no commits yet."
                     } else {
-                        "This directory is empty."
+                        "This repository is empty."
                     };
                     tree.push(native::wrapping(native::secondary(
                         "forge/tree-empty",
@@ -77,7 +36,6 @@ impl ForgeView {
                     ));
                 }
             }
-            _ => {}
         }
         let pane = native::pane(
             "forge/tree-pane",
@@ -117,9 +75,10 @@ impl ForgeView {
                     [
                         pane,
                         resize,
-                        native::scroll(
-                            "forge/file-scroll",
+                        native::sized(
                             native::padded(self.file_screen(), wire::Edges::all(16.)),
+                            Some(wire::Length::Fill),
+                            Some(wire::Length::Fill),
                         ),
                     ],
                 ),
@@ -134,14 +93,101 @@ impl ForgeView {
         split
     }
 
+    /// The rows under `dir`, each inset by its depth. An unfolded directory
+    /// is followed by its own rows, or by one line saying they are on the
+    /// way.
+    fn tree_rows(&self, dir: &str, depth: usize, rows: &mut Vec<wire::Node>) {
+        let p = native::palette();
+        let inset = |depth: usize| wire::Edges {
+            top: 4.,
+            right: 8.,
+            bottom: 4.,
+            left: 8. + 14. * depth as f32,
+        };
+        let Some(entries) = self.tree_children.get(dir) else {
+            rows.push(native::padded(
+                native::row(
+                    format!("forge/tree/{dir}/loading"),
+                    [native::caption(
+                        format!("forge/tree/{dir}/loading-text"),
+                        "Loading…",
+                    )],
+                ),
+                inset(depth + 1),
+            ));
+            return;
+        };
+        for entry in entries {
+            let key = format!("forge/tree/{}", entry.path);
+            let directory = entry.kind == "dir";
+            let unfolded = directory && self.tree_open.contains(&entry.path);
+            let route = if directory {
+                Message::ForgeOpenDir(entry.path.clone())
+            } else {
+                Message::ForgeOpenFile(entry.path.clone())
+            };
+            let caret = match (directory, unfolded) {
+                (false, _) => "",
+                (true, false) => "▸",
+                (true, true) => "▾",
+            };
+            let name = native::nowrap(native::text(format!("{key}/name"), &entry.name));
+            let name = if directory {
+                native::weighted(name, wire::Weight::Medium)
+            } else {
+                name
+            };
+            // the row fills the button, so its content starts at the left
+            // instead of centering in it; the caret slot keeps names in one
+            // column whether or not a row has one
+            let line = native::sized(
+                native::spaced(
+                    native::centered_row(
+                        format!("{key}/line"),
+                        [
+                            native::sized(
+                                native::row(
+                                    format!("{key}/caret-slot"),
+                                    [native::colored(
+                                        native::caption(format!("{key}/caret"), caret),
+                                        p.muted,
+                                    )],
+                                ),
+                                Some(wire::Length::Fixed(12.)),
+                                None,
+                            ),
+                            name,
+                        ],
+                    ),
+                    4.,
+                ),
+                Some(wire::Length::Fill),
+                None,
+            );
+            let mut button = native::list_row(
+                &key,
+                line,
+                entry.path == self.file_path,
+                Some(slots::message(route)),
+            );
+            if let wire::Node::Button {
+                description, label, ..
+            } = &mut button
+            {
+                *description = Some(entry.path.clone());
+                *label = Some(entry.name.clone());
+            }
+            rows.push(native::padded(button, inset(depth)));
+            if unfolded {
+                self.tree_rows(&entry.path, depth + 1, rows);
+            }
+        }
+    }
+
+    /// The reader: its header, then the body — a code file fills the pane
+    /// and scrolls inside its editor, anything else scrolls as a page.
     fn file_screen(&self) -> wire::Node {
-        let path = host::forge_file_header(
-            &self.opened_dir,
-            &self.opened_rev,
-            &self.tree_path,
-            &self.tree_rev,
-            &self.file_path,
-        );
+        let path = host::forge_file_header(&self.opened_rev, &self.tree_rev, &self.file_path);
         // no file open: the tree pane already says why when it is still
         // loading, failed, or lists nothing, so this pane speaks only when
         // there is something to choose
@@ -158,7 +204,7 @@ impl ForgeView {
             }
             return native::column("forge/file", content);
         }
-        let mut content = vec![native::centered_row(
+        let head = native::centered_row(
             "forge/file-head",
             [
                 native::sized(
@@ -168,7 +214,11 @@ impl ForgeView {
                 ),
                 native::nowrap(native::caption("forge/code-context", "Read only")),
             ],
-        )];
+        );
+        let markdown = host::markdown_path(&self.file_path);
+        let code =
+            self.file_phase == "ready" && !self.file_binary && !self.file_picture && !markdown;
+        let mut content = Vec::new();
         match self.file_phase.as_str() {
             "loading" => content.push(native::secondary("forge/loading-file", "Loading file…")),
             "failed" => content.push(native::tone_text(
@@ -197,7 +247,6 @@ impl ForgeView {
                         host::picture_caption(self.file_width, self.file_height),
                     ));
                 } else {
-                    let markdown = host::markdown_path(&self.file_path);
                     content.push(wire::Node::Surface {
                         key: "forge/file-text".into(),
                         name: if markdown {
@@ -233,7 +282,24 @@ impl ForgeView {
             }
             _ => {}
         }
-        native::spaced(native::column("forge/file", content), 10.)
+        // the code body GROWS into what the header leaves, rather than
+        // taking the pane's full height and overflowing by the header's row
+        let body = match code {
+            true => native::sized(
+                native::spaced(native::column("forge/file-body", content), 10.),
+                Some(wire::Length::Fill),
+                Some(wire::Length::FillPortion(1)),
+            ),
+            false => native::scroll(
+                "forge/file-scroll",
+                native::spaced(native::column("forge/file-body", content), 10.),
+            ),
+        };
+        native::sized(
+            native::spaced(native::column("forge/file", [head, body]), 10.),
+            Some(wire::Length::Fill),
+            Some(wire::Length::Fill),
+        )
     }
 
     pub(super) fn diff_screen(&self) -> wire::Node {

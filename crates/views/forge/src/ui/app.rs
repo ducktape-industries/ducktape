@@ -60,6 +60,12 @@ pub struct ForgeView {
     pub(crate) tree_path: String,
     pub(crate) tree_rev: String,
     pub(crate) tree_entries: Vec<crate::host::TreeEntry>,
+    /// Every directory listing read at `tree_rev`, by path (`""` is the
+    /// root); the viewer paints the tree out of these.
+    pub(crate) tree_children: std::collections::BTreeMap<String, Vec<crate::host::TreeEntry>>,
+    /// The directories unfolded in the viewer, in the order they were
+    /// opened; the root is always unfolded.
+    pub(crate) tree_open: Vec<String>,
     pub(crate) tree_born: bool,
     pub(crate) tree_truncated: bool,
     pub(crate) tree_phase: String,
@@ -187,6 +193,8 @@ impl ForgeView {
             tree_path: "".to_owned(),
             tree_rev: "".to_owned(),
             tree_entries: Vec::new(),
+            tree_children: Default::default(),
+            tree_open: Vec::new(),
             tree_born: false,
             tree_truncated: false,
             tree_phase: "loading".to_owned(),

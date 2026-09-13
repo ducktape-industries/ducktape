@@ -63,6 +63,8 @@ fn reads(frame: &Frame) -> Vec<(u64, String)> {
 struct Drive {
     frame: Frame,
     open: Vec<(u64, String)>,
+    /// Every frame so far, for the reads they opened.
+    frames: Vec<Frame>,
 }
 
 impl Drive {
@@ -71,6 +73,7 @@ impl Drive {
         let mut drive = Drive {
             frame: Frame::default(),
             open: Vec::new(),
+            frames: Vec::new(),
         };
         drive.tick(Vec::new());
         drive
@@ -79,6 +82,7 @@ impl Drive {
     fn tick(&mut self, events: Vec<Event>) {
         self.frame = tick_native(events);
         self.open.extend(reads(&self.frame));
+        self.frames.push(self.frame.clone());
     }
 
     /// The id of the outstanding read whose ask names `tag`, consumed.
@@ -93,6 +97,26 @@ impl Drive {
 
     fn answer(&mut self, tag: &str, payload: &[u8]) {
         let id = self.take(tag);
+        self.tick(vec![answer(id, payload)]);
+    }
+
+    /// Answer the newest outstanding tree read for `path` — the view opens
+    /// one per (revision, directory), and a repo opens with a read at no
+    /// revision whose subscription is gone by the time the head is known.
+    fn answer_tree(&mut self, path: &str, payload: &[u8]) {
+        let id = self
+            .frames
+            .iter()
+            .flat_map(|frame| &frame.requests)
+            .filter(|request| request.kind == "rpc.query")
+            .filter(|request| self.open.iter().any(|(open, _)| *open == request.id))
+            .filter_map(|request| {
+                let ask: serde_json::Value = serde_json::from_slice(&request.payload).ok()?;
+                (ask["query"]["tree"]["path"].as_str()? == path).then_some(request.id)
+            })
+            .next_back()
+            .unwrap_or_else(|| panic!("no open tree read for {path:?} in {:?}", self.open));
+        self.open.retain(|(open, _)| *open != id);
         self.tick(vec![answer(id, payload)]);
     }
 }
@@ -446,6 +470,111 @@ fn the_repository_tree_width_is_the_readers_and_its_edge_has_a_resize_cursor() {
         dy: 0.0,
     }]);
     assert_eq!(width(&frame), 302.0);
+}
+
+/// The directories every tree read so far asked for, in order; a read opens
+/// in one frame and is answered in a later one, so the history is what a
+/// test checks.
+fn tree_asks(frames: &[Frame]) -> Vec<String> {
+    frames
+        .iter()
+        .flat_map(|frame| &frame.requests)
+        .filter(|request| request.kind == "rpc.query")
+        .filter_map(|request| {
+            let ask: serde_json::Value = serde_json::from_slice(&request.payload).ok()?;
+            Some(ask["query"]["tree"]["path"].as_str()?.to_owned())
+        })
+        .collect()
+}
+
+fn listing(entries: &[(&str, &str)]) -> Vec<u8> {
+    let entries: Vec<_> = entries
+        .iter()
+        .map(|(path, kind)| {
+            let name = path.rsplit('/').next().unwrap();
+            serde_json::json!({ "name": name, "path": path, "kind": kind })
+        })
+        .collect();
+    serde_json::json!({ "tree": {
+        "rev": "1111222233334444", "born": true, "truncated": false, "entries": entries
+    }})
+    .to_string()
+    .into_bytes()
+}
+
+fn row_inset(frame: &Frame, suffix: &str) -> f32 {
+    match node_ending(frame, suffix) {
+        Node::Button {
+            padding: Some(edges),
+            ..
+        } => edges.left,
+        node => panic!("padded tree row: {node:?}"),
+    }
+}
+
+fn has_key_ending(frame: &Frame, suffix: &str) -> bool {
+    fn walk(node: &Node, suffix: &str) -> bool {
+        node.key().is_some_and(|key| key.ends_with(suffix))
+            || node.children().iter().any(|child| walk(child, suffix))
+    }
+    walk(frame.root.as_ref().unwrap(), suffix)
+}
+
+/// The tree unfolds in place: pressing a directory reads its listing and
+/// paints its rows under it, one step further in; pressing it again folds
+/// them without another read.
+#[test]
+fn a_directory_unfolds_under_its_row_and_folds_again() {
+    let (mut drive, _) = namespace("duck://forge/core");
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    assert_eq!(
+        tree_asks(&drive.frames).last().map(String::as_str),
+        Some("")
+    );
+    drive.answer_tree("", &listing(&[("src", "dir"), ("README.md", "file")]));
+    assert!(!has_key_ending(&drive.frame, "forge/tree-root"));
+    drive.tick(press(&drive.frame, "src"));
+    let asked = tree_asks(&drive.frames);
+    assert_eq!(asked.last().map(String::as_str), Some("src"));
+    assert!(has_text(&drive.frame, "Loading…"));
+    drive.answer_tree("src", &listing(&[("src/main.rs", "file")]));
+    assert_eq!(
+        row_inset(&drive.frame, "forge/tree/src/main.rs"),
+        row_inset(&drive.frame, "forge/tree/src") + 14.
+    );
+    drive.tick(press(&drive.frame, "src"));
+    assert!(!has_key_ending(&drive.frame, "forge/tree/src/main.rs"));
+    assert_eq!(tree_asks(&drive.frames), asked, "a fold reads nothing");
+}
+
+/// A link into a file reads that file's directory first, then the root, and
+/// leaves the tree unfolded down to the file.
+#[test]
+fn a_file_link_unfolds_the_tree_down_to_it() {
+    let (mut drive, _) = namespace("duck://forge/core/blob/src/main.rs");
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    assert_eq!(
+        tree_asks(&drive.frames).last().map(String::as_str),
+        Some("src")
+    );
+    drive.answer_tree("src", &listing(&[("src/main.rs", "file")]));
+    assert_eq!(
+        tree_asks(&drive.frames).last().map(String::as_str),
+        Some("")
+    );
+    drive.answer_tree("", &listing(&[("src", "dir")]));
+    assert!(
+        has_key_ending(&drive.frame, "forge/tree/src/main.rs"),
+        "asks {:?} open {:?} texts {:?}",
+        tree_asks(&drive.frames),
+        drive.open,
+        texts(&drive.frame)
+    );
+    assert!(has_text(&drive.frame, "Loading file…"));
 }
 
 #[test]
