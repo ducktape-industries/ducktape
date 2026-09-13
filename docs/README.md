@@ -58,8 +58,7 @@ document nothing cites is deleted, not archived.
 
 ## Vendored patches
 
-The `block` patch under `patches/` carries a `PATCH.md` stating what it changes
-and when it can be dropped. The wasm32 `blst` patch lives under
+The wasm32 `blst` patch lives under
 `crates/module-sdk/stubs/blst/` and carries its own `PATCH.md`.
 
 `docs/superpowers/` is gitignored planning scratch; nothing under it ships.

@@ -426,12 +426,6 @@ overlay-net = { path = "crates/networking/overlay-net" }
 governor = "0.10.2"
 rand_core = "0.10.1"
 
-[patch.crates-io]
-# `block` 0.1.6 is still required transitively by Metal and AVFoundation, but
-# its uninhabited extern-static type is future-incompatible with Rust. Keep the
-# API/ABI identical and patch only that declaration locally.
-block = { path = "patches/block" }
-
 # dev/test builds compile wasm guests through cranelift (consensus components
 # in the kernel tests, index guests at every store open). unoptimized
 # cranelift is 10-30x slower — enough that a fleet of e2e daemons booting
