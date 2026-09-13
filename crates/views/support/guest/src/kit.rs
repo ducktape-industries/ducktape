@@ -327,7 +327,7 @@ fn border(color: design::Color, radius: f32) -> wire::Border {
     }
 }
 
-/// A card: one step off the window, a hairline, padded content.
+/// A card: the window's own colour inside a hairline, padded content.
 pub fn card(key: impl Into<String>, child: Node) -> Node {
     let p = palette();
     let mut node = container(key, child);
@@ -340,9 +340,9 @@ pub fn card(key: impl Into<String>, child: Node) -> Node {
     else {
         unreachable!()
     };
-    *background = Some(wire::Background::Color(rgba(p.surface)));
+    *background = Some(wire::Background::Color(rgba(p.background)));
     *value = Some(border(p.border, design::radius::CARD as f32));
-    *padding = Some(wire::Edges::all(16.));
+    *padding = Some(wire::Edges::all(12.));
     node
 }
 
@@ -362,10 +362,10 @@ pub fn notice(key: impl Into<String>, child: Node, tone: Tone) -> Node {
     *background = Some(wire::Background::Color(rgba(tone.wash(p))));
     *value = Some(border(tone.color(p), design::radius::CARD as f32));
     *padding = Some(wire::Edges {
-        top: 10.,
-        right: 14.,
-        bottom: 10.,
-        left: 14.,
+        top: 8.,
+        right: 12.,
+        bottom: 8.,
+        left: 12.,
     });
     node
 }
@@ -404,8 +404,8 @@ pub fn page(key: impl Into<String>, children: impl IntoIterator<Item = Node>) ->
     else {
         unreachable!()
     };
-    *padding = Some(wire::Edges::all(24.));
-    *spacing = Some(16.);
+    *padding = Some(wire::Edges::all(20.));
+    *spacing = Some(12.);
     *height = Some(Length::Fill);
     node
 }
@@ -432,7 +432,7 @@ pub fn kv(key: impl Into<String>, name: impl Into<String>, value: Node) -> Node 
     let Node::Text { width, options, .. } = &mut label else {
         unreachable!()
     };
-    *width = Some(Length::Fixed(160.));
+    *width = Some(Length::Fixed(140.));
     options.wrapping = Some(wire::Wrapping::None);
     let mut node = row(key, [label, value]);
     let Node::Linear { align, spacing, .. } = &mut node else {
@@ -443,7 +443,7 @@ pub fn kv(key: impl Into<String>, name: impl Into<String>, value: Node) -> Node 
     node
 }
 
-/// A small pill: a count, a state, a kind.
+/// A small tag: a count, a state, a kind.
 pub fn badge(key: impl Into<String>, content: impl Into<String>, tone: Tone) -> Node {
     let p = palette();
     let key = key.into();
@@ -471,13 +471,13 @@ pub fn badge(key: impl Into<String>, content: impl Into<String>, tone: Tone) -> 
     *value = Some(wire::Border {
         color: None,
         width: None,
-        radius: Some([design::radius::PILL as f32; 4]),
+        radius: Some([design::radius::CONTROL as f32; 4]),
     });
     *padding = Some(wire::Edges {
-        top: 2.,
-        right: 8.,
-        bottom: 2.,
-        left: 8.,
+        top: 1.,
+        right: 6.,
+        bottom: 1.,
+        left: 6.,
     });
     *width = Some(Length::Shrink);
     node
@@ -506,7 +506,7 @@ pub fn avatar(key: impl Into<String>, initials: impl Into<String>, tone: Tone) -
         key.clone(),
         nowrap(weighted(
             colored(
-                text_size(text(format!("{key}/text"), initials), 11.),
+                text_size(text(format!("{key}/text"), initials), 10.),
                 tone.color(p),
             ),
             wire::Weight::Semibold,
@@ -530,8 +530,8 @@ pub fn avatar(key: impl Into<String>, initials: impl Into<String>, tone: Tone) -
         width: None,
         radius: Some([design::radius::PILL as f32; 4]),
     });
-    *width = Some(Length::Fixed(28.));
-    *height = Some(Length::Fixed(28.));
+    *width = Some(Length::Fixed(24.));
+    *height = Some(Length::Fixed(24.));
     *align_x = Some(wire::AlignX::Center);
     *align_y = Some(wire::AlignY::Center);
     node
@@ -567,10 +567,10 @@ pub fn empty_state(
     else {
         unreachable!()
     };
-    *padding = Some(wire::Edges::all(32.));
+    *padding = Some(wire::Edges::all(24.));
     *max_width = Some(420.);
     *align = Some(wire::AlignX::Left);
-    *spacing = Some(6.);
+    *spacing = Some(4.);
     node
 }
 
@@ -623,10 +623,10 @@ pub fn list_row(
     *checked = Some(chosen);
     *width = Some(Length::Fill);
     *padding = Some(wire::Edges {
-        top: 6.,
-        right: 10.,
-        bottom: 6.,
-        left: 10.,
+        top: 4.,
+        right: 8.,
+        bottom: 4.,
+        left: 8.,
     });
     button
 }
@@ -885,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn a_card_paints_the_surface_with_a_hairline() {
+    fn a_card_paints_the_window_colour_inside_a_hairline() {
         set_dark(false);
         let Node::Container {
             background, border, ..
@@ -895,7 +895,7 @@ mod tests {
         };
         assert_eq!(
             background,
-            Some(wire::Background::Color(rgba(design::LIGHT.surface)))
+            Some(wire::Background::Color(rgba(design::LIGHT.background)))
         );
         assert_eq!(border.unwrap().color, Some(rgba(design::LIGHT.border)));
     }

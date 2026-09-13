@@ -131,10 +131,10 @@ fn a_connected_view_reads_its_own_roster() {
         THIS_NODE,
         "this node",
         RESIDENT,
-        "VALIDATOR",
-        "RESIDENT",
+        "validator",
+        "resident",
         "Reviewer Bot",
-        "AGENT",
+        "agent",
     ] {
         assert!(
             has_text(&frame, expected),

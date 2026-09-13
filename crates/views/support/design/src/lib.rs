@@ -19,39 +19,52 @@ pub mod fonts {
     ];
 }
 
-/// Text sizes, in pixels. One scale for the shell and every view.
+/// Text sizes, in pixels. One dense scale for the shell and every view: the
+/// body is 13px and nothing in the chrome is louder than 16px.
 pub mod type_scale {
-    /// a page title — the header, a view's own title row
-    pub const TITLE: f64 = 20.;
+    /// a page title — a view's own title row
+    pub const TITLE: f64 = 16.;
     /// a section title inside a view
-    pub const SECTION: f64 = 15.;
+    pub const SECTION: f64 = 13.5;
     /// The native shell's default text size.
-    pub const BODY: f64 = 13.5;
+    pub const BODY: f64 = 13.;
     /// secondary copy beside body text
-    pub const SECONDARY: f64 = 12.5;
+    pub const SECONDARY: f64 = 12.;
     /// a caption, a timestamp, a badge
-    pub const CAPTION: f64 = 11.5;
+    pub const CAPTION: f64 = 11.;
     /// identifiers in the data face
-    pub const MONO: f64 = 12.5;
+    pub const MONO: f64 = 12.;
 }
 
-/// Corner radii, in pixels.
+/// Corner radii, in pixels. Tight: a control is barely rounded, a card a
+/// touch more, and only an avatar is a circle.
 pub mod radius {
     /// a control: a button, an input, a list row
-    pub const CONTROL: f64 = 6.;
+    pub const CONTROL: f64 = 4.;
     /// a card, a panel, a modal
-    pub const CARD: f64 = 8.;
-    /// a pill: a badge, an avatar
+    pub const CARD: f64 = 6.;
+    /// a pill: an avatar
     pub const PILL: f64 = 999.;
 }
 
 /// One sRGB color as the wire carries it: `[r, g, b, a]` in `0.0..=1.0`.
 pub type Color = [f32; 4];
 
-/// The named colors of one appearance. Warm paper and ink, a single amber
-/// accent for what is live or chosen, and the four status tones.
+/// The named colors of one appearance. Cool neutral greys, an ink sidebar in
+/// both modes, one indigo accent for what is live or chosen, and the four
+/// status tones.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Palette {
+    /// the sidebar rail: ink in both modes
+    pub sidebar: Color,
+    /// text on the sidebar
+    pub sidebar_foreground: Color,
+    /// secondary text on the sidebar: section names, the resting rows
+    pub sidebar_muted: Color,
+    /// the chosen or hovered sidebar row
+    pub sidebar_raised: Color,
+    /// hairlines on the sidebar
+    pub sidebar_border: Color,
     /// the window
     pub background: Color,
     /// a sidebar, a pane, a card — one step off the window
@@ -99,52 +112,62 @@ const fn hex(value: u32) -> Color {
 }
 
 pub const LIGHT: Palette = Palette {
+    sidebar: hex(0x17181C),
+    sidebar_foreground: hex(0xE8E8EC),
+    sidebar_muted: hex(0x8B8D97),
+    sidebar_raised: hex(0x26282F),
+    sidebar_border: hex(0x2A2C33),
     background: hex(0xFFFFFF),
-    surface: hex(0xF6F5F1),
-    surface_raised: hex(0xEDEBE5),
-    border: hex(0xE4E1D9),
-    border_strong: hex(0xCBC7BD),
-    foreground: hex(0x17160F),
-    muted: hex(0x6F6B61),
-    faint: hex(0xA39F94),
-    accent: hex(0xF2B705),
-    accent_soft: hex(0xFCEFC2),
-    accent_foreground: hex(0x17160F),
-    primary: hex(0x17160F),
+    surface: hex(0xF7F7F8),
+    surface_raised: hex(0xEDEDF0),
+    border: hex(0xE4E4E8),
+    border_strong: hex(0xD0D0D6),
+    foreground: hex(0x1B1B1F),
+    muted: hex(0x6B6C76),
+    faint: hex(0xA2A3AC),
+    accent: hex(0x5B5FC7),
+    accent_soft: hex(0xECEDFB),
+    accent_foreground: hex(0x3B3FA8),
+    primary: hex(0x1B1B1F),
     primary_foreground: hex(0xFFFFFF),
-    link: hex(0x2457C5),
-    success: hex(0x1E7F47),
-    success_soft: hex(0xDDF3E4),
-    warning: hex(0xA3660F),
-    warning_soft: hex(0xFBEBCB),
-    danger: hex(0xC1361B),
-    danger_soft: hex(0xFBE1DB),
-    agent: hex(0x5B3FBF),
-    agent_soft: hex(0xE9E3FA),
+    link: hex(0x4C52C9),
+    success: hex(0x1F9D55),
+    success_soft: hex(0xE3F5EA),
+    warning: hex(0xB4700F),
+    warning_soft: hex(0xFBF0DA),
+    danger: hex(0xD33A2E),
+    danger_soft: hex(0xFCE6E4),
+    agent: hex(0x7A4BD8),
+    agent_soft: hex(0xF0EAFC),
 };
 
 pub const DARK: Palette = Palette {
-    background: hex(0x141310),
-    surface: hex(0x1C1B17),
-    surface_raised: hex(0x26241F),
-    border: hex(0x2C2A24),
-    border_strong: hex(0x3E3B33),
-    foreground: hex(0xF1EFE8),
-    muted: hex(0x9B968A),
-    faint: hex(0x6B675D),
-    accent: hex(0xF2B705),
-    accent_soft: hex(0x3A2F0E),
-    accent_foreground: hex(0xF9E2A0),
-    primary: hex(0xF1EFE8),
-    primary_foreground: hex(0x141310),
-    link: hex(0x7EA6F5),
-    success: hex(0x4FC97E),
+    sidebar: hex(0x101114),
+    sidebar_foreground: hex(0xE7E7EA),
+    sidebar_muted: hex(0x7E8189),
+    sidebar_raised: hex(0x1E2026),
+    sidebar_border: hex(0x24262C),
+    background: hex(0x151619),
+    surface: hex(0x1B1C20),
+    surface_raised: hex(0x24262C),
+    border: hex(0x27292F),
+    border_strong: hex(0x363940),
+    foreground: hex(0xE7E7EA),
+    muted: hex(0x8E9098),
+    faint: hex(0x5E616A),
+    accent: hex(0x7C82E8),
+    accent_soft: hex(0x24263D),
+    accent_foreground: hex(0xB4B8F5),
+    primary: hex(0xE7E7EA),
+    primary_foreground: hex(0x151619),
+    link: hex(0x8F95F0),
+    success: hex(0x4CC27E),
     success_soft: hex(0x16301F),
-    warning: hex(0xE7B04A),
+    warning: hex(0xE1A93F),
     warning_soft: hex(0x3A2C10),
-    danger: hex(0xF0705A),
+    danger: hex(0xF0665A),
     danger_soft: hex(0x3E1B14),
-    agent: hex(0xA995F2),
+    agent: hex(0xA78BF5),
     agent_soft: hex(0x2A2340),
 };
 
@@ -235,12 +258,12 @@ pub fn kit_theme_json() -> String {
     "table.head.background": "{surface}",
     "table.head.foreground": "{muted}",
     "table.row.border": "{border}",
-    "sidebar.background": "{surface}",
-    "sidebar.foreground": "{fg}",
-    "sidebar.border": "{border}",
-    "sidebar.accent.background": "{accent_soft}",
-    "sidebar.accent.foreground": "{fg}",
-    "sidebar.primary.background": "{primary}",
+    "sidebar.background": "{sidebar}",
+    "sidebar.foreground": "{sidebar_fg}",
+    "sidebar.border": "{sidebar_border}",
+    "sidebar.accent.background": "{sidebar_raised}",
+    "sidebar.accent.foreground": "{sidebar_fg}",
+    "sidebar.primary.background": "{accent}",
     "sidebar.primary.foreground": "{primary_fg}",
     "tab_bar.background": "{surface}",
     "tab_bar.segmented.background": "{surface}",
@@ -273,6 +296,10 @@ pub fn kit_theme_json() -> String {
             mono_size = type_scale::MONO,
             radius = radius::CONTROL as usize,
             radius_lg = radius::CARD as usize,
+            sidebar = c(p.sidebar),
+            sidebar_fg = c(p.sidebar_foreground),
+            sidebar_border = c(p.sidebar_border),
+            sidebar_raised = c(p.sidebar_raised),
             bg = c(p.background),
             fg = c(p.foreground),
             border = c(p.border),
@@ -321,10 +348,11 @@ mod tests {
 
     #[test]
     fn css_notation_round_trips_the_palette() {
-        assert_eq!(css(hex(0xF2B705)), "#f2b705");
+        assert_eq!(css(hex(0x5B5FC7)), "#5b5fc7");
         assert_eq!(css([1., 1., 1., 0.5]), "#ffffff80");
         assert_eq!(css(LIGHT.background), "#ffffff");
-        assert_eq!(css(DARK.background), "#141310");
+        assert_eq!(css(DARK.background), "#151619");
+        assert_eq!(css(LIGHT.sidebar), "#17181c");
     }
 
     #[test]

@@ -688,7 +688,7 @@ impl DesktopWindow {
                         )
                         .ghost()
                         .w_full()
-                        .when(picked, |button| button.primary()),
+                        .when(picked, |button| button.secondary()),
                     );
                 }
                 if !selected.is_empty() {
@@ -709,7 +709,7 @@ impl DesktopWindow {
                                 )
                                 .primary()
                                 .w_full()
-                                .h_10(),
+                                .h_8(),
                             ),
                     );
                 }
@@ -766,7 +766,7 @@ impl DesktopWindow {
                         )
                         .primary()
                         .w_full()
-                        .h_10(),
+                        .h_8(),
                     )
                     .child(
                         self.action("password-back", "Back", Message::GoLogin, busy)
@@ -815,7 +815,7 @@ impl DesktopWindow {
                     )
                     .primary()
                     .w_full()
-                    .h_10(),
+                    .h_8(),
                 )
             }
             HubStep::Confirm => body
@@ -841,7 +841,7 @@ impl DesktopWindow {
                     )
                     .primary()
                     .w_full()
-                    .h_10(),
+                    .h_8(),
                 )
                 .child(
                     self.action(
@@ -875,7 +875,7 @@ impl DesktopWindow {
                     )
                     .primary()
                     .w_full()
-                    .h_10(),
+                    .h_8(),
                 )
                 .child(
                     self.action("restore-back", "Back", Message::GoLogin, busy)
@@ -950,7 +950,7 @@ impl DesktopWindow {
                                 )
                                 .ghost()
                                 .flex_1()
-                                .when(picked, |button| button.primary()),
+                                .when(picked, |button| button.secondary()),
                             )
                             .child(
                                 self.action(
@@ -979,7 +979,7 @@ impl DesktopWindow {
                                 )
                                 .primary()
                                 .w_full()
-                                .h_10(),
+                                .h_8(),
                             ),
                     );
                 }
@@ -1072,7 +1072,7 @@ impl DesktopWindow {
                     )
                     .primary()
                     .w_full()
-                    .h_10(),
+                    .h_8(),
                 )
                 .child(
                     self.action("join-back", "Back to networks", Message::GoNetworks, busy)
@@ -1121,13 +1121,13 @@ impl DesktopWindow {
                     )
                     .outline()
                     .w_full()
-                    .h_10(),
+                    .h_8(),
                 )
                 .child(
                     self.action("enter-console", "Open Ducktape", Message::EnterConsole, busy)
                         .primary()
                         .w_full()
-                        .h_10(),
+                        .h_8(),
                 ),
             HubStep::Account => {
                 let state = &self.model.read(cx).state;
@@ -1170,7 +1170,7 @@ impl DesktopWindow {
                         )
                         .primary()
                         .w_full()
-                        .h_10(),
+                        .h_8(),
                     )
                     .child(
                         div()
@@ -1518,7 +1518,7 @@ impl DesktopWindow {
     }
 
     fn console(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        use gpui_kit::component::{Selectable as _, Sizable as _, button::ButtonVariants as _};
+        use gpui_kit::component::{Sizable as _, button::ButtonVariants as _};
         use gpui_kit::*;
         let colors = gpui_kit::component::Theme::global(cx).color_tokens();
         let (spec, route) = self.model.read(cx).state.native_view();
@@ -1562,19 +1562,23 @@ impl DesktopWindow {
         let state = &self.model.read(cx).state;
         let palette = design::palette(state.is_dark());
         let accent = hsla_of(palette.accent);
-        let accent_soft = hsla_of(palette.accent_soft);
+        let ink_fg = hsla_of(palette.sidebar_foreground);
+        let ink_muted = hsla_of(palette.sidebar_muted);
+        let ink_raised = hsla_of(palette.sidebar_raised);
+        let ink_border = hsla_of(palette.sidebar_border);
         let faint = hsla_of(palette.faint);
         let live = state.connected;
-        // The sidebar carries the network: its name, whether it is live, and
-        // the way to another one. The header then only names the screen.
+        // The sidebar is the ink rail: it carries the network — its name,
+        // whether it is live, the way to another one — and the navigation.
+        // The header then only names the screen.
         let network = self
             .action("switch-network", "", Message::SwitchNetwork, false)
             .ghost()
             .w_full()
             .h_auto()
             .px_2()
-            .py_2()
-            .justify_start()
+            .py_1p5()
+            .text_color(ink_fg)
             .accessibility_label("Switch network")
             .child(
                 div()
@@ -1585,7 +1589,7 @@ impl DesktopWindow {
                     .min_w_0()
                     .child(
                         div()
-                            .size(px(8.))
+                            .size(px(6.))
                             .flex_shrink_0()
                             .rounded_full()
                             .bg(if live { accent } else { faint }),
@@ -1597,22 +1601,22 @@ impl DesktopWindow {
                             .flex()
                             .flex_col()
                             .items_start()
-                            .gap_0p5()
                             .child(
                                 div()
                                     .w_full()
                                     .truncate()
-                                    .text_size(px(13.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ink_fg)
                                     .child(state.network_name.clone()),
                             )
                             .child(
                                 div()
                                     .w_full()
                                     .truncate()
-                                    .text_size(px(11.5))
+                                    .text_size(px(11.))
                                     .font_weight(FontWeight::NORMAL)
-                                    .text_color(colors.muted_foreground)
+                                    .text_color(ink_muted)
                                     .child(state.status.clone()),
                             ),
                     )
@@ -1621,24 +1625,23 @@ impl DesktopWindow {
                             gpui_kit::component::IconName::ChevronsUpDown,
                         )
                         .xsmall()
-                        .text_color(colors.muted_foreground),
+                        .text_color(ink_muted),
                     ),
             );
         let mut tabs = div()
             .id("workspace-rail")
             .flex()
             .flex_col()
-            .gap_0p5()
-            .w(px(208.))
+            .w(px(200.))
             .h_full()
             .flex_shrink_0()
             .px_2()
             .py_2()
             .bg(sidebar)
             .border_r_1()
-            .border_color(colors.border)
+            .border_color(ink_border)
             .child(network)
-            .child(div().h_2().flex_shrink_0());
+            .child(div().h_3().flex_shrink_0());
         for (tab, label) in navigation {
             let section = match tab {
                 ShellTab::Chat => Some("Workspace"),
@@ -1657,29 +1660,46 @@ impl DesktopWindow {
                         .flex_shrink_0()
                         .text_size(px(11.))
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(colors.muted_foreground)
+                        .text_color(ink_muted)
                         .child(section),
                 );
             }
             let selected = tab == selected_tab;
-            tabs = tabs.child(
-                self.action(label, label, Message::SelectShellTab(tab), false)
-                    .ghost()
-                    .selected(selected)
-                    .icon(nav_icon(tab).xsmall())
-                    .w_full()
-                    .h_8()
-                    .px_2()
-                    .justify_start()
-                    .font_weight(if selected {
-                        FontWeight::MEDIUM
-                    } else {
-                        FontWeight::NORMAL
-                    })
-                    .when(selected, |button| {
-                        button.bg(accent_soft).border_l_2().border_color(accent)
-                    }),
-            );
+            // A nav row is its own element, not a kit button: the kit centres
+            // a button's content and a rail reads left-aligned.
+            let row = div()
+                .id(label)
+                .flex()
+                .items_center()
+                .gap_2()
+                .h(px(28.))
+                .px_2()
+                .mb_0p5()
+                .rounded(px(design::radius::CONTROL as f32))
+                .cursor_pointer()
+                .text_size(px(13.))
+                .font_weight(if selected {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(if selected { ink_fg } else { ink_muted })
+                .when(selected, |row| row.bg(ink_raised))
+                .hover(move |style| style.bg(ink_raised).text_color(ink_fg))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.model.update(cx, |model, cx| {
+                        model.dispatch(Message::SelectShellTab(tab), cx)
+                    });
+                }))
+                .child(nav_icon(tab).small())
+                .child(div().flex_1().min_w_0().truncate().child(label));
+            #[cfg(test)]
+            let row = {
+                use gpui_kit::test::TestSupportExt as _;
+                row.test_support()
+            };
+            tabs = tabs.child(row);
         }
         let state = &self.model.read(cx).state;
         let mut modifiers = Modifiers::default();
@@ -1696,11 +1716,11 @@ impl DesktopWindow {
         let header = div()
             .id("workspace-header")
             .flex()
-            .gap_2()
+            .gap_1p5()
             .items_center()
-            .h(px(48.))
+            .h(px(40.))
             .flex_shrink_0()
-            .px_4()
+            .px_3()
             .border_b_1()
             .border_color(colors.border)
             .bg(colors.background)
@@ -1708,8 +1728,8 @@ impl DesktopWindow {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(15.))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::MEDIUM)
                     .child(title),
             )
             .child(
@@ -1724,31 +1744,34 @@ impl DesktopWindow {
                 )
                 .outline()
                 .icon(gpui_kit::component::IconName::Search)
-                .h_8()
+                .h_7()
                 .px_2()
+                .text_size(px(12.))
+                .text_color(colors.muted_foreground)
                 .child(
                     div()
                         .ml_1()
                         .text_size(px(11.))
-                        .text_color(colors.muted_foreground)
+                        .text_color(hsla_of(palette.faint))
                         .child(shortcut),
                 ),
             )
             .child(
                 self.action("bell", "", Message::ToggleBell, !state.connected)
-                    .outline()
+                    .ghost()
                     .icon(gpui_kit::component::IconName::Bell)
                     .accessibility_label(bell_label)
-                    .h_8()
-                    .w_8()
+                    .h_7()
+                    .w_7()
                     .px_0()
+                    .text_color(colors.muted_foreground)
                     .child(div().relative().when(state.bell_unread > 0, |element| {
                         element.child(
                             div()
                                 .absolute()
                                 .top(px(-10.))
                                 .right(px(-12.))
-                                .size(px(7.))
+                                .size(px(6.))
                                 .rounded_full()
                                 .bg(accent),
                         )
@@ -1769,21 +1792,23 @@ impl DesktopWindow {
             .bg(colors.background)
             .child(header);
         if needs_account {
+            // A quiet one-line notice: the screen behind it stays the loudest thing.
             content = content.child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_3()
-                    .px_4()
-                    .py_2()
+                    .gap_2()
+                    .px_3()
+                    .h(px(32.))
                     .flex_shrink_0()
                     .border_b_1()
                     .border_color(colors.border)
-                    .bg(accent_soft)
+                    .bg(hsla_of(palette.surface))
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(12.5))
+                            .text_size(px(12.))
+                            .text_color(colors.muted_foreground)
                             .child("Sign in to use your account on this network."),
                     )
                     .child(
@@ -1793,8 +1818,9 @@ impl DesktopWindow {
                             Message::OpenAccountWelcome,
                             false,
                         )
-                        .primary()
-                        .h_7(),
+                        .outline()
+                        .h_6()
+                        .text_size(px(12.)),
                     )
                     .child(
                         self.action(
@@ -1804,7 +1830,9 @@ impl DesktopWindow {
                             false,
                         )
                         .ghost()
-                        .h_7(),
+                        .h_6()
+                        .text_size(px(12.))
+                        .text_color(colors.muted_foreground),
                     ),
             );
         }

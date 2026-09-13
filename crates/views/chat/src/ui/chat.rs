@@ -84,11 +84,11 @@ fn pane_header(key: String, children: impl IntoIterator<Item = wire::Node>) -> w
         native::sized(
             native::centered_row(key, children),
             Some(wire::Length::Fill),
-            Some(wire::Length::Fixed(48.)),
+            Some(wire::Length::Fixed(40.)),
         ),
         wire::Edges {
             top: 0.,
-            right: 12.,
+            right: 8.,
             bottom: 0.,
             left: 16.,
         },
@@ -239,6 +239,10 @@ impl ChatView {
     fn room(&self, key: &str) -> wire::Node {
         let mut header = Vec::new();
         if self.active_dm.name.is_empty() {
+            header.push(native::nowrap(native::colored(
+                native::heading(format!("{key}/room-hash"), "#"),
+                native::palette().muted,
+            )));
             header.push(native::nowrap(native::heading(
                 format!("{key}/room-name"),
                 &self.active_channel_name,

@@ -178,29 +178,31 @@ The microVM shim signs the same way: `bin/duck-vz-shim/build.sh` takes
 ## Visual language
 
 One palette drives the whole app. `crates/views/support/design` holds it as
-`design::LIGHT` / `design::DARK` (paper and ink, one amber accent): the native
-shell registers the two as gpui-kit themes (`design::kit_theme_json`) and every
-WASM view reads the same values through `ducktape_view_guest::kit::palette()`,
-switched by the `dark` fact the kernel pushes with each view's session props.
-The accent is spent in three places only — the live dot, the focus ring and the
-selection wash — so state colors (success, warning, danger, agent) read as
-state and nothing else.
+`design::LIGHT` / `design::DARK` — cool neutral greys, an ink sidebar in both
+modes, one indigo accent: the native shell registers the two as gpui-kit
+themes (`design::kit_theme_json`) and every WASM view reads the same values
+through `ducktape_view_guest::kit::palette()`, switched by the `dark` fact the
+kernel pushes with each view's session props. The accent is spent on the live
+dot, the focus ring, the chosen row and the selection wash, so state colors
+(success, warning, danger, agent) read as state and nothing else.
 
-The console is a 208px sidebar carrying the network (name, live dot, block
-height, the switch to another network) and the icon navigation, a 48px header
-naming the screen with search and notifications, and the content. WASM views
-own their layout and interaction routes and compose it from the guest kit's
-semantic pieces — `page`, `card`, `pane`, `list_row`, `kv`, `badge`, `avatar`,
-`notice`, `empty_state`, `tabs`, `field` — so a list, a record rail, a reading
-and a form look the same on every screen. The native renderer maps the wire's
-button presets onto gpui-kit variants (primary, outline, ghost, link, danger).
+The console is a 200px ink rail carrying the network (name, live dot, block
+height, the switch to another network) and the left-aligned navigation, a
+40px header naming the screen with search and notifications, and the content,
+which runs to the edges: a split view (chat, pages) butts its panes against
+the rail, a reading (node, settings) insets itself. WASM views own their layout
+and interaction routes and compose it from the guest kit's semantic pieces —
+`page`, `card`, `pane`, `list_row`, `kv`, `badge`, `avatar`, `notice`,
+`empty_state`, `tabs`, `field` — so a list, a record rail, a reading and a form
+look the same on every screen. The native renderer maps the wire's button
+presets onto gpui-kit variants (primary, outline, ghost, link, danger).
 
 ## Design system
 
 - Faces: **Geist** (UI), **Geist Mono** (identifiers, hashes, paths, code).
   The files are embedded from `crates/views/support/design/assets/fonts/` at
   build time; the kit's component icons come from `gpui_kit::assets::Assets`.
-- Type scale (`design::type_scale`): title 20, section 15, body 13.5,
-  secondary 12.5, caption 11.5, mono 12.5.
-- Radii (`design::radius`): 6px controls, 8px cards, pill badges.
+- Type scale (`design::type_scale`): title 16, section 13.5, body 13,
+  secondary 12, caption 11, mono 12.
+- Radii (`design::radius`): 4px controls and badges, 6px cards, round avatars.
 - Console frame: 1280×800 default (1040×540 minimum); launch window 480×680.

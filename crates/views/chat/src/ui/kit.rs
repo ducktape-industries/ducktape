@@ -25,7 +25,7 @@ impl ChatView {
                 message.avatar_kind != "human",
             )
         } else {
-            native::space(Some(wire::Length::Fixed(28.)), Some(wire::Length::Fixed(4.)))
+            native::space(Some(wire::Length::Fixed(24.)), Some(wire::Length::Fixed(4.)))
         };
         let contents = self.message_contents(format!("{key}/contents"), message, surface);
         let mut row = native::row(format!("{key}/row"), [rail, contents]);
@@ -38,7 +38,7 @@ impl ChatView {
         {
             *spacing = Some(10.);
             *padding = Some(wire::Edges {
-                top: if message.show_author { 8. } else { 1. },
+                top: if message.show_author { 6. } else { 1. },
                 right: 16.,
                 bottom: 1.,
                 left: 16.,
@@ -68,6 +68,7 @@ impl ChatView {
         use ducktape_view_guest::slots;
         let mut children = Vec::new();
         if message.show_author {
+            let p = native::palette();
             let mut header = vec![native::nowrap(native::strong(
                 format!("{key}/author"),
                 &message.author,
@@ -76,12 +77,21 @@ impl ChatView {
                 header.push(native::badge(format!("{key}/agent"), "Agent", Tone::Agent));
             }
             if message.height > 0 {
-                header.push(native::nowrap(native::caption(
-                    format!("{key}/height"),
-                    crate::host::height_label_short(message.height),
+                header.push(native::nowrap(native::colored(
+                    native::text_size(
+                        native::mono(
+                            format!("{key}/height"),
+                            crate::host::height_label_short(message.height),
+                        ),
+                        native::type_scale::CAPTION as f32,
+                    ),
+                    p.faint,
                 )));
             }
-            children.push(native::centered_row(format!("{key}/header"), header));
+            children.push(native::spaced(
+                native::centered_row(format!("{key}/header"), header),
+                6.,
+            ));
         }
         children.push(wire::Node::MouseArea {
             key: format!("{key}/select"),

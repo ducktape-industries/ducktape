@@ -2851,10 +2851,10 @@ impl gpui_kit::Render for NativeModuleView {
                         "ducktape_guest",
                         format!("view{}", cx.entity().entity_id().as_u64()),
                     );
+                    // A view owns its own inset: a split pane runs to the edges.
                     gpui_kit::div()
                         .key_context(context)
                         .size_full()
-                        .p_4()
                         .child(input::Observe::new(
                             content.clone().into_any_element(),
                             self,

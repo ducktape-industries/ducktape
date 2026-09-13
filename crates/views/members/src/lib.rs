@@ -411,11 +411,7 @@ impl MembersView {
                 if member.is_this_node {
                     name_line.push(kit::badge(format!("{key}/local"), "this node", Tone::Accent));
                 }
-                let mut meta = vec![kit::badge(
-                    format!("{key}/role"),
-                    member.role.to_uppercase(),
-                    tone,
-                )];
+                let mut meta = vec![kit::badge(format!("{key}/role"), &member.role, tone)];
                 if !member.model.is_empty() {
                     meta.push(kit::caption(format!("{key}/model"), &member.model));
                 }
@@ -570,7 +566,7 @@ impl MembersView {
                 kit::centered_row(
                     format!("{key}/badges"),
                     [
-                        kit::badge(format!("{key}/role"), member.role.to_uppercase(), tone),
+                        kit::badge(format!("{key}/role"), &member.role, tone),
                         kit::badge(
                             format!("{key}/status"),
                             host::presence_label(member),
