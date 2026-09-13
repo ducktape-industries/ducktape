@@ -85,21 +85,23 @@ impl ForgeView {
         if !self.host_error.is_empty() {
             content.push(self.unavailable("forge/error".into()));
         }
-        content.push(native::centered_row(
-            "forge/head",
-            [
-                native::sized(
-                    native::title("forge/organization", &self.org),
-                    Some(wire::Length::Fill),
-                    None,
-                ),
-                native::badge("forge/tier", &self.tier, Tone::Neutral),
-                native::nowrap(native::secondary(
-                    "forge/repo-count",
-                    host::plural(self.repos.len() as i64, "repository", "repositories"),
-                )),
-            ],
-        ));
+        let mut head = vec![native::sized(
+            native::title("forge/organization", &self.org),
+            Some(wire::Length::Fill),
+            None,
+        )];
+        if !self.tier.is_empty() {
+            head.push(native::badge(
+                "forge/tier",
+                host::state_label(&self.tier),
+                Tone::Neutral,
+            ));
+        }
+        head.push(native::nowrap(native::secondary(
+            "forge/repo-count",
+            host::plural(self.repos.len() as i64, "repository", "repositories"),
+        )));
+        content.push(native::spaced(native::centered_row("forge/head", head), 8.));
         if !self.about.is_empty() {
             content.push(native::wrapping(native::secondary(
                 "forge/about",
@@ -287,7 +289,8 @@ impl ForgeView {
         )
     }
 
-    /// Code, then the two trackers with their open counts.
+    /// Code, then the two trackers, each wearing its open count when there
+    /// is one.
     fn tab_row(&self) -> wire::Node {
         let choices = [
             ("code", "Code", ""),
@@ -296,10 +299,12 @@ impl ForgeView {
         ]
         .into_iter()
         .map(|(tab, label, kind)| {
-            let name = if kind.is_empty() {
-                label.to_owned()
+            let open = host::forge_open_count(&self.items, kind);
+            let counted = !kind.is_empty() && open > 0;
+            let name = if counted {
+                format!("{label} {open}")
             } else {
-                format!("{label}  {}", host::forge_open_count(&self.items, kind))
+                label.to_owned()
             };
             (
                 tab.to_owned(),
@@ -340,7 +345,7 @@ impl ForgeView {
                             [
                                 native::badge(
                                     format!("{key}/state"),
-                                    &item.state,
+                                    host::state_label(&item.state),
                                     state_tone(&item.state),
                                 ),
                                 native::sized(
@@ -414,7 +419,7 @@ impl ForgeView {
                 let mut meta = vec![
                     native::badge(
                         "forge/item-state",
-                        &self.forge_item_state,
+                        host::state_label(&self.forge_item_state),
                         state_tone(&self.forge_item_state),
                     ),
                     native::nowrap(native::mono(
@@ -427,7 +432,7 @@ impl ForgeView {
                     )),
                 ];
                 if !self.forge_item_branches.is_empty() {
-                    meta.push(native::nowrap(native::mono(
+                    meta.push(native::nowrap(native::secondary(
                         "forge/item-branches",
                         &self.forge_item_branches,
                     )));
@@ -462,10 +467,8 @@ impl ForgeView {
                     content
                         .push(self.item_body("forge/item-body".into(), Message::OpenMessageLink));
                 }
-                if !self.diff_rows.is_empty() {
-                    content.push(self.diff_screen());
-                }
                 if self.forge_item_kind == "pr" {
+                    content.push(self.diff_screen());
                     content.push(self.merge_screen());
                     content.push(self.review_screen());
                 }

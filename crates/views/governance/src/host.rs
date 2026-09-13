@@ -29,8 +29,10 @@ const SETTLE_SCAN_BLOCKS: usize = 400;
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ProposalRow {
     pub id: String,
+    /// What kind of change, in words: `Add validator`, `Update module`.
     pub action: String,
-    pub detail: String,
+    /// The action's payload as labelled fields, in the order they read.
+    pub fields: Vec<Field>,
     pub proposer: String,
     pub status: String,
     pub deadline: i64,
@@ -41,6 +43,33 @@ pub struct ProposalRow {
     pub electorate: i64,
     pub open: bool,
     pub settled_height: i64,
+}
+
+/// One labelled field of a proposal's action: `Key` / `8c4fa211…`. `code`
+/// marks a value that is an identifier (a key, a hash, a module id) and
+/// reads in mono; the rest is prose.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct Field {
+    pub name: String,
+    pub value: String,
+    pub code: bool,
+}
+
+impl Field {
+    fn prose(name: &str, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            code: false,
+        }
+    }
+    fn code(name: &str, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            code: true,
+        }
+    }
 }
 
 // ---------- the session ----------
@@ -167,8 +196,8 @@ fn fold_proposal(view: &serde_json::Value) -> ProposalRow {
     ProposalRow {
         id: view["proposal_id"].as_str().unwrap_or_default().to_string(),
         open: status == "open",
-        detail: gov_action_detail(&view["action"]),
-        proposer: short_label(&hex_encode(&json_bytes(&view["proposer"]))),
+        fields: gov_action_fields(&view["action"]),
+        proposer: principal_label(&view["proposer"], &view["voter_kind"]),
         deadline: view["deadline"].as_i64().unwrap_or(0),
         approvals: count_i64(approvals),
         rule: tagged_name(&view["voting_rule"]),
@@ -180,9 +209,62 @@ fn fold_proposal(view: &serde_json::Value) -> ProposalRow {
                 .map_or(0, |members| members.len()),
         ),
         settled_height: 0,
-        action: tagged_name(&view["action"]),
-        status,
+        action: action_label(&tagged_name(&view["action"])),
+        status: status_label(&status),
     }
+}
+
+/// A `GovAction` variant tag in words: `add_validator` reads `Add validator`.
+pub fn action_label(variant: &str) -> String {
+    match variant {
+        "add_validator" => "Add validator",
+        "remove_validator" => "Remove validator",
+        "signal" => "Signal",
+        "add_resident" => "Add resident",
+        "remove_resident" => "Remove resident",
+        "adopt_shares" => "Adopt shares",
+        "set_shares" => "Set shares",
+        "set_share_mode" => "Ballot mode",
+        "update_module" => "Update module",
+        "register_module" => "Register module",
+        "cancel_module_update" => "Cancel module update",
+        "set_acl_policy" => "Submit policy",
+        other => return sentence_case(other),
+    }
+    .into()
+}
+
+/// `open` / `passed` / `rejected` as a word, and the settled states named
+/// for what they mean to a reader.
+pub fn status_label(status: &str) -> String {
+    match status {
+        "open" => "Open".into(),
+        "passed" => "Passed".into(),
+        "rejected" => "Rejected".into(),
+        other => sentence_case(other),
+    }
+}
+
+/// `some_snake_token` → `Some snake token`: the fallback for a tag the
+/// view has no words for, so a token never reaches the screen raw.
+fn sentence_case(token: &str) -> String {
+    let words = token.replace('_', " ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// Who a proposal's principal is: `account #42` in share mode (the 8-byte
+/// LE account number), the short node key otherwise.
+fn principal_label(principal: &serde_json::Value, voter_kind: &serde_json::Value) -> String {
+    let bytes = json_bytes(principal);
+    let account_mode = voter_kind.as_str() == Some("account");
+    if account_mode && let Ok(number) = <[u8; 8]>::try_from(bytes.as_slice()) {
+        return format!("account #{}", u64::from_le_bytes(number));
+    }
+    short_label(&hex_encode(&bytes))
 }
 
 /// The block each settled proposal was EXECUTED at, off the recent op
@@ -227,33 +309,112 @@ pub fn fold_settle_heights(blocks: &serde_json::Value) -> BTreeMap<String, i64> 
     heights
 }
 
-/// The `GovAction` payload as one readable clause — what the op DOES, which
-/// the bare variant tag never says.
-pub fn gov_action_detail(action: &serde_json::Value) -> String {
+/// The `GovAction` payload as labelled fields — what the op DOES, which the
+/// bare variant tag never says. Every variant of
+/// `crates/modules/system/governance/src/interface.rs` reads here; a
+/// variant this view has no words for shows each of its scalar fields under
+/// its own name rather than nothing.
+pub fn gov_action_fields(action: &serde_json::Value) -> Vec<Field> {
     let Some(tagged) = action.as_object() else {
-        return String::new();
+        return Vec::new();
     };
     let Some((variant, payload)) = tagged.iter().next() else {
-        return String::new();
+        return Vec::new();
     };
-    let key = payload.get("key").map(json_bytes).unwrap_or_default();
-    if !key.is_empty() {
-        return format!("key {}", short_label(&hex_encode(&key)));
-    }
-    if let Some(text) = payload.get("text").and_then(|text| text.as_str()) {
-        return text.to_string();
-    }
+    let text = |name: &str| payload[name].as_str().unwrap_or_default().to_string();
+    let bytes = |name: &str| short_label(&hex_encode(&json_bytes(&payload[name])));
+    let module = || {
+        vec![
+            Field::prose("Module", text("name")),
+            Field::code("Module id", text("module_id")),
+            Field::prose(
+                "Activates",
+                format!(
+                    "{} after it settles",
+                    plural(
+                        payload["activation_lead"].as_i64().unwrap_or(0),
+                        "block",
+                        "blocks"
+                    )
+                ),
+            ),
+            Field::code("Code hash", bytes("code_hash")),
+        ]
+    };
     match variant.as_str() {
-        "update_module" => format!(
-            "{} → h {}",
-            payload["name"].as_str().unwrap_or_default(),
-            payload["activation_height"].as_i64().unwrap_or(0)
-        ),
-        "set_share_mode" => match payload["enabled"].as_bool().unwrap_or(false) {
-            true => "account shares".into(),
-            false => "one ballot per validator".into(),
-        },
-        _ => String::new(),
+        "add_validator" | "remove_validator" | "add_resident" | "remove_resident" => {
+            vec![Field::code("Node key", bytes("key"))]
+        }
+        "signal" => vec![Field::prose("Message", text("text"))],
+        "adopt_shares" => {
+            let allocations = payload["allocations"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let shares: i64 = allocations
+                .iter()
+                .map(|allocation| allocation["shares"].as_i64().unwrap_or(0))
+                .sum();
+            vec![Field::prose(
+                "Allocation",
+                format!(
+                    "{} across {}",
+                    plural(shares, "share", "shares"),
+                    plural(count_i64(allocations.len()), "account", "accounts")
+                ),
+            )]
+        }
+        "set_shares" => vec![
+            Field::prose(
+                "Account",
+                format!("#{}", payload["account_id"].as_i64().unwrap_or(0)),
+            ),
+            Field::prose(
+                "Shares",
+                payload["shares"].as_i64().unwrap_or(0).to_string(),
+            ),
+        ],
+        "set_share_mode" => {
+            let ballots = match payload["enabled"].as_bool().unwrap_or(false) {
+                true => "one per account share",
+                false => "one per validator",
+            };
+            vec![Field::prose("Ballots", ballots)]
+        }
+        "update_module" | "register_module" => module(),
+        "cancel_module_update" => vec![
+            Field::prose("Module", text("name")),
+            Field::code("Module id", text("module_id")),
+        ],
+        "set_acl_policy" => {
+            let target = match payload["target"].as_str() {
+                Some("*") | None => "every module".to_string(),
+                Some(target) => target.to_string(),
+            };
+            let standing = match payload["standing"].as_str() {
+                Some("validator") => "validators only",
+                Some("node") => "validators and residents",
+                Some("user") => "members with an account",
+                Some("open") | None => "anyone with a signature",
+                Some(other) => other,
+            };
+            vec![
+                Field::prose("Target", target),
+                Field::prose("Who may submit", standing),
+            ]
+        }
+        _ => payload
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(name, value)| {
+                let value = value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string());
+                Field::prose(&sentence_case(name), value)
+            })
+            .collect(),
     }
 }
 
@@ -412,6 +573,16 @@ pub fn badge(open: i64) -> bool {
 
 // ---------- the readings ----------
 
+/// `Could not read the proposals: not connected to a node` — a host
+/// refusal with the verb a person needs in front of it; no refusal, no
+/// sentence.
+pub fn sentence(verb: &str, error: &str) -> String {
+    if error.is_empty() {
+        return String::new();
+    }
+    format!("{verb}: {error}")
+}
+
 /// `12 open · 3 settled` — the Approvals title's machine subtitle.
 pub fn proposals_summary(connected: bool, rows: &[ProposalRow]) -> String {
     if !connected || rows.is_empty() {
@@ -462,7 +633,7 @@ pub fn approve_label(approvals: i64, required: i64) -> String {
 /// `h 84,912` — a block height, grouped; a negative one is `h —`.
 pub fn height_label_short(height: i64) -> String {
     if height < 0 {
-        return "h —".into();
+        return "block —".into();
     }
     let digits = height.to_string();
     let mut grouped = String::new();
@@ -473,7 +644,7 @@ pub fn height_label_short(height: i64) -> String {
         }
         grouped.push(digit);
     }
-    format!("h {grouped}")
+    format!("block {grouped}")
 }
 
 fn plural(count: i64, one: &str, many: &str) -> String {

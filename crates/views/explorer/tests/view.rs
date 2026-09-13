@@ -114,7 +114,7 @@ fn a_connected_view_reads_its_own_ledger() {
     assert!(has_text(&frame, "Not connected"), "{:?}", texts(&frame));
 
     let (frame, _live) = connected_with_ledger();
-    for expected in ["Explorer", "h 84,912", "live", "1 op"] {
+    for expected in ["Explorer", "block 84,912", "live", "1 op"] {
         assert!(
             has_text(&frame, expected),
             "missing {expected:?} in {:?}",
@@ -257,7 +257,7 @@ fn search_hits_name_the_page_author_and_room_once() {
     let shown = texts(&frame);
     for expected in [
         "account 7",
-        "room-qa · #12",
+        "message 12",
         "Message needle",
         "Named QA page",
         "Page needle",
@@ -364,7 +364,8 @@ fn a_search_that_lost_a_source_says_which_one_and_keeps_no_chip_for_it() {
         // is named by the shortened key rather than by their account name
         "user 48cedb0d…",
         "the needle is here",
-        "general · #12",
+        "general",
+        "message 12",
         "Files did not answer — these results are incomplete.",
     ] {
         assert!(
@@ -438,11 +439,13 @@ fn an_ops_hash_reads_prefixed_and_copies_bare() {
     let (frame, _live) = connected_with_ledger();
     let frame = tick_native(press(&frame, "Inspect block"));
     assert!(has_text(&frame, "0xab12cd34"), "{:?}", texts(&frame));
-    assert!(
-        has_text(&frame, "chat · 1 msg · 0 events"),
-        "every count in the trace names what it counts: {:?}",
-        texts(&frame)
-    );
+    for expected in ["Dispatch", "chat", "1 message, 0 events"] {
+        assert!(
+            has_text(&frame, expected),
+            "the trace is a labelled row per hop, missing {expected:?}: {:?}",
+            texts(&frame)
+        );
+    }
     let frame = tick_native(press(&frame, "Copy op hash"));
     let [intent] = frame.requests.as_slice() else {
         panic!("one intent, got {:?}", frame.requests);
@@ -453,6 +456,61 @@ fn an_ops_hash_reads_prefixed_and_copies_bare() {
         Copy {
             text: "ab12cd34".into(),
             label: "Op hash copied".into()
+        }
+    );
+}
+
+/// A PAYLOAD IS A TABLE, NEVER A JSON STRING ON THE SCREEN. The op line
+/// carries the message's verb; the fields sit under it, each by its path;
+/// the disposition reads as a word; and no text on the screen is a `{"…`.
+#[test]
+fn an_ops_payload_reads_as_labelled_fields_not_json() {
+    let frame = boot();
+    let session_id = request(&frame, "explorer.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true))]);
+    let feed = request(&frame, "rpc.blocks").id;
+    let rows = serde_json::json!([{
+        "height": 9, "hash": "9f3e".repeat(16), "commit_hash": "c0ffee11".repeat(8),
+        "ops": [{
+            "proposer": "module:files", "target": "files", "disposition": "rejected",
+            "op_hash": "ab12cd34",
+            "payload": "{\"put\":{\"path\":\"/shared/a.png\",\"size\":12}}",
+            "operations": []
+        }]
+    }])
+    .to_string();
+    let frame = tick_native(vec![answer(feed, rows.as_bytes())]);
+    let frame = tick_native(press(&frame, "Inspect block"));
+    let shown = texts(&frame);
+    for expected in [
+        "put",
+        "Payload",
+        "path",
+        "/shared/a.png",
+        "size",
+        "12",
+        "Rejected",
+        "module files",
+    ] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {shown:?}"
+        );
+    }
+    assert!(
+        !shown.iter().any(|text| text.contains("{\"")),
+        "a JSON string reached the screen: {shown:?}"
+    );
+    // and the copy still carries the proposer handle as it came
+    let frame = tick_native(press(&frame, "Copy proposer"));
+    let [intent] = frame.requests.as_slice() else {
+        panic!("one intent, got {:?}", frame.requests);
+    };
+    assert_eq!(
+        serde_json::from_slice::<Copy>(&intent.payload).expect("decodes"),
+        Copy {
+            text: "module:files".into(),
+            label: "Proposer copied".into()
         }
     );
 }

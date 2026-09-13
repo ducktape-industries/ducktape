@@ -693,7 +693,10 @@ impl SettingsView {
         if !self.host_error.is_empty() {
             content.push(kit::notice(
                 "settings/error",
-                kit::wrapping(kit::text("settings/error-text", &self.host_error)),
+                kit::wrapping(kit::text(
+                    "settings/error-text",
+                    format!("Could not read from the node: {}", self.host_error),
+                )),
                 kit::Tone::Danger,
             ));
         }
@@ -798,6 +801,14 @@ impl SettingsView {
             ],
         );
         if !self.connected {
+            // The empty state insets itself by 24; the actions line up under
+            // its words rather than at the page edge.
+            let inset = wire::Edges {
+                top: 0.,
+                right: 24.,
+                bottom: 24.,
+                left: 24.,
+            };
             return kit::column(
                 "settings/disconnected-network",
                 [
@@ -806,14 +817,20 @@ impl SettingsView {
                         "Not connected",
                         "Reconnect to this network, or open another one.",
                     ),
-                    actions,
+                    kit::padded(actions, inset),
                 ],
             );
         }
+        let network_name = if self.network_name.is_empty() {
+            "This network"
+        } else {
+            &self.network_name
+        };
+        let members = self.reading(&self.members_line, self.members_answered);
         settings_section(
             "settings/network",
             "settings/network-name",
-            &self.network_name,
+            network_name,
             "",
             kit::spaced(
                 kit::column(
@@ -857,11 +874,11 @@ impl SettingsView {
                                         [
                                             kit::nowrap(kit::text(
                                                 "settings/members-count",
-                                                &self.members_line,
+                                                members,
                                             )),
                                             settings_subtle(
                                                 "settings/manage-members",
-                                                "manage",
+                                                "Open members",
                                                 Message::ShowTab("members".into()),
                                                 true,
                                             ),
@@ -875,7 +892,7 @@ impl SettingsView {
                                         "settings/node-row",
                                         [settings_subtle(
                                             "settings/view-node",
-                                            "view",
+                                            "Open node",
                                             Message::ShowTab("node".into()),
                                             true,
                                         )],
@@ -900,10 +917,22 @@ impl SettingsView {
             );
         }
         let available = !self.account_busy && self.unlocked;
-        let standing = if self.tier.is_empty() && self.members_answered {
-            "standing unknown".to_owned()
+        let tier = match self.tier.as_str() {
+            "validator" => "Validator",
+            "resident" => "Resident",
+            "guest" => "Guest",
+            _ => "",
+        };
+        let standing = self.reading(tier, self.members_answered);
+        let number = if self.account_number.is_empty() {
+            kit::secondary("settings/account-number", "None yet")
         } else {
-            self.tier.clone()
+            kit::mono("settings/account-number", &self.account_number)
+        };
+        let seat = if self.seat_key.is_empty() {
+            kit::secondary("settings/seat", "No key on this device")
+        } else {
+            kit::wrapping(kit::mono("settings/seat", &self.seat_key))
         };
         let mut identity = vec![
             kit::kv(
@@ -912,7 +941,7 @@ impl SettingsView {
                 kit::text(
                     "settings/account-name",
                     if self.account_name.is_empty() {
-                        "(unnamed)"
+                        "Unnamed"
                     } else {
                         &self.account_name
                     },
@@ -929,7 +958,7 @@ impl SettingsView {
                 kit::centered_row(
                     "settings/number-row",
                     [
-                        kit::mono("settings/account-number", &self.account_number),
+                        number,
                         settings_subtle(
                             "settings/copy-number",
                             "Copy number",
@@ -942,11 +971,7 @@ impl SettingsView {
                     ],
                 ),
             ),
-            kit::kv(
-                "settings/seat-row",
-                "Key on this device",
-                kit::wrapping(kit::mono("settings/seat", &self.seat_key)),
-            ),
+            kit::kv("settings/seat-row", "Key on this device", seat),
         ];
         if self.account_exists {
             identity.push(setting_row(
@@ -1077,14 +1102,14 @@ impl SettingsView {
                                                 kit::nowrap(kit::strong(
                                                     format!("{key}/label"),
                                                     if row.label.is_empty() {
-                                                        "(unlabeled)"
+                                                        "No label"
                                                     } else {
                                                         &row.label
                                                     },
                                                 )),
                                                 kit::badge(
                                                     format!("{key}/scheme"),
-                                                    &row.scheme,
+                                                    key_kind(&row.scheme),
                                                     kit::Tone::Neutral,
                                                 ),
                                             ],
@@ -1213,32 +1238,38 @@ impl SettingsView {
             "show_qr" => {
                 content.push(kit::card(
                     "settings/ceremony",
-                    kit::column(
-                        "settings/ceremony-body",
-                        [
-                            wire::Node::Qr {
-                                key: "settings/ceremony-qr".into(),
-                                code: wire::Qr {
-                                    payload: Some(self.account_ceremony_qr.as_bytes().to_vec()),
-                                    correction: Some(wire::QrCorrection::Medium),
-                                    size: Some(wire::QrSize::Cell(3.)),
-                                    version: None,
-                                    cell: None,
-                                    background: None,
+                    kit::spaced(
+                        kit::column(
+                            "settings/ceremony-body",
+                            [
+                                wire::Node::Qr {
+                                    key: "settings/ceremony-qr".into(),
+                                    code: wire::Qr {
+                                        payload: Some(self.account_ceremony_qr.as_bytes().to_vec()),
+                                        correction: Some(wire::QrCorrection::Medium),
+                                        size: Some(wire::QrSize::Cell(3.)),
+                                        version: None,
+                                        cell: None,
+                                        background: None,
+                                    },
                                 },
-                            },
-                            kit::wrapping(kit::text(
-                                "settings/ceremony-detail",
-                                &self.account_ceremony_detail,
-                            )),
-                            kit::caption("settings/ceremony-left", &self.account_ceremony_left),
-                            settings_subtle(
-                                "settings/ceremony-cancel",
-                                "Cancel",
-                                Message::AccountCeremonyCancel,
-                                true,
-                            ),
-                        ],
+                                kit::wrapping(kit::text(
+                                    "settings/ceremony-detail",
+                                    &self.account_ceremony_detail,
+                                )),
+                                kit::caption(
+                                    "settings/ceremony-left",
+                                    format!("This code expires in {}", self.account_ceremony_left),
+                                ),
+                                settings_subtle(
+                                    "settings/ceremony-cancel",
+                                    "Cancel",
+                                    Message::AccountCeremonyCancel,
+                                    true,
+                                ),
+                            ],
+                        ),
+                        8.,
                     ),
                 ));
             }
@@ -1269,16 +1300,18 @@ impl SettingsView {
     }
     fn security_settings(&self) -> wire::Node {
         use ducktape_view_guest::{kit, slots, wire};
-        let state = if self.settings_key_state.is_empty() {
-            "unknown"
-        } else {
-            &self.settings_key_state
+        // The keystore's closed vocabulary (`absent` | `encrypted` |
+        // `unreadable`) as a reading; anything else is not known.
+        let (state, tone) = match self.settings_key_state.as_str() {
+            "encrypted" => ("Encrypted on disk", kit::Tone::Success),
+            "absent" => ("No key file", kit::Tone::Warning),
+            "unreadable" => ("Unreadable", kit::Tone::Danger),
+            _ => ("Unknown", kit::Tone::Neutral),
         };
-        let tone = match self.settings_key_state.as_str() {
-            "encrypted" => kit::Tone::Success,
-            "absent" => kit::Tone::Warning,
-            "unreadable" => kit::Tone::Danger,
-            _ => kit::Tone::Neutral,
+        let path = if self.settings_key_path.is_empty() {
+            kit::secondary("settings/key-path", "Not known yet")
+        } else {
+            kit::wrapping(kit::mono("settings/key-path", &self.settings_key_path))
         };
         let mut content = vec![
             kit::kv(
@@ -1286,11 +1319,7 @@ impl SettingsView {
                 "Key state",
                 kit::badge("settings/key-state", state, tone),
             ),
-            kit::kv(
-                "settings/key-path-row",
-                "Key path",
-                kit::wrapping(kit::mono("settings/key-path", &self.settings_key_path)),
-            ),
+            kit::kv("settings/key-path-row", "Key path", path),
         ];
         if self.unlocked {
             content.push(kit::centered_row(
@@ -1358,6 +1387,27 @@ impl SettingsView {
             "The key this device signs with, and whether it is unlocked now.",
             setting_list("settings/security-rows", content),
         )
+    }
+}
+impl SettingsView {
+    /// A value the view reads for itself, or what stands in while it has
+    /// not: the read is still out, or it failed and the notice above says so.
+    fn reading(&self, value: &str, answered: bool) -> String {
+        let pending = !answered && self.host_error.is_empty();
+        match (value.is_empty(), pending) {
+            (false, _) => value.to_owned(),
+            (true, true) => "Reading…".to_owned(),
+            (true, false) => "Unknown".to_owned(),
+        }
+    }
+}
+/// A key scheme token as the kind of device it names.
+fn key_kind(scheme: &str) -> &str {
+    match scheme {
+        "ed25519" => "Device key",
+        "secp256k1" => "Wallet",
+        "secp256r1" => "Passkey",
+        other => other,
     }
 }
 fn kit_plural(count: usize, one: &str, many: &str) -> String {

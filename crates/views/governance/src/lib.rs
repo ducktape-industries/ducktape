@@ -56,7 +56,7 @@ impl GovernanceView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "e6057c07e20054179436b36b5b86393d9516f49ee8dec60f74cecedff305c0f4";
+        "4fd8db607777674c4473164550c788121d5db5f9cf630603ced7636fba43ca3d";
 }
 impl GovernanceView {
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
@@ -180,7 +180,7 @@ impl GovernanceView {
         item: crate::host::SessionItem,
     ) -> ::ducktape_view_guest::Task<Message> {
         {
-            self.host_error = item.error.to_owned();
+            self.host_error = host::sentence("Could not read the session", &item.error);
             if !(item.error).is_empty() {
                 return ::ducktape_view_guest::Task::none();
             }
@@ -201,7 +201,7 @@ impl GovernanceView {
         item: crate::host::RegisterItem,
     ) -> ::ducktape_view_guest::Task<Message> {
         {
-            self.host_error = item.error.to_owned();
+            self.host_error = host::sentence("Could not read the proposals", &item.error);
             self.answered = true;
             if !(item.error).is_empty() {
                 return ::ducktape_view_guest::Task::none();
@@ -214,7 +214,7 @@ impl GovernanceView {
     fn on_act_done(&mut self, item: crate::host::ActItem) -> ::ducktape_view_guest::Task<Message> {
         {
             self.voting = "".to_owned();
-            self.host_error = item.error.to_owned();
+            self.host_error = host::sentence("The network refused it", &item.error);
             ::ducktape_view_guest::Task::none()
         }
     }
@@ -297,10 +297,14 @@ impl GovernanceView {
                 "governance/standing",
                 kit::wrapping(kit::text(
                     "governance/standing-text",
-                    "Approval votes are cast by this network's validators, and this node does not hold validator standing. You can still read every proposal and follow its tally while it runs.",
+                    "Only this network's validators vote here. You can follow every proposal and its tally.",
                 )),
                 Tone::Neutral,
             ));
+        }
+        if !self.answered {
+            content.push(kit::secondary("governance/loading", "Reading proposals…"));
+            return kit::reading_page("governance", content);
         }
         let open = host::open_proposals(&self.rows);
         if open > 0 {
@@ -308,7 +312,9 @@ impl GovernanceView {
                 "governance/pending",
                 host::pending_label(&self.rows),
             ));
-        } else if self.answered {
+        } else if self.host_error.is_empty() {
+            // a register that could not be read claims nothing about what
+            // the network is deciding: the notice above is the whole story.
             content.push(kit::empty_state(
                 "governance/empty-state",
                 "No proposals waiting.",
@@ -328,6 +334,7 @@ impl GovernanceView {
                     || proposal.status.eq_ignore_ascii_case("executed");
                 let mut cells = vec![
                     kit::nowrap(kit::mono(format!("{key}/id"), &proposal.id)),
+                    kit::nowrap(kit::secondary(format!("{key}/kind"), &proposal.action)),
                     kit::spacer(),
                     kit::badge(
                         format!("{key}/status"),
@@ -357,7 +364,7 @@ impl GovernanceView {
     fn proposal(&self, proposal: &host::ProposalRow) -> ducktape_view_guest::wire::Node {
         use ducktape_view_guest::{
             kit::{self, Tone},
-            slots, wire,
+            wire,
         };
         let key = format!("governance/proposal/{}", proposal.id);
         let available = self.voting.is_empty();
@@ -381,26 +388,30 @@ impl GovernanceView {
             Some(wire::Length::Fill),
             Some(wire::Length::Fixed(28.)),
         );
-        // one line about the change: what it does, who opened it, when it
-        // runs out.
-        let mut about = Vec::new();
-        if !proposal.detail.is_empty() {
-            about.push(kit::nowrap(kit::text(
-                format!("{key}/detail"),
-                &proposal.detail,
-            )));
-        }
-        about.extend([
-            kit::spacer(),
+        // what the change does, one labelled field per line.
+        let fields = proposal.fields.iter().enumerate().map(|(index, field)| {
+            let value_key = format!("{key}/field/{index}/value");
+            let value = match field.code {
+                true => kit::mono(value_key, &field.value),
+                false => kit::text(value_key, &field.value),
+            };
+            kit::kv(
+                format!("{key}/field/{index}"),
+                &field.name,
+                kit::wrapping(value),
+            )
+        });
+        // who opened it, when it runs out.
+        let about = [
             kit::nowrap(kit::caption(
                 format!("{key}/proposer"),
-                format!("proposed by @{}", proposal.proposer),
+                format!("proposed by {}", proposal.proposer),
             )),
             kit::nowrap(kit::caption(
                 format!("{key}/deadline"),
                 format!("expires {}", host::height_label_short(proposal.deadline)),
             )),
-        ]);
+        ];
         let mut actions = vec![kit::nowrap(kit::secondary(
             format!("{key}/quorum"),
             host::tally_note(proposal.approvals, proposal.required_yes),
@@ -410,6 +421,45 @@ impl GovernanceView {
                 format!("{key}/rejections"),
                 format!("{} against", proposal.rejections),
                 Tone::Danger,
+            )));
+        }
+        // the ballot is a validator's: a reader sees the tally and nothing
+        // to press.
+        if self.admin {
+            actions.extend(self.ballot(proposal, &key, available, met));
+        }
+        kit::card(
+            &key,
+            kit::spaced(
+                kit::column(
+                    format!("{key}/body"),
+                    [
+                        head,
+                        kit::spaced(kit::column(format!("{key}/fields"), fields), 4.),
+                        kit::spaced(kit::centered_row(format!("{key}/about"), about), 12.),
+                        kit::centered_row(format!("{key}/actions"), actions),
+                    ],
+                ),
+                8.,
+            ),
+        )
+    }
+    /// The validator's controls on one open proposal: a note while an op
+    /// is out, then Reject and Approve, or Settle once the rule is met.
+    fn ballot(
+        &self,
+        proposal: &host::ProposalRow,
+        key: &str,
+        available: bool,
+        met: bool,
+    ) -> Vec<ducktape_view_guest::wire::Node> {
+        use ducktape_view_guest::{kit, slots, wire};
+        let mut controls = Vec::new();
+        let busy = self.voting == proposal.id;
+        if busy {
+            controls.push(kit::nowrap(kit::secondary(
+                format!("{key}/busy"),
+                "Sending…",
             )));
         }
         let reject = kit::button(
@@ -436,21 +486,8 @@ impl GovernanceView {
         if let wire::Node::Button { label, .. } = &mut approval {
             *label = Some(if met { "Settle" } else { "Approve" }.into());
         }
-        actions.extend([kit::spacer(), reject, approval]);
-        kit::card(
-            &key,
-            kit::spaced(
-                kit::column(
-                    format!("{key}/body"),
-                    [
-                        head,
-                        kit::centered_row(format!("{key}/about"), about),
-                        kit::centered_row(format!("{key}/actions"), actions),
-                    ],
-                ),
-                8.,
-            ),
-        )
+        controls.extend([kit::spacer(), reject, approval]);
+        controls
     }
 }
 ducktape_view_guest::export_app!(

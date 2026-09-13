@@ -3,10 +3,10 @@
 //! settle heights through `rpc.blocks`), re-reads it on every `rpc.live`
 //! hit, and a press leaves as `op.submit` carrying the governance message.
 
-use governance_view::host::Session;
-use governance_view::{boot_native, tick_native};
 use ducktape_view_guest::testing::{answer, has_text, item, press, refuse, texts};
 use ducktape_view_guest::wire::{Frame, Node, Request};
+use governance_view::host::Session;
+use governance_view::{boot_native, tick_native};
 
 fn boot() -> Frame {
     boot_native();
@@ -123,13 +123,19 @@ fn a_connected_view_reads_its_own_register() {
         "1 open · 1 settled",
         "1 pending",
         "prop-open",
-        "key 8c4fa211",
+        "Add validator",
+        "Node key",
+        "8c4fa211",
+        "proposed by 010203",
+        "expires block 4,200",
         "1 / 2",
         "1 approval · 1 more for quorum",
         "Approve (final vote)",
         "Recently finalized",
         "prop-done",
-        "h 84,912",
+        "Signal",
+        "Passed",
+        "block 84,912",
     ] {
         assert!(
             has_text(&frame, expected),
@@ -151,7 +157,12 @@ fn a_connected_view_reads_its_own_register() {
 fn a_live_hit_reads_the_register_again() {
     let (_, live) = connected_with_register();
     let frame = tick_native(vec![item(live, b"{}")]);
-    assert_eq!(kinds(&frame.requests), ["rpc.query"], "{:?}", frame.requests);
+    assert_eq!(
+        kinds(&frame.requests),
+        ["rpc.query"],
+        "{:?}",
+        frame.requests
+    );
 }
 
 /// Approve leaves as `op.submit` with the governance vote; the card is busy
@@ -177,6 +188,7 @@ fn a_vote_leaves_as_a_signed_op_and_the_card_waits_for_the_answer() {
         "a busy card's buttons are disabled: {:?}",
         texts(&frame)
     );
+    assert!(has_text(&frame, "Sending…"), "{:?}", texts(&frame));
 
     let frame = tick_native(vec![refuse(submit.id, "the local user key is locked")]);
     assert!(
@@ -184,11 +196,94 @@ fn a_vote_leaves_as_a_signed_op_and_the_card_waits_for_the_answer() {
         "the answer frees the card: {:?}",
         texts(&frame)
     );
+    assert!(!has_text(&frame, "Sending…"), "{:?}", texts(&frame));
     assert!(
-        has_text(&frame, "the local user key is locked"),
+        has_text(
+            &frame,
+            "The network refused it: the local user key is locked"
+        ),
+        "a refusal reads as a sentence: {:?}",
+        texts(&frame)
+    );
+}
+
+/// Between the session coming up and the first register answer the screen
+/// says it is reading, not that nothing waits.
+#[test]
+fn a_register_still_being_read_is_not_an_empty_one() {
+    let frame = boot();
+    let session_id = request(&frame, "governance.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true))]);
+    assert!(
+        has_text(&frame, "Reading proposals…"),
         "{:?}",
         texts(&frame)
     );
+    assert!(
+        !has_text(&frame, "No proposals waiting."),
+        "{:?}",
+        texts(&frame)
+    );
+
+    // a refused read says why, and still claims nothing about the register
+    let query = request(&frame, "rpc.query").id;
+    let frame = tick_native(vec![refuse(query, "not connected to a node")]);
+    assert!(
+        has_text(
+            &frame,
+            "Could not read the proposals: not connected to a node"
+        ),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(
+        !has_text(&frame, "Reading proposals…"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(
+        !has_text(&frame, "No proposals waiting."),
+        "{:?}",
+        texts(&frame)
+    );
+}
+
+/// A node without validator standing reads every card but presses nothing:
+/// the ballot buttons are not there to refuse.
+#[test]
+fn a_reader_without_standing_sees_the_tally_and_no_ballot() {
+    let frame = boot();
+    let session_id = request(&frame, "governance.props").id;
+    let reader = serde_json::to_vec(&Session {
+        connected: true,
+        admin: false,
+        dark: false,
+    })
+    .expect("session encodes");
+    let frame = tick_native(vec![item(session_id, &reader)]);
+    let query = request(&frame, "rpc.query").id;
+    let frame = tick_native(vec![answer(query, &proposals())]);
+    let blocks_id = request(&frame, "rpc.blocks").id;
+    let frame = tick_native(vec![answer(blocks_id, &blocks())]);
+    for expected in [
+        "Only this network's validators vote here. You can follow every proposal and its tally.",
+        "1 / 2",
+        "1 approval · 1 more for quorum",
+    ] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
+    }
+    let mut root = frame.root.clone().expect("a tree");
+    root.for_each_mut(&mut |node| {
+        assert!(
+            !matches!(node, Node::Button { .. }),
+            "a reader has nothing to press: {:?}",
+            texts(&frame)
+        );
+    });
 }
 
 /// Once the rule is met the card offers Settle instead of Approve, and it

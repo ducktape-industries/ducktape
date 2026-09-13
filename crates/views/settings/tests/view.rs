@@ -217,7 +217,15 @@ fn a_connected_view_reads_its_own_standing_and_key_rows() {
     );
 
     let frame = tick_native(press(&frame, "Account"));
-    for expected in ["validator", "laptop", "8c4fa211", "phone", "ff00"] {
+    for expected in [
+        "Validator",
+        "laptop",
+        "Device key",
+        "8c4fa211",
+        "phone",
+        "Passkey",
+        "ff00",
+    ] {
         assert!(
             has_text(&frame, expected),
             "missing {expected:?} in {:?}",
@@ -524,13 +532,44 @@ fn the_last_key_is_never_offered_for_removal() {
     );
 }
 
+/// No raw token reaches the screen: the keystore's `encrypted` reads as a
+/// sentence, an unanswered roster reads as a wait rather than a blank badge,
+/// and the QR countdown says what it counts.
+#[test]
+fn raw_tokens_read_as_words_and_a_pending_read_says_so() {
+    let session = Session {
+        settings_key_state: "encrypted".into(),
+        account_ceremony_phase: "show_qr".into(),
+        account_ceremony_qr: "https://auth.example/c".into(),
+        account_ceremony_detail: "Scan this with your phone.".into(),
+        account_ceremony_left: "1:07".into(),
+        ..facts()
+    };
+    boot_native();
+    let frame = tick_native(Vec::new());
+    let props = request(&frame, "settings.props").id;
+    // the session is in, the standing and key reads are still out
+    let frame = tick_native(vec![item(props, &encoded(&session))]);
+    let frame = tick_native(press(&frame, "Account"));
+    assert!(has_text(&frame, "Reading…"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "validator"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "This code expires in 1:07"),
+        "{:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(press(&frame, "Security"));
+    assert!(has_text(&frame, "Encrypted on disk"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "encrypted"), "{:?}", texts(&frame));
+}
+
 /// The rail tabs the settings cards link to leave as the one `tab` intent —
 /// the view never opens another tab itself.
 #[test]
 fn a_link_to_another_tab_leaves_as_an_intent() {
     let (frame, _, _) = connected(&facts(), 2);
     let frame = tick_native(press(&frame, "Network"));
-    let frame = tick_native(press(&frame, "manage"));
+    let frame = tick_native(press(&frame, "Open members"));
     let intent = one_intent(&frame);
     assert_eq!(intent.kind, "settings.tab");
     assert_eq!(

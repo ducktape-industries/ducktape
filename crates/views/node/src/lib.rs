@@ -39,7 +39,10 @@ pub struct NodeView {
     /// the level the console keeps, "" for every level
     pub(crate) node_log_level: String,
     pub(crate) live_log_filter: String,
+    /// what the last retune came to: in flight, the node's answer, or its
+    /// refusal — and whether it was a refusal
     pub(crate) live_filter_note: String,
+    pub(crate) live_filter_failed: bool,
     pub(crate) host_error: String,
     pub(crate) dark: bool,
 }
@@ -61,7 +64,7 @@ pub enum Message {
 }
 impl NodeView {
     const SNAPSHOT_SCHEMA: &'static str =
-        "183d3743dd53e25b46199a2ddee2c14be32b1f904ffb5305b26795b4af98f695";
+        "5c1e0b7a9d2f4e6c8a1b3d5f7e9c0a2b4d6f8e1c3a5b7d9f0e2c4a6b8d1f3e5a";
     fn state() -> Self {
         Self {
             node_data_dir: "".to_owned(),
@@ -80,6 +83,7 @@ impl NodeView {
             node_log_level: "".to_owned(),
             live_log_filter: "".to_owned(),
             live_filter_note: "".to_owned(),
+            live_filter_failed: false,
             host_error: "".to_owned(),
             dark: false,
         }
@@ -242,12 +246,14 @@ impl NodeView {
         self.log_lines = host::push_logs(&self.log_lines, &item.lines);
         Task::none()
     }
+    /// The node's answer to a retune lands beside the control that asked,
+    /// never in the page's error strip: the node echoes the filter it now
+    /// runs, and a refusal is one sentence with a verb.
     fn on_act_done(&mut self, item: crate::host::ActItem) -> Task<Message> {
-        self.host_error = item.error;
-        self.live_filter_note = if self.host_error.is_empty() {
-            item.reply
-        } else {
-            self.host_error.clone()
+        self.live_filter_failed = !item.error.is_empty();
+        self.live_filter_note = match self.live_filter_failed {
+            true => format!("The node refused the filter: {}", item.error),
+            false => format!("The node now logs at {}", item.reply),
         };
         Task::none()
     }
@@ -275,7 +281,8 @@ impl NodeView {
         if (!self.admin) || (self.live_log_filter).is_empty() {
             return Task::none();
         }
-        self.live_filter_note = "".to_owned();
+        self.live_filter_note = "Retuning the node…".to_owned();
+        self.live_filter_failed = false;
         host::set_log_filter(&self.live_log_filter);
         Task::none()
     }

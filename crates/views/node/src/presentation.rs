@@ -40,28 +40,28 @@ impl NodeView {
     pub(crate) fn view(&self) -> Node {
         kit::set_dark(self.dark);
         let live = self.connected;
-        let mut body = vec![
-            kit::centered_row(
-                "node/head",
-                [
-                    kit::sized(
-                        kit::title("node/title", "This node"),
-                        Some(Length::Fill),
-                        None,
-                    ),
-                    kit::badge(
-                        "node/connection",
-                        &self.status,
-                        if live { Tone::Success } else { Tone::Neutral },
-                    ),
-                ],
-            ),
-            self.tab_row(),
-        ];
+        let mut head = vec![kit::sized(
+            kit::title("node/title", "This node"),
+            Some(Length::Fill),
+            None,
+        )];
+        // the app's connection reading is a badge only once there is one:
+        // an empty pill says nothing
+        if !self.status.is_empty() {
+            head.push(kit::badge(
+                "node/connection",
+                &self.status,
+                if live { Tone::Success } else { Tone::Neutral },
+            ));
+        }
+        let mut body = vec![kit::centered_row("node/head", head), self.tab_row()];
         if !self.host_error.is_empty() {
             body.push(kit::notice(
                 "node/error",
-                kit::wrapping(kit::text("node/error-text", &self.host_error)),
+                kit::wrapping(kit::text(
+                    "node/error-text",
+                    format!("Could not read this node: {}", self.host_error),
+                )),
                 Tone::Danger,
             ));
         }
@@ -217,21 +217,47 @@ impl NodeView {
             if !peers.is_empty() {
                 peers.push(kit::divider(format!("{key}/rule")));
             }
+            // the row shows the head of the key; the copy takes all of it
+            let mut copy = kit::button(
+                format!("{key}/copy"),
+                "Copy",
+                Some(slots::message(Message::CopyToClipboard(
+                    peer.key.clone(),
+                    "Peer key copied".into(),
+                ))),
+                ButtonPreset::Subtle,
+            );
+            let Node::Button { label, .. } = &mut copy else {
+                unreachable!("a copy control is a button")
+            };
+            *label = Some(format!("Copy peer key {}", host::short_label(&peer.key)));
             peers.push(Self::list_row(
                 &key,
                 [
                     kit::sized(
-                        kit::nowrap(kit::mono(format!("{key}/key"), &peer.key)),
+                        kit::nowrap(kit::mono(
+                            format!("{key}/key"),
+                            host::short_label(&peer.key),
+                        )),
                         Some(Length::Fill),
                         None,
                     ),
-                    kit::badge(format!("{key}/role"), &peer.role, Tone::Neutral),
+                    kit::badge(
+                        format!("{key}/role"),
+                        host::capitalized(&peer.role),
+                        Tone::Neutral,
+                    ),
                     kit::badge(format!("{key}/status"), status, tone),
+                    copy,
                 ],
             ));
         }
         if self.node_peers.is_empty() {
-            peers.push(kit::secondary("node/peers/empty", "No direct peers."));
+            peers.push(kit::empty_state(
+                "node/peers/empty",
+                "No direct peers",
+                "This node is not connected to any other node right now.",
+            ));
         }
         let mut sections = vec![Self::section(
             "node/chain-section",
@@ -244,7 +270,10 @@ impl NodeView {
                 "node/sync-error",
                 kit::wrapping(kit::text(
                     "node/sync-error/text",
-                    &facts.node_sync_last_error,
+                    format!(
+                        "The last sync attempt failed: {}",
+                        facts.node_sync_last_error
+                    ),
                 )),
                 Tone::Warning,
             ));
@@ -279,6 +308,10 @@ impl NodeView {
         } else {
             "Not available to this seat"
         };
+        let tier = match self.tier.is_empty() {
+            true => "Not reported".to_owned(),
+            false => host::capitalized(&self.tier),
+        };
         let capability = |key: &str, name: &str, tiers: [bool; 3]| {
             Self::list_row(
                 key,
@@ -302,7 +335,7 @@ impl NodeView {
                     Self::reading(
                         "node/tier",
                         "Standing",
-                        kit::badge("node/tier/value", &self.tier, Tone::Accent),
+                        kit::badge("node/tier/value", tier, Tone::Accent),
                     ),
                     Self::reading(
                         "node/admin",
@@ -409,20 +442,25 @@ impl NodeView {
                     [
                         kit::nowrap(kit::strong(format!("{key}/name"), &module.id)),
                         kit::spacer(),
-                        kit::badge(format!("{key}/category"), &module.category, Tone::Neutral),
+                        kit::badge(
+                            format!("{key}/category"),
+                            host::capitalized(&module.category),
+                            Tone::Neutral,
+                        ),
                         kit::badge(format!("{key}/state"), state, tone),
                     ],
                 ),
                 Some(Length::Fill),
                 Some(Length::Fixed(MODULE_ROW)),
             ));
-            // the hashes are what an operator compares across nodes: copyable
-            content.push(Self::copyable(
+            // the hashes are what an operator compares across nodes: the row
+            // shows the head of each, the copy takes all of it
+            content.push(Self::digest(
                 &format!("{key}/root"),
                 "State root",
                 &module.root,
             ));
-            content.push(Self::copyable(
+            content.push(Self::digest(
                 &format!("{key}/code"),
                 "Active code",
                 &module.code_hash,
@@ -438,15 +476,18 @@ impl NodeView {
                     [
                         kit::nowrap(kit::mono(
                             format!("{key}/pending/value"),
-                            &module.pending_hash,
+                            host::short_digest(&module.pending_hash),
                         )),
                         kit::caption(
                             format!("{key}/activation"),
-                            host::height_label_short(module.activation_height),
+                            format!(
+                                "activates at {}",
+                                host::height_label_short(module.activation_height)
+                            ),
                         ),
                         kit::caption(
                             format!("{key}/readiness"),
-                            format!("{} signalled", module.readiness),
+                            format!("{} signalled ready", module.readiness),
                         ),
                         kit::button(
                             format!("{key}/pending/copy"),
@@ -464,7 +505,7 @@ impl NodeView {
         if content.is_empty() {
             content.push(kit::empty_state(
                 "node/modules/empty",
-                "No installed modules reported.",
+                "No modules reported",
                 "The node lists its modules once it has read its genesis.",
             ));
         }
@@ -477,7 +518,7 @@ impl NodeView {
     fn activity(&self) -> Node {
         let filter = kit::input(
             "node/log-filter",
-            "filter logs…",
+            "Filter lines",
             &self.node_log_filter,
             slots::handler(Box::new(|value: String| {
                 Some(Message::NodeLogFilterChanged(value))
@@ -494,27 +535,43 @@ impl NodeView {
             Some(slots::message(Message::ApplyLiveLogFilter)),
         );
         let can_retune = self.admin && !self.live_log_filter.trim().is_empty();
-        let mut content = vec![kit::centered_row(
-            "node/filters",
-            [
-                self.level_chips(),
-                filter,
-                kit::sized(live, Some(Length::Fixed(240.)), None),
-                kit::sized(
-                    kit::button(
-                        "node/retune/apply",
-                        "Retune",
-                        can_retune.then(|| slots::message(Message::ApplyLiveLogFilter)),
-                        ButtonPreset::Secondary,
-                    ),
-                    None,
-                    Some(Length::Fixed(LIST_ROW)),
+        // what the retune row says beside its control: why it is closed to
+        // this seat, or how the last retune went
+        let noted = !self.live_filter_note.is_empty();
+        let retune_note = match (self.admin, noted, self.live_filter_failed) {
+            (false, ..) => Some(kit::caption(
+                "node/retune/closed",
+                "Only this node's operator can retune its tracing filter.",
+            )),
+            (true, false, _) => None,
+            (true, true, true) => Some(kit::tone_text(
+                "node/filter-note",
+                &self.live_filter_note,
+                Tone::Danger,
+            )),
+            (true, true, false) => Some(kit::caption("node/filter-note", &self.live_filter_note)),
+        };
+        // the console's own filters on one line, the node's tracing filter
+        // on the next: two controls with different reach do not share a row
+        let mut retune = vec![
+            kit::nowrap(kit::secondary("node/retune/label", "Tracing filter")),
+            kit::sized(live, Some(Length::Fixed(240.)), None),
+            kit::sized(
+                kit::button(
+                    "node/retune/apply",
+                    "Retune",
+                    can_retune.then(|| slots::message(Message::ApplyLiveLogFilter)),
+                    ButtonPreset::Secondary,
                 ),
-            ],
-        )];
-        if !self.live_filter_note.is_empty() {
-            content.push(kit::caption("node/filter-note", &self.live_filter_note));
-        }
+                None,
+                Some(Length::Fixed(LIST_ROW)),
+            ),
+        ];
+        retune.extend(retune_note.map(kit::wrapping));
+        let mut content = vec![
+            kit::centered_row("node/filters", [self.level_chips(), filter]),
+            kit::centered_row("node/retune", retune),
+        ];
         let visible =
             host::visible_log(&self.log_lines, &self.node_log_filter, &self.node_log_level);
         let note = host::log_note(self.log_lines.len() as i64, visible.len() as i64);
@@ -567,9 +624,17 @@ impl NodeView {
             ),
         );
         if let Node::Scroll {
-            background, border, ..
+            background,
+            border,
+            anchor_y,
+            auto_scroll,
+            ..
         } = &mut log
         {
+            // a console opens at its tail and follows it while the reader is
+            // there; scrolling up holds the place
+            *anchor_y = wire::ScrollAnchor::End;
+            *auto_scroll = true;
             *background = Some(kit::rgba(p.surface));
             *border = Some(wire::Border {
                 color: Some(kit::rgba(p.border)),
@@ -676,9 +741,30 @@ impl NodeView {
         Self::cell(key, text)
     }
 
+    /// A digest reading: the head of it on the row, all of it on the copy.
+    fn digest(key: &str, label: &str, value: &str) -> Node {
+        Self::copyable_showing(key, label, value, &host::short_digest(value))
+    }
+
     /// A reading the reader can take with them: the value, and a ghost copy
     /// control at the right of its row.
     fn copyable(key: &str, label: &str, value: &str) -> Node {
+        Self::copyable_showing(key, label, value, value)
+    }
+
+    /// A value the node has not reported is a reading, not a blank with a
+    /// copy control that copies nothing.
+    fn copyable_showing(key: &str, label: &str, value: &str, shown: &str) -> Node {
+        if value.is_empty() {
+            return Self::reading(
+                key,
+                label,
+                kit::colored(
+                    kit::text(format!("{key}/value"), "Not reported"),
+                    kit::palette().faint,
+                ),
+            );
+        }
         let mut copy = kit::button(
             format!("{key}/copy"),
             "Copy",
@@ -706,7 +792,7 @@ impl NodeView {
                     format!("{key}/reading"),
                     [
                         kit::sized(
-                            kit::wrapping(kit::mono(format!("{key}/value"), value)),
+                            kit::wrapping(kit::mono(format!("{key}/value"), shown)),
                             Some(Length::Fill),
                             None,
                         ),

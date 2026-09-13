@@ -49,7 +49,7 @@ pub enum Message {
 }
 impl ExplorerView {
     const SNAPSHOT_SCHEMA: &'static str =
-        "d3ae16434f63f6c404876080e3ecf8998eb426abfa14b3744f16bcc6160a845d";
+        "7c1f0b6e2a9d4f83b5e6c7d8a9f0e1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8";
     fn state() -> Self {
         Self {
             connected: false,

@@ -170,18 +170,21 @@ impl ExplorerView {
             rows.push(button);
         }
         if rows.is_empty() {
-            let message = if self.loading {
-                "Loading blocks…"
-            } else {
-                "No blocks carrying operations yet."
-            };
-            rows.push(kit::padded(
-                kit::column(
-                    "explorer/empty-ledger-box",
-                    [kit::secondary("explorer/empty-ledger", message)],
+            let plate = match self.loading {
+                true => kit::padded(
+                    kit::column(
+                        "explorer/empty-ledger-box",
+                        [kit::secondary("explorer/empty-ledger", "Loading blocks…")],
+                    ),
+                    wire::Edges::all(12.),
                 ),
-                wire::Edges::all(12.),
-            ));
+                false => kit::empty_state(
+                    "explorer/empty-ledger",
+                    "No blocks yet",
+                    "Blocks that carry operations appear here as the network writes them.",
+                ),
+            };
+            rows.push(plate);
         }
         let list = kit::pane(
             "explorer/ledger-pane",
@@ -271,21 +274,25 @@ impl ExplorerView {
         }
         for (index, op) in ops.iter().enumerate() {
             let key = format!("explorer/operation/{index}");
-            let applied = op.disposition.starts_with("applied") || op.disposition == "ok";
-            let disposition = if applied {
-                Tone::Success
-            } else {
-                Tone::Neutral
+            let disposition = match op.applied {
+                true => Tone::Success,
+                false => Tone::Neutral,
             };
             let mut lines = vec![
                 Self::operation_line(&key, index, op, disposition),
-                Self::digest(&format!("{key}/proposer"), "Proposer", &op.proposer),
+                Self::proposer(&key, &op.proposer),
                 Self::digest(&format!("{key}/hash"), "Op hash", &op.op_hash),
+                kit::kv(
+                    format!("{key}/payload"),
+                    "Payload",
+                    Self::payload(&key, &op.payload),
+                ),
             ];
             if !op.trace.is_empty() {
-                lines.push(kit::card(
-                    format!("{key}/trace-box"),
-                    kit::wrapping(kit::mono(format!("{key}/trace"), &op.trace)),
+                lines.push(kit::kv(
+                    format!("{key}/trace"),
+                    "Dispatch",
+                    Self::trace(&key, &op.trace),
                 ));
             }
             content.push(kit::spaced(kit::column(format!("{key}/body"), lines), 4.));
@@ -309,8 +316,9 @@ impl ExplorerView {
         ))
     }
 
-    /// One operation of the block: its index, what it targeted, what it
-    /// carried, and how it landed.
+    /// One operation of the block: its index, the module it targeted, the
+    /// message's verb, and how it landed. The payload itself is the table
+    /// under it — never a JSON string on this line.
     fn operation_line(key: &str, index: usize, op: &host::ExplorerOp, disposition: Tone) -> Node {
         kit::sized(
             kit::centered_row(
@@ -326,7 +334,7 @@ impl ExplorerView {
                     ),
                     kit::badge(format!("{key}/target"), &op.target, Tone::Neutral),
                     kit::sized(
-                        kit::nowrap(kit::text(format!("{key}/payload"), &op.payload)),
+                        kit::nowrap(kit::strong(format!("{key}/verb"), op.verb())),
                         Some(Length::Fill),
                         None,
                     ),
@@ -338,9 +346,80 @@ impl ExplorerView {
         )
     }
 
+    /// The proposer row: the key or label as words, the copy carrying the
+    /// handle as it came.
+    fn proposer(key: &str, proposer: &str) -> Node {
+        Self::copy_row(
+            &format!("{key}/proposer"),
+            "Proposer",
+            host::proposer_label(proposer),
+            proposer,
+        )
+    }
+
+    /// What the op carried: a table of its fields, or the text as it came
+    /// in a code box when it is not a message this can read.
+    fn payload(key: &str, payload: &host::Payload) -> Node {
+        let fields = match payload {
+            host::Payload::Text(text) if text.is_empty() => {
+                return kit::secondary(format!("{key}/payload/none"), "Nothing");
+            }
+            host::Payload::Text(text) => {
+                return kit::card(
+                    format!("{key}/payload/box"),
+                    kit::wrapping(kit::mono(format!("{key}/payload/text"), text)),
+                );
+            }
+            host::Payload::Fields(fields) => fields,
+        };
+        // the op line already names the verb: a field reads from inside it
+        let verb = fields
+            .first()
+            .and_then(|field| field.name.split('.').next())
+            .unwrap_or_default();
+        let verb_prefix = format!("{verb}.");
+        let rows = fields.iter().enumerate().map(|(index, field)| {
+            let row_key = format!("{key}/payload/{index}");
+            let is_digest = field.value.starts_with("0x");
+            let value = match is_digest {
+                true => kit::mono(format!("{row_key}/value"), &field.value),
+                false => kit::text(format!("{row_key}/value"), &field.value),
+            };
+            let name = field.name.strip_prefix(&verb_prefix).unwrap_or(&field.name);
+            kit::kv(row_key, name, kit::wrapping(value))
+        });
+        kit::card(
+            format!("{key}/payload/box"),
+            kit::spaced(kit::column(format!("{key}/payload/fields"), rows), 4.),
+        )
+    }
+
+    /// The dispatch trace: one row per module the op reached, naming what it
+    /// emitted there.
+    fn trace(key: &str, hops: &[host::TraceHop]) -> Node {
+        let rows = hops.iter().enumerate().map(|(index, hop)| {
+            let row_key = format!("{key}/trace/{index}");
+            kit::kv(
+                row_key.clone(),
+                &hop.module,
+                kit::wrapping(kit::text(format!("{row_key}/emitted"), hop.emitted())),
+            )
+        });
+        kit::card(
+            format!("{key}/trace/box"),
+            kit::spaced(kit::column(format!("{key}/trace/hops"), rows), 4.),
+        )
+    }
+
     /// A digest row: the value in the data face, with the copy that hands the
     /// bare key to the clipboard.
     fn digest(key: &str, label: &str, value: &str) -> Node {
+        Self::copy_row(key, label, host::hex(value), value)
+    }
+
+    /// A labelled value in the data face, with the copy that hands `value`
+    /// — not what is shown — to the clipboard.
+    fn copy_row(key: &str, label: &str, shown: String, value: &str) -> Node {
         kit::kv(
             key,
             label,
@@ -348,7 +427,7 @@ impl ExplorerView {
                 format!("{key}/row"),
                 [
                     kit::sized(
-                        kit::wrapping(kit::mono(format!("{key}/value"), host::hex(value))),
+                        kit::wrapping(kit::mono(format!("{key}/value"), shown)),
                         Some(Length::Fill),
                         None,
                     ),
@@ -434,7 +513,7 @@ impl ExplorerView {
                     kit::centered_row(
                         format!("{key}/line"),
                         [
-                            kit::badge(format!("{key}/kind"), &hit.kind, Tone::Neutral),
+                            kit::badge(format!("{key}/kind"), &hit.label, Tone::Neutral),
                             kit::sized(
                                 kit::nowrap(kit::strong(format!("{key}/title"), &hit.title)),
                                 Some(Length::Fill),
@@ -446,9 +525,10 @@ impl ExplorerView {
                                 None,
                             ),
                             kit::nowrap(kit::colored(
-                                kit::mono(format!("{key}/meta"), &hit.meta),
+                                kit::mono(format!("{key}/place"), &hit.place),
                                 kit::palette().muted,
                             )),
+                            kit::nowrap(kit::caption(format!("{key}/detail"), &hit.detail)),
                         ],
                     ),
                     GUTTER,

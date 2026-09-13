@@ -2,9 +2,17 @@
 //! from (the desktop app's `backend/shell.rs` and `backend/roster.rs`).
 
 use governance_view::host::{
-    ProposalRow, approve_label, fold_proposals, fold_settle_heights, gov_action_detail,
-    proposals_summary, tagged_name, tally_label, tally_note, yes_needed,
+    Field, ProposalRow, action_label, approve_label, fold_proposals, fold_settle_heights,
+    gov_action_fields, proposals_summary, status_label, tagged_name, tally_label, tally_note,
+    yes_needed,
 };
+
+fn named(fields: &[Field]) -> Vec<(&str, &str, bool)> {
+    fields
+        .iter()
+        .map(|field| (field.name.as_str(), field.value.as_str(), field.code))
+        .collect()
+}
 
 fn proposal(open: bool) -> ProposalRow {
     ProposalRow {
@@ -46,7 +54,10 @@ fn a_proposal_renders_its_payload_and_its_frozen_bar() {
         "action": { "add_validator": { "key": [0x8c, 0x4f, 0xa2, 0x11] } },
         "voting_rule": { "threshold": { "required_yes": 4 } }
     });
-    assert_eq!(gov_action_detail(&view["action"]), "key 8c4fa211");
+    assert_eq!(
+        named(&gov_action_fields(&view["action"])),
+        [("Node key", "8c4fa211", true)]
+    );
     // a threshold's bar does not move with the no votes.
     assert_eq!(yes_needed(&view["voting_rule"], 0), 4);
     assert_eq!(yes_needed(&view["voting_rule"], 2), 4);
@@ -64,10 +75,107 @@ fn a_proposal_renders_its_payload_and_its_frozen_bar() {
     assert_eq!(yes_needed(&majority, 3), 4, "…but yes must still exceed no");
 
     assert_eq!(tagged_name(&view["action"]), "add_validator");
+    assert_eq!(action_label("add_validator"), "Add validator");
+    assert_eq!(status_label("passed"), "Passed");
     assert_eq!(
-        gov_action_detail(&serde_json::json!({ "signal": { "text": "ship it" } })),
-        "ship it"
+        named(&gov_action_fields(
+            &serde_json::json!({ "signal": { "text": "ship it" } })
+        )),
+        [("Message", "ship it", false)]
     );
+}
+
+/// Every `GovAction` variant reads as labelled fields — never its variant
+/// tag, never its JSON — and one this view has no words for still shows
+/// each scalar under a name.
+#[test]
+fn every_action_kind_reads_as_fields() {
+    let module = serde_json::json!({ "update_module": {
+        "name": "chat", "module_id": "chat-2", "activation_lead": 12,
+        "code_hash": [0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89]
+    }});
+    assert_eq!(action_label("update_module"), "Update module");
+    assert_eq!(
+        named(&gov_action_fields(&module)),
+        [
+            ("Module", "chat", false),
+            ("Module id", "chat-2", true),
+            ("Activates", "12 blocks after it settles", false),
+            ("Code hash", "abcdef01…", true),
+        ]
+    );
+    let register = serde_json::json!({ "register_module": {
+        "name": "wiki", "module_id": "wiki", "activation_lead": 1, "code_hash": [1]
+    }});
+    assert_eq!(
+        named(&gov_action_fields(&register))[2],
+        ("Activates", "1 block after it settles", false)
+    );
+    let cancel =
+        serde_json::json!({ "cancel_module_update": { "name": "chat", "module_id": "chat-2" } });
+    assert_eq!(
+        named(&gov_action_fields(&cancel)),
+        [("Module", "chat", false), ("Module id", "chat-2", true)]
+    );
+    let adopt = serde_json::json!({ "adopt_shares": { "allocations": [
+        { "account_id": 1, "shares": 60 }, { "account_id": 2, "shares": 40 }
+    ]}});
+    assert_eq!(
+        named(&gov_action_fields(&adopt)),
+        [("Allocation", "100 shares across 2 accounts", false)]
+    );
+    let set = serde_json::json!({ "set_shares": { "account_id": 7, "shares": 0 } });
+    assert_eq!(
+        named(&gov_action_fields(&set)),
+        [("Account", "#7", false), ("Shares", "0", false)]
+    );
+    let mode = serde_json::json!({ "set_share_mode": { "enabled": true } });
+    assert_eq!(action_label("set_share_mode"), "Ballot mode");
+    assert_eq!(
+        named(&gov_action_fields(&mode)),
+        [("Ballots", "one per account share", false)]
+    );
+    let acl = serde_json::json!({ "set_acl_policy": { "target": "*", "standing": "validator" } });
+    assert_eq!(
+        named(&gov_action_fields(&acl)),
+        [
+            ("Target", "every module", false),
+            ("Who may submit", "validators only", false)
+        ]
+    );
+    let cleared = serde_json::json!({ "set_acl_policy": { "target": "chat", "standing": null } });
+    assert_eq!(
+        named(&gov_action_fields(&cleared)),
+        [
+            ("Target", "chat", false),
+            ("Who may submit", "anyone with a signature", false)
+        ]
+    );
+    let resident = serde_json::json!({ "remove_resident": { "key": [0xff, 0xee] } });
+    assert_eq!(action_label("remove_resident"), "Remove resident");
+    assert_eq!(
+        named(&gov_action_fields(&resident)),
+        [("Node key", "ffee", true)]
+    );
+    // a variant this view has no words for: each scalar under its name
+    let unknown = serde_json::json!({ "rename_network": { "new_name": "duckhouse", "at": 9 } });
+    assert_eq!(action_label("rename_network"), "Rename network");
+    assert_eq!(
+        named(&gov_action_fields(&unknown)),
+        [("At", "9", false), ("New name", "duckhouse", false)]
+    );
+}
+
+/// A share-mode proposer is an account number, not a key.
+#[test]
+fn a_share_mode_proposer_reads_as_its_account() {
+    let reply = serde_json::json!({ "proposals": [
+        { "proposal_id": "p", "action": { "signal": { "text": "x" } },
+          "proposer": [42, 0, 0, 0, 0, 0, 0, 0], "created_at": 1, "deadline": 1,
+          "status": "open", "votes": [], "voter_kind": "account", "electorate": [],
+          "voting_rule": { "threshold": { "required_yes": 1 } } }
+    ]});
+    assert_eq!(fold_proposals(&reply)[0].proposer, "account #42");
 }
 
 /// Open first, newest first within; a settled row takes its execute height

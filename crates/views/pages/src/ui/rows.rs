@@ -144,7 +144,10 @@ impl PagesView {
                         [
                             kit::caption(
                                 format!("{key}/reply/{}/meta", reply.id),
-                                format!("{} · {}", reply.author, reply.meta),
+                                match reply.meta.is_empty() {
+                                    true => reply.author.clone(),
+                                    false => format!("{} ({})", reply.author, reply.meta),
+                                },
                             ),
                             kit::wrapping(kit::text(
                                 format!("{key}/reply/{}/body", reply.id),

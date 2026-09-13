@@ -158,7 +158,7 @@ impl FilesView {
         let object = if entry.object.is_empty() {
             "—".into()
         } else {
-            entry.object
+            crate::host::short_digest(&entry.object)
         };
         let name = native::nowrap(native::text(
             format!("{key}/cells/name"),

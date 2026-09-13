@@ -404,20 +404,26 @@ impl ChatView {
                 Tone::Neutral,
             ));
         }
-        children.extend([
-            native::button(
-                format!("{key}/show"),
-                "Show huddle",
-                Some(slots::message(show())),
-                wire::ButtonPreset::Subtle,
-            ),
-            native::button(
-                format!("{key}/leave"),
-                "Leave huddle",
-                Some(slots::message(leave())),
-                wire::ButtonPreset::Subtle,
-            ),
-        ]);
+        // The live badge already says "huddle"; the controls stay one word
+        // each so the header fits beside a thread and a details pane.
+        let mut show = native::button(
+            format!("{key}/show"),
+            "Show",
+            Some(slots::message(show())),
+            wire::ButtonPreset::Subtle,
+        );
+        let mut leave = native::button(
+            format!("{key}/leave"),
+            "Leave",
+            Some(slots::message(leave())),
+            wire::ButtonPreset::Subtle,
+        );
+        for (button, label) in [(&mut show, "Show huddle"), (&mut leave, "Leave huddle")] {
+            if let wire::Node::Button { label: name, .. } = button {
+                *name = Some(label.into());
+            }
+        }
+        children.extend([show, leave]);
         native::sized(
             native::spaced(native::centered_row(&key, children), 6.),
             Some(wire::Length::Shrink),

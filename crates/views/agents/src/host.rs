@@ -672,7 +672,7 @@ async fn read_journal(dispatch_id: &str) -> Result<RunJournal, String> {
     let mut entries = Vec::with_capacity(JOURNAL_ENTRY_LIMIT + 1);
     if omitted > 0 {
         entries.push(JournalEntry {
-            kind: "history".into(),
+            kind: "History".into(),
             summary: format!(
                 "Showing the latest {JOURNAL_ENTRY_LIMIT} events; {omitted} earlier events are \
                  not shown."
@@ -841,7 +841,7 @@ impl Chips {
             "file" => link("file", chip_label(&text("path")), String::new()),
             "module" => link(
                 "module",
-                format!("module {}", text("module_id")),
+                format!("Module {}", text("module_id")),
                 String::new(),
             ),
             "conversation" => link("conversation", "Agent conversation".into(), String::new()),
@@ -1063,7 +1063,7 @@ impl Chips {
             _ => RunLink {
                 relation: "target".into(),
                 kind: "forge".into(),
-                label: format!("{repo} · {source} → {target}"),
+                label: format!("{repo}: {source} into {target}"),
                 url: duck_link(&format!("forge/{repo}"), &self.chain),
             },
         }
@@ -1120,14 +1120,19 @@ impl Chips {
         let operation = acted["operation"].as_str().unwrap_or_default();
         let result = &acted["result"];
         let (status, summary, target) = match &request {
-            Some(request) => (
-                action_status(&request["status"]),
-                action_description(
+            Some(request) => {
+                let (status, reason) = action_status(&request["status"]);
+                let description = action_description(
                     request["operation"].as_str().unwrap_or_default(),
                     &request["result"],
-                ),
-                prepared_action_target(request),
-            ),
+                );
+                // the badge carries the word; the reason is a sentence
+                let summary = match reason.is_empty() {
+                    true => description,
+                    false => format!("{description}. {reason}"),
+                };
+                (status, summary, prepared_action_target(request))
+            }
             None => (
                 "Status unavailable".to_owned(),
                 action_description(operation, result),
@@ -1178,60 +1183,77 @@ fn place_target(place: serde_json::Value) -> Target {
 /// One journal fact in the tracker's words, before its action detail.
 fn plain_entry(row: &serde_json::Value) -> JournalEntry {
     let fact = &row["fact"];
-    let (kind, summary) = journal_fact(fact);
+    let (kind, summary, status) = journal_fact(fact);
     JournalEntry {
         height: height_label_short(row["height"].as_i64().unwrap_or(0)),
         kind: kind.to_owned(),
         summary,
+        status,
         ..JournalEntry::default()
     }
 }
 
-fn journal_fact(fact: &serde_json::Value) -> (&'static str, String) {
+/// One fact as `(kind, summary, status)`: the kind is a sentence-case
+/// label, the status the badge beside it ("" for a fact that has none).
+fn journal_fact(fact: &serde_json::Value) -> (&'static str, String, String) {
     match tagged_name(fact).as_str() {
         "dispatched" => {
             let dispatched = &fact["dispatched"];
             (
-                "dispatched",
+                "Dispatched",
                 format!(
                     "for {} from {}",
                     dispatched["agent_id"].as_str().unwrap_or_default(),
                     run_origin(dispatched)
                 ),
+                String::new(),
             )
         }
         "session_opened" => (
-            "session opened",
+            "Session opened",
             format!(
                 "Attempt {}",
                 fact["session_opened"]["attempt"].as_i64().unwrap_or(0)
             ),
+            String::new(),
         ),
         "acted" => (
-            "action",
+            "Action",
             action_description(
                 fact["acted"]["operation"].as_str().unwrap_or_default(),
                 &fact["acted"]["result"],
             ),
+            String::new(),
         ),
         "settled" => {
             let settled = &fact["settled"];
-            let mut parts =
-                vec![outcome_word(settled["outcome"].as_str().unwrap_or_default()).to_owned()];
-            if settled["degraded"].as_bool().unwrap_or(false) {
-                parts.push("degraded".into());
-            }
+            let mut parts = Vec::new();
             if let Some(reason) = settled["reason"].as_str() {
                 parts.push(reason.to_owned());
+            }
+            if settled["degraded"].as_bool().unwrap_or(false) {
+                parts.push("The result was degraded".into());
             }
             if settled["pr"].is_object() {
                 parts.push(pr_label(&settled["pr"]));
             }
-            ("settled", parts.join(" · "))
+            (
+                "Settled",
+                parts.join(". "),
+                outcome_word(settled["outcome"].as_str().unwrap_or_default()).to_owned(),
+            )
         }
-        "result_action_refused" => ("result action refused", "Final action was refused".into()),
-        "pr_linked" => ("pr linked", pr_label(&fact["pr_linked"]["pr"])),
-        _ => ("action", String::new()),
+        "result_action_refused" => (
+            "Result action refused",
+            "Final action was refused".into(),
+            String::new(),
+        ),
+        "pr_linked" => (
+            "PR linked",
+            pr_label(&fact["pr_linked"]["pr"]),
+            String::new(),
+        ),
+        _ => ("Action", String::new(), String::new()),
     }
 }
 
@@ -1274,27 +1296,25 @@ fn action_description(operation: &str, result: &serde_json::Value) -> String {
     }
 }
 
-fn action_status(status: &serde_json::Value) -> String {
+/// An action's status as `(word, reason)`: the word fits a badge, the
+/// reason ("" when there is none) is told beside the action.
+fn action_status(status: &serde_json::Value) -> (String, String) {
+    let reason =
+        |value: &serde_json::Value| value["reason"].as_str().unwrap_or_default().to_owned();
     match tagged_name(status).as_str() {
-        "awaiting_program" => "Queued".into(),
-        "claimed" => "Running".into(),
-        "rejected" => format!(
-            "Rejected: {}",
-            status["rejected"]["reason"].as_str().unwrap_or_default()
-        ),
+        "awaiting_program" => ("Queued".into(), String::new()),
+        "claimed" => ("Running".into(), String::new()),
+        "rejected" => ("Rejected".into(), reason(&status["rejected"])),
         "completed" => {
             let outcome = &status["completed"]["outcome"];
             match tagged_name(outcome).as_str() {
-                "applied" => "Completed".into(),
-                "rejected" => format!(
-                    "Rejected: {}",
-                    outcome["rejected"]["reason"].as_str().unwrap_or_default()
-                ),
-                "refused" => "Refused".into(),
-                _ => "Outcome unavailable".into(),
+                "applied" => ("Completed".into(), String::new()),
+                "rejected" => ("Rejected".into(), reason(&outcome["rejected"])),
+                "refused" => ("Refused".into(), String::new()),
+                _ => ("Outcome unavailable".into(), String::new()),
             }
         }
-        _ => "Status unavailable".into(),
+        _ => ("Status unavailable".into(), String::new()),
     }
 }
 
@@ -1595,8 +1615,8 @@ fn provider_output(line: &str) -> Option<Output> {
             .find(|block| block["type"] == "tool_result")?;
         let failed = result["is_error"] == true;
         let title = match failed {
-            true => "Tool failed · waiting for agent",
-            false => "Tool finished · waiting for agent",
+            true => "Tool failed, waiting for the agent",
+            false => "Tool finished, waiting for the agent",
         };
         return Some(Output::Status(title.into()));
     }
@@ -1625,7 +1645,7 @@ fn provider_output(line: &str) -> Option<Output> {
             let server = item["server"].as_str().unwrap_or("tool");
             let tool = item["tool"].as_str().unwrap_or("call");
             (
-                format!("{server} · {tool}"),
+                format!("{tool} on {server}"),
                 json_text(item.get("arguments")),
             )
         }
@@ -1899,6 +1919,60 @@ pub fn runs_summary(runs: &[RunRow]) -> String {
     format!("{} {noun} · {in_flight} in flight", runs.len())
 }
 
+/// What a fault strip says: the verb, then the kernel's reason; "" when
+/// there is no fault.
+pub fn fault(verb: &str, error: &str) -> String {
+    if error.is_empty() {
+        return String::new();
+    }
+    format!("{verb}: {error}")
+}
+
+/// The journal's title: the agent that ran, never the run's key.
+pub fn run_title(run: &RunRow) -> String {
+    if run.agent_name.is_empty() {
+        return "Run".into();
+    }
+    run.agent_name.clone()
+}
+
+/// The run's receipt as `(name, value, is_code)` rows: only the facts this
+/// run has. Keys and hashes are code; heights, counts and names are not.
+pub fn run_facts(run: &RunRow) -> Vec<(String, String, bool)> {
+    let mut facts = vec![("Run".to_owned(), run.run_id.clone(), true)];
+    facts.push(("Dispatch".to_owned(), run.dispatch_id.clone(), true));
+    facts.push(("Agent".to_owned(), run.agent_id.clone(), true));
+    facts.push(("Dispatched".to_owned(), run.dispatched.clone(), false));
+    if !run.settled.is_empty() {
+        facts.push(("Settled".to_owned(), run.settled.clone(), false));
+    }
+    if run.attempt > 0 {
+        facts.push(("Attempt".to_owned(), run.attempt.to_string(), false));
+    }
+    if !run.holder.is_empty() {
+        facts.push(("Executing node".to_owned(), run.holder.clone(), true));
+    }
+    facts.push((
+        "Actions".to_owned(),
+        plural(run.actions, "action", "actions"),
+        false,
+    ));
+    if run.pr_number > 0 {
+        facts.push((
+            "Pull request".to_owned(),
+            format!("#{}", run.pr_number),
+            false,
+        ));
+    }
+    if run.degraded {
+        facts.push(("Result".to_owned(), "Degraded".to_owned(), false));
+    }
+    if !run.output_ref.is_empty() {
+        facts.push(("Output".to_owned(), run.output_ref.clone(), true));
+    }
+    facts
+}
+
 /// The run listed under `run_id`; an empty row when the list has none.
 pub fn run_named(runs: &[RunRow], run_id: &str) -> RunRow {
     runs.iter()
@@ -2149,7 +2223,7 @@ fn chip_label(text: &str) -> String {
 /// `h 84,912` — a block height, grouped; a negative one is `h —`.
 fn height_label_short(height: i64) -> String {
     if height < 0 {
-        return "h —".into();
+        return "block —".into();
     }
     let digits = height.to_string();
     let mut grouped = String::new();
@@ -2160,7 +2234,7 @@ fn height_label_short(height: i64) -> String {
         }
         grouped.push(digit);
     }
-    format!("h {grouped}")
+    format!("block {grouped}")
 }
 
 /// `duck://<path>?net=<chain>` — an address spelled for the chain it was

@@ -176,17 +176,27 @@ pub fn fold_agents(reply: &serde_json::Value) -> Vec<MemberRow> {
         .cloned()
         .unwrap_or_default()
         .iter()
-        .map(|record| MemberRow {
-            key: text(&record["agent_id"]),
-            label: text(&record["display_name"]),
-            role: "agent".into(),
-            is_this_node: false,
-            is_agent: true,
-            model: text(&record["capability"]),
-            // for an agent row this is REGISTRATION state (active vs
-            // paused), which is what the record renders for a machine —
-            // not "working now".
-            live: record["status"].as_str() == Some("active"),
+        .map(|record| {
+            let agent_id = text(&record["agent_id"]);
+            // a machine registered without a name is still called
+            // something: its id, never a blank row
+            let named = text(&record["display_name"]);
+            let label = match named.is_empty() {
+                true => agent_id.clone(),
+                false => named,
+            };
+            MemberRow {
+                key: agent_id,
+                label,
+                role: "agent".into(),
+                is_this_node: false,
+                is_agent: true,
+                model: text(&record["capability"]),
+                // for an agent row this is REGISTRATION state (active vs
+                // paused), which is what the record renders for a machine —
+                // not "working now".
+                live: record["status"].as_str() == Some("active"),
+            }
         })
         .collect()
 }
@@ -411,8 +421,8 @@ impl Stream for ActStream {
 
 // ---------- the readings ----------
 
-/// `2 humans · 1 agent` — the title's machine subtitle, folded off the same
-/// rows the filter strip splits.
+/// `2 humans, 1 agent` — the title's subtitle, folded off the same rows the
+/// filter strip splits.
 pub fn members_summary(connected: bool, rows: &[MemberRow]) -> String {
     if !connected || rows.is_empty() {
         return String::new();
@@ -420,7 +430,30 @@ pub fn members_summary(connected: bool, rows: &[MemberRow]) -> String {
     let agents = rows.iter().filter(|row| row.is_agent).count();
     let left = plural(rows.len() - agents, "human", "humans");
     let right = plural(agents, "agent", "agents");
-    format!("{left} · {right}")
+    format!("{left}, {right}")
+}
+
+/// What an empty list says under each filter: the roster may be full while
+/// the chosen tab is not, so the words name the tab, not the network.
+pub(crate) fn empty_words(filter: crate::MembersFilter) -> (&'static str, &'static str) {
+    match filter {
+        crate::MembersFilter::All => (
+            "No members yet",
+            "Validators, residents and registered agents appear as they join.",
+        ),
+        crate::MembersFilter::Humans => (
+            "No humans here",
+            "Validators and residents appear as they join the network.",
+        ),
+        crate::MembersFilter::Agents => (
+            "No agents registered",
+            "Agents appear here once a run registers them.",
+        ),
+        crate::MembersFilter::Validators => (
+            "No validators",
+            "A resident becomes a validator when a ballot to promote it passes.",
+        ),
+    }
 }
 
 /// The All / Humans / Agents / Validators strip.
@@ -434,6 +467,15 @@ pub(crate) fn filter_members(rows: &[MemberRow], filter: crate::MembersFilter) -
         })
         .cloned()
         .collect()
+}
+
+/// A role or presence word as a badge reads it: `validator` -> `Validator`.
+pub(crate) fn sentence_case(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// A human is `live`/`offline` on the mesh; an agent is `active`/`paused`

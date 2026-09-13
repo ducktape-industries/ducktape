@@ -270,8 +270,9 @@ fn sync_label(phase: &str, applied: i64, target: i64) -> String {
     )
 }
 
-/// The node spells its phases lowercase on the wire; a reader reads prose.
-fn capitalized(word: &str) -> String {
+/// The node spells its phases, roles and categories lowercase on the wire;
+/// a reader reads prose.
+pub fn capitalized(word: &str) -> String {
     let mut letters = word.chars();
     match letters.next() {
         Some(first) => first.to_uppercase().chain(letters).collect(),
@@ -287,6 +288,7 @@ fn capitalized(word: &str) -> String {
 /// call it theirs.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerRow {
+    /// the whole key: the row shows [`short_label`] of it and copies all of it
     pub key: String,
     pub role: String,
     pub live: bool,
@@ -330,7 +332,7 @@ fn peer_rows(reply: &serde_json::Value) -> Vec<PeerRow> {
         .unwrap_or_default()
         .iter()
         .map(|peer| PeerRow {
-            key: short_label(peer["peer"].as_str().unwrap_or_default()),
+            key: peer["peer"].as_str().unwrap_or_default().to_owned(),
             role: peer["role"].as_str().unwrap_or_default().to_owned(),
             live: peer["connected"].as_bool().unwrap_or(false),
         })
@@ -349,6 +351,8 @@ pub struct ModuleRow {
     /// `workspace` | `developer` | `automation` | `system` — the status
     /// projection's presentation category. Never consensus state.
     pub category: String,
+    /// the whole digests: a row shows [`short_digest`] of each and copies
+    /// all of it, because a digest is what an operator compares across nodes
     pub root: String,
     pub code_hash: String,
     pub pending_hash: String,
@@ -405,9 +409,9 @@ fn module_row(module: &serde_json::Value, code: &serde_json::Value) -> ModuleRow
     let pending = &registry["pending"];
     ModuleRow {
         category: module["category"].as_str().unwrap_or_default().to_owned(),
-        root: short_digest(module["root"].as_str().unwrap_or_default()),
-        code_hash: short_digest(&hex_encode(&json_bytes(&registry["active_code_hash"]))),
-        pending_hash: short_digest(&hex_encode(&json_bytes(&pending["code_hash"]))),
+        root: module["root"].as_str().unwrap_or_default().to_owned(),
+        code_hash: hex_encode(&json_bytes(&registry["active_code_hash"])),
+        pending_hash: hex_encode(&json_bytes(&pending["code_hash"])),
         activation_height: pending["activation_height"].as_i64().unwrap_or(0),
         readiness: pending["readiness"].as_array().map_or(0, Vec::len) as i64,
         // a swap is ready once its readiness latch closed: `ready_at` is the
@@ -510,7 +514,8 @@ fn log_item(frames: &[host::Answer]) -> LogItem {
 }
 
 /// Split `2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted` into its
-/// three columns. A line that carries no level is all message.
+/// three columns: the clock, the level and the message. A line that carries
+/// no level is all message.
 fn log_row(cursor: &str, line: String) -> LogRow {
     const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
     let cursor = cursor.to_owned();
@@ -526,10 +531,7 @@ fn log_row(cursor: &str, line: String) -> LogRow {
     let timestamped =
         first.contains(':') && first.chars().next().is_some_and(|c| c.is_ascii_digit());
     let (time, level_field) = match timestamped {
-        true => (
-            trim_time_to_millis(first),
-            fields.next().unwrap_or_default(),
-        ),
+        true => (clock_of(first), fields.next().unwrap_or_default()),
         false => (String::new(), first),
     };
     if !LEVELS.contains(&level_field) {
@@ -551,21 +553,21 @@ fn log_row(cursor: &str, line: String) -> LogRow {
     }
 }
 
-/// The ring's tracing timer prints microseconds (27 chars) but the console
-/// column is sized for milliseconds, and a text widget never clips itself —
-/// the extra digits paint over the level. Any other shape passes through.
-fn trim_time_to_millis(time: &str) -> String {
-    let Some((secs, frac)) = time.rsplit_once('.') else {
+/// `2026-07-27T09:12:44.918123Z` as the clock a console column reads:
+/// `09:12:44.918`. The ring's tracing timer prints the date and microseconds
+/// on every line; a ring is minutes deep, so the date says nothing a row
+/// needs and the extra digits only push the level out. Any other shape
+/// passes through whole.
+fn clock_of(time: &str) -> String {
+    let Some((_, clock)) = time.split_once('T') else {
         return time.to_owned();
     };
-    let Some(digits) = frac.strip_suffix('Z') else {
-        return time.to_owned();
+    let clock = clock.strip_suffix('Z').unwrap_or(clock);
+    let Some((secs, frac)) = clock.rsplit_once('.') else {
+        return clock.to_owned();
     };
-    let trimmable = digits.len() > 3 && digits.bytes().all(|byte| byte.is_ascii_digit());
-    if !trimmable {
-        return time.to_owned();
-    }
-    format!("{secs}.{}Z", &digits[..3])
+    let millis: String = frac.chars().take(3).collect();
+    format!("{secs}.{millis}")
 }
 
 /// A batch of lines onto the timeline, bounded and deduplicated by cursor:
@@ -681,11 +683,28 @@ impl Stream for ActStream {
                 },
                 Err(error) => ActItem {
                     reply: String::new(),
-                    error,
+                    error: refusal_message(&error),
                 },
             };
             Poll::Ready(Some(item))
         })
+    }
+}
+
+/// What a refused write says to a person. The kernel relays the node's
+/// refusal as `<route> rejected (<code>): {"error":"<message>"}`; the
+/// message is the sentence, the rest is the envelope. Any other refusal
+/// passes through whole.
+fn refusal_message(error: &str) -> String {
+    let Some(at) = error.find('{') else {
+        return error.to_owned();
+    };
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&error[at..]) else {
+        return error.to_owned();
+    };
+    match body["error"].as_str() {
+        Some(message) => message.to_owned(),
+        None => error.to_owned(),
     }
 }
 
@@ -717,12 +736,12 @@ pub fn reading_pair(left: &str, right: &str) -> String {
     format!("{left} / {right}")
 }
 
-/// `h 84,912`; a height the node has not reported reads `h —`.
+/// `block 84,912`; a height the node has not reported reads `block —`.
 pub fn height_label_short(height: i64) -> String {
     if height < 0 {
-        return "h —".into();
+        return "block —".into();
     }
-    format!("h {}", grouped_digits(height))
+    format!("block {}", grouped_digits(height))
 }
 
 /// `just now` / `5m ago`; a negative stamp is a reading the node never
@@ -762,7 +781,8 @@ fn grouped_digits(value: i64) -> String {
     grouped
 }
 
-fn short_digest(digest: &str) -> String {
+/// The first 12 characters of a digest, marked as cut.
+pub fn short_digest(digest: &str) -> String {
     let mut short: String = digest.chars().take(12).collect();
     if digest.chars().count() > 12 {
         short.push('…');
@@ -770,7 +790,8 @@ fn short_digest(digest: &str) -> String {
     short
 }
 
-fn short_label(id: &str) -> String {
+/// The first 8 characters of a peer key, marked as cut.
+pub fn short_label(id: &str) -> String {
     let mut label: String = id.chars().take(8).collect();
     if id.chars().count() > 8 {
         label.push('…');

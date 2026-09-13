@@ -812,9 +812,9 @@ async fn read_search(key: SearchKey) -> SearchItem {
     }
 }
 
-/// The node's hit rows as the palette and the search float draw them. THE ROOM
-/// COMES FIRST in `meta`, because it is the thing a hit is missing: `#12` alone
-/// reads as a CHANNEL in this app, while it is the message's sequence number.
+/// The node's hit rows as the search results draw them. `meta` says
+/// "message 12", never `#12`: a bare `#12` reads as a CHANNEL in this app.
+/// The room is the view's to name — it holds the channel list.
 pub fn fold_hits(reply: &serde_json::Value, names: &Names) -> Vec<ChatSearchHit> {
     reply
         .as_array()
@@ -825,7 +825,7 @@ pub fn fold_hits(reply: &serde_json::Value, names: &Names) -> Vec<ChatSearchHit>
             let channel_id = hit["channel_id"].as_str().unwrap_or_default().to_owned();
             let seq = hit["seq"].as_i64().unwrap_or(0);
             ChatSearchHit {
-                meta: format!("{channel_id} · #{seq}"),
+                meta: format!("message {seq}"),
                 root_seq: hit["thread"].as_i64().unwrap_or(seq),
                 author: author_display(hit["author"].as_str().unwrap_or_default(), names),
                 text: hit["text"].as_str().unwrap_or_default().to_owned(),
@@ -1757,9 +1757,18 @@ pub fn run_in_thread(live: &LiveRunHint, active_thread_seq: i64) -> bool {
     live.anchor_seq == active_thread_seq || live.thread_root == active_thread_seq
 }
 
-/// `chiefduck · View thread` — the live run card's one label.
+/// `Open chiefduck’s thread` — the live run's door in the timeline.
 pub fn live_thread_label(agent: &str) -> String {
-    format!("{agent} · View thread")
+    format!("Open {agent}’s thread")
+}
+
+/// A node's failure as a sentence: what the view was doing, then the reason.
+/// An empty reason stays empty — nothing failed.
+pub fn failure_note(doing: &str, error: &str) -> String {
+    match error.is_empty() {
+        true => String::new(),
+        false => format!("{doing}: {error}"),
+    }
 }
 
 /// The rows the sends in flight add at the tail of `messages`.
@@ -1992,9 +2001,9 @@ fn grouped_digits(value: i64) -> String {
 
 pub fn height_label(height: i64) -> String {
     if height < 0 {
-        return "h —".into();
+        return "block —".into();
     }
-    format!("h {}", grouped_digits(height))
+    format!("block {}", grouped_digits(height))
 }
 
 pub fn height_label_short(height: i64) -> String {

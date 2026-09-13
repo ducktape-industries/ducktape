@@ -330,7 +330,7 @@ fn the_card_lists_every_open_thread_expanded_under_its_anchor() {
         "first reply",
         "second reply",
         "third reply",
-        "1 more replies",
+        "1 more reply",
         "Resolved · 1",
         "Comment on this page",
     ] {
@@ -384,7 +384,7 @@ fn the_resolved_toggle_opens_the_settled_threads() {
 }
 
 /// A group's quote is the way IN to that block's scope, and the way back out
-/// is the card's own "← This page". Neither costs a read: the register already
+/// is the card's own "All comments". Neither costs a read: the register already
 /// answered for the page and every block on it.
 #[test]
 fn narrowing_to_a_block_and_widening_back_re_slice_the_rows_in_hand() {
@@ -406,7 +406,7 @@ fn narrowing_to_a_block_and_widening_back_re_slice_the_rows_in_hand() {
         texts(&frame)
     );
 
-    let frame = tick_native(press(&frame, "All comments on this page"));
+    let frame = tick_native(press(&frame, "All comments"));
     assert!(
         has_text(&frame, "the page reads well") && has_text(&frame, "This page · 2 threads"),
         "{:?}",
@@ -427,7 +427,7 @@ fn a_margin_badge_pins_the_card_to_its_own_block() {
         texts(&frame)
     );
     assert!(
-        !has_text(&frame, "← This page"),
+        !has_text(&frame, "All comments"),
         "a pinned card withholds the way back out: {:?}",
         texts(&frame)
     );

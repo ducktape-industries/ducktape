@@ -68,7 +68,7 @@ pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
                 },
                 Err(error) => SessionItem {
                     next: Session::default(),
-                    error,
+                    error: format!("Could not read the session: {error}"),
                 },
             }
         })
@@ -110,10 +110,69 @@ pub struct ExplorerOp {
     pub height: i64,
     pub proposer: String,
     pub target: String,
+    /// `Applied` / `Rejected`, as the screen prints it.
     pub disposition: String,
+    pub applied: bool,
     pub op_hash: String,
-    pub payload: String,
-    pub trace: String,
+    pub payload: Payload,
+    pub trace: Vec<TraceHop>,
+}
+
+/// One field of a module message, named by its path (`post.text`).
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct PayloadField {
+    pub name: String,
+    pub value: String,
+}
+
+/// What an op carried, shaped for a reader: the fields of a JSON message as
+/// a table, or the text as it came when it is not one (prose, or a preview
+/// the node cut mid-document). NEVER a JSON string — the screen has no
+/// business printing one.
+#[derive(Clone, Debug, Hash, PartialEq, Serialize, Deserialize)]
+pub enum Payload {
+    Fields(Vec<PayloadField>),
+    Text(String),
+}
+
+impl Default for Payload {
+    fn default() -> Self {
+        Payload::Text(String::new())
+    }
+}
+
+/// One hop of the dispatch trace: a module the op reached, and what it
+/// emitted there.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct TraceHop {
+    pub module: String,
+    pub emitted_msgs: i64,
+    pub emitted_events: i64,
+}
+
+impl ExplorerOp {
+    /// The message's verb — the top-level key a module message is tagged
+    /// with (`post`, `push`) — or nothing when the payload is not one.
+    pub fn verb(&self) -> &str {
+        let Payload::Fields(fields) = &self.payload else {
+            return "";
+        };
+        let Some(first) = fields.first() else {
+            return "";
+        };
+        first.name.split('.').next().unwrap_or_default()
+    }
+}
+
+impl TraceHop {
+    /// `1 message, 0 events`.
+    pub fn emitted(&self) -> String {
+        format!(
+            "{}, {}",
+            plural(self.emitted_msgs, "message", "messages"),
+            plural(self.emitted_events, "event", "events")
+        )
+    }
 }
 
 /// One item of the ledger subscription: the window, or why not.
@@ -140,14 +199,14 @@ async fn read_ledger() -> LedgerItem {
         Ok(reply) => reply,
         Err(error) => {
             return LedgerItem {
-                error,
+                error: format!("Could not read the blocks: {error}"),
                 ..LedgerItem::default()
             };
         }
     };
     let Ok(rows) = serde_json::from_slice::<Value>(&reply) else {
         return LedgerItem {
-            error: "the node's block feed is not JSON".into(),
+            error: "Could not read the blocks: the node's block feed is not JSON".into(),
             ..LedgerItem::default()
         };
     };
@@ -201,11 +260,14 @@ pub fn explorer_window(rows: &[Value]) -> LedgerItem {
             op_count: count_i64(row_ops.len()),
         });
         for op in row_ops {
+            let disposition = text(&op["disposition"]);
+            let applied = disposition == "applied";
             ops.push(ExplorerOp {
                 height,
                 proposer: text(&op["proposer"]),
                 target: text(&op["target"]),
-                disposition: text(&op["disposition"]),
+                disposition: disposition_label(&disposition),
+                applied,
                 // the `GET /v1/files/blob/{op_hash}` key
                 op_hash: text(&op["op_hash"]),
                 payload: explorer_payload(&op["payload"]),
@@ -222,22 +284,75 @@ pub fn explorer_window(rows: &[Value]) -> LedgerItem {
     }
 }
 
-/// The op payload, pretty-printed when it parses as JSON. The node already
-/// bounds what it sends (`payload_preview` caps the projection at 1024 chars),
-/// so the card holds the whole thing it was given — a preview the node cut
-/// mid-document fails the parse here and renders verbatim, ellipsis and all.
-fn explorer_payload(payload: &Value) -> String {
-    let Some(text) = payload.as_str() else {
-        // already-structured JSON (no projection in between): print it readably.
-        let mut parsed = payload.clone();
-        hex_byte_arrays(&mut parsed);
-        return serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| payload.to_string());
-    };
-    let Ok(mut parsed) = serde_json::from_str::<Value>(text) else {
-        return text.to_string();
+/// `Applied` / `Rejected` off the node's snake_case wire; anything else
+/// passes through, so a word this has not met still reads.
+fn disposition_label(disposition: &str) -> String {
+    match disposition {
+        "applied" => "Applied".into(),
+        "rejected" => "Rejected".into(),
+        other => other.to_string(),
+    }
+}
+
+/// The op payload as labelled fields when it parses as JSON — every leaf
+/// named by its dotted path — and as text otherwise. The node already bounds
+/// what it sends (`payload_preview` caps the projection at 1024 chars), so a
+/// preview the node cut mid-document fails the parse here and stays text,
+/// ellipsis and all. The screen never prints a JSON string.
+fn explorer_payload(payload: &Value) -> Payload {
+    let mut parsed = match payload.as_str() {
+        // already-structured JSON (no projection in between)
+        None => payload.clone(),
+        Some(text) => match serde_json::from_str::<Value>(text) {
+            Ok(parsed) => parsed,
+            Err(_) => return Payload::Text(text.to_string()),
+        },
     };
     hex_byte_arrays(&mut parsed);
-    serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| text.to_string())
+    let mut fields = Vec::new();
+    flatten_fields("", &parsed, &mut fields);
+    Payload::Fields(fields)
+}
+
+/// Every leaf of a JSON value as one field, named by its dotted path. An
+/// array of scalars is one field (`a, b, c`); an array carrying objects is
+/// indexed into the path. An empty container, and null, read as a dash.
+fn flatten_fields(path: &str, value: &Value, out: &mut Vec<PayloadField>) {
+    let child = |name: &str| match path.is_empty() {
+        true => name.to_string(),
+        false => format!("{path}.{name}"),
+    };
+    let is_scalar = |item: &Value| !item.is_object() && !item.is_array();
+    match value {
+        Value::Object(fields) if !fields.is_empty() => {
+            for (name, field) in fields {
+                flatten_fields(&child(name), field, out);
+            }
+        }
+        Value::Array(items) if !items.is_empty() && !items.iter().all(is_scalar) => {
+            for (index, item) in items.iter().enumerate() {
+                flatten_fields(&child(&index.to_string()), item, out);
+            }
+        }
+        leaf => out.push(PayloadField {
+            name: match path.is_empty() {
+                true => "value".into(),
+                false => path.to_string(),
+            },
+            value: leaf_text(leaf),
+        }),
+    }
+}
+
+fn leaf_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => "—".into(),
+        Value::Array(items) if items.is_empty() => "—".into(),
+        Value::Object(fields) if fields.is_empty() => "—".into(),
+        Value::Array(items) => items.iter().map(leaf_text).collect::<Vec<_>>().join(", "),
+        other => other.to_string(),
+    }
 }
 
 /// How many bytes an array has to carry before this reads it as a digest.
@@ -294,31 +409,24 @@ fn digest_bytes(items: &[Value]) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// The dispatch trace summary: one hop per module the op reached, each naming
-/// what it emitted. The counts come straight off `host::DispatchRecord` —
-/// `emitted_msgs` is "count of follow-up `Msg`s this dispatch emitted (the
-/// causal fan-out)", `emitted_events` "count of observability `Event`s" — so
-/// the units are spelled the way the fields are named. This rendered
-/// `chat(+0m/+0e)` before, a private shorthand nothing on the screen expanded:
-/// `m`/`e` are not words, and a reader who has not read `crates/kernel/host`
-/// has no way to recover them. The counts join their nouns through `plural`,
-/// the one count-label seam, so `1 msg` never renders as `1 msgs`.
-pub fn explorer_trace(operations: Option<&Vec<Value>>) -> String {
+/// The dispatch trace: one hop per module the op reached, in dispatch order,
+/// each carrying what it emitted. The counts come straight off
+/// `host::DispatchRecord` — `emitted_msgs` is "count of follow-up `Msg`s this
+/// dispatch emitted (the causal fan-out)", `emitted_events` "count of
+/// observability `Event`s". The screen prints each hop as its own labelled
+/// row (`TraceHop::emitted` names the units), never as one joined string.
+pub fn explorer_trace(operations: Option<&Vec<Value>>) -> Vec<TraceHop> {
     let Some(operations) = operations else {
-        return String::new();
+        return Vec::new();
     };
     operations
         .iter()
-        .map(|op| {
-            let module = op["module"].as_str().unwrap_or("?");
-            let msgs = op["emitted_msgs"].as_i64().unwrap_or(0);
-            let events = op["emitted_events"].as_i64().unwrap_or(0);
-            let emitted_msgs = plural(msgs, "msg", "msgs");
-            let emitted_events = plural(events, "event", "events");
-            format!("{module} · {emitted_msgs} · {emitted_events}")
+        .map(|op| TraceHop {
+            module: op["module"].as_str().unwrap_or("?").to_string(),
+            emitted_msgs: op["emitted_msgs"].as_i64().unwrap_or(0),
+            emitted_events: op["emitted_events"].as_i64().unwrap_or(0),
         })
-        .collect::<Vec<_>>()
-        .join(" → ")
+        .collect()
 }
 
 // ---------- the workspace search ----------
@@ -328,11 +436,14 @@ pub fn explorer_trace(operations: Option<&Vec<Value>>) -> String {
 pub struct ExplorerHit {
     /// `message` | `page` | `code` | `file` | `task` | `run`.
     pub kind: String,
-    /// the 2-letter mono plate: `ms` / `pg` / `fg` / `fl` / `tk` / `ag`.
-    pub code: String,
+    /// The kind as the row's badge says it: `Message`, `Page`, …
+    pub label: String,
     pub title: String,
     pub snippet: String,
-    pub meta: String,
+    /// Where the hit lives: the room, the repo, the path, the run's origin.
+    pub place: String,
+    /// Where in it: the message number, the line, the block kind, the height.
+    pub detail: String,
     /// where the row would navigate: the channel id, page id, `repo#number`,
     /// path, task id or run id of the hit.
     pub target: String,
@@ -473,17 +584,13 @@ async fn search_messages(phrase: String) -> Leg {
         .iter()
         .map(|hit| ExplorerHit {
             kind: "message".into(),
-            code: "ms".into(),
+            label: "Message".into(),
             title: author_name(hit["author"].as_str().unwrap_or_default()),
             snippet: text(&hit["text"]),
-            // THE ROOM COMES FIRST, because it is the thing a hit is missing:
-            // `#12` alone reads as a CHANNEL in this app, while it is the
-            // message's sequence number.
-            meta: format!(
-                "{} · #{}",
-                text(&hit["channel_id"]),
-                hit["seq"].as_i64().unwrap_or(0)
-            ),
+            place: text(&hit["channel_id"]),
+            // spelled out: `#12` alone reads as a CHANNEL in this app, while
+            // it is the message's sequence number.
+            detail: format!("message {}", hit["seq"].as_i64().unwrap_or(0)),
             target: text(&hit["channel_id"]),
         })
         .collect();
@@ -511,7 +618,7 @@ async fn search_pages(phrase: String) -> Leg {
             let page_id = text(&hit["page_id"]);
             ExplorerHit {
                 kind: "page".into(),
-                code: "pg".into(),
+                label: "Page".into(),
                 // THE ROW'S HEADING IS THE PAGE, the block text is the snippet
                 // beneath it — the shape every other hit here has.
                 title: titles
@@ -520,7 +627,8 @@ async fn search_pages(phrase: String) -> Leg {
                     .cloned()
                     .unwrap_or_else(|| "Untitled".into()),
                 snippet: text(&hit["text"]),
-                meta: format!("pages · {}", block_kind_name(hit["kind"].as_str())),
+                place: "Pages".into(),
+                detail: block_kind_name(hit["kind"].as_str()).into(),
                 target: page_id,
             }
         })
@@ -613,10 +721,11 @@ async fn search_code(needle: String) -> Leg {
             let number = item["number"].as_i64().unwrap_or(0);
             hits.push(ExplorerHit {
                 kind: "code".into(),
-                code: "fg".into(),
+                label: "Code".into(),
                 title: format!("#{number} {title}"),
-                snippet: format!("{} · {}", text(&item["kind"]), text(&item["state"])),
-                meta: format!("{} · {repo}", author_name(&party_handle(&item["author"]))),
+                snippet: format!("{}, {}", text(&item["kind"]), text(&item["state"])),
+                place: repo.clone(),
+                detail: author_name(&party_handle(&item["author"])),
                 target: format!("{repo}#{number}"),
             });
         }
@@ -641,10 +750,11 @@ async fn search_files(pattern: String) -> Leg {
             let path = text(&hit["path"]);
             ExplorerHit {
                 kind: "file".into(),
-                code: "fl".into(),
+                label: "File".into(),
                 title: path.rsplit('/').next().unwrap_or(&path).to_string(),
                 snippet: hit["text"].as_str().unwrap_or_default().trim().to_string(),
-                meta: format!("{path}:{}", hit["line"].as_i64().unwrap_or(0)),
+                place: path.clone(),
+                detail: format!("line {}", hit["line"].as_i64().unwrap_or(0)),
                 target: path,
             }
         })
@@ -689,10 +799,11 @@ async fn search_tasks(needle: String) -> Leg {
             let updated = height_label(row["updated_height"].as_i64().unwrap_or(0));
             hits.push(ExplorerHit {
                 kind: "task".into(),
-                code: "tk".into(),
+                label: "Task".into(),
                 title,
                 snippet: (*label).into(),
-                meta: format!("{author} · tasks · {updated}"),
+                place: author,
+                detail: updated,
                 target: id,
             });
         }
@@ -715,15 +826,14 @@ async fn search_runs(needle: String) -> Leg {
         })
         .map(|run| ExplorerHit {
             kind: "run".into(),
-            code: "ag".into(),
-            title: format!("{} · {}", text(&run["run_id"]), text(&run["agent_id"])),
-            snippet: format!("{} · {}", run_state(&run["state"]), run_origin(run)),
+            label: "Run".into(),
+            // the agent heads the row; the run id is the reference under it
+            title: text(&run["agent_id"]),
+            snippet: run_state(&run["state"]),
+            place: run_origin(run),
             // the dispatch BLOCK, already rendered as a height — this search
             // has no tip to count back from.
-            meta: format!(
-                "agent · {}",
-                height_label(run["dispatched"]["height"].as_i64().unwrap_or(0))
-            ),
+            detail: height_label(run["dispatched"]["height"].as_i64().unwrap_or(0)),
             target: text(&run["run_id"]),
         })
         .collect();
@@ -832,10 +942,22 @@ pub fn hex(digest: &str) -> String {
     format!("0x{digest}")
 }
 
+/// A proposer as the screen prints one: a frame-authored key as a `0x`
+/// digest, and the labels `project_root_op` stamps on the rest (`system`,
+/// `module:<id>`, `acct:<account>`) as words. The copy carries the handle
+/// as it came, never this.
+pub fn proposer_label(proposer: &str) -> String {
+    match proposer.split_once(':') {
+        Some(("module", id)) => format!("module {id}"),
+        Some(("acct", account)) => format!("account {account}"),
+        _ => hex(proposer),
+    }
+}
+
 /// `h 84,912`; a height the node has not reported reads `h —`.
 pub fn height_label(height: i64) -> String {
     if height < 0 {
-        return "h —".into();
+        return "block —".into();
     }
     let digits = height.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
@@ -845,7 +967,7 @@ pub fn height_label(height: i64) -> String {
         }
         grouped.push(digit);
     }
-    format!("h {grouped}")
+    format!("block {grouped}")
 }
 
 pub fn plural(count: i64, one: &str, many: &str) -> String {

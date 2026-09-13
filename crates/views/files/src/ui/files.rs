@@ -168,7 +168,12 @@ impl FilesView {
             ),
         ];
         if busy {
-            children.push(native::secondary(format!("{key}/loading"), "Loading…"));
+            let wait = match (self.saving, self.acting) {
+                (true, _) => "Saving…",
+                (false, true) => "Writing…",
+                (false, false) => "Loading…",
+            };
+            children.push(native::secondary(format!("{key}/loading"), wait));
         }
         children.push(native::spacer());
         let mut toggle = native::button(
@@ -354,7 +359,7 @@ impl FilesView {
                                             ),
                                             native::button(
                                                 format!("{scope}/diff"),
-                                                "Diff",
+                                                "Compare",
                                                 Some(slots::message(Message::ShowDiffOf(
                                                     snapshot.id.clone(),
                                                 ))),
@@ -390,20 +395,21 @@ impl FilesView {
                 children.push(native::empty_state(
                     format!("{key}/empty"),
                     "No differences",
-                    "This snapshot and HEAD hold the same files.",
+                    "This snapshot and the head hold the same files.",
                 ));
             }
             for entry in &self.diff {
-                let tone = match entry.kind.as_str() {
-                    "added" | "A" => Tone::Success,
-                    "removed" | "deleted" | "D" => Tone::Danger,
+                let label = crate::host::diff_kind_label(&entry.kind);
+                let tone = match label {
+                    "Added" => Tone::Success,
+                    "Removed" => Tone::Danger,
                     _ => Tone::Warning,
                 };
                 children.push(native::spaced(
                     native::centered_row(
                         format!("{key}/{}", entry.path),
                         [
-                            native::badge(format!("{key}/{}/kind", entry.path), &entry.kind, tone),
+                            native::badge(format!("{key}/{}/kind", entry.path), label, tone),
                             native::wrapping(native::mono(
                                 format!("{key}/{}/path", entry.path),
                                 &entry.path,
@@ -577,8 +583,9 @@ impl FilesView {
         use wire::SurfaceValue::{Bool, Str};
         let mut children = Vec::new();
         if self.preview_binary {
-            children.push(native::secondary(
+            children.push(native::empty_state(
                 format!("{key}/binary"),
+                "No preview",
                 &self.preview_display_text,
             ));
         }
@@ -594,7 +601,13 @@ impl FilesView {
                 crate::host::picture_caption(self.preview_width, self.preview_height),
             ));
         }
-        let text_preview = !self.preview_binary && !self.preview_picture;
+        // the head snapshot arrives with the page: until then nothing has
+        // been read, and a blank code box would read as an empty file
+        let reading = !self.preview_binary && !self.preview_picture && self.preview_base.is_empty();
+        if reading {
+            children.push(native::secondary(format!("{key}/reading"), "Reading the file…"));
+        }
+        let text_preview = !self.preview_binary && !self.preview_picture && !reading;
         if text_preview {
             let markdown = crate::host::markdown_path(&self.preview_path);
             let (name, args, on_event) = if markdown {
