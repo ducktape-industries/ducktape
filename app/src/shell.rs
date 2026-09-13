@@ -169,13 +169,16 @@ impl Desktop {
         }
     }
 
-    fn sync_appearance(&self, cx: &mut Context<Self>) {
+    fn sync_appearance(&mut self, cx: &mut Context<Self>) {
         use gpui_kit::component::{Theme, ThemeMode};
         match self.state.appearance {
             crate::Appearance::Light => Theme::change(ThemeMode::Light, None, cx),
             crate::Appearance::Dark => Theme::change(ThemeMode::Dark, None, cx),
             crate::Appearance::System => Theme::sync_system_appearance(None, cx),
         }
+        // System resolves through the kit: the palette every view paints
+        // with must follow the mode the theme actually landed on.
+        self.state.system_dark = Theme::global(cx).is_dark();
         configure_native_theme(cx);
     }
 
@@ -1949,9 +1952,10 @@ impl DesktopWindow {
                         .child(title),
                 )
                 .child(
-                    this.action("modal-close", "Close", close, false)
+                    this.action("modal-close", "", close, false)
                         .ghost()
                         .icon(gpui_kit::component::IconName::Close)
+                        .accessibility_label("Close")
                         .h_7()
                         .w_7()
                         .px_0(),
@@ -1960,7 +1964,8 @@ impl DesktopWindow {
         // A result or a notification is one full-width row: a name, then
         // what it says, in the muted tone.
         let row = |this: &Self, key: String, name: String, detail: String, message, disabled| {
-            this.action(key, format!("{name} {detail}"), message, disabled)
+            this.action(key, "", message, disabled)
+                .accessibility_label(format!("{name} {detail}"))
                 .ghost()
                 .w_full()
                 .h_auto()

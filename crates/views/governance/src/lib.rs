@@ -18,7 +18,6 @@ pub struct GovernanceView {
     pub(crate) connection_serial: i64,
     pub(crate) answered: bool,
     pub(crate) host_error: String,
-    #[serde(default)]
     pub(crate) dark: bool,
 }
 impl ::std::fmt::Debug for GovernanceView {
@@ -57,7 +56,7 @@ impl GovernanceView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "7c12db27b05b027805b40f4d493f95bcbf83f7b71fb9a350d90ef241043cbc72";
+        "e6057c07e20054179436b36b5b86393d9516f49ee8dec60f74cecedff305c0f4";
 }
 impl GovernanceView {
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
@@ -105,7 +104,7 @@ mod tests {
         let mut message = None;
         view.view().for_each_mut(&mut |node| {
             if let ducktape_view_guest::wire::Node::Text { key, content, .. } = node
-                && key == "governance/empty"
+                && key == "governance/empty-state/title"
             {
                 message = Some(content.clone());
             }
@@ -315,11 +314,6 @@ impl GovernanceView {
                 "No proposals waiting.",
                 "Membership and module changes show up here when a validator opens one.",
             ));
-            if let wire::Node::Linear { children, .. } = content.last_mut().unwrap()
-                && let Some(wire::Node::Text { key, .. }) = children.first_mut()
-            {
-                *key = "governance/empty".into();
-            }
         }
         for proposal in self.rows.iter().filter(|proposal| proposal.open) {
             content.push(self.proposal(proposal));

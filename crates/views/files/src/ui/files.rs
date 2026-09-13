@@ -10,15 +10,28 @@ fn action(key: String, label: &str, message: Message, disabled: bool) -> wire::N
     )
 }
 fn resize(key: String, vertical: bool, route: fn(f64, f64) -> Message) -> wire::Node {
+    // The hairline is what shows; the 10px grip around it is what the
+    // pointer has to land on, since the handle takes its size from its child.
     let (cursor, content) = if vertical {
         (
             wire::mouse::Cursor::ResizingVertically,
-            native::divider(format!("{key}/edge")),
+            native::sized(
+                native::container(format!("{key}/grip"), native::divider(format!("{key}/edge"))),
+                Some(wire::Length::Fill),
+                Some(wire::Length::Fixed(10.)),
+            ),
         )
     } else {
         (
             wire::mouse::Cursor::ResizingHorizontally,
-            native::vertical_divider(format!("{key}/edge")),
+            native::sized(
+                native::container(
+                    format!("{key}/grip"),
+                    native::vertical_divider(format!("{key}/edge")),
+                ),
+                Some(wire::Length::Fixed(10.)),
+                Some(wire::Length::Fill),
+            ),
         )
     };
     wire::Node::ResizeHandle {
@@ -190,13 +203,10 @@ impl FilesView {
         let mut rows = Vec::new();
         if self.listed {
             if self.directories.is_empty() && self.omitted == 0 {
-                rows.push(native::padded(
-                    native::empty_state(
-                        format!("{key}/no-folders"),
-                        "No folders",
-                        "Name one above and choose + Folder.",
-                    ),
-                    wire::Edges::all(10.),
+                rows.push(native::empty_state(
+                    format!("{key}/no-folders"),
+                    "No folders",
+                    "Name one above and choose + Folder.",
                 ));
             }
             for entry in &self.directories {

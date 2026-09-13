@@ -50,7 +50,6 @@ pub struct SettingsView {
     pub(crate) host_error: String,
     key_password: String,
     settings_pane: SettingsPane,
-    #[serde(default)]
     pub(crate) dark: bool,
 }
 impl ::std::fmt::Debug for SettingsView {
@@ -143,7 +142,7 @@ impl SettingsView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "f7208e9a48ef29a29f3cb594ed4aec98d6e8173f657a57fe97c64a8ff33cbe21";
+        "59a2e96a909e916d315084c8325ec77a1202d06a2dae9576077cd16ffec89cd2";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         wire::Snapshot {
             schema: Self::SNAPSHOT_SCHEMA.into(),

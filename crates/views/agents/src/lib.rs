@@ -576,11 +576,6 @@ impl AgentsView {
             }
         }
         items.push(section("agents/journal-title-section", "Journal", entries));
-        if let Some(Node::Linear { children, .. }) = items.last_mut()
-            && let Some(Node::Text { key, .. }) = children.first_mut()
-        {
-            *key = "agents/journal-title".into();
-        }
         kit::spaced(
             kit::padded(
                 kit::column("agents/journal-content", items),
@@ -887,7 +882,6 @@ pub struct AgentsView {
     pub(crate) skill_snapshot: String,
     pub(crate) skill_always: bool,
     pub(crate) sent: bool,
-    #[serde(default)]
     pub(crate) dark: bool,
 }
 impl ::std::fmt::Debug for AgentsView {
@@ -976,7 +970,7 @@ impl AgentsView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "ea29d77b6e03069ca0c580bd8bf52d687528c49195c03419d1d233b539e53355";
+        "165a8c2b163b16b6eee611dd7fa68f512771c2fccdb283444299e7cad67bce23";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {

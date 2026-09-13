@@ -408,8 +408,6 @@ impl NodeView {
                     &key,
                     [
                         kit::nowrap(kit::strong(format!("{key}/name"), &module.id)),
-                        Self::digest(&format!("{key}/root"), "root", &module.root),
-                        Self::digest(&format!("{key}/code"), "code", &module.code_hash),
                         kit::spacer(),
                         kit::badge(format!("{key}/category"), &module.category, Tone::Neutral),
                         kit::badge(format!("{key}/state"), state, tone),
@@ -417,6 +415,17 @@ impl NodeView {
                 ),
                 Some(Length::Fill),
                 Some(Length::Fixed(MODULE_ROW)),
+            ));
+            // the hashes are what an operator compares across nodes: copyable
+            content.push(Self::copyable(
+                &format!("{key}/root"),
+                "State root",
+                &module.root,
+            ));
+            content.push(Self::copyable(
+                &format!("{key}/code"),
+                "Active code",
+                &module.code_hash,
             ));
             if module.pending_hash.is_empty() {
                 continue;
@@ -438,6 +447,15 @@ impl NodeView {
                         kit::caption(
                             format!("{key}/readiness"),
                             format!("{} signalled", module.readiness),
+                        ),
+                        kit::button(
+                            format!("{key}/pending/copy"),
+                            "Copy pending code",
+                            Some(slots::message(Message::CopyToClipboard(
+                                module.pending_hash.clone(),
+                                "Pending code copied".into(),
+                            ))),
+                            ButtonPreset::Subtle,
                         ),
                     ],
                 ),
@@ -629,27 +647,6 @@ impl NodeView {
             kit::centered_row(key, children),
             Some(Length::Fill),
             Some(Length::Fixed(LIST_ROW)),
-        )
-    }
-
-    /// A digest under its name: the pair reads as one thing in a dense row.
-    fn digest(key: &str, name: &str, value: &str) -> Node {
-        kit::sized(
-            kit::spaced(
-                kit::centered_row(
-                    key,
-                    [
-                        kit::caption(format!("{key}/label"), name),
-                        kit::nowrap(kit::colored(
-                            kit::mono(format!("{key}/value"), value),
-                            kit::palette().muted,
-                        )),
-                    ],
-                ),
-                4.,
-            ),
-            Some(Length::Shrink),
-            None,
         )
     }
 

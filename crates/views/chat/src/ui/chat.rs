@@ -513,6 +513,8 @@ impl ChatView {
                 children.push(self.unread_marker(format!("{scope}/unread")));
             }
             let card = self.message_card(message, surface, plate);
+            // a live run answers the message, so its hint rides under the card
+            let mut run_hints = Vec::new();
             for live in &self.live_agents {
                 if crate::host::run_in_thread(live, message.seq) {
                     let run_key = format!("{scope}/run/{}", live.agent);
@@ -531,7 +533,7 @@ impl ChatView {
                             false,
                         )
                     };
-                    children.push(native::padded(
+                    run_hints.push(native::padded(
                         content,
                         wire::Edges {
                             top: 2.,
@@ -611,6 +613,7 @@ impl ChatView {
                     ],
                 };
                 children.push(hover);
+                children.extend(run_hints);
                 let content =
                     native::spaced(native::column(format!("{scope}/content"), children), 0.);
                 rows.push(wire::Node::MouseArea {
@@ -631,6 +634,7 @@ impl ChatView {
                 });
             } else {
                 children.push(card);
+                children.extend(run_hints);
                 rows.push(native::spaced(native::column(scope, children), 0.));
             }
             keys.push(wire::ListKey::from(message.view_key));

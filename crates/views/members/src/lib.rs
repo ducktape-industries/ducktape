@@ -30,7 +30,6 @@ pub struct MembersView {
     pub(crate) acting: String,
     pub(crate) viewport_width: f64,
     pub(crate) member_width: f64,
-    #[serde(default)]
     pub(crate) dark: bool,
 }
 impl ::std::fmt::Debug for MembersView {
@@ -79,7 +78,7 @@ impl MembersView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "c5b4c71dda09d5a068e1b5197b676ac214130791d9b62a6629ac8f67428df93e";
+        "2e83a4474a83cd1cec8a9b8c5c55db557002ca8afe7872c545a6e15969be41c1";
 }
 impl MembersView {
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
@@ -415,9 +414,15 @@ impl MembersView {
             }
             roster.push(kit::spaced(kit::column("members/rows", rows), 0.));
         }
+        // the page's Fill height would pin the content to the viewport and
+        // leave nothing to scroll; the list is as tall as its rows
         let mut panes = vec![kit::scroll(
             "members/roster",
-            kit::page("members/list", roster),
+            kit::sized(
+                kit::page("members/list", roster),
+                Some(wire::Length::Fill),
+                None,
+            ),
         )];
         if let Some(member) = self
             .rows

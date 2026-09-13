@@ -126,7 +126,7 @@ fn a_connected_view_reads_its_own_register() {
         "key 8c4fa211",
         "1 / 2",
         "1 approval · 1 more for quorum",
-        "Approve and settle",
+        "Approve (final vote)",
         "Recently finalized",
         "prop-done",
         "h 84,912",

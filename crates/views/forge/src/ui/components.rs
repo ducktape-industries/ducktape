@@ -98,7 +98,15 @@ impl ForgeView {
                 Some(Message::TreeResized(x, y))
             }))),
             cursor: Some(wire::mouse::Cursor::ResizingHorizontally),
-            content: Box::new(native::vertical_divider("forge/tree-edge")),
+            // the hairline shows; the 10px grip is what the pointer lands on
+            content: Box::new(native::sized(
+                native::container(
+                    "forge/tree-grip",
+                    native::vertical_divider("forge/tree-edge"),
+                ),
+                Some(wire::Length::Fixed(10.)),
+                Some(wire::Length::Fill),
+            )),
         };
         // the split runs to the edges of the content area: the pane's own
         // hairline is the only frame it gets

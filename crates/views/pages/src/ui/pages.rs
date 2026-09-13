@@ -22,11 +22,15 @@ impl PagesView {
         };
         let mut body = Vec::new();
         if !self.host_error.is_empty() {
+            // the inset goes on a wrapper: padding a notice replaces its own
             body.push(kit::padded(
-                kit::notice(
-                    "pages/host-error-box",
-                    kit::wrapping(kit::text("pages/host-error", &self.host_error)),
-                    Tone::Danger,
+                kit::column(
+                    "pages/host-error-inset",
+                    [kit::notice(
+                        "pages/host-error-box",
+                        kit::wrapping(kit::text("pages/host-error", &self.host_error)),
+                        Tone::Danger,
+                    )],
                 ),
                 wire::Edges {
                     top: 12.,
@@ -205,7 +209,7 @@ impl PagesView {
         if let Node::Button { checked, .. } = &mut comments {
             *checked = Some(self.block_comments_open);
         }
-        let controls = [
+        let mut controls = vec![
             kit::nowrap(kit::text_size(
                 kit::tone_text("pages/toolbar/save-status", status.0, status.1),
                 kit::type_scale::CAPTION as f32,
@@ -238,6 +242,22 @@ impl PagesView {
                 ButtonPreset::Subtle,
             ),
         ];
+        // a standing search is cleared from the toolbar: the result panel
+        // only shows while the draft still equals the query, so an edited
+        // draft would otherwise strand the subscription
+        let searching = !self.page_search_draft.is_empty() || !self.page_search_query.is_empty();
+        if searching {
+            controls.insert(
+                2,
+                action(
+                    "pages/toolbar/clear-search",
+                    "Clear search",
+                    Message::ClearPageSearch,
+                    true,
+                    ButtonPreset::Text,
+                ),
+            );
+        }
         kit::spaced(
             kit::column(
                 "pages/toolbar-bar",
@@ -468,13 +488,6 @@ impl PagesView {
                 ),
             )
         };
-        let mut results = results;
-        if let Node::Linear { children, .. } = &mut results
-            && let Some(Node::Text { key, .. }) = children.first_mut()
-            && key == "pages/search/empty-state/title"
-        {
-            *key = "pages/search/empty".into();
-        }
         let contents = fill(kit::spaced(
             kit::column(
                 "pages/search/content",

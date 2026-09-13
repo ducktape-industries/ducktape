@@ -199,7 +199,15 @@ impl ExplorerView {
                 Some(Message::LedgerResized(x, y))
             }))),
             cursor: Some(wire::mouse::Cursor::ResizingHorizontally),
-            content: Box::new(kit::vertical_divider("explorer/ledger-edge")),
+            // the hairline shows; the 10px grip is what the pointer lands on
+            content: Box::new(kit::sized(
+                kit::container(
+                    "explorer/ledger-grip",
+                    kit::vertical_divider("explorer/ledger-edge"),
+                ),
+                Some(Length::Fixed(10.)),
+                Some(Length::Fill),
+            )),
         };
         Self::filling(kit::spaced(
             kit::row("explorer/ledger", [list, divider, self.block_details()]),
@@ -275,17 +283,9 @@ impl ExplorerView {
                 Self::digest(&format!("{key}/hash"), "Op hash", &op.op_hash),
             ];
             if !op.trace.is_empty() {
-                lines.push(kit::padded(
-                    kit::card(
-                        format!("{key}/trace-box"),
-                        kit::wrapping(kit::mono(format!("{key}/trace"), &op.trace)),
-                    ),
-                    wire::Edges {
-                        top: 6.,
-                        right: 8.,
-                        bottom: 6.,
-                        left: 8.,
-                    },
+                lines.push(kit::card(
+                    format!("{key}/trace-box"),
+                    kit::wrapping(kit::mono(format!("{key}/trace"), &op.trace)),
                 ));
             }
             content.push(kit::spaced(kit::column(format!("{key}/body"), lines), 4.));
@@ -423,11 +423,6 @@ impl ExplorerView {
                 "No matching results.",
                 "Try another word, or clear the filter above.",
             ));
-            if let Some(Node::Linear { children, .. }) = content.last_mut()
-                && let Some(Node::Text { key, .. }) = children.first_mut()
-            {
-                *key = "explorer/no-results".into();
-            }
         }
         for (index, hit) in hits.iter().enumerate() {
             let key = format!("explorer/result/{index}");
@@ -460,6 +455,16 @@ impl ExplorerView {
                 ),
                 Some(Length::Fill),
                 Some(Length::Fixed(32.)),
+            ));
+            // the reference is what a hit is good for: the id to copy
+            content.push(kit::padded(
+                Self::digest(&format!("{key}/target"), "Reference", &hit.target),
+                wire::Edges {
+                    top: 0.,
+                    right: GUTTER.right,
+                    bottom: 6.,
+                    left: GUTTER.left,
+                },
             ));
         }
         Self::filling(kit::spaced(

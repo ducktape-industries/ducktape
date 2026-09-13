@@ -30,7 +30,6 @@ pub struct ExplorerView {
     pub(crate) viewport_width: f64,
     pub(crate) ledger_width: f64,
     pub(crate) host_error: String,
-    #[serde(default)]
     pub(crate) dark: bool,
 }
 #[derive(Clone, Debug)]
@@ -49,7 +48,8 @@ pub enum Message {
     BindQuery(String),
 }
 impl ExplorerView {
-    const SNAPSHOT_SCHEMA: &'static str = "04bc00e53f87dcbc66dc6576ac584618a68be12e5374d05e961f49caebcbc5b9";
+    const SNAPSHOT_SCHEMA: &'static str =
+        "d3ae16434f63f6c404876080e3ecf8998eb426abfa14b3744f16bcc6160a845d";
     fn state() -> Self {
         Self {
             connected: false,

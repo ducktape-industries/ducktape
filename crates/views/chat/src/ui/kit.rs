@@ -248,8 +248,8 @@ impl ChatView {
                         },
                     ));
                     let mut code = native::container(
-                        scope,
-                        native::spaced(native::column(format!("{key}/code-lines"), children), 4.),
+                        scope.clone(),
+                        native::spaced(native::column(format!("{scope}/code-lines"), children), 4.),
                     );
                     if let wire::Node::Container {
                         background,

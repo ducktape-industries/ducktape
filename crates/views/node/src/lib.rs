@@ -41,7 +41,6 @@ pub struct NodeView {
     pub(crate) live_log_filter: String,
     pub(crate) live_filter_note: String,
     pub(crate) host_error: String,
-    #[serde(default)]
     pub(crate) dark: bool,
 }
 #[derive(Clone, Debug)]
@@ -62,7 +61,7 @@ pub enum Message {
 }
 impl NodeView {
     const SNAPSHOT_SCHEMA: &'static str =
-        "c583cbb8bd8239885328e6a8867ee2664df8988d5294320887eba1b21855671e";
+        "183d3743dd53e25b46199a2ddee2c14be32b1f904ffb5305b26795b4af98f695";
     fn state() -> Self {
         Self {
             node_data_dir: "".to_owned(),

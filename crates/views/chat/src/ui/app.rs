@@ -126,7 +126,6 @@ pub struct ChatView {
     pub(crate) thread_edit_draft: String,
     pub(crate) host_error: String,
     pub(crate) sent: bool,
-    #[serde(default)]
     pub(crate) dark: bool,
 }
 impl ::std::fmt::Debug for ChatView {
@@ -304,7 +303,7 @@ impl ChatView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "cf1516e075a6b4b32487abe6afbfe3678c29fde066a7987abc12f3d3b256ef2b";
+        "97957d3d4452067dd635c9926be2ae75b13900550599c22244d9b402680b9ff5";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
