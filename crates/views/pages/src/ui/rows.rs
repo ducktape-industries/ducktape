@@ -107,8 +107,14 @@ impl PagesView {
                                 kit::column(
                                     format!("{key}/who"),
                                     [
-                                        kit::nowrap(kit::strong(format!("{key}/author"), &thread.author)),
-                                        kit::nowrap(kit::caption(format!("{key}/meta"), &thread.meta)),
+                                        kit::nowrap(kit::strong(
+                                            format!("{key}/author"),
+                                            &thread.author,
+                                        )),
+                                        kit::nowrap(kit::caption(
+                                            format!("{key}/meta"),
+                                            &thread.meta,
+                                        )),
                                     ],
                                 ),
                                 1.,
@@ -131,10 +137,12 @@ impl PagesView {
                 ),
                 8.,
             ),
-            kit::wrapping(kit::text(
+            self.comment_body(
                 format!("{key}/opener"),
-                crate::host::opener_text(thread),
-            )),
+                &crate::host::opener_id(thread),
+                &crate::host::opener_text(thread),
+                disabled,
+            ),
         ];
         for reply in crate::host::thread_replies(thread, expanded) {
             rows.push(kit::padded(
@@ -149,10 +157,12 @@ impl PagesView {
                                     false => format!("{} ({})", reply.author, reply.meta),
                                 },
                             ),
-                            kit::wrapping(kit::text(
+                            self.comment_body(
                                 format!("{key}/reply/{}/body", reply.id),
-                                reply.text,
-                            )),
+                                &reply.id,
+                                &reply.text,
+                                disabled,
+                            ),
                         ],
                     ),
                     2.,
@@ -215,6 +225,87 @@ impl PagesView {
                 ButtonPreset::Text,
             ));
         }
-        kit::card(key.clone(), kit::spaced(kit::column(format!("{key}/body"), rows), 6.))
+        kit::card(
+            key.clone(),
+            kit::spaced(kit::column(format!("{key}/body"), rows), 6.),
+        )
+    }
+
+    /// One comment's words with its Edit and Delete — or, while it is the one
+    /// being rewritten, the box holding the new words. The module refuses a
+    /// rewrite by anyone but the author, so the buttons ask, never gate.
+    fn comment_body(&self, key: String, id: &str, text: &str, disabled: bool) -> Node {
+        if id.is_empty() {
+            return kit::wrapping(kit::text(key, text));
+        }
+        if self.comment_edit_id == id {
+            return kit::spaced(
+                kit::row(
+                    format!("{key}/edit"),
+                    [
+                        input(
+                            format!("{PAGE_KEY}/comment-edit({id})"),
+                            "Edit comment",
+                            &self.comment_edit_draft,
+                            Message::CommentEditDraftChanged,
+                            Some(Message::SubmitEditComment),
+                            disabled,
+                        ),
+                        action(
+                            format!("{key}/save"),
+                            "Save",
+                            Message::SubmitEditComment,
+                            !disabled && !self.comment_edit_draft.trim().is_empty(),
+                            ButtonPreset::Primary,
+                        ),
+                        action(
+                            format!("{key}/cancel"),
+                            "Cancel",
+                            Message::CancelEditComment,
+                            true,
+                            ButtonPreset::Text,
+                        ),
+                    ],
+                ),
+                6.,
+            );
+        }
+        kit::spaced(
+            kit::column(
+                format!("{key}/said"),
+                [
+                    kit::wrapping(kit::text(format!("{key}/text"), text)),
+                    kit::spaced(
+                        kit::row(
+                            format!("{key}/actions"),
+                            [
+                                named(
+                                    action(
+                                        format!("{key}/edit"),
+                                        "Edit",
+                                        Message::BeginEditComment(id.to_owned(), text.to_owned()),
+                                        !disabled,
+                                        ButtonPreset::Text,
+                                    ),
+                                    "Edit comment",
+                                ),
+                                named(
+                                    action(
+                                        format!("{key}/delete"),
+                                        "Delete",
+                                        Message::DeleteCommentSubmit(id.to_owned()),
+                                        !disabled,
+                                        ButtonPreset::Text,
+                                    ),
+                                    "Delete comment",
+                                ),
+                            ],
+                        ),
+                        4.,
+                    ),
+                ],
+            ),
+            2.,
+        )
     }
 }

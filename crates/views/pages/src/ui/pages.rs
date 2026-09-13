@@ -149,7 +149,11 @@ impl PagesView {
                 },
             ));
         }
-        let mut list: Vec<Node> = self.pages.iter().map(|page| self.page_button(page)).collect();
+        let mut list: Vec<Node> = self
+            .pages
+            .iter()
+            .map(|page| self.page_button(page))
+            .collect();
         if list.is_empty() && !self.loading {
             list.push(kit::padded(
                 kit::column(
@@ -567,6 +571,7 @@ impl PagesView {
                     crate::editor_binding::keys(
                         self.document_history.clone(),
                         self.document_menu.clone(),
+                        self.member_names.clone(),
                     )
                     .register(Message::DocumentCommitted, Message::DocumentTransaction),
                 )),
@@ -652,7 +657,10 @@ impl PagesView {
         ));
         let mut threads = Vec::new();
         if self.threads_loading {
-            threads.push(kit::secondary("pages/comments/loading", "Loading comments…"));
+            threads.push(kit::secondary(
+                "pages/comments/loading",
+                "Loading comments…",
+            ));
         }
         let groups = crate::host::scope_groups(
             self.comment_rows.clone(),

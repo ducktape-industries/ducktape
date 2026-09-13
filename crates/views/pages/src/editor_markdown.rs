@@ -133,6 +133,14 @@ pub struct Style {
     pub strong: bool,
     pub emphasis: bool,
     pub link: bool,
+    /// `~~struck~~`, `++underlined++`, `` `code` ``, `==marked==`, `@name`.
+    pub strike: bool,
+    pub underline: bool,
+    pub code: bool,
+    pub highlight: bool,
+    pub mention: bool,
+    /// A colour span's packed `0xRRGGBB`: the ink it asks for over any other.
+    pub color: Option<u32>,
     pub commented: bool,
     /// A checked todo's content — muted and struck through.
     pub done: bool,
@@ -435,6 +443,30 @@ fn highlight(
                 link: true,
                 ..style
             },
+            Inline::Strike => Style {
+                strike: true,
+                ..style
+            },
+            Inline::Underline => Style {
+                underline: true,
+                ..style
+            },
+            Inline::Code => Style {
+                code: true,
+                ..style
+            },
+            Inline::Highlight => Style {
+                highlight: true,
+                ..style
+            },
+            Inline::Mention => Style {
+                mention: true,
+                ..style
+            },
+            Inline::Color(rgb) => Style {
+                color: Some(rgb),
+                ..style
+            },
         };
         marks.push((shifted, Mark::Body(inline_style)));
     }
@@ -452,6 +484,8 @@ struct Ink {
     callout_plate: Color,
     callout_line: Color,
     comment_wash: Color,
+    /// The `==marked==` wash: a highlighter pen over the prose.
+    mark_plate: Color,
     rule: Color,
     tick_fill: Color,
     /// The `x` on a filled checkbox: the page's own ground, showing through.
@@ -475,10 +509,20 @@ fn ink(dark: bool) -> Ink {
         callout_plate: Color(p.surface),
         callout_line: Color(p.border_strong),
         comment_wash: Color(p.accent_soft),
+        mark_plate: Color(match dark {
+            true => [0.91, 0.77, 0.29, 0.30],
+            false => [0.91, 0.77, 0.29, 0.38],
+        }),
         rule: Color(p.border_strong),
         tick_fill: Color(p.accent),
         tick_mark: Color(p.background),
     }
+}
+
+/// A colour span's packed `0xRRGGBB` as opaque ink.
+fn hex_color(rgb: u32) -> Color {
+    let channel = |shift: u32| ((rgb >> shift) & 0xff) as f32 / 255.0;
+    Color([channel(16), channel(8), channel(0), 1.0])
 }
 
 fn body_font(weight: Weight, style: FontStyle) -> Font {
@@ -503,6 +547,18 @@ fn border(color: Color, width: f32, radius: f32) -> wire::Border {
         width: Some(width),
         radius: Some([radius; 4]),
     }
+}
+
+/// The span plate an inline mark wears: the code wash inside its hairline for
+/// `` `code` ``, the highlighter pen for `==marked==`, nothing otherwise.
+fn inline_plate(style: Style, ink: &Ink) -> (Option<Color>, Option<wire::Border>) {
+    if style.code {
+        return (Some(ink.code_plate), Some(border(ink.code_line, 1.0, 4.0)));
+    }
+    if style.highlight {
+        return (Some(ink.mark_plate), Some(border(TRANSPARENT, 0.0, 3.0)));
+    }
+    (None, None)
 }
 
 fn tick_advance(checked: bool) -> f32 {
@@ -706,25 +762,44 @@ fn paint(mark: &Mark, dark: bool) -> Format {
 }
 
 fn body_format(style: Style, ink: &Ink) -> Format {
-    let weight = match style.strong || style.heading.is_some() {
-        true => Weight::Semibold,
-        false => Weight::Normal,
+    let weight = match (style.strong || style.heading.is_some(), style.mention) {
+        (true, _) => Weight::Semibold,
+        (false, true) => Weight::Medium,
+        (false, false) => Weight::Normal,
     };
     let italic = match style.emphasis || style.quote {
         true => FontStyle::Italic,
         false => FontStyle::Normal,
     };
-    let color = if style.link {
-        Some(ink.link)
-    } else if style.done || style.quote || style.divider {
-        Some(ink.muted)
-    } else {
-        None
+    let linked = style.link || style.mention;
+    let muted = style.done || style.quote || style.divider;
+    let color = match (style.color, linked, muted) {
+        (Some(rgb), _, _) => Some(hex_color(rgb)),
+        (None, true, _) => Some(ink.link),
+        (None, false, true) => Some(ink.muted),
+        (None, false, false) => None,
     };
+    let font = match style.code {
+        true => code_font(),
+        false => body_font(weight, italic),
+    };
+    // A done todo strikes in the marker grey; a `~~struck~~` run strikes in
+    // its own ink, which for a plain body is the host's foreground.
+    let struck = match (style.done, style.strike) {
+        (true, _) => Some(ink.marker),
+        (false, true) => Some(color.unwrap_or(ink.code_ink)),
+        (false, false) => None,
+    };
+    let (background, plate_border) = inline_plate(style, ink);
+    // A `++run++` underlines in its own ink, like a strike does.
+    let underlined = style.underline.then(|| color.unwrap_or(ink.code_ink));
     let mut format = Format {
         color,
-        font: Some(body_font(weight, italic)),
-        strikethrough: style.done.then_some(ink.marker),
+        font: Some(font),
+        strikethrough: struck,
+        underline: underlined,
+        background,
+        border: plate_border,
         ..Format::default()
     };
     // A commented block wears a quiet brand wash across its lines — the

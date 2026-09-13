@@ -12,6 +12,8 @@ pub mod inline;
 pub mod document_sync;
 pub mod editor;
 pub mod editor_binding;
+#[path = "editor_format.rs"]
+pub mod format;
 pub mod editor_menu;
 pub mod editor_view;
 pub mod host;

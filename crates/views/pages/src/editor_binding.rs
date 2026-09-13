@@ -88,10 +88,7 @@ pub fn menu_paint(
             items: view
                 .items
                 .into_iter()
-                .map(|(tag, label)| EditorMenuItem {
-                    tag: tag.into(),
-                    label: label.into(),
-                })
+                .map(|(tag, label)| EditorMenuItem { tag, label })
                 .collect(),
             selected: view.selected as u32,
         });
@@ -150,30 +147,18 @@ impl BindingState {
         }
         self.history.at_reset(state.reset);
         let doc = document(state.text, state.cursor);
-        let mut navigation = crate::document_sync::Navigation::default();
-        let comment_pick = matches!(action, wire::editor_presentation::EditorInteraction::MenuPick { tag } if tag == "comment");
-        if comment_pick {
-            navigation.comment_line = self
-                .menu
-                .current(&doc)
-                .filter(|menu| menu.items.iter().any(|item| item.0 == "comment"))
-                .and_then(|menu| menu.line)
-                .map(|line| line as u32);
-        }
+        // What the pick asks the host for is read off the menu it was picked
+        // from, before that menu closes.
+        let mut navigation = match action {
+            wire::editor_presentation::EditorInteraction::MenuPick { tag } => {
+                self.menu.intent(&doc, tag)
+            }
+            _ => crate::document_sync::Navigation::default(),
+        };
         let (_, successor) = interaction(&doc, self.menu.clone(), action);
         self.menu = successor;
-        match action {
-            wire::editor_presentation::EditorInteraction::Margin { line } => {
-                navigation.comment_line = Some(*line);
-            }
-            wire::editor_presentation::EditorInteraction::LinePress { tag: 2, position } => {
-                if let Some(line) = wire::editor_lines(state.text).nth(position.line as usize) {
-                    navigation.link =
-                        crate::inline::document_link_at(line, position.column as usize)
-                            .unwrap_or_default();
-                }
-            }
-            _ => {}
+        if let wire::editor_presentation::EditorInteraction::Margin { line } = action {
+            navigation.comment_line = Some(*line);
         }
         Some(self.update(id, state, wire::encode(&navigation)))
     }
@@ -204,18 +189,19 @@ impl BindingState {
                 action,
             );
             self.menu = successor;
+        } else if opens_format_menu(origin) {
+            self.menu.format(&after_doc);
+        } else if matches!(kind, wire::EditorEditKind::Cursor) {
+            self.menu.moved(&after_doc);
         } else {
-            if matches!(kind, wire::EditorEditKind::Cursor) {
-                self.menu.close();
-            } else {
-                let inserted_slash = matches!(kind, wire::EditorEditKind::Insert)
-                    && after.text_revision != before.text_revision
-                    && after_doc
-                        .line(after.cursor.position.line as usize)
-                        .and_then(|line| line.get(..after.cursor.position.column as usize))
-                        .is_some_and(|prefix| prefix.ends_with('/'));
-                self.menu.after_edit(&after_doc, inserted_slash);
-            }
+            let typed = matches!(kind, wire::EditorEditKind::Insert)
+                && after.text_revision != before.text_revision;
+            let trigger = after_doc
+                .line(after.cursor.position.line as usize)
+                .and_then(|line| line.get(..after.cursor.position.column as usize))
+                .and_then(|prefix| prefix.chars().next_back())
+                .filter(|last| typed && TRIGGERS.contains(last));
+            self.menu.after_edit(&after_doc, trigger);
         }
         let changes_history = before.text_revision != after.text_revision
             || matches!(
@@ -234,9 +220,45 @@ impl BindingState {
     }
 }
 
-/// Claims only structural keys and the platform command's undo/redo keys.
-/// All other input stays native and joins this history only after commit.
-pub fn keys(state: HistoryState, menu: MenuState) -> EditorBinding<EditorUpdate> {
+/// The characters that open a picker when typed: the slash palette, a
+/// member mention, an emoji short code.
+const TRIGGERS: &[char] = &['/', '@', ':'];
+
+/// The command-key letters the binding claims besides undo/redo, with the
+/// shift they need: bold, italic, underline, code, link, the format menu;
+/// strike and highlight on shift. Both cases are claimed — a shifted letter
+/// arrives as its capital on some platforms.
+const COMMAND_KEYS: &[(&str, bool)] = &[
+    ("b", false),
+    ("i", false),
+    ("u", false),
+    ("e", false),
+    ("k", false),
+    ("/", false),
+    ("x", true),
+    ("X", true),
+    ("h", true),
+    ("H", true),
+];
+
+/// `Cmd+/` — the key that opens the floating format menu. It edits nothing,
+/// so the host commits it as an empty step and the menu opens on that.
+fn opens_format_menu(origin: Option<&wire::EditorRequestInput>) -> bool {
+    let Some(wire::EditorRequestInput::Key { key, .. }) = origin else {
+        return false;
+    };
+    let command = key.modifiers.logo || key.modifiers.control;
+    command && matches!(&key.key, Key::Character(c) if c == "/")
+}
+
+/// Claims the structural keys, the platform command's undo/redo keys and the
+/// inline formatting shortcuts. All other input stays native and joins this
+/// history only after commit.
+pub fn keys(
+    state: HistoryState,
+    menu: MenuState,
+    names: Vec<String>,
+) -> EditorBinding<EditorUpdate> {
     let history = if state.snapshot.is_empty() {
         StoredHistory::default()
     } else {
@@ -247,6 +269,7 @@ pub fn keys(state: HistoryState, menu: MenuState) -> EditorBinding<EditorUpdate>
     } else {
         wire::decode(&menu.snapshot).expect("Pages menu snapshot")
     };
+    let menu = menu.with_names(&names);
     let state = Rc::new(RefCell::new(BindingState { history, menu }));
     let deciding = state.clone();
     let interacting = state.clone();
@@ -274,6 +297,14 @@ pub fn keys(state: HistoryState, menu: MenuState) -> EditorBinding<EditorUpdate>
             command: true,
         });
     }
+    claims.extend(COMMAND_KEYS.iter().map(|(key, shift)| EditorKeyClaim {
+        key: Key::Character((*key).into()),
+        modifiers: Modifiers {
+            shift: *shift,
+            ..bare
+        },
+        command: true,
+    }));
     EditorBinding::new(
         claims,
         move |request| {
@@ -341,6 +372,11 @@ fn interaction(
                 menu,
             )
         }
+        // A pressed link opens its popover; navigating is one of its picks.
+        EditorInteraction::LinePress { tag: 2, position } => {
+            menu.link(doc, position.line as usize, position.column as usize);
+            (Noop, menu)
+        }
         EditorInteraction::LinePress { .. } | EditorInteraction::Margin { .. } => (Noop, menu),
     }
 }
@@ -387,13 +423,15 @@ fn wire_history(value: editor::EditorHistoryEffect) -> EditorHistoryEffect {
 
 fn decide(request: EditorKeyRequest<'_>, history: &History) -> EditorDecision {
     let doc = document(request.state.text, request.state.cursor);
+    let shift = request.key.modifiers.shift;
     let decision = match &request.key.key {
-        Key::Character(key) if key.eq_ignore_ascii_case("z") => if request.key.modifiers.shift {
+        Key::Character(key) if key.eq_ignore_ascii_case("z") => if shift {
             history.redo(&doc)
         } else {
             history.undo(&doc)
         }
         .unwrap_or(editor::EditorDecision::Noop),
+        Key::Character(key) => shortcut(&doc, key, shift),
         Key::Named(key) => {
             let key = match key {
                 Named::Enter => editor::Key::Enter,
@@ -407,6 +445,23 @@ fn decide(request: EditorKeyRequest<'_>, history: &History) -> EditorDecision {
         _ => return EditorDecision::DefaultEditorAction,
     };
     wire_decision(&doc, decision)
+}
+
+/// The command-key formatting shortcuts. `Cmd+/` edits nothing: its empty
+/// commit is what opens the format menu.
+fn shortcut(doc: &Doc, key: &str, shift: bool) -> editor::EditorDecision {
+    use crate::format::{Wrap, link, toggle};
+    match (key.to_ascii_lowercase().as_str(), shift) {
+        ("b", false) => toggle(doc, Wrap::Bold),
+        ("i", false) => toggle(doc, Wrap::Italic),
+        ("u", false) => toggle(doc, Wrap::Underline),
+        ("e", false) => toggle(doc, Wrap::Code),
+        ("x", true) => toggle(doc, Wrap::Strike),
+        ("h", true) => toggle(doc, Wrap::Highlight),
+        ("k", false) => link(doc),
+        ("/", false) => editor::EditorDecision::Noop,
+        _ => editor::EditorDecision::DefaultEditorAction,
+    }
 }
 
 fn wire_decision(doc: &Doc, decision: editor::EditorDecision) -> EditorDecision {

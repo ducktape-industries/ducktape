@@ -582,3 +582,16 @@ fn a_page_s_blocks_render_as_the_document_the_editor_opens_on() {
             .collect::<Vec<_>>()
     );
 }
+
+/// A selection's byte columns become the module's UTF-16 anchor over the
+/// block's own text: the marker is not part of the block, and a selection
+/// that never leaves the marker anchors nothing.
+#[test]
+fn a_text_anchor_counts_utf16_units_past_the_block_marker() {
+    assert_eq!(text_anchor("- [ ] 한글 words", Some(6..12)), Some((0, 2)));
+    assert_eq!(text_anchor("## 👍🏽 ok", Some(12..14)), Some((5, 7)));
+    assert_eq!(text_anchor("## head", Some(0..2)), None);
+    assert_eq!(text_anchor("## head", Some(1..5)), Some((0, 2)));
+    assert_eq!(text_anchor("plain", Some(3..3)), None);
+    assert_eq!(text_anchor("plain", None), None);
+}
