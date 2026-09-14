@@ -484,6 +484,19 @@ mod tests {
         dir
     }
 
+    /// A scratch root on the checkout's own disk rather than `std::env::temp_dir`.
+    /// A dense-image test writes hundreds of megabytes of REAL bytes, and `/tmp`
+    /// is commonly a memory-backed tmpfs under a user quota: there those bytes
+    /// cost RAM and exhaust the quota the other image tests build inside.
+    fn scratch_on_disk(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target/sandbox-image-tests")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
     fn have_e2fsprogs() -> bool {
         crate::host_tools::find_system_tool("mke2fs").is_some()
             && crate::host_tools::find_system_tool("debugfs").is_some()
@@ -727,7 +740,7 @@ mod tests {
         if !have_e2fsprogs() {
             return;
         }
-        let root = scratch("ro-dense");
+        let root = scratch_on_disk("ro-dense");
         let src = root.join("src");
         std::fs::create_dir(&src).expect("src");
         let mut file = std::fs::File::create(src.join("pi")).expect("payload");
@@ -749,9 +762,13 @@ mod tests {
         let mut restored = std::fs::File::open(out.join("pi")).expect("restored payload");
         assert_eq!(restored.metadata().expect("stat").len(), 108 * 1024 * 1024);
         let mut buffer = [0u8; 64 * 1024];
-        for _ in 0..block_count {
+        for index in 0..block_count {
             restored.read_exact(&mut buffer).expect("read payload");
-            assert_eq!(buffer, block, "payload bytes must survive");
+            // Compared as a named predicate, never `assert_eq!` on the arrays:
+            // that prints both 64 KiB blocks per mismatch and once wrote a
+            // 201 MB log for one failure.
+            let block_survived = buffer == block;
+            assert!(block_survived, "payload block {index} did not survive");
         }
         let _ = std::fs::remove_dir_all(&root);
     }
