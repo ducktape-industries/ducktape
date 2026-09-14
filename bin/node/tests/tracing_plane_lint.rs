@@ -52,6 +52,7 @@ const PLANES: &[&str] = &[
     "stream",       // the node's websocket topic streams
     "submit",       // transaction submission from a client
     "term",         // terminal sessions and the pty plane
+    "update",       // the desktop app's self-update: manifest checks, downloads, staging
     "voice",        // huddle media: voice, camera, screen share
 ];
 
