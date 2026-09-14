@@ -17,7 +17,7 @@ use gpui_kit::{
 use gpui_notion::NotionEditor;
 use gpui_notion::editor::block::{BlockAttrs, BlockContent, types};
 use gpui_notion::editor::mark::{Mark, MarkKind, MarkList};
-use gpui_notion::editor::view::DocumentChanged;
+use gpui_notion::editor::view::{Caret, DocumentChanged};
 use std::sync::Arc;
 use ui_lang_wire as wire;
 
@@ -50,6 +50,7 @@ pub struct NotionWireEditor {
     installed: Arc<str>,
     cursor: wire::EditorCursor,
     reset: Option<u64>,
+    fault: Option<String>,
     _changes: Subscription,
 }
 
@@ -75,6 +76,7 @@ impl NotionWireEditor {
             installed: Arc::from(""),
             cursor: Default::default(),
             reset: None,
+            fault: None,
             _changes: changes,
         };
         this.sync(window, cx);
@@ -87,10 +89,16 @@ impl NotionWireEditor {
         let Some(projection) = self.store.projection(&self.key) else {
             return;
         };
+        self.note_fault(projection.fault.as_deref());
+        // No text yet (a page just opened, its transfer in flight): nothing to
+        // install — a blank rebuild here would blink the page and drop focus.
+        let Some(canonical) = projection.text.clone() else {
+            return;
+        };
         let reset = self.reset != Some(projection.reference.reset);
         let settled = !projection.pending;
-        let canonical = projection.text.clone().unwrap_or_else(|| Arc::from(""));
-        let install = reset || (settled && canonical != self.installed);
+        let moved = projection.reference.cursor != self.cursor;
+        let install = reset || (settled && (canonical != self.installed || moved));
         if !install {
             return;
         }
@@ -111,6 +119,17 @@ impl NotionWireEditor {
             }
         });
         cx.notify();
+    }
+
+    /// A store fault stops every editor on the document; say so once.
+    fn note_fault(&mut self, fault: Option<&str>) {
+        if fault == self.fault.as_deref() {
+            return;
+        }
+        if let Some(fault) = fault {
+            tracing::warn!(target: "ducktape::pages_editor", fault, "the notion editor store faulted");
+        }
+        self.fault = fault.map(str::to_owned);
     }
 
     fn changed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -152,10 +171,21 @@ impl NotionWireEditor {
         if !matches!(command, wire::WidgetCommand::Focus { .. }) {
             return false;
         }
-        if !self.is_focused(window, cx) {
-            self.editor
-                .update(cx, |editor, cx| editor.focus_trailing_block(window, cx));
+        if self.is_focused(window, cx) {
+            return true;
         }
+        // The caret goes to the block the document cursor names, never to a
+        // trailing paragraph the editor would have to insert: focusing a page
+        // must not write to it.
+        let line = self.cursor.position.line as usize;
+        let column = self.cursor.position.column as usize;
+        self.editor.update(cx, |editor, cx| {
+            let last = editor.block_count().saturating_sub(1);
+            let Some(id) = editor.block_id_at(line.min(last)) else {
+                return;
+            };
+            editor.focus_block(id, Caret::At(column), window, cx);
+        });
         true
     }
 }
