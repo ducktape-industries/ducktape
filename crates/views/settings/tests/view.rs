@@ -653,6 +653,8 @@ fn proposed_views_are_tried_and_left_from_the_network_tab() {
 
     let frame = tick_native(vec![item(props, &encoded(&facts()))]);
     assert!(!has_text(&frame, "Proposed views"), "{:?}", texts(&frame));
+}
+
 // ---------- updates ----------
 
 /// Without a launcher the Updates group says so and offers no control;

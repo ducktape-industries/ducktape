@@ -651,6 +651,8 @@ pub fn untaste(module: &str) -> bool {
             module: module.into(),
         },
     )
+}
+
 /// `settings.update_check` — ask the network for the release manifest now.
 pub fn check_for_update() -> bool {
     notify("settings.update_check", &())
