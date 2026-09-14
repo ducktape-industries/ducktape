@@ -485,8 +485,8 @@ mod tests {
                 rows += 1;
             }
             wire::Node::Text { content, .. } if content == "New messages" => unread += 1,
-            wire::Node::Text { key, content, .. }
-                if content == "Unread" && key.contains("/channel/") =>
+            wire::Node::Container { key, .. }
+                if key.ends_with("/unread") && key.contains("/channel/") =>
             {
                 unread_rooms += 1;
             }
@@ -568,7 +568,9 @@ mod tests {
             let mut tree = state.view();
             let (mut intros, mut anchored) = (0, 0);
             tree.for_each_mut(&mut |node| match node {
-                wire::Node::Text { content, .. } if content == "This is the start of #design." => {
+                wire::Node::Text { content, .. }
+                    if content.starts_with("This is the very beginning of #design.") =>
+                {
                     intros += 1;
                 }
                 wire::Node::Scroll { key, anchor_y, .. } if key.ends_with("/message-stream") => {

@@ -429,6 +429,14 @@ impl ChatView {
             Some(wire::Length::Fill),
         )
     }
+    /// The room a thread belongs to, as the thread pane's caption.
+    fn thread_room_label(&self) -> String {
+        let direct = !self.active_dm.name.is_empty();
+        match direct {
+            true => self.active_dm.name.clone(),
+            false => format!("#{}", self.active_channel_name),
+        }
+    }
     /// The composer's placeholder names the room it posts to.
     fn composer_hint(&self) -> String {
         let direct = !self.active_dm.name.is_empty();
@@ -481,14 +489,17 @@ impl ChatView {
             (
                 self.active_dm.name.clone(),
                 format!(
-                    "This is the start of your conversation with {}.",
+                    "This is the very beginning of your conversation with {}.",
                     self.active_dm.name
                 ),
             )
         } else {
             (
                 format!("#{}", self.active_channel_name),
-                format!("This is the start of #{}.", self.active_channel_name),
+                format!(
+                    "This is the very beginning of #{}. Say hello, or pin what the room is for.",
+                    self.active_channel_name
+                ),
             )
         };
         Some(native::padded(
@@ -496,15 +507,16 @@ impl ChatView {
                 native::column(
                     key.clone(),
                     [
-                        native::heading(format!("{key}/name"), name),
+                        native::text_size(native::title(format!("{key}/name"), name), 20.),
                         native::wrapping(native::secondary(format!("{key}/detail"), detail)),
+                        native::gap(4.),
                         native::divider(format!("{key}/rule")),
                     ],
                 ),
                 6.,
             ),
             wire::Edges {
-                top: 12.,
+                top: 24.,
                 right: 16.,
                 bottom: 8.,
                 left: 16.,
@@ -568,8 +580,7 @@ impl ChatView {
                             top: 2.,
                             right: 16.,
                             bottom: 2.,
-                            // the message rail: the 16px inset plus avatar and gap
-                            left: 50.,
+                            left: super::kit::RAIL,
                         },
                     ));
                 }
@@ -632,6 +643,10 @@ impl ChatView {
                 ]);
                 // The actions float over the card's top-right corner while
                 // the pointer is on it (or the message is chosen).
+                // the pointer washes the row it is on, as the bar appears
+                // (the wash is a layer over the text, so it stays faint)
+                let mut wash = native::palette().surface_raised;
+                wash[3] = 0.25;
                 let hover = wire::Node::Hover {
                     key: format!("{scope}/hover"),
                     width: Some(wire::Length::Fill),
@@ -639,7 +654,7 @@ impl ChatView {
                     padding: None,
                     background: None,
                     border: None,
-                    tint: None,
+                    tint: (!target).then_some(wire::Rgba(wash)),
                     radius: 0.,
                     open: target,
                     children: vec![
@@ -848,12 +863,28 @@ impl ChatView {
                 format!("{key}/header"),
                 [
                     native::sized(
-                        native::heading(format!("{key}/title"), "Thread"),
+                        native::spaced(
+                            native::centered_row(
+                                format!("{key}/title-row"),
+                                [
+                                    native::nowrap(native::heading(
+                                        format!("{key}/title"),
+                                        "Thread",
+                                    )),
+                                    native::nowrap(native::caption(
+                                        format!("{key}/room"),
+                                        self.thread_room_label(),
+                                    )),
+                                ],
+                            ),
+                            8.,
+                        ),
                         Some(wire::Length::Fill),
                         None,
                     ),
-                    subtle(
+                    glyph(
                         format!("{key}/close"),
+                        "✕",
                         "Close thread",
                         Message::CloseThread,
                         false,
@@ -1031,8 +1062,9 @@ impl ChatView {
                         Some(wire::Length::Fill),
                         None,
                     ),
-                    subtle(
+                    glyph(
                         format!("{key}/close"),
+                        "✕",
                         "Close channel details",
                         Message::ToggleChannelSettings,
                         false,

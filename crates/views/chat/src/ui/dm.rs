@@ -17,8 +17,15 @@ impl ChatView {
         } else {
             native::text(format!("{key}/name"), &peer.name)
         };
+        // the kit's 24px plate: a list row is 28px, the message rail's 28px
+        // avatar belongs beside a message
+        let tone = if peer.is_agent {
+            Tone::Agent
+        } else {
+            Tone::Neutral
+        };
         let mut children = vec![
-            self.principal_avatar(format!("{key}/avatar"), peer.initials.clone(), peer.is_agent),
+            native::avatar(format!("{key}/avatar"), peer.initials.clone(), tone),
             native::nowrap(name),
         ];
         if peer.is_agent {
@@ -26,7 +33,7 @@ impl ChatView {
         }
         if unread {
             children.push(native::spacer());
-            children.push(native::badge(format!("{key}/unread"), "Unread", Tone::Accent));
+            children.push(super::components::unread_dot(format!("{key}/unread")));
         }
         let action = if self.busy {
             None

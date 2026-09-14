@@ -256,20 +256,15 @@ fn a_connected_view_reads_its_own_room() {
         );
 
         let (frame, _live) = connected_room();
-        for expected in [
-            "general",
-            "ops",
-            "Unread",
-            "first light",
-            "second wind",
-            "mallard",
-        ] {
+        for expected in ["general", "ops", "first light", "second wind", "mallard"] {
             assert!(
                 has_text(&frame, expected),
                 "missing {expected:?} in {:?}",
                 texts(&frame)
             );
         }
+        // the unread room carries its dot, not a word
+        let _ = node_ending(&frame, "/unread");
         assert!(
             frame.requests.is_empty(),
             "a settled room asks for nothing more: {:?}",
