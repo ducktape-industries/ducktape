@@ -453,28 +453,36 @@ impl ChatView {
                 Some(wire::Length::Fill),
             );
         }
-        children.push(wire::Node::Surface {
-            key: format!("{key}/composer"),
-            name: "chat_composer".into(),
-            args: vec![
-                wire::SurfaceValue::Str(crate::host::composer_scope(
-                    &self.endpoint,
-                    &self.active_channel,
-                )),
-                wire::SurfaceValue::Str("message".into()),
-                wire::SurfaceValue::Bool(false),
-                wire::SurfaceValue::Str(self.composer_hint()),
-                wire::SurfaceValue::Bool(
-                    self.loading
-                        || !self.connected
-                        || self.active_channel.is_empty()
-                        || !self.post_refusal.is_empty(),
-                ),
-                wire::SurfaceValue::Bool(self.busy),
-                wire::SurfaceValue::Str("An earlier message wasn’t sent".into()),
-            ],
-            on_event: None,
-        });
+        // the composer sits inside the timeline's margins, with air under it
+        // — flush against the window's bottom edge it read as a footer
+        children.push(native::padded(
+            native::container(
+                format!("{key}/composer-room"),
+                wire::Node::Surface {
+                    key: format!("{key}/composer"),
+                    name: "chat_composer".into(),
+                    args: vec![
+                        wire::SurfaceValue::Str(crate::host::composer_scope(
+                            &self.endpoint,
+                            &self.active_channel,
+                        )),
+                        wire::SurfaceValue::Str("message".into()),
+                        wire::SurfaceValue::Bool(false),
+                        wire::SurfaceValue::Str(self.composer_hint()),
+                        wire::SurfaceValue::Bool(
+                            self.loading
+                                || !self.connected
+                                || self.active_channel.is_empty()
+                                || !self.post_refusal.is_empty(),
+                        ),
+                        wire::SurfaceValue::Bool(self.busy),
+                        wire::SurfaceValue::Str("An earlier message wasn’t sent".into()),
+                    ],
+                    on_event: None,
+                },
+            ),
+            COMPOSER_MARGIN,
+        ));
         native::sized(
             native::spaced(native::column(format!("{key}/room"), children), 0.),
             Some(wire::Length::Fill),
@@ -757,6 +765,18 @@ impl ChatView {
                 if !crate::host::run_in_thread(live, self.active_thread_seq) {
                     continue;
                 }
+                // The answer has landed: the committed reply is on screen
+                // and the run's row is a poll away from leaving. Drawing the
+                // card under the reply for that poll was the answer showing
+                // twice, then blinking out.
+                let answered = messages.iter().any(|message| {
+                    message.avatar_kind == "agent"
+                        && message.author == live.agent
+                        && message.seq > live.anchor_seq
+                });
+                if answered {
+                    continue;
+                }
                 let live_message = crate::host::live_run_message(live);
                 let run_key = format!("{key}/run/{}", live.agent);
                 let card = self.message_card(
@@ -1026,26 +1046,32 @@ impl ChatView {
         if editing_here {
             children.push(self.message_menu(&key, true));
         }
-        children.push(wire::Node::Surface {
-            key: format!("{key}/reply_composer"),
-            name: "chat_composer".into(),
-            args: vec![
-                wire::SurfaceValue::Str(crate::host::thread_scope(
-                    &self.endpoint,
-                    &self.active_channel,
-                    self.active_thread_seq,
-                )),
-                wire::SurfaceValue::Str("reply".into()),
-                wire::SurfaceValue::Bool(true),
-                wire::SurfaceValue::Str("Reply in thread".into()),
-                wire::SurfaceValue::Bool(
-                    self.thread_loading || !self.connected || !self.post_refusal.is_empty(),
-                ),
-                wire::SurfaceValue::Bool(false),
-                wire::SurfaceValue::Str("Unsent reply".into()),
-            ],
-            on_event: None,
-        });
+        children.push(native::padded(
+            native::container(
+                format!("{key}/reply_composer-room"),
+                wire::Node::Surface {
+                    key: format!("{key}/reply_composer"),
+                    name: "chat_composer".into(),
+                    args: vec![
+                        wire::SurfaceValue::Str(crate::host::thread_scope(
+                            &self.endpoint,
+                            &self.active_channel,
+                            self.active_thread_seq,
+                        )),
+                        wire::SurfaceValue::Str("reply".into()),
+                        wire::SurfaceValue::Bool(true),
+                        wire::SurfaceValue::Str("Reply in thread".into()),
+                        wire::SurfaceValue::Bool(
+                            self.thread_loading || !self.connected || !self.post_refusal.is_empty(),
+                        ),
+                        wire::SurfaceValue::Bool(false),
+                        wire::SurfaceValue::Str("Unsent reply".into()),
+                    ],
+                    on_event: None,
+                },
+            ),
+            COMPOSER_MARGIN,
+        ));
         native::pane(
             key.clone(),
             native::sized(
@@ -1509,10 +1535,17 @@ enum OpenMenu {
     Thread(MessageAction),
 }
 const MENU_ITEM_HEIGHT: f32 = 28.;
+/// The room around a composer: the timeline's 16px sides, and air under it.
+const COMPOSER_MARGIN: wire::Edges = wire::Edges {
+    top: 4.,
+    right: 16.,
+    bottom: 12.,
+    left: 16.,
+};
 const MENU_ITEM_GAP: f32 = 2.;
 const MENU_INSET: f32 = 6.;
 const PICKER_COLUMNS: u32 = 8;
-const PICKER_CELL: f32 = 32.;
+pub(super) const PICKER_CELL: f32 = 32.;
 const PICKER_GAP: f32 = 2.;
 const PICKER_INSET: f32 = 8.;
 /// The "…" dropdown's box for `items` rows.
@@ -1543,7 +1576,14 @@ fn menu_item(
             format!("{key}/row"),
             [
                 native::sized(
-                    native::nowrap(native::text(format!("{key}/glyph"), glyph)),
+                    native::nowrap(native::text_options(
+                        native::text(format!("{key}/glyph"), glyph),
+                        // an emoji's full glyph, inside the row's line box
+                        wire::TextOptions {
+                            line_height: Some(wire::LineHeight::Absolute(MENU_ITEM_HEIGHT)),
+                            ..Default::default()
+                        },
+                    )),
                     Some(wire::Length::Fixed(20.)),
                     None,
                 ),
@@ -1579,9 +1619,24 @@ fn menu_item(
     button
 }
 /// One cell of the reaction picker: a fixed square with the emoji centred
-/// in it, tall enough that the glyph's full height paints inside.
+/// in it, tall enough that the glyph's full height paints inside — the
+/// host's button clips its content to the line box, so the glyph is a text
+/// node whose line box IS the cell (a plain label gets a one-em line box,
+/// which cut the top off every emoji).
 fn emoji_cell(key: String, emoji: &str, message: Message, disabled: bool) -> wire::Node {
-    let mut button = subtle(key, emoji, message, disabled);
+    let glyph = native::text_options(
+        native::text_size(native::text(format!("{key}/glyph"), emoji), 18.),
+        wire::TextOptions {
+            line_height: Some(wire::LineHeight::Absolute(PICKER_CELL)),
+            ..Default::default()
+        },
+    );
+    let mut button = native::button_child(
+        key,
+        glyph,
+        (!disabled).then(|| slots::message(message)),
+        wire::ButtonPreset::Subtle,
+    );
     if let wire::Node::Button {
         label,
         description,
