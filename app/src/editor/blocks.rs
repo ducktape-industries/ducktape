@@ -1096,6 +1096,22 @@ impl Render for WireEditor {
                         );
                     }
                     if gutter.handle {
+                        // A right press anywhere on the row is the handle's
+                        // menu — Notion's context menu — without the trip to
+                        // the gutter.
+                        body = body.on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, _, _, cx| {
+                                this.interaction(
+                                    EditorInteraction::Gutter {
+                                        line,
+                                        button:
+                                            wire::editor_presentation::EditorGutterButton::Handle,
+                                    },
+                                    cx,
+                                )
+                            }),
+                        );
                         gutter_view = gutter_view.child(div()
                         .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, _| this.drag_line = Some(line)))
                         .child(Button::new(("block", index)).size(px(22.)).min_w(px(22.)).p_0().label("⋮").on_click(cx.listener(move |this, _, _, cx|

@@ -123,9 +123,46 @@ pub enum Mark {
     CodeBody,
 }
 
+/// Where a line sits in the column: the `-> ` (center) and `->> ` (end)
+/// markers right after the block prefix, the markdown-it-center-text
+/// convention. The marker is scaffolding — hidden away from the caret line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Align {
+    #[default]
+    Start,
+    Center,
+    End,
+}
+
+impl Align {
+    pub fn marker(self) -> &'static str {
+        match self {
+            Align::Start => "",
+            Align::Center => "-> ",
+            Align::End => "->> ",
+        }
+    }
+}
+
+/// The alignment a line's content opens with, and the marker's byte length.
+pub fn align_marker(content: &str) -> (Align, usize) {
+    for align in [Align::End, Align::Center] {
+        if content.starts_with(align.marker()) {
+            return (align, align.marker().len());
+        }
+    }
+    (Align::Start, 0)
+}
+
+/// The byte offset a line's content starts at, past its block prefix.
+pub fn content_start(line: &str) -> usize {
+    prefix_of(line).1
+}
+
 /// The shape a line's prefix declared, plus the inline marks inside it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Style {
+    pub align: Align,
     pub heading: Option<u8>,
     pub quote: bool,
     pub callout: bool,
@@ -328,7 +365,9 @@ fn highlight(
     let ticked_done =
         prefix == Prefix::List && (marker.ends_with("[x] ") || marker.ends_with("[X] "));
     let ticked = ticked_done || (prefix == Prefix::List && marker.ends_with("[ ] "));
+    let (align, align_len) = align_marker(&line[content..]);
     let style = Style {
+        align,
         heading: match prefix {
             Prefix::Heading(level) => Some(level),
             _ => None,
@@ -418,8 +457,20 @@ fn highlight(
         false => content,
     };
     marks.push((body_start..line.len(), Mark::Body(style)));
-    for (range, inline) in document_marks(&line[content..]) {
-        let shifted = content + range.start..content + range.end;
+    // The alignment marker is scaffolding like a fence: away from the caret
+    // line it collapses, and the body it aligns keeps the line's height.
+    if align_len > 0 {
+        marks.push((
+            content..content + align_len,
+            Mark::Marker {
+                hidden: !on_caret_line,
+                style,
+            },
+        ));
+    }
+    let body = content + align_len;
+    for (range, inline) in document_marks(&line[body..]) {
+        let shifted = body + range.start..body + range.end;
         let inline_style = match inline {
             Inline::Marker => {
                 marks.push((
@@ -585,7 +636,28 @@ pub fn format(mark: &Mark, dark: bool) -> Format {
     let [above, below] = block_pad(mark);
     format.line_padding.top += above;
     format.line_padding.bottom += below;
+    format.line_align = line_align(mark);
     format
+}
+
+/// Where the run's line sits in the column, when its content asked for a
+/// side. Every run of the line answers the same, so whichever the layout
+/// reads last still carries it.
+fn line_align(mark: &Mark) -> Option<wire::Align> {
+    let style = match *mark {
+        Mark::Indent(style)
+        | Mark::Body(style)
+        | Mark::ListMarker(style)
+        | Mark::Marker { style, .. }
+        | Mark::Tick { style, .. }
+        | Mark::TickEdge { style, .. } => style,
+        Mark::Title | Mark::Fence { .. } | Mark::CodeBody => return None,
+    };
+    match style.align {
+        Align::Start => None,
+        Align::Center => Some(wire::Align::Center),
+        Align::End => Some(wire::Align::End),
+    }
 }
 
 /// The vertical inset a run's line is owed, `[above, below]`, on top of
@@ -1239,5 +1311,35 @@ mod plate_probe {
         }
         assert!(HEADING_PAD[0][0] > HEADING_PAD[1][0] && HEADING_PAD[1][0] > HEADING_PAD[2][0]);
         assert!(HEADING_PAD[2][0] > BLOCK_PAD, "an H3 still opens a section");
+    }
+    /// Alignment is a marker after the block prefix: hidden away from the
+    /// caret line, and every run of the line asks for the same side.
+    #[test]
+    fn an_alignment_marker_collapses_and_the_whole_line_takes_its_side() {
+        assert_eq!(align_marker("-> x"), (Align::Center, 3));
+        assert_eq!(align_marker("->> x"), (Align::End, 4));
+        assert_eq!(align_marker("x -> y"), (Align::Start, 0));
+        assert_eq!(content_start("## -> x"), 3);
+        let (away, _) = highlight("## -> Head", false, false, false);
+        let marker = away
+            .iter()
+            .find(|(range, _)| *range == (3..6))
+            .expect("the alignment marker run");
+        assert!(matches!(marker.1, Mark::Marker { hidden: true, .. }));
+        for (_, mark) in &away {
+            assert_eq!(format(mark, false).line_align, Some(wire::Align::Center));
+        }
+        let (under_caret, _) = highlight("- ->> item", false, true, false);
+        let marker = under_caret
+            .iter()
+            .find(|(range, _)| *range == (2..6))
+            .expect("the alignment marker run");
+        assert!(matches!(marker.1, Mark::Marker { hidden: false, .. }));
+        assert_eq!(
+            format(&under_caret[0].1, false).line_align,
+            Some(wire::Align::End)
+        );
+        let (plain, _) = highlight("plain", false, false, false);
+        assert_eq!(format(&plain[0].1, false).line_align, None);
     }
 }

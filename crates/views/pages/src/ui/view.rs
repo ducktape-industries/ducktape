@@ -14,9 +14,14 @@ pub struct PagesView {
     /// The exact text a comment started from the format menu anchors on, in
     /// the module's UTF-16 units over the block; `None` is the whole block.
     pub(crate) comment_anchor_range: Option<(u32, u32)>,
+    /// The agent account the open composer's comment is addressed to — an
+    /// "Ask AI" pick — or `0` for a plain comment.
+    pub(crate) comment_mention: i64,
     pub(crate) comments_card_height: f64,
     /// The network's named members: what an `@` in the document completes to.
     pub(crate) member_names: Vec<String>,
+    /// The active agents "Ask AI" can address: display name and account.
+    pub(crate) member_agents: Vec<(String, u64)>,
     /// The one comment being rewritten in place, and its words.
     pub(crate) comment_edit_id: String,
     pub(crate) comment_edit_draft: String,
@@ -152,8 +157,10 @@ impl PagesView {
             comment_anchor_y: -1.0,
             comment_anchor_line: 0,
             comment_anchor_range: None,
+            comment_mention: 0,
             comments_card_height: 0.0,
             member_names: Vec::new(),
+            member_agents: Vec::new(),
             comment_edit_id: "".to_owned(),
             comment_edit_draft: "".to_owned(),
             document_reserve: crate::editor_view::no_reserve(),

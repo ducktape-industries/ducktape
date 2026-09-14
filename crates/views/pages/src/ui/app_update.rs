@@ -170,6 +170,7 @@ impl PagesView {
         self.comment_rows = item.comment_rows.clone();
         self.commented_hits = item.commented_hits.clone();
         self.member_names = item.names.clone();
+        self.member_agents = item.agents.clone();
         self.threads_loading = false;
         self.document_commented =
             crate::host::commented_lines(&(item.blocks), &(item.commented_hits));
@@ -424,6 +425,7 @@ impl PagesView {
         self.comment_anchor_y = -1.0;
         self.comment_anchor_line = 0;
         self.comment_anchor_range = None;
+        self.comment_mention = 0;
         self.comment_edit_id = "".to_owned();
         self.comment_edit_draft = "".to_owned();
         if !(self.host_error).is_empty() {
@@ -462,6 +464,7 @@ impl PagesView {
         self.comment_anchor_y = -1.0;
         self.comment_anchor_line = 0;
         self.comment_anchor_range = None;
+        self.comment_mention = 0;
         self.comment_edit_id = "".to_owned();
         self.comment_edit_draft = "".to_owned();
         self.orphaned_comment_drafts = crate::host::remember_draft(
@@ -552,7 +555,7 @@ impl PagesView {
         self.threads_loading = true;
         self.pending_comment = (self.reply_draft).trim().to_owned();
         self.reply_draft = "".to_owned();
-        crate::host::post(&(self.pending_comment), &(reply_target), &(id), None);
+        crate::host::post(&(self.pending_comment), &(reply_target), &(id), None, 0);
         Task::none()
     }
     fn on_post_block_comment_submit(&mut self) -> Task<Message> {
@@ -577,7 +580,8 @@ impl PagesView {
         // A selection-anchored thread pins to its text once; the next
         // composer post is on the whole scope again.
         let anchor = self.comment_anchor_range.take();
-        crate::host::post(&(self.pending_comment), &(fresh_target), "", anchor);
+        let mention = std::mem::take(&mut self.comment_mention);
+        crate::host::post(&(self.pending_comment), &(fresh_target), "", anchor, mention);
         Task::none()
     }
     /// ONE COMMENT IS REWRITTEN AT A TIME: opening another box drops the last
@@ -750,6 +754,7 @@ impl PagesView {
         // A comment from the format menu pins to the words that were
         // selected; a badge or a block menu comments on the block as a whole.
         self.comment_anchor_range = crate::host::navigation_anchor(next.interaction.clone());
+        self.comment_mention = crate::host::navigation_mention(next.interaction.clone());
         self.orphaned_comment_drafts = crate::host::remember_draft(
             &(self.orphaned_comment_drafts),
             &(self.block_comment_draft),

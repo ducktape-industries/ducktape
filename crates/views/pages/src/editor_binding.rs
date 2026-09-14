@@ -225,20 +225,51 @@ impl BindingState {
 const TRIGGERS: &[char] = &['/', '@', ':'];
 
 /// The command-key letters the binding claims besides undo/redo, with the
-/// shift they need: bold, italic, underline, code, link, the format menu;
-/// strike and highlight on shift. Both cases are claimed — a shifted letter
+/// shift and alt they need — Tiptap's own bindings. Bold, italic, underline,
+/// code, link, the format menu; strike and highlight on shift; the block
+/// turns on shift (quote, the lists) and on alt (text, headings, code); the
+/// alignment on shift. Both cases of a letter are claimed — a shifted letter
 /// arrives as its capital on some platforms.
-const COMMAND_KEYS: &[(&str, bool)] = &[
-    ("b", false),
-    ("i", false),
-    ("u", false),
-    ("e", false),
-    ("k", false),
-    ("/", false),
-    ("x", true),
-    ("X", true),
-    ("h", true),
-    ("H", true),
+const COMMAND_KEYS: &[(&str, bool, bool)] = &[
+    ("b", false, false),
+    ("i", false, false),
+    ("u", false, false),
+    ("e", false, false),
+    ("k", false, false),
+    ("/", false, false),
+    ("x", true, false),
+    ("X", true, false),
+    ("h", true, false),
+    ("H", true, false),
+    ("b", true, false),
+    ("B", true, false),
+    ("7", true, false),
+    ("8", true, false),
+    ("9", true, false),
+    ("l", true, false),
+    ("L", true, false),
+    ("e", true, false),
+    ("E", true, false),
+    ("r", true, false),
+    ("R", true, false),
+    ("0", false, true),
+    ("1", false, true),
+    ("2", false, true),
+    ("3", false, true),
+    ("c", false, true),
+];
+
+/// The block a `Cmd+Shift` / `Cmd+Alt` key turns the caret's line into.
+const TURN_KEYS: &[(&str, bool, &str)] = &[
+    ("b", true, "quote"),
+    ("7", true, "number"),
+    ("8", true, "bullet"),
+    ("9", true, "todo"),
+    ("0", false, "text"),
+    ("1", false, "h1"),
+    ("2", false, "h2"),
+    ("3", false, "h3"),
+    ("c", false, "code"),
 ];
 
 /// `Cmd+/` — the key that opens the floating format menu. It edits nothing,
@@ -258,6 +289,7 @@ pub fn keys(
     state: HistoryState,
     menu: MenuState,
     names: Vec<String>,
+    agents: Vec<(String, u64)>,
 ) -> EditorBinding<EditorUpdate> {
     let history = if state.snapshot.is_empty() {
         StoredHistory::default()
@@ -269,7 +301,7 @@ pub fn keys(
     } else {
         wire::decode(&menu.snapshot).expect("Pages menu snapshot")
     };
-    let menu = menu.with_names(&names);
+    let menu = menu.with_names(&names).with_agents(&agents);
     let state = Rc::new(RefCell::new(BindingState { history, menu }));
     let deciding = state.clone();
     let interacting = state.clone();
@@ -297,10 +329,11 @@ pub fn keys(
             command: true,
         });
     }
-    claims.extend(COMMAND_KEYS.iter().map(|(key, shift)| EditorKeyClaim {
+    claims.extend(COMMAND_KEYS.iter().map(|(key, shift, alt)| EditorKeyClaim {
         key: Key::Character((*key).into()),
         modifiers: Modifiers {
             shift: *shift,
+            alt: *alt,
             ..bare
         },
         command: true,
@@ -424,6 +457,7 @@ fn wire_history(value: editor::EditorHistoryEffect) -> EditorHistoryEffect {
 fn decide(request: EditorKeyRequest<'_>, history: &History) -> EditorDecision {
     let doc = document(request.state.text, request.state.cursor);
     let shift = request.key.modifiers.shift;
+    let alt = request.key.modifiers.alt;
     let decision = match &request.key.key {
         Key::Character(key) if key.eq_ignore_ascii_case("z") => if shift {
             history.redo(&doc)
@@ -431,6 +465,7 @@ fn decide(request: EditorKeyRequest<'_>, history: &History) -> EditorDecision {
             history.undo(&doc)
         }
         .unwrap_or(editor::EditorDecision::Noop),
+        Key::Character(key) if alt => turn_shortcut(&doc, key, shift),
         Key::Character(key) => shortcut(&doc, key, shift),
         Key::Named(key) => {
             let key = match key {
@@ -450,7 +485,8 @@ fn decide(request: EditorKeyRequest<'_>, history: &History) -> EditorDecision {
 /// The command-key formatting shortcuts. `Cmd+/` edits nothing: its empty
 /// commit is what opens the format menu.
 fn shortcut(doc: &Doc, key: &str, shift: bool) -> editor::EditorDecision {
-    use crate::format::{Wrap, link, toggle};
+    use crate::format::{Wrap, align, link, toggle};
+    use crate::markdown::Align;
     match (key.to_ascii_lowercase().as_str(), shift) {
         ("b", false) => toggle(doc, Wrap::Bold),
         ("i", false) => toggle(doc, Wrap::Italic),
@@ -458,9 +494,26 @@ fn shortcut(doc: &Doc, key: &str, shift: bool) -> editor::EditorDecision {
         ("e", false) => toggle(doc, Wrap::Code),
         ("x", true) => toggle(doc, Wrap::Strike),
         ("h", true) => toggle(doc, Wrap::Highlight),
+        ("l", true) => align(doc, Align::Start),
+        ("e", true) => align(doc, Align::Center),
+        ("r", true) => align(doc, Align::End),
         ("k", false) => link(doc),
         ("/", false) => editor::EditorDecision::Noop,
-        _ => editor::EditorDecision::DefaultEditorAction,
+        _ => turn_shortcut(doc, key, shift),
+    }
+}
+
+/// The block-turn shortcuts, over the caret's line. The title turns into
+/// nothing.
+fn turn_shortcut(doc: &Doc, key: &str, shift: bool) -> editor::EditorDecision {
+    let line = doc.cursor.position.line as usize;
+    let lowered = key.to_ascii_lowercase();
+    let turn = TURN_KEYS
+        .iter()
+        .find(|(turn_key, turn_shift, _)| *turn_key == lowered && *turn_shift == shift);
+    match (line, turn) {
+        (0, _) | (_, None) => editor::EditorDecision::DefaultEditorAction,
+        (line, Some((_, _, tag))) => crate::editor_menu::turn(doc, line, tag),
     }
 }
 

@@ -144,7 +144,8 @@ fn threads() -> Vec<u8> {
 
 /// The canned reply for one kernel read, chosen by the query it carries: the
 /// page index, one page's blocks, the grouped thread read, or — on the
-/// identity module, which is where the names live — the account directory.
+/// identity module, which is where the names live — the account directory,
+/// and on the runs module the agent roster "Ask AI" addresses.
 fn answered(request: &Request) -> Vec<u8> {
     let ask: serde_json::Value =
         serde_json::from_slice(&request.payload).expect("a view ask decodes");
@@ -153,6 +154,18 @@ fn answered(request: &Request) -> Vec<u8> {
         return serde_json::json!({ "accounts": [] })
             .to_string()
             .into_bytes();
+    }
+    if ask["target"] == "runs" {
+        assert_eq!(
+            query,
+            &serde_json::json!({ "model": { "query": "agents" } })
+        );
+        return serde_json::json!({ "model": { "agents": [
+            { "account": 7, "agent_id": "builder", "display_name": "Builder", "status": "active" },
+            { "account": 8, "agent_id": "napping", "display_name": "Napping", "status": "paused" }
+        ] } })
+        .to_string()
+        .into_bytes();
     }
     assert_eq!(ask["target"], "pages", "a pages view asks the pages module");
     match query {
@@ -842,6 +855,41 @@ fn a_comment_from_the_format_menu_pins_to_the_selected_words() {
         serde_json::json!({
             "thread_id": "thread-9", "comment_id": "comment-9",
             "target": "alpha-1", "text": "first?", "anchor": { "start": 4, "end": 9 }
+        })
+    );
+}
+
+/// "Ask AI" is a comment addressed to an agent: the picker lists the active
+/// roster only, the post carries the agent's account as a mention — which
+/// is what makes the runs module answer in the thread — and, like Comment,
+/// the toolbar's ask pins to the selected words. The next post is plain.
+#[test]
+fn ask_ai_posts_the_comment_with_the_agent_mentioned() {
+    let (frame, _) = connected_with_register();
+    let frame = tick_native(cmd_slash_over(&frame, 1, 4, 9));
+    let frame = tick_native(menu_pick(&frame, "ai"));
+    // The paused agent is not on the picker, so its account opens nothing.
+    let frame = tick_native(menu_pick(&frame, "8"));
+    assert!(
+        !has_text(&frame, "Start a thread…"),
+        "a paused agent is not offered: {:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(menu_pick(&frame, "7"));
+    let frame = tick_native(type_into(&frame, "Start a thread…", "tighten this?"));
+    let frame = tick_native(press(&frame, "Post"));
+    let mint = request(&frame, "host.id");
+    let frame = tick_native(vec![answer(mint.id, b"thread-9")]);
+    let mint = request(&frame, "host.id");
+    let frame = tick_native(vec![answer(mint.id, b"comment-9")]);
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op["payload"]["add_comment"],
+        serde_json::json!({
+            "thread_id": "thread-9", "comment_id": "comment-9",
+            "target": "alpha-1", "text": "tighten this?",
+            "anchor": { "start": 4, "end": 9 }, "mentions": [7]
         })
     );
 }

@@ -53,6 +53,8 @@ pub struct Navigation {
     pub comment_line: Option<u32>,
     pub copy: String,
     pub anchor: Option<(u32, u32)>,
+    /// The agent account an "Ask AI" comment is addressed to; `0` is nobody.
+    pub mention: u64,
 }
 
 /// A selection's byte columns on a document line as the module's comment
