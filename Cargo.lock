@@ -3691,7 +3691,6 @@ dependencies = [
  "identity",
  "image",
  "inbox",
- "jpeg-encoder",
  "keystore",
  "media-service",
  "module-artifact",
@@ -3730,7 +3729,6 @@ dependencies = [
  "x11rb",
  "zbus",
  "zeroize",
- "zune-jpeg 0.4.21",
 ]
 
 [[package]]
@@ -7274,11 +7272,13 @@ name = "media-service"
 version = "0.1.0"
 dependencies = [
  "data-plane",
+ "jpeg-encoder",
  "opus-rs",
  "rand 0.8.6",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "zune-jpeg 0.4.21",
 ]
 
 [[package]]
