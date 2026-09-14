@@ -58,6 +58,14 @@ pub struct HuddleSeat {
     pub node: String,
 }
 
+/// Does the window on screen run up to the room's head — its newest landed
+/// message is the room's newest? A landing or an older page can, and then
+/// its tail is the latest; a pending row (seq 0) never counts.
+pub fn window_reaches_head(messages: &[ChatMessage], head_seq: i64) -> bool {
+    let newest = messages.iter().map(|message| message.seq).max().unwrap_or(0);
+    newest >= head_seq
+}
+
 /// Is this seat talking: the reader's own seat reads the local voice gate,
 /// any other reads the peer beacons by node key.
 pub fn seat_speaking(seat: &HuddleSeat, call_speaking: bool, speaking_peers: &[String]) -> bool {
@@ -241,6 +249,69 @@ pub struct LiveRunHint {
     pub dispatch_id: String,
     pub agent: String,
     pub status: String,
+    /// what the run has done so far, oldest first
+    #[serde(default)]
+    pub activity: Vec<LiveActivity>,
+    /// the answer as it is being written, clipped by the app
+    #[serde(default)]
+    pub answer_preview: String,
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct LiveActivity {
+    pub label: String,
+    pub done: bool,
+}
+
+/// A run in flight drawn as a message from its agent: the byline is the
+/// agent's, the body is what it has done and is writing, the caption its
+/// status. Nothing here is on the chain, so the row is pending and has no
+/// seq to select or thread.
+pub fn live_run_message(run: &LiveRunHint) -> ChatMessage {
+    let paragraph = |text: String| ChatBlock {
+        kind: "paragraph".into(),
+        text,
+        ..ChatBlock::default()
+    };
+    let mut blocks: Vec<ChatBlock> = run
+        .activity
+        .iter()
+        .map(|act| {
+            let mark = if act.done { "✓" } else { "·" };
+            paragraph(format!("{mark} {}", act.label))
+        })
+        .collect();
+    if !run.answer_preview.is_empty() {
+        blocks.push(paragraph(run.answer_preview.clone()));
+    }
+    ChatMessage {
+        id: format!("live/{}", run.run_id),
+        view_key: live_view_key(&run.run_id),
+        author: run.agent.clone(),
+        meta: run.status.clone(),
+        blocks,
+        pending: true,
+        show_author: true,
+        initial: run
+            .agent
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_default(),
+        avatar_kind: "agent".into(),
+        ..ChatMessage::default()
+    }
+}
+
+/// A negative, stable view key for a live row, off the seq space real
+/// messages key by.
+fn live_view_key(run_id: &str) -> i64 {
+    let hash = run_id
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |acc, byte| {
+            (acc ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    -((hash >> 1) as i64).max(1)
 }
 
 /// A body the composer surface has handed to the app but the chain has not

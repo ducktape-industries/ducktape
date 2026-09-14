@@ -368,12 +368,16 @@ fn a_failed_dispatch_outcome_posts_a_threaded_failure_reply_and_prunes_the_entry
         vec![ChatMsg::PostMessage {
             channel_id: "general".into(),
             message_id: reply_message_id(&run_id),
-            blocks: vec![Block::paragraph(
-                "⚠ BOT failed: worker exploded stack line two"
-            )],
+            blocks: vec![
+                Block::paragraph("⚠ BOT failed"),
+                Block::Code {
+                    lang: None,
+                    text: "worker exploded\nstack line two".into(),
+                },
+            ],
             thread: Some(1),
         }],
-        "one threaded ⚠ reply, authored as the agent"
+        "one threaded ⚠ reply with the reason in a code block, authored as the agent"
     );
     commit(&mut m);
     assert_eq!(get_pending(&m, &run_id), None, "the entry pruned");

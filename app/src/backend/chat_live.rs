@@ -83,6 +83,10 @@ pub struct LiveRunHint {
     pub dispatch_id: String,
     pub agent: String,
     pub status: String,
+    /// What the run has done so far, as the message it draws as lists it.
+    pub activity: Vec<LiveActivity>,
+    /// The answer as it is being written, clipped.
+    pub answer_preview: String,
 }
 
 impl From<&LiveAgentRow> for LiveRunHint {
@@ -95,6 +99,8 @@ impl From<&LiveAgentRow> for LiveRunHint {
             dispatch_id: row.dispatch_id.clone(),
             agent: row.agent.clone(),
             status: row.status.clone(),
+            activity: row.activity.clone(),
+            answer_preview: row.answer_preview.clone(),
         }
     }
 }

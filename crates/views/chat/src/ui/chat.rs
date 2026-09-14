@@ -374,7 +374,16 @@ impl ChatView {
             if self.copy_surface == CopySurface::Timeline {
                 children.push(self.selection_bar(format!("{key}/copy-range"), &self.messages));
             }
-            if !self.messages.is_empty() && (self.history_view || !self.at_live_tail) {
+            // A landing or an older page that still reaches the room's head
+            // IS the latest once scrolled to its tail: no jump to offer.
+            let head_seq = self
+                .rooms
+                .iter()
+                .find(|row| row.channel.id == self.active_channel)
+                .map_or(0, |row| row.channel.head_seq);
+            let behind_head =
+                self.history_view && !crate::host::window_reaches_head(&self.messages, head_seq);
+            if !self.messages.is_empty() && (behind_head || !self.at_live_tail) {
                 children.push(native::padded(
                     native::aligned(
                         native::column(
@@ -597,32 +606,48 @@ impl ChatView {
                 children.push(self.unread_marker(format!("{scope}/unread")));
             }
             let card = self.message_card(message, surface, plate);
-            // a live run answers the message, so its hint rides under the card
+            // a live run answers the message, so it rides under the card as
+            // a message of its own — the agent's byline, what it has done so
+            // far, the answer as it is written — updating as the run goes,
+            // with its doors (the thread it will land in, or the run; Stop)
+            // on a quiet row beneath.
             let mut run_hints = Vec::new();
             for live in &self.live_agents {
                 if crate::host::run_in_thread(live, message.seq) {
                     let run_key = format!("{scope}/run/{}", live.agent);
-                    let content = if thread {
-                        self.live_run_card(
-                            run_key,
-                            Message::CancelRun,
-                            Message::OpenRun,
-                            live.clone(),
+                    let live_message = crate::host::live_run_message(live);
+                    run_hints.push(self.message_card(
+                        &live_message,
+                        surface,
+                        crate::host::message_plate(false, false, false),
+                    ));
+                    let door = if thread {
+                        subtle(
+                            format!("{run_key}/open"),
+                            "View run",
+                            Message::OpenRun(live.dispatch_id.clone()),
+                            false,
                         )
                     } else {
                         subtle(
-                            run_key,
+                            format!("{run_key}/open"),
                             &crate::host::live_thread_label(&live.agent),
                             Message::OpenThreadFor(message.seq),
                             false,
                         )
                     };
+                    let stop = subtle(
+                        format!("{run_key}/stop"),
+                        "Stop",
+                        Message::CancelRun(live.run_id.clone()),
+                        false,
+                    );
                     run_hints.push(native::padded(
-                        content,
+                        native::spaced(native::row(format!("{run_key}/actions"), [door, stop]), 6.),
                         wire::Edges {
-                            top: 2.,
+                            top: 0.,
                             right: 16.,
-                            bottom: 2.,
+                            bottom: 4.,
                             left: super::kit::RAIL,
                         },
                     ));
@@ -685,11 +710,11 @@ impl ChatView {
                     ),
                 ]);
                 // The actions float over the card's top-right corner while
-                // the pointer is on it (or the message is chosen).
-                // the pointer washes the row it is on, as the bar appears
-                // (the wash is a layer over the text, so it stays faint)
+                // the pointer is on it (or the message is chosen), straddling
+                // the card's top edge; the pointer washes the row it is on
+                // (the wash is the row's ground, under the text).
                 let mut wash = native::palette().surface_raised;
-                wash[3] = 0.25;
+                wash[3] = 0.6;
                 let hover = wire::Node::Hover {
                     key: format!("{scope}/hover"),
                     width: Some(wire::Length::Fill),
