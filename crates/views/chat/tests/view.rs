@@ -314,7 +314,10 @@ fn a_huddle_lists_its_people_under_the_room() {
         assert!(has_text(&frame, "Ada Lovelace"), "{:?}", texts(&frame));
         assert!(has_text(&frame, "you · muted"), "{:?}", texts(&frame));
         let _ = node_ending(&frame, "channel/channel-b/seat/1");
-        assert!(!has_text(&frame, "Huddle 2"), "the count is a caption, not a badge");
+        assert!(
+            !has_text(&frame, "Huddle 2"),
+            "the count is a caption, not a badge"
+        );
     });
 }
 
@@ -419,7 +422,10 @@ fn a_search_reads_the_index_and_lands_its_hits() {
         let (frame, _) = connected_room();
         let frame = tick_native(type_into(&frame, "Search messages…", "  light  "));
         assert!(frame.requests.is_empty(), "typing runs no handler");
-        let frame = tick_native(ducktape_view_guest::testing::submit(&frame, "Search messages…"));
+        let frame = tick_native(ducktape_view_guest::testing::submit(
+            &frame,
+            "Search messages…",
+        ));
         let read = request(&frame, "rpc.view");
         let ask: serde_json::Value = serde_json::from_slice(&read.payload).expect("a read decodes");
         assert_eq!(ask["target"], "chat");
@@ -445,7 +451,10 @@ fn a_zero_hit_search_can_be_cleared_and_never_labels_a_different_draft() {
     on_a_deep_stack(|| {
         let (frame, _) = connected_room();
         let frame = tick_native(type_into(&frame, "Search messages…", "missing"));
-        let frame = tick_native(ducktape_view_guest::testing::submit(&frame, "Search messages…"));
+        let frame = tick_native(ducktape_view_guest::testing::submit(
+            &frame,
+            "Search messages…",
+        ));
         let read = request(&frame, "rpc.view").id;
         let frame = tick_native(vec![answer(read, br#"{"hits":[]}"#)]);
         assert!(has_text(&frame, "No messages match"));
@@ -456,7 +465,10 @@ fn a_zero_hit_search_can_be_cleared_and_never_labels_a_different_draft() {
         assert!(!has_text(&frame, "No messages match"));
         assert!(has_text(&frame, "first light"));
         let frame = tick_native(type_into(&frame, "Search messages…", "missing"));
-        let frame = tick_native(ducktape_view_guest::testing::submit(&frame, "Search messages…"));
+        let frame = tick_native(ducktape_view_guest::testing::submit(
+            &frame,
+            "Search messages…",
+        ));
         let read = request(&frame, "rpc.view").id;
         let frame = tick_native(vec![answer(read, br#"{"hits":[]}"#)]);
         let frame = tick_native(press(&frame, "Clear message search"));
@@ -619,12 +631,14 @@ fn the_channel_list_and_details_drawer_drag_with_horizontal_cursors() {
     });
 }
 
-/// A RUN IN FLIGHT HANGS OFF ITS ANCHOR, AND STOP LEAVES AS A CANCEL. The run
-/// lives in the app's process, not on the chain, so it reaches the view as a
-/// session fact and the timeline draws its door under the message that summoned
-/// it. Inside the thread the card carries the controls, and Stop is the one
-/// intent the app signs — carrying the run it names. A run the app's reading no
-/// longer holds takes its card with it.
+/// A RUN IN FLIGHT IS A REPLY BEING WRITTEN, AND STOP LEAVES AS A CANCEL. The
+/// run lives in the app's process, not on the chain, so it reaches the view as
+/// a session fact; the timeline shows it the way it shows any thread — the
+/// reply chip under the message that summoned it, counting the answer to come
+/// — and never the run's card. Inside the thread the card rides at the tail,
+/// once, with its controls; Stop is the one intent the app signs, carrying the
+/// run it names. A run the app's reading no longer holds takes its card with
+/// it.
 #[test]
 fn a_live_run_opens_its_thread_and_stop_leaves_as_a_cancel() {
     on_a_deep_stack(|| {
@@ -633,16 +647,27 @@ fn a_live_run_opens_its_thread_and_stop_leaves_as_a_cancel() {
             ..session(true)
         };
         let (frame, _, props) = connected_room_with(&seated, roots());
-        let door = chat_view::host::live_thread_label("chiefduck");
         assert!(
-            has_text(&frame, &door),
-            "the run's door is missing from the timeline: {:?}",
+            has_text(&frame, "1 reply"),
+            "the run is not counted as the anchor's reply: {:?}",
+            texts(&frame)
+        );
+        assert!(
+            !has_text(&frame, "Reading the repo"),
+            "the run's card leaked into the timeline: {:?}",
             texts(&frame)
         );
 
-        // the door opens the thread the run is anchored in, and the replies are
-        // a read of their own
-        let frame = tick_native(press(&frame, &door));
+        // the chip opens the thread the run is anchored in, and the replies
+        // are a read of their own
+        let Node::Button {
+            on_press: Some(open),
+            ..
+        } = node_ending(&frame, "/2/contents/thread")
+        else {
+            panic!("no reply chip under the anchor: {:?}", texts(&frame))
+        };
+        let frame = tick_native(vec![ducktape_view_guest::wire::Event::Message(*open)]);
         let thread = request(&frame, "rpc.view").id;
         let page = serde_json::json!({ "thread": {
             "root": row(2, "second wind"), "replies": [], "has_more": false,
@@ -651,11 +676,11 @@ fn a_live_run_opens_its_thread_and_stop_leaves_as_a_cancel() {
         .to_string()
         .into_bytes();
         let frame = tick_native(vec![answer(thread, &page)]);
-        assert!(
-            has_text(&frame, "Reading the repo"),
-            "the rail drew no run card: {:?}",
-            texts(&frame)
-        );
+        let cards = texts(&frame)
+            .iter()
+            .filter(|text| *text == "Reading the repo")
+            .count();
+        assert_eq!(cards, 1, "one run card, in the thread: {:?}", texts(&frame));
 
         let frame = tick_native(press(&frame, "Stop"));
         let intent = one_intent(&frame);
