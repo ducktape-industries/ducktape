@@ -124,7 +124,19 @@ fn the_editor_menu_paints_over_the_rows_below_it_and_shows_the_walked_item() {
     assert!(editor.contains("deferred(menu_view).with_priority(1)"));
     assert!(editor.contains(".rounded(theme.radius_tokens().md).occlude()"));
     assert!(editor.contains("letwalked=item_indexasu32==menu.selected;"));
-    assert!(editor.contains(".selected(walked)"));
+    assert!(editor.contains(".when(walked,|row|row.bg(raised))"));
+    assert!(editor.contains(".hover(move|style|style.bg(raised))"));
+}
+/// The comment badge sits on its row's LAST line, above the reserve the row
+/// carries for an inline card: the guest hangs the card half a line under the
+/// pointer that pressed the badge, so a top-aligned badge on a wrapped row
+/// would put the card over the row's own remaining lines.
+#[test]
+fn the_comment_badge_sits_on_the_last_line_of_its_row() {
+    let editor = rust_tokens(include_str!("../editor/blocks.rs"));
+    let badge = editor.find("Button::new((\"comments\",index))").expect("the badge");
+    let before = &editor[badge.saturating_sub(400)..badge];
+    assert!(before.contains(".absolute().right(px(0.)).bottom(px(layout.padding.bottom))"), "{before}");
 }
 #[test]
 fn persistent_split_panes_have_native_resize_handles_and_cursor_feedback() {
