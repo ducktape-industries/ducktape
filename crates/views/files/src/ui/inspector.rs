@@ -152,7 +152,7 @@ impl FilesView {
             let (document, on_document) =
                 self.draft.document("app:draft".into(), Message::EditDraft);
             return native::padded(
-                native::container(
+                native::card(
                     format!("{key}/editor-box"),
                     wire::Node::Editor {
                         key: format!("{key}/fs-editor"),
@@ -249,11 +249,21 @@ impl FilesView {
                 None,
             ),
         };
-        vec![wire::Node::Surface {
+        let document = wire::Node::Surface {
             key: format!("{key}/document"),
             name: name.into(),
             args,
             on_event,
+        };
+        // The code surface scrolls within its bounds; unlike Markdown it
+        // cannot measure an intrinsic height inside the inspector's scroll.
+        vec![match markdown {
+            true => document,
+            false => native::sized(
+                native::container(format!("{key}/code-box"), document),
+                None,
+                Some(wire::Length::Fixed(240.)),
+            ),
         }]
     }
 

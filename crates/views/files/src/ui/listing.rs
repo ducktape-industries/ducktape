@@ -1,13 +1,12 @@
 //! The directory as rows: a sortable header, one row per entry with its
-//! kind glyph, size and kind, the chosen row carrying its own actions, and
-//! the plates for an empty, filtered-out or failed directory.
+//! kind glyph, size and kind, and the plates for an empty, filtered-out or failed directory.
 
 use super::*;
 use ducktape_view_guest::slots;
 
 const SIZE_WIDTH: f32 = 76.;
 const KIND_WIDTH: f32 = 84.;
-const ROW_HEIGHT: f32 = 28.;
+const ROW_HEIGHT: f32 = 32.;
 
 /// A row's cell: a fixed-width, muted, unwrapped mono run.
 fn cell(key: String, value: String, width: f32, align: wire::AlignX) -> wire::Node {
@@ -42,9 +41,23 @@ impl FilesView {
                 (true, true) => " ▲",
                 (true, false) => " ▼",
             };
-            let mut button = native::button(
+            let mut title = native::sized(
+                native::nowrap(native::text(
+                    format!("{key}/{field}/label"),
+                    format!("{text}{arrow}"),
+                )),
+                Some(wire::Length::Fill),
+                None,
+            );
+            if let wire::Node::Text { align_x, .. } = &mut title {
+                *align_x = Some(match sort_key {
+                    SortKey::Size => wire::AlignX::Right,
+                    SortKey::Name | SortKey::Kind => wire::AlignX::Left,
+                });
+            }
+            let mut button = native::button_child(
                 format!("{key}/{field}"),
-                format!("{text}{arrow}"),
+                title,
                 Some(slots::message(Message::SortBy(sort_key))),
                 wire::ButtonPreset::Text,
             );
@@ -56,10 +69,14 @@ impl FilesView {
             } = &mut button
             {
                 *label = Some(format!("Sort by {text}"));
-                *w = Some(width.map_or(wire::Length::Fill, wire::Length::Fixed));
+                *w = Some(wire::Length::Fill);
                 *padding = Some(wire::Edges::all(0.));
             }
-            button
+            native::sized(
+                native::container(format!("{key}/{field}/cell"), button),
+                Some(width.map_or(wire::Length::Fill, wire::Length::Fixed)),
+                None,
+            )
         };
         kit::header_strip(
             &key,
@@ -202,8 +219,8 @@ impl FilesView {
         scroll
     }
 
-    /// One entry. A click chooses it; a double-click opens it. The chosen
-    /// row carries its Rename and Delete beside its cells.
+    /// One entry. A click chooses it; a double-click opens it. Selection
+    /// keeps the same columns; actions live outside the filename's space.
     fn list_row(&self, key: String, entry: &FsEntry) -> wire::Node {
         let chosen = entry.path == self.selected;
         let name = native::nowrap(native::text(format!("{key}/name"), entry.name.clone()));
@@ -226,9 +243,6 @@ impl FilesView {
             ),
             native::sized(name, Some(wire::Length::Fill), None),
         ];
-        if chosen {
-            cells.push(self.row_actions(format!("{key}/actions"), entry));
-        }
         cells.push(cell(
             format!("{key}/size"),
             size,
@@ -248,7 +262,8 @@ impl FilesView {
             chosen,
             Some(slots::message(Message::Select(entry.path.clone()))),
         );
-        if let wire::Node::Button { label, .. } = &mut button {
+        if let wire::Node::Button { label, height, .. } = &mut button {
+            *height = Some(wire::Length::Fixed(ROW_HEIGHT));
             *label = Some(match entry.is_dir() {
                 true => format!("Folder {}", entry.name),
                 false => format!("File {}", entry.name),
@@ -272,8 +287,8 @@ impl FilesView {
         }
     }
 
-    /// Open (a folder), Rename and Delete, on the chosen row only; the
-    /// toolbar's verbs act on the directory, these on the entry.
+    /// Open (a folder), Rename and Delete for the chosen entry, in the
+    /// inspector or the selection bar when the inspector is closed.
     pub(super) fn row_actions(&self, key: String, entry: &FsEntry) -> wire::Node {
         let busy = self.loading();
         let refused = !crate::host::write_refusal(&crate::host::fs_parent(&entry.path)).is_empty();

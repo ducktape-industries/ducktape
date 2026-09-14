@@ -174,10 +174,14 @@ fn dialog_card(key: String, children: Vec<wire::Node>) -> wire::Node {
         native::spaced(native::column(key, children), 12.),
     );
     if let wire::Node::Container {
-        padding, max_width, ..
+        padding,
+        width,
+        max_width,
+        ..
     } = &mut card
     {
         *padding = Some(wire::Edges::all(20.));
+        *width = Some(wire::Length::Fixed(420.));
         *max_width = Some(420.);
     }
     card
