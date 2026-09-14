@@ -472,7 +472,7 @@ args = ["run", "--model", "m1"]
             );
         }
 
-        // the full matrix is present: 19 codex + 16 claude variants + 2 bases.
+        // the full matrix is present: 19 codex + 16 claude variants + 3 bases.
         // codex efforts are per-model — the 5.6 family reaches `max`, 5.5 caps
         // at `xhigh` — so the codex side is not a rectangle.
         for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
@@ -488,6 +488,7 @@ args = ["run", "--model", "m1"]
                 get(&format!("claude_{model}_{effort}"));
             }
         }
-        assert_eq!(specs.len(), 37, "2 bases + 19 codex + 16 claude variants");
+        assert_eq!(get("pi").isolation.broker, Some(crate::spec::BrokerKind::Pi));
+        assert_eq!(specs.len(), 38, "3 bases + 19 codex + 16 claude variants");
     }
 }

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use ducktape_view_guest::testing::{answer, has_text, item, press, submit, texts, type_into};
 use ducktape_view_guest::wire::{ButtonContent, Frame, Node, Request};
-use settings_view::host::{KeyAdd, Name, Session, Tab, Unlock};
+use settings_view::host::{KeyAdd, Name, Session, Tab, TasteRow, Unlock};
 use settings_view::{boot_native, tick_native};
 
 const SEAT: &str = "8c4fa211";
@@ -47,6 +47,21 @@ fn facts() -> Session {
         update_checked: String::new(),
         update_note: String::new(),
         update_busy: false,
+        tasting: Vec::new(),
+    }
+}
+
+/// One taste row: the chat view a proposal would install.
+fn taste_row(tasting: bool, reason: &str) -> TasteRow {
+    TasteRow {
+        module: "chat".into(),
+        name: "Chat".into(),
+        proposal: "prop-code".into(),
+        hash: "ab".repeat(32),
+        status: "open".into(),
+        activation_height: 0,
+        tasting,
+        reason: reason.into(),
     }
 }
 
@@ -588,6 +603,68 @@ fn a_link_to_another_tab_leaves_as_an_intent() {
             tab: "members".into()
         }
     );
+}
+
+/// The Network tab lists the proposed views: "Try this view" leaves as
+/// `settings.taste` naming the module and hash, a tasted row offers "Back
+/// to current" (`settings.untaste`), a refused row shows its reason and
+/// nothing to press, and with nothing proposed the section is not there.
+#[test]
+fn proposed_views_are_tried_and_left_from_the_network_tab() {
+    let session = Session {
+        tasting: vec![taste_row(false, "")],
+        ..facts()
+    };
+    let (frame, props, _) = connected(&session, 1);
+    let frame = tick_native(press(&frame, "Network"));
+    for expected in [
+        "Proposed views",
+        "Chat",
+        "abababababab · proposal prop-code · on the ballot",
+    ] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
+    }
+    let frame = tick_native(press(&frame, "Try this view"));
+    let taste: settings_view::host::Taste =
+        serde_json::from_slice(&one_intent(&frame).payload).unwrap();
+    assert_eq!(taste.module, "chat");
+    assert_eq!(taste.hash, "ab".repeat(32));
+
+    let tasting = Session {
+        tasting: vec![taste_row(true, "")],
+        ..facts()
+    };
+    let frame = tick_native(vec![item(props, &encoded(&tasting))]);
+    assert!(
+        has_text(&frame, "You are trying this view"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(!has_text(&frame, "Try this view"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Back to current"));
+    let untaste: settings_view::host::Untaste =
+        serde_json::from_slice(&one_intent(&frame).payload).unwrap();
+    assert_eq!(untaste.module, "chat");
+
+    let refused = Session {
+        tasting: vec![taste_row(false, "not_held")],
+        ..facts()
+    };
+    let frame = tick_native(vec![item(props, &encoded(&refused))]);
+    assert!(
+        has_text(&frame, "Your node has not received these bytes yet"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(!has_text(&frame, "Try this view"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "Back to current"), "{:?}", texts(&frame));
+
+    let frame = tick_native(vec![item(props, &encoded(&facts()))]);
+    assert!(!has_text(&frame, "Proposed views"), "{:?}", texts(&frame));
 }
 
 // ---------- updates ----------
