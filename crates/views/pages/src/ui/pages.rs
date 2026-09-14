@@ -183,16 +183,26 @@ impl PagesView {
         } else {
             &self.active_page_title
         };
-        // Notion's crumb: every ancestor by TITLE, root first, each one a
-        // way back up the tree.
+        // Notion's crumb: the parent by TITLE, a way back up the tree, and
+        // an ellipsis standing for everything above it — the row does not
+        // clip, so a deep tree must not spell its whole path into the
+        // controls beside it.
         let mut crumb = Vec::new();
-        for ancestor in crate::host::ancestors(&self.pages, &self.active_page_parent) {
-            let key = format!("pages/toolbar/parent/{}", ancestor.id);
+        let ancestors = crate::host::ancestors(&self.pages, &self.active_page_parent);
+        if ancestors.len() > 1 {
+            crumb.push(kit::nowrap(kit::caption("pages/toolbar/ellipsis", "…")));
+            crumb.push(kit::nowrap(kit::caption(
+                "pages/toolbar/ellipsis/crumb",
+                "/",
+            )));
+        }
+        if let Some(parent) = ancestors.last() {
+            let key = format!("pages/toolbar/parent/{}", parent.id);
             crumb.push(kit::button(
                 key.clone(),
-                ancestor.title.clone(),
+                parent.title.clone(),
                 (!self.unavailable())
-                    .then(|| slots::message(Message::ChoosePage(ancestor.id.clone()))),
+                    .then(|| slots::message(Message::ChoosePage(parent.id.clone()))),
                 ButtonPreset::Subtle,
             ));
             crumb.push(kit::nowrap(kit::caption(format!("{key}/crumb"), "/")));
