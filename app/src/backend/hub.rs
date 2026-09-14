@@ -31,6 +31,10 @@ pub struct HubNetwork {
     pub probed: bool,
     pub live: bool,
     pub height: i64,
+    /// The node's contract number off the same probe ([`NodeFacts::contract`]);
+    /// `0` until a live node has answered. Read only through
+    /// [`contract_refuses`] — a dead or unprobed row has no number to judge.
+    pub contract: u32,
 }
 
 /// One probe answer. Never an error: a node that does not answer IS the
@@ -40,6 +44,7 @@ pub struct HubProbe {
     pub id: String,
     pub live: bool,
     pub height: i64,
+    pub contract: u32,
 }
 
 /// One wallet row the launch window lists, straight off `keystore::wallet`.
@@ -129,6 +134,7 @@ pub(crate) fn known_networks() -> Vec<HubNetwork> {
                 probed: false,
                 live: false,
                 height: -1,
+                contract: 0,
             }
         })
         .collect();
@@ -154,6 +160,7 @@ pub(crate) fn known_networks() -> Vec<HubNetwork> {
             probed: false,
             live: false,
             height: -1,
+            contract: 0,
         });
     }
     rows.sort_by(|a, b| b.last_used.cmp(&a.last_used).then(a.id.cmp(&b.id)));
@@ -466,7 +473,17 @@ async fn name_remote_keystore(rpc: &str) -> Result<(), String> {
         .status_json()
         .await
         .map_err(|error| error.to_string())?;
-    let chain_id = super::node::node_facts(&status).chain_id;
+    let facts = super::node::node_facts(&status);
+    // the same refusal the hub row prints for a probed node, for an endpoint
+    // typed in directly: a console never opens against a surface this app was
+    // not written for.
+    match super::node::contract_match(facts.contract) {
+        super::node::ContractMatch::Match => {}
+        super::node::ContractMatch::NodeBehind | super::node::ContractMatch::NodeAhead => {
+            return Err(super::node::contract_hint(facts.contract));
+        }
+    }
+    let chain_id = facts.chain_id;
     if chain_id.is_empty() {
         return Err(
             "this node serves no network yet, so there is no identity to hold for it".into(),
@@ -485,10 +502,53 @@ pub fn apply_network_probe(networks: Vec<HubNetwork>, probe: HubProbe) -> Vec<Hu
                 row.probed = true;
                 row.live = probe.live;
                 row.height = probe.height;
+                row.contract = probe.contract;
             }
             row
         })
         .collect()
+}
+
+/// The one line a network row prints after its name: the probe's reading,
+/// and — for a live node whose contract number is not this app's — the
+/// refusal, in the same voice as provisioning's `blocked` step.
+pub fn network_row_label(row: &HubNetwork) -> String {
+    let unprobed = !row.probed;
+    if unprobed {
+        return format!("{} · checking", row.name);
+    }
+    if !row.live {
+        return format!("{} · offline", row.name);
+    }
+    match super::node::contract_match(row.contract) {
+        super::node::ContractMatch::Match => format!("{} · block {}", row.name, row.height),
+        super::node::ContractMatch::NodeBehind | super::node::ContractMatch::NodeAhead => {
+            format!(
+                "{} · {}",
+                row.name,
+                super::node::contract_hint(row.contract)
+            )
+        }
+    }
+}
+
+/// Whether the console must NOT open on this row: the probe measured a live
+/// node and its contract number is not [`EXPECTED_NODE_CONTRACT`]. A row the
+/// probe has not answered for, or a dead one, has no number to refuse on —
+/// opening those is the same as before, and the console says offline itself.
+pub fn contract_refuses(row: &HubNetwork) -> bool {
+    let measured_live = row.probed && row.live;
+    let mismatched = super::node::contract_match(row.contract) != super::node::ContractMatch::Match;
+    measured_live && mismatched
+}
+
+/// Whether the selected row refuses ([`contract_refuses`]); a selection that
+/// names no row refuses nothing — the empty endpoint already stops the open.
+pub fn selected_network_refuses(networks: &[HubNetwork], id: &str) -> bool {
+    networks
+        .iter()
+        .find(|row| row.id == id)
+        .is_some_and(contract_refuses)
 }
 
 /// Probe every known network's endpoint, emitting one reading per row as it
@@ -496,28 +556,35 @@ pub fn apply_network_probe(networks: Vec<HubNetwork>, probe: HubProbe) -> Vec<Hu
 pub fn probe_known_networks() -> futures::stream::BoxStream<'static, HubProbe> {
     use futures::StreamExt;
     let probes = known_networks().into_iter().map(move |row| async move {
-        let reading = probe_endpoint(&row.endpoint).await;
+        let status = probe_endpoint(&row.endpoint).await;
         HubProbe {
             id: row.id,
-            live: reading.is_some(),
-            height: reading.unwrap_or(-1),
+            live: status.is_some(),
+            // the wire height verbatim: a fresh node at 0 IS at block 0 here,
+            // unlike the overview's `served_height`, which reads 0 as absent.
+            height: status
+                .as_ref()
+                .and_then(|status| status["height"].as_i64())
+                .unwrap_or(-1),
+            contract: status
+                .as_ref()
+                .map_or(0, |status| super::node::node_facts(status).contract),
         }
     });
     futures::stream::iter(probes).buffer_unordered(8).boxed()
 }
 
-/// One bounded status read: the height when the node answers, `None` when it
-/// does not. 3s — a liveness dot must not hang the list.
-async fn probe_endpoint(endpoint: &str) -> Option<i64> {
+/// One bounded status read: the `/v1/status` document when the node answers,
+/// `None` when it does not. 3s — a liveness dot must not hang the list.
+async fn probe_endpoint(endpoint: &str) -> Option<serde_json::Value> {
     if endpoint.is_empty() {
         return None;
     }
     let client = rpc_client(endpoint).ok()?;
-    let status = tokio::time::timeout(Duration::from_secs(3), client.status())
+    tokio::time::timeout(Duration::from_secs(3), client.status_json())
         .await
         .ok()?
-        .ok()?;
-    Some(status.height as i64)
+        .ok()
 }
 
 /// Stamp a network's last-used time and — for an endpoint no workspace
@@ -964,6 +1031,7 @@ mod tests {
             probed: false,
             live: false,
             height: -1,
+            contract: 0,
         }];
         assert_eq!(
             selected_network_name(rows.clone(), "demo#a1b2".into()),

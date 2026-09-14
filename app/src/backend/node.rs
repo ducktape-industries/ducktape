@@ -1,5 +1,51 @@
 use super::*;
 
+/// The shape of the node surface this app was written against — the app's copy
+/// of `noded::NODE_CONTRACT` (`/v1` routes and bodies, ws topics and frames,
+/// view-props JSON, the `duck://` grammar). Bumped in the same PR as the
+/// node's; `crates/noded/tests/contract_lint.rs` is the gate that notices a
+/// surface change without one. Compared for EQUALITY against
+/// [`NodeFacts::contract`] before a console opens — never a window, never
+/// "one behind still works": that would be the compat the repository forbids.
+pub const EXPECTED_NODE_CONTRACT: u32 = 1;
+
+/// The one three-way reading of a node's contract number against
+/// [`EXPECTED_NODE_CONTRACT`]. Only `Match` opens a console; the other two
+/// name which side is stale, because the fix differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContractMatch {
+    Match,
+    /// The node's number is lower — an older node (or one that publishes no
+    /// number at all, which reads as `0`). The node is what to update.
+    NodeBehind,
+    /// The node's number is higher — this app is the older half.
+    NodeAhead,
+}
+
+/// Where a node's contract number stands against this app's.
+pub fn contract_match(node: u32) -> ContractMatch {
+    match node.cmp(&EXPECTED_NODE_CONTRACT) {
+        std::cmp::Ordering::Equal => ContractMatch::Match,
+        std::cmp::Ordering::Less => ContractMatch::NodeBehind,
+        std::cmp::Ordering::Greater => ContractMatch::NodeAhead,
+    }
+}
+
+/// The refusal line for a node whose number differs: the two numbers and
+/// which side to update. Empty on a match — there is nothing to say.
+pub fn contract_hint(node: u32) -> String {
+    let expected = EXPECTED_NODE_CONTRACT;
+    match contract_match(node) {
+        ContractMatch::Match => String::new(),
+        ContractMatch::NodeBehind => {
+            format!("node contract {node} · app expects {expected} · update the node")
+        }
+        ContractMatch::NodeAhead => {
+            format!("node contract {node} · app expects {expected} · update the app")
+        }
+    }
+}
+
 /// The device-local settings facts: where this app points and what identity it
 /// holds locally. Node status belongs to [`NodeFacts`].
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -65,6 +111,10 @@ pub struct NodeFacts {
     /// `CARGO_PKG_VERSION`). A build/commit SHA is NOT published anywhere, so
     /// the version line carries the version alone.
     pub version: String,
+    /// The node's `contract` off `/v1/status` — the number naming the shape of
+    /// its app-facing surface. `0` when the document carries none: a node that
+    /// predates the number is behind by definition, and reads that way.
+    pub contract: u32,
     pub root_hash: String,
     /// The chain id every chain-scoped user proof (an `AddKey` consent) is
     /// minted for; "" on a daemon that serves no chain.
@@ -129,6 +179,7 @@ impl Default for NodeFacts {
         Self {
             public_key: String::new(),
             version: String::new(),
+            contract: 0,
             root_hash: String::new(),
             chain_id: String::new(),
             view: None,
@@ -164,6 +215,10 @@ pub(crate) fn node_facts(status: &serde_json::Value) -> NodeFacts {
             .unwrap_or_default()
             .to_string(),
         version: status["version"].as_str().unwrap_or_default().to_string(),
+        contract: status["contract"]
+            .as_u64()
+            .and_then(|contract| u32::try_from(contract).ok())
+            .unwrap_or(0),
         root_hash: status["root_hash"].as_str().unwrap_or_default().to_string(),
         chain_id: status["chain_id"].as_str().unwrap_or_default().to_string(),
         view: consensus["view"].as_i64(),

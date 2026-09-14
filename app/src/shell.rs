@@ -947,12 +947,9 @@ impl DesktopWindow {
                             )),
                     );
                 }
+                let refused = crate::backend::selected_network_refuses(&networks, &selected);
                 for network in networks {
-                    let label = match (network.probed, network.live) {
-                        (false, _) => format!("{} · checking", network.name),
-                        (true, true) => format!("{} · block {}", network.name, network.height),
-                        (true, false) => format!("{} · offline", network.name),
-                    };
+                    let label = crate::backend::network_row_label(&network);
                     let picked = network.id == selected;
                     recent = recent.child(
                         div()
@@ -982,7 +979,9 @@ impl DesktopWindow {
                             ),
                     );
                 }
-                let no_selection = busy || selected.is_empty();
+                // a measured contract mismatch disables the open the way no
+                // selection does: the row's own line says why.
+                let no_selection = busy || selected.is_empty() || refused;
                 if !empty {
                     recent = recent.child(
                         div()

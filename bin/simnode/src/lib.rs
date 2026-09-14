@@ -1362,6 +1362,7 @@ impl Sim {
             .collect();
         let height = self.height();
         NodeStatus {
+            contract: noded::NODE_CONTRACT,
             version: env!("CARGO_PKG_VERSION").into(),
             root_hash: hex_root(&host.root_hash()),
             height,
