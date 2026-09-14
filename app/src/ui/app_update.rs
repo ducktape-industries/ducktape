@@ -135,6 +135,12 @@ impl Ducktape {
             }
             AppMessage::FilesViewEvent(event) => self.on_files_view_event(event),
             AppMessage::FsFileDropped(path) => self.on_fs_file_dropped(path),
+            AppMessage::AttachmentQueued(scope, id, path) => {
+                self.on_attachment_queued(scope, id, path)
+            }
+            AppMessage::AttachmentUploaded(scope, id, outcome) => {
+                self.on_attachment_uploaded(scope, id, outcome)
+            }
             AppMessage::FsDropped(_result) => self.on_fs_dropped(_result),
             AppMessage::FsDropFailed(cause) => self.on_fs_drop_failed(cause),
             AppMessage::AccountLoaded(next) => self.on_account_loaded(next),
@@ -2078,12 +2084,24 @@ impl Ducktape {
             ForgeIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
                 crate::module_view::event_text(&(event), "url" ),
             )),
+            ForgeIntent::Attach => Task::done(AppMessage::AttachmentQueued(
+                crate::module_view::event_text(&(event), "scope"),
+                crate::module_view::event_text(&(event), "id"),
+                crate::module_view::event_text(&(event), "path"),
+            )),
             ForgeIntent::Composer => {
                 let scope = crate::module_view::event_text(&(event), "scope" );
                 let submitted_scope = scope.to_owned();
+                // the files the submit sent, linked into the note's body
+                let links = crate::composer_surface::take_attachments(
+                    &crate::module_view::event_text(&(event), "id"),
+                );
                 Task::done(AppMessage::ForgeComposerEvent(
                     submitted_scope.clone(),
-                    crate::module_view::event_text(&(event), "body" ),
+                    crate::backend::attachment_body(
+                        crate::module_view::event_text(&(event), "body"),
+                        &links,
+                    ),
                 ))
             }
             ForgeIntent::Copy => {
@@ -2124,7 +2142,6 @@ impl Ducktape {
                         channel.to_owned(),
                         op.to_owned(),
                         (body).trim().to_owned(),
-                        Vec::new(),
                     ),
                     move |result| match result {
                         Ok(value) => AppMessage::ForgeNoteSent(send_operation.clone(), value),
@@ -2182,6 +2199,10 @@ impl Ducktape {
         )))
     }
     fn on_fs_file_dropped(&mut self, path: String) -> Task<AppMessage> {
+        // a drop on the chat attaches to the room's composer
+        if self.shell_tab == ShellTab::Chat {
+            return self.on_chat_file_dropped(path);
+        }
         if ((self.shell_tab != ShellTab::Files) || self.fs_dropping) || (!self.connected) {
             return Task::none();
         }
@@ -2205,6 +2226,53 @@ impl Ducktape {
                 Err(error) => AppMessage::FsDropFailed(error),
             },
         )
+    }
+    /// A file dropped anywhere on the chat: into the standby zone of the
+    /// open room's composer, and on its way into DuckFS.
+    fn on_chat_file_dropped(&mut self, path: String) -> Task<AppMessage> {
+        if !self.connected || self.active_channel.is_empty() {
+            return Task::none();
+        }
+        let scope = crate::backend::composer_scope(&self.connected_rpc, &self.active_channel);
+        match crate::composer_surface::attach(&scope, &[path]) {
+            Ok(queued) => Task::batch(queued.into_iter().map(|attachment| {
+                Task::done(AppMessage::AttachmentQueued(
+                    scope.clone(),
+                    attachment.id,
+                    attachment.path,
+                ))
+            })),
+            Err(reason) => {
+                self.error = reason;
+                Task::none()
+            }
+        }
+    }
+    /// An attached file starts its upload under its own id.
+    fn on_attachment_queued(&mut self, scope: String, id: String, path: String) -> Task<AppMessage> {
+        let answer_scope = scope.clone();
+        let answer_id = id.clone();
+        Task::perform(
+            crate::backend::attach_file(
+                self.connected_rpc.to_owned(),
+                self.password.to_owned(),
+                id,
+                path,
+            ),
+            move |outcome| {
+                AppMessage::AttachmentUploaded(answer_scope.clone(), answer_id.clone(), outcome)
+            },
+        )
+    }
+    /// Where the file landed, or why it did not, back to its chip.
+    fn on_attachment_uploaded(
+        &mut self,
+        scope: String,
+        id: String,
+        outcome: Result<String, String>,
+    ) -> Task<AppMessage> {
+        crate::composer_surface::attached(&scope, &id, outcome);
+        Task::none()
     }
     fn on_fs_dropped(&mut self, _result: bool) -> Task<AppMessage> {
         self.fs_dropping = false;
@@ -3673,11 +3741,9 @@ impl Ducktape {
         pending_id: String,
         scope: String,
     ) -> Task<AppMessage> {
-        // the files the submit queued, and the body that links them
-        let attachments = crate::composer_surface::take_attachments(&pending_id);
-        let names: Vec<String> = attachments.iter().map(|a| a.name.clone()).collect();
-        let paths: Vec<String> = attachments.into_iter().map(|a| a.path).collect();
-        let pending_body = crate::backend::attachment_body(pending_body, &pending_id, &names);
+        // the files the submit sent, already in DuckFS, and the body that links them
+        let links = crate::composer_surface::take_attachments(&pending_id);
+        let pending_body = crate::backend::attachment_body(pending_body, &links);
         match kind {
             ComposerKind::Message => {
                 match crate::backend::submit_verdict(
@@ -3713,7 +3779,6 @@ impl Ducktape {
                                 self.active_channel.to_owned(),
                                 pending_id.to_owned(),
                                 pending_body.to_owned(),
-                                paths,
                             ),
                             |result| match result {
                                 Ok(value) => AppMessage::MessageSent(value),
@@ -3760,7 +3825,6 @@ impl Ducktape {
                                 thread_seq,
                                 pending_id.to_owned(),
                                 pending_body.to_owned(),
-                                paths,
                             ),
                             |result| match result {
                                 Ok(value) => AppMessage::ThreadReplySent(value),
@@ -4417,6 +4481,11 @@ impl Ducktape {
             ),
             ChatIntent::OpenRun => Task::done(AppMessage::OpenRunPanel(
                 crate::module_view::event_text(&(event), "dispatch_id" ),
+            )),
+            ChatIntent::Attach => Task::done(AppMessage::AttachmentQueued(
+                crate::module_view::event_text(&(event), "scope"),
+                crate::module_view::event_text(&(event), "id"),
+                crate::module_view::event_text(&(event), "path"),
             )),
             ChatIntent::Composer => {
                 let kind = crate::module_view::chat_event_kind(&(event));

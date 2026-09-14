@@ -273,6 +273,7 @@ fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does
         archived: false,
         members_only: false,
         huddle_count: 0,
+        huddle: Vec::new(),
         head_seq: head,
     };
 
@@ -745,6 +746,7 @@ fn another_members_dm_is_not_a_channel_of_mine() {
         archived: false,
         members_only: false,
         huddle_count: 0,
+        huddle: Vec::new(),
         head_seq: 4,
     };
     // the live network's shape: me(1) ↔ orthory(2), me(1) ↔ orthory-ops(3),

@@ -288,6 +288,29 @@ fn disconnect_hides_retained_rooms_messages_and_composer() {
     });
 }
 
+/// A room with a huddle lists its people under the room, the way a voice
+/// channel does; the reader's own seat says so, and says when she is muted.
+#[test]
+fn a_huddle_lists_its_people_under_the_room() {
+    on_a_deep_stack(|| {
+        let mut seated = session(true);
+        let seat = |label: &str, is_you: bool| chat_view::host::HuddleSeat {
+            label: label.into(),
+            initials: label.chars().take(2).collect(),
+            is_you,
+        };
+        seated.rooms[1].channel.huddle_count = 2;
+        seated.rooms[1].channel.huddle = vec![seat("Ada Lovelace", false), seat("Me", true)];
+        seated.huddle_joined = true;
+        seated.call_muted = true;
+        let (frame, _, _) = connected_room_with(&seated, roots());
+        assert!(has_text(&frame, "Ada Lovelace"), "{:?}", texts(&frame));
+        assert!(has_text(&frame, "you · muted"), "{:?}", texts(&frame));
+        let _ = node_ending(&frame, "channel/channel-b/seat/1");
+        assert!(!has_text(&frame, "Huddle 2"), "the count is a caption, not a badge");
+    });
+}
+
 /// A chat block re-reads the room through the live subscription.
 #[test]
 fn a_live_hit_reads_the_room_again() {

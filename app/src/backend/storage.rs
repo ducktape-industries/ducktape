@@ -89,42 +89,30 @@ pub async fn files_upload(
 /// attachments root, the root `duck_uri::classify_files` opens.
 pub const ATTACHMENTS_ROOT: &str = "/shared/attachments";
 
-/// Upload each local file beside the message it goes with. Sequential on
-/// purpose: every put is its own head-based commit.
-pub async fn attach_files(
-    rpc: &str,
-    password: &str,
-    message_id: &str,
-    sources: &[String],
-) -> Result<(), String> {
-    let dir = format!("{ATTACHMENTS_ROOT}/{message_id}");
-    for source in sources {
-        let name = attachment_name(&file_name(source)?);
-        files_put(
-            rpc.to_owned(),
-            password.to_owned(),
-            dir.clone(),
-            source.clone(),
-            name,
-        )
-        .await?;
-    }
-    Ok(())
+/// Upload one local file under its attachment id, the moment it is
+/// attached; the answer is the `duck://` address the send will link.
+pub async fn attach_file(
+    rpc: String,
+    password: String,
+    attachment_id: String,
+    source: String,
+) -> Result<String, String> {
+    let dir = format!("{ATTACHMENTS_ROOT}/{attachment_id}");
+    let name = attachment_name(&file_name(&source)?);
+    files_put(rpc, password, dir.clone(), source, name.clone()).await?;
+    Ok(format!("duck://files{dir}/{name}"))
 }
 
 /// The body a send with files posts: the typed text, then one link line per
-/// file at the path `attach_files` puts it — so the row, the optimistic row
+/// file at the address its upload answered — so the row, the optimistic row
 /// and the runs injector all read the same address.
-pub fn attachment_body(body: String, message_id: &str, names: &[String]) -> String {
-    if names.is_empty() {
+pub fn attachment_body(body: String, links: &[(String, String)]) -> String {
+    if links.is_empty() {
         return body;
     }
     let mut lines: Vec<String> = body.lines().map(str::to_owned).collect();
-    for name in names {
-        let name = attachment_name(name);
-        lines.push(format!(
-            "[{name}](duck://files{ATTACHMENTS_ROOT}/{message_id}/{name})"
-        ));
+    for (name, uri) in links {
+        lines.push(format!("[{}]({uri})", attachment_name(name)));
     }
     lines.join("\n")
 }

@@ -91,19 +91,25 @@ fn a_retained_file_base_refuses_an_external_edit_of_the_same_path() {
 /// directory, in a name a markdown link can carry.
 #[test]
 fn a_send_with_files_links_them_under_the_message() {
-    assert_eq!(attachment_body("hi".into(), "message-1-2", &[]), "hi");
+    assert_eq!(attachment_body("hi".into(), &[]), "hi");
+    let link = |name: &str| {
+        let stored = attachment_name(name);
+        (
+            name.to_owned(),
+            format!("duck://files/shared/attachments/attach-1-2/{stored}"),
+        )
+    };
     let body = attachment_body(
         "hi\nthere".into(),
-        "message-1-2",
-        &["my notes (v2).txt".into(), "plain.png".into()],
+        &[link("my notes (v2).txt"), link("plain.png")],
     );
     assert_eq!(
         body,
-        "hi\nthere\n[my_notes__v2_.txt](duck://files/shared/attachments/message-1-2/my_notes__v2_.txt)\n[plain.png](duck://files/shared/attachments/message-1-2/plain.png)"
+        "hi\nthere\n[my_notes__v2_.txt](duck://files/shared/attachments/attach-1-2/my_notes__v2_.txt)\n[plain.png](duck://files/shared/attachments/attach-1-2/plain.png)"
     );
     // what the module makes of it: text, then one link span a line
     let blocks = ::chat::client::parse_message(&body);
     assert_eq!(blocks.len(), 4);
-    let link = classify_duck_link("duck://files/shared/attachments/message-1-2/plain.png".into());
+    let link = classify_duck_link("duck://files/shared/attachments/attach-1-2/plain.png".into());
     assert!(matches!(link.kind, DuckKind::Files), "{link:?}");
 }

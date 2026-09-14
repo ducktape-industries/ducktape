@@ -1307,7 +1307,7 @@ impl DesktopWindow {
             .into_any_element()
     }
 
-    fn huddle(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn huddle(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         use gpui_kit::component::button::ButtonVariants as _;
         use gpui_kit::*;
         let colors = gpui_kit::component::Theme::global(cx).color_tokens();
@@ -1326,10 +1326,8 @@ impl DesktopWindow {
         };
         let stage = state.huddle_stage.clone();
         let video_live = state.call_video_live;
-        let row_count = state.huddle_rows.len();
-        let columns = ((f32::from(window.viewport_size().width) - 24.) / 128.)
-            .floor()
-            .max(1.) as usize;
+        let rows = state.huddle_rows.clone();
+        let row_count = rows.len();
         let title = state.huddle_channel_name.clone();
         let status = state.call_status.clone();
         let elapsed = if state.huddle_joined_at > 0 {
@@ -1369,68 +1367,65 @@ impl DesktopWindow {
         if video_live {
             body = body.child(tiles.clone());
         }
+        // The people, one a row, the way a voice channel lists them: the
+        // plate, the name, and "you" / "muted" beside it. The list stays
+        // virtual: only the rows on screen are built.
         body = body.child(
-            uniform_list("huddle-roster", row_count.div_ceil(columns), {
-                let model = self.model.clone();
-                move |range, _, cx| {
-                    let state = &model.read(cx).state;
-                    range
-                        .map(|index| {
-                            div().h(px(112.)).pb_2().flex().gap_2().children(
-                                state
-                                    .huddle_rows
-                                    .iter()
-                                    .skip(index * columns)
-                                    .take(columns)
-                                    .map(|row| {
-                                        let caption = match (row.person.is_you, row.muted) {
-                                            (true, true) => "you · muted",
-                                            (true, false) => "you",
-                                            (false, true) => "muted",
-                                            (false, false) => "",
-                                        };
-                                        div()
-                                            .w_0()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .p_3()
-                                            .border_1()
-                                            .border_color(colors.border)
-                                            .bg(colors.surface)
-                                            .rounded(px(design::radius::CARD as f32))
-                                            .flex()
-                                            .flex_col()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .size(px(36.))
-                                                    .rounded_full()
-                                                    .bg(colors.secondary)
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .text_size(px(12.))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .child(row.person.initials.clone()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .truncate()
-                                                    .text_size(px(12.5))
-                                                    .child(row.person.label.clone()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(11.5))
-                                                    .text_color(colors.muted_foreground)
-                                                    .child(caption),
-                                            )
-                                    }),
+            div()
+                .px_1()
+                .text_size(px(11.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(colors.muted_foreground)
+                .child(format!("In the huddle · {row_count}")),
+        );
+        body = body.child(
+            uniform_list("huddle-roster", row_count, move |range, _, _| {
+                rows[range]
+                    .iter()
+                    .map(|row| {
+                        let caption = match (row.person.is_you, row.muted) {
+                            (true, true) => "you · muted",
+                            (true, false) => "you",
+                            (false, true) => "muted",
+                            (false, false) => "",
+                        };
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h(px(36.))
+                            .px_2()
+                            .rounded(px(design::radius::CONTROL as f32))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .size(px(26.))
+                                    .rounded_full()
+                                    .bg(colors.secondary)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(row.person.initials.clone()),
                             )
-                        })
-                        .collect()
-                }
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(13.))
+                                    .child(row.person.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.5))
+                                    .text_color(colors.muted_foreground)
+                                    .child(caption),
+                            )
+                    })
+                    .collect()
             })
             .flex_1()
             .min_h_0(),
@@ -1567,6 +1562,15 @@ impl DesktopWindow {
         let faint = hsla_of(palette.faint);
         let live = state.connected;
         let bell_unread = state.bell_unread;
+        // The voice dock's facts, read here so the rail below owns no borrow.
+        let voice = state.huddle_joined.then(|| VoiceDock {
+            room: state.huddle_channel_name.clone(),
+            elapsed: crate::backend::mmss(state.huddle_now - state.huddle_joined_at),
+            others: state.huddle_rows.len().saturating_sub(1),
+            muted: state.call_muted,
+        });
+        let success = hsla_of(palette.success);
+        let danger = hsla_of(palette.danger);
         // Who is signed in, as the rail's foot shows it.
         let (who, whose_key) = crate::backend::rail_identity(
             state.account_exists,
@@ -1824,6 +1828,13 @@ impl DesktopWindow {
                             .child(whose_key),
                     ),
             );
+        // The voice dock: while the reader is in a huddle the rail's foot
+        // says so — the room, how long, who else — with mute, the huddle
+        // window and leave at hand, the way a voice client keeps its call
+        // under the navigation.
+        if let Some(voice) = voice {
+            tabs = tabs.child(self.voice_dock(voice, ink, success, danger));
+        }
         tabs = tabs.child(account);
         let state = &self.model.read(cx).state;
         let error = state.error.clone();
@@ -2780,6 +2791,98 @@ struct RailInk {
 /// wash on hover and when chosen. Its own element, not a kit button: the
 /// kit centres a button's content and a rail reads left-aligned. The
 /// caller adds the click.
+/// What the rail's voice dock says while the reader is in a huddle.
+struct VoiceDock {
+    room: String,
+    elapsed: String,
+    others: usize,
+    muted: bool,
+}
+
+impl DesktopWindow {
+    fn voice_dock(
+        &self,
+        voice: VoiceDock,
+        ink: RailInk,
+        success: gpui_kit::Hsla,
+        danger: gpui_kit::Hsla,
+    ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        use gpui_kit::component::Sizable as _;
+        use gpui_kit::component::button::ButtonVariants as _;
+        use gpui_kit::*;
+        let RailInk { fg, muted, raised } = ink;
+        let with = match voice.others {
+            0 => "alone".to_owned(),
+            1 => "with 1 other".to_owned(),
+            n => format!("with {n} others"),
+        };
+        let mute = if voice.muted { "Unmute" } else { "Mute" };
+        div()
+            .id("rail-voice")
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .p(px(8.))
+            .mt_1()
+            .rounded(px(design::radius::CONTROL as f32))
+            .bg(raised)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().size(px(8.)).rounded_full().bg(success))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(success)
+                            .child("Voice connected"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(muted)
+                            .child(voice.elapsed),
+                    ),
+            )
+            .child(
+                div()
+                    .truncate()
+                    .text_size(px(12.))
+                    .text_color(fg)
+                    .child(format!("#{} · {with}", voice.room)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        self.action("rail-voice-mute", mute, Message::ToggleCallMute, false)
+                            .xsmall()
+                            .outline(),
+                    )
+                    .child(
+                        self.action("rail-voice-open", "Open", Message::ShowHuddle, false)
+                            .xsmall()
+                            .ghost()
+                            .text_color(fg),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        self.action("rail-voice-leave", "Leave", Message::LeaveHuddleHere, false)
+                            .xsmall()
+                            .ghost()
+                            .text_color(danger),
+                    ),
+            )
+    }
+}
+
 fn rail_row(
     id: impl Into<gpui_kit::ElementId>,
     icon: gpui_kit::component::Icon,
