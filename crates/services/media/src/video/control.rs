@@ -39,11 +39,13 @@ pub enum CallControl {
     KeyframeRequest,
     /// 1 Hz presence + ephemeral state (drives tiles, NOT consensus). `sharing`
     /// marks the video lane as a screen share (vs the camera) so peers render it
-    /// letterboxed + labelled.
+    /// letterboxed + labelled. `speaking` is the sender's own voice gate: the
+    /// hub mixes audio, so a receiver cannot tell whose sound it hears.
     Beacon {
         muted: bool,
         camera_on: bool,
         sharing: bool,
+        speaking: bool,
     },
     /// receiver loss report: send to me at no more than `max_kbps`.
     RateHint { max_kbps: u32 },
@@ -65,7 +67,14 @@ impl CallControl {
                 muted,
                 camera_on,
                 sharing,
-            } => vec![TAG_BEACON, *muted as u8, *camera_on as u8, *sharing as u8],
+                speaking,
+            } => vec![
+                TAG_BEACON,
+                *muted as u8,
+                *camera_on as u8,
+                *sharing as u8,
+                *speaking as u8,
+            ],
             CallControl::RateHint { max_kbps } => {
                 let mut frame = vec![TAG_RATE_HINT];
                 frame.extend_from_slice(&max_kbps.to_be_bytes());
@@ -80,10 +89,11 @@ impl CallControl {
         }
         match frame[0] {
             TAG_KEYFRAME_REQUEST => Ok(CallControl::KeyframeRequest),
-            TAG_BEACON if frame.len() >= 4 => Ok(CallControl::Beacon {
+            TAG_BEACON if frame.len() >= 5 => Ok(CallControl::Beacon {
                 muted: frame[1] != 0,
                 camera_on: frame[2] != 0,
                 sharing: frame[3] != 0,
+                speaking: frame[4] != 0,
             }),
             TAG_RATE_HINT if frame.len() >= 5 => Ok(CallControl::RateHint {
                 max_kbps: u32::from_be_bytes(frame[1..5].try_into().expect("4 bytes")),
@@ -112,13 +122,16 @@ mod tests {
         for muted in [false, true] {
             for camera_on in [false, true] {
                 for sharing in [false, true] {
-                    let control = CallControl::Beacon {
-                        muted,
-                        camera_on,
-                        sharing,
-                    };
-                    let frame = control.encode();
-                    assert_eq!(CallControl::decode(&frame).unwrap(), control);
+                    for speaking in [false, true] {
+                        let control = CallControl::Beacon {
+                            muted,
+                            camera_on,
+                            sharing,
+                            speaking,
+                        };
+                        let frame = control.encode();
+                        assert_eq!(CallControl::decode(&frame).unwrap(), control);
+                    }
                 }
             }
         }
@@ -141,9 +154,14 @@ mod tests {
             CallControl::decode(&[TAG_BEACON, 1]),
             Err(ControlError::Truncated)
         ));
-        // 3-byte beacons (pre-share wire) are retired: short = truncated.
+        // Shorter beacons (pre-share, pre-speaking wires) are retired: short =
+        // truncated.
         assert!(matches!(
             CallControl::decode(&[TAG_BEACON, 1, 1]),
+            Err(ControlError::Truncated)
+        ));
+        assert!(matches!(
+            CallControl::decode(&[TAG_BEACON, 1, 1, 1]),
             Err(ControlError::Truncated)
         ));
         assert!(matches!(

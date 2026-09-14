@@ -1313,6 +1313,8 @@ impl DesktopWindow {
         let colors = gpui_kit::component::Theme::global(cx).color_tokens();
         let state = &self.model.read(cx).state;
         let live_dot = hsla_of(design::palette(state.is_dark()).accent);
+        // The ring a plate wears while its person talks.
+        let speaking_ring = hsla_of(design::palette(state.is_dark()).success);
         let mute = if state.call_muted { "Unmute" } else { "Mute" };
         let camera = if state.call_camera {
             "Stop camera"
@@ -1389,6 +1391,20 @@ impl DesktopWindow {
                             (false, true) => "muted",
                             (false, false) => "",
                         };
+                        let mut plate = div()
+                            .flex_shrink_0()
+                            .size(px(26.))
+                            .rounded_full()
+                            .bg(colors.secondary)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(row.person.initials.clone());
+                        if row.speaking {
+                            plate = plate.border_2().border_color(speaking_ring);
+                        }
                         div()
                             .flex()
                             .items_center()
@@ -1396,19 +1412,7 @@ impl DesktopWindow {
                             .h(px(36.))
                             .px_2()
                             .rounded(px(design::radius::CONTROL as f32))
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .size(px(26.))
-                                    .rounded_full()
-                                    .bg(colors.secondary)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(row.person.initials.clone()),
-                            )
+                            .child(plate)
                             .child(
                                 div()
                                     .flex_1()

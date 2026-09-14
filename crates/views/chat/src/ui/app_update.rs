@@ -238,6 +238,8 @@ impl super::ChatView {
         self.huddle_joined_at = next.huddle_joined_at;
         self.huddle_now = next.huddle_now;
         self.call_muted = next.call_muted;
+        self.call_speaking = next.call_speaking;
+        self.speaking_peers = next.speaking_peers.clone();
         self.shift_held = next.shift_held;
         self.pending_sends = next.pending_sends.clone();
         self.live_agents = next.live_agents.clone();

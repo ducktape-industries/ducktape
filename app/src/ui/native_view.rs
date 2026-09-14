@@ -36,6 +36,8 @@ impl Ducktape {
                     self.huddle_joined_at,
                     self.huddle_now,
                     self.call_muted,
+                    self.call_speaking,
+                    &self.call_peers,
                     self.shift_held,
                     self.chat_copy_chord_serial,
                     self.chat_sent_serial,
