@@ -127,6 +127,18 @@ fn the_editor_menu_paints_over_the_rows_below_it_and_shows_the_walked_item() {
     assert!(editor.contains(".when(walked,|row|row.bg(raised))"));
     assert!(editor.contains(".hover(move|style|style.bg(raised))"));
 }
+/// The shell's keystroke interceptor runs before the guest editor's and cannot
+/// be stopped by it, so the editor's rows sit in a key context the shell reads
+/// off the stack to yield the chords a guest claims: Ctrl+K is a link in the
+/// editor, and the search palette must not open over it.
+#[test]
+fn the_shell_yields_the_palette_chord_inside_a_guest_editor() {
+    let editor = rust_tokens(include_str!("../editor/blocks.rs"));
+    assert!(editor.contains(".key_context(GUEST_EDITOR_CONTEXT)"));
+    let shell = rust_tokens(include_str!("../shell.rs"));
+    assert!(shell.contains("context.contains(crate::editor::wire::GUEST_EDITOR_CONTEXT)"));
+    assert!(shell.contains("leteditor_claims_the_chord=in_guest_editor&&palette==\"open\";"));
+}
 /// The comment badge sits on its row's LAST line, above the reserve the row
 /// carries for an inline card: the guest hangs the card half a line under the
 /// pointer that pressed the badge, so a top-aligned badge on a wrapped row

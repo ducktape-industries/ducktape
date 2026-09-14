@@ -19,6 +19,11 @@ use ui_lang_wire as wire;
 use unicode_segmentation::UnicodeSegmentation;
 use wire::editor_presentation::{EditorFormat, EditorInteraction};
 
+/// The key context every guest editor row sits in. The shell's keystroke
+/// interceptor runs before this editor's and cannot be stopped by it, so it
+/// reads this off the context stack to yield the chords a guest claims.
+pub const GUEST_EDITOR_CONTEXT: &str = "GuestEditor";
+
 /// Removing a hidden syntax span is a projection, never a document mutation.
 /// Segments retain both byte spaces so a click or IME edit maps back exactly.
 #[derive(Clone, Debug)]
@@ -1020,7 +1025,10 @@ impl Render for WireEditor {
         let pad = paint
             .and_then(|p| p.padding)
             .unwrap_or_else(|| wire::Edges::all(options.padding.unwrap_or(8.)));
+        // The shell reads this context off a keystroke to yield the chords a
+        // guest editor claims — Ctrl+K is a link here, not the search palette.
         let mut content = div()
+            .key_context(GUEST_EDITOR_CONTEXT)
             .relative()
             .flex()
             .flex_col()
