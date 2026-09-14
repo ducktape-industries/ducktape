@@ -113,6 +113,9 @@ enum ServerControl {
 /// time — the subscribe gate guarantees it.
 struct Handles {
     muted: Arc<AtomicBool>,
+    /// Deafened: the speaker plays silence. Local only — Discord shows a
+    /// deafened peer, this beacon does not (yet).
+    deafened: Arc<AtomicBool>,
     /// The mic's voice gate as the pump last read it — what our beacon says.
     speaking: Arc<AtomicBool>,
     control: tokio::sync::mpsc::UnboundedSender<ClientControl>,
@@ -132,6 +135,16 @@ pub fn call_set_muted(muted: bool) -> bool {
     }
     beacon_state();
     muted
+}
+
+/// Deafen: the speaker goes silent for the running session (the mixed frames
+/// still arrive and drain, so nothing stale plays on undeafen). Deafening
+/// also mutes — that is the caller's step, the way Discord ties the two.
+pub fn call_set_deafened(deafened: bool) -> bool {
+    if let Some(handles) = handles().lock().expect("call handles").as_ref() {
+        handles.deafened.store(deafened, Ordering::Relaxed);
+    }
+    deafened
 }
 
 /// Beacon the CURRENT local state (mute + camera) to peers — the one place
@@ -441,7 +454,8 @@ async fn run_session(
     let (mic_tx, mut mic_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<i16>>();
     let playout = Arc::new(Mutex::new(PlayoutRing::default()));
 
-    let audio = AudioThread::start(muted.clone(), mic_tx, playout.clone());
+    let deafened = Arc::new(AtomicBool::new(false));
+    let audio = AudioThread::start(muted.clone(), deafened.clone(), mic_tx, playout.clone());
     let audio_note = audio.note.clone();
 
     // The video leg (crate::video): camera or shared screen, one at a time.
@@ -463,6 +477,7 @@ async fn run_session(
     let mut gate_tick = tokio::time::interval(VOICE_GATE_HANGOVER / 2);
     *handles().lock().expect("call handles") = Some(Handles {
         muted: muted.clone(),
+        deafened,
         speaking: speaking.clone(),
         control: control_tx.clone(),
     });
@@ -646,6 +661,15 @@ impl PlayoutRing {
             *slot = self.samples.pop_front().unwrap_or(0);
         }
     }
+
+    /// Drain a deafened session too — the ring must not hold 200 ms of stale
+    /// voice for the undeafen — but hand the speaker silence.
+    fn drain_into_unless(&mut self, out: &mut [i16], deafened: bool) {
+        self.drain_into(out);
+        if deafened {
+            out.fill(0);
+        }
+    }
 }
 
 /// Accumulates mono 48 kHz i16 samples into exact voice frames.
@@ -737,6 +761,7 @@ struct AudioThread {
 impl AudioThread {
     fn start(
         muted: Arc<AtomicBool>,
+        deafened: Arc<AtomicBool>,
         mic: tokio::sync::mpsc::UnboundedSender<Vec<i16>>,
         playout: Arc<Mutex<PlayoutRing>>,
     ) -> Self {
@@ -745,7 +770,7 @@ impl AudioThread {
         let thread_note = note.clone();
         let thread = std::thread::Builder::new()
             .name("huddle-audio".into())
-            .spawn(move || audio_thread(muted, mic, playout, shutdown_rx, thread_note))
+            .spawn(move || audio_thread(muted, deafened, mic, playout, shutdown_rx, thread_note))
             .ok();
         Self {
             shutdown: Some(shutdown_tx),
@@ -766,6 +791,7 @@ impl Drop for AudioThread {
 
 fn audio_thread(
     muted: Arc<AtomicBool>,
+    deafened: Arc<AtomicBool>,
     mic: tokio::sync::mpsc::UnboundedSender<Vec<i16>>,
     playout: Arc<Mutex<PlayoutRing>>,
     shutdown: std::sync::mpsc::Receiver<()>,
@@ -845,7 +871,9 @@ fn audio_thread(
                 move |data: &mut [f32], _| {
                     let ticks = data.len() / channels.max(1);
                     let mut mono = vec![0i16; ((ticks as f64) * step).ceil() as usize];
-                    ring.lock().expect("playout ring").drain_into(&mut mono);
+                    ring.lock()
+                        .expect("playout ring")
+                        .drain_into_unless(&mut mono, deafened.load(Ordering::Relaxed));
                     let mut source = mono.into_iter();
                     for tick in data.chunks_exact_mut(channels.max(1)) {
                         phase += step;
@@ -867,7 +895,9 @@ fn audio_thread(
                 move |data: &mut [i16], _| {
                     let ticks = data.len() / channels.max(1);
                     let mut mono = vec![0i16; ((ticks as f64) * step).ceil() as usize];
-                    ring.lock().expect("playout ring").drain_into(&mut mono);
+                    ring.lock()
+                        .expect("playout ring")
+                        .drain_into_unless(&mut mono, deafened.load(Ordering::Relaxed));
                     let mut source = mono.into_iter();
                     for tick in data.chunks_exact_mut(channels.max(1)) {
                         phase += step;
@@ -1106,6 +1136,15 @@ mod tests {
         let mut empty = PlayoutRing::default();
         empty.drain_into(&mut out);
         assert_eq!(out, [0i16; 4]);
+        // Deafened: the samples leave the ring and the speaker gets silence.
+        let mut deaf = PlayoutRing::default();
+        deaf.push_frame(&[7i16; 8]);
+        let mut out = [1i16; 4];
+        deaf.drain_into_unless(&mut out, true);
+        assert_eq!(out, [0i16; 4]);
+        assert_eq!(deaf.samples.len(), 4);
+        deaf.drain_into_unless(&mut out, false);
+        assert_eq!(out, [7i16; 4]);
     }
 
     #[test]
