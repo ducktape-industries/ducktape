@@ -28,6 +28,7 @@ network:
 ```
 ducktape module register <id> <component.wasm> [--index <index.wasm>] [--after N]  # admit a new id
 ducktape module update   <id> <component.wasm> [--index <index.wasm>] [--after N]  # swap live code
+ducktape module register <id> --view target/views/<id>_view.wasm [--assets crates/views/<id>/assets] [--after N]  # admit a VIEW-ONLY entry (kind `view`: a UI with no core, built by `ops/build-views.sh -p <id>-view`; the app draws its tab off the registry)
 ducktape module status                                      # the registry
 ```
 
@@ -42,9 +43,9 @@ a refusal to propose: the swap activates at `height + N` (`N > MIN_SWAP_LEAD`,
 i.e. `> 3`; default 50 to leave room for the ceremony's own blocks) only once
 every validator holds the code and signals ready, and a holdout fetches the
 committed artifact off a peer before that boundary. `status` prints one row per
-module — `id  active
-pending`, a pending swap carrying `ready k` (validators that signalled) or
-`ready ✓`. Restore and state sync compose the wasm set from the registry's
+entry — `id  kind  active  pending` (`kind` is `module` or `view`: what the
+registry says the artifact is, fixed at admission), a pending swap carrying
+`ready k` (validators that signalled) or `ready ✓`. Restore and state sync compose the wasm set from the registry's
 roster at the boundary (`noded::compose`, `Boot::Reopen`), so an admitted id
 composes like a genesis one; a module admitted after the last checkpoint
 starts fresh and is rebuilt by replay (`seat_at`, unit-pinned in

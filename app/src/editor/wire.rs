@@ -587,4 +587,7 @@ fn native_key(text: &str, cursor: wire::EditorCursor, key: &wire::keyboard::KeyS
 
 #[path = "blocks.rs"]
 mod blocks;
+#[path = "notion.rs"]
+mod notion;
 pub use blocks::{GUEST_EDITOR_CONTEXT, WireEditor};
+pub use notion::{NOTION_DOCUMENT_KEY, NotionWireEditor, init as init_notion};

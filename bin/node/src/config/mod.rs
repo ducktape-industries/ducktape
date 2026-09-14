@@ -23,7 +23,8 @@ pub use workspace_config::*;
 /// compile-validate every deployment `genesis` carries — the same check a
 /// validator runs before arming a live swap (`noded::compose::validate_deployment`:
 /// `declared_shape` + `check_realizable` + the mapper's `on_apply`/`query`
-/// export) — before a founder writes a single byte. Discovery
+/// export for a module, the view ABI for a view-only entry) — before a
+/// founder writes a single byte. Discovery
 /// (`Genesis::compose`) only checks filenames, ids, and the Borsh/mapper
 /// framing; this is the first point that actually loads each component and
 /// mapper through wasmtime, so a zero-byte or truncated artifact refuses
@@ -52,13 +53,19 @@ pub fn validate_founding_set(
     // per-module one.
     let index = indexer::IndexStore::open_bare(&scratch, &[])
         .map_err(|e| format!("open validation store at {}: {e}", scratch.display()))?;
+    // at genesis an entry's kind IS its frame's tag (`compose::genesis_seeds`
+    // seeds the registry the same way), so each founding file is validated
+    // as what it says it is: a module through its core, a view through the
+    // view ABI alone.
     let result = genesis.modules.iter().try_for_each(|module| {
-        noded::compose::validate_deployment(&module.id, &module.bytes, &index).map_err(|error| {
-            format!(
-                "{}: {error}",
-                workspace_config::component_path(source, &module.id).display()
-            )
-        })
+        let kind = noded::compose::artifact_kind(&module.bytes)
+            .map_err(|error| format!("{} {}: {error}", source.display(), module.id))?;
+        let file = match kind {
+            modules::Kind::Module => workspace_config::component_path(source, &module.id),
+            modules::Kind::View => source.join(format!("{}.view.wasm", module.id)),
+        };
+        noded::compose::validate_deployment(&module.id, kind, &module.bytes, &index)
+            .map_err(|error| format!("{}: {error}", file.display()))
     });
     drop(index);
     let _ = std::fs::remove_dir_all(&scratch);

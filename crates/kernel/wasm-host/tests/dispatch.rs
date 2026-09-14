@@ -128,7 +128,7 @@ async fn hot_swap_keeps_state() {
     assert_eq!(count(before.clone()), 2);
 
     // swap to the SAME code (stand-in for a new version); state must survive.
-    m.swap_code(&module_artifact::ModuleArtifact::component(HELLO.to_vec()).encode())
+    m.swap_code(&module_artifact::Artifact::module(HELLO.to_vec()).encode())
         .expect("swap");
     assert_eq!(
         m.query(b"").await.expect("query"),
@@ -156,7 +156,7 @@ async fn a_swap_to_another_backing_is_refused_and_keeps_the_running_code() {
     let before = m.root();
 
     let err = m
-        .swap_code(&module_artifact::ModuleArtifact::component(OBJECT.to_vec()).encode())
+        .swap_code(&module_artifact::Artifact::module(OBJECT.to_vec()).encode())
         .expect_err("an odb-declared replacement over a map is refused");
     assert!(
         err.to_string().contains("declares a Odb backing"),

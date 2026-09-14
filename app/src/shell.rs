@@ -244,7 +244,8 @@ impl Desktop {
         let size = match kind {
             crate::shell::WindowKind::Onboarding => size(px(480.0), px(680.0)),
             crate::shell::WindowKind::Console => size(px(1280.0), px(800.0)),
-            crate::shell::WindowKind::Huddle => size(px(320.0), px(460.0)),
+            // room for a stage at a readable size; it resizes from here
+            crate::shell::WindowKind::Huddle => size(px(560.0), px(600.0)),
         };
         let model = cx.entity();
         let titlebar = match kind {
@@ -946,12 +947,9 @@ impl DesktopWindow {
                             )),
                     );
                 }
+                let refused = crate::backend::selected_network_refuses(&networks, &selected);
                 for network in networks {
-                    let label = match (network.probed, network.live) {
-                        (false, _) => format!("{} · checking", network.name),
-                        (true, true) => format!("{} · block {}", network.name, network.height),
-                        (true, false) => format!("{} · offline", network.name),
-                    };
+                    let label = crate::backend::network_row_label(&network);
                     let picked = network.id == selected;
                     recent = recent.child(
                         div()
@@ -981,7 +979,9 @@ impl DesktopWindow {
                             ),
                     );
                 }
-                let no_selection = busy || selected.is_empty();
+                // a measured contract mismatch disables the open the way no
+                // selection does: the row's own line says why.
+                let no_selection = busy || selected.is_empty() || refused;
                 if !empty {
                     recent = recent.child(
                         div()
@@ -1343,6 +1343,8 @@ impl DesktopWindow {
         };
         let stage = state.huddle_stage.clone();
         let video_live = state.call_video_live;
+        let invitees =
+            crate::backend::huddle_invitees(&state.huddle_invitees, &state.huddle_roster);
         let (muted, camera_on, sharing) = (state.call_muted, state.call_camera, state.call_sharing);
         let rows = state.huddle_rows.clone();
         let row_count = rows.len();
@@ -1379,11 +1381,19 @@ impl DesktopWindow {
             .flex()
             .flex_col()
             .gap_3();
+        // The video takes the room the roster leaves: the stage whole in the
+        // largest box left, the tiles a strip under it or, with no stage, the
+        // grid in that box instead. The surfaces fill whatever box they get.
         if !stage.is_empty() {
-            body = body.child(picture.clone());
+            body = body.child(div().flex_1().min_h_0().w_full().child(picture.clone()));
         }
         if video_live {
-            body = body.child(tiles.clone());
+            let tiles_box = if stage.is_empty() {
+                div().flex_1().min_h_0()
+            } else {
+                div().flex_shrink_0()
+            };
+            body = body.child(tiles_box.w_full().child(tiles.clone()));
         }
         // The people, one a row, the way a voice channel lists them: the
         // plate, the name, and "you" / "muted" beside it. The list stays
@@ -1447,9 +1457,46 @@ impl DesktopWindow {
                     })
                     .collect()
             })
-            .flex_1()
-            .min_h_0(),
+            // with video on screen the list yields to it and scrolls instead
+            .when(video_live, |list| list.flex_shrink_0().max_h(px(150.)))
+            .when(!video_live, |list| list.flex_1().min_h_0()),
         );
+        // The room's members not seated yet, one chip each: a press posts a
+        // mention into the room that says come join, and the chip is gone —
+        // an invite is sent once.
+        if !invitees.is_empty() {
+            use gpui_kit::component::Sizable as _;
+            let mut chips = div().flex().flex_wrap().gap_1();
+            for member in invitees {
+                chips = chips.child(
+                    self.action(
+                        format!("huddle-invite-{}", member.key),
+                        member.label.clone(),
+                        Message::InviteToHuddle(member.key.clone()),
+                        false,
+                    )
+                    .outline()
+                    .xsmall(),
+                );
+            }
+            body = body.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(colors.border)
+                    .child(
+                        div()
+                            .pb_1()
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(colors.muted_foreground)
+                            .child("Invite"),
+                    )
+                    .child(chips),
+            );
+        }
         // The control bar reads left to right as media, then the room, then
         // the exit: a toggle that is ON is filled so its state is visible
         // without reading the label (a muted mic is the red one).
@@ -1521,17 +1568,8 @@ impl DesktopWindow {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(
-                        div()
-                            .size(px(8.))
-                            .rounded_full()
-                            .bg(live_dot),
-                    )
-                    .child(
-                        div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(title),
-                    )
+                    .child(div().size(px(8.)).rounded_full().bg(live_dot))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(title))
                     .child(
                         div()
                             .font_family(design::fonts::FAMILY_MONO)
@@ -1573,18 +1611,46 @@ impl DesktopWindow {
         let view = self.module.as_ref().expect("module seated").1.clone();
         view.update(cx, |view, cx| view.set_props(spec.props, cx));
         let selected_tab = self.model.read(cx).state.shell_tab;
-        let navigation = [
-            (ShellTab::Chat, "Chat"),
-            (ShellTab::Pages, "Pages"),
-            (ShellTab::Forge, "Forge"),
-            (ShellTab::Agents, "Agents"),
-            (ShellTab::Files, "Files"),
-            (ShellTab::Explorer, "Explorer"),
-            (ShellTab::Node, "Node"),
-            (ShellTab::Members, "Members"),
-            (ShellTab::Governance, "Governance"),
-            (ShellTab::Settings, "Settings"),
-        ];
+        // the dashboard leads the rail, above every section: it is the
+        // network at a glance, not a workspace tool or a network tool
+        let registered = crate::module_view::registered_views();
+        let dashboard = registered
+            .iter()
+            .copied()
+            .filter(|module| *module == HOME_VIEW);
+        let mut navigation: Vec<(ShellTab, String)> = dashboard
+            .map(|module| {
+                (
+                    ShellTab::Registered(module),
+                    crate::module_view::registered_view_name(module),
+                )
+            })
+            .collect();
+        navigation.extend([
+            (ShellTab::Chat, "Chat".to_owned()),
+            (ShellTab::Pages, "Pages".to_owned()),
+            (ShellTab::Forge, "Forge".to_owned()),
+            (ShellTab::Agents, "Agents".to_owned()),
+            (ShellTab::Files, "Files".to_owned()),
+            (ShellTab::Explorer, "Explorer".to_owned()),
+            (ShellTab::Node, "Node".to_owned()),
+            (ShellTab::Members, "Members".to_owned()),
+            (ShellTab::Governance, "Governance".to_owned()),
+        ]);
+        // the other views the connected node's registry lists, after the
+        // built-in tabs and in the registry's order; named by their manifests
+        navigation.extend(
+            registered
+                .into_iter()
+                .filter(|module| *module != HOME_VIEW)
+                .map(|module| {
+                    (
+                        ShellTab::Registered(module),
+                        crate::module_view::registered_view_name(module),
+                    )
+                }),
+        );
+        navigation.push((ShellTab::Settings, "Settings".to_owned()));
         let (sidebar, popover) = {
             let theme = gpui_kit::component::Theme::global(cx);
             (theme.sidebar, theme.popover)
@@ -1683,7 +1749,11 @@ impl DesktopWindow {
         } else {
             modifiers.control = true;
         }
-        let shortcut = if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl K" };
+        let shortcut = if cfg!(target_os = "macos") {
+            "⌘K"
+        } else {
+            "Ctrl K"
+        };
         let ink = RailInk {
             fg: ink_fg,
             muted: ink_muted,
@@ -1729,13 +1799,7 @@ impl DesktopWindow {
             live,
         )
         .when(bell_unread > 0, |row| {
-            row.child(
-                div()
-                    .flex_shrink_0()
-                    .size(px(6.))
-                    .rounded_full()
-                    .bg(accent),
-            )
+            row.child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(accent))
         })
         .on_click(cx.listener(move |this, _, _, cx| {
             cx.stop_propagation();
@@ -1795,7 +1859,13 @@ impl DesktopWindow {
                 );
             }
             let selected = tab == selected_tab;
-            let row = rail_row(label, nav_icon(tab), label, ink, selected, true).on_click(
+            // a registered tab's element id is its registry id, not its
+            // manifest name: two views may share a name, never an id
+            let id: gpui_kit::SharedString = match tab {
+                ShellTab::Registered(module) => format!("view:{module}").into(),
+                _ => label.clone().into(),
+            };
+            let row = rail_row(id, nav_icon(tab), label, ink, selected, true).on_click(
                 cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.model.update(cx, |model, cx| {
@@ -1876,6 +1946,7 @@ impl DesktopWindow {
         let state = &self.model.read(cx).state;
         let error = state.error.clone();
         let toast = state.toast.clone();
+        let update_strip = state.update_strip();
         let needs_account =
             state.connected && !state.account_exists && !state.account_banner_dismissed;
         let mut content = div()
@@ -1931,6 +2002,9 @@ impl DesktopWindow {
                         .text_color(colors.muted_foreground),
                     ),
             );
+        }
+        if let Some(strip) = update_strip {
+            content = content.child(self.update_strip(strip, &colors, palette));
         }
         if !error.is_empty() {
             content = content.child(
@@ -1990,9 +2064,14 @@ impl DesktopWindow {
                             .shadow_md()
                             .child(div().flex_1().text_size(px(12.5)).child(toast))
                             .child(
-                                self.action("toast-dismiss", "Dismiss", Message::DismissToast, false)
-                                    .ghost()
-                                    .h_7(),
+                                self.action(
+                                    "toast-dismiss",
+                                    "Dismiss",
+                                    Message::DismissToast,
+                                    false,
+                                )
+                                .ghost()
+                                .h_7(),
                             ),
                     )
                 }),
@@ -2010,6 +2089,60 @@ impl DesktopWindow {
             root = root.child(overlay);
         }
         root.into_any_element()
+    }
+
+    /// The update strip across the top of the console: the same quiet
+    /// one-line band as the account notice. A staged release offers the
+    /// restart; a rollback says so until dismissed.
+    fn update_strip(
+        &self,
+        strip: crate::backend::update::UpdateStrip,
+        colors: &gpui_kit::component::ColorTokens,
+        palette: &design::Palette,
+    ) -> gpui_kit::AnyElement {
+        use gpui_kit::*;
+        let (words, tone, action) = match strip {
+            crate::backend::update::UpdateStrip::Ready { display } => (
+                format!("Ducktape {display} is ready"),
+                hsla_of(palette.accent_soft),
+                self.action(
+                    "update-restart",
+                    "Restart to update",
+                    Message::UpdateAction(crate::UpdateAction::RestartToUpdate),
+                    false,
+                ),
+            ),
+            crate::backend::update::UpdateStrip::RolledBack { failed, reason } => (
+                format!("Update {failed} was rolled back ({reason})"),
+                hsla_of(palette.warning_soft),
+                self.action(
+                    "update-rollback-dismiss",
+                    "Dismiss",
+                    Message::UpdateAction(crate::UpdateAction::DismissRollbackNotice),
+                    false,
+                ),
+            ),
+        };
+        div()
+            .id("update-strip")
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .h(px(32.))
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(colors.border)
+            .bg(tone)
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(12.))
+                    .text_color(colors.foreground)
+                    .child(words),
+            )
+            .child(action.outline().h_6().text_size(px(12.)))
+            .into_any_element()
     }
 
     fn overlay(
@@ -2457,7 +2590,10 @@ mod close_tests {
                 assert_eq!(theme.radius, gpui_kit::px(design::radius::CONTROL as f32));
                 assert_eq!(theme.radius_lg, gpui_kit::px(design::radius::CARD as f32));
                 assert_eq!(theme.highlight_theme.appearance, mode);
-                assert_eq!(theme.highlight_theme.style.editor_background, Some(theme.background));
+                assert_eq!(
+                    theme.highlight_theme.style.editor_background,
+                    Some(theme.background)
+                );
                 let background: gpui_kit::Rgba = theme.background.into();
                 let [r, g, b, _] = palette.background;
                 let close = |a: f32, b: f32| (a - b).abs() < 1.5 / 255.;
@@ -2828,6 +2964,10 @@ fn hsla_of(color: design::Color) -> gpui_kit::Hsla {
 }
 
 /// Lucide glyphs the kit's default bundle does not carry.
+/// The registry id of the dashboard view: the one registered view that
+/// leads the rail instead of following the built-in tabs.
+const HOME_VIEW: &str = "home";
+
 const MESSAGE_SQUARE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>"#;
 const GIT_BRANCH: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>"#;
 const USERS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>"#;
@@ -2976,6 +3116,12 @@ fn rail_row(
 fn nav_icon(tab: ShellTab) -> gpui_kit::component::Icon {
     use gpui_kit::component::{Icon, IconName};
     match tab {
+        // the view's own `icons/tab.svg`, once it is seated; a plain mark
+        // until then and for a view that ships none
+        ShellTab::Registered(module) => match crate::module_view::registered_view_icon(module) {
+            Some(bytes) => Icon::empty().data(&bytes),
+            None => Icon::new(IconName::LayoutDashboard),
+        },
         ShellTab::Chat => Icon::empty().data(MESSAGE_SQUARE),
         ShellTab::Pages => Icon::new(IconName::BookOpen),
         ShellTab::Forge => Icon::empty().data(GIT_BRANCH),
@@ -3001,6 +3147,7 @@ pub(crate) fn run() {
     });
     application.run(move |cx| {
         gpui_kit::init(cx);
+        crate::editor::wire::init_notion(cx);
         // Ask the host about banners at launch, so the macOS prompt is a
         // launch event and its answer is in the log before the first mention.
         crate::backend::boot_desktop_notifications();

@@ -119,6 +119,15 @@ pub(crate) enum ShellTab {
     Members,
     Governance,
     Settings,
+    /// A view the connected node's registry lists as a `Kind::View` entry,
+    /// by its id: drawn after the built-in tabs, gone when the id leaves
+    /// the registry.
+    Registered(&'static str),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RegisteredIntent {
+    OpenLink,
+    Copy,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ForgeIntent {
@@ -155,6 +164,17 @@ pub(crate) enum SettingsIntent {
     Light,
     Dark,
     Notifications,
+    UpdateCheck,
+    UpdateRestart,
+    UpdateRollback,
+}
+/// The update controls the reader can press; each is one `app_update::Event`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum UpdateAction {
+    CheckNow,
+    RestartToUpdate,
+    RollBack,
+    DismissRollbackNotice,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PagesIntent {
@@ -271,6 +291,9 @@ pub struct Ducktape {
     pub(crate) password: String,
     pub(crate) status: String,
     pub(crate) connected: bool,
+    /// The self-update machine's executor, present only when the launcher
+    /// started this process (`DUCKTAPE_RELEASE` + `DUCKTAPE_UPDATE_STATE`).
+    pub(crate) updater: Option<crate::backend::update::Updater>,
     pub(crate) loading: bool,
     pub(crate) views_live_serial: i64,
     pub(crate) cmd_held: bool,
@@ -418,6 +441,9 @@ pub struct Ducktape {
     pub(crate) huddle_stage: String,
     pub(crate) huddle_roster: Vec<crate::backend::HuddleParticipant>,
     pub(crate) huddle_rows: Vec<crate::call::HuddleTileRow>,
+    /// The huddle room's member roll, loaded on seating; the window offers
+    /// the ones not seated as invite chips. A sent invite leaves the roll.
+    pub(crate) huddle_invitees: Vec<crate::backend::ChatMember>,
     pub(crate) secrets: crate::secret::SecretStore,
 }
 impl ::std::fmt::Debug for Ducktape {
@@ -524,6 +550,12 @@ pub(crate) enum AppMessage {
     NodeViewEvent(crate::module_view::ModuleViewEvent),
     NodeFactsLoaded(crate::backend::NodeFacts),
     NodeFactsFailed(crate::backend::AppError),
+    /// An update job (manifest fetch, archive download, verify) answered;
+    /// `None` when the network served nothing.
+    UpdateJobReplied(Option<app_update::Event>),
+    /// The reader pressed one of the update controls (the console strip or
+    /// the Settings "Updates" section).
+    UpdateAction(UpdateAction),
     NodeStatusPushed(crate::backend::NodeFacts),
     SettingsLoaded(crate::backend::SettingsFacts),
     SettingsFailed(crate::backend::HydrationError),
@@ -579,6 +611,7 @@ pub(crate) enum AppMessage {
     CopyChordPressed(crate::shell::KeyPress),
     ChatViewEvent(crate::module_view::ModuleViewEvent),
     PagesViewEvent(crate::module_view::ModuleViewEvent),
+    RegisteredViewEvent(crate::module_view::ModuleViewEvent),
     OpenPageSearchHit(String, String),
     ExternalUrlFailed(crate::backend::AppError),
     OnboardingOpened(crate::shell::WindowKey),
@@ -645,6 +678,12 @@ pub(crate) enum AppMessage {
     HuddleGoChannel,
     LeaveHuddleHere,
     HuddleLeft(bool),
+    HuddleInviteesLoaded(Vec<crate::backend::ChatMember>),
+    /// Invite a member (by their member-row key) into the huddle the reader
+    /// is seated in.
+    InviteToHuddle(String),
+    HuddleInviteSent(String),
+    HuddleInviteFailed(String, crate::backend::OptimisticMutationError),
     SecretTyped(String, String),
     ChannelDraftChanged(String),
 }
@@ -660,6 +699,18 @@ impl Ducktape {
             Appearance::Light => false,
             Appearance::System => self.system_dark,
         }
+    }
+    /// The updater's reading, when the app was started through the launcher.
+    pub(crate) fn update_reading(&self) -> Option<crate::backend::update::UpdateReading> {
+        self.updater.as_ref().map(|updater| updater.reading())
+    }
+    /// The console's update strip, if a phase draws one.
+    pub(crate) fn update_strip(&self) -> Option<crate::backend::update::UpdateStrip> {
+        crate::backend::update::strip_of(self.update_reading().as_ref())
+    }
+    /// The Settings "Updates" section's facts.
+    pub(crate) fn update_facts(&self) -> crate::backend::update::UpdateFacts {
+        crate::backend::update::facts_of(self.update_reading().as_ref(), self.wall_now)
     }
     pub(crate) fn initial_state() -> Self {
         Self {
@@ -726,6 +777,7 @@ impl Ducktape {
             password: "".to_owned(),
             status: "Connecting…".to_owned(),
             connected: false,
+            updater: crate::backend::update::Updater::from_env(),
             loading: false,
             views_live_serial: 0,
             cmd_held: false,
@@ -872,6 +924,7 @@ impl Ducktape {
             huddle_stage: "".to_owned(),
             huddle_roster: Vec::new(),
             huddle_rows: Vec::new(),
+            huddle_invitees: Vec::new(),
             secrets: Default::default(),
         }
     }

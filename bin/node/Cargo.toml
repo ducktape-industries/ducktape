@@ -70,6 +70,8 @@ collaboration = { workspace = true }
 identity = { workspace = true }
 # the passkey enrollment challenge — the same bytes `KeyScheme::Secp256r1` verifies.
 keyscheme = { workspace = true }
+# the desktop app's release manifest + signature: `ducktape release sign`.
+app-update = { workspace = true }
 authpage = { workspace = true }
 gateway = { workspace = true }
 # the airlock contract: `server` supplies the GrantCheck type the lender daemon

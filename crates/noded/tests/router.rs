@@ -1148,6 +1148,26 @@ async fn the_open_query_lane_stays_open_and_anonymous() {
     );
 }
 
+/// The contract number is a fact about the binary, not the boundary: a node
+/// that has published nothing yet serves it too, so the app can refuse (or
+/// not) before the first block.
+#[tokio::test]
+async fn status_carries_the_contract_number_before_any_publish() {
+    let (handle, _cmd_rx, _events) = local_node();
+    let response = noded::router(handle)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["contract"], noded::NODE_CONTRACT);
+}
+
 #[tokio::test]
 async fn status_reports_root_hash_height_and_module_roots() {
     // deliberately NO actor: /v1/status serves the last-published snapshot
@@ -1156,6 +1176,7 @@ async fn status_reports_root_hash_height_and_module_roots() {
     // exists to prevent.
     let (handle, _cmd_rx, _events) = local_node();
     handle.status_cell().publish(NodeStatus {
+        contract: noded::NODE_CONTRACT,
         version: "9.9.9".into(),
         root_hash: "cd".repeat(32),
         height: 3,
@@ -1188,6 +1209,9 @@ async fn status_reports_root_hash_height_and_module_roots() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
+    // the app-facing surface's number rides beside the build version: the
+    // desktop app reads this one field to decide whether to open a console.
+    assert_eq!(body["contract"], noded::NODE_CONTRACT);
     assert_eq!(body["version"], "9.9.9");
     assert_eq!(body["root_hash"], "cd".repeat(32));
     assert_eq!(body["height"], 3);
@@ -1625,7 +1649,7 @@ async fn the_module_stage_body_cap_is_explicit_and_its_refusal_is_named() {
     spawn_fake_actor(cmd_rx, None);
     let response = noded::router(handle)
         .oneshot(stage(
-            module_artifact::ModuleArtifact::component(vec![7u8; 3 * 1024 * 1024]).encode(),
+            module_artifact::Artifact::module(vec![7u8; 3 * 1024 * 1024]).encode(),
         ))
         .await
         .unwrap();

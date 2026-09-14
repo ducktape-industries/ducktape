@@ -330,7 +330,7 @@ args = ["run", "--model", "m1"]
         assert_eq!(
             get("codex").args,
             vec![
-                "exec",
+                "app-server",
                 "-c",
                 "mcp_servers.ducktape.command=\"ducktape\"",
                 "-c",
@@ -339,11 +339,8 @@ args = ["run", "--model", "m1"]
                 "mcp_servers.ducktape.env_vars=[\"DUCKTAPE_NODE\",\"DUCKTAPE_RUN_AGENT\",\"DUCKTAPE_RUN_WORKSPACE\",\"DUCKTAPE_RUN_SKILLS\",\"DUCKTAPE_RUN_ACTION_URL\",\"DUCKTAPE_RUN_ACTION_TOKEN\",\"DUCKTAPE_RUN_ID\",\"DUCKTAPE_PROVIDER_CONTROL_URL\",\"DUCKTAPE_PROVIDER_CONTROL_TOKEN\"]",
                 "-c",
                 "mcp_servers.ducktape.default_tools_approval_mode=\"approve\"",
-                "--json",
-                "--sandbox",
-                "workspace-write",
-                "--skip-git-repo-check",
-                "-"
+                "-c",
+                "sandbox_mode=\"workspace-write\""
             ],
         );
         assert_eq!(
@@ -354,6 +351,11 @@ args = ["run", "--model", "m1"]
                 "{\"mcpServers\":{\"ducktape\":{\"command\":\"ducktape\",\"args\":[\"mcp\"]}}}",
                 "--allowedTools",
                 "mcp__ducktape",
+                "--input-format",
+                "stream-json",
+                "--replay-user-messages",
+                "--permission-prompts",
+                "host",
                 "--output-format",
                 "stream-json",
                 "--verbose",
@@ -375,7 +377,7 @@ args = ["run", "--model", "m1"]
         assert_eq!(
             get("codex_gpt-5.5_xhigh").args,
             vec![
-                "exec",
+                "app-server",
                 "-c",
                 "mcp_servers.ducktape.command=\"ducktape\"",
                 "-c",
@@ -384,15 +386,12 @@ args = ["run", "--model", "m1"]
                 "mcp_servers.ducktape.env_vars=[\"DUCKTAPE_NODE\",\"DUCKTAPE_RUN_AGENT\",\"DUCKTAPE_RUN_WORKSPACE\",\"DUCKTAPE_RUN_SKILLS\",\"DUCKTAPE_RUN_ACTION_URL\",\"DUCKTAPE_RUN_ACTION_TOKEN\",\"DUCKTAPE_RUN_ID\",\"DUCKTAPE_PROVIDER_CONTROL_URL\",\"DUCKTAPE_PROVIDER_CONTROL_TOKEN\"]",
                 "-c",
                 "mcp_servers.ducktape.default_tools_approval_mode=\"approve\"",
-                "--json",
-                "--sandbox",
-                "workspace-write",
-                "--skip-git-repo-check",
-                "-m",
-                "gpt-5.5",
+                "-c",
+                "sandbox_mode=\"workspace-write\"",
+                "-c",
+                "model=\"gpt-5.5\"",
                 "-c",
                 "model_reasoning_effort=\"xhigh\"",
-                "-",
             ],
         );
         assert_eq!(
@@ -403,6 +402,11 @@ args = ["run", "--model", "m1"]
                 "{\"mcpServers\":{\"ducktape\":{\"command\":\"ducktape\",\"args\":[\"mcp\"]}}}",
                 "--allowedTools",
                 "mcp__ducktape",
+                "--input-format",
+                "stream-json",
+                "--replay-user-messages",
+                "--permission-prompts",
+                "host",
                 "--output-format",
                 "stream-json",
                 "--verbose",

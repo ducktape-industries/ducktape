@@ -200,8 +200,72 @@ struct VirtualScroll {
 }
 
 struct EditorMount {
-    view: Entity<crate::editor::wire::WireEditor>,
+    view: EditorView,
     _subscription: Subscription,
+}
+
+/// An editor's `()` is "the store has events": forward them as this tree's.
+fn drain_editor(store: &crate::editor::wire::EditorStore, cx: &mut Context<ViewTree>) {
+    for event in store.drain() {
+        cx.emit(event);
+    }
+}
+
+/// The two editors a `Node::Editor` can mount: the line editor every view
+/// gets, or gpui-notion for the pages document.
+enum EditorView {
+    Wire(Entity<crate::editor::wire::WireEditor>),
+    Notion(Entity<crate::editor::wire::NotionWireEditor>),
+}
+
+impl EditorView {
+    fn sync(&self, window: &mut Window, cx: &mut App) {
+        match self {
+            Self::Wire(view) => view.update(cx, |editor, cx| editor.sync(window, cx)),
+            Self::Notion(view) => view.update(cx, |editor, cx| editor.sync(window, cx)),
+        }
+    }
+
+    fn widget_command(&self, command: &wire::WidgetCommand, window: &mut Window, cx: &mut App) {
+        match self {
+            Self::Wire(view) => view.update(cx, |editor, cx| {
+                editor.widget_command(command, window, cx);
+            }),
+            Self::Notion(view) => view.update(cx, |editor, cx| {
+                editor.widget_command(command, window, cx);
+            }),
+        }
+    }
+
+    /// The guest echoes which editor held focus when the frame was built,
+    /// so a rebuilt line editor can put its caret back. The notion editor is
+    /// one persistent entity: it keeps its own focus, and re-focusing it here
+    /// would steal the caret from whatever the guest focused this frame.
+    fn restore_focus(&self, key: &str, window: &mut Window, cx: &mut App) {
+        let Self::Wire(view) = self else {
+            return;
+        };
+        let focus = wire::WidgetCommand::Focus {
+            target: key.to_owned(),
+        };
+        view.update(cx, |editor, cx| {
+            editor.widget_command(&focus, window, cx);
+        });
+    }
+
+    fn is_focused(&self, window: &Window, cx: &App) -> bool {
+        match self {
+            Self::Wire(view) => view.read(cx).is_focused(window, cx),
+            Self::Notion(view) => view.read(cx).is_focused(window, cx),
+        }
+    }
+
+    fn element(&self) -> AnyElement {
+        match self {
+            Self::Wire(view) => view.clone().into_any_element(),
+            Self::Notion(view) => view.clone().into_any_element(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -661,7 +725,7 @@ impl ViewTree {
         }
         self.editors
             .get(target)
-            .is_some_and(|editor| editor.view.read(cx).is_focused(window, cx))
+            .is_some_and(|editor| editor.view.is_focused(window, cx))
     }
 
     fn focus_relative(
@@ -741,9 +805,7 @@ impl ViewTree {
             }
         }
         if let Some(editor) = self.editors.get(target) {
-            editor.view.update(cx, |editor, cx| {
-                editor.widget_command(command, window, cx);
-            });
+            editor.view.widget_command(command, window, cx);
             return Ok(wire::encode(&()));
         }
         if let Some(picker) = self.pickers.get(target) {
@@ -1086,7 +1148,7 @@ impl ViewTree {
                 let focused = self
                     .editors
                     .get(key)
-                    .is_some_and(|editor| editor.view.read(cx).is_focused(window, cx));
+                    .is_some_and(|editor| editor.view.is_focused(window, cx));
                 if focused {
                     editors.insert(key.clone(), document.clone());
                 }
@@ -2623,14 +2685,26 @@ impl ViewTree {
             return div().child("Editor host is unavailable").into_any_element();
         };
         if !self.editors.contains_key(key) {
-            let view = cx.new(|cx| {
-                crate::editor::wire::WireEditor::new(key.clone(), store.clone(), window, cx)
-            });
-            let subscription = cx.subscribe(&view, move |_, _, _: &(), cx| {
-                for event in store.drain() {
-                    cx.emit(event);
+            let events = store.clone();
+            let notion = key.ends_with(crate::editor::wire::NOTION_DOCUMENT_KEY);
+            let (view, subscription) = match notion {
+                true => {
+                    let view = cx.new(|cx| {
+                        crate::editor::wire::NotionWireEditor::new(key.clone(), store, window, cx)
+                    });
+                    let subscription =
+                        cx.subscribe(&view, move |_, _, _: &(), cx| drain_editor(&events, cx));
+                    (EditorView::Notion(view), subscription)
                 }
-            });
+                false => {
+                    let view = cx.new(|cx| {
+                        crate::editor::wire::WireEditor::new(key.clone(), store, window, cx)
+                    });
+                    let subscription =
+                        cx.subscribe(&view, move |_, _, _: &(), cx| drain_editor(&events, cx));
+                    (EditorView::Wire(view), subscription)
+                }
+            };
             self.editors.insert(
                 key.clone(),
                 EditorMount {
@@ -2640,19 +2714,11 @@ impl ViewTree {
             );
         }
         let editor = self.editors.get(key).expect("editor inserted");
-        editor.view.update(cx, |editor, cx| editor.sync(window, cx));
+        editor.view.sync(window, cx);
         if self.presentation.editors.remove(key).as_ref() == Some(document) {
-            editor.view.update(cx, |editor, cx| {
-                editor.widget_command(
-                    &wire::WidgetCommand::Focus {
-                        target: key.clone(),
-                    },
-                    window,
-                    cx,
-                );
-            });
+            editor.view.restore_focus(key, window, cx);
         }
-        let view = editor.view.clone();
+        let view = editor.view.element();
         let mut element = dimensions(
             div().relative(),
             Some(width.map_or(wire::Length::Fill, wire::Length::Fixed)),

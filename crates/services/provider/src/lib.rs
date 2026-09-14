@@ -208,6 +208,7 @@ pub(crate) use sandbox_host::{firecracker_api, guest_manifest, microvm};
 mod egress_proxy;
 mod pi;
 mod read_lane;
+pub mod run_session;
 mod spec;
 mod variants;
 #[cfg(unix)]
@@ -2784,6 +2785,56 @@ impl CliProvider {
             )
         };
 
+        let protocol = match self.spec.output {
+            OutputFormat::CodexSession => Some(run_session::Protocol::Codex),
+            OutputFormat::ClaudeSession => Some(run_session::Protocol::Claude),
+            // Pi is a one-shot `--print` run whose events arrive on stdout; it
+            // drives no bidirectional session protocol.
+            OutputFormat::PiJson
+            | OutputFormat::JsonlEvents
+            | OutputFormat::JsonResult
+            | OutputFormat::Text => None,
+        };
+        if let Some(protocol) = protocol {
+            let result = run_session::drive(
+                protocol,
+                prompt,
+                (stdin, stdout_pipe, stderr_pipe),
+                ctx,
+                self.output_sink.clone(),
+                (idle, hard),
+                broker_invocation.as_ref(),
+            )
+            .await;
+            if let Some(invocation) = &broker_invocation {
+                invocation.revoke();
+            }
+            if result.is_err() {
+                control.terminate().await;
+                return result;
+            }
+            let exited = tokio::time::timeout(
+                Duration::from_secs(10),
+                control.wait_success("provider session"),
+            )
+            .await;
+            match exited {
+                Ok(Ok((true, _))) => return result,
+                Ok(Ok((false, code))) => {
+                    control.terminate().await;
+                    return Err(format!("provider session exited unsuccessfully: {code:?}"));
+                }
+                Ok(Err(error)) => {
+                    control.terminate().await;
+                    return Err(error.to_string());
+                }
+                Err(_) => {
+                    control.terminate().await;
+                    return Err("provider session did not exit after its result".into());
+                }
+            }
+        }
+
         // feed the prompt CONCURRENTLY with collecting output: a prompt larger
         // than the pipe buffer would deadlock a sequential write-then-wait if
         // the CLI streams output before draining stdin.
@@ -3056,6 +3107,9 @@ impl CliProvider {
             // Plain stdout is model-authored answer text, not a provider
             // telemetry envelope. Never infer usage from answer content.
             OutputFormat::Text => (parse_text_output(&stdout)?, None),
+            OutputFormat::CodexSession | OutputFormat::ClaudeSession => {
+                unreachable!("session driver returned above")
+            }
         };
         Ok(Invocation { text, usage })
     }
@@ -3681,7 +3735,7 @@ mod tests {
         let installed = scratch("announce-installed").join("executors");
         std::fs::create_dir_all(&installed).expect("executors dir");
         for name in ["codex", "codex-code-mode-host"] {
-            std::fs::copy("/bin/true", installed.join(name)).expect("copy");
+            fake_cli(&installed, name, "exit 0");
         }
         let announced = discover(
             b"n",

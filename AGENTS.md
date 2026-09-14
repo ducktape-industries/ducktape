@@ -22,7 +22,9 @@ in `skills/` (`qa`, `sim-lane`, `module-dev`).
 - Version numbering is reset to v1 and stays there: no protocol-version bumps,
   no v2/v3 names, no admission gates keyed on a version number. The
   invitation/join flow in particular is v1 — a "v2" hint anywhere in it is a
-  bug.
+  bug — except the app↔node contract number (`noded::NODE_CONTRACT`): an
+  equality check the desktop app alone performs against `/v1/status`; it is
+  never a tolerance window and nothing on the node or between peers reads it.
 - This holds until a real network is live. Re-introducing versioning, upgrade
   gating, or migration machinery is an explicit, user-requested decision —
   never a side effect of a task.

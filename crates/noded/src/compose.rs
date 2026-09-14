@@ -110,6 +110,39 @@ pub enum Start<'a, 'b> {
     },
 }
 
+/// one founding deployment, fetched and verified: what the registry seeds
+/// for it (`kind`) is what its frame says it is.
+pub struct Founding {
+    pub id: String,
+    pub hash: [u8; 32],
+    pub kind: modules::Kind,
+}
+
+/// what a deployment frame IS, by its tag: the kind the registry seeds a
+/// genesis entry with, and the kind a post-genesis registration must match.
+pub fn artifact_kind(bytes: &[u8]) -> Result<modules::Kind, String> {
+    Ok(match module_artifact::ArtifactRef::decode(bytes)? {
+        module_artifact::ArtifactRef::Module(_) => modules::Kind::Module,
+        module_artifact::ArtifactRef::View(_) => modules::Kind::View,
+    })
+}
+
+/// the registry's genesis seed table for the founding set: every entry's
+/// kind is its frame's tag — a `<id>.component.wasm` founds a module, a
+/// `<id>.view.wasm` alone founds a view (`workspace_config::Genesis::compose`).
+pub fn genesis_seeds(founding: &[Founding]) -> BTreeMap<String, modules::Seed> {
+    founding
+        .iter()
+        .map(|entry| {
+            let seed = modules::Seed {
+                kind: entry.kind,
+                code_hash: entry.hash.to_vec(),
+            };
+            (entry.id.clone(), seed)
+        })
+        .collect()
+}
+
 /// Compose the boot mode's deployment set into a [`Host`];
 /// the boot mode supplies the authenticated module set and initialization or
 /// snapshot data. Every module uses the same Wasm constructor.
@@ -121,13 +154,6 @@ pub async fn compose(
     mut boot: Boot<'_, '_>,
 ) -> Result<Host, String> {
     let mut host = Host::new();
-    let parameters = match &boot {
-        Boot::Genesis { validators, bundle } => sdk::genesis_config::encode_config(&[
-            ("modules", &sdk::wire::encode(bundle)),
-            ("validators", &sdk::wire::encode(validators)),
-        ]),
-        Boot::Reopen { .. } => sdk::genesis_config::encode_config(&[]),
-    };
     let codes = match &boot {
         Boot::Genesis { bundle, .. } => *bundle,
         Boot::Reopen { codes, .. } => *codes,
@@ -135,8 +161,29 @@ pub async fn compose(
     for id in codes.keys() {
         workspace_config::validate_module_id(id)?;
     }
+    // every deployment is fetched and verified before anything seats: the
+    // genesis seed table names each entry's kind off its frame, and a
+    // reopen's set is the seated modules' hashes (a checkpoint records what
+    // ran, and a view never runs), so a view frame can only be a founding one.
+    let mut founding = Vec::with_capacity(codes.len());
+    let mut fetched = Vec::with_capacity(codes.len());
     for (id, hash) in codes {
         let bytes = fetch_code(code, id, hash).await?;
+        founding.push(Founding {
+            id: id.clone(),
+            hash: *hash,
+            kind: artifact_kind(&bytes)?,
+        });
+        fetched.push((id, bytes));
+    }
+    let parameters = match &boot {
+        Boot::Genesis { validators, .. } => sdk::genesis_config::encode_config(&[
+            ("modules", &sdk::wire::encode(&genesis_seeds(&founding))),
+            ("validators", &sdk::wire::encode(validators)),
+        ]),
+        Boot::Reopen { .. } => sdk::genesis_config::encode_config(&[]),
+    };
+    for (entry, (id, bytes)) in founding.iter().zip(fetched) {
         let start = match &mut boot {
             Boot::Genesis { .. } => Start::Fresh {
                 parameters: &parameters,
@@ -145,8 +192,15 @@ pub async fn compose(
                 snapshots: &mut **snapshots,
             },
         };
-        let module = wasm_module(id, &bytes, stores, substrates, bindings, start).await?;
-        register_new(&mut host, Box::new(module))?;
+        match entry.kind {
+            modules::Kind::Module => {
+                let module = wasm_module(id, &bytes, stores, substrates, bindings, start).await?;
+                register_new(&mut host, Box::new(module))?;
+            }
+            // a view seats nothing: the registry entry carries its hash and
+            // the desktop fetches the artifact by that hash.
+            modules::Kind::View => {}
+        }
     }
     // Durable stores can have advanced beyond the checkpoint. Its registry
     // names admissions replay will encounter; prepare those through the same
@@ -237,6 +291,11 @@ async fn registry_active_set(host: &Host, height: u64) -> Result<Vec<ActiveCode>
     };
     Ok(roster
         .into_iter()
+        .filter(|entry| match entry.kind {
+            modules::Kind::Module => true,
+            // a view is a registry entry with nothing to seat.
+            modules::Kind::View => false,
+        })
         .filter_map(|entry| {
             let (hash, seat) = seat_at(&entry, height)?;
             Some(ActiveCode {
@@ -350,18 +409,45 @@ pub async fn wasm_module(
     Ok(module)
 }
 
-/// Readiness covers consensus code, the optional mapper, and the optional view.
-/// Mapper validation matches its eventual index install. View validation checks
-/// strict metadata and the canonical Ice ABI without instantiating or executing
-/// the view. Unknown imports follow the desktop host's trap policy; static
-/// acceptance does not guarantee that instantiation, init, or boot will succeed.
+/// Readiness is "a validator can run what the registry entry IS": for a
+/// `Kind::Module` entry the consensus code (declared shape realizable here),
+/// its optional mapper (matching its eventual index install) and its optional
+/// view; for a `Kind::View` entry the view alone. Either way the frame's tag
+/// must be the entry's kind — a view frame under a module id (or a module
+/// frame under a view id) is a named refusal, never a vote. View validation
+/// checks strict metadata and the canonical Ice ABI without instantiating or
+/// executing the view; unknown imports follow the desktop host's trap policy,
+/// so static acceptance does not guarantee that instantiation, init, or boot
+/// will succeed.
 pub fn validate_deployment(
     id: &str,
+    kind: modules::Kind,
     bytes: &[u8],
     index: &indexer::IndexStore,
 ) -> Result<(), String> {
     workspace_config::validate_module_id(id)?;
-    let artifact = module_artifact::ModuleArtifactRef::decode(bytes)?;
+    let artifact = module_artifact::ArtifactRef::decode(bytes)?;
+    match (kind, artifact) {
+        (modules::Kind::Module, module_artifact::ArtifactRef::Module(module)) => {
+            validate_module(id, module, index)
+        }
+        (modules::Kind::View, module_artifact::ArtifactRef::View(view)) => {
+            validate_view(view.component)
+        }
+        (modules::Kind::Module, module_artifact::ArtifactRef::View(_)) => Err(format!(
+            "artifact_kind_mismatch: {id} is registered as a module, but the artifact is a view-only frame"
+        )),
+        (modules::Kind::View, module_artifact::ArtifactRef::Module(_)) => Err(format!(
+            "artifact_kind_mismatch: {id} is registered as a view, but the artifact is a module frame"
+        )),
+    }
+}
+
+fn validate_module(
+    id: &str,
+    artifact: module_artifact::ModuleArtifactRef<'_>,
+    index: &indexer::IndexStore,
+) -> Result<(), String> {
     let shape =
         WasmModule::declared_shape(artifact.component).map_err(|error| error.to_string())?;
     check_realizable(id, &shape)?;
@@ -565,8 +651,20 @@ impl host::ModuleFactory for Admissions {
         // plane's record committed through the same id-generic registry. Skip
         // and latch — a hard error here is a permanent code stall on every
         // node, for bytes this boundary never owned.
-        let Ok(artifact) = module_artifact::ModuleArtifactRef::decode(bytes) else {
+        let Ok(artifact) = module_artifact::ArtifactRef::decode(bytes) else {
             return Ok(host::Admitted::ForeignAbi);
+        };
+        // the host never asks this factory for a `Kind::View` entry
+        // (`Host::realize_module_swaps` skips them), so a view frame here is
+        // a module entry whose bytes are no module: fail closed rather than
+        // seat an empty core.
+        let artifact = match artifact {
+            module_artifact::ArtifactRef::Module(module) => module,
+            module_artifact::ArtifactRef::View(_) => {
+                return Err(sdk::Error::Module(format!(
+                    "artifact_kind_mismatch: {id} is a module entry, but the artifact is a view-only frame"
+                )));
+            }
         };
         let bindings = Bindings {
             invite: &self.invite,

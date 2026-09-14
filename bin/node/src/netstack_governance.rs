@@ -159,8 +159,13 @@ pub(crate) async fn reconcile(
             );
             continue;
         };
-        let answer = match module_artifact::ModuleArtifact::decode(&component) {
-            Ok(artifact) => apply_netstack_artifact(artifact).await,
+        let answer = match module_artifact::Artifact::decode(&component) {
+            Ok(module_artifact::Artifact::Module(artifact)) => {
+                apply_netstack_artifact(artifact).await
+            }
+            Ok(module_artifact::Artifact::View(_)) => {
+                SwapAnswer::Refused("the reachability component is not a view".into())
+            }
             Err(error) => SwapAnswer::Refused(error),
         };
         crate::reachability_plane::record_swap(&metrics, &answer);
@@ -262,6 +267,7 @@ mod tests {
     fn entry(pending: Option<[u8; 32]>, active: &[u8]) -> modules::ModuleCode {
         modules::ModuleCode {
             module_id: NETSTACK_MODULE_ID.into(),
+            kind: modules::Kind::Module,
             active_code_hash: active.to_vec(),
             pending: pending.map(|code_hash| modules::ScheduledSwap {
                 name: "netstack-v1".into(),
@@ -277,6 +283,7 @@ mod tests {
     fn other() -> modules::ModuleCode {
         modules::ModuleCode {
             module_id: "kanban".into(),
+            kind: modules::Kind::Module,
             active_code_hash: vec![9; 32],
             pending: None,
             history: Vec::new(),

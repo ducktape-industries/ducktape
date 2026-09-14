@@ -24,6 +24,18 @@ the platform's application directories (`~/.config`, `~/.local/state` and
 `~/Library/Caches` on macOS; an `XDG_*` variable wins on either), never under
 the home.
 
+Agents opens an existing run's journal, recent provider trace, and session controls.
+The process disclosure shows provider thinking as Markdown and groups tool inputs
+with their results. The executor's elapsed time labels the closed session
+(`Worked for 2m 5s`); the answer remains visible when the process is collapsed.
+Raw events have their own disclosure inside the process.
+The run creator can add instructions, stop the run, and answer pending tool
+approvals. Codex steers its active turn; Claude interrupts the current response
+and accepts the instruction in the same process and session. Controls require a
+compute worker attached to the connected node; a peer's mirrored output alone
+does not provide a control connection. Trace is a bounded live buffer and can
+expire. Settled runs retain creator-only access to any output still buffered.
+
 ## Module-owned views
 
 The Approvals, Members, Agents, Node, Explorer, Settings, Chat, Files,
@@ -35,8 +47,8 @@ loads from a file at runtime (`src/module_view.rs`).
 `target/views/<module>_view.wasm`, where a built binary looks for it
 (`DUCKTAPE_VIEWS_DIR` overrides; the native packaging script carries the
 directory into `Ducktape.app` as resources linked beside the executable, and the Linux
-`make install-app` copies it beside the binary); `make dev` and `make app` run
-it first. A tab whose view is not
+`make install-app` stages it beside the binary in the release it seeds); `make dev`
+and `make app` run it first. A tab whose view is not
 staged says so in its place.
 
 Deployed views follow the module registry's active deployment hash on block
@@ -122,6 +134,18 @@ identity and notarized by Apple. `ops/bundle-app-macos.sh` does both itself, off
 environment variables; `make app` inherits the environment, so exporting them
 is the whole configuration.
 
+The bundle carries two executables in `Contents/MacOS`: `ducktape-launcher`,
+its `CFBundleExecutable` (`app/packaging/Info.plist`), reads the update state
+and `exec`s `ducktape-app` beside it — same PID, same bundle, so notifications,
+TCC grants and `duck://` events all belong to `dev.ducktape.app`. The views
+sit under `Contents/Resources/views` with a `MacOS/views` link, where
+`views_dir()` finds them beside the executable. The helper is nested code and
+is signed first, then the bundle, so `codesign --verify --deep --strict` — what
+`ducktape-launcher --qualify` runs on a staged release — passes on the bundle
+as built. `make install-app` hands that bundle to `ducktape-launcher install
+--from target/app-bundle/Ducktape.app` unchanged: nothing is copied in, nothing
+is re-sealed.
+
 1. **The signing identity.** A "Developer ID Application" certificate from the
    Apple Developer Program, in the login keychain. The exact string is what
    `DUCKTAPE_CODESIGN_IDENTITY` takes:
@@ -164,6 +188,20 @@ is the whole configuration.
    xcrun stapler validate target/app-bundle/Ducktape-*.dmg
    codesign -dv --verbose=4 target/app-bundle/Ducktape.app   # Authority + TeamIdentifier
    ```
+
+5. **Package and publish.** `make release-app` is `app-release` with all
+   three `DUCKTAPE_NOTARY_*` required (every release a network offers is
+   notarized), the ticket stapled to the bundle, and `ops/release/archive.sh`
+   packing it into `target/release-archive/Ducktape-<sha7>-macos-<arch>.tar.zst`
+   — the name `app_update::layout::archive_name` gives the archive's own
+   sha256. The script refuses by name an ad-hoc bundle (`adhoc_bundle_refused`)
+   or one Apple never notarized (`bundle_not_stapled`). On Linux the same
+   target packs `target/app-release/{ducktape-launcher, ducktape-app, views/}`
+   into `Ducktape-<sha7>-linux-<arch>.tar.zst`. Then `make publish-app` with
+   `NODE`, `RELEASE_KEY`, `SEQUENCE` and `DISPLAY` composes and signs the
+   manifest and lands everything under `/shared/releases` on the network's
+   duckfs (`ops/release/publish.sh`); its `ARCHIVES` defaults to what
+   `release-app` just wrote.
 
 `ops/macos-preflight.sh` reports both halves — the Developer ID identities in
 the keychain and whether the three notary variables are exported with the key

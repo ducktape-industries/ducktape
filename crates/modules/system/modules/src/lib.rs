@@ -33,8 +33,8 @@
 //! ## state model
 //!
 //! pure logic over a host-injected [`sdk::MerkleStore`]: one point record per
-//! registered module (`mod\0{id}` → active hash + optional pending swap,
-//! borsh) behind the sorted module roster (`modules`, bounded by
+//! registered module (`mod\0{id}` → kind + activation history + optional
+//! pending swap, borsh) behind the sorted module roster (`modules`, bounded by
 //! [`MAX_MODULES`]) the status/advance walks read. writes are staged during a
 //! block and flushed in one batch at `commit_block`; the module root IS the
 //! store's merkle root, and sync belongs to the store. the `Advance` decide
@@ -85,6 +85,9 @@ const MODULE_ROSTER_KEY: &[u8] = b"modules";
 /// one encoding).
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 struct ModuleEntry {
+    /// what the artifact under this id is — set at admission, kept by every
+    /// swap ([`Kind`]).
+    kind: Kind,
     pending: Option<ScheduledSwap>,
     /// every activation in block order — appended by a register/seed and by
     /// each `Advance` flip, never rewritten; its last entry IS the active
@@ -152,6 +155,7 @@ impl Modules {
     pub async fn seed(
         &mut self,
         module_id: impl Into<String>,
+        kind: Kind,
         code_hash: Vec<u8>,
     ) -> Result<(), Error> {
         assert_eq!(
@@ -174,6 +178,7 @@ impl Modules {
         self.store(
             mod_key(&module_id),
             &ModuleEntry {
+                kind,
                 history: vec![activation(0, &code_hash)],
                 pending: None,
             },
@@ -358,6 +363,7 @@ impl Modules {
         &mut self,
         ctx: &mut dyn Ctx,
         module_id: String,
+        kind: Kind,
         code_hash: Vec<u8>,
     ) -> Result<(), Error> {
         self.require_governance_or_system(ctx)?;
@@ -372,6 +378,7 @@ impl Modules {
             roster,
             module_id,
             &ModuleEntry {
+                kind,
                 history: vec![activation(ctx.env().height, &code_hash)],
                 pending: None,
             },
@@ -438,6 +445,7 @@ impl Modules {
         ctx: &mut dyn Ctx,
         name: String,
         module_id: String,
+        kind: Kind,
         activation_height: u64,
         code_hash: Vec<u8>,
     ) -> Result<(), Error> {
@@ -472,6 +480,7 @@ impl Modules {
             roster,
             module_id,
             &ModuleEntry {
+                kind,
                 pending: Some(ScheduledSwap {
                     name,
                     activation_height,
@@ -656,6 +665,7 @@ impl Modules {
             let active_code_hash = e.active_code_hash().to_vec();
             modules.push(ModuleCode {
                 module_id: id,
+                kind: e.kind,
                 active_code_hash,
                 pending: e.pending,
                 history: e.history,
@@ -709,18 +719,18 @@ impl Module for Modules {
 
     async fn initialize(&mut self, params: &[u8]) -> Result<(), Error> {
         let config = sdk::genesis_config::decode_config(params)?;
-        let roster: std::collections::BTreeMap<String, Vec<u8>> =
+        let roster: std::collections::BTreeMap<String, Seed> =
             match sdk::genesis_config::find(&config, "modules") {
                 Some(bytes) => sdk::wire::decode(bytes).map_err(Error::Module)?,
                 None => Default::default(),
             };
-        for (id, hash) in roster {
-            if hash.len() != CODE_HASH_LEN {
+        for (id, seed) in roster {
+            if seed.code_hash.len() != CODE_HASH_LEN {
                 return Err(Error::Module(
                     "initial module code hash must be 32 bytes".into(),
                 ));
             }
-            self.seed(id, hash).await?;
+            self.seed(id, seed.kind, seed.code_hash).await?;
         }
         self.finish_seed().await
     }
@@ -729,8 +739,12 @@ impl Module for Modules {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             ModulesMsg::RegisterModule {
                 module_id,
+                kind,
                 code_hash,
-            } => self.handle_register_module(ctx, module_id, code_hash).await,
+            } => {
+                self.handle_register_module(ctx, module_id, kind, code_hash)
+                    .await
+            }
             ModulesMsg::ScheduleSwap {
                 name,
                 module_id,
@@ -743,11 +757,19 @@ impl Module for Modules {
             ModulesMsg::ScheduleRegister {
                 name,
                 module_id,
+                kind,
                 activation_height,
                 code_hash,
             } => {
-                self.handle_schedule_register(ctx, name, module_id, activation_height, code_hash)
-                    .await
+                self.handle_schedule_register(
+                    ctx,
+                    name,
+                    module_id,
+                    kind,
+                    activation_height,
+                    code_hash,
+                )
+                .await
             }
             ModulesMsg::CancelSwap { name, module_id } => {
                 self.handle_cancel_swap(ctx, name, module_id).await

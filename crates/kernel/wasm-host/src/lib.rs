@@ -44,7 +44,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use module_artifact::ModuleArtifact;
+use module_artifact::Artifact;
 use sha2::{Digest, Sha256};
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store};
@@ -878,18 +878,25 @@ impl CompiledModule {
             engine,
             linker,
             component,
-            code_hash: ModuleArtifact::component(component_bytes.to_vec())
-                .hash()
-                .to_vec(),
+            code_hash: Artifact::module(component_bytes.to_vec()).hash().to_vec(),
             index_guest: None,
             shape,
         })
     }
 
     /// Compile one deployment. Its code identity commits both the consensus
-    /// component and the mapper; there is no raw-component wire fallback.
+    /// component and the mapper; there is no raw-component wire fallback. A
+    /// view-only frame has no consensus code to compile: it is refused here,
+    /// never seated as an empty module.
     pub fn compile_artifact(bytes: &[u8]) -> Result<Self, SdkError> {
-        let artifact = ModuleArtifact::decode(bytes).map_err(SdkError::Module)?;
+        let artifact = match Artifact::decode(bytes).map_err(SdkError::Module)? {
+            Artifact::Module(module) => module,
+            Artifact::View(_) => {
+                return Err(SdkError::Module(
+                    "view_artifact_has_no_component: a view-only artifact is not a module".into(),
+                ));
+            }
+        };
         let mut compiled = Self::compile(&artifact.component)?;
         compiled.code_hash = sha256(bytes);
         compiled.index_guest = artifact.index;

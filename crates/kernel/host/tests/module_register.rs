@@ -29,7 +29,7 @@ const COMPONENT: &[u8] = include_bytes!("fixtures/hello.component.wasm");
 const H: u64 = 10;
 
 fn deployment(bytes: &[u8]) -> Vec<u8> {
-    module_artifact::ModuleArtifact::component(bytes.to_vec()).encode()
+    module_artifact::Artifact::module(bytes.to_vec()).encode()
 }
 
 fn sha(bytes: &[u8]) -> Vec<u8> {
@@ -75,7 +75,9 @@ impl ModuleFactory for WasmFactory {
         // HERE stays fail-closed; bytes that are no module at all are another
         // plane's record (see `noded::compose::Admissions`) — including bytes
         // that carry no artifact frame in the first place.
-        let Ok(artifact) = module_artifact::ModuleArtifactRef::decode(bytes) else {
+        let Ok(module_artifact::ArtifactRef::Module(artifact)) =
+            module_artifact::ArtifactRef::decode(bytes)
+        else {
             return Ok(Admitted::ForeignAbi);
         };
         match wasm_host::CompiledModule::compile_artifact(bytes)
@@ -140,6 +142,7 @@ fn schedule_register_msg() -> Msg {
     modules_msg(&ModulesMsg::ScheduleRegister {
         name: "kanban-v1".into(),
         module_id: "kanban".into(),
+        kind: modules::Kind::Module,
         activation_height: H,
         code_hash: sha(COMPONENT),
     })
@@ -270,6 +273,7 @@ fn a_module_that_touches_nothing_admits_over_the_empty_root_and_never_moves_it()
         modules_msg(&ModulesMsg::ScheduleRegister {
             name: "noop-v1".into(),
             module_id: "noop".into(),
+            kind: modules::Kind::Module,
             activation_height: H,
             code_hash: sha(NOOP),
         }),
@@ -403,6 +407,7 @@ fn a_foreign_abi_record_is_skipped_and_the_boundary_keeps_sealing() {
             modules_msg(&ModulesMsg::ScheduleRegister {
                 name: name.into(),
                 module_id: id.into(),
+                kind: modules::Kind::Module,
                 activation_height: H,
                 code_hash: sha(code),
             }),
@@ -491,6 +496,7 @@ fn a_non_frame_registry_blob_is_skipped_and_the_boundary_keeps_sealing() {
             modules_msg(&ModulesMsg::ScheduleRegister {
                 name: name.into(),
                 module_id: id.into(),
+                kind: modules::Kind::Module,
                 activation_height: H,
                 code_hash: code_hash.clone(),
             }),

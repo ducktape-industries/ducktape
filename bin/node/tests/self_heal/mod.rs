@@ -222,7 +222,7 @@ fn a_blind_agent_repairs_and_deploys_from_symptoms() {
     let faulty_component = fixtures.join("faulty.component.wasm");
     std::fs::copy(seed.join("hello.component.wasm"), &faulty_component).unwrap();
     let faulty_artifact =
-        module_artifact::ModuleArtifact::component(std::fs::read(&faulty_component).unwrap())
+        module_artifact::Artifact::module(std::fs::read(&faulty_component).unwrap())
             .encode();
     let faulty_hash = sha256_hex(&seed.join("hello.component.wasm").to_string_lossy());
     // No clean version or correction history is pushed. The only commit the
@@ -428,7 +428,7 @@ fn a_blind_agent_repairs_and_deploys_from_symptoms() {
     // The host rebuild command is not present in the agent's checkout.
     build(&delivered);
     assert_eq!(
-        module_artifact::ModuleArtifact::component(
+        module_artifact::Artifact::module(
             std::fs::read(delivered.join("hello.component.wasm")).unwrap(),
         )
         .encode(),

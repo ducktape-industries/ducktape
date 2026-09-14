@@ -153,7 +153,7 @@ fn chat_commits_a_component_and_the_node_deploys_it_without_an_operator_update()
         let component = std::fs::read(fixture(fixture_id)).unwrap();
         std::fs::write(
             seed.join(name),
-            module_artifact::ModuleArtifact::component(component).encode(),
+            module_artifact::Artifact::module(component).encode(),
         )
         .unwrap();
     }
@@ -310,7 +310,7 @@ fn chat_commits_a_component_and_the_node_deploys_it_without_an_operator_update()
     );
     assert_eq!(
         delivered,
-        module_artifact::ModuleArtifact::component(
+        module_artifact::Artifact::module(
             std::fs::read(fixture("hello-replacement")).unwrap()
         )
         .encode()

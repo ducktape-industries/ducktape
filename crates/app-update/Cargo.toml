@@ -1,0 +1,22 @@
+[package]
+name = "app-update"
+edition.workspace = true
+version.workspace = true
+
+# The desktop app's self-update, as a pure library: the update state machine
+# (`Phase` × `Event` → `Phase` + `Command`s), the signed release-manifest
+# codec + wallet-key signature verification, and the `state.json` codec. No I/O, no
+# clock, no network — the launcher (boot: flip/exec) and the app (running:
+# fetch/download/verify/stage/banner) each drive `step` with their own
+# executor and share nothing but `state.json`.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# sha256: artifact identity and the manifest's `release.sha256_id`.
+sha2 = { workspace = true }
+# the release signature is a wallet key's namespaced ed25519 signature: the
+# same verify gate every op frame passes (`KeyScheme::Ed25519.verify`) …
+keyscheme = { workspace = true }
+# … and the same signer the wallet is (`ed25519::PrivateKey::sign`), so the
+# release tool and the app share one preimage.
+commonware-cryptography = { workspace = true }

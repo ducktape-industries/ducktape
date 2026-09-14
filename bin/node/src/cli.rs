@@ -2251,6 +2251,7 @@ mod tests {
             GovAction::RegisterModule {
                 name: "x".into(),
                 module_id: "hello".into(),
+                kind: modules::Kind::Module,
                 activation_lead: 60,
                 code_hash: hash.clone(),
             },

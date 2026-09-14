@@ -282,6 +282,7 @@ pub fn settings_view(
     account_exists: bool,
     account_busy: bool,
     account_ticket: &str,
+    updates: &crate::backend::update::UpdateFacts,
 ) -> ViewSpec {
     let appearance = match appearance {
         crate::Appearance::System => "system",
@@ -313,6 +314,14 @@ pub fn settings_view(
         "account_exists": account_exists,
         "account_busy": account_busy,
         "account_ticket": account_ticket,
+        "update_state": updates.state,
+        "update_current": updates.current,
+        "update_previous": updates.previous,
+        "update_staged_display": updates.staged_display,
+        "update_channel": updates.channel,
+        "update_checked": updates.checked,
+        "update_note": updates.note,
+        "update_busy": updates.busy,
     });
     module_view(
         "settings",
@@ -349,6 +358,9 @@ pub fn settings_intent(event: &ModuleViewEvent) -> crate::SettingsIntent {
         "light" => Intent::Light,
         "dark" => Intent::Dark,
         "notifications" => Intent::Notifications,
+        "update_check" => Intent::UpdateCheck,
+        "update_restart" => Intent::UpdateRestart,
+        "update_rollback" => Intent::UpdateRollback,
         _ => Intent::Copy,
     }
 }
@@ -745,13 +757,17 @@ fn surface_bool(args: &[wire::SurfaceValue], index: usize) -> bool {
 }
 
 fn surface_allowed(module: &str, surface: &str) -> bool {
-    match (module, surface) {
-        (_, "artifact_svg" | "artifact_image") => true,
-        ("chat", "chat_composer" | "picture") => true,
-        ("forge", "forge_composer" | "picture" | "forge_markdown" | "forge_code") => true,
-        ("files", "picture" | "forge_code" | "agent_markdown") => true,
-        _ => false,
-    }
+    matches!(
+        (module, surface),
+        (_, "artifact_svg" | "artifact_image")
+            | ("chat", "chat_composer" | "picture")
+            | (
+                "forge",
+                "forge_composer" | "picture" | "forge_markdown" | "forge_code"
+            )
+            | ("files", "picture" | "forge_code" | "agent_markdown")
+            | ("agents", "agent_markdown")
+    )
 }
 
 /// The operations a view may ask of the app, by module. An intent outside
@@ -821,14 +837,111 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "light",
             "dark",
             "notifications",
+            "update_check",
+            "update_restart",
+            "update_rollback",
         ],
         // pages speaks the kernel contract: every read is `rpc.view` and
         // every write `op.submit`. What is left are the two OS doors — the
         // clipboard, and the open plane a `duck://` link in a document goes
         // through.
         "pages" => &["copy", "open_link"],
-        _ => &[],
+        // a registry-listed view (no arm above) speaks the kernel contract
+        // and the two OS doors every view is allowed: nothing of its own
+        _ => GENERIC_DOORS,
     }
+}
+
+/// The two OS doors the app owns for every view: the open plane a `duck://`
+/// address goes through, and the clipboard. A view seated off the registry
+/// alone gets exactly these.
+const GENERIC_DOORS: &[&str] = &["open_link", "copy"];
+
+// ---------- the registry-listed seats ----------
+
+/// A view the registry lists as a `Kind::View` entry: the app knows nothing
+/// of it but its id, so its props are the session basics every view gets
+/// (the same four the files view is sent), and its events are the two
+/// generic doors. The tab it draws is named by its manifest and iconed by
+/// its `icons/tab.svg` asset.
+pub fn registered_view(
+    module: &'static str,
+    dark: bool,
+    connected: bool,
+    chain: &str,
+    account: &str,
+) -> ViewSpec {
+    let props = serde_json::json!({
+        "connected": connected,
+        "dark": dark,
+        "chain": chain,
+        "account": account,
+    });
+    module_view(module, serde_json::to_vec(&props).expect("props encode"))
+}
+
+/// The generic decoder: `open_link` (`link`) goes to the open plane, and
+/// anything else a registered view may say is the clipboard (`text`,
+/// `label`) — the door list admits nothing else.
+pub fn registered_intent(event: &ModuleViewEvent) -> crate::RegisteredIntent {
+    use crate::RegisteredIntent as Intent;
+    match event.kind.as_str() {
+        "open_link" => Intent::OpenLink,
+        _ => Intent::Copy,
+    }
+}
+
+/// The ids the connected node's registry lists as `Kind::View` entries, in
+/// the registry's (id) order: the tabs the shell draws after the built-in
+/// ones. Set by [`connected`] and moved by [`deployments_checked`]; empty
+/// off any node.
+fn registered() -> &'static Mutex<Vec<&'static str>> {
+    static REGISTERED: OnceLock<Mutex<Vec<&'static str>>> = OnceLock::new();
+    REGISTERED.get_or_init(Mutex::default)
+}
+
+pub fn registered_views() -> Vec<&'static str> {
+    registered().lock().expect("registered views").clone()
+}
+
+/// The name a registered view's tab shows: its manifest's, once the view is
+/// seated; its id until then.
+pub fn registered_view_name(module: &'static str) -> String {
+    let mounted = mounted(module);
+    let locked = mounted.lock().expect("module view lock");
+    match &locked.slot {
+        Slot::Ready(guest) if !guest.name.is_empty() => guest.name.clone(),
+        _ => module.to_owned(),
+    }
+}
+
+/// The `icons/tab.svg` a registered view ships beside itself, once seated.
+pub fn registered_view_icon(module: &'static str) -> Option<Arc<Vec<u8>>> {
+    let mounted = mounted(module);
+    let locked = mounted.lock().expect("module view lock");
+    let Slot::Ready(guest) = &locked.slot else {
+        return None;
+    };
+    guest
+        .assets
+        .get("icons/tab.svg")
+        .map(|bytes| Arc::new(bytes.clone()))
+}
+
+/// A registry id as the `&'static str` the seat registry, the tab and the
+/// guest are keyed by. Leaked ONCE per distinct id: the set is the ids a
+/// network's registry lists, bounded by its module set, and a repeat
+/// answers the same leak — the same interning `bin/node` does for module
+/// labels.
+pub(crate) fn intern(id: &str) -> &'static str {
+    static INTERNED: OnceLock<Mutex<std::collections::BTreeSet<&'static str>>> = OnceLock::new();
+    let mut interned = INTERNED.get_or_init(Mutex::default).lock().expect("interned ids");
+    if let Some(known) = interned.get(id) {
+        return known;
+    }
+    let leaked: &'static str = Box::leak(id.to_owned().into_boxed_str());
+    interned.insert(leaked);
+    leaked
 }
 
 // ---------- mounting ----------
@@ -878,11 +991,17 @@ pub fn connected(client: &ducktape_rpc::Client) -> Loads {
     for module in crate::backend::view_source::MODULE_OWNED {
         registry.entry(module).or_insert_with(Mounted::seat);
     }
-    let loads = registry
+    // the registry-listed views of the node just left are not this node's:
+    // their seats and tabs go now, and this node's come back once its own
+    // registry has been read below
+    for retired in registered().lock().expect("registered views").drain(..) {
+        registry.remove(retired);
+    }
+    let mut loads: Vec<std::thread::JoinHandle<()>> = registry
         .iter()
         .filter_map(|(module, mounted)| {
             let mut locked = mounted.lock().expect("module view lock");
-            let desktop_view = !crate::backend::view_source::module_owned(module);
+            let desktop_view = crate::backend::view_source::desktop_owned(module);
             let seated = matches!(locked.slot, Slot::Ready(_));
             // the desktop's own view is the same on every node: one seated,
             // or on its way from the staged file, is left alone
@@ -890,13 +1009,93 @@ pub fn connected(client: &ducktape_rpc::Client) -> Loads {
             if left_alone {
                 return None;
             }
-            // a module-owned view is reloaded from this node's deployment;
+            // a node-owned view is reloaded from this node's deployment;
             // the seat keeps what it shows until that lands
             let generation = locked.start(None);
             Some(spawn_load(module, mounted, generation, snapshot.clone()))
         })
         .collect();
+    // the views this node's registry lists and no built-in tab draws are
+    // found off the registry itself, on their own thread, and their loads
+    // are joined by it — so the connect settles with them in hand too
+    loads.push(spawn_registry_read(snapshot));
     Loads(loads)
+}
+
+/// Reads the node's registry for its `Kind::View` entries, seats each one
+/// the registry does not hold yet, loads them off this node and joins the
+/// loads. Nothing is seated if the app has moved to another node meanwhile.
+fn spawn_registry_read(asked_of: Connection) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let Some(client) = asked_of.client.as_ref() else {
+            return;
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the registry read");
+        let entries = match runtime.block_on(crate::backend::view_source::active_hashes(client)) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(
+                    target: "ducktape::app",
+                    reason = "module_status_unreadable",
+                    error = %error,
+                    "registry-listed views not seated"
+                );
+                return;
+            }
+        };
+        let loads = {
+            let mut registry = registry().lock().expect("module views");
+            let node_since_left = connection().lock().expect("views rpc").rev != asked_of.rev;
+            if node_since_left {
+                return;
+            }
+            seat_registered_views(&mut registry, &entries, &asked_of)
+        };
+        for load in loads {
+            load.join().expect("a registered view load");
+        }
+    })
+}
+
+/// The registry's `Kind::View` entries become the registered tab set, in
+/// registry order; one not seated yet is seated and loaded, one no longer
+/// listed is dropped with its seat (its tab disappears). The built-in and
+/// desktop seats are never touched here. Under the registry lock.
+fn seat_registered_views(
+    registry: &mut HashMap<&'static str, Arc<Mutex<Mounted>>>,
+    entries: &std::collections::BTreeMap<String, crate::backend::view_source::Entry>,
+    asked_of: &Connection,
+) -> Vec<std::thread::JoinHandle<()>> {
+    use crate::backend::view_source::Kind;
+    let listed: Vec<&'static str> = entries
+        .iter()
+        .filter(|(_, entry)| match entry.kind {
+            Kind::View => true,
+            Kind::Module => false,
+        })
+        .map(|(id, _)| intern(id))
+        .collect();
+    let mut registered = registered().lock().expect("registered views");
+    for retired in registered.iter().filter(|id| !listed.contains(id)) {
+        registry.remove(retired);
+    }
+    let mut loads = Vec::new();
+    for module in &listed {
+        let seat = registry.entry(module).or_insert_with(Mounted::seat);
+        let mut locked = seat.lock().expect("module view lock");
+        let asked = locked.generation > 0;
+        if asked {
+            continue;
+        }
+        let generation = locked.start(None);
+        drop(locked);
+        loads.push(spawn_load(module, seat, generation, asked_of.clone()));
+    }
+    *registered = listed;
+    loads
 }
 
 /// The desktop's own views, staged beside the binary: every one is asked
@@ -982,21 +1181,24 @@ async fn deployments_check() -> Loads {
             return Loads(Vec::new());
         }
     };
-    let registry = registry().lock().expect("module views");
+    let mut registry = registry().lock().expect("module views");
     // the connection may have moved while the registry answered: a load
     // asked of the old one dies at install, and `connected` restarted
     // everything under the new one
     if connection().lock().expect("views rpc").rev != asked_of.rev {
         return Loads(Vec::new());
     }
-    let loads = registry
+    // a block may have activated a registry-listed view (seated here) or
+    // retired one (its seat and tab go); the built-in seats reload below
+    let mut loads = seat_registered_views(&mut registry, &hashes, &asked_of);
+    let reloads = registry
         .iter()
-        .filter(|(module, _)| crate::backend::view_source::module_owned(module))
+        .filter(|(module, _)| !crate::backend::view_source::desktop_owned(module))
         .filter_map(|(module, mounted)| {
             let mut locked = mounted.lock().expect("module view lock");
             // a module the node does not run has no deployment to move
             // to: the view stays as `connected` left it
-            let active = hashes.get(*module).copied()?;
+            let active = hashes.get(*module).copied()?.hash;
             // a load already after this deployment — or after whatever is
             // active, as a reconnect's is — lands or fails on its own;
             // starting over on every block would never let it land
@@ -1021,8 +1223,8 @@ async fn deployments_check() -> Loads {
             let generation = locked.start(active);
             locked.replacement = replacement;
             Some(spawn_load(module, mounted, generation, asked_of.clone()))
-        })
-        .collect();
+        });
+    loads.extend(reloads);
     Loads(loads)
 }
 
@@ -1197,7 +1399,7 @@ fn spawn_load(
             return;
         }
         locked.in_flight = false;
-        let from_the_node = crate::backend::view_source::module_owned(module);
+        let from_the_node = !crate::backend::view_source::desktop_owned(module);
         let node_since_left = connection.rev != asked_of.rev;
         if from_the_node && node_since_left {
             return;
@@ -1556,6 +1758,8 @@ type Restore = TypedFunc<(Vec<u8>, bool), (Result<(), String>,)>;
 
 struct Guest {
     module: &'static str,
+    /// The manifest's name: what a registered view's tab is called.
+    name: String,
     store: Store<HostState>,
     tick: TypedFunc<(Vec<u8>,), (Vec<u8>,)>,
     /// The guest's events for its next tick.
@@ -1763,7 +1967,7 @@ impl Guest {
     ) -> Result<Loaded, Unloaded> {
         use crate::backend::view_source::{self, ViewSource};
         let before_any_candidate = |reason: String| Unloaded { hash: None, reason };
-        if !view_source::module_owned(module) {
+        if view_source::desktop_owned(module) {
             let path = views_dir()
                 .map_err(before_any_candidate)?
                 .join(format!("{module}_view.wasm"));
@@ -1866,12 +2070,15 @@ impl Guest {
                 timing.path = "swap";
             }
             let compiled = Instant::now();
-            let component = Self::compile(&component, &shown);
+            let component_bytes = component;
+            let component = Self::compile(&component_bytes, &shown);
             timing.compile = compiled.elapsed();
             let component = component?;
             let seated = Instant::now();
+            let name = manifest_name(&component_bytes);
             let prepared = (|| -> Result<Self, String> {
                 let mut fresh = Self::instantiate(module, &component, &shown)?;
+                fresh.name = name.clone();
                 fresh.deployed(hash, assets);
                 match &mut against {
                     // A once-valid view carries its state over. Only an
@@ -2097,6 +2304,7 @@ impl Guest {
     fn from_bytes(module: &'static str, bytes: &[u8], shown: &str) -> Result<Self, String> {
         let component = Self::compile(bytes, shown)?;
         let mut guest = Self::instantiate(module, &component, shown)?;
+        guest.name = manifest_name(bytes);
         guest.init(shown)?;
         Ok(guest)
     }
@@ -2180,6 +2388,7 @@ impl Guest {
             .map_err(|error| format!("{shown}: {error}"))?;
         Ok(Self {
             module,
+            name: String::new(),
             store,
             tick,
             pending: Vec::new(),
@@ -2615,6 +2824,14 @@ mod pictures;
 #[path = "module_view/surfaces.rs"]
 mod surfaces;
 
+/// The name a component's manifest gives it; "" for one whose manifest
+/// cannot be read (`compile` refuses those before a seat).
+fn manifest_name(bytes: &[u8]) -> String {
+    ui_lang_wire::manifest::read_manifest(bytes)
+        .map(|manifest| manifest.name)
+        .unwrap_or_default()
+}
+
 // ---------- the widget ----------
 
 /// The native window retains this entity while a tab is open. A deployment
@@ -2955,7 +3172,10 @@ pub(crate) mod tests {
         size: gpui::Size<gpui::Pixels>,
         cx: &mut TestAppContext,
     ) -> (Entity<crate::view_tree::ViewTree>, VisualTestContext) {
-        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::editor::wire::init_notion(cx);
+        });
         let window = cx.open_window(size, |_, _| crate::view_tree::ViewTree::new(root));
         let view = window.root(cx).expect("native tree");
         let mut native = VisualTestContext::from_window(window.into(), cx);
@@ -3109,6 +3329,10 @@ pub(crate) mod tests {
     #[test]
     fn only_declared_intents_are_routed() {
         assert!(intents_of("governance").is_empty());
+        // a registry-listed view declares nothing of its own: the two
+        // generic OS doors, and only those
+        assert_eq!(intents_of("home"), GENERIC_DOORS);
+        assert_eq!(GENERIC_DOORS, ["open_link", "copy"]);
         assert_eq!(intents_of("members"), ["copy"]);
         // the agents view signs its own pause and save through `op.submit`
         assert_eq!(intents_of("agents"), ["register", "open_run", "open_link"]);
@@ -3570,6 +3794,136 @@ pub(crate) mod tests {
         let live_id = guest.live_subscriptions[0].0;
         guest.pending.push(wire::Event::Response {
             id: live_id,
+            result: Ok(b"{}".to_vec()),
+            done: false,
+        });
+        let ticks = guest.ticks;
+        guest.redraw(&session);
+        assert!(guest.ticks > ticks, "the live item ticked the view");
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
+    }
+
+    /// The `home` component — a registry-listed view with no core, seated
+    /// off `module_status` alone — end to end through the host, on the
+    /// kernel contract and the generic session props: it boots on the
+    /// offline plate, and once the session says connected it opens one
+    /// `rpc.live` subscription per plane it draws and reads every card
+    /// through the kernel doors (`rpc.status`, `rpc.query`, `rpc.view`,
+    /// `files.get`), canned here. Needs `make views`; without the staged
+    /// component the test says so and does nothing.
+    #[test]
+    fn the_staged_home_view_boots_and_reads_status_through_the_kernel() {
+        let Some(staged) = staged("home") else {
+            return;
+        };
+        let _turn = blocking_connection_turn();
+        can_reads([
+            (
+                "rpc.status",
+                serde_json::json!({
+                    "public_key": "8c4fa211deadbeef", "height": 84912, "chain_id": "dev#a1b2c3d4",
+                    "operations": { "phase": "validating", "sync": {} }
+                }),
+            ),
+            // one canned answer serves every string-named query: the two
+            // valset lists and governance's proposals
+            (
+                "rpc.query",
+                serde_json::json!({
+                    "validators": [[0x8c, 0x4f, 0xa2, 0x11, 0xde, 0xad, 0xbe, 0xef]],
+                    "residents": [[3], [4]],
+                    "proposals": []
+                }),
+            ),
+            (
+                "channels",
+                serde_json::json!({ "channels": { "channels": [
+                    { "id": "general", "name": "general", "head_seq": 12,
+                      "archived": false, "voice": false }
+                ], "has_more": false } }),
+            ),
+            ("recent", serde_json::json!({ "runs": [] })),
+            ("files.get", serde_json::json!({ "snapshots": [] })),
+            (
+                "rpc.peers",
+                serde_json::json!({ "peers": [
+                    { "peer": "f00dbeefcafe", "role": "validator", "connected": true }
+                ] }),
+            ),
+            (
+                "rpc.blocks",
+                serde_json::json!([
+                    { "height": 84912, "hash": "ab".repeat(32), "commit_hash": "",
+                      "ops": [{ "op_hash": "cd".repeat(32) }] }
+                ]),
+            ),
+        ]);
+        let mut guest = Guest::load_from("home", &staged).expect("the view loads");
+        assert_eq!(guest.name, "Home", "the tab is named by the manifest");
+        let no_props = None;
+        assert!(
+            !guest.redraw(&no_props),
+            "a booted view with no props is quiet"
+        );
+        assert!(
+            guest.props_subscription.is_some(),
+            "the view subscribes to its session"
+        );
+        assert!(
+            texts(&guest).iter().any(|text| text == "Not connected"),
+            "{:?}",
+            texts(&guest)
+        );
+
+        // connected on the generic session: the view reads every card
+        let spec = registered_view("home", false, true, "dev#a1b2c3d4", "7");
+        let session = Some(spec.props);
+        guest.redraw(&session);
+        let mut planes: Vec<&str> = guest
+            .live_subscriptions
+            .iter()
+            .map(|(_, plane)| plane.as_str())
+            .collect();
+        planes.sort_unstable();
+        assert_eq!(
+            planes,
+            ["block", "chat", "files", "governance", "runs", "valset"],
+            "one `rpc.live` subscription per plane the dashboard draws"
+        );
+        while guest.redraw(&session) {}
+        let shown = texts(&guest);
+        for expected in [
+            "Validating",
+            "block 84,912",
+            "8c4fa211",
+            "#general",
+            "Validator",
+            "f00dbeef",
+            "Online",
+            "1 ops",
+        ] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} in {shown:?}"
+            );
+        }
+        assert!(guest.intents.is_empty(), "{:?}", guest.intents);
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
+        assert!(
+            !guest.redraw(&session),
+            "an unchanged session leaves the view quiet"
+        );
+
+        // a block on the chat plane: the live item lands and the view
+        // reads its rooms again
+        let chat_live = guest
+            .live_subscriptions
+            .iter()
+            .find(|(_, plane)| plane == "chat")
+            .map(|(id, _)| *id)
+            .expect("the chat plane subscription");
+        guest.pending.push(wire::Event::Response {
+            id: chat_live,
             result: Ok(b"{}".to_vec()),
             done: false,
         });
@@ -4130,7 +4484,10 @@ pub(crate) mod tests {
                 "account_ceremony_detail": "", "account_ceremony_left": "",
                 "settings_key_state": "sealed", "settings_key_path": "/keys/user.key",
                 "account_number": "42", "account_exists": true,
-                "account_busy": false, "account_ticket": ""
+                "account_busy": false, "account_ticket": "",
+                "update_state": "unavailable", "update_current": "", "update_previous": "",
+                "update_staged_display": "", "update_channel": "stable",
+                "update_checked": "", "update_note": "", "update_busy": false
             }))
             .expect("props encode"),
         );
@@ -4230,15 +4587,20 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
-    /// A module-owned view has one source, the module's deployment on the
-    /// connected node: with no node it is not there yet, and the staged file
-    /// a desktop view would take is never opened for it.
+    /// A node-owned view — a built-in module's, or a registry-listed one —
+    /// has one source, its deployment on the connected node: with no node
+    /// it is not there yet, and the staged file a desktop view would take
+    /// is never opened for it.
     #[test]
     fn a_module_owned_view_never_comes_from_the_staged_file() {
         // a staged file for every one of them, where `views_dir` would look
         let _turn = blocking_connection_turn();
         let staged = tempfile::tempdir().expect("a staging dir");
-        for module in crate::backend::view_source::MODULE_OWNED {
+        let node_owned: Vec<&'static str> = crate::backend::view_source::MODULE_OWNED
+            .into_iter()
+            .chain(["home"])
+            .collect();
+        for module in &node_owned {
             std::fs::write(staged.path().join(format!("{module}_view.wasm")), b"\0asm")
                 .expect("staged");
         }
@@ -4246,7 +4608,7 @@ pub(crate) mod tests {
         // view — the one reader of this variable — is loaded under;
         // `every_desktop_view_is_asked_at_boot` sets it too, under its own.
         unsafe { std::env::set_var("DUCKTAPE_VIEWS_DIR", staged.path()) };
-        for module in crate::backend::view_source::MODULE_OWNED {
+        for module in node_owned {
             let mounted = Mounted::seat();
             assert_eq!(
                 Guest::load(module, None, 0, &mounted)
@@ -4257,7 +4619,8 @@ pub(crate) mod tests {
                 "{module}"
             );
         }
-        assert!(!crate::backend::view_source::module_owned("settings"));
+        assert!(crate::backend::view_source::desktop_owned("settings"));
+        assert!(!crate::backend::view_source::desktop_owned("home"));
     }
 
     /// A load still in flight when the app moves to another node lands
@@ -4267,22 +4630,24 @@ pub(crate) mod tests {
     async fn a_load_the_previous_node_answers_late_is_not_installed() {
         let _turn = connection_turn().await;
         use crate::backend::view_source::tests::node;
-        use module_artifact::{ModuleArtifact, ViewArtifact};
+        use module_artifact::{Artifact, ModuleArtifact, ViewArtifact};
         let Some(staged) = staged("governance") else {
             return;
         };
         let component = std::fs::read(staged).expect("the staged view");
-        let deployment = |asset: &str| ModuleArtifact {
-            component: vec![1, 2, 3],
-            index: None,
-            view: Some(ViewArtifact {
-                component: component.clone(),
-                assets: [(asset.to_owned(), b"<svg/>".to_vec())].into(),
-            }),
+        let deployment = |asset: &str| {
+            Artifact::Module(ModuleArtifact {
+                component: vec![1, 2, 3],
+                index: None,
+                view: Some(ViewArtifact {
+                    component: component.clone(),
+                    assets: [(asset.to_owned(), b"<svg/>".to_vec())].into(),
+                }),
+            })
         };
-        let status = |artifact: &ModuleArtifact| {
+        let status = |artifact: &Artifact| {
             serde_json::json!({"module_status": {"modules": [
-                {"module_id": "forge", "active_code_hash": artifact.hash().to_vec(),
+                {"module_id": "forge", "kind": "module", "active_code_hash": artifact.hash().to_vec(),
                  "pending": null, "history": []}
             ]}})
         };
@@ -4389,15 +4754,15 @@ pub(crate) mod tests {
 
     /// A deployment of `module` on the fake node: the staged governance
     /// component as its view, told apart by the one asset it ships.
-    fn deployment(component: &[u8], asset: &str) -> module_artifact::ModuleArtifact {
-        module_artifact::ModuleArtifact {
+    fn deployment(component: &[u8], asset: &str) -> module_artifact::Artifact {
+        module_artifact::Artifact::Module(module_artifact::ModuleArtifact {
             component: vec![1, 2, 3],
             index: None,
             view: Some(module_artifact::ViewArtifact {
                 component: component.to_vec(),
                 assets: [(asset.to_owned(), b"<svg/>".to_vec())].into(),
             }),
-        }
+        })
     }
 
     fn slot_assets(mounted: &Arc<Mutex<Mounted>>) -> Vec<String> {
@@ -4603,8 +4968,12 @@ pub(crate) mod tests {
         hold
     }
 
-    /// The connect seats and loads every module-owned view, drawn or not,
-    /// and a draw before any node asks for nothing.
+    /// The connect seats and loads every node-owned view, drawn or not —
+    /// the built-in module tabs, and every `Kind::View` entry the node's
+    /// registry lists, found off the registry itself — and a draw before
+    /// any node asks for nothing. A registered view's tab is named by its
+    /// manifest and iconed by its `icons/tab.svg`; a block that retires the
+    /// entry takes the seat and the tab with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn every_module_owned_view_is_asked_at_connect_not_at_its_tabs_first_draw() {
         let _turn = connection_turn().await;
@@ -4615,7 +4984,29 @@ pub(crate) mod tests {
         };
         let component = std::fs::read(staged).expect("the staged view");
         let a = deployment(&component, "a.svg");
-        let client = fake_node(FakeDeployment::serving("governance", &a)).await;
+        // `home`: a view-only entry whose frame IS the view — the same
+        // staged component, under its own id, with a tab icon beside it
+        let home = module_artifact::Artifact::View(module_artifact::ViewArtifact {
+            component: component.clone(),
+            assets: [("icons/tab.svg".to_owned(), b"<svg/>".to_vec())].into(),
+        });
+        let node = FakeDeployment::serving("governance", &a);
+        let listing = |with_home: bool| {
+            let mut modules = vec![serde_json::json!({
+                "module_id": "governance", "kind": "module", "active_code_hash": a.hash(),
+                "pending": null, "history": [{"height": 7, "code_hash": a.hash()}]
+            })];
+            if with_home {
+                modules.push(serde_json::json!({
+                    "module_id": "home", "kind": "view", "active_code_hash": home.hash(),
+                    "pending": null, "history": [{"height": 0, "code_hash": home.hash()}]
+                }));
+            }
+            serde_json::json!({"module_status": {"modules": modules}})
+        };
+        *node.status.lock().unwrap() = listing(true);
+        node.artifacts.lock().unwrap().push(home.clone());
+        let client = fake_node(node.clone()).await;
         // A presenter asks for a seat before any node: nothing starts loading.
         drop(mounted("files"));
         {
@@ -4625,11 +5016,12 @@ pub(crate) mod tests {
             assert!(!locked.in_flight, "the draw started a load");
             assert_eq!(locked.generation, 0);
         }
+        assert!(registered_views().is_empty(), "no registry read yet");
         let loads = connected(&client);
         assert_eq!(
             loads.started(),
-            MODULE_OWNED.len(),
-            "one load per module-owned view, drawn or not"
+            MODULE_OWNED.len() + 1,
+            "one load per built-in module view, drawn or not, plus the registry read"
         );
         for module in MODULE_OWNED {
             let seat = mounted(module);
@@ -4641,9 +5033,34 @@ pub(crate) mod tests {
         }
         loads.joined();
         assert_eq!(slot_assets(&mounted("governance")), ["a.svg"]);
-        for module in MODULE_OWNED {
+        // the registry's view entry is seated off the connect too, and its
+        // tab is drawn from what it ships
+        assert_eq!(registered_views(), ["home"]);
+        assert_eq!(slot_assets(&mounted("home")), ["icons/tab.svg"]);
+        assert_eq!(registered_view_name("home"), "Approvals");
+        assert_eq!(
+            registered_view_icon("home").as_deref(),
+            Some(&b"<svg/>".to_vec())
+        );
+        assert_eq!(canary::seated_hash("home"), Some(home.hash()));
+
+        // a block that retires the entry: the seat and the tab go
+        *node.status.lock().unwrap() = listing(false);
+        deployments_check().await.joined();
+        assert!(registered_views().is_empty(), "a retired view's tab is gone");
+        assert!(
+            !registry().lock().expect("module views").contains_key("home"),
+            "a retired view's seat is gone"
+        );
+        // and one that lists it again seats it again
+        *node.status.lock().unwrap() = listing(true);
+        deployments_check().await.joined();
+        assert_eq!(registered_views(), ["home"]);
+        assert_eq!(canary::seated_hash("home"), Some(home.hash()));
+        for module in MODULE_OWNED.into_iter().chain(["home"]) {
             registry().lock().expect("module views").remove(module);
         }
+        registered().lock().expect("registered views").clear();
     }
 
     /// The desktop's own views are all asked for at boot and joined before
@@ -4800,8 +5217,10 @@ pub(crate) mod tests {
 
     /// A load starts at a view's source event and never at a draw: the only
     /// callers of `spawn_load` are the boot, the connect and the block
-    /// check, and the views the shell draws are exactly the ones those ask
-    /// for.
+    /// check (the registry-listed seats they share, `seat_registered_views`,
+    /// is called by the connect's registry read and the block check alone),
+    /// and the views the shell draws by name are exactly the ones those ask
+    /// for — a registered view is drawn by the id the registry listed.
     #[test]
     fn a_load_starts_at_a_source_event_never_at_a_draw() {
         use crate::backend::view_source::{DESKTOP_OWNED, MODULE_OWNED};
@@ -4832,8 +5251,23 @@ pub(crate) mod tests {
         }
         assert_eq!(
             callers,
-            BTreeSet::from(["booted", "connected", "deployments_check"]),
+            BTreeSet::from([
+                "booted",
+                "connected",
+                "deployments_check",
+                "seat_registered_views"
+            ]),
             "a load started outside the boot, the connect and the block check"
+        );
+        let registered_callers: BTreeSet<&str> = shell
+            .lines()
+            .filter(|line| line.contains("seat_registered_views(&mut registry"))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            registered_callers.len(),
+            2,
+            "the registered seats are made by the connect's registry read and the block check: {registered_callers:?}"
         );
         let drawn: BTreeSet<&str> = shell
             .split("module_view(")
@@ -5542,7 +5976,7 @@ pub(crate) mod tests {
                 });
                 assert_eq!(
                     published_width,
-                    Some(pane_width - 340. - 32.),
+                    Some(pane_width - 320. - 24.),
                     "the measured pane must reach the guest before native layout"
                 );
             }
@@ -5569,15 +6003,16 @@ pub(crate) mod tests {
         };
         let (beside_editor, beside_card) = measured(1500.);
         assert_eq!(f32::from(beside_editor.size.width), 704.);
-        assert_eq!(f32::from(beside_card.size.width), 340.);
+        assert_eq!(f32::from(beside_card.size.width), 320.);
         let (squeeze_editor, squeeze_card) = measured(1300.);
         assert_eq!(
             f32::from(squeeze_editor.size.width),
-            1066. - 340. - 32. - 62.
+            1066. - 320. - 24. - 62.
         );
-        assert_eq!(f32::from(squeeze_card.size.width), 340.);
+        assert_eq!(f32::from(squeeze_card.size.width), 320.);
         assert!(squeeze_editor.size.width < beside_editor.size.width);
-        let (inline_editor, inline_card) = measured(1100.);
+        // 1000 − 234 = 766 of pane: under the 844 squeeze floor, so inline.
+        let (inline_editor, inline_card) = measured(1000.);
         assert_eq!(f32::from(inline_editor.size.width), 704.);
         assert_eq!(inline_card.size.width, inline_editor.size.width);
     }
@@ -6229,7 +6664,7 @@ pub(crate) mod tests {
         };
         let component = std::fs::read(staged).expect("the staged view");
         let a = deployment(&component, "a.svg");
-        let removed = module_artifact::ModuleArtifact::component(vec![9, 9, 9]);
+        let removed = module_artifact::Artifact::module(vec![9, 9, 9]);
         let node = FakeDeployment::serving("forge", &a);
         let client = fake_node(node.clone()).await;
         let mounted = fresh("forge");
@@ -6361,7 +6796,7 @@ pub(crate) mod tests {
             deployment(&component, "a.svg"),
             deployment(&component, "c.svg"),
         );
-        let removed = module_artifact::ModuleArtifact::component(vec![9, 9, 9]);
+        let removed = module_artifact::Artifact::module(vec![9, 9, 9]);
         let node = FakeDeployment::serving("governance", &a);
         let client = fake_node(node.clone()).await;
         let mounted = fresh("governance");

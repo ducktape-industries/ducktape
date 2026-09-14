@@ -14,7 +14,11 @@
 //!   The receiver acks with its resume offset (transfers survive drops),
 //!   streams the tail into a disk-staged slot, and answers one result frame.
 //! - PULL: a node missing a committed artifact asks a peer to stream it —
-//!   the data-plane twin of the mesh's ranged blob lane.
+//!   the data-plane twin of the mesh's ranged blob lane. The eager puller on
+//!   every member (`validator::code_announce`: pending swaps AND open
+//!   ballots, validators and residents alike) rides that mesh lane; this
+//!   plane is hosted by validators only, and a resident is never a push
+//!   target.
 //!
 //! Admission is default-deny per the plane's contract: members only, one
 //! live transfer per digest, [`MAX_INBOUND_PUSHES_PER_PEER`] concurrent
@@ -1047,6 +1051,7 @@ mod tests {
         let action = |hash: [u8; 32]| GovAction::RegisterModule {
             name: "hello@x".into(),
             module_id: "hello".into(),
+            kind: modules::Kind::Module,
             activation_lead: 50,
             code_hash: hash.to_vec(),
         };
@@ -1152,6 +1157,7 @@ mod tests {
         registry.update(HashSet::from([old, active, cancelled]));
         let modules = vec![modules::ModuleCode {
             module_id: "hello".into(),
+            kind: modules::Kind::Module,
             active_code_hash: active.to_vec(),
             pending: None,
             history: vec![

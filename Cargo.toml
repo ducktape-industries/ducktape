@@ -159,6 +159,9 @@ members = [
     "crates/duckfs/disk",
     "crates/duckfs/client",
     "crates/rpc-client",
+    # the desktop app's self-update state machine + release-manifest verify,
+    # pure (no I/O): driven by the launcher at boot and by the app while running.
+    "crates/app-update",
     # apps — product feature modules
     "crates/modules/apps/forge",
     "crates/modules/apps/pages",
@@ -192,6 +195,8 @@ members = [
     "bin/airlock-gateway",
     "bin/guest-builder",
     "bin/duck-guest-init",
+    # the desktop app's boot-time executor (flip / rollback / exec)
+    "bin/app-launcher",
     # native desktop client — intentionally only Chat + Pages
     "app",
 ]
@@ -221,6 +226,10 @@ lru = "0.18"
 libc = "0.2"
 smallvec = "1"
 sha2 = "0.10"
+# the desktop app's release archives (`.tar.zst`): app/src/backend/update.rs
+# extracts a staged release out of one.
+tar = "0.4"
+zstd = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -395,6 +404,9 @@ run-envelope = { path = "crates/run-envelope" }
 # a ducktape workspace on disk + the join ceremony, linked by the CLI and the
 # desktop app.
 workspace-config = { path = "crates/workspace-config" }
+# the app's update state machine, manifest + minisign verify and state.json
+# codec, shared by the launcher and the desktop app.
+app-update = { path = "crates/app-update" }
 # `$DUCKTAPE_HOME` else `~/.ducktape`, resolved once for every reader of it.
 ducktape-home = { path = "crates/ducktape-home" }
 # the module composition catalog (id universe + named genesis selections).

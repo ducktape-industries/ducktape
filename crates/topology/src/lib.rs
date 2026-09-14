@@ -123,6 +123,14 @@ pub const PRODUCTION: &[&str] = &[
     "collaboration",
 ];
 
+/// The founding VIEW-ONLY entries: registry entries of `Kind::View` with no
+/// consensus code, staged beside the production set as `<id>.view.wasm` +
+/// `<id>.assets` out of `target/views` (built by `make views` from
+/// `crates/views/<id>`), and composed by `node init` into the same genesis.
+/// A view here draws a tab in the app off the registry alone; it must not
+/// also be a module id.
+pub const VIEWS: &[&str] = &["home"];
+
 /// the DEFAULT set (16) simnode and the noded daemon compose at genesis —
 /// `bin/noded/tests/daemon_e2e.rs` pins the same `sim_base` against noded.
 /// Changing it means changing the daemon.
@@ -288,6 +296,17 @@ mod tests {
             universe, used,
             "every spec must be composed by some selection and every composed id must have a spec"
         );
+    }
+
+    /// a founding view is a registry entry beside the modules, under one id
+    /// space: a view id that is also a module id would collide at genesis.
+    #[test]
+    fn founding_views_are_not_module_ids() {
+        assert_eq!(VIEWS, &["home"], "the founding view set");
+        assert!(!has_dups(VIEWS), "views has a duplicate id");
+        for id in VIEWS {
+            assert!(TOPOLOGY.spec(id).is_none(), "view {id} is also a module");
+        }
     }
 
     #[test]

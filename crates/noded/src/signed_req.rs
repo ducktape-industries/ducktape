@@ -236,6 +236,7 @@ enum Lane {
     /// a device pointed at a node it does not host has no operator credential
     /// and still has to be able to join a huddle through it.
     HuddleProof,
+    RunControl,
     Open,
 }
 
@@ -288,6 +289,9 @@ const LANE_PREFIXES: &[(&str, Lane)] = &[
 ];
 
 fn lane_of(path: &str) -> Lane {
+    if path == "/v1/run-control" {
+        return Lane::RunControl;
+    }
     if let Some((_, lane)) = LANE_PREFIXES
         .iter()
         .find(|(prefix, _)| path.starts_with(prefix))
@@ -339,7 +343,7 @@ impl Lane {
             Lane::Term | Lane::NodeLevel => posts.then_some(Authority::Operator),
             // the proof binds the SIGNER; the handler refuses a key that holds
             // no account, so possession is the gate's whole job here.
-            Lane::HuddleProof => posts.then_some(Authority::Acting),
+            Lane::HuddleProof | Lane::RunControl => posts.then_some(Authority::Acting),
             Lane::Open => None,
         }
     }
@@ -369,6 +373,7 @@ impl Lane {
             | Lane::NodeLevel
             | Lane::HuddleProof
             | Lane::Open => DEFAULT_JSON_BODY_BYTES,
+            Lane::RunControl => 64 * 1024,
         }
     }
 }

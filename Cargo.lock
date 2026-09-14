@@ -401,6 +401,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
+name = "app-launcher"
+version = "0.1.0"
+dependencies = [
+ "app-update",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "app-update"
+version = "0.1.0"
+dependencies = [
+ "commonware-cryptography",
+ "keyscheme",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3670,11 +3695,13 @@ name = "ducktape-app"
 version = "0.1.0"
 dependencies = [
  "agent",
+ "app-update",
  "authpage",
  "base64 0.22.1",
  "block2 0.5.1",
  "chat",
  "commonware-cryptography",
+ "core-graphics 0.24.0",
  "cpal",
  "design",
  "dispatch 0.1.0",
@@ -3688,6 +3715,7 @@ dependencies = [
  "gethostname",
  "git2",
  "gpui-kit",
+ "gpui-notion",
  "identity",
  "image",
  "inbox",
@@ -3714,6 +3742,7 @@ dependencies = [
  "sha2 0.10.9",
  "simnode",
  "syn 2.0.119",
+ "tar",
  "tasks",
  "tempfile",
  "tokio",
@@ -3729,6 +3758,7 @@ dependencies = [
  "x11rb",
  "zbus",
  "zeroize",
+ "zstd",
 ]
 
 [[package]]
@@ -5085,6 +5115,20 @@ dependencies = [
  "rust-embed",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+]
+
+[[package]]
+name = "gpui-notion"
+version = "0.1.0"
+source = "git+https://github.com/orthory/gpui-notion?rev=8f6bc373397d5e29fe0d395d3bca25c254bf14ca#8f6bc373397d5e29fe0d395d3bca25c254bf14ca"
+dependencies = [
+ "anyhow",
+ "gpui-kit",
+ "regex",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -7695,6 +7739,7 @@ dependencies = [
  "anstream",
  "anstyle",
  "anyhow",
+ "app-update",
  "argon2",
  "async-trait",
  "attribution",
@@ -10166,9 +10211,9 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.12.4"
+version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1292b7759ae1cb9ec195452d1390a074f0cd8541ab7a5a8c31cd6db45d4a6ba"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
 dependencies = [
  "aho-corasick",
  "memchr",

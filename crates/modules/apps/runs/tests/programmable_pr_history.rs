@@ -566,7 +566,7 @@ async fn deployment_network(label: &str, actions: usize) -> (Directory, Network)
     )
     .await;
     let mut registry = modules::Modules::new("modules", store(), "valset", "governance");
-    registry.seed("hello", vec![0; 32]).await.unwrap();
+    registry.seed("hello", modules::Kind::Module, vec![0; 32]).await.unwrap();
     registry.finish_seed().await.unwrap();
     network.host.register(Box::new(registry));
     network.host.register(Box::new(

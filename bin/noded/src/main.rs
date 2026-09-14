@@ -577,6 +577,7 @@ fn publish_status(
         })
         .collect();
     status.publish(NodeStatus {
+        contract: noded::NODE_CONTRACT,
         version: env!("CARGO_PKG_VERSION").into(),
         root_hash: hex_root(&host.root_hash()),
         height,

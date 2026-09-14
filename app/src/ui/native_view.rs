@@ -157,8 +157,19 @@ impl Ducktape {
                     self.account_exists,
                     self.account_busy,
                     &self.account_ticket,
+                    &self.update_facts(),
                 ),
                 AppMessage::SettingsViewEvent,
+            ),
+            ShellTab::Registered(module) => (
+                crate::module_view::registered_view(
+                    module,
+                    self.is_dark(),
+                    self.connected,
+                    &self.network_chain_id,
+                    &self.account_number,
+                ),
+                AppMessage::RegisteredViewEvent,
             ),
         }
     }

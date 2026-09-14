@@ -65,7 +65,11 @@ pub struct HuddleSeat {
 /// message is the room's newest? A landing or an older page can, and then
 /// its tail is the latest; a pending row (seq 0) never counts.
 pub fn window_reaches_head(messages: &[ChatMessage], head_seq: i64) -> bool {
-    let newest = messages.iter().map(|message| message.seq).max().unwrap_or(0);
+    let newest = messages
+        .iter()
+        .map(|message| message.seq)
+        .max()
+        .unwrap_or(0);
     newest >= head_seq
 }
 
@@ -164,7 +168,10 @@ pub fn picture_links(messages: &[ChatMessage], thread: &[ChatMessage]) -> Vec<St
 pub fn picture_box(width: i64, height: i64) -> (f32, f32) {
     let (width, height) = (width.max(1) as f64, height.max(1) as f64);
     let scale = (PICTURE_BOX.0 / width).min(PICTURE_BOX.1 / height).min(1.);
-    ((width * scale).round() as f32, (height * scale).round() as f32)
+    (
+        (width * scale).round() as f32,
+        (height * scale).round() as f32,
+    )
 }
 
 /// Ask the host to decode a duckfs picture into this view's slot; the
@@ -309,11 +316,9 @@ pub fn live_run_message(run: &LiveRunHint) -> ChatMessage {
 /// A negative, stable view key for a live row, off the seq space real
 /// messages key by.
 fn live_view_key(run_id: &str) -> i64 {
-    let hash = run_id
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |acc, byte| {
-            (acc ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-        });
+    let hash = run_id.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |acc, byte| {
+        (acc ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    });
     -((hash >> 1) as i64).max(1)
 }
 
@@ -1955,11 +1960,6 @@ pub fn run_in_thread(live: &LiveRunHint, active_thread_seq: i64) -> bool {
     live.anchor_seq == active_thread_seq || live.thread_root == active_thread_seq
 }
 
-/// `Open chiefduck’s thread` — the live run's door in the timeline.
-pub fn live_thread_label(agent: &str) -> String {
-    format!("Open {agent}’s thread")
-}
-
 /// A node's failure as a sentence: what the view was doing, then the reason.
 /// An empty reason stays empty — nothing failed.
 pub fn failure_note(doing: &str, error: &str) -> String {
@@ -2332,7 +2332,10 @@ mod tests {
         let block = block_view(&file, &names);
         assert_eq!(block.kind, "attachment");
         assert_eq!(block.text, "deck.pdf");
-        assert_eq!(block.link, "duck://files/shared/attachments/message-1-2/deck.pdf");
+        assert_eq!(
+            block.link,
+            "duck://files/shared/attachments/message-1-2/deck.pdf"
+        );
         let web = serde_json::json!({"paragraph": [{"text": "site", "marks": [{"link": "https://example.com"}]}]});
         assert_eq!(block_view(&web, &names).kind, "paragraph");
         let worded = serde_json::json!({"paragraph": [{"text": "see ", "marks": []}, {"text": "deck.pdf", "marks": [{"link": "duck://files/shared/attachments/message-1-2/deck.pdf"}]}]});
@@ -2394,10 +2397,22 @@ mod tests {
     #[test]
     fn a_menu_opens_at_the_pointer_and_flips_away_from_the_edges() {
         let viewport = (1000.0, 600.0);
-        assert_eq!(menu_origin((100.0, 100.0), (200.0, 150.0), viewport), (100.0, 104.0));
-        assert_eq!(menu_origin((950.0, 100.0), (200.0, 150.0), viewport), (750.0, 104.0));
-        assert_eq!(menu_origin((100.0, 550.0), (200.0, 150.0), viewport), (100.0, 396.0));
-        assert_eq!(menu_origin((2.0, 2.0), (200.0, 150.0), viewport), (8.0, 8.0));
+        assert_eq!(
+            menu_origin((100.0, 100.0), (200.0, 150.0), viewport),
+            (100.0, 104.0)
+        );
+        assert_eq!(
+            menu_origin((950.0, 100.0), (200.0, 150.0), viewport),
+            (750.0, 104.0)
+        );
+        assert_eq!(
+            menu_origin((100.0, 550.0), (200.0, 150.0), viewport),
+            (100.0, 396.0)
+        );
+        assert_eq!(
+            menu_origin((2.0, 2.0), (200.0, 150.0), viewport),
+            (8.0, 8.0)
+        );
     }
 
     /// A ⇧-PRESS WITH NO RANGE OPEN STARTS ONE ON THE ROW IT LANDED ON, and
