@@ -2208,15 +2208,28 @@ impl ViewTree {
             *border,
         )
         .id(key.clone());
+        /// How far above the row's top edge the float's box starts: half a
+        /// message bar, so the bar straddles the edge.
+        const HOVER_FLOAT_LIFT: f32 = 14.;
         let reveal = *open || self.hovered.contains(key);
+        // The tint is the row's own ground while the pointer is on it — it
+        // sits UNDER the content, never over the text.
+        if reveal && let Some(color) = tint {
+            element = element.bg(rgba(*color)).rounded(px(*radius));
+        }
         if let Some(base) = children.first() {
             element = element.child(self.node(base, window, cx));
         }
         if reveal && let Some(child) = children.get(1) {
-            let mut layer = div().absolute().inset_0().rounded(px(*radius));
-            if let Some(color) = tint {
-                layer = layer.bg(rgba(*color));
-            }
+            // The float straddles the row's top edge, half above it, the way
+            // a message bar does; nothing here clips, so it draws over the
+            // row above.
+            let layer = div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px(-HOVER_FLOAT_LIFT))
+                .bottom_0();
             element = element.child(layer.child(self.node(child, window, cx)));
         }
         let element = element.on_hover(cx.listener(move |this, hovered, _, cx| {
