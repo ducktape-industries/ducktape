@@ -15,7 +15,7 @@ LOCKED ?= --locked
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app app-release views views-repro-check dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
+.PHONY: all app app-release publish-app views views-repro-check dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
 
 ## the system packages a build needs and cargo cannot install: rustup (the
 ## pinned toolchain and its wasm32 target install themselves through it), a C
@@ -201,6 +201,21 @@ install-app: app
 	target/release/ducktape-launcher install --from target/app-release
 	-update-desktop-database "$(DESKTOP_DEST)"
 endif
+
+## publish a built desktop-app release to a network's duckfs: compose +
+## seal the manifest, sign it with the release wallet, `fs put` the archives,
+## the manifest and its signature under /shared/releases. Runs
+## ops/release/publish.sh; every flag is a variable:
+##   make publish-app NODE=http://127.0.0.1:8844 RELEASE_KEY=~/.ducktape/release/keys/release.key \
+##        SEQUENCE=18 DISPLAY="2026.09.2+9d71b254a" \
+##        ARCHIVES="macos-aarch64=target/Ducktape-macos-aarch64.tar.zst linux-x86_64=target/Ducktape-linux-x86_64.tar.zst"
+publish-app:
+	@test -n "$(NODE)" -a -n "$(RELEASE_KEY)" -a -n "$(SEQUENCE)" -a -n "$(DISPLAY)" -a -n "$(ARCHIVES)" || \
+	  { echo "publish-app needs NODE, RELEASE_KEY, SEQUENCE, DISPLAY and ARCHIVES (see the comment above)" >&2; exit 2; }
+	DUCKTAPE_BIN="$${DUCKTAPE_BIN:-$(CARGO_BIN)/ducktape}" bash ops/release/publish.sh \
+	  --node "$(NODE)" --key "$(RELEASE_KEY)" --sequence "$(SEQUENCE)" --display "$(DISPLAY)" \
+	  $(if $(NOTES_URL),--notes-url "$(NOTES_URL)") \
+	  $(foreach archive,$(ARCHIVES),--archive "$(archive)")
 
 # where `cargo install` puts the binary, and so where the installed binary
 # looks for its founding set: workspace_config::modules_dir() reads

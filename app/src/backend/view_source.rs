@@ -1,9 +1,11 @@
-//! Where a module-owned view comes from: the deployed artifact of the module
-//! it belongs to. The registry names the module's ACTIVE code hash
-//! (`ModulesQuery::ModuleStatus`), the artifact under that hash is fetched
-//! and verified (`view_artifact`), and its view — component bytes plus the
-//! assets shipped beside them — is handed over as one unit. A pending swap is
-//! never read: the view drawn is the view of the code that runs.
+//! Where a network view comes from: the deployed artifact of the registry
+//! entry it belongs to — a module's, whose frame may embed a view, or a
+//! view-only entry's, whose frame IS the view. The registry names the
+//! entry's kind and its ACTIVE code hash (`ModulesQuery::ModuleStatus`), the
+//! artifact under that hash is fetched and verified (`view_artifact`), and
+//! its view — component bytes plus the assets shipped beside them — is
+//! handed over as one unit. A pending swap is never read: the view drawn is
+//! the view of the code that runs.
 //!
 //! Every reading here is strict. A registry reply of another shape, a module
 //! the registry does not list or lists twice, a hash that is not 32 bytes,
@@ -23,18 +25,19 @@ use serde::Deserialize;
 
 use super::view_artifact;
 
-/// The modules whose tab is drawn by the view in their own artifact, asked
-/// of the connected node at connect and again at every block that moves
-/// the deployment.
+/// The BUILT-IN tabs whose view is drawn by the module's own artifact: each
+/// has a `ShellTab` arm, a props builder and an intent decoder of its own,
+/// and is asked of the connected node at connect and again at every block
+/// that moves its deployment. Every other view off the node is a
+/// registry-listed `Kind::View` entry, seated from `module_status` alone.
 pub const MODULE_OWNED: [&str; 5] = ["governance", "files", "pages", "chat", "forge"];
 
 /// The desktop's own views, staged beside the binary and asked for at boot.
-/// With [`MODULE_OWNED`], every view the app draws: a tab's draw never
-/// starts a load, so a view named in neither would never be there.
+/// Every view that is not one of these comes off the connected node.
 pub const DESKTOP_OWNED: [&str; 5] = ["members", "agents", "node", "explorer", "settings"];
 
-pub fn module_owned(module: &str) -> bool {
-    MODULE_OWNED.contains(&module)
+pub fn desktop_owned(module: &str) -> bool {
+    DESKTOP_OWNED.contains(&module)
 }
 
 /// The assets a deployment ships beside its view, by canonical relative
@@ -95,10 +98,6 @@ struct ModuleStatus {
 #[serde(deny_unknown_fields)]
 struct ModuleCode {
     module_id: String,
-    #[allow(
-        dead_code,
-        reason = "read for shape only: the seat set does not yet branch on kind"
-    )]
     kind: Kind,
     active_code_hash: Vec<u8>,
     #[allow(
@@ -111,13 +110,20 @@ struct ModuleCode {
 }
 
 /// What the entry's artifact is: a module (whose frame may embed a view) or
-/// a view alone.
+/// a view alone — the registry's word, fixed at admission.
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code, reason = "read for shape only")]
-enum Kind {
+pub enum Kind {
     Module,
     View,
+}
+
+/// One registry entry as the seat set reads it: what it is, and its active
+/// code hash — `None` for an admission that has not reached its boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Entry {
+    pub kind: Kind,
+    pub hash: Option<[u8; 32]>,
 }
 
 #[derive(Deserialize)]
@@ -139,14 +145,15 @@ struct Activation {
     code_hash: Vec<u8>,
 }
 
-/// Every registered module's active code hash — `None` for an admission
-/// that has not reached its boundary — in one registry read.
-pub async fn active_hashes(client: &Client) -> Result<BTreeMap<String, Option<[u8; 32]>>, Error> {
+/// Every registry entry — its kind, and its active code hash (`None` for an
+/// admission that has not reached its boundary) — in one registry read,
+/// id-ordered as the registry lists them.
+pub async fn active_hashes(client: &Client) -> Result<BTreeMap<String, Entry>, Error> {
     let reply: StatusReply = client
         .query("modules", &serde_json::json!("module_status"))
         .await
         .map_err(|error| Error::Status(error.to_string()))?;
-    let mut hashes = BTreeMap::new();
+    let mut entries = BTreeMap::new();
     for entry in reply.module_status.modules {
         let module = entry.module_id;
         let hash = if entry.active_code_hash.is_empty() {
@@ -159,21 +166,26 @@ pub async fn active_hashes(client: &Client) -> Result<BTreeMap<String, Option<[u
                 ))
             })?)
         };
-        if hashes.insert(module.clone(), hash).is_some() {
+        let entry = Entry {
+            kind: entry.kind,
+            hash,
+        };
+        if entries.insert(module.clone(), entry).is_some() {
             return Err(Error::Status(format!(
                 "module {module:?} is registered more than once"
             )));
         }
     }
-    Ok(hashes)
+    Ok(entries)
 }
 
-/// The module's active code hash, or `None` for an admission that has not
+/// The entry's active code hash, or `None` for an admission that has not
 /// reached its boundary.
 pub async fn active_hash(client: &Client, module: &str) -> Result<Option<[u8; 32]>, Error> {
     active_hashes(client)
         .await?
         .remove(module)
+        .map(|entry| entry.hash)
         .ok_or_else(|| Error::Status(format!("module {module:?} is not registered")))
 }
 
@@ -237,6 +249,8 @@ pub(crate) mod tests {
             held: tokio::sync::Notify::new(),
             queries: Mutex::new(BTreeMap::new()),
             files_lanes: Mutex::new(BTreeMap::new()),
+            files: Mutex::new(BTreeMap::new()),
+            file_reads: Mutex::new(Vec::new()),
             index_views: Mutex::new(BTreeMap::new()),
         };
         fake_node(Arc::new(deployment)).await
@@ -264,6 +278,14 @@ pub(crate) mod tests {
         /// a view makes for itself through the kernel's `files.get`. A lane
         /// not here is not found.
         pub files_lanes: Mutex<BTreeMap<String, serde_json::Value>>,
+        /// Whole duckfs files by path, served byte-ranged on the `read`
+        /// lane (`path`, `offset`, `len` → `{b64, eof}`) the way the node
+        /// does; a path not here falls through to `files_lanes`.
+        pub files: Mutex<BTreeMap<String, Vec<u8>>>,
+        /// Every `read`-lane page served out of `files`: `(path, offset,
+        /// len)` — the pin that a resumed download asked only for what it
+        /// lacked.
+        pub file_reads: Mutex<Vec<(String, u64, u64)>>,
         /// What an index-tier read answers, by module then by the query's own
         /// first key — a view reads its register with several shapes down the
         /// one `rpc.view` door, and each shape wants its own reply. A module
@@ -282,8 +304,20 @@ pub(crate) mod tests {
                 held: tokio::sync::Notify::new(),
                 queries: Mutex::new(BTreeMap::new()),
                 files_lanes: Mutex::new(BTreeMap::new()),
+                files: Mutex::new(BTreeMap::new()),
+                file_reads: Mutex::new(Vec::new()),
                 index_views: Mutex::new(BTreeMap::new()),
             })
+        }
+
+        /// The duckfs file at `path` is `bytes` from now on.
+        pub(crate) fn publish_file(&self, path: &str, bytes: Vec<u8>) {
+            self.files.lock().unwrap().insert(path.to_owned(), bytes);
+        }
+
+        /// The duckfs file at `path` is gone.
+        pub(crate) fn withdraw_file(&self, path: &str) {
+            self.files.lock().unwrap().remove(path);
         }
 
         /// Every `rpc.query` for `target` answers `reply` from now on.
@@ -392,6 +426,13 @@ pub(crate) mod tests {
                             Some(reply) => ("200 OK", reply.to_string().into_bytes()),
                             None => ("404 Not Found", Vec::new()),
                         }
+                    } else if let Some(page) = route
+                        .strip_prefix("/v1/files/read?")
+                        .and_then(|query| file_page(&deployment, query))
+                    {
+                        // a byte-ranged read of a published file, as the
+                        // node's read lane answers it
+                        ("200 OK", page.to_string().into_bytes())
                     } else if let Some(lane) = route.strip_prefix("/v1/files/") {
                         // a view's own duckfs read: the lane names it, the
                         // query string carries its params
@@ -419,6 +460,66 @@ pub(crate) mod tests {
 
     /// One HTTP request off the socket, head and body: the body arrives in
     /// its own write as often as not, and a query's target is in it.
+    /// One page of a published file for a `read`-lane query string, or
+    /// `None` when the path is not published (the caller falls through).
+    fn file_page(deployment: &FakeDeployment, query: &str) -> Option<serde_json::Value> {
+        let params: BTreeMap<String, String> = query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(key, value)| (key.to_owned(), percent_decode(value)))
+            .collect();
+        let path = params.get("path")?;
+        let bytes = deployment.files.lock().unwrap().get(path)?.clone();
+        let offset = params
+            .get("offset")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let len = params
+            .get("len")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1024 * 1024)
+            .min(1024 * 1024);
+        deployment
+            .file_reads
+            .lock()
+            .unwrap()
+            .push((path.clone(), offset, len));
+        let start = (offset as usize).min(bytes.len());
+        let end = (start + len as usize).min(bytes.len());
+        let page = &bytes[start..end];
+        use base64::Engine as _;
+        Some(serde_json::json!({
+            "b64": base64::engine::general_purpose::STANDARD.encode(page),
+            "eof": end == bytes.len(),
+        }))
+    }
+
+    /// `%2F` → `/` and `+` → space: what reqwest's query encoder produces
+    /// for a duckfs path.
+    fn percent_decode(text: &str) -> String {
+        let mut out = Vec::with_capacity(text.len());
+        let bytes = text.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            let escaped = bytes[index] == b'%' && index + 3 <= bytes.len();
+            let decoded = escaped
+                .then(|| std::str::from_utf8(&bytes[index + 1..index + 3]).ok())
+                .flatten()
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+            match decoded {
+                Some(byte) => {
+                    out.push(byte);
+                    index += 3;
+                }
+                None => {
+                    out.push(if bytes[index] == b'+' { b' ' } else { bytes[index] });
+                    index += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
     async fn read_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
         let mut request = Vec::new();
         let mut chunk = vec![0u8; 4096];
@@ -473,6 +574,49 @@ pub(crate) mod tests {
                 .unwrap(),
             ViewSource::Ready {
                 hash: artifact.hash(),
+                component: vec![4, 5, 6],
+                assets: Arc::new(artifact.view().unwrap().assets.clone()),
+            }
+        );
+    }
+
+    /// A `Kind::View` entry's frame IS its view: the registry lists it as a
+    /// view, the artifact under its hash is the view frame, and the seat
+    /// set reads its kind off the same status read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_view_only_entry_is_ready_off_its_own_frame() {
+        let artifact = Artifact::View(ViewArtifact {
+            component: vec![4, 5, 6],
+            assets: [("icons/tab.svg".to_owned(), b"<svg/>".to_vec())].into(),
+        });
+        let hash = artifact.hash();
+        let status = serde_json::json!({"module_status": {"modules": [
+            {"module_id": "files", "kind": "module", "active_code_hash": [], "pending": null, "history": []},
+            {"module_id": "home", "kind": "view", "active_code_hash": hash, "pending": null,
+             "history": [{"height": 0, "code_hash": hash}]}
+        ]}});
+        let client = node(status, Some(artifact.clone()), None).await;
+        let entries = active_hashes(&client).await.unwrap();
+        assert_eq!(
+            entries["home"],
+            Entry {
+                kind: Kind::View,
+                hash: Some(hash)
+            }
+        );
+        assert_eq!(
+            entries["files"],
+            Entry {
+                kind: Kind::Module,
+                hash: None
+            }
+        );
+        assert_eq!(
+            resolve(&client, "home", &mut Asked::default())
+                .await
+                .unwrap(),
+            ViewSource::Ready {
+                hash,
                 component: vec![4, 5, 6],
                 assets: Arc::new(artifact.view().unwrap().assets.clone()),
             }

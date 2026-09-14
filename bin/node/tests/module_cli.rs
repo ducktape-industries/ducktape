@@ -242,6 +242,88 @@ fn an_activation_inside_the_min_lead_is_refused_with_the_registry_reason() {
     assert_no_proposals(&cluster, 0);
 }
 
+/// `module register <id> --view <view.wasm> --assets <dir>` with no component
+/// admits a `Kind::View` entry: the ceremony schedules it, every validator
+/// signals ready on the view ABI alone (no core to run), it activates at its
+/// height, `module status` lists it as a `view`, and no module seats under
+/// its id. A component under that id afterwards is refused: a swap keeps
+/// the entry's kind.
+#[test]
+fn register_a_view_only_entry_across_three_validators() {
+    let cluster = three_validators();
+    let view = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../crates/noded/tests/fixtures/ice-view.component.wasm"
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let assets = scratch.path().join("assets");
+    std::fs::create_dir_all(assets.join("icons")).unwrap();
+    std::fs::write(assets.join("icons/tab.svg"), b"<svg/>").unwrap();
+    let artifact = module_artifact::Artifact::View(module_artifact::ViewArtifact {
+        component: std::fs::read(view).unwrap(),
+        assets: [("icons/tab.svg".to_owned(), b"<svg/>".to_vec())].into(),
+    });
+    let expected = common::hex(&artifact.hash());
+    let runs = run_on_each(
+        &cluster,
+        &[
+            "module",
+            "register",
+            "dashboard",
+            "--view",
+            view,
+            "--assets",
+            assets.to_str().unwrap(),
+            "--after",
+            AFTER,
+        ],
+    );
+    assert_ceremony_scheduled(&runs, "dashboard");
+    for idx in 0..3 {
+        cluster.await_committed(
+            idx,
+            "dashboard view active",
+            Duration::from_secs(180),
+            || active_hash(&cluster, idx, "dashboard").filter(|hash| *hash == expected),
+        );
+    }
+    for idx in 0..3 {
+        let cfg = cluster.config_file(idx);
+        let (ok, out) = cluster.run_verb(&["module", "status", "--config", cfg.to_str().unwrap()]);
+        assert!(ok, "{out}");
+        let row = out
+            .lines()
+            .find(|line| line.starts_with("dashboard "))
+            .unwrap_or_else(|| panic!("no dashboard row on node {idx}:\n{out}"));
+        assert!(row.contains("view"), "{row}");
+        assert!(row.contains(&expected[..12]), "{row}");
+    }
+    // no module seats under the id: the node's running roster is unchanged
+    let status = cluster.rpc(0, serde_json::json!({ "cmd": "status" }));
+    assert_eq!(status["ok"], true, "{status}");
+    let roster = status["status"]["modules"]
+        .as_object()
+        .expect("status carries the module roster");
+    assert!(
+        !roster.contains_key("dashboard"),
+        "a view entry runs no module: {roster:?}"
+    );
+    // a core under a view id is a different kind: refused before any proposal
+    let cfg = cluster.config_file(0);
+    let (ok, out) = cluster.run_verb(&[
+        "module",
+        "update",
+        "dashboard",
+        &fixture("hello"),
+        "--after",
+        AFTER,
+        "--config",
+        cfg.to_str().unwrap(),
+    ]);
+    assert!(!ok, "{out}");
+    assert!(out.contains("registered as a view"), "{out}");
+}
+
 #[test]
 fn register_carries_a_mapper_and_update_can_remove_it() {
     let cluster = three_validators();

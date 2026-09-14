@@ -486,6 +486,152 @@ async fn schedule_swap(host: &mut host::Host, height: u64, id: &str, hash: [u8; 
     .await;
 }
 
+/// a founding `<id>.view.wasm` with no core is a `Kind::View` registry entry:
+/// the genesis seeds it (the registry lists it, kind `view`, active on its
+/// hash), no module seats under its id, the boundary leaves it alone at every
+/// height, a reopen off the seated set does not miss it, and a live
+/// registration of a second view latches on the view frame alone and never
+/// asks the admission factory for a core.
+#[test]
+fn a_view_entry_composes_no_module_and_the_boundary_leaves_it_alone() {
+    use commonware_cryptography::Signer as _;
+    use module_artifact::{Artifact, ViewArtifact};
+    use sdk::Origin;
+    run(|context, dir| {
+        Box::pin(async move {
+            let member = commonware_cryptography::ed25519::PrivateKey::from_seed(1)
+                .public_key()
+                .as_ref()
+                .to_vec();
+            let mut source = ArtifactSource(Default::default());
+            let mut codes = std::collections::BTreeMap::new();
+            for id in ["modules", "valset"] {
+                let bytes = std::fs::read(fixtures().join(format!("{id}.component.wasm"))).unwrap();
+                codes.insert(id.to_string(), source.add(Artifact::module(bytes)));
+            }
+            let home = source.add(Artifact::View(ViewArtifact {
+                component: ice_view(),
+                assets: [("icons/tab.svg".to_owned(), b"<svg/>".to_vec())].into(),
+            }));
+            codes.insert("home".into(), home);
+            assert_eq!(
+                noded::compose::genesis_seeds(&[noded::compose::Founding {
+                    id: "home".into(),
+                    hash: home,
+                    kind: modules::Kind::View,
+                }])["home"],
+                modules::Seed {
+                    kind: modules::Kind::View,
+                    code_hash: home.to_vec()
+                }
+            );
+
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
+            let mut host = compose(
+                &source,
+                &mut stores,
+                &substrates,
+                &BINDINGS,
+                Boot::Genesis {
+                    validators: std::slice::from_ref(&member),
+                    bundle: &codes,
+                },
+            )
+            .await
+            .unwrap();
+            host.set_module_factory(Box::new(Admissions::new(&context, &substrates, &BINDINGS)));
+            assert!(host.module_root("home").is_none(), "a view seats no module");
+            let ids: Vec<String> = host.module_roots().into_iter().map(|(id, _)| id).collect();
+            assert_eq!(ids, ["modules", "valset"]);
+            let status = host.module_status().await.unwrap().unwrap();
+            let entry = status.iter().find(|m| m.module_id == "home").unwrap();
+            assert_eq!(entry.kind, modules::Kind::View);
+            assert_eq!(entry.active_code_hash, home.to_vec());
+            assert_eq!(entry.history.len(), 1, "seeded active at genesis");
+
+            // every boundary: nothing to realize for the view, no factory
+            // call, the roster unchanged.
+            let root = host.root_hash();
+            for height in 1..=3 {
+                host.realize_module_swaps(height, &source).await.unwrap();
+                registry_op(&mut host, height, Origin::System, modules::ModulesMsg::Advance).await;
+            }
+            assert!(host.module_root("home").is_none());
+            assert_eq!(host.root_hash(), root);
+
+            // a second view registered live: readiness is the view ABI alone
+            // (the drain's verdict), the swap latches at R = n and advances
+            // with no core ever asked of the factory.
+            let dashboard = source.add(Artifact::View(ViewArtifact {
+                component: ice_view(),
+                assets: [("icons/tab.svg".to_owned(), b"<svg>2</svg>".to_vec())].into(),
+            }));
+            let index = indexer::IndexStore::open_bare(dir.join("index"), &["modules"]).unwrap();
+            noded::compose::validate_deployment(
+                "dashboard",
+                modules::Kind::View,
+                &source.0[&dashboard.to_vec()],
+                &index,
+            )
+            .unwrap();
+            registry_op(
+                &mut host,
+                4,
+                Origin::System,
+                modules::ModulesMsg::ScheduleRegister {
+                    name: "deploy-dashboard".into(),
+                    module_id: "dashboard".into(),
+                    kind: modules::Kind::View,
+                    activation_height: 10,
+                    code_hash: dashboard.to_vec(),
+                },
+            )
+            .await;
+            ready(&mut host, 5, &member, "dashboard", dashboard).await;
+            host.realize_module_swaps(10, &source).await.unwrap();
+            registry_op(&mut host, 10, Origin::System, modules::ModulesMsg::Advance).await;
+            assert!(host.module_root("dashboard").is_none());
+            let status = host.module_status().await.unwrap().unwrap();
+            let entry = status.iter().find(|m| m.module_id == "dashboard").unwrap();
+            assert_eq!(entry.kind, modules::Kind::View);
+            assert_eq!(entry.active_code_hash, dashboard.to_vec());
+            assert!(entry.pending.is_none(), "the view activated at its height");
+
+            // reopen off the SEATED set (what a checkpoint records): the
+            // registry still lists both views, and the root is the same.
+            let root = host.root_hash();
+            drop(host);
+            let mut snapshots =
+                |_: &str, _: Backing| -> SnapshotFut<'_> { Box::pin(async { Ok(None) }) };
+            codes.remove("home");
+            let reopened = compose(
+                &source,
+                &mut stores,
+                &substrates,
+                &BINDINGS,
+                Boot::Reopen {
+                    height: 10,
+                    codes: &codes,
+                    snapshots: &mut snapshots,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(reopened.root_hash(), root);
+            assert!(reopened.module_root("home").is_none());
+            assert!(reopened.module_root("dashboard").is_none());
+            let status = reopened.module_status().await.unwrap().unwrap();
+            let views: Vec<&str> = status
+                .iter()
+                .filter(|m| m.kind == modules::Kind::View)
+                .map(|m| m.module_id.as_str())
+                .collect();
+            assert_eq!(views, ["dashboard", "home"]);
+        })
+    });
+}
+
 /// Both registries are actual Wasm. A live admission carries its mapper, an
 /// update can remove that mapper, and the registry can replace ITSELF. Reopen
 /// uses authenticated deployment hashes, including the registry's new code.
@@ -562,7 +708,7 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
             let index =
                 indexer::IndexStore::open_bare(dir.join("index"), &["modules", "valset"]).unwrap();
             noded::converge_host_modules(&index, &host).unwrap();
-            noded::compose::validate_deployment("pages", &source.0[&indexed.to_vec()], &index)
+            noded::compose::validate_deployment("pages", modules::Kind::Module, &source.0[&indexed.to_vec()], &index)
                 .unwrap();
             let Artifact::Module(mut invalid_mapper) =
                 Artifact::decode(&source.0[&indexed.to_vec()]).unwrap()
@@ -573,6 +719,7 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
             assert!(
                 noded::compose::validate_deployment(
                     "pages",
+                    modules::Kind::Module,
                     &Artifact::Module(invalid_mapper).encode(),
                     &index
                 )
@@ -762,7 +909,7 @@ fn deployment_readiness_rejects_invalid_view_manifest() {
     }
     assert!(ui_lang_wire::manifest::read_manifest(&view).is_none());
     let error =
-        noded::compose::validate_deployment("pages", &encode(&view_deployment(view)), &index)
+        noded::compose::validate_deployment("pages", modules::Kind::Module, &encode(&view_deployment(view)), &index)
             .expect_err("invalid view manifest must refuse readiness");
     assert!(error.contains("view manifest"), "{error}");
 }
@@ -781,7 +928,7 @@ fn deployment_readiness_rejects_invalid_view_abi() {
     .unwrap();
     append_manifest(&mut view);
     let error =
-        noded::compose::validate_deployment("pages", &encode(&view_deployment(view)), &index)
+        noded::compose::validate_deployment("pages", modules::Kind::Module, &encode(&view_deployment(view)), &index)
             .expect_err("wrong view export type must refuse readiness");
     assert!(
         error.contains("view ABI") && error.contains("init"),
@@ -805,8 +952,50 @@ fn append_manifest(view: &mut Vec<u8>) {
 fn deployment_readiness_accepts_actual_view() {
     let dir = tempfile::tempdir().unwrap();
     let index = indexer::IndexStore::open_bare(dir.path(), &["pages"]).unwrap();
-    noded::compose::validate_deployment("pages", &encode(&view_deployment(ice_view())), &index)
+    noded::compose::validate_deployment("pages", modules::Kind::Module, &encode(&view_deployment(ice_view())), &index)
         .unwrap();
+}
+
+/// a `Kind::View` entry is ready on the view ABI alone: no core to compile,
+/// no shape to realize. the frame's tag must be the entry's kind either way.
+#[test]
+fn a_view_entry_is_ready_on_the_view_alone_and_the_tag_must_match_the_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = indexer::IndexStore::open_bare(dir.path(), &["pages"]).unwrap();
+    let view_frame = module_artifact::Artifact::View(module_artifact::ViewArtifact {
+        component: ice_view(),
+        assets: [("icons/tab.svg".to_owned(), b"<svg/>".to_vec())].into(),
+    })
+    .encode();
+    assert_eq!(
+        noded::compose::artifact_kind(&view_frame).unwrap(),
+        modules::Kind::View
+    );
+    noded::compose::validate_deployment("home", modules::Kind::View, &view_frame, &index).unwrap();
+    let error =
+        noded::compose::validate_deployment("home", modules::Kind::Module, &view_frame, &index)
+            .unwrap_err();
+    assert!(error.starts_with("artifact_kind_mismatch"), "{error}");
+    let module_frame = encode(&view_deployment(ice_view()));
+    assert_eq!(
+        noded::compose::artifact_kind(&module_frame).unwrap(),
+        modules::Kind::Module
+    );
+    let error =
+        noded::compose::validate_deployment("pages", modules::Kind::View, &module_frame, &index)
+            .unwrap_err();
+    assert!(error.starts_with("artifact_kind_mismatch"), "{error}");
+    // a view that is no view refuses a view entry the same way it refuses a
+    // module's embedded one
+    let broken = module_artifact::Artifact::View(module_artifact::ViewArtifact {
+        component: b"not a component".to_vec(),
+        assets: Default::default(),
+    })
+    .encode();
+    let error =
+        noded::compose::validate_deployment("home", modules::Kind::View, &broken, &index)
+            .unwrap_err();
+    assert!(error.contains("view manifest"), "{error}");
 }
 
 #[test]
@@ -836,7 +1025,7 @@ fn deployment_readiness_does_not_instantiate_view() {
             (result (result (error string)))
             (canon lift (core func $i "restore") (memory $i "memory") (realloc (func $i "realloc")))))"#).unwrap();
     append_manifest(&mut view);
-    noded::compose::validate_deployment("pages", &encode(&view_deployment(view.clone())), &index)
+    noded::compose::validate_deployment("pages", modules::Kind::Module, &encode(&view_deployment(view.clone())), &index)
         .expect("static view readiness must not execute the trapping start");
     // Prove the fixture's trap is reached on real instantiation; a passing
     // readiness assertion alone would not establish this counterexample.
@@ -939,7 +1128,7 @@ fn wasm_registry_activates_view_assets_and_reopens_after_view_removal() {
             let index =
                 indexer::IndexStore::open_bare(dir.join("index"), &["modules", "valset"]).unwrap();
             for deployment in &deployments {
-                noded::compose::validate_deployment("pages", &encode(deployment), &index).unwrap();
+                noded::compose::validate_deployment("pages", modules::Kind::Module, &encode(deployment), &index).unwrap();
                 assert_eq!(deployment.component, deployments[0].component);
                 assert_eq!(deployment.index, deployments[0].index);
             }

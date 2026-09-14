@@ -284,7 +284,10 @@ fn init_writes_module_hashes_and_the_genesis() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let d = workspace_config::NetworkDescriptor::load(&ws.join("network.toml")).unwrap();
     let ids: Vec<&str> = d.modules.iter().map(|m| m.id.as_str()).collect();
+    // the descriptor pins every founding entry: the module set and the
+    // founding views (`home`), each under its own hash
     let mut want = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
+    want.extend(topology::VIEWS);
     want.sort_unstable();
     assert_eq!(ids, want);
     let file = ws.join("genesis");
@@ -396,6 +399,7 @@ fn init_founds_from_the_set_the_build_staged_beside_the_binary() {
     let genesis = workspace_config::Genesis::load(&ws.join("genesis")).expect("the genesis file");
     let ids: Vec<&str> = genesis.modules.iter().map(|a| a.id.as_str()).collect();
     let mut want = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
+    want.extend(topology::VIEWS);
     want.sort_unstable();
     assert_eq!(ids, want);
 }

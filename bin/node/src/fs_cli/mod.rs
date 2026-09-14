@@ -16,7 +16,7 @@ mod args;
 mod read_cmds;
 mod work_cmds;
 
-use self::args::{nfc_path, NodeAddr};
+use self::args::{NodeAddr, nfc_path};
 
 /// the `ducktape fs` verb tree. usage errors (a missing positional, a bad
 /// numeric flag, an unknown verb) are clap's job at the top-level parse — it
@@ -40,6 +40,8 @@ pub(crate) enum FsCmd {
     Status(StatusArgs),
     /// commit the working copy (exit 2 on conflict)
     Commit(CommitArgs),
+    /// write one local file to a duckfs path in one commit
+    Put(PutArgs),
     /// pin a snapshot so gc keeps it
     Pin(PinArgs),
     /// release a pin (the owner or `system` only)
@@ -174,6 +176,27 @@ pub(crate) struct CommitArgs {
 }
 
 #[derive(Debug, clap::Args)]
+pub(crate) struct PutArgs {
+    /// the local file to write
+    pub local: std::path::PathBuf,
+    /// the absolute duckfs path it lands at (parents are created)
+    #[arg(value_parser = nfc_path)]
+    pub path: String,
+    /// the commit message (default: `put <path>`)
+    #[arg(long, value_name = "MESSAGE")]
+    pub message: Option<String>,
+    #[command(flatten)]
+    pub addr: NodeAddr,
+    /// the user key that signs the write (default: the active wallet)
+    #[arg(long, value_name = "PATH")]
+    pub key: Option<std::path::PathBuf>,
+    /// re-pin this node's identity to whatever it answers with now — the
+    /// only way an already-trusted key changes (see `known_nodes`)
+    #[arg(long)]
+    pub trust_node: bool,
+}
+
+#[derive(Debug, clap::Args)]
 pub(crate) struct PinArgs {
     /// the snapshot to pin
     pub snapshot: String,
@@ -234,6 +257,7 @@ pub(crate) fn run(cmd: FsCmd) -> u8 {
         FsCmd::Checkout(a) => work_cmds::checkout(a),
         FsCmd::Status(a) => work_cmds::status(a),
         FsCmd::Commit(a) => work_cmds::commit(a),
+        FsCmd::Put(a) => work_cmds::put(a),
         FsCmd::Pin(a) => work_cmds::pin(a),
         FsCmd::Unpin(a) => work_cmds::unpin(a),
     };

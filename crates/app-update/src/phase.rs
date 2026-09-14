@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::manifest::SuccessorKey;
 use crate::sha::Sha;
-use crate::verify::{Refusal, SignedManifest};
+use crate::verify::{Refusal, VerifiedManifest};
 
 /// Where the install is. Every transition is persisted tmp-write + rename by
 /// the executor's `Persist`; the machine returns the phase it ends in.
@@ -57,7 +57,6 @@ pub struct Downloading {
     pub previous: Option<Sha>,
     pub pinned_sequence: u64,
     pub target: Sha,
-    pub url: String,
     pub size: u64,
     pub sequence: u64,
     pub display: String,
@@ -167,7 +166,7 @@ pub enum Event {
     /// Launcher, answering `ResolveSwap`: which side of the swap is live.
     SwapResolved(SwapState),
     /// App: the channel manifest was fetched and its signature checked.
-    ManifestFetched(Result<SignedManifest, Refusal>),
+    ManifestFetched(Result<VerifiedManifest, Refusal>),
     /// App: `releases/<sha>.partial` is complete.
     DownloadFinished { sha: Sha },
     /// App: the download could not complete; `reason` is a stable token.
@@ -211,12 +210,14 @@ pub enum SwapState {
 pub enum Command {
     /// Write `state.json` (tmp-write + rename).
     Persist(Phase),
-    /// Fetch the channel manifest + `.minisig`, verify, answer with
-    /// `ManifestFetched`.
+    /// Read the channel manifest + `.sig` off the connected network's duckfs
+    /// ([`crate::layout`]), verify, answer with `ManifestFetched`.
     Fetch,
-    /// Download `url` into `releases/<sha>.partial`, resumable by size;
-    /// answer with `DownloadFinished`/`DownloadFailed`.
-    Download { url: String, sha: Sha, size: u64 },
+    /// Download the archive ([`crate::layout::archive_path`] of `sha` for
+    /// the host platform) into `releases/<sha>.partial`, resumable by size,
+    /// sha256-checked as it lands; answer with
+    /// `DownloadFinished`/`DownloadFailed`.
+    Download { sha: Sha, size: u64 },
     /// sha256 the archive against `sha`, extract into `releases/<sha>/`,
     /// macOS `codesign --verify`; answer with `Verified`/`VerifyRefused`.
     Verify(Sha),

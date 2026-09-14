@@ -71,18 +71,35 @@ impl FromStr for Sha {
     type Err = ShaParseError;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let has_expected_length = text.len() == 64;
-        if !has_expected_length {
-            return Err(ShaParseError);
-        }
-        let mut bytes = [0u8; 32];
-        for (index, pair) in text.as_bytes().chunks_exact(2).enumerate() {
-            let high = hex_nibble(pair[0]).ok_or(ShaParseError)?;
-            let low = hex_nibble(pair[1]).ok_or(ShaParseError)?;
-            bytes[index] = (high << 4) | low;
-        }
-        Ok(Sha(bytes))
+        hex_to_array(text).map(Sha).ok_or(ShaParseError)
     }
+}
+
+/// `text` as exactly `N` bytes of lowercase-or-uppercase hex, or `None`.
+/// Shared by every fixed-size hex field in the crate (a digest, a key, a
+/// signature).
+pub(crate) fn hex_to_array<const N: usize>(text: &str) -> Option<[u8; N]> {
+    let has_expected_length = text.len() == N * 2;
+    if !has_expected_length {
+        return None;
+    }
+    let mut bytes = [0u8; N];
+    for (index, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        bytes[index] = (high << 4) | low;
+    }
+    Some(bytes)
+}
+
+/// `bytes` as lowercase hex.
+pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
 }
 
 fn hex_nibble(character: u8) -> Option<u8> {

@@ -1,8 +1,10 @@
-//! the working-copy loop: checkout / status / commit / pin. these operate on a
-//! local checkout dir plus its `.duckfs` index; the node address comes from the
-//! shared [`crate::cli_args::NodeAddr`] ladder, which for verbs running inside a
-//! checkout takes the index's recorded node url as its context rung.
+//! the working-copy loop: checkout / status / commit / pin, and the one-file
+//! `put`. these operate on a local checkout dir plus its `.duckfs` index; the
+//! node address comes from the shared [`crate::cli_args::NodeAddr`] ladder,
+//! which for verbs running inside a checkout takes the index's recorded node
+//! url as its context rung.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -12,7 +14,7 @@ use duckfs_client::http::HttpNode;
 use duckfs_client::index::Index;
 
 use crate::fs_cli::args::{CliError, NodeAddr, resolve_node};
-use crate::fs_cli::{CheckoutArgs, CommitArgs, PinArgs, StatusArgs, UnpinArgs};
+use crate::fs_cli::{CheckoutArgs, CommitArgs, PinArgs, PutArgs, StatusArgs, UnpinArgs};
 
 /// resolve the node for a verb running inside `dir`: the shared addressing
 /// ladder, with this checkout's `.duckfs` index as the ambient context rung —
@@ -159,6 +161,107 @@ pub fn commit(args: CommitArgs) -> Result<(), CliError> {
             "nothing to commit (the working copy is clean)",
         )),
         Err(e) => Err(CliError::failed(e.to_string())),
+    }
+}
+
+/// `put <local> <path> [--message M]` — write one local file to an absolute
+/// duckfs path in ONE commit, with no checkout: a file within the inline
+/// budget rides inside the commit op; a larger one is staged a 1 MiB chunk
+/// per op (a chunk still staged from an interrupted run is skipped, as
+/// `commit` does — a commit consumes its staging, so a re-put stages afresh)
+/// and then named by one commit. Never the `/v1/files/object` facade: that
+/// path is one request capped at 64 MiB, and a release archive is neither.
+/// prints the new snapshot id.
+pub fn put(args: PutArgs) -> Result<(), CliError> {
+    use base64::Engine as _;
+    use duckfs_client::api::{ApiError, NodeApi};
+    use duckfs_client::chunk::chunk_ids;
+    use duckfs_core::{CHUNK_SIZE, Change, Content, MAX_INLINE_COMMIT_BYTES, MAX_SYNC_IDS, to_hex};
+
+    let bytes = std::fs::read(&args.local)
+        .map_err(|e| CliError::failed(format!("read {}: {e}", args.local.display())))?;
+    let node = signing_node(&args.addr, Path::new("."), args.key, args.trust_node)?;
+    let api_err = |e: ApiError| match e {
+        ApiError::NotFound => CliError::failed("not found"),
+        ApiError::Rejected(m) => CliError::failed(m),
+        ApiError::Transport(m) => CliError::failed(format!("cannot reach the node: {m}")),
+    };
+
+    let rides_inline = bytes.len() <= MAX_INLINE_COMMIT_BYTES;
+    let content = match rides_inline {
+        true => Content::Inline {
+            b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        },
+        false => {
+            let hexes: Vec<String> = chunk_ids(&bytes).iter().map(|id| to_hex(id)).collect();
+            let slices: Vec<&[u8]> = bytes.chunks(CHUNK_SIZE as usize).collect();
+            let mut staged = 0usize;
+            for (batch_index, batch) in hexes.chunks(MAX_SYNC_IDS).enumerate() {
+                let present = node.has_chunks(batch).map_err(api_err)?;
+                for (offset, (hex, present)) in batch.iter().zip(present).enumerate() {
+                    if present {
+                        continue;
+                    }
+                    let index = batch_index * MAX_SYNC_IDS + offset;
+                    let digest = node.stage_chunk(slices[index]).map_err(api_err)?;
+                    let landed_as_named = digest == *hex;
+                    if !landed_as_named {
+                        return Err(CliError::failed(format!(
+                            "the node staged chunk {index} as {digest}, expected {hex}"
+                        )));
+                    }
+                    staged += 1;
+                }
+            }
+            eprintln!(
+                "ducktape fs: staged {staged} of {} chunks ({} bytes)",
+                hexes.len(),
+                bytes.len()
+            );
+            Content::Chunks {
+                size: bytes.len() as u64,
+                chunks: hexes,
+            }
+        }
+    };
+
+    let head = node.refs().map_err(api_err)?.head;
+    let message = args.message.unwrap_or_else(|| format!("put {}", args.path));
+    let change = Change::Put {
+        path: args.path.clone(),
+        exec: false,
+        meta: BTreeMap::new(),
+        content,
+    };
+    let receipt = node
+        .commit(head.as_deref(), &message, vec![change])
+        .map_err(api_err)?;
+    let snapshot = snapshot_of(&node, receipt.height, &message).map_err(api_err)?;
+    println!("{snapshot}");
+    Ok(())
+}
+
+/// the snapshot id the commit at `height` with `message` produced. a block
+/// can hold several members' commits, so the height alone is ambiguous; the
+/// message is this verb's own and the newest-first window is short.
+fn snapshot_of(
+    node: &HttpNode,
+    height: u64,
+    message: &str,
+) -> Result<String, duckfs_client::api::ApiError> {
+    use duckfs_client::api::NodeApi;
+    use duckfs_core::MAX_PAGE;
+
+    let window = node.history(MAX_PAGE)?;
+    let ours = window
+        .iter()
+        .find(|entry| entry.height == height && entry.message == message)
+        .map(|entry| entry.id.clone());
+    match ours {
+        Some(id) => Ok(id),
+        None => Err(duckfs_client::api::ApiError::Rejected(format!(
+            "files: the commit landed at height {height} but the history window does not show it"
+        ))),
     }
 }
 

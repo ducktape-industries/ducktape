@@ -162,6 +162,7 @@ impl Ducktape {
             AppMessage::AgentStatusSet(_result) => self.on_agent_status_set(_result),
             AppMessage::NodeViewEvent(event) => self.on_node_view_event(event),
             AppMessage::NodeFactsLoaded(next) => self.on_node_facts_loaded(next),
+            AppMessage::UpdateJobReplied(reply) => self.on_update_job_replied(reply),
             AppMessage::NodeFactsFailed(_cause) => self.on_node_facts_failed(_cause),
             AppMessage::NodeStatusPushed(next) => self.on_node_status_pushed(next),
             AppMessage::SettingsLoaded(next) => self.on_settings_loaded(next),
@@ -240,6 +241,7 @@ impl Ducktape {
             AppMessage::CopyChordPressed(event) => self.on_copy_chord_pressed(event),
             AppMessage::ChatViewEvent(event) => self.on_chat_view_event(event),
             AppMessage::PagesViewEvent(event) => self.on_pages_view_event(event),
+            AppMessage::RegisteredViewEvent(event) => self.on_registered_view_event(event),
             AppMessage::OpenPageSearchHit(page_id, _block_id) => {
                 self.on_open_page_search_hit(page_id, _block_id)
             }
@@ -1755,7 +1757,38 @@ impl Ducktape {
     }
     fn on_wall_tick(&mut self) -> Task<AppMessage> {
         self.wall_now = crate::backend::current_wall_seconds();
-        Task::none()
+        let Some(updater) = self.updater.as_mut() else {
+            return Task::none();
+        };
+        let Some(job) = updater.tick(self.wall_now, self.connected) else {
+            return Task::none();
+        };
+        self.run_update_job(job)
+    }
+    fn on_update_job_replied(&mut self, reply: Option<app_update::Event>) -> Task<AppMessage> {
+        let Some(updater) = self.updater.as_mut() else {
+            return Task::none();
+        };
+        let Some(job) = updater.reply(reply) else {
+            return Task::none();
+        };
+        self.run_update_job(job)
+    }
+    /// One update job against the connected node; its answer comes back as
+    /// `UpdateJobReplied`.
+    fn run_update_job(&self, job: crate::backend::update::Job) -> Task<AppMessage> {
+        let Some(updater) = self.updater.as_ref() else {
+            return Task::none();
+        };
+        Task::perform(
+            crate::backend::update::run_job(
+                self.connected_rpc.to_owned(),
+                updater.keys().clone(),
+                updater.updates_dir().to_path_buf(),
+                job,
+            ),
+            AppMessage::UpdateJobReplied,
+        )
     }
     fn on_window_was_closed(&mut self, id: crate::shell::WindowKey) -> Task<AppMessage> {
         let closed_welcome =
@@ -4612,6 +4645,25 @@ impl Ducktape {
                 crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(
                     &(event),
                     "text",
+                ))
+            }
+        }
+    }
+    /// A registry-listed view's two doors: a `duck://` link through the
+    /// one open plane, and the clipboard with its toast.
+    fn on_registered_view_event(
+        &mut self,
+        event: crate::module_view::ModuleViewEvent,
+    ) -> Task<AppMessage> {
+        match crate::module_view::registered_intent(&event) {
+            RegisteredIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
+                crate::module_view::event_text(&event, "link"),
+            )),
+            RegisteredIntent::Copy => {
+                self.toast = crate::module_view::event_text(&event, "label");
+                self.toast_age = 0;
+                crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(
+                    &event, "text",
                 ))
             }
         }

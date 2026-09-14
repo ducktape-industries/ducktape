@@ -418,9 +418,8 @@ dependencies = [
 name = "app-update"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
- "blake2",
- "ed25519-dalek",
+ "commonware-cryptography",
+ "keyscheme",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3696,6 +3695,7 @@ name = "ducktape-app"
 version = "0.1.0"
 dependencies = [
  "agent",
+ "app-update",
  "authpage",
  "base64 0.22.1",
  "block2 0.5.1",
@@ -7737,6 +7737,7 @@ dependencies = [
  "anstream",
  "anstyle",
  "anyhow",
+ "app-update",
  "argon2",
  "async-trait",
  "attribution",

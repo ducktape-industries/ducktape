@@ -51,19 +51,23 @@ pub struct PackArgs {
     pub out: PathBuf,
 }
 
-/// `<id> <component.wasm> [--index <index.wasm>] [--after N]` — shared by update and register.
+/// `<id> [<component.wasm>] [--index <index.wasm>] [--view <view.wasm>] [--after N]`
+/// — shared by update and register. A component (with or without `--view`)
+/// stages a `module` entry; `--view` with no component stages a `view` entry
+/// — a UI with no consensus code, drawn by the desktop off the registry.
 #[derive(Debug, clap::Args)]
 pub struct StageArgs {
     /// the module id the code belongs to
     #[arg(value_name = "ID")]
     pub id: String,
-    /// the component bytes to stage
-    #[arg(value_name = "COMPONENT.WASM")]
-    pub component: PathBuf,
+    /// the component bytes to stage; omit it (with --view) for a view-only entry
+    #[arg(value_name = "COMPONENT.WASM", required_unless_present = "view")]
+    pub component: Option<PathBuf>,
     /// Optional mapper deployed and activated with this component; omission removes it.
-    #[arg(long, value_name = "INDEX.WASM")]
+    #[arg(long, value_name = "INDEX.WASM", requires = "component")]
     pub index: Option<PathBuf>,
-    /// View deployed with the module; omission removes its UI.
+    /// View deployed with the module (omission removes its UI), or, with no
+    /// component, the whole view-only deployment.
     #[arg(long, value_name = "VIEW.WASM")]
     pub view: Option<PathBuf>,
     /// View assets rooted here, using canonical relative paths.
@@ -91,7 +95,7 @@ pub fn run(cmd: ModuleCmd) -> CommandResult {
 
 fn cmd_pack(args: PackArgs) -> CommandResult {
     let artifact = workspace_config::read_deployment_files(
-        &args.component,
+        Some(&args.component),
         args.index.as_deref(),
         args.view.as_deref(),
         args.assets.as_deref(),
@@ -123,6 +127,7 @@ impl Verb {
     fn action(
         self,
         module_id: &str,
+        kind: modules::Kind,
         activation_lead: u64,
         code_hash: [u8; 32],
     ) -> governance::GovAction {
@@ -130,6 +135,7 @@ impl Verb {
         let module_id = module_id.to_string();
         let code_hash = code_hash.to_vec();
         match self {
+            // a swap keeps the entry's kind: the registry fixed it at admission.
             Verb::Update => governance::GovAction::UpdateModule {
                 name,
                 module_id,
@@ -139,7 +145,7 @@ impl Verb {
             Verb::Register => governance::GovAction::RegisterModule {
                 name,
                 module_id,
-                kind: modules::Kind::Module,
+                kind,
                 activation_lead,
                 code_hash,
             },
@@ -212,13 +218,16 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         )
         .into());
     }
-    let bytes = workspace_config::read_deployment_files(
-        &args.component,
+    let artifact = workspace_config::read_deployment_files(
+        args.component.as_deref(),
         args.index.as_deref(),
         args.view.as_deref(),
         args.assets.as_deref(),
-    )?
-    .encode();
+    )?;
+    // the frame says what the entry is: a component makes a module frame, a
+    // view alone a view frame — and the registry entry is registered as that.
+    let kind = noded::compose::artifact_kind(&artifact.encode())?;
+    let bytes = artifact.encode();
     let cfg_path = args.selector.config_path()?;
     let resolved = config::resolve(&cfg_path)?;
     let node = crate::cli::DrivenNode::of(&resolved, verb.name())?;
@@ -238,6 +247,7 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         &read_module_status(rpc_addr)?,
         &live_modules,
         &args.id,
+        kind,
         &code_hash,
     )?;
     match precheck {
@@ -274,7 +284,7 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         &pubkey_hex,
         verb.name(),
         "module:",
-        verb.action(&args.id, args.after, code_hash),
+        verb.action(&args.id, kind, args.after, code_hash),
         &matches,
     );
     let outcome = match ceremony {
@@ -423,10 +433,24 @@ fn registry_precheck(
     modules: &[modules::ModuleCode],
     live_modules: &[String],
     id: &str,
+    kind: modules::Kind,
     code_hash: &[u8; 32],
 ) -> Result<Precheck, String> {
     if let Some(held) = registry_holds(modules, id, code_hash) {
         return Ok(Precheck::AlreadyHeld(held));
+    }
+    // a swap can never change what an entry is: a module id takes module
+    // frames, a view id view frames. every validator would refuse the
+    // mismatched bytes at readiness and the swap would never latch.
+    let entry = modules.iter().find(|m| m.module_id == id);
+    if let Some(registered) = entry
+        && registered.kind != kind
+    {
+        return Err(format!(
+            "module {id} is registered as a {}, and a swap keeps its kind (a {} is a new id)",
+            kind_word(registered.kind),
+            kind_word(kind)
+        ));
     }
     let already_live = live_modules.iter().any(|live| live == id);
     let registering_live_module = matches!(verb, Verb::Register) && already_live;
@@ -435,7 +459,6 @@ fn registry_precheck(
             "module {id} is already registered (code changes go through `module update`)"
         ));
     }
-    let entry = modules.iter().find(|m| m.module_id == id);
     let other_swap_pending = entry.map(|m| m.pending.is_some());
     match (verb, other_swap_pending) {
         (Verb::Register, None) | (Verb::Update, Some(false)) => Ok(Precheck::Proceed),
@@ -858,8 +881,9 @@ mod tests {
             pending,
             history: Vec::new(),
         };
-        let precheck =
-            |verb, modules: &[ModuleCode]| registry_precheck(verb, modules, &[], "hello", &ours);
+        let precheck = |verb, modules: &[ModuleCode]| {
+            registry_precheck(verb, modules, &[], "hello", modules::Kind::Module, &ours)
+        };
 
         // register: a free id proceeds; any existing entry refuses
         assert!(matches!(
@@ -905,35 +929,52 @@ mod tests {
         );
         assert_eq!(Held::Active.word(), "active");
         // A familiar name is available when this network does not run it.
+        let module = modules::Kind::Module;
         assert!(matches!(
-            registry_precheck(Verb::Register, &[], &[], "identity", &ours),
+            registry_precheck(Verb::Register, &[], &[], "identity", module, &ours),
             Ok(Precheck::Proceed)
         ));
         let live = vec!["identity".to_string()];
-        let err = registry_precheck(Verb::Register, &[], &live, "identity", &ours).unwrap_err();
+        let err = registry_precheck(Verb::Register, &[], &live, "identity", module, &ours)
+            .unwrap_err();
         assert!(err.contains("already registered"), "{err}");
-        let err = registry_precheck(Verb::Update, &[], &live, "identity", &ours).unwrap_err();
+        let err =
+            registry_precheck(Verb::Update, &[], &live, "identity", module, &ours).unwrap_err();
         assert!(err.contains("unregistered module identity"), "{err}");
+        // a swap keeps the entry's kind: view bytes under a module id (and
+        // the reverse) are refused before anything is proposed.
+        let err = registry_precheck(
+            Verb::Update,
+            &[entry(&theirs, None)],
+            &[],
+            "hello",
+            modules::Kind::View,
+            &ours,
+        )
+        .unwrap_err();
+        assert!(err.contains("registered as a module"), "{err}");
     }
 
     #[test]
     fn the_matcher_checks_verb_id_code_and_lead() {
         let hash = [0xabu8; 32];
-        let update = Verb::Update.action("hello", 100, hash);
-        let register = Verb::Register.action("hello", 100, hash);
+        let module = modules::Kind::Module;
+        let update = Verb::Update.action("hello", module, 100, hash);
+        let register = Verb::Register.action("hello", module, 100, hash);
         let same_update = matches_module_action(Verb::Update, "hello", &hash, 100);
         assert!(same_update(&update));
         assert!(!same_update(&register), "register is not update");
-        assert!(!same_update(&Verb::Update.action("other", 100, hash)));
+        assert!(!same_update(&Verb::Update.action("other", module, 100, hash)));
         assert!(!same_update(&Verb::Update.action(
             "hello",
+            module,
             100,
             [0xcdu8; 32]
         )));
         // activation_lead is now a fixed part of the action's identity (it is
         // relative to the EXECUTE height, so it never goes stale): a
         // different lead is a DIFFERENT proposal, not one to join.
-        assert!(!same_update(&Verb::Update.action("hello", 999, hash)));
+        assert!(!same_update(&Verb::Update.action("hello", module, 999, hash)));
         let same_register = matches_module_action(Verb::Register, "hello", &hash, 100);
         assert!(same_register(&register));
         assert!(!same_register(&update));

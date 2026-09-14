@@ -55,15 +55,24 @@ pub fn index_guest_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.index.wasm"))
 }
 
-/// Package a module's component, optional mapper, view and assets from a directory.
+/// Package one founding entry's files from a directory: `<id>.component.wasm`
+/// with its optional mapper, view and assets as a module frame, or
+/// `<id>.view.wasm` (+ `<id>.assets`) alone as a view-only frame.
 pub fn read_module_artifact(dir: &Path, id: &str) -> Result<module_artifact::Artifact, String> {
     crate::ensure_view_ready(dir, id)?;
-    let component = component_path(dir, id);
+    let component = optional_path(component_path(dir, id))?;
     let index = optional_path(index_guest_path(dir, id))?;
     let view = optional_path(dir.join(format!("{id}.view.wasm")))?;
     let assets = optional_path(dir.join(format!("{id}.assets")))?;
+    let no_files_at_all = component.is_none() && view.is_none();
+    if no_files_at_all {
+        return Err(format!(
+            "{}: no such founding entry (neither a component nor a view)",
+            component_path(dir, id).display()
+        ));
+    }
     crate::read_deployment_files(
-        &component,
+        component.as_deref(),
         index.as_deref(),
         view.as_deref(),
         assets.as_deref(),
@@ -112,7 +121,18 @@ impl Genesis {
             ));
         }
         let mut index_guests = discover_artifact_ids(source, ".index.wasm")?;
-        let modules = components
+        // a view with no component under its id is a view-only entry; a
+        // pending marker under such an id is a view not built yet, which
+        // `read_module_artifact` refuses by name.
+        let views = discover_artifact_ids(source, ".view.wasm")?;
+        let pending = discover_artifact_ids(source, ".view.pending")?;
+        let entries: std::collections::BTreeSet<String> = components
+            .iter()
+            .chain(&views)
+            .chain(&pending)
+            .cloned()
+            .collect();
+        let modules = entries
             .into_iter()
             .map(|id| {
                 index_guests.remove(&id);
@@ -120,21 +140,10 @@ impl Genesis {
                 Ok(Artifact { id, bytes })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        for entry in std::fs::read_dir(source).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                return Err("non-UTF-8 founding file name".into());
-            };
-            let id = [".view.wasm", ".assets", ".view.pending"]
-                .iter()
-                .find_map(|suffix| name.strip_suffix(suffix));
-            if let Some(id) = id
-                && !modules.iter().any(|module| module.id == id)
-            {
-                return Err(format!(
-                    "view or assets {id} has no module component in the genesis"
-                ));
+        for id in discover_artifact_ids(source, ".assets")? {
+            let owned = modules.iter().any(|module| module.id == id);
+            if !owned {
+                return Err(format!("assets {id} have no view in the genesis"));
             }
         }
         if let Some(id) = index_guests.first() {
@@ -533,6 +542,47 @@ mod tests {
             b"<svg/>"
         );
         assert!(!modules.join("home.view.pending").exists());
+    }
+
+    /// `<id>.view.wasm` with no `<id>.component.wasm` composes a view-only
+    /// entry beside the modules: the same file layout `materialize` writes
+    /// for one, so the directory round-trips. A view still being built (its
+    /// pending marker) refuses the compose by name; assets under an id with
+    /// no view belong to nothing.
+    #[test]
+    fn compose_admits_a_view_without_a_component_as_a_view_only_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        founding_set(dir.path(), &[("pages", b"P")], &[]);
+        std::fs::write(dir.path().join("home.view.wasm"), b"H").unwrap();
+        std::fs::create_dir_all(dir.path().join("home.assets/icons")).unwrap();
+        std::fs::write(dir.path().join("home.assets/icons/tab.svg"), b"<svg/>").unwrap();
+        let genesis = Genesis::compose(dir.path()).unwrap();
+        let ids: Vec<&str> = genesis.modules.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["home", "pages"]);
+        assert_eq!(genesis.component("home"), None, "a view has no core");
+        let home = ArtifactRef::decode(genesis.artifact("home").unwrap()).unwrap();
+        let ArtifactRef::View(view) = home else {
+            panic!("home is a view-only frame");
+        };
+        assert_eq!(view.component, b"H");
+        assert_eq!(view.assets["icons/tab.svg"], b"<svg/>");
+
+        let ws = tempfile::tempdir().unwrap();
+        let modules = modules_path(ws.path());
+        genesis.materialize(&modules).unwrap();
+        assert_eq!(
+            Genesis::compose(&modules).unwrap(),
+            genesis,
+            "the directory is the genesis, unpacked"
+        );
+
+        std::fs::write(dir.path().join("home.view.pending"), b"building").unwrap();
+        let err = Genesis::compose(dir.path()).unwrap_err();
+        assert!(err.contains("home") && err.contains("pending"), "{err}");
+        std::fs::remove_file(dir.path().join("home.view.pending")).unwrap();
+        std::fs::remove_file(dir.path().join("home.view.wasm")).unwrap();
+        let err = Genesis::compose(dir.path()).unwrap_err();
+        assert!(err.contains("assets home"), "{err}");
     }
 
     #[test]
