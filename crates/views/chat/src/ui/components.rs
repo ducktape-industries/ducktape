@@ -265,45 +265,4 @@ impl ChatView {
         )
     }
 
-    pub(super) fn live_run_card(
-        &self,
-        key: String,
-        stop: impl Fn(String) -> Message + Clone + 'static,
-        open: impl Fn(String) -> Message + Clone + 'static,
-        run: crate::host::LiveRunHint,
-    ) -> wire::Node {
-        native::card(
-            key.clone(),
-            native::column(
-                format!("{key}/body"),
-                [
-                    native::centered_row(
-                        format!("{key}/byline"),
-                        [
-                            native::badge(format!("{key}/kind"), "Agent", Tone::Agent),
-                            native::nowrap(native::strong(format!("{key}/agent"), run.agent)),
-                        ],
-                    ),
-                    native::wrapping(native::secondary(format!("{key}/status"), run.status)),
-                    native::row(
-                        format!("{key}/actions"),
-                        [
-                            native::button(
-                                format!("{key}/open"),
-                                "View run",
-                                Some(slots::message(open(run.dispatch_id))),
-                                wire::ButtonPreset::Secondary,
-                            ),
-                            native::button(
-                                format!("{key}/stop"),
-                                "Stop",
-                                Some(slots::message(stop(run.run_id))),
-                                wire::ButtonPreset::Subtle,
-                            ),
-                        ],
-                    ),
-                ],
-            ),
-        )
-    }
 }

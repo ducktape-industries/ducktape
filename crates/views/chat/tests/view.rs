@@ -197,6 +197,11 @@ fn live_run(agent: &str, status: &str) -> chat_view::host::LiveRunHint {
         dispatch_id: "dispatch-1".into(),
         agent: agent.into(),
         status: status.into(),
+        activity: vec![chat_view::host::LiveActivity {
+            label: "Reading src/lib.rs".into(),
+            done: true,
+        }],
+        answer_preview: "The repo builds clean.".into(),
     }
 }
 

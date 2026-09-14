@@ -128,6 +128,14 @@ fn paragraph_block(text: String) -> ReplyBlock {
     }
 }
 
+fn code_block(text: String) -> ReplyBlock {
+    ReplyBlock {
+        kind: REPLY_KIND_CODE.into(),
+        text,
+        lang: None,
+    }
+}
+
 /// map a NORMALIZED response's reply blocks into chat blocks — the only place
 /// the response vocabulary meets chat's. normalization guarantees only known
 /// kinds and non-empty texts remain.
@@ -227,6 +235,16 @@ pub(super) const FAILURE_EXCERPT_BYTES: usize = 400;
 
 /// a failed run's error as ONE bounded chat line: whitespace runs (newlines
 /// included) collapse to single spaces, then the excerpt bound applies.
+/// The failure's detail for its code block: the reason as written, lines and
+/// all, clipped to the excerpt budget.
+fn failure_detail(reason: &str) -> String {
+    let detail = reason.trim();
+    if detail.is_empty() {
+        return "no error detail".into();
+    }
+    crate::truncate_on_boundary(detail, FAILURE_EXCERPT_BYTES, "…")
+}
+
 pub(super) fn failure_excerpt(reason: &str) -> String {
     let line = reason.split_whitespace().collect::<Vec<_>>().join(" ");
     if line.is_empty() {
@@ -1663,13 +1681,18 @@ impl RunsModule {
         } else {
             agent.display_name.as_str()
         };
-        let text = format!("⚠ {name} failed: {}", failure_excerpt(reason));
+        // The reason rides in a code block: an error is a program's words,
+        // and a code block keeps its lines and lets the reader copy it.
+        let blocks = [
+            paragraph_block(format!("⚠ {name} failed")),
+            code_block(failure_detail(reason)),
+        ];
         self.reply_msg(
             ctx,
             run_id,
             entry,
             "reply",
-            &[paragraph_block(text)],
+            &blocks,
             None,
             &mut ReplyPosts::default(),
         )

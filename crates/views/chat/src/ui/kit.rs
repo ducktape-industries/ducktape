@@ -86,8 +86,8 @@ fn reaction_pill(
     pill
 }
 
-/// The way into a message's thread: the reply count in the accent, and
-/// beside it the invitation, on one quiet row.
+/// The way into a message's thread: an outlined chip under the message with
+/// the reply count in the accent and the invitation beside it.
 fn reply_link(key: String, replies: i64, open: Message) -> wire::Node {
     let p = native::palette();
     let content = native::spaced(
@@ -110,10 +110,10 @@ fn reply_link(key: String, replies: i64, open: Message) -> wire::Node {
         8.,
     );
     let mut button = native::button_child(
-        key,
+        key.clone(),
         content,
         Some(slots::message(open)),
-        wire::ButtonPreset::Subtle,
+        wire::ButtonPreset::Secondary,
     );
     if let wire::Node::Button {
         label,
@@ -123,15 +123,24 @@ fn reply_link(key: String, replies: i64, open: Message) -> wire::Node {
     } = &mut button
     {
         *label = Some("Open thread".into());
-        *height = Some(wire::Length::Fixed(24.));
+        *height = Some(wire::Length::Fixed(26.));
         *padding = Some(wire::Edges {
             top: 0.,
-            right: 8.,
+            right: 10.,
             bottom: 0.,
-            left: 6.,
+            left: 10.,
         });
     }
-    native::sized(button, Some(wire::Length::Shrink), None)
+    // A row hugs the chip; a column would stretch it across the message.
+    native::padded(
+        native::row(format!("{key}/hug"), [button]),
+        wire::Edges {
+            top: 2.,
+            right: 0.,
+            bottom: 0.,
+            left: 0.,
+        },
+    )
 }
 
 impl ChatView {

@@ -598,7 +598,8 @@ const LIVE_AGENT_TEXT_BUDGET: usize = 6 << 10;
 
 /// The bytes a live run hint puts on the wire as text.
 fn live_text_bytes(hint: &crate::backend::LiveRunHint) -> usize {
-    hint.agent.len() + hint.status.len()
+    let activity: usize = hint.activity.iter().map(|act| act.label.len()).sum();
+    hint.agent.len() + hint.status.len() + activity + hint.answer_preview.len()
 }
 
 /// The runs anchored in `channel_id` whose hints fit `budget`, newest anchor
