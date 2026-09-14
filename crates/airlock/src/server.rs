@@ -1125,9 +1125,9 @@ async fn proxy_inner(
     }
     // Account routing belongs to the credential holder, never the child or
     // the broker (Pi supplies a deliberately fictitious account in its token).
-    let account_id = match entry.kind {
-        CredentialKind::Claude => None,
-        CredentialKind::Codex => codex_account_id(&access),
+    let account_id = match vendor {
+        ModelVendor::Claude => None,
+        ModelVendor::Codex => codex_account_id(&access),
     };
     if let Some(account_id) = account_id {
         rb = rb.header("chatgpt-account-id", account_id);

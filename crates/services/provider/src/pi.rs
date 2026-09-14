@@ -20,6 +20,11 @@ pub(crate) fn configure(
     let provider = match endpoint.kind {
         crate::CredentialKind::Claude => "anthropic",
         crate::CredentialKind::Codex => "openai-codex",
+        crate::CredentialKind::AppleCodesign => {
+            return Err(
+                "credential kind apple-codesign is a signing identity, not a model lane".into(),
+            );
+        }
     };
     let models = json!({"providers": {provider: {
         "baseUrl": endpoint.base_url,
