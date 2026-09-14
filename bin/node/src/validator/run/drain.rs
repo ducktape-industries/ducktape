@@ -1,7 +1,5 @@
 //! Finalized-block drain, checkpoint, and epoch-cutover handling.
 
-use std::collections::HashSet;
-
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::{Recipients, Sender as _};
@@ -77,7 +75,7 @@ fn decide_prune_action(
 fn stall_window(cadence: consensus::Cadence) -> std::time::Duration {
     cadence.block_time * 30
 }
-use crate::validator::code_announce::CodeVerdict;
+use crate::validator::code_announce::{CodeVerdict, Role};
 use crate::{join_gate, relay};
 use noded::projection::{BlockProjection, project_block};
 
@@ -1459,55 +1457,16 @@ impl ValidatorRuntime<'_> {
         }
     }
 
-    /// the digests OPEN `RegisterModule`/`UpdateModule` proposals name, read
-    /// from governance ONLY when its root has moved since the last read.
-    ///
-    /// the walk instantiates governance's guest — the same cost class as the
-    /// registry read this pump already pays each tick (~20 ms measured on a
-    /// three-node e2e cluster), on the loop that also answers `/v1` and the
-    /// RPC lane. paying it again every tick buys nothing: governance's root is
-    /// exactly the change gate for this set, since no ballot opens, closes or
-    /// moves without it.
-    ///
-    /// a net with no governance module (no root) names no proposed code, and
-    /// neither does a reply that is not the listing: an EMPTY set, never a
-    /// skipped refresh — the registry half drives readiness on its own.
-    async fn proposed_code_blobs(
-        node: &super::ValidatorNode,
-        cache: &mut Option<(sdk::StateRoot, HashSet<[u8; 32]>)>,
-    ) -> HashSet<[u8; 32]> {
-        let Some(root) = node.host().module_root("governance") else {
-            *cache = None;
-            return HashSet::new();
-        };
-        if let Some((read_at, digests)) = cache.as_ref()
-            && *read_at == root
-        {
-            return digests.clone();
-        }
-        let req = governance::encode_query(&governance::GovQuery::Proposals);
-        let reply = node.host().query("governance", &req).await;
-        let Ok(Ok(governance::GovReply::Proposals(proposals))) =
-            reply.as_deref().map(governance::decode_reply)
-        else {
-            // a read that failed or answered something else names nothing
-            // THIS tick and is retried on the next — never cached, because
-            // no root change would invalidate that emptiness.
-            return HashSet::new();
-        };
-        let digests = crate::code_plane::code_blobs_proposed(&proposals);
-        *cache = Some((root, digests.clone()));
-        digests
-    }
-
-    // CODE READINESS: the byte-receipt half of a pending modreg swap.
-    // a current boundary member checks the committed pending swaps against
-    // its LOCAL blob store: verified-resident bytes earn one truthful
-    // validator-origin `SignalReady` (the covering signal latches the swap
-    // `ready` in consensus); missing bytes spawn one ranged mesh fetch
-    // (the custodian's data-plane push normally lands first — this heals a
-    // node the push missed). state-driven and idempotent; inert while
-    // nothing is pending.
+    // CODE READINESS: the byte-receipt half of a pending modreg swap, and
+    // the byte PULL lane beside it. EVERY member checks the committed pending
+    // swaps and the OPEN code ballots against its LOCAL blob store and spawns
+    // one ranged mesh fetch per digest it lacks (the custodian's data-plane
+    // push normally lands first — this heals a node the push missed, and
+    // carries a proposal's bytes to a node that must hold them before the
+    // ballot closes). A CURRENT boundary member additionally earns one
+    // truthful validator-origin `SignalReady` per verified-resident swap
+    // (the covering signal latches the swap `ready` in consensus).
+    // state-driven and idempotent; inert while nothing is pending or open.
     async fn pump_code_readiness(&mut self) {
         let Self {
             node,
@@ -1526,32 +1485,8 @@ impl ValidatorRuntime<'_> {
             ..
         } = self;
         // reap finished fetch tasks first, so a failed fetch retries — on a
-        // BACKOFF, and speaking only on the first failure and every Nth after
-        // it. Nobody serving these bytes is the steady state, not a blip: the
-        // peer book may be empty (refused synchronously) and the module never
-        // clears a pending swap, so an unpaced retry+warn here is a permanent
-        // ~10/s log bomb that evicts the ring an operator restarted to read.
-        // The warn lives HERE rather than in the task because this is where
-        // the attempt counter — the actual diagnosis — is.
-        while let Ok((digest, failure)) = fetch_done_rx.try_recv() {
-            let Some(error) = failure else {
-                code_signaller.fetch_succeeded(&digest);
-                continue;
-            };
-            let attempt = code_signaller.fetch_failed(&digest);
-            if !attempt.speak {
-                continue;
-            }
-            tracing::warn!(
-                target: "ducktape::modules",
-                node = %label,
-                reason = "code_fetch_unserved",
-                digest = %crate::config::hex_bytes(&digest),
-                attempts = attempt.attempts,
-                error = %error,
-                "pending-swap code fetch failed"
-            );
-        }
+        // backoff, speaking only on the first failure and every Nth after it.
+        code_signaller.reap_fetches(fetch_done_rx, label);
         code_signaller.tick_fetch_backoff();
         let req = modules::encode_query(&modules::ModulesQuery::ModuleStatus);
         let Ok(bytes) = node.host().query(host::MODULES_ID, &req).await else {
@@ -1570,7 +1505,8 @@ impl ValidatorRuntime<'_> {
         // that on every tick as well as the registry read put this loop past
         // the RPC lane's 10 s deadline. nothing but a governance state change
         // can move the set, and the root is exactly that.
-        let proposed = Self::proposed_code_blobs(node, proposed_code).await;
+        let proposed =
+            crate::validator::code_announce::proposed_code_blobs(node.host(), proposed_code).await;
         // the code plane's push admission gate reads THIS set (#1833): a
         // digest nothing here names any more is refused before any staging.
         // reclaim rides the same registry-change point — whatever fell out
@@ -1579,16 +1515,19 @@ impl ValidatorRuntime<'_> {
         // once justified it. activation history stays referenced because
         // checkpoint restore and replay use it.
         let mut referenced = crate::code_plane::code_blobs_referenced(&modules);
-        referenced.extend(proposed);
+        referenced.extend(proposed.iter().copied());
         for digest in code_registry.update(referenced) {
             blobs.forget(&digest);
         }
-        if !orchestrator
+        // the ONE role read: a seat in the current boundary signals; anyone
+        // else running this loop (a seat that rotated out) only pulls.
+        let seated = orchestrator
             .current_members()
-            .contains(&signer.public_key())
-        {
-            return;
-        }
+            .contains(&signer.public_key());
+        let role = match seated {
+            true => Role::Validator,
+            false => Role::Resident,
+        };
         // residency is a VERIFYING read (content re-hashed on the disk path)
         // AND a LOADABILITY read: signing ready must mean sha256(local bytes)
         // == committed hash AND "this binary can instantiate them" AND "this
@@ -1607,7 +1546,8 @@ impl ValidatorRuntime<'_> {
         // and unloadable alike — and every validator pays it at the same
         // moment, right after the swap commits.
         let height = node.finalized().map_or(0, |f| f.height);
-        let actions = code_signaller.decide(height, &modules, |entry, digest| {
+        let held = |digest: &[u8; 32]| blobs.has_verified_chunk(digest);
+        let verdict = |entry: &modules::ModuleCode, digest: &[u8; 32]| {
             let Some(bytes) = blobs.get_chunk(digest) else {
                 return CodeVerdict::Absent;
             };
@@ -1633,7 +1573,14 @@ impl ValidatorRuntime<'_> {
                     detail: detail.lines().next().unwrap_or_default().to_string(),
                 },
             }
-        });
+        };
+        let actions = code_signaller.decide(role, height, &modules, &proposed, held, verdict);
+        crate::validator::code_announce::spawn_fetches(
+            actions.fetches,
+            blob_client,
+            blobs,
+            fetch_done_tx,
+        );
         for (key, detail) in actions.refusals {
             tracing::warn!(
                 target: "ducktape::modules",
@@ -1645,25 +1592,6 @@ impl ValidatorRuntime<'_> {
                 "pending-swap code refused: this binary cannot instantiate it, so \
                  this node will not signal ready"
             );
-        }
-        for digest in actions.fetches {
-            let client = blob_client.clone();
-            let blobs = blobs.clone();
-            let done = fetch_done_tx.clone();
-            tokio::spawn(async move {
-                // the OUTCOME goes back to the pump, which owns the attempt
-                // counter, the backoff and the (latched) warning.
-                let failure = crate::blob_fetch::fetch_blob(
-                    &client,
-                    &blobs,
-                    &digest,
-                    crate::constants::MAX_MODULE_CODE_BYTES,
-                    crate::constants::BLOB_FETCH_ATTEMPTS,
-                )
-                .await
-                .err();
-                let _ = done.send((digest, failure));
-            });
         }
         for (key, msg) in actions.signals {
             let seq = *next_seq;
