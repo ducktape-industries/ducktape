@@ -75,12 +75,16 @@ impl FilesView {
         if let wire::Node::Linear { width, .. } = &mut column {
             *width = Some(wire::Length::Fixed(COLUMN_WIDTH));
         }
-        native::spaced(
-            native::row(
-                format!("{key}/framed"),
-                [column, native::vertical_divider(format!("{key}/edge"))],
+        native::sized(
+            native::spaced(
+                native::row(
+                    format!("{key}/framed"),
+                    [column, native::vertical_divider(format!("{key}/edge"))],
+                ),
+                0.,
             ),
-            0.,
+            Some(wire::Length::Shrink),
+            Some(wire::Length::Fill),
         )
     }
 
