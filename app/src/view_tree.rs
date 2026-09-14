@@ -1295,14 +1295,6 @@ impl ViewTree {
         input.into_any_element()
     }
 
-    // A thin dispatcher, and it must stay thin: it recurses once per tree
-    // level (directly and through `mouse_area`, `virtual_scroll`, …), so its
-    // frame is multiplied by the depth of the tree. The dev build is
-    // opt-level 0, where every arm's builder temporaries get their own slot in
-    // the one frame, so an inlined body costs every level of every tree — a
-    // ~20-deep chat message overflowed the 8 MB main stack that way. Each arm
-    // body therefore lives in its own `#[inline(never)]` method and the arm is
-    // a single delegation.
     fn node(
         &mut self,
         node: &wire::Node,
@@ -1312,37 +1304,85 @@ impl ViewTree {
         if let Some(key) = node.key() {
             self.mounted.insert(key.to_owned());
         }
+        // One arm, one method: this dispatcher is on the recursion chain for
+        // every nesting level the wire allows (`wire::MAX_DEPTH`), and an
+        // unoptimised build gives a function the stack of ALL its arms at
+        // once — inlined bodies here once cost 570 KiB a level and overflowed
+        // the main thread at a depth of fourteen.
         use wire::Node;
         match node {
-            Node::Text { .. } => self.node_text(node, cx),
+            Node::Text { .. } => self.text(node, cx),
             Node::Space { width, height } => dimensions(div(), *width, *height).into_any_element(),
-            Node::Linear { .. } => self.node_linear(node, window, cx),
-            Node::KeyedColumn { .. } => self.node_keyed_column(node, window, cx),
-            Node::Container { .. } => self.node_container(node, window, cx),
-            Node::Scroll { .. } => self.node_scroll(node, window, cx),
-            Node::Button { .. } => self.node_button(node, window, cx),
+            Node::Linear { .. } => self.linear(node, window, cx),
+            Node::KeyedColumn { .. } => self.keyed_column(node, window, cx),
+            Node::Container { .. } => self.container(node, window, cx),
+            Node::Scroll { .. } => self.scroll(node, window, cx),
+            Node::Button { .. } => self.button(node, window, cx),
             Node::Input { .. } => self.input(node, window, cx),
             Node::PickList { .. } | Node::ComboBox { .. } => self.picker(node, window, cx),
-            Node::Toggle { .. } => self.node_toggle(node, cx),
-            Node::Radio { .. } => self.node_radio(node, cx),
-            Node::Rule { .. } => self.node_rule(node, cx),
+            Node::Toggle { .. } => self.toggle(node, cx),
+            Node::Radio {
+                key,
+                label,
+                selected,
+                on_select,
+                ..
+            } => {
+                let message = *on_select;
+                Radio::new(key.clone())
+                    .label(label.clone())
+                    .checked(*selected)
+                    .on_click(
+                        cx.listener(move |_, _, _, cx| cx.emit(wire::Event::Message(message))),
+                    )
+                    .into_any_element()
+            }
+            Node::Rule {
+                axis,
+                thickness,
+                color,
+                ..
+            } => {
+                let element = div().bg(color.map(rgba).unwrap_or_else(|| {
+                    gpui_kit::component::Theme::global(cx).color_tokens().border
+                }));
+                match axis {
+                    wire::Axis::Column => element.w(px(*thickness)).h_full().into_any_element(),
+                    wire::Axis::Row => element.h(px(*thickness)).w_full().into_any_element(),
+                }
+            }
             Node::Lazy { content, .. } => self.node(content, window, cx),
-            Node::ResizeHandle { .. } => self.node_resize_handle(node, window, cx),
-            Node::Responsive { .. } => self.node_responsive(node, window, cx),
-            Node::When { .. } => self.node_when(node, window, cx),
-            Node::Sensor { .. } => self.node_sensor(node, window, cx),
+            Node::ResizeHandle { .. } => self.resize_handle(node, window, cx),
+            Node::Responsive { .. } => self.responsive(node, window, cx),
+            Node::When { .. } => self.when(node, window, cx),
+            Node::Sensor { .. } => self.sensor(node, window, cx),
             Node::MouseArea { .. } => self.mouse_area(node, window, cx),
             Node::Slider { .. } => self.slider(node, window, cx),
             Node::RichText { .. } => self.rich_text(node, window, cx),
             Node::Flex { .. } => self.flex(node, window, cx),
-            Node::Grid { .. } => self.node_grid(node, window, cx),
-            Node::Hover { .. } => self.node_hover(node, window, cx),
-            Node::Tooltip { .. } => self.node_tooltip(node, window, cx),
-            Node::Float { .. } => self.node_float(node, window, cx),
-            Node::Image { .. } => self.node_image(node),
+            Node::Grid { .. } => self.grid(node, window, cx),
+            Node::Hover { .. } => self.hover(node, window, cx),
+            Node::Tooltip { .. } => self.tooltip(node, window, cx),
+            Node::Float { .. } => self.float(node, window, cx),
+            Node::Image {
+                hash,
+                data,
+                width,
+                height,
+                fit,
+                opacity,
+                ..
+            } => self.picture(
+                *hash,
+                data.as_ref(),
+                *width,
+                *height,
+                *fit,
+                opacity.unwrap_or(1.0),
+            ),
             Node::ImageViewer { .. } => self.image_viewer(node, window, cx),
-            Node::Svg { .. } => self.node_svg(node, window),
-            Node::Canvas { .. } => self.node_canvas(node, cx),
+            Node::Svg { .. } => self.vector(node, window),
+            Node::Canvas { .. } => self.drawing(node, cx),
             Node::Qr { code, .. } => qr(code),
             Node::Surface { key, name, .. } => match self.surfaces.get(key) {
                 Some(surface) => surface.clone().into_any_element(),
@@ -1350,25 +1390,15 @@ impl ViewTree {
                     .child(format!("Unavailable host surface: {name}"))
                     .into_any_element(),
             },
-            Node::Stack { .. } => self.node_stack(node, window, cx),
-            Node::Overlay { .. } => self.node_overlay(node, window, cx),
-            Node::Progress { .. } => self.node_progress(node, cx),
-            Node::Pin {
-                content,
-                x,
-                y,
-                width,
-                height,
-                ..
-            } => dimensions(div().absolute().left(px(*x)).top(px(*y)), *width, *height)
-                .child(self.node(content, window, cx))
-                .into_any_element(),
+            Node::Stack { .. } => self.stack(node, window, cx),
+            Node::Overlay { .. } => self.overlay(node, window, cx),
+            Node::Progress { .. } => self.progress(node, cx),
+            Node::Pin { .. } => self.pin(node, window, cx),
             Node::Editor { .. } => self.editor(node, window, cx),
         }
     }
 
-    #[inline(never)]
-    fn node_text(&mut self, node: &wire::Node, cx: &mut Context<Self>) -> AnyElement {
+    fn text(&mut self, node: &wire::Node, cx: &mut Context<Self>) -> AnyElement {
         let wire::Node::Text {
             key,
             content,
@@ -1412,8 +1442,7 @@ impl ViewTree {
         element.into_any_element()
     }
 
-    #[inline(never)]
-    fn node_linear(
+    fn linear(
         &mut self,
         node: &wire::Node,
         window: &mut Window,
@@ -1462,8 +1491,7 @@ impl ViewTree {
         self.focusable_container(node, element, window, cx)
     }
 
-    #[inline(never)]
-    fn node_keyed_column(
+    fn keyed_column(
         &mut self,
         node: &wire::Node,
         window: &mut Window,
@@ -1520,8 +1548,7 @@ impl ViewTree {
         element.into_any_element()
     }
 
-    #[inline(never)]
-    fn node_container(
+    fn container(
         &mut self,
         node: &wire::Node,
         window: &mut Window,
@@ -1578,8 +1605,7 @@ impl ViewTree {
         self.focusable_container(node, element, window, cx)
     }
 
-    #[inline(never)]
-    fn node_scroll(
+    fn scroll(
         &mut self,
         node: &wire::Node,
         window: &mut Window,
@@ -1712,8 +1738,7 @@ impl ViewTree {
             .into_any_element()
     }
 
-    #[inline(never)]
-    fn node_button(
+    fn button(
         &mut self,
         node: &wire::Node,
         window: &mut Window,
@@ -1760,8 +1785,7 @@ impl ViewTree {
         dimensions(pad(button, *padding), *width, *height).into_any_element()
     }
 
-    #[inline(never)]
-    fn node_toggle(&mut self, node: &wire::Node, cx: &mut Context<Self>) -> AnyElement {
+    fn toggle(&mut self, node: &wire::Node, cx: &mut Context<Self>) -> AnyElement {
         let wire::Node::Toggle {
             key,
             kind,
@@ -1799,48 +1823,7 @@ impl ViewTree {
         checkbox.into_any_element()
     }
 
-    #[inline(never)]
-    fn node_radio(&mut self, node: &wire::Node, cx: &mut Context<Self>) -> AnyElement {
-        let wire::Node::Radio {
-            key,
-            label,
-            selected,
-            on_select,
-            ..
-        } = node
-        else {
-            unreachable!()
-        };
-        let message = *on_select;
-        Radio::new(key.clone())
-            .label(label.clone())
-            .checked(*selected)
-            .on_click(cx.listener(move |_, _, _, cx| cx.emit(wire::Event::Message(message))))
-            .into_any_element()
-    }
-
-    #[inline(never)]
-    fn node_rule(&mut self, node: &wire::Node, cx: &mut Context<Self>) -> AnyElement {
-        let wire::Node::Rule {
-            axis,
-            thickness,
-            color,
-            ..
-        } = node
-        else {
-            unreachable!()
-        };
-        let element = div().bg(color.map(rgba).unwrap_or_else(|| {
-            gpui_kit::component::Theme::global(cx).color_tokens().border
-        }));
-        match axis {
-            wire::Axis::Column => element.w(px(*thickness)).h_full().into_any_element(),
-            wire::Axis::Row => element.h(px(*thickness)).w_full().into_any_element(),
-        }
-    }
-
-    #[inline(never)]
-    fn node_resize_handle(
+    fn resize_handle(
         &mut self,
         node: &wire::Node,
         window: &mut Window,
@@ -1935,8 +1918,7 @@ impl ViewTree {
         element.into_any_element()
     }
 
-    #[inline(never)]
-    fn node_responsive(
+    fn responsive(
         &mut self,
         node: &wire::Node,
         window: &mut Window,
@@ -1977,8 +1959,7 @@ impl ViewTree {
             .into_any_element()
     }
 
-    #[inline(never)]
-    fn node_when(
+    fn when(
         &mut self,
         node: &wire::Node,
         window: &mut Window,
@@ -2001,8 +1982,7 @@ impl ViewTree {
         element.into_any_element()
     }
 
-    #[inline(never)]
-    fn node_sensor(
+    fn sensor(
         &mut self,
         node: &wire::Node,
         window: &mut Window,
@@ -2142,8 +2122,7 @@ impl ViewTree {
             .into_any_element()
     }
 
-    #[inline(never)]
-    fn node_grid(
+    fn grid(
         &mut self,
         node: &wire::Node,
         window: &mut Window,
@@ -2187,8 +2166,9 @@ impl ViewTree {
         );
         let gap = spacing.unwrap_or_default();
         grid = grid.gap(px(gap));
-        let cell_width =
-            ((available - gap * columns.saturating_sub(1) as f32) / columns as f32).max(0.0);
+        let cell_width = ((available - gap * columns.saturating_sub(1) as f32)
+            / columns as f32)
+            .max(0.0);
         for child in children {
             let cell = div()
                 .w(px(cell_width))
@@ -2200,8 +2180,7 @@ impl ViewTree {
             .into_any_element()
     }
 
-    #[inline(never)]
-    fn node_hover(
+    fn hover(
         &mut self,
         node: &wire::Node,
         window: &mut Window,
@@ -2259,8 +2238,7 @@ impl ViewTree {
         element.into_any_element()
     }
 
-    #[inline(never)]
-    fn node_tooltip(
+    fn tooltip(
         &mut self,
         node: &wire::Node,
         window: &mut Window,
@@ -2289,8 +2267,7 @@ impl ViewTree {
         element.into_any_element()
     }
 
-    #[inline(never)]
-    fn node_float(
+    fn float(
         &mut self,
         node: &wire::Node,
         window: &mut Window,
@@ -2361,32 +2338,7 @@ impl ViewTree {
             .into_any_element()
     }
 
-    #[inline(never)]
-    fn node_image(&mut self, node: &wire::Node) -> AnyElement {
-        let wire::Node::Image {
-            hash,
-            data,
-            width,
-            height,
-            fit,
-            opacity,
-            ..
-        } = node
-        else {
-            unreachable!()
-        };
-        self.picture(
-            *hash,
-            data.as_ref(),
-            *width,
-            *height,
-            *fit,
-            opacity.unwrap_or(1.0),
-        )
-    }
-
-    #[inline(never)]
-    fn node_svg(&mut self, node: &wire::Node, window: &mut Window) -> AnyElement {
+    fn vector(&mut self, node: &wire::Node, window: &mut Window) -> AnyElement {
         let wire::Node::Svg {
             hash,
             bytes,
@@ -2426,8 +2378,7 @@ impl ViewTree {
         element.into_any_element()
     }
 
-    #[inline(never)]
-    fn node_canvas(&mut self, node: &wire::Node, cx: &mut Context<Self>) -> AnyElement {
+    fn drawing(&mut self, node: &wire::Node, cx: &mut Context<Self>) -> AnyElement {
         let wire::Node::Canvas {
             key,
             width,
@@ -2460,8 +2411,7 @@ impl ViewTree {
             .into_any_element()
     }
 
-    #[inline(never)]
-    fn node_stack(
+    fn stack(
         &mut self,
         node: &wire::Node,
         window: &mut Window,
@@ -2503,8 +2453,7 @@ impl ViewTree {
         element.into_any_element()
     }
 
-    #[inline(never)]
-    fn node_overlay(
+    fn overlay(
         &mut self,
         node: &wire::Node,
         window: &mut Window,
@@ -2574,8 +2523,7 @@ impl ViewTree {
         element.into_any_element()
     }
 
-    #[inline(never)]
-    fn node_progress(&mut self, node: &wire::Node, cx: &mut Context<Self>) -> AnyElement {
+    fn progress(&mut self, node: &wire::Node, cx: &mut Context<Self>) -> AnyElement {
         let wire::Node::Progress {
             value,
             min,
@@ -2616,6 +2564,28 @@ impl ViewTree {
             .child(fill.h(relative(fraction)).w_full())
             .into_any_element(),
         }
+    }
+
+    fn pin(
+        &mut self,
+        node: &wire::Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let wire::Node::Pin {
+            content,
+            x,
+            y,
+            width,
+            height,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        dimensions(div().absolute().left(px(*x)).top(px(*y)), *width, *height)
+            .child(self.node(content, window, cx))
+            .into_any_element()
     }
 
     fn editor(

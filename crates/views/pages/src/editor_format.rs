@@ -129,7 +129,7 @@ pub fn target(document: &Doc) -> Range<usize> {
     let caret = document.offset(document.cursor.position);
     if let Some(anchor) = document.cursor.selection {
         let anchor = document.offset(anchor);
-        return caret.min(anchor)..caret.max(anchor);
+        return past_prefix(document, caret.min(anchor)..caret.max(anchor));
     }
     let text = &document.text;
     let is_word = |c: char| c.is_alphanumeric() || c == '\'';
@@ -142,7 +142,21 @@ pub fn target(document: &Doc) -> Range<usize> {
     let end = text[caret..]
         .find(|c| !is_word(c))
         .map_or(text.len(), |offset| caret + offset);
-    start..end
+    past_prefix(document, start..end)
+}
+
+/// A selection that swallowed the block prefix — Shift+Home on a quote, a
+/// todo, a heading — marks the words after it. The prefix is the block's
+/// shape, never part of what an inline mark wraps: `[> quote](url)` is a
+/// paragraph that lost its quote.
+fn past_prefix(document: &Doc, range: Range<usize>) -> Range<usize> {
+    let line = document.position_at(range.start).line as usize;
+    let Some(text) = document.line(line) else {
+        return range;
+    };
+    let base = document.offset(editor::EditorPosition::new(line, 0));
+    let content = base + content_start(text);
+    range.start.max(content).min(range.end)..range.end
 }
 
 /// The title is a page property, not prose: line 0 takes no inline marks.

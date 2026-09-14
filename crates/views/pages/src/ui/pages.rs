@@ -767,22 +767,27 @@ impl PagesView {
         if let Node::Container {
             clip,
             width,
-            height,
             padding,
             ..
         } = &mut card
         {
             *clip = true;
             *width = Some(Length::Fill);
-            *height = Some(Length::Fill);
             *padding = Some(wire::Edges::all(12.));
         }
-        kit::sized(
+        // The card is as tall as its threads: a block with one note is a
+        // short card, not 400px of blank under it. The limit is a ceiling the
+        // thread list scrolls under, never the height of an empty card.
+        let mut frame = kit::sized(
             kit::container("PagesView/root/pages/comments-card", card),
             Some(Length::Fixed(
                 crate::host::comments_card_width(self.pages_pane_width) as f32,
             )),
-            Some(Length::Fixed(limit)),
-        )
+            None,
+        );
+        if let Node::Container { max_height, .. } = &mut frame {
+            *max_height = Some(limit);
+        }
+        frame
     }
 }
