@@ -17,14 +17,25 @@
 //! replayed older manifest is `sequence_not_newer`; a replaced archive fails
 //! the manifest's sha256. Withholding is the only thing an open directory
 //! lets a stranger do.
+//!
+//! `release sign-bundle` is the macOS signing step when a release is signed
+//! by the airlock gateway rather than a local Developer ID
+//! (`DUCKTAPE_SIGN_VIA=airlock` in `make release-app`): it reaches the
+//! enclave the way a provider run does, through the node's browser gateway
+//! onto the overlay, and comes back with the signed, notarized, stapled
+//! bundle. See [`sign_bundle`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use airlock::client::Gateway;
+use airlock::wire::WorkRef;
+use airlock::{bodyseal, sign};
 use app_update::{
     Artifact, Manifest, PublicKey, Release, SCHEMA, Sha, Signature, SuccessorKey, layout,
 };
 
+use crate::cli_args::NodeAddr;
 use crate::userkey_cli;
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;
@@ -39,6 +50,10 @@ pub(crate) enum ReleaseCmd {
     Sign(SignArgs),
     /// verify a manifest against its `.sig` under a release public key
     Verify(VerifyArgs),
+    /// sign, notarize and staple an UNSIGNED `Ducktape.app` through the
+    /// airlock gateway holding an `apple-codesign` credential; writes the
+    /// signed `.tar.zst` the enclave returned
+    SignBundle(SignBundleArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -96,12 +111,33 @@ pub(crate) struct VerifyArgs {
     pub pubkey: PublicKey,
 }
 
+#[derive(Debug, clap::Args)]
+pub(crate) struct SignBundleArgs {
+    /// the UNSIGNED bundle: a `Ducktape.app` directory (what `make app`
+    /// stages under `DUCKTAPE_SIGN_VIA=airlock`) or its `.tar.zst`
+    pub bundle: PathBuf,
+    /// the `apple-codesign` credential's on-chain name — the session's `sub`
+    #[arg(long, value_name = "NAME")]
+    pub credential: String,
+    /// where to write the signed `.tar.zst`, byte for byte as the enclave
+    /// returned it
+    #[arg(long, value_name = "PATH")]
+    pub out: PathBuf,
+    /// also unpack the signed `Ducktape.app/` into this directory, replacing
+    /// the one already there (what `ops/release/archive.sh --from` packs)
+    #[arg(long, value_name = "DIR")]
+    pub unpack_into: Option<PathBuf>,
+    #[command(flatten)]
+    pub addr: NodeAddr,
+}
+
 pub(crate) fn run(cmd: ReleaseCmd) -> CommandResult {
     let mut stdin = std::io::BufReader::new(std::io::stdin());
     match cmd {
         ReleaseCmd::Manifest(args) => manifest(args),
         ReleaseCmd::Sign(args) => sign(args, &mut stdin),
         ReleaseCmd::Verify(args) => verify(args),
+        ReleaseCmd::SignBundle(args) => sign_bundle(args),
     }
 }
 
@@ -271,4 +307,692 @@ fn verify(args: VerifyArgs) -> CommandResult {
     }
     println!("ok");
     Ok(())
+}
+
+// ============================================================================
+// sign-bundle
+// ============================================================================
+
+/// The gateway route the enclave is served under: `<AIRLOCK_ROUTE>.<owner
+/// handle>.duck`, the label the lender daemon and the credential resolver both
+/// use (`bin/node/src/compute/cred.rs`).
+const AIRLOCK_ROUTE: &str = crate::airlock::AIRLOCK_ROUTE;
+/// The enclave's signing route.
+const SIGN_ROUTE: &str = "/sign/macos-bundle";
+/// Total deadline for the one signing request. Apple's notary wait runs
+/// minutes, not seconds, so the client this crate shares for the handshake
+/// (20 s total) is the wrong shape here.
+const SIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// The bundle's user-facing version keys, read out of `Info.plist` for the
+/// shape check.
+const VERSION_KEYS: [&str; 2] = ["CFBundleShortVersionString", "CFBundleVersion"];
+
+/// Where the signing enclave is and what the overlay admits on the way there,
+/// resolved from committed state the same way a provider run resolves a
+/// credential: the record names the owner, the owner's handle names the
+/// route, the route's policy caps the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SigningGateway {
+    /// `airlock.<owner-handle>.duck`
+    authority: String,
+    /// this node's browser-gateway base — the transport onto the overlay
+    via: String,
+    /// the on-chain seal key, pinned: the trust anchor for the session
+    seal_pk: [u8; 32],
+    /// the published route's `max_request_bytes`: what the overlay hop admits
+    /// for ONE request, measured from the record rather than assumed
+    max_request_bytes: u64,
+}
+
+/// What a bundle IS, independent of its signature: the identity and version
+/// its `Info.plist` names, the executables it carries and the views it ships.
+/// Signing adds `_CodeSignature/` and rewrites the Mach-Os; it changes none of
+/// these, so the reply is checked to carry the same shape as the request.
+/// Signature validity itself is the host's `codesign`/`spctl` call in
+/// `ops/release/archive.sh`, never this side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BundleShape {
+    bundle_id: String,
+    versions: BTreeMap<&'static str, Option<String>>,
+    macos: BTreeSet<String>,
+    views: BTreeSet<String>,
+}
+
+impl BundleShape {
+    /// Unpack `archive` into a scratch dir (the same rules the enclave unpacks
+    /// under) and read its shape. `what` names the side for the error.
+    fn of_archive(archive: &[u8], what: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let scratch = tempfile::tempdir().map_err(|e| format!("scratch dir: {e}"))?;
+        sign::unpack_bundle(archive, scratch.path())
+            .map_err(|refusal| format!("{what} archive: {refusal}"))?;
+        let bundle = scratch.path().join(sign::BUNDLE_NAME);
+        sign::validate_layout(&bundle).map_err(|refusal| format!("{what} bundle: {refusal}"))?;
+        Self::of_bundle(&bundle).map_err(|e| format!("{what} bundle: {e}").into())
+    }
+
+    fn of_bundle(bundle: &Path) -> Result<Self, String> {
+        let plist = std::fs::read_to_string(bundle.join("Contents/Info.plist"))
+            .map_err(|e| format!("read Info.plist: {e}"))?;
+        let bundle_id = sign::plist_string(&plist, "CFBundleIdentifier")
+            .ok_or("Info.plist names no CFBundleIdentifier")?;
+        let versions = VERSION_KEYS
+            .iter()
+            .map(|key| (*key, sign::plist_string(&plist, key)))
+            .collect();
+        let macos = entry_names(&bundle.join("Contents/MacOS"))?;
+        let views = entry_names(&bundle.join("Contents/Resources/views"))?;
+        Ok(Self {
+            bundle_id,
+            versions,
+            macos,
+            views,
+        })
+    }
+}
+
+fn entry_names(dir: &Path) -> Result<BTreeSet<String>, String> {
+    let listing = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+    let mut names = BTreeSet::new();
+    for entry in listing {
+        let entry = entry.map_err(|e| format!("read {}: {e}", dir.display()))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| format!("{}: non-UTF-8 entry name", dir.display()))?;
+        names.insert(name);
+    }
+    Ok(names)
+}
+
+/// The `.tar.zst` to send: a directory is packed the way the enclave packs its
+/// reply (and `ops/release/archive.sh` packs a release); a file is sent as is.
+fn load_unsigned_archive(bundle: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let meta = std::fs::metadata(bundle).map_err(|e| format!("read {}: {e}", bundle.display()))?;
+    let archive = if meta.is_dir() {
+        let is_the_bundle = bundle
+            .file_name()
+            .is_some_and(|name| name == sign::BUNDLE_NAME);
+        if !is_the_bundle {
+            return Err(format!(
+                "{} is a directory but not {}",
+                bundle.display(),
+                sign::BUNDLE_NAME
+            )
+            .into());
+        }
+        sign::pack_bundle(bundle).map_err(|e| format!("pack {}: {e}", bundle.display()))?
+    } else {
+        std::fs::read(bundle).map_err(|e| format!("read {}: {e}", bundle.display()))?
+    };
+    let too_large = archive.len() > sign::MAX_BUNDLE_BYTES;
+    if too_large {
+        return Err(format!(
+            "bundle_too_large: the archive is {} bytes, the signing route takes at most {}",
+            archive.len(),
+            sign::MAX_BUNDLE_BYTES
+        )
+        .into());
+    }
+    Ok(archive)
+}
+
+/// Resolve the credential NAME to its enclave, from committed state on the
+/// node this verb dials — the record, the owner's handle, the owner's
+/// `airlock` route, and this node's browser-gateway base.
+fn resolve_signing_gateway(
+    base: &str,
+    credential: &str,
+) -> Result<SigningGateway, Box<dyn std::error::Error>> {
+    let record = match crate::cred_cli::query_gateway(
+        base,
+        &gateway::GatewayQuery::Credential {
+            name: credential.to_string(),
+        },
+    )? {
+        gateway::GatewayReply::Credential(record) => record,
+        other => return Err(format!("unexpected gateway reply: {other:?}").into()),
+    };
+    let Some(record) = record else {
+        let registered = crate::cred_cli::list_credential_names(base)?;
+        return Err(format!(
+            "unknown credential: {credential} (registered: {})",
+            registered.join(", ")
+        )
+        .into());
+    };
+    // The same refusal the gateway makes (`credential_kind_mismatch`), made
+    // here before a session is opened on a model credential.
+    let is_signing_identity = record.kind == gateway::CredentialKind::AppleCodesign;
+    if !is_signing_identity {
+        return Err(format!(
+            "credential_kind_mismatch: {credential} is a {:?} credential, not apple-codesign",
+            record.kind
+        )
+        .into());
+    }
+    let handle = owner_handle(base, record.owner_account)?;
+    let name = gateway::RouteName::named(AIRLOCK_ROUTE);
+    let route = match crate::cred_cli::query_gateway(
+        base,
+        &gateway::GatewayQuery::Get {
+            account_id: record.owner_account,
+            name,
+        },
+    )? {
+        gateway::GatewayReply::Route(boxed) => *boxed,
+        other => return Err(format!("unexpected gateway reply: {other:?}").into()),
+    };
+    let policy = route
+        .and_then(|route| route.statement.route)
+        .map(|definition| definition.policy)
+        .ok_or_else(|| {
+            format!("credential owner ({handle}.duck) publishes no {AIRLOCK_ROUTE} route")
+        })?;
+    let via = crate::node_http::get_json(base, "/v1/gateway/browser")
+        .map_err(|error| format!("read this node's browser gateway base: {error}"))?["base"]
+        .as_str()
+        .ok_or("this node serves no browser gateway, so it cannot route a .duck authority")?
+        .to_string();
+    Ok(SigningGateway {
+        authority: format!("{AIRLOCK_ROUTE}.{handle}.duck"),
+        via,
+        seal_pk: record.seal_pk,
+        max_request_bytes: policy.max_request_bytes,
+    })
+}
+
+/// The `.duck` handle registered to `account_id`. One page, like the
+/// provider-side resolver: a network past `MAX_QUERY_LIMIT` handles needs
+/// pagination here.
+fn owner_handle(base: &str, account_id: u64) -> Result<String, Box<dyn std::error::Error>> {
+    let registrations = match crate::cred_cli::query_gateway(
+        base,
+        &gateway::GatewayQuery::Registrations {
+            from: 0,
+            limit: gateway::MAX_QUERY_LIMIT,
+        },
+    )? {
+        gateway::GatewayReply::Registrations(list) => list,
+        other => return Err(format!("unexpected gateway reply: {other:?}").into()),
+    };
+    registrations
+        .into_iter()
+        .find(|registration| registration.account_id == account_id)
+        .map(|registration| registration.handle)
+        .ok_or_else(|| "credential owner has no registered duck handle".into())
+}
+
+/// The sealed request against what the overlay hop admits. The route's cap is
+/// read off the published record, so the refusal names the number the
+/// network actually enforces rather than one copied from a crate.
+fn admitted_by_route(sealed_len: usize, target: &SigningGateway) -> Result<(), String> {
+    let fits = sealed_len as u64 <= target.max_request_bytes;
+    if fits {
+        return Ok(());
+    }
+    Err(format!(
+        "bundle_exceeds_route_cap: the sealed archive is {sealed_len} bytes, the {} route admits {} per request",
+        target.authority, target.max_request_bytes
+    ))
+}
+
+/// One signing exchange: a sealed session on the credential, the sealed
+/// archive up, the sealed reply stream down and opened. Returns the signed
+/// `.tar.zst` exactly as the enclave produced it.
+async fn request_signature(
+    target: &SigningGateway,
+    credential: &str,
+    archive: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let gw = Gateway::remote(target.authority.clone(), target.via.clone());
+    // The session names the credential and draws for no committed work; the
+    // enclave refuses plaintext on a signing credential, so it is sealed.
+    let (token, keys) = gw
+        .open_session_sealed(&target.seal_pk, credential, &WorkRef::Direct)
+        .await
+        .map_err(|e| format!("open a signing session on {credential}: {e:#}"))?;
+    let aad = bodyseal::request_aad("POST", SIGN_ROUTE);
+    let sealed = bodyseal::seal_request(&keys, &aad, archive);
+    admitted_by_route(sealed.len(), target)?;
+    let binding = bodyseal::request_binding(&sealed);
+    tracing::info!(
+        target: "ducktape::gateway",
+        event = "release_sign_submitted",
+        credential = %credential,
+        authority = %target.authority,
+        sha256_in = %sign::sha256_hex(archive),
+        size = archive.len(),
+        "release bundle sent for signing"
+    );
+    let http = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(SIGN_TIMEOUT)
+        .build()
+        .map_err(|e| format!("build http client: {e}"))?;
+    let response = gw
+        .route(http.post(gw.url(SIGN_ROUTE)))
+        .bearer_auth(&token)
+        .header(bodyseal::SEAL_HEADER, bodyseal::SEAL_V1)
+        .body(sealed)
+        .send()
+        .await
+        .map_err(|e| format!("signing request: {e}"))?;
+    let status = response.status();
+    let wire = response
+        .bytes()
+        .await
+        .map_err(|e| format!("signing reply: {e}"))?;
+    // Not `error_for_status`: the body IS the refusal token
+    // (`bundle_shape_refused`, `notary_rejected`, …), or the proxy's reason.
+    if !status.is_success() {
+        let reason = String::from_utf8_lossy(&wire).trim().to_string();
+        tracing::warn!(
+            target: "ducktape::gateway",
+            event = "release_sign_refused",
+            credential = %credential,
+            status = status.as_u16(),
+            reason = %reason,
+            "release signing refused"
+        );
+        return Err(format!("the gateway refused signing ({status}): {reason}").into());
+    }
+    let signed = open_signed_reply(&keys, &binding, &wire)?;
+    tracing::info!(
+        target: "ducktape::gateway",
+        event = "release_sign_received",
+        credential = %credential,
+        sha256_out = %sign::sha256_hex(&signed),
+        size = signed.len(),
+        "signed release bundle received"
+    );
+    Ok(signed)
+}
+
+/// Open the sealed chunk stream (salt, head, data…, Final) into the archive.
+fn open_signed_reply(
+    keys: &airlock::handshake::SessionKeys,
+    binding: &[u8],
+    wire: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut opener = bodyseal::StreamOpener::new(keys, binding);
+    let items = opener
+        .feed(wire)
+        .map_err(|e| format!("unseal the signing reply: {e}"))?;
+    if !opener.finished() {
+        return Err("reply_truncated: the sealed reply ended before its Final marker".into());
+    }
+    let mut content_type = None;
+    let mut archive = Vec::new();
+    for item in items {
+        match item {
+            bodyseal::OpenedItem::Head(kind) => content_type = Some(kind),
+            bodyseal::OpenedItem::Data(bytes) => archive.extend(bytes),
+            bodyseal::OpenedItem::Final => {}
+        }
+    }
+    let is_archive = content_type.as_deref() == Some("application/zstd");
+    if !is_archive {
+        return Err(format!(
+            "reply_not_an_archive: the enclave replied {}",
+            content_type.unwrap_or_default()
+        )
+        .into());
+    }
+    Ok(archive)
+}
+
+/// Write `bytes` to `out` through a sibling `.partial`, so a failed write
+/// never leaves a truncated archive under the final name.
+fn write_atomically(out: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut partial = out.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = PathBuf::from(partial);
+    std::fs::write(&partial, bytes).map_err(|e| format!("write {}: {e}", partial.display()))?;
+    std::fs::rename(&partial, out).map_err(|e| format!("rename to {}: {e}", out.display()))?;
+    Ok(())
+}
+
+/// Unpack the signed `Ducktape.app/` into `dir`, replacing the bundle already
+/// there (the unsigned one `make app` staged). Unpacked beside it first, so a
+/// refused archive leaves the staged bundle untouched.
+fn unpack_replacing(archive: &[u8], dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let stage =
+        tempfile::tempdir_in(dir).map_err(|e| format!("stage under {}: {e}", dir.display()))?;
+    sign::unpack_bundle(archive, stage.path())
+        .map_err(|refusal| format!("signed archive: {refusal}"))?;
+    let target = dir.join(sign::BUNDLE_NAME);
+    if target.exists() {
+        std::fs::remove_dir_all(&target)
+            .map_err(|e| format!("replace {}: {e}", target.display()))?;
+    }
+    std::fs::rename(stage.path().join(sign::BUNDLE_NAME), &target)
+        .map_err(|e| format!("move into {}: {e}", target.display()))?;
+    Ok(target)
+}
+
+/// `release sign-bundle` — see the module doc. Sync like its siblings; the
+/// airlock client is async, so one current-thread runtime is built here.
+fn sign_bundle(args: SignBundleArgs) -> CommandResult {
+    // a one-shot verb installs no sink; this one runs for minutes under
+    // Apple's notary wait and its lifecycle events are what the operator
+    // watches. `RUST_LOG` overrides.
+    crate::fs_cli::install_log_sink("info");
+    let archive = load_unsigned_archive(&args.bundle)?;
+    let sent = BundleShape::of_archive(&archive, "unsigned")?;
+    let base = args.addr.resolve()?;
+    let target = resolve_signing_gateway(&base, &args.credential)?;
+    tracing::info!(
+        target: "ducktape::gateway",
+        event = "release_sign_resolved",
+        credential = %args.credential,
+        authority = %target.authority,
+        route_max_request_bytes = target.max_request_bytes,
+        "signing enclave resolved"
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let signed = runtime.block_on(request_signature(&target, &args.credential, &archive))?;
+    let received = BundleShape::of_archive(&signed, "signed")?;
+    let same_bundle = received == sent;
+    if !same_bundle {
+        return Err(format!(
+            "bundle_shape_changed: the enclave returned a different bundle\n  sent:     {sent:?}\n  received: {received:?}"
+        )
+        .into());
+    }
+    write_atomically(&args.out, &signed)?;
+    let unpacked = match &args.unpack_into {
+        Some(dir) => Some(unpack_replacing(&signed, dir)?),
+        None => None,
+    };
+    println!("signed:  {}", args.out.display());
+    println!("sha256:  {}", sign::sha256_hex(&signed));
+    println!("size:    {}", signed.len());
+    if let Some(bundle) = unpacked {
+        println!("bundle:  {}", bundle.display());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser as _;
+    use std::io::Write as _;
+
+    #[derive(Debug, clap::Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        cmd: ReleaseCmd,
+    }
+
+    #[test]
+    fn sign_bundle_parses_its_flags() {
+        let cli = Cli::try_parse_from([
+            "release",
+            "sign-bundle",
+            "target/app-bundle/Ducktape.app",
+            "--credential",
+            "release-sign",
+            "--out",
+            "target/app-bundle/Ducktape-signed.tar.zst",
+            "--unpack-into",
+            "target/app-bundle",
+            "-n",
+            "chain-1",
+        ])
+        .unwrap();
+        let ReleaseCmd::SignBundle(args) = cli.cmd else {
+            panic!("parsed another verb");
+        };
+        assert_eq!(args.bundle, PathBuf::from("target/app-bundle/Ducktape.app"));
+        assert_eq!(args.credential, "release-sign");
+        assert_eq!(
+            args.out,
+            PathBuf::from("target/app-bundle/Ducktape-signed.tar.zst")
+        );
+        assert_eq!(args.unpack_into, Some(PathBuf::from("target/app-bundle")));
+        assert_eq!(args.addr.network.as_deref(), Some("chain-1"));
+        assert!(args.addr.node.is_none());
+    }
+
+    #[test]
+    fn sign_bundle_requires_credential_and_out() {
+        for missing in [
+            vec![
+                "release",
+                "sign-bundle",
+                "Ducktape.app",
+                "--out",
+                "x.tar.zst",
+            ],
+            vec![
+                "release",
+                "sign-bundle",
+                "Ducktape.app",
+                "--credential",
+                "c",
+            ],
+            vec!["release", "sign-bundle", "--credential", "c", "--out", "x"],
+        ] {
+            assert!(
+                Cli::try_parse_from(missing.clone()).is_err(),
+                "{missing:?} parsed"
+            );
+        }
+    }
+
+    /// A bundle of the staged shape with no Mach-O in it: the shape check
+    /// reads names and the plist, never the executables' bytes.
+    fn stage(root: &Path, bundle_id: &str, version: &str, views: &[&str]) -> PathBuf {
+        let bundle = root.join(sign::BUNDLE_NAME);
+        let contents = bundle.join("Contents");
+        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+        std::fs::create_dir_all(contents.join("Resources/views")).unwrap();
+        for executable in ["ducktape-launcher", "ducktape-app"] {
+            std::fs::write(contents.join("MacOS").join(executable), b"\xcf\xfa\xed\xfe").unwrap();
+        }
+        std::os::unix::fs::symlink("../Resources/views", contents.join("MacOS/views")).unwrap();
+        for view in views {
+            std::fs::write(contents.join("Resources/views").join(view), b"\0asm").unwrap();
+        }
+        let mut plist = std::fs::File::create(contents.join("Info.plist")).unwrap();
+        write!(
+            plist,
+            "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>\
+             <key>CFBundleIdentifier</key><string>{bundle_id}</string>\
+             <key>CFBundleShortVersionString</key><string>{version}</string>\
+             <key>CFBundleVersion</key><string>{version}</string>\
+             </dict></plist>"
+        )
+        .unwrap();
+        bundle
+    }
+
+    fn shape_of(bundle_id: &str, version: &str, views: &[&str]) -> BundleShape {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = stage(root.path(), bundle_id, version, views);
+        let archive = sign::pack_bundle(&bundle).unwrap();
+        BundleShape::of_archive(&archive, "test").unwrap()
+    }
+
+    #[test]
+    fn the_shape_is_identity_version_executables_and_views() {
+        let shape = shape_of(sign::BUNDLE_ID, "2026.9.2", &["chat.wasm", "forge.wasm"]);
+        assert_eq!(shape.bundle_id, sign::BUNDLE_ID);
+        assert_eq!(
+            shape.versions,
+            BTreeMap::from([
+                ("CFBundleShortVersionString", Some("2026.9.2".to_string())),
+                ("CFBundleVersion", Some("2026.9.2".to_string())),
+            ])
+        );
+        assert_eq!(
+            shape.macos,
+            BTreeSet::from([
+                "ducktape-launcher".into(),
+                "ducktape-app".into(),
+                "views".into()
+            ])
+        );
+        assert_eq!(
+            shape.views,
+            BTreeSet::from(["chat.wasm".into(), "forge.wasm".into()])
+        );
+    }
+
+    #[test]
+    fn a_signed_reply_with_the_same_shape_matches_what_was_sent() {
+        let sent = shape_of(sign::BUNDLE_ID, "2026.9.2", &["chat.wasm"]);
+        // signing adds _CodeSignature and rewrites the executables: neither
+        // is part of the shape, so a re-staged bundle reads the same.
+        let root = tempfile::tempdir().unwrap();
+        let bundle = stage(root.path(), sign::BUNDLE_ID, "2026.9.2", &["chat.wasm"]);
+        std::fs::create_dir_all(bundle.join("Contents/_CodeSignature")).unwrap();
+        std::fs::write(
+            bundle.join("Contents/_CodeSignature/CodeResources"),
+            b"<plist/>",
+        )
+        .unwrap();
+        std::fs::write(bundle.join("Contents/MacOS/ducktape-app"), b"signed bytes").unwrap();
+        let received =
+            BundleShape::of_archive(&sign::pack_bundle(&bundle).unwrap(), "signed").unwrap();
+        assert_eq!(received, sent);
+    }
+
+    #[test]
+    fn a_reply_with_another_version_or_view_set_does_not_match() {
+        let sent = shape_of(sign::BUNDLE_ID, "2026.9.2", &["chat.wasm"]);
+        assert_ne!(shape_of(sign::BUNDLE_ID, "2026.9.3", &["chat.wasm"]), sent);
+        assert_ne!(
+            shape_of(sign::BUNDLE_ID, "2026.9.2", &["chat.wasm", "extra.wasm"]),
+            sent
+        );
+    }
+
+    #[test]
+    fn a_reply_of_another_bundle_id_is_refused_by_the_layout_check() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = stage(root.path(), "dev.example.other", "1", &["a.wasm"]);
+        let error = BundleShape::of_archive(&sign::pack_bundle(&bundle).unwrap(), "signed")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bundle_shape_refused"), "{error}");
+        assert!(error.starts_with("signed bundle"), "{error}");
+    }
+
+    #[test]
+    fn a_reply_that_is_not_an_archive_is_refused_by_name() {
+        let error = BundleShape::of_archive(b"not zstd", "signed")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bundle_shape_refused"), "{error}");
+    }
+
+    #[test]
+    fn a_directory_is_sent_only_when_it_is_the_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let error = load_unsigned_archive(root.path()).unwrap_err().to_string();
+        assert!(
+            error.contains("is a directory but not Ducktape.app"),
+            "{error}"
+        );
+        let bundle = stage(root.path(), sign::BUNDLE_ID, "1", &["a.wasm"]);
+        let packed = load_unsigned_archive(&bundle).unwrap();
+        assert_eq!(packed, sign::pack_bundle(&bundle).unwrap());
+        // the same bytes on disk are sent as they are
+        let file = root.path().join("unsigned.tar.zst");
+        std::fs::write(&file, &packed).unwrap();
+        assert_eq!(load_unsigned_archive(&file).unwrap(), packed);
+    }
+
+    fn target(max_request_bytes: u64) -> SigningGateway {
+        SigningGateway {
+            authority: "airlock.alice.duck".into(),
+            via: "http://127.0.0.1:1".into(),
+            seal_pk: [7; 32],
+            max_request_bytes,
+        }
+    }
+
+    #[test]
+    fn the_route_cap_is_measured_from_the_published_policy() {
+        assert!(admitted_by_route(1024, &target(1024)).is_ok());
+        let error = admitted_by_route(1025, &target(1024)).unwrap_err();
+        assert!(error.starts_with("bundle_exceeds_route_cap"), "{error}");
+        assert!(error.contains("1025 bytes"), "{error}");
+        assert!(error.contains("admits 1024"), "{error}");
+        assert!(error.contains("airlock.alice.duck"), "{error}");
+    }
+
+    #[test]
+    fn the_sealed_reply_round_trips_and_a_truncated_one_is_refused() {
+        let keys = airlock::handshake::client_handshake(&[9; 32]).1;
+        let binding = b"binding";
+        let (mut sealer, salt) = bodyseal::StreamSealer::new(&keys, binding);
+        let mut wire = salt;
+        wire.extend(sealer.seal_head("application/zstd"));
+        wire.extend(sealer.seal_chunk(b"hello "));
+        wire.extend(sealer.seal_chunk(b"world"));
+        let without_final = wire.clone();
+        wire.extend(sealer.seal_final());
+        assert_eq!(
+            open_signed_reply(&keys, binding, &wire).unwrap(),
+            b"hello world"
+        );
+        let error = open_signed_reply(&keys, binding, &without_final)
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("reply_truncated"), "{error}");
+    }
+
+    #[test]
+    fn a_reply_of_another_content_type_is_refused_by_name() {
+        let keys = airlock::handshake::client_handshake(&[9; 32]).1;
+        let (mut sealer, salt) = bodyseal::StreamSealer::new(&keys, b"b");
+        let mut wire = salt;
+        wire.extend(sealer.seal_head("text/plain"));
+        wire.extend(sealer.seal_final());
+        let error = open_signed_reply(&keys, b"b", &wire)
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("reply_not_an_archive"), "{error}");
+        assert!(error.contains("text/plain"), "{error}");
+    }
+
+    #[test]
+    fn unpack_replacing_swaps_the_staged_bundle_and_keeps_it_on_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = stage(dir.path(), sign::BUNDLE_ID, "1", &["a.wasm"]);
+        std::fs::write(staged.join("Contents/MacOS/ducktape-app"), b"unsigned").unwrap();
+        let error = unpack_replacing(b"not zstd", dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bundle_shape_refused"), "{error}");
+        assert_eq!(
+            std::fs::read(staged.join("Contents/MacOS/ducktape-app")).unwrap(),
+            b"unsigned"
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        let signed = stage(other.path(), sign::BUNDLE_ID, "1", &["a.wasm"]);
+        std::fs::write(signed.join("Contents/MacOS/ducktape-app"), b"signed").unwrap();
+        let archive = sign::pack_bundle(&signed).unwrap();
+        let replaced = unpack_replacing(&archive, dir.path()).unwrap();
+        assert_eq!(replaced, staged);
+        assert_eq!(
+            std::fs::read(staged.join("Contents/MacOS/ducktape-app")).unwrap(),
+            b"signed"
+        );
+        assert!(std::fs::read_link(staged.join("Contents/MacOS/views")).is_ok());
+        // nothing but the bundle is left in the directory
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from(sign::BUNDLE_NAME)]);
+    }
 }

@@ -538,7 +538,10 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// `Ducktape.app/` tree of regular files, directories and symlinks that stay
 /// inside it. Every entry is checked before it is written, and the declared
 /// sizes are summed against [`MAX_UNPACKED_BYTES`] as they go.
-fn unpack_bundle(archive: &[u8], root: &Path) -> Result<(), Refusal> {
+///
+/// Shared with the client side (`ducktape release sign-bundle`), which
+/// unpacks the enclave's reply under the same rules before it trusts its shape.
+pub fn unpack_bundle(archive: &[u8], root: &Path) -> Result<(), Refusal> {
     let decoder = zstd::Decoder::new(archive).map_err(|_| Refusal::BundleShapeRefused)?;
     let mut tar = tar::Archive::new(decoder);
     tar.set_overwrite(false);
@@ -708,7 +711,7 @@ pub fn validate_layout(bundle: &Path) -> Result<(), Refusal> {
 /// bundle's `Info.plist` is the XML `app/packaging/Info.plist` with two
 /// version keys added by `PlistBuddy`, which keeps it XML; a binary plist
 /// is not the shape this route signs.
-fn plist_string(plist: &str, key: &str) -> Option<String> {
+pub fn plist_string(plist: &str, key: &str) -> Option<String> {
     let key_tag = format!("<key>{key}</key>");
     let after_key = &plist[plist.find(&key_tag)? + key_tag.len()..];
     let open = after_key.find("<string>")?;
@@ -726,8 +729,9 @@ fn plist_string(plist: &str, key: &str) -> Option<String> {
 
 /// Archive the finished bundle as `Ducktape.app/…` in a `.tar.zst`, symlinks
 /// kept as symlinks (the `views` link), owners and times zeroed as
-/// `ops/release/archive.sh` does.
-fn pack_bundle(bundle: &Path) -> io::Result<Vec<u8>> {
+/// `ops/release/archive.sh` does. The client packs an unsigned bundle with
+/// the same function, so what it sends is what this side unpacks.
+pub fn pack_bundle(bundle: &Path) -> io::Result<Vec<u8>> {
     let encoder = zstd::Encoder::new(Vec::new(), 3)?;
     let mut tar = tar::Builder::new(encoder);
     tar.mode(tar::HeaderMode::Deterministic);

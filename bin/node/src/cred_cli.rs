@@ -1054,7 +1054,7 @@ fn query_credentials(
     }
 }
 
-fn query_gateway(
+pub(crate) fn query_gateway(
     base: &str,
     query: &gateway::GatewayQuery,
 ) -> Result<gateway::GatewayReply, Box<dyn std::error::Error>> {

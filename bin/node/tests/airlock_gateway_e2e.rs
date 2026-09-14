@@ -30,8 +30,9 @@ use std::time::Duration;
 use common::{Cluster, create_account, submit_frame};
 use commonware_cryptography::{Signer as _, ed25519};
 use gateway::{
-    DuckDnsName, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, RouteAudience,
-    RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement, RouteTarget,
+    CredentialRecord, DuckDnsName, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization,
+    RouteAudience, RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement,
+    RouteTarget, SetCredentialStatement,
 };
 
 use airlock::attest::{self, Measurement};
@@ -267,6 +268,369 @@ async fn boot_gateway_and_upstream() -> (String, u16) {
     (format!("http://127.0.0.1:{port}"), port)
 }
 
+/// An attested gateway carrying the SIGNING toolchain (`POST /sign/macos-bundle`
+/// mounted), with Apple stubbed: `rcodesign sign` is real, the notary answers
+/// `Accepts`. The shape `bin/airlock-gateway` serves, minus Apple.
+async fn boot_signing_gateway(work_root: &std::path::Path) -> (String, u16) {
+    let (app, vendor) = server::build_with_quoter(
+        GatewayConfig {
+            attest: AttestMode::Tsm("snp".into()),
+            seal_keypair: None,
+            // port 1 never listens: no model call in this lane reaches anything
+            anthropic_base: "http://127.0.0.1:1".into(),
+            openai_base: String::new(),
+            oauth_token_url: String::new(),
+            oauth_client_id: String::new(),
+            session_ttl_secs: 3600,
+            max_requests: 4,
+            sign: Some(airlock::sign::Tools {
+                rcodesign: airlock::sign::fixture::rcodesign(),
+                entitlements: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../app/packaging/entitlements.plist"),
+                work_root: work_root.to_path_buf(),
+                notary: airlock::sign::Notary::Stub(airlock::sign::StubNotary::Accepts),
+            }),
+        },
+        "snp",
+        test_enclave().quoter(),
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(vendor, "snp");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://127.0.0.1:{port}"), port)
+}
+
+/// Verify the gateway's quote against the test enclave's roots and read the
+/// seal key out of the attested REPORTDATA — the trust step the operator's
+/// `cred seal` performs.
+async fn attested_seal_pk(gw: &AirlockClient) -> [u8; 32] {
+    let (quote, _vendor) = gw.fetch_quote().await.unwrap();
+    let expected = Measurement::from_hex(&measurement_hex()).unwrap();
+    let rd = airlock::verify::verify_quote(&quote, &expected, &test_enclave().roots())
+        .await
+        .unwrap();
+    attest::split_report_data(&rd).0
+}
+
+/// The owner-signed on-chain record of a credential the gateway holds: what
+/// `ducktape release sign-bundle --credential <name>` resolves the enclave
+/// from (owner → handle → `airlock.<handle>.duck`; `seal_pk` pinned).
+fn signed_set_credential(
+    owner: &ed25519::PrivateKey,
+    chain: &str,
+    owner_account: u64,
+    publisher_node: &[u8],
+    name: &str,
+    kind: gateway::CredentialKind,
+    seal_pk: [u8; 32],
+) -> GatewayMsg {
+    let statement = SetCredentialStatement {
+        chain_id: chain.into(),
+        record: CredentialRecord {
+            name: name.into(),
+            owner_account,
+            publisher_node: publisher_node.to_vec(),
+            kind,
+            seal_pk,
+            grants: std::collections::BTreeSet::new(),
+        },
+    };
+    let signature = owner
+        .sign(
+            gateway::GATEWAY_CREDENTIAL_NS,
+            &gateway::set_credential_preimage(&statement).unwrap(),
+        )
+        .as_ref()
+        .to_vec();
+    GatewayMsg::SetCredential {
+        statement,
+        authorization: MemberAuthorization {
+            signer: owner.public_key().as_ref().to_vec(),
+            signature,
+        },
+    }
+}
+
+fn credential_registered(cluster: &Cluster, reader: usize, name: &str) -> Option<()> {
+    let bytes = cluster.query(
+        reader,
+        "gateway",
+        &gateway::encode_query(&GatewayQuery::Credential {
+            name: name.to_string(),
+        }),
+    )?;
+    match gateway::decode_reply(&bytes).ok()? {
+        GatewayReply::Credential(record) => record.map(|_| ()),
+        _ => None,
+    }
+}
+
+/// One validator node serving a loopback gateway under `airlock.alice.duck`:
+/// alice's account and handle, the port bound under the `airlock` label, the
+/// signed route committed. Returns alice's key, account and node identity.
+fn alice_serves_airlock(
+    cluster: &mut Cluster,
+    gw_port: u16,
+) -> (ed25519::PrivateKey, u64, Vec<u8>) {
+    // No peer, so no handshake ever completes — but the gateway plane still
+    // binds and serves the node's own routes locally.
+    cluster.wireguard = true;
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", READY);
+    cluster.wait_marker(0, "converged root_hash=", READY);
+    cluster.wait_marker(0, "gateway plane: overlay stream bound", READY);
+
+    let alice = ed25519::PrivateKey::from_seed(42);
+    let alice_node = Cluster::identity(0);
+    let alice_account = create_account(cluster, 0, &alice, "alice");
+
+    submit_frame(
+        cluster,
+        0,
+        &alice,
+        "gateway",
+        &gateway::encode_msg(&GatewayMsg::SetHandle {
+            handle: Some("alice".into()),
+        }),
+    );
+    cluster.await_committed(0, "alice.duck resolution", FINALIZE, || {
+        resolve_handle(cluster, 0, "alice")
+    });
+
+    let workspace = cluster.workspace(0);
+    let (ok, output) = cluster.run_verb(&[
+        "gateway",
+        "bind",
+        "--workspace",
+        workspace.to_str().unwrap(),
+        "--label",
+        "airlock",
+        "--port",
+        &gw_port.to_string(),
+        // whose signed route this node serves under the label — stated, so
+        // the harness inherits no active wallet from the host keystore.
+        "--account",
+        &alice_account.to_string(),
+    ]);
+    assert!(ok, "airlock gateway port bind failed: {output}");
+
+    submit_frame(
+        cluster,
+        0,
+        &alice,
+        "gateway",
+        &gateway::encode_msg(&signed_airlock_route(
+            &alice,
+            &cluster.namespace,
+            alice_account,
+            &alice_node,
+            1,
+        )),
+    );
+    cluster.await_committed(0, "airlock route revision 1", FINALIZE, || {
+        (airlock_route_revision(cluster, 0, alice_account) == Some(1)).then_some(())
+    });
+    (alice, alice_account, alice_node)
+}
+
+/// `ducktape release sign-bundle` through one real node: the verb resolves
+/// the credential's on-chain record to `airlock.alice.duck`, opens a sealed
+/// session through the node's browser gateway, and the enclave signs the
+/// fixture bundle with a throwaway Developer-ID-shaped identity. What comes
+/// back unpacks to a bundle `rcodesign verify` accepts, in place of the
+/// unsigned one — the `make release-app` sequence under
+/// `DUCKTAPE_SIGN_VIA=airlock`, minus `archive.sh`'s macOS-only checks.
+#[test]
+fn release_sign_bundle_round_trips_through_the_node() {
+    use airlock::codesign::fixture::{self as cred, Marker};
+    use airlock::sign::{self, fixture};
+
+    let rt = Runtime::new().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let (gw_base, gw_port) = rt.block_on(boot_signing_gateway(work.path()));
+
+    // Credential Provider: verify the quote, seal the signing identity in.
+    let seal_pk = rt.block_on(async {
+        let gw = AirlockClient::local(gw_base.clone());
+        let seal_pk = attested_seal_pk(&gw).await;
+        gw.upload_sealed_credential(
+            &seal_pk,
+            "release-sign",
+            CredentialKind::AppleCodesign,
+            &CredentialPayload::AppleCodesign {
+                p12_b64: cred::p12_b64(cred::TEAM_ID, Marker::DeveloperIdApplication),
+                p12_password: cred::P12_PASSWORD.into(),
+                api_key_json: cred::api_key_json(),
+                team_id: cred::TEAM_ID.into(),
+            },
+        )
+        .await
+        .unwrap();
+        // a model credential beside it, for the kind refusal below
+        gw.upload_sealed_credential(
+            &seal_pk,
+            "compute-node",
+            CredentialKind::Claude,
+            &CredentialPayload::Bearer {
+                access_token: "seed".into(),
+            },
+        )
+        .await
+        .unwrap();
+        seal_pk
+    });
+
+    let mut cluster = Cluster::new(&[0], &[0]);
+    let (alice, alice_account, alice_node) = alice_serves_airlock(&mut cluster, gw_port);
+    for (name, kind) in [
+        ("release-sign", gateway::CredentialKind::AppleCodesign),
+        ("compute-node", gateway::CredentialKind::Claude),
+    ] {
+        submit_frame(
+            &cluster,
+            0,
+            &alice,
+            "gateway",
+            &gateway::encode_msg(&signed_set_credential(
+                &alice,
+                &cluster.namespace,
+                alice_account,
+                &alice_node,
+                name,
+                kind,
+                seal_pk,
+            )),
+        );
+        cluster.await_committed(
+            0,
+            &format!("credential {name} registered"),
+            FINALIZE,
+            || credential_registered(&cluster, 0, name),
+        );
+    }
+
+    let stage = tempfile::tempdir().unwrap();
+    let unsigned = fixture::stage_bundle(stage.path(), sign::BUNDLE_ID);
+    let unsigned_app = std::fs::read(unsigned.join("Contents/MacOS/ducktape-app")).unwrap();
+    let out = stage.path().join("Ducktape-signed.tar.zst");
+    let node = cluster.http_base(0);
+    let bundle_arg = unsigned.to_str().unwrap();
+    let out_arg = out.to_str().unwrap();
+    let stage_arg = stage.path().to_str().unwrap();
+
+    // the wrong kind of credential is refused by name before a session opens
+    let (ok, output) = cluster.run_verb(&[
+        "release",
+        "sign-bundle",
+        bundle_arg,
+        "--credential",
+        "compute-node",
+        "--out",
+        out_arg,
+        "--node",
+        &node,
+    ]);
+    assert!(!ok, "{output}");
+    assert!(output.contains("credential_kind_mismatch"), "{output}");
+    assert!(!out.exists());
+
+    // an unknown name says what is registered
+    let (ok, output) = cluster.run_verb(&[
+        "release",
+        "sign-bundle",
+        bundle_arg,
+        "--credential",
+        "nope",
+        "--out",
+        out_arg,
+        "--node",
+        &node,
+    ]);
+    assert!(!ok, "{output}");
+    assert!(output.contains("unknown credential: nope"), "{output}");
+    assert!(output.contains("release-sign"), "{output}");
+
+    // the round trip, unpacked in place of the unsigned bundle
+    let (ok, output) = cluster.run_verb(&[
+        "release",
+        "sign-bundle",
+        bundle_arg,
+        "--credential",
+        "release-sign",
+        "--out",
+        out_arg,
+        "--unpack-into",
+        stage_arg,
+        "--node",
+        &node,
+    ]);
+    assert!(ok, "sign-bundle: {output}\n{}", cluster.all_log_tails(40));
+    assert!(output.contains("release_sign_submitted"), "{output}");
+    assert!(output.contains("release_sign_received"), "{output}");
+    let signed_archive = std::fs::read(&out).unwrap();
+    assert!(!signed_archive.is_empty());
+
+    let signed = stage.path().join(sign::BUNDLE_NAME);
+    sign::validate_layout(&signed).unwrap();
+    let signed_app = std::fs::read(signed.join("Contents/MacOS/ducktape-app")).unwrap();
+    assert_ne!(signed_app, unsigned_app, "the executable came back signed");
+    for executable in ["ducktape-launcher", "ducktape-app"] {
+        let verify = std::process::Command::new(fixture::rcodesign())
+            .arg("verify")
+            .arg(signed.join("Contents/MacOS").join(executable))
+            .output()
+            .unwrap();
+        assert!(
+            verify.status.success(),
+            "rcodesign verify {executable}: {}{}",
+            String::from_utf8_lossy(&verify.stdout),
+            String::from_utf8_lossy(&verify.stderr)
+        );
+    }
+    assert_eq!(
+        std::fs::read_link(signed.join("Contents/MacOS/views")).unwrap(),
+        std::path::PathBuf::from("../Resources/views"),
+        "the views link survives the round trip"
+    );
+    assert!(
+        std::fs::read_dir(work.path()).unwrap().next().is_none(),
+        "the enclave's work dir is empty after the request"
+    );
+
+    // a bundle past the route's published per-request cap (1 MiB here) is
+    // refused by name before anything is sent. Incompressible bytes: the
+    // cap is on the archive, and zstd folds a constant fill to nothing.
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let huge: Vec<u8> = std::iter::repeat_with(|| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    })
+    .take(2 * 1024 * 1024)
+    .collect();
+    std::fs::write(signed.join("Contents/Resources/views/huge.wasm"), huge).unwrap();
+    let (ok, output) = cluster.run_verb(&[
+        "release",
+        "sign-bundle",
+        bundle_arg,
+        "--credential",
+        "release-sign",
+        "--out",
+        out_arg,
+        "--node",
+        &node,
+    ]);
+    assert!(!ok, "{output}");
+    assert!(output.contains("bundle_exceeds_route_cap"), "{output}");
+    assert!(output.contains("airlock.alice.duck"), "{output}");
+}
+
 // TODO(full-spec, needs hardware): this proves the node-to-node overlay hop with
 // a minted SNP chain (real verifier, test roots) and a mock upstream. The full
 // 2-node + TEE run — silicon-backed quote GENERATION on a confidential VM and
@@ -462,61 +826,8 @@ fn airlock_single_node_self_serves_its_own_route() {
         .unwrap();
     });
 
-    // One validator node; no peer, so no handshake ever completes — but the gateway
-    // plane still binds and serves the node's own routes locally.
     let mut cluster = Cluster::new(&[0], &[0]);
-    cluster.wireguard = true;
-    cluster.spawn(0);
-    cluster.wait_marker(0, "rpc listening on", READY);
-    cluster.wait_marker(0, "converged root_hash=", READY);
-    cluster.wait_marker(0, "gateway plane: overlay stream bound", READY);
-
-    let alice = ed25519::PrivateKey::from_seed(42);
-    let alice_node = Cluster::identity(0);
-    let alice_account = create_account(&cluster, 0, &alice, "alice");
-
-    submit_frame(
-        &cluster,
-        0,
-        &alice,
-        "gateway",
-        &gateway::encode_msg(&GatewayMsg::SetHandle {
-            handle: Some("alice".into()),
-        }),
-    );
-    cluster.await_committed(0, "alice.duck resolution", FINALIZE, || {
-        resolve_handle(&cluster, 0, "alice")
-    });
-
-    let workspace = cluster.workspace(0);
-    let (ok, output) = cluster.run_verb(&[
-        "gateway",
-        "bind",
-        "--workspace",
-        workspace.to_str().unwrap(),
-        "--label",
-        "airlock",
-        "--port",
-        &gw_port.to_string(),
-    ]);
-    assert!(ok, "airlock gateway port bind failed: {output}");
-
-    submit_frame(
-        &cluster,
-        0,
-        &alice,
-        "gateway",
-        &gateway::encode_msg(&signed_airlock_route(
-            &alice,
-            &cluster.namespace,
-            alice_account,
-            &alice_node,
-            1,
-        )),
-    );
-    cluster.await_committed(0, "airlock route revision 1", FINALIZE, || {
-        (airlock_route_revision(&cluster, 0, alice_account) == Some(1)).then_some(())
-    });
+    alice_serves_airlock(&mut cluster, gw_port);
 
     let (status, browser) = cluster.http(0, "GET", "/v1/gateway/browser", None);
     assert_eq!(status, 200, "browser base failed: {browser}");

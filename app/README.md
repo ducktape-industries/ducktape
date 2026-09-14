@@ -208,6 +208,59 @@ the keychain and whether the three notary variables are exported with the key
 file present — as an informational section; it never fails on them, because a
 local build needs neither.
 
+### Signing through the airlock gateway
+
+The other signing path keeps the Developer ID off this Mac entirely: an
+airlock gateway (`bin/airlock-gateway`, in a confidential VM) holds the
+certificate, the PKCS#12 password and the App Store Connect key as an
+`apple-codesign` credential, and `POST /sign/macos-bundle` signs, notarizes
+and staples a bundle inside the enclave. `make release-app` takes it with
+`DUCKTAPE_SIGN_VIA=airlock`; there is exactly ONE path per environment, and
+`DUCKTAPE_SIGN_VIA=airlock` set together with `DUCKTAPE_CODESIGN_IDENTITY` or
+any `DUCKTAPE_NOTARY_*` is refused as `sign_path_conflict` before anything
+builds (the Makefile and `ops/bundle-app-macos.sh` both check).
+
+1. **Enrol the identity** into the gateway, once, from any machine that holds
+   the material (`ducktape user cred seal --vendor apple-codesign`, which
+   verifies the enclave's quote against the pinned measurement first):
+
+   ```sh
+   ducktape user cred seal --remote airlock.<handle>.duck --attest snp --snp-product genoa \
+     --measurement <audited image measurement> --vendor apple-codesign --name release-sign \
+     --p12 DeveloperID.p12 --p12-password-file p12.password \
+     --api-key AuthKey.json --team-id TEAMID -n <chain-id>
+   ```
+
+2. **Build, sign, pack.** The bundle script stages `Ducktape.app` unsigned
+   (no `codesign`, no DMG), `ducktape release sign-bundle` sends it and
+   unpacks the signed bundle back in place, and `ops/release/archive.sh`
+   runs unchanged as the host-side verifier (`codesign --verify --deep
+   --strict`, `stapler validate`, `spctl -a -t exec`) before it packs:
+
+   ```sh
+   DUCKTAPE_SIGN_VIA=airlock DUCKTAPE_SIGN_CREDENTIAL=release-sign NODE=http://127.0.0.1:8844 make release-app
+   ```
+
+   The verb resolves `release-sign` from committed state on `NODE` the way a
+   provider run resolves a lent credential — the credential record names its
+   owner, the owner's handle names the `airlock.<handle>.duck` route, the
+   record's `seal_pk` is the pinned trust anchor — opens a sealed session on
+   it through the node's browser gateway and streams the `.tar.zst` up and
+   the signed one down. What comes back is checked to be the same bundle
+   (identifier, version keys, executables, views) before it replaces the
+   staged one; the archive the enclave returned is kept beside it as
+   `target/app-bundle/Ducktape-signed.tar.zst`. The gateway's refusals come
+   back by name (`bundle_shape_refused`, `bundle_too_large`,
+   `codesign_failed`, `notary_rejected`, `staple_failed`, `tool_missing`);
+   the verb's own are `credential_kind_mismatch` (the name is a model
+   credential), `bundle_exceeds_route_cap` (the archive is over the
+   `airlock` route's published `max_request_bytes`) and
+   `bundle_shape_changed`. Its progress is logged under
+   `ducktape::gateway` (`release_sign_resolved`, `release_sign_submitted`,
+   `release_sign_received`, `release_sign_refused`).
+
+3. **Verify and publish** exactly as above (step 4, then `make publish-app`).
+
 The microVM shim signs the same way: `bin/duck-vz-shim/build.sh` takes
 `CODESIGN_IDENTITY` (ad-hoc `-` by default) and passes the
 `com.apple.security.virtualization` entitlement whichever identity it is given
