@@ -301,11 +301,9 @@ impl ChatView {
                     message.body.clone(),
                     message.rev,
                 ),
-                CopySurface::Timeline | CopySurface::Nowhere => Message::OpenMessageReactions(
-                    message.seq,
-                    message.body.clone(),
-                    message.rev,
-                ),
+                CopySurface::Timeline | CopySurface::Nowhere => {
+                    Message::OpenMessageReactions(message.seq, message.body.clone(), message.rev)
+                }
             };
             reactions.push(reaction_pill(
                 format!("{key}/reaction/add"),
@@ -375,13 +373,7 @@ impl ChatView {
                     if !block.lang.is_empty() {
                         children.push(native::caption(format!("{scope}/language"), &block.lang));
                     }
-                    children.push(native::text_options(
-                        native::mono(format!("{scope}/code"), &block.text),
-                        wire::TextOptions {
-                            wrapping: Some(wire::Wrapping::WordOrGlyph),
-                            ..Default::default()
-                        },
-                    ));
+                    children.push(Self::plain_line(format!("{scope}/code"), &block.text, true));
                     let mut code = native::container(
                         scope.clone(),
                         native::spaced(native::column(format!("{scope}/code-lines"), children), 4.),
@@ -407,7 +399,7 @@ impl ChatView {
                     let text = if block.rich {
                         Self::rich_line(format!("{scope}/text"), block, on_link)
                     } else {
-                        native::wrapping(native::text(format!("{scope}/text"), &block.text))
+                        Self::plain_line(format!("{scope}/text"), &block.text, false)
                     };
                     if block.kind == "quote" {
                         let mut quote = native::row(
@@ -547,6 +539,37 @@ impl ChatView {
         }
         // a column stretches its children; a row lets the card hug its name
         native::row(key, [card])
+    }
+    /// An unmarked paragraph or a code block as ONE rich span. A plain `Text`
+    /// node is a label to the host — it registers no selection, so a reader
+    /// could not drag over most messages to copy them; only `RichText`
+    /// carries the host's text-selection handle. `mono` is a code block.
+    pub(super) fn plain_line(key: String, text: &str, mono: bool) -> wire::Node {
+        let span = wire::RichSpan {
+            content: text.to_owned(),
+            size: mono.then_some(native::type_scale::MONO as f32),
+            font: mono.then_some(wire::NamedFont {
+                family: wire::FontFamily::Monospace,
+                weight: wire::Weight::Normal,
+                stretch: wire::FontStretch::Normal,
+                style: wire::FontStyle::Normal,
+            }),
+            ..Default::default()
+        };
+        wire::Node::RichText {
+            key,
+            spans: vec![span],
+            on_link: None,
+            options: wire::TextOptions {
+                wrapping: Some(wire::Wrapping::WordOrGlyph),
+                ..Default::default()
+            },
+            size: None,
+            color: None,
+            font: Default::default(),
+            width: Some(wire::Length::Fill),
+            align_x: None,
+        }
     }
     pub(super) fn rich_line(
         key: String,
@@ -787,7 +810,9 @@ impl ChatView {
 
 /// What a file is, from its extension: the caption under its name.
 fn attachment_kind(name: &str) -> String {
-    let extension = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_uppercase());
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_uppercase());
     match extension {
         Some(ext) if !ext.is_empty() && ext.len() <= 5 => format!("{ext} file"),
         _ => "File".into(),

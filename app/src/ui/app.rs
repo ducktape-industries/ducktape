@@ -418,6 +418,9 @@ pub struct Ducktape {
     pub(crate) huddle_stage: String,
     pub(crate) huddle_roster: Vec<crate::backend::HuddleParticipant>,
     pub(crate) huddle_rows: Vec<crate::call::HuddleTileRow>,
+    /// The huddle room's member roll, loaded on seating; the window offers
+    /// the ones not seated as invite chips. A sent invite leaves the roll.
+    pub(crate) huddle_invitees: Vec<crate::backend::ChatMember>,
     pub(crate) secrets: crate::secret::SecretStore,
 }
 impl ::std::fmt::Debug for Ducktape {
@@ -645,6 +648,12 @@ pub(crate) enum AppMessage {
     HuddleGoChannel,
     LeaveHuddleHere,
     HuddleLeft(bool),
+    HuddleInviteesLoaded(Vec<crate::backend::ChatMember>),
+    /// Invite a member (by their member-row key) into the huddle the reader
+    /// is seated in.
+    InviteToHuddle(String),
+    HuddleInviteSent(String),
+    HuddleInviteFailed(String, crate::backend::OptimisticMutationError),
     SecretTyped(String, String),
     ChannelDraftChanged(String),
 }
@@ -872,6 +881,7 @@ impl Ducktape {
             huddle_stage: "".to_owned(),
             huddle_roster: Vec::new(),
             huddle_rows: Vec::new(),
+            huddle_invitees: Vec::new(),
             secrets: Default::default(),
         }
     }
