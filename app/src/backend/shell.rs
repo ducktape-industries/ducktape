@@ -13,6 +13,11 @@ use super::*;
 /// from state, and state is what the connect load and the live-plane lane fill
 /// — no chip depends on a tab click.
 pub fn tab_reads_plane(tab: crate::ShellTab, plane: String) -> bool {
+    // a registry-listed view reads its own planes through `rpc.live`; no
+    // app-side load is on its screen's path
+    if let crate::ShellTab::Registered(_) = tab {
+        return false;
+    }
     match plane.as_str() {
         // the tier badge, the admin gate and the forge write gate all read the
         // roster, so five panes draw it.
