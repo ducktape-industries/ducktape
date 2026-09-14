@@ -54,6 +54,10 @@ pub struct Session {
     pub recovering: bool,
     pub appearance: String,
     pub desktop_notifications: bool,
+    /// what the host said about raising banners: `pending`, `ready`,
+    /// `unbundled` (not an app bundle), `denied` (refused in System
+    /// Settings) or `unavailable` (no notification service)
+    pub desktop_notifications_host: String,
     pub unlocked: bool,
     pub seat_key: String,
     pub account_name: String,

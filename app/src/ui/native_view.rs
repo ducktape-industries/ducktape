@@ -141,6 +141,7 @@ impl Ducktape {
                     self.mutation_phase,
                     self.appearance,
                     self.desktop_notifications,
+                    crate::backend::desktop_notifications_host().token(),
                     &self.password,
                     &self.settings_user_key,
                     &self.account_name,

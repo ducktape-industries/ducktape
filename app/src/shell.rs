@@ -3001,6 +3001,9 @@ pub(crate) fn run() {
     });
     application.run(move |cx| {
         gpui_kit::init(cx);
+        // Ask the host about banners at launch, so the macOS prompt is a
+        // launch event and its answer is in the log before the first mention.
+        crate::backend::boot_desktop_notifications();
         let fonts: Vec<std::borrow::Cow<'static, [u8]>> = vec![
             std::borrow::Cow::Borrowed(include_bytes!("../../crates/views/support/design/assets/fonts/Geist[wght].ttf")),
             std::borrow::Cow::Borrowed(include_bytes!("../../crates/views/support/design/assets/fonts/GeistMono[wght].ttf")),

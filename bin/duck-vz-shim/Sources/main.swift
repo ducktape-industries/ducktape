@@ -262,6 +262,11 @@ final class StopWatcher: NSObject, VZVirtualMachineDelegate {
 
 // MARK: - main
 
+// A tunnel peer may close while either bridge thread is writing. Let write
+// return EPIPE so pump ends that direction; SIGPIPE's default action would
+// kill the VMM and every other connection, including the guest's exit lane.
+signal(SIGPIPE, SIG_IGN)
+
 let config = loadConfig()
 
 // No tap on macOS, by design and not by omission: the egress story here is
