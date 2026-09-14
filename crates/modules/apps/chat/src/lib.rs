@@ -161,6 +161,12 @@ fn msgid_key(message_id: &str) -> Vec<u8> {
     keyed(b"msgid", message_id)
 }
 
+/// The two accounts of a DM channel, stored at its creation: the id is a
+/// digest of them, so nothing else can name the other side of a post.
+fn dm_pair_key(channel_id: &str) -> Vec<u8> {
+    keyed(b"dmpair", channel_id)
+}
+
 fn member_key(channel_id: &str, party: &Party) -> Vec<u8> {
     let party = party_bytes(party);
     let mut key = Vec::with_capacity(6 + 16 + channel_id.len() + party.len());
@@ -264,12 +270,20 @@ fn channel_relations(owner: &Party) -> Vec<Relation> {
 }
 
 /// a live message's relation set: its author's authorship (when the author is
-/// an account) plus one mention per mentioned account. `mentions` is already
-/// deduplicated, so no `(recipient, reason)` repeats.
-fn message_relations(author: &Party, mentions: &[AccountNumber]) -> Vec<Relation> {
+/// an account) plus one mention per mentioned account, plus the other side
+/// of a DM as one more mention — a DM ADDRESSES ITS OTHER SIDE, so an agent
+/// there is summoned the way an @-mention summons it in a room. `mentions`
+/// is already deduplicated, so no `(recipient, reason)` repeats; the
+/// counterpart is skipped when the post names them outright.
+fn message_relations(
+    author: &Party,
+    mentions: &[AccountNumber],
+    addressed: Option<AccountNumber>,
+) -> Vec<Relation> {
     let authorship = author
         .account()
         .map(|account| relation(account, Reason::Authorship));
+    let addressed = addressed.filter(|account| !mentions.contains(account));
     authorship
         .into_iter()
         .chain(
@@ -277,6 +291,7 @@ fn message_relations(author: &Party, mentions: &[AccountNumber]) -> Vec<Relation
                 .iter()
                 .map(|account| relation(*account, Reason::Mention)),
         )
+        .chain(addressed.map(|account| relation(account, Reason::Mention)))
         .collect()
 }
 
@@ -472,6 +487,28 @@ impl Chat {
             .get_raw(&member_key(channel_id, party))
             .await?
             .is_some())
+    }
+
+    /// The other side of a DM, when `channel_id` is one and `author` is one
+    /// of its two accounts; `None` for a room, or for a poster the pair does
+    /// not name (a module, a key on no account).
+    async fn dm_counterpart(
+        &self,
+        channel_id: &str,
+        author: &Party,
+    ) -> Result<Option<AccountNumber>, Error> {
+        let Some((first, second)) = self
+            .load::<(AccountNumber, AccountNumber)>(&dm_pair_key(channel_id))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let counterpart = match author.account() {
+            Some(account) if account == first => Some(second),
+            Some(account) if account == second => Some(first),
+            _ => None,
+        };
+        Ok(counterpart)
     }
 
     // ---- identity ---------------------------------------------------------
@@ -942,6 +979,7 @@ impl Chat {
         )?;
         self.store(member_key(&channel_id, party), &true);
         self.store(member_key(&channel_id, &Party::Account(counterpart)), &true);
+        self.store(dm_pair_key(&channel_id), &(creator, counterpart));
         self.bump_creator_count(party).await?;
         Ok((channel_id, report))
     }
@@ -1082,6 +1120,7 @@ impl Chat {
         self.store(msgid_key(&message_id), &(channel_id.to_string(), seq));
         let hooks = channel.hooks.clone();
         self.store_channel(&channel)?;
+        let addressed = self.dm_counterpart(channel_id, &head.author).await?;
         Ok(Posted {
             seq,
             thread_root: thread,
@@ -1089,7 +1128,7 @@ impl Chat {
             report: Report {
                 object: message_object(&message_id),
                 revision: head.revision,
-                relations: message_relations(&head.author, &mentions),
+                relations: message_relations(&head.author, &mentions, addressed),
             },
         })
     }
@@ -1139,12 +1178,13 @@ impl Chat {
             ..head
         };
         self.store_head(channel_id, seq, &new_head)?;
+        let addressed = self.dm_counterpart(channel_id, &new_head.author).await?;
         Ok((
             rev,
             Report {
                 object: message_object(&new_head.message_id),
                 revision: new_head.revision,
-                relations: message_relations(&new_head.author, &mentions),
+                relations: message_relations(&new_head.author, &mentions, addressed),
             },
         ))
     }

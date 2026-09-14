@@ -1201,3 +1201,67 @@ fn program_huddle_proof_binds_the_node_to_its_authenticated_account() {
         assert_eq!(channel.huddle[0].node, node.public_key().as_ref());
     });
 }
+
+/// A DM ADDRESSES ITS OTHER SIDE: a post in a DM attributes the counterpart
+/// like a mention, so an agent on the other side is summoned without being
+/// @-named — and a post that does name them carries the one relation.
+#[test]
+fn a_dm_post_attributes_its_counterpart_as_a_mention() {
+    block_on(async {
+        let mut host = boot().await;
+        apply(
+            &mut host,
+            key(1),
+            "chat",
+            ChatMsg::CreateDmChannel {
+                counterpart: 2,
+                name: "one & two".into(),
+            },
+        )
+        .await;
+        let dm = chat::client::dm_channel_id("1", "2");
+        let plain = vec![Block::Paragraph(vec![Span {
+            text: "hello".into(),
+            marks: Vec::new(),
+        }])];
+        apply(
+            &mut host,
+            key(1),
+            "chat",
+            ChatMsg::PostMessage {
+                channel_id: dm.clone(),
+                message_id: "d1".into(),
+                blocks: plain,
+                thread: None,
+            },
+        )
+        .await;
+        let addressed = relations(&host, "chat", "message", "d1").await;
+        assert_eq!(
+            addressed
+                .relations
+                .iter()
+                .map(|r| (r.recipient, &r.reason))
+                .collect::<Vec<_>>(),
+            vec![(1, &Reason::Authorship), (2, &Reason::Mention)]
+        );
+        // naming them outright is still one mention, not two
+        apply(
+            &mut host,
+            key(1),
+            "chat",
+            ChatMsg::PostMessage {
+                channel_id: dm,
+                message_id: "d2".into(),
+                blocks: body(2),
+                thread: None,
+            },
+        )
+        .await;
+        let named = relations(&host, "chat", "message", "d2").await;
+        assert_eq!(
+            named.relations.iter().filter(|r| r.recipient == 2).count(),
+            1
+        );
+    });
+}

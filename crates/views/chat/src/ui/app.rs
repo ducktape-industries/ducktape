@@ -637,8 +637,21 @@ mod tests {
                     };
                     assert!(on_press.is_some());
                     assert_eq!(description.as_ref(), Some(&emoji));
-                    assert!(
-                        matches!(content, wire::ButtonContent::Label(label) if label == &emoji)
+                    // the glyph is a text node whose line box is the cell,
+                    // so the host's button clips nothing off the emoji
+                    let wire::ButtonContent::Child(glyph) = content else {
+                        panic!("the cell's glyph is a text node");
+                    };
+                    let wire::Node::Text {
+                        content, options, ..
+                    } = glyph.as_ref()
+                    else {
+                        panic!("the cell's glyph is a text node");
+                    };
+                    assert_eq!(content, &emoji);
+                    assert_eq!(
+                        options.line_height,
+                        Some(wire::LineHeight::Absolute(super::chat::PICKER_CELL))
                     );
                 }
                 grids += 1;
@@ -735,7 +748,13 @@ mod tests {
         let _ = state.update(Message::OpenMessageActions(1, "body".into(), 0));
         assert_eq!(
             menu_of(&state, "message-action-focus"),
-            ["Reply in thread", "Add reaction", "Copy link", "Edit message", "Delete message"]
+            [
+                "Reply in thread",
+                "Add reaction",
+                "Copy link",
+                "Edit message",
+                "Delete message"
+            ]
         );
         // a press on one of its items does not move the open menu
         let _ = state.update(Message::PressedAt(10.0, 10.0));
@@ -749,7 +768,12 @@ mod tests {
         let _ = state.update(Message::OpenThreadMessageActions(1, "body".into(), 0));
         assert_eq!(
             menu_of(&state, "thread-action-focus"),
-            ["Add reaction", "Copy link", "Edit message", "Delete message"]
+            [
+                "Add reaction",
+                "Copy link",
+                "Edit message",
+                "Delete message"
+            ]
         );
         // a press at the right edge (the "…" of a row) opens leftward
         let (x, y) = crate::host::menu_origin(

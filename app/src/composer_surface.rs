@@ -12,9 +12,8 @@ use gpui_kit::component::input::{
 use gpui_kit::component::{ActiveTheme, Disableable, Sizable as _};
 use gpui_kit::{
     App, AppContext, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, FontWeight,
-    HighlightStyle,
-    InteractiveElement, IntoElement, KeyDownEvent, Keystroke, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Subscription, Window, div, px,
+    HighlightStyle, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, ParentElement,
+    Render, StatefulInteractiveElement, Styled, Subscription, Window, div, px,
 };
 use std::{
     cell::RefCell,
@@ -206,7 +205,10 @@ fn attachment_of(path: &str) -> Result<Attachment, String> {
 /// What a paste attaches: a copied picture (its bytes and extension) or a
 /// copied file (its path). Text on the clipboard is not an attachment.
 enum Pasted {
-    Picture { extension: &'static str, bytes: Vec<u8> },
+    Picture {
+        extension: &'static str,
+        bytes: Vec<u8>,
+    },
     File(String),
 }
 
@@ -249,13 +251,15 @@ fn park_pasted_picture(
     extension: &str,
     bytes: &[u8],
 ) -> Result<String, String> {
-    std::fs::create_dir_all(dir).map_err(|error| format!("cannot keep the pasted picture: {error}"))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("cannot keep the pasted picture: {error}"))?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_millis())
         .unwrap_or(0);
     let path = dir.join(format!("pasted-{stamp}.{extension}"));
-    std::fs::write(&path, bytes).map_err(|error| format!("cannot keep the pasted picture: {error}"))?;
+    std::fs::write(&path, bytes)
+        .map_err(|error| format!("cannot keep the pasted picture: {error}"))?;
     path.to_str()
         .map(str::to_owned)
         .ok_or_else(|| "the cache path is not unicode".to_owned())
@@ -1120,11 +1124,15 @@ impl Render for ComposerView {
             );
         }
         let drop_ring = cx.theme().primary;
+        // The editor pads its own text (10px at this size), so the plate
+        // keeps only a hairline's worth beside it — with both, the first
+        // letter floated a full indent in from the border.
         let mut plate = div()
             .flex()
             .flex_col()
             .w_full()
-            .p(px(if self.args.compact { 6. } else { 8. }))
+            .px(px(2.))
+            .py(px(if self.args.compact { 4. } else { 6. }))
             .border_1()
             .border_color(cx.theme().border)
             // the standby zone lights up while a file is dragged over it
@@ -1228,9 +1236,9 @@ impl Render for ComposerView {
                             .label("Retry")
                             .ghost()
                             .xsmall()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.retry_attach(index, cx)
-                            })),
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.retry_attach(index, cx)),
+                            ),
                     );
                 }
                 chip = chip.child(
@@ -1254,7 +1262,7 @@ impl Render for ComposerView {
                     .child(attach_note),
             );
         }
-        let mut toolbar = div().flex().items_center().gap(px(4.));
+        let mut toolbar = div().flex().items_center().gap(px(4.)).px(px(4.));
         if self.attaches() {
             toolbar = toolbar.child(
                 Button::new("attach")
@@ -1622,10 +1630,20 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].bytes, 5);
         assert_eq!(lock(&slot("native-files")).document.attachments.len(), 1);
-        assert!(attach("native-files", &[std::env::temp_dir().to_string_lossy().into_owned()]).is_err());
+        assert!(
+            attach(
+                "native-files",
+                &[std::env::temp_dir().to_string_lossy().into_owned()]
+            )
+            .is_err()
+        );
         // a send waits for the upload; an edit never takes files
         assert!(testing::submit("native-files", "message", false).is_none());
-        attached("native-files", &queued[0].id, Ok("duck://files/shared/attachments/a/x".into()));
+        attached(
+            "native-files",
+            &queued[0].id,
+            Ok("duck://files/shared/attachments/a/x".into()),
+        );
         assert!(testing::submit("native-files", "edit", false).is_none());
         // with nothing typed the send still goes, files alone
         let sent = testing::submit("native-files", "message", false).expect("files alone send");

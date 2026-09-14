@@ -176,7 +176,13 @@ pub(crate) fn live_row_apply(mut row: LiveAgentRow, event: &AgentChatEvent) -> L
             row.status = event.title.clone();
         }
         "preview" | "answer" => {
-            row.answer_preview = clip_text(&event.answer, MAX_LIVE_PREVIEW_BYTES);
+            // A provider's last item can be its structured payload (a JSON
+            // block list) before the words: not a preview anyone reads, and
+            // it flashed in the card for a poll before the reply landed.
+            let raw_payload = matches!(event.answer.trim_start().chars().next(), Some('{' | '['));
+            if !raw_payload {
+                row.answer_preview = clip_text(&event.answer, MAX_LIVE_PREVIEW_BYTES);
+            }
             row.status = if event.kind == "answer" {
                 "Done".into()
             } else {

@@ -9,7 +9,11 @@ pub(super) const RAIL_GAP: f32 = 10.;
 /// Where a message's text starts, from the row's left edge.
 pub(super) const RAIL: f32 = 16. + AVATAR + RAIL_GAP;
 
-/// A reaction as a pill: the emoji and its count on a 22px line inside a
+/// A reaction pill's height: tall enough for an emoji's full glyph, which
+/// the host's button clips to the line box.
+const PILL_HEIGHT: f32 = 24.;
+
+/// A reaction as a pill: the emoji and its count on one line inside a
 /// hairline, the reader's own in the accent wash. Without a count it is
 /// the "add one" chip that ends the row.
 fn reaction_pill(
@@ -21,9 +25,14 @@ fn reaction_pill(
     on_press: Option<u32>,
 ) -> wire::Node {
     let p = native::palette();
-    let mut parts = vec![native::nowrap(native::text_size(
-        native::text(format!("{key}/emoji"), emoji),
-        13.,
+    // an emoji glyph stands taller than its point size: the host's button
+    // clips its content to the line box, so the line box says how tall
+    let mut parts = vec![native::nowrap(native::text_options(
+        native::text_size(native::text(format!("{key}/emoji"), emoji), 13.),
+        wire::TextOptions {
+            line_height: Some(wire::LineHeight::Absolute(PILL_HEIGHT)),
+            ..Default::default()
+        },
     ))];
     if let Some(count) = count {
         parts.push(native::nowrap(native::weighted(
@@ -55,7 +64,7 @@ fn reaction_pill(
         *checked = Some(mine);
         *accessible = Some(label.into());
         *description = Some(emoji.into());
-        *height = Some(wire::Length::Fixed(22.));
+        *height = Some(wire::Length::Fixed(PILL_HEIGHT));
         *padding = Some(wire::Edges {
             top: 0.,
             right: 8.,
@@ -307,7 +316,7 @@ impl ChatView {
             };
             reactions.push(reaction_pill(
                 format!("{key}/reaction/add"),
-                "😀",
+                "+",
                 None,
                 "Add reaction",
                 false,
