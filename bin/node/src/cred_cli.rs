@@ -765,6 +765,9 @@ fn register_credential(enrolment: &Enrolment, kind: gateway::CredentialKind) -> 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AirlockLane {
     Model,
+    // only `cred seal --vendor apple-codesign` publishes the signing lane,
+    // and that verb's body exists only in a `verify` build.
+    #[cfg_attr(not(feature = "verify"), allow(dead_code))]
     Sign,
 }
 
@@ -809,6 +812,7 @@ impl Publisher {
     /// The node this verb dials, as `/v1/status` reports it: what `cred
     /// seal` publishes under, which holds no store and needs no workspace —
     /// the operator binds the enclave's port on that node.
+    #[cfg(feature = "verify")]
     pub(crate) fn of_node(base: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let status = crate::node_http::get_json(base, "/v1/status")
             .map_err(|error| format!("read the node's status: {error}"))?;

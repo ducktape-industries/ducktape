@@ -173,10 +173,10 @@ pub(crate) fn cmd_inspect(
 
 #[cfg(not(feature = "verify"))]
 pub(crate) fn cmd_seal(
+    _ctx: &crate::cred_cli::VerbCtx,
     _gateway: GatewayArgs,
     _attest_args: AttestArgs,
     _seal: SealArgs,
-    _node_base: impl FnOnce() -> Result<String, Box<dyn std::error::Error>>,
     _stdin: &mut impl std::io::BufRead,
 ) -> CredResult {
     Err(NEEDS_VERIFY_BUILD.into())
