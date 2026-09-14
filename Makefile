@@ -15,7 +15,7 @@ LOCKED ?= --locked
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app app-release publish-app views views-repro-check dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
+.PHONY: all app app-release release-app publish-app views views-repro-check dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
 
 ## the system packages a build needs and cargo cannot install: rustup (the
 ## pinned toolchain and its wasm32 target install themselves through it), a C
@@ -154,16 +154,28 @@ app-release:
 	  { echo "app-release requires DUCKTAPE_CODESIGN_IDENTITY (Developer ID Application)" >&2; exit 1; }
 	@$(MAKE) app
 
+## the archive a release offers: `app-release` (Developer ID + notarized —
+## every offered release is; the three DUCKTAPE_NOTARY_* are required here,
+## not optional as for `app`), the ticket stapled to the bundle, then
+## ops/release/archive.sh packs Ducktape.app into
+## target/release-archive/Ducktape-<sha7>-macos-<arch>.tar.zst and refuses
+## an ad-hoc or unnotarized bundle by name. Publish it with `make publish-app`.
+release-app:
+	@test -n "$$DUCKTAPE_NOTARY_KEY" -a -n "$$DUCKTAPE_NOTARY_KEY_ID" -a -n "$$DUCKTAPE_NOTARY_ISSUER" || \
+	  { echo "release-app requires DUCKTAPE_NOTARY_KEY, DUCKTAPE_NOTARY_KEY_ID and DUCKTAPE_NOTARY_ISSUER: a release is notarized" >&2; exit 1; }
+	@$(MAKE) app-release
+	bash ops/release/archive.sh --from target/app-bundle/Ducktape.app --out-dir "$(RELEASE_ARCHIVE_DIR)"
+
 ## install the operator CLI and desktop app without requiring root
 install: install-node install-app
 
 ## put the built bundle under the launcher: `ducktape-launcher install` seeds
 ## it as a release, swaps it into /Applications (DUCKTAPE_INSTALL_DIR
 ## overrides; the directory must be writable by this user) and writes the
-## update state the app and the launcher share. A bundle that carries no
-## launcher of its own gets this one copied into Contents/MacOS.
+## update state the app and the launcher share. The bundle ships its own
+## launcher (Contents/MacOS/ducktape-launcher is its CFBundleExecutable),
+## signed with the rest of it, so nothing is added or re-sealed here.
 install-app: app
-	$(CARGO) build $(LOCKED) --release -p app-launcher
 	target/release/ducktape-launcher install --from target/app-bundle/Ducktape.app
 else
 ## where the Linux desktop entry and its icon land — the XDG per-user roots,
@@ -174,9 +186,23 @@ ICON_DEST ?= $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/icons/
 ## install the ducktape operator CLI and the desktop app without requiring root
 install: install-node install-app
 
-## build the desktop app binary, its launcher, and the views it loads
+## build the desktop app binary, its launcher, and the views it loads, and
+## stage them whole as one release under target/app-release:
+## `{ducktape-launcher, ducktape-app, views/*.wasm}` — what `ducktape-launcher
+## install --from` takes and what ops/release/archive.sh packs.
 app: prereqs views
 	$(CARGO) build $(LOCKED) --release -p ducktape-app -p app-launcher
+	rm -rf target/app-release
+	mkdir -p target/app-release/views
+	install -m 0755 target/release/ducktape-app target/release/ducktape-launcher target/app-release/
+	install -m 0644 target/views/*.wasm target/app-release/views/
+
+## the archive a release offers: the staged release packed by
+## ops/release/archive.sh into
+## target/release-archive/Ducktape-<sha7>-linux-<arch>.tar.zst. Publish it
+## with `make publish-app`.
+release-app: app
+	bash ops/release/archive.sh --from target/app-release --out-dir "$(RELEASE_ARCHIVE_DIR)"
 
 ## install the desktop app under its launcher and REGISTER THE duck:// SCHEME
 ## with the desktop. The release is staged whole (`ducktape-launcher`,
@@ -194,21 +220,25 @@ app: prereqs views
 install-app: app
 	mkdir -p "$(ICON_DEST)"
 	install -m 0644 app/assets/icon.svg "$(ICON_DEST)/ducktape.svg"
-	rm -rf target/app-release
-	mkdir -p target/app-release/views
-	install -m 0755 target/release/ducktape-app target/release/ducktape-launcher target/app-release/
-	install -m 0644 target/views/*.wasm target/app-release/views/
 	target/release/ducktape-launcher install --from target/app-release
 	-update-desktop-database "$(DESKTOP_DEST)"
 endif
 
+## where `release-app` leaves its archives and `archives.txt` (one
+## `<os>-<arch>=<path>` line per platform; a rerun replaces its own line).
+RELEASE_ARCHIVE_DIR ?= target/release-archive
+
 ## publish a built desktop-app release to a network's duckfs: compose +
 ## seal the manifest, sign it with the release wallet, `fs put` the archives,
 ## the manifest and its signature under /shared/releases. Runs
-## ops/release/publish.sh; every flag is a variable:
+## ops/release/publish.sh; every flag is a variable. ARCHIVES defaults to
+## what `make release-app` wrote to $(RELEASE_ARCHIVE_DIR)/archives.txt, so
+## after a `release-app` on this machine the archive list may be left out;
+## a release for several platforms names every archive explicitly:
 ##   make publish-app NODE=http://127.0.0.1:8844 RELEASE_KEY=~/.ducktape/release/keys/release.key \
 ##        SEQUENCE=18 DISPLAY="2026.09.2+9d71b254a" \
 ##        ARCHIVES="macos-aarch64=target/Ducktape-macos-aarch64.tar.zst linux-x86_64=target/Ducktape-linux-x86_64.tar.zst"
+ARCHIVES ?= $(shell cat "$(RELEASE_ARCHIVE_DIR)/archives.txt" 2>/dev/null)
 publish-app:
 	@test -n "$(NODE)" -a -n "$(RELEASE_KEY)" -a -n "$(SEQUENCE)" -a -n "$(DISPLAY)" -a -n "$(ARCHIVES)" || \
 	  { echo "publish-app needs NODE, RELEASE_KEY, SEQUENCE, DISPLAY and ARCHIVES (see the comment above)" >&2; exit 2; }
