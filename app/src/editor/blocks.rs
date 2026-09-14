@@ -5,8 +5,8 @@ use super::{EditorStore, Projection, offset, position};
 use gpui_kit::base::input::{
     Editor, EditorState, InputEditorStyle, TextDecoration, TextDecorationCollection,
 };
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::component::button::Button;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Edges, Entity, EntityInputHandler as _,
     EventEmitter, Focusable as _, FontWeight, HighlightStyle, Hsla, InteractiveElement as _,
@@ -33,9 +33,88 @@ struct Segment {
     format: Option<EditorFormat>,
 }
 
+/// The block a line's prefix declares, read off the SOURCE line: the guest
+/// collapses the prefix out of the displayed text, and the host draws the
+/// block's furniture in its place — Notion's checkbox, bullet, quote bar and
+/// one continuous code plate — instead of glyphs dressed up as those.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    Plain,
+    Bullet,
+    Todo {
+        done: bool,
+    },
+    Quote,
+    /// The opening fence: the plate's top edge.
+    CodeOpen,
+    Code,
+    /// The closing fence: the plate's bottom edge.
+    CodeClose,
+}
+
+impl Shape {
+    /// The room the furniture takes to the left of the content.
+    fn lead(self) -> f32 {
+        match self {
+            Shape::Bullet | Shape::Todo { .. } => MARKER_COLUMN,
+            Shape::Quote => QUOTE_BAR + QUOTE_GAP,
+            Shape::Plain | Shape::CodeOpen | Shape::Code | Shape::CodeClose => 0.,
+        }
+    }
+}
+
+/// Notion's marker column: the bullet or the box sits in it, centred, and
+/// the content starts past it.
+const MARKER_COLUMN: f32 = 24.;
+const QUOTE_BAR: f32 = 3.;
+const QUOTE_GAP: f32 = 14.;
+const CHECKBOX: f32 = 16.;
+
+/// One document's line shapes, in order: a fence carries "inside code" to the
+/// lines after it, so the shapes are read in one pass over the whole text.
+fn line_shapes(text: &str) -> Vec<Shape> {
+    let mut inside_code = false;
+    wire::editor_lines(text)
+        .enumerate()
+        .map(|(index, line)| {
+            let trimmed = line.trim_start_matches([' ', '\t']);
+            let title = index == 0;
+            let fence = trimmed.starts_with("```");
+            let shape = match (title, inside_code, fence) {
+                (true, _, _) => Shape::Plain,
+                (false, false, true) => Shape::CodeOpen,
+                (false, true, true) => Shape::CodeClose,
+                (false, true, false) => Shape::Code,
+                (false, false, false) => prefix_shape(trimmed),
+            };
+            if fence && !title {
+                inside_code = !inside_code;
+            }
+            shape
+        })
+        .collect()
+}
+
+fn prefix_shape(trimmed: &str) -> Shape {
+    if trimmed.starts_with("- [ ] ") {
+        return Shape::Todo { done: false };
+    }
+    if trimmed.starts_with("- [x] ") || trimmed.starts_with("- [X] ") {
+        return Shape::Todo { done: true };
+    }
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        return Shape::Bullet;
+    }
+    if trimmed.starts_with("> ") {
+        return Shape::Quote;
+    }
+    Shape::Plain
+}
+
 #[derive(Clone, Debug)]
 struct LineProjection {
     source: Range<usize>,
+    shape: Shape,
     display: String,
     segments: Vec<Segment>,
     size: f32,
@@ -584,11 +663,18 @@ impl WireEditor {
                     );
                     input.set_editor_paddings(Edges::all(px(0.)));
                     let face = &projection.options.style.active;
+                    // A face that names no selection ink gets the theme's: the
+                    // default is transparent, and a selection nobody can see
+                    // is a selection nobody trusts.
+                    let selection = face
+                        .selection
+                        .map(color)
+                        .unwrap_or(gpui_kit::component::Theme::global(cx).selection);
                     input.set_editor_style(InputEditorStyle {
                         foreground: face.value.map(color).unwrap_or_default(),
                         muted_foreground: face.placeholder.map(color).unwrap_or_default(),
                         background: face.background.map(color).unwrap_or_default(),
-                        selection: face.selection.map(color).unwrap_or_default(),
+                        selection,
                         ..Default::default()
                     });
                 });
@@ -634,6 +720,9 @@ impl WireEditor {
         let editable =
             projection.editable && projection.fault.is_none() && projection.text.is_some();
         for row in &self.lines {
+            // A fence row is the code plate's edge: nothing is typed there.
+            let fence = matches!(row.projection.shape, Shape::CodeOpen | Shape::CodeClose);
+            let editable = editable && !fence;
             row.input.update(cx, |input, cx| {
                 if input.is_editable() != editable {
                     input.set_readonly(!editable, cx);
@@ -665,6 +754,12 @@ impl WireEditor {
     fn observed(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let focused = self.focused_line(window, cx) == Some(index);
         if !focused {
+            return;
+        }
+        // A hop to another row is in flight: this row's caret is the one the
+        // hop LEFT, and reporting it would pull the cursor straight back.
+        let hopping_away = self.focus_line.is_some_and(|line| line != index);
+        if hopping_away {
             return;
         }
         let Some(row) = self.lines.get_mut(index) else {
@@ -763,6 +858,7 @@ impl WireEditor {
         } else {
             wire::EditorEditKind::Insert
         };
+        tracing::debug!(target: "ducktape::pages_editor", index, caret, ?next, ?kind, "observed");
         self.store
             .native(&self.key, &self.preview, self.cursor, &after, next, kind);
         self.preview = Arc::from(after);
@@ -907,7 +1003,10 @@ impl WireEditor {
         let row = &self.lines[index];
         let input = row.input.read(cx);
         let caret = input.cursor();
-        let range = input.cursor_layout().map(|(b, _)| b);
+        // All three in ONE space: `cursor_layout` reports the caret after the
+        // scroll offset moved the input's origin, so against `range_to_bounds`
+        // it read a line lower than it was and no Up ever hopped.
+        let range = input.range_to_bounds(&(caret..caret));
         let first = input.range_to_bounds(&(0..0));
         let end = row.projection.display.len();
         let last = input.range_to_bounds(&(end..end));
@@ -917,22 +1016,37 @@ impl WireEditor {
         let at_bottom = range
             .zip(last)
             .is_some_and(|(a, b)| a.origin.y >= b.origin.y);
-        let target = match key.key {
-            Key::Named(Named::ArrowUp) if at_top && index > 0 => {
-                Some((index - 1, self.cursor.position.column))
-            }
-            Key::Named(Named::ArrowDown) if at_bottom && index + 1 < self.lines.len() => {
-                Some((index + 1, self.cursor.position.column))
-            }
-            Key::Named(Named::ArrowLeft) if caret == 0 && index > 0 => Some((index - 1, u32::MAX)),
-            Key::Named(Named::ArrowRight) if caret == end && index + 1 < self.lines.len() => {
-                Some((index + 1, 0))
+        // A vertical hop keeps the DISPLAYED column, not the source one: the
+        // line above may hide a `## ` the caret would otherwise jump past.
+        let displayed = row
+            .projection
+            .display_at(self.cursor.position.column as usize);
+        // Where the hop lands on its row: the same displayed column, the
+        // row's end, or its first displayed byte (past a collapsed prefix).
+        let hop = match key.key {
+            Key::Named(Named::ArrowUp) if at_top => Some((Direction::Up, Landing::Column)),
+            Key::Named(Named::ArrowDown) if at_bottom => Some((Direction::Down, Landing::Column)),
+            Key::Named(Named::ArrowLeft) if caret == 0 => Some((Direction::Up, Landing::End)),
+            Key::Named(Named::ArrowRight) if caret == end => {
+                Some((Direction::Down, Landing::Start))
             }
             _ => None,
         };
-        let Some((line, column)) = target else {
+        let Some((direction, landing)) = hop else {
             return false;
         };
+        // A fence row is the code plate's edge, not a line: a hop steps over
+        // it, or typing there would break the fence open.
+        let Some(line) = self.next_line_over_fences(index, direction) else {
+            return false;
+        };
+        let projection = &self.lines[line].projection;
+        let column = match landing {
+            Landing::Column => same_column_from(projection, displayed),
+            Landing::Start => same_column_from(projection, 0),
+            Landing::End => u32::MAX,
+        };
+        tracing::debug!(target: "ducktape::pages_editor", index, line, column, "cross_line_key");
         let mut cursor = wire::EditorCursor {
             position: wire::EditorPosition {
                 line: line as u32,
@@ -948,6 +1062,22 @@ impl WireEditor {
         self.focus_line = Some(line);
         self.move_cursor(cursor, cx);
         true
+    }
+
+    /// The nearest row in `direction` that is not a fence, if any.
+    fn next_line_over_fences(&self, from: usize, direction: Direction) -> Option<usize> {
+        let mut line = from;
+        loop {
+            line = match direction {
+                Direction::Up => line.checked_sub(1)?,
+                Direction::Down => line + 1,
+            };
+            let shape = self.lines.get(line)?.projection.shape;
+            let fence = matches!(shape, Shape::CodeOpen | Shape::CodeClose);
+            if !fence {
+                return Some(line);
+            }
+        }
     }
 
     fn move_cursor(&mut self, cursor: wire::EditorCursor, cx: &mut Context<Self>) {
@@ -969,6 +1099,85 @@ impl WireEditor {
         self.store
             .request(&self.key, wire::EditorRequestInput::Interaction { action });
         cx.emit(());
+    }
+
+    /// The block's own furniture, drawn where its collapsed prefix was: a
+    /// bullet or a checkbox in the marker column, a bar beside a quote.
+    /// Nothing for a paragraph, a heading or a code line.
+    fn furniture(
+        &self,
+        index: usize,
+        shape: Shape,
+        left: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let row = &self.lines[index];
+        let layout = &row.projection;
+        let theme = gpui_kit::component::Theme::global(cx);
+        let colors = theme.color_tokens();
+        // The first visual line of the row: the furniture centres on it, and
+        // a wrapped row's later lines run under empty column.
+        let column = div()
+            .absolute()
+            .left(px(left))
+            .top(px(layout.padding.top))
+            .h(px(layout.line_height))
+            .flex()
+            .items_center()
+            .justify_center();
+        match shape {
+            Shape::Plain | Shape::CodeOpen | Shape::Code | Shape::CodeClose => {
+                div().into_any_element()
+            }
+            Shape::Bullet => column
+                .w(px(MARKER_COLUMN))
+                .child(div().size(px(6.)).rounded_full().bg(colors.foreground))
+                .into_any_element(),
+            Shape::Todo { done } => {
+                let line = index as u32;
+                column
+                    .w(px(MARKER_COLUMN))
+                    .child(
+                        div()
+                            .id(("todo", index))
+                            .size(px(CHECKBOX))
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(colors.muted_foreground)
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(done, |tick| {
+                                tick.bg(colors.accent).border_color(colors.accent).child(
+                                    gpui_kit::component::Icon::new(
+                                        gpui_kit::component::IconName::Check,
+                                    )
+                                    .size(px(12.))
+                                    .text_color(colors.background),
+                                )
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.interaction(
+                                    EditorInteraction::LinePress {
+                                        tag: 1,
+                                        position: wire::EditorPosition { line, column: 0 },
+                                    },
+                                    cx,
+                                )
+                            })),
+                    )
+                    .into_any_element()
+            }
+            Shape::Quote => div()
+                .absolute()
+                .left(px(left))
+                .top(px(layout.padding.top))
+                .bottom(px(layout.padding.bottom))
+                .w(px(QUOTE_BAR))
+                .bg(colors.foreground)
+                .into_any_element(),
+        }
     }
 
     fn measure(&mut self, cx: &mut Context<Self>) {
@@ -1038,11 +1247,17 @@ impl Render for WireEditor {
         for (index, row) in self.lines.iter().enumerate() {
             let line = index as u32;
             let layout = &row.projection;
+            // The row is a hover group: its gutter (the `+` and the handle)
+            // paints only while the pointer is over the row, Notion's way,
+            // instead of on every row at once.
+            let shape = layout.shape;
+            let furniture_left = pad.left + layout.padding.left;
             let mut body = div()
                 .id(("line", index))
+                .group(format!("row-{index}"))
                 .relative()
                 .w_full()
-                .pl(px(pad.left + layout.padding.left))
+                .pl(px(furniture_left + shape.lead()))
                 .pr(px(pad.right + layout.padding.right))
                 .pt(px(layout.padding.top))
                 .pb(px(layout.padding.bottom));
@@ -1053,10 +1268,32 @@ impl Render for WireEditor {
                 if let Some(ink) = border.color {
                     body = body.border_color(color(ink));
                 }
-                body = body
-                    .border(px(border.width.unwrap_or(0.)))
-                    .rounded(px(border.radius.unwrap_or_default()[0]));
+                let width = px(border.width.unwrap_or(0.));
+                let radius = px(border.radius.unwrap_or_default()[0]);
+                // A code block is ONE plate: its lines share the side edges,
+                // the opening fence rounds the top corners, the closing fence
+                // the bottom ones, and no line draws an edge between two
+                // lines of the same plate.
+                body = match shape {
+                    Shape::CodeOpen => body
+                        .border_t(width)
+                        .border_l(width)
+                        .border_r(width)
+                        .rounded_tl(radius)
+                        .rounded_tr(radius),
+                    Shape::Code => body.border_l(width).border_r(width),
+                    Shape::CodeClose => body
+                        .border_b(width)
+                        .border_l(width)
+                        .border_r(width)
+                        .rounded_bl(radius)
+                        .rounded_br(radius),
+                    Shape::Plain | Shape::Bullet | Shape::Todo { .. } | Shape::Quote => {
+                        body.border(width).rounded(radius)
+                    }
+                };
             }
+            body = body.child(self.furniture(index, shape, furniture_left, cx));
             if let Some(ink) = layout.rule {
                 body = body.border_b_1().border_color(color(ink));
             }
@@ -1084,7 +1321,9 @@ impl Render for WireEditor {
                         .left(px(0.))
                         .top(px(layout.padding.top))
                         .flex()
-                        .gap(px(1.));
+                        .gap(px(1.))
+                        .opacity(0.)
+                        .group_hover(format!("row-{index}"), |style| style.opacity(1.));
                     if gutter.plus {
                         gutter_view = gutter_view.child(
                             Button::new(("plus", index))
@@ -1300,17 +1539,38 @@ fn local_cursor(line: &LineProjection, cursor: wire::EditorCursor, index: usize)
     }
 }
 
+#[derive(Clone, Copy)]
+enum Direction {
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy)]
+enum Landing {
+    Column,
+    Start,
+    End,
+}
+
+/// The source column on `projection` under a displayed column, clamped to
+/// the line: what a caret hop between rows carries across.
+fn same_column_from(projection: &LineProjection, displayed: usize) -> u32 {
+    projection.source_at(displayed.min(projection.display.len())) as u32
+}
+
 fn line_projections(text: &str, options: &wire::EditorOptions) -> Vec<LineProjection> {
     let paint = options
         .presentation
         .as_deref()
         .filter(|paint| paint.validate(text).is_ok());
+    let shapes = line_shapes(text);
     wire::editor_lines(text)
         .enumerate()
         .map(|(index, source)| {
             let start = source.as_ptr() as usize - text.as_ptr() as usize;
             let mut line = LineProjection {
                 source: start..start + source.len(),
+                shape: shapes[index],
                 display: String::new(),
                 segments: Vec::new(),
                 size: options.size.unwrap_or(14.),

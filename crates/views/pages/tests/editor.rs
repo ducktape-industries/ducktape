@@ -200,8 +200,8 @@ fn backspace_at_the_content_edge_drops_the_marker_not_the_line_above() {
     let heading = pressed(typed("one\n## two", 1, 3), Key::Backspace);
     assert_eq!(heading.text, "one\ntwo");
     assert_eq!(heading.cursor, EditorCursor::at(1, 0));
-    // The focused row shows its prefix raw, so Home lands BEFORE the `## `:
-    // Backspace there drops the shape too, never the line above.
+    // A caret can still land before the collapsed `## ` (an arrow hop lands
+    // on column 0): Backspace there drops the shape too, never the line above.
     let before_prefix = pressed(typed("one\n## two", 1, 0), Key::Backspace);
     assert_eq!(before_prefix.text, "one\ntwo");
     assert_eq!(before_prefix.cursor, EditorCursor::at(1, 0));

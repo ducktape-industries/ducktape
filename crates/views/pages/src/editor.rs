@@ -345,9 +345,8 @@ fn remove_list_marker(doc: &Doc) -> Option<Edit> {
         Some(marker) => (marker.indent, marker.content),
         None => block_prefix(text)?,
     };
-    // At the content edge, or anywhere inside the prefix the focused row
-    // shows raw (Home lands before a heading's `# `): the shape goes, the
-    // line above stays.
+    // At the content edge, or anywhere inside the collapsed prefix (an arrow
+    // hop can land on column 0): the shape goes, the line above stays.
     let past_the_prefix = doc.cursor.position.column as usize > content;
     if past_the_prefix {
         return None;
