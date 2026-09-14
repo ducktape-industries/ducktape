@@ -577,12 +577,17 @@ impl ChatView {
         key: String,
         join: impl Fn() -> Message + Clone + 'static,
     ) -> wire::Node {
-        native::button(
+        // one word in the header; the full name is what a reader hears
+        let mut button = native::button(
             key,
-            "Start a huddle",
+            "Huddle",
             Some(slots::message(join())),
             wire::ButtonPreset::Subtle,
-        )
+        );
+        if let wire::Node::Button { label, .. } = &mut button {
+            *label = Some("Start a huddle".into());
+        }
+        button
     }
 
     pub(super) fn disconnected(&self, key: String) -> wire::Node {
