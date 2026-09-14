@@ -256,7 +256,7 @@ fn a_connected_view_reads_every_card_through_the_kernel() {
         // the head: the node's version beside the phase
         "ducktape 0.1.0",
         // the node card: consensus, checkpoint, root hash
-        "2 reachable of 3 needed",
+        "2 of 3 for quorum",
         "block 84,900",
         "feedface",
         // the peers card, connected first
@@ -334,6 +334,46 @@ fn the_columns_follow_the_measured_pane() {
         assert!(has_text(&frame, card), "{card} lost: {:?}", texts(&frame));
     }
     assert!(frame.requests.is_empty(), "a measurement reads nothing");
+}
+
+/// Every text in a card row keeps ONE line: the rows are built at a fixed
+/// height and a card in a three-column pane is narrow, so a height, a
+/// count or a digest allowed to wrap lands under the next row. The one
+/// text that may wrap is a notice.
+#[test]
+fn every_row_cell_keeps_one_line() {
+    let (frame, _) = connected_dashboard();
+    let mut root = frame.root.clone().expect("a drawn page");
+    let mut wrapping = Vec::new();
+    root.for_each_mut(&mut |node| {
+        let Node::Text { key, options, .. } = node else {
+            return;
+        };
+        let in_a_row = [
+            "home/node/",
+            "home/members/",
+            "home/peer/",
+            "home/block/",
+            "home/module/",
+            "home/room/",
+            "home/run/",
+            "home/proposal/",
+            "home/file/",
+            "home/stat/",
+        ]
+        .iter()
+        .any(|prefix| key.starts_with(prefix));
+        let one_line = options.wrapping == Some(ducktape_view_guest::wire::Wrapping::None);
+        let is_notice = key.contains("error") || key.contains("sync-error");
+        // a kv label is 140 px wide and short; a tile label sits in a
+        // tile with no fixed height
+        let is_label = key.ends_with("/label");
+        let is_card_title = key.ends_with("/title");
+        if in_a_row && !one_line && !is_notice && !is_label && !is_card_title {
+            wrapping.push(key.clone());
+        }
+    });
+    assert!(wrapping.is_empty(), "cells that may wrap: {wrapping:?}");
 }
 
 /// A pressed room leaves as `home.open_link` with the room's `duck://`
