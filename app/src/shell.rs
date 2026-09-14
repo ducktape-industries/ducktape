@@ -1611,6 +1611,11 @@ impl DesktopWindow {
         let view = self.module.as_ref().expect("module seated").1.clone();
         view.update(cx, |view, cx| view.set_props(spec.props, cx));
         let selected_tab = self.model.read(cx).state.shell_tab;
+        // every tab by its module: a seat tasting a proposed view says so
+        // on its label
+        let label = |module: &'static str| {
+            crate::module_view::tab_label(module, &crate::module_view::module_name(module))
+        };
         // the dashboard leads the rail, above every section: it is the
         // network at a glance, not a workspace tool or a network tool
         let registered = crate::module_view::registered_views();
@@ -1619,23 +1624,18 @@ impl DesktopWindow {
             .copied()
             .filter(|module| *module == HOME_VIEW);
         let mut navigation: Vec<(ShellTab, String)> = dashboard
-            .map(|module| {
-                (
-                    ShellTab::Registered(module),
-                    crate::module_view::registered_view_name(module),
-                )
-            })
+            .map(|module| (ShellTab::Registered(module), label(module)))
             .collect();
         navigation.extend([
-            (ShellTab::Chat, "Chat".to_owned()),
-            (ShellTab::Pages, "Pages".to_owned()),
-            (ShellTab::Forge, "Forge".to_owned()),
-            (ShellTab::Agents, "Agents".to_owned()),
-            (ShellTab::Files, "Files".to_owned()),
-            (ShellTab::Explorer, "Explorer".to_owned()),
-            (ShellTab::Node, "Node".to_owned()),
-            (ShellTab::Members, "Members".to_owned()),
-            (ShellTab::Governance, "Governance".to_owned()),
+            (ShellTab::Chat, label("chat")),
+            (ShellTab::Pages, label("pages")),
+            (ShellTab::Forge, label("forge")),
+            (ShellTab::Agents, label("agents")),
+            (ShellTab::Files, label("files")),
+            (ShellTab::Explorer, label("explorer")),
+            (ShellTab::Node, label("node")),
+            (ShellTab::Members, label("members")),
+            (ShellTab::Governance, label("governance")),
         ]);
         // the other views the connected node's registry lists, after the
         // built-in tabs and in the registry's order; named by their manifests
@@ -1643,14 +1643,9 @@ impl DesktopWindow {
             registered
                 .into_iter()
                 .filter(|module| *module != HOME_VIEW)
-                .map(|module| {
-                    (
-                        ShellTab::Registered(module),
-                        crate::module_view::registered_view_name(module),
-                    )
-                }),
+                .map(|module| (ShellTab::Registered(module), label(module))),
         );
-        navigation.push((ShellTab::Settings, "Settings".to_owned()));
+        navigation.push((ShellTab::Settings, label("settings")));
         let (sidebar, popover) = {
             let theme = gpui_kit::component::Theme::global(cx);
             (theme.sidebar, theme.popover)

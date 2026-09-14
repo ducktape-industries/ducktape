@@ -19,6 +19,8 @@ pub struct GovernanceView {
     pub(crate) answered: bool,
     pub(crate) host_error: String,
     pub(crate) dark: bool,
+    /// The taste set the kernel pushes with the session.
+    pub(crate) tasting: Vec<crate::host::TasteRow>,
 }
 impl ::std::fmt::Debug for GovernanceView {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -32,6 +34,10 @@ pub enum Message {
     ActDone(crate::host::ActItem),
     GovVote(String, bool),
     GovExecute(String),
+    /// Try the view a code ballot would install: `(module, hash hex)`.
+    Taste(String, String),
+    /// Back to the current view of `module`.
+    Untaste(String),
 }
 impl ::std::fmt::Debug for Message {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -49,6 +55,7 @@ impl GovernanceView {
             answered: false,
             host_error: "".to_owned(),
             dark: false,
+            tasting: Vec::new(),
         }
     }
     pub(crate) fn boot() -> (Self, ::ducktape_view_guest::Task<Message>) {
@@ -56,7 +63,7 @@ impl GovernanceView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "4fd8db607777674c4473164550c788121d5db5f9cf630603ced7636fba43ca3d";
+        "9b1e5c0d2a6f4e8b7c3d1a5f9e2b4c6d8a0f3e1b5d7c9a2e4f6b8d0c1a3e5f7b";
 }
 impl GovernanceView {
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
@@ -173,7 +180,17 @@ impl GovernanceView {
             Message::ActDone(item) => self.on_act_done(item),
             Message::GovVote(proposal_id, approve) => self.on_gov_vote(proposal_id, approve),
             Message::GovExecute(proposal_id) => self.on_gov_execute(proposal_id),
+            Message::Taste(module, hash) => self.on_taste(module, hash),
+            Message::Untaste(module) => self.on_untaste(module),
         }
+    }
+    fn on_taste(&mut self, module: String, hash: String) -> ::ducktape_view_guest::Task<Message> {
+        let _sent = crate::host::taste(&module, &hash);
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_untaste(&mut self, module: String) -> ::ducktape_view_guest::Task<Message> {
+        let _sent = crate::host::untaste(&module);
+        ::ducktape_view_guest::Task::none()
     }
     fn on_session_arrived(
         &mut self,
@@ -193,6 +210,7 @@ impl GovernanceView {
             self.admin = next.admin;
             self.connected = next.connected;
             self.dark = next.dark;
+            self.tasting = next.tasting;
             ::ducktape_view_guest::Task::none()
         }
     }
@@ -428,21 +446,52 @@ impl GovernanceView {
         if self.admin {
             actions.extend(self.ballot(proposal, &key, available, met));
         }
+        let mut body = vec![
+            head,
+            kit::spaced(kit::column(format!("{key}/fields"), fields), 4.),
+            kit::spaced(kit::centered_row(format!("{key}/about"), about), 12.),
+        ];
+        // a code ballot's view can be tried before the vote: every member,
+        // on their own screen alone
+        if let Some(taste) = host::taste_of(&self.tasting, proposal) {
+            body.push(self.taste(taste, &key));
+        }
+        body.push(kit::centered_row(format!("{key}/actions"), actions));
         kit::card(
             &key,
-            kit::spaced(
-                kit::column(
-                    format!("{key}/body"),
-                    [
-                        head,
-                        kit::spaced(kit::column(format!("{key}/fields"), fields), 4.),
-                        kit::spaced(kit::centered_row(format!("{key}/about"), about), 12.),
-                        kit::centered_row(format!("{key}/actions"), actions),
-                    ],
-                ),
-                8.,
-            ),
+            kit::spaced(kit::column(format!("{key}/body"), body), 8.),
         )
+    }
+    /// The taste line of a code ballot: where it stands and "Try this view"
+    /// / "Back to current" for a row this app can seat; the reason it
+    /// cannot, otherwise.
+    fn taste(&self, row: &host::TasteRow, key: &str) -> ducktape_view_guest::wire::Node {
+        use ducktape_view_guest::{kit, slots, wire};
+        let refused = !row.reason.is_empty();
+        if refused {
+            return kit::nowrap(kit::caption(
+                format!("{key}/taste/refused"),
+                host::refusal_words(&row.reason),
+            ));
+        }
+        let status = kit::nowrap(kit::caption(
+            format!("{key}/taste/status"),
+            host::taste_status(row),
+        ));
+        let (name, message) = match row.tasting {
+            true => ("Back to current", Message::Untaste(row.module.clone())),
+            false => (
+                "Try this view",
+                Message::Taste(row.module.clone(), row.hash.clone()),
+            ),
+        };
+        let button = kit::button(
+            format!("{key}/taste/toggle"),
+            name,
+            Some(slots::message(message)),
+            wire::ButtonPreset::Secondary,
+        );
+        kit::centered_row(format!("{key}/taste"), [status, kit::spacer(), button])
     }
     /// The validator's controls on one open proposal: a note while an op
     /// is out, then Reject and Approve, or Settle once the rule is met.

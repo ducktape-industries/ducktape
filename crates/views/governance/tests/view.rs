@@ -5,7 +5,7 @@
 
 use ducktape_view_guest::testing::{answer, has_text, item, press, refuse, texts};
 use ducktape_view_guest::wire::{Frame, Node, Request};
-use governance_view::host::Session;
+use governance_view::host::{Session, TasteRow};
 use governance_view::{boot_native, tick_native};
 
 fn boot() -> Frame {
@@ -49,8 +49,46 @@ fn session(connected: bool) -> Vec<u8> {
         connected,
         admin: true,
         dark: false,
+        tasting: Vec::new(),
     })
     .expect("session encodes")
+}
+
+/// The session with one taste row for the open code ballot below.
+fn session_tasting(tasting: bool, reason: &str) -> Vec<u8> {
+    serde_json::to_vec(&Session {
+        connected: true,
+        admin: true,
+        dark: false,
+        tasting: vec![TasteRow {
+            module: "chat".into(),
+            name: "Chat".into(),
+            proposal: "prop-code".into(),
+            hash: "ab".repeat(32),
+            status: "open".into(),
+            activation_height: 0,
+            tasting,
+            reason: reason.into(),
+        }],
+    })
+    .expect("session encodes")
+}
+
+/// The node's `proposals` reply: one open code ballot for the chat module.
+fn code_proposals() -> Vec<u8> {
+    serde_json::json!({ "proposals": [{
+        "proposal_id": "prop-code",
+        "action": { "update_module": {
+            "name": "chat-2", "module_id": "chat", "activation_lead": 10,
+            "code_hash": vec![0xab_u8; 32]
+        }},
+        "proposer": [1, 2, 3], "created_at": 1, "deadline": 4200,
+        "status": "open", "votes": [], "voter_kind": "validator_node",
+        "electorate": [[[1], 1], [[2], 1]],
+        "voting_rule": { "threshold": { "required_yes": 2 } }
+    }]})
+    .to_string()
+    .into_bytes()
 }
 
 /// The node's `proposals` reply: one open proposal one vote from its bar,
@@ -258,6 +296,7 @@ fn a_reader_without_standing_sees_the_tally_and_no_ballot() {
         connected: true,
         admin: false,
         dark: false,
+        tasting: Vec::new(),
     })
     .expect("session encodes");
     let frame = tick_native(vec![item(session_id, &reader)]);
@@ -313,4 +352,61 @@ fn a_met_rule_offers_settle_which_leaves_as_execute() {
         op["payload"],
         serde_json::json!({ "execute": { "proposal_id": "prop-met" } })
     );
+}
+
+/// A code ballot in the taste set offers "Try this view", which leaves as
+/// the `governance.taste` intent naming the module and hash; a tasted row
+/// offers "Back to current" (`governance.untaste`); a refused row shows
+/// the reason and nothing to press; a ballot the set does not name shows
+/// no taste line at all.
+#[test]
+fn a_code_ballots_view_can_be_tried_and_left_from_its_card() {
+    let frame = boot();
+    let session_id = request(&frame, "governance.props").id;
+    let frame = tick_native(vec![item(session_id, &session_tasting(false, ""))]);
+    let query = request(&frame, "rpc.query").id;
+    let frame = tick_native(vec![answer(query, &code_proposals())]);
+    assert!(has_text(&frame, "On the ballot"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "Back to current"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Try this view"));
+    let taste = request(&frame, "governance.taste");
+    let intent: serde_json::Value = serde_json::from_slice(&taste.payload).expect("decodes");
+    assert_eq!(
+        intent,
+        serde_json::json!({ "module": "chat", "hash": "ab".repeat(32) })
+    );
+
+    // the app seated it: the session says so
+    let frame = tick_native(vec![item(session_id, &session_tasting(true, ""))]);
+    assert!(
+        has_text(&frame, "On the ballot · you are trying it"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(!has_text(&frame, "Try this view"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Back to current"));
+    let untaste = request(&frame, "governance.untaste");
+    let intent: serde_json::Value = serde_json::from_slice(&untaste.payload).expect("decodes");
+    assert_eq!(intent, serde_json::json!({ "module": "chat" }));
+
+    // refused: the reason, and nothing to press
+    let frame = tick_native(vec![item(
+        session_id,
+        &session_tasting(false, "core_changes_too"),
+    )]);
+    assert!(
+        has_text(
+            &frame,
+            "Changes the module's code too — it becomes current when it activates"
+        ),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(!has_text(&frame, "Try this view"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "Back to current"), "{:?}", texts(&frame));
+
+    // a ballot the taste set does not name has no taste line
+    let frame = tick_native(vec![item(session_id, &session(true))]);
+    assert!(!has_text(&frame, "On the ballot"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "Try this view"), "{:?}", texts(&frame));
 }

@@ -62,6 +62,8 @@ pub struct SettingsView {
     key_password: String,
     settings_pane: SettingsPane,
     pub(crate) dark: bool,
+    /// The taste set the kernel pushes with the session.
+    pub(crate) tasting: Vec<crate::host::TasteRow>,
 }
 impl ::std::fmt::Debug for SettingsView {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -102,6 +104,10 @@ pub enum Message {
     BindAccountJoinDraft(String),
     BindAccountKeyDraft(String),
     BindAccountKeyLabelDraft(String),
+    /// Try the view a code ballot would install: `(module, hash hex)`.
+    Taste(String, String),
+    /// Back to the current view of `module`.
+    Untaste(String),
 }
 impl ::std::fmt::Debug for Message {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -158,6 +164,7 @@ impl SettingsView {
             key_password: String::new(),
             settings_pane: SettingsPane::General,
             dark: false,
+            tasting: Vec::new(),
         }
     }
     pub(crate) fn boot() -> (Self, Task<Message>) {
@@ -165,7 +172,7 @@ impl SettingsView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "59a2e96a909e916d315084c8325ec77a1202d06a2dae9576077cd16ffec89cd2";
+        "c4d7a1e2f0b3958c6d2e4f1a7b9c0d3e5f8a2b4c6d1e3f5a7b9c0d2e4f6a8b1c";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         wire::Snapshot {
             schema: Self::SNAPSHOT_SCHEMA.into(),
@@ -319,6 +326,8 @@ impl SettingsView {
             Message::BindAccountJoinDraft(value) => self.on_bind_account_join_draft(value),
             Message::BindAccountKeyDraft(value) => self.on_bind_account_key_draft(value),
             Message::BindAccountKeyLabelDraft(value) => self.on_bind_account_key_label_draft(value),
+            Message::Taste(module, hash) => self.on_taste(module, hash),
+            Message::Untaste(module) => self.on_untaste(module),
         }
     }
     fn on_session_arrived(&mut self, item: Box<crate::host::SessionItem>) -> Task<Message> {
@@ -354,6 +363,7 @@ impl SettingsView {
         self.settings_key_path = next.settings_key_path.to_owned();
         self.account_busy = next.account_busy;
         self.account_ticket = next.account_ticket.to_owned();
+        self.tasting = next.tasting.clone();
         self.update_state = next.update_state.to_owned();
         self.update_current = next.update_current.to_owned();
         self.update_previous = next.update_previous.to_owned();
@@ -524,6 +534,14 @@ impl SettingsView {
     }
     fn on_set_desktop_notifications(&mut self, enabled: bool) -> Task<Message> {
         crate::host::set_notifications(enabled);
+        Task::none()
+    }
+    fn on_taste(&mut self, module: String, hash: String) -> Task<Message> {
+        crate::host::taste(&module, &hash);
+        Task::none()
+    }
+    fn on_untaste(&mut self, module: String) -> Task<Message> {
+        crate::host::untaste(&module);
         Task::none()
     }
     fn on_check_for_update(&mut self) -> Task<Message> {
@@ -1012,7 +1030,7 @@ impl SettingsView {
             &self.network_name
         };
         let members = self.reading(&self.members_line, self.members_answered);
-        settings_section(
+        let network = settings_section(
             "settings/network",
             "settings/network-name",
             network_name,
@@ -1090,6 +1108,60 @@ impl SettingsView {
                 ),
                 12.,
             ),
+        );
+        if self.tasting.is_empty() {
+            return network;
+        }
+        kit::spaced(
+            kit::column("settings/network-panes", [network, self.proposed_views()]),
+            24.,
+        )
+    }
+    /// The views a code ballot or a scheduled swap would install, one row
+    /// each: "Try this view" / "Back to current" for one this app can seat,
+    /// the reason for one it cannot.
+    fn proposed_views(&self) -> wire::Node {
+        use ducktape_view_guest::kit;
+        let rows = self.tasting.iter().map(|row| {
+            let key = format!("settings/proposed/{}/{}", row.module, row.hash);
+            let control = match row.reason.is_empty() {
+                false => kit::wrapping(kit::caption(
+                    format!("{key}/refused"),
+                    crate::host::refusal_words(&row.reason),
+                )),
+                true => match row.tasting {
+                    true => settings_action(
+                        format!("{key}/untaste"),
+                        "Back to current",
+                        Message::Untaste(row.module.clone()),
+                        true,
+                    ),
+                    false => settings_action(
+                        format!("{key}/taste"),
+                        "Try this view",
+                        Message::Taste(row.module.clone(), row.hash.clone()),
+                        true,
+                    ),
+                },
+            };
+            let note = match row.tasting {
+                true => "You are trying this view",
+                false => "",
+            };
+            setting_row(
+                &key,
+                &row.name,
+                &crate::host::taste_detail(row),
+                note,
+                control,
+            )
+        });
+        settings_section(
+            "settings/proposed",
+            "settings/proposed-title",
+            "Proposed views",
+            "A view a proposal would install can be tried on this device before the vote settles. Only you see it.",
+            setting_list("settings/proposed-rows", rows),
         )
     }
     fn account_settings(&self) -> wire::Node {
