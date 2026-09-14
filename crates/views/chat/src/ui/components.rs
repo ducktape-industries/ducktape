@@ -157,8 +157,15 @@ impl ChatView {
             2.,
         );
         let mut button = native::list_row(key, content, false, Some(action));
-        if let wire::Node::Button { label, .. } = &mut button {
+        if let wire::Node::Button { label, padding, .. } = &mut button {
             *label = Some(hit.text);
+            // two lines a hit: more air than a one-line room row
+            *padding = Some(wire::Edges {
+                top: 6.,
+                right: 8.,
+                bottom: 6.,
+                left: 8.,
+            });
         }
         button
     }

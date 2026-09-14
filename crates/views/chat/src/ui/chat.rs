@@ -179,17 +179,23 @@ impl ChatView {
         if let wire::Node::Input { placeholder, .. } = &mut search {
             *placeholder = "Search messages…".into();
         }
-        let mut top = vec![search];
+        // the clear rides at the field's end while a search stands
         let search_active =
             self.search_phase != SearchPhase::Idle || !self.search_draft.trim().is_empty();
+        let mut field_row = vec![native::sized(search, Some(wire::Length::Fill), None)];
         if search_active {
-            top.push(subtle(
+            field_row.push(glyph(
                 format!("{key}/clear-search"),
+                "✕",
                 "Clear message search",
                 Message::ClearChatSearch,
                 false,
             ));
         }
+        let top = vec![native::spaced(
+            native::centered_row(format!("{key}/search-row"), field_row),
+            4.,
+        )];
         let (mark, name) = if self.channel_create_open {
             ("✕", "Close")
         } else {
@@ -329,8 +335,11 @@ impl ChatView {
             if self.loading && self.messages.is_empty() {
                 children.push(self.loading_messages(format!("{key}/loading")));
             }
+            // an empty room opens on its beginning, down by the composer
+            // where the first message will land
             if !self.loading && self.messages.is_empty() {
-                children.push(self.empty_messages(format!("{key}/empty")));
+                children.push(native::space(None, Some(wire::Length::Fill)));
+                children.push(self.room_intro(format!("{key}/empty")));
             }
             if self.has_older_history {
                 children.push(native::padded(
@@ -353,11 +362,15 @@ impl ChatView {
                     wire::Edges::all(8.),
                 ));
             }
-            children.push(self.message_list(
-                format!("{key}/message-stream"),
-                &self.messages,
-                CopySurface::Timeline,
-            ));
+            // an empty room has nothing to scroll; its intro keeps the space
+            let empty_room = !self.loading && self.messages.is_empty();
+            if !empty_room {
+                children.push(self.message_list(
+                    format!("{key}/message-stream"),
+                    &self.messages,
+                    CopySurface::Timeline,
+                ));
+            }
             if self.copy_surface == CopySurface::Timeline {
                 children.push(self.selection_bar(format!("{key}/copy-range"), &self.messages));
             }
@@ -456,17 +469,35 @@ impl ChatView {
                     "Try other words, or clear the search to see the room again.",
                 )]
             }
-            SearchPhase::Done => self
-                .search_hits
-                .iter()
-                .map(|hit| {
+            SearchPhase::Done => {
+                // what was asked and how much came back, over the hits
+                let mut rows = vec![native::padded(
+                    native::container(
+                        format!("{key}/summary-box"),
+                        native::label(
+                            format!("{key}/summary"),
+                            crate::host::search_summary(
+                                self.search_hits.len(),
+                                &self.search_query,
+                            ),
+                        ),
+                    ),
+                    wire::Edges {
+                        top: 8.,
+                        right: 8.,
+                        bottom: 4.,
+                        left: 8.,
+                    },
+                )];
+                rows.extend(self.search_hits.iter().map(|hit| {
                     self.search_result(
                         format!("{key}/{}/{}", hit.channel_id, hit.seq),
                         Message::OpenChatSearchHit,
                         hit.clone(),
                     )
-                })
-                .collect(),
+                }));
+                rows
+            }
             SearchPhase::Idle => Vec::new(),
         };
         native::scroll(
@@ -485,6 +516,10 @@ impl ChatView {
         if !whole_history {
             return None;
         }
+        Some(self.room_intro(key))
+    }
+    /// The room's beginning: its name as a title and what this place is.
+    fn room_intro(&self, key: String) -> wire::Node {
         let direct = !self.active_dm.name.is_empty();
         let (name, detail) = if direct {
             (
@@ -503,7 +538,7 @@ impl ChatView {
                 ),
             )
         };
-        Some(native::padded(
+        native::padded(
             native::spaced(
                 native::column(
                     key.clone(),
@@ -522,7 +557,7 @@ impl ChatView {
                 bottom: 8.,
                 left: 16.,
             },
-        ))
+        )
     }
     fn message_list(
         &self,

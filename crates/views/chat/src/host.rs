@@ -1980,6 +1980,14 @@ pub fn block_action_menu_y(pointer_y: f64, viewport_height: f64) -> f64 {
     }
 }
 
+/// The line over a search's hits: how many, for what.
+pub fn search_summary(hits: usize, query: &str) -> String {
+    match hits {
+        1 => format!("1 result for “{query}”"),
+        hits => format!("{hits} results for “{query}”"),
+    }
+}
+
 pub fn search_answer_stands(query: &str, draft: &str, searching: bool) -> bool {
     !searching && !query.is_empty() && draft.trim() == query
 }

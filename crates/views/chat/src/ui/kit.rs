@@ -598,14 +598,6 @@ impl ChatView {
         )
     }
 
-    pub(super) fn empty_messages(&self, key: String) -> wire::Node {
-        native::empty_state(
-            key,
-            "No messages yet",
-            "Nobody has posted here. Send the first message below.",
-        )
-    }
-
     pub(super) fn archived_notice(&self, key: String) -> wire::Node {
         native::notice(
             key.clone(),
