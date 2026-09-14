@@ -540,6 +540,23 @@ impl AgentsView {
         )
     }
 
+    fn markdown(&self, key: &str, text: &str) -> Node {
+        Node::Surface {
+            key: key.into(),
+            name: "agent_markdown".into(),
+            args: vec![
+                wire::SurfaceValue::Str(text.into()),
+                wire::SurfaceValue::Bool(self.dark),
+            ],
+            on_event: Some(slots::handler::<wire::SurfaceValue, Message>(Box::new(
+                |value| match value {
+                    wire::SurfaceValue::Str(link) => Some(Message::OpenPlace(link)),
+                    _ => None,
+                },
+            ))),
+        }
+    }
+
     fn journal_panel(&self) -> Node {
         let mut items = vec![
             kit::centered_row(
@@ -571,15 +588,6 @@ impl AgentsView {
                         )),
                         filler(),
                         subtle(
-                            "agents/trace-toggle",
-                            if self.trace_open {
-                                "Hide trace"
-                            } else {
-                                "Trace"
-                            },
-                            Some(Message::ToggleTrace),
-                        ),
-                        subtle(
                             "agents/receipt",
                             "Run details",
                             Some(Message::ToggleReceipt(self.open_run.clone())),
@@ -605,29 +613,73 @@ impl AgentsView {
                 kit::spaced(kit::column("agents/receipt-body", facts), 6.),
             ));
         }
+        let process_label = self.live.process_label(self.open_row.state == "running");
+        items.push(subtle(
+            "agents/trace-toggle",
+            &format!(
+                "{} {process_label}",
+                if self.trace_open { "▾" } else { "▸" }
+            ),
+            Some(Message::ToggleTrace),
+        ));
         if self.trace_open {
-            let events = match self.live.trace.is_empty() {
-                true => vec![kit::wrapping(kit::secondary(
-                    "agents/trace-empty",
-                    "No trace is available from this node. Older output may have expired.",
-                ))],
-                false => self
-                    .live
-                    .trace
-                    .iter()
-                    .enumerate()
-                    .map(|(index, line)| {
-                        kit::wrapping(kit::mono(format!("agents/trace/{index}"), line))
-                    })
-                    .collect(),
-            };
-            items.push(section(
-                "agents/trace",
-                "Recent trace · up to 128 events",
-                events,
+            let mut steps = Vec::new();
+            if self.live.process.is_empty() {
+                steps.push(kit::wrapping(kit::secondary(
+                    "agents/process-empty",
+                    "No process details are available from this node. Older output may have expired.",
+                )));
+            }
+            for (index, step) in self.live.process.iter().enumerate() {
+                let key = format!("agents/process/{index}");
+                let (mark, tone, suffix) = match step.state {
+                    host::ProcessState::Running => ("·", Tone::Neutral, ""),
+                    host::ProcessState::Completed => ("✓", Tone::Neutral, ""),
+                    host::ProcessState::Failed => ("!", Tone::Danger, " · failed"),
+                };
+                let mut content = vec![kit::wrapping(kit::tone_text(
+                    format!("{key}/title"),
+                    format!("{mark} {}{suffix}", step.title),
+                    tone,
+                ))];
+                if !step.body.is_empty() {
+                    let body = match step.code {
+                        true => kit::wrapping(kit::mono(format!("{key}/body"), &step.body)),
+                        false => self.markdown(&format!("{key}/body"), &step.body),
+                    };
+                    content.push(body);
+                }
+                steps.push(kit::card(
+                    &key,
+                    kit::spaced(kit::column(format!("{key}/content"), content), 6.),
+                ));
+            }
+            steps.push(subtle(
+                "agents/raw-trace-toggle",
+                if self.raw_trace_open {
+                    "Hide raw events"
+                } else {
+                    "Show raw events"
+                },
+                Some(Message::ToggleRawTrace),
             ));
+            if self.raw_trace_open {
+                steps.extend(self.live.trace.iter().enumerate().map(|(index, line)| {
+                    kit::wrapping(kit::mono(format!("agents/trace/{index}"), line))
+                }));
+            }
+            steps.push(kit::wrapping(kit::caption(
+                "agents/process-retention",
+                "Recent output retained by this node",
+            )));
+            items.push(kit::spaced(kit::column("agents/process", steps), 8.));
         }
-        if self.live.present {
+        if !self.live.answer.is_empty() {
+            items.push(self.markdown("agents/answer-full", &self.live.answer));
+        }
+        let show_progress =
+            self.live.present && self.live.answer.is_empty() && self.live.elapsed_ms.is_none();
+        if show_progress {
             let mut live = vec![kit::strong("agents/live-state", &self.live.status)];
             for (index, activity) in self.live.activity.iter().enumerate() {
                 live.push(kit::spaced(
@@ -1027,6 +1079,7 @@ pub struct AgentsView {
     pub(crate) viewport_width: f64,
     pub(crate) expanded_receipt: String,
     pub(crate) trace_open: bool,
+    pub(crate) raw_trace_open: bool,
     pub(crate) control_draft: String,
     pub(crate) control_state: host::ControlState,
     pub(crate) control_serial: u64,
@@ -1067,6 +1120,7 @@ pub enum Message {
     ViewportChanged(f64, f64),
     ToggleReceipt(String),
     ToggleTrace,
+    ToggleRawTrace,
     ControlDraft(String),
     ControlSend,
     ControlInterrupt,
@@ -1117,6 +1171,7 @@ impl AgentsView {
             viewport_width: 1280.0,
             expanded_receipt: "".to_owned(),
             trace_open: false,
+            raw_trace_open: false,
             control_draft: String::new(),
             control_state: host::ControlState::Idle,
             control_serial: 0,
@@ -1151,7 +1206,7 @@ impl AgentsView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "352bbfe7ff7550c3671eb8064f9cfced5d2d88679ea8c7e87b2eda6b0a9e003f";
+        "9c4a810d48f931b96a2853922b8f0c237adf52031ccab56970b92bdb7afe383c";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
@@ -1355,6 +1410,7 @@ impl AgentsView {
             Message::ViewportChanged(width, _height) => self.on_viewport_changed(width, _height),
             Message::ToggleReceipt(value) => self.on_toggle_receipt(value),
             Message::ToggleTrace => self.on_toggle_trace(),
+            Message::ToggleRawTrace => self.on_toggle_raw_trace(),
             Message::ControlDraft(text) => self.on_control_draft(text),
             Message::ControlSend => self.on_control_send(),
             Message::ControlInterrupt => self.on_control_interrupt(),
@@ -1513,6 +1569,11 @@ impl AgentsView {
         ducktape_view_guest::Task::none()
     }
 
+    fn on_toggle_raw_trace(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.raw_trace_open = !self.raw_trace_open;
+        ducktape_view_guest::Task::none()
+    }
+
     fn on_toggle_trace(&mut self) -> ducktape_view_guest::Task<Message> {
         self.trace_open = !self.trace_open;
         ducktape_view_guest::Task::none()
@@ -1564,6 +1625,8 @@ impl AgentsView {
                     self.control_serial = self.control_serial.wrapping_add(1);
                     self.control_draft.clear();
                     self.live = host::LiveRun::default();
+                    self.trace_open = false;
+                    self.raw_trace_open = false;
                 }
                 self.open_run = next.open_run.to_owned();
             }
@@ -1853,6 +1916,8 @@ impl AgentsView {
     fn on_open_run_row(&mut self, run_id: String) -> ::ducktape_view_guest::Task<Message> {
         {
             {
+                self.trace_open = false;
+                self.raw_trace_open = false;
                 self.expanded_receipt = "".to_owned();
                 self.control_state = host::ControlState::Idle;
                 self.control_serial = self.control_serial.wrapping_add(1);
@@ -1865,6 +1930,9 @@ impl AgentsView {
                 );
             }
             {
+                if self.open_run != self.open_row.dispatch_id {
+                    self.live = host::LiveRun::default();
+                }
                 self.open_run = self.open_row.dispatch_id.to_owned();
             }
             {
@@ -1878,6 +1946,8 @@ impl AgentsView {
     fn on_close_run(&mut self) -> ::ducktape_view_guest::Task<Message> {
         {
             {
+                self.trace_open = false;
+                self.raw_trace_open = false;
                 self.expanded_receipt = "".to_owned();
                 self.control_state = host::ControlState::Idle;
                 self.control_serial = self.control_serial.wrapping_add(1);

@@ -25,6 +25,10 @@ the platform's application directories (`~/.config`, `~/.local/state` and
 the home.
 
 Agents opens an existing run's journal, recent provider trace, and session controls.
+The process disclosure shows provider thinking as Markdown and groups tool inputs
+with their results. The executor's elapsed time labels the closed session
+(`Worked for 2m 5s`); the answer remains visible when the process is collapsed.
+Raw events have their own disclosure inside the process.
 The run creator can add instructions, stop the run, and answer pending tool
 approvals. Codex steers its active turn; Claude interrupts the current response
 and accepts the instruction in the same process and session. Controls require a

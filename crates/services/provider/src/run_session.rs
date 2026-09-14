@@ -82,6 +82,7 @@ struct Registration {
     sender: mpsc::Sender<Offered>,
     ctx: RunContext,
     sink: Option<OutputSink>,
+    started: tokio::time::Instant,
 }
 impl Drop for Registration {
     fn drop(&mut self) {
@@ -97,7 +98,7 @@ impl Drop for Registration {
             emit(
                 &self.sink,
                 &self.ctx,
-                json!({"type":"run_control","state":"closed"}),
+                json!({"type":"run_control","state":"closed","elapsed_ms":self.started.elapsed().as_millis() as u64}),
             );
         }
     }
@@ -284,6 +285,7 @@ pub(crate) async fn drive(
     (idle, hard): (Duration, tokio::time::Instant),
     broker: Option<&broker_host::BrokerInvocation>,
 ) -> Result<crate::Invocation, String> {
+    let started = tokio::time::Instant::now();
     let (sender, mut offers) = mpsc::channel(16);
     let _registration = ctx.run_key.clone().map(|key| {
         sessions().lock().expect("run sessions").insert(
@@ -299,6 +301,7 @@ pub(crate) async fn drive(
             sender,
             ctx: ctx.clone(),
             sink: sink.clone(),
+            started,
         }
     });
     let initial = match protocol {
@@ -560,6 +563,36 @@ mod tests {
             rx,
         )
     }
+    #[test]
+    fn closing_a_session_emits_executor_elapsed_time() {
+        let (sink, mut events) = sink();
+        let (sender, _offers) = mpsc::channel(1);
+        let key = "elapsed-test".to_owned();
+        sessions().lock().unwrap().insert(
+            key.clone(),
+            Entry {
+                sender: sender.clone(),
+                ready: None,
+                approvals: HashMap::new(),
+            },
+        );
+        let registration = Registration {
+            key: key.clone(),
+            sender,
+            sink,
+            ctx: RunContext {
+                run_key: Some(key.clone()),
+                ..Default::default()
+            },
+            started: tokio::time::Instant::now() - Duration::from_secs(125),
+        };
+        drop(registration);
+        let event = events.try_recv().unwrap();
+        assert_eq!(event["state"], "closed");
+        assert!(event["elapsed_ms"].as_u64().unwrap() >= 125_000);
+        assert!(!sessions().lock().unwrap().contains_key(&key));
+    }
+
     #[test]
     fn claude_steer_waits_for_both_interrupt_boundaries_in_either_order() {
         assert_eq!(
