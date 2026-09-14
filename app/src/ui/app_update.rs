@@ -173,6 +173,7 @@ impl Ducktape {
             AppMessage::CopyToClipboard(text, label) => self.on_copy_to_clipboard(text, label),
             AppMessage::DismissToast => self.on_dismiss_toast(),
             AppMessage::ToastTick => self.on_toast_tick(),
+            AppMessage::ViewNotice(sentence) => self.on_view_notice(sentence),
             AppMessage::ExplorerViewEvent(event) => self.on_explorer_view_event(event),
             AppMessage::ClosePalette => self.on_close_palette(),
             AppMessage::ToggleBell => self.on_toggle_bell(),
@@ -2549,10 +2550,12 @@ impl Ducktape {
         &mut self,
         event: crate::module_view::ModuleViewEvent,
     ) -> Task<AppMessage> {
-        if event.kind != "badge" {
-            return Task::none();
+        match event.kind.as_str() {
+            "badge" => self.gov_open = crate::module_view::event_int(&(event), "count"),
+            "taste" => self.on_taste_event(&event, true),
+            "untaste" => self.on_taste_event(&event, false),
+            _ => {}
         }
-        self.gov_open = crate::module_view::event_int(&(event), "count");
         Task::none()
     }
     fn on_members_view_event(
@@ -3043,6 +3046,14 @@ impl Ducktape {
             }
             SettingsIntent::Light => Task::done(AppMessage::SetAppearanceLight),
             SettingsIntent::Dark => Task::done(AppMessage::SetAppearanceDark),
+            SettingsIntent::Taste => {
+                self.on_taste_event(&event, true);
+                Task::none()
+            }
+            SettingsIntent::Untaste => {
+                self.on_taste_event(&event, false);
+                Task::none()
+            }
             SettingsIntent::Notifications => {
                 self.desktop_notifications = crate::module_view::event_flag(&(event), "enabled");
                 let pending_task = Task::perform(
@@ -3085,6 +3096,35 @@ impl Ducktape {
         self.toast = "".to_owned();
         self.toast_age = 0;
         Task::none()
+    }
+    fn on_view_notice(&mut self, sentence: String) -> Task<AppMessage> {
+        self.toast = sentence;
+        self.toast_age = 0;
+        Task::none()
+    }
+    /// A member's own taste of a proposed view — `taste {module, hash}` /
+    /// `untaste {module}` off the governance card or the Settings list.
+    /// A device preference: the seat moves, nothing is written to the
+    /// network. Every load it starts swaps in place; nobody waits on it.
+    fn on_taste_event(&mut self, event: &crate::module_view::ModuleViewEvent, taste: bool) {
+        let module = crate::module_view::event_text(event, "module");
+        if !taste {
+            let _swapping = crate::module_view::untaste(&module);
+            return;
+        }
+        let hash = crate::backend::hex_decode(&crate::module_view::event_text(event, "hash"))
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+        let Some(hash) = hash else {
+            tracing::warn!(
+                target: "ducktape::app",
+                module,
+                reason = "taste_hash_unreadable",
+                "taste intent refused"
+            );
+            return;
+        };
+        let _swapping = crate::module_view::taste(&module, hash);
     }
     fn on_toast_tick(&mut self) -> Task<AppMessage> {
         self.toast_age += 1;

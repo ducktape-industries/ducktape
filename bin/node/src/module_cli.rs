@@ -536,8 +536,68 @@ fn cmd_status(args: StatusArgs) -> CommandResult {
         println!("{}", serde_json::to_string_pretty(&modules)?);
         return Ok(());
     }
+    let proposed = read_open_code_proposals(&rpc_addr)?;
     print!("{}", render_status(&modules));
+    print!("{}", render_proposed(&proposed));
     Ok(())
+}
+
+/// one open code ballot: the proposal and the module and hash it would
+/// install. every member may taste its view from the app while it is open,
+/// so an operator sees "tasteable" here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenCodeProposal {
+    proposal_id: String,
+    module_id: String,
+    code_hash: Vec<u8>,
+}
+
+/// the open `UpdateModule` / `RegisterModule` proposals off the governance
+/// register, in the register's order.
+fn read_open_code_proposals(rpc_addr: &str) -> Result<Vec<OpenCodeProposal>, String> {
+    use governance::{GovQuery, GovReply, decode_reply, encode_query};
+    let raw = rpc_query(rpc_addr, "governance", &encode_query(&GovQuery::Proposals))?;
+    match decode_reply(&raw)? {
+        GovReply::Proposals(views) => Ok(open_code_proposals(&views)),
+        other => Err(format!("expected Proposals, got {other:?}")),
+    }
+}
+
+fn open_code_proposals(views: &[governance::ProposalView]) -> Vec<OpenCodeProposal> {
+    use governance::{GovAction, ProposalStatus};
+    views
+        .iter()
+        .filter(|view| view.status == ProposalStatus::Open)
+        .filter_map(|view| {
+            let (module_id, code_hash) = match &view.action {
+                GovAction::UpdateModule {
+                    module_id,
+                    code_hash,
+                    ..
+                }
+                | GovAction::RegisterModule {
+                    module_id,
+                    code_hash,
+                    ..
+                } => (module_id, code_hash),
+                GovAction::AddValidator { .. }
+                | GovAction::RemoveValidator { .. }
+                | GovAction::Signal { .. }
+                | GovAction::AddResident { .. }
+                | GovAction::RemoveResident { .. }
+                | GovAction::AdoptShares { .. }
+                | GovAction::SetShares { .. }
+                | GovAction::SetShareMode { .. }
+                | GovAction::CancelModuleUpdate { .. }
+                | GovAction::SetAclPolicy { .. } => return None,
+            };
+            Some(OpenCodeProposal {
+                proposal_id: view.proposal_id.clone(),
+                module_id: module_id.clone(),
+                code_hash: code_hash.clone(),
+            })
+        })
+        .collect()
 }
 
 /// the modules registry over the generic query lane — the same shape
@@ -763,6 +823,29 @@ fn render_status(modules: &[modules::ModuleCode]) -> String {
     out
 }
 
+/// the open code ballots under the table, one line each: `proposed
+/// <module>  <hash>  proposal <id>  (tasteable)` — nothing when none is open.
+fn render_proposed(proposed: &[OpenCodeProposal]) -> String {
+    if proposed.is_empty() {
+        return String::new();
+    }
+    let id_width = proposed
+        .iter()
+        .map(|p| p.module_id.len())
+        .max()
+        .unwrap_or_default();
+    let mut out = String::from("\nopen code proposals (tasteable from the app while open):\n");
+    for p in proposed {
+        out.push_str(&format!(
+            "{:<id_width$}  {:<SHORT_HASH$}  proposal {}\n",
+            p.module_id,
+            short(&p.code_hash),
+            p.proposal_id
+        ));
+    }
+    out
+}
+
 /// the `kind` column's width: the longer of its two words.
 const KIND_WIDTH: usize = 6;
 
@@ -791,6 +874,67 @@ fn short(hash: &[u8]) -> String {
 mod tests {
     use super::*;
     use modules::{ModuleCode, ScheduledSwap};
+
+    #[test]
+    fn status_lists_the_open_code_proposals_as_tasteable() {
+        use governance::{GovAction, ProposalStatus, ProposalView, VoterKind, VotingRule};
+        let view = |id: &str, action: GovAction, status: ProposalStatus| ProposalView {
+            proposal_id: id.into(),
+            action,
+            proposer: vec![1],
+            created_at: 1,
+            deadline: 9,
+            status,
+            votes: Vec::new(),
+            voter_kind: VoterKind::ValidatorNode,
+            electorate: Vec::new(),
+            voting_rule: VotingRule::Threshold { required_yes: 1 },
+        };
+        let update = |module: &str| GovAction::UpdateModule {
+            name: "n".into(),
+            module_id: module.into(),
+            activation_lead: 10,
+            code_hash: vec![0xcd; 32],
+        };
+        let views = vec![
+            view("chat-1", update("chat"), ProposalStatus::Open),
+            view("chat-0", update("chat"), ProposalStatus::Passed),
+            view(
+                "signal",
+                GovAction::Signal { text: "hi".into() },
+                ProposalStatus::Open,
+            ),
+            view(
+                "home-1",
+                GovAction::RegisterModule {
+                    name: "n".into(),
+                    module_id: "home".into(),
+                    kind: modules::Kind::View,
+                    activation_lead: 10,
+                    code_hash: vec![0xab; 32],
+                },
+                ProposalStatus::Open,
+            ),
+        ];
+        let proposed = open_code_proposals(&views);
+        assert_eq!(
+            proposed
+                .iter()
+                .map(|p| p.proposal_id.as_str())
+                .collect::<Vec<_>>(),
+            ["chat-1", "home-1"]
+        );
+        let out = render_proposed(&proposed);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "");
+        assert_eq!(
+            lines[1],
+            "open code proposals (tasteable from the app while open):"
+        );
+        assert_eq!(lines[2], "chat  cdcdcdcdcdcd  proposal chat-1");
+        assert_eq!(lines[3], "home  abababababab  proposal home-1");
+        assert_eq!(render_proposed(&[]), "");
+    }
 
     fn receipt(peer: &[u8], status: &str, ok: bool) -> PeerReceipt {
         PeerReceipt {

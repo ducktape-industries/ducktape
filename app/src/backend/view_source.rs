@@ -4,8 +4,12 @@
 //! entry's kind and its ACTIVE code hash (`ModulesQuery::ModuleStatus`), the
 //! artifact under that hash is fetched and verified (`view_artifact`), and
 //! its view — component bytes plus the assets shipped beside them — is
-//! handed over as one unit. A pending swap is never read: the view drawn is
-//! the view of the code that runs.
+//! handed over as one unit. The view drawn is the view of the code that
+//! runs — unless the member is TASTING a proposed one: the taste set
+//! ([`taste_set`]) is every `(module, hash)` an open `UpdateModule` /
+//! `RegisterModule` proposal or a scheduled swap names, and a seat asked
+//! for one of those hashes ([`resolve`] with a `wanted`) reads that frame
+//! instead of the active one. Nothing on-chain moves for it.
 //!
 //! Every reading here is strict. A registry reply of another shape, a module
 //! the registry does not list or lists twice, a hash that is not 32 bytes,
@@ -15,15 +19,18 @@
 //! not yet activated ([`ViewSource::NotActivated`]) and a verified
 //! deployment that ships no view ([`ViewSource::Missing`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ducktape_rpc::Client;
 use serde::Deserialize;
 
-use super::view_artifact;
+use super::view_artifact::{self, Frame};
+
+/// Why a frame could not be fetched and verified, as [`frame`] tells it.
+pub use super::view_artifact::Error as FetchError;
 
 /// The BUILT-IN tabs whose view is drawn by the module's own artifact: each
 /// has a `ShellTab` arm, a props builder and an intent decoder of its own,
@@ -100,39 +107,51 @@ struct ModuleCode {
     module_id: String,
     kind: Kind,
     active_code_hash: Vec<u8>,
-    #[allow(
-        dead_code,
-        reason = "read for shape only: a pending swap is never loaded"
-    )]
     pending: Option<ScheduledSwap>,
     #[allow(dead_code, reason = "read for shape only")]
     history: Vec<Activation>,
 }
 
-/// What the entry's artifact is: a module (whose frame may embed a view) or
-/// a view alone — the registry's word, fixed at admission.
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Kind {
-    Module,
-    View,
-}
+pub use super::view_artifact::Kind;
 
-/// One registry entry as the seat set reads it: what it is, and its active
-/// code hash — `None` for an admission that has not reached its boundary.
+/// One registry entry as the seat set reads it: what it is, its active
+/// code hash — `None` for an admission that has not reached its boundary —
+/// and the swap scheduled after it, if one is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Entry {
     pub kind: Kind,
     pub hash: Option<[u8; 32]>,
+    pub pending: Option<Scheduled>,
+}
+
+/// A swap the registry holds for its height: the post-pass canary record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scheduled {
+    pub hash: [u8; 32],
+    pub activation_height: u64,
+    /// The height the readiness quorum latched at, once it has.
+    pub ready_at: Option<u64>,
+}
+
+impl Scheduled {
+    /// Past its height and never latched: the registry keeps it until it
+    /// is cancelled, but it will never activate — `ScheduledSwap::stale_at`
+    /// in the registry's own words.
+    pub fn stale_at(&self, height: u64) -> bool {
+        let past_due = self.activation_height <= height;
+        let never_latched = self.ready_at.is_none();
+        past_due && never_latched
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code, reason = "read for shape only")]
 struct ScheduledSwap {
+    #[allow(dead_code, reason = "read for shape only")]
     name: String,
     activation_height: u64,
     code_hash: Vec<u8>,
+    #[allow(dead_code, reason = "read for shape only")]
     readiness: Vec<Vec<u8>>,
     ready_at: Option<u64>,
 }
@@ -159,16 +178,20 @@ pub async fn active_hashes(client: &Client) -> Result<BTreeMap<String, Entry>, E
         let hash = if entry.active_code_hash.is_empty() {
             None
         } else {
-            Some(entry.active_code_hash.as_slice().try_into().map_err(|_| {
-                Error::Status(format!(
-                    "module {module:?}: active code hash is {} bytes, not 32",
-                    entry.active_code_hash.len()
-                ))
-            })?)
+            Some(hash_of(&module, "active", &entry.active_code_hash)?)
+        };
+        let pending = match entry.pending {
+            None => None,
+            Some(swap) => Some(Scheduled {
+                hash: hash_of(&module, "pending", &swap.code_hash)?,
+                activation_height: swap.activation_height,
+                ready_at: swap.ready_at,
+            }),
         };
         let entry = Entry {
             kind: entry.kind,
             hash,
+            pending,
         };
         if entries.insert(module.clone(), entry).is_some() {
             return Err(Error::Status(format!(
@@ -177,6 +200,15 @@ pub async fn active_hashes(client: &Client) -> Result<BTreeMap<String, Entry>, E
         }
     }
     Ok(entries)
+}
+
+fn hash_of(module: &str, which: &str, bytes: &[u8]) -> Result<[u8; 32], Error> {
+    bytes.try_into().map_err(|_| {
+        Error::Status(format!(
+            "module {module:?}: {which} code hash is {} bytes, not 32",
+            bytes.len()
+        ))
+    })
 }
 
 /// The entry's active code hash, or `None` for an admission that has not
@@ -198,23 +230,31 @@ pub struct Asked {
     pub fetch: Duration,
 }
 
-/// The module's view as its active deployment ships it; `asked` takes the
-/// time each question of the node took.
+/// The module's view as the frame under `wanted` ships it — the tasted
+/// hash — or, with none wanted, as its active deployment does; `asked`
+/// takes the time each question of the node took.
 pub async fn resolve(
     client: &Client,
     module: &str,
+    wanted: Option<[u8; 32]>,
     asked: &mut Asked,
 ) -> Result<ViewSource, Error> {
-    let started = Instant::now();
-    let active = active_hash(client, module).await;
-    asked.status = started.elapsed();
-    let Some(hash) = active? else {
-        return Ok(ViewSource::NotActivated);
+    let hash = match wanted {
+        Some(hash) => hash,
+        None => {
+            let started = Instant::now();
+            let active = active_hash(client, module).await;
+            asked.status = started.elapsed();
+            let Some(hash) = active? else {
+                return Ok(ViewSource::NotActivated);
+            };
+            hash
+        }
     };
     let started = Instant::now();
-    let loaded = view_artifact::load(client, hash).await;
+    let loaded = frame(client, hash).await;
     asked.fetch = started.elapsed();
-    match loaded.map_err(Error::Artifact)? {
+    match loaded.map_err(Error::Artifact)?.view.clone() {
         None => Ok(ViewSource::Missing { hash }),
         Some(view) => Ok(ViewSource::Ready {
             hash,
@@ -222,6 +262,213 @@ pub async fn resolve(
             assets: Arc::new(view.assets),
         }),
     }
+}
+
+// ---------- the frames held ----------
+
+/// The frames the taste set last walked — every tasteable one and the
+/// active one beside it — so a taste, and the way back, is a swap and
+/// not a fetch. Content-addressed: a hash names one frame forever, so an
+/// entry is never stale, only unneeded; [`retain_frames`] drops those.
+fn frames() -> &'static Mutex<HashMap<[u8; 32], Arc<Frame>>> {
+    static FRAMES: OnceLock<Mutex<HashMap<[u8; 32], Arc<Frame>>>> = OnceLock::new();
+    FRAMES.get_or_init(Mutex::default)
+}
+
+/// The verified frame under `hash`: the one held, else fetched off the
+/// node and verified — and NOT held: only the taste walk decides what is
+/// worth holding.
+pub async fn frame(client: &Client, hash: [u8; 32]) -> Result<Arc<Frame>, view_artifact::Error> {
+    let held = frames().lock().expect("held frames").get(&hash).cloned();
+    if let Some(frame) = held {
+        return Ok(frame);
+    }
+    view_artifact::fetch(client, hash).await.map(Arc::new)
+}
+
+/// The verified frame under `hash`, held from now on.
+pub async fn hold_frame(
+    client: &Client,
+    hash: [u8; 32],
+) -> Result<Arc<Frame>, view_artifact::Error> {
+    let frame = frame(client, hash).await?;
+    frames()
+        .lock()
+        .expect("held frames")
+        .insert(hash, frame.clone());
+    Ok(frame)
+}
+
+/// Drops every held frame but those under `kept`.
+pub fn retain_frames(kept: &BTreeSet<[u8; 32]>) {
+    frames()
+        .lock()
+        .expect("held frames")
+        .retain(|hash, _| kept.contains(hash));
+}
+
+// ---------- the taste set ----------
+
+/// Where a tasteable hash stands in governance: on an open ballot, or
+/// scheduled by a passed one for its height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    Open,
+    Scheduled { activation_height: u64 },
+}
+
+/// One `(module, hash)` a member may taste: what an open proposal would
+/// install, or a scheduled swap will.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tasteable {
+    pub module: String,
+    pub hash: [u8; 32],
+    /// The open proposal naming it; none for a scheduled swap, which the
+    /// registry names on its own.
+    pub proposal: Option<String>,
+    pub stage: Stage,
+}
+
+/// The node's word on where its chain stands, read beside the taste set:
+/// the chain the taste preference is keyed by and the height a scheduled
+/// swap is judged stale against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chain {
+    pub id: String,
+    pub height: u64,
+}
+
+/// The taste set: `{ (module, hash) : open UpdateModule / RegisterModule
+/// proposal } ∪ { (module, pending.hash) : a scheduled swap not stale at
+/// the height }`, module-ordered then hash-ordered, one row per pair.
+/// `entries` is the registry as [`active_hashes`] read it on the same
+/// tick.
+pub async fn taste_set(
+    client: &Client,
+    entries: &BTreeMap<String, Entry>,
+) -> Result<(Chain, Vec<Tasteable>), Error> {
+    let chain = chain(client).await?;
+    let proposals = open_proposals(client).await?;
+    let mut rows: BTreeMap<(String, [u8; 32]), Tasteable> = BTreeMap::new();
+    for (module, entry) in entries {
+        let Some(scheduled) = entry.pending else {
+            continue;
+        };
+        if scheduled.stale_at(chain.height) {
+            continue;
+        }
+        rows.insert(
+            (module.clone(), scheduled.hash),
+            Tasteable {
+                module: module.clone(),
+                hash: scheduled.hash,
+                proposal: None,
+                stage: Stage::Scheduled {
+                    activation_height: scheduled.activation_height,
+                },
+            },
+        );
+    }
+    for proposal in proposals {
+        // the registry's word outranks the ballot's: a hash scheduled by
+        // one passed proposal and still named by another open one is
+        // scheduled
+        rows.entry((proposal.module.clone(), proposal.hash))
+            .or_insert(Tasteable {
+                module: proposal.module,
+                hash: proposal.hash,
+                proposal: Some(proposal.id),
+                stage: Stage::Open,
+            });
+    }
+    Ok((chain, rows.into_values().collect()))
+}
+
+async fn chain(client: &Client) -> Result<Chain, Error> {
+    let status = client
+        .status_json()
+        .await
+        .map_err(|error| Error::Status(format!("status: {error}")))?;
+    let id = status["chain_id"].as_str().unwrap_or_default().to_owned();
+    let height = status["height"]
+        .as_u64()
+        .ok_or_else(|| Error::Status("status: no height".to_owned()))?;
+    Ok(Chain { id, height })
+}
+
+/// A module-code proposal off the governance register: only the fields
+/// the taste set reads. The register is the governance view's own to
+/// fold; this reader takes the module and hash a code ballot names and
+/// nothing else, and reads an action that is not a code ballot as none.
+struct CodeProposal {
+    id: String,
+    module: String,
+    hash: [u8; 32],
+}
+
+#[derive(Deserialize)]
+struct ProposalsReply {
+    proposals: Vec<ProposalView>,
+}
+
+#[derive(Deserialize)]
+struct ProposalView {
+    proposal_id: String,
+    action: serde_json::Value,
+    status: ProposalStatus,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProposalStatus {
+    Open,
+    Passed,
+    Rejected,
+}
+
+async fn open_proposals(client: &Client) -> Result<Vec<CodeProposal>, Error> {
+    let reply: ProposalsReply = client
+        .query("governance", &serde_json::json!("proposals"))
+        .await
+        .map_err(|error| Error::Status(format!("governance proposals: {error}")))?;
+    let mut open = Vec::new();
+    for proposal in reply.proposals {
+        let is_open = match proposal.status {
+            ProposalStatus::Open => true,
+            ProposalStatus::Passed | ProposalStatus::Rejected => false,
+        };
+        if !is_open {
+            continue;
+        }
+        let Some(code) = code_action(&proposal.action) else {
+            continue;
+        };
+        let hash: Vec<u8> = code["code_hash"]
+            .as_array()
+            .map(|bytes| {
+                bytes
+                    .iter()
+                    .filter_map(|byte| byte.as_u64().and_then(|byte| u8::try_from(byte).ok()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let module = code["module_id"].as_str().unwrap_or_default().to_owned();
+        let hash = hash_of(&module, "proposed", &hash)?;
+        open.push(CodeProposal {
+            id: proposal.proposal_id,
+            module,
+            hash,
+        });
+    }
+    Ok(open)
+}
+
+/// The payload of an `update_module` / `register_module` action; any other
+/// action installs no code.
+fn code_action(action: &serde_json::Value) -> Option<&serde_json::Value> {
+    action
+        .get("update_module")
+        .or_else(|| action.get("register_module"))
 }
 
 #[cfg(test)]
@@ -252,6 +499,7 @@ pub(crate) mod tests {
             files: Mutex::new(BTreeMap::new()),
             file_reads: Mutex::new(Vec::new()),
             index_views: Mutex::new(BTreeMap::new()),
+            chain: Mutex::new(chain_status(7)),
         };
         fake_node(Arc::new(deployment)).await
     }
@@ -291,6 +539,14 @@ pub(crate) mod tests {
         /// one `rpc.view` door, and each shape wants its own reply. A module
         /// or a shape not here is not found.
         pub index_views: Mutex<BTreeMap<String, serde_json::Value>>,
+        /// What `/v1/status` answers: the chain id the taste preference is
+        /// keyed by and the height a scheduled swap is judged against.
+        pub chain: Mutex<serde_json::Value>,
+    }
+
+    /// A `/v1/status` document at `height` on the fake chain.
+    pub(crate) fn chain_status(height: u64) -> serde_json::Value {
+        serde_json::json!({"height": height, "chain_id": "fake-chain", "public_key": "00"})
     }
 
     impl FakeDeployment {
@@ -307,6 +563,7 @@ pub(crate) mod tests {
                 files: Mutex::new(BTreeMap::new()),
                 file_reads: Mutex::new(Vec::new()),
                 index_views: Mutex::new(BTreeMap::new()),
+                chain: Mutex::new(chain_status(7)),
             })
         }
 
@@ -348,6 +605,53 @@ pub(crate) mod tests {
             *self.status.lock().unwrap() = status_naming(module, &artifact.hash());
             self.artifacts.lock().unwrap().push(artifact.clone());
         }
+
+        /// The blob store has `artifact`; the registry says nothing of it —
+        /// the bytes a proposal fanned out ahead of its ballot.
+        pub(crate) fn stage(&self, artifact: &Artifact) {
+            self.artifacts.lock().unwrap().push(artifact.clone());
+        }
+
+        /// The registry names `active` as `module`'s active code and
+        /// `scheduled` as the swap pending for `activation_height`.
+        pub(crate) fn schedule(
+            &self,
+            module: &str,
+            active: &Artifact,
+            scheduled: &Artifact,
+            activation_height: u64,
+        ) {
+            let (active, next) = (active.hash(), scheduled.hash());
+            *self.status.lock().unwrap() = serde_json::json!({"module_status": {"modules": [
+                {"module_id": module, "kind": "module", "active_code_hash": active,
+                 "pending": {"name": "next", "activation_height": activation_height,
+                             "code_hash": next, "readiness": [], "ready_at": null},
+                 "history": [{"height": 7, "code_hash": active}]}
+            ]}});
+        }
+
+        /// The governance register lists one open code ballot per
+        /// `(module, hash)` in `open`, ids `prop-<n>` in order.
+        pub(crate) fn propose(&self, open: &[(&str, [u8; 32])]) {
+            let proposals: Vec<serde_json::Value> = open
+                .iter()
+                .enumerate()
+                .map(|(index, (module, hash))| {
+                    serde_json::json!({
+                        "proposal_id": format!("prop-{index}"),
+                        "action": { "update_module": {
+                            "name": "next", "module_id": module,
+                            "activation_lead": 10, "code_hash": hash.to_vec(),
+                        }},
+                        "proposer": [1, 2, 3], "created_at": 1, "deadline": 4200,
+                        "status": "open", "votes": [], "voter_kind": "validator_node",
+                        "electorate": [[[1], 1]],
+                        "voting_rule": { "threshold": { "required_yes": 1 } }
+                    })
+                })
+                .collect();
+            self.answer_query("governance", serde_json::json!({ "proposals": proposals }));
+        }
     }
 
     pub(crate) fn status_naming(module: &str, hash: &[u8]) -> serde_json::Value {
@@ -370,7 +674,10 @@ pub(crate) mod tests {
                     let request = read_request(&mut socket).await;
                     let head = String::from_utf8_lossy(&request).into_owned();
                     let route = head.split(' ').nth(1).unwrap_or("").to_owned();
-                    let (status_line, body) = if route == "/v1/query" {
+                    let (status_line, body) = if route == "/v1/status" {
+                        let chain = deployment.chain.lock().unwrap().clone();
+                        ("200 OK", chain.to_string().into_bytes())
+                    } else if route == "/v1/query" {
                         let hold = deployment.hold_status.lock().unwrap().take();
                         if let Some(hold) = hold {
                             deployment.held.notify_one();
@@ -569,7 +876,7 @@ pub(crate) mod tests {
         let artifact = with_view();
         let client = node(status_of(&artifact.hash()), Some(artifact.clone()), None).await;
         assert_eq!(
-            resolve(&client, "files", &mut Asked::default())
+            resolve(&client, "files", None, &mut Asked::default())
                 .await
                 .unwrap(),
             ViewSource::Ready {
@@ -601,18 +908,20 @@ pub(crate) mod tests {
             entries["home"],
             Entry {
                 kind: Kind::View,
-                hash: Some(hash)
+                hash: Some(hash),
+                pending: None,
             }
         );
         assert_eq!(
             entries["files"],
             Entry {
                 kind: Kind::Module,
-                hash: None
+                hash: None,
+                pending: None,
             }
         );
         assert_eq!(
-            resolve(&client, "home", &mut Asked::default())
+            resolve(&client, "home", None, &mut Asked::default())
                 .await
                 .unwrap(),
             ViewSource::Ready {
@@ -628,7 +937,7 @@ pub(crate) mod tests {
         let artifact = Artifact::module(vec![1, 2, 3]);
         let client = node(status_of(&artifact.hash()), Some(artifact.clone()), None).await;
         assert_eq!(
-            resolve(&client, "files", &mut Asked::default())
+            resolve(&client, "files", None, &mut Asked::default())
                 .await
                 .unwrap(),
             ViewSource::Missing {
@@ -641,7 +950,7 @@ pub(crate) mod tests {
     async fn bytes_that_do_not_hash_to_the_active_code_fail() {
         let client = node(status_of(&[7; 32]), Some(with_view()), None).await;
         assert!(matches!(
-            resolve(&client, "files", &mut Asked::default()).await,
+            resolve(&client, "files", None, &mut Asked::default()).await,
             Err(Error::Artifact(view_artifact::Error::HashMismatch))
         ));
     }
@@ -650,8 +959,8 @@ pub(crate) mod tests {
     async fn a_fetch_that_fails_is_an_error() {
         let client = node(status_of(&[7; 32]), None, None).await;
         assert!(matches!(
-            resolve(&client, "files", &mut Asked::default()).await,
-            Err(Error::Artifact(view_artifact::Error::Transport(_)))
+            resolve(&client, "files", None, &mut Asked::default()).await,
+            Err(Error::Artifact(view_artifact::Error::NotHeld))
         ));
     }
 
@@ -659,7 +968,7 @@ pub(crate) mod tests {
     async fn an_admission_before_its_boundary_is_not_activated() {
         let client = node(status_of(&[7; 32]), Some(with_view()), None).await;
         assert_eq!(
-            resolve(&client, "chat", &mut Asked::default())
+            resolve(&client, "chat", None, &mut Asked::default())
                 .await
                 .unwrap(),
             ViewSource::NotActivated
@@ -710,11 +1019,144 @@ pub(crate) mod tests {
             let client = node(status, Some(with_view()), None).await;
             assert!(
                 matches!(
-                    resolve(&client, "files", &mut Asked::default()).await,
+                    resolve(&client, "files", None, &mut Asked::default()).await,
                     Err(Error::Status(_))
                 ),
                 "{case}"
             );
         }
+    }
+
+    /// The taste set is every `(module, hash)` an open code ballot names
+    /// plus every scheduled swap not stale at the height: a passed or
+    /// rejected ballot names nothing, a swap past its height that never
+    /// latched names nothing, and the registry's word outranks the
+    /// ballot's for a hash both name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_taste_set_is_open_code_ballots_and_live_scheduled_swaps() {
+        let active = with_view();
+        let next = Artifact::module(vec![9, 9, 9]);
+        let (active_hash, next_hash) = (active.hash(), next.hash());
+        let node = FakeDeployment::serving("chat", &active);
+        let client = fake_node(node.clone()).await;
+        let entries = active_hashes(&client).await.unwrap();
+        assert_eq!(entries["chat"].pending, None);
+        // nothing open, nothing scheduled
+        node.answer_query("governance", serde_json::json!({ "proposals": [] }));
+        let (chain, rows) = taste_set(&client, &entries).await.unwrap();
+        assert_eq!(
+            chain,
+            Chain {
+                id: "fake-chain".into(),
+                height: 7
+            }
+        );
+        assert!(rows.is_empty());
+        // an open update and a register, a passed one, a rejected one,
+        // and a ballot that installs no code
+        let ballot = |id: &str, action: serde_json::Value, status: &str| {
+            serde_json::json!({
+                "proposal_id": id, "action": action,
+                "proposer": [1], "created_at": 1, "deadline": 4200, "status": status,
+                "votes": [], "voter_kind": "validator_node", "electorate": [[[1], 1]],
+                "voting_rule": { "threshold": { "required_yes": 1 } }
+            })
+        };
+        let update = |module: &str, hash: &[u8; 32]| {
+            serde_json::json!({ "update_module": {
+                "name": "n", "module_id": module, "activation_lead": 10, "code_hash": hash.to_vec()
+            }})
+        };
+        node.answer_query(
+            "governance",
+            serde_json::json!({ "proposals": [
+                ballot("prop-chat", update("chat", &next_hash), "open"),
+                ballot("prop-home", serde_json::json!({ "register_module": {
+                    "name": "n", "module_id": "home", "kind": "view",
+                    "activation_lead": 10, "code_hash": vec![5u8; 32]
+                }}), "open"),
+                ballot("prop-passed", update("chat", &[6u8; 32]), "passed"),
+                ballot("prop-rejected", update("chat", &[7u8; 32]), "rejected"),
+                ballot("prop-signal", serde_json::json!({ "signal": { "text": "hi" } }), "open"),
+            ]}),
+        );
+        let (_, rows) = taste_set(&client, &entries).await.unwrap();
+        assert_eq!(
+            rows,
+            [
+                Tasteable {
+                    module: "chat".into(),
+                    hash: next_hash,
+                    proposal: Some("prop-chat".into()),
+                    stage: Stage::Open,
+                },
+                Tasteable {
+                    module: "home".into(),
+                    hash: [5; 32],
+                    proposal: Some("prop-home".into()),
+                    stage: Stage::Open,
+                },
+            ]
+        );
+        // the ballot passed and the swap is scheduled: the registry's word,
+        // even while the (settled) ballot still lists the hash as open
+        node.schedule("chat", &active, &next, 40);
+        let entries = active_hashes(&client).await.unwrap();
+        assert_eq!(
+            entries["chat"],
+            Entry {
+                kind: Kind::Module,
+                hash: Some(active_hash),
+                pending: Some(Scheduled {
+                    hash: next_hash,
+                    activation_height: 40,
+                    ready_at: None,
+                }),
+            }
+        );
+        let (_, rows) = taste_set(&client, &entries).await.unwrap();
+        assert_eq!(rows[0].stage, Stage::Scheduled { activation_height: 40 });
+        assert_eq!(rows[0].proposal, None);
+        assert_eq!(rows.len(), 2);
+        // past its height and never latched: stale, and nobody's to taste
+        *node.chain.lock().unwrap() = chain_status(40);
+        node.answer_query("governance", serde_json::json!({ "proposals": [] }));
+        let (chain, rows) = taste_set(&client, &entries).await.unwrap();
+        assert_eq!(chain.height, 40);
+        assert!(rows.is_empty(), "{rows:?}");
+        // a proposed hash that is not 32 bytes is a register this reader
+        // does not understand
+        node.answer_query(
+            "governance",
+            serde_json::json!({ "proposals": [ballot("short", update("chat", &[1u8; 32]), "open")] }),
+        );
+        let mut short = node.queries.lock().unwrap()["governance"].clone();
+        short["proposals"][0]["action"]["update_module"]["code_hash"] = serde_json::json!([1, 2]);
+        node.answer_query("governance", short);
+        assert!(matches!(
+            taste_set(&client, &entries).await,
+            Err(Error::Status(_))
+        ));
+    }
+
+    /// A frame held is served without a fetch; one not held is fetched
+    /// and, held, kept until the taste walk retains without it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_frame_is_a_swap_not_a_fetch() {
+        let artifact = with_view();
+        let hash = artifact.hash();
+        let node = FakeDeployment::serving("chat", &artifact);
+        let client = fake_node(node.clone()).await;
+        let held = hold_frame(&client, hash).await.unwrap();
+        assert_eq!(held.kind, Kind::Module);
+        assert!(held.view.is_some());
+        // the node forgets the bytes: the held frame still answers
+        node.artifacts.lock().unwrap().clear();
+        assert_eq!(frame(&client, hash).await.unwrap(), held);
+        retain_frames(&BTreeSet::new());
+        assert!(matches!(
+            frame(&client, hash).await,
+            Err(view_artifact::Error::NotHeld)
+        ));
     }
 }

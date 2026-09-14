@@ -43,6 +43,74 @@ pub struct ProposalRow {
     pub electorate: i64,
     pub open: bool,
     pub settled_height: i64,
+    /// For a code ballot (`update_module` / `register_module`): the module
+    /// it names and the full hex of the hash it would install — the pair
+    /// the taste set is keyed by. Empty for every other action.
+    pub module_id: String,
+    pub code_hash: String,
+}
+
+/// One row of the taste set the kernel pushes with the session: a
+/// `(module, hash)` an open code ballot or a scheduled swap names, whether
+/// this app tastes it, and why it cannot be tasted if it cannot (`reason`
+/// empty when it can).
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct TasteRow {
+    pub module: String,
+    /// The module's tab name.
+    pub name: String,
+    pub proposal: String,
+    pub hash: String,
+    /// `open` or `scheduled`.
+    pub status: String,
+    pub activation_height: i64,
+    pub tasting: bool,
+    pub reason: String,
+}
+
+/// The taste row a proposal's `(module, hash)` names, if the taste set
+/// lists it.
+pub fn taste_of<'a>(tasting: &'a [TasteRow], proposal: &ProposalRow) -> Option<&'a TasteRow> {
+    let names_code = !proposal.code_hash.is_empty();
+    if !names_code {
+        return None;
+    }
+    tasting
+        .iter()
+        .find(|row| row.module == proposal.module_id && row.hash == proposal.code_hash)
+}
+
+/// Why a proposed view cannot be tried here, for the reader.
+pub fn refusal_words(reason: &str) -> String {
+    match reason {
+        "not_registered" => "Its module is not registered here yet".into(),
+        "not_held" => "Your node has not received these bytes yet".into(),
+        "hash_mismatch" => "The bytes your node holds do not match the proposal".into(),
+        "invalid_artifact" => "The proposed artifact cannot be read".into(),
+        "kind_mismatch" => "The proposed artifact is not this entry's kind".into(),
+        "core_changes_too" => {
+            "Changes the module's code too — it becomes current when it activates".into()
+        }
+        "wire_protocol" => "Built for another version of this app".into(),
+        "no_view" => "Removes the view".into(),
+        other => sentence_case(other),
+    }
+}
+
+/// The line under a tasteable row: where the ballot stands, and whether
+/// this app is on it.
+pub fn taste_status(row: &TasteRow) -> String {
+    let stage = match row.status.as_str() {
+        "scheduled" => format!(
+            "Scheduled for {}",
+            height_label_short(row.activation_height)
+        ),
+        _ => "On the ballot".into(),
+    };
+    match row.tasting {
+        true => format!("{stage} · you are trying it"),
+        false => stage,
+    }
 }
 
 /// One labelled field of a proposal's action: `Key` / `8c4fa211…`. `code`
@@ -80,6 +148,9 @@ pub struct Session {
     pub connected: bool,
     pub admin: bool,
     pub dark: bool,
+    /// The taste set: what a member may try before the ballot settles.
+    #[serde(default)]
+    pub tasting: Vec<TasteRow>,
 }
 
 /// One item of the session subscription: the facts, or why not.
@@ -211,7 +282,21 @@ fn fold_proposal(view: &serde_json::Value) -> ProposalRow {
         settled_height: 0,
         action: action_label(&tagged_name(&view["action"])),
         status: status_label(&status),
+        module_id: code_ballot(&view["action"])
+            .map(|code| code["module_id"].as_str().unwrap_or_default().to_string())
+            .unwrap_or_default(),
+        code_hash: code_ballot(&view["action"])
+            .map(|code| hex_encode(&json_bytes(&code["code_hash"])))
+            .unwrap_or_default(),
     }
+}
+
+/// The payload of a code ballot — `update_module` / `register_module` —
+/// and nothing for any other action.
+fn code_ballot(action: &serde_json::Value) -> Option<&serde_json::Value> {
+    action
+        .get("update_module")
+        .or_else(|| action.get("register_module"))
 }
 
 /// A `GovAction` variant tag in words: `add_validator` reads `Add validator`.
@@ -568,6 +653,33 @@ impl Stream for ActStream {
 /// Tells the kernel how many proposals wait: the tab badge.
 pub fn badge(open: i64) -> bool {
     host::notify("host.badge", open.to_string().as_bytes());
+    true
+}
+
+#[derive(Serialize)]
+struct Taste<'a> {
+    module: &'a str,
+    hash: &'a str,
+}
+
+#[derive(Serialize)]
+struct Untaste<'a> {
+    module: &'a str,
+}
+
+/// `governance.taste` — this device tries the view a proposal would
+/// install for `module`, under `hash`. A preference of the app, never a
+/// write to the network.
+pub fn taste(module: &str, hash: &str) -> bool {
+    let payload = serde_json::to_vec(&Taste { module, hash }).expect("an intent encodes");
+    host::notify("governance.taste", &payload);
+    true
+}
+
+/// `governance.untaste` — back to the current view for `module`.
+pub fn untaste(module: &str) -> bool {
+    let payload = serde_json::to_vec(&Untaste { module }).expect("an intent encodes");
+    host::notify("governance.untaste", &payload);
     true
 }
 

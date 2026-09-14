@@ -15,6 +15,7 @@
 //! A view that traps shows why in its place instead of taking the window with it.
 
 mod kernel;
+mod taste;
 
 pub use kernel::{block_hit as view_block_hit, live_hit as view_live_hit};
 
@@ -85,6 +86,7 @@ pub fn governance_view(dark: bool, connected: bool, admin: bool) -> ViewSpec {
         "admin": admin,
         "connected": connected,
         "dark": dark,
+        "tasting": taste_props(),
     });
     module_view(
         "governance",
@@ -313,6 +315,7 @@ pub fn settings_view(
         "account_exists": account_exists,
         "account_busy": account_busy,
         "account_ticket": account_ticket,
+        "tasting": taste_props(),
     });
     module_view(
         "settings",
@@ -349,6 +352,8 @@ pub fn settings_intent(event: &ModuleViewEvent) -> crate::SettingsIntent {
         "light" => Intent::Light,
         "dark" => Intent::Dark,
         "notifications" => Intent::Notifications,
+        "taste" => Intent::Taste,
+        "untaste" => Intent::Untaste,
         _ => Intent::Copy,
     }
 }
@@ -758,9 +763,10 @@ fn surface_allowed(module: &str, surface: &str) -> bool {
 /// the list is refused at the door, never handed to a handler.
 fn intents_of(module: &str) -> &'static [&'static str] {
     match module {
-        // the governance view speaks the kernel contract only: its writes
-        // are `op.submit`, never an intent the app decodes
-        "governance" => &[],
+        // the governance view speaks the kernel contract: its writes are
+        // `op.submit`. What is left at the door is a member's own taste of
+        // a proposed view — a device preference, never a write
+        "governance" => &["taste", "untaste"],
         // members speaks it too; `copy` is the clipboard door, not a write
         "members" => &["copy"],
         // the agents view speaks the kernel contract: its pause and its save
@@ -821,6 +827,8 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "light",
             "dark",
             "notifications",
+            "taste",
+            "untaste",
         ],
         // pages speaks the kernel contract: every read is `rpc.view` and
         // every write `op.submit`. What is left are the two OS doors — the
@@ -909,6 +917,203 @@ pub fn registered_view_icon(module: &'static str) -> Option<Arc<Vec<u8>>> {
         .map(|bytes| Arc::new(bytes.clone()))
 }
 
+// ---------- tasting ----------
+
+/// The proposed hash `module`'s seat tastes, if it tastes one.
+pub fn tasting(module: &'static str) -> Option<[u8; 32]> {
+    let mounted = mounted(module);
+    let tasting = mounted.lock().expect("module view lock").tasting;
+    tasting
+}
+
+/// The tab's name with its taste on it: `Chat · proposed` while the seat
+/// tastes a proposed view.
+pub fn tab_label(module: &'static str, name: &str) -> String {
+    match tasting(module) {
+        Some(_) => format!("{name} · proposed"),
+        None => name.to_owned(),
+    }
+}
+
+/// This device tastes `hash` for `module` from now on: the seat loads the
+/// proposed frame's view in place of the active one, and the preference
+/// is kept for the chain. A pair the taste set refuses, or does not name,
+/// is not seated and says why in the log. `module` is a view's word: it
+/// names a seat, or nothing happens.
+pub fn taste(module: &str, hash: [u8; 32]) -> Loads {
+    let Some(module) = seated_id(module) else {
+        log_source(module, Some(&hash), "Refused", 0, "not_seated");
+        return Loads(Vec::new());
+    };
+    if let Some(reason) = taste::refused(module, hash) {
+        log_source(module, Some(&hash), "Refused", 0, reason);
+        return Loads(Vec::new());
+    }
+    taste::remember(&taste::chain_id(), module, hash);
+    Loads(retaste(module, Some(hash)))
+}
+
+/// This device tastes nothing for `module` from now on: the seat returns
+/// to the active view.
+pub fn untaste(module: &str) -> Loads {
+    let Some(module) = seated_id(module) else {
+        log_source(module, None, "Refused", 0, "not_seated");
+        return Loads(Vec::new());
+    };
+    taste::forget(&taste::chain_id(), module);
+    Loads(retaste(module, None))
+}
+
+/// The seat registry's own key for `module`, if it has a seat: a view's
+/// word for a module is never interned on its say-so.
+fn seated_id(module: &str) -> Option<&'static str> {
+    registry()
+        .lock()
+        .expect("module views")
+        .keys()
+        .copied()
+        .find(|seated| *seated == module)
+}
+
+/// The seat's taste set to `wanted`, and a load after it started under a
+/// new generation — so a load after the previous taste dies at install.
+fn retaste(module: &'static str, wanted: Option<[u8; 32]>) -> Vec<std::thread::JoinHandle<()>> {
+    // lock order, as everywhere: registry, then connection, then the seat
+    let registry = registry().lock().expect("module views");
+    let snapshot = connection().lock().expect("views rpc").clone();
+    let Some(mounted) = registry.get(module).cloned() else {
+        return Vec::new();
+    };
+    let mut locked = mounted.lock().expect("module view lock");
+    let unchanged = locked.tasting == wanted;
+    if unchanged {
+        return Vec::new();
+    }
+    locked.tasting = wanted;
+    let generation = locked.start(wanted);
+    drop(locked);
+    vec![spawn_load(module, &mounted, generation, snapshot)]
+}
+
+/// The taste set as the governance and settings views draw it: one row
+/// per tasteable pair, with where it stands, whether this seat tastes it,
+/// and why it cannot be tasted if it cannot.
+fn taste_props() -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = taste::rows()
+        .into_iter()
+        .map(|row| {
+            let (status, activation_height) = match row.stage {
+                crate::backend::view_source::Stage::Open => ("open", 0),
+                crate::backend::view_source::Stage::Scheduled { activation_height } => {
+                    ("scheduled", activation_height)
+                }
+            };
+            let tasting = tasting(row.module) == Some(row.hash);
+            serde_json::json!({
+                "module": row.module,
+                "name": module_name(row.module),
+                "proposal": row.proposal.unwrap_or_default(),
+                "hash": crate::backend::hex_encode(&row.hash),
+                "status": status,
+                "activation_height": activation_height,
+                "tasting": tasting,
+                "reason": row.refusal.map_or("", taste::Refusal::reason),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(rows)
+}
+
+/// The name a module's tab shows: the built-in tabs' own, a registered
+/// view's manifest name.
+pub fn module_name(module: &'static str) -> String {
+    match module {
+        "chat" => "Chat".to_owned(),
+        "pages" => "Pages".to_owned(),
+        "forge" => "Forge".to_owned(),
+        "agents" => "Agents".to_owned(),
+        "files" => "Files".to_owned(),
+        "explorer" => "Explorer".to_owned(),
+        "node" => "Node".to_owned(),
+        "members" => "Members".to_owned(),
+        "governance" => "Governance".to_owned(),
+        "settings" => "Settings".to_owned(),
+        registered => registered_view_name(registered),
+    }
+}
+
+/// The notices a taste leaves for the member — withdrawn, activated — as
+/// the stream the app's toast subscribes to.
+pub fn notices() -> impl futures::Stream<Item = String> {
+    taste::notice_stream()
+}
+
+/// The seats' tastes reconciled with the taste set just walked: a seat
+/// tasting a hash the set no longer names is returned to the active view
+/// — silently when the hash IS the active one now (the seat already
+/// draws it), with a notice either way. Under the registry lock.
+fn reconcile_tastes(
+    registry: &HashMap<&'static str, Arc<Mutex<Mounted>>>,
+    hashes: &std::collections::BTreeMap<String, crate::backend::view_source::Entry>,
+) {
+    for (module, mounted) in registry {
+        let mut locked = mounted.lock().expect("module view lock");
+        let Some(tasted) = locked.tasting else {
+            continue;
+        };
+        if taste::listed(module, tasted) {
+            continue;
+        }
+        let active = hashes.get(*module).and_then(|entry| entry.hash);
+        let activated = active == Some(tasted);
+        locked.tasting = None;
+        taste::forget(&taste::chain_id(), module);
+        let name = module_name(module);
+        let (reason, sentence) = match activated {
+            true => (
+                "taste_activated",
+                format!("The {name} view you were trying is now the current view"),
+            ),
+            false => (
+                "taste_withdrawn",
+                format!("The proposed {name} view was withdrawn — back to the current view"),
+            ),
+        };
+        log_source(module, Some(&tasted), "Untasted", locked.generation, reason);
+        taste::notice(sentence);
+    }
+}
+
+/// The device's remembered tastes for this chain, seated: every module
+/// whose remembered hash the taste set names and does not refuse starts a
+/// load after it. Under the registry lock.
+fn seat_remembered_tastes(
+    registry: &HashMap<&'static str, Arc<Mutex<Mounted>>>,
+    asked_of: &Connection,
+) -> Vec<std::thread::JoinHandle<()>> {
+    let mut loads = Vec::new();
+    for (module, hash) in taste::remembered(&taste::chain_id()) {
+        let module = intern(&module);
+        let Some(mounted) = registry.get(module) else {
+            continue;
+        };
+        if let Some(reason) = taste::refused(module, hash) {
+            log_source(module, Some(&hash), "Refused", 0, reason);
+            continue;
+        }
+        let mut locked = mounted.lock().expect("module view lock");
+        let already = locked.tasting == Some(hash);
+        if already {
+            continue;
+        }
+        locked.tasting = Some(hash);
+        let generation = locked.start(Some(hash));
+        drop(locked);
+        loads.push(spawn_load(module, mounted, generation, asked_of.clone()));
+    }
+    loads
+}
+
 /// A registry id as the `&'static str` the seat registry, the tab and the
 /// guest are keyed by. Leaked ONCE per distinct id: the set is the ids a
 /// network's registry lists, bounded by its module set, and a repeat
@@ -991,7 +1196,10 @@ pub fn connected(client: &ducktape_rpc::Client) -> Loads {
                 return None;
             }
             // a node-owned view is reloaded from this node's deployment;
-            // the seat keeps what it shows until that lands
+            // the seat keeps what it shows until that lands. A taste is
+            // the previous chain's: this chain's is re-read from the
+            // preference once its registry has answered
+            locked.tasting = None;
             let generation = locked.start(None);
             Some(spawn_load(module, mounted, generation, snapshot.clone()))
         })
@@ -1027,13 +1235,26 @@ fn spawn_registry_read(asked_of: Connection) -> std::thread::JoinHandle<()> {
                 return;
             }
         };
+        // the taste set for this chain, and what this device remembers
+        // tasting on it: a walk that fails seats no taste, and says so
+        let taste_walk = runtime.block_on(taste::refresh(client, &entries));
         let loads = {
             let mut registry = registry().lock().expect("module views");
             let node_since_left = connection().lock().expect("views rpc").rev != asked_of.rev;
             if node_since_left {
                 return;
             }
-            seat_registered_views(&mut registry, &entries, &asked_of)
+            let mut loads = seat_registered_views(&mut registry, &entries, &asked_of);
+            match taste_walk {
+                Ok(_chain) => loads.extend(seat_remembered_tastes(&registry, &asked_of)),
+                Err(error) => tracing::warn!(
+                    target: "ducktape::app",
+                    reason = "taste_set_unreadable",
+                    error = %error,
+                    "remembered tastes not seated"
+                ),
+            }
+            loads
         };
         for load in loads {
             load.join().expect("a registered view load");
@@ -1162,6 +1383,7 @@ async fn deployments_check() -> Loads {
             return Loads(Vec::new());
         }
     };
+    let taste_walk = taste::refresh(client, &hashes).await.map(|_chain| ());
     let mut registry = registry().lock().expect("module views");
     // the connection may have moved while the registry answered: a load
     // asked of the old one dies at install, and `connected` restarted
@@ -1172,6 +1394,19 @@ async fn deployments_check() -> Loads {
     // a block may have activated a registry-listed view (seated here) or
     // retired one (its seat and tab go); the built-in seats reload below
     let mut loads = seat_registered_views(&mut registry, &hashes, &asked_of);
+    // the same block may have opened, settled or withdrawn a code
+    // proposal: the taste set is walked on the same tick, and a seat whose
+    // taste left it returns to the active view. A walk that fails leaves
+    // every taste as it was: nothing is known to have left
+    match taste_walk {
+        Ok(()) => reconcile_tastes(&registry, &hashes),
+        Err(error) => tracing::warn!(
+            target: "ducktape::app",
+            reason = "taste_set_unreadable",
+            error = %error,
+            "proposed views not checked"
+        ),
+    }
     let reloads = registry
         .iter()
         .filter(|(module, _)| !crate::backend::view_source::desktop_owned(module))
@@ -1180,28 +1415,32 @@ async fn deployments_check() -> Loads {
             // a module the node does not run has no deployment to move
             // to: the view stays as `connected` left it
             let active = hashes.get(*module).copied()?.hash;
+            // the seat is after its taste, else the active deployment
+            let wanted = locked.tasting.or(active);
             // a load already after this deployment — or after whatever is
             // active, as a reconnect's is — lands or fails on its own;
             // starting over on every block would never let it land
-            let waited_for =
-                locked.in_flight && locked.wanted.is_none_or(|wanted| Some(wanted) == active);
+            let waited_for = locked.in_flight
+                && locked
+                    .wanted
+                    .is_none_or(|in_flight_after| Some(in_flight_after) == wanted);
             // a candidate that just failed is left alone until its gap is
             // up: the same bytes fail the same way, so one attempt a block
             // is unbounded work for a deployment that never lands
-            if waited_for || active == locked.hash || locked.held_off(active) {
+            if waited_for || wanted == locked.hash || locked.held_off(wanted) {
                 return None;
             }
             let Some(replacement) = locked.replacement_after_wait() else {
                 log_source(
                     module,
-                    active.as_ref(),
+                    wanted.as_ref(),
                     "Failed",
                     locked.generation,
                     "replacement_waiting",
                 );
                 return None;
             };
-            let generation = locked.start(active);
+            let generation = locked.start(wanted);
             locked.replacement = replacement;
             Some(spawn_load(module, mounted, generation, asked_of.clone()))
         });
@@ -1237,6 +1476,11 @@ struct Mounted {
     /// for it instead of starting over.
     in_flight: bool,
     wanted: Option<[u8; 32]>,
+    /// The proposed frame this device tastes in place of the active one:
+    /// the seat's wanted hash is `tasting.or(active)`. Cleared, with a
+    /// notice, when the hash leaves the taste set — withdrawn, or
+    /// activated into the very hash the seat already draws.
+    tasting: Option<[u8; 32]>,
     /// The seated view has held a replacement off with pending work since
     /// then; a block that names a deployment for it waits under the same
     /// generation instead of opening one per block.
@@ -1290,6 +1534,7 @@ impl Mounted {
             hash: None,
             in_flight: false,
             wanted: None,
+            tasting: None,
             waiting_since: None,
             replacement: Replacement::Preserve,
             retry: None,
@@ -1977,7 +2222,11 @@ impl Guest {
             ..LoadTiming::default()
         };
         let mut asked = view_source::Asked::default();
-        let source = runtime.block_on(view_source::resolve(client, module, &mut asked));
+        // the seat's taste, read once: a load is after the frame the seat
+        // wanted when it started, and a taste that moves meanwhile starts
+        // another load under another generation
+        let tasting = mounted.lock().expect("module view lock").tasting;
+        let source = runtime.block_on(view_source::resolve(client, module, tasting, &mut asked));
         timing.status = asked.status;
         timing.fetch = asked.fetch;
         let source = match source {
@@ -1996,6 +2245,17 @@ impl Guest {
                 return Err(before_any_candidate(format!(
                     "the {module} module is not activated yet"
                 )));
+            }
+            ViewSource::Missing { hash } if tasting.is_some() => {
+                // a taste never empties a seat: the taste set lists such a
+                // frame as `no_view` and refuses it before it gets here
+                let reason = "no_view";
+                logged(Some(&hash), "Failed", reason);
+                timing.log(module, Some(&hash), started, "Failed");
+                return Err(Unloaded {
+                    hash: Some(hash),
+                    reason: reason.to_owned(),
+                });
             }
             ViewSource::Missing { hash } => {
                 // a removal answered late, after the code moved on, is not
@@ -2117,11 +2377,16 @@ impl Guest {
                 .saturating_sub(timing.first_frame.unwrap_or_default());
             let fresh = prepared?;
             // the deployment may have moved while this one was prepared;
-            // the block that moved it starts another load
+            // the block that moved it starts another load. A tasted frame
+            // is content-addressed and moves for nobody: the seat's taste
+            // is the word, and a taste that moved dies at install
             let checked = Instant::now();
-            let active = runtime.block_on(still_active(client, module, hash));
+            let still_wanted = match tasting {
+                Some(_) => Ok(true),
+                None => runtime.block_on(still_active(client, module, hash)),
+            };
             timing.check = checked.elapsed();
-            if !active? {
+            if !still_wanted? {
                 return Err("the active code moved while the view was prepared".into());
             }
             Ok(match against {
@@ -2133,9 +2398,13 @@ impl Guest {
                 None => Loaded::Fresh(Box::new(fresh)),
             })
         })();
+        let tasted = match tasting {
+            Some(_) => "tasting",
+            None => "",
+        };
         let state = match &outcome {
             Ok(Loaded::Fresh(_)) => {
-                logged(Some(&hash), "Ready", "");
+                logged(Some(&hash), "Ready", tasted);
                 "Ready"
             }
             Ok(Loaded::Unchanged) => "Unchanged",
@@ -3309,7 +3578,7 @@ pub(crate) mod tests {
     /// The governance view declares none: it speaks the kernel contract.
     #[test]
     fn only_declared_intents_are_routed() {
-        assert!(intents_of("governance").is_empty());
+        assert_eq!(intents_of("governance"), ["taste", "untaste"]);
         // a registry-listed view declares nothing of its own: the two
         // generic OS doors, and only those
         assert_eq!(intents_of("home"), GENERIC_DOORS);
@@ -3916,6 +4185,7 @@ pub(crate) mod tests {
             hash: None,
             in_flight: false,
             wanted: None,
+            tasting: None,
             waiting_since: None,
             replacement: Replacement::Preserve,
             retry: None,
@@ -4756,6 +5026,8 @@ pub(crate) mod tests {
         registry.clear();
         connection.client = None;
         connection.rev += 1;
+        // and the previous test's taste set, with the frames it held
+        taste::clear();
     }
 
     /// One test's turn over the seats: taken with them retired, and
@@ -4799,6 +5071,7 @@ pub(crate) mod tests {
             hash: Some([7; 32]),
             in_flight: false,
             wanted: None,
+            tasting: None,
             waiting_since: None,
             replacement: Replacement::Preserve,
             retry: None,
@@ -6326,6 +6599,345 @@ pub(crate) mod tests {
             // other deployment tests, know nothing of this one
             registry().lock().expect("module views").remove(module);
         }
+    }
+
+    /// A proposed frame with the ACTIVE core and another view: the one
+    /// shape a member may taste.
+    fn proposed_view(component: &[u8], asset: &str) -> module_artifact::Artifact {
+        deployment(component, asset)
+    }
+
+    /// The governance tab's seat over a node serving `active`, holding
+    /// `staged` (the bytes proposals fanned out) and listing one open code
+    /// ballot per pair in `open`; the staged governance view drawn and
+    /// settled on the session facts, its register read.
+    async fn seated_over(
+        active: &module_artifact::Artifact,
+        staged: &[&module_artifact::Artifact],
+        open: &[(&str, [u8; 32])],
+    ) -> (
+        Arc<crate::backend::view_source::tests::FakeDeployment>,
+        ducktape_rpc::Client,
+        Arc<Mutex<Mounted>>,
+    ) {
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let node = FakeDeployment::serving("governance", active);
+        for artifact in staged {
+            node.stage(artifact);
+        }
+        node.propose(open);
+        let client = fake_node(node.clone()).await;
+        let mounted = fresh("governance");
+        connected(&client).joined();
+        {
+            let mut locked = mounted.lock().expect("module view lock");
+            let Slot::Ready(guest) = &mut locked.slot else {
+                panic!("the view of the active deployment");
+            };
+            settle_documents(guest, &session_props());
+        }
+        (node, client, mounted)
+    }
+
+    /// The seated governance view redrawn on the session — the taste set
+    /// in its props — and settled; its texts.
+    fn redrawn_texts(mounted: &Arc<Mutex<Mounted>>) -> Vec<String> {
+        // the props read the seat's taste under its own lock, as the
+        // shell's render does: built before this seat is held
+        let props = Some(governance_view(false, true, true).props);
+        let mut locked = mounted.lock().expect("module view lock");
+        let Slot::Ready(guest) = &mut locked.slot else {
+            panic!("a seated view");
+        };
+        settle_documents(guest, &props);
+        texts(guest)
+    }
+
+    /// A member tastes the view an open proposal would install: the seat
+    /// loads the proposed frame's view in place of the active one, the tab
+    /// says so, the preference is kept for the chain, and a block that
+    /// finds the taste still open leaves the seat alone. Back and forth is
+    /// a swap out of the frames held, not a fetch. When the proposal is
+    /// withdrawn the seat returns to the active view with a notice, and the
+    /// preference is forgotten.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_member_tastes_an_open_proposals_view_and_is_returned_when_it_is_withdrawn() {
+        let _turn = connection_turn().await;
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let component = std::fs::read(staged).expect("the staged view");
+        let (a, b) = (
+            deployment(&component, "a.svg"),
+            proposed_view(&component, "b.svg"),
+        );
+        // the ballot is open and the bytes were fanned out: the connect's
+        // walk lists the pair, and the card offers it — nobody is forced
+        let (node, _client, mounted) =
+            seated_over(&a, &[&b], &[("governance", b.hash())]).await;
+        assert_eq!(slot_assets(&mounted), ["a.svg"]);
+        let rows = taste::rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            (rows[0].module, rows[0].hash, rows[0].refusal, rows[0].stage),
+            (
+                "governance",
+                b.hash(),
+                None,
+                crate::backend::view_source::Stage::Open
+            )
+        );
+        assert_eq!(rows[0].proposal.as_deref(), Some("prop-0"));
+        let props = taste_props();
+        assert_eq!(props[0]["reason"], "");
+        assert_eq!(props[0]["tasting"], false);
+        assert_eq!(props[0]["name"], "Governance");
+        assert_eq!(props[0]["status"], "open");
+        let shown = redrawn_texts(&mounted);
+        assert!(
+            shown.iter().any(|text| text == "Try this view"),
+            "the card offers the taste: {shown:?}"
+        );
+
+        // the member tries it
+        let generation = mounted.lock().expect("module view lock").generation;
+        taste("governance", b.hash()).joined();
+        assert_eq!(slot_assets(&mounted), ["b.svg"]);
+        {
+            let locked = mounted.lock().expect("module view lock");
+            assert_eq!(locked.tasting, Some(b.hash()));
+            assert_eq!(locked.hash, Some(b.hash()));
+            assert!(locked.generation > generation);
+        }
+        assert_eq!(tab_label("governance", "Governance"), "Governance · proposed");
+        assert_eq!(
+            taste::remembered("fake-chain"),
+            [("governance".to_owned(), b.hash())].into()
+        );
+        assert_eq!(taste_props()[0]["tasting"], true);
+        let shown = redrawn_texts(&mounted);
+        assert!(
+            shown.iter().any(|text| text == "Back to current"),
+            "the card offers the way back: {shown:?}"
+        );
+        // a block that finds the taste still open leaves the seat alone
+        let generation = mounted.lock().expect("module view lock").generation;
+        deployments_checked().await.joined();
+        assert_eq!(slot_assets(&mounted), ["b.svg"]);
+        assert_eq!(
+            mounted.lock().expect("module view lock").generation,
+            generation
+        );
+        // and the same taste again is nothing to do
+        assert_eq!(taste("governance", b.hash()).started(), 0);
+
+        // back to the current view, and to the taste again: the frames
+        // are held, so neither asks the node for bytes
+        node.artifacts.lock().unwrap().clear();
+        untaste("governance").joined();
+        assert_eq!(slot_assets(&mounted), ["a.svg"]);
+        assert_eq!(mounted.lock().expect("module view lock").tasting, None);
+        assert!(taste::remembered("fake-chain").is_empty());
+        assert_eq!(tab_label("governance", "Governance"), "Governance");
+        taste("governance", b.hash()).joined();
+        assert_eq!(slot_assets(&mounted), ["b.svg"]);
+        assert!(taste::take_notices().is_empty(), "a member's own move is no news");
+
+        // the ballot is withdrawn: the next block returns the seat
+        node.propose(&[]);
+        deployments_checked().await.joined();
+        assert_eq!(slot_assets(&mounted), ["a.svg"]);
+        {
+            let locked = mounted.lock().expect("module view lock");
+            assert_eq!(locked.tasting, None);
+            assert_eq!(locked.hash, Some(a.hash()));
+        }
+        assert_eq!(
+            taste::take_notices(),
+            ["The proposed Governance view was withdrawn — back to the current view"]
+        );
+        assert!(taste::remembered("fake-chain").is_empty());
+        assert!(taste::rows().is_empty());
+        registry().lock().expect("module views").remove("governance");
+    }
+
+    /// A taste that the ballot passes stays a taste while the swap is
+    /// scheduled — the card reads "scheduled" — and when the swap
+    /// activates the tasted hash IS the active one: the seat is not
+    /// reloaded, the taste is cleared, and the member is told.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_activated_taste_is_the_current_view_without_a_reload() {
+        let _turn = connection_turn().await;
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let component = std::fs::read(staged).expect("the staged view");
+        let (a, b) = (
+            deployment(&component, "a.svg"),
+            proposed_view(&component, "b.svg"),
+        );
+        let (node, client, mounted) = seated_over(&a, &[&b], &[("governance", b.hash())]).await;
+        taste("governance", b.hash()).joined();
+        assert_eq!(slot_assets(&mounted), ["b.svg"]);
+        // passed: the registry schedules the swap, the ballot settles
+        node.schedule("governance", &a, &b, 40);
+        node.propose(&[]);
+        deployments_checked().await.joined();
+        assert_eq!(slot_assets(&mounted), ["b.svg"]);
+        assert_eq!(
+            mounted.lock().expect("module view lock").tasting,
+            Some(b.hash())
+        );
+        let props = taste_props();
+        assert_eq!(props[0]["status"], "scheduled");
+        assert_eq!(props[0]["activation_height"], 40);
+        assert_eq!(props[0]["tasting"], true);
+        assert!(taste::take_notices().is_empty());
+        // the height: B is active, nothing is pending, nothing is open
+        let generation = mounted.lock().expect("module view lock").generation;
+        node.deploy("governance", &b);
+        deployments_checked().await.joined();
+        assert_eq!(slot_assets(&mounted), ["b.svg"]);
+        {
+            let locked = mounted.lock().expect("module view lock");
+            assert_eq!(locked.tasting, None);
+            assert_eq!(locked.hash, Some(b.hash()));
+            assert_eq!(locked.generation, generation, "no reload: the seat already draws it");
+        }
+        assert_eq!(
+            taste::take_notices(),
+            ["The Governance view you were trying is now the current view"]
+        );
+        assert!(taste::remembered("fake-chain").is_empty());
+        assert_eq!(tab_label("governance", "Governance"), "Governance");
+        drop(client);
+        registry().lock().expect("module views").remove("governance");
+    }
+
+    /// Every refusal by name: a proposal that changes the core too, one
+    /// whose bytes the node lacks (until it holds them), one that removes
+    /// the view, one of another kind, and one whose view does not speak
+    /// this app's wire. None is ever seated, and the card says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_proposal_is_listed_by_reason_and_never_seated() {
+        let _turn = connection_turn().await;
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let component = std::fs::read(staged).expect("the staged view");
+        let a = deployment(&component, "a.svg");
+        let core_changes = module_artifact::Artifact::Module(module_artifact::ModuleArtifact {
+            component: vec![9, 9, 9],
+            index: None,
+            view: Some(module_artifact::ViewArtifact {
+                component: component.clone(),
+                assets: [("core.svg".to_owned(), b"<svg/>".to_vec())].into(),
+            }),
+        });
+        let no_view = module_artifact::Artifact::Module(module_artifact::ModuleArtifact {
+            component: vec![1, 2, 3],
+            index: None,
+            view: None,
+        });
+        let view_only = module_artifact::Artifact::View(module_artifact::ViewArtifact {
+            component: component.clone(),
+            assets: Default::default(),
+        });
+        let other_wire = proposed_view(b"not a component", "wire.svg");
+        let not_held = proposed_view(&component, "held.svg");
+        let (node, _client, mounted) = seated_over(
+            &a,
+            &[&core_changes, &no_view, &view_only, &other_wire],
+            &[
+                ("governance", core_changes.hash()),
+                ("governance", no_view.hash()),
+                ("governance", view_only.hash()),
+                ("governance", other_wire.hash()),
+                ("governance", not_held.hash()),
+            ],
+        )
+        .await;
+        let reason_of = |hash: [u8; 32]| {
+            taste::rows()
+                .into_iter()
+                .find(|row| row.hash == hash)
+                .and_then(|row| row.refusal)
+                .map(taste::Refusal::reason)
+        };
+        assert_eq!(reason_of(core_changes.hash()), Some("core_changes_too"));
+        assert_eq!(reason_of(no_view.hash()), Some("no_view"));
+        assert_eq!(reason_of(view_only.hash()), Some("kind_mismatch"));
+        assert_eq!(reason_of(other_wire.hash()), Some("wire_protocol"));
+        assert_eq!(reason_of(not_held.hash()), Some("not_held"));
+        for refused in [&core_changes, &no_view, &view_only, &other_wire, &not_held] {
+            assert_eq!(taste("governance", refused.hash()).started(), 0);
+            assert_eq!(slot_assets(&mounted), ["a.svg"]);
+            assert_eq!(mounted.lock().expect("module view lock").tasting, None);
+        }
+        assert!(taste::remembered("fake-chain").is_empty());
+        let props = taste_props();
+        let reasons: Vec<&str> = props
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["reason"].as_str().unwrap())
+            .collect();
+        assert_eq!(reasons.len(), 5);
+        assert!(reasons.iter().all(|reason| !reason.is_empty()));
+        let shown = redrawn_texts(&mounted);
+        for expected in [
+            "Changes the module's code too — it becomes current when it activates",
+            "Removes the view",
+            "Your node has not received these bytes yet",
+        ] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} in {shown:?}"
+            );
+        }
+        assert!(!shown.iter().any(|text| text == "Try this view"), "{shown:?}");
+        // the bytes arrive: the next walk finds them
+        node.stage(&not_held);
+        deployments_checked().await.joined();
+        assert_eq!(reason_of(not_held.hash()), None);
+        taste("governance", not_held.hash()).joined();
+        assert_eq!(slot_assets(&mounted), ["held.svg"]);
+        registry().lock().expect("module views").remove("governance");
+    }
+
+    /// A taste is a device preference: at connect, once the chain's
+    /// registry has answered, the remembered hash is seated again — if the
+    /// taste set still names it — and a taste the set no longer names is
+    /// left where it was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_remembered_taste_is_seated_again_at_connect() {
+        let _turn = connection_turn().await;
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let component = std::fs::read(staged).expect("the staged view");
+        let (a, b) = (
+            deployment(&component, "a.svg"),
+            proposed_view(&component, "b.svg"),
+        );
+        let (node, client, mounted) = seated_over(&a, &[&b], &[("governance", b.hash())]).await;
+        taste("governance", b.hash()).joined();
+        assert_eq!(slot_assets(&mounted), ["b.svg"]);
+        // the app reconnects: the seat is asked of the node afresh, and
+        // the remembered taste rides in once the registry has answered
+        connected(&client).joined();
+        assert_eq!(slot_assets(&mounted), ["b.svg"]);
+        assert_eq!(
+            mounted.lock().expect("module view lock").tasting,
+            Some(b.hash())
+        );
+        // the proposal is gone before the next connect: the preference
+        // names nothing the set does, and the seat draws the active view
+        node.propose(&[]);
+        connected(&client).joined();
+        assert_eq!(slot_assets(&mounted), ["a.svg"]);
+        assert_eq!(mounted.lock().expect("module view lock").tasting, None);
+        registry().lock().expect("module views").remove("governance");
     }
 
     /// A valid view with an admitted event it has not consumed yet.

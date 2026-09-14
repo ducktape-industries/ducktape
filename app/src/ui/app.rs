@@ -164,6 +164,8 @@ pub(crate) enum SettingsIntent {
     Light,
     Dark,
     Notifications,
+    Taste,
+    Untaste,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PagesIntent {
@@ -551,6 +553,9 @@ pub(crate) enum AppMessage {
     CopyToClipboard(String, String),
     DismissToast,
     ToastTick,
+    /// A sentence a taste left for the member: the proposed view they
+    /// were trying was withdrawn, or became the current one.
+    ViewNotice(String),
     ExplorerViewEvent(crate::module_view::ModuleViewEvent),
     ClosePalette,
     ToggleBell,
@@ -966,6 +971,8 @@ impl Ducktape {
             subscriptions
                 .push(Subscription::run(crate::shell::toast_ticks).map(|()| AppMessage::ToastTick));
         }
+        subscriptions
+            .push(Subscription::run(crate::module_view::notices).map(AppMessage::ViewNotice));
         Subscription::batch(subscriptions)
     }
     pub(crate) fn boot() -> (Self, Task<AppMessage>) {

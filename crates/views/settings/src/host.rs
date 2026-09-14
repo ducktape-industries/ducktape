@@ -73,6 +73,58 @@ pub struct Session {
     pub settings_key_path: String,
     pub account_busy: bool,
     pub account_ticket: String,
+    /// The taste set: the views a code ballot or a scheduled swap would
+    /// install, which a member may try before they land.
+    #[serde(default)]
+    pub tasting: Vec<TasteRow>,
+}
+
+/// One row of the taste set the kernel pushes with the session: a
+/// `(module, hash)` an open code ballot or a scheduled swap names, whether
+/// this app tastes it, and why it cannot be tasted if it cannot (`reason`
+/// empty when it can).
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct TasteRow {
+    pub module: String,
+    /// The module's tab name.
+    pub name: String,
+    pub proposal: String,
+    pub hash: String,
+    /// `open` or `scheduled`.
+    pub status: String,
+    pub activation_height: i64,
+    pub tasting: bool,
+    pub reason: String,
+}
+
+/// Why a proposed view cannot be tried here, for the reader.
+pub fn refusal_words(reason: &str) -> String {
+    match reason {
+        "not_registered" => "Its module is not registered here yet".into(),
+        "not_held" => "Your node has not received these bytes yet".into(),
+        "hash_mismatch" => "The bytes your node holds do not match the proposal".into(),
+        "invalid_artifact" => "The proposed artifact cannot be read".into(),
+        "kind_mismatch" => "The proposed artifact is not this entry's kind".into(),
+        "core_changes_too" => {
+            "Changes the module's code too — it becomes current when it activates".into()
+        }
+        "wire_protocol" => "Built for another version of this app".into(),
+        "no_view" => "Removes the view".into(),
+        other => other.replace('_', " "),
+    }
+}
+
+/// The line under a taste row: which ballot, where it stands.
+pub fn taste_detail(row: &TasteRow) -> String {
+    let stage = match row.status.as_str() {
+        "scheduled" => format!("scheduled for block {}", row.activation_height),
+        _ => "on the ballot".to_owned(),
+    };
+    let short: String = row.hash.chars().take(12).collect();
+    match row.proposal.is_empty() {
+        true => format!("{short} · {stage}"),
+        false => format!("{short} · proposal {} · {stage}", row.proposal),
+    }
 }
 
 /// One item of the session subscription: the facts, or why not.
@@ -549,6 +601,39 @@ pub fn set_dark() -> bool {
 
 pub fn set_notifications(enabled: bool) -> bool {
     notify("settings.notifications", &Notifications { enabled })
+}
+
+/// `settings.taste` — this device tries the view a proposal would install
+/// for `module`, under `hash`; `settings.untaste` — back to the current
+/// one. A preference of the app, never a write to the network.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Taste {
+    pub module: String,
+    pub hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Untaste {
+    pub module: String,
+}
+
+pub fn taste(module: &str, hash: &str) -> bool {
+    notify(
+        "settings.taste",
+        &Taste {
+            module: module.into(),
+            hash: hash.into(),
+        },
+    )
+}
+
+pub fn untaste(module: &str) -> bool {
+    notify(
+        "settings.untaste",
+        &Untaste {
+            module: module.into(),
+        },
+    )
 }
 
 fn notify<T: Serialize>(operation: &str, payload: &T) -> bool {
