@@ -34,6 +34,26 @@ cannot read the credential out of it.
   record; `inspect` (pin an enclave's measurement) and `seal` (verify the quote,
   then seal + upload the credential) are the enclave half.
 
+## Pi harness
+
+Pi can use either existing credential kind; it is not a third credential kind.
+Install its standalone Linux bundle, then select Pi explicitly:
+
+```sh
+ducktape agent install pi -n <chain-id>
+ducktape agent pty pi --cred <credential-name> -n <chain-id>
+```
+
+Interactive Pi sessions are solo-only: shared command-driven sessions are
+refused because Pi's tool allowlist does not restrict its interactive shell.
+The same `pi` capability works for scheduled runs. A Claude credential selects
+Pi's Anthropic provider; a Codex credential selects its OpenAI Codex provider.
+Without `--cred`, Pi uses the host Anthropic credential path. Real credentials
+stay behind the broker/airlock: the guest receives only a run-scoped capability,
+a fresh `PI_CODING_AGENT_DIR`, and a loopback model endpoint. Pi uses SSE through
+the broker; its headless Ducktape tools use a staged MCP extension, not a host
+Pi configuration or installed plugin set.
+
 ## Two topologies
 
 | topology | when | broker/cred flags |

@@ -3,8 +3,9 @@
 use std::collections::BTreeMap;
 
 use home_view::host::{
-    RoomRow, baseline_after_read, duck_channel_link, duck_run_link, fold_proposals, fold_roster,
-    fold_rooms, fold_runs, fold_snapshots, height_label, node_facts, prose, rooms_with_news,
+    RoomRow, baseline_after_read, columns_for, dealt, duck_channel_link, duck_run_link,
+    fold_blocks, fold_peers, fold_proposals, fold_rooms, fold_roster, fold_runs, fold_snapshots,
+    height_label, live_peers, node_facts, prose, rooms_with_news, tiles_per_row,
 };
 
 #[test]
@@ -22,6 +23,76 @@ fn the_node_card_reads_phase_height_and_sync_progress() {
     assert_eq!(silent.height, -1);
     assert_eq!(height_label(silent.height), "block —");
     assert_eq!(height_label(84912), "block 84,912");
+}
+
+/// The consensus section is a validator's alone and the module set is the
+/// status document's own list; both read as absent, never as zero, when
+/// the node leaves them out.
+#[test]
+fn the_node_card_reads_consensus_checkpoint_and_the_module_set() {
+    let facts = node_facts(&serde_json::json!({
+        "height": 12, "version": "0.1.0", "root_hash": "feed",
+        "modules": [{ "id": "chat", "category": "collaboration" }],
+        "operations": {
+            "phase": "validating",
+            "consensus": { "quorum": 3, "reachable_validators": 2 },
+            "storage": { "checkpoint_height": 8 },
+            "sync": { "failures": 2, "last_error": "peer gone" }
+        }
+    }));
+    assert_eq!((facts.quorum, facts.reachable_validators), (3, 2));
+    assert_eq!(facts.checkpoint_height, 8);
+    assert_eq!(
+        (facts.version.as_str(), facts.root_hash.as_str()),
+        ("0.1.0", "feed")
+    );
+    assert_eq!(facts.modules[0].id, "chat");
+    assert_eq!(facts.modules[0].category, "collaboration");
+    assert_eq!(
+        (facts.sync_failures, facts.sync_last_error.as_str()),
+        (2, "peer gone")
+    );
+    let resident = node_facts(&serde_json::json!({ "operations": { "phase": "following" } }));
+    assert_eq!((resident.quorum, resident.reachable_validators), (-1, -1));
+    assert!(resident.modules.is_empty());
+}
+
+/// Peers read connected first; blocks keep only the rows that carried
+/// operations, in the node's own newest-first order.
+#[test]
+fn peers_lead_with_the_connected_and_blocks_drop_the_idle() {
+    let peers = fold_peers(&serde_json::json!({ "peers": [
+        { "peer": "a", "role": "validator", "connected": false },
+        { "peer": "b", "role": "resident", "connected": true }
+    ]}));
+    let keys: Vec<&str> = peers.iter().map(|peer| peer.key.as_str()).collect();
+    assert_eq!(keys, ["b", "a"]);
+    assert_eq!(live_peers(&peers), 1);
+
+    let blocks = fold_blocks(&serde_json::json!([
+        { "height": 9, "hash": "", "ops": [] },
+        { "height": 8, "hash": "aa", "ops": [{}, {}] },
+        { "height": 7, "hash": "bb", "ops": [{}] }
+    ]));
+    let heights: Vec<(i64, i64)> = blocks.iter().map(|b| (b.height, b.op_count)).collect();
+    assert_eq!(heights, [(8, 2), (7, 1)]);
+}
+
+/// The column count follows the pane: one rail below 720, two below 1120,
+/// three above; the tiles per line are two per column, capped at four; and
+/// the cards are dealt round-robin so the first cards lead every column.
+#[test]
+fn the_layout_answers_the_pane_width() {
+    assert_eq!(columns_for(400.), 1);
+    assert_eq!(columns_for(720.), 2);
+    assert_eq!(columns_for(1119.), 2);
+    assert_eq!(columns_for(1120.), 3);
+    assert_eq!(columns_for(2560.), 3);
+    assert_eq!(tiles_per_row(1), 2);
+    assert_eq!(tiles_per_row(2), 4);
+    assert_eq!(tiles_per_row(3), 4);
+    assert_eq!(dealt(vec![1, 2, 3, 4, 5], 2), [vec![1, 3, 5], vec![2, 4]]);
+    assert_eq!(dealt(vec![1, 2], 0), [vec![1, 2]], "never zero rails");
 }
 
 #[test]

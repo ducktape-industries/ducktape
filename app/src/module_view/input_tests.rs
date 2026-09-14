@@ -24,6 +24,7 @@ fn seated(opened: &[&str]) -> Arc<Mutex<Mounted>> {
         hash: None,
         in_flight: false,
         wanted: None,
+        tasting: None,
         waiting_since: None,
         replacement: Replacement::Preserve,
         retry: None,

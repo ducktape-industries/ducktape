@@ -163,6 +163,7 @@ impl Ducktape {
             AppMessage::NodeViewEvent(event) => self.on_node_view_event(event),
             AppMessage::NodeFactsLoaded(next) => self.on_node_facts_loaded(next),
             AppMessage::UpdateJobReplied(reply) => self.on_update_job_replied(reply),
+            AppMessage::UpdateAction(action) => self.on_update_action(action),
             AppMessage::NodeFactsFailed(_cause) => self.on_node_facts_failed(_cause),
             AppMessage::NodeStatusPushed(next) => self.on_node_status_pushed(next),
             AppMessage::SettingsLoaded(next) => self.on_settings_loaded(next),
@@ -173,6 +174,7 @@ impl Ducktape {
             AppMessage::CopyToClipboard(text, label) => self.on_copy_to_clipboard(text, label),
             AppMessage::DismissToast => self.on_dismiss_toast(),
             AppMessage::ToastTick => self.on_toast_tick(),
+            AppMessage::ViewNotice(sentence) => self.on_view_notice(sentence),
             AppMessage::ExplorerViewEvent(event) => self.on_explorer_view_event(event),
             AppMessage::ClosePalette => self.on_close_palette(),
             AppMessage::ToggleBell => self.on_toggle_bell(),
@@ -1765,6 +1767,41 @@ impl Ducktape {
         };
         self.run_update_job(job)
     }
+    /// One of the update controls. `CheckNow` is the only one that starts a
+    /// job; the rest are events the machine answers with local writes or,
+    /// for a restart and a rollback, by spawning the launcher — then the
+    /// app leaves the way the tray's Quit does, so every lane retires and
+    /// the launcher's flip and exec follow a clean shutdown.
+    fn on_update_action(&mut self, action: UpdateAction) -> Task<AppMessage> {
+        let Some(updater) = self.updater.as_mut() else {
+            return Task::none();
+        };
+        let job = match action {
+            UpdateAction::CheckNow => updater.check_now(self.wall_now),
+            UpdateAction::RestartToUpdate => updater.apply(app_update::Event::RestartToUpdate),
+            UpdateAction::RollBack => updater.apply(app_update::Event::UserRollback),
+            UpdateAction::DismissRollbackNotice => {
+                updater.apply(app_update::Event::DismissRollbackNotice)
+            }
+        };
+        let launcher_takes_over = updater.take_relaunch();
+        if launcher_takes_over {
+            return Task::done(AppMessage::TrayQuit);
+        }
+        let Some(job) = job else {
+            return Task::none();
+        };
+        self.run_update_job(job)
+    }
+    /// The healthy signal: the first window opened. In `PendingHealthy`
+    /// that settles the flipped release as `current` and collects the rest;
+    /// in any other phase it is nothing.
+    fn mark_update_rendered(&mut self) {
+        let Some(updater) = self.updater.as_mut() else {
+            return;
+        };
+        updater.apply(app_update::Event::Rendered);
+    }
     fn on_update_job_replied(&mut self, reply: Option<app_update::Event>) -> Task<AppMessage> {
         let Some(updater) = self.updater.as_mut() else {
             return Task::none();
@@ -1784,7 +1821,7 @@ impl Ducktape {
             crate::backend::update::run_job(
                 self.connected_rpc.to_owned(),
                 updater.keys().clone(),
-                updater.updates_dir().to_path_buf(),
+                updater.paths().clone(),
                 job,
             ),
             AppMessage::UpdateJobReplied,
@@ -2549,10 +2586,12 @@ impl Ducktape {
         &mut self,
         event: crate::module_view::ModuleViewEvent,
     ) -> Task<AppMessage> {
-        if event.kind != "badge" {
-            return Task::none();
+        match event.kind.as_str() {
+            "badge" => self.gov_open = crate::module_view::event_int(&(event), "count"),
+            "taste" => self.on_taste_event(&event, true),
+            "untaste" => self.on_taste_event(&event, false),
+            _ => {}
         }
-        self.gov_open = crate::module_view::event_int(&(event), "count");
         Task::none()
     }
     fn on_members_view_event(
@@ -3043,6 +3082,23 @@ impl Ducktape {
             }
             SettingsIntent::Light => Task::done(AppMessage::SetAppearanceLight),
             SettingsIntent::Dark => Task::done(AppMessage::SetAppearanceDark),
+            SettingsIntent::Taste => {
+                self.on_taste_event(&event, true);
+                Task::none()
+            }
+            SettingsIntent::Untaste => {
+                self.on_taste_event(&event, false);
+                Task::none()
+            }
+            SettingsIntent::UpdateCheck => {
+                Task::done(AppMessage::UpdateAction(UpdateAction::CheckNow))
+            }
+            SettingsIntent::UpdateRestart => {
+                Task::done(AppMessage::UpdateAction(UpdateAction::RestartToUpdate))
+            }
+            SettingsIntent::UpdateRollback => {
+                Task::done(AppMessage::UpdateAction(UpdateAction::RollBack))
+            }
             SettingsIntent::Notifications => {
                 self.desktop_notifications = crate::module_view::event_flag(&(event), "enabled");
                 let pending_task = Task::perform(
@@ -3085,6 +3141,35 @@ impl Ducktape {
         self.toast = "".to_owned();
         self.toast_age = 0;
         Task::none()
+    }
+    fn on_view_notice(&mut self, sentence: String) -> Task<AppMessage> {
+        self.toast = sentence;
+        self.toast_age = 0;
+        Task::none()
+    }
+    /// A member's own taste of a proposed view — `taste {module, hash}` /
+    /// `untaste {module}` off the governance card or the Settings list.
+    /// A device preference: the seat moves, nothing is written to the
+    /// network. Every load it starts swaps in place; nobody waits on it.
+    fn on_taste_event(&mut self, event: &crate::module_view::ModuleViewEvent, taste: bool) {
+        let module = crate::module_view::event_text(event, "module");
+        if !taste {
+            let _swapping = crate::module_view::untaste(&module);
+            return;
+        }
+        let hash = crate::backend::hex_decode(&crate::module_view::event_text(event, "hash"))
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+        let Some(hash) = hash else {
+            tracing::warn!(
+                target: "ducktape::app",
+                module,
+                reason = "taste_hash_unreadable",
+                "taste intent refused"
+            );
+            return;
+        };
+        let _swapping = crate::module_view::taste(&module, hash);
     }
     fn on_toast_tick(&mut self) -> Task<AppMessage> {
         self.toast_age += 1;
@@ -4684,6 +4769,7 @@ impl Ducktape {
     }
     fn on_onboarding_opened(&mut self, id: crate::shell::WindowKey) -> Task<AppMessage> {
         self.onboarding_win = Some(id);
+        self.mark_update_rendered();
         Task::batch([
             {
                 let pending_task = Task::perform(crate::backend::load_appearance(), |value| {

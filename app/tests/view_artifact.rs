@@ -2,7 +2,7 @@
 mod view_artifact;
 
 #[tokio::test]
-async fn a_missing_blob_is_not_a_view_removal() {
+async fn a_missing_blob_is_not_held_and_not_a_view_removal() {
     use std::io::{Read as _, Write as _};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let client =
@@ -20,8 +20,8 @@ async fn a_missing_blob_is_not_a_view_removal() {
             .unwrap();
     });
     assert!(matches!(
-        view_artifact::load(&client, [0; 32]).await,
-        Err(view_artifact::Error::Transport(_))
+        view_artifact::fetch(&client, [0; 32]).await,
+        Err(view_artifact::Error::NotHeld)
     ));
     server.join().unwrap();
 }

@@ -330,7 +330,7 @@ args = ["run", "--model", "m1"]
         assert_eq!(
             get("codex").args,
             vec![
-                "exec",
+                "app-server",
                 "-c",
                 "mcp_servers.ducktape.command=\"ducktape\"",
                 "-c",
@@ -339,11 +339,8 @@ args = ["run", "--model", "m1"]
                 "mcp_servers.ducktape.env_vars=[\"DUCKTAPE_NODE\",\"DUCKTAPE_RUN_AGENT\",\"DUCKTAPE_RUN_WORKSPACE\",\"DUCKTAPE_RUN_SKILLS\",\"DUCKTAPE_RUN_ACTION_URL\",\"DUCKTAPE_RUN_ACTION_TOKEN\",\"DUCKTAPE_RUN_ID\",\"DUCKTAPE_PROVIDER_CONTROL_URL\",\"DUCKTAPE_PROVIDER_CONTROL_TOKEN\"]",
                 "-c",
                 "mcp_servers.ducktape.default_tools_approval_mode=\"approve\"",
-                "--json",
-                "--sandbox",
-                "workspace-write",
-                "--skip-git-repo-check",
-                "-"
+                "-c",
+                "sandbox_mode=\"workspace-write\""
             ],
         );
         assert_eq!(
@@ -354,6 +351,11 @@ args = ["run", "--model", "m1"]
                 "{\"mcpServers\":{\"ducktape\":{\"command\":\"ducktape\",\"args\":[\"mcp\"]}}}",
                 "--allowedTools",
                 "mcp__ducktape",
+                "--input-format",
+                "stream-json",
+                "--replay-user-messages",
+                "--permission-prompts",
+                "host",
                 "--output-format",
                 "stream-json",
                 "--verbose",
@@ -375,7 +377,7 @@ args = ["run", "--model", "m1"]
         assert_eq!(
             get("codex_gpt-5.5_xhigh").args,
             vec![
-                "exec",
+                "app-server",
                 "-c",
                 "mcp_servers.ducktape.command=\"ducktape\"",
                 "-c",
@@ -384,15 +386,12 @@ args = ["run", "--model", "m1"]
                 "mcp_servers.ducktape.env_vars=[\"DUCKTAPE_NODE\",\"DUCKTAPE_RUN_AGENT\",\"DUCKTAPE_RUN_WORKSPACE\",\"DUCKTAPE_RUN_SKILLS\",\"DUCKTAPE_RUN_ACTION_URL\",\"DUCKTAPE_RUN_ACTION_TOKEN\",\"DUCKTAPE_RUN_ID\",\"DUCKTAPE_PROVIDER_CONTROL_URL\",\"DUCKTAPE_PROVIDER_CONTROL_TOKEN\"]",
                 "-c",
                 "mcp_servers.ducktape.default_tools_approval_mode=\"approve\"",
-                "--json",
-                "--sandbox",
-                "workspace-write",
-                "--skip-git-repo-check",
-                "-m",
-                "gpt-5.5",
+                "-c",
+                "sandbox_mode=\"workspace-write\"",
+                "-c",
+                "model=\"gpt-5.5\"",
                 "-c",
                 "model_reasoning_effort=\"xhigh\"",
-                "-",
             ],
         );
         assert_eq!(
@@ -403,6 +402,11 @@ args = ["run", "--model", "m1"]
                 "{\"mcpServers\":{\"ducktape\":{\"command\":\"ducktape\",\"args\":[\"mcp\"]}}}",
                 "--allowedTools",
                 "mcp__ducktape",
+                "--input-format",
+                "stream-json",
+                "--replay-user-messages",
+                "--permission-prompts",
+                "host",
                 "--output-format",
                 "stream-json",
                 "--verbose",
@@ -468,7 +472,7 @@ args = ["run", "--model", "m1"]
             );
         }
 
-        // the full matrix is present: 19 codex + 16 claude variants + 2 bases.
+        // the full matrix is present: 19 codex + 16 claude variants + 3 bases.
         // codex efforts are per-model — the 5.6 family reaches `max`, 5.5 caps
         // at `xhigh` — so the codex side is not a rectangle.
         for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
@@ -484,6 +488,7 @@ args = ["run", "--model", "m1"]
                 get(&format!("claude_{model}_{effort}"));
             }
         }
-        assert_eq!(specs.len(), 37, "2 bases + 19 codex + 16 claude variants");
+        assert_eq!(get("pi").isolation.broker, Some(crate::spec::BrokerKind::Pi));
+        assert_eq!(specs.len(), 38, "3 bases + 19 codex + 16 claude variants");
     }
 }

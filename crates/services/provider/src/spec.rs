@@ -174,6 +174,15 @@ pub enum ReleaseSource {
         sums: String,
         members: Vec<String>,
     },
+    /// A self-contained release bundle whose sibling assets must remain beside
+    /// the executable. `{arch}` uses x64/arm64. `root` is the archive directory
+    /// containing `detect.bin`; the installer preserves that whole directory.
+    GithubBundle {
+        repo: String,
+        asset: String,
+        sums: String,
+        root: String,
+    },
 }
 
 /// the argv for an interactive, pty-backed TUI session. deliberately its own
@@ -253,6 +262,9 @@ pub enum BrokerKind {
     /// `claudeAiOauth` creds file seeded into the config home, not argv (see
     /// [`crate::broker`]).
     AnthropicMessages,
+    /// Pi speaks either existing model API, selected by the borrowed credential.
+    /// Its run-local models/auth configuration is distinct from either vendor CLI.
+    Pi,
 }
 
 /// the named stdout parsers. a CLOSED set on purpose: each name is a tested
@@ -260,6 +272,10 @@ pub enum BrokerKind {
 /// adding a name is a code change with tests — that is the point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
+    /// Pi's authoritative `message_end` events, including per-turn usage.
+    PiJson,
+    CodexSession,
+    ClaudeSession,
     /// a JSONL event stream; the LAST `agent_message` item wins.
     JsonlEvents,
     /// a single `{"type":"result",...}` object (the contract of
@@ -332,6 +348,32 @@ enum RawSource {
         sums: String,
         members: Vec<String>,
     },
+    #[serde(rename = "github-bundle")]
+    GithubBundle {
+        repo: String,
+        asset: String,
+        sums: String,
+        root: String,
+    },
+}
+
+fn validate_github_source(repo: &str, asset: &str, sums: &str, origin: &str) -> Result<(), String> {
+    let is_owner_slash_name = matches!(
+        repo.split('/').collect::<Vec<_>>().as_slice(),
+        [owner, name] if !owner.is_empty() && !name.is_empty()
+    );
+    if !is_owner_slash_name {
+        return Err(format!("{origin}: source.repo {repo:?} is not owner/name"));
+    }
+    if !asset.contains("{arch}") {
+        return Err(format!(
+            "{origin}: source.asset {asset:?} names no {{arch}} placeholder"
+        ));
+    }
+    if sums.is_empty() {
+        return Err(format!("{origin}: source.sums must be non-empty"));
+    }
+    Ok(())
 }
 
 /// validate `[source]` against `[detect]`: the channel must deliver exactly
@@ -368,21 +410,7 @@ fn parse_source(
             sums,
             members,
         } => {
-            let is_owner_slash_name = matches!(
-                repo.split('/').collect::<Vec<_>>().as_slice(),
-                [owner, name] if !owner.is_empty() && !name.is_empty()
-            );
-            if !is_owner_slash_name {
-                return Err(format!("{origin}: source.repo {repo:?} is not owner/name"));
-            }
-            if !asset.contains("{arch}") {
-                return Err(format!(
-                    "{origin}: source.asset {asset:?} names no {{arch}} placeholder"
-                ));
-            }
-            if sums.is_empty() {
-                return Err(format!("{origin}: source.sums must be non-empty"));
-            }
+            validate_github_source(&repo, &asset, &sums, origin)?;
             let delivered: std::collections::BTreeSet<&str> = members
                 .iter()
                 .map(|m| m.rsplit('/').next().unwrap_or(m.as_str()))
@@ -403,6 +431,36 @@ fn parse_source(
                 asset,
                 sums,
                 members,
+            }))
+        }
+        RawSource::GithubBundle {
+            repo,
+            asset,
+            sums,
+            root,
+        } => {
+            validate_github_source(&repo, &asset, &sums, origin)?;
+            let safe_root = !root.is_empty()
+                && root != "."
+                && root != ".."
+                && root
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+            if !safe_root {
+                return Err(format!(
+                    "{origin}: source.root must be one safe directory name"
+                ));
+            }
+            if !companions.is_empty() {
+                return Err(format!(
+                    "{origin}: a github-bundle preserves its assets; detect.companions must be empty"
+                ));
+            }
+            Ok(Some(ReleaseSource::GithubBundle {
+                repo,
+                asset,
+                sums,
+                root,
             }))
         }
     }
@@ -438,9 +496,10 @@ fn parse_isolation(raw: Option<RawIsolation>, origin: &str) -> Result<IsolationS
         .map(|broker| match broker.as_str() {
             "codex-responses" => Ok(BrokerKind::CodexResponses),
             "anthropic-messages" => Ok(BrokerKind::AnthropicMessages),
+            "pi" => Ok(BrokerKind::Pi),
             other => Err(format!(
                 "{origin}: isolation.broker {other:?} is unsupported \
-                 (want codex-responses | anthropic-messages)"
+                 (want codex-responses | anthropic-messages | pi)"
             )),
         })
         .transpose()?;
@@ -706,13 +765,17 @@ impl CapabilitySpec {
             ));
         }
         let output = match raw.output.format.as_str() {
+            "pi-json" => OutputFormat::PiJson,
+            "codex-session" => OutputFormat::CodexSession,
+            "claude-session" => OutputFormat::ClaudeSession,
             "jsonl-events" => OutputFormat::JsonlEvents,
             "json-result" => OutputFormat::JsonResult,
             "text" => OutputFormat::Text,
             other => {
                 return Err(format!(
                     "{origin}: output.format {other:?} is not a known parser \
-                     (want jsonl-events | json-result | text)"
+                     (want codex-session | claude-session | pi-json | jsonl-events | \
+                     json-result | text)"
                 ));
             }
         };
@@ -969,6 +1032,62 @@ base = "https://releases.example/feed/"
             let err = CapabilitySpec::parse(&toml, "t").unwrap_err();
             assert!(err.contains(expected), "{case}: {err}");
         }
+    }
+
+    #[test]
+    fn pi_spec_declares_both_run_modes_and_isolated_auth() {
+        let specs = builtin_specs();
+        let pi = specs.iter().find(|spec| spec.tag == "pi").unwrap();
+        assert_eq!(pi.output, OutputFormat::PiJson);
+        assert_eq!(pi.isolation.broker, Some(BrokerKind::Pi));
+        assert_eq!(
+            pi.isolation.config_home_env.as_deref(),
+            Some("PI_CODING_AGENT_DIR")
+        );
+        assert!(matches!(
+            pi.source,
+            Some(ReleaseSource::GithubBundle { .. })
+        ));
+        let interactive = pi.interactive.as_ref().unwrap();
+        for args in [&pi.args, &interactive.args] {
+            assert!(args.iter().any(|arg| arg == "--no-extensions"));
+            assert!(args.iter().any(|arg| arg == "--offline"));
+        }
+        assert!(
+            interactive.restricted_args.is_none(),
+            "Pi's interactive !shell bypasses model-tool allowlists; shared sessions must be refused"
+        );
+    }
+
+    #[test]
+    fn bundle_source_requires_one_safe_root_and_no_flattened_companions() {
+        let bundle = spec_toml("bundle")
+            + r#"
+    [source]
+    kind = "github-bundle"
+    repo = "vendor/pkg"
+    asset = "pkg-{arch}.tar.gz"
+    sums = "SHA256SUMS"
+    root = "pkg"
+    "#;
+        assert!(CapabilitySpec::parse(&bundle, "t").is_ok());
+        for root in ["", ".", "..", "../pkg", "/pkg", "pkg/sub"] {
+            let invalid = bundle.replace("root = \"pkg\"", &format!("root = {root:?}"));
+            assert!(
+                CapabilitySpec::parse(&invalid, "t")
+                    .unwrap_err()
+                    .contains("safe directory")
+            );
+        }
+        let companions = bundle.replace(
+            "bin = \"bundle-cli\"",
+            "bin = \"bundle-cli\"\ncompanions = [\"helper\"]",
+        );
+        assert!(
+            CapabilitySpec::parse(&companions, "t")
+                .unwrap_err()
+                .contains("companions must be empty")
+        );
     }
 
     #[test]
@@ -1369,12 +1488,7 @@ args = ["run", "--model", "m", "--hard", "-"]
                 "{}: tools right after args[0]",
                 spec.tag
             );
-            assert_eq!(
-                spec.args.last().unwrap(),
-                "-",
-                "{}: the stdin marker is still last",
-                spec.tag
-            );
+            assert_eq!(spec.args.last().unwrap(), "-");
         }
 
         // the variant argvs are otherwise verbatim — injection ADDS, never
@@ -1454,13 +1568,12 @@ args = ["run", "--model", "m", "--hard", "-"]
             );
         }
 
-        // every codex argv keeps its trailing bare "-" LAST — the reason the
-        // tool args splice after args[0] instead of being appended.
+        // App Server receives JSON-RPC on persistent stdin; it takes no prompt marker.
         for spec in specs.iter().filter(|s| s.tag.starts_with("codex")) {
             assert_eq!(
                 spec.args[..5],
                 [
-                    "exec",
+                    "app-server",
                     "-c",
                     "mcp_servers.ducktape.command=\"ducktape\"",
                     "-c",
@@ -1469,12 +1582,8 @@ args = ["run", "--model", "m", "--hard", "-"]
                 "{}: mcp override right after the subcommand",
                 spec.tag
             );
-            assert_eq!(
-                spec.args.last().unwrap(),
-                "-",
-                "{}: the stdin marker survives injection",
-                spec.tag
-            );
+            assert_eq!(spec.output, OutputFormat::CodexSession);
+            assert!(!spec.args.iter().any(|arg| arg == "-"));
         }
     }
 

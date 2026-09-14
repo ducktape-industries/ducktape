@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use ducktape_view_guest::testing::{answer, has_text, item, press, submit, texts, type_into};
 use ducktape_view_guest::wire::{ButtonContent, Frame, Node, Request};
-use settings_view::host::{KeyAdd, Name, Session, Tab, Unlock};
+use settings_view::host::{KeyAdd, Name, Session, Tab, TasteRow, Unlock};
 use settings_view::{boot_native, tick_native};
 
 const SEAT: &str = "8c4fa211";
@@ -39,6 +39,29 @@ fn facts() -> Session {
         settings_key_path: "/keys/user.key".into(),
         account_busy: false,
         account_ticket: String::new(),
+        update_state: "unavailable".into(),
+        update_current: String::new(),
+        update_previous: String::new(),
+        update_staged_display: String::new(),
+        update_channel: "stable".into(),
+        update_checked: String::new(),
+        update_note: String::new(),
+        update_busy: false,
+        tasting: Vec::new(),
+    }
+}
+
+/// One taste row: the chat view a proposal would install.
+fn taste_row(tasting: bool, reason: &str) -> TasteRow {
+    TasteRow {
+        module: "chat".into(),
+        name: "Chat".into(),
+        proposal: "prop-code".into(),
+        hash: "ab".repeat(32),
+        status: "open".into(),
+        activation_height: 0,
+        tasting,
+        reason: reason.into(),
     }
 }
 
@@ -241,6 +264,7 @@ fn each_tab_selects_only_its_own_groups_inside_the_shared_scroll_root() {
     let groups = [
         ("settings/appearance", "General"),
         ("settings/notifications", "General"),
+        ("settings/updates", "General"),
         ("settings/network", "Network"),
         ("settings/identity-title", "Account"),
         ("settings/keys-title", "Account"),
@@ -579,4 +603,149 @@ fn a_link_to_another_tab_leaves_as_an_intent() {
             tab: "members".into()
         }
     );
+}
+
+/// The Network tab lists the proposed views: "Try this view" leaves as
+/// `settings.taste` naming the module and hash, a tasted row offers "Back
+/// to current" (`settings.untaste`), a refused row shows its reason and
+/// nothing to press, and with nothing proposed the section is not there.
+#[test]
+fn proposed_views_are_tried_and_left_from_the_network_tab() {
+    let session = Session {
+        tasting: vec![taste_row(false, "")],
+        ..facts()
+    };
+    let (frame, props, _) = connected(&session, 1);
+    let frame = tick_native(press(&frame, "Network"));
+    for expected in [
+        "Proposed views",
+        "Chat",
+        "abababababab · proposal prop-code · on the ballot",
+    ] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
+    }
+    let frame = tick_native(press(&frame, "Try this view"));
+    let taste: settings_view::host::Taste =
+        serde_json::from_slice(&one_intent(&frame).payload).unwrap();
+    assert_eq!(taste.module, "chat");
+    assert_eq!(taste.hash, "ab".repeat(32));
+
+    let tasting = Session {
+        tasting: vec![taste_row(true, "")],
+        ..facts()
+    };
+    let frame = tick_native(vec![item(props, &encoded(&tasting))]);
+    assert!(
+        has_text(&frame, "You are trying this view"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(!has_text(&frame, "Try this view"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Back to current"));
+    let untaste: settings_view::host::Untaste =
+        serde_json::from_slice(&one_intent(&frame).payload).unwrap();
+    assert_eq!(untaste.module, "chat");
+
+    let refused = Session {
+        tasting: vec![taste_row(false, "not_held")],
+        ..facts()
+    };
+    let frame = tick_native(vec![item(props, &encoded(&refused))]);
+    assert!(
+        has_text(&frame, "Your node has not received these bytes yet"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(!has_text(&frame, "Try this view"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "Back to current"), "{:?}", texts(&frame));
+
+    let frame = tick_native(vec![item(props, &encoded(&facts()))]);
+    assert!(!has_text(&frame, "Proposed views"), "{:?}", texts(&frame));
+}
+
+// ---------- updates ----------
+
+/// Without a launcher the Updates group says so and offers no control;
+/// installed, its rows read the facts and each control leaves as its own
+/// intent: `Check now` while idle, `Restart to update` only while staged,
+/// `Roll back to <previous>` only while idle with a previous release.
+#[test]
+fn the_updates_group_reads_the_facts_and_each_control_is_one_intent() {
+    let (frame, props, _) = connected(&facts(), 2);
+    assert!(
+        has_text(
+            &frame,
+            "Updates unavailable: not installed through the launcher."
+        ),
+        "{:?}",
+        texts(&frame)
+    );
+    let mut root = frame.root.clone().expect("a tree");
+    let mut update_buttons = 0;
+    root.for_each_mut(&mut |node| {
+        if let Node::Button { key, .. } = node
+            && key.starts_with("settings/update-")
+        {
+            update_buttons += 1;
+        }
+    });
+    assert_eq!(update_buttons, 0, "no control without a launcher");
+
+    let idle = Session {
+        update_state: "idle".into(),
+        update_current: "1a2b3c4".into(),
+        update_previous: "9f8e7d6".into(),
+        update_checked: "5 min ago".into(),
+        update_note: "Up to date.".into(),
+        ..facts()
+    };
+    let frame = tick_native(vec![item(props, &encoded(&idle))]);
+    for expected in ["1a2b3c4", "stable", "5 min ago", "Up to date."] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
+    }
+    assert!(!button_disabled(&frame, "Check now"));
+    let pressed = tick_native(press(&frame, "Check now"));
+    assert_eq!(one_intent(&pressed).kind, "settings.update_check");
+    let pressed = tick_native(press(&frame, "Roll back to 9f8e7d6"));
+    assert_eq!(one_intent(&pressed).kind, "settings.update_rollback");
+
+    let staged = Session {
+        update_state: "staged".into(),
+        update_staged_display: "2026.09.2+abc1234".into(),
+        ..idle.clone()
+    };
+    let frame = tick_native(vec![item(props, &encoded(&staged))]);
+    assert!(has_text(&frame, "2026.09.2+abc1234"), "{:?}", texts(&frame));
+    assert!(
+        button_disabled(&frame, "Check now"),
+        "staged: nothing to check for"
+    );
+    let pressed = tick_native(press(&frame, "Restart to update"));
+    assert_eq!(one_intent(&pressed).kind, "settings.update_restart");
+    let mut root = frame.root.clone().expect("a tree");
+    let mut rollback_offered = false;
+    root.for_each_mut(&mut |node| {
+        if let Node::Button { key, .. } = node
+            && key == "settings/update-rollback"
+        {
+            rollback_offered = true;
+        }
+    });
+    assert!(!rollback_offered, "a rollback is offered only while idle");
+
+    let busy = Session {
+        update_busy: true,
+        ..idle
+    };
+    let frame = tick_native(vec![item(props, &encoded(&busy))]);
+    assert!(has_text(&frame, "Checking…"), "{:?}", texts(&frame));
+    assert!(button_disabled(&frame, "Check now"));
 }
