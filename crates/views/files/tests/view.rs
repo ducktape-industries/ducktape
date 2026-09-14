@@ -7,7 +7,7 @@
 use ducktape_view_guest::testing::{
     answer, edit, find, has_text, item, keys, press, refuse, texts, type_into,
 };
-use ducktape_view_guest::wire::{Event, Frame, Node, Request, keyboard};
+use ducktape_view_guest::wire::{self, Event, Frame, Node, Request, keyboard};
 use files_view::host::Session;
 use files_view::{boot_native, tick_native};
 
@@ -300,7 +300,7 @@ fn a_connected_view_lists_its_own_directory() {
         "Markdown",
         "2 items, 1 folder",
         "Nothing chosen",
-        "Drop a file on the window to upload it here",
+        "Drop files here to upload",
     ] {
         assert!(
             has_text(&frame, expected),
@@ -1123,7 +1123,13 @@ fn an_edited_body_saves_against_the_snapshot_it_was_read_at() {
     );
 
     let frame = tick_native(press(&frame, "Edit"));
-    assert!(frame.requests.is_empty(), "editing is the view's own");
+    assert_eq!(frame.requests.len(), 1, "editing only focuses the editor");
+    let focus = request(&frame, "host.widget");
+    let command: ducktape_view_guest::wire::WidgetCommand =
+        ducktape_view_guest::wire::decode(&focus.payload).unwrap();
+    assert!(matches!(command,
+        ducktape_view_guest::wire::WidgetCommand::Focus { target }
+            if target == "FilesView/screen/inspector/info/preview/fs-editor"));
     let frame = tick_native(press(&frame, "Save"));
     let submit = request(&frame, "op.submit");
     let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
@@ -1431,4 +1437,52 @@ fn read_draft(frame: &Frame) -> (Frame, String) {
         }
     }
     panic!("the small Files document must finish its bounded transfer");
+}
+
+#[test]
+fn name_dialog_focuses_its_field_and_escape_cancels_without_a_write() {
+    let (frame, _) = connected_with_listing();
+    let frame = tick_native(press(&frame, "New file"));
+    let focus = request(&frame, "host.widget");
+    let command: ducktape_view_guest::wire::WidgetCommand =
+        ducktape_view_guest::wire::decode(&focus.payload).unwrap();
+    assert!(matches!(command,
+        ducktape_view_guest::wire::WidgetCommand::Focus { target }
+            if target == "FilesView/screen/name-prompt/name"));
+    let mut escape = key(keyboard::Named::Escape, false);
+    if let Event::Keyboard { captured, .. } = &mut escape[0] {
+        *captured = true;
+    }
+    let frame = tick_native(escape);
+    assert!(!has_text(&frame, "Create file"));
+    assert!(!has_request(&frame, "op.submit"));
+    let frame = tick_native(press(&frame, "File README.md"));
+    let frame = tick_native(press(&frame, "Delete README.md"));
+    assert!(has_text(&frame, "Delete this file"));
+    let focus = request(&frame, "host.widget");
+    let command: ducktape_view_guest::wire::WidgetCommand =
+        ducktape_view_guest::wire::decode(&focus.payload).unwrap();
+    assert!(matches!(command,
+        ducktape_view_guest::wire::WidgetCommand::Focus { target }
+            if target == "FilesView/screen/confirm-delete"));
+    let frame = tick_native(key(keyboard::Named::Escape, false));
+    assert!(!has_text(&frame, "Delete this file"));
+    assert!(!has_request(&frame, "op.submit"));
+}
+
+#[test]
+fn a_text_preview_gives_the_native_reader_a_scrollable_height() {
+    let (_, held) = connected_with_listing();
+    let frame = tick_native(vec![item(
+        held.session,
+        &routed_session(true, "/shared/notes.txt", 1),
+    )]);
+    let head = files_get(&frame, "refs").0.id;
+    let frame = tick_native(vec![answer(head, &refs())]);
+    let page = files_get(&frame, "read").0.id;
+    let frame = tick_native(vec![answer(page, &read("first line\nsecond line"))]);
+    assert_eq!(surface_names(&frame), ["forge_code"]);
+    assert!(matches!(node_ending(&frame, "/code-box"),
+        Node::Container { height: Some(wire::Length::Fixed(height)), .. }
+            if height >= 240.));
 }

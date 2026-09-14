@@ -436,6 +436,14 @@ impl FilesView {
     }
 
     fn on_key_pressed(&mut self, key: BrowseKey) -> Task<Message> {
+        let dismissing = key == BrowseKey::Cancel && !self.busy_writing();
+        if dismissing {
+            return match self.modal() {
+                app_view::Modal::Naming => self.on_prompt(NamePrompt::Closed),
+                app_view::Modal::Deleting => self.on_disarm_delete(),
+                app_view::Modal::None => Task::none(),
+            };
+        }
         let modal = self.name_prompt.is_open() || !self.delete_target.is_empty();
         if modal || self.draft_here() {
             return Task::none();
@@ -449,7 +457,7 @@ impl FilesView {
             BrowseKey::Parent => self.on_parent(),
             BrowseKey::Back => self.on_back(),
             BrowseKey::Forward => self.on_forward(),
-            BrowseKey::Ignored => Task::none(),
+            BrowseKey::Cancel | BrowseKey::Ignored => Task::none(),
         }
     }
 
@@ -528,12 +536,16 @@ impl FilesView {
 
     fn on_toggle_sidebar(&mut self) -> Task<Message> {
         self.sidebar_open = !self.sidebar_open;
-        Task::none()
+        let crowded = self.sidebar_open && self.viewport_width < BOTH_PANES_MIN;
+        if crowded {
+            self.inspector_open = false;
+        }
+        self.on_viewport_changed(self.viewport_width, self.viewport_height)
     }
 
     fn on_toggle_inspector(&mut self) -> Task<Message> {
         self.inspector_open = !self.inspector_open;
-        Task::none()
+        self.on_viewport_changed(self.viewport_width, self.viewport_height)
     }
 
     // ---- the writes ----
@@ -554,7 +566,13 @@ impl FilesView {
             NamePrompt::NewFolder | NamePrompt::NewFile | NamePrompt::Closed => String::new(),
         };
         self.name_prompt = prompt;
-        Task::none()
+        let target = "FilesView/screen/name-prompt/name".to_owned();
+        ducktape_view_guest::widget::perform(wire::WidgetCommand::Focus {
+            target: target.clone(),
+        })
+        .chain(ducktape_view_guest::widget::perform(
+            wire::WidgetCommand::SelectAll { target },
+        ))
     }
 
     fn on_name_changed(&mut self, name: String) -> Task<Message> {
@@ -603,7 +621,9 @@ impl FilesView {
             return Task::none();
         }
         self.delete_target = target;
-        Task::none()
+        ducktape_view_guest::widget::perform(wire::WidgetCommand::Focus {
+            target: "FilesView/screen/confirm-delete".to_owned(),
+        })
     }
 
     fn on_disarm_delete(&mut self) -> Task<Message> {
@@ -640,7 +660,7 @@ impl FilesView {
         self.diff_omitted = 0;
         self.diff_from = id;
         self.inspector_open = true;
-        Task::none()
+        self.on_viewport_changed(self.viewport_width, self.viewport_height)
     }
 
     fn on_close_diff(&mut self) -> Task<Message> {
@@ -670,7 +690,9 @@ impl FilesView {
         self.draft_base = self.preview.base.clone();
         self.notice.clear();
         self.replace_draft(self.preview.text.clone());
-        Task::none()
+        ducktape_view_guest::widget::perform(wire::WidgetCommand::Focus {
+            target: "FilesView/screen/inspector/info/preview/fs-editor".to_owned(),
+        })
     }
 
     fn on_cancel_edit(&mut self, token: String) -> Task<Message> {
@@ -747,7 +769,11 @@ impl FilesView {
         self.sidebar_width = sidebar_width_within(
             self.sidebar_width + dx,
             self.viewport_width,
-            self.inspector_width,
+            if self.inspector_open {
+                self.inspector_width
+            } else {
+                0.
+            },
         );
         Task::none()
     }
@@ -756,7 +782,11 @@ impl FilesView {
         self.inspector_width = inspector_width_within(
             self.inspector_width - dx,
             self.viewport_width,
-            self.sidebar_width,
+            if self.sidebar_open {
+                self.sidebar_width
+            } else {
+                0.
+            },
         );
         Task::none()
     }
@@ -764,9 +794,32 @@ impl FilesView {
     fn on_viewport_changed(&mut self, width: f64, height: f64) -> Task<Message> {
         self.viewport_width = width;
         self.viewport_height = height;
-        self.sidebar_width = sidebar_width_within(self.sidebar_width, width, self.inspector_width);
-        self.inspector_width =
-            inspector_width_within(self.inspector_width, width, self.sidebar_width);
+        // Close a rail before taking the filename column's space. Toggling
+        // either rail on a small window makes room by closing the other.
+        let both_crowded = self.sidebar_open && self.inspector_open && width < BOTH_PANES_MIN;
+        if both_crowded {
+            self.sidebar_open = false;
+        }
+        let inspector_crowded = self.inspector_open && width < INSPECTOR_MIN;
+        if inspector_crowded {
+            self.inspector_open = false;
+        }
+        let sidebar_crowded = self.sidebar_open && width < SIDEBAR_MIN;
+        if sidebar_crowded {
+            self.sidebar_open = false;
+        }
+        let inspector = if self.inspector_open {
+            self.inspector_width
+        } else {
+            0.
+        };
+        self.sidebar_width = sidebar_width_within(self.sidebar_width, width, inspector);
+        let sidebar = if self.sidebar_open {
+            self.sidebar_width
+        } else {
+            0.
+        };
+        self.inspector_width = inspector_width_within(self.inspector_width, width, sidebar);
         Task::none()
     }
 }
@@ -782,14 +835,19 @@ fn listing_of(read: crate::host::DirectoryRead) -> Listing {
 }
 
 /// The main pane never drops under this, whatever the rails take.
-const MAIN_PANE_MIN: f64 = 360.;
+const MAIN_PANE_MIN: f64 = 320.;
+pub(super) const SIDEBAR_MIN: f64 = MAIN_PANE_MIN + 160. + 10.;
+pub(super) const INSPECTOR_MIN: f64 = MAIN_PANE_MIN + 260. + 10.;
+const BOTH_PANES_MIN: f64 = MAIN_PANE_MIN + 160. + 260. + 20.;
 
 pub(crate) fn sidebar_width_within(width: f64, viewport: f64, inspector: f64) -> f64 {
-    let maximum = (viewport - inspector - MAIN_PANE_MIN).clamp(160., 320.);
+    let other = if inspector > 0. { inspector + 10. } else { 0. };
+    let maximum = (viewport - other - 10. - MAIN_PANE_MIN).clamp(160., 320.);
     width.clamp(160., maximum)
 }
 
 pub(crate) fn inspector_width_within(width: f64, viewport: f64, sidebar: f64) -> f64 {
-    let maximum = (viewport - sidebar - MAIN_PANE_MIN).clamp(260., 640.);
+    let other = if sidebar > 0. { sidebar + 10. } else { 0. };
+    let maximum = (viewport - other - 10. - MAIN_PANE_MIN).clamp(260., 640.);
     width.clamp(260., maximum)
 }

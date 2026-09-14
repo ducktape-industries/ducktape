@@ -397,11 +397,18 @@ impl FilesView {
                 Subscription::filter_events(|event| match event {
                     wire::Event::Keyboard {
                         event: wire::keyboard::Event::Press { state, .. },
-                        captured: false,
-                    } => match browse::browse_key(state) {
-                        BrowseKey::Ignored => None,
-                        key => Some(Message::KeyPressed(key)),
-                    },
+                        captured,
+                    } => {
+                        let key = browse::browse_key(state);
+                        // Native fields consume Escape, but the enclosing
+                        // dialog still owns dismissal.
+                        let ignored =
+                            key == BrowseKey::Ignored || (*captured && key != BrowseKey::Cancel);
+                        if ignored {
+                            return None;
+                        }
+                        Some(Message::KeyPressed(key))
+                    }
                     _ => None,
                 })
             }),
@@ -423,6 +430,40 @@ fn gated<M: 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resizing_and_toggling_rails_preserve_the_filename_column() {
+        let (mut app, _) = FilesView::boot();
+        for width in [1280., 1080., 800., 760., 620., 590., 580., 490., 480., 400.] {
+            drop(app.update(Message::ViewportChanged(width, 680.)));
+            for message in [Message::ToggleSidebar, Message::ToggleInspector] {
+                drop(app.update(message));
+                let sidebar = if app.sidebar_open {
+                    app.sidebar_width + 10.
+                } else {
+                    0.
+                };
+                let inspector = if app.inspector_open {
+                    app.inspector_width + 10.
+                } else {
+                    0.
+                };
+                assert!(
+                    width - sidebar - inspector >= 320.,
+                    "filename space at {width}"
+                );
+            }
+        }
+        drop(app.update(Message::ViewportChanged(620., 680.)));
+        drop(app.update(Message::ToggleInspector));
+        assert!(app.inspector_open);
+        drop(app.update(Message::ToggleSidebar));
+        assert!(app.sidebar_open);
+        assert!(!app.inspector_open);
+        drop(app.update(Message::ToggleInspector));
+        assert!(app.inspector_open);
+        assert!(!app.sidebar_open);
+    }
 
     #[test]
     fn snapshot_preserves_unsaved_document_and_browser_state() {
