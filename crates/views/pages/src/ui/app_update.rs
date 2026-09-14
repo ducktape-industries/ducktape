@@ -15,6 +15,7 @@ impl PagesView {
             Message::SessionArrived(item) => self.on_session_arrived(item),
             Message::CommentPointerMoved(_x, y) => self.on_comment_pointer_moved(_x, y),
             Message::ChoosePage(id) => self.on_choose_page(id),
+            Message::TogglePageFold(id) => self.on_toggle_page_fold(id),
             Message::RegisterArrived(item) => self.on_register_arrived(item),
             Message::SearchArrived(item) => self.on_search_arrived(item),
             Message::ActDone(item) => self.on_act_done(item),
@@ -561,6 +562,10 @@ impl PagesView {
                 target: format!("{PAGE_KEY}/thread-reply({id})"),
             },
         )
+    }
+    fn on_toggle_page_fold(&mut self, id: String) -> Task<Message> {
+        self.folded_pages = crate::host::toggled(::std::mem::take(&mut self.folded_pages), &(id));
+        Task::none()
     }
     fn on_toggle_thread_replies(&mut self, id: String) -> Task<Message> {
         self.expanded_threads =

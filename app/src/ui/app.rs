@@ -633,6 +633,7 @@ pub(crate) enum AppMessage {
     SwitchNetwork,
     OnboardingReopened(crate::shell::WindowKey),
     DismissAccountBanner,
+    OpenAccount,
     OpenAccountWelcome,
     WelcomeReopened(crate::shell::WindowKey),
     CallEvent(crate::call::CallEvent),

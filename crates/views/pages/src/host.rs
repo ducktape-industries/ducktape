@@ -1530,6 +1530,23 @@ pub fn page_display_title(pages: &[PageItem], id: &str, current: &str) -> String
         .unwrap_or_else(|| current.to_owned())
 }
 
+/// The pages above `parent`, root first, `parent` last: the breadcrumb. A
+/// parent the index does not hold ends the walk, and a cycle among parents
+/// cannot run longer than the index.
+pub fn ancestors<'a>(pages: &'a [PageItem], parent: &str) -> Vec<&'a PageItem> {
+    let mut chain = Vec::new();
+    let mut next = parent;
+    while chain.len() < pages.len() {
+        let Some(page) = pages.iter().find(|page| page.id == next) else {
+            break;
+        };
+        chain.push(page);
+        next = &page.parent;
+    }
+    chain.reverse();
+    chain
+}
+
 /// The composer's caption: where a NEW comment will anchor.
 pub fn compose_hint_of(blocks: &[PageBlock], scope: &str, page_id: &str) -> String {
     document_sync::comment_compose_hint(blocks, scope, page_id)
@@ -2031,6 +2048,29 @@ pub fn measured_card_height(current: f64, measured: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::CommentsMode;
+
+    /// The crumb walks the parents by title, root first; a parent the index
+    /// does not hold ends the walk, and a cycle cannot run away.
+    #[test]
+    fn the_breadcrumb_walks_ancestors_root_first_and_survives_a_cycle() {
+        let page = |id: &str, parent: &str| PageItem {
+            id: id.into(),
+            title: id.to_uppercase(),
+            parent: parent.into(),
+            prefix: String::new(),
+            child_count: 0,
+        };
+        let pages = vec![page("root", ""), page("mid", "root"), page("leaf", "mid")];
+        let titles: Vec<&str> = ancestors(&pages, "mid")
+            .iter()
+            .map(|page| page.title.as_str())
+            .collect();
+        assert_eq!(titles, ["ROOT", "MID"]);
+        assert!(ancestors(&pages, "").is_empty());
+        assert!(ancestors(&pages, "unknown").is_empty());
+        let looped = vec![page("a", "b"), page("b", "a")];
+        assert_eq!(ancestors(&looped, "a").len(), 2);
+    }
 
     #[test]
     fn the_three_placements_are_decided_at_their_own_pane_widths() {

@@ -296,6 +296,7 @@ impl Ducktape {
             AppMessage::SwitchNetwork => self.on_switch_network(),
             AppMessage::OnboardingReopened(id) => self.on_onboarding_reopened(id),
             AppMessage::DismissAccountBanner => self.on_dismiss_account_banner(),
+            AppMessage::OpenAccount => self.on_open_account(),
             AppMessage::OpenAccountWelcome => self.on_open_account_welcome(),
             AppMessage::WelcomeReopened(id) => self.on_welcome_reopened(id),
             AppMessage::CallEvent(event) => self.on_call_event(event),
@@ -5766,6 +5767,19 @@ impl Ducktape {
     fn on_dismiss_account_banner(&mut self) -> Task<AppMessage> {
         self.account_banner_dismissed = true;
         Task::none()
+    }
+    /// The rail's account row: the account screen for whoever is signed in,
+    /// the sign-in when nobody is. The console's account screen is the
+    /// Settings tab (it draws the account card); the sign-in is the welcome
+    /// window, which replaces the console — so a signed-in press must never
+    /// take that branch, or the console closes under the very account it
+    /// was asked to show.
+    fn on_open_account(&mut self) -> Task<AppMessage> {
+        let signed_in = crate::backend::account_probe(self.account_exists);
+        match signed_in {
+            AccountProbe::Found => Task::done(AppMessage::SelectShellTab(ShellTab::Settings)),
+            AccountProbe::Missing => self.on_open_account_welcome(),
+        }
     }
     fn on_open_account_welcome(&mut self) -> Task<AppMessage> {
         if self.mutation_phase != MutationPhase::Idle {
