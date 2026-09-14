@@ -9,6 +9,12 @@ const PAGE_ROW_ACTIONS_WIDTH: f32 = 52.;
 const PAGE_MENU_WIDTH: f64 = 200.;
 const PAGE_MENU_INSET: f32 = 6.;
 const PAGE_MENU_ITEM_HEIGHT: f32 = 28.;
+/// A reply sits one avatar in from its opener.
+const COMMENT_REPLY_INSET: f32 = 32.;
+/// How far the hover bar rises above a comment's top edge.
+const COMMENT_ACTIONS_RISE: f32 = 6.;
+/// The resolve mark's column at an opener's right edge.
+const COMMENT_MARK_WIDTH: f32 = 28.;
 
 impl PagesView {
     /// The page tree's rows in order, with every row under a folded parent
@@ -296,142 +302,90 @@ impl PagesView {
         )
     }
 
+    /// One thread, Notion's card: the opener's line (avatar, name, the
+    /// resolve mark), its words with Edit and Delete under the pointer, the
+    /// replies in the same shape one step in, and a reply box that is always
+    /// there to be written in while the thread is open.
     fn comment_thread(&self, thread: &crate::host::PageCommentThread) -> Node {
         let key = format!("{PAGE_KEY}/thread/{}", thread.id);
         let expanded = crate::host::expanded(&self.expanded_threads, &thread.id);
-        let replying = self.reply_thread == thread.id && !thread.resolved;
         let disabled = self.unavailable() || self.threads_loading;
-        let mut rows = vec![
-            kit::spaced(
-                kit::centered_row(
-                    format!("{key}/header"),
-                    [
-                        kit::avatar(
-                            format!("{key}/avatar"),
-                            kit::initials(&thread.author),
-                            Tone::Neutral,
-                        ),
-                        kit::sized(
-                            kit::spaced(
-                                kit::column(
-                                    format!("{key}/who"),
-                                    [
-                                        kit::nowrap(kit::strong(
-                                            format!("{key}/author"),
-                                            &thread.author,
-                                        )),
-                                        kit::nowrap(kit::caption(
-                                            format!("{key}/meta"),
-                                            &thread.meta,
-                                        )),
-                                    ],
-                                ),
-                                1.,
-                            ),
-                            Some(Length::Fill),
-                            None,
-                        ),
-                        action(
-                            format!("{key}/resolve"),
-                            if thread.resolved {
-                                "Reopen"
-                            } else {
-                                "Resolve thread"
-                            },
-                            Message::ResolveThreadSubmit(thread.id.clone(), !thread.resolved),
-                            !disabled,
-                            ButtonPreset::Text,
-                        ),
-                    ],
-                ),
-                8.,
-            ),
-            self.comment_body(
-                format!("{key}/opener"),
-                &crate::host::opener_id(thread),
-                &crate::host::opener_text(thread),
-                disabled,
-            ),
-        ];
+        let resolve = glyph(
+            format!("{key}/resolve"),
+            if thread.resolved { "↺" } else { "✓" },
+            if thread.resolved {
+                "Reopen thread"
+            } else {
+                "Resolve thread"
+            },
+            Message::ResolveThreadSubmit(thread.id.clone(), !thread.resolved),
+            disabled,
+        );
+        let mut rows = vec![self.comment_entry(
+            format!("{key}/opener"),
+            &thread.author,
+            &crate::host::opener_id(thread),
+            &crate::host::opener_text(thread),
+            crate::host::opener_meta(thread),
+            Some(resolve),
+            disabled,
+        )];
         for reply in crate::host::thread_replies(thread, expanded) {
             rows.push(kit::padded(
-                kit::spaced(
-                    kit::column(
+                kit::container(
+                    format!("{key}/reply/{}/inset", reply.id),
+                    self.comment_entry(
                         format!("{key}/reply/{}", reply.id),
-                        [
-                            kit::caption(
-                                format!("{key}/reply/{}/meta", reply.id),
-                                match reply.meta.is_empty() {
-                                    true => reply.author.clone(),
-                                    false => format!("{} ({})", reply.author, reply.meta),
-                                },
-                            ),
-                            self.comment_body(
-                                format!("{key}/reply/{}/body", reply.id),
-                                &reply.id,
-                                &reply.text,
-                                disabled,
-                            ),
-                        ],
+                        &reply.author,
+                        &reply.id,
+                        &reply.text,
+                        reply.meta.clone(),
+                        None,
+                        disabled,
                     ),
-                    2.,
                 ),
                 wire::Edges {
                     top: 0.,
                     right: 0.,
                     bottom: 0.,
-                    left: 36.,
+                    left: COMMENT_REPLY_INSET,
                 },
             ));
         }
         let toggle = crate::host::reply_toggle_label(thread, expanded);
         if !toggle.is_empty() {
-            rows.push(named(
-                action(
-                    format!("{key}/replies"),
-                    toggle,
-                    Message::ToggleThreadReplies(thread.id.clone()),
-                    !disabled,
-                    ButtonPreset::Text,
+            rows.push(kit::padded(
+                named(
+                    action(
+                        format!("{key}/replies"),
+                        toggle,
+                        Message::ToggleThreadReplies(thread.id.clone()),
+                        !disabled,
+                        ButtonPreset::Text,
+                    ),
+                    if expanded {
+                        "Fewer replies"
+                    } else {
+                        "Show every reply"
+                    },
                 ),
-                if expanded {
-                    "Fewer replies"
-                } else {
-                    "Show every reply"
+                wire::Edges {
+                    top: 0.,
+                    right: 0.,
+                    bottom: 0.,
+                    left: COMMENT_REPLY_INSET,
                 },
             ));
         }
-        if replying {
-            rows.push(kit::spaced(
-                kit::row(
-                    format!("{key}/compose"),
-                    [
-                        input(
-                            format!("{PAGE_KEY}/thread-reply({})", thread.id),
-                            "Reply…",
-                            &self.reply_draft,
-                            Message::ReplyDraftChanged,
-                            Some(Message::PostThreadReply(thread.id.clone())),
-                            disabled,
-                        ),
-                        action(
-                            format!("{key}/submit"),
-                            "Post reply",
-                            Message::PostThreadReply(thread.id.clone()),
-                            !disabled && !self.reply_draft.trim().is_empty(),
-                            ButtonPreset::Primary,
-                        ),
-                    ],
-                ),
-                6.,
-            ));
-        } else if !thread.resolved {
-            rows.push(action(
-                format!("{key}/reply"),
-                "Reply to this thread",
-                Message::SelectReplyThread(thread.id.clone()),
-                !disabled,
-                ButtonPreset::Text,
+        if !thread.resolved {
+            rows.push(kit::padded(
+                self.reply_box(&key, &thread.id, disabled),
+                wire::Edges {
+                    top: 2.,
+                    right: 0.,
+                    bottom: 0.,
+                    left: COMMENT_REPLY_INSET,
+                },
             ));
         }
         kit::card(
@@ -440,15 +394,81 @@ impl PagesView {
         )
     }
 
-    /// One comment's words with its Edit and Delete — or, while it is the one
-    /// being rewritten, the box holding the new words. The module refuses a
-    /// rewrite by anyone but the author, so the buttons ask, never gate.
-    fn comment_body(&self, key: String, id: &str, text: &str, disabled: bool) -> Node {
-        if id.is_empty() {
-            return kit::wrapping(kit::text(key, text));
+    /// The reply box under an open thread. Every open thread has one; the
+    /// draft belongs to the thread it was typed in, so a box the reader is
+    /// not writing in stays empty.
+    fn reply_box(&self, key: &str, thread_id: &str, disabled: bool) -> Node {
+        let mine = self.reply_thread == thread_id;
+        let draft = if mine { self.reply_draft.as_str() } else { "" };
+        let id = thread_id.to_owned();
+        let change = slots::handler::<String, Message>(Box::new(move |text| {
+            Some(Message::ReplyDraftChangedIn(id.clone(), text))
+        }));
+        let submit =
+            (!disabled).then(|| slots::message(Message::PostThreadReply(thread_id.to_owned())));
+        let mut input = kit::input(
+            format!("{PAGE_KEY}/thread-reply({thread_id})"),
+            "Reply…",
+            draft,
+            change,
+            submit,
+        );
+        if let Node::Input { options, .. } = &mut input {
+            options.disabled = disabled;
         }
-        if self.comment_edit_id == id {
-            return kit::spaced(
+        let mut row = vec![kit::sized(input, Some(Length::Fill), None)];
+        if mine && !self.reply_draft.trim().is_empty() {
+            row.push(action(
+                format!("{key}/submit"),
+                "Reply",
+                Message::PostThreadReply(thread_id.to_owned()),
+                !disabled,
+                ButtonPreset::Primary,
+            ));
+        }
+        kit::spaced(kit::centered_row(format!("{key}/compose"), row), 6.)
+    }
+
+    /// One comment: who, then the words — or, while it is the one being
+    /// rewritten, the box holding the new words. Edit and Delete show only
+    /// under the pointer, at the entry's top-right; `trailing` (the
+    /// opener's resolve mark) always shows. The module refuses a rewrite by
+    /// anyone but the author, so the buttons ask, never gate.
+    #[allow(clippy::too_many_arguments)]
+    fn comment_entry(
+        &self,
+        key: String,
+        author: &str,
+        id: &str,
+        text: &str,
+        meta: String,
+        trailing: Option<Node>,
+        disabled: bool,
+    ) -> Node {
+        let mut who = vec![
+            kit::avatar(
+                format!("{key}/avatar"),
+                kit::initials(author),
+                Tone::Neutral,
+            ),
+            kit::nowrap(kit::strong(format!("{key}/author"), author)),
+        ];
+        if !meta.is_empty() {
+            who.push(kit::nowrap(kit::caption(format!("{key}/meta"), meta)));
+        }
+        // The hover bar sits left of the resolve mark, never over it.
+        let bar_inset = match trailing.is_some() {
+            true => COMMENT_MARK_WIDTH,
+            false => 0.,
+        };
+        who.push(kit::spacer());
+        if let Some(trailing) = trailing {
+            who.push(trailing);
+        }
+        let head = kit::spaced(kit::centered_row(format!("{key}/head"), who), 8.);
+        let editing = !id.is_empty() && self.comment_edit_id == id;
+        let words = if editing {
+            kit::spaced(
                 kit::row(
                     format!("{key}/edit"),
                     [
@@ -477,45 +497,87 @@ impl PagesView {
                     ],
                 ),
                 6.,
-            );
+            )
+        } else {
+            kit::wrapping(kit::text(format!("{key}/text"), text))
+        };
+        let entry = kit::spaced(kit::column(format!("{key}/entry"), [head, words]), 4.);
+        let deleted_or_editing = id.is_empty() || editing;
+        if deleted_or_editing {
+            return entry;
         }
-        kit::spaced(
-            kit::column(
-                format!("{key}/said"),
+        let mut bar = kit::spaced(
+            kit::row(
+                format!("{key}/actions"),
                 [
-                    kit::wrapping(kit::text(format!("{key}/text"), text)),
-                    kit::spaced(
-                        kit::row(
-                            format!("{key}/actions"),
-                            [
-                                named(
-                                    action(
-                                        format!("{key}/edit"),
-                                        "Edit",
-                                        Message::BeginEditComment(id.to_owned(), text.to_owned()),
-                                        !disabled,
-                                        ButtonPreset::Text,
-                                    ),
-                                    "Edit comment",
-                                ),
-                                named(
-                                    action(
-                                        format!("{key}/delete"),
-                                        "Delete",
-                                        Message::DeleteCommentSubmit(id.to_owned()),
-                                        !disabled,
-                                        ButtonPreset::Text,
-                                    ),
-                                    "Delete comment",
-                                ),
-                            ],
-                        ),
-                        4.,
+                    glyph(
+                        format!("{key}/edit"),
+                        "✎",
+                        "Edit comment",
+                        Message::BeginEditComment(id.to_owned(), text.to_owned()),
+                        disabled,
+                    ),
+                    glyph(
+                        format!("{key}/delete"),
+                        "🗑",
+                        "Delete comment",
+                        Message::DeleteCommentSubmit(id.to_owned()),
+                        disabled,
                     ),
                 ],
             ),
-            2.,
-        )
+            0.,
+        );
+        if let Node::Linear {
+            width,
+            background,
+            border,
+            padding,
+            ..
+        } = &mut bar
+        {
+            *width = Some(Length::Shrink);
+            *background = Some(kit::rgba(kit::palette().surface_raised));
+            *border = Some(wire::Border {
+                color: Some(kit::rgba(kit::palette().border)),
+                width: Some(1.),
+                radius: Some([6.; 4]),
+            });
+            *padding = Some(wire::Edges::all(2.));
+        }
+        let mut anchor = kit::container(format!("{key}/actions-anchor"), bar);
+        if let Node::Container {
+            align_x,
+            align_y,
+            width,
+            height,
+            padding,
+            ..
+        } = &mut anchor
+        {
+            *align_x = Some(wire::AlignX::Right);
+            *align_y = Some(wire::AlignY::Top);
+            *width = Some(Length::Fill);
+            *height = Some(Length::Fill);
+            *padding = Some(wire::Edges {
+                top: HOVER_FLOAT_LIFT - COMMENT_ACTIONS_RISE,
+                right: bar_inset,
+                bottom: 0.,
+                left: 0.,
+            });
+        }
+        Node::Hover {
+            key: format!("{key}/hover"),
+            width: Some(Length::Fill),
+            height: None,
+            padding: None,
+            background: None,
+            border: None,
+            tint: None,
+            radius: 0.,
+            open: false,
+            children: vec![entry, anchor],
+        }
     }
 }
 

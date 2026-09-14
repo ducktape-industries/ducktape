@@ -70,6 +70,9 @@ impl PagesView {
             Message::PageDraftChanged(value) => self.on_page_draft_changed(value),
             Message::SearchDraftChanged(value) => self.on_search_draft_changed(value),
             Message::ReplyDraftChanged(value) => self.on_reply_draft_changed(value),
+            Message::ReplyDraftChangedIn(thread, value) => {
+                self.on_reply_draft_changed_in(thread, value)
+            }
             Message::CommentDraftChanged(value) => self.on_comment_draft_changed(value),
             Message::DocumentTransaction(transaction) => self.on_document_transaction(transaction),
             Message::DocumentUpdated(document) => self.on_document_updated(document),
@@ -875,6 +878,14 @@ impl PagesView {
         Task::none()
     }
     fn on_reply_draft_changed(&mut self, value: String) -> Task<Message> {
+        self.reply_draft = value;
+        Task::none()
+    }
+    fn on_reply_draft_changed_in(&mut self, thread: String, value: String) -> Task<Message> {
+        let moved = self.reply_thread != thread;
+        if moved {
+            self.reply_thread = thread;
+        }
         self.reply_draft = value;
         Task::none()
     }

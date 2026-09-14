@@ -149,6 +149,12 @@ fn glyph(key: String, glyph: &str, label: &str, message: Message, disabled: bool
     button
 }
 
+/// A row's worth of `node` held to the left edge: a text button reads as a
+/// line of the list, not a centred banner.
+fn leading(key: impl Into<String>, node: Node) -> Node {
+    kit::row(key, [node, kit::spacer()])
+}
+
 /// A modal card: surface, border, the card radius, a fixed width.
 fn modal(key: &str, child: Node, width: f32) -> Node {
     let mut card = kit::card(key, child);

@@ -1874,6 +1874,15 @@ pub fn opener_text(thread: &PageCommentThread) -> String {
     }
 }
 
+/// The opening comment's caption ("edited"), or nothing.
+pub fn opener_meta(thread: &PageCommentThread) -> String {
+    thread
+        .comments
+        .first()
+        .map(|opener| opener.meta.clone())
+        .unwrap_or_default()
+}
+
 /// The opening comment's own id — what its Edit and Delete act on.
 pub fn opener_id(thread: &PageCommentThread) -> String {
     thread

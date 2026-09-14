@@ -753,15 +753,18 @@ impl PagesView {
                 && group.target != self.active_page
                 && !group.anchor.is_empty();
             if block_anchor {
-                threads.push(named(
-                    action(
-                        format!("pages/comments/scope/{}", group.target),
-                        &group.anchor,
-                        Message::NarrowCommentScope(group.target.clone()),
-                        !disabled,
-                        ButtonPreset::Text,
+                threads.push(leading(
+                    format!("pages/comments/scope/{}/lead", group.target),
+                    named(
+                        action(
+                            format!("pages/comments/scope/{}", group.target),
+                            &group.anchor,
+                            Message::NarrowCommentScope(group.target.clone()),
+                            !disabled,
+                            ButtonPreset::Text,
+                        ),
+                        "Comments on this block",
                     ),
-                    "Comments on this block",
                 ));
             }
             threads.extend(
@@ -772,15 +775,18 @@ impl PagesView {
             );
         }
         if !resolved.is_empty() {
-            threads.push(named(
-                action(
-                    "pages/comments/resolved",
-                    crate::host::resolved_label(&resolved),
-                    Message::ToggleResolvedComments,
-                    true,
-                    ButtonPreset::Text,
+            threads.push(leading(
+                "pages/comments/resolved/lead",
+                named(
+                    action(
+                        "pages/comments/resolved",
+                        crate::host::resolved_label(&resolved),
+                        Message::ToggleResolvedComments,
+                        true,
+                        ButtonPreset::Text,
+                    ),
+                    "Resolved threads",
                 ),
-                "Resolved threads",
             ));
             if self.resolved_open {
                 threads.extend(resolved.iter().map(|row| self.comment_thread(&row.thread)));

@@ -150,6 +150,8 @@ pub enum Message {
     PageDraftChanged(String),
     SearchDraftChanged(String),
     ReplyDraftChanged(String),
+    /// Typing in one thread's reply box: the draft belongs to that thread.
+    ReplyDraftChangedIn(String, String),
     CommentDraftChanged(String),
     DocumentUpdated(::ducktape_view_guest::EditorDocumentUpdate),
     DocumentTransaction(::ducktape_view_guest::EditorTransaction<Message>),
