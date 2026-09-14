@@ -206,3 +206,45 @@ impl LineText for Doc {
         before + self.cursor.position.column as usize
     }
 }
+
+#[test]
+fn alignment_is_a_marker_after_the_prefix_and_the_caret_keeps_its_place() {
+    use pages_view::markdown::Align;
+    let before = doc("Title\n- item", 1, 6);
+    let centered = apply(&before, format::align(&before, Align::Center));
+    assert_eq!(centered, doc("Title\n- -> item", 1, 9));
+    let right = apply(&centered, format::align(&centered, Align::End));
+    assert_eq!(right, doc("Title\n- ->> item", 1, 10));
+    let back = apply(&right, format::align(&right, Align::Start));
+    assert_eq!(back, before);
+    assert_eq!(format::align(&back, Align::Start), EditorDecision::Noop);
+    // A caret inside the marker lands after the new one; one before it stays.
+    let inside = doc("Title\n- ->> item", 1, 4);
+    assert_eq!(
+        apply(&inside, format::align(&inside, Align::Center)),
+        doc("Title\n- -> item", 1, 5)
+    );
+    let ahead = doc("Title\n- ->> item", 1, 1);
+    assert_eq!(
+        apply(&ahead, format::align(&ahead, Align::Start)),
+        doc("Title\n- item", 1, 1)
+    );
+}
+
+#[test]
+fn alignment_covers_every_selected_line_and_skips_the_title_fences_and_dividers() {
+    use pages_view::markdown::Align;
+    let text = "Title\none\n```\ncode\n```\n---\n> two";
+    let mut before = doc(text, 6, 5);
+    before.cursor.selection = Some(EditorPosition::new(0, 0));
+    let after = apply(&before, format::align(&before, Align::Center));
+    assert_eq!(after.text, "Title\n-> one\n```\ncode\n```\n---\n> -> two");
+    assert_eq!(after.cursor.position, EditorPosition::new(6, 8));
+    assert_eq!(after.cursor.selection, Some(EditorPosition::new(0, 0)));
+    let title = doc(text, 0, 2);
+    assert_eq!(format::align(&title, Align::End), EditorDecision::Noop);
+    assert_eq!(
+        apply(&after, format::align_lines(&after, 1..2, Align::Start)).text,
+        "Title\none\n```\ncode\n```\n---\n> -> two"
+    );
+}

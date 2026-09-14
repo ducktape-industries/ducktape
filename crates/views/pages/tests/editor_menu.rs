@@ -211,6 +211,8 @@ fn cmd_slash_opens_the_format_menu_at_the_caret_and_its_picks_wrap_the_selection
             "color",
             "link",
             "comment",
+            "ai",
+            "align",
             "turn",
             "clear"
         ]
@@ -290,7 +292,9 @@ fn the_block_menu_copies_the_block_and_resets_its_formatting() {
         tags(&state.current(&document).unwrap()),
         vec![
             "turn",
+            "align",
             "comment",
+            "ai",
             "copy",
             "clear",
             "duplicate",
@@ -371,4 +375,90 @@ fn a_block_offers_comment_without_editing_the_document() {
     let (decision, closed) = menu.pick(&document, "comment");
     assert!(matches!(decision, EditorDecision::Noop));
     assert!(!closed.is_open());
+}
+
+#[test]
+fn the_align_submenu_sets_a_side_from_the_toolbar_and_the_block_menu() {
+    let mut selection = doc("Title\nsome words", 1, 10);
+    selection.cursor.selection = Some(editor::EditorPosition::new(1, 5));
+    let mut state = menu::Menu::default();
+    state.format(&selection);
+    let (decision, sides) = state.pick(&selection, "align");
+    assert_eq!(decision, EditorDecision::Noop);
+    let view = sides.current(&selection).unwrap();
+    assert_eq!(view.line, None, "the submenu floats where the toolbar did");
+    assert_eq!(tags(&view), vec!["left", "center", "right"]);
+    let (decision, closed) = sides.pick(&selection, "center");
+    let centered = apply(&selection, decision);
+    assert_eq!(centered.text, "Title\n-> some words");
+    assert_eq!(centered.cursor.position, editor::EditorPosition::new(1, 13));
+    assert_eq!(
+        centered.cursor.selection,
+        Some(editor::EditorPosition::new(1, 8))
+    );
+    assert!(!closed.is_open());
+
+    let block = doc("Title\n# Head\nbody", 1, 0);
+    let mut state = menu::Menu::default();
+    state.block(&block, 1);
+    let (_, sides) = state.pick(&block, "align");
+    assert_eq!(
+        sides.current(&block).unwrap().line,
+        Some(1),
+        "the block menu's submenu stays on its block"
+    );
+    let (decision, _) = sides.pick(&block, "right");
+    assert_eq!(apply(&block, decision).text, "Title\n# ->> Head\nbody");
+    let (decision, _) = sides.pick(&block, "left");
+    assert_eq!(
+        decision,
+        EditorDecision::Noop,
+        "a line already at the start is not rewritten"
+    );
+}
+
+#[test]
+fn ask_ai_lists_the_agents_and_addresses_the_comment_to_the_one_picked() {
+    let mut selection = doc("Title\nsome words", 1, 10);
+    selection.cursor.selection = Some(editor::EditorPosition::new(1, 5));
+    let agents = vec![("Builder".to_owned(), 7), ("Reviewer".to_owned(), 9)];
+    let mut state = menu::Menu::default().with_agents(&agents);
+    state.format(&selection);
+    let (decision, picker) = state.pick(&selection, "ai");
+    assert_eq!(decision, EditorDecision::Noop);
+    let view = picker.current(&selection).unwrap();
+    assert_eq!(tags(&view), vec!["7", "9"]);
+    assert_eq!(view.items[0].1, "Builder");
+    let intent = picker.intent(&selection, "7");
+    assert_eq!(intent.comment_line, Some(1));
+    assert_eq!(
+        intent.anchor,
+        Some((5, 10)),
+        "the toolbar's ask pins to the selection"
+    );
+    assert_eq!(intent.mention, 7);
+    let (decision, closed) = picker.pick(&selection, "7");
+    assert_eq!(decision, EditorDecision::Noop, "asking edits nothing");
+    assert!(!closed.is_open());
+    assert_eq!(
+        picker.intent(&selection, "8").mention,
+        0,
+        "an agent not offered is not addressed"
+    );
+
+    let block = doc("Title\nA paragraph", 1, 0);
+    let mut state = menu::Menu::default().with_agents(&agents);
+    state.block(&block, 1);
+    let (_, picker) = state.pick(&block, "ai");
+    assert_eq!(picker.current(&block).unwrap().line, Some(1));
+    let intent = picker.intent(&block, "9");
+    assert_eq!(
+        (intent.comment_line, intent.anchor, intent.mention),
+        (Some(1), None, 9)
+    );
+
+    let mut nobody = menu::Menu::default();
+    nobody.format(&selection);
+    let (_, picker) = nobody.pick(&selection, "ai");
+    assert!(picker.current(&selection).is_none(), "no agents, no picker");
 }

@@ -250,7 +250,37 @@ pub struct RegisterItem {
     /// Every named member of the network — what an `@` in the document
     /// completes to.
     pub names: Vec<String>,
+    /// The active agents "Ask AI" can address: each one's display name and
+    /// program account.
+    pub agents: Vec<(String, u64)>,
     pub error: String,
+}
+
+/// The runs module's active agents, name and account, sorted by name. A
+/// node that cannot answer the roster offers nobody.
+async fn read_agents() -> Vec<(String, u64)> {
+    let ask = json!({ "target": "runs", "query": { "model": { "query": "agents" } } });
+    let Ok(reply) = host::request("rpc.query", &encode(&ask)).await else {
+        return Vec::new();
+    };
+    let Ok(reply) = serde_json::from_slice::<Value>(&reply) else {
+        return Vec::new();
+    };
+    let mut agents: Vec<(String, u64)> = rows(&reply["model"]["agents"])
+        .iter()
+        .filter(|record| record["status"].as_str() == Some("active"))
+        .filter_map(|record| {
+            let account = record["account"].as_u64().filter(|account| *account > 0)?;
+            let name = text_of(&record["display_name"]);
+            let name = match name.is_empty() {
+                true => text_of(&record["agent_id"]),
+                false => name,
+            };
+            Some((name, account))
+        })
+        .collect();
+    agents.sort();
+    agents
 }
 
 /// The workspace now and after every pages block: read once per connection
@@ -344,6 +374,7 @@ async fn read_register(requested: &str) -> Result<RegisterItem, String> {
         comment_rows,
         commented_hits,
         names: names.members(),
+        agents: read_agents().await,
         error: String::new(),
     })
 }
@@ -1007,15 +1038,24 @@ async fn delete_page(page_id: String) -> Result<ActItem, String> {
 /// `AddComment` — a new thread on `target` (an empty `thread_id`) or a reply.
 /// A new thread pins itself to the exact text `anchor` names, in the
 /// module's UTF-16 units; `None` is a comment on the whole block.
-pub fn post(text: &str, target: &str, thread_id: &str, anchor: Option<(u32, u32)>) -> bool {
+/// `mention` names the agent account an "Ask AI" comment addresses — the
+/// runs module answers a mentioned agent in the same thread; `0` is nobody.
+pub fn post(
+    text: &str,
+    target: &str,
+    thread_id: &str,
+    anchor: Option<(u32, u32)>,
+    mention: i64,
+) -> bool {
     let (text, target, thread_id) = (
         text.trim().to_owned(),
         target.to_owned(),
         thread_id.to_owned(),
     );
     let anchor = anchor.filter(|(start, end)| start < end && thread_id.is_empty());
+    let mention = u64::try_from(mention).unwrap_or_default();
     push_act(Box::pin(async move {
-        acted(post_comment(text, target, thread_id, anchor).await)
+        acted(post_comment(text, target, thread_id, anchor, mention).await)
     }))
 }
 
@@ -1024,6 +1064,7 @@ async fn post_comment(
     target: String,
     thread_id: String,
     anchor: Option<(u32, u32)>,
+    mention: u64,
 ) -> Result<ActItem, String> {
     if text.is_empty() || target.is_empty() {
         return Err("write a comment first".into());
@@ -1042,6 +1083,9 @@ async fn post_comment(
     });
     if let Some((start, end)) = anchor {
         add["anchor"] = json!({ "start": start, "end": end });
+    }
+    if mention > 0 {
+        add["mentions"] = json!([mention]);
     }
     submit(json!({ "add_comment": add })).await?;
     Ok(ActItem::default())
@@ -1637,6 +1681,11 @@ pub fn navigation_copy(interaction: Vec<u8>) -> String {
 /// module's UTF-16 units — or `None` for a comment on the whole block.
 pub fn navigation_anchor(interaction: Vec<u8>) -> Option<(u32, u32)> {
     decode_navigation(&interaction).anchor
+}
+
+/// The agent account an "Ask AI" pick addressed, or `0` for a plain comment.
+pub fn navigation_mention(interaction: Vec<u8>) -> i64 {
+    i64::try_from(decode_navigation(&interaction).mention).unwrap_or_default()
 }
 
 /// The line a margin badge was pressed on, or `-1` when the interaction was

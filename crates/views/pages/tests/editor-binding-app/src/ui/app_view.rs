@@ -30,6 +30,7 @@ impl PagesEditorFixture {
                         self.history.clone(),
                         self.menu.clone(),
                         Vec::new(),
+                        Vec::new(),
                     )
                     .register(Message::Committed, Message::DocumentTransaction),
                 )),

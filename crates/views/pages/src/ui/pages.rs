@@ -572,6 +572,7 @@ impl PagesView {
                         self.document_history.clone(),
                         self.document_menu.clone(),
                         self.member_names.clone(),
+                        self.member_agents.clone(),
                     )
                     .register(Message::DocumentCommitted, Message::DocumentTransaction),
                 )),

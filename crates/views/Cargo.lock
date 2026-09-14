@@ -1293,7 +1293,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 [[package]]
 name = "ui-lang-wire"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=da48d1999ea49a882d0978f7bc73f694b3e35719#da48d1999ea49a882d0978f7bc73f694b3e35719"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=5abde0db4ebe6a3c4d26e86c7ceadb0153de4623#5abde0db4ebe6a3c4d26e86c7ceadb0153de4623"
 dependencies = [
  "bincode",
  "memchr",

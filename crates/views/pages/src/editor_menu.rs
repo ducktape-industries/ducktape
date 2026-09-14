@@ -309,8 +309,17 @@ const FORMAT_ITEMS: &[(&str, &str)] = &[
     ("color", "Text color"),
     ("link", "Link"),
     ("comment", "Comment"),
+    ("ai", "Ask AI…"),
+    ("align", "Align…"),
     ("turn", "Turn into…"),
     ("clear", "Clear formatting"),
+];
+
+/// The alignment submenu: the three sides the wire can lay a line on.
+const ALIGN_ITEMS: &[(&str, &str)] = &[
+    ("left", "Align left"),
+    ("center", "Align center"),
+    ("right", "Align right"),
 ];
 
 /// The colour submenu: the Notion palette Tiptap's template ships, as the
@@ -337,7 +346,9 @@ const LINK_ITEMS: &[(&str, &str)] = &[
 
 const BLOCK_ITEMS: &[(&str, &str)] = &[
     ("turn", "Turn into…"),
+    ("align", "Align…"),
     ("comment", "Comment"),
+    ("ai", "Ask AI…"),
     ("copy", "Copy to clipboard"),
     ("clear", "Reset formatting"),
     ("duplicate", "Duplicate"),
@@ -402,6 +413,9 @@ pub struct Menu {
     open: Option<Open>,
     /// The members a mention completes to, handed in by the binding.
     names: Vec<String>,
+    /// The active agents "Ask AI" addresses — display name and program
+    /// account — handed in by the binding.
+    agents: Vec<(String, u64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -430,6 +444,19 @@ enum Kind {
     /// The toolbar's colour palette over the selection on `line`.
     Color {
         line: usize,
+    },
+    /// The alignment submenu: over the one block at `line` from the block
+    /// menu, else over the selection from the toolbar.
+    Align {
+        line: usize,
+        block: bool,
+    },
+    /// The agent picker behind "Ask AI": a comment on the block at `line`
+    /// from the block menu, else on the selection from the toolbar, addressed
+    /// to the agent picked.
+    Ai {
+        line: usize,
+        block: bool,
     },
     /// The popover over the link at `column` of `line`.
     Link {
@@ -471,12 +498,14 @@ impl Menu {
         Self {
             open: Some(Open { kind, selected: 0 }),
             names: Vec::new(),
+            agents: Vec::new(),
         }
     }
 
     fn reopen(&self, kind: Kind) -> Self {
         Self {
             names: self.names.clone(),
+            agents: self.agents.clone(),
             ..Self::opened(kind)
         }
     }
@@ -485,6 +514,7 @@ impl Menu {
         Self {
             open: None,
             names: self.names.clone(),
+            agents: self.agents.clone(),
         }
     }
 
@@ -492,6 +522,12 @@ impl Menu {
     /// every menu snapshot.
     pub fn with_names(mut self, names: &[String]) -> Self {
         self.names = names.iter().take(256).cloned().collect();
+        self
+    }
+
+    /// The agents "Ask AI" may address, bounded like the names.
+    pub fn with_agents(mut self, agents: &[(String, u64)]) -> Self {
+        self.agents = agents.iter().take(MENU_ROWS).cloned().collect();
         self
     }
 
@@ -537,6 +573,8 @@ impl Menu {
                     .map(|(tag, label, _)| ((*tag).to_owned(), (*label).to_owned()))
                     .collect(),
             ),
+            Kind::Align { line, block } => (block.then_some(line), owned(ALIGN_ITEMS)),
+            Kind::Ai { line, block } => (block.then_some(line), agent_items(&self.agents)),
             Kind::Link { line, .. } => (Some(line), owned(LINK_ITEMS)),
             Kind::Mention { line, strip } => (
                 None,
@@ -606,6 +644,8 @@ impl Menu {
                 | Kind::Turn { .. }
                 | Kind::Format { .. }
                 | Kind::Color { .. }
+                | Kind::Align { .. }
+                | Kind::Ai { .. }
                 | Kind::Link { .. },
             ) => self.close(),
         }
@@ -697,6 +737,18 @@ impl Menu {
                     .and_then(|(_, _, rgb)| *rgb);
                 (crate::format::color(document, rgb), self.closed())
             }
+            Kind::Align { line, block } => {
+                let Some(align) = crate::markdown::Align::from_tag(tag) else {
+                    return (EditorDecision::Noop, self.clone());
+                };
+                let decision = match block {
+                    true => crate::format::align_lines(document, line..line + 1, align),
+                    false => crate::format::align(document, align),
+                };
+                (decision, self.closed())
+            }
+            // The pick edits nothing: its intent opens the composer.
+            Kind::Ai { .. } => (EditorDecision::Noop, self.closed()),
             Kind::Link { line, column } => {
                 let decision = match tag {
                     "unlink" => crate::format::unlink(document, line, column),
@@ -746,6 +798,18 @@ impl Menu {
         if tag == "turn" {
             return (EditorDecision::Noop, self.reopen(Kind::Turn { line }));
         }
+        if tag == "align" {
+            return (
+                EditorDecision::Noop,
+                self.reopen(Kind::Align { line, block: true }),
+            );
+        }
+        if tag == "ai" {
+            return (
+                EditorDecision::Noop,
+                self.reopen(Kind::Ai { line, block: true }),
+            );
+        }
         let decision = match tag {
             "comment" | "copy" => EditorDecision::Noop,
             "clear" => clear_block(document, line),
@@ -764,6 +828,18 @@ impl Menu {
         }
         if tag == "color" {
             return (EditorDecision::Noop, self.reopen(Kind::Color { line }));
+        }
+        if tag == "align" {
+            return (
+                EditorDecision::Noop,
+                self.reopen(Kind::Align { line, block: false }),
+            );
+        }
+        if tag == "ai" {
+            return (
+                EditorDecision::Noop,
+                self.reopen(Kind::Ai { line, block: false }),
+            );
         }
         let decision = match (tag, crate::format::Wrap::from_tag(tag)) {
             (_, Some(wrap)) => crate::format::toggle(document, wrap),
@@ -797,10 +873,30 @@ impl Menu {
             }
             (Kind::Link { line, column }, "open") => intent.link = link_at(document, line, column),
             (Kind::Link { line, column }, "copy") => intent.copy = link_at(document, line, column),
+            // An agent pick is a comment addressed to that agent: on the
+            // selection from the toolbar, on the whole block otherwise.
+            (Kind::Ai { line, block }, account) => {
+                intent.comment_line = Some(line as u32);
+                intent.mention = account.parse().unwrap_or_default();
+                if !block {
+                    intent.anchor = crate::document_sync::text_anchor(
+                        document.line(line).unwrap_or_default(),
+                        selection_columns(document, line),
+                    );
+                }
+            }
             _ => {}
         }
         intent
     }
+}
+
+/// The agent picker's rows: the account as the tag, the name as the label.
+fn agent_items(agents: &[(String, u64)]) -> Vec<(String, String)> {
+    agents
+        .iter()
+        .map(|(name, account)| (account.to_string(), name.clone()))
+        .collect()
 }
 
 /// The selection's byte columns on `line`, when the whole selection sits on it.
