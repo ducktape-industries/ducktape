@@ -608,10 +608,21 @@ pub(crate) async fn folded_update(
             // row from its canonical record instead of guessing the count.
             let delta = match delta {
                 ChatDelta::ChannelRefresh { channel_id } => {
-                    let channel = match load_channel_row(rpc, &channel_id).await {
+                    // Named through the same cached directory as the fold:
+                    // the seats under the room are the reader's own "you"
+                    // and their peers' names, not bare account numbers.
+                    let channel = match load_channel_row(rpc, &channel_id, facts.reader()).await
+                    {
                         Ok(Some(channel)) => channel,
                         Ok(None) | Err(_) => return Some(live_resync("chat", height)),
                     };
+                    tracing::debug!(
+                        target: "ducktape::live",
+                        channel = %channel_id,
+                        seats = channel.huddle.len(),
+                        height,
+                        "chat.channel_refresh"
+                    );
                     ChatDelta::ChannelUpdated {
                         channel_id,
                         channel,
@@ -708,9 +719,10 @@ fn stream_origin_kind(kind: &ducktape_rpc::StreamOriginKind) -> &'static str {
 pub(crate) async fn load_channel_row(
     rpc: &str,
     channel_id: &str,
+    reader: ChatReader<'_>,
 ) -> Result<Option<ChatChannel>, String> {
     let rpc = rpc_client(rpc)?;
-    let room = load_channel_facts(&rpc, channel_id, ChatReader::nobody()).await?;
+    let room = load_channel_facts(&rpc, channel_id, reader).await?;
     Ok(room.map(|(channel, _roster)| channel))
 }
 
