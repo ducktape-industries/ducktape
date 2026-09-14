@@ -105,6 +105,50 @@ fn switching_panes_retires_a_stale_error_banner_on_every_tab() {
     assert_eq!(app.shell_tab, ShellTab::Members);
 }
 
+/// THE RAIL'S ACCOUNT ROW NEVER SENDS A SIGNED-IN USER TO THE SIGN-IN.
+///
+/// The row reads "who is signed in"; pressing it opens the account screen —
+/// Settings, which draws the account card — and only a session with NO
+/// account goes to the welcome window. The welcome window replaces the
+/// console, so routing a signed-in press there closes the console under the
+/// account it was asked to show: the re-login the row shipped with.
+#[test]
+fn the_rail_account_row_opens_settings_when_signed_in_and_the_welcome_when_not() {
+    use futures::StreamExt as _;
+    let (mut app, _) = Ducktape::boot();
+    app.connected = true;
+    app.account_exists = true;
+    app.shell_tab = ShellTab::Chat;
+    let task = app.update(AppMessage::OpenAccount);
+    let queued = futures::executor::block_on(task.into_stream().collect::<Vec<_>>());
+    assert!(
+        matches!(
+            queued.as_slice(),
+            [AppMessage::SelectShellTab(ShellTab::Settings)]
+        ),
+        "a signed-in press goes to the account card in Settings"
+    );
+    assert_eq!(
+        app.hub_chain_id, "",
+        "a signed-in press never arms the welcome window"
+    );
+
+    let (mut app, _) = Ducktape::boot();
+    app.connected = true;
+    app.account_exists = false;
+    app.network_chain_id = "mynet#d0cdf950".into();
+    let task = app.update(AppMessage::OpenAccount);
+    let queued = futures::executor::block_on(task.into_stream().collect::<Vec<_>>());
+    assert!(
+        queued.is_empty(),
+        "a press with no account opens the welcome window, not a tab"
+    );
+    assert_eq!(
+        app.hub_chain_id, "mynet#d0cdf950",
+        "the welcome window is armed with this network"
+    );
+}
+
 /// EVERY READER OF `/v1/peers` USES THE NAMES `PeerView` SERIALIZES.
 ///
 /// `crates/noded/src/peers.rs` serves `peer` / `connected` / `role`; it has never
