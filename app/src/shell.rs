@@ -1611,7 +1611,22 @@ impl DesktopWindow {
         let view = self.module.as_ref().expect("module seated").1.clone();
         view.update(cx, |view, cx| view.set_props(spec.props, cx));
         let selected_tab = self.model.read(cx).state.shell_tab;
-        let mut navigation = vec![
+        // the dashboard leads the rail, above every section: it is the
+        // network at a glance, not a workspace tool or a network tool
+        let registered = crate::module_view::registered_views();
+        let dashboard = registered
+            .iter()
+            .copied()
+            .filter(|module| *module == HOME_VIEW);
+        let mut navigation: Vec<(ShellTab, String)> = dashboard
+            .map(|module| {
+                (
+                    ShellTab::Registered(module),
+                    crate::module_view::registered_view_name(module),
+                )
+            })
+            .collect();
+        navigation.extend([
             (ShellTab::Chat, "Chat".to_owned()),
             (ShellTab::Pages, "Pages".to_owned()),
             (ShellTab::Forge, "Forge".to_owned()),
@@ -1621,12 +1636,13 @@ impl DesktopWindow {
             (ShellTab::Node, "Node".to_owned()),
             (ShellTab::Members, "Members".to_owned()),
             (ShellTab::Governance, "Governance".to_owned()),
-        ];
-        // the views the connected node's registry lists, after the built-in
-        // tabs and in the registry's order; named by their manifests
+        ]);
+        // the other views the connected node's registry lists, after the
+        // built-in tabs and in the registry's order; named by their manifests
         navigation.extend(
-            crate::module_view::registered_views()
+            registered
                 .into_iter()
+                .filter(|module| *module != HOME_VIEW)
                 .map(|module| {
                     (
                         ShellTab::Registered(module),
@@ -2948,6 +2964,10 @@ fn hsla_of(color: design::Color) -> gpui_kit::Hsla {
 }
 
 /// Lucide glyphs the kit's default bundle does not carry.
+/// The registry id of the dashboard view: the one registered view that
+/// leads the rail instead of following the built-in tabs.
+const HOME_VIEW: &str = "home";
+
 const MESSAGE_SQUARE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>"#;
 const GIT_BRANCH: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>"#;
 const USERS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>"#;
