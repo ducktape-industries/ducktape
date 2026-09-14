@@ -879,6 +879,10 @@ fn airlock_over_gateway_two_wireguard_nodes() {
         "airlock",
         "--port",
         &gw_port.to_string(),
+        // whose signed route this node serves under the label — stated, so
+        // the harness inherits no active wallet from the host keystore.
+        "--account",
+        &alice_account.to_string(),
     ]);
     assert!(ok, "airlock gateway port bind failed: {output}");
 
@@ -1169,6 +1173,10 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
             label,
             "--port",
             &upstream_port.to_string(),
+            // whose signed route this node serves under the label — stated,
+            // so the harness inherits no active wallet from the host keystore.
+            "--account",
+            &alice_account.to_string(),
         ]);
         assert!(ok, "{label} port bind failed: {output}");
     }
