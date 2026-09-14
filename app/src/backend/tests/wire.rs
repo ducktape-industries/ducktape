@@ -363,7 +363,7 @@ async fn chat_round_trips_over_signed_frames() {
     assert!(!changed.load_chat, "a folded chat delta requires no reload");
     assert!(changed.height > workspace.height);
     let base_height = changed.height;
-    // Production drops this payload when the generated LiveUpdated reducer
+    // Production drops this payload when the LiveUpdated reducer
     // returns. This direct stream fixture is that consumer, so release its
     // one-in-flight permit before asking the stream for later blocks.
     drop(changed);
@@ -530,13 +530,13 @@ async fn the_live_subscription_waits_for_the_ui_to_drop_its_publication() {
     assert!(update.permit.is_held());
     assert!(gate.clone().try_acquire_owned().is_err());
 
-    let generated_message_clone = update.clone();
+    let message_clone = update.clone();
     drop(update);
     assert!(
         gate.clone().try_acquire_owned().is_err(),
-        "every clone must leave the generated update before the stream resumes"
+        "every message clone must be dropped before the stream resumes"
     );
-    drop(generated_message_clone);
+    drop(message_clone);
     assert!(gate.try_acquire_owned().is_ok());
 }
 
@@ -549,9 +549,8 @@ async fn the_live_subscription_waits_for_the_ui_to_drop_its_publication() {
 /// checkpoint-gated (`backend/live.rs`), so that poll would also be the thing
 /// that hands a healthy node's console "error sending request".
 ///
-/// `assert_no_polling` cannot see this: it greps `lifecycle.ice` for lines
-/// starting with `every ` and a load reached through a live update is invisible
-/// to it. So the guard is here, on the value itself.
+/// Subscription shape checks cannot detect a load reached through a live
+/// update, so the guard is here, on the value itself.
 #[test]
 fn a_tip_carries_the_head_and_loads_nothing() {
     let tip = live_update(crate::LiveKind::Tip, "Live · block 41", 41);

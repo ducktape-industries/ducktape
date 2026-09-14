@@ -2,8 +2,6 @@
 # Run from the checkout root. Match guest-builder's canonical source prefixes;
 # encoded flags preserve paths containing spaces and replace ambient Rust flags.
 set -euo pipefail
-ice=$1
-shift
 repo=$(pwd -P)
 cargo_home=$(cd "${CARGO_HOME:-$HOME/.cargo}" && pwd -P)
 # A toolchain installed without rustup (the agent guest's /opt/rust) has no
@@ -20,5 +18,23 @@ printf -v CARGO_ENCODED_RUSTFLAGS '%s\x1f%s\x1f%s\x1f%s' \
 export CARGO_ENCODED_RUSTFLAGS
 export CARGO_TARGET_DIR="$view_target"
 unset RUSTFLAGS
-exec "$ice" bundle --manifest-path crates/views/Cargo.toml "$@" \
-  --target wasm32-unknown-unknown --no-wasm-opt --out target/views
+# wit-bindgen emits the component type into each Rust cdylib. No UI compiler,
+# browser import adapters, or embedded guest bytes are involved.
+packages=()
+while (($#)); do
+  case "$1" in
+    -p) packages+=("$2"); shift 2 ;;
+    *) echo "expected -p <view-package>, got $1" >&2; exit 1 ;;
+  esac
+done
+(("${#packages[@]}")) || { echo "no view packages selected" >&2; exit 1; }
+arguments=()
+for package in "${packages[@]}"; do arguments+=(-p "$package"); done
+"${CARGO:-cargo}" build --locked --manifest-path crates/views/Cargo.toml --release \
+  --target wasm32-unknown-unknown "${arguments[@]}"
+mkdir -p "$repo/target/views"
+for package in "${packages[@]}"; do
+  library=${package//-/_}
+  wasm-tools component new "$view_target/wasm32-unknown-unknown/release/$library.wasm" \
+    -o "$repo/target/views/$library.wasm"
+done

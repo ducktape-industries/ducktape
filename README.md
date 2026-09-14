@@ -45,7 +45,7 @@ The tree groups by function into three layers — module / kernel / networking:
 | `crates/views/support/design/` | The desktop app's font identity and type scale (shared tokens come from `ducktape-ui`) |
 | `crates/labs/` | Quarantined experimental modules (`evm`, `multisig`): in-tree and tested but registered by NO genesis set, kept as a standalone crate EXCLUDED from the workspace so its heavy deps (revm, alloy) never tax the shipping build — gated via `make labs-gate` |
 | `bin/` | Runnable binaries: `node` (the unified `ducktape` CLI: `node run` plus every operator family — `node`, `user`, `account`, `wallet`, `gateway`, `fs`, `service`, `agent`, `module`, `mcp`), `noded` (`noded-bin`: the throwaway dev daemon with temp storage), `simnode` (deterministic /v1 twin), `coordinator` (STUN rendezvous + the TCP first-contact relay), `airlock-gateway` (the TEE enclave lender; the non-TEE lender is `ducktape service run airlock`), `guest-builder` (module → wasm component packaging tool), `duck-guest-init` (PID 1 inside a run's microVM), `duck-vz-shim` (the macOS Virtualization.framework VMM shim, Swift) |
-| `app/` | `ducktape-app`, the native Iced desktop client (Chat + Pages), UI declared in `src/ui/*.ice`; `crates/views/support/design` is its design system |
+| `app/` | `ducktape-app`, the native GPUI desktop host; Rust-authored WASM views live in `crates/views`, with product assets in `crates/views/support/design` |
 | `ops/` | Operator scripts, the node and coordinator systemd units, the sandbox guest image builder, the hosted auth page — see `ops/README.md` |
 | `docs/` | Operator runbooks (`deploy/`, `dogfood.md`, `sandbox-macos.md`) and the few records code cites by path (`records/`); `docs/README.md` indexes every document in the repo by the question it answers |
 
@@ -89,16 +89,17 @@ ordering arm.
 
 Prerequisites: `rustup` (the pinned toolchain and its wasm32 target install
 themselves on the first build), a C compiler, and on Linux `pkg-config`,
-`libclang-dev` and `libasound2-dev`:
+libclang, ALSA, X11/XKB and font development libraries:
 
 ```sh
-sudo apt install build-essential pkg-config libclang-dev libasound2-dev   # Debian/Ubuntu
-xcode-select --install                                                    # macOS
+sudo apt install build-essential pkg-config libclang-dev libasound2-dev \
+  libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev
+xcode-select --install  # macOS
 ```
 
 `make` checks for them up front and prints that line when one is missing.
-`wasm-tools` and `cargo-ice` are pinned and installed under `target/` by the
-recipes that need them — nothing to install by hand.
+`wasm-tools` is pinned and installed under `target/` by the recipes that need
+it. Views build with Cargo and are componentized into separate runtime files.
 
 Run the workspace tests:
 
@@ -188,7 +189,7 @@ revision, built with cargo and `guest-builder componentize` — the recipe is in
 Install the `ducktape` operator CLI into `~/.cargo/bin` (and the founding
 set — every module's wasm — into `~/.cargo/bin/modules` beside it, which
 `node init` composes a network's genesis from); on macOS this also builds the
-Ice `.app`/`.dmg` and installs `Ducktape.app` into `~/Applications`:
+native GPUI `.app`/`.dmg` and installs `Ducktape.app` into `~/Applications`:
 
 ```sh
 make install
@@ -244,8 +245,8 @@ Also runnable:
 - **`coordinator`** — the untrusted UDP rendezvous + TCP first-contact relay
   (see the operator path above and `docs/deploy/coordinator.md`).
 
-- **`ducktape-app`** (`app/`) — the native Iced desktop client for Chat and
-  Pages, its UI declared in `app/src/ui/*.ice`. `make views && cargo run -p
+- **`ducktape-app`** (`app/`) — the native GPUI desktop host for dynamically
+  loaded Rust-authored WASM views. `make views && cargo run -p
   ducktape-app` (the tabs are wasm views the app loads from `target/views`;
   without them every tab says so); `app/README.md` states which node it
   dials and which key it signs with.

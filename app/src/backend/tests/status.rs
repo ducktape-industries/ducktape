@@ -7,34 +7,9 @@ fn machine_values_read_as_a_person_reads_them() {
     assert_eq!(initials_of("Kestrel Song"), "KS");
     assert_eq!(initials_of("triage"), "TR");
     assert_eq!(initials_of(""), "?");
-    assert_eq!(height_label(84_912), "h 84,912");
-    assert_eq!(height_label_short(84_912), "h 84,912");
-    assert_eq!(height_label(-1), "h —");
     assert_eq!(optional_number(Some(4)), "4");
     // absent, not zero: a resident's status carries no consensus section.
     assert_eq!(optional_number(None), "—");
-}
-
-/// An `operations` reading the node never published prints `—`, not a
-/// measured value.
-///
-/// `operations` is absent on a resident, a joiner and the embedded local
-/// daemon — which is exactly why the consensus trio beside these two is
-/// `Option`. `last_finalized_at` and `checkpoint_height` are plain `i64`
-/// because `0` is a legal height and a legal timestamp, so they carry
-/// `UNMEASURED` instead and both renderers turn it into an em dash.
-#[test]
-fn an_unpublished_operations_reading_renders_as_unknown() {
-    assert_eq!(height_label(UNMEASURED), "h —");
-    assert_eq!(height_label_short(UNMEASURED), "h —");
-    assert_eq!(relative_time(UNMEASURED, 1), "—");
-
-    // and a real reading of zero is still a real reading: height 0 is the
-    // genesis block, not an absence.
-    assert_eq!(height_label(0), "h 0");
-    // a record with no stamp keeps printing nothing — an em dash on every
-    // unstamped row would be noise, and that is a different fact.
-    assert_eq!(relative_time(0, 1), "");
 }
 
 /// THE OTHER HALF OF THE SAME FACT: the reading has to ARRIVE as `UNMEASURED`.
@@ -142,46 +117,6 @@ fn the_sync_label_shows_progress_only_while_catching_up() {
     assert_eq!(sync_label("", 412, 900), "");
 }
 
-/// A record stamp is a BLOCK HEIGHT on this chain, so every record-time
-/// string counts blocks. Only `/v1/status` supplies unix seconds.
-#[test]
-fn record_stamps_count_blocks_and_status_stamps_count_seconds() {
-    let now = now_seconds();
-    assert_eq!(height_ago(84_500, 84_912, now), "412 blocks ago");
-    assert_eq!(height_ago(84_911, 84_912, now), "1 block ago");
-    assert_eq!(height_ago(84_912, 84_912, now), "this block");
-    // a follower behind the record it is rendering still reads as now.
-    assert_eq!(height_ago(84_913, 84_912, now), "this block");
-    assert_eq!(height_ago(0, 84_912, now), "");
-    assert_eq!(
-        expires_in_blocks(85_324, 84_912, now),
-        "expires in 412 blocks"
-    );
-    assert_eq!(expires_in_blocks(84_913, 84_912, now), "expires in 1 block");
-    assert_eq!(expires_in_blocks(84_912, 84_912, now), "expired");
-    assert_eq!(relative_time(now - 30, now), "just now");
-    assert_eq!(relative_time(now - 40 * 60, now), "40m ago");
-    assert_eq!(relative_time(now - 2 * 60 * 60, now), "2h ago");
-    assert_eq!(relative_time(0, now), "");
-}
-
-/// The OTHER lane: a single-writer noded stamps `consensus_time` in unix
-/// MILLIS, so renderers for consensus stamps use the shared wall reading.
-#[test]
-fn a_unix_millis_consensus_stamp_uses_the_wall_clock() {
-    let now = now_seconds();
-    let two_hours_ago = (now - 2 * 60 * 60) * 1_000;
-    assert_eq!(height_ago(two_hours_ago, 84_912, now), "2h ago");
-    assert_eq!(
-        expires_in_blocks((now + 3 * 60 * 60) * 1_000, 84_912, now),
-        "expires in 3h"
-    );
-    assert_eq!(
-        expires_in_blocks((now - 60) * 1_000, 84_912, now),
-        "expired"
-    );
-}
-
 /// ONE CARD, ONE SAMPLE — AND THE SAMPLE IS THE WHOLE PAIR.
 ///
 /// A checkpoint carries no meaning alone; it only ever says how far the durable
@@ -244,11 +179,6 @@ async fn a_resyncing_replica_has_no_head_to_print_a_checkpoint_against() {
     assert_eq!(
         facts.height, UNMEASURED,
         "a node serving no boundary reports height 0; that is absence, not a measurement"
-    );
-    assert_eq!(
-        height_label_short(facts.height),
-        "h —",
-        "the rendered head says it has no reading"
     );
     assert!(
         facts.height < 0 || facts.checkpoint_height <= facts.height,

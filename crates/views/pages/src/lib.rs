@@ -12,6 +12,8 @@ pub mod inline;
 pub mod document_sync;
 pub mod editor;
 pub mod editor_binding;
+#[path = "editor_format.rs"]
+pub mod format;
 pub mod editor_menu;
 pub mod editor_view;
 pub mod host;
@@ -20,9 +22,9 @@ pub mod markdown;
 #[path = "editor_presentation.rs"]
 pub mod presentation;
 
-ui_lang::include_app!("src/ui/app.ice");
+include!("ui/view.rs");
 
-ui_lang_guest::export_app!(
+ducktape_view_guest::export_app!(
     PagesView,
     "Pages",
     "The workspace's pages: the sidebar, the document header, the tab strip and the comments rail.",

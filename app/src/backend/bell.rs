@@ -265,10 +265,6 @@ fn bell_summary(item: &BellItem, actor: &str) -> BellPresentation {
     }
 }
 
-pub fn bell_label(item: &BellItem, presentations: &[BellPresentation]) -> String {
-    bell_presentation(item, presentations).title
-}
-
 pub fn bell_openable(item: &BellItem, presentations: &[BellPresentation]) -> bool {
     presentations.iter().any(|entry| {
         entry.seq == item.seq && entry.target != BellTarget::Unavailable && !entry.object.is_empty()
@@ -577,7 +573,7 @@ async fn bell_source(
 }
 
 async fn enrich_bell(rpc: &RpcClient, items: Vec<BellItem>) -> Vec<BellPresentation> {
-    use iced::futures::{StreamExt, stream};
+    use futures::{StreamExt, stream};
     let facts = ReaderFacts::current().await;
     stream::iter(items)
         .map(|item| {
@@ -620,49 +616,6 @@ pub fn bell_title(kind: &str) -> String {
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => words,
-    }
-}
-
-/// Source-defined reason names may carry a severity; unclassified reasons
-/// stay informational. This does not infer severity from opaque source detail.
-pub fn bell_severity(kind: &str) -> String {
-    const WARN: &[&str] = &[
-        "review_requested",
-        "changes_requested",
-        "proposal_opened",
-        "vote_needed",
-        "run_cancelled",
-        "quota",
-    ];
-    const ERROR: &[&str] = &["failed", "error", "rejected", "conflict", "revoked"];
-    let kind = kind.to_lowercase();
-    let names_error = ERROR.iter().any(|token| kind.contains(token));
-    let names_warning = WARN.iter().any(|token| kind.contains(token));
-    // These three strings ARE the tone vocabulary `PulseDot`, `StillDot` and
-    // `BellBadge` match on. They used to be `error`/`warn`, which no arm of
-    // `BellBadge` carried, so a failed run painted the badge info-blue through
-    // the fallthrough. One name per severity, spoken everywhere.
-    match (names_error, names_warning) {
-        (true, _) => "danger".into(),
-        (false, true) => "warning".into(),
-        (false, false) => "info".into(),
-    }
-}
-
-/// The worst severity among the UNREAD rows, for the bell badge's tint —
-/// `info` when nothing is unread.
-pub fn bell_worst_severity(items: &[BellItem]) -> String {
-    let severities: Vec<String> = items
-        .iter()
-        .filter(|item| !item.read)
-        .map(|item| bell_severity(&item.reason))
-        .collect();
-    let any_error = severities.iter().any(|severity| severity == "danger");
-    let any_warning = severities.iter().any(|severity| severity == "warning");
-    match (any_error, any_warning) {
-        (true, _) => "danger".into(),
-        (false, true) => "warning".into(),
-        (false, false) => "info".into(),
     }
 }
 

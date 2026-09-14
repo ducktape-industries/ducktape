@@ -137,7 +137,7 @@ echo "release signing (only for a bundle that leaves this Mac):"
 DEVELOPER_ID="$(security find-identity -v -p codesigning 2>/dev/null | grep 'Developer ID Application' || true)"
 if [[ -n "$DEVELOPER_ID" ]]; then
   # one line per identity, quoted name only — that string is what
-  # ICE_CODESIGN_IDENTITY takes.
+  # DUCKTAPE_CODESIGN_IDENTITY takes.
   while IFS= read -r line; do
     ok "codesigning identity: ${line#*\"}"
   done <<< "$(printf '%s\n' "$DEVELOPER_ID" | sed 's/"$//')"
@@ -146,16 +146,16 @@ else
     "enroll in the Apple Developer Program, then download the certificate; without one \`make app\` signs ad-hoc"
 fi
 
-if [[ -n "${ICE_NOTARY_KEY:-}" && -n "${ICE_NOTARY_KEY_ID:-}" && -n "${ICE_NOTARY_ISSUER:-}" ]]; then
-  if [[ -f "$ICE_NOTARY_KEY" ]]; then
-    ok "notary credentials (ICE_NOTARY_KEY exists, KEY_ID and ISSUER set)"
+if [[ -n "${DUCKTAPE_NOTARY_KEY:-}" && -n "${DUCKTAPE_NOTARY_KEY_ID:-}" && -n "${DUCKTAPE_NOTARY_ISSUER:-}" ]]; then
+  if [[ -f "$DUCKTAPE_NOTARY_KEY" ]]; then
+    ok "notary credentials (DUCKTAPE_NOTARY_KEY exists, KEY_ID and ISSUER set)"
   else
-    note "ICE_NOTARY_KEY points at no file ($ICE_NOTARY_KEY)" \
+    note "DUCKTAPE_NOTARY_KEY points at no file ($DUCKTAPE_NOTARY_KEY)" \
       "point it at the App Store Connect API key .p8, stored outside this repo"
   fi
 else
   note "notary credentials not exported" \
-    "export ICE_NOTARY_KEY=<path to .p8> ICE_NOTARY_KEY_ID=<id> ICE_NOTARY_ISSUER=<uuid>; all three or none"
+    "export DUCKTAPE_NOTARY_KEY=<path to .p8> DUCKTAPE_NOTARY_KEY_ID=<id> DUCKTAPE_NOTARY_ISSUER=<uuid>; all three or none"
 fi
 
 echo

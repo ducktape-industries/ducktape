@@ -2,43 +2,37 @@ use super::*;
 
 /// The global-key router for the command palette: platform-Command+K
 /// toggles, Escape closes an open palette; anything else is `none`.
-pub fn palette_key_action(
-    logical: iced::keyboard::Key,
-    physical: iced::keyboard::key::Physical,
-    modifiers: iced::keyboard::Modifiers,
-    open: bool,
-) -> String {
-    use iced::keyboard::{
-        Key,
-        key::{Code, Named, Physical},
-    };
-    let is_toggle = modifiers.command() && physical == Physical::Code(Code::KeyK);
+pub fn palette_key_action(logical: String, modifiers: gpui_kit::Modifiers, open: bool) -> String {
+    let is_toggle = command_held(modifiers) && logical.eq_ignore_ascii_case("k");
     if is_toggle {
         return match open {
             true => "close".into(),
             false => "open".into(),
         };
     }
-    if open && logical == Key::Named(Named::Escape) {
+    let closes_palette = open && logical == "escape";
+    if closes_palette {
         return "close".into();
     }
     "none".into()
 }
 
 /// Is the command modifier down? The cheap half of the quit chord: it is read
-/// off the modifier stream to ARM the key-press route, so an ordinary keystroke
-/// never publishes one. It asks the same `command()` [`quit_chord`] judges by —
-/// Command on a Mac, Control elsewhere — because arming on one modifier and
-/// judging on another yields a chord that can never fire.
-pub fn command_held(modifiers: iced::keyboard::Modifiers) -> bool {
-    modifiers.command()
+/// off the native modifier stream. Command on a Mac, Control elsewhere:
+/// arming and routing a chord must use the same platform modifier.
+pub fn command_held(modifiers: gpui_kit::Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.platform
+    } else {
+        modifiers.control
+    }
 }
 
 /// Is ⇧ down right now? A press carries no modifiers of its own, so the chat's
 /// shift-click reads the arming this fills instead of the app growing a second
 /// key route to learn the same fact.
-pub fn shift_held(modifiers: iced::keyboard::Modifiers) -> bool {
-    modifiers.shift()
+pub fn shift_held(modifiers: gpui_kit::Modifiers) -> bool {
+    modifiers.shift
 }
 
 /// Which command chord this press is (⌘Q / ⌘W, Ctrl off a Mac), or none. The
@@ -46,33 +40,20 @@ pub fn shift_held(modifiers: iced::keyboard::Modifiers) -> bool {
 /// each use site — macOS binds both through an app menu this app does not have,
 /// so it reads them itself.
 ///
-/// Both key readings, like the palette's toggle: the physical code is what a
-/// Dvorak or AZERTY layout still calls Q or W, and the logical character is
-/// what a layout that remaps the code actually types.
-pub fn command_chord(
-    logical: iced::keyboard::Key,
-    physical: iced::keyboard::key::Physical,
-    modifiers: iced::keyboard::Modifiers,
-) -> crate::CommandChord {
-    use iced::keyboard::key::{Code, Physical};
-    if !modifiers.command() {
+/// GPUI supplies the platform-resolved key name, including keyboard layout.
+pub fn command_chord(logical: String, modifiers: gpui_kit::Modifiers) -> crate::CommandChord {
+    if !command_held(modifiers) {
         return crate::CommandChord::Ignored;
     }
-    let quit = physical == Physical::Code(Code::KeyQ) || types_letter(&logical, "q");
+    let quit = logical.eq_ignore_ascii_case("q");
     if quit {
         return crate::CommandChord::Quit;
     }
-    let close_window = physical == Physical::Code(Code::KeyW) || types_letter(&logical, "w");
+    let close_window = logical.eq_ignore_ascii_case("w");
     if close_window {
         return crate::CommandChord::CloseWindow;
     }
     crate::CommandChord::Ignored
-}
-
-/// The letter a press actually types, after the layout has had its say — the
-/// other half of the physical code in every chord above.
-fn types_letter(logical: &iced::keyboard::Key, letter: &str) -> bool {
-    matches!(logical, iced::keyboard::Key::Character(typed) if typed.eq_ignore_ascii_case(letter))
 }
 
 /// The transient layer currently over the console's content — the TOPMOST one
@@ -90,11 +71,9 @@ fn types_letter(logical: &iced::keyboard::Key, letter: &str) -> bool {
 /// (`crates/views/pages`); the forge's switchers are the host's own pick lists.
 /// Each guest paints its own scrim and dismisses its own layers — a key the
 /// kernel contract carries no door for. What is enumerated here is what rides
-/// EVERY tab, which is why `slot palette` and `slot bell` sit OUTSIDE the
-/// `match tab` in `components/shell.ice`.
+/// EVERY tab: the native shell renders the palette and bell outside the tab.
 //
-// One argument per layer: the Ice extern surface is flat, and the reading must
-// see every layer at once to name the topmost.
+// Inspect every shell layer together to name the topmost.
 pub fn topmost_overlay(palette_open: bool, bell_open: bool, channel_create_open: bool) -> String {
     if palette_open {
         return "palette".into();
@@ -120,13 +99,12 @@ pub fn topmost_overlay(palette_open: bool, bell_open: bool, channel_create_open:
 /// left after the views took their own layers is the palette, the bell and the
 /// create modal, all three of which ride every tab.
 pub fn escape_target(
-    logical: iced::keyboard::Key,
+    logical: String,
     palette_open: bool,
     bell_open: bool,
     channel_create_open: bool,
 ) -> String {
-    use iced::keyboard::{Key, key::Named};
-    let not_escape = logical != Key::Named(Named::Escape);
+    let not_escape = logical != "escape";
     if not_escape {
         return String::new();
     }
@@ -138,15 +116,6 @@ pub fn escape_target(
         return String::new();
     }
     topmost
-}
-
-/// True when the live connection is in a state the shell should banner:
-/// the stream is down, retrying, or a resync failed and is backing off.
-pub fn connection_degraded(status: &str) -> bool {
-    status == "Offline"
-        || status == "Sync delayed"
-        || status == "Reconnecting…"
-        || status == "Live · resyncing"
 }
 
 pub fn canonical_endpoint(input: String) -> String {
@@ -164,11 +133,6 @@ pub fn canonical_endpoint(input: String) -> String {
 /// It reaches that route only when no widget captured the press (the
 /// subscription is `status=ignored`), so a caret in a composer or a field with
 /// its own selection keeps its own copy, exactly as it should.
-pub fn is_copy_chord(
-    logical: iced::keyboard::Key,
-    physical: iced::keyboard::key::Physical,
-    modifiers: iced::keyboard::Modifiers,
-) -> bool {
-    use iced::keyboard::key::{Code, Physical};
-    modifiers.command() && (physical == Physical::Code(Code::KeyC) || types_letter(&logical, "c"))
+pub fn is_copy_chord(logical: String, modifiers: gpui_kit::Modifiers) -> bool {
+    command_held(modifiers) && logical.eq_ignore_ascii_case("c")
 }

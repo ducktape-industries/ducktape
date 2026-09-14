@@ -1,70 +1,31 @@
-//! THE DAEMON'S LIFE, AND THE WAYS OUT OF IT. Closing a window is not
-//! quitting where a status item can hold the daemon (macOS): there the process
-//! leaves only when someone says so, through the tray's Quit or ⌘Q. Off macOS
-//! there is no status item, and the last close leaves. Every shape below is one a later edit can undo without failing a
-//! build, and the scenarios in `ui/tests/app.ice` cannot cover them — the test
-//! harness swallows `runtime::Action::Exit` (`ui-lang-runtime/src/testing.rs`),
-//! so "it exited" and "it did NOT exit" are both unassertable there. What a
-//! scenario CAN see (the close unregisters, the menu reopens, the chord's
-//! arming) it does see; this file pins the rest.
+//! Native window lifetime, command routing and authentication cancellation.
+use super::*;
 
-use super::{__DucktapeMessage, Ducktape, ShellTab, ice_handlers};
-
-const LIFECYCLE: &str = include_str!("../ui/handlers/lifecycle.ice");
-const CORE_STATE: &str = include_str!("../ui/state/core.ice");
-const EXTERNS: &str = include_str!("../ui/extern/backend.ice");
-
-fn handler(name: &str) -> String {
-    ice_handlers(LIFECYCLE)
-        .into_iter()
-        .find(|(handler, _)| handler == name)
-        .map(|(_, body)| body)
-        .unwrap_or_else(|| panic!("lifecycle.ice routes `{name}`"))
-}
-
-/// A CLOSED WINDOW ENDS NOTHING BY ITSELF. The handler unregisters the slot
-/// the window held and then asks ONE decide-fn whether this close leaves —
-/// true only off macOS, where no status item exists, once no window remains.
-/// A bare `exit` back in here, or a survivor guard spelled inline, turns the
-/// red button into a quit on a Mac again — the exact regression this guards,
-/// and the one a scenario cannot catch because the harness ignores the exit
-/// it would have to observe.
 #[test]
-fn closing_a_window_exits_only_where_no_status_item_lives() {
-    let body = handler("window_was_closed");
-    for slot in ["onboarding_win", "console_win", "huddle_win"] {
-        assert!(
-            body.contains(&format!("{slot} = without_window({slot}, id)")),
-            "window_was_closed stopped unregistering {slot}"
-        );
-    }
+fn os_duck_urls_are_received_before_launch_and_wait_for_network_identity() {
+    let shell = rust_tokens(include_str!("../shell.rs"));
+    let registered = shell
+        .find("application.on_open_urls(")
+        .expect("OS URL handler");
+    let launched = shell.find("application.run(").expect("native launch");
     assert!(
-        body.contains("let leaving = last_window_closed_exits(console_win, onboarding_win)"),
-        "window_was_closed stopped asking the decide-fn: {body}"
+        registered < launched,
+        "initial OS URL cannot race registration"
     );
-    assert!(
-        body.contains("return if !leaving"),
-        "the exit is no longer gated on the decide-fn: {body}"
-    );
-    assert!(
-        !body.contains("!= none"),
-        "the survivor guard is spelled inline again: {body}"
-    );
-    assert!(
-        EXTERNS.contains(
-            "pure last_window_closed_exits(console:window-id?, onboarding:window-id?) -> bool"
-        ),
-        "backend.ice lost the close-exits discriminant"
-    );
+    assert!(shell.contains("url_sender.unbounded_send(urls)"));
+    assert!(shell.contains("desktop.pending_urls.extend("));
+    assert!(shell.contains("url.starts_with(\"duck://\")"));
+    assert!(shell.contains("self.state.connected&&self.state.console_win.is_some()&&!self.state.network_chain_id.is_empty()"));
+    assert!(shell.contains("std::mem::take(&mutself.pending_urls)"));
+    assert!(shell.contains("self.dispatch(Message::OpenMessageLink(url),cx)"));
+    let route = handler_body("OpenMessageLink");
+    assert!(route.contains("resolve_duck_link("));
+    assert!(route.contains("DuckKind::ForeignNetwork"));
 }
-
-/// OFF MACOS THE LAST CLOSE LEAVES, ON A MAC IT NEVER DOES. The decide-fn is
-/// the platform rule in one place; this pins both halves on the platform the
-/// test runs on.
 #[test]
 fn the_last_close_leaves_exactly_where_there_is_no_status_item() {
     use crate::backend::last_window_closed_exits;
-    let some = Some(iced::window::Id::unique());
+    let some = Some(crate::shell::WindowKey::unique());
     assert!(
         !last_window_closed_exits(some, None),
         "a close with the console still up must never leave"
@@ -80,261 +41,38 @@ fn the_last_close_leaves_exactly_where_there_is_no_status_item() {
         "the last close leaves exactly where no status item can hold the daemon"
     );
 }
-
-/// QUIT IS SAID OUT LOUD, IN EXACTLY THREE PLACES. The tray's row, the ⌘Q
-/// chord and the last close off macOS are the only handlers that may leave; a
-/// fourth one is a way out nobody asked for.
-#[test]
-fn only_the_tray_row_and_the_quit_chord_leave() {
-    let leaving: Vec<String> = ice_handlers(LIFECYCLE)
-        .into_iter()
-        .filter(|(_, body)| body.contains("exit"))
-        .map(|(name, _)| name)
-        .collect();
-    assert_eq!(
-        leaving,
-        vec![
-            "window_was_closed".to_owned(),
-            "tray_quit".to_owned(),
-            "command_chord_pressed".to_owned(),
-        ],
-        "the set of handlers that exit changed"
-    );
-}
-
-/// "OPEN" OPENS WHEN THERE IS NOTHING TO RAISE, and it decides that ONCE, on a
-/// discriminant — three-valued (#1782), since a connected network with
-/// nothing tracked must reopen the CONSOLE, never the launch window (which
-/// resets `hub_step` to the picker). `window_target` on an untracked slot
-/// names a fresh id whose focus is a no-op, so a raise-only row is a dead row
-/// the moment every window is closed — which the change above made an
-/// ordinary state to be in.
-#[test]
-fn the_tray_open_row_branches_once_on_a_discriminant() {
-    let body = handler("tray_open");
-    assert!(
-        body.contains("tray_open_action(connected, window_tracked)"),
-        "tray_open stopped asking the decide-fn: {body}"
-    );
-    let branches = body
-        .lines()
-        .filter(|line| line.trim_start().starts_with("match "))
-        .count();
-    assert_eq!(branches, 1, "one branch, not a ladder: {body}");
-    assert!(body.contains("TrayOpen.launch"), "no launch arm: {body}");
-    assert!(body.contains("TrayOpen.console"), "no console arm: {body}");
-    assert!(body.contains("TrayOpen.raise"), "no raise arm: {body}");
-    assert!(
-        body.contains("task window open onboarding"),
-        "the launch arm no longer opens the onboarding window: {body}"
-    );
-    assert!(
-        body.contains("done -> network_entered()"),
-        "the console arm no longer re-enters the network through the doors' landing: {body}"
-    );
-    assert!(
-        EXTERNS
-            .contains("pure tray_open_action(network_open:bool, window_tracked:bool) -> TrayOpen"),
-        "backend.ice lost the tray-open discriminant"
-    );
-}
-
-/// ORDINARY TYPING PAYS NOTHING FOR ⌘Q. A key-press subscription publishes a
-/// proxied message and an unconditional rebuild for every key it sees, so the
-/// route that carries the chord is gated on the modifier actually being down;
-/// the modifier stream, which fires only when a modifier moves, is what arms
-/// it. Dropping the gate is invisible in every test except this one — the app
-/// still quits on ⌘Q, it just taxes every keystroke to do it.
-#[test]
-fn the_quit_route_is_armed_by_the_modifier_stream() {
-    assert!(
-        LIFECYCLE.contains("keyboard modifiers -> modifier_state_changed _"),
-        "the cheap half is gone: nothing sets cmd_held"
-    );
-    assert!(
-        LIFECYCLE
-            .contains("keyboard press status=ignored when cmd_held -> command_chord_pressed _"),
-        "the quit key route lost its `when cmd_held` arming, and now taxes every keystroke"
-    );
-    assert!(
-        CORE_STATE.contains("cmd_held = false"),
-        "cmd_held is no longer plain state"
-    );
-    // ARMING, AND NOTHING ELSE. Both lines are the same cheap fact off the
-    // same stream — ⌘ arms the quit/close chord, ⇧ is read by the chat's
-    // shift-click, and a press carries no modifiers of its own. A THIRD kind
-    // of statement here is the thing this guards: the stream fires on every
-    // modifier transition, so work done in it is work done constantly.
-    let armed = handler("modifier_state_changed");
-    assert_eq!(
-        armed.trim(),
-        "cmd_held = command_held(mods)\n  shift_held = shift_held(mods)",
-        "the arming handler does more than arm: {armed}"
-    );
-}
-
-/// THE CHORD IS ONE ANSWER, IN ONE PLACE. The handler asks the extern and
-/// leaves; spelling the modifier and the key here instead would put the chord
-/// in two places, and the arming gate reads `command()` — so a chord judged by
-/// anything else is a chord that never fires off a Mac.
-#[test]
-fn the_command_chords_are_classified_in_one_extern() {
-    let body = handler("command_chord_pressed");
-    assert!(
-        body.contains("let chord = command_chord(event.key, event.physical_key, event.modifiers)"),
-        "the chord handler stopped asking the extern: {body}"
-    );
-    assert!(body.contains("exit"), "the chord handler stopped quitting");
-    assert!(
-        body.contains("task window close target=window_target(focused_win)"),
-        "⌘W stopped closing the FOCUSED window: {body}"
-    );
-    // Statement lines only: prose in this handler's own comments says "match"
-    // too, and a lint a comment can satisfy is a lint that proves nothing.
-    let dispatches = body
-        .lines()
-        .filter(|line| line.trim_start().starts_with("match "))
-        .count();
-    assert_eq!(dispatches, 1, "one dispatch for both chords: {body}");
-    for spelled in ["logo", "command()", "Named::", "physical =="] {
-        assert!(
-            !body.contains(spelled),
-            "the chord is spelled inside the handler as well as the extern: {spelled}"
-        );
-    }
-    for declared in [
-        "pure command_held(modifiers:key-modifiers) -> bool",
-        "pure command_chord(logical:key, physical:physical-key, modifiers:key-modifiers) -> CommandChord",
-    ] {
-        assert!(EXTERNS.contains(declared), "backend.ice lost `{declared}`");
-    }
-}
-
-/// A FILE DROPPED ON THE WINDOW IS A FILES-TAB UPLOAD. The Files screen is a
-/// module-owned view that reads and writes duckfs itself, but the OS drop
-/// stays a WINDOW event the daemon hears (`window file-dropped ->
-/// fs_file_dropped _`): on the Files tab, connected, the handler uploads into
-/// the directory the view last said it stands in; on any other tab the drop is
-/// nobody's and changes nothing.
-#[test]
-fn a_dropped_file_starts_a_files_upload_only_on_the_files_tab() {
-    assert!(
-        LIFECYCLE.contains("window file-dropped -> fs_file_dropped _"),
-        "lifecycle.ice stopped routing the OS drop to the files handler"
-    );
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.shell_tab = ShellTab::Pages;
-    let _ = app.__update(__DucktapeMessage::FsFileDropped("/tmp/notes.md".into()));
-    assert!(!app.fs_dropping, "a drop off the Files tab is nobody's");
-
-    app.shell_tab = ShellTab::Files;
-    app.fs_drop_dir = "/shared/reports".into();
-    let _ = app.__update(__DucktapeMessage::FsFileDropped("/tmp/notes.md".into()));
-    assert!(app.error.is_empty(), "{}", app.error);
-    assert!(app.fs_dropping, "the drop starts its upload");
-    assert!(
-        include_str!("../ui/handlers/files.ice")
-            .contains("files_upload(connected_rpc, password, fs_drop_dir, path)"),
-        "the drop stopped landing in the directory the view named"
-    );
-}
-
-// Cancellation is an effect contract: the scenario harness cannot observe a
-// dropped backend future, so pin lane ownership alongside its state scenarios.
-#[test]
-fn authentication_operations_always_have_replace_lanes() {
-    for source in [
-        include_str!("../ui/handlers/node.ice"),
-        include_str!("../ui/handlers/onboarding.ice"),
-    ] {
-        for line in source.lines() {
-            let authenticates = ["register_passkey(", "login_with_passkey(", "link_wallet("]
-                .iter()
-                .any(|operation| line.contains(operation));
-            if authenticates {
-                assert!(
-                    line.trim_start().starts_with("run replace lane="),
-                    "uncancellable authentication: {line}"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn authentication_lanes_retire_before_navigation_and_quit() {
-    let onboarding = include_str!("../ui/handlers/onboarding.ice");
-    for name in ["switch_network", "open_account_welcome", "network_entered"] {
-        let body = super::ice_handler_body(onboarding, name);
-        assert!(
-            body.contains("invalidate lane=account_ceremony"),
-            "{name} leaves account authentication alive"
-        );
-    }
-    for name in ["tray_quit", "command_chord_pressed", "window_was_closed"] {
-        let body = handler(name);
-        for lane in [
-            "ceremony",
-            "desktop_ceremony",
-            "account_ceremony",
-            "account_desktop_ceremony",
-        ] {
-            assert!(
-                body.contains(&format!("invalidate lane={lane}")),
-                "{name} leaves {lane} alive"
-            );
-        }
-    }
-    let body = handler("select_shell_tab");
-    let cancel = body
-        .find("invalidate lane=account_ceremony")
-        .expect("leaving Settings aborts authentication");
-    assert!(cancel < body.find("return if !connected").unwrap());
-}
-
-#[test]
-fn browser_authentication_keeps_a_visible_cancel_action() {
-    let source = include_str!("../../../crates/views/settings/src/ui/kit.ice");
-    let plate = source.split("component CeremonyPlate(").nth(1).unwrap();
-    let working = plate.split("if phase == \"working\"").nth(1).unwrap();
-    assert!(working.contains("#plate-cancel-working -> emit(account_ceremony_cancel)"));
-}
-
 #[test]
 fn leaving_settings_clears_authentication_but_reselecting_keeps_it() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.shell_tab = ShellTab::Settings;
     app.account_busy = true;
     app.account_ceremony_phase = "working".into();
     app.account_ceremony_detail = "Continue in the browser…".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Settings));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Settings));
     assert!(app.account_busy);
     assert_eq!(app.account_ceremony_phase, "working");
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Chat));
     assert!(!app.account_busy);
     assert!(app.account_ceremony_phase.is_empty());
     assert!(app.account_ceremony_detail.is_empty());
 }
-
 #[test]
 fn reselecting_settings_without_authentication_still_refreshes() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.shell_tab = ShellTab::Settings;
     app.connected = true;
     app.settings_generation = 10;
     app.error = "old error".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Settings));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Settings));
     assert_eq!(app.settings_generation, 11);
     assert!(app.error.is_empty());
 }
-
 #[test]
 fn closing_a_window_cancels_only_its_own_authentication() {
-    let (mut app, _) = Ducktape::__boot();
-    let launch = iced::window::Id::unique();
-    let console = iced::window::Id::unique();
-    let huddle = iced::window::Id::unique();
+    let (mut app, _) = Ducktape::boot();
+    let launch = crate::shell::WindowKey::unique();
+    let console = crate::shell::WindowKey::unique();
+    let huddle = crate::shell::WindowKey::unique();
     app.onboarding_win = Some(launch);
     app.console_win = Some(console);
     app.huddle_win = Some(huddle);
@@ -344,62 +82,249 @@ fn closing_a_window_cancels_only_its_own_authentication() {
     app.account_busy = true;
     app.account_ceremony_phase = "working".into();
 
-    let _ = app.__update(__DucktapeMessage::WindowWasClosed(huddle));
+    let _ = app.update(AppMessage::WindowWasClosed(huddle));
     assert_eq!(app.ceremony_phase, "working");
     assert!(app.account_busy);
-    let _ = app.__update(__DucktapeMessage::WindowWasClosed(launch));
+    let _ = app.update(AppMessage::WindowWasClosed(launch));
     assert!(app.ceremony_phase.is_empty());
     assert!(matches!(app.mutation_phase, crate::MutationPhase::Idle));
     assert!(
         app.account_busy,
         "the console still owns its authentication"
     );
-    let _ = app.__update(__DucktapeMessage::WindowWasClosed(console));
+    let _ = app.update(AppMessage::WindowWasClosed(console));
     assert!(!app.account_busy);
     assert!(app.account_ceremony_phase.is_empty());
 }
-
 #[test]
 fn returning_to_the_picker_cancels_welcome_authentication() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.hub_step = crate::HubStep::Account;
     app.mutation_phase = crate::MutationPhase::Onboarding;
     app.ceremony_phase = "working".into();
     app.ceremony_detail = "Continue in the browser…".into();
-    let _ = app.__update(__DucktapeMessage::GoNetworks);
+    let _ = app.update(AppMessage::GoNetworks);
     assert!(matches!(app.hub_step, crate::HubStep::Networks));
     assert!(matches!(app.mutation_phase, crate::MutationPhase::Idle));
     assert!(app.ceremony_phase.is_empty());
     assert!(app.ceremony_detail.is_empty());
 }
-
 #[test]
-fn phone_and_desktop_account_authentication_retire_together() {
-    for source in [
-        include_str!("../ui/handlers/node.ice"),
-        include_str!("../ui/handlers/onboarding.ice"),
-        include_str!("../ui/handlers/lifecycle.ice"),
-        include_str!("../ui/handlers/chat.ice"),
-        include_str!("../ui/handlers/pages.ice"),
-        include_str!("../ui/handlers/huddle.ice"),
-    ] {
-        let lines: Vec<_> = source.lines().map(str::trim).collect();
-        for (index, line) in lines.iter().enumerate() {
-            if *line == "invalidate lane=account_ceremony" {
-                assert_eq!(
-                    lines.get(index + 1),
-                    Some(&"invalidate lane=account_desktop_ceremony")
-                );
+fn closing_a_window_exits_only_where_no_status_item_lives() {
+    let mut app = Ducktape::initial_state();
+    let launch = crate::shell::WindowKey::unique();
+    let console = crate::shell::WindowKey::unique();
+    app.onboarding_win = Some(launch);
+    app.console_win = Some(console);
+    let _ = app.update(AppMessage::WindowWasClosed(launch));
+    assert_eq!(app.onboarding_win, None);
+    assert_eq!(app.console_win, Some(console));
+    let route = handler_body("WindowWasClosed");
+    assert!(route.contains("letleaving=crate::backend::last_window_closed_exits("));
+    use quote::ToTokens as _;
+    use syn::visit::Visit as _;
+    struct Exits(usize);
+    impl<'ast> syn::visit::Visit<'ast> for Exits {
+        fn visit_block(&mut self, block: &'ast syn::Block) {
+            for (index, statement) in block.stmts.iter().enumerate() {
+                let expression = match statement {
+                    syn::Stmt::Expr(syn::Expr::Return(returned), _) => returned.expr.as_deref(),
+                    syn::Stmt::Expr(expression, _) => Some(expression),
+                    _ => None,
+                };
+                let Some(syn::Expr::Call(call)) = expression else {
+                    continue;
+                };
+                let syn::Expr::Path(path) = call.func.as_ref() else {
+                    continue;
+                };
+                if !path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|part| part.ident == "quit")
+                {
+                    continue;
+                }
+                let Some(syn::Stmt::Expr(syn::Expr::If(guard), _)) = index
+                    .checked_sub(1)
+                    .and_then(|index| block.stmts.get(index))
+                else {
+                    panic!("every close exit needs its immediate non-leaving guard");
+                };
+                let condition = guard.cond.to_token_stream().to_string().replace(' ', "");
+                assert_eq!(condition.trim_matches(['(', ')']), "!leaving");
+                let refusal = guard
+                    .then_branch
+                    .to_token_stream()
+                    .to_string()
+                    .replace(' ', "");
+                assert_eq!(refusal, "{returnTask::none();}");
+                self.0 += 1;
             }
+            syn::visit::visit_block(self, block);
+        }
+    }
+    let exits = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let mut exits = Exits(0);
+            let source = syn::parse_file(include_str!("../ui/app_update.rs"))
+                .expect("native window close route");
+            let handler = source
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    syn::Item::Impl(item) => Some(&item.items),
+                    _ => None,
+                })
+                .flatten()
+                .find_map(|item| match item {
+                    syn::ImplItem::Fn(function) if function.sig.ident == "on_window_was_closed" => {
+                        Some(function)
+                    }
+                    _ => None,
+                })
+                .expect("named window-close handler");
+            exits.visit_block(&handler.block);
+            exits.0
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(exits > 0);
+}
+#[test]
+fn only_the_tray_row_and_the_quit_chord_leave() {
+    let leaving: Vec<_> = handler_bodies()
+        .into_iter()
+        .filter(|(_, body)| body.contains("shell::quit"))
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        leaving,
+        ["WindowWasClosed", "TrayQuit", "CommandChordPressed"]
+    );
+}
+#[test]
+fn the_tray_open_row_branches_once_on_a_discriminant() {
+    use crate::TrayOpen;
+    assert_eq!(backend::tray_open_action(false, false), TrayOpen::Launch);
+    assert_eq!(backend::tray_open_action(true, false), TrayOpen::Console);
+    assert_eq!(backend::tray_open_action(false, true), TrayOpen::Raise);
+    assert_eq!(backend::tray_open_action(true, true), TrayOpen::Raise);
+    let route = handler_body("TrayOpen");
+    for action in ["TrayOpen::Launch", "TrayOpen::Console", "TrayOpen::Raise"] {
+        assert!(route.contains(action));
+    }
+}
+#[test]
+fn the_quit_route_is_armed_by_the_modifier_stream() {
+    let mut app = Ducktape::initial_state();
+    let mods = command_chord("q").modifiers;
+    let _ = app.update(AppMessage::ModifierStateChanged(mods));
+    assert!(app.cmd_held);
+    let _ = app.update(AppMessage::ModifierStateChanged(Default::default()));
+    assert!(!app.cmd_held);
+    let route = handler_body("ModifierStateChanged");
+    assert!(!route.contains("Task::perform"));
+    assert!(!route.contains("Task::run"));
+}
+#[test]
+fn the_command_chords_are_classified_in_one_extern() {
+    let mods = command_chord("q").modifiers;
+    assert_eq!(
+        backend::command_chord("q".into(), mods),
+        crate::CommandChord::Quit
+    );
+    assert_eq!(
+        backend::command_chord("w".into(), mods),
+        crate::CommandChord::CloseWindow
+    );
+    assert_eq!(
+        backend::command_chord("q".into(), Default::default()),
+        crate::CommandChord::Ignored
+    );
+    let route = handler_body("CommandChordPressed");
+    assert_eq!(route.matches("backend::command_chord(").count(), 1);
+    assert!(route.contains("window_target(self.focused_win"));
+}
+#[test]
+fn a_dropped_file_starts_a_files_upload_only_on_the_files_tab() {
+    let mut app = Ducktape::initial_state();
+    app.connected = true;
+    app.shell_tab = ShellTab::Pages;
+    let _ = app.update(AppMessage::FsFileDropped("/tmp/notes.md".into()));
+    assert!(!app.fs_dropping);
+    app.shell_tab = ShellTab::Files;
+    app.fs_drop_dir = "/shared/reports".into();
+    let _ = app.update(AppMessage::FsFileDropped("/tmp/notes.md".into()));
+    assert!(app.fs_dropping);
+    assert!(handler_body("FsFileDropped").contains("self.fs_drop_dir"));
+}
+#[test]
+fn authentication_operations_always_have_replace_lanes() {
+    for operation in ["register_passkey(", "login_with_passkey(", "link_wallet("] {
+        let routes: Vec<_> = handler_bodies()
+            .into_iter()
+            .filter(|(_, body)| body.contains(operation))
+            .collect();
+        assert!(
+            !routes.is_empty(),
+            "real authentication operation {operation}"
+        );
+        for (name, body) in routes {
+            assert!(
+                body.contains(".abortable()") && body.contains(".abort()"),
+                "{name} replaces authentication"
+            );
         }
     }
 }
-
+#[test]
+fn authentication_lanes_retire_before_navigation_and_quit() {
+    for (message, closes_account) in [
+        (AppMessage::TrayQuit, true),
+        (AppMessage::GoNetworks, false),
+    ] {
+        let mut app = Ducktape::initial_state();
+        let before = (
+            app.account_qr_auth_generation,
+            app.account_desktop_auth_generation,
+            app.welcome_qr_auth_generation,
+            app.welcome_desktop_auth_generation,
+        );
+        let _ = app.update(message);
+        // GoNetworks belongs to the onboarding window. It must not cancel
+        // the independently open console's account authentication lanes.
+        assert_eq!(app.account_qr_auth_generation > before.0, closes_account);
+        assert_eq!(
+            app.account_desktop_auth_generation > before.1,
+            closes_account
+        );
+        assert!(app.welcome_qr_auth_generation > before.2);
+        assert!(app.welcome_desktop_auth_generation > before.3);
+    }
+}
+#[test]
+fn phone_and_desktop_account_authentication_retire_together() {
+    for (name, body) in handler_bodies() {
+        if body.contains("self.account_qr_auth_task.take()") {
+            assert!(
+                body.contains("self.account_desktop_auth_task.take()"),
+                "{name}"
+            );
+        }
+    }
+}
 #[test]
 fn passkey_login_shows_its_cancellation_plate_without_an_account() {
-    let source = include_str!("../../../crates/views/settings/src/ui/settings.ice");
-    let missing_account = source.split("if !account_exists").nth(1).unwrap();
-    let missing_account = missing_account.split("if account_exists").next().unwrap();
-    assert!(missing_account.contains("CeremonyPlate #account-login-ceremony"));
-    assert!(missing_account.contains("account_ceremony_cancel"));
+    let mut app = Ducktape::initial_state();
+    app.shell_tab = ShellTab::Settings;
+    app.account_exists = false;
+    app.account_ceremony_phase = "working".into();
+    let (view, _) = app.native_view();
+    let props: serde_json::Value = serde_json::from_slice(&view.props).unwrap();
+    assert_eq!(props["account_exists"], false);
+    assert_eq!(props["account_ceremony_phase"], "working");
 }

@@ -1,7 +1,6 @@
 //! Compare the flattened wire paint with the existing native Markdown policy.
-use iced::advanced::text::Highlighter;
+use ducktape_view_guest::{Editor, wire};
 use pages_view::{editor_binding, editor_menu, editor_view, editor_view::EditorReserve, markdown};
-use ui_lang_guest::{Editor, wire};
 #[path = "../src/editor_presentation.rs"]
 pub mod presentation;
 
@@ -11,29 +10,24 @@ fn flattened_runs_preserve_native_body_gaps_and_inline_precedence() {
     let editor = Editor::new(text);
     for dark in [false, true] {
         let caret = markdown::Caret {
-            focused: true,
-            line: 2,
-            column: 0,
             dark,
             commented: vec![1],
         };
-        let state = ui_lang_guest::EditorStateView {
+        let state = ducktape_view_guest::EditorStateView {
             cursor: wire::EditorCursor {
                 position: wire::EditorPosition { line: 2, column: 0 },
                 selection: None,
             },
             ..editor.state_view()
         };
-        let actual =
-            presentation::build(
-                state,
-                editor_binding::initial_menu(),
-                dark,
-                vec![1],
-                true,
-                EditorReserve::default(),
-            )
-            .unwrap();
+        let actual = presentation::build(
+            state,
+            editor_binding::initial_menu(),
+            dark,
+            vec![1],
+            EditorReserve::default(),
+        )
+        .unwrap();
         let mut native = markdown::DocumentHighlighter::new(&caret);
         for (line, source) in wire::editor_lines(text).enumerate() {
             let expected: Vec<_> = native.highlight_line(source).collect();
@@ -42,7 +36,7 @@ fn flattened_runs_preserve_native_body_gaps_and_inline_precedence() {
                     .iter()
                     .rev()
                     .find(|(range, _)| range.contains(&byte))
-                    .map(|(_, mark)| presentation::convert(markdown::format(mark, dark)).unwrap());
+                    .map(|(_, mark)| markdown::format(mark, dark));
                 let actual = actual
                     .spans
                     .iter()
@@ -62,24 +56,25 @@ fn flattened_runs_preserve_native_body_gaps_and_inline_precedence() {
 }
 
 #[test]
-fn named_link_syntax_hides_on_blur_and_returns_without_changing_source_or_caret() {
+fn named_link_syntax_never_paints_even_under_the_caret() {
     let line = "앞 [작업 보기](duck://agents/runs/abc) 뒤";
     let text = format!("Title\n{line}");
     let editor = Editor::new(&text);
-    let state = ui_lang_guest::EditorStateView {
+    let state = ducktape_view_guest::EditorStateView {
         cursor: wire::EditorCursor {
             position: wire::EditorPosition { line: 1, column: 8 },
             selection: None,
         },
         ..editor.state_view()
     };
-    for focused in [true, false, true] {
+    // The caret sits INSIDE the link syntax, and the syntax still never
+    // paints: the label is the whole of what the reader sees.
+    {
         let paint = presentation::build(
             state,
             editor_binding::initial_menu(),
             false,
             vec![],
-            focused,
             EditorReserve::default(),
         )
         .unwrap();
@@ -90,14 +85,7 @@ fn named_link_syntax_hides_on_blur_and_returns_without_changing_source_or_caret(
             .filter(|span| paint.formats[span.format as usize].size.unwrap_or(14.0) > 1.0)
             .map(|span| &line[span.start as usize..span.end as usize])
             .collect();
-        assert_eq!(
-            visible,
-            if focused {
-                line
-            } else {
-                "앞 작업 보기 뒤"
-            }
-        );
+        assert_eq!(visible, "앞 작업 보기 뒤");
         let hit = paint
             .affordances
             .hits
@@ -183,7 +171,6 @@ fn the_reserved_line_carries_the_gap_and_keeps_its_own_padding() {
         editor_binding::initial_menu(),
         false,
         vec![],
-        true,
         EditorReserve::default(),
     )
     .unwrap();
@@ -194,7 +181,6 @@ fn the_reserved_line_carries_the_gap_and_keeps_its_own_padding() {
         editor_binding::initial_menu(),
         false,
         vec![],
-        true,
         EditorReserve {
             line: 2,
             height: 200,
@@ -221,11 +207,81 @@ fn the_reserved_line_carries_the_gap_and_keeps_its_own_padding() {
         editor_binding::initial_menu(),
         false,
         vec![],
-        true,
         EditorReserve { line: 2, height: 0 },
     )
     .unwrap();
     assert_eq!(none.formats, plain.formats);
     assert_eq!(none.spans, plain.spans);
     assert_eq!(editor_view::no_reserve(), EditorReserve::default());
+}
+
+/// The inline grammar past bold and italic: strike, code, highlight and a
+/// member mention each paint their own run, and the markers around them hide
+/// away from the caret line exactly as `**` does.
+#[test]
+fn strike_code_highlight_and_mentions_paint_their_own_runs() {
+    use pages_view::inline::{Inline, inline_marks};
+    let line = "a ~~gone~~ ++under++ `code` ==mark== @alice me@host.io <span style=\"color:#ff0000\">red</span> done";
+    let marks: Vec<_> = inline_marks(line)
+        .into_iter()
+        .filter(|(_, kind)| *kind != Inline::Marker)
+        .map(|(range, kind)| (&line[range], kind))
+        .collect();
+    assert_eq!(
+        marks,
+        vec![
+            ("gone", Inline::Strike),
+            ("under", Inline::Underline),
+            ("code", Inline::Code),
+            ("mark", Inline::Highlight),
+            ("@alice", Inline::Mention),
+            ("red", Inline::Color(0xff0000)),
+        ]
+    );
+    let text = format!("Title\n{line}");
+    let editor = Editor::new(&text);
+    let state = ducktape_view_guest::EditorStateView {
+        cursor: wire::EditorCursor {
+            position: wire::EditorPosition { line: 0, column: 0 },
+            selection: None,
+        },
+        ..editor.state_view()
+    };
+    let paint = presentation::build(
+        state,
+        editor_binding::initial_menu(),
+        false,
+        vec![],
+        EditorReserve::default(),
+    )
+    .unwrap();
+    let format_of = |word: &str| {
+        let start = line.find(word).unwrap() as u32;
+        let span = paint
+            .spans
+            .iter()
+            .find(|span| span.line == 1 && span.start <= start && start < span.end)
+            .unwrap_or_else(|| panic!("no run covers {word:?}"));
+        paint.formats[span.format as usize].clone()
+    };
+    assert!(format_of("gone").strikethrough.is_some());
+    assert!(format_of("gone").underline.is_none());
+    assert!(format_of("under").underline.is_some());
+    assert!(format_of("under").strikethrough.is_none());
+    assert!(format_of("code").background.is_some());
+    assert!(format_of("mark").background.is_some());
+    assert_ne!(format_of("@alice").color, format_of("done").color);
+    assert_eq!(
+        format_of("red").color,
+        Some(wire::Rgba([1.0, 0.0, 0.0, 1.0])),
+        "a colour span paints its own ink"
+    );
+    let visible: String = paint
+        .spans
+        .iter()
+        .filter(|span| span.line == 1)
+        .filter(|span| paint.formats[span.format as usize].size.unwrap_or(14.0) > 1.0)
+        .map(|span| &line[span.start as usize..span.end as usize])
+        .collect();
+    assert_eq!(visible, "a gone under code mark @alice me@host.io red done");
 }

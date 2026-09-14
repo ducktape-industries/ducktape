@@ -39,66 +39,6 @@ pub(crate) fn live_resync(module: &str, height: i64) -> LiveUpdate {
     update
 }
 
-/// The artifact's line icon for `name`, as the SVG bytes the view hands to
-/// iced as an in-memory handle. An unknown name renders an empty document.
-///
-/// BYTES, NOT `str`: the `svg … memory` node feeds its source straight into
-/// `svg::Handle::from_memory`, and a `str` source makes codegen emit
-/// `(…).as_bytes().to_vec()` — so a `&'static str` became a String and then a
-/// second Vec, per icon, per frame, on a surface that mounts dozens of them
-/// outside the cached message rows. `bytes` lowers to the Vec the handle wants
-/// and the copy happens once.
-pub fn icon(name: &str) -> Vec<u8> {
-    design::icons::svg(name).as_bytes().to_vec()
-}
-
-/// The titlebar's extra left padding. On macOS the window is drawn with a
-/// hidden title and a transparent, full-size content view (`app.ice`), so the
-/// three traffic lights overlay the content's top-left ~70px — the chain chip
-/// must start past them. Zero on every other platform.
-pub fn titlebar_inset() -> f64 {
-    if cfg!(target_os = "macos") { 68.0 } else { 0.0 }
-}
-
-/// Whether the live palette is the dark reading. The generated theme's base
-/// text color IS `app_text`, so light text means a dark surface — no theme
-/// name string to allocate and compare per style call.
-pub(crate) fn theme_is_dark(theme: &iced::Theme) -> bool {
-    theme.palette().text.r > 0.5
-}
-
-/// The token set matching the live palette reading.
-pub(crate) fn app_tokens(theme: &iced::Theme) -> ui_lang_components::ui::theme::Theme {
-    if theme_is_dark(theme) {
-        ui_lang_components::ui::theme::DARK
-    } else {
-        ui_lang_components::ui::theme::LIGHT
-    }
-}
-
-/// Floating menu/popover surface, derived from the shared design tokens.
-///
-/// `popover`, not `glass.regular`: glass is a TRANSLUCENT role that only reads
-/// as a material when the renderer blurs what is behind it, and **iced has no
-/// backdrop blur** — the app window is opaque for exactly that reason. Painted
-/// without one, a 62%-alpha plate over a message just lets the message through
-/// it, so the sentence under a menu item and the item's own label overlapped
-/// and both became hard to read. `popover` is the design system's own opaque
-/// floating surface; the border and `elevation.popover` carry the lift.
-pub fn raised_style(theme: &iced::Theme) -> iced::widget::container::Style {
-    let tokens = app_tokens(theme);
-    iced::widget::container::Style {
-        background: Some(iced::Background::Color(tokens.palette.popover)),
-        border: iced::Border {
-            color: tokens.palette.border,
-            width: 1.0,
-            radius: tokens.radius.card.into(),
-        },
-        shadow: tokens.elevation.popover,
-        ..Default::default()
-    }
-}
-
 pub(crate) const fn block_kind_name(kind: BlockKind) -> &'static str {
     match kind {
         BlockKind::Page => "Page",
@@ -160,4 +100,3 @@ pub(crate) fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
         })
         .collect()
 }
-

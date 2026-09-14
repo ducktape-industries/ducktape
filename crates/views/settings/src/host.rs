@@ -20,9 +20,9 @@
 
 use std::fmt::Write as _;
 
-use iced::futures::{StreamExt, stream};
+use ducktape_view_guest::host;
+use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HostError {
@@ -54,6 +54,10 @@ pub struct Session {
     pub recovering: bool,
     pub appearance: String,
     pub desktop_notifications: bool,
+    /// what the host said about raising banners: `pending`, `ready`,
+    /// `unbundled` (not an app bundle), `denied` (refused in System
+    /// Settings) or `unavailable` (no notification service)
+    pub desktop_notifications_host: String,
     pub unlocked: bool,
     pub seat_key: String,
     pub account_name: String,
@@ -79,8 +83,8 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("settings.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -132,8 +136,8 @@ pub struct StandingItem {
 }
 
 /// This node's standing now and after every valset block.
-pub fn standing(connection: i64) -> iced::Subscription<StandingItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn standing(connection: i64) -> ducktape_view_guest::Subscription<StandingItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         let live = host::subscribe("rpc.live", b"valset");
         stream::once(load_standing()).chain(live.then(|_| load_standing()))
     })
@@ -258,8 +262,8 @@ pub struct KeysItem {
 /// The key associations of the account the seat belongs to, now and after
 /// every identity block — an op that admits or drops a key lands on that
 /// plane, so the card re-reads itself without the host saying so.
-pub fn account_keys(connection: i64, seat: String) -> iced::Subscription<KeysItem> {
-    iced::Subscription::run_with((connection, seat), |(_, seat)| {
+pub fn account_keys(connection: i64, seat: String) -> ducktape_view_guest::Subscription<KeysItem> {
+    ducktape_view_guest::Subscription::run_with((connection, seat), |(_, seat)| {
         let seat = seat.clone();
         let again = seat.clone();
         let live = host::subscribe("rpc.live", b"identity");
@@ -551,24 +555,6 @@ fn notify<T: Serialize>(operation: &str, payload: &T) -> bool {
     let bytes = serde_json::to_vec(payload).expect("an intent encodes");
     host::notify(operation, &bytes);
     true
-}
-
-// The desktop app's own readings (app/src/backend), repeated here because the
-// view is its own crate: the wire carries the words, not the functions.
-
-pub fn connection_degraded(status: &str) -> bool {
-    status == "Offline"
-        || status == "Sync delayed"
-        || status == "Reconnecting…"
-        || status == "Live · resyncing"
-}
-
-pub fn initial_of(name: &str) -> String {
-    name.trim()
-        .chars()
-        .next()
-        .map(|first| first.to_uppercase().to_string())
-        .unwrap_or_default()
 }
 
 /// The draft as it stands, or nothing once the read it targeted moved.

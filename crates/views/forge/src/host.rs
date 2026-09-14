@@ -22,14 +22,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use ducktape_view_guest::host;
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
 
 pub use crate::blocks::{ChatBlock, ChatSpan};
 use crate::blocks::{
     Names, author_display, avatar_initial, avatar_kind, blocks_of_json, blocks_view, body_blocks,
-    deleted_block, message_body, party_handle, party_of_json,
+    deleted_block, party_handle, party_of_json,
 };
 
 /// The module this view reads and writes: its query target, its live plane,
@@ -97,7 +97,6 @@ pub struct ChatMessage {
     pub blocks: Vec<ChatBlock>,
     pub initial: String,
     pub avatar_kind: String,
-    pub render_rev: i64,
 }
 
 /// One line comment a review carried, anchored `path:line (side)`.
@@ -140,8 +139,9 @@ pub struct TreeEntry {
     pub kind: String,
 }
 
-/// One painted row of the unified patch. `kind` is `file` | `hunk` | `add`
-/// | `del` | `ctx`.
+/// One painted row of the unified patch. `kind` is `file` (one per changed
+/// file, `text` naming it) | `hunk` | `add` | `del` | `ctx` | `note` (the
+/// `\ No newline at end of file` remark).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DiffLine {
     pub key: i64,
@@ -184,8 +184,8 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("forge.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -197,11 +197,18 @@ pub fn session() -> iced::Subscription<SessionItem> {
                 },
                 Err(error) => SessionItem {
                     next: Session::default(),
-                    error,
+                    error: failure("Could not read the session", &error),
                 },
             }
         })
     })
+}
+
+/// A refusal as the screen says it: what we were doing, then the kernel's
+/// own words. Every error a reader hands the view passes through here, so
+/// no strip ever shows a bare token.
+fn failure(doing: &str, error: &str) -> String {
+    format!("{doing}: {error}")
 }
 
 /// The serial every read subscription is keyed by: it moves when the
@@ -274,8 +281,8 @@ pub struct RepoListItem {
 }
 
 /// The repo namespace now and after every forge block.
-pub fn repos(connection: i64) -> iced::Subscription<RepoListItem> {
-    iced::Subscription::run_with(connection, |_| on_forge_blocks(load_repos))
+pub fn repos(connection: i64) -> ducktape_view_guest::Subscription<RepoListItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| on_forge_blocks(load_repos))
 }
 
 async fn load_repos() -> RepoListItem {
@@ -286,7 +293,7 @@ async fn load_repos() -> RepoListItem {
         },
         Err(error) => RepoListItem {
             repos: Vec::new(),
-            error,
+            error: failure("Could not read the repositories", &error),
         },
     }
 }
@@ -324,8 +331,8 @@ pub struct RepoItem {
 
 /// The open repo's branches and tracker items, re-read on every forge
 /// block. No repo open reads nothing.
-pub fn repo(connection: i64, repo: String) -> iced::Subscription<RepoItem> {
-    iced::Subscription::run_with((connection, repo), |(_, repo)| {
+pub fn repo(connection: i64, repo: String) -> ducktape_view_guest::Subscription<RepoItem> {
+    ducktape_view_guest::Subscription::run_with((connection, repo), |(_, repo)| {
         let repo = repo.clone();
         on_forge_blocks(move || load_repo(repo.clone()))
     })
@@ -339,7 +346,7 @@ async fn load_repo(repo: String) -> RepoItem {
         Ok(item) => item,
         Err(error) => RepoItem {
             repo,
-            error,
+            error: failure("Could not read this repository", &error),
             ..RepoItem::default()
         },
     }
@@ -424,8 +431,12 @@ pub struct ItemItem {
 }
 
 /// The open item in full, re-read on every forge block.
-pub fn item(connection: i64, repo: String, number: i64) -> iced::Subscription<ItemItem> {
-    iced::Subscription::run_with((connection, repo, number), |(_, repo, number)| {
+pub fn item(
+    connection: i64,
+    repo: String,
+    number: i64,
+) -> ducktape_view_guest::Subscription<ItemItem> {
+    ducktape_view_guest::Subscription::run_with((connection, repo, number), |(_, repo, number)| {
         let (repo, number) = (repo.clone(), *number);
         on_forge_blocks(move || load_item(repo.clone(), number))
     })
@@ -441,7 +452,7 @@ async fn load_item(repo: String, number: i64) -> ItemItem {
         Err(error) => ItemItem {
             repo,
             number,
-            error,
+            error: failure("Could not read this item", &error),
             ..ItemItem::default()
         },
     }
@@ -483,7 +494,7 @@ pub fn fold_item(
     let target_branch = detail["target_branch"].as_str().unwrap_or_default();
     let branches = match source_branch.is_empty() {
         true => String::new(),
-        false => format!("{source_branch} → {target_branch}"),
+        false => format!("{source_branch} into {target_branch}"),
     };
     let body = detail["body"].as_str().unwrap_or_default().to_owned();
     ItemItem {
@@ -538,11 +549,7 @@ fn tally(reviews: &[ForgeReview]) -> (i64, i64) {
     )
 }
 
-fn fold_reviews(
-    reviews: &serde_json::Value,
-    source_oid: &str,
-    names: &Names,
-) -> Vec<ForgeReview> {
+fn fold_reviews(reviews: &serde_json::Value, source_oid: &str, names: &Names) -> Vec<ForgeReview> {
     reviews
         .as_array()
         .cloned()
@@ -569,11 +576,10 @@ fn fold_reviews(
                     .map(|comment| {
                         let body = comment["body"].as_str().unwrap_or_default().to_owned();
                         ForgeReviewComment {
-                            anchor: format!(
-                                "{}:{} ({})",
+                            anchor: comment_anchor(
                                 comment["path"].as_str().unwrap_or_default(),
-                                comment["line"].as_i64().unwrap_or(0),
-                                comment["side"].as_str().unwrap_or_default()
+                                &comment["line"].as_i64().unwrap_or(0).to_string(),
+                                comment["side"].as_str().unwrap_or_default(),
                             ),
                             blocks: body_blocks(&body),
                             body,
@@ -614,8 +620,11 @@ pub struct DiscussionItem {
 
 /// The item's hidden `forge:<repo>:<n>` channel, re-read on every chat
 /// block — a note posted anywhere lands here the same way it does in Chat.
-pub fn discussion(connection: i64, channel_id: String) -> iced::Subscription<DiscussionItem> {
-    iced::Subscription::run_with((connection, channel_id), |(_, channel_id)| {
+pub fn discussion(
+    connection: i64,
+    channel_id: String,
+) -> ducktape_view_guest::Subscription<DiscussionItem> {
+    ducktape_view_guest::Subscription::run_with((connection, channel_id), |(_, channel_id)| {
         let channel_id = channel_id.clone();
         let live = host::subscribe("rpc.live", CHAT.as_bytes());
         let load = move || load_discussion(channel_id.clone());
@@ -631,7 +640,7 @@ async fn load_discussion(channel_id: String) -> DiscussionItem {
         Ok(item) => item,
         Err(error) => DiscussionItem {
             channel_id,
-            error,
+            error: failure("Could not read the discussion", &error),
             ..DiscussionItem::default()
         },
     }
@@ -682,39 +691,17 @@ fn fold_message(row: &serde_json::Value, names: &Names) -> ChatMessage {
         false => blocks_view(&wire, names),
     };
     let meta = match edited {
-        true => format!("#{seq} · edited"),
+        true => format!("#{seq} (edited)"),
         false => format!("#{seq}"),
     };
-    let message = ChatMessage {
+    ChatMessage {
         seq,
         author: author_display(author, names),
         meta,
         blocks,
         initial: avatar_initial(author, names),
         avatar_kind: avatar_kind(author, names),
-        render_rev: 0,
-    };
-    let body = match deleted {
-        true => "Message deleted".to_owned(),
-        false => message_body(&wire, names),
-    };
-    seed_render_rev(message, &body)
-}
-
-/// The keyed lazy repaints a row exactly when this (or `seq`) moves, so the
-/// seed hashes everything the row draws with.
-fn seed_render_rev(mut message: ChatMessage, body: &str) -> ChatMessage {
-    use std::hash::{Hash as _, Hasher as _};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    message.seq.hash(&mut hasher);
-    message.author.hash(&mut hasher);
-    message.meta.hash(&mut hasher);
-    message.initial.hash(&mut hasher);
-    message.avatar_kind.hash(&mut hasher);
-    body.hash(&mut hasher);
-    message.render_rev = i64::from_ne_bytes(hasher.finish().to_ne_bytes());
-    message
+    }
 }
 
 /// The composer's mention vocabulary: the channel's members by the label
@@ -774,10 +761,16 @@ pub struct TreeItem {
 
 /// One directory listing, pinned to the commit the root listing answered
 /// with. Keyed by what it names, so a move re-reads and nothing else does.
-pub fn tree(connection: i64, repo: String, rev: String, path: String) -> iced::Subscription<TreeItem> {
-    iced::Subscription::run_with((connection, repo, rev, path), |(_, repo, rev, path)| {
-        stream::once(load_tree(repo.clone(), rev.clone(), path.clone()))
-    })
+pub fn tree(
+    connection: i64,
+    repo: String,
+    rev: String,
+    path: String,
+) -> ducktape_view_guest::Subscription<TreeItem> {
+    ducktape_view_guest::Subscription::run_with(
+        (connection, repo, rev, path),
+        |(_, repo, rev, path)| stream::once(load_tree(repo.clone(), rev.clone(), path.clone())),
+    )
 }
 
 async fn load_tree(repo: String, rev: String, path: String) -> TreeItem {
@@ -806,7 +799,7 @@ async fn load_tree(repo: String, rev: String, path: String) -> TreeItem {
             repo,
             rev,
             path,
-            error,
+            error: failure("Could not read the repository tree", &error),
             ..TreeItem::default()
         },
     }
@@ -852,8 +845,8 @@ pub fn blob(
     rev: String,
     path: String,
     net: String,
-) -> iced::Subscription<BlobItem> {
-    iced::Subscription::run_with(
+) -> ducktape_view_guest::Subscription<BlobItem> {
+    ducktape_view_guest::Subscription::run_with(
         (connection, repo, rev, path, net),
         |(_, repo, rev, path, net)| {
             stream::once(load_blob(
@@ -880,7 +873,7 @@ async fn load_blob(repo: String, rev: String, path: String, net: String) -> Blob
         Err(error) => BlobItem {
             repo,
             path,
-            error,
+            error: failure("Could not load this file", &error),
             ..BlobItem::default()
         },
     }
@@ -919,13 +912,21 @@ async fn read_text(repo: &str, rev: &str, path: &str, net: &str) -> Result<BlobI
 /// the addresses are `duck://` refs, repo-relative paths and web URLs, and
 /// only the app's one open plane knows how to fetch each kind.
 async fn park_inline_pictures(item: &BlobItem, repo: &str, rev: &str, net: &str) {
-    let base = format!("duck://forge/{repo}/blob/{}@{rev}{}", item.path, net_query(net));
+    let base = format!(
+        "duck://forge/{repo}/blob/{}@{rev}{}",
+        item.path,
+        net_query(net)
+    );
     let ask = serde_json::json!({
         "doc": &item.path,
         "source": &item.text,
         "base": base,
     });
-    let _ = host::request("picture.inline", &serde_json::to_vec(&ask).expect("encodes")).await;
+    let _ = host::request(
+        "picture.inline",
+        &serde_json::to_vec(&ask).expect("encodes"),
+    )
+    .await;
 }
 
 /// A picture blob: page it in, hand it to the host's picture store, draw
@@ -951,8 +952,7 @@ async fn read_picture(repo: &str, rev: &str, path: &str) -> Result<BlobItem, Str
         )));
     };
     let ask = serde_json::json!({ "surface": PICTURE_SURFACE, "path": path, "pages": pages });
-    let parked =
-        host::request("picture.put", &serde_json::to_vec(&ask).expect("encodes")).await;
+    let parked = host::request("picture.put", &serde_json::to_vec(&ask).expect("encodes")).await;
     let parked = parked.and_then(|reply| {
         serde_json::from_slice::<serde_json::Value>(&reply).map_err(|error| error.to_string())
     });
@@ -1070,8 +1070,8 @@ fn start(act: impl Future<Output = ActItem> + 'static) -> bool {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;
@@ -1134,6 +1134,10 @@ pub fn review_submit(
                 submit(message).await.err().unwrap_or_default()
             }
         };
+        let error = match error.is_empty() {
+            true => error,
+            false => failure("The review was not sent", &error),
+        };
         ActItem {
             kind: "review".to_owned(),
             error,
@@ -1172,11 +1176,19 @@ pub fn merge(
     prev_target_oid: String,
 ) -> bool {
     start(async move {
-        match merge_pr(repo, number, source_branch, expected_source_oid, prev_target_oid).await {
+        match merge_pr(
+            repo,
+            number,
+            source_branch,
+            expected_source_oid,
+            prev_target_oid,
+        )
+        .await
+        {
             Ok(item) => item,
             Err(error) => ActItem {
                 kind: "merge".to_owned(),
-                error,
+                error: failure("The merge did not go through", &error),
                 ..ActItem::default()
             },
         }
@@ -1328,10 +1340,6 @@ pub fn forge_link(url: &str) -> ForgeLink {
 
 // ---------- the readings ----------
 
-pub fn icon(name: &str) -> Vec<u8> {
-    design::icons::svg(name).as_bytes().to_vec()
-}
-
 pub fn plural(count: i64, one: &str, many: &str) -> String {
     let noun = if count == 1 { one } else { many };
     format!("{count} {noun}")
@@ -1380,8 +1388,26 @@ pub fn kind_tab(kind: &str) -> String {
 pub fn forge_merge_note(merge_oid: &str, branches: &str) -> String {
     let short: String = merge_oid.chars().take(8).collect();
     match branches.is_empty() {
-        true => format!("Merged as {short}"),
-        false => format!("Merged as {short} · {branches}"),
+        true => format!("Merged as {short}."),
+        false => format!("Merged {branches} as {short}."),
+    }
+}
+
+/// A state or seat word as a badge reads it: `open` → `Open`.
+pub fn state_label(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// The file pane's line under a failed read: the loader's note, or the
+/// refusal as a sentence.
+pub fn blob_note(note: &str, error: &str) -> String {
+    match error.is_empty() {
+        true => note.to_owned(),
+        false => error.to_owned(),
     }
 }
 
@@ -1391,14 +1417,6 @@ pub fn verdict_label(verdict: &str) -> String {
         "approve" => "approved".into(),
         "request_changes" => "requested changes".into(),
         _ => "commented".into(),
-    }
-}
-
-/// A verdict picker label, dotted when it is the current pick.
-pub fn verdict_pick_label(current: &str, key: &str, label: &str) -> String {
-    match current == key {
-        true => format!("● {label}"),
-        false => label.to_owned(),
     }
 }
 
@@ -1459,7 +1477,7 @@ pub fn forge_comment_target(path: &str, line: &str, side: &str) -> String {
     if path.is_empty() {
         return String::new();
     }
-    format!("{path}:{line} ({side})")
+    comment_anchor(path, line, side)
 }
 
 /// What the branch selector reads while no branch stands at the browse's
@@ -1479,13 +1497,6 @@ pub fn repo_names(repos: &[ForgeRepo]) -> Vec<String> {
 /// The branch selector's options: the open repo's born branches by name.
 pub fn branch_names(branches: &[ForgeBranch]) -> Vec<String> {
     branches.iter().map(|branch| branch.name.clone()).collect()
-}
-
-/// The branch selector's selection: the branch standing at the browse's
-/// commit, or none once every branch has moved past it.
-pub fn pinned_branch(tree_branch: &str) -> Option<String> {
-    let a_branch_stands_at_the_commit = !tree_branch.is_empty();
-    a_branch_stands_at_the_commit.then(|| tree_branch.to_owned())
 }
 
 /// The commit a branch's head stood on when the repo slice was read, or
@@ -1534,27 +1545,32 @@ pub fn forge_parent(path: &str) -> String {
     }
 }
 
-/// The reader header's path, gated on the directory AND revision the file
-/// was opened under: a preview opened in another directory or an older
-/// commit was retired by that move.
-pub fn forge_file_header(
-    opened_dir: &str,
-    opened_rev: &str,
-    dir: &str,
-    rev: &str,
-    path: &str,
-) -> String {
-    let same_place = opened_dir == dir;
+/// The reader header's path, gated on the revision the file was opened
+/// under: a preview opened at an older commit was retired by the branch
+/// move. Unfolding another directory in the tree retires nothing.
+pub fn forge_file_header(opened_rev: &str, rev: &str, path: &str) -> String {
     let same_commit = opened_rev == rev;
-    match same_place && same_commit {
+    match same_commit {
         true => path.to_owned(),
         false => String::new(),
     }
 }
 
-/// The PR stats line: `3 files · +12 −4`.
+/// The PR stats line: `3 files, +12 −4`.
 pub fn forge_stats(files: i64, additions: i64, deletions: i64) -> String {
-    format!("{files} files · +{additions} −{deletions}")
+    format!(
+        "{}, +{additions} −{deletions}",
+        plural(files, "file", "files")
+    )
+}
+
+/// Where a line comment sits, as a person reads it: `main.rs:12`, and the
+/// side only when it is the removed line.
+pub fn comment_anchor(path: &str, line: &str, side: &str) -> String {
+    match side {
+        "old" => format!("{path}:{line} (removed line)"),
+        _ => format!("{path}:{line}"),
+    }
 }
 
 /// Stage one line comment, or replace the one already on that line.
@@ -1576,7 +1592,7 @@ pub fn stage_forge_comment(
         return staged;
     }
     let comment = ForgeDraftComment {
-        anchor: format!("{path}:{line} ({side})"),
+        anchor: comment_anchor(&path, &line, &side),
         path,
         line,
         side,
@@ -1592,10 +1608,7 @@ pub fn stage_forge_comment(
 }
 
 /// Drop the comment staged at one anchor. A miss leaves the list alone.
-pub fn drop_forge_comment(
-    staged: Vec<ForgeDraftComment>,
-    anchor: &str,
-) -> Vec<ForgeDraftComment> {
+pub fn drop_forge_comment(staged: Vec<ForgeDraftComment>, anchor: &str) -> Vec<ForgeDraftComment> {
     let mut staged = staged;
     staged.retain(|row| row.anchor != anchor);
     staged
@@ -1691,15 +1704,6 @@ pub fn composer_scope(endpoint: &str, channel_id: &str) -> String {
     }
 }
 
-/// The appearance as the word the handler matches on.
-pub(crate) fn appearance_of(dark: bool) -> crate::Appearance {
-    if dark {
-        crate::Appearance::Dark
-    } else {
-        crate::Appearance::Light
-    }
-}
-
 // ---------- the patch, painted ----------
 
 /// A unified patch as the rows the diff pane draws.
@@ -1717,8 +1721,10 @@ pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
     let mut new_no = 0i64;
     // The path every following code row is anchored to, taken from the
     // patch's own `+++ b/…` header: a comment cannot be authored from a row
-    // that does not know its file.
+    // that does not know its file. The `--- a/…` side is held only to name
+    // a deleted file, whose head side is `/dev/null`.
     let mut path = String::new();
+    let mut old_path = String::new();
     // What the open hunk still owes on each side. A hunk header DECLARES how
     // many lines its body covers, and while either side is still owed one,
     // every line is body content — never a header. That budget is the ONLY
@@ -1729,13 +1735,18 @@ pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
     for line in diff.lines() {
         let inside_hunk_body = old_left > 0 || new_left > 0;
         if !inside_hunk_body {
-            if let Some(target) = added_side_path(line) {
-                path = target;
-                rows.push(marker_row(line));
+            if let Some(source) = removed_side_path(line) {
+                old_path = source;
                 continue;
             }
-            if is_file_header(line) {
-                rows.push(marker_row(line));
+            if let Some(target) = added_side_path(line) {
+                path = target;
+                rows.push(file_row(&old_path, &path));
+                old_path.clear();
+                continue;
+            }
+            if let Some(name) = binary_file(line) {
+                rows.push(named_file_row(&format!("{name} (binary)")));
                 continue;
             }
             if let Some(span) = hunk_span(line) {
@@ -1743,15 +1754,34 @@ pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
                 new_no = span.new_start;
                 old_left = span.old_len;
                 new_left = span.new_len;
-                rows.push(diff_row("hunk", String::new(), String::new(), "", line, "", ""));
+                rows.push(diff_row(
+                    "hunk",
+                    String::new(),
+                    String::new(),
+                    "",
+                    line,
+                    "",
+                    "",
+                ));
                 continue;
             }
+            // `diff --git`, `index`, a mode or rename line: git's own
+            // bookkeeping between files, which the one file row already says
+            continue;
         }
         // `\ No newline at end of file` is a note ABOUT the previous line. It
         // holds no position on either side, so it consumes neither a line
         // number nor the hunk's budget.
         if line.starts_with('\\') {
-            rows.push(marker_row(line));
+            rows.push(diff_row(
+                "note",
+                String::new(),
+                String::new(),
+                "",
+                line.trim_start_matches('\\').trim(),
+                "",
+                "",
+            ));
             continue;
         }
         match line.chars().next() {
@@ -1805,31 +1835,50 @@ pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
     rows
 }
 
-/// The non-code rows: a file header, and the `\ No newline` note. Neither
-/// is a commentable position, so both carry an empty path and side.
-fn marker_row(line: &str) -> DiffLine {
-    diff_row("file", String::new(), String::new(), "", line, "", "")
+/// The one row that opens a changed file: its name, and whether it is new
+/// or gone. Not a commentable position, so it carries no path or side.
+fn file_row(old_path: &str, new_path: &str) -> DiffLine {
+    let name = match (old_path.is_empty(), new_path.is_empty()) {
+        (true, false) => format!("{new_path} (new file)"),
+        (false, false) => new_path.to_owned(),
+        (false, true) => format!("{old_path} (deleted)"),
+        (true, true) => "(unnamed file)".to_owned(),
+    };
+    named_file_row(&name)
 }
 
-fn is_file_header(line: &str) -> bool {
-    line.starts_with("diff ")
-        || line.starts_with("--- ")
-        || line.starts_with("index ")
-        || line.starts_with("new file")
-        || line.starts_with("deleted file")
+fn named_file_row(name: &str) -> DiffLine {
+    diff_row("file", String::new(), String::new(), "", name, "", "")
 }
 
 /// The head-side path a `+++ b/<path>` header names. A pure deletion writes
 /// `+++ /dev/null`, which names no file on the head side and yields an
 /// empty path — its rows are then uncommentable, which is correct.
 fn added_side_path(line: &str) -> Option<String> {
-    let target = line.strip_prefix("+++ ")?;
+    header_path(line.strip_prefix("+++ ")?, "b/")
+}
+
+/// The base-side path a `--- a/<path>` header names; a new file's is empty.
+fn removed_side_path(line: &str) -> Option<String> {
+    header_path(line.strip_prefix("--- ")?, "a/")
+}
+
+fn header_path(target: &str, marker: &str) -> Option<String> {
     if target == "/dev/null" {
         return Some(String::new());
     }
-    // git writes `b/<path>`; a patch produced without prefixes writes the
-    // path bare, so strip the marker only when it is there.
-    Some(target.strip_prefix("b/").unwrap_or(target).to_owned())
+    // git writes `a/<path>` / `b/<path>`; a patch produced without prefixes
+    // writes the path bare, so strip the marker only when it is there.
+    Some(target.strip_prefix(marker).unwrap_or(target).to_owned())
+}
+
+/// The head-side name a `Binary files a/<x> and b/<x> differ` line carries:
+/// git writes no `+++` for one, so this is its only file row.
+fn binary_file(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("Binary files ")?;
+    let (_, head) = rest.split_once(" and ")?;
+    let head = head.strip_suffix(" differ")?;
+    header_path(head, "b/")
 }
 
 fn diff_row(

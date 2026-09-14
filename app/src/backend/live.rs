@@ -111,8 +111,8 @@ pub async fn connect(
     })
 }
 
-pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, LiveUpdate> {
-    iced::futures::stream::unfold(
+pub fn live_events(rpc: String) -> futures::stream::BoxStream<'static, LiveUpdate> {
+    futures::stream::unfold(
         LiveEventState {
             rpc,
             cursors: BTreeMap::new(),
@@ -123,7 +123,7 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
         },
         |mut state| async move {
             // One subscription item may exist outside this stream at a time.
-            // iced drops the generated LiveUpdated message after `update`;
+            // The app drops the LiveUpdated message after `update`;
             // that drop is the acknowledgement that releases this permit.
             let publication_permit = state
                 .publication_gate
@@ -256,7 +256,7 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                     //
                     // No de-duplication here, deliberately: the handler stops a
                     // tip immediately after the head assignment
-                    // (`handlers/lifecycle.ice`), so a repeated height costs two
+                    // in the live-update handler, so a repeated height costs two
                     // scalar writes and no fold. Suppressing it would buy that
                     // back at the price of carrying a last-height in this state,
                     // and the fold path — the part that actually cost something
@@ -348,8 +348,8 @@ async fn collect_ready_chat_updates(
     batch
 }
 
-/// The complete chat-owned result of one live batch. Ice crosses the extern
-/// boundary once with each list, then assigns the result fields; no delta in
+/// The complete chat-owned result of one live batch. Each list is folded
+/// once before the app assigns the result fields; no delta in
 /// the batch can wander through Pages, Bell, or Forge lifecycle reducers.
 /// THE CHAT TAB'S TIMELINE IS NOT IN HERE. The Chat tab is a module-owned
 /// view on the kernel contract: it re-reads its own room on the same block
@@ -426,8 +426,7 @@ fn fold_channel_updated(state: &mut ChatFoldState, channel_id: String, channel: 
 
 /// Fold one ordered live chat batch in one Rust ownership domain. Lists move
 /// into this function once, then each delta mutates those owned lists in
-/// sequence. This replaces the former Ice handler's repeated by-value extern
-/// calls, which deep-cloned the whole timeline for every operation.
+/// sequence, without cloning the whole timeline for every operation.
 #[allow(clippy::too_many_arguments)]
 pub fn fold_live_chat(
     deltas: Vec<ChatDelta>,
@@ -609,10 +608,28 @@ pub(crate) async fn folded_update(
             // row from its canonical record instead of guessing the count.
             let delta = match delta {
                 ChatDelta::ChannelRefresh { channel_id } => {
-                    let channel = match load_channel_row(rpc, &channel_id).await {
+                    // Named through the same cached directory as the fold:
+                    // the seats under the room are the reader's own "you"
+                    // and their peers' names, not bare account numbers.
+                    let channel = match load_channel_row(rpc, &channel_id, facts.reader()).await
+                    {
                         Ok(Some(channel)) => channel,
                         Ok(None) | Err(_) => return Some(live_resync("chat", height)),
                     };
+                    tracing::debug!(
+                        target: "ducktape::live",
+                        channel = %channel_id,
+                        seats = channel.huddle.len(),
+                        height,
+                        "chat.channel_refresh"
+                    );
+                    let a_join = matches!(
+                        chat::decode_msg(&payload),
+                        Ok(ChatMsg::JoinHuddle { .. })
+                    );
+                    if a_join {
+                        notify_huddle_started(&channel);
+                    }
                     ChatDelta::ChannelUpdated {
                         channel_id,
                         channel,
@@ -709,9 +726,10 @@ fn stream_origin_kind(kind: &ducktape_rpc::StreamOriginKind) -> &'static str {
 pub(crate) async fn load_channel_row(
     rpc: &str,
     channel_id: &str,
+    reader: ChatReader<'_>,
 ) -> Result<Option<ChatChannel>, String> {
     let rpc = rpc_client(rpc)?;
-    let room = load_channel_facts(&rpc, channel_id, ChatReader::nobody()).await?;
+    let room = load_channel_facts(&rpc, channel_id, reader).await?;
     Ok(room.map(|(channel, _roster)| channel))
 }
 
@@ -786,17 +804,12 @@ pub async fn live_resync_load(
 }
 
 /// Did this live update say `want`'s plane went stale?
-///
-/// AN EXTERN, not a `let`, because the Ice checker cannot type a subscription
-/// payload's field inside one (`handlers/overlays.ice` records the same
-/// limitation) — which is why `forge_live_hit` is one too. Taking the wanted
-/// module as an argument keeps it to a single predicate for every plane.
 pub fn plane_live_hit(kind: crate::LiveKind, module: String, want: String) -> bool {
     kind == crate::LiveKind::Plane && module == want
 }
 
 // per-field keepers: apply a refreshed value only when its plane loaded —
-// the Ice handler assigns every field unconditionally and these self-select.
+// unchanged planes retain their current values.
 
 /// The channel keeper folds rather than replaces — [`upsert_channel_rows`]
 /// states why — and it owns the loaded pick so the fold is never paid for on a
@@ -975,6 +988,7 @@ pub async fn create_channel(
     password: String,
     name: String,
     members_only: bool,
+    voice: bool,
     generation: i64,
 ) -> Result<ChatData, AppError> {
     async {
@@ -982,20 +996,27 @@ pub async fn create_channel(
         let landing_name = name.clone();
         let channel_id = fresh_id("channel");
         let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::CreateChannel {
+        let op = match voice {
+            true => ChatMsg::CreateVoiceChannel {
+                channel_id: channel_id.clone(),
+                name,
+            },
+            false => ChatMsg::CreateChannel {
                 channel_id: channel_id.clone(),
                 name,
                 post_policy: match members_only {
                     true => PostPolicy::MembersOnly,
                     false => PostPolicy::Open,
                 },
-            }),
-            password,
-        )
-        .await?;
+            },
+        };
+        signed_write(&rpc, "chat", chat::encode_msg(&op), password).await?;
+        // a voice room is entered, not read: the room on screen stays
+        if voice {
+            let mut data = load_chat_data(&rpc, None).await.map_err(committed_error)?;
+            data.generation = generation;
+            return Ok(data);
+        }
         let data = load_chat_data(&rpc, Some(&channel_id))
             .await
             .map_err(committed_error)?;
@@ -1105,7 +1126,7 @@ pub fn dm_channel_id(a: String, b: String) -> String {
 /// key names draws `DmHeader` with his avatar and name and SUPPRESSES the `#`
 /// glyph and `active_channel_name` — while a key whose peer has left the
 /// identity roster resolves to the blank row and falls THROUGH to that title
-/// (the `empty(active_dm.name)` arms in `screens/chat.ice`), instead of drawing
+/// in the Chat view, instead of drawing
 /// a nameless avatar plate the way branching on the key itself did.
 ///
 /// Cleared by the channel picker alone, it rode a search hit, a create, a

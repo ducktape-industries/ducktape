@@ -19,9 +19,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use ducktape_view_guest::host;
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
 
 /// One page of roots, replies or hits — chat's own index page size.
 const PAGE_LIMIT: usize = 64;
@@ -44,6 +44,38 @@ pub struct ChatChannel {
     pub members_only: bool,
     pub huddle_count: i64,
     pub head_seq: i64,
+    /// Who is in the room's huddle, join order.
+    #[serde(default)]
+    pub huddle: Vec<HuddleSeat>,
+    /// A voice room: listed under "Voice", entered by joining its huddle.
+    #[serde(default)]
+    pub voice: bool,
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct HuddleSeat {
+    pub label: String,
+    pub initials: String,
+    pub is_you: bool,
+    /// The seat's node key — what `speaking_peers` names.
+    pub node: String,
+}
+
+/// Does the window on screen run up to the room's head — its newest landed
+/// message is the room's newest? A landing or an older page can, and then
+/// its tail is the latest; a pending row (seq 0) never counts.
+pub fn window_reaches_head(messages: &[ChatMessage], head_seq: i64) -> bool {
+    let newest = messages.iter().map(|message| message.seq).max().unwrap_or(0);
+    newest >= head_seq
+}
+
+/// Is this seat talking: the reader's own seat reads the local voice gate,
+/// any other reads the peer beacons by node key.
+pub fn seat_speaking(seat: &HuddleSeat, call_speaking: bool, speaking_peers: &[String]) -> bool {
+    match seat.is_you {
+        true => call_speaking,
+        false => speaking_peers.contains(&seat.node),
+    }
 }
 
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
@@ -78,6 +110,75 @@ pub struct ChatBlock {
     pub lang: String,
     pub rich: bool,
     pub spans: Vec<ChatSpan>,
+    /// An `attachment` block's destination: the file the send put beside
+    /// the message, which `text` names.
+    pub link: String,
+}
+
+/// Where a send puts a message's files; a paragraph that is one link into
+/// it reads as a file card, not a line of text.
+pub const ATTACHMENTS_PREFIX: &str = "duck://files/shared/attachments/";
+
+/// The host picture slot this view draws into.
+pub const PICTURE_SURFACE: &str = "chat";
+/// The box a picture attachment is shown in: it fits inside, keeping its
+/// shape, and never grows past its own size.
+pub const PICTURE_BOX: (f64, f64) = (360., 280.);
+
+/// A file the host can decode for the timeline, by its name.
+pub fn is_picture(name: &str) -> bool {
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
+    )
+}
+
+/// The duckfs path behind an attachment link: the scheme and host dropped,
+/// the query too.
+pub fn attachment_file_path(link: &str) -> String {
+    let path = link.strip_prefix("duck://files").unwrap_or(link);
+    path.split('?').next().unwrap_or_default().to_owned()
+}
+
+/// Every picture attachment across the timeline and the thread, once each,
+/// in reading order.
+pub fn picture_links(messages: &[ChatMessage], thread: &[ChatMessage]) -> Vec<String> {
+    let mut links = Vec::new();
+    for message in messages.iter().chain(thread) {
+        for block in &message.blocks {
+            let picture = block.kind == "attachment" && is_picture(&block.text);
+            if picture && !links.contains(&block.link) {
+                links.push(block.link.clone());
+            }
+        }
+    }
+    links
+}
+
+/// The size a picture is drawn at in the timeline: inside [`PICTURE_BOX`],
+/// keeping its shape, and no larger than it is.
+pub fn picture_box(width: i64, height: i64) -> (f32, f32) {
+    let (width, height) = (width.max(1) as f64, height.max(1) as f64);
+    let scale = (PICTURE_BOX.0 / width).min(PICTURE_BOX.1 / height).min(1.);
+    ((width * scale).round() as f32, (height * scale).round() as f32)
+}
+
+/// Ask the host to decode a duckfs picture into this view's slot; the
+/// answer is the size it will be drawn at.
+pub async fn picture_load(path: String) -> Result<(i64, i64), String> {
+    let drawn = ask(
+        "picture.load",
+        &serde_json::json!({ "surface": PICTURE_SURFACE, "path": path }),
+    )
+    .await?;
+    Ok((
+        drawn["width"].as_i64().unwrap_or(0),
+        drawn["height"].as_i64().unwrap_or(0),
+    ))
 }
 
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
@@ -151,6 +252,69 @@ pub struct LiveRunHint {
     pub dispatch_id: String,
     pub agent: String,
     pub status: String,
+    /// what the run has done so far, oldest first
+    #[serde(default)]
+    pub activity: Vec<LiveActivity>,
+    /// the answer as it is being written, clipped by the app
+    #[serde(default)]
+    pub answer_preview: String,
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct LiveActivity {
+    pub label: String,
+    pub done: bool,
+}
+
+/// A run in flight drawn as a message from its agent: the byline is the
+/// agent's, the body is what it has done and is writing, the caption its
+/// status. Nothing here is on the chain, so the row is pending and has no
+/// seq to select or thread.
+pub fn live_run_message(run: &LiveRunHint) -> ChatMessage {
+    let paragraph = |text: String| ChatBlock {
+        kind: "paragraph".into(),
+        text,
+        ..ChatBlock::default()
+    };
+    let mut blocks: Vec<ChatBlock> = run
+        .activity
+        .iter()
+        .map(|act| {
+            let mark = if act.done { "✓" } else { "·" };
+            paragraph(format!("{mark} {}", act.label))
+        })
+        .collect();
+    if !run.answer_preview.is_empty() {
+        blocks.push(paragraph(run.answer_preview.clone()));
+    }
+    ChatMessage {
+        id: format!("live/{}", run.run_id),
+        view_key: live_view_key(&run.run_id),
+        author: run.agent.clone(),
+        meta: run.status.clone(),
+        blocks,
+        pending: true,
+        show_author: true,
+        initial: run
+            .agent
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_default(),
+        avatar_kind: "agent".into(),
+        ..ChatMessage::default()
+    }
+}
+
+/// A negative, stable view key for a live row, off the seq space real
+/// messages key by.
+fn live_view_key(run_id: &str) -> i64 {
+    let hash = run_id
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |acc, byte| {
+            (acc ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    -((hash >> 1) as i64).max(1)
 }
 
 /// A body the composer surface has handed to the app but the chain has not
@@ -228,6 +392,10 @@ pub struct Session {
     pub huddle_joined_at: i64,
     pub huddle_now: i64,
     pub call_muted: bool,
+    /// the reader's own mic voice gate is open
+    pub call_speaking: bool,
+    /// the node keys of the peers whose call beacons say they are talking
+    pub speaking_peers: Vec<String>,
     /// the reader is holding ⇧: the copy range's gesture, and the guest sees
     /// no modifiers of its own
     pub shift_held: bool,
@@ -250,8 +418,8 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("chat.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -431,7 +599,7 @@ async fn view(variant: &str, query: serde_json::Value) -> Result<serde_json::Val
 }
 
 /// What the room subscription is keyed by: a fresh key re-reads the room.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomKey {
     pub serial: i64,
     pub names: i64,
@@ -469,8 +637,8 @@ pub struct RoomItem {
 
 /// The room now and after every chat block: read once per key, then again on
 /// each `rpc.live` hit for the chat plane.
-pub fn room(key: RoomKey) -> iced::Subscription<RoomItem> {
-    iced::Subscription::run_with(key, |key| {
+pub fn room(key: RoomKey) -> ducktape_view_guest::Subscription<RoomItem> {
+    ducktape_view_guest::Subscription::run_with(key, |key| {
         let key = key.clone();
         let live = host::subscribe("rpc.live", b"chat");
         let first = read_room(key.clone());
@@ -606,10 +774,7 @@ async fn older_roots_exist(channel: &str, floor: u64) -> Result<bool, String> {
         }),
     )
     .await?;
-    Ok(!page["roots"]
-        .as_array()
-        .map(Vec::is_empty)
-        .unwrap_or(true))
+    Ok(!page["roots"].as_array().map(Vec::is_empty).unwrap_or(true))
 }
 
 async fn read_members(channel: &str, names: &Names) -> Result<Vec<ChatMember>, String> {
@@ -642,7 +807,7 @@ async fn read_members(channel: &str, names: &Names) -> Result<Vec<ChatMember>, S
 }
 
 /// What the thread subscription is keyed by.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadKey {
     pub serial: i64,
     pub names: i64,
@@ -684,8 +849,8 @@ pub struct ThreadItem {
 }
 
 /// The open thread now and after every chat block.
-pub fn thread(key: ThreadKey) -> iced::Subscription<ThreadItem> {
-    iced::Subscription::run_with(key, |key| {
+pub fn thread(key: ThreadKey) -> ducktape_view_guest::Subscription<ThreadItem> {
+    ducktape_view_guest::Subscription::run_with(key, |key| {
         let key = key.clone();
         let live = host::subscribe("rpc.live", b"chat");
         let first = read_thread(key.clone());
@@ -759,7 +924,7 @@ async fn read_thread_now(key: &ThreadKey, names: &Names) -> Result<ThreadItem, S
 }
 
 /// What the search subscription is keyed by: an empty query reads nothing.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchKey {
     pub serial: i64,
     pub names: i64,
@@ -782,8 +947,8 @@ pub struct SearchItem {
 }
 
 /// One workspace-wide message search, run once per query.
-pub fn search(key: SearchKey) -> iced::Subscription<SearchItem> {
-    iced::Subscription::run_with(key, |key| stream::once(read_search(key.clone())))
+pub fn search(key: SearchKey) -> ducktape_view_guest::Subscription<SearchItem> {
+    ducktape_view_guest::Subscription::run_with(key, |key| stream::once(read_search(key.clone())))
 }
 
 async fn read_search(key: SearchKey) -> SearchItem {
@@ -815,9 +980,9 @@ async fn read_search(key: SearchKey) -> SearchItem {
     }
 }
 
-/// The node's hit rows as the palette and the search float draw them. THE ROOM
-/// COMES FIRST in `meta`, because it is the thing a hit is missing: `#12` alone
-/// reads as a CHANNEL in this app, while it is the message's sequence number.
+/// The node's hit rows as the search results draw them. `meta` says
+/// "message 12", never `#12`: a bare `#12` reads as a CHANNEL in this app.
+/// The room is the view's to name — it holds the channel list.
 pub fn fold_hits(reply: &serde_json::Value, names: &Names) -> Vec<ChatSearchHit> {
     reply
         .as_array()
@@ -828,7 +993,7 @@ pub fn fold_hits(reply: &serde_json::Value, names: &Names) -> Vec<ChatSearchHit>
             let channel_id = hit["channel_id"].as_str().unwrap_or_default().to_owned();
             let seq = hit["seq"].as_i64().unwrap_or(0);
             ChatSearchHit {
-                meta: format!("{channel_id} · #{seq}"),
+                meta: format!("message {seq}"),
                 root_seq: hit["thread"].as_i64().unwrap_or(seq),
                 author: author_display(hit["author"].as_str().unwrap_or_default(), names),
                 text: hit["text"].as_str().unwrap_or_default().to_owned(),
@@ -1167,6 +1332,7 @@ fn block_view(block: &serde_json::Value, names: &Names) -> ChatBlock {
             lang: payload["lang"].as_str().unwrap_or_default().to_owned(),
             rich: false,
             spans: Vec::new(),
+            link: String::new(),
         },
         _ => ChatBlock {
             kind: "divider".into(),
@@ -1197,16 +1363,39 @@ fn rich_block(kind: &str, spans: &serde_json::Value, names: &Names) -> ChatBlock
     let marked = runs
         .iter()
         .any(|span| !span["marks"].as_array().is_none_or(Vec::is_empty));
+    let views = match marked {
+        true => run_spans(&runs, names),
+        false => Vec::new(),
+    };
+    if let Some(attachment) = attachment_block(kind, &views) {
+        return attachment;
+    }
     ChatBlock {
         kind: kind.into(),
         text: span_text(spans, names),
         lang: String::new(),
-        spans: match marked {
-            true => run_spans(&runs, names),
-            false => Vec::new(),
-        },
+        spans: views,
         rich: marked,
+        link: String::new(),
     }
+}
+
+/// A paragraph that is exactly one link into the attachments root: the
+/// card the send's link line becomes.
+fn attachment_block(kind: &str, spans: &[ChatSpan]) -> Option<ChatBlock> {
+    let [only] = spans else {
+        return None;
+    };
+    let is_file = kind == "paragraph" && only.link.starts_with(ATTACHMENTS_PREFIX);
+    if !is_file {
+        return None;
+    }
+    Some(ChatBlock {
+        kind: "attachment".into(),
+        text: only.link_text.clone(),
+        link: only.link.clone(),
+        ..ChatBlock::default()
+    })
 }
 
 fn span_text(spans: &serde_json::Value, names: &Names) -> String {
@@ -1300,7 +1489,10 @@ fn avatar_initial(author: &str, names: &Names) -> String {
     source
         .chars()
         .find(char::is_ascii_alphanumeric)
-        .map_or_else(|| "•".into(), |glyph| glyph.to_ascii_uppercase().to_string())
+        .map_or_else(
+            || "•".into(),
+            |glyph| glyph.to_ascii_uppercase().to_string(),
+        )
 }
 
 /// A person's key or account is `human`; a program account (an agent's) and
@@ -1345,8 +1537,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_bytes(hex: &str) -> Vec<u8> {
-    let looks_hex =
-        !hex.is_empty() && hex.len().is_multiple_of(2) && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    let looks_hex = !hex.is_empty()
+        && hex.len().is_multiple_of(2)
+        && hex.bytes().all(|b| b.is_ascii_hexdigit());
     if !looks_hex {
         return Vec::new();
     }
@@ -1392,8 +1585,8 @@ fn submit(message: serde_json::Value) -> bool {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;
@@ -1612,6 +1805,12 @@ pub fn send_join_huddle() -> bool {
     notify("chat.join_huddle", &())
 }
 
+/// Enter a voice room from the room list: the app joins (or moves to) its
+/// huddle without changing the room on screen.
+pub fn send_join_voice(id: &str) -> bool {
+    notify("chat.join_voice", &Channel { id: id.into() })
+}
+
 pub fn send_scrolled(absolute_x: f64, absolute_y: f64, relative_x: f64, relative_y: f64) -> bool {
     notify(
         "chat.scrolled",
@@ -1673,7 +1872,7 @@ pub fn near_scroll_top(relative_offset: f64) -> bool {
 }
 
 /// Is the reader AT the live tail — the other end of the same offset. A NaN
-/// offset (content that fits, which iced reports as `0/0`) reads as AT THE
+/// offset (`0/0` when content fits) reads as AT THE
 /// TAIL, and NaN compares false against everything, so the band is written as
 /// the comparison plus that case.
 pub fn near_scroll_tail(relative_offset: f64) -> bool {
@@ -1711,10 +1910,6 @@ pub(crate) fn copy_range_after_press(
         head: seq,
         surface: surface_name(pressed_in),
     }
-}
-
-pub fn icon(name: &str) -> Vec<u8> {
-    design::icons::svg(name).as_bytes().to_vec()
 }
 
 pub fn connection_degraded(status: &str) -> bool {
@@ -1760,25 +1955,17 @@ pub fn run_in_thread(live: &LiveRunHint, active_thread_seq: i64) -> bool {
     live.anchor_seq == active_thread_seq || live.thread_root == active_thread_seq
 }
 
-/// `chiefduck · View thread` — the live run card's one label.
+/// `Open chiefduck’s thread` — the live run's door in the timeline.
 pub fn live_thread_label(agent: &str) -> String {
-    format!("{agent} · View thread")
+    format!("Open {agent}’s thread")
 }
 
-/// The stream and the runs live in it, as one value: the timeline memo hashes
-/// its one dependency, so the two lists that draw together must cross the
-/// boundary together — a run's status folded into `live_agents` alone would
-/// leave the memo's key unmoved and the hint would never repaint.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
-pub struct Timeline {
-    pub messages: Vec<ChatMessage>,
-    pub live_agents: Vec<LiveRunHint>,
-}
-
-pub fn timeline_of(messages: &[ChatMessage], live_agents: &[LiveRunHint]) -> Timeline {
-    Timeline {
-        messages: messages.to_vec(),
-        live_agents: live_agents.to_vec(),
+/// A node's failure as a sentence: what the view was doing, then the reason.
+/// An empty reason stays empty — nothing failed.
+pub fn failure_note(doing: &str, error: &str) -> String {
+    match error.is_empty() {
+        true => String::new(),
+        false => format!("{doing}: {error}"),
     }
 }
 
@@ -1966,6 +2153,21 @@ pub fn thread_width_after_delta(width: f64, delta: f64, viewport: f64, sidebar: 
     (width + delta).clamp(280.0, maximum)
 }
 
+/// Where a floating menu of `size` sits for a press at `press` inside a
+/// `viewport`: its top-left at the pointer, flipped left or up when it would
+/// run off an edge, and never past the top-left corner.
+pub fn menu_origin(press: (f64, f64), size: (f64, f64), viewport: (f64, f64)) -> (f64, f64) {
+    const GUTTER: f64 = 8.0;
+    let (px, py) = press;
+    let (w, h) = size;
+    let (vw, vh) = viewport;
+    let fits_right = px + w + GUTTER <= vw;
+    let fits_below = py + h + GUTTER <= vh;
+    let x = if fits_right { px } else { px - w };
+    let y = if fits_below { py + 4.0 } else { py - h - 4.0 };
+    (x.max(GUTTER), y.max(GUTTER))
+}
+
 pub fn block_action_menu_y(pointer_y: f64, viewport_height: f64) -> f64 {
     let below = (pointer_y - 4.0).max(0.0);
     let below_fits = below + 190.0 <= viewport_height;
@@ -1973,6 +2175,14 @@ pub fn block_action_menu_y(pointer_y: f64, viewport_height: f64) -> f64 {
         below
     } else {
         (pointer_y - 190.0).max(0.0)
+    }
+}
+
+/// The line over a search's hits: how many, for what.
+pub fn search_summary(hits: usize, query: &str) -> String {
+    match hits {
+        1 => format!("1 result for “{query}”"),
+        hits => format!("{hits} results for “{query}”"),
     }
 }
 
@@ -2012,9 +2222,9 @@ fn grouped_digits(value: i64) -> String {
 
 pub fn height_label(height: i64) -> String {
     if height < 0 {
-        return "h —".into();
+        return "block —".into();
     }
-    format!("h {}", grouped_digits(height))
+    format!("block {}", grouped_digits(height))
 }
 
 pub fn height_label_short(height: i64) -> String {
@@ -2085,14 +2295,6 @@ pub(crate) fn surface_name(surface: crate::CopySurface) -> String {
     .to_owned()
 }
 
-pub(crate) fn tone_of(dark: bool) -> crate::Tone {
-    if dark {
-        crate::Tone::Dark
-    } else {
-        crate::Tone::Light
-    }
-}
-
 pub fn no_dm_peer() -> DmPeer {
     DmPeer::default()
 }
@@ -2116,6 +2318,87 @@ pub fn message_target_key(messages: &[ChatMessage], target: i64, changed: bool) 
 mod tests {
     use super::*;
     use crate::CopySurface;
+
+    /// A MENU OPENS AT THE POINTER AND FLIPS AWAY FROM THE EDGE IT WOULD
+    /// CROSS: the "…" at a row's right end opens its menu to the left, a
+    /// press near the bottom opens upward, and a corner press never leaves
+    /// the screen.
+    /// The link line a send with files posts reads as a file card; any
+    /// other link, or a link with words around it, stays a line of text.
+    #[test]
+    fn a_lone_link_into_the_attachments_root_is_a_file_card() {
+        let names = Names::default();
+        let file = serde_json::json!({"paragraph": [{"text": "deck.pdf", "marks": [{"link": "duck://files/shared/attachments/message-1-2/deck.pdf"}]}]});
+        let block = block_view(&file, &names);
+        assert_eq!(block.kind, "attachment");
+        assert_eq!(block.text, "deck.pdf");
+        assert_eq!(block.link, "duck://files/shared/attachments/message-1-2/deck.pdf");
+        let web = serde_json::json!({"paragraph": [{"text": "site", "marks": [{"link": "https://example.com"}]}]});
+        assert_eq!(block_view(&web, &names).kind, "paragraph");
+        let worded = serde_json::json!({"paragraph": [{"text": "see ", "marks": []}, {"text": "deck.pdf", "marks": [{"link": "duck://files/shared/attachments/message-1-2/deck.pdf"}]}]});
+        assert_eq!(block_view(&worded, &names).kind, "paragraph");
+    }
+
+    /// A picture attachment is asked for once by its link, fetched by its
+    /// duckfs path, and drawn inside the box keeping its shape.
+    /// The reader's seat lights from the local gate; a peer's from the
+    /// beacons, by node key.
+    #[test]
+    fn a_seat_lights_from_the_local_gate_or_the_peer_beacons() {
+        let seat = |is_you: bool, node: &str| HuddleSeat {
+            label: "A".into(),
+            initials: "A".into(),
+            is_you,
+            node: node.into(),
+        };
+        let peers = vec!["bb".to_owned()];
+        assert!(seat_speaking(&seat(true, "aa"), true, &peers));
+        assert!(!seat_speaking(&seat(true, "bb"), false, &peers));
+        assert!(seat_speaking(&seat(false, "bb"), false, &peers));
+        assert!(!seat_speaking(&seat(false, "aa"), true, &peers));
+    }
+
+    #[test]
+    fn picture_attachments_are_found_once_and_fit_the_box() {
+        assert!(is_picture("Cover.PNG") && is_picture("a.jpeg") && !is_picture("deck.pdf"));
+        assert_eq!(
+            attachment_file_path("duck://files/shared/attachments/a-1/x.png?net=abcd1234"),
+            "/shared/attachments/a-1/x.png"
+        );
+        let block = |name: &str| ChatBlock {
+            kind: "attachment".into(),
+            text: name.into(),
+            link: format!("duck://files/shared/attachments/a-1/{name}"),
+            ..ChatBlock::default()
+        };
+        let message = |blocks: Vec<ChatBlock>| ChatMessage {
+            blocks,
+            ..ChatMessage::default()
+        };
+        let links = picture_links(
+            &[message(vec![block("x.png"), block("deck.pdf")])],
+            &[message(vec![block("x.png"), block("y.gif")])],
+        );
+        assert_eq!(
+            links,
+            vec![
+                "duck://files/shared/attachments/a-1/x.png".to_owned(),
+                "duck://files/shared/attachments/a-1/y.gif".to_owned()
+            ]
+        );
+        assert_eq!(picture_box(1200, 600), (360., 180.));
+        assert_eq!(picture_box(300, 900), (93., 280.));
+        assert_eq!(picture_box(200, 100), (200., 100.));
+    }
+
+    #[test]
+    fn a_menu_opens_at_the_pointer_and_flips_away_from_the_edges() {
+        let viewport = (1000.0, 600.0);
+        assert_eq!(menu_origin((100.0, 100.0), (200.0, 150.0), viewport), (100.0, 104.0));
+        assert_eq!(menu_origin((950.0, 100.0), (200.0, 150.0), viewport), (750.0, 104.0));
+        assert_eq!(menu_origin((100.0, 550.0), (200.0, 150.0), viewport), (100.0, 396.0));
+        assert_eq!(menu_origin((2.0, 2.0), (200.0, 150.0), viewport), (8.0, 8.0));
+    }
 
     /// A ⇧-PRESS WITH NO RANGE OPEN STARTS ONE ON THE ROW IT LANDED ON, and
     /// the next widens it. A plain press never reaches here — the handler

@@ -1,13 +1,19 @@
-ui_lang::include_app!("src/ui/app.ice");
+#[path = "ui/app.rs"]
+mod app_state;
+pub(crate) use app_state::*;
 
 mod backend;
 mod call;
 mod composer_surface;
 mod editor;
 mod module_view;
+mod shell;
+mod secret;
+mod tray;
+mod view_tree;
 mod video;
 
-fn main() -> iced::Result {
+fn main() {
     install_log();
     // macOS launches a GUI with a 256-fd soft limit; the app's own stores,
     // sockets and the node it hosts hit that as a bare EMFILE. raised AFTER
@@ -30,13 +36,12 @@ fn main() -> iced::Result {
     // the desktop's own views are there before the window is: a tab's
     // first draw never finds a load on its way
     module_view::booted().joined();
-    Ducktape::run()
+    shell::run();
 }
 
-/// the app's own sink: `<DUCKTAPE_HOME or ~/.ducktape>/app.log`, rotated at
+/// The app's sink is `app.log` in its platform state directory, rotated at
 /// open exactly like the node's `daemon.log`, plus a panic hook that lands in
-/// it. the FILE ONLY — a GUI's stderr is `/dev/null` under every launcher a
-/// member actually uses, and iced's own prints are all a terminal should see.
+/// it. The file remains available when a desktop launcher discards stderr.
 ///
 /// `RUST_LOG` ADDS to `info` rather than replacing it, the `noded::log` rule:
 /// `RUST_LOG=ducktape::auth=debug` turns one plane up without turning the rest

@@ -1,24 +1,17 @@
-//! Desktop font identity and the product type scale. Shared color, shape, and
-//! component tokens come from `ducktape-ui`; this crate only owns assets that
-//! are specific to the Ducktape application.
+//! The product's visual system: bundled fonts, the type scale, and the one
+//! palette both the native shell (through the kit's theme) and the WASM
+//! views (through `ducktape_view_guest::kit`) paint with.
 
-/// Font identity. The app embeds these files via `app.ice` `font "…"`
-/// settings (paths under this crate's `assets/fonts/`), and `theme.ice`
-/// binds roles to the family names. Swap the face by replacing the asset
-/// and the family constant together — the app's guard test pins the two to
-/// each other.
+/// Font identity. The native shell loads these files into GPUI's text system.
+/// Guest wire text names the same families. Replace an asset and its family
+/// constant together when changing the product face.
 pub mod fonts {
     /// the UI face — every sans role (default, medium, display).
     pub const FAMILY_UI: &str = "Geist";
     /// the data face — hashes, seqs, diffs, code, the log ring.
     pub const FAMILY_MONO: &str = "Geist Mono";
-    /// the embedded files, relative to this crate's root — what `app.ice`
-    /// points its `font` settings at. The emoji face is not a type role:
-    /// it exists so cosmic-text's emoji fallback RESOLVES in-process — an
-    /// unresolved emoji re-scans the whole font database on every fresh
-    /// paragraph (~3.7ms per emoji, uncached), and the chat row toolbar
-    /// carries three of them, which turned every freshly mounted row into
-    /// ~11ms of layout and a channel switch into a half-second freeze.
+    /// Bundled files relative to this crate. The emoji face supplies fallback
+    /// glyphs; it is not a separate product type role.
     pub const ASSETS: [&str; 3] = [
         "assets/fonts/Geist[wght].ttf",
         "assets/fonts/GeistMono[wght].ttf",
@@ -26,260 +19,319 @@ pub mod fonts {
     ];
 }
 
-/// The product type roles from the canonical Ducktape design artifact. The
-/// drift guard walks every app-authored `.ice` source and rejects other sizes.
+/// Text sizes, in pixels. One dense scale for the shell and every view: the
+/// body is 13px and nothing in the chrome is louder than 16px.
 pub mod type_scale {
-    pub const MICRO: f64 = 7.5;
-    pub const BADGE: f64 = 9.0;
-    pub const NAV: f64 = 9.5;
-    pub const FIELD_LABEL: f64 = 10.0;
-    pub const MACHINE_META: f64 = 10.5;
-    pub const META: f64 = 11.0;
-    pub const CONTROL: f64 = 11.5;
-    pub const MACHINE: f64 = 12.0;
-    pub const CAPTION: f64 = 12.5;
-    pub const LIST: f64 = 13.0;
-    pub const BODY: f64 = 13.5;
-    pub const PANE_HEADER: f64 = 14.0;
-    pub const SECTION: f64 = 16.0;
-    pub const SCREEN_TITLE: f64 = 20.0;
-    pub const DISPLAY: f64 = 22.0;
-
-    /// every legal `size=` literal in `.ice` sources, the guard's whitelist.
-    /// `1.0` is the established off-screen focus-shim size, not a text step.
-    ///
-    /// A role earns its place here by being USED. The whitelist is the only
-    /// thing standing between "a type role" and "whatever this screen needed",
-    /// so an entry with no caller costs the guard real teeth and buys nothing —
-    /// it silently pre-approves a size the design never asked for.
-    pub const ALL: [f64; 16] = [
-        MICRO,
-        BADGE,
-        NAV,
-        FIELD_LABEL,
-        MACHINE_META,
-        META,
-        CONTROL,
-        MACHINE,
-        CAPTION,
-        LIST,
-        BODY,
-        PANE_HEADER,
-        SECTION,
-        SCREEN_TITLE,
-        DISPLAY,
-        1.0,
-    ];
+    /// a page title — a view's own title row
+    pub const TITLE: f64 = 16.;
+    /// a section title inside a view
+    pub const SECTION: f64 = 13.5;
+    /// The native shell's default text size.
+    pub const BODY: f64 = 13.;
+    /// secondary copy beside body text
+    pub const SECONDARY: f64 = 12.;
+    /// a caption, a timestamp, a badge
+    pub const CAPTION: f64 = 11.;
+    /// identifiers in the data face
+    pub const MONO: f64 = 12.;
 }
 
-/// The line icon set, lifted glyph-for-glyph out of the canonical design
-/// artifact. Every file is a 24×24 stroke drawing on `currentColor`, so one
-/// asset serves every tone: the view tints it through the `icon_tint` SVG
-/// style rather than shipping a per-color copy.
-pub mod icons {
-    /// The SVG source for `name`, or an empty document when the name is not in
-    /// the set. An unknown name renders nothing instead of panicking a view.
-    pub fn svg(name: &str) -> &'static str {
-        match name {
-            "agent-tile" => include_str!("../assets/icons/agent-tile.svg"),
-            "arrow-right" => include_str!("../assets/icons/arrow-right.svg"),
-            "bell" => include_str!("../assets/icons/bell.svg"),
-            "branch" => include_str!("../assets/icons/branch.svg"),
-            "brightness" => include_str!("../assets/icons/brightness.svg"),
-            "camera" => include_str!("../assets/icons/camera.svg"),
-            "camera-off" => include_str!("../assets/icons/camera-off.svg"),
-            "check" => include_str!("../assets/icons/check.svg"),
-            "chevron-down" => include_str!("../assets/icons/chevron-down.svg"),
-            "chevron-right" => include_str!("../assets/icons/chevron-right.svg"),
-            "code-brackets" => include_str!("../assets/icons/code-brackets.svg"),
-            "code-slash" => include_str!("../assets/icons/code-slash.svg"),
-            "collapse" => include_str!("../assets/icons/collapse.svg"),
-            "copy" => include_str!("../assets/icons/copy.svg"),
-            "copy-lg" => include_str!("../assets/icons/copy-lg.svg"),
-            "doc" => include_str!("../assets/icons/doc.svg"),
-            "dot" => include_str!("../assets/icons/dot.svg"),
-            "emoji" => include_str!("../assets/icons/emoji.svg"),
-            "external" => include_str!("../assets/icons/external.svg"),
-            "file" => include_str!("../assets/icons/file.svg"),
-            "folder" => include_str!("../assets/icons/folder.svg"),
-            "gear" => include_str!("../assets/icons/gear.svg"),
-            "gear-rays" => include_str!("../assets/icons/gear-rays.svg"),
-            "headphones" => include_str!("../assets/icons/headphones.svg"),
-            "inline-ref" => include_str!("../assets/icons/inline-ref.svg"),
-            "issue-closed" => include_str!("../assets/icons/issue-closed.svg"),
-            "issue-open" => include_str!("../assets/icons/issue-open.svg"),
-            "link" => include_str!("../assets/icons/link.svg"),
-            "list" => include_str!("../assets/icons/list.svg"),
-            "lock" => include_str!("../assets/icons/lock.svg"),
-            "mic" => include_str!("../assets/icons/mic.svg"),
-            "mic-off" => include_str!("../assets/icons/mic-off.svg"),
-            "modules" => include_str!("../assets/icons/modules.svg"),
-            "nav-agents" => include_str!("../assets/icons/nav-agents.svg"),
-            "nav-chat" => include_str!("../assets/icons/nav-chat.svg"),
-            "nav-explorer" => include_str!("../assets/icons/nav-explorer.svg"),
-            "nav-files" => include_str!("../assets/icons/nav-files.svg"),
-            "nav-forge" => include_str!("../assets/icons/nav-forge.svg"),
-            "nav-members" => include_str!("../assets/icons/nav-members.svg"),
-            "nav-pages" => include_str!("../assets/icons/nav-pages.svg"),
-            "node" => include_str!("../assets/icons/node.svg"),
-            "pencil" => include_str!("../assets/icons/pencil.svg"),
-            "pin" => include_str!("../assets/icons/pin.svg"),
-            "plus" => include_str!("../assets/icons/plus.svg"),
-            "plus-lg" => include_str!("../assets/icons/plus-lg.svg"),
-            "popout" => include_str!("../assets/icons/popout.svg"),
-            "pull-request" => include_str!("../assets/icons/pull-request.svg"),
-            "quote" => include_str!("../assets/icons/quote.svg"),
-            "screen-share" => include_str!("../assets/icons/screen-share.svg"),
-            "search" => include_str!("../assets/icons/search.svg"),
-            "search-lg" => include_str!("../assets/icons/search-lg.svg"),
-            "shield" => include_str!("../assets/icons/shield.svg"),
-            "shield-check" => include_str!("../assets/icons/shield-check.svg"),
-            "trash" => include_str!("../assets/icons/trash.svg"),
-            _ => EMPTY,
-        }
-    }
-
-    /// What an unknown name renders: a valid, invisible document.
-    pub const EMPTY: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"></svg>"#;
+/// Corner radii, in pixels. Tight: a control is barely rounded, a card a
+/// touch more, and only an avatar is a circle.
+pub mod radius {
+    /// a control: a button, an input, a list row
+    pub const CONTROL: f64 = 4.;
+    /// a card, a panel, a modal
+    pub const CARD: f64 = 6.;
+    /// a pill: an avatar
+    pub const PILL: f64 = 999.;
 }
 
-/// The artifact's ink ramp — the text/stroke colors that fade back as content
-/// recedes. `ducktape-ui` owns the semantic palette; these are the extra steps
-/// the artifact names but a semantic role has no word for.
-pub mod ink {
-    /// The darkest ink: brand tiles, primary fills, the strongest headings.
-    pub const INK: u32 = 0x26251f;
-    /// `ink` under the pointer.
-    pub const INK_HOVER: u32 = 0x322f28;
-    /// Body copy.
-    pub const BODY: u32 = 0x2c2b27;
-    /// Emphasised body — list titles, active labels.
-    pub const STRONG: u32 = 0x3f3e39;
-    /// Machine values: hashes, heights, endpoints.
-    pub const MONO: u32 = 0x5e5c55;
-    /// Secondary copy.
-    pub const MUTED: u32 = 0x6b6962;
-    /// Supporting explanation under a title.
-    pub const CAPTION: u32 = 0x9a988f;
-    /// Timestamps, counts, key fragments.
-    pub const META: u32 = 0xa7a59b;
-    /// Placeholder text.
-    pub const HINT: u32 = 0xb3b1a8;
-    /// All-caps field labels and section numbers.
-    pub const LABEL: u32 = 0xbdbbb1;
-    /// The avatar plate behind initials.
-    pub const AVATAR: u32 = 0xd2d0c7;
-    /// A rail icon nobody is pointing at.
-    pub const IDLE: u32 = 0xcbc9bf;
-    /// The label under the rail icon you are on.
-    pub const STRONG_INK: u32 = 0x3a3934;
-    /// The single accent.
-    pub const ACCENT: u32 = 0xa05a3c;
-    /// Status inks.
-    pub const SUCCESS: u32 = 0x5f9e74;
-    /// The lighter success tick used on progress marks.
-    pub const SUCCESS_TICK: u32 = 0x7ba78c;
-    /// Pending/waiting ink.
-    pub const WARNING: u32 = 0xa07b32;
-    /// Refusal/destructive ink.
-    pub const DANGER: u32 = 0xb8544c;
-    /// Paper, for ink drawn on a dark plate.
-    pub const PAPER: u32 = 0xf3f1ea;
+/// One sRGB color as the wire carries it: `[r, g, b, a]` in `0.0..=1.0`.
+pub type Color = [f32; 4];
 
-    /// The dark reading of the same ramp — the ink order mirrors (body copy
-    /// forward, each step fades toward the dark surface) and the semantic
-    /// hues lift one step so they carry on ink-dark plates. `paper` flips to
-    /// the dark plate ink for the same reason it existed at all.
-    pub fn tone_dark(name: &str) -> u32 {
-        match name {
-            "ink" => 0xe8e6df,
-            "ink-hover" => 0xf4f2ea,
-            "body" => 0xdcdad2,
-            "strong" => 0xcfcdc4,
-            "mono" => 0xb5b3a9,
-            "muted" => 0xa8a69c,
-            "caption" => 0x8f8d84,
-            "meta" => 0x7c7a71,
-            "hint" => 0x6b6a61,
-            "label" => 0x605f56,
-            "avatar" => 0x3a3931,
-            "idle" => 0x55544c,
-            "strong-ink" => 0xdcdad2,
-            "accent" => 0xc98a63,
-            "success" => 0x7fb894,
-            "success-tick" => 0x7ba78c,
-            "warning" => 0xd4a94e,
-            "danger" => 0xd97b72,
-            "paper" => 0x26251f,
-            _ => 0xa8a69c,
-        }
-    }
+/// The named colors of one appearance. Cool neutral greys, an ink sidebar in
+/// both modes, one indigo accent for what is live or chosen, and the four
+/// status tones.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Palette {
+    /// the sidebar rail: ink in both modes
+    pub sidebar: Color,
+    /// text on the sidebar
+    pub sidebar_foreground: Color,
+    /// secondary text on the sidebar: section names, the resting rows
+    pub sidebar_muted: Color,
+    /// the chosen or hovered sidebar row
+    pub sidebar_raised: Color,
+    /// hairlines on the sidebar
+    pub sidebar_border: Color,
+    /// the window
+    pub background: Color,
+    /// a sidebar, a pane, a card — one step off the window
+    pub surface: Color,
+    /// a raised surface: a hovered row, a code block
+    pub surface_raised: Color,
+    /// hairlines between regions
+    pub border: Color,
+    /// the border of a control
+    pub border_strong: Color,
+    /// body text
+    pub foreground: Color,
+    /// secondary text
+    pub muted: Color,
+    /// faint text: placeholders, disabled
+    pub faint: Color,
+    /// the accent itself: the live dot, the focus ring, the selection bar
+    pub accent: Color,
+    /// the accent as a wash behind a chosen row
+    pub accent_soft: Color,
+    /// text on the accent wash
+    pub accent_foreground: Color,
+    /// a primary action's fill (ink) and its text
+    pub primary: Color,
+    pub primary_foreground: Color,
+    pub link: Color,
+    pub success: Color,
+    pub success_soft: Color,
+    pub warning: Color,
+    pub warning_soft: Color,
+    pub danger: Color,
+    pub danger_soft: Color,
+    /// an agent's identity tint
+    pub agent: Color,
+    pub agent_soft: Color,
+}
 
-    /// The ramp keyed by the artifact's own name for each step. An unknown
-    /// tone falls back to `MUTED` so a view never renders an invisible icon.
-    pub fn tone(name: &str) -> u32 {
-        match name {
-            "ink" => INK,
-            "ink-hover" => INK_HOVER,
-            "body" => BODY,
-            "strong" => STRONG,
-            "mono" => MONO,
-            "muted" => MUTED,
-            "caption" => CAPTION,
-            "meta" => META,
-            "hint" => HINT,
-            "label" => LABEL,
-            "avatar" => AVATAR,
-            "idle" => IDLE,
-            "strong-ink" => STRONG_INK,
-            "accent" => ACCENT,
-            "success" => SUCCESS,
-            "success-tick" => SUCCESS_TICK,
-            "warning" => WARNING,
-            "danger" => DANGER,
-            "paper" => PAPER,
-            _ => MUTED,
-        }
+const fn hex(value: u32) -> Color {
+    [
+        ((value >> 16) & 0xff) as f32 / 255.,
+        ((value >> 8) & 0xff) as f32 / 255.,
+        (value & 0xff) as f32 / 255.,
+        1.,
+    ]
+}
+
+pub const LIGHT: Palette = Palette {
+    sidebar: hex(0x17181C),
+    sidebar_foreground: hex(0xE8E8EC),
+    sidebar_muted: hex(0x8B8D97),
+    sidebar_raised: hex(0x26282F),
+    sidebar_border: hex(0x2A2C33),
+    background: hex(0xFFFFFF),
+    surface: hex(0xF7F7F8),
+    surface_raised: hex(0xEDEDF0),
+    border: hex(0xE4E4E8),
+    border_strong: hex(0xD0D0D6),
+    foreground: hex(0x1B1B1F),
+    muted: hex(0x6B6C76),
+    faint: hex(0xA2A3AC),
+    accent: hex(0x5B5FC7),
+    accent_soft: hex(0xECEDFB),
+    accent_foreground: hex(0x3B3FA8),
+    primary: hex(0x1B1B1F),
+    primary_foreground: hex(0xFFFFFF),
+    link: hex(0x4C52C9),
+    success: hex(0x1F9D55),
+    success_soft: hex(0xE3F5EA),
+    warning: hex(0xB4700F),
+    warning_soft: hex(0xFBF0DA),
+    danger: hex(0xD33A2E),
+    danger_soft: hex(0xFCE6E4),
+    agent: hex(0x7A4BD8),
+    agent_soft: hex(0xF0EAFC),
+};
+
+pub const DARK: Palette = Palette {
+    sidebar: hex(0x101114),
+    sidebar_foreground: hex(0xE7E7EA),
+    sidebar_muted: hex(0x7E8189),
+    sidebar_raised: hex(0x1E2026),
+    sidebar_border: hex(0x24262C),
+    background: hex(0x151619),
+    surface: hex(0x1B1C20),
+    surface_raised: hex(0x24262C),
+    border: hex(0x27292F),
+    border_strong: hex(0x363940),
+    foreground: hex(0xE7E7EA),
+    muted: hex(0x8E9098),
+    faint: hex(0x5E616A),
+    accent: hex(0x7C82E8),
+    accent_soft: hex(0x24263D),
+    accent_foreground: hex(0xB4B8F5),
+    primary: hex(0xE7E7EA),
+    primary_foreground: hex(0x151619),
+    link: hex(0x8F95F0),
+    success: hex(0x4CC27E),
+    success_soft: hex(0x16301F),
+    warning: hex(0xE1A93F),
+    warning_soft: hex(0x3A2C10),
+    danger: hex(0xF0665A),
+    danger_soft: hex(0x3E1B14),
+    agent: hex(0xA78BF5),
+    agent_soft: hex(0x2A2340),
+};
+
+/// The palette of an appearance.
+pub const fn palette(dark: bool) -> &'static Palette {
+    if dark { &DARK } else { &LIGHT }
+}
+
+/// `#rrggbb` (or `#rrggbbaa` when translucent) — the notation the kit's
+/// theme JSON and SVG both read.
+pub fn css(color: Color) -> String {
+    let channel = |value: f32| (value.clamp(0., 1.) * 255.).round() as u8;
+    let [r, g, b, a] = color;
+    if a >= 1. {
+        format!("#{:02x}{:02x}{:02x}", channel(r), channel(g), channel(b))
+    } else {
+        format!(
+            "#{:02x}{:02x}{:02x}{:02x}",
+            channel(r),
+            channel(g),
+            channel(b),
+            channel(a)
+        )
     }
 }
+
+/// The same palette as a gpui-kit theme set: two themes, one per mode, so
+/// the kit's own controls (buttons, inputs, checkboxes, scrollbars) paint
+/// with the colors the views paint with.
+pub fn kit_theme_json() -> String {
+    let theme = |name: &str, mode: &str, p: &Palette| {
+        let c = css;
+        format!(
+            r##"{{
+  "name": "{name}",
+  "mode": "{mode}",
+  "font.family": "{ui}",
+  "font.size": {body},
+  "mono_font.family": "{mono}",
+  "mono_font.size": {mono_size},
+  "radius": {radius},
+  "radius.lg": {radius_lg},
+  "shadow": false,
+  "colors": {{
+    "background": "{bg}",
+    "foreground": "{fg}",
+    "border": "{border}",
+    "input.border": "{border_strong}",
+    "ring": "{accent}",
+    "caret": "{fg}",
+    "selection.background": "{selection}",
+    "muted.background": "{surface}",
+    "muted.foreground": "{muted}",
+    "accent.background": "{surface_raised}",
+    "accent.foreground": "{fg}",
+    "secondary.background": "{surface}",
+    "secondary.hover.background": "{surface_raised}",
+    "secondary.active.background": "{accent_soft}",
+    "secondary.foreground": "{fg}",
+    "primary.background": "{primary}",
+    "primary.hover.background": "{primary}",
+    "primary.active.background": "{primary}",
+    "primary.foreground": "{primary_fg}",
+    "danger.background": "{danger}",
+    "danger.foreground": "{bg}",
+    "success.background": "{success}",
+    "success.foreground": "{bg}",
+    "warning.background": "{warning}",
+    "warning.foreground": "{bg}",
+    "info.background": "{link}",
+    "info.foreground": "{bg}",
+    "link.foreground": "{link}",
+    "link.hover.foreground": "{link}",
+    "link.active.foreground": "{link}",
+    "popover.background": "{bg}",
+    "popover.foreground": "{fg}",
+    "list.background": "{bg}",
+    "list.hover.background": "{surface}",
+    "list.active.background": "{accent_soft}",
+    "list.active.border": "{accent}",
+    "list.even.background": "{bg}",
+    "list.head.background": "{surface}",
+    "table.background": "{bg}",
+    "table.hover.background": "{surface}",
+    "table.active.background": "{accent_soft}",
+    "table.active.border": "{accent}",
+    "table.even.background": "{bg}",
+    "table.head.background": "{surface}",
+    "table.head.foreground": "{muted}",
+    "table.row.border": "{border}",
+    "sidebar.background": "{sidebar}",
+    "sidebar.foreground": "{sidebar_fg}",
+    "sidebar.border": "{sidebar_border}",
+    "sidebar.accent.background": "{sidebar_raised}",
+    "sidebar.accent.foreground": "{sidebar_fg}",
+    "sidebar.primary.background": "{accent}",
+    "sidebar.primary.foreground": "{primary_fg}",
+    "tab_bar.background": "{surface}",
+    "tab_bar.segmented.background": "{surface}",
+    "tab.background": "{surface}",
+    "tab.foreground": "{muted}",
+    "tab.active.background": "{bg}",
+    "tab.active.foreground": "{fg}",
+    "group_box.background": "{surface}",
+    "group_box.foreground": "{fg}",
+    "description_list_label.background": "{surface}",
+    "description_list_label.foreground": "{muted}",
+    "switch.background": "{border_strong}",
+    "slider.bar.background": "{accent}",
+    "slider.thumb.background": "{bg}",
+    "progress_bar.background": "{accent}",
+    "skeleton.background": "{surface_raised}",
+    "scrollbar.background": "{bg}00",
+    "scrollbar.thumb.background": "{border_strong}",
+    "scrollbar.thumb.hover.background": "{muted}",
+    "drag_border": "{accent}",
+    "drop_target.background": "{accent_soft}",
+    "title_bar.background": "{bg}",
+    "title_bar.border": "{border}",
+    "window.border": "{border}"
+  }}
+}}"##,
+            ui = fonts::FAMILY_UI,
+            mono = fonts::FAMILY_MONO,
+            body = type_scale::BODY,
+            mono_size = type_scale::MONO,
+            radius = radius::CONTROL as usize,
+            radius_lg = radius::CARD as usize,
+            sidebar = c(p.sidebar),
+            sidebar_fg = c(p.sidebar_foreground),
+            sidebar_border = c(p.sidebar_border),
+            sidebar_raised = c(p.sidebar_raised),
+            bg = c(p.background),
+            fg = c(p.foreground),
+            border = c(p.border),
+            border_strong = c(p.border_strong),
+            accent = c(p.accent),
+            selection = c([p.accent[0], p.accent[1], p.accent[2], 0.35]),
+            surface = c(p.surface),
+            surface_raised = c(p.surface_raised),
+            muted = c(p.muted),
+            accent_soft = c(p.accent_soft),
+            primary = c(p.primary),
+            primary_fg = c(p.primary_foreground),
+            danger = c(p.danger),
+            success = c(p.success),
+            warning = c(p.warning),
+            link = c(p.link),
+        )
+    };
+    format!(
+        "{{\"name\": \"Ducktape\", \"themes\": [{}, {}]}}",
+        theme(LIGHT_THEME, "light", &LIGHT),
+        theme(DARK_THEME, "dark", &DARK)
+    )
+}
+
+/// The theme names `kit_theme_json` registers.
+pub const LIGHT_THEME: &str = "Ducktape Light";
+pub const DARK_THEME: &str = "Ducktape Dark";
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn every_icon_asset_is_routed_and_every_route_resolves() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icons");
-        let mut count = 0;
-        for entry in std::fs::read_dir(&dir).expect("icon directory unreadable") {
-            let path = entry.expect("icon entry unreadable").path();
-            let name = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .expect("icon file name is not utf-8");
-            let routed = icons::svg(name);
-            assert_ne!(
-                routed,
-                icons::EMPTY,
-                "icon asset {name}.svg has no arm in icons::svg"
-            );
-            assert!(
-                routed.starts_with("<svg") && routed.trim_end().ends_with("</svg>"),
-                "icon {name} is not a standalone svg document"
-            );
-            count += 1;
-        }
-        assert!(
-            count >= 49,
-            "expected the full artifact icon set, saw {count}"
-        );
-    }
-
-    #[test]
-    fn an_unknown_icon_renders_nothing_instead_of_panicking() {
-        assert_eq!(icons::svg("no-such-icon"), icons::EMPTY);
-    }
-
     #[test]
     fn every_embedded_font_file_exists_and_is_truetype() {
         for asset in fonts::ASSETS {
@@ -295,22 +347,22 @@ mod tests {
     }
 
     #[test]
-    fn the_scale_is_strictly_increasing() {
-        let steps = [
-            type_scale::BADGE,
-            type_scale::NAV,
-            type_scale::FIELD_LABEL,
-            type_scale::MACHINE_META,
-            type_scale::META,
-            type_scale::MACHINE,
-            type_scale::CAPTION,
-            type_scale::LIST,
-            type_scale::BODY,
-            type_scale::PANE_HEADER,
-            type_scale::SECTION,
-            type_scale::SCREEN_TITLE,
-            type_scale::DISPLAY,
-        ];
-        assert!(steps.windows(2).all(|pair| pair[0] < pair[1]));
+    fn css_notation_round_trips_the_palette() {
+        assert_eq!(css(hex(0x5B5FC7)), "#5b5fc7");
+        assert_eq!(css([1., 1., 1., 0.5]), "#ffffff80");
+        assert_eq!(css(LIGHT.background), "#ffffff");
+        assert_eq!(css(DARK.background), "#151619");
+        assert_eq!(css(LIGHT.sidebar), "#17181c");
+    }
+
+    #[test]
+    fn the_kit_theme_json_names_both_modes_and_the_product_fonts() {
+        let json = kit_theme_json();
+        assert!(json.contains("\"Ducktape Light\""));
+        assert!(json.contains("\"Ducktape Dark\""));
+        assert!(json.contains("\"font.family\": \"Geist\""));
+        assert!(json.contains("\"mode\": \"dark\""));
+        let braces = json.matches('{').count();
+        assert_eq!(braces, json.matches('}').count());
     }
 }

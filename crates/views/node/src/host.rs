@@ -20,9 +20,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use ducktape_view_guest::host;
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
 
 /// The plane every block moves: this view re-reads the node's own facts on
 /// it, because a height, a checkpoint and a peer sample answer to no module.
@@ -74,8 +74,8 @@ pub struct SessionItem {
     pub error: String,
 }
 
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("node.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -178,8 +178,8 @@ pub struct FactsItem {
 
 /// The node's own facts now and after every block: one `/v1/status` read
 /// per block boundary, which is the cell the node publishes them from.
-pub fn facts(connection: i64) -> iced::Subscription<FactsItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn facts(connection: i64) -> ducktape_view_guest::Subscription<FactsItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         stream::once(load_facts()).chain(every_block().then(|_| load_facts()))
     })
 }
@@ -209,10 +209,7 @@ fn node_facts(status: &serde_json::Value) -> NodeFacts {
     let applied = sync["applied_height"].as_i64().unwrap_or(UNMEASURED);
     let target = sync["target_height"].as_i64().unwrap_or(UNMEASURED);
     NodeFacts {
-        node_key: status["public_key"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned(),
+        node_key: status["public_key"].as_str().unwrap_or_default().to_owned(),
         node_height: served_height(&status["height"]),
         node_checkpoint: operations["storage"]["checkpoint_height"]
             .as_i64()
@@ -273,8 +270,9 @@ fn sync_label(phase: &str, applied: i64, target: i64) -> String {
     )
 }
 
-/// The node spells its phases lowercase on the wire; a reader reads prose.
-fn capitalized(word: &str) -> String {
+/// The node spells its phases, roles and categories lowercase on the wire;
+/// a reader reads prose.
+pub fn capitalized(word: &str) -> String {
     let mut letters = word.chars();
     match letters.next() {
         Some(first) => first.to_uppercase().chain(letters).collect(),
@@ -290,6 +288,7 @@ fn capitalized(word: &str) -> String {
 /// call it theirs.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerRow {
+    /// the whole key: the row shows [`short_label`] of it and copies all of it
     pub key: String,
     pub role: String,
     pub live: bool,
@@ -304,8 +303,8 @@ pub struct PeersItem {
 /// The mesh sample now and after every block. EVERY SAMPLE ENCODES THE
 /// NODE'S WHOLE METRICS REGISTRY, so the `when` this subscription is held
 /// under is the budget: leaving the overview stops the encode at the source.
-pub fn peers(connection: i64) -> iced::Subscription<PeersItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn peers(connection: i64) -> ducktape_view_guest::Subscription<PeersItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         stream::once(load_peers()).chain(every_block().then(|_| load_peers()))
     })
 }
@@ -333,7 +332,7 @@ fn peer_rows(reply: &serde_json::Value) -> Vec<PeerRow> {
         .unwrap_or_default()
         .iter()
         .map(|peer| PeerRow {
-            key: short_label(peer["peer"].as_str().unwrap_or_default()),
+            key: peer["peer"].as_str().unwrap_or_default().to_owned(),
             role: peer["role"].as_str().unwrap_or_default().to_owned(),
             live: peer["connected"].as_bool().unwrap_or(false),
         })
@@ -352,6 +351,8 @@ pub struct ModuleRow {
     /// `workspace` | `developer` | `automation` | `system` — the status
     /// projection's presentation category. Never consensus state.
     pub category: String,
+    /// the whole digests: a row shows [`short_digest`] of each and copies
+    /// all of it, because a digest is what an operator compares across nodes
     pub root: String,
     pub code_hash: String,
     pub pending_hash: String,
@@ -369,8 +370,8 @@ pub struct ModulesItem {
 /// The registered set now and after every block: `/v1/status` publishes id,
 /// root and category for every module, and the modules registry (where a
 /// network runs one) adds the active code hash and any armed swap.
-pub fn modules(connection: i64) -> iced::Subscription<ModulesItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn modules(connection: i64) -> ducktape_view_guest::Subscription<ModulesItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         stream::once(load_modules()).chain(every_block().then(|_| load_modules()))
     })
 }
@@ -408,9 +409,9 @@ fn module_row(module: &serde_json::Value, code: &serde_json::Value) -> ModuleRow
     let pending = &registry["pending"];
     ModuleRow {
         category: module["category"].as_str().unwrap_or_default().to_owned(),
-        root: short_digest(module["root"].as_str().unwrap_or_default()),
-        code_hash: short_digest(&hex_encode(&json_bytes(&registry["active_code_hash"]))),
-        pending_hash: short_digest(&hex_encode(&json_bytes(&pending["code_hash"]))),
+        root: module["root"].as_str().unwrap_or_default().to_owned(),
+        code_hash: hex_encode(&json_bytes(&registry["active_code_hash"])),
+        pending_hash: hex_encode(&json_bytes(&pending["code_hash"])),
         activation_height: pending["activation_height"].as_i64().unwrap_or(0),
         readiness: pending["readiness"].as_array().map_or(0, Vec::len) as i64,
         // a swap is ready once its readiness latch closed: `ready_at` is the
@@ -472,8 +473,8 @@ const LOG_FRAMES_PER_ITEM: usize = 512;
 /// the seated key and hands over every frame verbatim — the ring's whole
 /// contents on subscribe, then each line as it is written. A frame this view
 /// cannot read leaves the timeline as it was.
-pub fn logs(connection: i64) -> iced::Subscription<LogItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn logs(connection: i64) -> ducktape_view_guest::Subscription<LogItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         let asked = serde_json::json!({ "topic": LOGS_TOPIC });
         host::subscribe(
             "rpc.stream",
@@ -513,7 +514,8 @@ fn log_item(frames: &[host::Answer]) -> LogItem {
 }
 
 /// Split `2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted` into its
-/// three columns. A line that carries no level is all message.
+/// three columns: the clock, the level and the message. A line that carries
+/// no level is all message.
 fn log_row(cursor: &str, line: String) -> LogRow {
     const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
     let cursor = cursor.to_owned();
@@ -529,10 +531,7 @@ fn log_row(cursor: &str, line: String) -> LogRow {
     let timestamped =
         first.contains(':') && first.chars().next().is_some_and(|c| c.is_ascii_digit());
     let (time, level_field) = match timestamped {
-        true => (
-            trim_time_to_millis(first),
-            fields.next().unwrap_or_default(),
-        ),
+        true => (clock_of(first), fields.next().unwrap_or_default()),
         false => (String::new(), first),
     };
     if !LEVELS.contains(&level_field) {
@@ -554,21 +553,21 @@ fn log_row(cursor: &str, line: String) -> LogRow {
     }
 }
 
-/// The ring's tracing timer prints microseconds (27 chars) but the console
-/// column is sized for milliseconds, and a text widget never clips itself —
-/// the extra digits paint over the level. Any other shape passes through.
-fn trim_time_to_millis(time: &str) -> String {
-    let Some((secs, frac)) = time.rsplit_once('.') else {
+/// `2026-07-27T09:12:44.918123Z` as the clock a console column reads:
+/// `09:12:44.918`. The ring's tracing timer prints the date and microseconds
+/// on every line; a ring is minutes deep, so the date says nothing a row
+/// needs and the extra digits only push the level out. Any other shape
+/// passes through whole.
+fn clock_of(time: &str) -> String {
+    let Some((_, clock)) = time.split_once('T') else {
         return time.to_owned();
     };
-    let Some(digits) = frac.strip_suffix('Z') else {
-        return time.to_owned();
+    let clock = clock.strip_suffix('Z').unwrap_or(clock);
+    let Some((secs, frac)) = clock.rsplit_once('.') else {
+        return clock.to_owned();
     };
-    let trimmable = digits.len() > 3 && digits.bytes().all(|byte| byte.is_ascii_digit());
-    if !trimmable {
-        return time.to_owned();
-    }
-    format!("{secs}.{}Z", &digits[..3])
+    let millis: String = frac.chars().take(3).collect();
+    format!("{secs}.{millis}")
 }
 
 /// A batch of lines onto the timeline, bounded and deduplicated by cursor:
@@ -590,13 +589,14 @@ pub fn push_logs(lines: &[LogRow], arrived: &[LogRow]) -> Vec<LogRow> {
     next
 }
 
-/// The tail of the timeline the frame draws, filtered: at most
-/// [`LOG_LINES_DRAWN`] rows, because the wire carries text and not a
-/// virtual list.
-pub fn visible_log(lines: &[LogRow], filter: &str) -> Vec<LogRow> {
+/// The tail of the timeline the frame draws, filtered by level and by text:
+/// at most [`LOG_LINES_DRAWN`] rows, because the wire carries text and not a
+/// virtual list. An empty `level` keeps every level.
+pub fn visible_log(lines: &[LogRow], filter: &str, level: &str) -> Vec<LogRow> {
     let filter = filter.trim().to_lowercase();
     let matching: Vec<LogRow> = lines
         .iter()
+        .filter(|line| level.is_empty() || line.level == level)
         .filter(|line| filter.is_empty() || line.message.to_lowercase().contains(&filter))
         .cloned()
         .collect();
@@ -653,8 +653,8 @@ pub fn set_log_filter(filter: &str) -> bool {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;
@@ -683,11 +683,28 @@ impl Stream for ActStream {
                 },
                 Err(error) => ActItem {
                     reply: String::new(),
-                    error,
+                    error: refusal_message(&error),
                 },
             };
             Poll::Ready(Some(item))
         })
+    }
+}
+
+/// What a refused write says to a person. The kernel relays the node's
+/// refusal as `<route> rejected (<code>): {"error":"<message>"}`; the
+/// message is the sentence, the rest is the envelope. Any other refusal
+/// passes through whole.
+fn refusal_message(error: &str) -> String {
+    let Some(at) = error.find('{') else {
+        return error.to_owned();
+    };
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&error[at..]) else {
+        return error.to_owned();
+    };
+    match body["error"].as_str() {
+        Some(message) => message.to_owned(),
+        None => error.to_owned(),
     }
 }
 
@@ -715,46 +732,16 @@ pub fn copy(text: &str, label: &str) -> bool {
 
 // ---------- the readings the screen draws ----------
 
-pub fn icon(name: &str) -> Vec<u8> {
-    design::icons::svg(name).as_bytes().to_vec()
-}
-
-pub fn connection_degraded(status: &str) -> bool {
-    status == "Offline"
-        || status == "Sync delayed"
-        || status == "Reconnecting…"
-        || status == "Live · resyncing"
-}
-
 pub fn reading_pair(left: &str, right: &str) -> String {
     format!("{left} / {right}")
 }
 
-pub fn count_label(count: i64) -> String {
-    match count > 0 {
-        true => count.to_string(),
-        false => String::new(),
-    }
-}
-
-pub fn keep_str(loaded: bool, next: &str, current: &str) -> String {
-    if loaded { next } else { current }.to_owned()
-}
-
-pub fn initial_of(name: &str) -> String {
-    name.trim()
-        .chars()
-        .next()
-        .map(|first| first.to_uppercase().to_string())
-        .unwrap_or_default()
-}
-
-/// `h 84,912`; a height the node has not reported reads `h —`.
+/// `block 84,912`; a height the node has not reported reads `block —`.
 pub fn height_label_short(height: i64) -> String {
     if height < 0 {
-        return "h —".into();
+        return "block —".into();
     }
-    format!("h {}", grouped_digits(height))
+    format!("block {}", grouped_digits(height))
 }
 
 /// `just now` / `5m ago`; a negative stamp is a reading the node never
@@ -794,7 +781,8 @@ fn grouped_digits(value: i64) -> String {
     grouped
 }
 
-fn short_digest(digest: &str) -> String {
+/// The first 12 characters of a digest, marked as cut.
+pub fn short_digest(digest: &str) -> String {
     let mut short: String = digest.chars().take(12).collect();
     if digest.chars().count() > 12 {
         short.push('…');
@@ -802,7 +790,8 @@ fn short_digest(digest: &str) -> String {
     short
 }
 
-fn short_label(id: &str) -> String {
+/// The first 8 characters of a peer key, marked as cut.
+pub fn short_label(id: &str) -> String {
     let mut label: String = id.chars().take(8).collect();
     if id.chars().count() > 8 {
         label.push('…');

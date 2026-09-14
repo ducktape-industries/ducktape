@@ -33,14 +33,17 @@ prereqs:
 	  command -v pkg-config >/dev/null || missing="$$missing pkg-config"; \
 	  { [ -n "$$LIBCLANG_PATH" ] || $$(command -v ldconfig || echo /sbin/ldconfig) -p 2>/dev/null | grep -q libclang; } || missing="$$missing libclang"; \
 	  pkg-config --exists alsa 2>/dev/null || missing="$$missing alsa"; \
+	  for library in x11-xcb xkbcommon xkbcommon-x11 fontconfig freetype2; do \
+	    pkg-config --exists "$$library" 2>/dev/null || missing="$$missing $$library"; \
+	  done; \
 	fi; \
 	[ -z "$$missing" ] || { \
 	  echo "missing build prerequisites:$$missing" >&2; \
 	  if [ "$(UNAME_S)" = Darwin ]; then \
 	    echo "  xcode-select --install" >&2; \
 	  else \
-	    echo "  sudo apt install build-essential pkg-config libclang-dev libasound2-dev   # Debian/Ubuntu" >&2; \
-	    echo "  sudo dnf install gcc pkgconf-pkg-config clang-devel alsa-lib-devel       # Fedora" >&2; \
+	    echo "  sudo apt install build-essential pkg-config libclang-dev libasound2-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev   # Debian/Ubuntu" >&2; \
+	    echo "  On other distributions, install development packages for the missing libraries above." >&2; \
 	  fi; \
 	  echo "  rustup: https://rustup.rs" >&2; \
 	  exit 1; }
@@ -120,48 +123,7 @@ coordinator:
 coordinator-smoke:
 	$(CARGO) test $(LOCKED) -p coordinator-bin
 
-# Build cargo-ice from the same ducktape-ui rev as the app. A global cargo-ice
-# can parse a different language than the compiler in app/Cargo.toml.
-#
-# Both the URL and the rev come from app/Cargo.toml, so the install source
-# cannot drift from the pin the app compiles against.
-#
-# This installs straight from the pinned rev. `cargo install --git` resolves the
-# package's whole workspace, so it also clones the one git dependency no part of
-# cargo-ice uses (pornin/ecgfp5, which the trading example wants). That clone is
-# the deliberate price: the alternative was a hand-maintained `ice-install/<rev>`
-# branch holding the same rev minus the example members, which had to be rebased
-# and pushed on every pin bump and broke `make app` with a bare git exit 128
-# every time someone forgot.
-ICE_GIT = $(shell sed -n 's|.*git = "\([^"]*ducktape-ui.git\)", rev = .*|\1|p' app/Cargo.toml | head -n1)
-ICE_REV = $(shell sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' app/Cargo.toml | head -n1)
-ICE_ROOT = $(CURDIR)/target/cargo-ice/$(ICE_REV)
-ICE_BIN = $(ICE_ROOT)/bin/cargo-ice
-ICE_INSTALL_STAMP = $(ICE_ROOT)/.installed-from-rev-build
-
-# The build dir is keyed by rev too: cargo treats every checkout under its git
-# cache as immutable (no mtime check on its sources) and hashes a git package's
-# outputs without the revision, so a build dir shared across revs hands the
-# next rev the previous rev's binary as "fresh" — a cargo-ice that parses the
-# wrong language, filed under the right rev. An existing binary can predate the
-# isolated build dir. Only reuse an install completed by this recipe; --force
-# also replaces Cargo's stale registration.
-.PHONY: ice-tool
-ice-tool:
-	@if test -x "$(ICE_BIN)" && test -f "$(ICE_INSTALL_STAMP)"; then exit 0; fi; \
-	rm -f "$(ICE_INSTALL_STAMP)" && \
-	CARGO_TARGET_DIR="$(CURDIR)/target/cargo-ice-build/$(ICE_REV)" $(CARGO) install cargo-ice \
-		--git "$(ICE_GIT)" --rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)" --force && \
-	touch "$(ICE_INSTALL_STAMP)"
-
-# The `wasm-tools` CLI the view bundler drives (cargo-ice shells out to it to
-# wrap each view as a component), installed the same way cargo-ice is: under
-# target, keyed by version, so `make views` needs nothing on PATH and cannot
-# pick up a global copy at another version. It is the componentizer's own
-# release — `wasm-tools 1.x.y` and the `wit-component 0.x.y` guest-builder
-# links ship together and write the same bytes — so the version is read off
-# guest-builder's manifest, the one place the componentizer is pinned, and no
-# second number exists to drift.
+# Pin wasm-tools to the component encoder used by guest-builder.
 WASM_TOOLS_VERSION = 1.$(shell sed -n 's/^wit-component = "=0\.\([0-9.]*\)".*/\1/p' bin/guest-builder/Cargo.toml | head -n1)
 WASM_TOOLS_ROOT = $(CURDIR)/target/wasm-tools/$(WASM_TOOLS_VERSION)
 WASM_TOOLS_BIN = $(WASM_TOOLS_ROOT)/bin/wasm-tools
@@ -170,59 +132,27 @@ $(WASM_TOOLS_BIN):
 	CARGO_TARGET_DIR="$(WASM_TOOLS_ROOT)/build" $(CARGO) install wasm-tools \
 		--version "$(WASM_TOOLS_VERSION)" --locked --root "$(WASM_TOOLS_ROOT)"
 
-## build every desktop view (crates/views) as an `ice:view` component
-## and stage it under target/views, where a built desktop app loads it from
-## (`DUCKTAPE_VIEWS_DIR` overrides; `make install-app` installs them beside the
-## binary). Installs the bundler's wasm-tools under target on first use and
-## puts it on the recipe's PATH, never the operator's. The views workspace pins
-## the same ducktape-ui rev as the app, and this refuses when they differ: a
-## view compiled by another language revision than the host that renders it is
-## a wire nobody tested.
+## Compile Rust-authored views and stage dynamically loaded WASM components.
 VIEW_PACKAGES = $(shell awk '/^\[/{ in_package = ($$0 == "[package]") } in_package && /^name *= *"/ { split($$0, part, "\""); printf "-p %s ", part[2] }' crates/views/*/Cargo.toml)
 
-views: ice-tool $(WASM_TOOLS_BIN)
-	@test "$$(sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' crates/views/Cargo.toml | head -n1)" = "$(ICE_REV)" || \
-	  { echo "crates/views/Cargo.toml pins a different ducktape-ui rev than app/Cargo.toml" >&2; exit 1; }
-	PATH="$(WASM_TOOLS_ROOT)/bin:$$PATH" bash ops/build-views.sh "$(ICE_BIN)" $(VIEW_PACKAGES)
+views: $(WASM_TOOLS_BIN)
+	PATH="$(WASM_TOOLS_ROOT)/bin:$$PATH" CARGO="$(CARGO)" bash ops/build-views.sh $(VIEW_PACKAGES)
 
-## rebuild the committed view sources in two isolated roots and compare bytes
-views-repro-check: ice-tool $(WASM_TOOLS_BIN)
-	bash ops/views-repro-check.sh "$(ICE_BIN)" "$(WASM_TOOLS_ROOT)" "$(ICE_ROOT)"
+## Rebuild committed view sources in two isolated roots and compare bytes.
+views-repro-check: $(WASM_TOOLS_BIN)
+	bash ops/views-repro-check.sh "$(WASM_TOOLS_ROOT)"
 
 ifeq ($(UNAME_S),Darwin)
-## build Ducktape.app and its DMG under target/ice-bundle. Ad-hoc signed
-## unless the environment says otherwise — `cargo-ice bundle` reads these
-## itself, and this recipe inherits the environment, so nothing is forwarded
-## by hand:
-##   ICE_CODESIGN_IDENTITY  a "Developer ID Application: … (TEAMID)" identity
-##                          (`security find-identity -v -p codesigning`).
-##                          Signs the .app and the .dmg with --timestamp
-##                          --options runtime; without it both are signed
-##                          ad-hoc, which Gatekeeper refuses off this machine.
-##   ICE_NOTARY_KEY         path to the App Store Connect API key .p8
-##   ICE_NOTARY_KEY_ID      that key's id
-##   ICE_NOTARY_ISSUER      the issuer UUID
-##                          All three together add `xcrun notarytool submit
-##                          --wait` + `xcrun stapler staple` on the DMG. Set
-##                          without ICE_CODESIGN_IDENTITY, cargo-ice refuses
-##                          before the upload — Apple rejects an ad-hoc
-##                          signature.
-## The release recipe is app/README.md § "Release build".
-app: prereqs ice-tool views
-	"$(ICE_BIN)" bundle -p ducktape-app
+## Build native Ducktape.app and DMG using Apple's packaging tools.
+## DUCKTAPE_CODESIGN_IDENTITY selects Developer ID; default is ad-hoc.
+## DUCKTAPE_NOTARY_KEY, DUCKTAPE_NOTARY_KEY_ID, DUCKTAPE_NOTARY_ISSUER
+## together submit and staple the signed image. See app/README.md.
+app: prereqs views
+	CARGO="$(CARGO)" bash ops/bundle-app-macos.sh
 
-## `make app-release` for a build that leaves this machine: refuses unless a
-## real Developer ID identity is set, so an ad-hoc bundle cannot be shipped by
-## forgetting one variable. Notarization needs the three ICE_NOTARY_* vars on
-## top; without them the bundle is signed and stapleable but not stapled.
 app-release:
-	@if [ -z "$$ICE_CODESIGN_IDENTITY" ]; then \
-		echo "app-release needs ICE_CODESIGN_IDENTITY set to a Developer ID Application identity;" >&2; \
-		echo "list them with: security find-identity -v -p codesigning" >&2; \
-		echo "(and ICE_NOTARY_KEY, ICE_NOTARY_KEY_ID, ICE_NOTARY_ISSUER to notarize)" >&2; \
-		echo "see app/README.md § \"Release build\"; 'make app' builds the ad-hoc bundle" >&2; \
-		exit 1; \
-	fi
+	@test -n "$$DUCKTAPE_CODESIGN_IDENTITY" && test "$$DUCKTAPE_CODESIGN_IDENTITY" != "-" || \
+	  { echo "app-release requires DUCKTAPE_CODESIGN_IDENTITY (Developer ID Application)" >&2; exit 1; }
 	@$(MAKE) app
 
 ## install the operator CLI and desktop app without requiring root
@@ -231,7 +161,7 @@ install: install-node install-app
 install-app: app
 	mkdir -p "$(APP_DEST)"
 	rm -rf "$(APP_DEST)/Ducktape.app"
-	cp -R target/ice-bundle/Ducktape.app "$(APP_DEST)/"
+	cp -R target/app-bundle/Ducktape.app "$(APP_DEST)/"
 	@echo "installed $(APP_DEST)/Ducktape.app"
 else
 ## where the Linux desktop entry and its icon land — the XDG per-user roots,

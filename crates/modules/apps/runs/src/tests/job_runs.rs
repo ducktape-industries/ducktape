@@ -238,7 +238,7 @@ fn a_failed_job_result_finalizes_with_error_detail() {
                 created_at_revision: 1,
                 job_id: "job-1".into(),
                 comment_id: post_message_id(&run_id, "reply"),
-                text: "⚠ DUCK failed: model unavailable".into(),
+                text: "⚠ DUCK failed\n\n```\nmodel unavailable\n```".into(),
             }
         ]
     );

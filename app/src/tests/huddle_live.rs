@@ -41,7 +41,7 @@
 
 use std::time::Duration;
 
-use iced::futures::StreamExt as _;
+use futures::StreamExt as _;
 
 /// The huddle is a meeting: this side waits for the other one to show up,
 /// join, and start publishing. Generous on purpose — a person is slower than

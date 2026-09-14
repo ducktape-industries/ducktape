@@ -21,10 +21,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use ducktape_view_guest::host;
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use ui_lang_guest::host;
 
 use crate::document_sync::{
     self, BlockOp, PageBlock, document_body, document_plan, document_title, page_document_text,
@@ -135,8 +135,8 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("pages.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -247,14 +247,47 @@ pub struct RegisterItem {
     /// resolved thread is filed away, so it is not what the page carries.
     pub thread_total: i64,
     pub commented_hits: Vec<String>,
+    /// Every named member of the network — what an `@` in the document
+    /// completes to.
+    pub names: Vec<String>,
+    /// The active agents "Ask AI" can address: each one's display name and
+    /// program account.
+    pub agents: Vec<(String, u64)>,
     pub error: String,
+}
+
+/// The runs module's active agents, name and account, sorted by name. A
+/// node that cannot answer the roster offers nobody.
+async fn read_agents() -> Vec<(String, u64)> {
+    let ask = json!({ "target": "runs", "query": { "model": { "query": "agents" } } });
+    let Ok(reply) = host::request("rpc.query", &encode(&ask)).await else {
+        return Vec::new();
+    };
+    let Ok(reply) = serde_json::from_slice::<Value>(&reply) else {
+        return Vec::new();
+    };
+    let mut agents: Vec<(String, u64)> = rows(&reply["model"]["agents"])
+        .iter()
+        .filter(|record| record["status"].as_str() == Some("active"))
+        .filter_map(|record| {
+            let account = record["account"].as_u64().filter(|account| *account > 0)?;
+            let name = text_of(&record["display_name"]);
+            let name = match name.is_empty() {
+                true => text_of(&record["agent_id"]),
+                false => name,
+            };
+            Some((name, account))
+        })
+        .collect();
+    agents.sort();
+    agents
 }
 
 /// The workspace now and after every pages block: read once per connection
 /// and per page picked, then again on each `rpc.live` hit for the pages
 /// plane.
-pub fn register(page: String, serial: i64) -> iced::Subscription<RegisterItem> {
-    iced::Subscription::run_with((page, serial), |key| {
+pub fn register(page: String, serial: i64) -> ducktape_view_guest::Subscription<RegisterItem> {
+    ducktape_view_guest::Subscription::run_with((page, serial), |key| {
         let page = key.0.clone();
         let live = host::subscribe("rpc.live", b"pages");
         let first = load_register(page.clone());
@@ -315,10 +348,9 @@ async fn read_register(requested: &str) -> Result<RegisterItem, String> {
     // only once the rail is.
     let threads = read_threads(&active_page, &blocks).await?;
     let commented_hits = commented_targets(&active_page, &threads);
-    let names = match threads.is_empty() {
-        true => Names::default(),
-        false => read_names().await,
-    };
+    // The directory names comment authors AND fills the `@` picker, so it is
+    // read whether or not the page has threads.
+    let names = read_names().await;
     let comment_rows: Vec<PageCommentThreadRow> = threads
         .iter()
         .map(|thread| PageCommentThreadRow {
@@ -341,6 +373,8 @@ async fn read_register(requested: &str) -> Result<RegisterItem, String> {
         document,
         comment_rows,
         commented_hits,
+        names: names.members(),
+        agents: read_agents().await,
         error: String::new(),
     })
 }
@@ -357,7 +391,8 @@ async fn read_page_index() -> Result<Vec<PageItem>, String> {
         }
         wire.extend(rows(&listed["pages"]));
         let next = listed["next_after"].as_str().map(str::to_owned);
-        let done = !listed["has_more"].as_bool().unwrap_or(false) || next.is_none() || next == after;
+        let done =
+            !listed["has_more"].as_bool().unwrap_or(false) || next.is_none() || next == after;
         if done {
             return Ok(page_items(&wire));
         }
@@ -548,15 +583,14 @@ fn comment_thread(thread: &Value, names: &Names) -> PageCommentThread {
         1 => "1 comment".to_string(),
         count => format!("{count} comments"),
     };
+    // A settled thread sits under the card's own "Resolved" fold and offers
+    // "Reopen": its caption need not say so a third time.
     let resolved = thread["resolved"].as_bool().unwrap_or(false);
     PageCommentThread {
         id: text_of(&thread["id"]),
         target: text_of(&thread["target"]),
         author: names.display(&text_of(&thread["opener"])),
-        meta: match resolved {
-            true => format!("{count_label} · resolved"),
-            false => count_label,
-        },
+        meta: count_label,
         resolved,
         comment_count,
         comments,
@@ -593,6 +627,19 @@ impl Names {
             _ => "system".into(),
         }
     }
+
+    /// Every account's name, sorted and deduplicated, for the mention picker.
+    fn members(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .by_account
+            .values()
+            .filter(|name| !name.is_empty())
+            .cloned()
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
 }
 
 /// The identity module's page cap, restated at the read that walks it.
@@ -617,7 +664,9 @@ async fn read_names() -> Names {
             let number = account["number"].as_i64().unwrap_or_default();
             let name = text_of(&account["name"]);
             for key in rows(&account["keys"]) {
-                names.by_key.insert(hex_encode(&json_bytes(&key["pubkey"])), name.clone());
+                names
+                    .by_key
+                    .insert(hex_encode(&json_bytes(&key["pubkey"])), name.clone());
             }
             names.by_account.insert(number, name);
         }
@@ -657,16 +706,17 @@ fn short_label(id: &str) -> String {
     label
 }
 
-
 fn page_comment(ordinal: usize, comment: &Value, names: &Names) -> PageComment {
     let ordinal = count_i64(ordinal);
     let edited = !comment["edited_at"].is_null();
+    // The caption under a reply is its author; an ordinal names nothing a
+    // reader can find. An edit is the one fact worth a word.
     PageComment {
         id: text_of(&comment["id"]),
         author: names.display(&text_of(&comment["author"])),
         meta: match edited {
-            true => format!("#{ordinal} · edited"),
-            false => format!("#{ordinal}"),
+            true => "edited".into(),
+            false => String::new(),
         },
         text: text_of(&comment["text"]),
         ordinal,
@@ -684,8 +734,10 @@ pub struct SearchItem {
 }
 
 /// The page search: one answer per query the reader sends.
-pub fn search(query: String, serial: i64) -> iced::Subscription<SearchItem> {
-    iced::Subscription::run_with((query, serial), |key| stream::once(run_search(key.0.clone())))
+pub fn search(query: String, serial: i64) -> ducktape_view_guest::Subscription<SearchItem> {
+    ducktape_view_guest::Subscription::run_with((query, serial), |key| {
+        stream::once(run_search(key.0.clone()))
+    })
 }
 
 async fn run_search(query: String) -> SearchItem {
@@ -732,11 +784,41 @@ async fn read_search(query: &str) -> Result<Vec<PageSearchHit>, String> {
                     .unwrap_or_else(|| "Untitled".into()),
                 block_id: text_of(&hit["block_id"]),
                 kind: block_kind_name(&text_of(&hit["kind"])).into(),
-                text: text_of(&hit["text"]),
+                text: excerpt(&text_of(&hit["text"]), query),
                 page_id,
             }
         })
         .collect())
+}
+
+/// The most characters a search row shows of the block it hit.
+const EXCERPT_CHARS: usize = 160;
+
+/// A result row's excerpt: the block's text around the first match, on one
+/// line and bounded — a hit inside a long code block is a row, not the block.
+fn excerpt(text: &str, query: &str) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = flat.chars().collect();
+    if chars.len() <= EXCERPT_CHARS {
+        return flat;
+    }
+    let lowered = flat.to_lowercase();
+    let hit_byte = lowered.find(&query.trim().to_lowercase()).unwrap_or(0);
+    let hit = lowered[..hit_byte].chars().count();
+    let start = hit
+        .saturating_sub(EXCERPT_CHARS / 3)
+        .min(chars.len() - EXCERPT_CHARS);
+    let end = start + EXCERPT_CHARS;
+    let head = match start > 0 {
+        true => "…",
+        false => "",
+    };
+    let tail = match end < chars.len() {
+        true => "…",
+        false => "",
+    };
+    let middle: String = chars[start..end].iter().collect();
+    format!("{head}{middle}{tail}")
 }
 
 // ---------- the block vocabulary ----------
@@ -803,6 +885,13 @@ pub struct SaveItem {
     pub refusal: String,
     /// The page's canonical text after the save.
     pub document: String,
+    /// Whether the page had moved under this reader since their baseline,
+    /// so the save landed their changes on the moved page instead of the
+    /// one they last saw. The buffer then owes itself the same merge.
+    pub merged: bool,
+    /// The lines both this reader and someone else changed: the reader's
+    /// spelling won, and the screen says so.
+    pub conflicts: Vec<String>,
     pub error: String,
 }
 
@@ -846,14 +935,14 @@ fn push_save(save: Save) -> bool {
 }
 
 /// Every act's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 /// Every save's outcome, kept apart from the acts because only a save
 /// settles a baseline.
-pub fn saves() -> iced::Subscription<SaveItem> {
-    iced::Subscription::run(|| SaveStream)
+pub fn saves() -> ducktape_view_guest::Subscription<SaveItem> {
+    ducktape_view_guest::Subscription::run(|| SaveStream)
 }
 
 /// Polls a queue of in-flight writes and yields the first one that finishes,
@@ -938,12 +1027,49 @@ async fn create_page(title: String) -> Result<ActItem, String> {
     })
 }
 
+/// The title a subpage is born with; the writer replaces it in the title
+/// line.
+pub const NEW_SUBPAGE_TITLE: &str = "Untitled";
+
+/// `AddSubpage` — a page inside `parent`, after its last block, landed on
+/// as soon as it exists: the "+" on a sidebar row.
+pub fn create_subpage(parent: &str) -> bool {
+    let parent = parent.to_owned();
+    push_act(Box::pin(
+        async move { acted(create_subpage_in(parent).await) },
+    ))
+}
+
+async fn create_subpage_in(parent: String) -> Result<ActItem, String> {
+    if parent.is_empty() {
+        return Err("choose a page first".into());
+    }
+    let blocks = read_page_blocks(&parent).await?;
+    // The page's own record is element 0; its last top-level child is the
+    // anchor so the subpage lands at the end of the document.
+    let last = blocks
+        .iter()
+        .skip(1)
+        .rev()
+        .find(|block| block.parent.as_deref() == Some(parent.as_str()))
+        .map(|block| block.id.clone());
+    let page_id = mint("page").await?;
+    submit(json!({ "insert_block": {
+        "parent": parent,
+        "after": last,
+        "block": { "id": page_id, "kind": "page", "text": NEW_SUBPAGE_TITLE },
+    } }))
+    .await?;
+    Ok(ActItem {
+        page: page_id,
+        error: String::new(),
+    })
+}
+
 /// `RemoveBlock` on a page: the module takes its whole subtree with it.
 pub fn delete(page_id: &str) -> bool {
     let page_id = page_id.to_owned();
-    push_act(Box::pin(async move {
-        acted(delete_page(page_id).await)
-    }))
+    push_act(Box::pin(async move { acted(delete_page(page_id).await) }))
 }
 
 async fn delete_page(page_id: String) -> Result<ActItem, String> {
@@ -955,10 +1081,27 @@ async fn delete_page(page_id: String) -> Result<ActItem, String> {
 }
 
 /// `AddComment` — a new thread on `target`, or a reply on the open one.
-pub fn post(text: &str, target: &str, thread_id: &str) -> bool {
-    let (text, target, thread_id) = (text.trim().to_owned(), target.to_owned(), thread_id.to_owned());
+/// `AddComment` — a new thread on `target` (an empty `thread_id`) or a reply.
+/// A new thread pins itself to the exact text `anchor` names, in the
+/// module's UTF-16 units; `None` is a comment on the whole block.
+/// `mention` names the agent account an "Ask AI" comment addresses — the
+/// runs module answers a mentioned agent in the same thread; `0` is nobody.
+pub fn post(
+    text: &str,
+    target: &str,
+    thread_id: &str,
+    anchor: Option<(u32, u32)>,
+    mention: i64,
+) -> bool {
+    let (text, target, thread_id) = (
+        text.trim().to_owned(),
+        target.to_owned(),
+        thread_id.to_owned(),
+    );
+    let anchor = anchor.filter(|(start, end)| start < end && thread_id.is_empty());
+    let mention = u64::try_from(mention).unwrap_or_default();
     push_act(Box::pin(async move {
-        acted(post_comment(text, target, thread_id).await)
+        acted(post_comment(text, target, thread_id, anchor, mention).await)
     }))
 }
 
@@ -966,6 +1109,8 @@ async fn post_comment(
     text: String,
     target: String,
     thread_id: String,
+    anchor: Option<(u32, u32)>,
+    mention: u64,
 ) -> Result<ActItem, String> {
     if text.is_empty() || target.is_empty() {
         return Err("write a comment first".into());
@@ -976,13 +1121,53 @@ async fn post_comment(
         false => thread_id,
     };
     let comment_id = mint("comment").await?;
-    submit(json!({ "add_comment": {
+    let mut add = json!({
         "thread_id": thread_id,
         "comment_id": comment_id,
         "target": target,
         "text": text,
-    } }))
-    .await?;
+    });
+    if let Some((start, end)) = anchor {
+        add["anchor"] = json!({ "start": start, "end": end });
+    }
+    if mention > 0 {
+        add["mentions"] = json!([mention]);
+    }
+    submit(json!({ "add_comment": add })).await?;
+    Ok(ActItem::default())
+}
+
+/// `EditComment` — replace one comment's words.
+pub fn edit_comment(comment_id: &str, text: &str) -> bool {
+    let (comment_id, text) = (comment_id.to_owned(), text.trim().to_owned());
+    push_act(Box::pin(async move {
+        acted(rewrite_comment(comment_id, text).await)
+    }))
+}
+
+async fn rewrite_comment(comment_id: String, text: String) -> Result<ActItem, String> {
+    if comment_id.is_empty() || text.is_empty() {
+        return Err("write a comment first".into());
+    }
+    let text = bounded(&text, "comment", MAX_COMMENT_BYTES)?;
+    submit(json!({ "edit_comment": { "comment_id": comment_id, "text": text } })).await?;
+    Ok(ActItem::default())
+}
+
+/// `DeleteComment` — tombstone one comment; the module drops a thread whose
+/// last live comment goes.
+pub fn delete_comment(comment_id: &str) -> bool {
+    let comment_id = comment_id.to_owned();
+    push_act(Box::pin(
+        async move { acted(remove_comment(comment_id).await) },
+    ))
+}
+
+async fn remove_comment(comment_id: String) -> Result<ActItem, String> {
+    if comment_id.is_empty() {
+        return Err("choose a comment first".into());
+    }
+    submit(json!({ "delete_comment": { "comment_id": comment_id } })).await?;
     Ok(ActItem::default())
 }
 
@@ -1041,12 +1226,29 @@ async fn save_document(page_id: String, text: String, saved: String) -> Result<S
         .map(|head| head.text.clone())
         .unwrap_or_default();
     let blocks = page_blocks(&current, &page_id);
-    let plan = document_plan(&stored_lines(&blocks), &document_body(&text));
+    // THE PLAN WRITES ONLY WHAT THIS READER CHANGED. The buffer is diffed
+    // against the page as the node holds it NOW, and that page may carry
+    // someone else's edit since this reader's baseline: planning the whole
+    // buffer against it would write the baseline's old words back over that
+    // edit. So the reader's own changes (baseline → buffer) are landed on
+    // the node's page first, and it is the merged document that is planned.
+    let node_text = page_document_text(&node_title, &blocks);
+    let page_moved_under_us = !saved.is_empty() && node_text != saved;
+    let merge = match page_moved_under_us {
+        true => document_sync::merge_text(&saved, &text, &node_text),
+        false => document_sync::Merge {
+            text: text.clone(),
+            conflicts: Vec::new(),
+        },
+    };
+    let plan = document_plan(&stored_lines(&blocks), &document_body(&merge.text));
     if !plan.refusal.is_empty() {
         return Ok(SaveItem {
             written: false,
             refusal: plan.refusal,
-            document: page_document_text(&node_title, &blocks),
+            document: node_text,
+            merged: page_moved_under_us,
+            conflicts: merge.conflicts,
             error: String::new(),
         });
     }
@@ -1068,7 +1270,9 @@ async fn save_document(page_id: String, text: String, saved: String) -> Result<S
         return Ok(SaveItem {
             written,
             refusal: String::new(),
-            document: page_document_text(&node_title, &blocks),
+            document: node_text,
+            merged: page_moved_under_us,
+            conflicts: merge.conflicts,
             error: String::new(),
         });
     }
@@ -1081,8 +1285,35 @@ async fn save_document(page_id: String, text: String, saved: String) -> Result<S
         written,
         refusal: String::new(),
         document: page_document_text(&landed_title, &page_blocks(&landed, &page_id)),
+        merged: page_moved_under_us,
+        conflicts: merge.conflicts,
         error: String::new(),
     })
+}
+
+/// The buffer after a save that merged: the keystrokes typed during the
+/// round trip (`inflight` → `now`) landed on the page the save left behind.
+pub fn rebased_buffer(inflight: &str, now: &str, landed: &str) -> String {
+    document_sync::merge_text(inflight, now, landed).text
+}
+
+/// What the screen says about the lines a merge could not keep both of.
+pub fn merge_notice(conflicts: &[String]) -> String {
+    let Some(first) = conflicts.first() else {
+        return String::new();
+    };
+    let summary = first.trim();
+    let named = match summary.is_empty() {
+        true => "a line".to_owned(),
+        false => format!("“{summary}”"),
+    };
+    match conflicts.len() {
+        1 => format!("Someone else also changed {named} — your version was kept"),
+        more => format!(
+            "Someone else also changed {named} and {} more — your versions were kept",
+            more - 1
+        ),
+    }
 }
 
 /// Whether this save owes the node a title write.
@@ -1262,6 +1493,9 @@ pub struct Copy {
 }
 
 pub fn copy(text: &str, label: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
     host::notify(
         "pages.copy",
         &encode(&json!({ "text": text, "label": label })),
@@ -1282,18 +1516,6 @@ pub fn open_link(link: &str) -> bool {
 }
 
 // ---------- readings ----------
-
-pub fn icon(name: &str) -> Vec<u8> {
-    design::icons::svg(name).as_bytes().to_vec()
-}
-
-/// A count as the header chip prints it: the number, or nothing for zero.
-pub fn count_label(count: i64) -> String {
-    match count > 0 {
-        true => count.to_string(),
-        false => String::new(),
-    }
-}
 
 pub fn keep_str(keep: bool, next: &str, current: &str) -> String {
     if keep { next } else { current }.to_owned()
@@ -1326,29 +1548,6 @@ pub fn search_answer_stands(query: &str, draft: &str, searching: bool) -> bool {
     !searching && !query.is_empty() && draft.trim() == query
 }
 
-/// A principal's plate letters: two initials, or the first letter.
-pub fn initials_of(name: &str) -> String {
-    let words: Vec<&str> = name.split_whitespace().take(2).collect();
-    if words.len() == 2 {
-        let letters: String = words
-            .iter()
-            .filter_map(|word| word.chars().find(char::is_ascii_alphanumeric))
-            .collect();
-        if letters.chars().count() == 2 {
-            return letters.to_uppercase();
-        }
-    }
-    let letters: String = name
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(2)
-        .collect();
-    match letters.is_empty() {
-        true => "?".into(),
-        false => letters.to_uppercase(),
-    }
-}
-
 /// `duck://page/<id>?net=<chain>` — the open page's own address.
 pub fn page_address(page_id: &str, chain: &str) -> String {
     if page_id.is_empty() {
@@ -1368,6 +1567,60 @@ pub fn page_display_title(pages: &[PageItem], id: &str, current: &str) -> String
         .find(|page| page.id == id)
         .map(|page| page.title.clone())
         .unwrap_or_else(|| current.to_owned())
+}
+
+/// Where the view stands once `deleted` and its subtree are gone: the
+/// active page when it survives, else the deleted page's parent (the root
+/// list when it had none).
+pub fn page_after_delete(
+    pages: &[PageItem],
+    deleted: &str,
+    active: &str,
+    active_parent: &str,
+) -> String {
+    let active_gone = active == deleted
+        || ancestors(pages, active_parent)
+            .iter()
+            .any(|page| page.id == deleted);
+    if !active_gone {
+        return active.to_owned();
+    }
+    pages
+        .iter()
+        .find(|page| page.id == deleted)
+        .map(|page| page.parent.clone())
+        .unwrap_or_default()
+}
+
+/// Where a menu of `size` opens for a press at `press`: at the pointer,
+/// flipped left or up when it would run off the viewport.
+pub fn menu_origin(press: (f64, f64), size: (f64, f64), viewport: (f64, f64)) -> (f64, f64) {
+    const GUTTER: f64 = 8.0;
+    let (px, py) = press;
+    let (w, h) = size;
+    let (vw, vh) = viewport;
+    let fits_right = px + w + GUTTER <= vw;
+    let fits_below = py + h + GUTTER <= vh;
+    let x = if fits_right { px } else { px - w };
+    let y = if fits_below { py + 4.0 } else { py - h - 4.0 };
+    (x.max(GUTTER), y.max(GUTTER))
+}
+
+/// The pages above `parent`, root first, `parent` last: the breadcrumb. A
+/// parent the index does not hold ends the walk, and a cycle among parents
+/// cannot run longer than the index.
+pub fn ancestors<'a>(pages: &'a [PageItem], parent: &str) -> Vec<&'a PageItem> {
+    let mut chain = Vec::new();
+    let mut next = parent;
+    while chain.len() < pages.len() {
+        let Some(page) = pages.iter().find(|page| page.id == next) else {
+            break;
+        };
+        chain.push(page);
+        next = &page.parent;
+    }
+    chain.reverse();
+    chain
 }
 
 /// The composer's caption: where a NEW comment will anchor.
@@ -1391,11 +1644,7 @@ pub fn comment_scope_label(
 /// block-anchored thread replied to with the page id is refused. A thread id
 /// the list does not carry (a stale card) answers `""`, which the submit
 /// refuses rather than posting somewhere else.
-pub fn comment_post_target(
-    rows: &[PageCommentThreadRow],
-    thread_id: &str,
-    scope: &str,
-) -> String {
+pub fn comment_post_target(rows: &[PageCommentThreadRow], thread_id: &str, scope: &str) -> String {
     if thread_id.is_empty() {
         return scope.to_owned();
     }
@@ -1467,13 +1716,13 @@ pub fn block_at_line(blocks: &[PageBlock], line: i64) -> String {
 }
 
 /// The text the editor is holding.
-pub fn document_text(document: &ui_lang_guest::Editor) -> String {
+pub fn document_text(document: &ducktape_view_guest::Editor) -> String {
     document.text()
 }
 
 /// A document installed from the node: the text, caret at the origin.
-pub fn document_editor(text: &str) -> ui_lang_guest::Editor {
-    ui_lang_guest::Editor::new(text)
+pub fn document_editor(text: &str) -> ducktape_view_guest::Editor {
+    ducktape_view_guest::Editor::new(text)
 }
 
 /// The buffer a context change installs: the incoming page's canonical text
@@ -1569,6 +1818,22 @@ pub fn navigation_link(interaction: Vec<u8>) -> String {
     decode_navigation(&interaction).link
 }
 
+/// The text a menu pick asked to copy, or nothing.
+pub fn navigation_copy(interaction: Vec<u8>) -> String {
+    decode_navigation(&interaction).copy
+}
+
+/// The selection a comment pick anchors on — its start and end in the
+/// module's UTF-16 units — or `None` for a comment on the whole block.
+pub fn navigation_anchor(interaction: Vec<u8>) -> Option<(u32, u32)> {
+    decode_navigation(&interaction).anchor
+}
+
+/// The agent account an "Ask AI" pick addressed, or `0` for a plain comment.
+pub fn navigation_mention(interaction: Vec<u8>) -> i64 {
+    i64::try_from(decode_navigation(&interaction).mention).unwrap_or_default()
+}
+
 /// The line a margin badge was pressed on, or `-1` when the interaction was
 /// not a badge press.
 pub fn navigation_comment_line(interaction: Vec<u8>) -> i64 {
@@ -1581,7 +1846,7 @@ fn decode_navigation(interaction: &[u8]) -> crate::document_sync::Navigation {
     if interaction.is_empty() {
         return crate::document_sync::Navigation::default();
     }
-    ui_lang_guest::wire::decode(interaction).unwrap_or_default()
+    ducktape_view_guest::wire::decode(interaction).unwrap_or_default()
 }
 
 /// A card the reader opened AT A LINE stays near that line, so it is bounded;
@@ -1609,6 +1874,15 @@ pub fn opener_text(thread: &PageCommentThread) -> String {
     }
 }
 
+/// The opening comment's own id — what its Edit and Delete act on.
+pub fn opener_id(thread: &PageCommentThread) -> String {
+    thread
+        .comments
+        .first()
+        .map(|opener| opener.id.clone())
+        .unwrap_or_default()
+}
+
 /// The replies under it, held to [`VISIBLE_REPLIES`] until the reader asks.
 pub fn thread_replies(thread: &PageCommentThread, expanded: bool) -> Vec<PageComment> {
     let replies = thread.comments.iter().skip(1);
@@ -1626,7 +1900,10 @@ pub fn reply_toggle_label(thread: &PageCommentThread, expanded: bool) -> String 
     }
     match expanded {
         true => "Fewer replies".into(),
-        false => format!("{hidden} more replies"),
+        false => match hidden {
+            1 => "1 more reply".into(),
+            hidden => format!("{hidden} more replies"),
+        },
     }
 }
 
@@ -1775,12 +2052,12 @@ pub fn comments_left_inset(pane: f64) -> f64 {
 }
 
 /// Line 0 is the page title: 22px of glyph at 1.15 between the 4px block pads
-/// `editor_markdown` gives it. A body line is 14px at 1.65 between the same.
+/// `editor_markdown` gives it. A body line is 14px at 1.5 between the same.
 const TITLE_LINE: f64 = 22.0 * 1.15 + 8.0;
-const BODY_LINE: f64 = 14.0 * 1.65 + 8.0;
+const BODY_LINE: f64 = 14.0 * 1.5 + 8.0;
 /// The card layer's own top edge, and so the origin every offset below is
-/// measured from: the 50px document header and its 1px separator.
-const LAYER_TOP: f64 = 51.0;
+/// measured from: the 40px document toolbar and its 1px separator.
+const LAYER_TOP: f64 = 41.0;
 
 /// How far the card may be pushed down and still keep its 400px body above the
 /// pane's bottom inset.
@@ -1806,8 +2083,9 @@ fn inline_card_offset(anchor_y: f64) -> f64 {
     if page_scope {
         return DOCUMENT_TOP_PADDING + TITLE_LINE + COMMENTS_GAP / 2.0;
     }
-    // The margin badge is centred on its line, so the pointer that opened the
-    // card is half a body line above that line's bottom edge.
+    // The host sits the margin badge on its row's LAST line, so the pointer that
+    // opened the card is half a body line above that row's bottom edge — under a
+    // wrapped paragraph as much as under a one-liner.
     anchor_y - LAYER_TOP + BODY_LINE / 2.0 + COMMENTS_GAP / 2.0
 }
 
@@ -1846,6 +2124,69 @@ pub fn measured_card_height(current: f64, measured: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::CommentsMode;
+
+    /// The crumb walks the parents by title, root first; a parent the index
+    /// does not hold ends the walk, and a cycle cannot run away.
+    #[test]
+    fn the_breadcrumb_walks_ancestors_root_first_and_survives_a_cycle() {
+        let page = |id: &str, parent: &str| PageItem {
+            id: id.into(),
+            title: id.to_uppercase(),
+            parent: parent.into(),
+            prefix: String::new(),
+            child_count: 0,
+        };
+        let pages = vec![page("root", ""), page("mid", "root"), page("leaf", "mid")];
+        let titles: Vec<&str> = ancestors(&pages, "mid")
+            .iter()
+            .map(|page| page.title.as_str())
+            .collect();
+        assert_eq!(titles, ["ROOT", "MID"]);
+        assert!(ancestors(&pages, "").is_empty());
+        assert!(ancestors(&pages, "unknown").is_empty());
+        let looped = vec![page("a", "b"), page("b", "a")];
+        assert_eq!(ancestors(&looped, "a").len(), 2);
+    }
+
+    /// Deleting a page under the reader's feet — the page itself or one
+    /// above it — lands on the deleted page's parent; deleting elsewhere
+    /// moves nothing.
+    #[test]
+    fn a_delete_lands_on_the_parent_only_when_it_takes_the_active_page() {
+        let page = |id: &str, parent: &str| PageItem {
+            id: id.into(),
+            title: id.to_uppercase(),
+            parent: parent.into(),
+            prefix: String::new(),
+            child_count: 0,
+        };
+        let pages = vec![
+            page("root", ""),
+            page("mid", "root"),
+            page("leaf", "mid"),
+            page("other", ""),
+        ];
+        assert_eq!(page_after_delete(&pages, "other", "leaf", "mid"), "leaf");
+        assert_eq!(page_after_delete(&pages, "leaf", "leaf", "mid"), "mid");
+        assert_eq!(page_after_delete(&pages, "mid", "leaf", "mid"), "root");
+        assert_eq!(page_after_delete(&pages, "root", "leaf", "mid"), "");
+    }
+
+    #[test]
+    fn a_menu_opens_at_the_pointer_and_flips_inside_the_viewport() {
+        assert_eq!(
+            menu_origin((10., 10.), (200., 100.), (800., 600.)),
+            (10., 14.)
+        );
+        assert_eq!(
+            menu_origin((700., 10.), (200., 100.), (800., 600.)),
+            (500., 14.)
+        );
+        assert_eq!(
+            menu_origin((10., 550.), (200., 100.), (800., 600.)),
+            (10., 446.)
+        );
+    }
 
     #[test]
     fn the_three_placements_are_decided_at_their_own_pane_widths() {
@@ -1891,7 +2232,7 @@ mod tests {
 
     #[test]
     fn the_card_floats_right_beside_the_document_and_onto_its_text_column_inline() {
-        // The float in `pages.ice` computes exactly this.
+        // The authored comments overlay computes this placement.
         let placed = |pane: f64, viewport_width: f64, original_x: f64, card: f64| {
             (0.0 + viewport_width - original_x - card) * comments_right_anchor(pane)
                 + comments_left_inset(pane)
@@ -1909,17 +2250,17 @@ mod tests {
     #[test]
     fn an_inline_card_drops_into_the_gap_under_its_line_and_a_floating_one_onto_the_pointer() {
         // Beside and Squeeze put the card's top on the pointer that opened it:
-        // 51 of header and separator, measured from the layer's own corner.
-        assert_eq!(comment_card_offset(2000.0, 300.0, 900.0), 249.0);
-        assert_eq!(comment_card_offset(1000.0, 300.0, 900.0), 249.0);
+        // 41 of toolbar and separator, measured from the layer's own corner.
+        assert_eq!(comment_card_offset(2000.0, 300.0, 900.0), 259.0);
+        assert_eq!(comment_card_offset(1000.0, 300.0, 900.0), 259.0);
         // A gutter below the separator at the top, and its body above the
         // bottom inset at the other end.
         assert_eq!(comment_card_offset(2000.0, 0.0, 900.0), 16.0);
-        assert_eq!(comment_card_offset(2000.0, 5000.0, 900.0), 433.0);
+        assert_eq!(comment_card_offset(2000.0, 5000.0, 900.0), 443.0);
         // Inline, half a body line below the pointer plus half a gutter.
         assert_eq!(
             comment_card_offset(800.0, 300.0, 900.0),
-            300.0 - 51.0 + BODY_LINE / 2.0 + 8.0
+            300.0 - 41.0 + BODY_LINE / 2.0 + 8.0
         );
         // Page scope: under the title, measured from the surface's top padding.
         assert_eq!(
@@ -1946,6 +2287,19 @@ mod tests {
                 "pane {pane} open {open} height {height}"
             );
         }
+    }
+
+    #[test]
+    fn a_search_excerpt_is_one_bounded_line_around_the_match() {
+        assert_eq!(excerpt("short  hit\nhere", "hit"), "short hit here");
+        let long = format!("{}NEEDLE{}", "a ".repeat(200), " b".repeat(200));
+        let shown = excerpt(&long, "needle");
+        assert!(shown.contains("NEEDLE"), "{shown}");
+        assert!(shown.starts_with('…') && shown.ends_with('…'), "{shown}");
+        assert!(shown.chars().count() <= EXCERPT_CHARS + 2, "{shown}");
+        // A match past the end still answers the head, bounded.
+        let tail = excerpt(&"x ".repeat(400), "missing");
+        assert!(!tail.starts_with('…') && tail.ends_with('…'), "{tail}");
     }
 
     #[test]

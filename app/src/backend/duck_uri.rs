@@ -8,8 +8,8 @@
 //! ```
 //!
 //! [`classify_duck_link`] is the module table: every surface that opens or
-//! embeds a link (the reader's markdown, the open plane in
-//! `handlers/chat.ice`) classifies through it and nowhere else. A malformed
+//! embeds a link (the Markdown reader or app navigation handler)
+//! classifies through it and nowhere else. A malformed
 //! or unknown ref is [`DuckKind::Unknown`] — never an error here; the caller
 //! decides what "nothing to open" looks like.
 //!
@@ -192,11 +192,6 @@ pub fn duck_forge_item_link(repo: String, number: i64, chain_id: String) -> Stri
 /// `duck://forge/<repo>?net=…` — one repository.
 pub fn duck_forge_repo_link(repo: String, chain_id: String) -> String {
     format!("duck://forge/{repo}{}", net_query(&chain_id))
-}
-
-/// `duck://channel/<id>?net=…` — likewise the only handle on a channel.
-pub fn duck_channel_link(channel: String, chain_id: String) -> String {
-    format!("duck://channel/{channel}{}", net_query(&chain_id))
 }
 
 /// `duck://channel/<id>?net=…#<seq>` — one message. The query precedes the
@@ -393,23 +388,6 @@ fn classify_channel(segments: &[&str], rev: &str, fragment: &str) -> DuckLink {
         ..DuckLink::of(DuckKind::ChannelMessage)
     }
 }
-
-/// Echo lanes: the open plane hands a classified link's field to an EXISTING
-/// navigation handler through a run continuation (`run every duck_echo_str(x)
-/// -> forge_open_repo _`), the one way an Ice handler reaches another.
-pub async fn duck_echo_str(value: String) -> Result<String, AppError> {
-    Ok(value)
-}
-
-pub async fn duck_echo_i64(value: i64) -> Result<i64, AppError> {
-    Ok(value)
-}
-
-pub async fn duck_echo_f64(value: f64) -> Result<f64, AppError> {
-    Ok(value)
-}
-
-use super::AppError;
 
 #[cfg(test)]
 mod tests {
@@ -650,17 +628,13 @@ mod tests {
             "duck://channel/general?net=d0cdf950#42"
         );
         assert_eq!(
-            duck_channel_link("c1".into(), "mynet#d0cdf950".into()),
-            "duck://channel/c1?net=d0cdf950"
-        );
-        assert_eq!(
             duck_page_link("p1".into(), String::new()),
             "duck://page/p1",
             "no chain id yet, no query — never a `?net=` naming nothing"
         );
         for built in [
             duck_page_link("p1".into(), "mynet#d0cdf950".into()),
-            duck_channel_link("c1".into(), "mynet#d0cdf950".into()),
+            "duck://channel/c1?net=d0cdf950".into(),
             duck_channel_message_link("c1".into(), 3, "mynet#d0cdf950".into()),
         ] {
             let link = resolve_duck_link(built.clone(), "mynet#d0cdf950".into());

@@ -3,12 +3,15 @@
 //! threads for itself through `rpc.view`, re-reads them on every `rpc.live`
 //! hit, and every act leaves as `op.submit` carrying the pages message.
 
+use ducktape_view_guest::testing::{
+    answer, edit, find, has_text, item, measure, press, submit, texts, type_into,
+};
+use ducktape_view_guest::wire::{self, Event, Frame, Length, Node, Request};
 use pages_view::host::{
-    PageCommentThread, PageCommentThreadRow, Session, comment_post_target, sidebar_width_after_delta,
+    PageCommentThread, PageCommentThreadRow, Session, comment_post_target,
+    sidebar_width_after_delta,
 };
 use pages_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{answer, find, has_text, item, measure, press, texts, type_into};
-use ui_lang_guest::wire::{self, Event, Frame, Length, Node, Request};
 
 /// The first editor in the tree, depth first.
 fn find_editor(node: &Node) -> Option<&Node> {
@@ -21,6 +24,37 @@ fn find_editor(node: &Node) -> Option<&Node> {
 fn boot() -> Frame {
     boot_native();
     tick_native(Vec::new())
+}
+
+#[test]
+fn search_results_show_page_titles_and_excerpts_not_internal_block_ids() {
+    let (frame, _) = connected_with_register();
+    let frame = tick_native(type_into(&frame, "Search pages…", "needle"));
+    let frame = tick_native(submit(&frame, "Search pages…"));
+    let reply = serde_json::json!({"hits": [{
+        "page_id": "gamma", "block_id": "private-block-identifier",
+        "kind": "paragraph", "text": "A matching needle excerpt"
+    }]});
+    let frame = tick_native(vec![answer(
+        request(&frame, "rpc.view").id,
+        reply.to_string().as_bytes(),
+    )]);
+    let titles = serde_json::json!({"pages": {"pages": [
+        {"id": "gamma", "title": "Search-only page title", "parent": null}
+    ], "has_more": false, "next_after": null}});
+    let frame = tick_native(vec![answer(
+        request(&frame, "rpc.view").id,
+        titles.to_string().as_bytes(),
+    )]);
+    let shown = texts(&frame);
+    assert!(has_text(&frame, "Search-only page title"), "{shown:?}");
+    assert!(has_text(&frame, "A matching needle excerpt"), "{shown:?}");
+    assert!(
+        !shown
+            .iter()
+            .any(|text| text.contains("private-block-identifier")),
+        "{shown:?}"
+    );
 }
 
 fn kinds(requests: &[Request]) -> Vec<&str> {
@@ -110,7 +144,8 @@ fn threads() -> Vec<u8> {
 
 /// The canned reply for one kernel read, chosen by the query it carries: the
 /// page index, one page's blocks, the grouped thread read, or — on the
-/// identity module, which is where the names live — the account directory.
+/// identity module, which is where the names live — the account directory,
+/// and on the runs module the agent roster "Ask AI" addresses.
 fn answered(request: &Request) -> Vec<u8> {
     let ask: serde_json::Value =
         serde_json::from_slice(&request.payload).expect("a view ask decodes");
@@ -119,6 +154,18 @@ fn answered(request: &Request) -> Vec<u8> {
         return serde_json::json!({ "accounts": [] })
             .to_string()
             .into_bytes();
+    }
+    if ask["target"] == "runs" {
+        assert_eq!(
+            query,
+            &serde_json::json!({ "model": { "query": "agents" } })
+        );
+        return serde_json::json!({ "model": { "agents": [
+            { "account": 7, "agent_id": "builder", "display_name": "Builder", "status": "active" },
+            { "account": 8, "agent_id": "napping", "display_name": "Napping", "status": "paused" }
+        ] } })
+        .to_string()
+        .into_bytes();
     }
     assert_eq!(ask["target"], "pages", "a pages view asks the pages module");
     match query {
@@ -288,6 +335,14 @@ fn the_card_lists_every_open_thread_expanded_under_its_anchor() {
     );
 
     let frame = tick_native(press(&frame, "Comments"));
+    // the card opened to be written in: the keyboard moves to its composer
+    let focus = request(&frame, "host.widget");
+    assert_eq!(
+        wire::decode::<wire::WidgetCommand>(&focus.payload).unwrap(),
+        wire::WidgetCommand::Focus {
+            target: "PagesView/root/pages/page-comment(alpha)".into()
+        }
+    );
     for expected in [
         "This page · 2 threads",
         "“the first paragraph”",
@@ -296,7 +351,7 @@ fn the_card_lists_every_open_thread_expanded_under_its_anchor() {
         "first reply",
         "second reply",
         "third reply",
-        "1 more replies",
+        "1 more reply",
         "Resolved · 1",
         "Comment on this page",
     ] {
@@ -350,7 +405,7 @@ fn the_resolved_toggle_opens_the_settled_threads() {
 }
 
 /// A group's quote is the way IN to that block's scope, and the way back out
-/// is the card's own "← This page". Neither costs a read: the register already
+/// is the card's own "All comments". Neither costs a read: the register already
 /// answered for the page and every block on it.
 #[test]
 fn narrowing_to_a_block_and_widening_back_re_slice_the_rows_in_hand() {
@@ -372,7 +427,7 @@ fn narrowing_to_a_block_and_widening_back_re_slice_the_rows_in_hand() {
         texts(&frame)
     );
 
-    let frame = tick_native(press(&frame, "All comments on this page"));
+    let frame = tick_native(press(&frame, "All comments"));
     assert!(
         has_text(&frame, "the page reads well") && has_text(&frame, "This page · 2 threads"),
         "{:?}",
@@ -393,7 +448,7 @@ fn a_margin_badge_pins_the_card_to_its_own_block() {
         texts(&frame)
     );
     assert!(
-        !has_text(&frame, "← This page"),
+        !has_text(&frame, "All comments"),
         "a pinned card withholds the way back out: {:?}",
         texts(&frame)
     );
@@ -434,6 +489,14 @@ fn the_foot_composer_opens_a_new_thread_on_the_scope() {
 fn a_reply_inherits_its_threads_own_anchor() {
     let frame = page_card();
     let frame = tick_native(press(&frame, "Reply to this thread"));
+    // the reply box opened to be written in: the keyboard moves to it
+    let focus = request(&frame, "host.widget");
+    assert_eq!(
+        wire::decode::<wire::WidgetCommand>(&focus.payload).unwrap(),
+        wire::WidgetCommand::Focus {
+            target: "PagesView/root/pages/thread-reply(t-page)".into()
+        }
+    );
     let frame = tick_native(type_into(&frame, "Reply…", "agreed"));
     let frame = tick_native(press(&frame, "Post reply"));
 
@@ -484,6 +547,31 @@ fn a_stale_thread_id_names_no_target() {
     assert_eq!(comment_post_target(&rows, "t-block", "alpha"), "alpha-1");
     assert_eq!(comment_post_target(&rows, "", "alpha"), "alpha");
     assert_eq!(comment_post_target(&rows, "t-gone", "alpha"), "");
+}
+
+#[test]
+fn the_sidebar_drag_round_trips_through_the_wire_handler() {
+    let (frame, _) = connected_with_register();
+    let Some(Node::ResizeHandle {
+        on_drag: Some(handler),
+        ..
+    }) = find(&frame, "PagesView/root/pages/sidebar-divider")
+    else {
+        panic!("sidebar divider");
+    };
+    let next = tick_native(vec![Event::Drag {
+        handler: *handler,
+        dx: 35.,
+        dy: 0.,
+    }]);
+    let Some(Node::Container {
+        width: Some(Length::Fixed(width)),
+        ..
+    }) = find(&next, "PagesView/root/pages/page-list")
+    else {
+        panic!("sidebar width");
+    };
+    assert_eq!(*width, 265.);
 }
 
 /// The screen after the pane sensor reports `width`: the card is placed against
@@ -627,5 +715,319 @@ fn crossing_a_placement_threshold_keeps_the_rail_and_what_is_typed_in_it() {
     assert_eq!(
         op["payload"]["add_comment"]["text"], "half a thought",
         "the draft survived the placement change"
+    );
+}
+
+/// One comment's Edit opens a box holding its words; Save leaves as the
+/// module's own `edit_comment` on that comment's id.
+#[test]
+fn editing_a_comment_rewrites_it_in_place() {
+    let frame = page_card();
+    let frame = tick_native(press(&frame, "Edit comment"));
+    assert!(
+        has_text(&frame, "Save") && has_text(&frame, "Cancel"),
+        "the box replaces the words: {:?}",
+        texts(&frame)
+    );
+    // the box opened to be written in: the keyboard moves to it
+    let focus = request(&frame, "host.widget");
+    assert_eq!(
+        wire::decode::<wire::WidgetCommand>(&focus.payload).unwrap(),
+        wire::WidgetCommand::Focus {
+            target: "PagesView/root/pages/comment-edit(c1)".into()
+        }
+    );
+    let frame = tick_native(type_into(&frame, "Edit comment", "the page reads better"));
+    let frame = tick_native(press(&frame, "Save"));
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op,
+        serde_json::json!({
+            "target": "pages",
+            "payload": { "edit_comment": { "comment_id": "c1", "text": "the page reads better" } }
+        })
+    );
+}
+
+/// A comment's Delete leaves as `delete_comment`; the module tombstones it and
+/// drops a thread whose last comment goes.
+#[test]
+fn deleting_a_comment_leaves_as_its_own_op() {
+    let frame = page_card();
+    let frame = tick_native(press(&frame, "Delete comment"));
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op,
+        serde_json::json!({
+            "target": "pages",
+            "payload": { "delete_comment": { "comment_id": "c1" } }
+        })
+    );
+}
+
+/// The editor node on screen, with its commit route.
+fn editor_of(frame: &Frame) -> (&wire::editor_document::EditorDocumentRef, u32) {
+    let editor = frame
+        .root
+        .as_ref()
+        .and_then(find_editor)
+        .expect("the document editor is on screen");
+    let Node::Editor {
+        document, options, ..
+    } = editor
+    else {
+        unreachable!("find_editor answers editors")
+    };
+    let binding = options.binding.as_ref().expect("editor commit route");
+    (document, binding.on_event)
+}
+
+fn transaction_id(
+    document: &wire::editor_document::EditorDocumentRef,
+) -> wire::EditorTransactionId {
+    wire::EditorTransactionId {
+        instance: 0,
+        document: document.document.clone(),
+        reset: document.reset,
+        sequence: document.revision + 1,
+        attempt: 0,
+        text_revision: document.text_revision,
+        revision: document.revision,
+    }
+}
+
+/// `Cmd+/` over a selection: the host commits the empty step with the key as
+/// its origin, and the caret carrying the selection.
+fn cmd_slash_over(frame: &Frame, line: u32, from: u32, to: u32) -> Vec<Event> {
+    use wire::keyboard::{Key, KeyState, Location, Modifiers, NativeCode, Physical};
+    let (document, handler) = editor_of(frame);
+    let key = Key::Character("/".into());
+    let mut after = document.clone();
+    after.revision += 1;
+    after.cursor = wire::EditorCursor {
+        position: wire::EditorPosition { line, column: to },
+        selection: Some(wire::EditorPosition { line, column: from }),
+    };
+    vec![Event::EditorTransaction {
+        handler,
+        event: wire::EditorTransactionEvent::Commit {
+            origin: Some(wire::EditorRequestInput::Key {
+                key: KeyState {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key: Physical::Unidentified(NativeCode::Unidentified),
+                    location: Location::Standard,
+                    modifiers: Modifiers {
+                        control: true,
+                        ..Modifiers::default()
+                    },
+                },
+                repeat: false,
+            }),
+            id: transaction_id(document),
+            before: document.clone(),
+            after,
+            patches: Vec::new(),
+            kind: wire::EditorEditKind::Cursor,
+            history: wire::EditorHistoryEffect::Native,
+            input_time_ms: 0,
+        },
+    }]
+}
+
+fn menu_pick(frame: &Frame, tag: &str) -> Vec<Event> {
+    let (document, handler) = editor_of(frame);
+    vec![Event::EditorTransaction {
+        handler,
+        event: wire::EditorTransactionEvent::Interaction {
+            id: transaction_id(document),
+            state: document.clone(),
+            action: wire::editor_presentation::EditorInteraction::MenuPick { tag: tag.into() },
+            input_time_ms: 0,
+        },
+    }]
+}
+
+/// The format menu's Comment pins the new thread to the words that were
+/// selected — the block's own text in UTF-16 units, marker dropped — and the
+/// composer's next post is on the whole block again.
+#[test]
+fn a_comment_from_the_format_menu_pins_to_the_selected_words() {
+    let (frame, _) = connected_with_register();
+    // "the first paragraph": `first` is 4..9
+    let frame = tick_native(cmd_slash_over(&frame, 1, 4, 9));
+    let (document, _) = editor_of(&frame);
+    assert_eq!(document.cursor.selection.map(|p| p.column), Some(4));
+    let frame = tick_native(menu_pick(&frame, "comment"));
+    assert!(
+        has_text(&frame, "the opening claim") && !has_text(&frame, "the page reads well"),
+        "the pick opens the block's own conversation: {:?}",
+        texts(&frame)
+    );
+    // the card is as tall as its threads, under a ceiling the list scrolls in
+    let Some(Node::Container {
+        height: None,
+        max_height: Some(_),
+        ..
+    }) = find(&frame, "PagesView/root/pages/comments-card")
+    else {
+        panic!("the comment card is a content-sized container with a ceiling");
+    };
+    // the card opened to be written in: the keyboard moves to its composer
+    let focus = request(&frame, "host.widget");
+    assert_eq!(
+        wire::decode::<wire::WidgetCommand>(&focus.payload).unwrap(),
+        wire::WidgetCommand::Focus {
+            target: "PagesView/root/pages/page-comment(alpha)".into()
+        }
+    );
+    let frame = tick_native(type_into(&frame, "Start a thread…", "first?"));
+    let frame = tick_native(press(&frame, "Post"));
+    let mint = request(&frame, "host.id");
+    let frame = tick_native(vec![answer(mint.id, b"thread-9")]);
+    let mint = request(&frame, "host.id");
+    let frame = tick_native(vec![answer(mint.id, b"comment-9")]);
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op["payload"]["add_comment"],
+        serde_json::json!({
+            "thread_id": "thread-9", "comment_id": "comment-9",
+            "target": "alpha-1", "text": "first?", "anchor": { "start": 4, "end": 9 }
+        })
+    );
+}
+
+/// "Ask AI" is a comment addressed to an agent: the picker lists the active
+/// roster only, the post carries the agent's account as a mention — which
+/// is what makes the runs module answer in the thread — and, like Comment,
+/// the toolbar's ask pins to the selected words. The next post is plain.
+#[test]
+fn ask_ai_posts_the_comment_with_the_agent_mentioned() {
+    let (frame, _) = connected_with_register();
+    let frame = tick_native(cmd_slash_over(&frame, 1, 4, 9));
+    let frame = tick_native(menu_pick(&frame, "ai"));
+    // The paused agent is not on the picker, so its account opens nothing.
+    let frame = tick_native(menu_pick(&frame, "8"));
+    assert!(
+        !has_text(&frame, "Start a thread…"),
+        "a paused agent is not offered: {:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(menu_pick(&frame, "7"));
+    let frame = tick_native(type_into(&frame, "Start a thread…", "tighten this?"));
+    let frame = tick_native(press(&frame, "Post"));
+    let mint = request(&frame, "host.id");
+    let frame = tick_native(vec![answer(mint.id, b"thread-9")]);
+    let mint = request(&frame, "host.id");
+    let frame = tick_native(vec![answer(mint.id, b"comment-9")]);
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op["payload"]["add_comment"],
+        serde_json::json!({
+            "thread_id": "thread-9", "comment_id": "comment-9",
+            "target": "alpha-1", "text": "tighten this?",
+            "anchor": { "start": 4, "end": 9 }, "mentions": [7]
+        })
+    );
+}
+
+/// Like `connected_with_register`, also handing back the autosave clock's
+/// subscription id, which the register's landing frame opened.
+fn connected_with_clock() -> (Frame, u64) {
+    let frame = boot();
+    let session_id = request(&frame, "pages.props").id;
+    let mut frame = tick_native(vec![item(session_id, &session(true))]);
+    let mut clock = None;
+    for _ in 0..16 {
+        if let Some(ticks) = frame.requests.iter().find(|one| one.kind == "clock.ticks") {
+            clock = Some(ticks.id);
+        }
+        let read = frame
+            .requests
+            .iter()
+            .find(|one| one.kind == "rpc.view" || one.kind == "rpc.query");
+        let Some(read) = read else {
+            return (frame, clock.expect("the open page arms the autosave clock"));
+        };
+        let reply = answered(read);
+        frame = tick_native(vec![answer(read.id, &reply)]);
+    }
+    panic!("the register never settled")
+}
+
+fn page_with(paragraphs: &[(&str, &str)]) -> Vec<u8> {
+    let children: Vec<&str> = paragraphs.iter().map(|(id, _)| *id).collect();
+    let mut blocks = vec![serde_json::json!({
+        "id": "alpha", "parent": null, "page": "alpha", "kind": "page",
+        "text": "Alpha", "checked": false, "children": children
+    })];
+    blocks.extend(paragraphs.iter().map(|(id, text)| {
+        serde_json::json!({
+            "id": id, "parent": "alpha", "page": "alpha", "kind": "paragraph",
+            "text": text, "checked": false, "children": []
+        })
+    }));
+    serde_json::json!({ "page": { "blocks": blocks, "next_after": null } })
+        .to_string()
+        .into_bytes()
+}
+
+/// THE SAVE WRITES ONLY WHAT THIS READER CHANGED. Someone else added a
+/// paragraph while this reader sharpened the first one: the save lands the
+/// sharpening alone, never a removal of the newcomer, and the buffer takes
+/// the newcomer in so the next tick does not read it as a deletion.
+#[test]
+fn a_save_lands_only_this_readers_edits_on_a_page_someone_else_moved() {
+    let (frame, clock) = connected_with_clock();
+    let before = "Alpha\nthe first paragraph";
+    let sharpened = "Alpha\nthe first paragraph, sharpened";
+    let _edited = tick_native(edit(&frame, "Write with Markdown…", before, sharpened));
+    let frame = tick_native(vec![item(clock, b"")]);
+    let moved = page_with(&[
+        ("alpha-1", "the first paragraph"),
+        ("alpha-2", "a second paragraph by someone else"),
+    ]);
+    // The save reads the page as it stands, then the block it rewrites.
+    let read = request(&frame, "rpc.view");
+    let frame = tick_native(vec![answer(read.id, &moved)]);
+    let read = request(&frame, "rpc.view");
+    let frame = tick_native(vec![answer(read.id, &moved)]);
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op,
+        serde_json::json!({ "target": "pages", "payload": { "update_text": {
+            "block_id": "alpha-1", "text": "the first paragraph, sharpened"
+        } } })
+    );
+    let frame = tick_native(vec![answer(submit.id, b"7")]);
+    assert!(
+        frame.requests.iter().all(|one| one.kind != "op.submit"),
+        "the other reader's paragraph is not written off: {:?}",
+        frame.requests
+    );
+    let landed = page_with(&[
+        ("alpha-1", "the first paragraph, sharpened"),
+        ("alpha-2", "a second paragraph by someone else"),
+    ]);
+    let read = request(&frame, "rpc.view");
+    let frame = tick_native(vec![answer(read.id, &landed)]);
+    let (document, _) = editor_of(&frame);
+    let rebased = "Alpha\nthe first paragraph, sharpened\na second paragraph by someone else";
+    assert_eq!(
+        document.byte_len as usize,
+        rebased.len(),
+        "the buffer took the newcomer in"
+    );
+    // Settled: the next tick has nothing to save.
+    let frame = tick_native(vec![item(clock, b"")]);
+    assert!(
+        frame.requests.iter().all(|one| one.kind != "rpc.view"),
+        "a rebased buffer is clean: {:?}",
+        frame.requests
     );
 }

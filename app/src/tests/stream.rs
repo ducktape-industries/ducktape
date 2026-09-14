@@ -41,86 +41,41 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
         ("active_dm", &["active_dm_peer", "dm_peers"]),
     ];
 
-    // Every handler file, because a mirror's source can move in any of them.
-    macro_rules! handler_sources {
-        ($($path:literal),* $(,)?) => { [$(($path, include_str!(concat!("../", $path)))),*] };
-    }
-    let files = handler_sources![
-        "ui/handlers/chat.ice",
-        "ui/handlers/files.ice",
-        "ui/handlers/forge.ice",
-        "ui/handlers/huddle.ice",
-        "ui/handlers/lifecycle.ice",
-        "ui/handlers/node.ice",
-        "ui/handlers/onboarding.ice",
-        "ui/handlers/overlays.ice",
-        "ui/handlers/pages.ice",
-        "ui/handlers/roster.ice",
-    ];
-
-    // An ASSIGNMENT opens a statement line — prose naming a field, and a call
-    // that merely READS one, are not writes.
-    let assigns = |body: &str, field: &str| {
-        let statement = format!("{field} = ");
-        body.lines()
-            .any(|line| line.trim_start().starts_with(&statement))
-    };
-
-    let mut checked = 0usize;
-    for (path, source) in files {
-        for block in source
-            .split(
-                "
-on ",
-            )
-            .skip(1)
-        {
-            let handler = block.split('(').next().unwrap_or(block).trim();
-            let handler = handler.lines().next().unwrap_or(handler).trim();
-            for (mirror, sources) in MIRRORS {
-                let Some(moved) = sources.iter().find(|field| assigns(block, field)) else {
-                    continue;
-                };
-                checked += 1;
-                assert!(
-                    assigns(block, mirror),
-                    "{path}: `on {handler}` assigns `{moved}`, so it must also                      assign `{mirror}` — the view reads the mirror and never                      recomputes it (see state/chat.ice)"
-                );
+    let mut checked = 0;
+    for (handler, body) in handler_bodies() {
+        for (mirror, sources) in MIRRORS {
+            let moved = sources
+                .iter()
+                .any(|field| body.contains(&format!("self.{field}=")));
+            if !moved {
+                continue;
             }
+            checked += 1;
+            assert!(
+                body.contains(&format!("self.{mirror}=")),
+                "{handler} moves a source without refreshing {mirror}"
+            );
         }
     }
-    // The sweep must actually have found writers: a rename that silently
-    // stopped matching would otherwise pass with nothing checked at all.
-    assert!(
-        checked >= 20,
-        "the mirror sweep matched only {checked} writers — it has stopped seeing them"
-    );
+    assert!(checked >= 20, "the sweep must see actual assignments");
 }
 
 #[test]
 fn history_windows_offer_a_jump_back_to_latest() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.loading = false;
     app.active_channel = "general".into();
 
     // landing on a search hit enters history mode…
-    let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("general".into(), 7));
+    let _ = app.update(AppMessage::OpenChatSearchHit("general".into(), 7));
     assert!(app.history_view);
     assert_eq!(app.chat_land_seq, 7);
 
     // …and the Jump-to-latest press — which the view emits as `choose_channel`
     // on the room it is already in — leaves it
-    let _ = app.__update(__DucktapeMessage::ChooseChannel("general".into()));
+    let _ = app.update(AppMessage::ChooseChannel("general".into()));
     assert!(!app.history_view);
     assert_eq!(app.chat_land_seq, 0, "and the view opens back on the tail");
-
-    // The way back is a float over the timeline's bottom edge now, not a
-    // button inside an amber band at the top of the column — and it is shown
-    // for a reader who simply scrolled up, not only for a history window.
-    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
-    assert!(chat.contains("if !empty(messages) && (history_view || !at_live_tail)"));
-    assert!(chat.contains("button \"↓  Jump to latest\""));
-    assert!(chat.contains("-> emit(choose_channel, active_channel)"));
 }
 
 /// THE BANNER DESCRIBES THE ROWS IN HAND, SO EVERY WRITER OF THEM ANSWERS IT.
@@ -133,14 +88,14 @@ fn history_windows_offer_a_jump_back_to_latest() {
 /// reader is already at the end of. Same after a create.
 #[test]
 fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.loading = false;
     app.active_channel = "general".into();
-    let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("general".into(), 7));
+    let _ = app.update(AppMessage::OpenChatSearchHit("general".into(), 7));
     assert!(app.history_view);
 
     // a resync carrying no chat news leaves the window — and its banner — alone
-    let _ = app.__update(__DucktapeMessage::LiveResynced(backend::LiveRefresh {
+    let _ = app.update(AppMessage::LiveResynced(backend::LiveRefresh {
         chat_loaded: false,
         ..live_refresh(app.hydration_generation, "general")
     }));
@@ -150,7 +105,7 @@ fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
     );
 
     // one that carries chat replaced it with the latest page
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+    let _ = app.update(AppMessage::LiveResynced(live_refresh(
         app.hydration_generation,
         "general",
     )));
@@ -160,11 +115,11 @@ fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
     );
 
     // and a create lands you in a brand-new room, which has no history at all
-    let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("general".into(), 7));
+    let _ = app.update(AppMessage::OpenChatSearchHit("general".into(), 7));
     assert!(app.history_view);
     let mut created = chat_data("brand-new");
     created.generation = app.chat_generation;
-    let _ = app.__update(__DucktapeMessage::ChannelCreated(created));
+    let _ = app.update(AppMessage::ChannelCreated(created));
     assert!(!app.history_view);
 }
 
@@ -180,12 +135,12 @@ fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
 /// means nothing else was.
 #[test]
 fn a_plane_op_refetches_only_the_plane_it_names() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.loading = false;
 
     let plane = |app: &mut Ducktape, module: &str| {
-        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        let _ = app.update(AppMessage::LiveUpdated(backend::LiveUpdate {
             kind: LiveKind::Plane,
             status: "Live".into(),
             height: 12,
@@ -258,15 +213,17 @@ fn a_resync_across_a_chain_drops_the_previous_networks_rooms() {
         archived: false,
         members_only: false,
         huddle_count: 0,
+        voice: false,
+        huddle: Vec::new(),
         head_seq,
     };
     let resync = |app: &Ducktape, channels: Vec<backend::ChatChannel>| {
         let mut refresh = live_refresh(app.hydration_generation, "dm-1");
         refresh.channels = channels;
-        __DucktapeMessage::LiveResynced(refresh)
+        AppMessage::LiveResynced(refresh)
     };
 
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.loading = false;
     // The console is holding the network she left, and the node is now serving
@@ -275,7 +232,7 @@ fn a_resync_across_a_chain_drops_the_previous_networks_rooms() {
     app.network_chain_id = "ducktape-industries#549d70e8".into();
     app.channels = vec![room("general", 40), room("random", 3)];
 
-    let _ = app.__update(resync(&app, vec![room("dm-1", 6)]));
+    let _ = app.update(resync(&app, vec![room("dm-1", 6)]));
 
     let held: Vec<&str> = app.channels.iter().map(|row| row.id.as_str()).collect();
     assert_eq!(
@@ -293,7 +250,7 @@ fn a_resync_across_a_chain_drops_the_previous_networks_rooms() {
     // must survive it and a head a delta moved must not walk back.
     app.channels.push(room("brand-new", 1));
     app.channels[0].head_seq = 9;
-    let _ = app.__update(resync(&app, vec![room("dm-1", 6)]));
+    let _ = app.update(resync(&app, vec![room("dm-1", 6)]));
     assert!(
         app.channels.iter().any(|row| row.id == "brand-new"),
         "the room created mid-resync is still in the sidebar"

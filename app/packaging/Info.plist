@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleName</key><string>Ducktape</string>
+<key>CFBundleDisplayName</key><string>Ducktape</string>
+<key>CFBundleIdentifier</key><string>dev.ducktape.app</string>
+<key>CFBundleExecutable</key><string>ducktape-app</string>
+<key>CFBundleIconFile</key><string>Ducktape</string>
+<key>LSMinimumSystemVersion</key><string>11.0</string>
+<key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
+<key>NSHighResolutionCapable</key><true/>
+<key>CFBundleSupportedPlatforms</key><array><string>MacOSX</string></array>
+<key>NSCameraUsageDescription</key><string>Ducktape uses the camera for video in huddles.</string>
+<key>NSMicrophoneUsageDescription</key><string>Ducktape uses the microphone for voice in huddles.</string>
+</dict></plist>

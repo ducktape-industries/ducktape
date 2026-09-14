@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ::chat::index::{ChatViewQuery, ChatViewReply, MsgRow};
+use ::chat::index::{ChatViewQuery, ChatViewReply};
 // No `ChatQuery`/`ChatReply` here on purpose: every chat read in this app goes
 // through `/v1/index/chat/view`, off the node's select loop. A dispatch query
 // import reappearing is the signal that one crawled back onto it.
@@ -14,7 +14,7 @@ use ::chat::{ChatMsg, PostPolicy};
 // frames through `::node::encode_frame` — see `rpc::Signer`.
 use commonware_cryptography::{Signer as _, ed25519};
 use ducktape_rpc::{Client as RpcClient, ModuleEvent, Status as NodeStatus};
-use iced::futures::{FutureExt as _, StreamExt as _};
+use futures::{FutureExt as _, StreamExt as _};
 use pages::BlockKind;
 use pages::index::{PageRow, PagesViewQuery, PagesViewReply};
 use tokio::sync::OwnedSemaphorePermit;
@@ -22,25 +22,20 @@ use zeroize::Zeroizing;
 
 // chat's client view model is module-owned (`chat::client`) — the rendered
 // row types, the composer parsing, the optimistic merges, and the op-delta
-// splices. re-exported here because the Ice externs resolve `crate::backend`.
+// splices. Re-exported here for app state handlers.
 pub use ::chat::client::{
-    CHAT_HOT_WINDOW_LIMIT, ChatBlock, ChatChannel, ChatDelta, ChatMember, ChatMessage,
-    ChatReaction, ChatReader, ChatSpan, MentionCandidates, NameDirectory, author_display,
-    chat_message, handle_char, mark_message_groups, short_label,
+    ChatChannel, ChatDelta, ChatMember, ChatReader, HuddleSeat, MentionCandidates, NameDirectory,
+    author_display, short_label,
 };
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.
 #[cfg(test)]
-pub use ::chat::client::{BoundAccount, author_name, paragraph_blocks};
+pub use ::chat::client::{BoundAccount, ChatMessage, author_name, paragraph_blocks};
 pub use inbox::client::{BellDelta, BellItem};
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 /// How many one-second polls the provisioning screen waits before it says the
 /// node is not running and names the command that starts it.
 const PROVISION_PATIENCE: u32 = 8;
-/// One index view page fills the entire bounded render window. Timeline roots
-/// have their own index keyspace, so this is always one RPC regardless of how
-/// many thread replies sit between roots.
-const CHAT_VIEW_PAGE_LIMIT: usize = CHAT_HOT_WINDOW_LIMIT;
 
 /// Client-local read cursor for one channel: the newest `seq` this device has
 /// "seen". There is no wire read-cursor — this list lives only in app state and
@@ -181,7 +176,7 @@ pub struct LiveUpdate {
     pub chat: Vec<ChatDelta>,
     pub bell: BellDelta,
     /// Subscription backpressure, not UI state. The next socket publication
-    /// cannot be read until the generated app message carrying this token has
+    /// cannot be read until the app message carrying this token has
     /// finished its update and all of its clones have been dropped.
     pub(crate) permit: LivePermit,
 }
@@ -278,7 +273,7 @@ pub use rpc::*;
 pub use search::*;
 pub use shell::*;
 pub use storage::*;
-pub use style::*;
+pub(crate) use style::*;
 
 #[cfg(test)]
 mod tests;

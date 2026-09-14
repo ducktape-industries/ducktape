@@ -5,11 +5,11 @@
 //! `rpc.stream`, and retunes the running node's tracing filter with one
 //! `rpc.admin` POST. The clipboard is the one intent left.
 
+use ducktape_view_guest::testing::{answer, has_text, item, press, refuse, texts, type_into};
+use ducktape_view_guest::wire::{Event, Frame, Node, Request};
 use node_view::host::{Copy, Session};
 use node_view::{boot_native, tick_native};
 use serde_json::{Value, json};
-use ui_lang_guest::testing::{answer, has_text, item, press, texts, type_into};
-use ui_lang_guest::wire::{Event, Frame, Node, Request};
 
 // ---------- what the node answers ----------
 
@@ -38,10 +38,14 @@ fn peers() -> Value {
     ]})
 }
 
+/// A whole 32-byte digest, as a module serializes one.
+const ACTIVE_CODE: [u8; 32] = [0x77; 32];
+const ACTIVE_CODE_HEX: &str = "7777777777777777777777777777777777777777777777777777777777777777";
+
 fn module_status() -> Value {
     json!({ "module_status": { "modules": [{
         "module_id": "chat",
-        "active_code_hash": [0x77, 0xaa],
+        "active_code_hash": ACTIVE_CODE,
         "history": [],
         "pending": null,
     }]}})
@@ -83,10 +87,14 @@ fn request<'a>(frame: &'a Frame, kind: &str) -> &'a Request {
 }
 
 fn session() -> Vec<u8> {
+    session_as(true)
+}
+
+fn session_as(admin: bool) -> Vec<u8> {
     serde_json::to_vec(&Session {
         connected: true,
         dark: false,
-        admin: true,
+        admin,
         tier: "validator".into(),
         status: "Live".into(),
         data_dir: "/var/ducktape/demo".into(),
@@ -118,8 +126,21 @@ fn settle(mut frame: Frame) -> (Frame, Vec<Request>) {
 
 /// Boots, pushes the session, and answers every read it starts.
 fn connected() -> (Frame, Vec<Request>) {
+    connected_as(true)
+}
+
+fn connected_as(admin: bool) -> (Frame, Vec<Request>) {
     let props = request(&boot(), "node.props").id;
-    settle(tick_native(vec![item(props, &session())]))
+    settle(tick_native(vec![item(props, &session_as(admin))]))
+}
+
+/// The one `node.copy` intent a frame carries.
+fn copied(frame: &Frame) -> Copy {
+    let [intent] = frame.requests.as_slice() else {
+        panic!("one intent, got {:?}", frame.requests);
+    };
+    assert_eq!(intent.kind, "node.copy");
+    serde_json::from_slice(&intent.payload).expect("decodes")
 }
 
 /// One `logs` tail frame, as the node sends it.
@@ -158,8 +179,8 @@ fn a_connected_view_reads_the_node_for_itself() {
         "This node",
         "ab12cd34",
         "/var/ducktape/demo",
-        "h 84,912",
-        "h 84,900",
+        "block 84,912",
+        "block 84,900",
         "just now",
         "3 / 3",
         "peer-1aa…",
@@ -185,7 +206,10 @@ fn a_connected_view_reads_the_node_for_itself() {
     }
     let mut names = Vec::new();
     surfaces(frame.root.as_ref().expect("a tree"), &mut names);
-    assert!(names.is_empty(), "the log ring is the guest's now: {names:?}");
+    assert!(
+        names.is_empty(),
+        "the log ring is the guest's now: {names:?}"
+    );
 
     // a block moved: the view reads the node again off its own subscription
     let frame = tick_native(vec![item(live[0].id, b"{}")]);
@@ -202,17 +226,54 @@ fn a_connected_view_reads_the_node_for_itself() {
 fn the_node_key_leaves_as_a_clipboard_intent() {
     let (frame, _) = connected();
     let frame = tick_native(press(&frame, "Copy node key"));
-    let [intent] = frame.requests.as_slice() else {
-        panic!("one intent, got {:?}", frame.requests);
-    };
-    assert_eq!(intent.kind, "node.copy");
     assert_eq!(
-        serde_json::from_slice::<Copy>(&intent.payload).expect("decodes"),
+        copied(&frame),
         Copy {
             text: "ab12cd34".into(),
             label: "Node key copied".into()
         }
     );
+}
+
+/// A peer row shows the head of its key and copies all of it; its role
+/// reads as prose, not as the wire's token.
+#[test]
+fn a_peer_row_copies_the_whole_key_it_shortens() {
+    let (frame, _) = connected();
+    assert!(has_text(&frame, "peer-1aa…"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "peer-1aabbcc"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Copy peer key peer-1aa…"));
+    assert_eq!(
+        copied(&frame),
+        Copy {
+            text: "peer-1aabbcc".into(),
+            label: "Peer key copied".into()
+        }
+    );
+}
+
+/// A node that answers nothing yet has readings, not blanks beside copy
+/// controls that would copy nothing.
+#[test]
+fn an_unreported_identity_reads_not_reported_and_offers_no_copy() {
+    let props = request(&boot(), "node.props").id;
+    let frame = tick_native(vec![item(props, &session())]);
+    let status = request(&frame, "rpc.status").id;
+    let frame = tick_native(vec![refuse(status, "not connected to a node yet")]);
+    let shown = texts(&frame);
+    assert!(
+        shown
+            .iter()
+            .any(|text| text == "Could not read this node: not connected to a node yet"),
+        "{shown:?}"
+    );
+    assert!(has_text(&frame, "Not reported"), "{shown:?}");
+    assert!(
+        !shown.iter().any(|text| text == "Copy node key"),
+        "{shown:?}"
+    );
+    // the session's own facts are still readings
+    assert!(has_text(&frame, "/var/ducktape/demo"), "{shown:?}");
 }
 
 // ---------- the registry ----------
@@ -228,13 +289,23 @@ fn the_modules_tab_reads_the_code_registry_itself() {
         !left.iter().any(|request| request.kind.starts_with("node.")),
         "the app is asked for nothing: {left:?}"
     );
-    for expected in ["chat", "workspace", "9f3e"] {
+    for expected in ["chat", "Workspace", "9f3e", "777777777777…"] {
         assert!(
             has_text(&frame, expected),
             "missing {expected:?} in {:?}",
             texts(&frame)
         );
     }
+    // the row shows the head of a digest; the copy takes all of it
+    assert!(!has_text(&frame, ACTIVE_CODE_HEX), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Copy active code"));
+    assert_eq!(
+        copied(&frame),
+        Copy {
+            text: ACTIVE_CODE_HEX.into(),
+            label: "Active code copied".into()
+        }
+    );
 }
 
 // ---------- the log ring ----------
@@ -260,23 +331,32 @@ fn the_activity_tab_streams_the_node_log_ring() {
     let frame = tick_native(vec![
         item(
             stream.id,
-            log_frame(1, "2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted resident")
-                .to_string()
-                .as_bytes(),
+            log_frame(
+                1,
+                "2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted resident",
+            )
+            .to_string()
+            .as_bytes(),
         ),
         item(
             stream.id,
-            log_frame(2, "2026-07-27T09:12:45.001Z  WARN ducktape::mesh: retrying dial")
-                .to_string()
-                .as_bytes(),
+            log_frame(
+                2,
+                "2026-07-27T09:12:45.001Z  WARN ducktape::mesh: retrying dial",
+            )
+            .to_string()
+            .as_bytes(),
         ),
         // the ring replays on every re-subscribe: a cursor already held is
         // the same line, and is not listed twice
         item(
             stream.id,
-            log_frame(1, "2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted resident")
-                .to_string()
-                .as_bytes(),
+            log_frame(
+                1,
+                "2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted resident",
+            )
+            .to_string()
+            .as_bytes(),
         ),
     ]);
     let shown = texts(&frame);
@@ -289,10 +369,30 @@ fn the_activity_tab_streams_the_node_log_ring() {
         "{shown:?}"
     );
     assert!(has_text(&frame, "WARN"), "{shown:?}");
-    assert!(has_text(&frame, "2026-07-27T09:12:45.001Z"), "{shown:?}");
+    // the clock column reads the clock: the date and the microseconds stay
+    // on the wire
+    assert!(has_text(&frame, "09:12:45.001"), "{shown:?}");
+    assert!(!has_text(&frame, "2026-07-27T09:12:45.001Z"), "{shown:?}");
+
+    // a level chip keeps that level alone, and `All` gives the ring back
+    let frame = tick_native(press(&frame, "Info"));
+    let shown = texts(&frame);
+    assert!(
+        shown
+            .iter()
+            .any(|text| text == "ducktape::join: admitted resident"),
+        "{shown:?}"
+    );
+    assert!(
+        !shown
+            .iter()
+            .any(|text| text == "ducktape::mesh: retrying dial"),
+        "{shown:?}"
+    );
+    let frame = tick_native(press(&frame, "All"));
 
     // the filter is the view's own, over the timeline it holds
-    let frame = tick_native(type_into(&frame, "filter logs…", "retrying"));
+    let frame = tick_native(type_into(&frame, "Filter lines", "retrying"));
     let shown = texts(&frame);
     assert!(
         !shown
@@ -300,9 +400,12 @@ fn the_activity_tab_streams_the_node_log_ring() {
             .any(|text| text == "ducktape::join: admitted resident"),
         "{shown:?}"
     );
-    assert!(has_text(&frame, "ducktape::mesh: retrying dial"), "{shown:?}");
+    assert!(
+        has_text(&frame, "ducktape::mesh: retrying dial"),
+        "{shown:?}"
+    );
 
-    let frame = tick_native(type_into(&frame, "filter logs…", "nothing matches this"));
+    let frame = tick_native(type_into(&frame, "Filter lines", "nothing matches this"));
     assert!(
         has_text(&frame, "No lines match this filter."),
         "{:?}",
@@ -310,29 +413,14 @@ fn the_activity_tab_streams_the_node_log_ring() {
     );
 }
 
-/// EVERY READER OF `/v1/peers` USES THE NAMES `PeerView` SERIALIZES.
-///
-/// `crates/noded/src/peers.rs` serves `peer` / `connected` / `role`; it has
-/// never served `key`, `live`, or a per-peer `height`. Reading the wrong ones
-/// does not fail — `as_str()` answers `None` and the row renders blank, zero
-/// and offline for a peer that is connected. That has already shipped twice in
-/// two different readers, so the rule is pinned at the source rather than left
-/// to a fixture that happens to carry the right keys.
 #[test]
 fn the_peers_reader_uses_the_names_the_node_serves() {
-    let source = include_str!("../src/host.rs");
-    for wrong in ["peer[\"key\"]", "peer[\"live\"]", "peer[\"height\"]"] {
-        assert!(
-            !source.contains(wrong),
-            "host.rs reads {wrong}, which `/v1/peers` does not serve — see \
-             crates/noded/src/peers.rs for the names it does"
-        );
+    let (frame, _) = connected();
+    let shown = texts(&frame);
+    for expected in ["peer-1aa…", "Validator", "Connected"] {
+        assert!(has_text(&frame, expected), "missing {expected}: {shown:?}");
     }
-    assert!(
-        source.contains("peer[\"peer\"]") && source.contains("peer[\"connected\"]"),
-        "host.rs was expected to read the peers view; if it no longer does, drop \
-         this lint rather than leaving the guard vacuous"
-    );
+    assert!(!has_text(&frame, "Disconnected"), "{shown:?}");
 }
 
 /// Retuning the RUNNING node leaves as one `rpc.admin` POST on the node's
@@ -348,12 +436,69 @@ fn the_live_tracing_filter_leaves_as_one_admin_post() {
         "info,ducktape::mesh=debug",
     ));
     let frame = tick_native(press(&frame, "Retune"));
+    assert!(
+        has_text(&frame, "Retuning the node…"),
+        "{:?}",
+        texts(&frame)
+    );
 
     let post = request(&frame, "rpc.admin");
     let asked: Value = serde_json::from_slice(&post.payload).expect("the ask decodes");
     assert_eq!(asked["route"], "/v1/log-filter");
     assert_eq!(asked["payload"], "info,ducktape::mesh=debug");
 
-    let frame = tick_native(vec![answer(post.id, b"filter set")]);
-    assert!(has_text(&frame, "filter set"), "{:?}", texts(&frame));
+    // the node echoes the filter it now runs
+    let frame = tick_native(vec![answer(post.id, b"info,ducktape::mesh=debug")]);
+    assert!(
+        has_text(&frame, "The node now logs at info,ducktape::mesh=debug"),
+        "{:?}",
+        texts(&frame)
+    );
+
+    // a refusal is one sentence beside the control, not the page's error
+    // strip and not the kernel's envelope
+    let frame = tick_native(press(&frame, "Retune"));
+    let post = request(&frame, "rpc.admin");
+    let frame = tick_native(vec![refuse(
+        post.id,
+        r#"/v1/log-filter rejected (400 Bad Request): {"error":"invalid filter directive"}"#,
+    )]);
+    let shown = texts(&frame);
+    assert!(
+        shown
+            .iter()
+            .any(|text| text == "The node refused the filter: invalid filter directive"),
+        "{shown:?}"
+    );
+    assert!(
+        !shown.iter().any(|text| text.starts_with("Could not read")),
+        "{shown:?}"
+    );
+}
+
+/// A seat that is not the node's operator sees why the retune is closed
+/// instead of a button that does nothing.
+#[test]
+fn a_seat_without_administration_is_told_the_retune_is_closed() {
+    let (frame, _) = connected_as(false);
+    let (frame, _) = settle(tick_native(press(&frame, "Node activity")));
+    assert!(
+        has_text(
+            &frame,
+            "Only this node's operator can retune its tracing filter."
+        ),
+        "{:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(type_into(
+        &frame,
+        "info,ducktape::join=debug",
+        "info,ducktape::mesh=debug",
+    ));
+    let Some(Node::Button { on_press, .. }) =
+        ducktape_view_guest::testing::find(&frame, "node/retune/apply")
+    else {
+        panic!("no retune button in {:?}", texts(&frame));
+    };
+    assert!(on_press.is_none(), "the retune is closed to this seat");
 }

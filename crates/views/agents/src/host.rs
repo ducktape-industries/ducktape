@@ -21,9 +21,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use iced::futures::{Stream, StreamExt, stream};
+use ducktape_view_guest::host;
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ui_lang_guest::host;
 
 /// The planes the register follows: `runs` carries every model record and
 /// every run fact, `identity` the controllers and their names.
@@ -77,7 +77,6 @@ pub struct AgentSkill {
 pub struct AgentRow {
     pub id: String,
     pub name: String,
-    pub initials: String,
     pub capability: String,
     pub status: String,
     pub owner_handle: String,
@@ -180,8 +179,8 @@ pub struct SessionItem {
 }
 
 /// The session now, and again on every change the kernel sees.
-pub fn session() -> iced::Subscription<SessionItem> {
-    iced::Subscription::run(|| {
+pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
+    ducktape_view_guest::Subscription::run(|| {
         host::subscribe("agents.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
@@ -359,8 +358,8 @@ pub struct RegisterItem {
 /// The register now and after every block that moved it: read once at
 /// start, then again on each `rpc.live` hit for the `runs` or `identity`
 /// plane — the two planes an agent record is folded from.
-pub fn register(connection: i64) -> iced::Subscription<RegisterItem> {
-    iced::Subscription::run_with(connection, |_| {
+pub fn register(connection: i64) -> ducktape_view_guest::Subscription<RegisterItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
         let live = stream::select(
             host::subscribe("rpc.live", RUNS_PLANE),
             host::subscribe("rpc.live", IDENTITY_PLANE),
@@ -380,7 +379,11 @@ async fn load_register() -> RegisterItem {
 }
 
 async fn read_register() -> Result<RegisterItem, String> {
-    let reply = query("runs", serde_json::json!({ "model": { "query": "agents" } })).await?;
+    let reply = query(
+        "runs",
+        serde_json::json!({ "model": { "query": "agents" } }),
+    )
+    .await?;
     let records = reply["model"]["agents"]
         .as_array()
         .cloned()
@@ -464,10 +467,12 @@ fn fold_agents(
                 .controllers
                 .get(&account)
                 .ok_or_else(|| "the model account has no program controller".to_string())?;
-            let name = record["display_name"].as_str().unwrap_or_default().to_owned();
+            let name = record["display_name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
             Ok(AgentRow {
                 id: record["agent_id"].as_str().unwrap_or_default().to_owned(),
-                initials: initials_of(&name),
                 capability: record["capability"].as_str().unwrap_or_default().to_owned(),
                 status: tagged_name(&record["status"]),
                 owner_handle: names.account_label(*controller),
@@ -503,10 +508,7 @@ fn fold_skills(skills: &serde_json::Value) -> Vec<AgentSkill> {
 
 /// The tracker's rows. A chat-born run is named by its room, which costs
 /// one channel read per distinct room in the list.
-async fn fold_runs(
-    runs: Vec<serde_json::Value>,
-    named: &BTreeMap<String, String>,
-) -> Vec<RunRow> {
+async fn fold_runs(runs: Vec<serde_json::Value>, named: &BTreeMap<String, String>) -> Vec<RunRow> {
     let mut rooms: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut rows = Vec::with_capacity(runs.len());
     for run in runs {
@@ -572,7 +574,10 @@ fn fold_run(run: &serde_json::Value, named: &BTreeMap<String, String>) -> RunRow
             row.holder = short_pubkey(settled["executing_node"].as_str().unwrap_or_default());
             row.degraded = settled["degraded"].as_bool().unwrap_or(false);
             row.reason = settled["reason"].as_str().unwrap_or_default().to_owned();
-            row.output_ref = settled["output_ref"].as_str().unwrap_or_default().to_owned();
+            row.output_ref = settled["output_ref"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
         }
         _ => {}
     }
@@ -620,13 +625,15 @@ pub struct JournalItem {
 
 /// The open run's journal now, and again on every `runs` block: the facts
 /// it committed and the chips of every place it touched.
-pub fn run_journal(open_run: String, connection: i64) -> iced::Subscription<JournalItem> {
-    iced::Subscription::run_with((open_run, connection), |(open_run, _)| {
+pub fn run_journal(
+    open_run: String,
+    connection: i64,
+) -> ducktape_view_guest::Subscription<JournalItem> {
+    ducktape_view_guest::Subscription::run_with((open_run, connection), |(open_run, _)| {
         let open_run = open_run.clone();
         let again = open_run.clone();
         let live = host::subscribe("rpc.live", RUNS_PLANE);
-        stream::once(load_journal(open_run))
-            .chain(live.then(move |_| load_journal(again.clone())))
+        stream::once(load_journal(open_run)).chain(live.then(move |_| load_journal(again.clone())))
     })
 }
 
@@ -665,7 +672,7 @@ async fn read_journal(dispatch_id: &str) -> Result<RunJournal, String> {
     let mut entries = Vec::with_capacity(JOURNAL_ENTRY_LIMIT + 1);
     if omitted > 0 {
         entries.push(JournalEntry {
-            kind: "history".into(),
+            kind: "History".into(),
             summary: format!(
                 "Showing the latest {JOURNAL_ENTRY_LIMIT} events; {omitted} earlier events are \
                  not shown."
@@ -826,11 +833,15 @@ impl Chips {
                 duck_link(&format!("page/{}", text("page_id")), &self.chain),
             ),
             "job" => link("job", "Job discussion".into(), String::new()),
-            "task" => link("task", self.task_label(&text("task_id")).await, String::new()),
+            "task" => link(
+                "task",
+                self.task_label(&text("task_id")).await,
+                String::new(),
+            ),
             "file" => link("file", chip_label(&text("path")), String::new()),
             "module" => link(
                 "module",
-                format!("module {}", text("module_id")),
+                format!("Module {}", text("module_id")),
                 String::new(),
             ),
             "conversation" => link("conversation", "Agent conversation".into(), String::new()),
@@ -959,7 +970,9 @@ impl Chips {
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .find(|row| row["channel_id"].as_str() == Some(channel) && row["seq"].as_u64() == Some(seq))
+            .find(|row| {
+                row["channel_id"].as_str() == Some(channel) && row["seq"].as_u64() == Some(seq)
+            })
     }
 
     fn message_label(
@@ -992,11 +1005,14 @@ impl Chips {
     }
 
     async fn message(&self, channel: String, thread: Option<u64>, id: String) -> RunLink {
-        let found = view("chat", serde_json::json!({ "message": { "message_id": id } }))
-            .await
-            .ok()
-            .map(|reply| reply["message"].clone())
-            .filter(serde_json::Value::is_object);
+        let found = view(
+            "chat",
+            serde_json::json!({ "message": { "message_id": id } }),
+        )
+        .await
+        .ok()
+        .map(|reply| reply["message"].clone())
+        .filter(serde_json::Value::is_object);
         let Some(row) = found else {
             let mut destination = self.chat(channel, thread, None).await;
             destination.label = format!("Destination · {}", destination.label);
@@ -1031,7 +1047,10 @@ impl Chips {
             let same_branches = item["source_branch"].as_str() == Some(source.as_str())
                 && item["target_branch"].as_str() == Some(target.as_str());
             if same_branches {
-                matching.push((number, item["title"].as_str().unwrap_or_default().to_owned()));
+                matching.push((
+                    number,
+                    item["title"].as_str().unwrap_or_default().to_owned(),
+                ));
             }
         }
         match matching.as_slice() {
@@ -1044,7 +1063,7 @@ impl Chips {
             _ => RunLink {
                 relation: "target".into(),
                 kind: "forge".into(),
-                label: format!("{repo} · {source} → {target}"),
+                label: format!("{repo}: {source} into {target}"),
                 url: duck_link(&format!("forge/{repo}"), &self.chain),
             },
         }
@@ -1101,14 +1120,19 @@ impl Chips {
         let operation = acted["operation"].as_str().unwrap_or_default();
         let result = &acted["result"];
         let (status, summary, target) = match &request {
-            Some(request) => (
-                action_status(&request["status"]),
-                action_description(
+            Some(request) => {
+                let (status, reason) = action_status(&request["status"]);
+                let description = action_description(
                     request["operation"].as_str().unwrap_or_default(),
                     &request["result"],
-                ),
-                prepared_action_target(request),
-            ),
+                );
+                // the badge carries the word; the reason is a sentence
+                let summary = match reason.is_empty() {
+                    true => description,
+                    false => format!("{description}. {reason}"),
+                };
+                (status, summary, prepared_action_target(request))
+            }
             None => (
                 "Status unavailable".to_owned(),
                 action_description(operation, result),
@@ -1159,61 +1183,77 @@ fn place_target(place: serde_json::Value) -> Target {
 /// One journal fact in the tracker's words, before its action detail.
 fn plain_entry(row: &serde_json::Value) -> JournalEntry {
     let fact = &row["fact"];
-    let (kind, summary) = journal_fact(fact);
+    let (kind, summary, status) = journal_fact(fact);
     JournalEntry {
         height: height_label_short(row["height"].as_i64().unwrap_or(0)),
         kind: kind.to_owned(),
         summary,
+        status,
         ..JournalEntry::default()
     }
 }
 
-fn journal_fact(fact: &serde_json::Value) -> (&'static str, String) {
+/// One fact as `(kind, summary, status)`: the kind is a sentence-case
+/// label, the status the badge beside it ("" for a fact that has none).
+fn journal_fact(fact: &serde_json::Value) -> (&'static str, String, String) {
     match tagged_name(fact).as_str() {
         "dispatched" => {
             let dispatched = &fact["dispatched"];
             (
-                "dispatched",
+                "Dispatched",
                 format!(
                     "for {} from {}",
                     dispatched["agent_id"].as_str().unwrap_or_default(),
                     run_origin(dispatched)
                 ),
+                String::new(),
             )
         }
         "session_opened" => (
-            "session opened",
+            "Session opened",
             format!(
                 "Attempt {}",
                 fact["session_opened"]["attempt"].as_i64().unwrap_or(0)
             ),
+            String::new(),
         ),
         "acted" => (
-            "action",
+            "Action",
             action_description(
                 fact["acted"]["operation"].as_str().unwrap_or_default(),
                 &fact["acted"]["result"],
             ),
+            String::new(),
         ),
         "settled" => {
             let settled = &fact["settled"];
-            let mut parts = vec![
-                outcome_word(settled["outcome"].as_str().unwrap_or_default()).to_owned(),
-            ];
-            if settled["degraded"].as_bool().unwrap_or(false) {
-                parts.push("degraded".into());
-            }
+            let mut parts = Vec::new();
             if let Some(reason) = settled["reason"].as_str() {
                 parts.push(reason.to_owned());
+            }
+            if settled["degraded"].as_bool().unwrap_or(false) {
+                parts.push("The result was degraded".into());
             }
             if settled["pr"].is_object() {
                 parts.push(pr_label(&settled["pr"]));
             }
-            ("settled", parts.join(" · "))
+            (
+                "Settled",
+                parts.join(". "),
+                outcome_word(settled["outcome"].as_str().unwrap_or_default()).to_owned(),
+            )
         }
-        "result_action_refused" => ("result action refused", "Final action was refused".into()),
-        "pr_linked" => ("pr linked", pr_label(&fact["pr_linked"]["pr"])),
-        _ => ("action", String::new()),
+        "result_action_refused" => (
+            "Result action refused",
+            "Final action was refused".into(),
+            String::new(),
+        ),
+        "pr_linked" => (
+            "PR linked",
+            pr_label(&fact["pr_linked"]["pr"]),
+            String::new(),
+        ),
+        _ => ("Action", String::new(), String::new()),
     }
 }
 
@@ -1256,27 +1296,25 @@ fn action_description(operation: &str, result: &serde_json::Value) -> String {
     }
 }
 
-fn action_status(status: &serde_json::Value) -> String {
+/// An action's status as `(word, reason)`: the word fits a badge, the
+/// reason ("" when there is none) is told beside the action.
+fn action_status(status: &serde_json::Value) -> (String, String) {
+    let reason =
+        |value: &serde_json::Value| value["reason"].as_str().unwrap_or_default().to_owned();
     match tagged_name(status).as_str() {
-        "awaiting_program" => "Queued".into(),
-        "claimed" => "Running".into(),
-        "rejected" => format!(
-            "Rejected: {}",
-            status["rejected"]["reason"].as_str().unwrap_or_default()
-        ),
+        "awaiting_program" => ("Queued".into(), String::new()),
+        "claimed" => ("Running".into(), String::new()),
+        "rejected" => ("Rejected".into(), reason(&status["rejected"])),
         "completed" => {
             let outcome = &status["completed"]["outcome"];
             match tagged_name(outcome).as_str() {
-                "applied" => "Completed".into(),
-                "rejected" => format!(
-                    "Rejected: {}",
-                    outcome["rejected"]["reason"].as_str().unwrap_or_default()
-                ),
-                "refused" => "Refused".into(),
-                _ => "Outcome unavailable".into(),
+                "applied" => ("Completed".into(), String::new()),
+                "rejected" => ("Rejected".into(), reason(&outcome["rejected"])),
+                "refused" => ("Refused".into(), String::new()),
+                _ => ("Outcome unavailable".into(), String::new()),
             }
         }
-        _ => "Status unavailable".into(),
+        _ => ("Status unavailable".into(), String::new()),
     }
 }
 
@@ -1355,12 +1393,7 @@ fn action_target(operation: &str, result: &serde_json::Value) -> Option<Target> 
         }),
         "reply" => {
             let destination = result.get("destination")?;
-            let at = |key: &str| {
-                destination[key]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned()
-            };
+            let at = |key: &str| destination[key].as_str().unwrap_or_default().to_owned();
             match destination["kind"].as_str().unwrap_or_default() {
                 "chat" => Some(Target::Message {
                     channel: at("channel_id"),
@@ -1470,8 +1503,8 @@ pub fn empty_live() -> LiveRun {
 /// key that asked for the run and nobody else — and hands the view every
 /// frame verbatim. Every reading below is folded HERE; the kernel carries
 /// bytes and knows nothing about a run.
-pub fn live_run(open_run: String, connection: i64) -> iced::Subscription<LiveRun> {
-    iced::Subscription::run_with((open_run, connection), |(open_run, _)| {
+pub fn live_run(open_run: String, connection: i64) -> ducktape_view_guest::Subscription<LiveRun> {
+    ducktape_view_guest::Subscription::run_with((open_run, connection), |(open_run, _)| {
         let topic = format!("run-output:{open_run}");
         let ask = serde_json::json!({
             "topic": topic,
@@ -1582,8 +1615,8 @@ fn provider_output(line: &str) -> Option<Output> {
             .find(|block| block["type"] == "tool_result")?;
         let failed = result["is_error"] == true;
         let title = match failed {
-            true => "Tool failed · waiting for agent",
-            false => "Tool finished · waiting for agent",
+            true => "Tool failed, waiting for the agent",
+            false => "Tool finished, waiting for the agent",
         };
         return Some(Output::Status(title.into()));
     }
@@ -1611,7 +1644,10 @@ fn provider_output(line: &str) -> Option<Output> {
         "mcp_tool_call" => {
             let server = item["server"].as_str().unwrap_or("tool");
             let tool = item["tool"].as_str().unwrap_or("call");
-            (format!("{server} · {tool}"), json_text(item.get("arguments")))
+            (
+                format!("{tool} on {server}"),
+                json_text(item.get("arguments")),
+            )
         }
         "web_search" => ("Web search".to_owned(), json_text(item.get("query"))),
         _ => return None,
@@ -1730,8 +1766,8 @@ fn skills_wire(skills: &[AgentSkill]) -> serde_json::Value {
 }
 
 /// Every write's outcome, as the kernel answers it.
-pub fn acts() -> iced::Subscription<ActItem> {
-    iced::Subscription::run(|| ActStream)
+pub fn acts() -> ducktape_view_guest::Subscription<ActItem> {
+    ducktape_view_guest::Subscription::run(|| ActStream)
 }
 
 struct ActStream;
@@ -1841,6 +1877,12 @@ pub fn drafts_consumed(
     write_landed || registration_landed
 }
 
+/// `3 skills` — a count with its noun.
+pub(crate) fn plural(count: i64, one: &str, many: &str) -> String {
+    let noun = if count == 1 { one } else { many };
+    format!("{count} {noun}")
+}
+
 /// `4 agents · 2 working` — the title's machine subtitle. `working` is runs
 /// in flight, not `status == active`, which is the registration default.
 pub fn agents_summary(connected: bool, rows: &[AgentRow]) -> String {
@@ -1877,6 +1919,60 @@ pub fn runs_summary(runs: &[RunRow]) -> String {
     format!("{} {noun} · {in_flight} in flight", runs.len())
 }
 
+/// What a fault strip says: the verb, then the kernel's reason; "" when
+/// there is no fault.
+pub fn fault(verb: &str, error: &str) -> String {
+    if error.is_empty() {
+        return String::new();
+    }
+    format!("{verb}: {error}")
+}
+
+/// The journal's title: the agent that ran, never the run's key.
+pub fn run_title(run: &RunRow) -> String {
+    if run.agent_name.is_empty() {
+        return "Run".into();
+    }
+    run.agent_name.clone()
+}
+
+/// The run's receipt as `(name, value, is_code)` rows: only the facts this
+/// run has. Keys and hashes are code; heights, counts and names are not.
+pub fn run_facts(run: &RunRow) -> Vec<(String, String, bool)> {
+    let mut facts = vec![("Run".to_owned(), run.run_id.clone(), true)];
+    facts.push(("Dispatch".to_owned(), run.dispatch_id.clone(), true));
+    facts.push(("Agent".to_owned(), run.agent_id.clone(), true));
+    facts.push(("Dispatched".to_owned(), run.dispatched.clone(), false));
+    if !run.settled.is_empty() {
+        facts.push(("Settled".to_owned(), run.settled.clone(), false));
+    }
+    if run.attempt > 0 {
+        facts.push(("Attempt".to_owned(), run.attempt.to_string(), false));
+    }
+    if !run.holder.is_empty() {
+        facts.push(("Executing node".to_owned(), run.holder.clone(), true));
+    }
+    facts.push((
+        "Actions".to_owned(),
+        plural(run.actions, "action", "actions"),
+        false,
+    ));
+    if run.pr_number > 0 {
+        facts.push((
+            "Pull request".to_owned(),
+            format!("#{}", run.pr_number),
+            false,
+        ));
+    }
+    if run.degraded {
+        facts.push(("Result".to_owned(), "Degraded".to_owned(), false));
+    }
+    if !run.output_ref.is_empty() {
+        facts.push(("Output".to_owned(), run.output_ref.clone(), true));
+    }
+    facts
+}
+
 /// The run listed under `run_id`; an empty row when the list has none.
 pub fn run_named(runs: &[RunRow], run_id: &str) -> RunRow {
     runs.iter()
@@ -1895,24 +1991,6 @@ pub fn run_at(runs: &[RunRow], dispatch_id: &str) -> RunRow {
 
 pub fn empty_journal() -> RunJournal {
     RunJournal::default()
-}
-
-/// The glyph a chip wears for the kind of place it names.
-pub fn link_glyph(kind: &str) -> String {
-    match kind {
-        "chat" => "#",
-        "page" => "¶",
-        "forge" => "⎇",
-        "file" => "▤",
-        "task" => "☐",
-        "job" => "⚙",
-        "module" => "⬡",
-        "conversation" => "✉",
-        "run" => "▶",
-        "output" => "⇣",
-        _ => "·",
-    }
-    .to_owned()
 }
 
 pub fn empty_run() -> RunRow {
@@ -2024,10 +2102,6 @@ pub fn some_str(value: &str) -> Option<String> {
     Some(value.to_owned())
 }
 
-pub fn skill_count(skills: &[AgentSkill]) -> i64 {
-    count_i64(skills.len())
-}
-
 /// What the pane on screen IS, stated where a reader lands rather than
 /// discovered by using it.
 pub fn pane_note(pane: &str) -> String {
@@ -2043,10 +2117,6 @@ pub fn pane_note(pane: &str) -> String {
 
 pub fn or_empty(value: &Option<String>) -> String {
     value.clone().unwrap_or_default()
-}
-
-pub fn pick_list(condition: bool, then: &[String], or: &[String]) -> Vec<String> {
-    if condition { then } else { or }.to_vec()
 }
 
 pub fn pick_skills(condition: bool, then: &[AgentSkill], or: &[AgentSkill]) -> Vec<AgentSkill> {
@@ -2150,33 +2220,10 @@ fn chip_label(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The avatar text of a display name: two letters, or one glyph.
-fn initials_of(name: &str) -> String {
-    let words: Vec<&str> = name.split_whitespace().take(2).collect();
-    if words.len() == 2 {
-        let letters: String = words
-            .iter()
-            .filter_map(|word| word.chars().find(char::is_ascii_alphanumeric))
-            .collect();
-        if letters.chars().count() == 2 {
-            return letters.to_uppercase();
-        }
-    }
-    let letters: String = name
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(2)
-        .collect();
-    match letters.is_empty() {
-        true => "?".into(),
-        false => letters.to_uppercase(),
-    }
-}
-
 /// `h 84,912` — a block height, grouped; a negative one is `h —`.
 fn height_label_short(height: i64) -> String {
     if height < 0 {
-        return "h —".into();
+        return "block —".into();
     }
     let digits = height.to_string();
     let mut grouped = String::new();
@@ -2187,7 +2234,7 @@ fn height_label_short(height: i64) -> String {
         }
         grouped.push(digit);
     }
-    format!("h {grouped}")
+    format!("block {grouped}")
 }
 
 /// `duck://<path>?net=<chain>` — an address spelled for the chain it was

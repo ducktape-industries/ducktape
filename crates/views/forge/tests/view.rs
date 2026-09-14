@@ -4,10 +4,10 @@
 //! read HERE through `rpc.query` / `rpc.view`, re-read on every `rpc.live`
 //! hit. A review and a merge leave as `op.submit`.
 
+use ducktape_view_guest::testing::{answer, has_text, item, press, refuse, texts, type_into};
+use ducktape_view_guest::wire::{Event, Frame, Node, Request};
 use forge_view::host::Session;
 use forge_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{answer, has_text, item, press, refuse, texts, type_into};
-use ui_lang_guest::wire::{Event, Frame, Node, Request};
 
 fn node_ending(frame: &Frame, suffix: &str) -> Node {
     fn find(node: &Node, suffix: &str) -> Option<Node> {
@@ -63,6 +63,8 @@ fn reads(frame: &Frame) -> Vec<(u64, String)> {
 struct Drive {
     frame: Frame,
     open: Vec<(u64, String)>,
+    /// Every frame so far, for the reads they opened.
+    frames: Vec<Frame>,
 }
 
 impl Drive {
@@ -71,6 +73,7 @@ impl Drive {
         let mut drive = Drive {
             frame: Frame::default(),
             open: Vec::new(),
+            frames: Vec::new(),
         };
         drive.tick(Vec::new());
         drive
@@ -79,6 +82,7 @@ impl Drive {
     fn tick(&mut self, events: Vec<Event>) {
         self.frame = tick_native(events);
         self.open.extend(reads(&self.frame));
+        self.frames.push(self.frame.clone());
     }
 
     /// The id of the outstanding read whose ask names `tag`, consumed.
@@ -93,6 +97,26 @@ impl Drive {
 
     fn answer(&mut self, tag: &str, payload: &[u8]) {
         let id = self.take(tag);
+        self.tick(vec![answer(id, payload)]);
+    }
+
+    /// Answer the newest outstanding tree read for `path` — the view opens
+    /// one per (revision, directory), and a repo opens with a read at no
+    /// revision whose subscription is gone by the time the head is known.
+    fn answer_tree(&mut self, path: &str, payload: &[u8]) {
+        let id = self
+            .frames
+            .iter()
+            .flat_map(|frame| &frame.requests)
+            .filter(|request| request.kind == "rpc.query")
+            .filter(|request| self.open.iter().any(|(open, _)| *open == request.id))
+            .filter_map(|request| {
+                let ask: serde_json::Value = serde_json::from_slice(&request.payload).ok()?;
+                (ask["query"]["tree"]["path"].as_str()? == path).then_some(request.id)
+            })
+            .next_back()
+            .unwrap_or_else(|| panic!("no open tree read for {path:?} in {:?}", self.open));
+        self.open.retain(|(open, _)| *open != id);
         self.tick(vec![answer(id, payload)]);
     }
 }
@@ -128,7 +152,7 @@ fn accounts() -> Vec<u8> {
 }
 
 fn refs() -> Vec<u8> {
-    serde_json::json!({ "refs": [{ "name": "main", "target": "1111222233334444" }] })
+    serde_json::json!({ "refs": [{ "name": "main", "head": "1111222233334444" }] })
         .to_string()
         .into_bytes()
 }
@@ -244,7 +268,80 @@ fn a_refused_read_is_shown_where_the_listing_would_be() {
     let repo_list = drive.take("list_repos");
     drive.tick(vec![refuse(repo_list, "the node is not reachable")]);
     assert!(
-        has_text(&drive.frame, "the node is not reachable"),
+        has_text(
+            &drive.frame,
+            "Could not read the repositories: the node is not reachable"
+        ),
+        "{:?}",
+        texts(&drive.frame)
+    );
+}
+
+/// A refused file read is a sentence in the file pane, never a blank
+/// danger strip: the loader's note is empty on a refusal, so the refusal
+/// itself is the line.
+#[test]
+fn a_refused_file_read_says_so_in_the_file_pane() {
+    let (mut drive, _) = namespace("duck://forge/core/blob/main.rs");
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    let tree = serde_json::json!({ "tree": {
+        "rev": "1111222233334444", "born": true, "truncated": false,
+        "entries": [{ "name": "main.rs", "path": "main.rs", "kind": "file" }]
+    }});
+    drive.answer("tree", tree.to_string().as_bytes());
+    // the file opens at the commit the tree answered with — one blob read
+    assert!(
+        has_text(&drive.frame, "Loading file…"),
+        "{:?}",
+        texts(&drive.frame)
+    );
+    let blob = drive.take("blob");
+    drive.tick(vec![refuse(blob, "object missing")]);
+    assert!(
+        has_text(&drive.frame, "Could not load this file: object missing"),
+        "{:?}",
+        texts(&drive.frame)
+    );
+}
+
+/// The patch is drawn per file — one row naming the file, then its hunks —
+/// never git's own `---`/`+++`/`index` bookkeeping lines.
+#[test]
+fn a_patch_opens_each_file_with_one_named_row() {
+    let drive = open_item("duck://forge/core/7");
+    let shown = texts(&drive.frame);
+    assert!(shown.iter().any(|text| text == "main.rs"), "{shown:?}");
+    assert!(
+        !shown
+            .iter()
+            .any(|text| text.starts_with("--- ") || text.starts_with("+++ ")),
+        "{shown:?}"
+    );
+    assert!(
+        shown.iter().any(|text| text == "1 file, +1 −1"),
+        "{shown:?}"
+    );
+}
+
+/// A refused patch read leaves the merge and review doors shut, and the
+/// Changes section says why instead of vanishing.
+#[test]
+fn a_refused_patch_read_is_said_under_changes() {
+    let (mut drive, _) = namespace("duck://forge/core/7");
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    drive.answer("get_item", &detail());
+    let diff = drive.take("pr_diff");
+    drive.tick(vec![refuse(diff, "the pack is gone")]);
+    drive.answer("all", &accounts());
+    assert!(
+        has_text(
+            &drive.frame,
+            "The changes could not be loaded. Open the pull request again to retry."
+        ),
         "{:?}",
         texts(&drive.frame)
     );
@@ -257,7 +354,7 @@ fn a_refused_read_is_shown_where_the_listing_would_be() {
 #[test]
 fn a_routed_link_opens_the_item_it_names() {
     let drive = open_item("duck://forge/core/7");
-    for expected in ["Bound every list", "work → main", "Mallard"] {
+    for expected in ["Bound every list", "work into main", "Mallard"] {
         assert!(
             has_text(&drive.frame, expected),
             "missing {expected:?} in {:?}",
@@ -336,7 +433,10 @@ fn a_conflicting_merge_submits_nothing() {
         kinds(&drive.frame.requests)
     );
     assert!(
-        has_text(&drive.frame, "Merge conflicts — resolve on the branch and push again:"),
+        has_text(
+            &drive.frame,
+            "Merge conflicts — resolve on the branch and push again:"
+        ),
         "{:?}",
         texts(&drive.frame)
     );
@@ -344,7 +444,7 @@ fn a_conflicting_merge_submits_nothing() {
 
 #[test]
 fn the_repository_tree_width_is_the_readers_and_its_edge_has_a_resize_cursor() {
-    use ui_lang_guest::wire::{Length, mouse};
+    use ducktape_view_guest::wire::{Length, mouse};
 
     let (drive, _) = namespace("duck://forge/core");
     let width = |frame: &Frame| match node_ending(frame, "/tree-pane") {
@@ -363,11 +463,140 @@ fn the_repository_tree_width_is_the_readers_and_its_edge_has_a_resize_cursor() {
         panic!("tree resize handle")
     };
     assert_eq!(cursor, Some(mouse::Cursor::ResizingHorizontally));
-    assert_eq!(width(&drive.frame), 258.0);
+    assert_eq!(width(&drive.frame), 260.0);
     let frame = tick_native(vec![Event::Drag {
         handler,
         dx: 42.0,
         dy: 0.0,
     }]);
-    assert_eq!(width(&frame), 300.0);
+    assert_eq!(width(&frame), 302.0);
+}
+
+/// The directories every tree read so far asked for, in order; a read opens
+/// in one frame and is answered in a later one, so the history is what a
+/// test checks.
+fn tree_asks(frames: &[Frame]) -> Vec<String> {
+    frames
+        .iter()
+        .flat_map(|frame| &frame.requests)
+        .filter(|request| request.kind == "rpc.query")
+        .filter_map(|request| {
+            let ask: serde_json::Value = serde_json::from_slice(&request.payload).ok()?;
+            Some(ask["query"]["tree"]["path"].as_str()?.to_owned())
+        })
+        .collect()
+}
+
+fn listing(entries: &[(&str, &str)]) -> Vec<u8> {
+    let entries: Vec<_> = entries
+        .iter()
+        .map(|(path, kind)| {
+            let name = path.rsplit('/').next().unwrap();
+            serde_json::json!({ "name": name, "path": path, "kind": kind })
+        })
+        .collect();
+    serde_json::json!({ "tree": {
+        "rev": "1111222233334444", "born": true, "truncated": false, "entries": entries
+    }})
+    .to_string()
+    .into_bytes()
+}
+
+fn row_inset(frame: &Frame, suffix: &str) -> f32 {
+    match node_ending(frame, suffix) {
+        Node::Button {
+            padding: Some(edges),
+            ..
+        } => edges.left,
+        node => panic!("padded tree row: {node:?}"),
+    }
+}
+
+fn has_key_ending(frame: &Frame, suffix: &str) -> bool {
+    fn walk(node: &Node, suffix: &str) -> bool {
+        node.key().is_some_and(|key| key.ends_with(suffix))
+            || node.children().iter().any(|child| walk(child, suffix))
+    }
+    walk(frame.root.as_ref().unwrap(), suffix)
+}
+
+/// The tree unfolds in place: pressing a directory reads its listing and
+/// paints its rows under it, one step further in; pressing it again folds
+/// them without another read.
+#[test]
+fn a_directory_unfolds_under_its_row_and_folds_again() {
+    let (mut drive, _) = namespace("duck://forge/core");
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    assert_eq!(
+        tree_asks(&drive.frames).last().map(String::as_str),
+        Some("")
+    );
+    drive.answer_tree("", &listing(&[("src", "dir"), ("README.md", "file")]));
+    assert!(!has_key_ending(&drive.frame, "forge/tree-root"));
+    drive.tick(press(&drive.frame, "src"));
+    let asked = tree_asks(&drive.frames);
+    assert_eq!(asked.last().map(String::as_str), Some("src"));
+    assert!(has_text(&drive.frame, "Loading…"));
+    drive.answer_tree("src", &listing(&[("src/main.rs", "file")]));
+    assert_eq!(
+        row_inset(&drive.frame, "forge/tree/src/main.rs"),
+        row_inset(&drive.frame, "forge/tree/src") + 14.
+    );
+    drive.tick(press(&drive.frame, "src"));
+    assert!(!has_key_ending(&drive.frame, "forge/tree/src/main.rs"));
+    assert_eq!(tree_asks(&drive.frames), asked, "a fold reads nothing");
+}
+
+/// A link into a file reads that file's directory first, then the root, and
+/// leaves the tree unfolded down to the file.
+#[test]
+fn a_file_link_unfolds_the_tree_down_to_it() {
+    let (mut drive, _) = namespace("duck://forge/core/blob/src/main.rs");
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    assert_eq!(
+        tree_asks(&drive.frames).last().map(String::as_str),
+        Some("src")
+    );
+    drive.answer_tree("src", &listing(&[("src/main.rs", "file")]));
+    assert_eq!(
+        tree_asks(&drive.frames).last().map(String::as_str),
+        Some("")
+    );
+    drive.answer_tree("", &listing(&[("src", "dir")]));
+    assert!(
+        has_key_ending(&drive.frame, "forge/tree/src/main.rs"),
+        "asks {:?} open {:?} texts {:?}",
+        tree_asks(&drive.frames),
+        drive.open,
+        texts(&drive.frame)
+    );
+    assert!(has_text(&drive.frame, "Loading file…"));
+}
+
+#[test]
+fn a_diff_line_comment_keeps_its_anchor_and_submits_without_a_review_body() {
+    let mut drive = open_item("duck://forge/core/7");
+    drive.tick(press(&drive.frame, "Comment on this line"));
+    drive.tick(type_into(
+        &drive.frame,
+        "Comment on this line…",
+        "Keep this guard",
+    ));
+    drive.tick(press(&drive.frame, "Add comment"));
+    assert!(has_text(&drive.frame, "Not sent yet"));
+    assert!(has_text(&drive.frame, "Keep this guard"));
+    drive.tick(press(&drive.frame, "Pick approve verdict"));
+    drive.tick(press(&drive.frame, "Submit review"));
+    let op: serde_json::Value =
+        serde_json::from_slice(&request(&drive.frame, "op.submit").payload).unwrap();
+    let review = &op["payload"]["submit_review"];
+    assert_eq!(review["verdict"], "approve");
+    assert_eq!(review["body"], "");
+    assert_eq!(review["comments"][0]["path"], "main.rs");
+    assert_eq!(review["comments"][0]["line"], 1);
+    assert_eq!(review["comments"][0]["body"], "Keep this guard");
 }

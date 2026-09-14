@@ -29,6 +29,7 @@
 //! an audio-only build.
 
 pub mod assembly;
+pub mod codec;
 pub mod control;
 pub mod frame;
 

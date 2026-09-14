@@ -1,5 +1,4 @@
-# Desktop font identity and the product type scale. Shared color, shape, and
-# component tokens live in `ducktape-ui`.
+# Bundled desktop fonts and the native shell's default text size.
 [package]
 name = "design"
 edition = "2024"

@@ -152,6 +152,9 @@ pub struct ChannelRow {
     pub hooks: Vec<String>,
     /// the live huddle roster, join order.
     pub huddle: Vec<HuddleEntry>,
+    /// a voice room (`CreateVoiceChannel`): listed under its own heading and
+    /// entered by joining.
+    pub voice: bool,
 }
 
 /// one huddle participant: rendered party handle plus the hex node key peers
@@ -517,6 +520,23 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                     archived: false,
                     hooks: Vec::new(),
                     huddle: Vec::new(),
+                    voice: false,
+                },
+            )?;
+        }
+        ChatMsg::CreateVoiceChannel { channel_id, name } => {
+            put_channel(
+                &mut out,
+                &ChannelRow {
+                    id: channel_id,
+                    name,
+                    created_at: op.time,
+                    post_policy: PostPolicy::Open,
+                    owner: actor.clone(),
+                    archived: false,
+                    hooks: Vec::new(),
+                    huddle: Vec::new(),
+                    voice: true,
                 },
             )?;
         }
@@ -538,6 +558,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                     archived: false,
                     hooks: Vec::new(),
                     huddle: Vec::new(),
+                    voice: false,
                 },
             )?;
             for handle in [actor.clone(), party_handle(&Party::Account(counterpart))] {

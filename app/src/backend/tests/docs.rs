@@ -9,16 +9,6 @@ fn empty_pages_probe() -> serde_json::Value {
     serde_json::json!({ "threads_for_targets": { "targets": [] } })
 }
 
-#[test]
-fn an_unnamed_principal_gets_a_bare_plate() {
-    // Never a `?` — that glyph in the rail's corner reads as HELP, not as
-    // "nobody has named this account".
-    assert_eq!(initial_of(""), "");
-    assert_eq!(initial_of("   "), "");
-    assert_eq!(initial_of("quackbot"), "Q");
-}
-
-
 /// A PAGE HIT NAMES ITS PAGE, AND SAYS EACH THING ONCE. The index's hit row
 /// carries a `page_id` and no title, so nothing downstream could name the page
 /// a match came from: the Explorer set BOTH its row title and its snippet to
@@ -76,38 +66,11 @@ fn a_page_search_hit_names_the_page_it_came_from() {
     assert_eq!(hits[0].page_id, "page-1");
     assert_eq!(hits[0].kind, "Text");
 
-    // THE CALL SITES. A pure join proves nothing about what the surfaces
-    // render, and the Explorer's double print lived at ITS call site — which
-    // is the Explorer view's own crate now: it reads the index row itself and
-    // joins the titles for the same reason this one does.
-    const EXPLORER: &str = include_str!("../../../../crates/views/explorer/src/host.rs");
-    let page_arm = EXPLORER
-        .split("kind: \"page\".into(),")
-        .nth(1)
-        .expect("the page hit arm")
-        .split(".collect()")
-        .next()
-        .expect("arm body");
+    // Guest search surfaces verify their own rendered replies in their wire tests.
+    const PALETTE: &str = include_str!("../../shell.rs");
     assert!(
-        page_arm.contains("titles") && page_arm.contains("snippet: text(&hit[\"text\"]),"),
-        "the Explorer heads a page hit with its page and keeps the block text as the snippet"
-    );
-    assert!(
-        !page_arm.contains("title: text(&hit[\"text\"])"),
-        "titling the row with the block text is what printed the same sentence twice"
-    );
-
-    // The palette and the pages search panel render the same hit type; #997's
-    // lesson is that a fix at one surface leaves the siblings broken.
-    const PALETTE: &str = include_str!("../../ui/screens/overlays.ice");
-    const PANEL: &str = include_str!("../../../../crates/views/pages/src/ui/rows.ice");
-    assert!(
-        PALETTE.contains("text hit.page_title"),
+        PALETTE.contains("hit.page_title"),
         "the palette's page hit names its page"
-    );
-    assert!(
-        PANEL.contains("text hit.page_title") && !PANEL.contains("text hit.block_id"),
-        "the pages search panel names the page instead of printing a raw block id"
     );
 }
 

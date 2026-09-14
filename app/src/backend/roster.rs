@@ -297,7 +297,7 @@ pub fn members_is_admin(rows: &[MemberRow]) -> bool {
 /// loads, so it can be the only one that fails, and folding its silence into
 /// `guest` told a validator's operator — with no error anywhere on screen —
 /// that this device may not post. `""` lights the STANDING UNKNOWN arm in
-/// node.ice instead.
+/// Node view instead.
 ///
 /// An empty vec is the only unanswered signal a pure row function has, and it
 /// is a sound one: an answered roster always carries the chain's own
@@ -311,4 +311,3 @@ pub fn member_tier(rows: &[MemberRow]) -> String {
         .find(|row| row.is_this_node)
         .map_or_else(|| "guest".into(), |row| row.role.clone())
 }
-

@@ -200,7 +200,7 @@ members = [
 # the shipping workspace build. It stays in-tree and is gated via `make labs-gate`.
 # The shared design crate belongs to the views workspace so Cargo gives
 # its guest dependency a checkout-independent package identity.
-exclude = ["crates/labs", "crates/module-sdk", "crates/views/support/design"]
+exclude = ["crates/labs", "crates/module-sdk", "crates/views/support/design", "crates/views/support/guest"]
 
 [workspace.package]
 edition = "2024"
@@ -426,133 +426,35 @@ overlay-net = { path = "crates/networking/overlay-net" }
 governor = "0.10.2"
 rand_core = "0.10.1"
 
-[patch.crates-io]
-# A caret move replaces its selection, including clearing the previous anchor.
-iced_graphics = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "00fccc604d5b2fb37a1d64eb47184419ba83de86" }
-# `block` 0.1.6 is still required transitively by Metal and AVFoundation, but
-# its uninhabited extern-static type is future-incompatible with Rust. Keep the
-# API/ABI identical and patch only that declaration locally.
-block = { path = "patches/block" }
-# cosmic-text 0.15.0's font fallback only matched faces at EXACTLY the
-# requested weight before falling back to re-shaping a run against every face
-# in the database. A variable font registers once at 400 and the bundled
-# emoji/CJK fallback faces are static 400s, so every semibold/bold run with a
-# non-Latin glyph paid that walk (26us -> ~3ms per emoji paragraph), and bold
-# Latin could land on a platform face instead of Geist. The patched copy
-# matches a family at its closest weight; see patches/cosmic-text/README.md
-# for the drop condition.
-cosmic-text = { path = "patches/cosmic-text" }
-
 # dev/test builds compile wasm guests through cranelift (consensus components
 # in the kernel tests, index guests at every store open). unoptimized
 # cranelift is 10-30x slower — enough that a fleet of e2e daemons booting
 # concurrently blows readiness deadlines — so the code generator itself is
 # always built optimized. build-time only; artifacts and semantics unchanged.
-# The desktop app's view is one generated function big enough that LLVM's DWARF
-# emitter segfaults on it (rustc 1.96, `-C debuginfo=2`). Dropping debug info for
-# this crate alone keeps the rest of the workspace debuggable — and takes the
-# dev binary from ~516 MB to a fraction of that.
-
-# Build scripts default to opt-level 0, and the app's build script IS the Ice
-# compiler: every `.ice` edit re-runs parse + typecheck + 8.5 MB of codegen
-# through ui-lang-core. Unoptimized that is ~1.3 s of every edit loop.
+# Native build scripts are optimized independently from application code.
 [profile.dev.build-override]
 opt-level = 2
 
 [profile.dev.package.ducktape-app]
 debug = 0
-# opt-level history: 1 was load-bearing for STACK SAFETY when outlining first
-# landed (98e2b82) — outlined debug frames stacked to 8-12 MiB of view render
-# at opt-0, past the 8 MiB main-thread default, and SROA at opt-1 collapsed
-# them under 4 MiB. Since then dedup (fdadedf), lazy bodies as associated fns
-# (360d3a5), and the per-fragment split (66ccc13) shrank every frame in the
-# chain enough for the app's 8 MiB main thread. opt-0 is the dev-loop choice:
-# the per-build fixed cost (whole-crate mono collection + MIR work at opt-1)
-# dominated the post-split edit loop, and app-crate runtime perf never depended
-# on this stanza (hot paths live in the iced / ducktape-ui stanzas below; the
-# 08-01 lag campaign measured zero win here). The smaller libtest stack has its
-# own profile and executable contract below.
 opt-level = 0
 
-# Ice semantic tests render the same generated component tree from libtest's
-# 2 MiB worker threads. At opt-0, the generated ChatScreen frame alone exceeds
-# that budget on arm64 macOS; opt-1's SROA keeps the test harness on its default
-# stack without slowing the normal app edit loop above.
+# Keep native UI unit test code compact on the default test worker stack.
 [profile.test.package.ducktape-app]
 debug = 0
 opt-level = 1
 
-# `make dev` runs the desktop app under the dev profile, and an unoptimized
-# GUI stack is a lag machine on its own: cosmic-text shapes every glyph run
-# ~10x slower and iced re-lays the whole tree per frame. Optimizing ONLY the
-# render/text/gpu dependency stack keeps workspace crates fast to compile
-# (a `package."*"` wildcard would drag the node's wasmtime universe to O2,
-# which this box cannot compile reliably — #887).
-[profile.dev.package.iced]
+# Optimize the native render and text stack without slowing unrelated workspace crates.
+[profile.dev.package.gpui-pre]
 opt-level = 2
 
-# The ice framework layer itself — the widget builders, layout drivers and
-# memo/lazy machinery every view rebuild runs through. These were the LAST
-# opt-0 crates on the view hot path (iced/wgpu/cosmic-text below were already
-# covered), and they are what a module switch actually spends: measured on
-# this box, Pages->Chat with 40 mounted rows stalled ~700 ms with these at
-# opt-0. They rebuild only on a pin bump (ducktape-ui) or rarely (design), so
-# the compile-time cost of optimizing them is paid almost never.
-[profile.dev.package.ui-lang-components]
+[profile.dev.package.gpui-base]
 opt-level = 2
 
-[profile.dev.package.ui-lang-runtime]
+[profile.dev.package.gpui-component]
 opt-level = 2
 
 [profile.dev.package.design]
-opt-level = 2
-
-[profile.dev.package.iced_core]
-opt-level = 2
-
-[profile.dev.package.iced_debug]
-opt-level = 2
-
-[profile.dev.package.iced_futures]
-opt-level = 2
-
-[profile.dev.package.iced_graphics]
-opt-level = 2
-
-[profile.dev.package.iced_program]
-opt-level = 2
-
-[profile.dev.package.iced_renderer]
-opt-level = 2
-
-[profile.dev.package.iced_runtime]
-opt-level = 2
-
-[profile.dev.package.iced_selector]
-opt-level = 2
-
-[profile.dev.package.iced_tiny_skia]
-opt-level = 2
-
-[profile.dev.package.iced_wgpu]
-opt-level = 2
-
-[profile.dev.package.iced_widget]
-opt-level = 2
-
-[profile.dev.package.iced_winit]
-opt-level = 2
-
-[profile.dev.package.winit]
-opt-level = 2
-
-[profile.dev.package.lilt]
-opt-level = 2
-
-[profile.dev.package.cosmic-text]
-opt-level = 2
-
-[profile.dev.package.cryoglyph]
 opt-level = 2
 
 [profile.dev.package.fontdb]
@@ -627,22 +529,8 @@ opt-level = 2
 [profile.dev.package.usvg]
 opt-level = 2
 
-[profile.dev.package.softbuffer]
-opt-level = 2
-
-# The Markdown parse and the syntect pass every fenced code block pays — the
-# agent transcript, the forge reader and the Files preview all render through
-# them, and a regex engine at opt-0 is the slowest thing on that path.
+# The native document readers parse Markdown on their presentation path.
 [profile.dev.package.pulldown-cmark]
-opt-level = 2
-
-[profile.dev.package.syntect]
-opt-level = 2
-
-[profile.dev.package.iced_highlighter]
-opt-level = 2
-
-[profile.dev.package.fancy-regex]
 opt-level = 2
 
 [profile.dev.package.regex-automata]
@@ -674,10 +562,22 @@ opt-level = 3
 
 # The huddle's per-frame video codecs. Every captured frame pays an MJPEG
 # decode (mozjpeg's C, whose cc build inherits this profile's OPT_LEVEL) or a
-# YUYV conversion (nokhwa-core), a JPEG encode (jpeg-encoder), and every peer
-# frame a JPEG decode (zune-jpeg) — 25 times a second each. Unoptimized, the
-# encode alone runs 40-80 ms and eats the whole capture interval; that was
-# most of the "huddle video fps" report under `make dev`.
+# YUYV conversion (nokhwa-core), a JPEG encode, and every peer frame a JPEG
+# decode — 25 times a second each. Unoptimized, a VGA encode runs ~25 ms, a
+# decode ~44 ms and the channel swap ~24 ms, and the capture loop falls behind
+# the camera: the "huddle video latency" report under `make dev`.
+#
+# The pure-Rust codecs (jpeg-encoder, zune-jpeg) are GENERIC over their writer
+# and reader, so their entry points and everything inlined into them
+# instantiate in the crate that CALLS them — an override on the codec
+# packages alone left the app's O0 copy doing the work. That caller is
+# media-service (`video::codec`, non-generic entry points), optimized here so
+# the app crate stays at opt-level 0 and never touches a pixel loop; the codec
+# packages stay optimized too for the non-generic internals (IDCT, Huffman)
+# that are compiled in their own crate.
+[profile.dev.package.media-service]
+opt-level = 3
+
 [profile.dev.package.jpeg-encoder]
 opt-level = 3
 

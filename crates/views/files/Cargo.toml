@@ -4,27 +4,16 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-# An ordinary Ice application, exported as an `ice:view` component by
+# A Rust-authored view, exported as a dynamically loaded WASM component by
 # `export_app!`; `unsafe_code` is not forbidden only because the component
 # exports need `#[unsafe(export_name)]`.
 [lib]
 crate-type = ["cdylib", "rlib"]
-# The generated `#[cfg(test)]` glue needs the runtime's test driver, which
-# pulls a renderer into the graph; the view's tests live in `tests/` and
-# drive it natively through the wire.
-test = false
 
 [dependencies]
+futures.workspace = true
 # the duckfs read lane's b64 pages, and the inline bytes a commit carries
 base64.workspace = true
-# the product icon set, as bytes the wire carries
-design = { path = "../support/design" }
-iced.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-ui-lang.workspace = true
-ui-lang-guest.workspace = true
-ui-lang-runtime.workspace = true
-
-[build-dependencies]
-ui-lang-build.workspace = true
+ducktape-view-guest.workspace = true

@@ -6,10 +6,10 @@
 
 use std::collections::BTreeMap;
 
+use ducktape_view_guest::testing::{answer, has_text, item, press, submit, texts, type_into};
+use ducktape_view_guest::wire::{ButtonContent, Frame, Node, Request};
 use settings_view::host::{KeyAdd, Name, Session, Tab, Unlock};
 use settings_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{answer, has_text, item, press, submit, texts, type_into};
-use ui_lang_guest::wire::{ButtonContent, Frame, Node, Request};
 
 const SEAT: &str = "8c4fa211";
 
@@ -23,6 +23,7 @@ fn facts() -> Session {
         recovering: false,
         appearance: "system".into(),
         desktop_notifications: true,
+        desktop_notifications_host: "ready".into(),
         unlocked: true,
         seat_key: SEAT.into(),
         account_name: "duck".into(),
@@ -96,9 +97,7 @@ fn status() -> Vec<u8> {
 }
 
 fn seats(name: &str, keys: &[[u8; 4]]) -> Vec<u8> {
-    serde_json::json!({ name: keys })
-        .to_string()
-        .into_bytes()
+    serde_json::json!({ name: keys }).to_string().into_bytes()
 }
 
 fn agents() -> Vec<u8> {
@@ -219,12 +218,70 @@ fn a_connected_view_reads_its_own_standing_and_key_rows() {
     );
 
     let frame = tick_native(press(&frame, "Account"));
-    for expected in ["validator", "laptop", "8c4fa211", "phone", "ff00"] {
+    for expected in [
+        "Validator",
+        "laptop",
+        "Device key",
+        "8c4fa211",
+        "phone",
+        "Passkey",
+        "ff00",
+    ] {
         assert!(
             has_text(&frame, expected),
             "missing {expected:?} in {:?}",
             texts(&frame)
         );
+    }
+}
+
+#[test]
+fn each_tab_selects_only_its_own_groups_inside_the_shared_scroll_root() {
+    let panes = ["General", "Network", "Account", "Security"];
+    let groups = [
+        ("settings/appearance", "General"),
+        ("settings/notifications", "General"),
+        ("settings/network", "Network"),
+        ("settings/identity-title", "Account"),
+        ("settings/keys-title", "Account"),
+        ("settings/security-title", "Security"),
+    ];
+    let (mut frame, props, _) = connected(&facts(), 2);
+    for selected in panes {
+        tick_native(press(&frame, selected));
+        // Unrelated incoming facts must not select a different pane.
+        frame = tick_native(vec![item(props, &encoded(&facts()))]);
+        let mut root = frame.root.clone().expect("Settings tree");
+        assert!(matches!(&root, Node::Scroll { key, .. } if key == "settings"));
+        let mut visible_keys = Vec::new();
+        let mut tabs = Vec::new();
+        root.for_each_mut(&mut |node| {
+            if let Some(key) = node.key() {
+                visible_keys.push(key.to_owned());
+            }
+            if let Node::Button {
+                key,
+                checked,
+                on_press,
+                ..
+            } = node
+                && let Some(pane) = key.strip_prefix("settings/tab/")
+            {
+                assert!(on_press.is_some());
+                tabs.push((pane.to_owned(), *checked));
+            }
+        });
+        assert_eq!(tabs.len(), panes.len());
+        for pane in panes {
+            assert!(tabs.contains(&(pane.to_lowercase(), Some(pane == selected))));
+        }
+        for (group, owner) in groups {
+            assert_eq!(
+                visible_keys.iter().filter(|key| *key == group).count(),
+                usize::from(owner == selected),
+                "{group} while {selected} selected"
+            );
+        }
     }
 }
 
@@ -246,6 +303,74 @@ fn an_unconnected_view_asks_the_kernel_for_nothing() {
         "nothing to read with no node: {:?}",
         frame.requests
     );
+}
+
+#[test]
+fn disconnect_hides_retained_account_and_network_claims_without_losing_drafts() {
+    let (frame, props, _) = connected(&facts(), 2);
+    let frame = tick_native(press(&frame, "Account"));
+    let frame = tick_native(type_into(&frame, "rename account…", "kept draft"));
+    assert!(has_text(&frame, "Account keys"));
+    let offline = Session {
+        connected: false,
+        ..facts()
+    };
+    let frame = tick_native(vec![item(props, &encoded(&offline))]);
+    assert!(has_text(&frame, "Not connected"));
+    for hidden in [
+        "duck",
+        "42",
+        "Account keys",
+        "Rename",
+        "Mint ticket",
+        "Remove",
+    ] {
+        assert!(
+            !has_text(&frame, hidden),
+            "stale {hidden}: {:?}",
+            texts(&frame)
+        );
+    }
+    let frame = tick_native(press(&frame, "Network"));
+    assert!(has_text(&frame, "Not connected"));
+    assert!(!has_text(&frame, "Connected"));
+    assert!(!has_text(&frame, "Members"));
+    assert!(!button_disabled(&frame, "Reconnect"));
+    let frame = tick_native(vec![item(props, &encoded(&facts()))]);
+    let frame = tick_native(press(&frame, "Account"));
+    assert!(
+        !button_disabled(&frame, "Rename"),
+        "the draft survives disconnect"
+    );
+    let frame = tick_native(press(&frame, "Rename"));
+    assert_eq!(
+        serde_json::from_slice::<Name>(&request(&frame, "settings.rename").payload)
+            .unwrap()
+            .name,
+        "kept draft"
+    );
+}
+
+#[test]
+fn copy_actions_send_complete_account_number_and_ticket() {
+    let number = "18446744073709551615";
+    let ticket = "fixture-ticket-with-a-long-capability-that-must-not-be-truncated";
+    let session = Session {
+        account_number: number.into(),
+        account_ticket: ticket.into(),
+        ..facts()
+    };
+    let (frame, _, _) = connected(&session, 2);
+    let frame = tick_native(press(&frame, "Account"));
+    assert!(has_text(&frame, number));
+    let frame = tick_native(press(&frame, "Copy number"));
+    let copied: settings_view::host::Copy =
+        serde_json::from_slice(&request(&frame, "settings.copy").payload).unwrap();
+    assert_eq!(copied.text, number);
+    let frame = tick_native(press(&frame, "Copy ticket"));
+    let copied: settings_view::host::Copy =
+        serde_json::from_slice(&request(&frame, "settings.copy").payload).unwrap();
+    assert_eq!(copied.text, ticket);
 }
 
 /// A valset block re-reads the standing; an identity block re-reads the key
@@ -274,6 +399,21 @@ fn a_block_on_a_plane_reads_only_that_plane_again() {
 }
 
 // ---------- the acts ----------
+
+#[test]
+fn working_browser_ceremony_can_be_cancelled_without_an_account() {
+    let working = Session {
+        account_exists: false,
+        account_ceremony_phase: "working".into(),
+        account_ceremony_detail: "Waiting for browser".into(),
+        ..facts()
+    };
+    let (frame, _, _) = connected(&working, 0);
+    let frame = tick_native(press(&frame, "Account"));
+    assert!(!button_disabled(&frame, "Cancel"));
+    let frame = tick_native(press(&frame, "Cancel"));
+    assert_eq!(one_intent(&frame).kind, "settings.ceremony_cancel");
+}
 
 /// The seat's password leaves as an `unlock` intent and never comes back:
 /// what the kernel pushes is the FLAG.
@@ -393,13 +533,44 @@ fn the_last_key_is_never_offered_for_removal() {
     );
 }
 
+/// No raw token reaches the screen: the keystore's `encrypted` reads as a
+/// sentence, an unanswered roster reads as a wait rather than a blank badge,
+/// and the QR countdown says what it counts.
+#[test]
+fn raw_tokens_read_as_words_and_a_pending_read_says_so() {
+    let session = Session {
+        settings_key_state: "encrypted".into(),
+        account_ceremony_phase: "show_qr".into(),
+        account_ceremony_qr: "https://auth.example/c".into(),
+        account_ceremony_detail: "Scan this with your phone.".into(),
+        account_ceremony_left: "1:07".into(),
+        ..facts()
+    };
+    boot_native();
+    let frame = tick_native(Vec::new());
+    let props = request(&frame, "settings.props").id;
+    // the session is in, the standing and key reads are still out
+    let frame = tick_native(vec![item(props, &encoded(&session))]);
+    let frame = tick_native(press(&frame, "Account"));
+    assert!(has_text(&frame, "Reading…"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "validator"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "This code expires in 1:07"),
+        "{:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(press(&frame, "Security"));
+    assert!(has_text(&frame, "Encrypted on disk"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "encrypted"), "{:?}", texts(&frame));
+}
+
 /// The rail tabs the settings cards link to leave as the one `tab` intent —
 /// the view never opens another tab itself.
 #[test]
 fn a_link_to_another_tab_leaves_as_an_intent() {
     let (frame, _, _) = connected(&facts(), 2);
     let frame = tick_native(press(&frame, "Network"));
-    let frame = tick_native(press(&frame, "manage"));
+    let frame = tick_native(press(&frame, "Open members"));
     let intent = one_intent(&frame);
     assert_eq!(intent.kind, "settings.tab");
     assert_eq!(

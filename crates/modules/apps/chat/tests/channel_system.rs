@@ -1274,6 +1274,49 @@ fn rejects_posts_to_missing_channels_and_aborts_cleanly() {
     });
 }
 
+/// A voice room is a channel with `voice` set: open to post, listed by the
+/// record, and refused an id another channel holds like any other.
+#[test]
+fn a_voice_room_is_an_open_channel_marked_voice() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = chat_on!(context, "chat");
+        module
+            .execute(
+                &mut ctx_with_origin(10, user(1)),
+                &module_msg(ChatMsg::CreateVoiceChannel {
+                    channel_id: "lounge".into(),
+                    name: "Lounge".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "lounge".into(),
+            },
+        )
+        .await
+        else {
+            panic!("the voice room exists");
+        };
+        assert!(channel.voice, "the record says voice");
+        assert_eq!(channel.post_policy, PostPolicy::Open);
+
+        let err = module
+            .execute(
+                &mut ctx_with_origin(11, user(2)),
+                &module_msg(create_channel("lounge")),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Module(_)), "the id is taken");
+        module.abort_block().await.unwrap();
+    });
+}
+
 #[test]
 fn two_instances_replaying_the_same_ops_produce_identical_roots() {
     deterministic::Runner::default().start(|context| async move {

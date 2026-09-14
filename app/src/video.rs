@@ -15,10 +15,14 @@
 //! the client picks the codec. Pure-Rust JPEG keeps the build free of C
 //! toolchains on every platform; intra-only means a lost frame costs nothing
 //! (the next one is a sync point), so inbound `KeyframeRequest`s are
-//! meaningless and never sent. The seam to a delta codec (VP8/AV1) is
-//! `encode_frame`/`store_peer_frame` — nothing else knows JPEG exists.
-//! MAX_FRAME_BYTES on the mesh is ~129 KB; 640×480 at the fixed q60 runs
-//! 30–60 KB.
+//! meaningless and never sent. The codec itself is
+//! `media_service::video::codec` — NOT this crate, because its two APIs are
+//! generic and would instantiate here at the app's dev `opt-level = 0`, where
+//! a VGA frame cost ~90 ms of encode, decode and channel swap and the loop
+//! fell behind the camera (the "video latency" under `make dev`). The seam to
+//! a delta codec (VP8/AV1) is that module and `store_peer_frame`; nothing
+//! else knows JPEG exists. MAX_FRAME_BYTES on the mesh is ~129 KB; 640×480 at
+//! q60 runs 30–60 KB.
 // ponytail: fixed 640x480-ish @ q60, wire ≤60 fps, no rate-ladder response —
 // ducktape is a private-network workspace app, so the generous ceiling is
 // deliberate (q60 VGA at 60 fps ≈ 2-4 MB/s per sender); wire the RateHint →
@@ -31,15 +35,25 @@
 //! `call_video_stage` extern components read; both are SELF-REDRAWING widgets
 //! that repaint their own window at the capture cadence — no app message, no
 //! view rebuild, no other window woken.
+//!
+//! EVERY FRAME IS A NEW RENDERER IMAGE, AND THE RENDERER FREES NOTHING ON ITS
+//! OWN. `img(Arc<RenderImage>)` uploads a sprite-atlas tile per image id and
+//! keeps it until `Window::drop_image`; a call that never called it grew the
+//! atlas by a VGA tile per frame, ~36 MB/s, for as long as it ran. So the
+//! store RETIRES every handle it replaces, and the surfaces drop the retired
+//! ones on their next paint — the one place a `Window` is in hand.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use gpui_kit::StyledImage;
+use gpui_kit::{
+    Context, IntoElement, ObjectFit, ParentElement, Render, RenderImage, Styled, Window, div, img,
+    px,
+};
 use media_service::call_wire::{CapturedFrame, PeerFrame};
-use iced::{Element, Rectangle, Size};
-
-mod live_surface;
+use media_service::video::codec;
 
 /// Toggle/shutdown poll while no source is open. WITH A CAMERA OPEN THE LOOP
 /// KEEPS NO CLOCK AT ALL: `Camera::frame()` blocks until the device has the
@@ -55,20 +69,13 @@ const WIRE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 /// not watched: ~10/s tracks a scroll and a typed line without spending a
 /// camera's bandwidth on a mostly-still picture.
 const SCREEN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-/// The fixed v1 encode quality (see the ponytail note above).
-const JPEG_QUALITY: u8 = 60;
 /// Tile width in the strip; height follows the frame's aspect.
 const TILE_WIDTH: f32 = 128.0;
 /// Capture ceiling, in pixels: the documented ~VGA budget whose q60 JPEG
 /// stays well under the mesh's MAX_FRAME_BYTES. A camera that only offers
 /// bigger modes is box-halved down to it before the encode.
 const CAPTURE_PIXEL_BUDGET: u32 = 640 * 480;
-/// Decoded-tile ceiling, in pixels: keeps a tile's RGBA under iced_wgpu's
-/// 2 MiB synchronous-upload cliff no matter what a peer ships — the sender
-/// bounds itself, but a peer is not trusted to. The cliff test is a STRICT
-/// `<` (iced_wgpu `image/cache.rs`), so the budget sits one pixel under the
-/// exact boundary: at 512·1024 px a frame's RGBA equals 2 MiB, takes the
-/// async path, and is not drawn the frame its handle first appears.
+/// Decoded-tile ceiling: peers cannot allocate more than this pixel budget.
 const TILE_PIXEL_BUDGET: u32 = 512 * 1024 - 1;
 /// A shared screen's capture ceiling — the TILE budget, not the camera's,
 /// because legibility is the whole point of a screen and the receiver cannot
@@ -78,57 +85,12 @@ const TILE_PIXEL_BUDGET: u32 = 512 * 1024 - 1;
 // codec that carries a still screen cheaply (delta frames), not a bigger JPEG.
 const SCREEN_PIXEL_BUDGET: u32 = TILE_PIXEL_BUDGET;
 
-/// One 2×2 box-average pass over an interleaved `CHANNELS`-per-pixel image;
-/// odd edges clamp their second sample. Repeated until a budget holds — a
-/// pass is one integer average per output byte, cheap enough for the capture
-/// thread and the decode's blocking task alike.
-fn halve<const CHANNELS: usize>(pixels: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32) {
-    let (out_w, out_h) = ((width / 2).max(1), (height / 2).max(1));
-    let mut out = Vec::with_capacity(out_w as usize * out_h as usize * CHANNELS);
-    for y in 0..out_h {
-        let (y0, y1) = ((y * 2).min(height - 1), (y * 2 + 1).min(height - 1));
-        for x in 0..out_w {
-            let (x0, x1) = ((x * 2).min(width - 1), (x * 2 + 1).min(width - 1));
-            for channel in 0..CHANNELS {
-                let sample = |sx: u32, sy: u32| {
-                    u16::from(pixels[(sy * width + sx) as usize * CHANNELS + channel])
-                };
-                let sum = sample(x0, y0) + sample(x1, y0) + sample(x0, y1) + sample(x1, y1);
-                out.push((sum / 4) as u8);
-            }
-        }
-    }
-    (out, out_w, out_h)
-}
-
-/// Halve `pixels` until `width * height` fits `budget`.
-fn shrink_to_budget<const CHANNELS: usize>(
-    mut pixels: Vec<u8>,
-    mut width: u32,
-    mut height: u32,
-    budget: u32,
-) -> (Vec<u8>, u32, u32) {
-    while width * height > budget {
-        (pixels, width, height) = halve::<CHANNELS>(&pixels, width, height);
-    }
-    (pixels, width, height)
-}
-
-/// One decoded tile: the renderer handle, built ONCE per decoded frame, plus
-/// the capture size the tile's aspect ratio is computed from.
-///
-/// THE HANDLE'S IDENTITY IS THE WHOLE POINT. `Handle::from_rgba` stamps a
-/// fresh `Id` on every call (iced_core `image.rs`), and iced_wgpu treats a
-/// never-seen id as a never-seen image: full copy, fresh atlas allocation,
-/// and — above its 2 MiB synchronous-upload cliff — nothing drawn in the
-/// frame the id first appears (iced_wgpu `image/cache.rs`). Minting the
-/// handle here rather than in `tile()` means every view rebuild between two
-/// captures hands the renderer the SAME id and hits its cache, so a tile
-/// holds the last decoded frame on screen until the next one arrives.
+/// A decoded frame owns one renderer image. Cloning it between paints keeps
+/// its upload cached until the next captured frame replaces it.
 struct TileFrame {
     width: u32,
     height: u32,
-    handle: iced::widget::image::Handle,
+    handle: Arc<RenderImage>,
 }
 
 struct VideoStore {
@@ -142,6 +104,15 @@ struct VideoStore {
     /// DROPPED rather than queued — a hostile 25 fps sender must not stack
     /// concurrent decodes on the blocking pool.
     decoding: HashSet<String>,
+    /// handles a newer frame (or a departure) replaced, whose atlas tiles the
+    /// next paint drops — see the module doc.
+    retired: Vec<Arc<RenderImage>>,
+}
+
+impl VideoStore {
+    fn retire(&mut self, frame: Option<TileFrame>) {
+        self.retired.extend(frame.map(|frame| frame.handle));
+    }
 }
 
 fn store() -> &'static Mutex<VideoStore> {
@@ -151,8 +122,21 @@ fn store() -> &'static Mutex<VideoStore> {
             peers: HashMap::new(),
             preview: None,
             decoding: HashSet::new(),
+            retired: Vec::new(),
         })
     })
+}
+
+/// The handles replaced since the last paint, for `Window::drop_image`.
+pub(crate) fn take_retired() -> Vec<Arc<RenderImage>> {
+    std::mem::take(&mut store().lock().expect("video store").retired)
+}
+
+/// A BGRA picture as one renderer image. The renderer reads BGRA out of an
+/// `RgbaImage` container, so the bytes go in as they are.
+fn render_bgra(pixels: Vec<u8>, width: u32, height: u32) -> Option<Arc<RenderImage>> {
+    let pixels = image::RgbaImage::from_raw(width, height, pixels)?;
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])))
 }
 
 /// What the video leg is sending, if anything.
@@ -210,7 +194,10 @@ fn use_source(next: Source) -> VideoSource {
     SOURCE.store(next.code(), Ordering::Relaxed);
     // The outgoing preview belongs to the source that is ending — a camera
     // still on screen under a "sharing" beacon is a lie for one frame.
-    store().lock().expect("video store").preview = None;
+    let mut store = store().lock().expect("video store");
+    let ended = store.preview.take();
+    store.retire(ended);
+    drop(store);
     crate::call::beacon_state();
     VideoSource {
         camera: next == Source::Camera,
@@ -232,8 +219,12 @@ pub fn call_use_screen(on: bool) -> VideoSource {
 /// last call's faces.
 pub(crate) fn reset() {
     let mut store = store().lock().expect("video store");
-    store.peers.clear();
-    store.preview = None;
+    let peers: Vec<TileFrame> = store.peers.drain().map(|(_, frame)| frame).collect();
+    for frame in peers {
+        store.retire(Some(frame));
+    }
+    let preview = store.preview.take();
+    store.retire(preview);
     store.decoding.clear();
     SOURCE.store(Source::Off.code(), Ordering::Relaxed);
 }
@@ -266,14 +257,17 @@ pub(crate) fn store_peer_frame(frame: PeerFrame) {
     let Some(tile) = tile else {
         return;
     };
-    store.peers.insert(peer, tile);
+    let replaced = store.peers.insert(peer, tile);
+    store.retire(replaced);
 }
 
 /// Drop a peer's last frame: they left the huddle, or their beacon says the
 /// source behind it is off. Frames only ever arrive, so nothing else would
 /// ever take one down.
 pub(crate) fn forget_peer(node: &str) {
-    store().lock().expect("video store").peers.remove(node);
+    let mut store = store().lock().expect("video store");
+    let gone = store.peers.remove(node);
+    store.retire(gone);
 }
 
 fn hex_of(key: &[u8; 32]) -> String {
@@ -285,93 +279,39 @@ fn hex_of(key: &[u8; 32]) -> String {
     out
 }
 
+/// A peer's JPEG as a tile: refused before allocation over
+/// SCREEN_PIXEL_BUDGET (the larger receive-side budget — today the tile's,
+/// but a screen-share frame is the one this path must not under-bound), and
+/// bounded HERE onto TILE_PIXEL_BUDGET rather than trusted to its sender —
+/// above the renderer's upload cliff a fresh handle is skipped for a frame,
+/// which reads as the tile blinking.
 fn decode_frame(data: &[u8]) -> Option<TileFrame> {
-    let mut decoder = zune_jpeg::JpegDecoder::new(data);
-    decoder.set_options(
-        zune_jpeg::zune_core::options::DecoderOptions::default()
-            .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA),
-    );
-    // Read the SOF's declared size WITHOUT allocating the decoded output.
-    // `decode_headers` stops the instant it has parsed the SOS marker — it
-    // never sizes a buffer off width×height (the only thing zune-jpeg
-    // allocates per component during header parsing is a small per-component
-    // Vec); the width×height×4 allocation happens inside `decode()`, called
-    // below only once the declared size has cleared the budget.
-    //
-    // zune-core's own `max_width`/`max_height` (the knob `DecoderOptions`
-    // exposes) default to 16384 EACH and are checked per AXIS — a hostile SOF
-    // sitting exactly on that boundary sails through it (16384 is not
-    // greater than 16384), which is this defect. Widening that knob doesn't
-    // fix it either: TILE_PIXEL_BUDGET/SCREEN_PIXEL_BUDGET are AREA budgets
-    // (pixel counts), and no single per-axis pair strict enough to refuse a
-    // 16384×16384 attack can also admit a real tile's aspect — a documented
-    // 1080p share alone lands at 960×540 (see SCREEN_PIXEL_BUDGET), already
-    // past a symmetric budget-derived per-axis cap. So the gate checks the
-    // area the budget is actually defined in, against SCREEN_PIXEL_BUDGET —
-    // the larger of the two named budgets a receive-side tile can be (today
-    // the same constant as TILE_PIXEL_BUDGET, but a screen-share frame is the
-    // one this receive path must not under-bound if that ever changes).
-    decoder.decode_headers().ok()?;
-    let (width, height) = decoder.dimensions()?;
-    if width as u64 * height as u64 > u64::from(SCREEN_PIXEL_BUDGET) {
+    let Some(picture) = codec::decode_bgra(data, SCREEN_PIXEL_BUDGET, TILE_PIXEL_BUDGET) else {
         // debug, not warn: a hostile sender can repeat this every frame at
         // 25 fps, and a per-frame warn would evict the whole ring in minutes.
         tracing::debug!(
             target: "ducktape::call",
-            reason = "tile_dimensions_over_budget",
-            width,
-            height,
-            "peer tile refused before allocation"
+            reason = "tile_refused",
+            "peer tile refused: over budget or not a picture"
         );
         return None;
-    }
-    let pixels = decoder.decode().ok()?;
-    // An oversized-but-in-budget peer frame is bounded HERE too, not trusted
-    // to have been bounded at its sender — above the renderer's upload cliff
-    // a fresh handle is skipped for a frame, which reads as the tile blinking.
-    let (pixels, width, height) =
-        shrink_to_budget::<4>(pixels, width as u32, height as u32, TILE_PIXEL_BUDGET);
+    };
+    let codec::Picture {
+        pixels,
+        width,
+        height,
+    } = picture;
     Some(TileFrame {
         width,
         height,
-        handle: iced::widget::image::Handle::from_rgba(width, height, pixels),
+        handle: render_bgra(pixels, width, height)?,
     })
 }
 
-/// Encode one captured RGBA frame to the wire's opaque bytes (the encoder
-/// ignores the alpha channel). Public for the unit round-trip; the capture
-/// thread is its only product caller.
-///
-/// RGBA, NOT RGB, BECAUSE THE PREVIEW IS RGBA. The camera is decoded once,
-/// into the layout the renderer wants, and the wire copy borrows that — the
-/// arrangement this replaced decoded to RGB and then rebuilt a whole second
-/// RGBA image per frame, on the capture thread, in the gap between two frames.
-pub(crate) fn encode_frame(rgba: &[u8], width: u16, height: u16) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    let encoder = jpeg_encoder::Encoder::new(&mut out, JPEG_QUALITY);
-    encoder
-        .encode(rgba, width, height, jpeg_encoder::ColorType::Rgba)
-        .ok()?;
-    if out.len() <= media_service::video::MAX_FRAME_BYTES {
-        return Some(out);
-    }
-    // OVER THE MESH CAP, so this frame cannot be sent as it is — and a source
-    // that overruns once overruns every frame, which is a stream that stops
-    // dead with no error anywhere. A busy screen is exactly that source (a
-    // detailed desktop at 960×540 out-compresses nothing), so trade its
-    // resolution rather than its liveness: half the size, one more try.
-    let (small, width, height) = halve::<4>(rgba, u32::from(width), u32::from(height));
-    let mut out = Vec::new();
-    let encoder = jpeg_encoder::Encoder::new(&mut out, JPEG_QUALITY);
-    encoder
-        .encode(
-            &small,
-            width as u16,
-            height as u16,
-            jpeg_encoder::ColorType::Rgba,
-        )
-        .ok()?;
-    (out.len() <= media_service::video::MAX_FRAME_BYTES).then_some(out)
+/// Encode one captured BGRA frame to the wire's opaque bytes. The capture
+/// thread is its only product caller; the codec does the work.
+pub(crate) fn encode_frame(bgra: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    codec::encode_bgra(bgra, width, height)
 }
 
 /// How the self-view is ARRIVING: frames stored, and the worst and total gap
@@ -420,23 +360,25 @@ fn note_preview_arrival() {
     }
 }
 
-/// The local preview: the camera's own pixels, taking ownership of the frame
-/// the capture pass decoded.
-pub(crate) fn store_preview(rgba: Vec<u8>, width: u32, height: u32) {
+/// The local preview: the camera's own pixels (BGRA), taking ownership of
+/// the frame the capture pass decoded.
+pub(crate) fn store_preview(bgra: Vec<u8>, width: u32, height: u32) {
+    let Some(handle) = render_bgra(bgra, width, height) else {
+        return;
+    };
     note_preview_arrival();
-    store().lock().expect("video store").preview = Some(TileFrame {
+    let mut store = store().lock().expect("video store");
+    let replaced = store.preview.replace(TileFrame {
         width,
         height,
-        handle: iced::widget::image::Handle::from_rgba(width, height, rgba),
+        handle,
     });
+    store.retire(replaced);
 }
 
-/// Open the camera, or say why. 640×480 AT ITS HIGHEST FRAME RATE — the size
-/// this module has always documented. `AbsoluteHighestFrameRate` alone meant
-/// "highest frame rate, then the HIGHEST resolution" (nokhwa-core `types.rs`),
-/// so a 720p/1080p webcam negotiated a mode whose q60 JPEG overran the mesh's
-/// ~126 KiB `MAX_FRAME_BYTES` and whose RGBA blew iced's 2 MiB upload cliff —
-/// both read as blinking. A camera that has no VGA mode, or refuses it, gets
+/// Open the camera at 640×480 and its highest frame rate, or say why.
+/// Larger frames increase decoding and upload costs and can exceed the mesh's
+/// `MAX_FRAME_BYTES` JPEG budget. A camera that has no VGA mode, or refuses it, gets
 /// the largest mode INSIDE the capture budget instead ([`open_within_budget`]):
 /// every frame is shrunk onto that budget anyway, so a bigger mode only buys
 /// a bigger decode — a 1080p JPEG per frame at the camera's top rate is a
@@ -445,7 +387,7 @@ pub(crate) fn store_preview(rgba: Vec<u8>, width: u32, height: u32) {
 /// A refusal turns the toggle back off and surfaces as "live · camera: …"
 /// through the status fold; the caller has nothing to decide.
 fn open_camera(
-    events: &iced::futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
+    events: &futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
 ) -> Option<nokhwa::Camera> {
     use nokhwa::pixel_format::RgbAFormat;
     use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType, Resolution};
@@ -519,7 +461,7 @@ fn budget_format(
 /// the toggle back where the user can see it is off. The capture thread has
 /// nothing left to decide.
 fn refuse_source(
-    events: &iced::futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
+    events: &futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
     message: String,
 ) {
     let _ = events.unbounded_send(crate::call::CallEvent {
@@ -614,16 +556,19 @@ impl ScreenSource {
             .map_err(|error| error.to_string())?
             .reply()
             .map_err(|error| error.to_string())?;
-        let (mut pixels, width, height) = shrink_to_budget::<4>(
+        let codec::Picture {
+            mut pixels,
+            width,
+            height,
+        } = codec::shrink_to_budget(
             image.data,
             u32::from(geometry.width),
             u32::from(geometry.height),
             SCREEN_PIXEL_BUDGET,
         );
-        // X hands back BGRX; the renderer and the encoder both read RGBA. The
-        // swap runs AFTER the shrink, over the small image.
+        // X hands back BGRX, which IS the renderer's and the encoder's order;
+        // only the alpha byte needs writing, over the small image.
         for pixel in pixels.chunks_exact_mut(4) {
-            pixel.swap(0, 2);
             pixel[3] = 0xff;
         }
         Ok((pixels, width, height))
@@ -655,7 +600,7 @@ impl Open {
 
 fn open_source(
     source: Source,
-    events: &iced::futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
+    events: &futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
 ) -> Open {
     match source {
         Source::Off => Open::None,
@@ -670,7 +615,7 @@ fn open_source(
     }
 }
 
-/// One frame from whatever is open, RGBA and inside its source's budget. An
+/// One frame from whatever is open, BGRA and inside its source's budget. An
 /// error is the source having stopped answering; the loop drops it and the
 /// reopen says why if it cannot come back.
 fn grab(open: &mut Open) -> Result<(Vec<u8>, u32, u32), String> {
@@ -685,12 +630,15 @@ fn grab(open: &mut Open) -> Result<(Vec<u8>, u32, u32), String> {
                 .decode_image::<RgbAFormat>()
                 .map_err(|error| error.to_string())?;
             let (width, height) = (decoded.width(), decoded.height());
-            Ok(shrink_to_budget::<4>(
-                decoded.into_raw(),
+            let codec::Picture {
+                mut pixels,
                 width,
                 height,
-                CAPTURE_PIXEL_BUDGET,
-            ))
+            } = codec::shrink_to_budget(decoded.into_raw(), width, height, CAPTURE_PIXEL_BUDGET);
+            // the one swap left in the pipeline: the camera decodes RGBA, the
+            // renderer and the encoder both read BGRA
+            codec::rgba_to_bgra_in_place(&mut pixels);
+            Ok((pixels, width, height))
         }
         Open::Screen(screen) => screen.grab(),
     }
@@ -715,7 +663,7 @@ fn grab(open: &mut Open) -> Result<(Vec<u8>, u32, u32), String> {
 pub(crate) fn capture_thread(
     frames: tokio::sync::mpsc::UnboundedSender<CapturedFrame>,
     shutdown: std::sync::mpsc::Receiver<()>,
-    events: iced::futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
+    events: futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
 ) {
     let mut open = Open::None;
     let started = std::time::Instant::now();
@@ -760,7 +708,7 @@ pub(crate) fn capture_thread(
             open = open_source(wanted, &events);
             continue;
         }
-        let Ok((rgba, width, height)) = grab(&mut open) else {
+        let Ok((bgra, width, height)) = grab(&mut open) else {
             // A source that stopped answering must not spin this loop: drop
             // it, and the reopen above says why if it cannot come back.
             open = Open::None;
@@ -772,9 +720,9 @@ pub(crate) fn capture_thread(
         // frame the encoder refuses (over the mesh cap) must not freeze it.
         let wire_due = last_sent.is_none_or(|at| at.elapsed() >= WIRE_INTERVAL);
         let encoded = wire_due
-            .then(|| encode_frame(&rgba, width as u16, height as u16))
+            .then(|| encode_frame(&bgra, width, height))
             .flatten();
-        store_preview(rgba, width, height);
+        store_preview(bgra, width, height);
         let Some(encoded) = encoded else {
             continue;
         };
@@ -790,61 +738,77 @@ pub(crate) fn capture_thread(
     }
 }
 
-/// The tile strip the huddle panel mounts — a runtime `LiveSurface`, not a
-/// state-driven mount. The surface reads the store in its own draw pass and
-/// repaints only ITS OWN window at the paint ceiling, so a live camera costs
-/// the huddle window a paint pass and costs every other window nothing at
-/// all (the state-driven predecessor rebuilt EVERY window's view tree per
-/// beat). The layout key is the tile count: the wrap-grid's height depends
-/// only on it, so layout invalidates on a join/leave/camera toggle — never
-/// per frame. Zero tiles parks the clock; frames cannot appear without a
-/// camera beacon riding the call control channel first, and that roster
-/// message redraws the window once, which re-arms it.
-///
-/// `staged` names the frame the stage above is already showing whole (see
-/// [`call_video_stage`]), and the strip leaves it out: the same desktop
-/// Cover-cropped into a 128×96 plate beside its full-size self is not a second
-/// view of anything, it is a smear of somebody's wallpaper.
-pub fn call_video_tiles(staged: &str) -> Element<'_, ()> {
-    live_surface::live_surface(
-        REDRAW_INTERVAL,
-        move |width| Size::new(width, grid_height(tile_count(staged), grid_columns(width))),
-        move || tile_count(staged) as u64,
-        move || tile_count(staged) > 0,
-        move |renderer, bounds, viewport| paint_tiles(staged, renderer, bounds, viewport),
-    )
-    .into()
+/// Native video surfaces read the latest decoded frame at the window's vsync.
+/// Empty stores park redraws; the call roster update mounts/re-arms the surface.
+pub struct VideoView {
+    source: VideoDisplay,
+}
+enum VideoDisplay {
+    Tiles(String),
+    Stage(String),
 }
 
-/// The stage the panel mounts above the strip while someone is sharing a
-/// screen: ONE frame, as large as the panel is wide, whole.
-///
-/// A SHARED SCREEN IS NOT A FACE. The strip's plates are a fixed 4:3 crop —
-/// the right treatment for a person, and useless for a desktop, which is
-/// 16:9 or wider and whose whole content is the point. So the stage takes its
-/// height from the frame's own aspect and draws it CONTAINED: every pixel the
-/// sharer sees, none of them cropped, none of them stretched.
-///
-/// `peer` is the sharer's node key, or [`SELF_STAGE`] when this device is the
-/// one sharing — seeing your own share is how you know what you published.
-pub fn call_video_stage(peer: &str) -> Element<'_, ()> {
-    live_surface::live_surface(
-        REDRAW_INTERVAL,
-        move |width| Size::new(width, stage_height(peer, width)),
-        // Layout follows the ASPECT and nothing else: a new frame of the same
-        // shape (every frame, ten times a second) must not invalidate layout.
-        // Packed, not arithmetic: the width comes off a PEER'S frame, and a
-        // multiply wide enough to be readable is a multiply a peer can
-        // overflow.
-        move || {
-            stage_frame(peer).map_or(0, |(width, height, _)| {
-                u64::from(width) << 32 | u64::from(height)
-            })
-        },
-        move || stage_frame(peer).is_some(),
-        move |renderer, bounds, viewport| paint_stage(peer, renderer, bounds, viewport),
-    )
-    .into()
+pub fn call_video_tiles(staged: &str) -> VideoView {
+    VideoView {
+        source: VideoDisplay::Tiles(staged.to_owned()),
+    }
+}
+pub fn call_video_stage(peer: &str) -> VideoView {
+    VideoView {
+        source: VideoDisplay::Stage(peer.to_owned()),
+    }
+}
+impl VideoView {
+    pub fn replace_tiles(&mut self, staged: String, cx: &mut Context<Self>) {
+        self.source = VideoDisplay::Tiles(staged);
+        cx.notify();
+    }
+    pub fn replace_stage(&mut self, peer: String, cx: &mut Context<Self>) {
+        self.source = VideoDisplay::Stage(peer);
+        cx.notify();
+    }
+}
+impl Render for VideoView {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // the frames a newer one replaced since the last paint give their
+        // atlas tiles back here, the one place a Window is in hand
+        for handle in take_retired() {
+            let _ = window.drop_image(handle);
+        }
+        match &self.source {
+            VideoDisplay::Stage(peer) => {
+                let Some((_, _, handle)) = stage_frame(peer) else {
+                    return div().into_any_element();
+                };
+                window.request_animation_frame();
+                img(handle)
+                    .w_full()
+                    .h_auto()
+                    .object_fit(ObjectFit::Contain)
+                    .rounded(px(8.))
+                    .into_any_element()
+            }
+            VideoDisplay::Tiles(staged) => {
+                let tiles = tiles_snapshot(staged);
+                if !tiles.is_empty() {
+                    window.request_animation_frame();
+                }
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(TILE_GAP))
+                    .children(tiles.into_iter().map(|(_, _, handle)| {
+                        img(handle)
+                            .w(px(TILE_WIDTH))
+                            .h(px(TILE_HEIGHT))
+                            .object_fit(ObjectFit::Cover)
+                            .rounded(px(6.))
+                    }))
+                    .into_any_element()
+            }
+        }
+    }
 }
 
 /// The stage's stand-in for "the screen this device is sharing" — a sentinel
@@ -855,7 +819,7 @@ pub const SELF_STAGE: &str = "you";
 /// preview under [`SELF_STAGE`]. `pub(crate)` for the live huddle lane, which
 /// asks the store the same question the stage does: is this peer's picture
 /// here yet?
-pub(crate) fn stage_frame(peer: &str) -> Option<(u32, u32, iced::widget::image::Handle)> {
+pub(crate) fn stage_frame(peer: &str) -> Option<(u32, u32, Arc<RenderImage>)> {
     let store = store().lock().expect("video store");
     let frame = match peer {
         SELF_STAGE => store.preview.as_ref(),
@@ -864,87 +828,16 @@ pub(crate) fn stage_frame(peer: &str) -> Option<(u32, u32, iced::widget::image::
     Some((frame.width, frame.height, frame.handle.clone()))
 }
 
-/// The height that gives `width` the frame's own aspect. No frame yet is no
-/// stage: zero, so the panel reserves nothing for a picture that may never
-/// arrive (a sharer whose first frame is still crossing).
-fn stage_height(peer: &str, width: f32) -> f32 {
-    stage_frame(peer).map_or(0.0, |(frame_width, frame_height, _)| {
-        width * frame_height as f32 / frame_width.max(1) as f32
-    })
-}
-
-fn paint_stage(peer: &str, renderer: &mut iced::Renderer, bounds: Rectangle, viewport: &Rectangle) {
-    use iced::advanced::image::Renderer as _;
-
-    let Some((width, height, handle)) = stage_frame(peer) else {
-        return;
-    };
-    let Some(clip) = bounds.intersection(viewport) else {
-        return;
-    };
-    // Contain, not cover: the height above already follows the aspect, so this
-    // only matters for the frame or two after a resolution change — and a
-    // shared screen with its edges cut off is the one thing this must not do.
-    let scale = (bounds.width / width.max(1) as f32).min(bounds.height / height.max(1) as f32);
-    let drawn = Size::new(width as f32 * scale, height as f32 * scale);
-    let drawing = Rectangle {
-        x: bounds.x + (bounds.width - drawn.width) / 2.0,
-        y: bounds.y + (bounds.height - drawn.height) / 2.0,
-        width: drawn.width,
-        height: drawn.height,
-    };
-    renderer.draw_image(
-        iced::advanced::image::Image {
-            handle,
-            filter_method: iced::widget::image::FilterMethod::default(),
-            rotation: iced::Radians(0.0),
-            border_radius: 8.0.into(),
-            opacity: 1.0,
-            snap: true,
-        },
-        drawing,
-        clip,
-    );
-}
-
 /// Displayed tile plate: fixed 4:3, the frame Cover-cropped onto it, wrapped
 /// into rows on the strip's width.
 const TILE_HEIGHT: f32 = 96.0;
 const TILE_GAP: f32 = 8.0;
-/// How soon after painting a live tile the surface asks to be painted again.
-///
-/// SHORTER THAN ANY DISPLAY'S FRAME, ON PURPOSE — this is not a target rate,
-/// it is "there is always a repaint owed". The window presents on vsync, so
-/// what a beat longer than a refresh period buys is a beat that drifts against
-/// it: ask again 16 ms after a frame the compositor showed 16.7 ms apart and
-/// every few frames the request lands a hair too late, waits a whole extra
-/// refresh, and shows the same picture twice — a periodic hitch on a preview
-/// whose pixels arrived on time. At 4 ms the redraw is always already owed and
-/// each vsync paints the newest camera frame in hand, which is as close to
-/// "straight from the camera" as a composited window gets.
-///
-/// It costs the huddle's own window a paint pass per refresh and no other
-/// window anything (that is what `live_surface` is for), and it parks
-/// completely when no tile is live.
-const REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
-
-fn tile_count(staged: &str) -> usize {
-    let store = store().lock().expect("video store");
-    let peers = store
-        .peers
-        .keys()
-        .filter(|node| node.as_str() != staged)
-        .count();
-    let previewing = store.preview.is_some() && staged != SELF_STAGE;
-    peers + usize::from(previewing)
-}
-
 /// Peers in stable key order, the local preview last — the same order the
 /// row-based strip always drew, minus whatever the stage is showing whole.
 /// `Handle` is `Bytes`-backed (Arc) and its `Id` survives the clone, so each
 /// entry is a refcount bump that keeps pointing at the renderer's cached
 /// upload.
-fn tiles_snapshot(staged: &str) -> Vec<(u32, u32, iced::widget::image::Handle)> {
+fn tiles_snapshot(staged: &str) -> Vec<(u32, u32, Arc<RenderImage>)> {
     let store = store().lock().expect("video store");
     let mut ordered: Vec<(&String, &TileFrame)> = store
         .peers
@@ -964,144 +857,29 @@ fn tiles_snapshot(staged: &str) -> Vec<(u32, u32, iced::widget::image::Handle)> 
     tiles
 }
 
-fn grid_columns(width: f32) -> usize {
-    ((width + TILE_GAP) / (TILE_WIDTH + TILE_GAP))
-        .floor()
-        .max(1.0) as usize
-}
-
-fn grid_height(count: usize, columns: usize) -> f32 {
-    if count == 0 {
-        return 0.0;
-    }
-    let rows = count.div_ceil(columns);
-    rows as f32 * TILE_HEIGHT + (rows - 1) as f32 * TILE_GAP
-}
-
-fn paint_tiles(
-    staged: &str,
-    renderer: &mut iced::Renderer,
-    bounds: Rectangle,
-    viewport: &Rectangle,
-) {
-    use iced::advanced::image::Renderer as _;
-
-    let columns = grid_columns(bounds.width);
-    for (index, (width, height, handle)) in tiles_snapshot(staged).into_iter().enumerate() {
-        let cell = Rectangle {
-            x: bounds.x + (index % columns) as f32 * (TILE_WIDTH + TILE_GAP),
-            y: bounds.y + (index / columns) as f32 * (TILE_HEIGHT + TILE_GAP),
-            width: TILE_WIDTH,
-            height: TILE_HEIGHT,
-        };
-        let Some(clip) = cell.intersection(viewport) else {
-            continue;
-        };
-        // Cover: scale the frame to fill the plate, center, crop by clip.
-        let scale = (TILE_WIDTH / width.max(1) as f32).max(TILE_HEIGHT / height.max(1) as f32);
-        let drawn = Size::new(width as f32 * scale, height as f32 * scale);
-        let drawing = Rectangle {
-            x: cell.x + (cell.width - drawn.width) / 2.0,
-            y: cell.y + (cell.height - drawn.height) / 2.0,
-            width: drawn.width,
-            height: drawn.height,
-        };
-        renderer.draw_image(
-            iced::advanced::image::Image {
-                handle,
-                filter_method: iced::widget::image::FilterMethod::default(),
-                rotation: iced::Radians(0.0),
-                border_radius: 6.0.into(),
-                opacity: 1.0,
-                snap: true,
-            },
-            drawing,
-            clip,
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The codec's own tests own the round trip and the crafted-SOF refusal;
+    /// this end is the budgets: a within-budget frame decodes AT its size
+    /// (flat grey, so the encode stays under the mesh cap and never halves)
+    /// and one declaring more than SCREEN_PIXEL_BUDGET is refused.
     #[test]
-    fn encode_decode_round_trips_a_synthetic_frame() {
-        // A 64×48 gradient: encode must fit the mesh cap and decode back to
-        // the same dimensions with RGBA pixels. Capture is RGBA end to end now
-        // — the camera decodes once, into the layout the renderer wants — and
-        // the encoder drops the alpha it is handed.
-        let (width, height) = (64u16, 48u16);
-        let rgba: Vec<u8> = (0..u32::from(width) * u32::from(height))
-            .flat_map(|i| [(i % 251) as u8, (i % 83) as u8, (i % 199) as u8, 0xff])
-            .collect();
-        let encoded = encode_frame(&rgba, width, height).expect("encode");
-        assert!(encoded.len() < media_service::video::MAX_FRAME_BYTES);
-        let tile = decode_frame(&encoded).expect("decode");
-        assert_eq!((tile.width, tile.height), (64, 48));
-        assert!(matches!(
-            &tile.handle,
-            iced::widget::image::Handle::Rgba { pixels, .. } if pixels.len() == 64 * 48 * 4
-        ));
-    }
-
-    /// A within-budget encoded frame, well clear of the crafted-header cases
-    /// below, still decodes end to end — the gate must not cost the happy
-    /// path anything.
-    #[test]
-    fn a_within_budget_frame_still_decodes() {
-        // 700×700 = 490_000 px, under SCREEN_PIXEL_BUDGET. Flat grey, not the
-        // round-trip test's modulo pattern: at this pixel count a short-period
-        // pattern is a high spatial frequency and could push the encode over
-        // MAX_FRAME_BYTES, triggering `encode_frame`'s own halving fallback —
-        // this test wants a frame that decodes AT the requested size.
-        let (width, height) = (700u16, 700u16);
-        let rgba = vec![0x80u8; usize::from(width) * usize::from(height) * 4];
-        let encoded = encode_frame(&rgba, width, height).expect("encode");
+    fn a_peer_frame_decodes_inside_the_budget_and_is_refused_over_it() {
+        let (width, height) = (700u32, 700u32);
+        let bgra = vec![0x80u8; (width * height * 4) as usize];
+        let encoded = encode_frame(&bgra, width, height).expect("encode");
         let tile = decode_frame(&encoded).expect("a within-budget frame must still decode");
         assert_eq!((tile.width, tile.height), (700, 700));
-    }
-
-    /// Bytes for a JPEG whose SOF declares `width`×`height` and nothing else —
-    /// one Luma component, no quantization/Huffman tables, no scan data.
-    /// `decode_headers` only needs to walk SOI → SOF0 → SOS to learn the
-    /// declared size (it returns the instant SOS parses, never reading scan
-    /// bytes), so this is enough to probe the size gate without a real
-    /// encoder and without the whole image ever needing to be valid.
-    fn crafted_sof_bytes(width: u16, height: u16) -> Vec<u8> {
-        let [h_hi, h_lo] = height.to_be_bytes();
-        let [w_hi, w_lo] = width.to_be_bytes();
-        vec![
-            0xFF, 0xD8, // SOI
-            0xFF, 0xC0, // SOF0
-            0x00, 0x0B, // length = 8 + 3*1 components
-            0x08, // precision
-            h_hi, h_lo, // height
-            w_hi, w_lo, // width
-            0x01, // one component
-            0x01, 0x11, 0x00, // id=1, h/v sample=1/1, quant table 0
-            0xFF, 0xDA, // SOS
-            0x00, 0x08, // length = 6 + 2*1 components
-            0x01, // one component in scan
-            0x01, 0x00, // component id=1, DC/AC huffman table 0/0
-            0x00, 0x3F, 0x00, // spectral start/end, approximation
-        ]
-    }
-
-    /// THE ATTACK IN #1791: a SOF declaring 16384×16384 sat exactly on
-    /// zune-core's own per-axis default (`max_width`/`max_height` = 16384,
-    /// checked with a strict `>`), so it passed the decoder's own guard and
-    /// `decode()` allocated the full 16384·16384·4 = 1 GiB RGBA output before
-    /// the tile's own shrink ever ran. The fix reads the declared size via
-    /// `decode_headers`/`dimensions` — which never allocates output — and
-    /// refuses before `decode()` is called at all.
-    #[test]
-    fn an_oversized_declared_frame_is_refused_before_any_allocation() {
-        let crafted = crafted_sof_bytes(16384, 16384);
-        assert!(
-            decode_frame(&crafted).is_none(),
-            "16384×16384 is 268,435,456 declared pixels against a {SCREEN_PIXEL_BUDGET}-pixel budget"
+        assert_eq!(
+            tile.handle.as_bytes(0).expect("frame pixels").len(),
+            700 * 700 * 4
         );
+        let (width, height) = (1280u32, 720u32);
+        let bgra = vec![0x80u8; (width * height * 4) as usize];
+        let encoded = encode_frame(&bgra, width, height).expect("encode");
+        assert!(decode_frame(&encoded).is_none(), "720p is over the budget");
     }
 
     /// THE FALLBACK NEVER DECODES BIGGER THAN THE BUDGET. A camera that refuses
@@ -1141,26 +919,6 @@ mod tests {
         assert_eq!(budget_format(&[], CAPTURE_PIXEL_BUDGET), None);
     }
 
-    #[test]
-    fn halving_boxes_pixels_and_respects_the_budget() {
-        // A 2×2 quad averages to its mean pixel.
-        let quad = [0, 0, 0, 40, 40, 40, 80, 80, 80, 120, 120, 120];
-        let (half, w, h) = halve::<3>(&quad, 2, 2);
-        assert_eq!((w, h), (1, 1));
-        assert_eq!(half, vec![60, 60, 60]);
-        // An oversized peer frame shrinks by whole halvings until the tile
-        // budget holds — 720p lands at 640×360, under the upload cliff.
-        let (pixels, w, h) =
-            shrink_to_budget::<4>(vec![7; 1280 * 720 * 4], 1280, 720, TILE_PIXEL_BUDGET);
-        assert_eq!((w, h), (640, 360));
-        assert_eq!(pixels.len(), 640 * 360 * 4);
-        assert!(pixels.iter().all(|&byte| byte == 7));
-        // A frame already inside the budget passes through untouched.
-        let (pixels, w, h) =
-            shrink_to_budget::<3>(vec![9; 64 * 48 * 3], 64, 48, CAPTURE_PIXEL_BUDGET);
-        assert_eq!((w, h, pixels.len()), (64, 48, 64 * 48 * 3));
-    }
-
     /// One global store AND one global source, so this stays ONE test, in
     /// sequence — and it carries the blink's property: a stored frame owns ONE
     /// renderer handle, so every view rebuild between two captures reads the
@@ -1173,29 +931,36 @@ mod tests {
                 .unwrap()
                 .preview
                 .as_ref()
-                .map(|frame| frame.handle.id())
+                .map(|frame| frame.handle.id)
         };
         // "" is "nothing is staged" — the strip's ordinary reading.
         reset();
-        assert_eq!(tile_count(""), 0);
+        assert!(tiles_snapshot("").is_empty());
         store_preview(vec![10, 20, 30, 0xff], 1, 1);
-        assert_eq!(tile_count(""), 1);
+        assert_eq!(tiles_snapshot("").len(), 1);
         let first = preview_id().expect("preview");
         assert_eq!(first, preview_id().expect("preview"));
         store_preview(vec![40, 50, 60, 0xff], 1, 1);
         assert_ne!(first, preview_id().expect("preview"));
+        // ...and the replaced frame is RETIRED for the next paint to drop, so
+        // its atlas tile does not outlive it (the leak that grew a call's
+        // atlas by a tile per frame).
+        let retired = take_retired();
+        assert_eq!(
+            retired.iter().map(|handle| handle.id).collect::<Vec<_>>(),
+            vec![first]
+        );
+        assert!(take_retired().is_empty());
 
-        // The staged frame is the local preview under the sentinel, and its
-        // height carries the frame's aspect — a 2:1 frame in a 100px column is
-        // 50px tall, never a 4:3 plate's crop.
+        // The staged frame preserves the original dimensions for native
+        // image aspect layout, rather than the tile's fixed crop.
         store_preview(vec![0xff; 8], 2, 1);
         assert!(stage_frame(SELF_STAGE).is_some());
-        assert_eq!(stage_height(SELF_STAGE, 100.0), 50.0);
+        let (width, height, _) = stage_frame(SELF_STAGE).unwrap();
+        assert_eq!((width, height), (2, 1));
         assert!(stage_frame("a-peer-nobody-sent").is_none());
-        assert_eq!(stage_height("a-peer-nobody-sent", 100.0), 0.0);
         // ...and what the stage shows whole, the strip leaves out, so a
         // desktop is not also a cropped plate beside itself.
-        assert_eq!(tile_count(SELF_STAGE), 0);
         assert!(tiles_snapshot(SELF_STAGE).is_empty());
         assert_eq!(tiles_snapshot("").len(), 1);
 
@@ -1245,16 +1010,5 @@ mod tests {
         reset();
         assert!(preview_id().is_none());
         assert_eq!(source(), Source::Off);
-    }
-
-    /// The strip's whole layout contract: columns floor on width and never
-    /// hit zero, height is rows of fixed plates — count in, size out.
-    #[test]
-    fn the_grid_wraps_on_width_and_sizes_by_count() {
-        assert_eq!(grid_columns(300.0), 2);
-        assert_eq!(grid_columns(100.0), 1);
-        assert_eq!(grid_height(0, 2), 0.0);
-        assert_eq!(grid_height(1, 2), TILE_HEIGHT);
-        assert_eq!(grid_height(3, 2), 2.0 * TILE_HEIGHT + TILE_GAP);
     }
 }

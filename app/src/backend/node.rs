@@ -116,9 +116,8 @@ pub struct NodeFacts {
 /// [`UNMEASURED`] and not zero.
 ///
 /// `derive(Default)` gave them `0`, which is the one value this whole file
-/// exists to keep off the screen: `height_label(0)` renders `h 0` and
-/// `relative_time(0)` renders nothing, so a defaulted document prints a
-/// measured head and a measured checkpoint for a node that has served neither.
+/// exists to keep off the screen: a defaulted document must not report a
+/// measured head and checkpoint for a node that has served neither.
 /// It is inert today: both arms of `overview_from` construct a default (the
 /// struct literal is evaluated before the status arm overwrites `facts`), but
 /// only the peers frame's copy survives, and every one of the six `keep_i64` /
@@ -262,15 +261,10 @@ fn served_height(height: &serde_json::Value) -> i64 {
 
 /// What an `operations` reading the node did not publish carries.
 ///
-/// The rule is already written twice — `NodeFacts`'s consensus trio is
-/// `Option` "rather than being filled with misleading zeroes", and `state/node.ice`
-/// says an absent reading "must print `—`, never a measured `0`". The two
-/// `i64` fields beside them had no way to say it, because `0` is a legal
-/// height and a legal timestamp.
+/// An absent reading must display `—`, never a measured `0`: zero is a
+/// legal height and timestamp.
 ///
-/// NEGATIVE is that way: `height_label` already renders `< 0` as `h —`, so
-/// this reuses a contract the renderer had rather than inventing one. Naming
-/// it keeps the `-1` from reading as arithmetic at the fill site.
+/// A negative sentinel distinguishes absence from every valid measurement.
 pub const UNMEASURED: i64 = -1;
 
 /// A consensus fact the node did not publish for this role reads `—`, never a
@@ -294,15 +288,14 @@ pub fn optional_number(value: Option<i64>) -> String {
 /// dropped socket is not a reason to blank the surface: the facts on screen
 /// were true when they were sampled, so the subscription is rebuilt and they
 /// stand until a fresher document replaces them.
-pub fn node_status_live(rpc: String) -> iced::futures::stream::BoxStream<'static, NodeFacts> {
+pub fn node_status_live(rpc: String) -> futures::stream::BoxStream<'static, NodeFacts> {
     struct State {
         rpc: String,
-        stream: Option<
-            iced::futures::stream::BoxStream<'static, ducktape_rpc::Result<serde_json::Value>>,
-        >,
+        stream:
+            Option<futures::stream::BoxStream<'static, ducktape_rpc::Result<serde_json::Value>>>,
         retry_attempt: u32,
     }
-    iced::futures::stream::unfold(
+    futures::stream::unfold(
         State {
             rpc,
             stream: None,
@@ -428,10 +421,8 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
         let runs::RunsReply::Model(runs::ModelReply::Agents(records)) = reply else {
             return Err("the runs module returned the wrong model roster reply".into());
         };
-        let (accounts, working) = tokio::join!(
-            read_accounts(&client),
-            agents_with_a_run_in_flight(&client)
-        );
+        let (accounts, working) =
+            tokio::join!(read_accounts(&client), agents_with_a_run_in_flight(&client));
         let controllers: BTreeMap<u64, u64> = accounts?
             .into_iter()
             .filter_map(|account| match account.control {
@@ -492,28 +483,6 @@ async fn agents_with_a_run_in_flight(rpc: &RpcClient) -> BTreeSet<String> {
         .iter()
         .filter_map(|run| run["agent_id"].as_str().map(str::to_string))
         .collect()
-}
-
-/// Pause or resume one agent — owner-gated at the module, not quorum-gated.
-pub async fn set_agent_status(
-    rpc: String,
-    password: String,
-    agent_id: String,
-    paused: bool,
-) -> Result<bool, AppError> {
-    async {
-        let agent_id = required_id(agent_id, "agent")?;
-        let rpc = rpc_client(&rpc)?;
-        let operation = match paused {
-            true => runs::ModelMsg::PauseModel { agent_id },
-            false => runs::ModelMsg::ResumeModel { agent_id },
-        };
-        let payload = runs::encode_msg(&runs::RunsMsg::ConfigureModel { operation });
-        signed_write(&rpc, "runs", payload, password).await
-    }
-    .await
-    .map_err(app_error)?;
-    Ok(true)
 }
 
 /// The editor's record as the Agents view hands it back: every field the
@@ -710,11 +679,6 @@ pub async fn chain_id_of(rpc: String) -> Result<String, AppError> {
     }
     .await
     .map_err(app_error)
-}
-
-/// Test seam: Ice reads extern structs but cannot construct one.
-pub fn account_data_none(generation: i64) -> AccountData {
-    AccountData::none(generation)
 }
 
 /// The probe's answer as the discriminant the launch window branches on.
@@ -1168,16 +1132,6 @@ impl CeremonyStep {
     }
 }
 
-/// Test seam: Ice reads extern structs but cannot construct one.
-pub fn ceremony_step(phase: String, qr: String, detail: String) -> CeremonyStep {
-    CeremonyStep {
-        phase,
-        qr,
-        detail,
-        left: String::new(),
-    }
-}
-
 /// Which welcome door a ceremony came through: a name was typed only on the
 /// create path.
 pub fn welcome_door(name_draft: &str) -> crate::WelcomeDoor {
@@ -1197,12 +1151,12 @@ pub fn ceremony_phase(step: &CeremonyStep) -> crate::CeremonyPhase {
     }
 }
 
-type StepSender = iced::futures::channel::mpsc::Sender<CeremonyStep>;
+type StepSender = futures::channel::mpsc::Sender<CeremonyStep>;
 
 /// Hand one reading to the UI; a closed receiver means the lane was
 /// invalidated (a cancel), which ends the ceremony as an error nobody reads.
 async fn step(tx: &mut StepSender, step: CeremonyStep) -> Result<(), String> {
-    use iced::futures::SinkExt as _;
+    use futures::SinkExt as _;
     tx.send(step)
         .await
         .map_err(|_| "the ceremony was cancelled".to_string())
@@ -1271,13 +1225,13 @@ pub(crate) async fn qr_ceremony(
 /// no runtime handle is assumed), and every reading — the closing one too —
 /// travels the one channel, so the UI sees them in order. Dropping the
 /// stream (a lane invalidation) drops the body mid-await: the cancel.
-fn ceremony_stream<F, Fut>(body: F) -> iced::futures::stream::BoxStream<'static, CeremonyStep>
+fn ceremony_stream<F, Fut>(body: F) -> futures::stream::BoxStream<'static, CeremonyStep>
 where
     F: FnOnce(StepSender) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
 {
-    use iced::futures::{SinkExt as _, StreamExt as _};
-    let (tx, rx) = iced::futures::channel::mpsc::channel::<CeremonyStep>(8);
+    use futures::{SinkExt as _, StreamExt as _};
+    let (tx, rx) = futures::channel::mpsc::channel::<CeremonyStep>(8);
     let mut closing = tx.clone();
     let driving = async move {
         let last = match body(tx).await {
@@ -1292,8 +1246,8 @@ where
         };
         let _ = closing.send(last).await;
     };
-    let driver = iced::futures::stream::once(driving).filter_map(|()| async { None });
-    iced::futures::stream::select(rx, driver).boxed()
+    let driver = futures::stream::once(driving).filter_map(|()| async { None });
+    futures::stream::select(rx, driver).boxed()
 }
 
 /// Create the account with this device's key (no touch), then register a
@@ -1304,7 +1258,7 @@ pub fn create_account_by_qr(
     password: String,
     chain_id: String,
     name: String,
-) -> iced::futures::stream::BoxStream<'static, CeremonyStep> {
+) -> futures::stream::BoxStream<'static, CeremonyStep> {
     ceremony_stream(move |mut tx| async move {
         let chain_id = named_chain(chain_id)?;
         require_password(&password)?;
@@ -1322,7 +1276,7 @@ pub fn add_passkey_by_qr(
     password: String,
     chain_id: String,
     label: String,
-) -> iced::futures::stream::BoxStream<'static, CeremonyStep> {
+) -> futures::stream::BoxStream<'static, CeremonyStep> {
     ceremony_stream(move |mut tx| async move {
         let chain_id = named_chain(chain_id)?;
         let label = optional_label(label)?;
@@ -1394,7 +1348,7 @@ pub fn login_by_qr(
     rpc: String,
     password: String,
     chain_id: String,
-) -> iced::futures::stream::BoxStream<'static, CeremonyStep> {
+) -> futures::stream::BoxStream<'static, CeremonyStep> {
     ceremony_stream(move |mut tx| async move {
         let chain_id = named_chain(chain_id)?;
         require_password(&password)?;
@@ -1669,7 +1623,7 @@ mod qr_ceremony_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_qr_ceremony_shows_the_url_then_yields_the_outcome() {
         let base = fake_relay(1, ASSERTION);
-        let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<CeremonyStep>(8);
+        let (mut tx, mut rx) = futures::channel::mpsc::channel::<CeremonyStep>(8);
         let outcome = qr_ceremony(
             &base,
             authpage::Request::Get {

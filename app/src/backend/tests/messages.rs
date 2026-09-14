@@ -19,6 +19,8 @@ fn a_dm_id_is_pair_derived_and_cannot_be_forged() {
         archived: false,
         members_only: false,
         huddle_count: 0,
+        voice: false,
+        huddle: Vec::new(),
         head_seq: 0,
     };
     let peers = vec![DmPeer {
@@ -149,55 +151,23 @@ fn a_search_hit_names_its_room_exactly_once() {
         hit.contains(r#"meta: format!("{} · #{}", hit.channel_id, hit.seq)"#),
         "the room comes first, then the sequence"
     );
-
-    // The Explorer reads the same index row in its own crate, and composes
-    // that meta exactly ONCE — the room, then the sequence. Composing the
-    // channel on top of a meta that already carried it is what printed it
-    // twice.
-    const EXPLORER: &str = include_str!("../../../../crates/views/explorer/src/host.rs");
-    let message_arm = EXPLORER
-        .split("kind: \"message\".into(),")
-        .nth(1)
-        .expect("the message hit arm")
-        .split(".collect()")
-        .next()
-        .expect("arm body");
-    assert!(
-        message_arm.contains(r#""{} · #{}""#),
-        "the room comes first, then the sequence"
-    );
-    assert_eq!(
-        message_arm.matches("channel_id").count(),
-        2,
-        "the channel names the row's meta and its target, and nothing else: \
-         {message_arm}"
-    );
 }
 
 /// AN UNREAD HEIGHT SAYS SO. The Node overview must not print `h 0` before a
 /// status document lands — a measured zero for a chain sitting at ~398,000.
 ///
-/// `height_label` already had the vocabulary: a negative height is `h —`. The
-/// field simply defaulted to 0, which is a reading rather than the absence of
-/// one, so the state default is now the sentinel the label understands.
+/// A negative height distinguishes no reading from a measured genesis height.
 #[test]
 fn an_unread_block_height_is_not_reported_as_zero() {
-    assert_eq!(height_label(-1), "h —", "the no-reading sentinel");
-    assert_ne!(
-        height_label(0),
-        "h —",
-        "zero is a real height and must keep reading as one"
-    );
-
     // The state default is what Node shows before any node fact lands.
     // This is the RENDERER's contract and it is unchanged: `0` still reads as a
     // real height here. What changed is upstream — `served_height` decides that
     // a `0` on the wire was never a measurement, so no zero reaches this label
     // as a head. See `a_resyncing_replica_has_no_head_to_print_a_checkpoint_against`.
-    const STATE: &str = include_str!("../../ui/state/node.ice");
-    assert!(
-        STATE.contains("node_height:i64 = -1"),
-        "an unread height must default to the sentinel, not to a measured zero"
+    let (app, _) = crate::Ducktape::boot();
+    assert_eq!(
+        app.node_height, -1,
+        "an unread height is not a measured zero"
     );
 }
 
@@ -244,31 +214,6 @@ fn a_search_hits_author_is_not_reformatted_into_system() {
     assert_eq!(
         author_display("acct:7", &NameDirectory::from_accounts(&[program])),
         "quackbot"
-    );
-
-    // ONE FORMATTING PASS, AT THE SOURCE. `author_display` above is the app's
-    // pass over a RENDERED handle; running it a second time over its own
-    // output found no `user:`/`agent:` prefix to split and fell through to
-    // "system", which is how every Explorer message hit lost its author. The
-    // Explorer reads the index row in its own crate now, so its `author` is
-    // the raw handle and `author_name` is that single pass — pinned here so a
-    // second one cannot come back.
-    const EXPLORER: &str = include_str!("../../../../crates/views/explorer/src/host.rs");
-    let message_arm = EXPLORER
-        .split("kind: \"message\".into(),")
-        .nth(1)
-        .expect("the message hit arm")
-        .split(".collect()")
-        .next()
-        .expect("arm body");
-    assert!(
-        message_arm.contains("title: author_name(hit[\"author\"]"),
-        "the message hit names its author off the index row's own handle"
-    );
-    assert_eq!(
-        message_arm.matches("author_name(").count(),
-        1,
-        "formatting the author twice is what produced `system`: {message_arm}"
     );
 }
 
@@ -386,6 +331,8 @@ fn a_cold_start_lands_on_a_room_with_something_in_it() {
         archived,
         members_only: false,
         huddle_count: 0,
+        voice: false,
+        huddle: Vec::new(),
         head_seq: head,
     };
     let landing = |channels: &[ChatChannel]| {
@@ -434,6 +381,8 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
         archived: false,
         members_only: false,
         huddle_count: 0,
+        voice: false,
+        huddle: Vec::new(),
         head_seq: head,
     };
     let read = |channel: &str, seq: i64| ChannelRead {
@@ -669,8 +618,6 @@ fn chat_reads_never_cross_the_dispatch_query_lane() {
 /// mentions against. A timeline read creeping back here is a second, stale
 /// copy of the stream and one more round trip on every room open.
 ///
-/// The one message read that survives is the forge discussion's, which is a
-/// host-drawn stream over chat rows.
 #[test]
 fn the_room_load_reads_the_record_and_the_rosters_but_never_a_timeline() {
     const LOAD: &str = include_str!("../load.rs");
@@ -683,16 +630,6 @@ fn the_room_load_reads_the_record_and_the_rosters_but_never_a_timeline() {
         .expect("load_chat_data body");
     assert!(!load_chat.contains("load_messages("));
     assert!(!load_chat.contains("query_roots("));
-
-    let load_messages = LOAD
-        .split("pub(crate) async fn load_messages(")
-        .nth(1)
-        .expect("load_messages is declared")
-        .split("\n}")
-        .next()
-        .expect("load_messages body");
-    assert_eq!(load_messages.matches("query_roots(").count(), 1);
-    assert!(!load_messages.contains(".view("));
 
     assert!(!LOAD.contains("walk_roots_back"));
     assert!(!LOAD.contains("ChatViewQuery::MessagesLatest"));

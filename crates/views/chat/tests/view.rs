@@ -6,8 +6,8 @@
 
 use chat_view::host::{Channel, PendingSend, Session};
 use chat_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{answer, has_text, item, press, texts, type_into};
-use ui_lang_guest::wire::{Frame, Node, Request, SurfaceValue};
+use ducktape_view_guest::testing::{answer, has_text, item, press, texts, type_into};
+use ducktape_view_guest::wire::{Frame, Node, Request, SurfaceValue};
 
 /// A native tick of this screen walks a deep tree; libtest's 2 MiB thread is
 /// at the edge of it in a debug build, so every test runs on its own roomier
@@ -197,6 +197,11 @@ fn live_run(agent: &str, status: &str) -> chat_view::host::LiveRunHint {
         dispatch_id: "dispatch-1".into(),
         agent: agent.into(),
         status: status.into(),
+        activity: vec![chat_view::host::LiveActivity {
+            label: "Reading src/lib.rs".into(),
+            done: true,
+        }],
+        answer_preview: "The repo builds clean.".into(),
     }
 }
 
@@ -220,7 +225,11 @@ fn view_asking<'a>(frame: &'a Frame, name: &str) -> &'a Request {
             request.kind == "rpc.view"
                 && serde_json::from_slice::<serde_json::Value>(&request.payload)
                     .ok()
-                    .and_then(|ask| ask["query"].as_object().and_then(|q| q.keys().next().cloned()))
+                    .and_then(|ask| {
+                        ask["query"]
+                            .as_object()
+                            .and_then(|q| q.keys().next().cloned())
+                    })
                     .as_deref()
                     == Some(name)
         })
@@ -252,25 +261,60 @@ fn a_connected_view_reads_its_own_room() {
         );
 
         let (frame, _live) = connected_room();
-        for expected in [
-            "testnet",
-            "general",
-            "ops",
-            "first light",
-            "second wind",
-            "mallard",
-        ] {
+        for expected in ["general", "ops", "first light", "second wind", "mallard"] {
             assert!(
                 has_text(&frame, expected),
                 "missing {expected:?} in {:?}",
                 texts(&frame)
             );
         }
+        // the unread room carries its dot, not a word
+        let _ = node_ending(&frame, "/unread");
         assert!(
             frame.requests.is_empty(),
             "a settled room asks for nothing more: {:?}",
             frame.requests
         );
+    });
+}
+
+#[test]
+fn disconnect_hides_retained_rooms_messages_and_composer() {
+    on_a_deep_stack(|| {
+        let (frame, _, props) = connected_room_with(&session(true), roots());
+        assert!(has_text(&frame, "general"));
+        let frame = tick_native(vec![item(props, &encoded(&session(false)))]);
+        assert!(has_text(&frame, "Not connected"));
+        assert!(!has_text(&frame, "general"));
+        assert!(!has_text(&frame, "Unread"));
+        let mut mounted = Vec::new();
+        surfaces(frame.root.as_ref().unwrap(), &mut mounted);
+        assert!(mounted.is_empty(), "no disconnected composer offers a send");
+    });
+}
+
+/// A room with a huddle lists its people under the room, the way a voice
+/// channel does; the reader's own seat says so, and says when she is muted.
+#[test]
+fn a_huddle_lists_its_people_under_the_room() {
+    on_a_deep_stack(|| {
+        let mut seated = session(true);
+        let seat = |label: &str, is_you: bool| chat_view::host::HuddleSeat {
+            label: label.into(),
+            initials: label.chars().take(2).collect(),
+            is_you,
+            node: label.to_ascii_lowercase(),
+        };
+        seated.rooms[1].channel.huddle_count = 2;
+        seated.rooms[1].channel.huddle = vec![seat("Ada Lovelace", false), seat("Me", true)];
+        seated.speaking_peers = vec!["ada lovelace".into()];
+        seated.huddle_joined = true;
+        seated.call_muted = true;
+        let (frame, _, _) = connected_room_with(&seated, roots());
+        assert!(has_text(&frame, "Ada Lovelace"), "{:?}", texts(&frame));
+        assert!(has_text(&frame, "you · muted"), "{:?}", texts(&frame));
+        let _ = node_ending(&frame, "channel/channel-b/seat/1");
+        assert!(!has_text(&frame, "Huddle 2"), "the count is a caption, not a badge");
     });
 }
 
@@ -303,6 +347,30 @@ fn the_composer_is_the_rooms_own_host_slot() {
                 "chat_composer".to_owned(),
                 "http://127.0.0.1:1\u{1f}channel-a".to_owned()
             )]
+        );
+    });
+}
+
+/// A voice room sits under its own heading, not among the channels, and a
+/// press on it asks the app to join — the room on screen is not what moves.
+#[test]
+fn a_voice_room_lists_under_voice_and_joins_on_press() {
+    on_a_deep_stack(|| {
+        let mut seated = session(true);
+        let mut lounge = sidebar_row("channel-v", "lounge", false);
+        lounge.channel.voice = true;
+        seated.rooms.push(lounge);
+        let (frame, _, _) = connected_room_with(&seated, roots());
+        assert!(has_text(&frame, "Voice"), "{:?}", texts(&frame));
+        let _ = node_ending(&frame, "voice/channel-v");
+        let frame = tick_native(press(&frame, "lounge"));
+        let intent = one_intent(&frame);
+        assert_eq!(intent.kind, "chat.join_voice");
+        assert_eq!(
+            serde_json::from_slice::<Channel>(&intent.payload).expect("decodes"),
+            Channel {
+                id: "channel-v".into()
+            }
         );
     });
 }
@@ -349,9 +417,9 @@ fn a_reaction_leaves_as_a_signed_op_and_the_chip_does_not_wait_for_the_block() {
 fn a_search_reads_the_index_and_lands_its_hits() {
     on_a_deep_stack(|| {
         let (frame, _) = connected_room();
-        let frame = tick_native(type_into(&frame, "Search…", "  light  "));
+        let frame = tick_native(type_into(&frame, "Search messages…", "  light  "));
         assert!(frame.requests.is_empty(), "typing runs no handler");
-        let frame = tick_native(ui_lang_guest::testing::submit(&frame, "Search…"));
+        let frame = tick_native(ducktape_view_guest::testing::submit(&frame, "Search messages…"));
         let read = request(&frame, "rpc.view");
         let ask: serde_json::Value = serde_json::from_slice(&read.payload).expect("a read decodes");
         assert_eq!(ask["target"], "chat");
@@ -360,11 +428,69 @@ fn a_search_reads_the_index_and_lands_its_hits() {
             .to_string()
             .into_bytes();
         let frame = tick_native(vec![answer(read.id, &hits)]);
-        assert!(
-            has_text(&frame, "channel-a · #1"),
-            "the hit names its room: {:?}",
-            texts(&frame)
-        );
+        // the hit names its room by name, never by the id the node keys it by
+        for expected in ["#general", "message 1"] {
+            assert!(
+                has_text(&frame, expected),
+                "missing {expected:?}: {:?}",
+                texts(&frame)
+            );
+        }
+        assert!(!has_text(&frame, "channel-a · #1"));
+    });
+}
+
+#[test]
+fn a_zero_hit_search_can_be_cleared_and_never_labels_a_different_draft() {
+    on_a_deep_stack(|| {
+        let (frame, _) = connected_room();
+        let frame = tick_native(type_into(&frame, "Search messages…", "missing"));
+        let frame = tick_native(ducktape_view_guest::testing::submit(&frame, "Search messages…"));
+        let read = request(&frame, "rpc.view").id;
+        let frame = tick_native(vec![answer(read, br#"{"hits":[]}"#)]);
+        assert!(has_text(&frame, "No messages match"));
+        let frame = tick_native(type_into(&frame, "Search messages…", "different"));
+        assert!(!has_text(&frame, "No messages match"));
+        assert!(frame.requests.is_empty());
+        let frame = tick_native(press(&frame, "Clear message search"));
+        assert!(!has_text(&frame, "No messages match"));
+        assert!(has_text(&frame, "first light"));
+        let frame = tick_native(type_into(&frame, "Search messages…", "missing"));
+        let frame = tick_native(ducktape_view_guest::testing::submit(&frame, "Search messages…"));
+        let read = request(&frame, "rpc.view").id;
+        let frame = tick_native(vec![answer(read, br#"{"hits":[]}"#)]);
+        let frame = tick_native(press(&frame, "Clear message search"));
+        assert!(!has_text(&frame, "No messages match"));
+        assert!(has_text(&frame, "first light"));
+    });
+}
+
+#[test]
+fn edited_annotations_reach_author_continuation_and_thread_rows() {
+    fn annotations(node: &Node) -> usize {
+        usize::from(matches!(node, Node::Text { content, .. } if content == "edited"))
+            + node.children().iter().map(annotations).sum::<usize>()
+    }
+    on_a_deep_stack(|| {
+        let mut first = row(1, "first edited");
+        first["rev"] = 1.into();
+        let mut second = row(2, "second edited");
+        second["rev"] = 1.into();
+        second["reply_count"] = 1.into();
+        let window = serde_json::json!({"roots":{"roots":[first,second.clone()],"has_more":false}})
+            .to_string()
+            .into_bytes();
+        let (frame, _) = connected_room_reading(window);
+        assert_eq!(annotations(node_ending(&frame, "/message-stream")), 2);
+        let frame = tick_native(press(&frame, "Open thread"));
+        // A thread remains independently annotated when its root and a reply
+        // share the same author, just like adjacent timeline messages.
+        let read = request(&frame, "rpc.view").id;
+        let mut third = reply(3, "edited reply", 2);
+        third["rev"] = 1.into();
+        let page = serde_json::json!({"thread":{"root":second,"replies":[third],"has_more":false,"next_reply_seq":null}}).to_string();
+        let frame = tick_native(vec![answer(read, page.as_bytes())]);
+        assert_eq!(annotations(node_ending(&frame, "/thread-stream")), 2);
     });
 }
 
@@ -422,7 +548,7 @@ fn the_newest_message_of_a_busy_room_still_reads_through_the_wire() {
             .to_string()
             .into_bytes();
         let (mut frame, _) = connected_room_reading(window);
-        ui_lang_guest::wire::sanitize(&mut frame).expect("the frame sanitizes");
+        ducktape_view_guest::wire::sanitize(&mut frame).expect("the frame sanitizes");
         let shown = texts(&frame);
         let newest = format!("m{ROWS} ");
         assert!(
@@ -454,7 +580,7 @@ fn node_ending<'a>(frame: &'a Frame, suffix: &str) -> &'a Node {
 #[test]
 fn the_channel_list_and_details_drawer_drag_with_horizontal_cursors() {
     on_a_deep_stack(|| {
-        use ui_lang_guest::wire::{Event, Length, mouse};
+        use ducktape_view_guest::wire::{Event, Length, mouse};
 
         let width = |frame: &Frame, suffix: &str| match node_ending(frame, suffix) {
             Node::Container {
@@ -492,7 +618,6 @@ fn the_channel_list_and_details_drawer_drag_with_horizontal_cursors() {
         assert_eq!(width(&frame, "/details-pane"), 370.0);
     });
 }
-
 
 /// A RUN IN FLIGHT HANGS OFF ITS ANCHOR, AND STOP LEAVES AS A CANCEL. The run
 /// lives in the app's process, not on the chain, so it reaches the view as a
@@ -555,12 +680,14 @@ fn a_live_run_opens_its_thread_and_stop_leaves_as_a_cancel() {
 }
 
 /// Every widget command a frame carries, decoded.
-fn widget_commands(frame: &Frame) -> Vec<ui_lang_guest::wire::WidgetCommand> {
+fn widget_commands(frame: &Frame) -> Vec<ducktape_view_guest::wire::WidgetCommand> {
     frame
         .requests
         .iter()
         .filter(|request| request.kind == "host.widget")
-        .map(|request| ui_lang_guest::wire::decode(&request.payload).expect("a command decodes"))
+        .map(|request| {
+            ducktape_view_guest::wire::decode(&request.payload).expect("a command decodes")
+        })
         .collect()
 }
 
@@ -615,7 +742,7 @@ fn a_landing_reveals_the_row_it_named_and_a_menu_does_not() {
         assert!(
             matches!(
                 &commands[0],
-                ui_lang_guest::wire::WidgetCommand::ScrollToKey { target, key: 2 }
+                ducktape_view_guest::wire::WidgetCommand::ScrollToKey { target, key: 2 }
                     if target.ends_with("chat/message-stream")
             ),
             "{commands:?}"
@@ -625,10 +752,22 @@ fn a_landing_reveals_the_row_it_named_and_a_menu_does_not() {
         // the keyboard needs and leaves the offset alone
         let frame = tick_native(press(&frame, "More message actions"));
         let after = widget_commands(&frame);
+        assert_eq!(
+            after,
+            vec![ducktape_view_guest::wire::WidgetCommand::Focus {
+                target: "ChatView/chat/message-action-focus".into(),
+            }]
+        );
+        let focus = request(&frame, "host.widget").id;
+        let settled = tick_native(vec![answer(focus, &[])]);
+        assert!(
+            widget_commands(&settled).is_empty(),
+            "focus stays on the menu after the host acknowledges it"
+        );
         assert!(
             !after.iter().any(|command| matches!(
                 command,
-                ui_lang_guest::wire::WidgetCommand::ScrollToKey { .. }
+                ducktape_view_guest::wire::WidgetCommand::ScrollToKey { .. }
             )),
             "the menu scrolled the stream: {after:?}"
         );
@@ -675,7 +814,7 @@ fn a_landing_on_a_reply_reveals_it_inside_the_rail() {
         assert!(
             commands.iter().any(|command| matches!(
                 command,
-                ui_lang_guest::wire::WidgetCommand::ScrollToKey { target, key: 3 }
+                ducktape_view_guest::wire::WidgetCommand::ScrollToKey { target, key: 3 }
                     if target.ends_with("chat/thread-pane/thread-stream")
             )),
             "{commands:?}"

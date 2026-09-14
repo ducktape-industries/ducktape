@@ -1,176 +1,5 @@
 use super::*;
 
-/// THE ZERO-HIT PLATE SPEAKS FOR A QUERY, AND A BOOL COULD NOT CARRY ONE —
-/// page search is enter-to-submit with no `change=` route, so a keystroke runs
-/// no handler and only `trim(draft) == query` can retire the plate (the full
-/// rationale lives on the plate arm in the view's own `pages.ice`). The query's
-/// lifetime is the pages view's own state now; what the app still pins is the
-/// SHAPE of the arm that reads it, on both surfaces that render a page hit.
-#[test]
-fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
-    // THE ARM. The plate may not be keyed on a flag, and may not fire during
-    // the round trip its own submit opened.
-    let pages_screen = inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"));
-    assert!(pages_screen.contains(
-        "if connected && empty(page_search_hits) && search_answer_stands(page_search_query, page_search_draft, page_searching)"
-    ));
-    let overlays = inlined(include_str!("../ui/screens/overlays.ice"));
-    assert!(
-        overlays.contains(
-            "if search_phase == SearchPhase.done && empty(chat_hits) && empty(page_hits)"
-        )
-    );
-
-    // THE PLATE IS OPAQUE. It is a sibling stack LAYER — over the live document
-    // or over "No page selected" — and `EmptyPlate` is `bg=transparent`, so
-    // what it denies would render straight through the sentence denying it.
-    let card = pages_screen
-        .split("if connected && empty(page_search_hits) && search_answer_stands(")
-        .nth(1)
-        .expect("the zero-hit arm");
-    let card = &card[..card.find("No pages matched").expect("the plate's message")];
-    assert!(
-        card.contains("bg=elevated"),
-        "a zero-hit plate must not be a transparent layer"
-    );
-}
-
-/// THE PLATE MUST HAVE A SEAT IN THE STATE THAT MOST NEEDS IT, AND IT MUST SIT
-/// ON TOP. Nested inside `connected && !empty(active_page)` — where the whole
-/// document header including the search input lives — the panel had no answer
-/// for its one real arrival with no page open: `live_resynced` moving
-/// `active_page` to "" under a STANDING query. Nested, that state showed "No
-/// page selected" and said nothing about the query; the × is gone with the
-/// header there, so picking a page would be the only exit. Hoisted to a
-/// sibling layer it must be declared AFTER the document arm: a stack paints in
-/// declaration order, first at the bottom, so an earlier position puts the
-/// opaque card UNDER the document it is supposed to cover.
-#[test]
-fn the_zero_hit_plates_sit_where_the_answer_is_needed() {
-    let pages_screen = inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"));
-    // Both needles carry the SAME ten-space indent, and the indent is the
-    // sibling pin: re-nesting the plate inside the document arm deepens its
-    // indent and its needle stops matching, exactly as hoisting the document
-    // arm would break its own.
-    let document = pages_screen
-        .find("\n          if connected && !empty(active_page)\n")
-        .expect("the document arm, as a stack layer");
-    let plate = pages_screen
-        .find("\n          if connected && empty(page_search_hits)")
-        .expect("the pages zero-hit arm, as a SIBLING stack layer");
-    assert!(
-        document < plate,
-        "the pages plate must be declared AFTER the document arm: a stack draws \
-         its layers in declaration order, first at the BOTTOM, so an earlier plate \
-         is painted UNDER the document it is supposed to cover"
-    );
-    // AND THE HITS HALF SITS BESIDE IT. Nested in the document arm it was a row
-    // in the document COLUMN, so `live_resynced` emptying `active_page` under a
-    // standing answer took the input, the × and the hits down together — "No
-    // page selected" over a search nobody could see or dismiss. Same indent,
-    // same pin: re-nesting it deepens the indent and this needle stops
-    // matching.
-    let hits = pages_screen
-        .find("\n          if connected && !empty(page_search_hits)")
-        .expect("the pages hits float, as a SIBLING stack layer");
-    assert!(
-        document < hits,
-        "the pages hits float must be declared AFTER the document arm, for the \
-         same paint order its zero-hit sibling needs"
-    );
-    // OPAQUE, like the plate: it floats over live document text.
-    let card = &pages_screen[hits..];
-    let card = &card[..card.find("PageSearchResult").expect("the hit rows")];
-    assert!(
-        card.contains("bg=elevated"),
-        "a hits float over the document must not be a transparent layer"
-    );
-}
-
-/// THE EXPLORER'S PLATE SPEAKS FOR THE QUERY IT WAS SENT — the same class the
-/// pages plate above was fixed for, on the last surface that still keyed its
-/// zero-hit sentence on the LIVE draft. Workspace search is enter-to-submit and
-/// two-way bound with no `change=` route, so a keystroke after a zero-hit answer
-/// runs no handler at all: only `trim(query) == sent_query` can retire the
-/// plate, and the captured string is the only thing that can carry the
-/// comparison. The Explorer is a module-owned view on the kernel contract, so
-/// the capture, the send and the arm are all the guest's.
-#[test]
-fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
-    let guest = inlined(include_str!(
-        "../../../crates/views/explorer/src/ui/app.ice"
-    ));
-    let submit = ice_handler_body(&guest, "search_submit");
-    // CAPTURED AT THE SEND, AND KEYED ON THE CAPTURE — the search
-    // subscription takes `sent_query` itself, so the string asked about and
-    // the string spoken for cannot drift apart in a later edit.
-    assert!(
-        submit.contains("sent_query = trim(query)"),
-        "the search must capture the query it sends"
-    );
-    assert!(
-        guest.contains(
-            "workspace_search(sent_query, search_serial) when connected && !empty(sent_query)"
-        ),
-        "the search must be run for the captured string itself"
-    );
-    // THE ARM. A flag could never carry this: `searching` is down and the hits
-    // are empty for a zero-hit answer no matter what is in the box.
-    assert!(
-        guest.contains(
-            "if connected && empty(hits) && empty(partial) && search_answer_stands(sent_query, query, searching)"
-        ),
-        "the zero-hit plate must be keyed on the query that was sent"
-    );
-    // AND THE DISMISSAL DROPS IT. Left standing, the plate would speak for a
-    // query whose box has been emptied.
-    assert!(
-        ice_handler_body(&guest, "clear_explorer_search").contains("sent_query = \"\""),
-        "clearing the box must take the standing answer with it"
-    );
-}
-
-/// ONE PREDICATE, THREE SURFACES. Pages, chat and the explorer each grew their
-/// own copy of the same conjunct arm, and a fourth surface would have grown a
-/// fourth; the arithmetic lives in one place now, and the three arms call it.
-#[test]
-fn one_predicate_decides_whether_a_search_answer_still_stands() {
-    // The answer speaks for the string it was sent for — trimmed, because that
-    // is what was sent.
-    assert!(backend::search_answer_stands("zzz", "  zzz  ", false));
-    // ONE MORE CHARACTER AND IT DOES NOT. No handler ran; only this comparison
-    // can tell.
-    assert!(!backend::search_answer_stands("zzz", "zzzq", false));
-    // A ROUND TRIP IS NOT AN ANSWER — the submit's own search is still out.
-    assert!(!backend::search_answer_stands("zzz", "zzz", true));
-    // AND AN EMPTY QUERY IS NO ANSWER AT ALL, which is what every dismissal
-    // leaves behind: an emptied box must not match an emptied query.
-    assert!(!backend::search_answer_stands("", "", false));
-
-    // The three arms read it, so none of them can drift from the others.
-    for (source, call) in [
-        (
-            inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice")),
-            "search_answer_stands(page_search_query, page_search_draft, page_searching)",
-        ),
-        (
-            inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice")),
-            "search_answer_stands(search_query, search_draft, search_phase == SearchPhase.searching)",
-        ),
-        (
-            inlined(include_str!(
-                "../../../crates/views/explorer/src/ui/app.ice"
-            )),
-            "search_answer_stands(sent_query, query, searching)",
-        ),
-    ] {
-        assert!(
-            source.contains(call),
-            "every search surface decides through the shared predicate: `{call}`"
-        );
-    }
-}
-
 /// A FAILED PALETTE SEARCH MUST SAY SO. `palette_search_failed` returns the
 /// phase to idle and clears the hits, and idle under a live draft is reachable
 /// no other way — so the panel needs an arm for exactly that pair, and the arm
@@ -179,31 +8,13 @@ fn one_predicate_decides_whether_a_search_answer_still_stands() {
 /// arm itself).
 #[test]
 fn the_palette_says_so_when_a_search_fails() {
-    let overlays = inlined(include_str!("../ui/screens/overlays.ice"));
-    let failure = overlays
-        .find("if search_phase == SearchPhase.idle && !empty(trim(query))")
-        .expect("the palette's failure arm");
-    // Bounded at the next sibling arm, so a "Search failed." that migrated
-    // anywhere else in the file cannot satisfy this.
-    let arm = &overlays[failure..];
-    let arm = &arm[..arm
-        .find("if !empty(chat_hits) || !empty(page_hits)")
-        .unwrap_or(arm.len())];
+    let shell = rust_tokens(include_str!("../shell.rs"));
+    assert!(shell.contains("SearchPhase::Idle") && shell.contains("Searchfailed."));
+    assert!(shell.contains("!query.trim().is_empty()"));
+    let handler = handler_body("PaletteSearchFailed");
     assert!(
-        arm.contains("Search failed."),
-        "a palette search that never ran must not render as a bare input"
-    );
-    // And the arm is not rescued by an error the scrim hides: the handler
-    // deliberately sets none. The slice runs to the next handler header, so an
-    // inserted blank line cannot shrink what this lint reads.
-    let handler = include_str!("../ui/handlers/overlays.ice")
-        .split("on palette_search_failed(cause)")
-        .nth(1)
-        .expect("the failure handler");
-    let handler = &handler[..handler.find("\non ").unwrap_or(handler.len())];
-    assert!(
-        !handler.contains("error ="),
-        "the console error banner is behind the palette's scrim; the arm is the report"
+        !handler.contains("self.error="),
+        "the report belongs inside the visible palette"
     );
 }
 
@@ -214,19 +25,19 @@ fn the_palette_says_so_when_a_search_fails() {
 /// instead of claiming a completed empty answer.
 #[test]
 fn the_palette_does_not_call_a_failed_search_an_empty_one() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected_rpc = "http://node".into();
     app.palette_open = true;
 
     // Typing is not an answer.
-    let _ = app.__update(__DucktapeMessage::PaletteChanged("zzz".into()));
+    let _ = app.update(AppMessage::PaletteChanged("zzz".into()));
     assert_eq!(app.palette_search_phase, SearchPhase::Searching);
 
     // A search that never ran is not an answer either — and it is the one a
     // bare `!searching` arm would mistake for one.
     app.palette_chat_hits = vec![stale_chat_hit()];
     app.palette_page_hits = vec![stale_page_hit()];
-    let _ = app.__update(__DucktapeMessage::PaletteSearchFailed(backend::AppError {
+    let _ = app.update(AppMessage::PaletteSearchFailed(backend::AppError {
         message: "node refused".into(),
         committed: false,
     }));
@@ -241,31 +52,27 @@ fn the_palette_does_not_call_a_failed_search_an_empty_one() {
     assert!(app.palette_page_hits.is_empty());
 
     // An empty result IS one.
-    let _ = app.__update(__DucktapeMessage::PaletteChanged("zzz".into()));
-    let _ = app.__update(__DucktapeMessage::PaletteResults(
-        backend::PaletteSearchData {
-            chat_hits: Vec::new(),
-            page_hits: Vec::new(),
-        },
-    ));
+    let _ = app.update(AppMessage::PaletteChanged("zzz".into()));
+    let _ = app.update(AppMessage::PaletteResults(backend::PaletteSearchData {
+        chat_hits: Vec::new(),
+        page_hits: Vec::new(),
+    }));
     assert_eq!(app.palette_search_phase, SearchPhase::Done);
 
     // ...and the next keystroke retires it, so the claim never outlives its
     // query.
-    let _ = app.__update(__DucktapeMessage::PaletteChanged("zzzz".into()));
+    let _ = app.update(AppMessage::PaletteChanged("zzzz".into()));
     assert_eq!(app.palette_search_phase, SearchPhase::Searching);
 
     // BACKSPACING TO EMPTY RUNS NO SEARCH, so nothing is coming to replace the
     // rows: `palette_changed` clears them above its early return, or the last
     // query's results sit listed under a blank field forever.
-    let _ = app.__update(__DucktapeMessage::PaletteResults(
-        backend::PaletteSearchData {
-            chat_hits: Vec::new(),
-            page_hits: vec![stale_page_hit()],
-        },
-    ));
+    let _ = app.update(AppMessage::PaletteResults(backend::PaletteSearchData {
+        chat_hits: Vec::new(),
+        page_hits: vec![stale_page_hit()],
+    }));
     assert_eq!(app.palette_page_hits.len(), 1);
-    let _ = app.__update(__DucktapeMessage::PaletteChanged(String::new()));
+    let _ = app.update(AppMessage::PaletteChanged(String::new()));
     assert!(app.palette_page_hits.is_empty());
     assert_eq!(app.palette_search_phase, SearchPhase::Idle);
 }
@@ -278,12 +85,12 @@ fn the_palette_does_not_call_a_failed_search_an_empty_one() {
 /// next block's `live_updated` overwrites the status, up to 3s on a quiet chain.
 #[test]
 fn a_single_failed_load_does_not_report_the_connection_offline() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.loading = true;
     app.status = "Live".into();
 
-    let _ = app.__update(__DucktapeMessage::ChatLoadFailed(backend::HydrationError {
+    let _ = app.update(AppMessage::ChatLoadFailed(backend::HydrationError {
         generation: app.chat_generation,
         message: "the channel did not load".into(),
     }));
@@ -331,177 +138,6 @@ fn connect_reports_the_cause_instead_of_guessing_at_it() {
     // check would fail on its own documentation.
 }
 
-/// A SCREEN THAT CANNOT REACH THE NODE MUST NOT REPORT ON ITS CONTENTS. With the
-/// node down the status bar already says "Connection degraded · Offline", and the
-/// bodies used to answer underneath it with `0 files · 0 dirs` and "Empty
-/// directory — nothing is committed under this path." — a claim about CONTENT
-/// made from a request that never went out. Chat and Pages already got this
-/// right; the other six asserted an emptiness nobody measured.
-///
-/// THE SCREEN LIST IS THE INVARIANT, SO THE SCREEN LIST IS PINNED. A ninth data
-/// screen has to decide what it says with the node down, and nothing about
-/// writing one would prompt that thought — which is exactly how six of them got
-/// written. This fails the build on a new screen so the decision is forced.
-/// Exemptions are named with their reason, never left implicit.
-#[test]
-fn every_data_screen_answers_a_dead_node_with_not_connected() {
-    /// Settings (which owns connection repair and stays useful with the node
-    /// down), Node (which owns the daemon diagnostics), Chat, Files, Pages
-    /// and Forge are module-owned views now and not in this inventory;
-    /// every native data screen answers.
-    const EXEMPT: [&str; 0] = [];
-
-    let mut screens: Vec<&str> = SCREENS
-        .lines()
-        .filter_map(|line| line.strip_prefix("component "))
-        .map(|rest| rest.split('(').next().unwrap_or(rest).trim())
-        .filter(|name| name.ends_with("Screen"))
-        .collect();
-    screens.sort_unstable();
-
-    assert_eq!(
-        screens, [""; 0],
-        "a screen appeared or vanished: decide what it says with the node down, \
-         then add it here or to EXEMPT with a reason"
-    );
-
-    // Scoped to each component's OWN body — a sweep over the whole file would
-    // pass on six screens off Chat's single arm.
-    for screen in screens.iter().filter(|name| !EXEMPT.contains(name)) {
-        let body = SCREENS
-            .split(&format!("\ncomponent {screen}("))
-            .nth(1)
-            .unwrap_or_else(|| panic!("{screen} is a component"))
-            .split("\ncomponent ")
-            .next()
-            .expect("component body");
-        assert!(
-            body.contains("if !connected\n"),
-            "{screen} draws readings of a network it may not be able to reach, \
-             so it needs an `if !connected` arm in place of its empty-state claim"
-        );
-        assert!(
-            body.contains(NOT_CONNECTED_PLATE),
-            "{screen} must use the shared \"Not connected\" wording verbatim"
-        );
-    }
-}
-
-/// AND THE PLATE IS ONLY HALF OF IT — the arms BESIDE it must stand down too.
-/// The first cut gated each screen's empty-state claim and left its POPULATED
-/// arms open, so a screen rendered "Not connected" and the stale register
-/// underneath it at the same time: Approvals showed the plate above three vote
-/// cards with live Approve buttons, Members showed it beside a detail panel
-/// carrying Promote and Remove, and Explorer showed it under a strip of search
-/// hits nobody had run. No register is ever cleared on disconnect — they are
-/// only overwritten by a successful load — so `connected == false` is routinely
-/// reached with a full set of stale rows in hand.
-///
-/// The invariant, stated mechanically: a screen may touch a LIST-TYPED register
-/// prop only under a `connected` gate, or on a line that carries `connected`
-/// itself (a header subtitle that folds its rows under a `connected` gate is
-/// already honest).
-#[test]
-fn a_disconnected_screen_stands_its_registers_down_too() {
-    const EXEMPT: [&str; 0] = [];
-
-    for source in [include_str!("../../../crates/views/forge/src/ui/forge.ice")] {
-        for chunk in source.split("\ncomponent ").skip(1) {
-            let name = chunk.split('(').next().unwrap_or("").trim();
-            if !name.ends_with("Screen") || EXEMPT.contains(&name) {
-                continue;
-            }
-            // The registers are the list-typed params of the screen's own
-            // signature — the readings only a live node can deliver.
-            // AFTER the opening paren: splitting the whole head on `,` leaves
-            // the first param as `GovernanceScreen(rows`, whose name never
-            // matches a word in the body — which silently disarmed the check
-            // for every screen whose only register is its first param.
-            let signature = chunk
-                .split(')')
-                .next()
-                .unwrap_or("")
-                .split_once('(')
-                .map(|(_, params)| params)
-                .unwrap_or("");
-            let registers: Vec<&str> = signature
-                .split(',')
-                .filter(|param| param.contains(":["))
-                .filter_map(|param| param.split(':').next())
-                .map(|name| name.trim().trim_start_matches("bind "))
-                .filter(|name| !name.is_empty())
-                .collect();
-            assert!(!registers.is_empty(), "{name} has no register to guard");
-
-            // Walk the body tracking which `if` arms are open above each line;
-            // a line is covered when it, or any arm enclosing it, says
-            // `connected`.
-            let mut open: Vec<(usize, bool)> = Vec::new();
-            for line in chunk.lines() {
-                let trimmed = line.trim_start();
-                if trimmed.is_empty() || trimmed.starts_with("//") {
-                    continue;
-                }
-                let indent = line.len() - trimmed.len();
-                open.retain(|(at, _)| *at < indent);
-                let says_connected = line.contains("connected");
-                if trimmed.starts_with("if ") {
-                    open.push((indent, says_connected));
-                }
-                let covered = says_connected || open.iter().any(|(_, gated)| *gated);
-                if covered {
-                    continue;
-                }
-                // Prose is not a register read: the Explorer's own subtitle
-                // says "read the blocks this node verified", and a screen may
-                // describe what it shows while showing nothing.
-                let code: String = trimmed.split('"').step_by(2).collect::<Vec<_>>().join(" ");
-                if let Some(register) = registers.iter().find(|reg| {
-                    code.split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .any(|word| word == **reg)
-                }) {
-                    panic!(
-                        "{name} touches `{register}` with no `connected` gate above it:\n  {trimmed}\n\
-                         a register nobody could read must not be drawn beside the \"Not connected\" plate"
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// AND THE HEADER SUBTITLES ARE CLAIMS TOO — the subtler half. `Agents 0 agents ·
-/// 0 working` is a measured zero about a register nobody read, and it sits ABOVE
-/// the body arm above, so it survives it. Every subtitle fold takes `connected`
-/// as its first argument and returns "" without it; this pins that no call site
-/// can quietly drop the guard.
-#[test]
-fn every_header_subtitle_is_gated_on_the_connection() {
-    let mut sites: Vec<&str> = SCREENS
-        .match_indices("_summary(")
-        .map(|(at, _)| {
-            let head = SCREENS[..at]
-                .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-                .map_or(0, |before| before + 1);
-            let close = at + SCREENS[at..].find(')').expect("a call site closes");
-            &SCREENS[head..=close]
-        })
-        .collect();
-    sites.sort_unstable();
-    // Approvals', Members', Agents', Settings' and Files' subtitles are their
-    // module views' now, gated the same way in `crates/views/*` — Settings'
-    // headcount folds the standing IT reads (`fold_standing`, and an
-    // unanswered roster reads as nothing at all), Files' crumb tally lives in
-    // its guest's `host.rs`.
-    let expected: [&str; 0] = [];
-
-    assert_eq!(
-        sites, expected,
-        "a header subtitle folds rows only a live node delivers: pass `connected` \
-         first so it says nothing rather than a confident zero"
-    );
-}
-
 /// THE CONSOLE HEALS ITSELF FROM A CONNECT FAILURE. The steady-state path has
 /// always retried forever (`live_resync_failed`), so the app recovered from
 /// every interruption except the one that gets it running: `on failed` set
@@ -512,17 +148,30 @@ fn every_header_subtitle_is_gated_on_the_connection() {
 /// timeout.
 #[test]
 fn a_failed_connect_retries_instead_of_giving_up() {
-    let (mut app, _) = Ducktape::__boot();
+    let (mut app, _) = Ducktape::boot();
     app.connected = true;
     let before = app.connect_generation;
 
     let fail = |generation: i64| {
-        __DucktapeMessage::ConnectFailed(backend::HydrationError {
+        AppMessage::ConnectFailed(backend::HydrationError {
             generation,
             message: "error sending request".into(),
         })
     };
-    let _ = app.__update(fail(app.connect_generation));
+    let retry = app.update(fail(app.connect_generation));
+    {
+        use futures::{FutureExt as _, StreamExt as _};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let mut retry = retry.into_stream();
+        assert!(
+            retry.next().now_or_never().is_none(),
+            "failure schedules a backoff task, rather than an empty completed task"
+        );
+    }
     assert_eq!(
         app.hydration_retry_attempt, 1,
         "the first failure is attempt 1"
@@ -535,8 +184,8 @@ fn a_failed_connect_retries_instead_of_giving_up() {
 
     // The counter CLIMBS — that is what feeds the backoff. A reset here would
     // retry at 1s forever against a genuinely dead endpoint.
-    let _ = app.__update(fail(app.connect_generation));
-    let _ = app.__update(fail(app.connect_generation));
+    let _ = app.update(fail(app.connect_generation));
+    let _ = app.update(fail(app.connect_generation));
     assert_eq!(app.hydration_retry_attempt, 3);
 
     // A CONNECT IS NOT GUARDED ON `hydration_generation`, AND THIS IS WHY.
@@ -547,11 +196,11 @@ fn a_failed_connect_retries_instead_of_giving_up() {
     // the successful reply; because it SUCCEEDED no failure arm fires and
     // nothing retries, so the console sits Offline forever. Strictly worse than
     // the defect this PR fixes.
-    let (mut wired, _) = Ducktape::__boot();
+    let (mut wired, _) = Ducktape::boot();
     wired.connected_rpc = "http://127.0.0.1:38259".into();
     let connect_gen = wired.connect_generation;
     let shared_before = wired.hydration_generation;
-    let _ = wired.__update(__DucktapeMessage::ChooseChannel("general".into()));
+    let _ = wired.update(AppMessage::ChooseChannel("general".into()));
     assert!(
         wired.hydration_generation > shared_before,
         "an ordinary channel click bumps the SHARED counter"
@@ -567,103 +216,33 @@ fn a_failed_connect_retries_instead_of_giving_up() {
     // 10.8s apart, summing to one 16s cap.
     let stale = app.connect_generation - 1;
     let attempts = app.hydration_retry_attempt;
-    let _ = app.__update(fail(stale));
+    let _ = app.update(fail(stale));
     assert_eq!(
         app.hydration_retry_attempt, attempts,
         "an abandoned chain must not start a second retry loop"
     );
 
-    // The handler re-runs the connect, and the reply is generation-guarded.
-    let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
-    let arm_rest = lifecycle
-        .split_once("on connect_failed(cause)")
-        .expect("connect owns its failure arm, not the shared one")
-        .1;
-    // The arm ends at the next handler, or at the end of the file when it is
-    // the last one — which it is, now that the pages handlers are the pages
-    // view's.
-    let arm = arm_rest.split_once("\non ").map_or(arm_rest, |(arm, _)| arm);
-    assert!(
-        arm.contains("hydration_retry_attempt = hydration_retry_attempt + 1"),
-        "the attempt climbs"
-    );
-    assert!(
-        arm.contains(
-            "run replace lane=connect connect(connected_rpc, hydration_retry_attempt, connect_generation) -> workspace_connected _ | connect_failed _"
-        ),
-        "and it goes round again, carrying the attempt into the backoff"
-    );
-    // Scoped to the ARM, not to the rest of the file: `live_resynced` further
-    // down guards on `hydration_generation` and is right to — that one really
-    // is the live plane's counter.
-    let connected_rest = lifecycle
-        .split_once("on workspace_connected(next)")
-        .expect("the success arm")
-        .1;
-    let connected = connected_rest
-        .split_once("\non ")
-        .map_or(connected_rest, |(arm, _)| arm);
-    // NO `||` HERE. An alternative that is trivially true short-circuits the
-    // half that matters — the first version of this assertion accepted the
-    // presence of a COMMENT and stayed green with the guard pointed back at the
-    // shared counter, which is the wedge this test exists to prevent.
-    assert!(
-        connected.contains("return if next.generation != connect_generation"),
-        "the connect is guarded on its OWN generation, never the shared one"
-    );
-    assert!(
-        !connected.contains("return if next.generation != hydration_generation"),
-        "the shared counter is bumped by 37 handlers; guarding on it drops a \
-         successful connect and nothing retries"
+    let mut stale_reply = workspace("abandoned-channel");
+    stale_reply.generation = connect_gen - 1;
+    let rpc = wired.connected_rpc.clone();
+    let _ = wired.update(AppMessage::WorkspaceConnected(stale_reply));
+    assert_eq!(
+        wired.connected_rpc, rpc,
+        "an abandoned success cannot replace the endpoint"
     );
 
-    // THE SHARED `failed` ARM IS GONE WITH THE LOADERS THAT ROUTED TO IT: the
-    // page loads belong to the pages view, which reads and refuses for
-    // itself. A run that resurrects it must route somewhere named, never into
-    // a catch-all one `run connect(` away from restarting the workspace.
-    for (path, source) in ice_sources() {
-        assert!(
-            !source.contains("on failed(") && !source.contains("| failed _"),
-            "{path} brought back the shared failure arm"
-        );
-    }
-}
-
-/// THE ZERO-HIT SEARCH CARD MUST STAY DISMISSABLE. The Clear-search × used to
-/// gate on `!empty(search_hits)`, but the float itself opens on
-/// `search_phase != SearchPhase.idle` — so a `done && empty(search_hits)` search drew
-/// "No messages match" with no way to close it: not the × (hidden), not
-/// Escape (`chat-search` carries no `escape_target` layer), not re-pressing
-/// Enter (lands `done`+empty again), not clearing the field (the submit
-/// handler returns early on an empty query, leaving the phase untouched).
-/// Only a channel/DM switch or a reconnect ever wrote "idle" again. The ×
-/// must therefore never be gated more narrowly than the float. It is gated
-/// WIDER: the float's own discriminant OR a live field. Every state that
-/// raises the float is covered — searching and done are both `!= idle`, and an
-/// answer that still stands for the box means the box is not empty.
-#[test]
-fn the_clear_search_button_survives_a_zero_hit_result() {
-    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
-    assert!(
-        screen.contains("if search_phase != SearchPhase.idle || !empty(trim(search_draft))\n"),
-        "the clear × must open on the float's discriminant or on a live field"
+    let mut landed = workspace("general");
+    landed.generation = connect_gen;
+    let rpc = landed.rpc.clone();
+    wired.hydration_retry_attempt = 3;
+    let _ = wired.update(AppMessage::WorkspaceConnected(landed));
+    assert_eq!(wired.connected_rpc, rpc);
+    assert_eq!(
+        wired.active_channel, "general",
+        "the matching connect succeeds despite unrelated hydration generation changes"
     );
-    assert!(
-        !screen.contains("if !empty(search_hits)\n"),
-        "the clear control must not gate on hits — a done+empty search has none"
+    assert_eq!(
+        wired.hydration_retry_attempt, 0,
+        "success clears the backoff"
     );
 }
-
-// ===========================================================================
-// THE FRAME-COST LINTS.
-//
-// `src/frame_probe.rs` asserts one number — allocations per keystroke on a
-// 256-row channel. A number catches a regression the day someone runs it; a
-// source sweep catches the two SHAPES that produce that regression at the
-// moment they are written, and names them. CLAUDE.md's own rule: guard a
-// load-bearing shape with a lint, not a comment.
-//
-// Both sweeps walk the whole `.ice` view tree rather than a list of files,
-// and both carry an allowlist that must stay LIVE — an entry matching nothing
-// fails the test, so the ledger cannot rot into a blanket exemption.
-// ===========================================================================

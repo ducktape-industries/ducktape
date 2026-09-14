@@ -1,7 +1,6 @@
 use super::*;
 
-/// A selected loader call. Ice task-flow transforms may read only their input,
-/// so the optional carries every argument the chosen effect needs.
+/// A selected loader call with every argument the chosen effect needs.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct LoadRequest {
     pub rpc: String,
@@ -26,15 +25,6 @@ pub fn load_request(
 
 pub fn fresh_operation_id(prefix: String) -> String {
     fresh_id(&prefix)
-}
-
-/// `12` — the bell's unread count on its seat. Zero reads as nothing at all,
-/// because a badge that says "0" is louder than the absence it reports.
-pub fn count_label(count: i64) -> String {
-    match count > 0 {
-        true => count.to_string(),
-        false => String::new(),
-    }
 }
 
 pub fn restore_draft(current: String, pending: String, keep_pending: bool) -> String {
@@ -80,20 +70,12 @@ fn committed_message_change(phase: crate::MutationPhase, committed: bool) -> boo
         return false;
     }
     match phase {
-        crate::MutationPhase::MessageDelete | crate::MutationPhase::MessageEdit => true,
+        crate::MutationPhase::MessageEdit => true,
         crate::MutationPhase::Idle
         | crate::MutationPhase::Recovering
-        | crate::MutationPhase::BlockComment
         | crate::MutationPhase::Channel
-        | crate::MutationPhase::ChannelArchive
-        | crate::MutationPhase::ChannelMember
-        | crate::MutationPhase::ChannelRename
-        | crate::MutationPhase::ChannelUnarchive
-        | crate::MutationPhase::CommentResolve
         | crate::MutationPhase::Huddle
-        | crate::MutationPhase::Onboarding
-        | crate::MutationPhase::Page
-        | crate::MutationPhase::PageDelete => false,
+        | crate::MutationPhase::Onboarding => false,
     }
 }
 
@@ -218,26 +200,13 @@ pub fn channel_switch_facts(
     }
 }
 
-/// Is the reader inside the last tenth of the loaded scrollback?
-///
-/// The stream is bottom-anchored, so a scrollable reports its offset relative
-/// to the END — 1.0 is the TOP of the history in hand, which is where the next
-/// older page belongs.
-///
-/// A NaN offset (content that fits reports `0/0`) compares false against
-/// everything, which is the answer this wants anyway — iced does not publish a
-/// viewport at all in that case, so it is a belt, not the braces.
-pub fn near_scroll_top(relative_offset: f64) -> bool {
-    relative_offset >= 0.9
-}
-
 /// Is the reader AT the live tail — the other end of the same offset.
 ///
 /// 0.0 is the end the stream is anchored to, so a small band around it counts
 /// as "now": the last row is on screen and the next arrival scrolls itself into
 /// view.
 ///
-/// A NaN offset (content that fits, which iced reports as `0/0`) must read as AT
+/// An undefined relative offset (`0/0` when content fits) must read as AT
 /// THE TAIL — a conversation too short to scroll is entirely on screen — and NaN
 /// compares false against everything, so the band is written as the comparison
 /// that must SUCCEED to be at the tail, with NaN taken by the explicit arm.
@@ -307,16 +276,6 @@ pub fn submit_verdict(
     }
 }
 
-/// The operation-id prefix each composer mints under, so a pending message and
-/// a pending reply never share an id space.
-pub fn composer_op_prefix(kind: crate::ComposerKind) -> String {
-    match kind {
-        crate::ComposerKind::Message => "message".to_owned(),
-        crate::ComposerKind::Reply => "reply".to_owned(),
-        crate::ComposerKind::Edit | crate::ComposerKind::ThreadEdit => "edit".to_owned(),
-    }
-}
-
 /// The rail's key: a reply belongs to its THREAD, and the same seq under two
 /// rooms is two different threads.
 pub fn thread_scope(endpoint: &str, channel_id: &str, thread_seq: i64) -> String {
@@ -382,7 +341,12 @@ pub struct PendingSend {
 }
 
 /// A newly admitted send, at the end of the queue.
-pub fn send_pending(mut sends: Vec<PendingSend>, id: String, body: String, thread_seq: i64) -> Vec<PendingSend> {
+pub fn send_pending(
+    mut sends: Vec<PendingSend>,
+    id: String,
+    body: String,
+    thread_seq: i64,
+) -> Vec<PendingSend> {
     sends.push(PendingSend {
         id,
         body,
@@ -408,8 +372,7 @@ pub fn send_failed(sends: Vec<PendingSend>, id: &str, committed: bool) -> Vec<Pe
     }
 }
 
-/// One channel row with the unread decision already attached. Ice externs take
-/// lists by value, so a view-time lookup cloned the unread list once per row.
+/// One channel row with the unread decision already attached.
 #[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct ChatSidebarRow {
     pub channel: ChatChannel,
@@ -547,16 +510,6 @@ pub fn frozen_unread_boundary(
     if arrived_with_unread { last_read } else { 0 }
 }
 
-pub fn block_action_menu_y(pointer_y: f64, viewport_height: f64) -> f64 {
-    let below = (pointer_y - 4.0).max(0.0);
-    let below_fits = below + 190.0 <= viewport_height;
-    if below_fits {
-        below
-    } else {
-        (pointer_y - 190.0).max(0.0)
-    }
-}
-
 pub(crate) struct Tip {
     pub(crate) height: i64,
     pub(crate) status: String,
@@ -620,4 +573,3 @@ fn operator_token_for(origin: &str) -> Option<String> {
     let token = token.trim().to_string();
     (!token.is_empty()).then_some(token)
 }
-

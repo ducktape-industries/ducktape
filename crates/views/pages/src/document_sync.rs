@@ -44,11 +44,34 @@ pub struct CommentMark {
 }
 
 /// Small read-only navigation emitted after the matching editor interaction:
-/// a link press, or a margin badge naming the line it was pressed on.
+/// a link to open, text to copy, or a comment to start on a line — with the
+/// exact selection it anchors on, in the module's UTF-16 units over the
+/// block's own text.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Navigation {
     pub link: String,
     pub comment_line: Option<u32>,
+    pub copy: String,
+    pub anchor: Option<(u32, u32)>,
+    /// The agent account an "Ask AI" comment is addressed to; `0` is nobody.
+    pub mention: u64,
+}
+
+/// A selection's byte columns on a document line as the module's comment
+/// anchor: UTF-16 units over the block's text, the marker prefix dropped.
+/// Nothing when the selection is empty or sits entirely in the marker.
+pub fn text_anchor(line: &str, columns: Option<std::ops::Range<usize>>) -> Option<(u32, u32)> {
+    let columns = columns?;
+    let (_, rest) = split_indent(line);
+    let content = parse_line(rest, 0).text;
+    let prefix = line.len() - content.len();
+    let start = columns.start.max(prefix);
+    let end = columns.end.min(line.len());
+    if start >= end || !line.is_char_boundary(start) || !line.is_char_boundary(end) {
+        return None;
+    }
+    let units = |slice: &str| slice.encode_utf16().count() as u32;
+    Some((units(&line[prefix..start]), units(&line[prefix..end])))
 }
 
 /// Two spaces per depth, matching the prefix the block fold writes.
@@ -681,3 +704,134 @@ pub fn subpages(blocks: &[PageBlock]) -> Vec<&PageBlock> {
     blocks.iter().filter(|block| !is_prose(block)).collect()
 }
 
+// ---------- the three-way merge ----------
+
+/// A merged document: the reader's own changes since their baseline, landed
+/// on the page as it stands now, and the lines both sides changed — kept as
+/// the reader spelled them, named here so the screen can say so.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Merge {
+    pub text: String,
+    pub conflicts: Vec<String>,
+}
+
+/// One side's edit of `base`, line by line: which base lines it dropped, and
+/// the lines it put before each base line (`inserted[base.len()]` is the
+/// tail). A changed line is a drop plus an insertion at the same index.
+struct Edit {
+    dropped: Vec<bool>,
+    inserted: Vec<Vec<String>>,
+}
+
+/// Merge `local` and `remote`, both edited from `base`, one line at a time.
+/// A line only one side touched takes that side's word; a line both changed
+/// keeps `local`'s and is reported. Insertions at the same spot keep both,
+/// the reader's first.
+pub fn merge_text(base: &str, local: &str, remote: &str) -> Merge {
+    let base: Vec<&str> = base.split('\n').collect();
+    let ours = edit_of(&base, &local.split('\n').collect::<Vec<_>>());
+    let theirs = edit_of(&base, &remote.split('\n').collect::<Vec<_>>());
+    let mut lines: Vec<String> = Vec::new();
+    let mut conflicts = Vec::new();
+    for index in 0..=base.len() {
+        let dropped_by_us = index < base.len() && ours.dropped[index];
+        let dropped_by_them = index < base.len() && theirs.dropped[index];
+        let same_insertion = ours.inserted[index] == theirs.inserted[index];
+        let both_changed_it = dropped_by_us && dropped_by_them && !same_insertion;
+        // Their insertion sits BEFORE a line we rewrote, so it goes first.
+        let theirs_first = dropped_by_us && !dropped_by_them;
+        match (same_insertion, both_changed_it, theirs_first) {
+            (true, _, _) => lines.extend(ours.inserted[index].iter().cloned()),
+            (false, true, _) => {
+                lines.extend(ours.inserted[index].iter().cloned());
+                conflicts.push(base[index].to_owned());
+            }
+            (false, false, true) => {
+                lines.extend(theirs.inserted[index].iter().cloned());
+                lines.extend(ours.inserted[index].iter().cloned());
+            }
+            (false, false, false) => {
+                lines.extend(ours.inserted[index].iter().cloned());
+                lines.extend(theirs.inserted[index].iter().cloned());
+            }
+        }
+        let kept = index < base.len() && !dropped_by_us && !dropped_by_them;
+        if kept {
+            lines.push(base[index].to_owned());
+        }
+    }
+    Merge {
+        text: lines.join("\n"),
+        conflicts,
+    }
+}
+
+/// `other` as an edit of `base`, off the longest common line sequence.
+fn edit_of(base: &[&str], other: &[&str]) -> Edit {
+    let mut edit = Edit {
+        dropped: vec![true; base.len()],
+        inserted: vec![Vec::new(); base.len() + 1],
+    };
+    // A gap's insertions sit at the FIRST base line the gap dropped, so a
+    // rewritten line is a drop and an insertion at one index — which is
+    // what lets the merge see two rewrites of one line as one disagreement.
+    let (mut gap_start, mut from) = (0, 0);
+    for (in_base, in_other) in common_lines(base, other) {
+        edit.dropped[in_base] = false;
+        edit.inserted[gap_start] = other[from..in_other]
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect();
+        gap_start = in_base + 1;
+        from = in_other + 1;
+    }
+    edit.inserted[gap_start] = other[from..]
+        .iter()
+        .map(|line| (*line).to_owned())
+        .collect();
+    edit
+}
+
+/// The matched `(base, other)` line pairs of a longest common subsequence.
+/// The common head and tail are matched outright; the middle is the usual
+/// quadratic table, which is what a page's worth of changed lines affords.
+fn common_lines(base: &[&str], other: &[&str]) -> Vec<(usize, usize)> {
+    let head = base.iter().zip(other).take_while(|(a, b)| a == b).count();
+    let room = base.len().min(other.len()) - head;
+    let tail = base[head..]
+        .iter()
+        .rev()
+        .zip(other[head..].iter().rev())
+        .take(room)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let (a, b) = (
+        &base[head..base.len() - tail],
+        &other[head..other.len() - tail],
+    );
+    // lengths[i][j] = the longest common subsequence of a[i..] and b[j..].
+    let mut lengths = vec![vec![0u32; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lengths[i][j] = match a[i] == b[j] {
+                true => lengths[i + 1][j + 1] + 1,
+                false => lengths[i + 1][j].max(lengths[i][j + 1]),
+            };
+        }
+    }
+    let mut pairs: Vec<(usize, usize)> = (0..head).map(|index| (index, index)).collect();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            pairs.push((head + i, head + j));
+            i += 1;
+            j += 1;
+        } else if lengths[i + 1][j] >= lengths[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    pairs.extend((0..tail).map(|offset| (base.len() - tail + offset, other.len() - tail + offset)));
+    pairs
+}

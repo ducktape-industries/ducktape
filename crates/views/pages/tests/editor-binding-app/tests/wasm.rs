@@ -98,13 +98,16 @@ fn load(text: &str) -> (Guest, wire::Frame) {
     use wire::editor_document::{EditorDocumentRef, EditorTransferId, EditorTransferSender};
     let mut guest = Guest::open();
     let initial = guest.frame(vec![]);
-    let frame = guest.frame(ui_lang_guest::testing::press(&initial, "Load document"));
+    let frame = guest.frame(ducktape_view_guest::testing::press(
+        &initial,
+        "Load document",
+    ));
     let request = frame
         .requests
         .iter()
-        .find(|r| r.kind == "pages.document")
+        .find(|r| r.kind == "fixture.document")
         .expect("actual source subscription");
-    let identity: pages_editor_binding_fixture::document_source::DocumentIdentity =
+    let identity: pages_editor_binding_fixture::fixture_source::DocumentIdentity =
         wire::decode(&request.payload).unwrap();
     let source = EditorDocumentRef {
         document: identity.document.clone(),
@@ -125,7 +128,7 @@ fn load(text: &str) -> (Guest, wire::Frame) {
     let request_id = request.id;
     let mut root = frame.root.or(initial.root).unwrap();
     while let Some(transfer) = sender.next_frame(&source, &text).unwrap() {
-        let frame = guest.frame(vec![ui_lang_guest::testing::item(
+        let frame = guest.frame(vec![ducktape_view_guest::testing::item(
             request_id,
             &wire::encode(&transfer),
         )]);
@@ -150,7 +153,7 @@ fn a_large_markdown_document_keeps_its_actual_wasm_presentation_within_the_host_
     let (guest, frame) = load(&text);
     let Some(wire::Node::Editor {
         document, options, ..
-    }) = ui_lang_guest::testing::find(&frame, "PagesEditorFixture/document")
+    }) = ducktape_view_guest::testing::find(&frame, "PagesEditorFixture/document")
     else {
         panic!("actual editor")
     };
@@ -191,7 +194,7 @@ fn dense_markdown_keeps_all_bytes_and_undo_in_a_disclosed_plain_editor() {
     let text = markdown(900, 4);
     assert_eq!(text.len(), 404117);
     let (mut guest, frame) = load(&text);
-    assert!(ui_lang_guest::testing::has_text(
+    assert!(ducktape_view_guest::testing::has_text(
         &frame,
         "Formatting is unavailable for this document. Your text and undo history are preserved."
     ));
@@ -200,7 +203,7 @@ fn dense_markdown_keeps_all_bytes_and_undo_in_a_disclosed_plain_editor() {
         options,
         on_document,
         ..
-    } = ui_lang_guest::testing::find(&frame, "PagesEditorFixture/document").unwrap()
+    } = ducktape_view_guest::testing::find(&frame, "PagesEditorFixture/document").unwrap()
     else {
         panic!("editor")
     };

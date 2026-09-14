@@ -1,14 +1,15 @@
 ---
 name: qa
-description: Verify a running Ducktape node and cluster — the node's /v1 surface, module transaction round-trips, the real-socket cluster e2e, the desktop app's own unit lane, and the live huddle lane. The app has no headless driving lane; its suites run with cargo test -p ducktape-app.
+description: Verify a running Ducktape node and cluster — the node's /v1 surface, module transactions, real-socket cluster e2e, native GPUI app suites, and the live huddle lane. App suites run with cargo test -p ducktape-app; device and pixel checks require platform support.
 ---
 
 # Node QA
 
-`ducktape-app` (`app/`) is a native Iced client with its UI in
-`app/src/ui/*.ice` and its own `#[cfg(test)]` suites. It has no headless
-driving lane; its unit tests run like any other crate and belong in every QA
-pass.
+`ducktape-app` (`app/`) hosts dynamically loaded WASM views in native GPUI.
+Its `#[cfg(test)]` suites run like any other crate and belong in every QA pass.
+Native test contexts do not prove desktop rendering: font/layout probes need
+the real platform text system, and live device/media behavior needs the huddle
+lane. Do not report unsupported native pixel capture as a passing screenshot.
 
 ## What to run
 
@@ -174,24 +175,13 @@ Query it directly, or drive its module surface with the
 Do not expose capability-bearing URL paths, keys, passwords, or recovery
 phrases in reports.
 
-## Frame telemetry (felt lag as numbers)
+## Native frame evidence
 
-Screenshots and CPU numbers cannot see a frame hitch. iced 0.14 ships
-per-stage span telemetry (Update/View/Layout/Interact/Draw/Present) behind a
-feature flag; `ops/beacon-collect` is the headless consumer:
-
-```bash
-(cd ops/beacon-collect && cargo run) &        # listens on 127.0.0.1:9167
-cargo run -p ducktape-app --features iced/debug
-```
-
-STALL lines name the stage the instant any span crosses `STALL_MS` (default
-100), and each 10 s summary window is independent, so scenario segments
-(idle / scroll / switch / typing) read clean. A Layout stall that is
-per-interaction and size-independent means a busted/missing layout cache;
-an Interact stall means the cost is inside the event walk. This lane found
-the 2026-08-16 emoji-fallback row cost (a semibold non-ASCII glyph walking the
-whole font DB on every layout).
+The app's `frame_probe` test helpers use native GPUI scenes and the platform
+text system. Separate idle, scrolling, tab switching and typing measurements;
+an aggregate CPU number cannot prove that an individual interaction is smooth.
+Do not substitute the test platform's no-op text backend for font or layout
+measurements. Pixel captures and device behavior require platform support.
 
 ## Process safety
 

@@ -2,27 +2,40 @@ use super::*;
 
 #[test]
 fn highlight_ranges_hold_char_boundaries_on_real_sources() {
-    // this repo's own sources carry the multibyte punctuation ('—', '·', '→')
-    // an ASCII probe never exercises; a syntect range that split a UTF-8 char
-    // would make `code_surface`'s `line[range]` panic inside the live view.
+    use gpui_kit::component::{
+        Rope,
+        highlighter::{HighlightTheme, SyntaxHighlighter},
+    };
+    // Exercise the native syntax engine with real multibyte source text.
     let rust = include_str!("../forge.rs");
     let toml = include_str!("../../../Cargo.toml");
-    for (path, source) in [("forge.rs", rust), ("Cargo.toml", toml)] {
-        let mut stream = iced::highlighter::Stream::new(&iced::highlighter::Settings {
-            theme: code_theme(true),
-            token: code_token(path),
-        });
-        for line in source.lines() {
-            for (range, _highlight) in stream.highlight_line(line) {
-                let _ = line[range].to_string();
-            }
-            stream.commit();
+    let theme = HighlightTheme::default_dark();
+    for (language, source) in [("rust", rust), ("toml", toml)] {
+        let mut highlighter = SyntaxHighlighter::new(language);
+        assert!(highlighter.update(None, &Rope::from_str(source), None));
+        for (range, _) in highlighter.styles(&(0..source.len()), theme.as_ref()) {
+            assert!(
+                source.get(range).is_some(),
+                "highlight splits a UTF-8 character"
+            );
         }
     }
 }
 
 #[test]
+fn forge_code_expands_tabs_to_the_next_stop() {
+    assert_eq!(expand_tabs("\tx\n\t\ty"), "    x\n        y");
+    assert_eq!(expand_tabs("ab\tc"), "ab  c");
+    assert_eq!(expand_tabs("abcd\tc"), "abcd    c");
+    assert_eq!(expand_tabs("한\tc"), "한   c");
+}
+
+#[test]
 fn forge_code_tokens_follow_the_path_and_rust_really_colors() {
+    use gpui_kit::component::{
+        Rope,
+        highlighter::{HighlightTheme, SyntaxHighlighter},
+    };
     assert_eq!(code_token("src/main.rs"), "rs");
     assert_eq!(code_token("a/b/query.SQL"), "sql");
     assert_eq!(code_token("Makefile"), "makefile");
@@ -31,23 +44,26 @@ fn forge_code_tokens_follow_the_path_and_rust_really_colors() {
     // and an unknown token degrades to plain text (uniform ink), never an
     // error — exactly the old single-ink reading.
     let colors = |token: &str| -> std::collections::BTreeSet<String> {
-        let mut stream = iced::highlighter::Stream::new(&iced::highlighter::Settings {
-            theme: code_theme(true),
-            token: token.into(),
-        });
-        stream
-            .highlight_line("fn main() { let answer = 42; }")
-            .map(|(_, highlight)| format!("{:?}", highlight.color()))
+        let source = "fn main() { let answer = 42; }";
+        let theme = HighlightTheme::default_dark();
+        let mut highlighter = SyntaxHighlighter::new(token);
+        highlighter.update(None, &Rope::from_str(source), None);
+        highlighter
+            .styles(&(0..source.len()), theme.as_ref())
+            .into_iter()
+            // GPUI returns one default span even without a grammar. Count
+            // actual ink overrides, not that unstyled coverage span.
+            .filter_map(|(_, highlight)| highlight.color.map(|color| format!("{color:?}")))
             .collect()
     };
     assert!(
-        colors("rs").len() > 1,
+        colors("rust").len() > 1,
         "rust source highlights with more than one color"
     );
     assert_eq!(
         colors("no-such-language").len(),
-        1,
-        "an unknown token is plain text in one ink"
+        0,
+        "an unknown token adds no syntax styles to the plain text"
     );
 }
 

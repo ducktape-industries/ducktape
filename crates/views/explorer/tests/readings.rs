@@ -2,7 +2,8 @@
 //! (the desktop app's `backend/explorer.rs` and `backend/search.rs`).
 
 use explorer_view::host::{
-    ExplorerHit, Leg, explorer_trace, explorer_window, fold_search, height_label, hex,
+    ExplorerHit, Leg, Payload, PayloadField, TraceHop, explorer_trace, explorer_window,
+    fold_search, height_label, hex, proposer_label,
 };
 
 fn hops() -> Vec<serde_json::Value> {
@@ -20,15 +21,30 @@ fn hops() -> Vec<serde_json::Value> {
 
 /// EVERY COUNT IN THE TRACE NAMES WHAT IT COUNTS. This rendered
 /// `chat(+0m/+0e)`, a private shorthand nothing on the screen expanded — `m`
-/// and `e` are not words. Both units appear once singular and once plural, so
-/// a hand-rolled `{n} msgs` that skips the `plural` seam fails here.
+/// and `e` are not words — and then one joined `a · b → c · d` string. Each
+/// hop is its own labelled row now; both units appear once singular and once
+/// plural, so a hand-rolled `{n} messages` that skips the `plural` seam fails.
 #[test]
-fn the_dispatch_trace_names_the_units_it_counts() {
+fn the_dispatch_trace_is_one_labelled_hop_per_module() {
+    let trace = explorer_trace(Some(&hops()));
     assert_eq!(
-        explorer_trace(Some(&hops())),
-        "chat · 1 msg · 0 events → attribution · 0 msgs · 2 events"
+        trace,
+        vec![
+            TraceHop {
+                module: "chat".into(),
+                emitted_msgs: 1,
+                emitted_events: 0
+            },
+            TraceHop {
+                module: "attribution".into(),
+                emitted_msgs: 0,
+                emitted_events: 2
+            },
+        ]
     );
-    assert_eq!(explorer_trace(None), "");
+    assert_eq!(trace[0].emitted(), "1 message, 0 events");
+    assert_eq!(trace[1].emitted(), "0 messages, 2 events");
+    assert_eq!(explorer_trace(None), Vec::new());
 }
 
 /// NO ROW MAY CONTRADICT THE SENTENCE OVER IT, which is a claim about the
@@ -71,10 +87,11 @@ fn the_window_lists_only_the_blocks_that_carried_operations() {
 }
 
 /// THE DIGESTS CROSS WHOLE AND BARE. The view adds the `0x`; a digest cut here
-/// is one no screen can ever recover. A JSON payload renders pretty-printed,
-/// anything else verbatim.
+/// is one no screen can ever recover. A JSON payload crosses as labelled
+/// fields — never as a JSON string the screen would print raw — and anything
+/// else as the text it was.
 #[test]
-fn every_published_digest_crosses_whole_and_a_json_payload_reads_pretty() {
+fn every_published_digest_crosses_whole_and_a_json_payload_reads_as_fields() {
     let rows = [serde_json::json!({
         "height": 7,
         "hash": "aa".repeat(32),
@@ -106,13 +123,32 @@ fn every_published_digest_crosses_whole_and_a_json_payload_reads_pretty() {
     );
     assert_eq!(
         window.ops[1].payload,
-        "{\n  \"put\": {\n    \"path\": \"/shared/a.png\"\n  }\n}",
-        "a JSON payload renders pretty-printed"
+        Payload::Fields(vec![PayloadField {
+            name: "put.path".into(),
+            value: "/shared/a.png".into()
+        }]),
+        "a JSON payload reads as labelled fields"
     );
+    assert_eq!(window.ops[1].verb(), "put");
     assert_eq!(
-        window.ops[0].payload, "plain prose, not a document",
-        "a non-JSON payload stays verbatim"
+        window.ops[0].payload,
+        Payload::Text("plain prose, not a document".into()),
+        "a non-JSON payload stays the text it was"
     );
+    assert_eq!(window.ops[0].verb(), "");
+    assert_eq!(window.ops[0].disposition, "Applied");
+    assert!(window.ops[0].applied);
+}
+
+/// A PROPOSER READS AS WORDS. A frame-authored key is a `0x` digest; the
+/// labels `project_root_op` stamps on the rest are spelled out, and `system`
+/// is already a word.
+#[test]
+fn a_proposer_reads_as_a_digest_or_as_words() {
+    assert_eq!(proposer_label("ab12cd34"), "0xab12cd34");
+    assert_eq!(proposer_label("module:chat"), "module chat");
+    assert_eq!(proposer_label("acct:7"), "account 7");
+    assert_eq!(proposer_label("system"), "system");
 }
 
 /// A DIGEST INSIDE A PAYLOAD IS A DIGEST. Module messages carry theirs as
@@ -137,18 +173,63 @@ fn payload_byte_arrays_read_as_hex_beside_the_hashes_they_belong_with() {
 
     let window = explorer_window(&rows);
 
-    assert!(
-        window.ops[0]
-            .payload
-            .contains("\"new_oid\": \"0x0102030405060708090a0b0c0d0e0f1011121314\""),
-        "the oid reads as one hex key: {}",
-        window.ops[0].payload
+    assert_eq!(
+        window.ops[0].payload,
+        Payload::Fields(vec![
+            PayloadField {
+                name: "push.counts".into(),
+                value: "1, 2, 3".into()
+            },
+            PayloadField {
+                name: "push.new_oid".into(),
+                value: "0x0102030405060708090a0b0c0d0e0f1011121314".into()
+            },
+        ]),
+        "the oid reads as one hex key; a short list of numbers is still a list"
     );
-    assert!(
-        window.ops[0].payload.contains("\"counts\": [\n      1,"),
-        "a short list of numbers is still a list of numbers: {}",
-        window.ops[0].payload
+}
+
+/// EVERY LEAF IS A FIELD, NAMED BY ITS PATH: nested objects flatten to dotted
+/// names, an array of objects indexes into the path, and an empty container
+/// or a null reads as a dash rather than as `{}`/`[]`/`null`.
+#[test]
+fn a_nested_payload_flattens_to_named_leaves() {
+    let rows = [serde_json::json!({
+        "height": 7, "hash": "aa".repeat(32), "commit_hash": "bb".repeat(32),
+        "ops": [{
+            "proposer": "system", "target": "tasks", "disposition": "rejected",
+            "op_hash": "dd".repeat(32),
+            "payload": serde_json::to_string(&serde_json::json!({
+                "create": {
+                    "title": "Ship it", "assignee": null, "tags": [],
+                    "steps": [{ "name": "build", "done": true }]
+                }
+            })).expect("payload encodes"),
+            "operations": []
+        }]
+    })];
+
+    let window = explorer_window(&rows);
+
+    let fields: Vec<(&str, &str)> = match &window.ops[0].payload {
+        Payload::Fields(fields) => fields
+            .iter()
+            .map(|field| (field.name.as_str(), field.value.as_str()))
+            .collect(),
+        other => panic!("fields, got {other:?}"),
+    };
+    assert_eq!(
+        fields,
+        [
+            ("create.assignee", "—"),
+            ("create.steps.0.done", "true"),
+            ("create.steps.0.name", "build"),
+            ("create.tags", "—"),
+            ("create.title", "Ship it"),
+        ]
     );
+    assert_eq!(window.ops[0].disposition, "Rejected");
+    assert!(!window.ops[0].applied);
 }
 
 fn hit(kind: &str) -> ExplorerHit {
@@ -260,6 +341,6 @@ fn the_display_forms_say_what_they_are() {
     assert_eq!(hex("ab12cd34"), "0xab12cd34");
     assert_eq!(hex("system"), "system");
     assert_eq!(hex(""), "");
-    assert_eq!(height_label(84_912), "h 84,912");
-    assert_eq!(height_label(-1), "h —");
+    assert_eq!(height_label(84_912), "block 84,912");
+    assert_eq!(height_label(-1), "block —");
 }

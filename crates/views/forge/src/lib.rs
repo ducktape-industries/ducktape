@@ -8,9 +8,12 @@
 pub mod blocks;
 pub mod host;
 
-ui_lang::include_app!("src/ui/app.ice");
+#[path = "ui/app.rs"]
+mod app;
+pub(crate) use app::*;
+pub use app::{ForgeView, Message};
 
-ui_lang_guest::export_app!(
+ducktape_view_guest::export_app!(
     ForgeView,
     "Forge",
     "This workspace's repositories: their code, pull requests and issues, with reviews and merges.",

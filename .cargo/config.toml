@@ -14,12 +14,3 @@ git-fetch-with-cli = true
 # wasm-modules-check` and `ops/wasm-repro-check.sh` are the proof.
 [target.'cfg(target_os = "linux")']
 rustflags = ["--cfg", "tokio_unstable"]
-
-# Do NOT try -Zincremental-ignore-spans (via RUSTC_BOOTSTRAP=1) to speed up
-# the .ice edit loop. It briefly delivered ~1 s edits, then poisoned the
-# incremental caches deterministically on rustc 1.96.1: every later compile
-# ICEs loading the dep graph ("A dep graph node
-# (explicit_supertraits_containing_assoc_item) does not have an unique
-# index"), reproduced in two independent target dirs with the same node
-# hash. The real fix for span-shift rebuild storms is splitting the
-# generated UI file per source fragment: byeongsu-hong/ducktape-ui#374.

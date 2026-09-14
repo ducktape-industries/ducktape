@@ -80,9 +80,6 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 - `huddle-lane.sh` — two real nodes in the dev shape with userspace
   WireGuard between them, one channel, one user key per side: the live
   arrangement a huddle (voice/camera/screen share) actually breaks in.
-- `beacon-collect/` — a standalone headless consumer for iced's frame
-  telemetry (`cargo run -p ducktape-app --features iced/debug`), for QA rigs
-  where the upstream GUI is useless; own `Cargo.toml`, not a workspace member.
 
 ## Dedicated Proxmox view lane
 
