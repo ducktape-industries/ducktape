@@ -3844,6 +3844,19 @@ pub(crate) mod tests {
             ),
             ("recent", serde_json::json!({ "runs": [] })),
             ("files.get", serde_json::json!({ "snapshots": [] })),
+            (
+                "rpc.peers",
+                serde_json::json!({ "peers": [
+                    { "peer": "f00dbeefcafe", "role": "validator", "connected": true }
+                ] }),
+            ),
+            (
+                "rpc.blocks",
+                serde_json::json!([
+                    { "height": 84912, "hash": "ab".repeat(32), "commit_hash": "",
+                      "ops": [{ "op_hash": "cd".repeat(32) }] }
+                ]),
+            ),
         ]);
         let mut guest = Guest::load_from("home", &staged).expect("the view loads");
         assert_eq!(guest.name, "Home", "the tab is named by the manifest");
@@ -3879,7 +3892,16 @@ pub(crate) mod tests {
         );
         while guest.redraw(&session) {}
         let shown = texts(&guest);
-        for expected in ["Validating", "block 84,912", "8c4fa211", "#general", "Validator"] {
+        for expected in [
+            "Validating",
+            "block 84,912",
+            "8c4fa211",
+            "#general",
+            "Validator",
+            "f00dbeef",
+            "Online",
+            "1 ops",
+        ] {
             assert!(
                 shown.iter().any(|text| text == expected),
                 "missing {expected:?} in {shown:?}"
