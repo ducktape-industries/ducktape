@@ -445,23 +445,38 @@ impl DesktopWindow {
             if window.window_handle().window_id() != window_id {
                 return;
             }
+            // This interceptor runs before the guest editor's, which cannot
+            // stop it: the stack says whether the key lands in one.
+            let in_guest_editor = event
+                .context_stack
+                .iter()
+                .any(|context| context.contains(crate::editor::wire::GUEST_EDITOR_CONTEXT));
             let _ = view.update(cx, |view, cx| {
                 view.global_key(
                     KeyPress {
                         key: event.keystroke.key.clone(),
                         modifiers: event.keystroke.modifiers,
                     },
+                    in_guest_editor,
                     cx,
                 );
             });
         })
     }
 
-    fn global_key(&mut self, key: KeyPress, cx: &mut Context<Self>) {
+    fn global_key(&mut self, key: KeyPress, in_guest_editor: bool, cx: &mut Context<Self>) {
         let state = &self.model.read(cx).state;
         let chord = crate::backend::command_chord(key.key.clone(), key.modifiers);
         let palette =
             crate::backend::palette_key_action(key.key.clone(), key.modifiers, state.palette_open);
+        // A guest editor claims Ctrl+K for a link: the palette does not open
+        // over it. Closing an open palette is unaffected — its focus is not in
+        // the editor.
+        let editor_claims_the_chord = in_guest_editor && palette == "open";
+        let palette = match editor_claims_the_chord {
+            true => "none".to_owned(),
+            false => palette,
+        };
         let escape = crate::backend::escape_target(
             key.key.clone(),
             state.palette_open,

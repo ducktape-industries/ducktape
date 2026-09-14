@@ -587,4 +587,4 @@ fn native_key(text: &str, cursor: wire::EditorCursor, key: &wire::keyboard::KeyS
 
 #[path = "blocks.rs"]
 mod blocks;
-pub use blocks::WireEditor;
+pub use blocks::{GUEST_EDITOR_CONTEXT, WireEditor};
