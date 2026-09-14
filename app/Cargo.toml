@@ -26,6 +26,8 @@ chat.workspace = true
 media-service.workspace = true
 design.workspace = true
 ducktape-rpc.workspace = true
+# the desktop app's self-update machine; `backend/update.rs` is its executor.
+app-update.workspace = true
 module-artifact.workspace = true
 # the files read lane's wire (`b64` pages), the one codec duckfs-core writes
 base64.workspace = true

@@ -237,6 +237,8 @@ pub(crate) mod tests {
             held: tokio::sync::Notify::new(),
             queries: Mutex::new(BTreeMap::new()),
             files_lanes: Mutex::new(BTreeMap::new()),
+            files: Mutex::new(BTreeMap::new()),
+            file_reads: Mutex::new(Vec::new()),
             index_views: Mutex::new(BTreeMap::new()),
         };
         fake_node(Arc::new(deployment)).await
@@ -264,6 +266,14 @@ pub(crate) mod tests {
         /// a view makes for itself through the kernel's `files.get`. A lane
         /// not here is not found.
         pub files_lanes: Mutex<BTreeMap<String, serde_json::Value>>,
+        /// Whole duckfs files by path, served byte-ranged on the `read`
+        /// lane (`path`, `offset`, `len` → `{b64, eof}`) the way the node
+        /// does; a path not here falls through to `files_lanes`.
+        pub files: Mutex<BTreeMap<String, Vec<u8>>>,
+        /// Every `read`-lane page served out of `files`: `(path, offset,
+        /// len)` — the pin that a resumed download asked only for what it
+        /// lacked.
+        pub file_reads: Mutex<Vec<(String, u64, u64)>>,
         /// What an index-tier read answers, by module then by the query's own
         /// first key — a view reads its register with several shapes down the
         /// one `rpc.view` door, and each shape wants its own reply. A module
@@ -282,8 +292,20 @@ pub(crate) mod tests {
                 held: tokio::sync::Notify::new(),
                 queries: Mutex::new(BTreeMap::new()),
                 files_lanes: Mutex::new(BTreeMap::new()),
+                files: Mutex::new(BTreeMap::new()),
+                file_reads: Mutex::new(Vec::new()),
                 index_views: Mutex::new(BTreeMap::new()),
             })
+        }
+
+        /// The duckfs file at `path` is `bytes` from now on.
+        pub(crate) fn publish_file(&self, path: &str, bytes: Vec<u8>) {
+            self.files.lock().unwrap().insert(path.to_owned(), bytes);
+        }
+
+        /// The duckfs file at `path` is gone.
+        pub(crate) fn withdraw_file(&self, path: &str) {
+            self.files.lock().unwrap().remove(path);
         }
 
         /// Every `rpc.query` for `target` answers `reply` from now on.
@@ -392,6 +414,13 @@ pub(crate) mod tests {
                             Some(reply) => ("200 OK", reply.to_string().into_bytes()),
                             None => ("404 Not Found", Vec::new()),
                         }
+                    } else if let Some(page) = route
+                        .strip_prefix("/v1/files/read?")
+                        .and_then(|query| file_page(&deployment, query))
+                    {
+                        // a byte-ranged read of a published file, as the
+                        // node's read lane answers it
+                        ("200 OK", page.to_string().into_bytes())
                     } else if let Some(lane) = route.strip_prefix("/v1/files/") {
                         // a view's own duckfs read: the lane names it, the
                         // query string carries its params
@@ -419,6 +448,66 @@ pub(crate) mod tests {
 
     /// One HTTP request off the socket, head and body: the body arrives in
     /// its own write as often as not, and a query's target is in it.
+    /// One page of a published file for a `read`-lane query string, or
+    /// `None` when the path is not published (the caller falls through).
+    fn file_page(deployment: &FakeDeployment, query: &str) -> Option<serde_json::Value> {
+        let params: BTreeMap<String, String> = query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(key, value)| (key.to_owned(), percent_decode(value)))
+            .collect();
+        let path = params.get("path")?;
+        let bytes = deployment.files.lock().unwrap().get(path)?.clone();
+        let offset = params
+            .get("offset")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let len = params
+            .get("len")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1024 * 1024)
+            .min(1024 * 1024);
+        deployment
+            .file_reads
+            .lock()
+            .unwrap()
+            .push((path.clone(), offset, len));
+        let start = (offset as usize).min(bytes.len());
+        let end = (start + len as usize).min(bytes.len());
+        let page = &bytes[start..end];
+        use base64::Engine as _;
+        Some(serde_json::json!({
+            "b64": base64::engine::general_purpose::STANDARD.encode(page),
+            "eof": end == bytes.len(),
+        }))
+    }
+
+    /// `%2F` → `/` and `+` → space: what reqwest's query encoder produces
+    /// for a duckfs path.
+    fn percent_decode(text: &str) -> String {
+        let mut out = Vec::with_capacity(text.len());
+        let bytes = text.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            let escaped = bytes[index] == b'%' && index + 3 <= bytes.len();
+            let decoded = escaped
+                .then(|| std::str::from_utf8(&bytes[index + 1..index + 3]).ok())
+                .flatten()
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+            match decoded {
+                Some(byte) => {
+                    out.push(byte);
+                    index += 3;
+                }
+                None => {
+                    out.push(if bytes[index] == b'+' { b' ' } else { bytes[index] });
+                    index += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
     async fn read_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
         let mut request = Vec::new();
         let mut chunk = vec![0u8; 4096];

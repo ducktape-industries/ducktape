@@ -271,6 +271,9 @@ pub struct Ducktape {
     pub(crate) password: String,
     pub(crate) status: String,
     pub(crate) connected: bool,
+    /// The self-update machine's executor, present only when the launcher
+    /// started this process (`DUCKTAPE_RELEASE` + `DUCKTAPE_UPDATE_STATE`).
+    pub(crate) updater: Option<crate::backend::update::Updater>,
     pub(crate) loading: bool,
     pub(crate) views_live_serial: i64,
     pub(crate) cmd_held: bool,
@@ -527,6 +530,9 @@ pub(crate) enum AppMessage {
     NodeViewEvent(crate::module_view::ModuleViewEvent),
     NodeFactsLoaded(crate::backend::NodeFacts),
     NodeFactsFailed(crate::backend::AppError),
+    /// An update job (manifest fetch, archive download) answered; `None`
+    /// when the network served nothing.
+    UpdateJobReplied(Option<app_update::Event>),
     NodeStatusPushed(crate::backend::NodeFacts),
     SettingsLoaded(crate::backend::SettingsFacts),
     SettingsFailed(crate::backend::HydrationError),
@@ -735,6 +741,7 @@ impl Ducktape {
             password: "".to_owned(),
             status: "Connecting…".to_owned(),
             connected: false,
+            updater: crate::backend::update::Updater::from_env(),
             loading: false,
             views_live_serial: 0,
             cmd_held: false,
