@@ -1611,18 +1611,30 @@ impl DesktopWindow {
         let view = self.module.as_ref().expect("module seated").1.clone();
         view.update(cx, |view, cx| view.set_props(spec.props, cx));
         let selected_tab = self.model.read(cx).state.shell_tab;
-        let navigation = [
-            (ShellTab::Chat, "Chat"),
-            (ShellTab::Pages, "Pages"),
-            (ShellTab::Forge, "Forge"),
-            (ShellTab::Agents, "Agents"),
-            (ShellTab::Files, "Files"),
-            (ShellTab::Explorer, "Explorer"),
-            (ShellTab::Node, "Node"),
-            (ShellTab::Members, "Members"),
-            (ShellTab::Governance, "Governance"),
-            (ShellTab::Settings, "Settings"),
+        let mut navigation = vec![
+            (ShellTab::Chat, "Chat".to_owned()),
+            (ShellTab::Pages, "Pages".to_owned()),
+            (ShellTab::Forge, "Forge".to_owned()),
+            (ShellTab::Agents, "Agents".to_owned()),
+            (ShellTab::Files, "Files".to_owned()),
+            (ShellTab::Explorer, "Explorer".to_owned()),
+            (ShellTab::Node, "Node".to_owned()),
+            (ShellTab::Members, "Members".to_owned()),
+            (ShellTab::Governance, "Governance".to_owned()),
         ];
+        // the views the connected node's registry lists, after the built-in
+        // tabs and in the registry's order; named by their manifests
+        navigation.extend(
+            crate::module_view::registered_views()
+                .into_iter()
+                .map(|module| {
+                    (
+                        ShellTab::Registered(module),
+                        crate::module_view::registered_view_name(module),
+                    )
+                }),
+        );
+        navigation.push((ShellTab::Settings, "Settings".to_owned()));
         let (sidebar, popover) = {
             let theme = gpui_kit::component::Theme::global(cx);
             (theme.sidebar, theme.popover)
@@ -1831,7 +1843,13 @@ impl DesktopWindow {
                 );
             }
             let selected = tab == selected_tab;
-            let row = rail_row(label, nav_icon(tab), label, ink, selected, true).on_click(
+            // a registered tab's element id is its registry id, not its
+            // manifest name: two views may share a name, never an id
+            let id: gpui_kit::SharedString = match tab {
+                ShellTab::Registered(module) => format!("view:{module}").into(),
+                _ => label.clone().into(),
+            };
+            let row = rail_row(id, nav_icon(tab), label, ink, selected, true).on_click(
                 cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.model.update(cx, |model, cx| {
@@ -3020,6 +3038,12 @@ fn rail_row(
 fn nav_icon(tab: ShellTab) -> gpui_kit::component::Icon {
     use gpui_kit::component::{Icon, IconName};
     match tab {
+        // the view's own `icons/tab.svg`, once it is seated; a plain mark
+        // until then and for a view that ships none
+        ShellTab::Registered(module) => match crate::module_view::registered_view_icon(module) {
+            Some(bytes) => Icon::empty().data(&bytes),
+            None => Icon::new(IconName::LayoutDashboard),
+        },
         ShellTab::Chat => Icon::empty().data(MESSAGE_SQUARE),
         ShellTab::Pages => Icon::new(IconName::BookOpen),
         ShellTab::Forge => Icon::empty().data(GIT_BRANCH),

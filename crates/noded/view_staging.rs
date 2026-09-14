@@ -1,8 +1,12 @@
-//! Copy owned desktop views into founding sets without making compilation
-//! depend on a view build. Pending files are refused by deployment readers.
+//! Copy network views into founding sets without making compilation depend
+//! on a view build. Pending files are refused by deployment readers.
+//!
+//! A view is DECLARED for a founding id by its crate: `crates/views/<id>/`
+//! exists for a module id in the topology (the module's own view, packed into
+//! its artifact) or for a view-only id in `topology::VIEWS` (a `Kind::View`
+//! entry of its own). The desktop's own views (`members`, `node`, …) are
+//! neither and never stage: they ship with the app, not with a network.
 use std::path::Path;
-
-pub const OWNERS: &[&str] = &["governance", "files", "pages", "chat", "forge"];
 
 pub fn stage_view(checkout: &Path, dest: &Path, id: &str) -> Result<(), String> {
     let manifest = checkout.join("crates/views").join(id).join("Cargo.toml");
@@ -13,8 +17,14 @@ pub fn stage_view(checkout: &Path, dest: &Path, id: &str) -> Result<(), String> 
     for path in [&manifest, &source, &assets] {
         println!("cargo:rerun-if-changed={}", path.display());
     }
-    let declared = OWNERS.contains(&id) && manifest.is_file();
+    let declared = founding_id(id) && manifest.is_file();
     sync_view(dest, id, declared, &source, &assets)
+}
+
+/// an id a founding set can carry a view for: a module of the topology or a
+/// founding view-only entry.
+pub fn founding_id(id: &str) -> bool {
+    topology::TOPOLOGY.spec(id).is_some() || topology::VIEWS.contains(&id)
 }
 
 pub fn sync_view(

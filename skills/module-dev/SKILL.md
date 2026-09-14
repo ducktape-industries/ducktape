@@ -28,6 +28,7 @@ network:
 ```
 ducktape module register <id> <component.wasm> [--index <index.wasm>] [--after N]  # admit a new id
 ducktape module update   <id> <component.wasm> [--index <index.wasm>] [--after N]  # swap live code
+ducktape module register <id> --view target/views/<id>_view.wasm [--assets crates/views/<id>/assets] [--after N]  # admit a VIEW-ONLY entry (kind `view`: a UI with no core, built by `ops/build-views.sh -p <id>-view`; the app draws its tab off the registry)
 ducktape module status                                      # the registry
 ```
 

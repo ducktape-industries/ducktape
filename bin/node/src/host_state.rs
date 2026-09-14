@@ -891,7 +891,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "25e4ffd5ba1436a90e54d484560e245c4ecdcb70a42d32cba698ed3c594dea60";
+        "fc6ad184fc825a050c97cad444ccf9964c3e0241fd08e02e6ecec7f3a3273c88";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's genesis `__config`
@@ -918,12 +918,14 @@ mod tests {
 
     /// the genesis code set the pins compose over: the founding set the build
     /// staged beside this test executable — the committed components (the
-    /// kernel fixtures pin the same bytes), read and hashed at test time,
-    /// never embedded.
+    /// kernel fixtures pin the same bytes) and the founding views
+    /// (`topology::VIEWS`, staged out of `make views`), read and hashed at
+    /// test time, never embedded. The same set `node init` composes.
     fn fixture_genesis() -> GenesisModules {
         let dir = workspace_config::modules_dir().expect("the build stages the founding set");
-        let hashes = noded::bundle::hash_bundle(&dir, &topology::TOPOLOGY.wasm_ids(PRODUCTION))
-            .expect("founding set");
+        let mut ids = topology::TOPOLOGY.wasm_ids(PRODUCTION);
+        ids.extend(topology::VIEWS);
+        let hashes = noded::bundle::hash_bundle(&dir, &ids).expect("founding set");
         GenesisModules {
             hashes,
             source: GenesisSource::FoundingSet(dir),

@@ -4,12 +4,38 @@ mod build_script;
 
 use build_script::view_staging as staging;
 
+/// the founding ids whose view crate stages into the founding set: the
+/// module-owned views (a module id with a `crates/views/<id>` crate) and the
+/// view-only entries (`topology::VIEWS`).
+fn network_views() -> Vec<&'static str> {
+    let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let module_owned = topology::PRODUCTION
+        .iter()
+        .copied()
+        .filter(|id| checkout.join("crates/views").join(id).join("Cargo.toml").is_file());
+    module_owned.chain(topology::VIEWS.iter().copied()).collect()
+}
+
+#[test]
+fn the_network_views_are_the_five_module_owned_and_home() {
+    assert_eq!(
+        network_views(),
+        ["pages", "chat", "forge", "governance", "files", "home"]
+    );
+    for id in network_views() {
+        assert!(staging::founding_id(id), "{id}");
+    }
+    for id in ["members", "agents", "node", "explorer", "settings"] {
+        assert!(!staging::founding_id(id), "{id} is the desktop's own");
+    }
+}
+
 #[test]
 fn declared_views_become_pending_restore_and_remove_only_with_ownership() {
     let scratch = tempfile::tempdir().unwrap();
     let checkout = scratch.path();
     let dest = checkout.join("staged");
-    for id in staging::OWNERS {
+    for id in network_views() {
         let package = checkout.join("crates/views").join(id);
         let source = checkout
             .join("target/views")
@@ -20,7 +46,11 @@ fn declared_views_become_pending_restore_and_remove_only_with_ownership() {
         std::fs::write(&source, b"view").unwrap();
         std::fs::write(package.join("assets/old"), b"old").unwrap();
         staging::stage_view(checkout, &dest, id).unwrap();
-        std::fs::write(dest.join(format!("{id}.component.wasm")), b"module").unwrap();
+        // a module id stages beside its core; a view-only id (`home`) has none
+        let view_only = topology::VIEWS.contains(&id);
+        if !view_only {
+            std::fs::write(dest.join(format!("{id}.component.wasm")), b"module").unwrap();
+        }
         let staged = dest.join(format!("{id}.view.wasm"));
         let pending = dest.join(format!("{id}.view.pending"));
         let assets = dest.join(format!("{id}.assets"));
@@ -123,7 +153,7 @@ fn indexed_pages_and_chat_stage_views_before_index_branch_and_clean_removed_modu
     std::fs::create_dir_all(&network).unwrap();
     std::fs::write(network.join("component.wasm"), b"network").unwrap();
     let dest = checkout.join("staged");
-    build_script::stage_preset(checkout, &dest, &["pages", "chat"]);
+    build_script::stage_preset(checkout, &dest, &["pages", "chat"], &[]);
     for id in ["pages", "chat"] {
         let module_artifact::Artifact::Module(artifact) =
             workspace_config::read_module_artifact(&dest, id).unwrap()
@@ -139,15 +169,69 @@ fn indexed_pages_and_chat_stage_views_before_index_branch_and_clean_removed_modu
             b"view"
         );
     }
-    build_script::stage_preset(checkout, &dest, &["chat"]);
+    build_script::stage_preset(checkout, &dest, &["chat"], &[]);
     assert!(!dest.join("pages.view.wasm").exists());
     assert!(!dest.join("pages.component.wasm").exists());
+}
+
+/// a founding view-only entry stages as `<id>.view.wasm` + `<id>.assets`
+/// with no component, composes as a `Kind::View` genesis entry, and is
+/// swept when the preset drops it.
+#[test]
+fn a_founding_view_stages_without_a_component_and_composes_a_view_entry() {
+    let scratch = tempfile::tempdir().unwrap();
+    let checkout = scratch.path();
+    let module = checkout.join("crates/modules/apps/chat");
+    std::fs::create_dir_all(module.join("src")).unwrap();
+    std::fs::write(module.join("src/index_guest.rs"), "").unwrap();
+    std::fs::write(module.join("component.wasm"), b"module").unwrap();
+    std::fs::write(module.join("index.wasm"), b"index").unwrap();
+    let package = checkout.join("crates/views/home");
+    std::fs::create_dir_all(package.join("assets/icons")).unwrap();
+    std::fs::write(package.join("Cargo.toml"), "[package]\n").unwrap();
+    std::fs::write(package.join("assets/icons/tab.svg"), b"<svg/>").unwrap();
+    std::fs::create_dir_all(checkout.join("target/views")).unwrap();
+    std::fs::write(checkout.join("target/views/home_view.wasm"), b"home").unwrap();
+    let network = checkout.join("crates/networking/netstack-machine");
+    std::fs::create_dir_all(&network).unwrap();
+    std::fs::write(network.join("component.wasm"), b"network").unwrap();
+    let dest = checkout.join("staged");
+    build_script::stage_preset(checkout, &dest, &["chat"], &["home"]);
+    assert!(!dest.join("home.component.wasm").exists());
+    assert_eq!(std::fs::read(dest.join("home.view.wasm")).unwrap(), b"home");
+    assert_eq!(
+        std::fs::read(dest.join("home.assets/icons/tab.svg")).unwrap(),
+        b"<svg/>"
+    );
+    let module_artifact::Artifact::View(view) =
+        workspace_config::read_module_artifact(&dest, "home").unwrap()
+    else {
+        panic!("home is a view-only frame");
+    };
+    assert_eq!(view.component, b"home");
+    let genesis = workspace_config::Genesis::compose(&dest).unwrap();
+    let ids: Vec<&str> = genesis.modules.iter().map(|a| a.id.as_str()).collect();
+    assert_eq!(ids, ["chat", "home"]);
+    assert_eq!(genesis.component("home"), None);
+
+    // the view not built yet: the pending marker holds the compose
+    std::fs::remove_file(checkout.join("target/views/home_view.wasm")).unwrap();
+    build_script::stage_preset(checkout, &dest, &["chat"], &["home"]);
+    assert!(dest.join("home.view.pending").exists());
+    let err = workspace_config::Genesis::compose(&dest).unwrap_err();
+    assert!(err.contains("pending"), "{err}");
+
+    // dropped from the preset: swept
+    build_script::stage_preset(checkout, &dest, &["chat"], &[]);
+    assert!(!dest.join("home.view.wasm").exists());
+    assert!(!dest.join("home.view.pending").exists());
+    assert!(!dest.join("home.assets").exists());
 }
 
 #[test]
 fn owned_view_packages_keep_the_staged_library_filename() {
     let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for id in staging::OWNERS {
+    for id in network_views() {
         let manifest = checkout.join("crates/views").join(id).join("Cargo.toml");
         if !manifest.exists() {
             continue;

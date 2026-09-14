@@ -119,6 +119,15 @@ pub(crate) enum ShellTab {
     Members,
     Governance,
     Settings,
+    /// A view the connected node's registry lists as a `Kind::View` entry,
+    /// by its id: drawn after the built-in tabs, gone when the id leaves
+    /// the registry.
+    Registered(&'static str),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RegisteredIntent {
+    OpenLink,
+    Copy,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ForgeIntent {
@@ -588,6 +597,7 @@ pub(crate) enum AppMessage {
     CopyChordPressed(crate::shell::KeyPress),
     ChatViewEvent(crate::module_view::ModuleViewEvent),
     PagesViewEvent(crate::module_view::ModuleViewEvent),
+    RegisteredViewEvent(crate::module_view::ModuleViewEvent),
     OpenPageSearchHit(String, String),
     ExternalUrlFailed(crate::backend::AppError),
     OnboardingOpened(crate::shell::WindowKey),

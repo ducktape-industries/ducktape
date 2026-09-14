@@ -241,6 +241,7 @@ impl Ducktape {
             AppMessage::CopyChordPressed(event) => self.on_copy_chord_pressed(event),
             AppMessage::ChatViewEvent(event) => self.on_chat_view_event(event),
             AppMessage::PagesViewEvent(event) => self.on_pages_view_event(event),
+            AppMessage::RegisteredViewEvent(event) => self.on_registered_view_event(event),
             AppMessage::OpenPageSearchHit(page_id, _block_id) => {
                 self.on_open_page_search_hit(page_id, _block_id)
             }
@@ -4644,6 +4645,25 @@ impl Ducktape {
                 crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(
                     &(event),
                     "text",
+                ))
+            }
+        }
+    }
+    /// A registry-listed view's two doors: a `duck://` link through the
+    /// one open plane, and the clipboard with its toast.
+    fn on_registered_view_event(
+        &mut self,
+        event: crate::module_view::ModuleViewEvent,
+    ) -> Task<AppMessage> {
+        match crate::module_view::registered_intent(&event) {
+            RegisteredIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
+                crate::module_view::event_text(&event, "link"),
+            )),
+            RegisteredIntent::Copy => {
+                self.toast = crate::module_view::event_text(&event, "label");
+                self.toast_age = 0;
+                crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(
+                    &event, "text",
                 ))
             }
         }

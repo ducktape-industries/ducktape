@@ -1,9 +1,11 @@
-//! Where a module-owned view comes from: the deployed artifact of the module
-//! it belongs to. The registry names the module's ACTIVE code hash
-//! (`ModulesQuery::ModuleStatus`), the artifact under that hash is fetched
-//! and verified (`view_artifact`), and its view — component bytes plus the
-//! assets shipped beside them — is handed over as one unit. A pending swap is
-//! never read: the view drawn is the view of the code that runs.
+//! Where a network view comes from: the deployed artifact of the registry
+//! entry it belongs to — a module's, whose frame may embed a view, or a
+//! view-only entry's, whose frame IS the view. The registry names the
+//! entry's kind and its ACTIVE code hash (`ModulesQuery::ModuleStatus`), the
+//! artifact under that hash is fetched and verified (`view_artifact`), and
+//! its view — component bytes plus the assets shipped beside them — is
+//! handed over as one unit. A pending swap is never read: the view drawn is
+//! the view of the code that runs.
 //!
 //! Every reading here is strict. A registry reply of another shape, a module
 //! the registry does not list or lists twice, a hash that is not 32 bytes,
@@ -23,18 +25,19 @@ use serde::Deserialize;
 
 use super::view_artifact;
 
-/// The modules whose tab is drawn by the view in their own artifact, asked
-/// of the connected node at connect and again at every block that moves
-/// the deployment.
+/// The BUILT-IN tabs whose view is drawn by the module's own artifact: each
+/// has a `ShellTab` arm, a props builder and an intent decoder of its own,
+/// and is asked of the connected node at connect and again at every block
+/// that moves its deployment. Every other view off the node is a
+/// registry-listed `Kind::View` entry, seated from `module_status` alone.
 pub const MODULE_OWNED: [&str; 5] = ["governance", "files", "pages", "chat", "forge"];
 
 /// The desktop's own views, staged beside the binary and asked for at boot.
-/// With [`MODULE_OWNED`], every view the app draws: a tab's draw never
-/// starts a load, so a view named in neither would never be there.
+/// Every view that is not one of these comes off the connected node.
 pub const DESKTOP_OWNED: [&str; 5] = ["members", "agents", "node", "explorer", "settings"];
 
-pub fn module_owned(module: &str) -> bool {
-    MODULE_OWNED.contains(&module)
+pub fn desktop_owned(module: &str) -> bool {
+    DESKTOP_OWNED.contains(&module)
 }
 
 /// The assets a deployment ships beside its view, by canonical relative
@@ -95,10 +98,6 @@ struct ModuleStatus {
 #[serde(deny_unknown_fields)]
 struct ModuleCode {
     module_id: String,
-    #[allow(
-        dead_code,
-        reason = "read for shape only: the seat set does not yet branch on kind"
-    )]
     kind: Kind,
     active_code_hash: Vec<u8>,
     #[allow(
@@ -111,13 +110,20 @@ struct ModuleCode {
 }
 
 /// What the entry's artifact is: a module (whose frame may embed a view) or
-/// a view alone.
+/// a view alone — the registry's word, fixed at admission.
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code, reason = "read for shape only")]
-enum Kind {
+pub enum Kind {
     Module,
     View,
+}
+
+/// One registry entry as the seat set reads it: what it is, and its active
+/// code hash — `None` for an admission that has not reached its boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Entry {
+    pub kind: Kind,
+    pub hash: Option<[u8; 32]>,
 }
 
 #[derive(Deserialize)]
@@ -139,14 +145,15 @@ struct Activation {
     code_hash: Vec<u8>,
 }
 
-/// Every registered module's active code hash — `None` for an admission
-/// that has not reached its boundary — in one registry read.
-pub async fn active_hashes(client: &Client) -> Result<BTreeMap<String, Option<[u8; 32]>>, Error> {
+/// Every registry entry — its kind, and its active code hash (`None` for an
+/// admission that has not reached its boundary) — in one registry read,
+/// id-ordered as the registry lists them.
+pub async fn active_hashes(client: &Client) -> Result<BTreeMap<String, Entry>, Error> {
     let reply: StatusReply = client
         .query("modules", &serde_json::json!("module_status"))
         .await
         .map_err(|error| Error::Status(error.to_string()))?;
-    let mut hashes = BTreeMap::new();
+    let mut entries = BTreeMap::new();
     for entry in reply.module_status.modules {
         let module = entry.module_id;
         let hash = if entry.active_code_hash.is_empty() {
@@ -159,21 +166,26 @@ pub async fn active_hashes(client: &Client) -> Result<BTreeMap<String, Option<[u
                 ))
             })?)
         };
-        if hashes.insert(module.clone(), hash).is_some() {
+        let entry = Entry {
+            kind: entry.kind,
+            hash,
+        };
+        if entries.insert(module.clone(), entry).is_some() {
             return Err(Error::Status(format!(
                 "module {module:?} is registered more than once"
             )));
         }
     }
-    Ok(hashes)
+    Ok(entries)
 }
 
-/// The module's active code hash, or `None` for an admission that has not
+/// The entry's active code hash, or `None` for an admission that has not
 /// reached its boundary.
 pub async fn active_hash(client: &Client, module: &str) -> Result<Option<[u8; 32]>, Error> {
     active_hashes(client)
         .await?
         .remove(module)
+        .map(|entry| entry.hash)
         .ok_or_else(|| Error::Status(format!("module {module:?} is not registered")))
 }
 
@@ -562,6 +574,49 @@ pub(crate) mod tests {
                 .unwrap(),
             ViewSource::Ready {
                 hash: artifact.hash(),
+                component: vec![4, 5, 6],
+                assets: Arc::new(artifact.view().unwrap().assets.clone()),
+            }
+        );
+    }
+
+    /// A `Kind::View` entry's frame IS its view: the registry lists it as a
+    /// view, the artifact under its hash is the view frame, and the seat
+    /// set reads its kind off the same status read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_view_only_entry_is_ready_off_its_own_frame() {
+        let artifact = Artifact::View(ViewArtifact {
+            component: vec![4, 5, 6],
+            assets: [("icons/tab.svg".to_owned(), b"<svg/>".to_vec())].into(),
+        });
+        let hash = artifact.hash();
+        let status = serde_json::json!({"module_status": {"modules": [
+            {"module_id": "files", "kind": "module", "active_code_hash": [], "pending": null, "history": []},
+            {"module_id": "home", "kind": "view", "active_code_hash": hash, "pending": null,
+             "history": [{"height": 0, "code_hash": hash}]}
+        ]}});
+        let client = node(status, Some(artifact.clone()), None).await;
+        let entries = active_hashes(&client).await.unwrap();
+        assert_eq!(
+            entries["home"],
+            Entry {
+                kind: Kind::View,
+                hash: Some(hash)
+            }
+        );
+        assert_eq!(
+            entries["files"],
+            Entry {
+                kind: Kind::Module,
+                hash: None
+            }
+        );
+        assert_eq!(
+            resolve(&client, "home", &mut Asked::default())
+                .await
+                .unwrap(),
+            ViewSource::Ready {
+                hash,
                 component: vec![4, 5, 6],
                 assets: Arc::new(artifact.view().unwrap().assets.clone()),
             }
