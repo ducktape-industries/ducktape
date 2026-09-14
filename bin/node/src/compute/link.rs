@@ -46,6 +46,7 @@ pub(crate) async fn attach(
     hint: std::sync::Arc<Notify>,
     mut lines: mpsc::Receiver<OutputLine>,
     token: String,
+    resync: std::sync::Arc<Notify>,
 ) {
     let mut failures: u64 = 0;
     loop {
@@ -81,7 +82,10 @@ pub(crate) async fn attach(
                     );
                 }
                 failures = 0;
-                pump(socket, &hint, &mut lines).await;
+                tokio::select! {
+                    _ = pump(socket, &hint, &mut lines) => {},
+                    _ = resync.notified() => {},
+                }
                 // a dropped link redials on the same pace as a failed dial:
                 // pump can return immediately (the node restarting mid-accept),
                 // and an unpaced success path dials at connect latency — the
@@ -157,6 +161,10 @@ where
                 // made every successful dial drop instantly — an unpaced
                 // redial storm.
                 let Some(line) = line else { break };
+                let obsolete = serde_json::from_str::<serde_json::Value>(&line.line)
+                    .ok()
+                    .is_some_and(|event| !provider_host::run_session::current_control_event(&line.run_key, &event));
+                if obsolete { continue; }
                 let stream = if line.stderr { "stderr" } else { "stdout" };
                 let frame = serde_json::json!({
                     "op": "run_output",
@@ -207,6 +215,30 @@ mod tests {
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::protocol::Role;
+
+    #[tokio::test]
+    async fn buffered_ready_for_a_closed_run_does_not_follow_a_reconnect_snapshot() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let (sender, mut lines) = mpsc::channel(2);
+        sender.send(OutputLine { run_key: "already-closed".into(), stderr: false, line: serde_json::json!({"type":"run_control","state":"ready","turn":"old","steers":true}).to_string() }).await.unwrap();
+        sender
+            .send(OutputLine {
+                run_key: "already-closed".into(),
+                stderr: false,
+                line: "retained output".into(),
+            })
+            .await
+            .unwrap();
+        let task = tokio::spawn(async move { pump(client, &Notify::new(), &mut lines).await });
+        let frame = server.next().await.unwrap().unwrap().into_text().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(value["line"], "retained output");
+        server.close(None).await.unwrap();
+        drop(server);
+        task.await.unwrap();
+    }
 
     /// the macOS bring-up storm: zero discovered providers drop every
     /// `OutputLine` sender before the link is even up, and a pump that treated

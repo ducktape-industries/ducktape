@@ -57,6 +57,37 @@ pub fn active() -> Vec<(String, Value)> {
         })
         .collect()
 }
+/// A buffered control notification may predate a reconnect's fresh snapshot.
+/// Never let that older notification resurrect a closed run or restore a stale
+/// turn/approval. Ordinary trace events remain available as history.
+pub fn current_control_event(run: &str, event: &Value) -> bool {
+    if event["type"] != "run_control" {
+        return true;
+    }
+    let registry = sessions().lock().expect("run sessions");
+    let entry = registry.get(run);
+    match event["state"].as_str() {
+        Some("ready") => entry.is_some_and(|entry| entry.ready.as_ref() == Some(event)),
+        Some("approval") => entry.is_some_and(|entry| {
+            event["request_id"]
+                .as_str()
+                .and_then(|id| entry.approvals.get(id))
+                == Some(event)
+        }),
+        Some("approval_resolved") => entry.is_some_and(|entry| {
+            entry
+                .ready
+                .as_ref()
+                .is_some_and(|ready| ready["turn"] == event["turn"])
+                && !entry
+                    .approvals
+                    .contains_key(event["request_id"].as_str().unwrap_or_default())
+        }),
+        Some("closed") => entry.is_none(),
+        _ => true,
+    }
+}
+
 static SESSIONS: OnceLock<Mutex<Registry>> = OnceLock::new();
 fn sessions() -> &'static Mutex<Registry> {
     SESSIONS.get_or_init(Default::default)
@@ -456,7 +487,7 @@ pub(crate) async fn drive(
                                 }
                                 "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
                                     if approvals.len() >= 16 { return Err("Too many pending approvals".into()); }
-                                    let id = frame["id"].to_string(); approvals.insert(id.clone(),frame.clone()); approval(&sink,ctx,&turn,&id,&frame["params"]);
+                                    let id = frame["id"].to_string(); approvals.insert(id.clone(),frame.clone()); approval(&sink,ctx,&turn,&id,&frame["params"])?;
                                 }
                                 _ => {}
                             }
@@ -480,7 +511,7 @@ pub(crate) async fn drive(
                             }
                             "system" if frame["subtype"] == "init" => { thread = frame["session_id"].as_str().unwrap_or_default().into(); turn = format!("{}:{}",thread,next_id); ready(&sink,ctx,&turn,true); }
                             "user" => { if let Some(id) = frame["uuid"].as_str() && let Some(reply) = pending.remove(id) { let _ = reply.send(Ok(json!({"status":"accepted"}))); } }
-                            "control_request" if frame["request"]["subtype"] == "can_use_tool" => { if approvals.len() >= 16 { return Err("Too many pending approvals".into()); } let id = frame["request_id"].as_str().unwrap_or_default().to_string(); approvals.insert(id.clone(),frame.clone()); approval(&sink,ctx,&turn,&id,&frame["request"]); }
+                            "control_request" if frame["request"]["subtype"] == "can_use_tool" => { if approvals.len() >= 16 { return Err("Too many pending approvals".into()); } let id = frame["request_id"].as_str().unwrap_or_default().to_string(); approvals.insert(id.clone(),frame.clone()); approval(&sink,ctx,&turn,&id,&frame["request"])?; }
                             "result" => {
                                 if frame["terminal_reason"] == "aborted_streaming" { acknowledge_stop(&mut stop_id,&mut pending); }
                                 if let Some(steer) = &mut steering { steer.boundary = steer.boundary.step(BoundaryEvent::ResultReceived); approvals.clear(); continue; }
@@ -520,12 +551,22 @@ fn ready(sink: &Option<OutputSink>, ctx: &RunContext, turn: &str, steers: bool) 
     }
     emit(sink, ctx, value);
 }
-fn approval(sink: &Option<OutputSink>, ctx: &RunContext, turn: &str, id: &str, detail: &Value) {
-    emit(
-        sink,
-        ctx,
-        json!({"type":"run_control","state":"approval","turn":turn,"request_id":id,"detail":detail}),
-    );
+fn approval(
+    sink: &Option<OutputSink>,
+    ctx: &RunContext,
+    turn: &str,
+    id: &str,
+    detail: &Value,
+) -> Result<(), String> {
+    let event = json!({"type":"run_control","state":"approval","turn":turn,"request_id":id,"detail":detail});
+    // The node's output lane admits 16 KiB per event. Never wait for an
+    // approval the reader cannot receive, or invite approval of clipped input.
+    let too_large = event.to_string().len() > 16 * 1024;
+    if too_large {
+        return Err("Approval details exceed the run-control display limit.".into());
+    }
+    emit(sink, ctx, event);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -563,6 +604,67 @@ mod tests {
             rx,
         )
     }
+    #[test]
+    fn oversized_approval_is_refused_instead_of_waiting_for_an_invisible_request() {
+        let (sink, mut events) = sink();
+        let result = approval(
+            &sink,
+            &RunContext::default(),
+            "turn",
+            "request",
+            &json!({"command":"x".repeat(16 * 1024)}),
+        );
+        assert!(result.unwrap_err().contains("display limit"));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn buffered_notifications_cannot_restore_an_old_turn_or_resolved_approval() {
+        let key = "stale-notification-test".to_owned();
+        let (sender, _offers) = mpsc::channel(1);
+        let (sink, mut events) = sink();
+        sessions().lock().unwrap().insert(
+            key.clone(),
+            Entry {
+                sender: sender.clone(),
+                ready: None,
+                approvals: HashMap::new(),
+            },
+        );
+        let ctx = RunContext {
+            run_key: Some(key.clone()),
+            ..Default::default()
+        };
+        let registration = Registration {
+            key: key.clone(),
+            sender,
+            ctx: ctx.clone(),
+            sink: sink.clone(),
+            started: tokio::time::Instant::now(),
+        };
+        ready(&sink, &ctx, "old", true);
+        let old = events.try_recv().unwrap();
+        ready(&sink, &ctx, "new", true);
+        let current = events.try_recv().unwrap();
+        assert!(!current_control_event(&key, &old));
+        assert!(current_control_event(&key, &current));
+        approval(&sink, &ctx, "new", "request", &json!({"command":"pwd"})).unwrap();
+        let pending = events.try_recv().unwrap();
+        assert!(current_control_event(&key, &pending));
+        emit(
+            &sink,
+            &ctx,
+            json!({"type":"run_control","state":"approval_resolved","turn":"new","request_id":"request"}),
+        );
+        assert!(!current_control_event(&key, &pending));
+        assert!(current_control_event(&key, &events.try_recv().unwrap()));
+        let closed = json!({"type":"run_control","state":"closed"});
+        assert!(!current_control_event(&key, &closed));
+        drop(registration);
+        assert!(!current_control_event(&key, &current));
+        assert!(current_control_event(&key, &closed));
+    }
+
     #[test]
     fn closing_a_session_emits_executor_elapsed_time() {
         let (sink, mut events) = sink();
