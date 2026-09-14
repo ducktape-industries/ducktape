@@ -3675,6 +3675,7 @@ dependencies = [
  "block2 0.5.1",
  "chat",
  "commonware-cryptography",
+ "core-graphics 0.24.0",
  "cpal",
  "design",
  "dispatch 0.1.0",
