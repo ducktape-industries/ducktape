@@ -10,9 +10,6 @@ fn flattened_runs_preserve_native_body_gaps_and_inline_precedence() {
     let editor = Editor::new(text);
     for dark in [false, true] {
         let caret = markdown::Caret {
-            focused: true,
-            line: 2,
-            column: 0,
             dark,
             commented: vec![1],
         };
@@ -28,7 +25,6 @@ fn flattened_runs_preserve_native_body_gaps_and_inline_precedence() {
             editor_binding::initial_menu(),
             dark,
             vec![1],
-            true,
             EditorReserve::default(),
         )
         .unwrap();
@@ -60,7 +56,7 @@ fn flattened_runs_preserve_native_body_gaps_and_inline_precedence() {
 }
 
 #[test]
-fn named_link_syntax_hides_on_blur_and_returns_without_changing_source_or_caret() {
+fn named_link_syntax_never_paints_even_under_the_caret() {
     let line = "앞 [작업 보기](duck://agents/runs/abc) 뒤";
     let text = format!("Title\n{line}");
     let editor = Editor::new(&text);
@@ -71,13 +67,14 @@ fn named_link_syntax_hides_on_blur_and_returns_without_changing_source_or_caret(
         },
         ..editor.state_view()
     };
-    for focused in [true, false, true] {
+    // The caret sits INSIDE the link syntax, and the syntax still never
+    // paints: the label is the whole of what the reader sees.
+    {
         let paint = presentation::build(
             state,
             editor_binding::initial_menu(),
             false,
             vec![],
-            focused,
             EditorReserve::default(),
         )
         .unwrap();
@@ -88,14 +85,7 @@ fn named_link_syntax_hides_on_blur_and_returns_without_changing_source_or_caret(
             .filter(|span| paint.formats[span.format as usize].size.unwrap_or(14.0) > 1.0)
             .map(|span| &line[span.start as usize..span.end as usize])
             .collect();
-        assert_eq!(
-            visible,
-            if focused {
-                line
-            } else {
-                "앞 작업 보기 뒤"
-            }
-        );
+        assert_eq!(visible, "앞 작업 보기 뒤");
         let hit = paint
             .affordances
             .hits
@@ -181,7 +171,6 @@ fn the_reserved_line_carries_the_gap_and_keeps_its_own_padding() {
         editor_binding::initial_menu(),
         false,
         vec![],
-        true,
         EditorReserve::default(),
     )
     .unwrap();
@@ -192,7 +181,6 @@ fn the_reserved_line_carries_the_gap_and_keeps_its_own_padding() {
         editor_binding::initial_menu(),
         false,
         vec![],
-        true,
         EditorReserve {
             line: 2,
             height: 200,
@@ -219,7 +207,6 @@ fn the_reserved_line_carries_the_gap_and_keeps_its_own_padding() {
         editor_binding::initial_menu(),
         false,
         vec![],
-        true,
         EditorReserve { line: 2, height: 0 },
     )
     .unwrap();
@@ -265,7 +252,6 @@ fn strike_code_highlight_and_mentions_paint_their_own_runs() {
         editor_binding::initial_menu(),
         false,
         vec![],
-        true,
         EditorReserve::default(),
     )
     .unwrap();

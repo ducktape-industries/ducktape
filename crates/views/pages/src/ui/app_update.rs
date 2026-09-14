@@ -6,7 +6,6 @@ impl PagesView {
             self.document_dark,
             self.document_commented.clone(),
             self.document_marks.clone(),
-            self.document_focused,
             self.document_reserve,
         );
     }
@@ -53,13 +52,6 @@ impl PagesView {
             Message::DeleteCommentSubmit(id) => self.on_delete_comment_submit(id),
             Message::CommentEditDraftChanged(value) => self.on_comment_edit_draft_changed(value),
             Message::CopyToClipboard(text, label) => self.on_copy_to_clipboard(text, label),
-            Message::DocumentPointerReleased(_button) => self.on_document_pointer_released(_button),
-            Message::DocumentKeyReleased(_key) => self.on_document_key_released(_key),
-            Message::DocumentWindowFocused => self.on_document_window_focused(),
-            Message::DocumentWindowUnfocused => self.on_document_window_unfocused(),
-            Message::DocumentFocusChecked(query, focused) => {
-                self.on_document_focus_checked(query, focused)
-            }
             Message::SidebarResized(dx, _dy) => self.on_sidebar_resized(dx, _dy),
             Message::PagesViewportChanged(width, _height) => {
                 self.on_pages_viewport_changed(width, _height)
@@ -197,7 +189,6 @@ impl PagesView {
             self.document.replace(next, reset);
         };
         self.document_menu = crate::editor_binding::initial_menu();
-        self.document_focused = false;
         self.document_error = "".to_owned();
         self.refresh_document_presentation();
         Task::none()
@@ -700,38 +691,6 @@ impl PagesView {
     }
     fn on_copy_to_clipboard(&mut self, text: String, label: String) -> Task<Message> {
         crate::host::copy(&(text), &(label));
-        Task::none()
-    }
-    fn on_document_pointer_released(&mut self, _button: wire::mouse::Button) -> Task<Message> {
-        self.focus_query += 1;
-        let query = self.focus_query;
-        ::ducktape_view_guest::widget::is_focused(String::from("PagesView/root/pages/document"))
-            .map(move |value| Message::DocumentFocusChecked(query, value))
-    }
-    fn on_document_key_released(&mut self, _key: KeyRelease) -> Task<Message> {
-        self.focus_query += 1;
-        let query = self.focus_query;
-        ::ducktape_view_guest::widget::is_focused(String::from("PagesView/root/pages/document"))
-            .map(move |value| Message::DocumentFocusChecked(query, value))
-    }
-    fn on_document_window_focused(&mut self) -> Task<Message> {
-        self.focus_query += 1;
-        let query = self.focus_query;
-        ::ducktape_view_guest::widget::is_focused(String::from("PagesView/root/pages/document"))
-            .map(move |value| Message::DocumentFocusChecked(query, value))
-    }
-    fn on_document_window_unfocused(&mut self) -> Task<Message> {
-        self.focus_query += 1;
-        self.document_focused = false;
-        self.refresh_document_presentation();
-        Task::none()
-    }
-    fn on_document_focus_checked(&mut self, query: i64, focused: bool) -> Task<Message> {
-        if (query != self.focus_query) || (focused == self.document_focused) {
-            return Task::none();
-        }
-        self.document_focused = focused;
-        self.refresh_document_presentation();
         Task::none()
     }
     fn on_sidebar_resized(&mut self, dx: f64, _dy: f64) -> Task<Message> {

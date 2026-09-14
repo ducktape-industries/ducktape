@@ -9,7 +9,6 @@ impl PagesEditorFixture {
             self.menu.clone(),
             self.paint_dark,
             self.commented.clone(),
-            true,
         );
         presentation
             .validate(self.document.state_view().text)

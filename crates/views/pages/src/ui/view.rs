@@ -1,5 +1,4 @@
 use ducktape_view_guest::{Subscription, Task, wire};
-type KeyRelease = wire::keyboard::KeyState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CommentsMode {
     Beside,
@@ -26,8 +25,6 @@ pub struct PagesView {
     pub(crate) comment_edit_id: String,
     pub(crate) comment_edit_draft: String,
     pub(crate) document_reserve: crate::editor_view::EditorReserve,
-    pub(crate) document_focused: bool,
-    pub(crate) focus_query: i64,
     pub(crate) document_paint: crate::editor_view::PreparedPresentation,
     #[serde(with = "document_snapshot")]
     pub(crate) document: ducktape_view_guest::Editor,
@@ -126,11 +123,6 @@ pub enum Message {
     DeleteCommentSubmit(String),
     CommentEditDraftChanged(String),
     CopyToClipboard(String, String),
-    DocumentPointerReleased(wire::mouse::Button),
-    DocumentKeyReleased(KeyRelease),
-    DocumentWindowFocused,
-    DocumentWindowUnfocused,
-    DocumentFocusChecked(i64, bool),
     SidebarResized(f64, f64),
     PagesViewportChanged(f64, f64),
     PagesPaneResized(f64, f64),
@@ -164,8 +156,6 @@ impl PagesView {
             comment_edit_id: "".to_owned(),
             comment_edit_draft: "".to_owned(),
             document_reserve: crate::editor_view::no_reserve(),
-            document_focused: false,
-            focus_query: 0,
             document_paint: crate::editor_view::empty_presentation(),
             document: ::ducktape_view_guest::Editor::new("".to_owned()),
             document_history: crate::editor_binding::initial_history(),
@@ -307,48 +297,6 @@ impl PagesView {
                     _ => None,
                 },
             )),
-            ::ducktape_view_guest::mouse::observe(Subscription::filter_events(
-                |event| match event {
-                    wire::Event::Mouse {
-                        event: wire::mouse::Event::ButtonReleased(button),
-                        ..
-                    } => Some(Message::DocumentPointerReleased(*button)),
-                    _ => None,
-                },
-            )),
-            Subscription::filter_events(|event| match event {
-                wire::Event::Keyboard {
-                    event: wire::keyboard::Event::Release(key),
-                    ..
-                } => Some(Message::DocumentKeyReleased(key.clone())),
-                _ => None,
-            }),
-            ::ducktape_view_guest::events::observe(
-                Subscription::filter_events(|event| match event {
-                    wire::Event::Observation {
-                        event: wire::events::Event::Window(wire::events::Window::Focused),
-                        ..
-                    } => Some(Message::DocumentWindowFocused),
-                    _ => None,
-                }),
-                wire::events::Interest {
-                    focus: true,
-                    ..Default::default()
-                },
-            ),
-            ::ducktape_view_guest::events::observe(
-                Subscription::filter_events(|event| match event {
-                    wire::Event::Observation {
-                        event: wire::events::Event::Window(wire::events::Window::Unfocused),
-                        ..
-                    } => Some(Message::DocumentWindowUnfocused),
-                    _ => None,
-                }),
-                wire::events::Interest {
-                    focus: true,
-                    ..Default::default()
-                },
-            ),
             crate::host::session().map(Message::SessionArrived),
             if self.connected {
                 crate::host::register(self.active_page.to_owned(), self.register_serial)
