@@ -453,6 +453,7 @@ fn publish_status(status: &crate::StatusCell, host: &Host, status_modules: &[Str
         })
         .collect();
     status.publish(NodeStatus {
+        contract: crate::NODE_CONTRACT,
         version: env!("CARGO_PKG_VERSION").into(),
         root_hash: hex_root(&host.root_hash()),
         height,

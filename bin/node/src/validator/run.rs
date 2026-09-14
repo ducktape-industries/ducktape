@@ -87,6 +87,7 @@ pub(super) fn publish_boundary_status(
 ) {
     let height = node.finalized().map(|f| f.height).unwrap_or(0);
     status.publish(noded::NodeStatus {
+        contract: noded::NODE_CONTRACT,
         version: crate::build_version(),
         root_hash: crate::util::hex(&node.root_hash()),
         height,

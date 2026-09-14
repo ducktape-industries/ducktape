@@ -5060,6 +5060,13 @@ impl Ducktape {
         {
             return Task::none();
         }
+        // the app↔node contract gate: a live node whose number is not this
+        // app's never gets a console. The row prints the two numbers.
+        let contract_refused =
+            crate::backend::selected_network_refuses(&self.hub_networks, &self.hub_selected);
+        if contract_refused {
+            return Task::none();
+        }
         self.rpc = crate::backend::selected_network_endpoint(
             self.hub_networks.clone(),
             self.hub_selected.to_owned(),

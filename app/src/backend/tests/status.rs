@@ -232,3 +232,82 @@ fn the_files_write_gate_answers_in_the_modules_words() {
     assert_eq!(gate(&format!("/home/ext:{other}")), "");
     assert_eq!(files_write_gate("/".into(), String::new()), "");
 }
+
+/// THE APP↔NODE CONTRACT IS AN EQUALITY, AND THE READING NAMES WHICH SIDE IS
+/// STALE. Three arms, no window: one behind is as refused as ten behind, and
+/// a node ahead of this app is refused too — that is the app's own staleness,
+/// and the line says so.
+#[test]
+fn a_contract_number_matches_or_names_the_stale_side() {
+    let expected = EXPECTED_NODE_CONTRACT;
+    assert_eq!(contract_match(expected), ContractMatch::Match);
+    assert_eq!(contract_hint(expected), "");
+    assert_eq!(contract_match(expected + 1), ContractMatch::NodeAhead);
+    assert_eq!(
+        contract_hint(expected + 1),
+        format!(
+            "node contract {} · app expects {expected} · update the app",
+            expected + 1
+        )
+    );
+    // a node publishing no number reads as 0: behind, by definition.
+    assert_eq!(contract_match(0), ContractMatch::NodeBehind);
+    assert_eq!(
+        contract_hint(0),
+        format!("node contract 0 · app expects {expected} · update the node")
+    );
+    assert_eq!(
+        node_facts(&serde_json::json!({ "version": "0.1.0" })).contract,
+        0,
+        "a document without the field is a node from before the number"
+    );
+    assert_eq!(
+        node_facts(&serde_json::json!({ "contract": expected })).contract,
+        expected
+    );
+}
+
+/// THE ROW REFUSES ONLY ON A MEASURED LIVE MISMATCH. An unprobed row and a
+/// dead node carry no number to judge, so they open the way they always did;
+/// a live node with the wrong number prints the two numbers and does not open.
+#[test]
+fn a_network_row_refuses_only_a_live_node_with_another_contract() {
+    let row = |probed: bool, live: bool, contract: u32| HubNetwork {
+        id: "demo#a1b2".into(),
+        chain_id: "demo#a1b2".into(),
+        name: "demo".into(),
+        endpoint: "http://127.0.0.1:1".into(),
+        kind: "local".into(),
+        last_used: 0,
+        probed,
+        live,
+        height: 7,
+        contract,
+    };
+    let expected = EXPECTED_NODE_CONTRACT;
+
+    let unprobed = row(false, false, 0);
+    assert!(!contract_refuses(&unprobed));
+    assert_eq!(network_row_label(&unprobed), "demo · checking");
+
+    let dead = row(true, false, 0);
+    assert!(!contract_refuses(&dead));
+    assert_eq!(network_row_label(&dead), "demo · offline");
+
+    let matching = row(true, true, expected);
+    assert!(!contract_refuses(&matching));
+    assert_eq!(network_row_label(&matching), "demo · block 7");
+
+    let behind = row(true, true, 0);
+    assert!(contract_refuses(&behind));
+    assert_eq!(
+        network_row_label(&behind),
+        format!("demo · node contract 0 · app expects {expected} · update the node")
+    );
+
+    // the open button and the handler read the selection through one predicate.
+    let rows = vec![behind.clone(), matching.clone()];
+    assert!(selected_network_refuses(&rows, "demo#a1b2"));
+    assert!(!selected_network_refuses(&rows, "gone"));
+    assert!(!selected_network_refuses(&[matching], "demo#a1b2"));
+}

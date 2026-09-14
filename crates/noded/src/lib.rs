@@ -306,12 +306,38 @@ pub fn block_row(record: &BlockRecord) -> Vec<u8> {
     serde_json::to_vec(record).expect("a plain record struct serializes")
 }
 
+/// The shape of this build's app-facing surface, as one integer: the `/v1`
+/// routes and their bodies, the ws topics and their frames, the view-props
+/// JSON a module view is handed, and the `duck://` URI grammar. Served on
+/// `GET /v1/status` and the ws `status` topic as [`NodeStatus::contract`].
+///
+/// Bumped in the PR that changes ANY of those — [`NODE_CONTRACT_SURFACE`] is
+/// the pin that makes forgetting fail the test lane. The desktop app carries
+/// its own copy (`EXPECTED_NODE_CONTRACT`) and opens a console only on
+/// EQUALITY: never a tolerance window, never "N-1 still works" — that would be
+/// the compat the repository forbids. Nothing on the node reads it, no peer
+/// sees it, and no code branches on its value; the app alone compares.
+pub const NODE_CONTRACT: u32 = 1;
+
+/// The surface [`NODE_CONTRACT`] names, fingerprinted: FNV-1a over the sorted
+/// `/v1` route paths of `lib.rs` + `admin.rs` and the ws topic/prefix names
+/// of `stream.rs`. The `contract_lint` test recomputes it from source; when
+/// they differ, the surface changed — bump [`NODE_CONTRACT`] and the app's
+/// `EXPECTED_NODE_CONTRACT` together, then repin this to the value the
+/// failing assertion prints. Repinning WITHOUT the bump is the defect the
+/// test exists to catch.
+pub const NODE_CONTRACT_SURFACE: u64 = 0x6c36_418b_06d0_b56f;
+
 /// the status projection: daemon build version, global root-hash, and each
 /// registered module's root. `Default` is the pre-first-publish snapshot in
 /// [`StatusCell`] — zeroed boundary facts are the honest answer before any
-/// boundary is served.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// boundary is served; the contract number is this build's even then.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeStatus {
+    /// [`NODE_CONTRACT`], always. Every publisher writes the constant, the
+    /// way `version` is always `CARGO_PKG_VERSION`: the number is a fact
+    /// about the binary, not about the boundary being published.
+    pub contract: u32,
     pub version: String,
     pub root_hash: String,
     pub height: u64,
@@ -340,6 +366,23 @@ pub struct NodeStatus {
     /// operators; dependency-specific consensus and transport metrics remain
     /// available on `/metrics` for deeper diagnosis.
     pub operations: OperationalStatus,
+}
+
+impl Default for NodeStatus {
+    fn default() -> Self {
+        Self {
+            contract: NODE_CONTRACT,
+            version: String::new(),
+            root_hash: String::new(),
+            height: 0,
+            consensus_time: 0,
+            consensus_time_unit: ConsensusTimeUnit::default(),
+            modules: Vec::new(),
+            public_key: String::new(),
+            chain_id: String::new(),
+            operations: OperationalStatus::default(),
+        }
+    }
 }
 
 /// The job this process is currently performing.

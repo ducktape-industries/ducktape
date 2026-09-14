@@ -270,6 +270,7 @@ async fn publish_replica_status(
         None => (0, String::new(), Vec::new()),
     };
     status.publish(noded::NodeStatus {
+        contract: noded::NODE_CONTRACT,
         version: crate::build_version(),
         root_hash,
         height,
