@@ -190,10 +190,8 @@ pub fn toggle(document: &Doc, wrap: Wrap) -> EditorDecision {
         let inner = range.start + marker.len()..range.end - marker.len();
         let mut next = document.clone();
         next.text.replace_range(range.clone(), &text[inner.clone()]);
-        return finish(
-            document,
-            selected(&next, range.start..range.start + inner.len()),
-        );
+        let marked = range.start..range.start + inner.len();
+        return finish(document, settled(document, next, marked, &range));
     }
     // The fence around the selection must be exactly this marker: the `*`
     // beside `**bold**` belongs to the bold fence, not to an italic one.
@@ -205,19 +203,61 @@ pub fn toggle(document: &Doc, wrap: Wrap) -> EditorDecision {
         .strip_prefix(marker)
         .is_some_and(|rest| !rest.starts_with(glyph));
     if before && after {
+        // Ctrl+B at the end of what was just typed in bold leaves the mark
+        // and keeps the words in it: the caret steps past the closing fence
+        // so what is typed next is plain. A selection, a caret mid-run, or
+        // an empty pair still unwraps.
+        let caret = document.offset(document.cursor.position);
+        let leaving_the_run = !selecting(document) && caret == range.end && !body.is_empty();
+        if leaving_the_run {
+            let mut next = document.clone();
+            next.cursor = EditorCursor {
+                position: next.position_at(range.end + marker.len()),
+                selection: None,
+            };
+            return finish(document, next);
+        }
         let mut next = document.clone();
         next.text
             .replace_range(range.end..range.end + marker.len(), "");
         next.text
             .replace_range(range.start - marker.len()..range.start, "");
         let start = range.start - marker.len();
-        return finish(document, selected(&next, start..start + body.len()));
+        let marked = start..start + body.len();
+        return finish(document, settled(document, next, marked, &range));
     }
     let mut next = document.clone();
     next.text.insert_str(range.end, marker);
     next.text.insert_str(range.start, marker);
     let start = range.start + marker.len();
-    finish(document, selected(&next, start..start + body.len()))
+    let marked = start..start + body.len();
+    finish(document, settled(document, next, marked, &range))
+}
+
+/// A standing selection, as opposed to a bare caret.
+fn selecting(document: &Doc) -> bool {
+    document
+        .cursor
+        .selection
+        .is_some_and(|anchor| anchor != document.cursor.position)
+}
+
+/// Where the cursor lands after a toggle over `was`, now `marked`: a selection
+/// stays selected for the next mark, Tiptap's way; a bare caret keeps its
+/// place in the word it was in, so what is typed next goes ON the word it
+/// just marked, never over it.
+fn settled(document: &Doc, next: Doc, marked: Range<usize>, was: &Range<usize>) -> Doc {
+    if selecting(document) {
+        return selected(&next, marked);
+    }
+    let caret = document.offset(document.cursor.position);
+    let into = caret.saturating_sub(was.start).min(marked.len());
+    let mut next = next;
+    next.cursor = EditorCursor {
+        position: next.position_at(marked.start + into),
+        selection: None,
+    };
+    next
 }
 
 /// Tiptap's colour mark over the target, in the form it serializes to. A
