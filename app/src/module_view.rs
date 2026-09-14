@@ -5173,8 +5173,10 @@ pub(crate) mod tests {
 
     /// A load starts at a view's source event and never at a draw: the only
     /// callers of `spawn_load` are the boot, the connect and the block
-    /// check, and the views the shell draws are exactly the ones those ask
-    /// for.
+    /// check (the registry-listed seats they share, `seat_registered_views`,
+    /// is called by the connect's registry read and the block check alone),
+    /// and the views the shell draws by name are exactly the ones those ask
+    /// for — a registered view is drawn by the id the registry listed.
     #[test]
     fn a_load_starts_at_a_source_event_never_at_a_draw() {
         use crate::backend::view_source::{DESKTOP_OWNED, MODULE_OWNED};
@@ -5205,8 +5207,23 @@ pub(crate) mod tests {
         }
         assert_eq!(
             callers,
-            BTreeSet::from(["booted", "connected", "deployments_check"]),
+            BTreeSet::from([
+                "booted",
+                "connected",
+                "deployments_check",
+                "seat_registered_views"
+            ]),
             "a load started outside the boot, the connect and the block check"
+        );
+        let registered_callers: BTreeSet<&str> = shell
+            .lines()
+            .filter(|line| line.contains("seat_registered_views(&mut registry"))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            registered_callers.len(),
+            2,
+            "the registered seats are made by the connect's registry read and the block check: {registered_callers:?}"
         );
         let drawn: BTreeSet<&str> = shell
             .split("module_view(")
