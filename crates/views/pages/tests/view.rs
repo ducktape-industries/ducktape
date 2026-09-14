@@ -335,6 +335,14 @@ fn the_card_lists_every_open_thread_expanded_under_its_anchor() {
     );
 
     let frame = tick_native(press(&frame, "Comments"));
+    // the card opened to be written in: the keyboard moves to its composer
+    let focus = request(&frame, "host.widget");
+    assert_eq!(
+        wire::decode::<wire::WidgetCommand>(&focus.payload).unwrap(),
+        wire::WidgetCommand::Focus {
+            target: "PagesView/root/pages/page-comment(alpha)".into()
+        }
+    );
     for expected in [
         "This page · 2 threads",
         "“the first paragraph”",
