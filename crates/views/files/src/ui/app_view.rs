@@ -156,6 +156,21 @@ impl FilesView {
                 false,
             ),
             native::gap(4.),
+            kit::quiet(
+                format!("{key}/list-mode"),
+                "☰ List",
+                "List view",
+                Some(Message::SetViewMode(ViewMode::List)),
+                self.view_mode == ViewMode::List,
+            ),
+            kit::quiet(
+                format!("{key}/columns-mode"),
+                "▥ Columns",
+                "Column view",
+                Some(Message::SetViewMode(ViewMode::Columns)),
+                self.view_mode == ViewMode::Columns,
+            ),
+            native::gap(4.),
             kit::action(
                 format!("{key}/new-folder"),
                 "New folder",

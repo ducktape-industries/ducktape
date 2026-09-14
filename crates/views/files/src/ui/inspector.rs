@@ -165,7 +165,7 @@ impl FilesView {
         )
     }
 
-    fn preview_content(&self, key: &str) -> Vec<wire::Node> {
+    pub(super) fn preview_content(&self, key: &str) -> Vec<wire::Node> {
         use wire::SurfaceValue::{Bool, Str};
         let preview = &self.preview;
         if !preview.error.is_empty() {

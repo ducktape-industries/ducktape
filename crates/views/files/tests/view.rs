@@ -1115,6 +1115,104 @@ fn a_parked_draft_keeps_its_bytes_and_never_retargets() {
     );
 }
 
+/// Column view: a chosen folder opens the next column to its right, read
+/// through the same workspace subscription; a chosen file in that column
+/// is previewed and named in the last column; a double-click makes the
+/// folder the directory.
+#[test]
+fn column_view_opens_each_chosen_folder_to_the_right() {
+    let (frame, _held) = connected_with_listing();
+    let frame = tick_native(press(&frame, "Column view"));
+    assert!(
+        has_text(&frame, "README.md"),
+        "the rows stay: {:?}",
+        texts(&frame)
+    );
+    assert!(frame.requests.is_empty(), "switching views reads nothing");
+
+    let frame = tick_native(press(&frame, "Folder docs"));
+    let here = ls_of(&frame, "/shared").0.id;
+    let frame = tick_native(vec![answer(here, &listing())]);
+    let (_, params) = ls_of(&frame, "/shared/docs");
+    assert_eq!(
+        params["path"], "/shared/docs",
+        "the chosen folder is read as a column"
+    );
+    let column = ls_of(&frame, "/shared/docs").0.id;
+    let frame = tick_native(vec![answer(
+        column,
+        serde_json::json!({ "entries": [
+            { "path": "/shared/docs/plan.md", "kind": "file", "size": 9, "object": "p" },
+            { "path": "/shared/docs/old", "kind": "dir", "size": 0, "object": "o" },
+        ]})
+        .to_string()
+        .as_bytes(),
+    )]);
+    let home = ls_of(&frame, "/home").0.id;
+    let frame = tick_native(vec![answer(home, &homes())]);
+    let snapshots = files_get(&frame, "history").0.id;
+    let frame = tick_native(vec![answer(snapshots, &history())]);
+    for expected in ["docs", "plan.md", "old", "2 items, 1 folder"] {
+        assert!(
+            has_text(&frame, expected),
+            "{expected}: {:?}",
+            texts(&frame)
+        );
+    }
+    assert!(
+        has_text(&frame, "/shared/docs"),
+        "the folder stays chosen while its column is open: {:?}",
+        texts(&frame)
+    );
+
+    // a file in the second column is chosen: previewed, and named last
+    let frame = tick_native(press(&frame, "File plan.md"));
+    assert!(has_text(&frame, "Chosen"), "{:?}", texts(&frame));
+    assert!(has_text(&frame, "Markdown · 9 B"), "{:?}", texts(&frame));
+    assert!(
+        files_gets(&frame, "ls").is_empty(),
+        "choosing a file opens no column: {:?}",
+        frame.requests
+    );
+    let head = files_get(&frame, "refs").0.id;
+    let frame = tick_native(vec![answer(head, &refs())]);
+    assert_eq!(files_get(&frame, "read").1["path"], "/shared/docs/plan.md");
+
+    // a folder in the second column opens a third, dropping nothing before it
+    let frame = tick_native(press(&frame, "Folder old"));
+    let read: Vec<String> = files_gets(&frame, "ls")
+        .into_iter()
+        .map(|(_, params)| params["path"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(read, ["/shared"], "the workspace reads the directory first");
+    let here = ls_of(&frame, "/shared").0.id;
+    let frame = tick_native(vec![answer(here, &listing())]);
+    assert_eq!(ls_of(&frame, "/shared/docs").1["path"], "/shared/docs");
+    let column = ls_of(&frame, "/shared/docs").0.id;
+    let frame = tick_native(vec![answer(column, &empty_listing())]);
+    assert_eq!(
+        ls_of(&frame, "/shared/docs/old").1["path"],
+        "/shared/docs/old"
+    );
+
+    // a double-click makes the folder the directory and the columns start over
+    let frame = tick_native(double_click(&frame, "/shared/docs"));
+    assert!(
+        button_disabled(&frame, "Go to /shared/docs"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert_eq!(ls_of(&frame, "/shared/docs").1["path"], "/shared/docs");
+    let here = ls_of(&frame, "/shared/docs").0.id;
+    let frame = tick_native(vec![answer(here, &empty_listing())]);
+    assert_eq!(
+        ls_of(&frame, "/home").1["path"],
+        "/home",
+        "no column is read after the move: {:?}",
+        frame.requests
+    );
+}
+
 /// What the name prompt's field reads now.
 fn name_field(frame: &Frame) -> String {
     let key = keys(frame)
