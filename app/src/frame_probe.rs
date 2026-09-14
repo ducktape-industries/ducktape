@@ -162,6 +162,7 @@ pub(crate) fn headless_context() -> HeadlessAppContext {
     );
     cx.update(|cx| {
         gpui_kit::init(cx);
+        crate::editor::wire::init_notion(cx);
         cx.text_system()
             .add_fonts(vec![
                 Cow::Borrowed(include_bytes!(
