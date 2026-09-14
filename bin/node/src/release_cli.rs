@@ -990,7 +990,10 @@ mod tests {
         completed.extend(sealer.seal_keepalive());
         completed.extend(sealer.seal_chunk(b"archive"));
         completed.extend(sealer.seal_final());
-        assert_eq!(open_signed_reply(&keys, b"c", &completed).unwrap(), b"archive");
+        assert_eq!(
+            open_signed_reply(&keys, b"c", &completed).unwrap(),
+            b"archive"
+        );
     }
 
     /// The signing lane's three caps are one number: what the enclave reads

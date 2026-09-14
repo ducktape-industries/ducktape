@@ -466,9 +466,7 @@ fn route_request_cap(cluster: &Cluster, account: u64, name: &str) -> Option<u64>
         }),
     )?;
     match gateway::decode_reply(&bytes).ok()? {
-        GatewayReply::Route(record) => {
-            Some((*record)?.statement.route?.policy.max_request_bytes)
-        }
+        GatewayReply::Route(record) => Some((*record)?.statement.route?.policy.max_request_bytes),
         _ => None,
     }
 }
@@ -580,7 +578,10 @@ fn release_sign_bundle_round_trips_through_the_node() {
     let ask = file("ask.pem", &ask);
     let vcek = file("vcek.der", &vcek);
     let p12 = file("id.p12", &p12);
-    let p12_password = file("p12.password", format!("{}\n", cred::P12_PASSWORD).as_bytes());
+    let p12_password = file(
+        "p12.password",
+        format!("{}\n", cred::P12_PASSWORD).as_bytes(),
+    );
     let api_key = file("AuthKey.json", cred::api_key_json().as_bytes());
     let node = cluster.http_base(0);
     let measurement = measurement_hex();

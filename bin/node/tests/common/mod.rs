@@ -1570,7 +1570,12 @@ impl Cluster {
     /// run a ducktape VERB with extra environment and a piped stdin (the
     /// `user`/`cred` families read a key password there) and return
     /// (success, combined output).
-    pub fn run_verb_with(&self, args: &[&str], env: &[(&str, &str)], stdin: &str) -> (bool, String) {
+    pub fn run_verb_with(
+        &self,
+        args: &[&str],
+        env: &[(&str, &str)],
+        stdin: &str,
+    ) -> (bool, String) {
         use std::io::Write as _;
         let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
             .args(args)

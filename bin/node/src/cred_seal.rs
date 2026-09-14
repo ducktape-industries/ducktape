@@ -360,7 +360,9 @@ pub(crate) fn cmd_seal(
     );
     match kind {
         CredentialKind::Claude | CredentialKind::Codex => Ok(()),
-        CredentialKind::AppleCodesign => register_signing_credential(ctx, &seal.name, seal_pk, stdin),
+        CredentialKind::AppleCodesign => {
+            register_signing_credential(ctx, &seal.name, seal_pk, stdin)
+        }
     }
 }
 
