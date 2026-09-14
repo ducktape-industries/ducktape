@@ -2955,7 +2955,10 @@ pub(crate) mod tests {
         size: gpui::Size<gpui::Pixels>,
         cx: &mut TestAppContext,
     ) -> (Entity<crate::view_tree::ViewTree>, VisualTestContext) {
-        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::editor::wire::init_notion(cx);
+        });
         let window = cx.open_window(size, |_, _| crate::view_tree::ViewTree::new(root));
         let view = window.root(cx).expect("native tree");
         let mut native = VisualTestContext::from_window(window.into(), cx);
@@ -5542,7 +5545,7 @@ pub(crate) mod tests {
                 });
                 assert_eq!(
                     published_width,
-                    Some(pane_width - 340. - 32.),
+                    Some(pane_width - 320. - 24.),
                     "the measured pane must reach the guest before native layout"
                 );
             }
@@ -5569,15 +5572,16 @@ pub(crate) mod tests {
         };
         let (beside_editor, beside_card) = measured(1500.);
         assert_eq!(f32::from(beside_editor.size.width), 704.);
-        assert_eq!(f32::from(beside_card.size.width), 340.);
+        assert_eq!(f32::from(beside_card.size.width), 320.);
         let (squeeze_editor, squeeze_card) = measured(1300.);
         assert_eq!(
             f32::from(squeeze_editor.size.width),
-            1066. - 340. - 32. - 62.
+            1066. - 320. - 24. - 62.
         );
-        assert_eq!(f32::from(squeeze_card.size.width), 340.);
+        assert_eq!(f32::from(squeeze_card.size.width), 320.);
         assert!(squeeze_editor.size.width < beside_editor.size.width);
-        let (inline_editor, inline_card) = measured(1100.);
+        // 1000 − 234 = 766 of pane: under the 844 squeeze floor, so inline.
+        let (inline_editor, inline_card) = measured(1000.);
         assert_eq!(f32::from(inline_editor.size.width), 704.);
         assert_eq!(inline_card.size.width, inline_editor.size.width);
     }

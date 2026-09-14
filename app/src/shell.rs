@@ -3036,6 +3036,7 @@ pub(crate) fn run() {
     });
     application.run(move |cx| {
         gpui_kit::init(cx);
+        crate::editor::wire::init_notion(cx);
         // Ask the host about banners at launch, so the macOS prompt is a
         // launch event and its answer is in the log before the first mention.
         crate::backend::boot_desktop_notifications();
