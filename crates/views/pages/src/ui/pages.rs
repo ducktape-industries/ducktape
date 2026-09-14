@@ -149,11 +149,7 @@ impl PagesView {
                 },
             ));
         }
-        let mut list: Vec<Node> = self
-            .pages
-            .iter()
-            .map(|page| self.page_button(page))
-            .collect();
+        let mut list = self.page_tree_rows();
         if list.is_empty() && !self.loading {
             list.push(kit::padded(
                 kit::column(
@@ -187,13 +183,19 @@ impl PagesView {
         } else {
             &self.active_page_title
         };
+        // Notion's crumb: every ancestor by TITLE, root first, each one a
+        // way back up the tree.
         let mut crumb = Vec::new();
-        if !self.active_page_parent.is_empty() {
-            crumb.push(kit::nowrap(kit::secondary(
-                "pages/toolbar/parent",
-                &self.active_page_parent,
-            )));
-            crumb.push(kit::nowrap(kit::caption("pages/toolbar/crumb", "/")));
+        for ancestor in crate::host::ancestors(&self.pages, &self.active_page_parent) {
+            let key = format!("pages/toolbar/parent/{}", ancestor.id);
+            crumb.push(kit::button(
+                key.clone(),
+                ancestor.title.clone(),
+                (!self.unavailable())
+                    .then(|| slots::message(Message::ChoosePage(ancestor.id.clone()))),
+                ButtonPreset::Subtle,
+            ));
+            crumb.push(kit::nowrap(kit::caption(format!("{key}/crumb"), "/")));
         }
         crumb.push(kit::nowrap(kit::strong("pages/toolbar/title", title)));
         let status = match self.autosave.as_str() {

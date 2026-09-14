@@ -43,6 +43,8 @@ pub struct PagesView {
     pub(crate) host_error: String,
     pub(crate) page_link: String,
     pub(crate) pages: Vec<crate::host::PageItem>,
+    /// Parents whose subtree the sidebar keeps folded shut.
+    pub(crate) folded_pages: Vec<String>,
     pub(crate) blocks: Vec<crate::document_sync::PageBlock>,
     pub(crate) pages_viewport_width: f64,
     pub(crate) pages_viewport_height: f64,
@@ -92,6 +94,7 @@ pub enum Message {
     SessionArrived(crate::host::SessionItem),
     CommentPointerMoved(f64, f64),
     ChoosePage(String),
+    TogglePageFold(String),
     RegisterArrived(crate::host::RegisterItem),
     SearchArrived(crate::host::SearchItem),
     ActDone(crate::host::ActItem),
@@ -173,6 +176,7 @@ impl PagesView {
             host_error: "".to_owned(),
             page_link: "".to_owned(),
             pages: Vec::new(),
+            folded_pages: Vec::new(),
             blocks: Vec::new(),
             pages_viewport_width: 1280.0,
             pages_viewport_height: 700.0,
@@ -386,6 +390,87 @@ mod tests {
         let snapshot = app.snapshot().unwrap();
         let restored = PagesView::restore(&snapshot).unwrap();
         assert_eq!(restored.snapshot().unwrap(), snapshot);
+    }
+    /// The sidebar is Notion's page tree: a child sits one step under its
+    /// parent, a parent carries a fold toggle, and folding it hides its
+    /// whole subtree — and only that.
+    #[test]
+    fn the_sidebar_folds_a_parents_subtree_and_nothing_else() {
+        use ducktape_view_guest::testing::keys;
+        let page = |id: &str, parent: &str, depth: usize, children: i64| crate::host::PageItem {
+            id: id.into(),
+            title: id.to_uppercase(),
+            parent: parent.into(),
+            prefix: "  ".repeat(depth),
+            child_count: children,
+        };
+        let (mut app, _) = PagesView::boot();
+        app.connected = true;
+        app.pages = vec![
+            page("alpha", "", 0, 1),
+            page("alpha-child", "alpha", 1, 1),
+            page("alpha-grandchild", "alpha-child", 2, 0),
+            page("beta", "", 0, 0),
+        ];
+        let frame = wire::Frame {
+            root: Some(app.view()),
+            ..Default::default()
+        };
+        let present = keys(&frame);
+        assert!(
+            present
+                .iter()
+                .any(|key| key == "PagesView/root/pages/page/alpha/fold")
+        );
+        assert!(
+            present
+                .iter()
+                .any(|key| key == "PagesView/root/pages/page/alpha-grandchild")
+        );
+        assert!(
+            !present
+                .iter()
+                .any(|key| key == "PagesView/root/pages/page/beta/fold"),
+            "a leaf has no toggle"
+        );
+
+        app.update(Message::TogglePageFold("alpha".into()));
+        let frame = wire::Frame {
+            root: Some(app.view()),
+            ..Default::default()
+        };
+        let folded = keys(&frame);
+        assert!(
+            folded
+                .iter()
+                .any(|key| key == "PagesView/root/pages/page/alpha")
+        );
+        assert!(
+            !folded
+                .iter()
+                .any(|key| key == "PagesView/root/pages/page/alpha-child")
+        );
+        assert!(
+            !folded
+                .iter()
+                .any(|key| key == "PagesView/root/pages/page/alpha-grandchild")
+        );
+        assert!(
+            folded
+                .iter()
+                .any(|key| key == "PagesView/root/pages/page/beta")
+        );
+
+        app.update(Message::TogglePageFold("alpha".into()));
+        let frame = wire::Frame {
+            root: Some(app.view()),
+            ..Default::default()
+        };
+        assert!(
+            keys(&frame)
+                .iter()
+                .any(|key| key == "PagesView/root/pages/page/alpha-child")
+        );
     }
     #[test]
     fn kit_composition_retains_editor_and_comment_routes_without_custom_control_faces() {
