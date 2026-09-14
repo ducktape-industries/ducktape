@@ -15,7 +15,7 @@ pub mod host;
 
 #[path = "ui/app.rs"]
 mod app;
-pub use app::{FilesView, Message};
+pub use app::{FilesView, Message, browse};
 
 ducktape_view_guest::export_app!(
     FilesView,

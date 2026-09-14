@@ -1,13 +1,13 @@
 //! The view driven natively through the wire: the kernel pushes session
-//! facts, the view lists the directory, reads the preview and the snapshot
-//! history for itself through `files.get`, re-reads on every `rpc.live` hit
-//! for the files plane, and a write leaves as `op.submit` carrying the
-//! duckfs commit.
+//! facts, the view lists the directory, the homes and the snapshot history
+//! for itself through `files.get`, re-reads on every `rpc.live` hit for the
+//! files plane, reads the chosen file, and every write leaves as `op.submit`
+//! carrying the duckfs commit.
 
 use ducktape_view_guest::testing::{
     answer, edit, find, has_text, item, keys, press, refuse, texts, type_into,
 };
-use ducktape_view_guest::wire::{Frame, Node, Request};
+use ducktape_view_guest::wire::{Event, Frame, Node, Request, keyboard};
 use files_view::host::Session;
 use files_view::{boot_native, tick_native};
 
@@ -31,15 +31,38 @@ fn request<'a>(frame: &'a Frame, kind: &str) -> &'a Request {
         .unwrap_or_else(|| panic!("no `{kind}` request in {:?}", frame.requests))
 }
 
-/// The `files.get` request on `lane`, and the params it carries.
+fn has_request(frame: &Frame, kind: &str) -> bool {
+    frame.requests.iter().any(|request| request.kind == kind)
+}
+
+/// Every `files.get` request on `lane`, with the params each carries.
+fn files_gets<'a>(frame: &'a Frame, lane: &str) -> Vec<(&'a Request, serde_json::Value)> {
+    frame
+        .requests
+        .iter()
+        .filter_map(|request| {
+            let ask: serde_json::Value =
+                serde_json::from_slice(&request.payload).unwrap_or_default();
+            let on_lane = request.kind == "files.get" && ask["lane"] == lane;
+            on_lane.then(|| (request, ask["params"].clone()))
+        })
+        .collect()
+}
+
+/// The one `files.get` request on `lane`, and the params it carries.
 fn files_get<'a>(frame: &'a Frame, lane: &str) -> (&'a Request, serde_json::Value) {
-    let found = frame.requests.iter().find(|request| {
-        let ask: serde_json::Value = serde_json::from_slice(&request.payload).unwrap_or_default();
-        request.kind == "files.get" && ask["lane"] == lane
-    });
-    let request = found.unwrap_or_else(|| panic!("no `{lane}` read in {:?}", frame.requests));
-    let ask: serde_json::Value = serde_json::from_slice(&request.payload).expect("a read decodes");
-    (request, ask["params"].clone())
+    files_gets(frame, lane)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("no `{lane}` read in {:?}", frame.requests))
+}
+
+/// The `ls` request for `path`.
+fn ls_of<'a>(frame: &'a Frame, path: &str) -> (&'a Request, serde_json::Value) {
+    files_gets(frame, "ls")
+        .into_iter()
+        .find(|(_, params)| params["path"] == path)
+        .unwrap_or_else(|| panic!("no `ls {path}` in {:?}", frame.requests))
 }
 
 fn session(connected: bool) -> Vec<u8> {
@@ -53,6 +76,7 @@ fn routed_session(connected: bool, route: &str, route_serial: i64) -> Vec<u8> {
         connected,
         dark: false,
         chain: "chain-a".into(),
+        account: "7".into(),
         route: route.into(),
         route_serial,
     })
@@ -68,9 +92,26 @@ fn listing() -> Vec<u8> {
     .into_bytes()
 }
 
+fn empty_listing() -> Vec<u8> {
+    serde_json::json!({ "entries": [] })
+        .to_string()
+        .into_bytes()
+}
+
+fn homes() -> Vec<u8> {
+    serde_json::json!({ "entries": [
+        { "path": "/home/acct:7", "kind": "dir", "size": 1, "object": "h7" },
+        { "path": "/home/acct:3", "kind": "dir", "size": 1, "object": "h3" },
+    ]})
+    .to_string()
+    .into_bytes()
+}
+
+/// The history as the node spells it: the author is duckfs's `Actor`, an
+/// externally tagged enum, never a display string.
 fn history() -> Vec<u8> {
     serde_json::json!({ "snapshots": [
-        { "id": "s1", "author": "ext:aa", "height": 84_912, "message": "first commit" },
+        { "id": "s1", "parent": null, "author": { "Account": 9 }, "height": 84_912, "message": "first commit" },
     ]})
     .to_string()
     .into_bytes()
@@ -97,17 +138,25 @@ struct Held {
     live: u64,
 }
 
-/// Boots, connects and answers the first listing read: the frame with the
+/// Answers a workspace read in the order the view asks: the directory (as
+/// `directory`), then the homes, then the history.
+fn settle_workspace(frame: &Frame, path: &str, directory: &[u8]) -> Frame {
+    let ls = ls_of(frame, path).0.id;
+    let frame = tick_native(vec![answer(ls, directory)]);
+    let home = ls_of(&frame, "/home").0.id;
+    let frame = tick_native(vec![answer(home, &homes())]);
+    let snapshots = files_get(&frame, "history").0.id;
+    tick_native(vec![answer(snapshots, &history())])
+}
+
+/// Boots, connects and answers the first workspace read: the frame with the
 /// directory on screen, and the subscriptions behind it.
 fn connected_with_listing() -> (Frame, Held) {
     let frame = boot();
     let session_id = request(&frame, "files.props").id;
     let frame = tick_native(vec![item(session_id, &session(true))]);
     let live = request(&frame, "rpc.live").id;
-    let ls = files_get(&frame, "ls").0.id;
-    let frame = tick_native(vec![answer(ls, &listing())]);
-    let snapshots = files_get(&frame, "history").0.id;
-    let frame = tick_native(vec![answer(snapshots, &history())]);
+    let frame = settle_workspace(&frame, "/shared", &listing());
     (
         frame,
         Held {
@@ -117,10 +166,10 @@ fn connected_with_listing() -> (Frame, Held) {
     )
 }
 
-/// Opens `/shared/README.md` and answers its two reads (the head snapshot,
+/// Chooses `/shared/README.md` and answers its two reads (the head snapshot,
 /// then the page at it).
 fn with_preview(frame: &Frame, body: &str) -> Frame {
-    let frame = tick_native(press(frame, "Show object"));
+    let frame = tick_native(press(frame, "File README.md"));
     let head = files_get(&frame, "refs").0.id;
     let frame = tick_native(vec![answer(head, &refs())]);
     let page = files_get(&frame, "read").0.id;
@@ -134,81 +183,97 @@ fn node_ending(frame: &Frame, suffix: &str) -> Node {
         }
         node.children().iter().find_map(|child| find(child, suffix))
     }
-    find(frame.root.as_ref().unwrap(), suffix).expect("node exists")
+    find(frame.root.as_ref().unwrap(), suffix)
+        .unwrap_or_else(|| panic!("no node ending {suffix:?} in {:?}", keys(frame)))
+}
+
+/// The events the host sends for a double-click on the row of `path`.
+fn double_click(frame: &Frame, path: &str) -> Vec<Event> {
+    let Node::MouseArea {
+        on_double_click: Some(message),
+        ..
+    } = node_ending(frame, &format!("/row/{path}"))
+    else {
+        panic!("row {path} takes no double-click")
+    };
+    vec![Event::Message(message)]
+}
+
+/// A key press the focused control did not take.
+fn key(named: keyboard::Named, control: bool) -> Vec<Event> {
+    let key = keyboard::Key::Named(named);
+    vec![Event::Keyboard {
+        event: keyboard::Event::Press {
+            state: keyboard::KeyState {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::Physical::Unidentified(keyboard::NativeCode::Unidentified),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers {
+                    control,
+                    ..Default::default()
+                },
+            },
+            text: None,
+            repeat: false,
+        },
+        captured: false,
+    }]
+}
+
+/// Where `content` sits among the frame's texts.
+fn position(frame: &Frame, content: &str) -> usize {
+    texts(frame)
+        .iter()
+        .position(|text| text == content)
+        .unwrap_or_else(|| panic!("no {content:?} in {:?}", texts(frame)))
 }
 
 #[test]
 fn every_browser_split_drags_with_the_cursor_its_axis_uses() {
-    use ducktape_view_guest::wire::{Event, Length, mouse};
+    use ducktape_view_guest::wire::{Length, mouse};
 
     let (frame, _) = connected_with_listing();
-    let frame = with_preview(&frame, "hello");
-    let fixed = |frame: &Frame, suffix: &str, vertical: bool| {
-        let (width, height) = match node_ending(frame, suffix) {
-            Node::Container { width, height, .. }
-            | Node::Linear { width, height, .. }
-            | Node::Scroll { width, height, .. } => (width, height),
-            node => panic!("fixed pane {suffix}: {node:?}"),
-        };
-        match vertical {
-            true => height,
-            false => width,
-        }
+    let fixed = |frame: &Frame, suffix: &str| match node_ending(frame, suffix) {
+        Node::Container { width, .. } | Node::Linear { width, .. } => width,
+        node => panic!("fixed pane {suffix}: {node:?}"),
     };
-    let drag = |frame: &Frame, suffix: &str, dx: f64, dy: f64, cursor| {
+    let drag = |frame: &Frame, suffix: &str, dx: f64| {
         let Node::ResizeHandle {
             on_drag: Some(handler),
-            cursor: actual,
+            cursor,
             ..
         } = node_ending(frame, suffix)
         else {
             panic!("resize handle {suffix}")
         };
-        assert_eq!(actual, Some(cursor));
-        tick_native(vec![Event::Drag { handler, dx, dy }])
+        assert_eq!(cursor, Some(mouse::Cursor::ResizingHorizontally));
+        tick_native(vec![Event::Drag {
+            handler,
+            dx,
+            dy: 0.0,
+        }])
     };
 
-    assert_eq!(
-        fixed(&frame, "/tree-pane", false),
-        Some(Length::Fixed(240.0))
-    );
-    let frame = drag(
-        &frame,
-        "/tree-resize",
-        40.0,
-        0.0,
-        mouse::Cursor::ResizingHorizontally,
-    );
-    assert_eq!(
-        fixed(&frame, "/tree-pane", false),
-        Some(Length::Fixed(280.0))
-    );
-    let frame = drag(
-        &frame,
-        "/preview-resize",
-        0.0,
-        -50.0,
-        mouse::Cursor::ResizingVertically,
-    );
-    assert_eq!(
-        fixed(&frame, "/preview-pane", true),
-        Some(Length::Fixed(350.0))
-    );
-    let frame = drag(
-        &frame,
-        "/object-resize",
-        -60.0,
-        0.0,
-        mouse::Cursor::ResizingHorizontally,
-    );
-    assert_eq!(
-        fixed(&frame, "/object-panel", false),
-        Some(Length::Fixed(366.0))
-    );
+    assert_eq!(fixed(&frame, "/sidebar"), Some(Length::Fixed(200.0)));
+    let frame = drag(&frame, "/sidebar-resize", 40.0);
+    assert_eq!(fixed(&frame, "/sidebar"), Some(Length::Fixed(240.0)));
+    assert_eq!(fixed(&frame, "/inspector"), Some(Length::Fixed(340.0)));
+    let frame = drag(&frame, "/inspector-resize", -60.0);
+    assert_eq!(fixed(&frame, "/inspector"), Some(Length::Fixed(400.0)));
+
+    // both rails fold away and come back
+    let frame = tick_native(press(&frame, "Toggle sidebar"));
+    assert!(!keys(&frame).iter().any(|key| key.ends_with("/sidebar")));
+    let frame = tick_native(press(&frame, "Toggle inspector"));
+    assert!(!keys(&frame).iter().any(|key| key.ends_with("/inspector")));
+    let frame = tick_native(press(&frame, "Toggle sidebar"));
+    assert_eq!(fixed(&frame, "/sidebar"), Some(Length::Fixed(240.0)));
 }
 
 /// At boot the view asks for the session only; connected, it lists the
-/// directory itself and folds the rows, the counts and the snapshot rail.
+/// directory, the homes and the snapshots itself, and draws the sidebar's
+/// places, the rows with their kinds, the tally and the recents.
 #[test]
 fn a_connected_view_lists_its_own_directory() {
     let frame = boot();
@@ -221,16 +286,44 @@ fn a_connected_view_lists_its_own_directory() {
     assert!(has_text(&frame, "Not connected"), "{:?}", texts(&frame));
 
     let (frame, _held) = connected_with_listing();
-    for expected in ["duckfs", "/shared", "1 file, 1 folder", "README.md", "412 KB"] {
+    for expected in [
+        "Shared",
+        "My home",
+        "acct:3",
+        "Recents",
+        "first commit",
+        "h 84,912 · acct:9",
+        "docs",
+        "Folder",
+        "README.md",
+        "412 KB",
+        "Markdown",
+        "2 items, 1 folder",
+        "Nothing chosen",
+        "Drop a file on the window to upload it here",
+    ] {
         assert!(
             has_text(&frame, expected),
             "missing {expected:?} in {:?}",
             texts(&frame)
         );
     }
-    let frame = tick_native(press(&frame, "History"));
-    assert!(has_text(&frame, "block 84,912"), "{:?}", texts(&frame));
-    assert!(has_text(&frame, "first commit"), "{:?}", texts(&frame));
+    assert!(
+        !has_text(&frame, "acct:7"),
+        "the reader's own home is 'My home', not listed twice: {:?}",
+        texts(&frame)
+    );
+}
+
+/// The directory is asked for a page at a time, never walked whole.
+#[test]
+fn a_directory_is_read_one_page_at_a_time() {
+    let frame = boot();
+    let session_id = request(&frame, "files.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true))]);
+    let (_, params) = ls_of(&frame, "/shared");
+    assert_eq!(params["limit"], 200);
+    assert!(params["after"].is_null());
 }
 
 #[test]
@@ -239,22 +332,35 @@ fn disconnect_hides_retained_listing_and_write_controls() {
     assert!(has_text(&frame, "README.md"));
     let frame = tick_native(vec![item(held.session, &session(false))]);
     assert!(has_text(&frame, "Not connected"));
-    for stale in ["README.md", "1 file, 1 folder", "+ Folder", "+ File"] {
+    for stale in ["README.md", "2 items, 1 folder", "New folder", "New file"] {
         assert!(!has_text(&frame, stale), "disconnected claim: {stale}");
     }
 }
 
-/// Opening a directory reads THAT directory, and the rows on hand go silent
-/// until its own listing lands — a tally of the directory you left, printed
-/// under the one you opened, is wrong in every word.
+/// A single click chooses a row and a double-click opens it. Opening a
+/// directory reads THAT directory, and the rows on hand go silent until
+/// its own listing lands — a tally of the directory you left, printed under
+/// the one you opened, is wrong in every word.
 #[test]
-fn a_directory_opens_as_its_own_read_and_the_old_rows_go_silent() {
+fn a_click_chooses_and_a_double_click_opens_a_directory() {
     let (frame, _held) = connected_with_listing();
-    let frame = tick_native(press(&frame, "Open directory"));
-    let (_, params) = files_get(&frame, "ls");
-    assert_eq!(params["path"], "/shared/docs");
+    let frame = tick_native(press(&frame, "Folder docs"));
     assert!(
-        !has_text(&frame, "1 file, 1 folder"),
+        frame.requests.is_empty(),
+        "choosing a folder reads nothing: {:?}",
+        frame.requests
+    );
+    assert!(has_text(&frame, "/shared/docs"), "{:?}", texts(&frame));
+    assert!(has_text(&frame, "2 entries"), "Get Info counts the folder");
+    assert!(
+        has_text(&frame, "Rename"),
+        "the chosen row carries its actions"
+    );
+
+    let frame = tick_native(double_click(&frame, "/shared/docs"));
+    assert_eq!(ls_of(&frame, "/shared/docs").1["path"], "/shared/docs");
+    assert!(
+        !has_text(&frame, "2 items, 1 folder"),
         "the old tally survived the navigation: {:?}",
         texts(&frame)
     );
@@ -263,22 +369,80 @@ fn a_directory_opens_as_its_own_read_and_the_old_rows_go_silent() {
         br#"{"path":"/shared/docs"}"#,
         "the window's drop door is told where the view stands"
     );
+    let frame = settle_workspace(&frame, "/shared/docs", &empty_listing());
+    assert!(has_text(&frame, "Empty folder"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "0 items, 0 folders"),
+        "{:?}",
+        texts(&frame)
+    );
+}
 
-    let ls = files_get(&frame, "ls").0.id;
-    let frame = tick_native(vec![answer(
-        ls,
-        serde_json::json!({ "entries": [] }).to_string().as_bytes(),
-    )]);
-    let snapshots = files_get(&frame, "history").0.id;
-    let frame = tick_native(vec![answer(snapshots, &history())]);
-    assert!(has_text(&frame, "Nothing here yet"), "{:?}", texts(&frame));
+/// Back, Forward and Up walk the trail, each a read of the directory it
+/// lands on, and each disabled where the trail ends.
+#[test]
+fn back_forward_and_up_walk_the_trail() {
+    let (frame, _held) = connected_with_listing();
+    assert!(button_disabled(&frame, "Back"));
+    assert!(button_disabled(&frame, "Forward"));
+    let frame = tick_native(double_click(&frame, "/shared/docs"));
+    let frame = settle_workspace(&frame, "/shared/docs", &empty_listing());
+    assert!(!button_disabled(&frame, "Back"));
+
+    let frame = tick_native(press(&frame, "Back"));
+    assert_eq!(ls_of(&frame, "/shared").1["path"], "/shared");
+    let frame = settle_workspace(&frame, "/shared", &listing());
+    assert!(!button_disabled(&frame, "Forward"));
+    assert!(has_text(&frame, "README.md"));
+
+    let frame = tick_native(press(&frame, "Forward"));
+    assert_eq!(ls_of(&frame, "/shared/docs").1["path"], "/shared/docs");
+    let frame = settle_workspace(&frame, "/shared/docs", &empty_listing());
+
+    let frame = tick_native(press(&frame, "Up"));
+    assert_eq!(ls_of(&frame, "/shared").1["path"], "/shared");
+    assert!(
+        button_disabled(&frame, "Forward"),
+        "a fresh move clears what was ahead"
+    );
+    let frame = settle_workspace(&frame, "/shared", &listing());
+    let frame = tick_native(press(&frame, "Up"));
+    assert_eq!(ls_of(&frame, "/").1["path"], "/");
+    let frame = settle_workspace(&frame, "/", &empty_listing());
+    assert!(button_disabled(&frame, "Up"), "the root has no parent");
+}
+
+/// The path bar has one button per directory on the way here; the last is
+/// where the reader stands and does not press.
+#[test]
+fn the_path_bar_opens_any_directory_on_the_way() {
+    let (frame, _held) = connected_with_listing();
+    let frame = tick_native(double_click(&frame, "/shared/docs"));
+    let frame = settle_workspace(&frame, "/shared/docs", &empty_listing());
+    assert!(button_disabled(&frame, "Go to /shared/docs"));
+    let frame = tick_native(press(&frame, "Go to /shared"));
+    assert_eq!(ls_of(&frame, "/shared").1["path"], "/shared");
+    let frame = settle_workspace(&frame, "/shared", &listing());
+    let frame = tick_native(press(&frame, "Go to /"));
+    assert_eq!(ls_of(&frame, "/").1["path"], "/");
+}
+
+/// A sidebar place is a navigation like any other.
+#[test]
+fn a_sidebar_place_opens_its_directory() {
+    let (frame, _held) = connected_with_listing();
+    let frame = tick_native(press(&frame, "Go to /home/acct:7"));
+    assert_eq!(ls_of(&frame, "/home/acct:7").1["path"], "/home/acct:7");
+    let frame = settle_workspace(&frame, "/home/acct:7", &empty_listing());
+    let frame = tick_native(press(&frame, "Go to /home/acct:3"));
+    assert_eq!(ls_of(&frame, "/home/acct:3").1["path"], "/home/acct:3");
 }
 
 /// A `duck://files/<path>` link is a SESSION fact, not a navigation the app
 /// performs: the shell resolves the address and moves the tab, and the view
-/// lands on the file — its directory listed, the file itself previewed. The
-/// serial is what says a push happened, so the SAME path pushed again
-/// navigates again instead of reading as an unchanged value.
+/// lands on the file — its directory listed, the file itself chosen and
+/// read. The serial is what says a push happened, so the SAME path pushed
+/// again navigates again instead of reading as an unchanged value.
 #[test]
 fn a_duck_link_lands_the_view_on_the_file_it_names() {
     let (frame, held) = connected_with_listing();
@@ -291,7 +455,7 @@ fn a_duck_link_lands_the_view_on_the_file_it_names() {
         &routed_session(true, "/shared/docs/plan.md", 1),
     )]);
     assert_eq!(
-        files_get(&frame, "ls").1["path"],
+        ls_of(&frame, "/shared/docs").1["path"],
         "/shared/docs",
         "the address's directory is what the browser lists"
     );
@@ -302,7 +466,7 @@ fn a_duck_link_lands_the_view_on_the_file_it_names() {
     );
     assert!(
         !has_text(&frame, "/shared/README.md"),
-        "the object panel kept the file the reader left: {:?}",
+        "the inspector kept the file the reader left: {:?}",
         texts(&frame)
     );
     let head = files_get(&frame, "refs").0.id;
@@ -310,7 +474,7 @@ fn a_duck_link_lands_the_view_on_the_file_it_names() {
     assert_eq!(
         files_get(&frame, "read").1["path"],
         "/shared/docs/plan.md",
-        "the file the address named is what the preview reads"
+        "the file the address named is what the inspector reads"
     );
     let page = files_get(&frame, "read").0.id;
     tick_native(vec![answer(page, &read("the plan"))]);
@@ -321,7 +485,7 @@ fn a_duck_link_lands_the_view_on_the_file_it_names() {
         held.session,
         &routed_session(true, "/shared/docs/plan.md", 2),
     )]);
-    assert_eq!(files_get(&frame, "ls").1["path"], "/shared/docs");
+    assert_eq!(ls_of(&frame, "/shared/docs").1["path"], "/shared/docs");
     assert_eq!(
         files_get(&frame, "refs").1,
         serde_json::json!({}),
@@ -329,20 +493,32 @@ fn a_duck_link_lands_the_view_on_the_file_it_names() {
     );
 }
 
-/// A files block re-reads the directory through the live subscription.
+/// A files block re-reads the workspace through the one live subscription.
 #[test]
 fn a_live_hit_lists_the_directory_again() {
-    let (_, held) = connected_with_listing();
+    let (frame, held) = connected_with_listing();
+    assert_eq!(
+        frame
+            .requests
+            .iter()
+            .filter(|request| request.kind == "rpc.live")
+            .count(),
+        0,
+        "one live subscription, taken at connect: {:?}",
+        frame.requests
+    );
     let frame = tick_native(vec![item(held.live, b"{}")]);
-    assert_eq!(files_get(&frame, "ls").1["path"], "/shared");
+    assert_eq!(ls_of(&frame, "/shared").1["path"], "/shared");
 }
 
-/// A preview reads the HEAD SNAPSHOT first and then the page at it: the
-/// snapshot the text was read at is the save's CAS base.
+/// A chosen file reads the HEAD SNAPSHOT first and then the page at it: the
+/// snapshot the text was read at is the save's CAS base. Get Info asks
+/// which snapshot last touched the path.
 #[test]
-fn a_preview_reads_the_snapshot_it_will_save_against() {
+fn a_chosen_file_reads_the_snapshot_it_will_save_against() {
     let (frame, _held) = connected_with_listing();
-    let frame = tick_native(press(&frame, "Show object"));
+    let frame = tick_native(press(&frame, "File README.md"));
+    assert!(has_text(&frame, "Reading the file…"), "{:?}", texts(&frame));
     let (_, params) = files_get(&frame, "refs");
     assert_eq!(params, serde_json::json!({}));
     let head = files_get(&frame, "refs").0.id;
@@ -351,16 +527,69 @@ fn a_preview_reads_the_snapshot_it_will_save_against() {
     assert_eq!(params["path"], "/shared/README.md");
     assert_eq!(params["snapshot"], "cc".repeat(32));
     assert_eq!(params["len"], 65_536);
+    let page = files_get(&frame, "read").0.id;
+    let frame = tick_native(vec![answer(page, &read("# Hello"))]);
+    // the first snapshot has no parent and touched everything it holds
+    for expected in ["Modified", "h 84,912 (s1)", "Author", "acct:9"] {
+        assert!(
+            has_text(&frame, expected),
+            "{expected}: {:?}",
+            texts(&frame)
+        );
+    }
 }
 
-/// A typed name leaves as a duckfs commit the kernel signs, the bar waits for
-/// the answer, and the committed write consumes the name it read.
+/// The snapshot that last touched a path is found by diffing each snapshot
+/// against its parent under that prefix, newest first.
 #[test]
-fn a_new_folder_leaves_as_a_signed_commit_and_consumes_its_name() {
+fn get_info_walks_the_history_for_the_last_change() {
+    let frame = boot();
+    let session_id = request(&frame, "files.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true))]);
+    let ls = ls_of(&frame, "/shared").0.id;
+    let frame = tick_native(vec![answer(ls, &listing())]);
+    let home = ls_of(&frame, "/home").0.id;
+    let frame = tick_native(vec![answer(home, &homes())]);
+    let snapshots = files_get(&frame, "history").0.id;
+    let frame = tick_native(vec![answer(
+        snapshots,
+        serde_json::json!({ "snapshots": [
+            { "id": "s2", "parent": "s1", "author": { "Account": 4 }, "height": 90_000, "message": "later" },
+            { "id": "s1", "parent": null, "author": { "Account": 9 }, "height": 84_912, "message": "first" },
+        ]})
+        .to_string()
+        .as_bytes(),
+    )]);
+    let frame = tick_native(press(&frame, "Folder docs"));
+    assert!(has_text(&frame, "Looking…"), "{:?}", texts(&frame));
+    let (walk, params) = files_get(&frame, "diff");
+    assert_eq!(params["from"], "s1");
+    assert_eq!(params["to"], "s2");
+    assert_eq!(params["prefix"], "/shared/docs");
+    let frame = tick_native(vec![answer(
+        walk.id,
+        serde_json::json!({ "entries": [] }).to_string().as_bytes(),
+    )]);
+    assert!(
+        !has_request(&frame, "files.get"),
+        "the first snapshot needs no diff: {:?}",
+        frame.requests
+    );
+    assert!(has_text(&frame, "h 84,912 (s1)"), "{:?}", texts(&frame));
+    assert!(has_text(&frame, "acct:9"), "{:?}", texts(&frame));
+}
+
+/// A name typed into the New folder prompt leaves as a duckfs commit the
+/// kernel signs; the prompt waits for the answer and closes on it.
+#[test]
+fn a_new_folder_leaves_as_a_signed_commit_and_closes_its_prompt() {
     let (frame, _held) = connected_with_listing();
-    let frame = tick_native(type_into(&frame, "new name…", "  reports  "));
+    let frame = tick_native(press(&frame, "New folder"));
+    assert!(has_text(&frame, "Create folder"), "{:?}", texts(&frame));
+    assert!(button_disabled(&frame, "Create folder"), "no name yet");
+    let frame = tick_native(type_into(&frame, "Folder name", "  reports  "));
     assert!(frame.requests.is_empty(), "typing runs no handler");
-    let frame = tick_native(press(&frame, "+ Folder"));
+    let frame = tick_native(press(&frame, "Create folder"));
     // the head the commit lands on, read first
     let head = files_get(&frame, "refs").0.id;
     let frame = tick_native(vec![answer(head, &refs())]);
@@ -377,6 +606,7 @@ fn a_new_folder_leaves_as_a_signed_commit_and_consumes_its_name() {
             }},
         })
     );
+    assert!(has_text(&frame, "Writing…"), "{:?}", texts(&frame));
     assert_eq!(
         name_field(&frame),
         "  reports  ",
@@ -384,41 +614,329 @@ fn a_new_folder_leaves_as_a_signed_commit_and_consumes_its_name() {
     );
 
     let frame = tick_native(vec![answer(submit.id, b"42")]);
-    assert_eq!(name_field(&frame), "");
+    assert!(!has_text(&frame, "Create folder"), "the prompt closed");
     assert_eq!(
-        files_get(&frame, "ls").1["path"],
+        ls_of(&frame, "/shared").1["path"],
         "/shared",
         "a committed write re-reads the directory"
     );
 }
 
-/// A refused write says so in place and keeps the name draft.
+/// A refused write says so in place and keeps the prompt and its name.
 #[test]
 fn a_refused_write_is_shown_in_place_and_keeps_the_draft() {
     let (frame, _held) = connected_with_listing();
-    let frame = tick_native(type_into(&frame, "new name…", "reports"));
-    let frame = tick_native(press(&frame, "+ Folder"));
+    let frame = tick_native(press(&frame, "New file"));
+    let frame = tick_native(type_into(&frame, "File name", "notes.txt"));
+    let frame = tick_native(press(&frame, "Create file"));
     let head = files_get(&frame, "refs").0.id;
     let frame = tick_native(vec![answer(head, &refs())]);
     let submit = request(&frame, "op.submit").id;
     let frame = tick_native(vec![refuse(submit, "the local user key is locked")]);
     assert!(
+        has_text(&frame, "the local user key is locked"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert_eq!(name_field(&frame), "notes.txt");
+}
+
+/// Rename leaves as a duckfs `mv`, and the renamed entry stays chosen under
+/// its new name.
+#[test]
+fn a_rename_leaves_as_a_move_and_follows_the_entry() {
+    let (frame, _held) = connected_with_listing();
+    let frame = with_preview(&frame, "hello");
+    let frame = tick_native(press(&frame, "Rename README.md"));
+    assert_eq!(
+        name_field(&frame),
+        "README.md",
+        "the prompt starts from the name"
+    );
+    let frame = tick_native(type_into(&frame, "New name", "READ/ME.md"));
+    assert!(
+        button_disabled(&frame, "Confirm rename"),
+        "a slash is not a name"
+    );
+    assert!(has_text(&frame, "A name cannot contain a slash."));
+    let frame = tick_native(type_into(&frame, "New name", "GUIDE.md"));
+    let frame = tick_native(press(&frame, "Confirm rename"));
+    let head = files_get(&frame, "refs").0.id;
+    let frame = tick_native(vec![answer(head, &refs())]);
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op["payload"]["commit"]["message"],
+        "mv /shared/README.md /shared/GUIDE.md"
+    );
+    assert_eq!(
+        op["payload"]["commit"]["changes"][0],
+        serde_json::json!({ "mv": { "from": "/shared/README.md", "to": "/shared/GUIDE.md" } })
+    );
+    let frame = tick_native(vec![answer(submit.id, b"43")]);
+    assert!(has_text(&frame, "/shared/GUIDE.md"), "{:?}", texts(&frame));
+    assert!(
+        !has_text(&frame, "/shared/README.md"),
+        "{:?}",
+        texts(&frame)
+    );
+    let head = files_get(&frame, "refs").0.id;
+    let frame = tick_native(vec![answer(head, &refs())]);
+    assert_eq!(
+        files_get(&frame, "read").1["path"],
+        "/shared/GUIDE.md",
+        "the preview follows the rename"
+    );
+}
+
+/// The delete gate: the row's Delete arms a dialog naming the file, Cancel
+/// drops it, the confirmed delete leaves as a signed `rm` commit, and the
+/// committed delete clears the preview of the file that is gone.
+#[test]
+fn a_deleted_file_leaves_the_inspector_with_it() {
+    let (frame, _held) = connected_with_listing();
+    let frame = with_preview(&frame, "hello");
+    assert!(has_text(&frame, "Edit"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Delete README.md"));
+    assert!(has_text(&frame, "Delete this file"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Cancel"));
+    assert!(!has_text(&frame, "Delete this file"), "{:?}", texts(&frame));
+    assert!(frame.requests.is_empty(), "cancelling submits nothing");
+
+    let frame = tick_native(press(&frame, "Delete README.md"));
+    let frame = tick_native(press(&frame, "Delete file"));
+    let head = files_get(&frame, "refs").0.id;
+    let frame = tick_native(vec![answer(head, &refs())]);
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op["payload"]["commit"]["changes"][0],
+        serde_json::json!({ "rm": { "path": "/shared/README.md" } })
+    );
+    let frame = tick_native(vec![answer(submit.id, b"44")]);
+    assert!(!has_text(&frame, "Delete this file"), "the dialog closed");
+    assert!(has_text(&frame, "Nothing chosen"), "{:?}", texts(&frame));
+    assert!(
+        !has_text(&frame, "Edit"),
+        "no stale editor over a file that is gone"
+    );
+    assert!(
+        surface_names(&frame).is_empty(),
+        "no stale body: {:?}",
+        texts(&frame)
+    );
+    assert!(
+        !has_request(&frame, "files.get") || files_gets(&frame, "read").is_empty(),
+        "the gone file is not read again: {:?}",
+        frame.requests
+    );
+}
+
+/// A folder deletes as a whole subtree, and the dialog says so.
+#[test]
+fn a_folder_deletes_with_everything_in_it() {
+    let (frame, _held) = connected_with_listing();
+    let frame = tick_native(press(&frame, "Folder docs"));
+    let frame = tick_native(press(&frame, "Delete docs"));
+    assert!(
+        has_text(&frame, "Delete this folder and everything in it"),
+        "{:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(press(&frame, "Delete folder"));
+    let head = files_get(&frame, "refs").0.id;
+    let frame = tick_native(vec![answer(head, &refs())]);
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op["payload"]["commit"]["changes"][0],
+        serde_json::json!({ "rm": { "path": "/shared/docs" } })
+    );
+    let frame = tick_native(vec![answer(submit.id, b"45")]);
+    assert!(has_text(&frame, "Nothing chosen"), "{:?}", texts(&frame));
+}
+
+/// A listing the node refuses is a STATE the pane draws, with the way back
+/// beside it — never a loading word that stays. The write controls stay
+/// reachable.
+#[test]
+fn a_failed_listing_is_a_plate_with_a_retry() {
+    let frame = boot();
+    let session_id = request(&frame, "files.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true))]);
+    let ls = ls_of(&frame, "/shared").0.id;
+    let frame = tick_native(vec![refuse(ls, "files: path not found")]);
+    let home = ls_of(&frame, "/home").0.id;
+    let frame = tick_native(vec![answer(home, &homes())]);
+    let snapshots = files_get(&frame, "history").0.id;
+    let frame = tick_native(vec![answer(snapshots, &history())]);
+    assert!(
         has_text(
             &frame,
-            "Could not create the folder: the local user key is locked"
+            "Could not list this directory: files: path not found"
         ),
         "{:?}",
         texts(&frame)
     );
-    assert_eq!(name_field(&frame), "reports");
+    assert!(!has_text(&frame, "Loading…"), "{:?}", texts(&frame));
+    assert!(
+        !has_text(&frame, "Empty folder"),
+        "a refusal is not an empty directory"
+    );
+    assert!(
+        !button_disabled(&frame, "New folder"),
+        "the write bar stays reachable"
+    );
+    assert!(
+        has_text(&frame, "Shared"),
+        "the sidebar is drawn from its own reads"
+    );
+
+    let frame = tick_native(press(&frame, "Try again"));
+    assert_eq!(ls_of(&frame, "/shared").1["path"], "/shared");
+    let frame = settle_workspace(&frame, "/shared", &listing());
+    assert!(has_text(&frame, "README.md"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "Try again"));
 }
 
-/// A file that is not text gets a plate that says so, never a byte count or
-/// a blank code box; a read the node refuses closes the pane and says why.
+/// The column heads sort, folders staying first; the filter box narrows
+/// the rows and the tally says how many it kept.
+#[test]
+fn the_rows_sort_by_column_and_narrow_by_filter() {
+    let frame = boot();
+    let session_id = request(&frame, "files.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true))]);
+    let frame = settle_workspace(
+        &frame,
+        "/shared",
+        serde_json::json!({ "entries": [
+            { "path": "/shared/big.txt", "kind": "file", "size": 4_096, "object": "b" },
+            { "path": "/shared/docs", "kind": "dir", "size": 2, "object": "d" },
+            { "path": "/shared/small.txt", "kind": "file", "size": 12, "object": "s" },
+        ]})
+        .to_string()
+        .as_bytes(),
+    );
+    assert!(position(&frame, "docs") < position(&frame, "big.txt"));
+    assert!(position(&frame, "big.txt") < position(&frame, "small.txt"));
+    let frame = tick_native(press(&frame, "Sort by Size"));
+    assert!(has_text(&frame, "Size ▲"), "{:?}", texts(&frame));
+    assert!(position(&frame, "small.txt") < position(&frame, "big.txt"));
+    assert!(
+        position(&frame, "docs") < position(&frame, "small.txt"),
+        "folders first"
+    );
+    let frame = tick_native(press(&frame, "Sort by Size"));
+    assert!(has_text(&frame, "Size ▼"), "{:?}", texts(&frame));
+    assert!(position(&frame, "big.txt") < position(&frame, "small.txt"));
+
+    let frame = tick_native(type_into(&frame, "Filter by name", "SMALL"));
+    assert!(has_text(&frame, "small.txt"));
+    assert!(!has_text(&frame, "big.txt"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "1 of 3 items, 1 folder"),
+        "{:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(type_into(&frame, "Filter by name", "zzz"));
+    assert!(has_text(&frame, "No names match"), "{:?}", texts(&frame));
+}
+
+/// Arrows move the choice, Enter opens it, Backspace goes up, ⌘← goes
+/// back — and a key a field consumed never reaches the browser.
+#[test]
+fn the_keyboard_walks_the_rows_and_the_trail() {
+    let (_listed, _held) = connected_with_listing();
+    let frame = tick_native(key(keyboard::Named::ArrowDown, false));
+    assert!(
+        has_text(&frame, "/shared/docs"),
+        "the first row: {:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(key(keyboard::Named::ArrowDown, false));
+    assert!(has_text(&frame, "/shared/README.md"), "{:?}", texts(&frame));
+    assert!(has_request(&frame, "files.get"), "a chosen file reads");
+    let frame = tick_native(key(keyboard::Named::ArrowDown, false));
+    assert!(has_text(&frame, "/shared/README.md"), "clamped at the end");
+    let frame = tick_native(key(keyboard::Named::ArrowUp, false));
+    assert!(has_text(&frame, "/shared/docs"), "{:?}", texts(&frame));
+
+    let frame = tick_native(key(keyboard::Named::Enter, false));
+    assert_eq!(ls_of(&frame, "/shared/docs").1["path"], "/shared/docs");
+    let _settled = settle_workspace(&frame, "/shared/docs", &empty_listing());
+    let frame = tick_native(key(keyboard::Named::Backspace, false));
+    assert_eq!(ls_of(&frame, "/shared").1["path"], "/shared");
+    let _settled = settle_workspace(&frame, "/shared", &listing());
+    let frame = tick_native(key(keyboard::Named::ArrowLeft, true));
+    assert_eq!(ls_of(&frame, "/shared/docs").1["path"], "/shared/docs");
+
+    // a captured press is the field's, not the browser's
+    let mut captured = key(keyboard::Named::Backspace, false);
+    if let Some(Event::Keyboard { captured: flag, .. }) = captured.first_mut() {
+        *flag = true;
+    }
+    let frame = tick_native(captured);
+    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
+}
+
+/// A directory past one page is shown to the page and says so; Load more
+/// walks one more page rather than the whole directory.
+#[test]
+fn a_long_directory_loads_a_page_at_a_time() {
+    let frame = boot();
+    let session_id = request(&frame, "files.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true))]);
+    let first_page = serde_json::json!({
+        "entries": [{ "path": "/shared/a.txt", "kind": "file", "size": 1, "object": "a" }],
+        "next": "a.txt",
+    })
+    .to_string();
+    let frame = settle_workspace(&frame, "/shared", first_page.as_bytes());
+    assert!(
+        has_text(&frame, "The first 1 entries are shown."),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(has_text(&frame, "· more not shown"), "{:?}", texts(&frame));
+
+    let frame = tick_native(press(&frame, "Load more"));
+    let (page_one, params) = ls_of(&frame, "/shared");
+    assert!(params["after"].is_null(), "the walk starts over: {params}");
+    let frame = tick_native(vec![answer(page_one.id, first_page.as_bytes())]);
+    let (page_two, params) = ls_of(&frame, "/shared");
+    assert_eq!(
+        params["after"], "a.txt",
+        "the second page follows the cursor"
+    );
+    let frame = tick_native(vec![answer(
+        page_two.id,
+        serde_json::json!({
+            "entries": [{ "path": "/shared/b.txt", "kind": "file", "size": 2, "object": "b" }],
+        })
+        .to_string()
+        .as_bytes(),
+    )]);
+    let home = ls_of(&frame, "/home").0.id;
+    let frame = tick_native(vec![answer(home, &homes())]);
+    let snapshots = files_get(&frame, "history").0.id;
+    let frame = tick_native(vec![answer(snapshots, &history())]);
+    assert!(
+        has_text(&frame, "a.txt") && has_text(&frame, "b.txt"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(!has_text(&frame, "Load more"), "the directory ended");
+    assert!(
+        has_text(&frame, "2 items, 0 folders"),
+        "{:?}",
+        texts(&frame)
+    );
+}
+
 #[test]
 fn a_binary_file_and_a_refused_read_each_say_so_in_words() {
     let (frame, _held) = connected_with_listing();
-    let frame = tick_native(press(&frame, "Show object"));
+    let frame = tick_native(press(&frame, "File README.md"));
     assert!(has_text(&frame, "Reading the file…"), "{:?}", texts(&frame));
     let head = files_get(&frame, "refs").0.id;
     let frame = tick_native(vec![answer(head, &refs())]);
@@ -434,13 +952,9 @@ fn a_binary_file_and_a_refused_read_each_say_so_in_words() {
     assert!(!has_text(&frame, "Edit"), "bytes are not edited in place");
 
     // the same file, read again, refused by the node
-    let frame = tick_native(press(&frame, "Open directory"));
-    let ls = files_get(&frame, "ls").0.id;
-    let frame = tick_native(vec![answer(ls, &listing())]);
-    let snapshots = files_get(&frame, "history").0.id;
-    let frame = tick_native(vec![answer(snapshots, &history())]);
-    let frame = tick_native(press(&frame, "Show object"));
+    let frame = tick_native(press(&frame, "Refresh"));
     let head = files_get(&frame, "refs").0.id;
+    let _settled = settle_workspace(&frame, "/shared", &listing());
     let frame = tick_native(vec![refuse(head, "not connected to a node")]);
     assert!(
         has_text(&frame, "Could not read this file: not connected to a node"),
@@ -449,64 +963,50 @@ fn a_binary_file_and_a_refused_read_each_say_so_in_words() {
     );
     assert!(
         !has_text(&frame, "Reading the file…"),
-        "the pane closed: {:?}",
+        "the wait ended: {:?}",
+        texts(&frame)
+    );
+    assert!(
+        has_text(&frame, "README.md"),
+        "the choice stays: {:?}",
         texts(&frame)
     );
 }
 
-/// The delete gate: the button arms a dialog naming the file, Cancel drops
-/// it, and the confirmed delete leaves as a signed `rm` commit.
+/// A recent snapshot opens its comparison against the head in the
+/// inspector; the changes read as words with a tone, never the wire's
+/// letter, and each path is a way to its directory.
 #[test]
-fn a_delete_is_confirmed_in_a_dialog_before_it_leaves() {
+fn a_recent_snapshot_compares_against_the_head() {
     let (frame, _held) = connected_with_listing();
-    let frame = with_preview(&frame, "hello");
-    assert!(!has_text(&frame, "Delete this object"));
-    let frame = tick_native(press(&frame, "Delete object"));
-    assert!(has_text(&frame, "Delete this object"), "{:?}", texts(&frame));
-    let frame = tick_native(press(&frame, "Cancel"));
-    assert!(!has_text(&frame, "Delete this object"), "{:?}", texts(&frame));
-    assert!(frame.requests.is_empty(), "cancelling submits nothing");
-
-    let frame = tick_native(press(&frame, "Delete object"));
-    // the header's button is disarmed while the dialog is up: the dialog's
-    // own is the one that presses
-    let confirm = keys(&frame)
-        .into_iter()
-        .find(|key| key.ends_with("/confirm-delete/delete"))
-        .expect("the dialog's delete button");
-    let frame = tick_native(press(&frame, &confirm));
+    let frame = tick_native(press(&frame, "Compare snapshot s1"));
     let head = files_get(&frame, "refs").0.id;
     let frame = tick_native(vec![answer(head, &refs())]);
-    let op: serde_json::Value =
-        serde_json::from_slice(&request(&frame, "op.submit").payload).expect("an op decodes");
-    assert_eq!(
-        op["payload"]["commit"]["changes"][0],
-        serde_json::json!({ "rm": { "path": "/shared/README.md" } })
-    );
-}
-
-/// A snapshot's changes read as words with a tone, never the wire's letter.
-#[test]
-fn a_diff_names_its_kinds_in_words() {
-    let (frame, _held) = connected_with_listing();
-    let frame = tick_native(press(&frame, "History"));
-    let frame = tick_native(press(&frame, "Compare"));
-    let head = files_get(&frame, "refs").0.id;
-    let frame = tick_native(vec![answer(head, &refs())]);
-    let diff = files_get(&frame, "diff").0.id;
+    let (diff, params) = files_get(&frame, "diff");
+    assert_eq!(params["from"], "s1");
+    assert_eq!(params["to"], "cc".repeat(32));
     let frame = tick_native(vec![answer(
-        diff,
+        diff.id,
         serde_json::json!({ "entries": [
-            { "path": "/shared/a.md", "kind": "A" },
-            { "path": "/shared/b.md", "kind": "modified" },
+            { "path": "/shared/docs/a.md", "kind": "added" },
+            { "path": "/shared/b.md", "kind": "X" },
         ]})
         .to_string()
         .as_bytes(),
     )]);
-    for expected in ["Changes since this snapshot", "Added", "Changed"] {
-        assert!(has_text(&frame, expected), "{expected}: {:?}", texts(&frame));
+    for expected in ["Since s1", "Added", "Changed", "/shared/docs/a.md"] {
+        assert!(
+            has_text(&frame, expected),
+            "{expected}: {:?}",
+            texts(&frame)
+        );
     }
-    assert!(!has_text(&frame, "A"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "X"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Go to /shared/docs/a.md"));
+    assert_eq!(ls_of(&frame, "/shared/docs").1["path"], "/shared/docs");
+    let frame = settle_workspace(&frame, "/shared/docs", &empty_listing());
+    let frame = tick_native(press(&frame, "Done"));
+    assert!(!has_text(&frame, "Since s1"), "{:?}", texts(&frame));
 }
 
 /// The root is nobody's to write in, and the view says so from the module's
@@ -514,24 +1014,22 @@ fn a_diff_names_its_kinds_in_words() {
 #[test]
 fn a_root_directory_refuses_the_write_bar_before_the_round_trip() {
     let (frame, _held) = connected_with_listing();
-    let frame = tick_native(press(&frame, "Go to the duckfs root"));
-    let ls = files_get(&frame, "ls").0.id;
-    let frame = tick_native(vec![answer(
-        ls,
-        serde_json::json!({ "entries": [] }).to_string().as_bytes(),
-    )]);
-    let snapshots = files_get(&frame, "history").0.id;
-    let frame = tick_native(vec![answer(snapshots, &history())]);
+    let frame = tick_native(press(&frame, "Go to /"));
+    let frame = settle_workspace(&frame, "/", &empty_listing());
     assert!(
-        has_text(&frame, "path is outside /home and /shared"),
+        has_text(
+            &frame,
+            "Nothing can be written here: path is outside /home and /shared."
+        ),
         "{:?}",
         texts(&frame)
     );
-    assert!(button_disabled(&frame, "+ Folder"));
+    assert!(button_disabled(&frame, "New folder"));
+    assert!(button_disabled(&frame, "New file"));
 }
 
-/// A Markdown preview reads as a document through the host's surface; a save
-/// carries the SNAPSHOT THE TEXT WAS READ AT, never the head it raced.
+/// A Markdown preview reads as a document through the host's surface; a
+/// save carries the SNAPSHOT THE TEXT WAS READ AT, never the head it raced.
 #[test]
 fn an_edited_body_saves_against_the_snapshot_it_was_read_at() {
     let (frame, _held) = connected_with_listing();
@@ -552,6 +1050,7 @@ fn an_edited_body_saves_against_the_snapshot_it_was_read_at() {
         op["payload"]["commit"]["changes"][0]["put"]["path"],
         "/shared/README.md"
     );
+    assert!(has_text(&frame, "Saving…"), "{:?}", texts(&frame));
     assert!(
         has_text(&frame, "Save"),
         "unacknowledged edits stay in the editor"
@@ -574,7 +1073,8 @@ fn a_parked_draft_keeps_its_bytes_and_never_retargets() {
         .find(|key| key.ends_with("/fs-editor"))
         .expect("the editor");
     let (editing, before) = read_draft(&editing);
-    tick_native(edit(&editing, &editor_key, &before, "unsaved A — 한글"));
+    let editing = tick_native(edit(&editing, &editor_key, &before, "unsaved A — 한글"));
+    let queued_save = press(&editing, "Save");
 
     // the network moves under the draft
     let frame = tick_native(vec![item(
@@ -583,6 +1083,7 @@ fn a_parked_draft_keeps_its_bytes_and_never_retargets() {
             connected: true,
             dark: false,
             chain: "chain-b".into(),
+            account: "7".into(),
             route: String::new(),
             route_serial: 0,
         })
@@ -593,12 +1094,10 @@ fn a_parked_draft_keeps_its_bytes_and_never_retargets() {
         "{:?}",
         texts(&frame)
     );
+    let frame = tick_native(queued_save);
     assert!(
-        !frame
-            .requests
-            .iter()
-            .any(|request| request.kind == "op.submit"),
-        "parking a draft never submits: {:?}",
+        !has_request(&frame, "op.submit"),
+        "a parked draft never submits: {:?}",
         frame.requests
     );
 
@@ -616,11 +1115,11 @@ fn a_parked_draft_keeps_its_bytes_and_never_retargets() {
     );
 }
 
-/// What the write bar's name field reads now.
+/// What the name prompt's field reads now.
 fn name_field(frame: &Frame) -> String {
     let key = keys(frame)
         .into_iter()
-        .find(|key| key.ends_with("/fs-new"))
+        .find(|key| key.ends_with("/name-prompt/name"))
         .expect("the name field");
     match find(frame, &key) {
         Some(Node::Input { value, .. }) => value.clone(),
@@ -647,7 +1146,7 @@ fn button_disabled(frame: &Frame, name: &str) -> bool {
             }
         }
     });
-    disabled.expect("the button is in the tree")
+    disabled.unwrap_or_else(|| panic!("no button {name:?} in {:?}", texts(frame)))
 }
 
 /// Every host surface the tree leaves a slot for.
@@ -687,7 +1186,7 @@ fn read_draft(frame: &Frame) -> (Frame, String) {
         attempt: 0,
     };
     let mut receiver = EditorTransferReceiver::new(id.clone(), document.clone()).unwrap();
-    let mut events = vec![ducktape_view_guest::wire::Event::EditorDocument {
+    let mut events = vec![Event::EditorDocument {
         handler,
         message: Message::Request {
             id: id.clone(),
@@ -701,7 +1200,7 @@ fn read_draft(frame: &Frame) -> (Frame, String) {
                 panic!("document transfer: {message:?}");
             };
             if let Some(text) = receiver.receive(transfer).unwrap() {
-                let settled = tick_native(vec![ducktape_view_guest::wire::Event::EditorDocument {
+                let settled = tick_native(vec![Event::EditorDocument {
                     handler,
                     message: Message::Acknowledged { id },
                 }]);

@@ -1,44 +1,111 @@
+//! The Files view's state, its messages and its subscriptions: a Finder-style
+//! browser over duckfs. The sidebar names the places (shared, the homes,
+//! recent snapshots), the toolbar carries Back / Forward / Up, the path bar,
+//! the actions and the filter, the main pane lists the directory as rows or
+//! as Miller columns, the inspector previews the chosen file and states what
+//! is known about it, and the status bar counts what is on screen.
+
 use ducktape_view_guest::{kit as native, wire};
-#[derive(Default)]
-struct DerivedCache {
-    refusal: ::std::cell::OnceCell<String>,
-    loading: ::std::cell::OnceCell<bool>,
-    draft_here: ::std::cell::OnceCell<bool>,
-    draft_parked: ::std::cell::OnceCell<bool>,
-    edit_context: ::std::cell::OnceCell<String>,
+
+use crate::host::{FsEntry, FsSnapshot};
+use browse::{Act, BrowseKey, Listing, NamePrompt, Navigation, Sort, SortKey, ViewMode};
+
+/// The chosen file's read, as the inspector shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Preview {
+    pub path: String,
+    pub base: String,
+    pub text: String,
+    pub display_text: String,
+    pub clipped: bool,
+    pub truncated: bool,
+    pub binary: bool,
+    pub picture: bool,
+    pub width: i64,
+    pub height: i64,
+    pub error: String,
 }
+
+impl Preview {
+    /// A file just chosen: the path is set and nothing has been read yet.
+    pub(crate) fn of(path: &str) -> Self {
+        Self {
+            path: path.to_owned(),
+            ..Self::default()
+        }
+    }
+
+    /// Has the read landed? Until the head snapshot arrives with the page,
+    /// nothing has been read and a blank body would read as an empty file.
+    pub(crate) fn is_read(&self) -> bool {
+        !self.base.is_empty() || self.binary || self.picture || !self.error.is_empty()
+    }
+}
+
+/// The snapshot that last touched the chosen path, once the walk answers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Provenance {
+    pub path: String,
+    pub snapshot: FsSnapshot,
+    pub searched: i64,
+    pub answered: bool,
+    pub error: String,
+}
+
+/// A write in flight, or none. One value: the toolbar's wait word, the
+/// disabled controls and the completion handler all read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Writing {
+    Idle,
+    Busy(Act),
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct FilesView {
+    // ---- the session ----
     pub(crate) connected: bool,
     pub(crate) dark: bool,
+    /// the network a draft belongs to, across reconnections to it
     pub(crate) chain: String,
+    /// the reader's account, which names her home
+    pub(crate) account: String,
+    /// moves when the session comes up and after every write: every read restarts
     pub(crate) generation: i64,
+    /// the last `duck://files/...` push this view has landed on
     pub(crate) route_serial: i64,
-    pub(crate) path: String,
-    pub(crate) listed: bool,
-    pub(crate) entries: Vec<crate::host::FsEntry>,
-    pub(crate) directories: Vec<crate::host::FsEntry>,
-    pub(crate) history: Vec<crate::host::FsSnapshot>,
-    pub(crate) omitted: i64,
-    pub(crate) diff_omitted: i64,
-    pub(crate) preview_path: String,
-    pub(crate) preview_entry: crate::host::FsEntry,
-    pub(crate) preview_base: String,
-    pub(crate) preview_text: String,
-    pub(crate) preview_display_text: String,
-    pub(crate) preview_clipped: bool,
-    pub(crate) preview_truncated: bool,
-    pub(crate) preview_binary: bool,
-    pub(crate) preview_picture: bool,
-    pub(crate) preview_width: i64,
-    pub(crate) preview_height: i64,
-    pub(crate) delete_target: String,
+    // ---- where the reader stands ----
+    pub(crate) nav: Navigation,
+    pub(crate) listing: Listing,
+    /// how many pages of the directory have been asked for
+    pub(crate) pages: i64,
+    /// the directories open to the right of the current one, in column view
+    pub(crate) columns: Vec<String>,
+    pub(crate) column_listings: std::collections::BTreeMap<String, Listing>,
+    pub(crate) homes: Vec<FsEntry>,
+    pub(crate) history: Vec<FsSnapshot>,
+    pub(crate) history_error: String,
+    // ---- what is chosen ----
+    /// the chosen row: a file (then previewed) or a folder (then inspected)
+    pub(crate) selected: String,
+    pub(crate) preview: Preview,
+    pub(crate) provenance: Provenance,
     pub(crate) diff_from: String,
     pub(crate) diff: Vec<crate::host::FsDiffEntry>,
-    pub(crate) acting: bool,
-    pub(crate) saving: bool,
+    pub(crate) diff_omitted: i64,
+    // ---- how the pane is laid out ----
+    pub(crate) view_mode: ViewMode,
+    pub(crate) sort: Sort,
+    pub(crate) filter: String,
+    pub(crate) sidebar_open: bool,
+    pub(crate) inspector_open: bool,
+    // ---- the writes ----
+    pub(crate) name_prompt: NamePrompt,
+    pub(crate) name_draft: String,
+    pub(crate) delete_target: String,
+    pub(crate) writing: Writing,
+    /// the last refusal or failure the view has to say
     pub(crate) notice: String,
-    pub(crate) new_name: String,
+    // ---- the editor over the previewed file ----
     #[serde(with = "draft_snapshot")]
     pub(crate) draft: ::ducktape_view_guest::Editor,
     pub(crate) editing: bool,
@@ -46,57 +113,78 @@ pub struct FilesView {
     pub(crate) draft_path: String,
     pub(crate) draft_base: String,
     pub(crate) draft_id: i64,
+    /// a write's acknowledgement — `host::notify` returns nothing to bind
     pub(crate) sent: bool,
+    // ---- the geometry ----
     pub(crate) viewport_width: f64,
     pub(crate) viewport_height: f64,
-    pub(crate) tree_width: f64,
-    pub(crate) preview_pane_height: f64,
-    pub(crate) object_width: f64,
-    #[serde(skip)]
-    derived: DerivedCache,
-    pub(crate) history_open: bool,
+    pub(crate) sidebar_width: f64,
+    pub(crate) inspector_width: f64,
 }
+
 impl ::std::fmt::Debug for FilesView {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
         formatter.write_str("FilesView")
     }
 }
+
 #[derive(Clone)]
 pub enum Message {
-    TreeResized(f64, f64),
-    PreviewResized(f64, f64),
-    ObjectResized(f64, f64),
-    ViewportChanged(f64, f64),
+    // the readings
     SessionArrived(crate::host::SessionItem),
     RouteTo(String),
-    ListingArrived(crate::host::ListingItem),
+    WorkspaceArrived(crate::host::WorkspaceItem),
     PreviewArrived(crate::host::PreviewItem),
+    ProvenanceArrived(crate::host::ProvenanceItem),
     DiffArrived(crate::host::DiffItem),
     ActDone(crate::host::ActItem),
-    OpenDirAt(String),
-    OpenFileAt(String),
-    MkdirSubmit,
-    NewFileSubmit,
-    ArmDeleteAt(String),
-    DisarmDeleteNow,
+    // the navigation
+    Navigate(String),
+    Back,
+    Forward,
+    Parent,
+    Refresh,
+    LoadMore,
+    Select(String),
+    Open(String),
+    KeyPressed(BrowseKey),
+    // the pane
+    SetViewMode(ViewMode),
+    SortBy(SortKey),
+    FilterChanged(String),
+    ToggleSidebar,
+    ToggleInspector,
+    // the writes
+    Prompt(NamePrompt),
+    NameChanged(String),
+    NameSubmit,
+    ArmDelete(String),
+    DisarmDelete,
     DeleteSubmit,
-    CloseDiffNow,
+    // the history
     ShowDiffOf(String),
+    CloseDiff,
+    // the editor
     BeginEdit(String),
     CancelEdit(String),
     DiscardDraft(i64),
     SaveEdit(String),
-    OpenLinkAt(String),
-    ToggleHistory,
-    NewNameChanged(String),
     EditDraft(::ducktape_view_guest::EditorDocumentUpdate),
     DraftTransaction(::ducktape_view_guest::EditorTransaction<Message>),
+    // the app's doors
+    OpenLinkAt(String),
+    // the geometry
+    SidebarResized(f64, f64),
+    InspectorResized(f64, f64),
+    ViewportChanged(f64, f64),
 }
+
 impl ::std::fmt::Debug for Message {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
         formatter.write_str("Message")
     }
 }
+
 impl FilesView {
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
@@ -124,9 +212,8 @@ impl FilesView {
         let dimensions = [
             self.viewport_width,
             self.viewport_height,
-            self.tree_width,
-            self.preview_pane_height,
-            self.object_width,
+            self.sidebar_width,
+            self.inspector_width,
         ];
         if dimensions.into_iter().all(f64::is_finite) {
             Ok(())
@@ -135,39 +222,64 @@ impl FilesView {
         }
     }
 
-    #[must_use]
-    fn derived_refusal(&self) -> &String {
-        self.derived
-            .refusal
-            .get_or_init(|| crate::host::write_refusal(::std::convert::AsRef::as_ref(&(self.path))))
+    // ---- the readings the screen and the handlers share ----
+
+    /// duckfs's write rule for the current directory, or "".
+    pub(crate) fn refusal(&self) -> String {
+        crate::host::write_refusal(&self.nav.path)
     }
-    fn derived_loading(&self) -> &bool {
-        self.derived
-            .loading
-            .get_or_init(|| (self.acting || self.saving) || (self.connected && (!self.listed)))
+
+    /// A write is out, or the directory has not answered yet: the controls
+    /// that would race it wait.
+    pub(crate) fn loading(&self) -> bool {
+        self.writing != Writing::Idle || (self.connected && self.listing.is_pending())
     }
-    fn derived_draft_here(&self) -> &bool {
-        self.derived.draft_here.get_or_init(|| {
-            (self.editing && (self.draft_path == self.preview_path))
-                && (self.draft_chain == self.chain)
-        })
+
+    pub(crate) fn busy_writing(&self) -> bool {
+        self.writing != Writing::Idle
     }
-    fn derived_draft_parked(&self) -> &bool {
-        self.derived
-            .draft_parked
-            .get_or_init(|| self.editing && (!(*self.derived_draft_here())))
+
+    pub(crate) fn draft_here(&self) -> bool {
+        self.editing && self.draft_path == self.preview.path && self.draft_chain == self.chain
     }
-    fn derived_edit_context(&self) -> &String {
-        self.derived.edit_context.get_or_init(|| {
-            crate::host::edit_token(
-                ::std::convert::AsRef::as_ref(&(self.chain)),
-                ::std::convert::AsRef::as_ref(&(self.preview_path)),
-                ::std::convert::AsRef::as_ref(&(self.preview_base)),
-                self.draft_id,
-            )
-        })
+
+    pub(crate) fn draft_parked(&self) -> bool {
+        self.editing && !self.draft_here()
+    }
+
+    pub(crate) fn edit_context(&self) -> String {
+        crate::host::edit_token(
+            &self.chain,
+            &self.preview.path,
+            &self.preview.base,
+            self.draft_id,
+        )
+    }
+
+    /// The reader's own home, or "" while the session names no account.
+    pub(crate) fn home(&self) -> String {
+        crate::host::home_of(&self.account)
+    }
+
+    /// The rows the main pane shows for the current directory.
+    pub(crate) fn rows(&self) -> Vec<FsEntry> {
+        browse::visible_rows(self.listing.entries(), &self.filter, self.sort)
+    }
+
+    /// The chosen row, as the listing on hand knows it.
+    pub(crate) fn selected_entry(&self) -> FsEntry {
+        let in_place = crate::host::entry_named(self.listing.entries(), &self.selected);
+        if !in_place.path.is_empty() {
+            return in_place;
+        }
+        self.column_listings
+            .values()
+            .map(|listing| crate::host::entry_named(listing.entries(), &self.selected))
+            .find(|entry| !entry.path.is_empty())
+            .unwrap_or_default()
     }
 }
+
 mod draft_snapshot {
     use serde::{Deserialize, Serialize};
 
@@ -186,104 +298,134 @@ mod draft_snapshot {
             .ok_or_else(|| serde::de::Error::custom("invalid draft snapshot"))
     }
 }
+
 impl FilesView {
     fn state() -> Self {
         Self {
             connected: false,
             dark: false,
-            chain: "".to_owned(),
+            chain: String::new(),
+            account: String::new(),
             generation: 0,
             route_serial: 0,
-            path: "/shared".to_owned(),
-            listed: false,
-            entries: Vec::new(),
-            directories: Vec::new(),
+            nav: Navigation::at("/shared"),
+            listing: Listing::Pending,
+            pages: 1,
+            columns: Vec::new(),
+            column_listings: Default::default(),
+            homes: Vec::new(),
             history: Vec::new(),
-            omitted: 0,
-            diff_omitted: 0,
-            preview_path: "".to_owned(),
-            preview_entry: crate::host::no_fs_entry(),
-            preview_base: "".to_owned(),
-            preview_text: "".to_owned(),
-            preview_display_text: "".to_owned(),
-            preview_clipped: false,
-            preview_truncated: false,
-            preview_binary: false,
-            preview_picture: false,
-            preview_width: 0,
-            preview_height: 0,
-            delete_target: "".to_owned(),
-            diff_from: "".to_owned(),
+            history_error: String::new(),
+            selected: String::new(),
+            preview: Preview::default(),
+            provenance: Provenance::default(),
+            diff_from: String::new(),
             diff: Vec::new(),
-            acting: false,
-            saving: false,
-            notice: "".to_owned(),
-            new_name: "".to_owned(),
-            draft: ::ducktape_view_guest::Editor::new("".to_owned()),
+            diff_omitted: 0,
+            view_mode: ViewMode::List,
+            sort: Sort::BY_NAME,
+            filter: String::new(),
+            sidebar_open: true,
+            inspector_open: true,
+            name_prompt: NamePrompt::Closed,
+            name_draft: String::new(),
+            delete_target: String::new(),
+            writing: Writing::Idle,
+            notice: String::new(),
+            draft: ::ducktape_view_guest::Editor::new(String::new()),
             editing: false,
-            draft_chain: "".to_owned(),
-            draft_path: "".to_owned(),
-            draft_base: "".to_owned(),
+            draft_chain: String::new(),
+            draft_path: String::new(),
+            draft_base: String::new(),
             draft_id: 0,
             sent: false,
             viewport_width: 1280.0,
             viewport_height: 700.0,
-            tree_width: 240.0,
-            preview_pane_height: 300.0,
-            object_width: 306.0,
-            derived: ::std::default::Default::default(),
-            history_open: false,
+            sidebar_width: 200.0,
+            inspector_width: 340.0,
         }
     }
+
     pub(crate) fn boot() -> (Self, ::ducktape_view_guest::Task<Message>) {
         (Self::state(), ::ducktape_view_guest::Task::none())
     }
+
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "524542bd8f5b55e48d5274087dd4997a644784746056385b50157aadfe239bba";
+        "7f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
 }
+
 impl FilesView {
     pub(crate) fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
-        ::ducktape_view_guest::Subscription::batch([
+        use ::ducktape_view_guest::Subscription;
+        let connected = self.connected;
+        let previewing = connected && !self.preview.path.is_empty();
+        let inspecting = connected && !self.selected.is_empty() && !self.history.is_empty();
+        let comparing = connected && !self.diff_from.is_empty();
+        let columns = match self.view_mode {
+            ViewMode::Columns => self.columns.clone(),
+            ViewMode::List => Vec::new(),
+        };
+        Subscription::batch([
             crate::host::session().map(Message::SessionArrived),
-            if self.connected {
-                ::ducktape_view_guest::Subscription::batch([crate::host::listing(
+            gated(connected, || {
+                crate::host::workspace(self.generation, self.nav.path.clone(), self.pages, columns)
+                    .map(Message::WorkspaceArrived)
+            }),
+            gated(previewing, || {
+                crate::host::preview(self.generation, self.preview.path.clone())
+                    .map(Message::PreviewArrived)
+            }),
+            gated(inspecting, || {
+                crate::host::provenance(
                     self.generation,
-                    self.path.to_owned(),
+                    self.selected.clone(),
+                    self.history.clone(),
                 )
-                .map(Message::ListingArrived)])
-            } else {
-                ::ducktape_view_guest::Subscription::none()
-            },
-            if self.connected && (!(self.preview_path).is_empty()) {
-                ::ducktape_view_guest::Subscription::batch([crate::host::preview(
-                    self.generation,
-                    self.preview_path.to_owned(),
-                )
-                .map(Message::PreviewArrived)])
-            } else {
-                ::ducktape_view_guest::Subscription::none()
-            },
-            if self.connected && (!(self.diff_from).is_empty()) {
-                ::ducktape_view_guest::Subscription::batch([crate::host::diff(
-                    self.generation,
-                    self.diff_from.to_owned(),
-                )
-                .map(Message::DiffArrived)])
-            } else {
-                ::ducktape_view_guest::Subscription::none()
-            },
+                .map(Message::ProvenanceArrived)
+            }),
+            gated(comparing, || {
+                crate::host::diff(self.generation, self.diff_from.clone()).map(Message::DiffArrived)
+            }),
             crate::host::acts().map(Message::ActDone),
+            // A key the focused control did not take is the browser's:
+            // arrows move the selection, Enter opens it, Backspace and ⌘↑ go
+            // up, ⌘← / ⌘→ walk the trail. A press a field consumed never
+            // arrives here, so typing a name is never a navigation.
+            gated(connected, || {
+                Subscription::filter_events(|event| match event {
+                    wire::Event::Keyboard {
+                        event: wire::keyboard::Event::Press { state, .. },
+                        captured: false,
+                    } => match browse::browse_key(state) {
+                        BrowseKey::Ignored => None,
+                        key => Some(Message::KeyPressed(key)),
+                    },
+                    _ => None,
+                })
+            }),
         ])
     }
 }
+
+/// A subscription that exists only while its condition holds.
+fn gated<M: 'static>(
+    on: bool,
+    make: impl FnOnce() -> ::ducktape_view_guest::Subscription<M>,
+) -> ::ducktape_view_guest::Subscription<M> {
+    match on {
+        true => make(),
+        false => ::ducktape_view_guest::Subscription::none(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn snapshot_preserves_unsaved_document_and_browser_state() {
         let (mut app, _) = FilesView::boot();
-        app.history_open = true;
         app.chain = "chain-a".into();
         app.editing = true;
         app.draft_chain = app.chain.clone();
@@ -291,24 +433,26 @@ mod tests {
         app.draft_base = "base".into();
         app.draft_id = 42;
         app.draft = ducktape_view_guest::Editor::new("unsaved 한글\nsecond line");
-        app.tree_width = 245.;
-        app.object_width = 355.;
-        app.preview_pane_height = 288.;
+        app.nav.go("/shared/docs");
+        app.view_mode = ViewMode::Columns;
+        app.sort = Sort::BY_NAME.toggled(SortKey::Size);
+        app.sidebar_width = 245.;
+        app.inspector_width = 355.;
         let bytes = app.snapshot().unwrap();
         let restored = FilesView::restore(&bytes).unwrap();
         assert_eq!(restored.snapshot().unwrap(), bytes);
         assert_eq!(restored.draft.text(), "unsaved 한글\nsecond line");
-        assert!(restored.history_open);
         assert_eq!(restored.draft_path, "/shared/draft.md");
+        assert_eq!(restored.nav.path, "/shared/docs");
+        assert_eq!(restored.nav.back, ["/shared"]);
+        assert_eq!(restored.view_mode, ViewMode::Columns);
+        assert_eq!(restored.sort.key, SortKey::Size);
         assert_eq!(
-            (
-                restored.tree_width,
-                restored.object_width,
-                restored.preview_pane_height
-            ),
-            (245., 355., 288.)
+            (restored.sidebar_width, restored.inspector_width),
+            (245., 355.)
         );
     }
+
     #[test]
     fn snapshot_rejects_wrong_schema_and_invalid_editor_state() {
         let (app, _) = FilesView::boot();
@@ -321,17 +465,9 @@ mod tests {
     }
 
     #[test]
-    fn restored_state_recomputes_transient_derived_values() {
-        let (mut app, _) = FilesView::boot();
-        assert!(!app.derived_loading());
-        app.acting = true;
-        let restored = FilesView::restore(&app.snapshot().unwrap()).unwrap();
-        assert!(*restored.derived_loading());
-    }
-    #[test]
     fn snapshot_rejects_nonfinite_dimensions_on_both_sides() {
         let (mut app, _) = FilesView::boot();
-        app.object_width = f64::NAN;
+        app.inspector_width = f64::NAN;
         assert!(app.snapshot().is_err());
         let bytes = wire::Snapshot {
             schema: FilesView::SNAPSHOT_SCHEMA.into(),
@@ -341,20 +477,24 @@ mod tests {
         .unwrap();
         assert!(FilesView::restore(&bytes).is_err());
     }
+
     #[test]
     fn a_captured_save_refuses_after_its_network_moves() {
         let (mut app, _) = FilesView::boot();
         app.connected = true;
-        app.listed = true;
+        app.listing = Listing::Listed {
+            entries: Vec::new(),
+            next: String::new(),
+        };
         app.chain = "chain-a".into();
-        app.preview_path = "/shared/a.md".into();
-        app.preview_base = "base-a".into();
+        app.preview = Preview::of("/shared/a.md");
+        app.preview.base = "base-a".into();
         app.editing = true;
         app.draft_chain = app.chain.clone();
-        app.draft_path = app.preview_path.clone();
-        app.draft_base = app.preview_base.clone();
+        app.draft_path = app.preview.path.clone();
+        app.draft_base = app.preview.base.clone();
         app.draft = ducktape_view_guest::Editor::new("unsaved A — 한글");
-        let save = Message::SaveEdit(app.derived_edit_context().clone());
+        let save = Message::SaveEdit(app.edit_context());
         let _ = app.update(Message::SessionArrived(crate::host::SessionItem {
             next: crate::host::Session {
                 connected: true,
@@ -367,12 +507,13 @@ mod tests {
         // domain command rather than replaying an ID against another table.
         let _ = app.update(save);
         assert!(!app.sent);
-        assert!(!app.saving);
+        assert_eq!(app.writing, Writing::Idle);
         assert_eq!(app.draft.text(), "unsaved A — 한글");
         assert_eq!(app.draft_chain, "chain-a");
         assert_eq!(app.draft_path, "/shared/a.md");
         assert_eq!(app.draft_base, "base-a");
     }
+
     #[test]
     fn view_fits_default_stack() {
         ::std::thread::Builder::new()
@@ -386,8 +527,12 @@ mod tests {
             .unwrap();
     }
 }
+
 mod app_update;
 mod app_view;
-mod browser;
-mod files;
+pub mod browse;
+mod columns;
+mod inspector;
 mod kit;
+mod listing;
+mod sidebar;
