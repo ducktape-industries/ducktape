@@ -73,6 +73,23 @@ pub struct Session {
     pub settings_key_path: String,
     pub account_busy: bool,
     pub account_ticket: String,
+    /// where the app's self-update stands: `unavailable` (not installed
+    /// through the launcher), `idle`, `downloading`, `staged`, `swapping`,
+    /// `pending_healthy` or `rolled_back`
+    pub update_state: String,
+    /// the running release's sha7 ("" when unavailable)
+    pub update_current: String,
+    /// the release kept for rollback, sha7 ("" when none)
+    pub update_previous: String,
+    /// the display name of the release being downloaded or staged
+    pub update_staged_display: String,
+    pub update_channel: String,
+    /// when the last check ran, in words ("never", "5 min ago")
+    pub update_checked: String,
+    /// the last check's outcome, in words ("" when nothing to say)
+    pub update_note: String,
+    /// a check, download or verify is running
+    pub update_busy: bool,
 }
 
 /// One item of the session subscription: the facts, or why not.
@@ -549,6 +566,21 @@ pub fn set_dark() -> bool {
 
 pub fn set_notifications(enabled: bool) -> bool {
     notify("settings.notifications", &Notifications { enabled })
+}
+
+/// `settings.update_check` — ask the network for the release manifest now.
+pub fn check_for_update() -> bool {
+    notify("settings.update_check", &())
+}
+
+/// `settings.update_restart` — relaunch into the staged release.
+pub fn restart_to_update() -> bool {
+    notify("settings.update_restart", &())
+}
+
+/// `settings.update_rollback` — relaunch into the previous release.
+pub fn roll_back_update() -> bool {
+    notify("settings.update_rollback", &())
 }
 
 fn notify<T: Serialize>(operation: &str, payload: &T) -> bool {

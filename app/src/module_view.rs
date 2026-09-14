@@ -282,6 +282,7 @@ pub fn settings_view(
     account_exists: bool,
     account_busy: bool,
     account_ticket: &str,
+    updates: &crate::backend::update::UpdateFacts,
 ) -> ViewSpec {
     let appearance = match appearance {
         crate::Appearance::System => "system",
@@ -313,6 +314,14 @@ pub fn settings_view(
         "account_exists": account_exists,
         "account_busy": account_busy,
         "account_ticket": account_ticket,
+        "update_state": updates.state,
+        "update_current": updates.current,
+        "update_previous": updates.previous,
+        "update_staged_display": updates.staged_display,
+        "update_channel": updates.channel,
+        "update_checked": updates.checked,
+        "update_note": updates.note,
+        "update_busy": updates.busy,
     });
     module_view(
         "settings",
@@ -349,6 +358,9 @@ pub fn settings_intent(event: &ModuleViewEvent) -> crate::SettingsIntent {
         "light" => Intent::Light,
         "dark" => Intent::Dark,
         "notifications" => Intent::Notifications,
+        "update_check" => Intent::UpdateCheck,
+        "update_restart" => Intent::UpdateRestart,
+        "update_rollback" => Intent::UpdateRollback,
         _ => Intent::Copy,
     }
 }
@@ -825,6 +837,9 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "light",
             "dark",
             "notifications",
+            "update_check",
+            "update_restart",
+            "update_rollback",
         ],
         // pages speaks the kernel contract: every read is `rpc.view` and
         // every write `op.submit`. What is left are the two OS doors — the
@@ -4447,7 +4462,10 @@ pub(crate) mod tests {
                 "account_ceremony_detail": "", "account_ceremony_left": "",
                 "settings_key_state": "sealed", "settings_key_path": "/keys/user.key",
                 "account_number": "42", "account_exists": true,
-                "account_busy": false, "account_ticket": ""
+                "account_busy": false, "account_ticket": "",
+                "update_state": "unavailable", "update_current": "", "update_previous": "",
+                "update_staged_display": "", "update_channel": "stable",
+                "update_checked": "", "update_note": "", "update_busy": false
             }))
             .expect("props encode"),
         );
