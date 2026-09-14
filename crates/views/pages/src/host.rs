@@ -1990,8 +1990,9 @@ fn inline_card_offset(anchor_y: f64) -> f64 {
     if page_scope {
         return DOCUMENT_TOP_PADDING + TITLE_LINE + COMMENTS_GAP / 2.0;
     }
-    // The margin badge is centred on its line, so the pointer that opened the
-    // card is half a body line above that line's bottom edge.
+    // The host sits the margin badge on its row's LAST line, so the pointer that
+    // opened the card is half a body line above that row's bottom edge — under a
+    // wrapped paragraph as much as under a one-liner.
     anchor_y - LAYER_TOP + BODY_LINE / 2.0 + COMMENTS_GAP / 2.0
 }
 

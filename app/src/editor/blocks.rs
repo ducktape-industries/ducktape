@@ -5,7 +5,7 @@ use super::{EditorStore, Projection, offset, position};
 use gpui_kit::base::input::{
     Editor, EditorState, InputEditorStyle, TextDecoration, TextDecorationCollection,
 };
-use gpui_kit::component::Selectable as _;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Edges, Entity, EntityInputHandler as _,
@@ -1125,7 +1125,12 @@ impl Render for WireEditor {
                         div()
                             .absolute()
                             .right(px(0.))
-                            .top(px(layout.padding.top))
+                            // The badge sits on the row's LAST line, above any reserve the row
+                            // carries: the pointer that presses it is then half a line above
+                            // the row's bottom edge, which is where the guest hangs the
+                            // inline card. Top-aligned, a wrapped row would put the card over
+                            // its own remaining lines.
+                            .bottom(px(layout.padding.bottom))
                             .child(
                                 Button::new(("comments", index))
                                     .label(margin.count.to_string())
@@ -1193,10 +1198,22 @@ impl Render for WireEditor {
                     for (item_index, item) in menu.items.iter().enumerate() {
                         let tag = item.tag.clone();
                         let walked = item_index as u32 == menu.selected;
+                        // A plain row, not the kit Button: the Button centres its
+                        // label, and a menu reads left-aligned like Notion's.
+                        let raised = colors.accent;
                         menu_view = menu_view.child(
-                            Button::new(("menu", item_index))
-                                .label(item.label.clone())
-                                .selected(walked)
+                            div()
+                                .id(("menu", item_index))
+                                .h(px(28.))
+                                .min_w(px(180.))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .rounded(theme.radius_tokens().sm)
+                                .cursor_pointer()
+                                .when(walked, |row| row.bg(raised))
+                                .hover(move |style| style.bg(raised))
+                                .child(item.label.clone())
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.interaction(
                                         EditorInteraction::MenuPick { tag: tag.clone() },
