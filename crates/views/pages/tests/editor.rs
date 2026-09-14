@@ -131,12 +131,12 @@ fn shift_tab_lifts_an_item_back_into_the_run_above_it() {
 }
 
 #[test]
-fn joining_two_items_recounts_what_is_left() {
-    // Backspace at column 0 is the editor's own merge — modelled here so the
-    // recount below it rides the same decision.
-    let joined = pressed(typed("1. one\n2. two\n3. three", 1, 0), Key::Backspace);
-    assert_eq!(joined.text, "1. one2. two\n2. three");
-    assert_eq!(joined.cursor, EditorCursor::at(0, 6));
+fn backspace_before_the_marker_drops_it_and_recounts_what_is_left() {
+    // Column 0 sits before a marker the row shows raw: the marker goes, the
+    // line above stays, and the run below restarts from one.
+    let dropped = pressed(typed("1. one\n2. two\n3. three", 1, 0), Key::Backspace);
+    assert_eq!(dropped.text, "1. one\ntwo\n1. three");
+    assert_eq!(dropped.cursor, EditorCursor::at(1, 0));
 }
 
 #[test]
@@ -195,6 +195,24 @@ fn backspace_at_the_content_edge_drops_the_marker_not_the_line_above() {
     let dropped = pressed(typed("one\n- two", 1, 2), Key::Backspace);
     assert_eq!(dropped.text, "one\ntwo");
     assert_eq!(dropped.cursor, EditorCursor::at(1, 0));
+    // A heading, a quote, a todo: the block's shape goes first, the line
+    // turns into a paragraph, and only the next press joins the line above.
+    let heading = pressed(typed("one\n## two", 1, 3), Key::Backspace);
+    assert_eq!(heading.text, "one\ntwo");
+    assert_eq!(heading.cursor, EditorCursor::at(1, 0));
+    // The focused row shows its prefix raw, so Home lands BEFORE the `## `:
+    // Backspace there drops the shape too, never the line above.
+    let before_prefix = pressed(typed("one\n## two", 1, 0), Key::Backspace);
+    assert_eq!(before_prefix.text, "one\ntwo");
+    assert_eq!(before_prefix.cursor, EditorCursor::at(1, 0));
+    let quote = pressed(typed("one\n> two", 1, 2), Key::Backspace);
+    assert_eq!(quote.text, "one\ntwo");
+    let todo = pressed(typed("one\n- [ ] two", 1, 6), Key::Backspace);
+    assert_eq!(todo.text, "one\ntwo");
+    assert!(
+        is_default(typed("one\ntwo", 1, 0), Key::Backspace),
+        "a paragraph's edge is the editor's own join with the line above"
+    );
 }
 
 #[test]

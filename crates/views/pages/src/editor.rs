@@ -341,16 +341,33 @@ fn remove_list_marker(doc: &Doc) -> Option<Edit> {
     }
     let line = doc.cursor.position.line as usize;
     let text = doc.line(line)?;
-    let marker = list_marker(text)?;
-    if doc.cursor.position.column as usize != marker.content {
+    let (indent, content) = match list_marker(text) {
+        Some(marker) => (marker.indent, marker.content),
+        None => block_prefix(text)?,
+    };
+    // At the content edge, or anywhere inside the prefix the focused row
+    // shows raw (Home lands before a heading's `# `): the shape goes, the
+    // line above stays.
+    let past_the_prefix = doc.cursor.position.column as usize > content;
+    if past_the_prefix {
         return None;
     }
     let start = doc.offset(EditorPosition::new(line, 0));
     Some(Edit {
-        range: start + marker.indent..start + marker.content,
+        range: start + indent..start + content,
         replacement: String::new(),
-        cursor: EditorCursor::at(line, marker.indent),
+        cursor: EditorCursor::at(line, indent),
     })
+}
+
+/// A heading, quote or callout prefix as `(indent, content)`: the shape
+/// Backspace at the content edge drops — the line turns into a paragraph —
+/// before it would join the line above, the way a list marker does.
+fn block_prefix(text: &str) -> Option<(usize, usize)> {
+    let indent = text.len() - text.trim_start_matches([' ', '\t']).len();
+    let content = crate::markdown::content_start(text);
+    let prefixed = content > indent;
+    prefixed.then_some((indent, content))
 }
 
 /// Tab / Shift+Tab move the caret's line by one nesting step. Two spaces is
