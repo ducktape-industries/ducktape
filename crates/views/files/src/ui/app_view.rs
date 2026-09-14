@@ -4,6 +4,14 @@
 use super::*;
 use ducktape_view_guest::{kit::Tone, slots};
 
+/// What is over the browser: nothing, the delete confirm, or a name prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Modal {
+    None,
+    Deleting,
+    Naming,
+}
+
 impl FilesView {
     pub(crate) fn view(&self) -> wire::Node {
         native::set_dark(self.dark);
@@ -51,22 +59,32 @@ impl FilesView {
             Some(wire::Length::Fill),
             Some(wire::Length::Fill),
         );
-        let deleting = !self.delete_target.is_empty();
-        let naming = self.name_prompt.is_open();
-        match (deleting, naming) {
-            (true, _) => kit::modal(
+        match self.modal() {
+            Modal::Deleting => kit::modal(
                 format!("{key}/delete-dialog"),
                 content,
                 self.confirm_delete(format!("{key}/confirm-delete")),
                 Message::DisarmDelete,
             ),
-            (false, true) => kit::modal(
+            Modal::Naming => kit::modal(
                 format!("{key}/name-dialog"),
                 content,
                 self.name_dialog(format!("{key}/name-prompt")),
                 Message::Prompt(NamePrompt::Closed),
             ),
-            (false, false) => content,
+            Modal::None => content,
+        }
+    }
+
+    /// The layer over the browser, if any. A delete confirm outranks a name
+    /// prompt: the prompt closes when a delete arms, never the reverse.
+    pub(super) fn modal(&self) -> Modal {
+        let deleting = !self.delete_target.is_empty();
+        let naming = self.name_prompt.is_open();
+        match (deleting, naming) {
+            (true, _) => Modal::Deleting,
+            (false, true) => Modal::Naming,
+            (false, false) => Modal::None,
         }
     }
 
@@ -308,7 +326,9 @@ impl FilesView {
                 Tone::Warning,
             ));
         }
-        if !self.notice.is_empty() {
+        // under a dialog the refusal is said in the dialog, where the reader is
+        let notice_here = !self.notice.is_empty() && self.modal() == Modal::None;
+        if notice_here {
             children.push(native::notice(
                 format!("{key}/notice-box"),
                 native::wrapping(native::text(format!("{key}/notice"), self.notice.clone())),

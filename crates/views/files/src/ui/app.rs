@@ -7,8 +7,9 @@
 
 use ducktape_view_guest::{kit as native, wire};
 
+use crate::host::Act;
 use crate::host::{FsEntry, FsSnapshot};
-use browse::{Act, BrowseKey, Listing, NamePrompt, Navigation, Sort, SortKey, ViewMode};
+use browse::{BrowseKey, Listing, NamePrompt, Navigation, Sort, SortKey, ViewMode};
 
 /// The chosen file's read, as the inspector shows it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -52,8 +53,8 @@ pub(crate) struct Provenance {
     pub error: String,
 }
 
-/// A write in flight, or none. One value: the toolbar's wait word, the
-/// disabled controls and the completion handler all read it.
+/// A write in flight, or none. One value: the toolbar's wait word and the
+/// disabled controls read it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Writing {
     Idle,

@@ -85,10 +85,21 @@ impl FilesView {
             true => Preview::default(),
             false => Preview::of(&entry.path),
         };
-        let opens_column = self.view_mode == ViewMode::Columns && entry.is_dir();
-        if opens_column {
-            self.open_column(&entry.path);
+        let in_columns = self.view_mode == ViewMode::Columns;
+        match (in_columns, entry.is_dir()) {
+            (true, true) => self.open_column(&entry.path),
+            (true, false) => self.close_columns_after(&entry.path),
+            (false, _) => {}
         }
+    }
+
+    /// The columns to the right of the one holding `path` close: a chosen
+    /// file ends the chain at its own column.
+    fn close_columns_after(&mut self, path: &str) {
+        let keep = self.column_owning(path).unwrap_or(0);
+        self.columns.truncate(keep);
+        self.column_listings
+            .retain(|column, _| self.columns.contains(column));
     }
 
     /// The columns to the right of the current directory end at the parent
@@ -170,12 +181,57 @@ impl FilesView {
         if self.history_error.is_empty() {
             self.history = item.history;
         }
-        // a chosen row the directory no longer holds is no longer chosen
-        let gone = !self.selected.is_empty() && self.selected_entry().path.is_empty();
+        // a chosen row its directory no longer holds is no longer chosen —
+        // judged only against a directory read WHOLE: a refusal or a page
+        // not yet walked says nothing about the row
+        let owner = self.listing_owning(&self.selected).cloned();
+        let complete = matches!(&owner, Some(Listing::Listed { next, .. }) if next.is_empty());
+        let gone = complete && self.selected_entry().path.is_empty();
         if gone {
             self.clear_choice();
         }
         Task::none()
+    }
+
+    /// The listing of the directory `path` sits in: the current one, or an
+    /// open column's; `None` when neither is on screen.
+    fn listing_owning(&self, path: &str) -> Option<&Listing> {
+        let parent = crate::host::fs_parent(path);
+        if parent == self.nav.path {
+            return Some(&self.listing);
+        }
+        self.column_listings.get(&parent)
+    }
+
+    /// Which column the row `path` belongs to: 0 for the current directory,
+    /// `i + 1` for the column opened for `columns[i]`, `None` for a row no
+    /// column shows.
+    fn column_owning(&self, path: &str) -> Option<usize> {
+        let parent = crate::host::fs_parent(path);
+        if parent == self.nav.path {
+            return Some(0);
+        }
+        self.columns
+            .iter()
+            .position(|column| *column == parent)
+            .map(|index| index + 1)
+    }
+
+    /// The rows column `index` shows: the current directory takes the
+    /// filter and the sort, an open column is name order.
+    pub(super) fn rows_of_column(&self, index: usize) -> Vec<FsEntry> {
+        if index == 0 {
+            return self.rows();
+        }
+        let Some(path) = self.columns.get(index - 1) else {
+            return Vec::new();
+        };
+        let entries = self
+            .column_listings
+            .get(path)
+            .map(Listing::entries)
+            .unwrap_or_default();
+        browse::visible_rows(entries, "", Sort::BY_NAME)
     }
 
     fn on_preview_arrived(&mut self, item: crate::host::PreviewItem) -> Task<Message> {
@@ -224,7 +280,9 @@ impl FilesView {
 
     /// EVERY WRITE'S OUTCOME IS THIS VIEW'S OWN. A committed write consumes
     /// the prompt it came from, and moves the generation so the directory,
-    /// the history and the open preview are read again.
+    /// the history and the open preview are read again. A refused write
+    /// leaves the prompt or the confirm OPEN with the refusal inside it, so
+    /// the reader fixes the name or backs out from where she stands.
     fn on_act_done(&mut self, item: crate::host::ActItem) -> Task<Message> {
         self.notice = item.error.clone();
         self.writing = Writing::Idle;
@@ -232,12 +290,11 @@ impl FilesView {
         if !committed {
             return Task::none();
         }
-        match browse::act_of(&item.kind) {
+        match item.act {
             Act::Mkdir | Act::NewFile => self.name_committed(),
             Act::Rename => self.rename_committed(),
             Act::Delete => self.delete_committed(),
             Act::Save => self.save_committed(),
-            Act::Unknown => {}
         }
         self.generation += 1;
         Task::none()
@@ -366,7 +423,7 @@ impl FilesView {
     }
 
     /// The entry `path` names in any listing on screen.
-    fn entry_at(&self, path: &str) -> FsEntry {
+    pub(super) fn entry_at(&self, path: &str) -> FsEntry {
         let here = crate::host::entry_named(self.listing.entries(), path);
         if !here.path.is_empty() {
             return here;
@@ -386,6 +443,8 @@ impl FilesView {
         match key {
             BrowseKey::Up => self.step_selection(-1),
             BrowseKey::Down => self.step_selection(1),
+            BrowseKey::Left => self.step_left(),
+            BrowseKey::Right => self.step_right(),
             BrowseKey::Open => self.open_selection(),
             BrowseKey::Parent => self.on_parent(),
             BrowseKey::Back => self.on_back(),
@@ -394,10 +453,44 @@ impl FilesView {
         }
     }
 
+    /// ↑/↓ move within the column that owns the choice; with nothing chosen
+    /// the first row of the current directory is next.
     fn step_selection(&mut self, step: i64) -> Task<Message> {
-        let rows = self.rows();
+        let column = self.column_owning(&self.selected).unwrap_or(0);
+        let rows = self.rows_of_column(column);
         match browse::neighbour(&rows, &self.selected, step) {
             Some(path) => self.on_select(path),
+            None => Task::none(),
+        }
+    }
+
+    /// ← in column view chooses the folder that opened the choice's column;
+    /// in list view it is nothing.
+    fn step_left(&mut self) -> Task<Message> {
+        let in_columns = self.view_mode == ViewMode::Columns;
+        let Some(column) = self.column_owning(&self.selected).filter(|_| in_columns) else {
+            return Task::none();
+        };
+        match column {
+            0 => Task::none(),
+            index => self.on_select(self.columns[index - 1].clone()),
+        }
+    }
+
+    /// → in column view moves into the column the chosen folder opened;
+    /// in list view it is nothing.
+    fn step_right(&mut self) -> Task<Message> {
+        let in_columns = self.view_mode == ViewMode::Columns;
+        let opened = self
+            .columns
+            .iter()
+            .position(|column| *column == self.selected);
+        let Some(index) = opened.filter(|_| in_columns) else {
+            return Task::none();
+        };
+        let rows = self.rows_of_column(index + 1);
+        match rows.first() {
+            Some(first) => self.on_select(first.path.clone()),
             None => Task::none(),
         }
     }
@@ -561,18 +654,13 @@ impl FilesView {
 
     fn on_begin_edit(&mut self, token: String) -> Task<Message> {
         let stale = token != self.edit_context();
-        let unreadable = self.preview.base.is_empty()
-            || self.preview.binary
-            || self.preview.picture
-            || self.preview.truncated
-            || self.preview.path.is_empty();
-        if stale
-            || self.editing
-            || self.loading()
-            || !self.connected
-            || self.chain.is_empty()
-            || unreadable
-        {
+        let not_text = self.preview.binary || self.preview.picture;
+        let not_whole = self.preview.truncated;
+        let not_read = self.preview.base.is_empty() || self.preview.path.is_empty();
+        let unreadable = not_text || not_whole || not_read;
+        let no_network = !self.connected || self.chain.is_empty();
+        let mid_flight = self.editing || self.loading();
+        if stale || unreadable || no_network || mid_flight {
             return Task::none();
         }
         self.editing = true;
@@ -619,12 +707,9 @@ impl FilesView {
     /// Keep the original bytes and base until this exact draft is committed.
     fn on_save_edit(&mut self, token: String) -> Task<Message> {
         let stale = token != self.edit_context();
-        if stale
-            || !self.draft_here()
-            || self.loading()
-            || !self.connected
-            || self.draft_base.is_empty()
-        {
+        let no_draft = !self.draft_here() || self.draft_base.is_empty();
+        let cannot_send = self.loading() || !self.connected;
+        if stale || no_draft || cannot_send {
             return Task::none();
         }
         self.notice.clear();

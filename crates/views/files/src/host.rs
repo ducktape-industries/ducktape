@@ -85,7 +85,6 @@ pub struct Session {
     pub connected: bool,
     pub dark: bool,
     pub chain: String,
-    #[serde(default)]
     pub account: String,
     pub route: String,
     pub route_serial: i64,
@@ -617,18 +616,29 @@ pub fn diff_kind_label(kind: &str) -> &'static str {
 
 // ---------- the writes ----------
 
+/// Which write a commit is. The queue carries it and hands it back with
+/// the outcome, so a completion never decodes a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Act {
+    Mkdir,
+    NewFile,
+    Rename,
+    Delete,
+    Save,
+}
+
 /// One finished write: which act it was, and the refusal if any.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct ActItem {
-    pub kind: String,
+    pub act: Act,
     pub error: String,
 }
 
-type Act = Pin<Box<dyn Future<Output = Result<(), String>>>>;
+type Pending = Pin<Box<dyn Future<Output = Result<(), String>>>>;
 
 #[derive(Default)]
 struct Acts {
-    pending: Vec<(String, Act)>,
+    pending: Vec<(Act, Pending)>,
     waker: Option<Waker>,
 }
 
@@ -644,27 +654,27 @@ thread_local! {
 pub fn make_dir(dir: &str, name: &str) -> bool {
     let path = fs_child(dir, name);
     let change = serde_json::json!({ "mkdir": { "path": path } });
-    act("mkdir", format!("mkdir {path}"), change)
+    act(Act::Mkdir, format!("mkdir {path}"), change)
 }
 
 /// Creates an empty file under `dir`.
 pub fn make_file(dir: &str, name: &str) -> bool {
     let path = fs_child(dir, name);
     let change = put_change(&path, "");
-    act("new_file", format!("write {path}"), change)
+    act(Act::NewFile, format!("write {path}"), change)
 }
 
 /// Removes a file or a whole subtree.
 pub fn delete_object(path: &str) -> bool {
     let change = serde_json::json!({ "rm": { "path": path } });
-    act("delete", format!("rm {path}"), change)
+    act(Act::Delete, format!("rm {path}"), change)
 }
 
 /// Moves a file or a whole subtree to another path — a rename when only the
 /// last segment changes, a move when the directory does.
 pub fn move_object(from: &str, to: &str) -> bool {
     let change = serde_json::json!({ "mv": { "from": from, "to": to } });
-    act("rename", format!("mv {from} {to}"), change)
+    act(Act::Rename, format!("mv {from} {to}"), change)
 }
 
 /// Writes the edited body back to its path, against the SNAPSHOT ITS TEXT WAS
@@ -674,7 +684,7 @@ pub fn save(path: &str, base: &str, text: &str) -> bool {
     let message = format!("write {path}");
     let base = base.to_owned();
     queue(
-        "save",
+        Act::Save,
         Box::pin(async move { submit_commit(Some(base), message, change).await }),
     )
 }
@@ -692,9 +702,9 @@ fn put_change(path: &str, text: &str) -> serde_json::Value {
 
 /// A write that lands on the CURRENT head: the head is read here, so two
 /// members' commits do not silently clobber each other.
-fn act(kind: &str, message: String, change: serde_json::Value) -> bool {
+fn act(act: Act, message: String, change: serde_json::Value) -> bool {
     queue(
-        kind,
+        act,
         Box::pin(async move {
             let head = head_snapshot().await?;
             submit_commit(head, message, change).await
@@ -702,9 +712,9 @@ fn act(kind: &str, message: String, change: serde_json::Value) -> bool {
     )
 }
 
-fn queue(kind: &str, act: Act) -> bool {
+fn queue(act: Act, pending: Pending) -> bool {
     ACTS.with_borrow_mut(|acts| {
-        acts.pending.push((kind.to_owned(), act));
+        acts.pending.push((act, pending));
         if let Some(waker) = acts.waker.take() {
             waker.wake();
         }
@@ -752,9 +762,9 @@ impl Stream for ActStream {
                 acts.waker = Some(cx.waker().clone());
                 return Poll::Pending;
             };
-            let (kind, _) = acts.pending.remove(index);
+            let (act, _) = acts.pending.remove(index);
             Poll::Ready(Some(ActItem {
-                kind,
+                act,
                 error: answer.err().unwrap_or_default(),
             }))
         })

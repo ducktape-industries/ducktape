@@ -15,15 +15,15 @@ impl FilesView {
             format!("{key}/column/{}", self.nav.path),
             &self.nav.path,
             &self.listing,
-            true,
+            0,
         )];
-        for path in &self.columns {
+        for (index, path) in self.columns.iter().enumerate() {
             let listing = self
                 .column_listings
                 .get(path)
                 .cloned()
                 .unwrap_or(Listing::Pending);
-            columns.push(self.column(format!("{key}/column/{path}"), path, &listing, false));
+            columns.push(self.column(format!("{key}/column/{path}"), path, &listing, index + 1));
         }
         let chosen = self.selected_entry();
         if !chosen.path.is_empty() && !chosen.is_dir() {
@@ -49,19 +49,17 @@ impl FilesView {
 
     /// One column: a folder's rows. Only the first column takes the filter
     /// and the sort — the rest are the chain the reader clicked through.
-    fn column(&self, key: String, path: &str, listing: &Listing, first: bool) -> wire::Node {
+    /// `index` is the column's place, 0 being the current directory.
+    fn column(&self, key: String, path: &str, listing: &Listing, index: usize) -> wire::Node {
         let body = match listing {
-            Listing::Pending => native::gap(0.),
+            Listing::Pending => kit::inset(
+                native::caption(format!("{key}/pending"), "Loading…"),
+                wire::Edges::all(10.),
+            ),
             Listing::Failed(reason) => {
                 kit::error_plate(format!("{key}/failed"), reason, Message::Refresh)
             }
-            Listing::Listed { entries, .. } => {
-                let rows = match first {
-                    true => self.rows(),
-                    false => browse::visible_rows(entries, "", Sort::BY_NAME),
-                };
-                self.column_rows(&key, rows)
-            }
+            Listing::Listed { .. } => self.column_rows(&key, self.rows_of_column(index)),
         };
         let name = crate::host::fs_name(path);
         let mut column = kit::filled_column(

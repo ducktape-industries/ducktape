@@ -188,7 +188,7 @@ impl FilesView {
     /// the exit first.
     pub(super) fn confirm_delete(&self, key: String) -> wire::Node {
         let busy = self.busy_writing();
-        let target = self.selected_entry();
+        let target = self.entry_at(&self.delete_target);
         let subtree = target.is_dir();
         let title = match subtree {
             true => "Delete this folder and everything in it",
@@ -198,41 +198,52 @@ impl FilesView {
             true => "Delete folder",
             false => "Delete file",
         };
-        dialog_card(
-            key.clone(),
-            vec![
-                native::heading(format!("{key}/title"), title),
-                native::wrapping(native::mono(
-                    format!("{key}/target"),
-                    self.delete_target.clone(),
-                )),
-                native::wrapping(native::secondary(
-                    format!("{key}/warning"),
-                    "The committed object is removed from duckfs for every member. Earlier snapshots keep their copies.",
-                )),
-                native::spaced(
-                    native::row(
-                        format!("{key}/actions"),
-                        [
-                            native::spacer(),
-                            native::button(
-                                format!("{key}/cancel"),
-                                "Cancel",
-                                (!busy).then(|| slots::message(Message::DisarmDelete)),
-                                wire::ButtonPreset::Secondary,
-                            ),
-                            native::button(
-                                format!("{key}/delete"),
-                                verb,
-                                (!busy).then(|| slots::message(Message::DeleteSubmit)),
-                                wire::ButtonPreset::Danger,
-                            ),
-                        ],
+        let mut children = vec![
+            native::heading(format!("{key}/title"), title),
+            native::wrapping(native::mono(
+                format!("{key}/target"),
+                self.delete_target.clone(),
+            )),
+            native::wrapping(native::secondary(
+                format!("{key}/warning"),
+                "The committed object is removed from duckfs for every member. Earlier snapshots keep their copies.",
+            )),
+        ];
+        children.extend(self.refusal_in_dialog(&key));
+        children.push(native::spaced(
+            native::row(
+                format!("{key}/actions"),
+                [
+                    native::spacer(),
+                    native::button(
+                        format!("{key}/cancel"),
+                        "Cancel",
+                        (!busy).then(|| slots::message(Message::DisarmDelete)),
+                        wire::ButtonPreset::Secondary,
                     ),
-                    8.,
-                ),
-            ],
-        )
+                    native::button(
+                        format!("{key}/delete"),
+                        verb,
+                        (!busy).then(|| slots::message(Message::DeleteSubmit)),
+                        wire::ButtonPreset::Danger,
+                    ),
+                ],
+            ),
+            8.,
+        ));
+        dialog_card(key, children)
+    }
+
+    /// A write the node refused, said inside the dialog the reader is
+    /// standing in — the base pane is under the backdrop.
+    fn refusal_in_dialog(&self, key: &str) -> Option<wire::Node> {
+        (!self.notice.is_empty()).then(|| {
+            native::notice(
+                format!("{key}/refused"),
+                native::wrapping(native::text(format!("{key}/refusal"), self.notice.clone())),
+                Tone::Danger,
+            )
+        })
     }
 
     /// The name prompt: one field, one verb, named for what it creates.
@@ -263,7 +274,9 @@ impl FilesView {
                 format!("{key}/where"),
                 match &self.name_prompt {
                     NamePrompt::Rename(path) => path.clone(),
-                    _ => self.nav.path.clone(),
+                    NamePrompt::NewFolder | NamePrompt::NewFile | NamePrompt::Closed => {
+                        self.nav.path.clone()
+                    }
                 },
             )),
             field,
@@ -275,6 +288,7 @@ impl FilesView {
                 Tone::Danger,
             ));
         }
+        children.extend(self.refusal_in_dialog(&key));
         children.push(native::spaced(
             native::row(
                 format!("{key}/actions"),

@@ -249,35 +249,14 @@ impl NamePrompt {
     }
 }
 
-/// Which write just finished. The host names an act by a string kind; it is
-/// read into this ONCE, and the completion handler branches on it alone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Act {
-    Mkdir,
-    NewFile,
-    Rename,
-    Delete,
-    Save,
-    Unknown,
-}
-
-pub fn act_of(kind: &str) -> Act {
-    match kind {
-        "mkdir" => Act::Mkdir,
-        "new_file" => Act::NewFile,
-        "rename" => Act::Rename,
-        "delete" => Act::Delete,
-        "save" => Act::Save,
-        _ => Act::Unknown,
-    }
-}
-
 /// What a key press over the browser means, decided from the wire's key
 /// state alone. Anything a focused control consumed never reaches here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrowseKey {
     Up,
     Down,
+    Left,
+    Right,
     Open,
     Parent,
     Back,
@@ -297,6 +276,8 @@ pub fn browse_key(state: &ducktape_view_guest::wire::keyboard::KeyState) -> Brow
         Key::Named(Named::Backspace) => BrowseKey::Parent,
         Key::Named(Named::ArrowLeft) if command => BrowseKey::Back,
         Key::Named(Named::ArrowRight) if command => BrowseKey::Forward,
+        Key::Named(Named::ArrowLeft) => BrowseKey::Left,
+        Key::Named(Named::ArrowRight) => BrowseKey::Right,
         Key::Named(Named::BrowserBack) => BrowseKey::Back,
         Key::Named(Named::BrowserForward) => BrowseKey::Forward,
         _ => BrowseKey::Ignored,

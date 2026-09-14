@@ -18,7 +18,7 @@ impl FilesView {
     // ---- what is chosen ----
 
     fn info_pane(&self, key: String) -> wire::Node {
-        let entry = self.selected_entry();
+        let entry = self.chosen_for_info();
         if entry.path.is_empty() {
             return kit::filled_column(
                 key.clone(),
@@ -70,6 +70,28 @@ impl FilesView {
                 ),
             ],
         )
+    }
+
+    /// The chosen entry as the inspector knows it. A choice the listing on
+    /// hand does not carry — a deep link into a directory past its first
+    /// page, a rename that just landed — is still a choice: its path and
+    /// name are known, and what is being read says whether it is a file.
+    fn chosen_for_info(&self) -> FsEntry {
+        let listed = self.selected_entry();
+        if !listed.path.is_empty() || self.selected.is_empty() {
+            return listed;
+        }
+        let previewing = self.preview.path == self.selected;
+        FsEntry {
+            path: self.selected.clone(),
+            name: crate::host::fs_name(&self.selected),
+            kind: match previewing {
+                true => "file".into(),
+                false => "dir".into(),
+            },
+            size: 0,
+            object: String::new(),
+        }
     }
 
     /// Edit / Cancel / Save over the preview, and the badges that say what
@@ -246,9 +268,11 @@ impl FilesView {
                 native::wrapping(native::mono(format!("{key}/{field}/value"), value)),
             )
         };
-        let size = match entry.is_dir() {
-            true => format!("{} entries", entry.size),
-            false => crate::host::size_label(entry.size),
+        let unlisted = entry.object.is_empty();
+        let size = match (unlisted, entry.is_dir()) {
+            (true, _) => "—".into(),
+            (false, true) => format!("{} entries", entry.size),
+            (false, false) => crate::host::size_label(entry.size),
         };
         let object = match entry.object.is_empty() {
             true => "—".into(),
@@ -273,6 +297,12 @@ impl FilesView {
     /// found, "earlier" when it fell off the walk's depth, or the wait.
     fn modified_line(&self) -> (String, String) {
         let provenance = &self.provenance;
+        // the walk needs snapshots to walk: none read, or none at all, and
+        // there is nothing to look in
+        let no_history = !self.listing.is_pending() && self.history.is_empty();
+        if !provenance.answered && no_history {
+            return ("unknown".into(), "".into());
+        }
         if !provenance.answered {
             return ("Looking…".into(), "".into());
         }

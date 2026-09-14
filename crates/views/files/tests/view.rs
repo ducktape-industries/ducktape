@@ -633,12 +633,94 @@ fn a_refused_write_is_shown_in_place_and_keeps_the_draft() {
     let frame = tick_native(vec![answer(head, &refs())]);
     let submit = request(&frame, "op.submit").id;
     let frame = tick_native(vec![refuse(submit, "the local user key is locked")]);
+    // the refusal is said INSIDE the prompt, where the reader is — not in
+    // the pane under the backdrop
+    let refusal = node_ending(&frame, "/name-prompt/refusal");
     assert!(
-        has_text(&frame, "the local user key is locked"),
-        "{:?}",
-        texts(&frame)
+        matches!(&refusal, Node::Text { content, .. } if content == "the local user key is locked"),
+        "{refusal:?}"
+    );
+    assert!(
+        !keys(&frame).iter().any(|key| key.ends_with("/notice")),
+        "one place for the refusal: {:?}",
+        keys(&frame)
     );
     assert_eq!(name_field(&frame), "notes.txt");
+    assert!(
+        !button_disabled(&frame, "Create file"),
+        "the prompt is live again"
+    );
+
+    // a refused delete stays in its confirm the same way
+    let frame = tick_native(press(&frame, "Cancel"));
+    let frame = tick_native(press(&frame, "Folder docs"));
+    let frame = tick_native(press(&frame, "Delete docs"));
+    let frame = tick_native(press(&frame, "Delete folder"));
+    let head = files_get(&frame, "refs").0.id;
+    let frame = tick_native(vec![answer(head, &refs())]);
+    let submit = request(&frame, "op.submit").id;
+    let frame = tick_native(vec![refuse(submit, "not a member")]);
+    let refusal = node_ending(&frame, "/confirm-delete/refusal");
+    assert!(
+        matches!(&refusal, Node::Text { content, .. } if content == "not a member"),
+        "{refusal:?}"
+    );
+    assert!(
+        has_text(&frame, "Delete this folder and everything in it"),
+        "the confirm names the folder from its own target: {:?}",
+        texts(&frame)
+    );
+    assert!(!button_disabled(&frame, "Cancel"));
+}
+
+/// A choice the listing on hand cannot vouch for is kept: a directory that
+/// refused says nothing about the row, and one with pages still to walk
+/// may hold it further on. Only a directory read WHOLE that lacks the row
+/// drops the choice.
+#[test]
+fn a_choice_survives_a_refusal_and_a_page_not_yet_walked() {
+    let (_listed, held) = connected_with_listing();
+    // a deep link into a directory whose first page does not carry the file
+    let frame = tick_native(vec![item(
+        held.session,
+        &routed_session(true, "/shared/big/zz.md", 1),
+    )]);
+    let ls = ls_of(&frame, "/shared/big").0.id;
+    let frame = tick_native(vec![answer(
+        ls,
+        serde_json::json!({
+            "entries": [{ "path": "/shared/big/aa.md", "kind": "file", "size": 1, "object": "a" }],
+            "next": "aa.md",
+        })
+        .to_string()
+        .as_bytes(),
+    )]);
+    let home = ls_of(&frame, "/home").0.id;
+    let frame = tick_native(vec![answer(home, &homes())]);
+    let snapshots = files_get(&frame, "history").0.id;
+    let frame = tick_native(vec![answer(snapshots, &history())]);
+    assert!(has_text(&frame, "/shared/big/zz.md"), "{:?}", texts(&frame));
+    assert!(has_text(&frame, "zz.md"), "the inspector names the choice");
+    assert!(!has_text(&frame, "Nothing chosen"), "{:?}", texts(&frame));
+
+    // the directory refuses on a re-read: the choice stays
+    let frame = tick_native(press(&frame, "Refresh"));
+    let ls = ls_of(&frame, "/shared/big").0.id;
+    let frame = tick_native(vec![refuse(ls, "files: busy")]);
+    let home = ls_of(&frame, "/home").0.id;
+    let frame = tick_native(vec![answer(home, &homes())]);
+    let snapshots = files_get(&frame, "history").0.id;
+    let frame = tick_native(vec![answer(snapshots, &history())]);
+    assert!(has_text(
+        &frame,
+        "Could not list this directory: files: busy"
+    ));
+    assert!(has_text(&frame, "/shared/big/zz.md"), "{:?}", texts(&frame));
+
+    // the whole directory, without the file: the choice is gone
+    let frame = tick_native(press(&frame, "Try again"));
+    let frame = settle_workspace(&frame, "/shared/big", &empty_listing());
+    assert!(has_text(&frame, "Nothing chosen"), "{:?}", texts(&frame));
 }
 
 /// Rename leaves as a duckfs `mv`, and the renamed entry stays chosen under
@@ -1193,6 +1275,48 @@ fn column_view_opens_each_chosen_folder_to_the_right() {
     assert_eq!(
         ls_of(&frame, "/shared/docs/old").1["path"],
         "/shared/docs/old"
+    );
+
+    // ↑/↓ step within the column that owns the choice (old, then plan.md:
+    // folders first); ← and → move between the columns
+    let frame = tick_native(press(&frame, "File plan.md"));
+    let columns_open = |frame: &Frame| {
+        keys(frame)
+            .iter()
+            .filter(|key| key.contains("/columns/column/") && key.ends_with("/head/rule"))
+            .count()
+    };
+    assert_eq!(columns_open(&frame), 2, "{:?}", keys(&frame));
+    let frame = tick_native(key(keyboard::Named::ArrowUp, false));
+    assert!(has_text(&frame, "/shared/docs/old"), "{:?}", texts(&frame));
+    assert_eq!(columns_open(&frame), 3, "a chosen folder opens its column");
+    let frame = tick_native(key(keyboard::Named::ArrowDown, false));
+    assert!(
+        has_text(&frame, "/shared/docs/plan.md"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert_eq!(
+        columns_open(&frame),
+        2,
+        "the choice stayed in its own column"
+    );
+    let frame = tick_native(key(keyboard::Named::ArrowDown, false));
+    assert!(
+        has_text(&frame, "/shared/docs/plan.md"),
+        "clamped at the column's end"
+    );
+    let frame = tick_native(key(keyboard::Named::ArrowLeft, false));
+    assert!(
+        has_text(&frame, "/shared/docs"),
+        "← chooses the folder that opened the column"
+    );
+    assert_eq!(columns_open(&frame), 2, "{:?}", keys(&frame));
+    let frame = tick_native(key(keyboard::Named::ArrowRight, false));
+    assert!(
+        has_text(&frame, "/shared/docs/old"),
+        "→ enters the open column at its first row: {:?}",
+        texts(&frame)
     );
 
     // a double-click makes the folder the directory and the columns start over

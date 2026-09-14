@@ -79,7 +79,13 @@ impl FilesView {
     fn list_body(&self, key: &str) -> wire::Node {
         match &self.listing {
             Listing::Pending => native::sized(
-                native::container(format!("{key}/pending"), native::gap(0.)),
+                native::container(
+                    format!("{key}/pending-box"),
+                    kit::inset(
+                        native::caption(format!("{key}/pending"), "Loading…"),
+                        wire::Edges::all(12.),
+                    ),
+                ),
                 Some(wire::Length::Fill),
                 Some(wire::Length::Fill),
             ),
