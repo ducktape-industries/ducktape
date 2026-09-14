@@ -904,12 +904,32 @@ fn body_format(style: Style, ink: &Ink) -> Format {
     if style.quote {
         format.line_height = Some(LineHeight::Absolute(BODY_SIZE * QUOTE_LINE_HEIGHT));
     }
+    // A body run says its size outright. The host sizes a line by the LAST
+    // run that named one, and a run with no size of its own paints at that:
+    // a ticked todo's second bracket (7px, squeezed beside the wider `x`)
+    // came right before the body and shrank the whole sentence to it.
+    format.size = Some(BODY_SIZE);
     format
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_body_run_names_its_size_so_a_squeezed_bracket_cannot_shrink_it() {
+        let (marks, _) = highlight("- [x] done", false, false, false);
+        let bracket = format(&marks[3].1, false);
+        assert!(
+            bracket.size.is_some_and(|size| size < BODY_SIZE),
+            "the ticked bracket is squeezed: {:?}",
+            bracket.size
+        );
+        assert!(matches!(marks[4].1, Mark::Body(_)));
+        assert_eq!(format(&marks[4].1, false).size, Some(BODY_SIZE));
+        let (plain, _) = highlight("plain words", false, false, false);
+        assert_eq!(format(&plain[0].1, false).size, Some(BODY_SIZE));
+    }
 
     #[test]
     fn ordinary_text_inherits_native_ink_without_erasing_semantic_marks() {
@@ -1077,7 +1097,7 @@ mod tests {
         assert_eq!(painted.color, Some(TRANSPARENT));
         assert!(painted.line_rule.is_some());
         // Full size: the line keeps its height and its click target.
-        assert!(painted.size.is_none());
+        assert_eq!(painted.size, Some(BODY_SIZE));
         // Under the caret the literal returns and the rule goes.
         let (under, _) = highlight("---", false, true, false);
         let editable = format(&under[0].1, false);
