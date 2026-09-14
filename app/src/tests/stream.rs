@@ -213,6 +213,7 @@ fn a_resync_across_a_chain_drops_the_previous_networks_rooms() {
         archived: false,
         members_only: false,
         huddle_count: 0,
+        huddle: Vec::new(),
         head_seq,
     };
     let resync = |app: &Ducktape, channels: Vec<backend::ChatChannel>| {

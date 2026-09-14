@@ -31,17 +31,27 @@ struct Document {
     menu: MenuState,
     handles: Vec<chat::client::MentionChoice>,
     mentions: Mentions,
-    /// Local files waiting to go with the next send. The paths never cross
-    /// the wire: the send uploads their bytes and links the copies.
+    /// The standby zone: files attached to the next send, each on its way
+    /// into DuckFS or already there under a `duck://` address. The local
+    /// path never crosses the wire; the address does.
     attachments: Vec<Attachment>,
     /// Why the last attach was refused; empty once one succeeds.
     attach_note: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attachment {
+    /// The upload's own id — also the directory the file lands in.
+    pub id: String,
     pub path: String,
     pub name: String,
     pub bytes: u64,
+    pub state: AttachState,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttachState {
+    Uploading,
+    Ready { uri: String },
+    Failed { reason: String },
 }
 #[derive(Default)]
 struct MenuState {
@@ -116,27 +126,61 @@ thread_local! {
     static SENT_ATTACHMENTS: RefCell<HashMap<String, Vec<Attachment>>> = RefCell::default();
 }
 
-/// The files a submit with this operation id attached, handed over once.
-pub fn take_attachments(operation_id: &str) -> Vec<Attachment> {
-    SENT_ATTACHMENTS.with_borrow_mut(|sent| sent.remove(operation_id).unwrap_or_default())
+/// The files a submit with this operation id sent — every one of them
+/// already in DuckFS — handed over once, as (name, `duck://` address).
+pub fn take_attachments(operation_id: &str) -> Vec<(String, String)> {
+    SENT_ATTACHMENTS
+        .with_borrow_mut(|sent| sent.remove(operation_id).unwrap_or_default())
+        .into_iter()
+        .filter_map(|attachment| match attachment.state {
+            AttachState::Ready { uri } => Some((attachment.name, uri)),
+            AttachState::Uploading | AttachState::Failed { .. } => None,
+        })
+        .collect()
 }
 
-/// Queue local files onto the composer under `scope`. A path that is not a
-/// readable file is refused with the reason; the rest are kept in order,
-/// a path already queued is not queued twice.
-pub fn attach(scope: &str, paths: &[String]) -> Result<(), String> {
+/// Put local files into the standby zone of the composer under `scope`,
+/// each with a fresh upload id; the app starts the uploads. A path that is
+/// not a readable file is refused with the reason; a path already there
+/// is not queued twice.
+pub fn attach(scope: &str, paths: &[String]) -> Result<Vec<Attachment>, String> {
     let shared = slot(scope);
     let mut slot = lock(&shared);
+    let mut queued = Vec::new();
     for path in paths {
         let attachment = attachment_of(path)?;
-        let queued = slot.document.attachments.iter().any(|a| a.path == *path);
-        if queued {
+        let already = slot.document.attachments.iter().any(|a| a.path == *path);
+        if already {
             continue;
         }
-        slot.document.attachments.push(attachment);
+        slot.document.attachments.push(attachment.clone());
         slot.rev += 1;
+        queued.push(attachment);
     }
-    Ok(())
+    slot.document.attach_note.clear();
+    Ok(queued)
+}
+
+/// The app's word on an upload: where the file landed, or why it did not.
+pub fn attached(scope: &str, id: &str, outcome: Result<String, String>) {
+    let shared = slot(scope);
+    let mut slot = lock(&shared);
+    let Some(attachment) = slot.document.attachments.iter_mut().find(|a| a.id == id) else {
+        return;
+    };
+    attachment.state = match outcome {
+        Ok(uri) => AttachState::Ready { uri },
+        Err(reason) => AttachState::Failed { reason },
+    };
+    slot.rev += 1;
+}
+
+/// Put a failed upload back on its way, under a fresh id.
+fn retry(document: &mut Document, index: usize) -> Option<Attachment> {
+    let attachment = document.attachments.get_mut(index)?;
+    attachment.id = crate::backend::fresh_operation_id("attach".into());
+    attachment.state = AttachState::Uploading;
+    Some(attachment.clone())
 }
 
 fn attachment_of(path: &str) -> Result<Attachment, String> {
@@ -150,10 +194,25 @@ fn attachment_of(path: &str) -> Result<Attachment, String> {
         return Err(format!("{name} is not a file"));
     }
     Ok(Attachment {
+        id: crate::backend::fresh_operation_id("attach".into()),
         path: path.to_owned(),
         name,
         bytes: meta.len(),
+        state: AttachState::Uploading,
     })
+}
+
+/// The event the app runs an upload on: the composer's scope, the upload
+/// id, and the local path.
+fn attach_event(scope: &str, attachment: &Attachment) -> Value {
+    Value::Record {
+        name: "composer_attach".into(),
+        fields: vec![
+            ("scope".into(), Value::Str(scope.into())),
+            ("id".into(), Value::Str(attachment.id.clone())),
+            ("path".into(), Value::Str(attachment.path.clone())),
+        ],
+    }
 }
 
 /// "12 B", "3.4 KB", "1.2 MB": a size a chip can carry.
@@ -267,23 +326,28 @@ pub fn intent(value: &Value) -> Option<crate::module_view::ModuleViewEvent> {
     let Value::Record { name, fields } = value else {
         return None;
     };
-    if name != "composer" {
-        return None;
-    }
     let field = |wanted: &str| {
         fields.iter().find_map(|(key, value)| match value {
             Value::Str(text) if key == wanted => Some(text.as_str()),
             _ => None,
         })
     };
-    let detail = serde_json::json!({
-        "scope": field("scope")?,
-        "kind": field("kind")?,
-        "body": field("body")?,
-        "id": field("id")?,
-    });
+    let detail = match name.as_str() {
+        "composer" => serde_json::json!({
+            "scope": field("scope")?,
+            "kind": field("kind")?,
+            "body": field("body")?,
+            "id": field("id")?,
+        }),
+        "composer_attach" => serde_json::json!({
+            "scope": field("scope")?,
+            "id": field("id")?,
+            "path": field("path")?,
+        }),
+        _ => return None,
+    };
     Some(crate::module_view::ModuleViewEvent {
-        kind: "composer".into(),
+        kind: name.clone(),
         detail: detail.to_string(),
     })
 }
@@ -724,8 +788,14 @@ impl ComposerView {
         !matches!(self.args.kind.as_str(), "edit" | "thread_edit")
     }
     fn attach_paths(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
-        let note = attach(&self.args.scope, &paths).err().unwrap_or_default();
-        lock(&self.shared).document.attach_note = note;
+        match attach(&self.args.scope, &paths) {
+            Ok(queued) => {
+                for attachment in queued {
+                    cx.emit(attach_event(&self.args.scope, &attachment));
+                }
+            }
+            Err(note) => lock(&self.shared).document.attach_note = note,
+        }
         cx.notify();
     }
     fn detach(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -736,6 +806,18 @@ impl ComposerView {
             slot.rev += 1;
         }
         drop(slot);
+        cx.notify();
+    }
+    fn retry_attach(&mut self, index: usize, cx: &mut Context<Self>) {
+        let retried = {
+            let mut slot = lock(&self.shared);
+            let retried = retry(&mut slot.document, index);
+            slot.rev += 1;
+            retried
+        };
+        if let Some(attachment) = retried {
+            cx.emit(attach_event(&self.args.scope, &attachment));
+        }
         cx.notify();
     }
     fn prompt_attach(&mut self, cx: &mut Context<Self>) {
@@ -848,7 +930,13 @@ impl Render for ComposerView {
                 slot.document.attach_note.clone(),
             )
         };
-        let sends_files = self.attaches() && !attachments.is_empty();
+        let uploading = attachments
+            .iter()
+            .any(|attachment| attachment.state == AttachState::Uploading);
+        let sends_files = self.attaches()
+            && attachments
+                .iter()
+                .any(|attachment| matches!(attachment.state, AttachState::Ready { .. }));
         let empty = empty && !sends_files;
         let mut content = div()
             .id("composer")
@@ -956,6 +1044,7 @@ impl Render for ComposerView {
                     ),
             );
         }
+        let drop_ring = cx.theme().primary;
         let mut plate = div()
             .flex()
             .flex_col()
@@ -963,6 +1052,10 @@ impl Render for ComposerView {
             .p(px(if self.args.compact { 6. } else { 8. }))
             .border_1()
             .border_color(cx.theme().border)
+            // the standby zone lights up while a file is dragged over it
+            .drag_over::<gpui_kit::ExternalPaths>(move |style, _, _, _| {
+                style.border_color(drop_ring)
+            })
             .rounded(px(design::radius::CARD as f32))
             .bg(cx.theme().background);
         if let Some(menu) = self.menu(cx) {
@@ -1007,41 +1100,73 @@ impl Render for ComposerView {
                 .gap(px(6.))
                 .pb(px(6.));
             for (index, attachment) in attachments.into_iter().enumerate() {
-                tray = tray.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .pl(px(10.))
-                        .pr(px(4.))
-                        .py(px(3.))
-                        .rounded(px(design::radius::PILL as f32))
-                        .bg(cx.theme().muted)
-                        .text_size(px(12.5))
-                        .child(
-                            div()
-                                .max_w(px(220.))
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .child(attachment.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(attachment_size(attachment.bytes)),
-                        )
-                        .child(
-                            Button::new(("detach", index))
-                                .label("×")
-                                .ghost()
-                                .xsmall()
-                                .accessibility_label(format!("Remove {}", attachment.name))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.detach(index, cx)
-                                })),
-                        ),
+                // what the chip says under the name: on its way, where it
+                // landed, or why it did not
+                let (note, note_color, failed) = match &attachment.state {
+                    AttachState::Uploading => (
+                        format!("Uploading · {}", attachment_size(attachment.bytes)),
+                        cx.theme().muted_foreground,
+                        false,
+                    ),
+                    AttachState::Ready { uri } => (uri.clone(), cx.theme().muted_foreground, false),
+                    AttachState::Failed { reason } => (reason.clone(), cx.theme().danger, true),
+                };
+                let mut chip = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .pl(px(10.))
+                    .pr(px(4.))
+                    .py(px(4.))
+                    .rounded(px(design::radius::CARD as f32))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().muted)
+                    .text_size(px(12.5))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .max_w(px(320.))
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(attachment.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(11.))
+                                    .text_color(note_color)
+                                    .child(note),
+                            ),
+                    );
+                if failed {
+                    chip = chip.child(
+                        Button::new(("retry-attach", index))
+                            .label("Retry")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.retry_attach(index, cx)
+                            })),
+                    );
+                }
+                chip = chip.child(
+                    Button::new(("detach", index))
+                        .label("×")
+                        .ghost()
+                        .xsmall()
+                        .accessibility_label(format!("Remove {}", attachment.name))
+                        .on_click(cx.listener(move |this, _, _, cx| this.detach(index, cx))),
                 );
+                tray = tray.child(chip);
             }
             plate = plate.child(tray);
         }
@@ -1089,7 +1214,8 @@ impl Render for ComposerView {
             Button::new("send")
                 .label(send_label)
                 .primary()
-                .disabled(self.args.blocked || empty)
+                // a send waits for its files to land
+                .disabled(self.args.blocked || empty || uploading)
                 .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
         );
         content.child(plate.child(toolbar))
@@ -1262,9 +1388,20 @@ fn submit_document(
     let body = mention_body(&document.text, &document.mentions)
         .trim()
         .to_owned();
-    // an edit rewrites a body; a send may be files alone
-    let sends_files = !matches!(kind, "edit" | "thread_edit") && !document.attachments.is_empty();
-    if body.is_empty() && !sends_files {
+    // an edit rewrites a body; a send may be files alone, and waits for
+    // every file still on its way
+    let is_edit = matches!(kind, "edit" | "thread_edit");
+    let landed = document
+        .attachments
+        .iter()
+        .filter(|attachment| matches!(attachment.state, AttachState::Ready { .. }))
+        .count();
+    let uploading = document
+        .attachments
+        .iter()
+        .any(|attachment| attachment.state == AttachState::Uploading);
+    let sends_files = !is_edit && landed > 0;
+    if (body.is_empty() && !sends_files) || (!is_edit && uploading) {
         return None;
     }
     let prefix = if kind == "reply" { "reply" } else { "message" };
@@ -1393,11 +1530,16 @@ mod tests {
         let file = std::env::temp_dir().join("composer-attach-test.txt");
         std::fs::write(&file, b"hello").unwrap();
         let path = file.to_string_lossy().into_owned();
-        attach("native-files", &[path.clone(), path.clone()]).unwrap();
+        let queued = attach("native-files", &[path.clone(), path.clone()]).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].bytes, 5);
         assert_eq!(lock(&slot("native-files")).document.attachments.len(), 1);
         assert!(attach("native-files", &[std::env::temp_dir().to_string_lossy().into_owned()]).is_err());
-        // an edit never takes files, a send with nothing typed still goes
+        // a send waits for the upload; an edit never takes files
+        assert!(testing::submit("native-files", "message", false).is_none());
+        attached("native-files", &queued[0].id, Ok("duck://files/shared/attachments/a/x".into()));
         assert!(testing::submit("native-files", "edit", false).is_none());
+        // with nothing typed the send still goes, files alone
         let sent = testing::submit("native-files", "message", false).expect("files alone send");
         let Value::Record { fields, .. } = sent else {
             panic!("not a record")
@@ -1406,10 +1548,21 @@ mod tests {
             panic!("no id")
         };
         let taken = take_attachments(id);
-        assert_eq!(taken.len(), 1);
-        assert_eq!(taken[0].name, "composer-attach-test.txt");
-        assert_eq!(taken[0].bytes, 5);
+        assert_eq!(
+            taken,
+            vec![(
+                "composer-attach-test.txt".to_owned(),
+                "duck://files/shared/attachments/a/x".to_owned()
+            )]
+        );
         assert!(take_attachments(id).is_empty());
+        // a failed upload is retried under a fresh id, and never sent
+        let queued = attach("native-files", std::slice::from_ref(&path)).unwrap();
+        attached("native-files", &queued[0].id, Err("no room".into()));
+        let retried = retry(&mut lock(&slot("native-files")).document, 0).unwrap();
+        assert_ne!(retried.id, queued[0].id);
+        assert_eq!(retried.state, AttachState::Uploading);
+        lock(&slot("native-files")).document.attachments.clear();
         assert!(lock(&slot("native-files")).document.attachments.is_empty());
         assert_eq!(attachment_size(5), "5 B");
         assert_eq!(attachment_size(1536), "1.5 KB");
