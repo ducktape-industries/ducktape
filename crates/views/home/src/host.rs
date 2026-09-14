@@ -4,7 +4,9 @@
 //! The kernel pushes SESSION FACTS ONLY (`home.props`: connected, dark, the
 //! chain id the titlebar names and the seated account). Everything on the
 //! screen is read HERE, through the kernel's doors alone: `rpc.status` for
-//! the node's phase and height, `rpc.query` against `valset` for the
+//! the node's phase, height, consensus facts and module set, `rpc.peers`
+//! for the mesh and `rpc.blocks` for the recent blocks (the three ride ONE
+//! `block` plane subscription), `rpc.query` against `valset` for the
 //! roster and against `governance` for the open proposals, `rpc.view`
 //! against `chat` for the rooms and against `runs` for the recent agent
 //! runs, and `files.get` for the recent duckfs snapshots — each re-read on
@@ -34,6 +36,9 @@ pub const ROOM_ROWS: usize = 8;
 pub const FILE_ROWS: usize = 6;
 pub const RUN_ROWS: usize = 6;
 pub const PROPOSAL_ROWS: usize = 6;
+pub const PEER_ROWS: usize = 8;
+pub const BLOCK_ROWS: usize = 8;
+pub const MODULE_ROWS: usize = 12;
 
 /// What a reading the node did not publish carries: negative, so an
 /// absence renders `—` and never a measured zero.
@@ -151,6 +156,27 @@ pub struct NodeFacts {
     pub node_key: String,
     /// the chain id the node reports, for the links this view spells
     pub chain_id: String,
+    pub version: String,
+    /// the composed root hash after the served head, hex
+    pub root_hash: String,
+    /// `operations.consensus`, present on a validator only: the quorum the
+    /// chain needs and how many validators this node can reach
+    pub quorum: i64,
+    pub reachable_validators: i64,
+    /// the newest checkpoint the store holds
+    pub checkpoint_height: i64,
+    pub sync_failures: i64,
+    pub sync_last_error: String,
+    /// the module set the node runs, as `/v1/status` lists it
+    pub modules: Vec<ModuleRow>,
+}
+
+/// One module the node runs: its id and the category the registry files
+/// it under.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleRow {
+    pub id: String,
+    pub category: String,
 }
 
 impl Default for NodeFacts {
@@ -161,6 +187,14 @@ impl Default for NodeFacts {
             sync_line: String::new(),
             node_key: String::new(),
             chain_id: String::new(),
+            version: String::new(),
+            root_hash: String::new(),
+            quorum: UNMEASURED,
+            reachable_validators: UNMEASURED,
+            checkpoint_height: UNMEASURED,
+            sync_failures: 0,
+            sync_last_error: String::new(),
+            modules: Vec::new(),
         }
     }
 }
@@ -171,8 +205,36 @@ pub struct FactsItem {
     pub error: String,
 }
 
-pub fn facts(connection: i64) -> ducktape_view_guest::Subscription<FactsItem> {
-    ducktape_view_guest::Subscription::run_with(connection, |_| reread(BLOCK_PLANE, load_facts))
+/// One reading off the node itself, as it lands: the three ride ONE
+/// `block` plane subscription and each folds into its own card.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeItem {
+    /// boxed: the facts carry the module set and dwarf the other two
+    Facts(Box<FactsItem>),
+    Peers(PeersItem),
+    Blocks(BlocksItem),
+}
+
+pub fn node(connection: i64) -> ducktape_view_guest::Subscription<NodeItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
+        node_readings().chain(live(BLOCK_PLANE).flat_map(|_| node_readings()))
+    })
+}
+
+/// The status, peers and blocks reads in flight together, each emitted as
+/// it answers: one refused door leaves the other two cards reading.
+fn node_readings() -> impl Stream<Item = NodeItem> {
+    stream::select_all([
+        stream::once(load_facts())
+            .map(|item| NodeItem::Facts(Box::new(item)))
+            .boxed_local(),
+        stream::once(load_peers())
+            .map(NodeItem::Peers)
+            .boxed_local(),
+        stream::once(load_blocks())
+            .map(NodeItem::Blocks)
+            .boxed_local(),
+    ])
 }
 
 async fn load_facts() -> FactsItem {
@@ -192,15 +254,38 @@ async fn load_facts() -> FactsItem {
 pub fn node_facts(status: &serde_json::Value) -> NodeFacts {
     let operations = &status["operations"];
     let sync = &operations["sync"];
+    let consensus = &operations["consensus"];
     let phase = operations["phase"].as_str().unwrap_or_default();
     let applied = sync["applied_height"].as_i64().unwrap_or(UNMEASURED);
     let target = sync["target_height"].as_i64().unwrap_or(UNMEASURED);
+    let modules = status["modules"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|module| ModuleRow {
+            id: module["id"].as_str().unwrap_or_default().to_owned(),
+            category: module["category"].as_str().unwrap_or_default().to_owned(),
+        })
+        .collect();
     NodeFacts {
         phase: capitalized(phase),
         height: served_height(&status["height"]),
         sync_line: sync_label(phase, applied, target),
         node_key: status["public_key"].as_str().unwrap_or_default().to_owned(),
         chain_id: status["chain_id"].as_str().unwrap_or_default().to_owned(),
+        version: status["version"].as_str().unwrap_or_default().to_owned(),
+        root_hash: status["root_hash"].as_str().unwrap_or_default().to_owned(),
+        quorum: consensus["quorum"].as_i64().unwrap_or(UNMEASURED),
+        reachable_validators: consensus["reachable_validators"]
+            .as_i64()
+            .unwrap_or(UNMEASURED),
+        checkpoint_height: operations["storage"]["checkpoint_height"]
+            .as_i64()
+            .unwrap_or(UNMEASURED),
+        sync_failures: sync["failures"].as_i64().unwrap_or(0),
+        sync_last_error: sync["last_error"].as_str().unwrap_or_default().to_owned(),
+        modules,
     }
 }
 
@@ -230,6 +315,114 @@ fn sync_label(phase: &str, applied: i64, target: i64) -> String {
         grouped_digits(applied),
         grouped_digits(target)
     )
+}
+
+// ---------- the peers ----------
+
+/// One peer of the mesh sample, THE KEYS THE NODE SERVES: `peer`, `role`,
+/// `connected`.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerRow {
+    pub key: String,
+    pub role: String,
+    pub live: bool,
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct PeersItem {
+    pub rows: Vec<PeerRow>,
+    pub error: String,
+}
+
+async fn load_peers() -> PeersItem {
+    match ask("rpc.peers", &serde_json::json!({})).await {
+        Ok(reply) => PeersItem {
+            rows: fold_peers(&reply),
+            error: String::new(),
+        },
+        Err(error) => PeersItem {
+            rows: Vec::new(),
+            error,
+        },
+    }
+}
+
+/// The mesh sample as rows, connected peers first.
+pub fn fold_peers(reply: &serde_json::Value) -> Vec<PeerRow> {
+    let mut rows: Vec<PeerRow> = reply["peers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|peer| PeerRow {
+            key: peer["peer"].as_str().unwrap_or_default().to_owned(),
+            role: peer["role"].as_str().unwrap_or_default().to_owned(),
+            live: peer["connected"].as_bool().unwrap_or(false),
+        })
+        .collect();
+    rows.sort_by_key(|peer| !peer.live);
+    rows
+}
+
+/// How many of the sampled peers are connected.
+pub fn live_peers(rows: &[PeerRow]) -> i64 {
+    count_i64(rows.iter().filter(|peer| peer.live).count())
+}
+
+// ---------- the blocks ----------
+
+/// One recent block that carried operations, as `GET /v1/blocks` lists it.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockRow {
+    pub height: i64,
+    /// the block's content address, hex
+    pub hash: String,
+    pub op_count: i64,
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct BlocksItem {
+    pub rows: Vec<BlockRow>,
+    pub error: String,
+}
+
+/// How many recent blocks are asked for: op-less filler blocks are dropped
+/// on the way to [`BLOCK_ROWS`] rows, so the window is wider than the card.
+const BLOCK_WINDOW: usize = 40;
+
+async fn load_blocks() -> BlocksItem {
+    match ask("rpc.blocks", &serde_json::json!({ "limit": BLOCK_WINDOW })).await {
+        Ok(reply) => BlocksItem {
+            rows: fold_blocks(&reply),
+            error: String::new(),
+        },
+        Err(error) => BlocksItem {
+            rows: Vec::new(),
+            error,
+        },
+    }
+}
+
+/// The block rows that carried operations, newest first as the node lists
+/// them. The endpoint is not uniformly filtered: a follower's boundary
+/// marker and an idle block come back with no ops, and neither is a block
+/// a dashboard has anything to say about.
+pub fn fold_blocks(reply: &serde_json::Value) -> Vec<BlockRow> {
+    reply
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| {
+            let ops = row["ops"].as_array().map_or(0, Vec::len);
+            (ops > 0).then(|| BlockRow {
+                height: row["height"].as_i64().unwrap_or(0),
+                hash: row["hash"].as_str().unwrap_or_default().to_owned(),
+                op_count: count_i64(ops),
+            })
+        })
+        .take(BLOCK_ROWS)
+        .collect()
 }
 
 // ---------- the roster ----------
@@ -394,7 +587,10 @@ pub fn rooms_with_news(rows: &[RoomRow], seen: &BTreeMap<String, i64>) -> Vec<(R
 /// The baseline after a read: a room seen for the first time is baselined
 /// at its head (nothing before the dashboard was open is news), a room
 /// already seen keeps its baseline until its link is followed.
-pub fn baseline_after_read(rows: &[RoomRow], seen: &BTreeMap<String, i64>) -> BTreeMap<String, i64> {
+pub fn baseline_after_read(
+    rows: &[RoomRow],
+    seen: &BTreeMap<String, i64>,
+) -> BTreeMap<String, i64> {
     rows.iter()
         .map(|room| {
             let baseline = seen.get(&room.id).copied().unwrap_or(room.head_seq);
@@ -469,7 +665,10 @@ fn fold_author(author: &serde_json::Value) -> String {
         return format!("module:{module}");
     }
     if author["Key"].is_array() {
-        return format!("ext:{}", short_label(&hex_encode(&json_bytes(&author["Key"]))));
+        return format!(
+            "ext:{}",
+            short_label(&hex_encode(&json_bytes(&author["Key"])))
+        );
     }
     String::new()
 }
@@ -628,8 +827,7 @@ pub fn open_link(link: &str) -> bool {
 pub fn copy(text: &str, label: &str) -> bool {
     host::notify(
         "home.copy",
-        &serde_json::to_vec(&serde_json::json!({ "text": text, "label": label }))
-            .expect("encodes"),
+        &serde_json::to_vec(&serde_json::json!({ "text": text, "label": label })).expect("encodes"),
     );
     true
 }
@@ -652,6 +850,45 @@ fn net_query(chain_id: &str) -> String {
         true => String::new(),
         false => format!("?net={digest}"),
     }
+}
+
+// ---------- the layout ----------
+
+/// The pane width before the sensor has measured it: wide enough that the
+/// first frame stands the cards in every column, so a wide window never
+/// flashes a single rail before its first measurement lands.
+pub const UNMEASURED_WIDTH: f64 = 1280.;
+
+/// How many columns the cards stand in at a pane width: one rail below the
+/// width two cards can share, two up to where three fit at a readable
+/// width, three above.
+pub fn columns_for(width: f64) -> usize {
+    const TWO_COLUMNS_FROM: f64 = 720.;
+    const THREE_COLUMNS_FROM: f64 = 1120.;
+    let fits_three = width >= THREE_COLUMNS_FROM;
+    let fits_two = width >= TWO_COLUMNS_FROM;
+    match (fits_three, fits_two) {
+        (true, _) => 3,
+        (false, true) => 2,
+        (false, false) => 1,
+    }
+}
+
+/// How many stat tiles share one line: two per card column, capped where
+/// a tile would stop fitting a grouped number and its label.
+pub fn tiles_per_row(columns: usize) -> usize {
+    (columns * 2).min(4)
+}
+
+/// `items` dealt into `columns` rails in order, round-robin, so the first
+/// cards lead every column and the rails stay close in length.
+pub fn dealt<T>(items: Vec<T>, columns: usize) -> Vec<Vec<T>> {
+    let columns = columns.max(1);
+    let mut rails: Vec<Vec<T>> = (0..columns).map(|_| Vec::new()).collect();
+    for (index, item) in items.into_iter().enumerate() {
+        rails[index % columns].push(item);
+    }
+    rails
 }
 
 // ---------- rendering helpers ----------
@@ -678,6 +915,15 @@ pub fn height_label(height: i64) -> String {
         return "block —".into();
     }
     format!("block {}", grouped_digits(height))
+}
+
+/// A count the node may not have served: the grouped digits, or `—` for
+/// an unmeasured one.
+pub fn count_label(count: i64) -> String {
+    match count < 0 {
+        true => "—".into(),
+        false => grouped_digits(count),
+    }
 }
 
 pub fn grouped_digits(number: i64) -> String {
@@ -712,7 +958,7 @@ pub fn tagged_name(value: &serde_json::Value) -> String {
     })
 }
 
-fn count_i64(count: usize) -> i64 {
+pub fn count_i64(count: usize) -> i64 {
     i64::try_from(count).unwrap_or(i64::MAX)
 }
 

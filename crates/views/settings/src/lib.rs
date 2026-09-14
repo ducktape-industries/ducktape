@@ -37,6 +37,15 @@ pub struct SettingsView {
     pub(crate) account_exists: bool,
     pub(crate) account_busy: bool,
     pub(crate) account_ticket: String,
+    /// the self-update facts (`host::Session::update_*`)
+    pub(crate) update_state: String,
+    pub(crate) update_current: String,
+    pub(crate) update_previous: String,
+    pub(crate) update_staged_display: String,
+    pub(crate) update_channel: String,
+    pub(crate) update_checked: String,
+    pub(crate) update_note: String,
+    pub(crate) update_busy: bool,
     pub(crate) connection_serial: i64,
     pub(crate) tier: String,
     pub(crate) admin: bool,
@@ -85,6 +94,9 @@ pub enum Message {
     SetAppearanceLight,
     SetAppearanceDark,
     SetDesktopNotifications(bool),
+    CheckForUpdate,
+    RestartToUpdate,
+    RollBackUpdate,
     PickSettingsPane(SettingsPane),
     EditSettingsPassword(String),
     BindAccountNameDraft(String),
@@ -128,6 +140,14 @@ impl SettingsView {
             account_exists: false,
             account_busy: false,
             account_ticket: "".to_owned(),
+            update_state: "unavailable".to_owned(),
+            update_current: "".to_owned(),
+            update_previous: "".to_owned(),
+            update_staged_display: "".to_owned(),
+            update_channel: "".to_owned(),
+            update_checked: "".to_owned(),
+            update_note: "".to_owned(),
+            update_busy: false,
             connection_serial: 0,
             tier: "".to_owned(),
             admin: false,
@@ -296,6 +316,9 @@ impl SettingsView {
             Message::SetAppearanceLight => self.on_set_appearance_light(),
             Message::SetAppearanceDark => self.on_set_appearance_dark(),
             Message::SetDesktopNotifications(enabled) => self.on_set_desktop_notifications(enabled),
+            Message::CheckForUpdate => self.on_check_for_update(),
+            Message::RestartToUpdate => self.on_restart_to_update(),
+            Message::RollBackUpdate => self.on_roll_back_update(),
             Message::PickSettingsPane(picked) => self.on_pick_settings_pane(picked),
             Message::EditSettingsPassword(value) => self.on_edit_settings_password(value),
             Message::BindAccountNameDraft(value) => self.on_bind_account_name_draft(value),
@@ -341,6 +364,14 @@ impl SettingsView {
         self.account_busy = next.account_busy;
         self.account_ticket = next.account_ticket.to_owned();
         self.tasting = next.tasting.clone();
+        self.update_state = next.update_state.to_owned();
+        self.update_current = next.update_current.to_owned();
+        self.update_previous = next.update_previous.to_owned();
+        self.update_staged_display = next.update_staged_display.to_owned();
+        self.update_channel = next.update_channel.to_owned();
+        self.update_checked = next.update_checked.to_owned();
+        self.update_note = next.update_note.to_owned();
+        self.update_busy = next.update_busy;
         let renamed = crate::host::renamed_to(&(next.account_name), &(self.renaming_to));
         self.renaming_to = crate::host::keep_draft(renamed, &(self.renaming_to));
         self.account_name_draft = crate::host::keep_draft(renamed, &(self.account_name_draft));
@@ -513,6 +544,18 @@ impl SettingsView {
         crate::host::untaste(&module);
         Task::none()
     }
+    fn on_check_for_update(&mut self) -> Task<Message> {
+        crate::host::check_for_update();
+        Task::none()
+    }
+    fn on_restart_to_update(&mut self) -> Task<Message> {
+        crate::host::restart_to_update();
+        Task::none()
+    }
+    fn on_roll_back_update(&mut self) -> Task<Message> {
+        crate::host::roll_back_update();
+        Task::none()
+    }
     fn on_pick_settings_pane(&mut self, picked: SettingsPane) -> Task<Message> {
         self.settings_pane = picked;
         Task::none()
@@ -638,6 +681,14 @@ fn host_notifier_note(enabled: bool, host: &str) -> &'static str {
         }
         "unavailable" => "No notification service on this desktop.",
         _ => "",
+    }
+}
+/// The "Last check" cell: the clock's words, or what is running instead.
+fn update_check_words(state: &str, checked: &str, busy: bool) -> String {
+    match (state, busy) {
+        ("downloading", _) => "Downloading…".to_owned(),
+        (_, true) => "Checking…".to_owned(),
+        (_, false) => checked.to_owned(),
     }
 }
 /// One setting on its own row: what it is and why on the left, the control
@@ -773,6 +824,7 @@ impl SettingsView {
         kit::scroll("settings", page)
     }
     fn general_settings(&self) -> wire::Node {
+        use ducktape_view_guest::kit;
         let appearance = settings_choice(
             "settings/appearance",
             [
@@ -817,7 +869,7 @@ impl SettingsView {
         } else {
             "Silent — the bell is the only notice."
         };
-        setting_list(
+        let preferences = setting_list(
             "settings/general",
             [
                 setting_row(
@@ -838,6 +890,98 @@ impl SettingsView {
                     notifications,
                 ),
             ],
+        );
+        kit::spaced(
+            kit::column(
+                "settings/general-body",
+                [preferences, self.updates_section()],
+            ),
+            18.,
+        )
+    }
+    /// The "Updates" group: what runs, what is staged, when the network was
+    /// last asked, and the controls — a check, the restart into a staged
+    /// release, the rollback to the kept one. Without a launcher (`make dev`
+    /// runs the binary bare) it says so and offers nothing.
+    fn updates_section(&self) -> wire::Node {
+        use ducktape_view_guest::kit;
+        let unavailable = self.update_state == "unavailable";
+        if unavailable {
+            return settings_section(
+                "settings/updates",
+                "settings/updates-title",
+                "Updates",
+                "",
+                kit::wrapping(kit::secondary(
+                    "settings/updates-unavailable",
+                    "Updates unavailable: not installed through the launcher.",
+                )),
+            );
+        }
+        let staged = self.update_state == "staged";
+        let rollback_offered = !self.update_previous.is_empty() && self.update_state == "idle";
+        let current = kit::kv(
+            "settings/update-current-row",
+            "Installed release",
+            kit::mono("settings/update-current", &self.update_current),
+        );
+        let channel = kit::kv(
+            "settings/update-channel-row",
+            "Channel",
+            kit::text("settings/update-channel", &self.update_channel),
+        );
+        let checked = kit::kv(
+            "settings/update-checked-row",
+            "Last check",
+            kit::text(
+                "settings/update-checked",
+                update_check_words(&self.update_state, &self.update_checked, self.update_busy),
+            ),
+        );
+        let mut rows = vec![current, channel, checked];
+        if staged {
+            rows.push(kit::kv(
+                "settings/update-staged-row",
+                "Ready to install",
+                kit::text("settings/update-staged", &self.update_staged_display),
+            ));
+        }
+        let mut actions = vec![settings_action(
+            "settings/update-check",
+            "Check now",
+            Message::CheckForUpdate,
+            !self.update_busy && self.update_state == "idle",
+        )];
+        if staged {
+            actions.push(settings_primary(
+                "settings/update-restart",
+                "Restart to update",
+                Message::RestartToUpdate,
+                true,
+            ));
+        }
+        if rollback_offered {
+            actions.push(settings_subtle(
+                "settings/update-rollback",
+                &format!("Roll back to {}", self.update_previous),
+                Message::RollBackUpdate,
+                !self.update_busy,
+            ));
+        }
+        let mut body = vec![setting_list("settings/update-rows", rows)];
+        if !self.update_note.is_empty() {
+            body.push(kit::wrapping(kit::caption(
+                "settings/update-note",
+                &self.update_note,
+            )));
+        }
+        body.push(kit::row("settings/update-actions", actions));
+        settings_section(
+            "settings/updates",
+            "settings/updates-title",
+            "Updates",
+            "",
+            kit::spaced(kit::column("settings/updates-body", body), 10.),
         )
     }
     fn network_settings(&self) -> wire::Node {

@@ -284,6 +284,7 @@ pub fn settings_view(
     account_exists: bool,
     account_busy: bool,
     account_ticket: &str,
+    updates: &crate::backend::update::UpdateFacts,
 ) -> ViewSpec {
     let appearance = match appearance {
         crate::Appearance::System => "system",
@@ -316,6 +317,14 @@ pub fn settings_view(
         "account_busy": account_busy,
         "account_ticket": account_ticket,
         "tasting": taste_props(),
+        "update_state": updates.state,
+        "update_current": updates.current,
+        "update_previous": updates.previous,
+        "update_staged_display": updates.staged_display,
+        "update_channel": updates.channel,
+        "update_checked": updates.checked,
+        "update_note": updates.note,
+        "update_busy": updates.busy,
     });
     module_view(
         "settings",
@@ -354,6 +363,9 @@ pub fn settings_intent(event: &ModuleViewEvent) -> crate::SettingsIntent {
         "notifications" => Intent::Notifications,
         "taste" => Intent::Taste,
         "untaste" => Intent::Untaste,
+        "update_check" => Intent::UpdateCheck,
+        "update_restart" => Intent::UpdateRestart,
+        "update_rollback" => Intent::UpdateRollback,
         _ => Intent::Copy,
     }
 }
@@ -750,13 +762,17 @@ fn surface_bool(args: &[wire::SurfaceValue], index: usize) -> bool {
 }
 
 fn surface_allowed(module: &str, surface: &str) -> bool {
-    match (module, surface) {
-        (_, "artifact_svg" | "artifact_image") => true,
-        ("chat", "chat_composer" | "picture") => true,
-        ("forge", "forge_composer" | "picture" | "forge_markdown" | "forge_code") => true,
-        ("files", "picture" | "forge_code" | "agent_markdown") => true,
-        _ => false,
-    }
+    matches!(
+        (module, surface),
+        (_, "artifact_svg" | "artifact_image")
+            | ("chat", "chat_composer" | "picture")
+            | (
+                "forge",
+                "forge_composer" | "picture" | "forge_markdown" | "forge_code"
+            )
+            | ("files", "picture" | "forge_code" | "agent_markdown")
+            | ("agents", "agent_markdown")
+    )
 }
 
 /// The operations a view may ask of the app, by module. An intent outside
@@ -829,6 +845,9 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "notifications",
             "taste",
             "untaste",
+            "update_check",
+            "update_restart",
+            "update_rollback",
         ],
         // pages speaks the kernel contract: every read is `rpc.view` and
         // every write `op.submit`. What is left are the two OS doors — the
@@ -4094,6 +4113,19 @@ pub(crate) mod tests {
             ),
             ("recent", serde_json::json!({ "runs": [] })),
             ("files.get", serde_json::json!({ "snapshots": [] })),
+            (
+                "rpc.peers",
+                serde_json::json!({ "peers": [
+                    { "peer": "f00dbeefcafe", "role": "validator", "connected": true }
+                ] }),
+            ),
+            (
+                "rpc.blocks",
+                serde_json::json!([
+                    { "height": 84912, "hash": "ab".repeat(32), "commit_hash": "",
+                      "ops": [{ "op_hash": "cd".repeat(32) }] }
+                ]),
+            ),
         ]);
         let mut guest = Guest::load_from("home", &staged).expect("the view loads");
         assert_eq!(guest.name, "Home", "the tab is named by the manifest");
@@ -4129,7 +4161,16 @@ pub(crate) mod tests {
         );
         while guest.redraw(&session) {}
         let shown = texts(&guest);
-        for expected in ["Validating", "block 84,912", "8c4fa211", "#general", "Validator"] {
+        for expected in [
+            "Validating",
+            "block 84,912",
+            "8c4fa211",
+            "#general",
+            "Validator",
+            "f00dbeef",
+            "Online",
+            "1 ops",
+        ] {
             assert!(
                 shown.iter().any(|text| text == expected),
                 "missing {expected:?} in {shown:?}"
@@ -4713,7 +4754,10 @@ pub(crate) mod tests {
                 "account_ceremony_detail": "", "account_ceremony_left": "",
                 "settings_key_state": "sealed", "settings_key_path": "/keys/user.key",
                 "account_number": "42", "account_exists": true,
-                "account_busy": false, "account_ticket": ""
+                "account_busy": false, "account_ticket": "",
+                "update_state": "unavailable", "update_current": "", "update_previous": "",
+                "update_staged_display": "", "update_channel": "stable",
+                "update_checked": "", "update_note": "", "update_busy": false
             }))
             .expect("props encode"),
         );

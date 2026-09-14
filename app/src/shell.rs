@@ -1616,7 +1616,17 @@ impl DesktopWindow {
         let label = |module: &'static str| {
             crate::module_view::tab_label(module, &crate::module_view::module_name(module))
         };
-        let mut navigation = vec![
+        // the dashboard leads the rail, above every section: it is the
+        // network at a glance, not a workspace tool or a network tool
+        let registered = crate::module_view::registered_views();
+        let dashboard = registered
+            .iter()
+            .copied()
+            .filter(|module| *module == HOME_VIEW);
+        let mut navigation: Vec<(ShellTab, String)> = dashboard
+            .map(|module| (ShellTab::Registered(module), label(module)))
+            .collect();
+        navigation.extend([
             (ShellTab::Chat, label("chat")),
             (ShellTab::Pages, label("pages")),
             (ShellTab::Forge, label("forge")),
@@ -1626,12 +1636,13 @@ impl DesktopWindow {
             (ShellTab::Node, label("node")),
             (ShellTab::Members, label("members")),
             (ShellTab::Governance, label("governance")),
-        ];
-        // the views the connected node's registry lists, after the built-in
-        // tabs and in the registry's order; named by their manifests
+        ]);
+        // the other views the connected node's registry lists, after the
+        // built-in tabs and in the registry's order; named by their manifests
         navigation.extend(
-            crate::module_view::registered_views()
+            registered
                 .into_iter()
+                .filter(|module| *module != HOME_VIEW)
                 .map(|module| (ShellTab::Registered(module), label(module))),
         );
         navigation.push((ShellTab::Settings, label("settings")));
@@ -1930,6 +1941,7 @@ impl DesktopWindow {
         let state = &self.model.read(cx).state;
         let error = state.error.clone();
         let toast = state.toast.clone();
+        let update_strip = state.update_strip();
         let needs_account =
             state.connected && !state.account_exists && !state.account_banner_dismissed;
         let mut content = div()
@@ -1985,6 +1997,9 @@ impl DesktopWindow {
                         .text_color(colors.muted_foreground),
                     ),
             );
+        }
+        if let Some(strip) = update_strip {
+            content = content.child(self.update_strip(strip, &colors, palette));
         }
         if !error.is_empty() {
             content = content.child(
@@ -2069,6 +2084,60 @@ impl DesktopWindow {
             root = root.child(overlay);
         }
         root.into_any_element()
+    }
+
+    /// The update strip across the top of the console: the same quiet
+    /// one-line band as the account notice. A staged release offers the
+    /// restart; a rollback says so until dismissed.
+    fn update_strip(
+        &self,
+        strip: crate::backend::update::UpdateStrip,
+        colors: &gpui_kit::component::ColorTokens,
+        palette: &design::Palette,
+    ) -> gpui_kit::AnyElement {
+        use gpui_kit::*;
+        let (words, tone, action) = match strip {
+            crate::backend::update::UpdateStrip::Ready { display } => (
+                format!("Ducktape {display} is ready"),
+                hsla_of(palette.accent_soft),
+                self.action(
+                    "update-restart",
+                    "Restart to update",
+                    Message::UpdateAction(crate::UpdateAction::RestartToUpdate),
+                    false,
+                ),
+            ),
+            crate::backend::update::UpdateStrip::RolledBack { failed, reason } => (
+                format!("Update {failed} was rolled back ({reason})"),
+                hsla_of(palette.warning_soft),
+                self.action(
+                    "update-rollback-dismiss",
+                    "Dismiss",
+                    Message::UpdateAction(crate::UpdateAction::DismissRollbackNotice),
+                    false,
+                ),
+            ),
+        };
+        div()
+            .id("update-strip")
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .h(px(32.))
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(colors.border)
+            .bg(tone)
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(12.))
+                    .text_color(colors.foreground)
+                    .child(words),
+            )
+            .child(action.outline().h_6().text_size(px(12.)))
+            .into_any_element()
     }
 
     fn overlay(
@@ -2890,6 +2959,10 @@ fn hsla_of(color: design::Color) -> gpui_kit::Hsla {
 }
 
 /// Lucide glyphs the kit's default bundle does not carry.
+/// The registry id of the dashboard view: the one registered view that
+/// leads the rail instead of following the built-in tabs.
+const HOME_VIEW: &str = "home";
+
 const MESSAGE_SQUARE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>"#;
 const GIT_BRANCH: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>"#;
 const USERS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>"#;

@@ -206,7 +206,9 @@ pub use sandbox_host::{GuestAsset, GuestLayout};
 #[cfg(unix)]
 pub(crate) use sandbox_host::{firecracker_api, guest_manifest, microvm};
 mod egress_proxy;
+mod pi;
 mod read_lane;
+pub mod run_session;
 mod spec;
 mod variants;
 #[cfg(unix)]
@@ -1182,6 +1184,9 @@ impl CliProvider {
         // built BEFORE the seed writes below, so a failed seed takes the
         // half-materialized home down with it on the `?`.
         let home = RunHome { slot, config };
+        if self.spec.isolation.broker == Some(BrokerKind::Pi) {
+            pi::stage_tools(home.config())?;
+        }
         // The two Claude Code state files this FRESH config home must carry.
         // Written only for the Anthropic broker (codex ignores both).
         //
@@ -1313,6 +1318,7 @@ impl CliProvider {
         // loopback — would now widen the credential endpoint's reach for no
         // caller.
         match kind {
+            BrokerKind::Pi => broker::RunBroker::start_pi(airlock).await.map(Some),
             BrokerKind::CodexResponses => broker::RunBroker::start(airlock).await.map(Some),
             BrokerKind::AnthropicMessages => {
                 broker::RunBroker::start_anthropic(airlock).await.map(Some)
@@ -1356,6 +1362,12 @@ impl CliProvider {
             return Ok(());
         };
         match self.spec.isolation.broker {
+            Some(BrokerKind::Pi) => {
+                let Some(config) = auth.config_home else {
+                    return Err(format!("{}: Pi broker run has no config home", self.spec.tag));
+                };
+                pi::configure(config, broker, &mut set)?;
+            }
             Some(BrokerKind::AnthropicMessages) => {
                 set("ANTHROPIC_BASE_URL", broker.base_url.clone());
                 // Seed the run bearer as a `claudeAiOauth` credentials file in the
@@ -1437,9 +1449,9 @@ impl CliProvider {
     /// provider in after the subcommand selector (`args[0]`, e.g. `exec`) —
     /// where codex expects its `-c` overrides. a no-op without a broker.
     ///
-    /// ARGV aiming is CODEX-SPECIFIC. The Anthropic broker aims claude by ENV
-    /// (see [`Self::apply_auth_env`]) — a claude argv has no `-c model_providers`
-    /// splice — so for any non-codex broker the argv passes through unchanged.
+    /// Model-provider argv overrides are Codex-specific. Claude and Pi use
+    /// [`Self::apply_auth_env`]; Pi's headless argv additionally loads its staged
+    /// Ducktape tool extension, while Claude's argv passes through unchanged.
     ///
     /// the child is given a base URL and [`BROKER_TOKEN_ENV`], and neither can
     /// recover the operator's credential: the bearer is 32 random bytes minted
@@ -1447,8 +1459,19 @@ impl CliProvider {
     /// ([`crate::interactive`]) shares [`broker_provider_overrides`] but PREPENDS
     /// them (a TUI argv has no `exec` selector to splice after).
     fn broker_argv(&self, args: &[String], workdir: &Path, auth: &RunAuth<'_>) -> Vec<String> {
-        if self.spec.isolation.broker != Some(BrokerKind::CodexResponses) {
-            return args.to_vec();
+        match self.spec.isolation.broker {
+            Some(BrokerKind::Pi) => {
+                let mut argv = args.to_vec();
+                if let Some(config) = auth.config_home {
+                    argv.extend([
+                        "-e".into(),
+                        config.join(pi::TOOL_EXTENSION).display().to_string(),
+                    ]);
+                }
+                return argv;
+            }
+            Some(BrokerKind::CodexResponses) => {}
+            Some(BrokerKind::AnthropicMessages) | None => return args.to_vec(),
         }
         let (Some(broker), Some(selector)) = (auth.broker, args.first()) else {
             return args.to_vec();
@@ -2762,6 +2785,56 @@ impl CliProvider {
             )
         };
 
+        let protocol = match self.spec.output {
+            OutputFormat::CodexSession => Some(run_session::Protocol::Codex),
+            OutputFormat::ClaudeSession => Some(run_session::Protocol::Claude),
+            // Pi is a one-shot `--print` run whose events arrive on stdout; it
+            // drives no bidirectional session protocol.
+            OutputFormat::PiJson
+            | OutputFormat::JsonlEvents
+            | OutputFormat::JsonResult
+            | OutputFormat::Text => None,
+        };
+        if let Some(protocol) = protocol {
+            let result = run_session::drive(
+                protocol,
+                prompt,
+                (stdin, stdout_pipe, stderr_pipe),
+                ctx,
+                self.output_sink.clone(),
+                (idle, hard),
+                broker_invocation.as_ref(),
+            )
+            .await;
+            if let Some(invocation) = &broker_invocation {
+                invocation.revoke();
+            }
+            if result.is_err() {
+                control.terminate().await;
+                return result;
+            }
+            let exited = tokio::time::timeout(
+                Duration::from_secs(10),
+                control.wait_success("provider session"),
+            )
+            .await;
+            match exited {
+                Ok(Ok((true, _))) => return result,
+                Ok(Ok((false, code))) => {
+                    control.terminate().await;
+                    return Err(format!("provider session exited unsuccessfully: {code:?}"));
+                }
+                Ok(Err(error)) => {
+                    control.terminate().await;
+                    return Err(error.to_string());
+                }
+                Err(_) => {
+                    control.terminate().await;
+                    return Err("provider session did not exit after its result".into());
+                }
+            }
+        }
+
         // feed the prompt CONCURRENTLY with collecting output: a prompt larger
         // than the pipe buffer would deadlock a sequential write-then-wait if
         // the CLI streams output before draining stdin.
@@ -3025,11 +3098,18 @@ impl CliProvider {
         }
         let stdout = String::from_utf8_lossy(&out_bytes).into_owned();
         let (text, usage) = match self.spec.output {
+            OutputFormat::PiJson => {
+                let output = pi::parse_output(&stdout)?;
+                (output.text, output.usage)
+            }
             OutputFormat::JsonlEvents => (parse_jsonl_events(&stdout)?, parse_token_usage(&stdout)),
             OutputFormat::JsonResult => (parse_json_result(&stdout)?, parse_token_usage(&stdout)),
             // Plain stdout is model-authored answer text, not a provider
             // telemetry envelope. Never infer usage from answer content.
             OutputFormat::Text => (parse_text_output(&stdout)?, None),
+            OutputFormat::CodexSession | OutputFormat::ClaudeSession => {
+                unreachable!("session driver returned above")
+            }
         };
         Ok(Invocation { text, usage })
     }
@@ -3655,7 +3735,7 @@ mod tests {
         let installed = scratch("announce-installed").join("executors");
         std::fs::create_dir_all(&installed).expect("executors dir");
         for name in ["codex", "codex-code-mode-host"] {
-            std::fs::copy("/bin/true", installed.join(name)).expect("copy");
+            fake_cli(&installed, name, "exit 0");
         }
         let announced = discover(
             b"n",
@@ -4083,6 +4163,7 @@ broker = "anthropic-messages"
             SandboxBackend::Bare,
         );
         let endpoint = broker::BrokerEndpoint {
+            kind: CredentialKind::Codex,
             base_url: "http://127.0.0.1:54321/v1".into(),
             run_bearer: "opaque-run-bearer".into(),
             control_url: "http://127.0.0.1:54321/v1/control/provider-idle".into(),
@@ -4220,6 +4301,79 @@ broker = "anthropic-messages"
         assert!(envs.iter().all(|(key, _)| {
             key != PROVIDER_CONTROL_URL_ENV && key != PROVIDER_CONTROL_TOKEN_ENV
         }));
+    }
+
+    #[test]
+    fn pi_config_and_argv_use_only_the_selected_run_broker() {
+        let spec = spec::builtin_specs()
+            .into_iter()
+            .find(|spec| spec.tag == "pi")
+            .unwrap();
+        let provider = CliProvider::from_spec(spec, PathBuf::from("/usr/bin/pi"), SandboxBackend::Bare);
+        let workdir = scratch("pi-config");
+        for kind in [CredentialKind::Claude, CredentialKind::Codex] {
+            let home = provider.prepare_config_home(&workdir).unwrap().unwrap();
+            let endpoint = broker::BrokerEndpoint {
+                kind,
+                base_url: "http://127.0.0.1:54321".into(),
+                run_bearer: "opaque-run-capability-not-an-upstream-token".into(),
+                control_url: "http://127.0.0.1:54321/control/provider-idle".into(),
+                control_token: "separate-control-capability".into(),
+            };
+            let auth = RunAuth {
+                config_home: Some(home.config()),
+                broker: Some(&endpoint),
+            };
+            let env: std::collections::BTreeMap<_, _> = provider
+                .sandbox_env(&RunContext::default(), &auth)
+                .unwrap()
+                .into_iter()
+                .collect();
+            assert_eq!(
+                env["PI_CODING_AGENT_DIR"],
+                home.config().display().to_string()
+            );
+            assert_eq!(env[BROKER_TOKEN_ENV], endpoint.run_bearer);
+            assert_eq!(env["PI_OFFLINE"], "1");
+            for name in [
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+            ] {
+                assert!(!env.contains_key(name));
+            }
+            let models: Value =
+                serde_json::from_slice(&std::fs::read(home.config().join("models.json")).unwrap())
+                    .unwrap();
+            let settings: Value =
+                serde_json::from_slice(&std::fs::read(home.config().join("settings.json")).unwrap())
+                    .unwrap();
+            let selected = match kind {
+                CredentialKind::Claude => "anthropic",
+                CredentialKind::Codex => "openai-codex",
+            };
+            assert_eq!(models["providers"].as_object().unwrap().len(), 1);
+            assert_eq!(models["providers"][selected]["baseUrl"], endpoint.base_url);
+            assert_eq!(
+                models["providers"][selected]["apiKey"],
+                format!("${BROKER_TOKEN_ENV}")
+            );
+            assert_eq!(settings["defaultProvider"], selected);
+            assert_eq!(settings["transport"], "sse");
+            assert!(!home.config().join("auth.json").exists());
+            assert!(!home.config().join(".credentials.json").exists());
+            let extension = home.config().join(pi::TOOL_EXTENSION);
+            assert!(extension.is_file());
+            let argv = provider.broker_argv(&provider.spec.args, &workdir, &auth);
+            assert!(
+                argv.windows(2)
+                    .any(|pair| pair[0] == "-e" && pair[1] == extension.display().to_string())
+            );
+            assert!(!argv.iter().any(|arg| arg.contains(&endpoint.run_bearer)));
+            let config = home.config().to_path_buf();
+            drop(home);
+            assert!(!config.exists());
+        }
     }
 
     /// A fresh claude config home is not usable EMPTY: Claude Code decides it is
@@ -4483,6 +4637,7 @@ broker = "anthropic-messages"
             SandboxBackend::Bare,
         );
         let endpoint = broker::BrokerEndpoint {
+            kind: CredentialKind::Claude,
             // NOTE: no `/v1` — ANTHROPIC_BASE_URL is the API root.
             base_url: "http://127.0.0.1:54321".into(),
             run_bearer: "opaque-run-bearer".into(),
@@ -5790,6 +5945,39 @@ format = "text"
             answer.contains("codex"),
             "the guest exec'd the codex from the executors image: {answer:?}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "live: needs a hypervisor, guest rootfs, and an installed Pi bundle"]
+    async fn installed_pi_bundle_execs_inside_a_microvm() {
+        let backend = platform_backend();
+        backend
+            .probe()
+            .expect("configured hypervisor and guest images");
+        let bin = installed_executor_dir().join("pi");
+        assert!(bin.is_file(), "install Pi in DUCKTAPE_EXECUTOR_DIR");
+        let root = scratch("installed-pi");
+        let mut spec = spec::builtin_specs()
+            .into_iter()
+            .find(|spec| spec.tag == "pi")
+            .unwrap();
+        spec.args = vec!["--version".into()];
+        spec.output = OutputFormat::Text;
+        spec.isolation.broker = None;
+        let provider = CliProvider::from_spec(spec, bin, backend).with_workdir(root.join("wd"));
+        let ctx = RunContext {
+            executing_node: Some(execution_node_id(b"installed-pi")),
+            limits: [("cores".into(), 1), ("mem_gb".into(), 1)]
+                .into_iter()
+                .collect(),
+            ..RunContext::default()
+        };
+        let answer = provider
+            .run("", &ctx)
+            .await
+            .expect("Pi bundle runs in the guest");
+        assert_ne!(answer, "0.0.0", "Pi must find its sibling package metadata");
+        assert!(answer.split('.').count() >= 3, "Pi version: {answer:?}");
     }
 
     /// The full hardware path on a real VMM: a spec's argv and prompt reach a

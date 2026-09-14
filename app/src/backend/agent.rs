@@ -20,6 +20,16 @@ pub struct AgentChatEvent {
 
 pub(crate) fn provider_output_event(provider: &str, line: &str, id: i64) -> Option<AgentChatEvent> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    // Live output does not identify its provider. Pi's authoritative event
+    // types are distinct from Claude messages and Codex items.
+    let pi_event = provider == "pi"
+        || matches!(
+            value["type"].as_str(),
+            Some("message_end" | "tool_execution_start" | "tool_execution_end")
+        );
+    if pi_event {
+        return pi_output_event(&value, id);
+    }
     if provider == "claude" && value["type"].as_str() == Some("result") {
         let answer = value["result"].as_str()?.to_string();
         return Some(chat_preview(id, answer));
@@ -111,6 +121,58 @@ pub(crate) fn provider_output_event(provider: &str, line: &str, id: i64) -> Opti
         title,
         detail: clip_text(&detail, 1_200),
         status: status.into(),
+        answer: String::new(),
+        saga_id: String::new(),
+    })
+}
+
+fn pi_output_event(value: &serde_json::Value, id: i64) -> Option<AgentChatEvent> {
+    let title = match value["type"].as_str()? {
+        "message_end" => {
+            let message = &value["message"];
+            let completed_assistant = message["role"] == "assistant"
+                && matches!(
+                    message["stopReason"].as_str(),
+                    Some("stop" | "length" | "toolUse")
+                );
+            if !completed_assistant {
+                return None;
+            }
+            // Only the authoritative text blocks belong in chat. Thinking and
+            // tool calls remain private; turn_end/agent_end repeat this message.
+            let answer = message["content"]
+                .as_array()?
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let empty_answer = answer.trim().is_empty();
+            if empty_answer {
+                return None;
+            }
+            return Some(chat_preview(id, answer));
+        }
+        "tool_execution_start" => {
+            let name = clip_text(value["toolName"].as_str()?, 80);
+            format!("Using {name}")
+        }
+        "tool_execution_end" => {
+            let failed = value["isError"].as_bool()?;
+            if failed {
+                "Tool failed · waiting for agent".into()
+            } else {
+                "Tool finished · waiting for agent".into()
+            }
+        }
+        _ => return None,
+    };
+    Some(AgentChatEvent {
+        id,
+        kind: "status".into(),
+        title,
+        detail: String::new(),
+        status: String::new(),
         answer: String::new(),
         saga_id: String::new(),
     })
@@ -312,6 +374,164 @@ mod tests {
         assert!(event.answer.is_empty());
         let thought = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"SECRET"}]}}"#;
         assert!(provider_output_event("claude", thought, 9).is_none());
+    }
+
+    #[test]
+    fn pi_events_reach_the_existing_live_output_caller() {
+        for line in [
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"Answer"}]}}"#,
+            r#"{"type":"tool_execution_start","toolName":"read","args":{"path":"SECRET"}}"#,
+            r#"{"type":"tool_execution_end","isError":false,"result":"SECRET"}"#,
+            r#"{"type":"tool_execution_end","isError":true,"result":"SECRET"}"#,
+        ] {
+            let expected = provider_output_event("pi", line, 15).unwrap();
+            // watch_live_output passes Claude because PendingRun has no provider.
+            let event = provider_output_event("claude", line, 15).unwrap();
+            assert_eq!(event, expected);
+        }
+        for line in [
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"error","content":[{"type":"text","text":"Incomplete"}]}}"#,
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"aborted","content":[{"type":"text","text":"Incomplete"}]}}"#,
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Answer"}}"#,
+            r#"{"type":"turn_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"Answer"}]}}"#,
+            r#"{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"Answer"}]}]}"#,
+        ] {
+            assert!(provider_output_event("claude", line, 15).is_none());
+        }
+    }
+
+    #[test]
+    fn pi_completed_assistant_projects_only_authoritative_text() {
+        for stop_reason in ["stop", "length", "toolUse"] {
+            let line = serde_json::json!({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": stop_reason,
+                    "content": [
+                        { "type": "thinking", "thinking": "SECRET reasoning" },
+                        { "type": "text", "text": "First paragraph" },
+                        { "type": "toolCall", "name": "read", "arguments": { "path": "SECRET path" } },
+                        { "type": "text", "text": "Second paragraph" }
+                    ]
+                }
+            });
+            let event = provider_output_event("pi", &line.to_string(), 10).unwrap();
+            assert_eq!(
+                event,
+                chat_preview(10, "First paragraph\nSecond paragraph".into())
+            );
+        }
+    }
+
+    #[test]
+    fn pi_tool_progress_never_copies_arguments_or_results() {
+        for (event_type, is_error, title) in [
+            ("tool_execution_start", false, "Using read"),
+            (
+                "tool_execution_end",
+                false,
+                "Tool finished · waiting for agent",
+            ),
+            (
+                "tool_execution_end",
+                true,
+                "Tool failed · waiting for agent",
+            ),
+        ] {
+            let line = serde_json::json!({
+                "type": event_type,
+                "toolCallId": "call-1",
+                "toolName": "read",
+                "args": { "path": "SECRET path" },
+                "result": { "content": [{ "type": "text", "text": "SECRET output" }] },
+                "isError": is_error
+            });
+            let event = provider_output_event("pi", &line.to_string(), 11).unwrap();
+            assert_eq!(event.id, 11);
+            assert_eq!(event.kind, "status");
+            assert_eq!(event.title, title);
+            assert!(event.detail.is_empty());
+            assert!(event.status.is_empty());
+            assert!(event.answer.is_empty());
+            assert!(event.saga_id.is_empty());
+        }
+    }
+
+    #[test]
+    fn pi_failed_or_unfinished_assistant_is_not_a_preview() {
+        for stop_reason in ["error", "aborted", "pending", "deferred", "unknown"] {
+            let line = serde_json::json!({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant", "stopReason": stop_reason,
+                    "content": [{ "type": "text", "text": "Incomplete answer" }],
+                    "errorMessage": "SECRET diagnostic"
+                }
+            });
+            assert!(provider_output_event("pi", &line.to_string(), 12).is_none());
+        }
+    }
+
+    #[test]
+    fn pi_streaming_and_duplicate_lifecycle_events_are_ignored() {
+        let message = serde_json::json!({
+            "role": "assistant", "stopReason": "stop",
+            "content": [{ "type": "text", "text": "Answer" }]
+        });
+        for event_type in [
+            "session",
+            "message_start",
+            "message_update",
+            "turn_end",
+            "agent_end",
+            "tool_execution_update",
+            "unknown",
+        ] {
+            let line = serde_json::json!({
+                "type": event_type,
+                "message": message,
+                "messages": [message],
+                "assistantMessageEvent": { "type": "text_delta", "delta": "Answer" },
+                "partialResult": { "content": [{ "type": "text", "text": "SECRET output" }] }
+            });
+            assert!(provider_output_event("pi", &line.to_string(), 13).is_none());
+        }
+        // Pi must not fall through to the Codex item parser.
+        let codex = r#"{"type":"item.completed","item":{"type":"agent_message","text":"Answer"}}"#;
+        assert!(provider_output_event("pi", codex, 13).is_none());
+    }
+
+    #[test]
+    fn pi_non_assistant_empty_and_malformed_messages_are_ignored() {
+        for role in ["user", "toolResult", "custom", "compactionSummary"] {
+            let line = serde_json::json!({
+                "type": "message_end",
+                "message": { "role": role, "stopReason": "stop", "content": [{ "type": "text", "text": "SECRET" }] }
+            });
+            assert!(provider_output_event("pi", &line.to_string(), 14).is_none());
+        }
+        for content in [
+            serde_json::json!([]),
+            serde_json::json!([{ "type": "text", "text": " \n" }]),
+            serde_json::json!([{ "type": "thinking", "thinking": "SECRET" }]),
+            serde_json::json!([{ "type": "toolCall", "name": "read", "arguments": { "path": "SECRET" } }]),
+        ] {
+            let line = serde_json::json!({
+                "type": "message_end",
+                "message": { "role": "assistant", "stopReason": "stop", "content": content }
+            });
+            assert!(provider_output_event("pi", &line.to_string(), 14).is_none());
+        }
+        for line in [
+            "not json",
+            "{}",
+            r#"{"type":"message_end"}"#,
+            r#"{"type":"tool_execution_start"}"#,
+            r#"{"type":"tool_execution_end"}"#,
+        ] {
+            assert!(provider_output_event("pi", line, 14).is_none());
+        }
     }
 
     #[test]

@@ -606,10 +606,16 @@ pub(super) async fn park(
     // so installing the fetching source HERE, before the journal is ever read
     // or handed on, is what makes the live fold, the recovery replay and the
     // catch-up apply resolve committed component bytes identically. a resident
-    // is not a module-code PUSH fan-out target (that plane is members-only), so
+    // never hosts the module-code plane and is not a push fan-out target, so
     // a local-only live fold is a guaranteed halt at the first code swap.
     recovery.set_code_source(code_source.clone());
     let mut recovery_slot = Some(recovery);
+    // the EAGER twin of `code_source`: once per non-empty drain pass, pull the
+    // bytes every pending swap and every open code ballot names, ahead of
+    // the fold that would otherwise stall on them — and ahead of the ballot,
+    // so a member can taste a proposal's view off its own node. pull only,
+    // over the same ranged lane; nothing here serves or admits a push.
+    let mut code_pull = crate::validator::code_announce::ResidentCodePull::new();
     let mut recovery_reopens = 0u32;
     // fold-driver state, all epoch-scoped and reset at (re)ascension:
     // the verifier for the CURRENT epoch's certificates, the view
@@ -1561,6 +1567,13 @@ pub(super) async fn park(
             {
                 metrics.record_sync_progress(*served_height);
                 metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);
+            }
+            // the code pull pass rides the fold pass: a record naming bytes
+            // (a pending swap, an open ballot) only changes with a block.
+            if !drained.is_empty() {
+                code_pull
+                    .pump(&label, *served_height, node_r.host(), &blobs, &client)
+                    .await;
             }
             // the boundary this pass folded is visible NOW on /v1/status.
             if !drained.is_empty() {

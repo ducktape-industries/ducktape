@@ -9,7 +9,8 @@
 //!
 //! Two wire shapes ship: the OpenAI Responses API (`codex exec`, aimed by argv)
 //! and the Anthropic Messages API (`claude`, aimed by env — see
-//! [`RunBroker::start_anthropic`]). They share the endpoint/bearer/teardown
+//! [`RunBroker::start_anthropic`]). Pi uses either via [`RunBroker::start_pi`]
+//! and its run-local model configuration. They share the endpoint/bearer/teardown
 //! scaffolding and the request/byte caps; they differ in the upstream
 //! credential, the route, and — critically — Anthropic STREAMS the SSE response
 //! through unbuffered where Codex buffers.
@@ -309,6 +310,7 @@ fn revoke_idle_control(state: &mut IdleControlState) {
 /// The only information that crosses into the provider child. None of these
 /// values can recover the host credential; all die with this run's broker.
 pub struct BrokerEndpoint {
+    pub kind: CredentialKind,
     pub base_url: String,
     pub run_bearer: String,
     pub control_url: String,
@@ -341,7 +343,58 @@ pub struct RunBroker {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// Native CLIs accept arbitrary capabilities; Pi inspects their syntax before
+/// sending a request. Both formats contain the same 256 bits of run entropy.
+#[derive(Clone, Copy)]
+enum BrokerClient {
+    Native,
+    Pi,
+}
+
+impl BrokerClient {
+    fn run_bearer(self, kind: CredentialKind) -> String {
+        let secret = random_token();
+        match (self, kind) {
+            (Self::Native, _) => secret,
+            (Self::Pi, CredentialKind::Claude) => format!("sk-ant-oat-ducktape-{secret}"),
+            (Self::Pi, CredentialKind::Codex) => {
+                // Pi decodes this claim but does not verify a JWT signature. The
+                // account is deliberately fictitious; only the credential holder
+                // may supply the real upstream account header. This is a random
+                // broker capability, NOT an OAuth token or a signed JWT.
+                const PAYLOAD: &str = "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiZHVja3RhcGUtcnVuIn19";
+                format!("e30.{PAYLOAD}.{secret}")
+            }
+        }
+    }
+
+    fn responses_path(self) -> &'static str {
+        match self {
+            Self::Native => "/v1/responses",
+            Self::Pi => "/v1/codex/responses",
+        }
+    }
+}
+
 impl RunBroker {
+    /// Pi selects its native wire API from the resolved credential, defaulting
+    /// to the Anthropic env/host lane when no explicit credential is selected.
+    pub async fn start_pi(airlock: Option<AirlockConfig>) -> Result<Self, String> {
+        let kind = airlock
+            .as_ref()
+            .map_or(CredentialKind::Claude, AirlockConfig::credential_kind);
+        match kind {
+            CredentialKind::Claude => {
+                let (auth, url) = resolve_anthropic_upstream(airlock).await?;
+                Self::start_anthropic_for_client(auth, url, BrokerClient::Pi).await
+            }
+            CredentialKind::Codex => {
+                let (auth, url) = resolve_codex_upstream(airlock).await?;
+                Self::start_codex_for_client(auth, url, BrokerClient::Pi).await
+            }
+        }
+    }
+
     /// `airlock` is the per-run credential source (a self-host resolution); when
     /// `None` the operator's local Codex credential proxies to the provider.
     pub async fn start(airlock: Option<AirlockConfig>) -> Result<Self, String> {
@@ -372,18 +425,21 @@ impl RunBroker {
     }
 
     async fn start_codex(auth: CodexAuth, responses_url: String) -> Result<Self, String> {
+        Self::start_codex_for_client(auth, responses_url, BrokerClient::Native).await
+    }
+
+    async fn start_codex_for_client(
+        auth: CodexAuth,
+        responses_url: String,
+        client: BrokerClient,
+    ) -> Result<Self, String> {
         let listener = tokio::net::TcpListener::bind((BROKER_BIND, 0))
             .await
             .map_err(|e| format!("bind run-scoped provider broker: {e}"))?;
         let addr = listener
             .local_addr()
             .map_err(|e| format!("read run-scoped provider broker address: {e}"))?;
-        let mut secret = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut secret);
-        let run_bearer = secret
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let run_bearer = client.run_bearer(CredentialKind::Codex);
         let idle_control = Arc::new(IdleControl {
             state: Mutex::new(IdleControlState {
                 token: String::new(),
@@ -410,7 +466,7 @@ impl RunBroker {
             idle_control: idle_control.clone(),
         });
         let app = Router::new()
-            .route("/v1/responses", post(forward_responses))
+            .route(client.responses_path(), post(forward_responses))
             .route("/v1/control/provider-idle", post(provider_idle_control))
             .fallback(reject)
             .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
@@ -431,6 +487,7 @@ impl RunBroker {
             // url/token are minted PER-INVOCATION by begin_invocation (rotated),
             // so they are empty placeholders here.
             endpoint: BrokerEndpoint {
+                kind: CredentialKind::Codex,
                 base_url: broker_base_url(addr, "/v1"),
                 run_bearer,
                 control_url: String::new(),
@@ -458,6 +515,7 @@ impl RunBroker {
         };
         BrokerInvocation {
             endpoint: BrokerEndpoint {
+                kind: self.endpoint.kind,
                 base_url: self.endpoint.base_url.clone(),
                 run_bearer: self.endpoint.run_bearer.clone(),
                 control_url: format!("{}/control/provider-idle", self.endpoint.base_url),
@@ -645,7 +703,8 @@ async fn forward_responses(
 /// APPENDS, and the browser-gateway reads the FIRST `x-duck-authority` — a
 /// child value left in would let the sandbox redirect the request, carrying
 /// the scoped session token, to an attacker-chosen overlay node; `route()`
-/// re-adds our own authority). `x-api-key` is Anthropic-only and
+/// re-adds our own authority). `chatgpt-account-id` is credential metadata,
+/// owned by the host/gateway rather than the caller. `x-api-key` is Anthropic-only and
 /// `accept-encoding` is stripped for both providers: our reqwest is built
 /// without the gzip/brotli features (Cargo.toml), so it never
 /// auto-decompresses, and the response side forwards only `content-type` —
@@ -657,6 +716,7 @@ fn is_stripped_request_header(name: &str) -> bool {
         name,
         "authorization"
             | "x-api-key"
+            | "chatgpt-account-id"
             | "host"
             | "content-length"
             | "connection"
@@ -1727,6 +1787,7 @@ pub enum AirlockTrust {
 /// → api.anthropic.com), which is unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AirlockConfig {
+    kind: CredentialKind,
     gateway: AirlockGateway,
     trust: AirlockTrust,
     sub: String,
@@ -1747,12 +1808,17 @@ pub struct AirlockConfig {
 }
 
 impl AirlockConfig {
+    pub fn credential_kind(&self) -> CredentialKind {
+        self.kind
+    }
+
     /// Build a self-host airlock config from a consensus-resolved credential:
     /// reach the owner's gateway over the overlay (`authority` through `via`),
     /// draw on the named credential (`sub` = the credential name), and PIN its
     /// on-chain seal_pk as the trust anchor. No env is read on this path.
     pub fn self_host(resolved: &ResolvedCredential, work: WorkRef) -> AirlockConfig {
         AirlockConfig {
+            kind: resolved.kind,
             gateway: AirlockGateway::Remote {
                 handle: resolved.authority.clone(),
                 via: resolved.via.clone(),
@@ -1812,6 +1878,7 @@ impl AirlockConfig {
             None => None,
         };
         Some(Ok(Self {
+            kind: CredentialKind::Claude,
             gateway,
             trust: AirlockTrust::Attested { measurement, attest },
             sub: env_nonempty("DUCKTAPE_AIRLOCK_SUB").unwrap_or_else(|| "compute-provider".into()),
@@ -1982,18 +2049,21 @@ impl RunBroker {
         auth: AnthropicAuth,
         messages_url: String,
     ) -> Result<Self, String> {
+        Self::start_anthropic_for_client(auth, messages_url, BrokerClient::Native).await
+    }
+
+    async fn start_anthropic_for_client(
+        auth: AnthropicAuth,
+        messages_url: String,
+        client: BrokerClient,
+    ) -> Result<Self, String> {
         let listener = tokio::net::TcpListener::bind((BROKER_BIND, 0))
             .await
             .map_err(|e| format!("bind run-scoped anthropic broker: {e}"))?;
         let addr = listener
             .local_addr()
             .map_err(|e| format!("read run-scoped anthropic broker address: {e}"))?;
-        let mut secret = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut secret);
-        let run_bearer = secret
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let run_bearer = client.run_bearer(CredentialKind::Claude);
         let state = Arc::new(AnthropicBrokerState {
             run_bearer: run_bearer.clone(),
             auth: tokio::sync::Mutex::new(auth),
@@ -2033,6 +2103,7 @@ impl RunBroker {
                 // NO `/v1` suffix: ANTHROPIC_BASE_URL is the API ROOT and Claude
                 // Code appends `/v1/messages` itself (unlike codex, whose argv
                 // appends `/responses` to a `…/v1` base).
+                kind: CredentialKind::Claude,
                 base_url: broker_base_url(addr, ""),
                 run_bearer,
                 // the Anthropic broker has no idle-control plane — unused.
@@ -2479,6 +2550,7 @@ mod tests {
             client
                 .post(&endpoint)
                 .bearer_auth(&invocation.endpoint.run_bearer)
+                .header("chatgpt-account-id", "attacker-account")
                 .body("{}")
                 .send()
                 .await
@@ -2492,6 +2564,7 @@ mod tests {
             "Bearer host-secret-never-in-child"
         );
         assert_eq!(headers["chatgpt-account-id"], "acct-1");
+        assert_eq!(headers.get_all("chatgpt-account-id").iter().count(), 1);
         assert_ne!(invocation.endpoint.run_bearer, "host-secret-never-in-child");
         upstream_task.abort();
     }
@@ -3397,6 +3470,7 @@ mod tests {
     #[tokio::test]
     async fn an_attested_trust_refuses_by_name_when_verify_is_not_compiled_in() {
         let cfg = AirlockConfig {
+            kind: CredentialKind::Claude,
             gateway: AirlockGateway::Local { url: "http://127.0.0.1:1".into() },
             trust: AirlockTrust::Attested { measurement: "11".repeat(48), attest: "snp".into() },
             sub: "test-sub".into(),
@@ -4163,6 +4237,328 @@ mod tests {
             matches!(auth, AnthropicAuth::Airlock(_)),
             "an explicit per-run config must win over the env/host path"
         );
+    }
+
+    fn pi_mock_sse(kind: CredentialKind) -> String {
+        let events = match kind {
+            CredentialKind::Claude => vec![
+                json!({"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","model":"mock","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"PI-AIRLOCK-OK"}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}),
+                json!({"type":"message_stop"}),
+            ],
+            CredentialKind::Codex => vec![
+                json!({"type":"response.created","response":{"id":"resp_test","status":"in_progress"}}),
+                json!({"type":"response.output_item.added","output_index":0,"item":{"id":"msg_test","type":"message","role":"assistant","status":"in_progress","content":[]}}),
+                json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"msg_test","delta":"PI-AIRLOCK-OK"}),
+                json!({"type":"response.output_item.done","output_index":0,"item":{"id":"msg_test","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"PI-AIRLOCK-OK","annotations":[]}]}}),
+                json!({"type":"response.completed","response":{"id":"resp_test","status":"completed","output":[{"id":"msg_test","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"PI-AIRLOCK-OK","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}),
+            ],
+        };
+        events
+            .into_iter()
+            .map(|event| {
+                format!(
+                    "event: {}\ndata: {event}\n\n",
+                    event["type"].as_str().unwrap()
+                )
+            })
+            .collect()
+    }
+
+    /// Run explicitly with PI_TEST_BIN pointing to the standalone Pi executable.
+    /// No operator auth, home, extensions, or network providers enter the child.
+    #[tokio::test]
+    #[ignore = "requires PI_TEST_BIN pointing to a standalone Pi executable"]
+    async fn real_pi_both_apis_through_self_host_airlock() {
+        let executable = std::env::var_os("PI_TEST_BIN")
+            .expect("set PI_TEST_BIN to the standalone Pi executable to run this test");
+        let executable = std::fs::canonicalize(executable)
+            .expect("PI_TEST_BIN must exist; use an absolute path");
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target");
+        let evidence = target.join("pi-verification");
+        std::fs::create_dir_all(&evidence).unwrap();
+        const REAL_TOKEN: &str = "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoicmVhbC1hY2NvdW50In19.vendor-signature";
+        for kind in [CredentialKind::Claude, CredentialKind::Codex] {
+            let (provider, upstream_path) = match kind {
+                CredentialKind::Claude => ("anthropic", "/v1/messages"),
+                CredentialKind::Codex => ("openai-codex", "/responses"),
+            };
+            let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let upstream = Router::new().route(
+                upstream_path,
+                post(move |headers: HeaderMap, body: Bytes| {
+                    let sent = sent.clone();
+                    async move {
+                        sent.send((headers, body)).unwrap();
+                        ([("content-type", "text/event-stream")], pi_mock_sse(kind))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind((BROKER_BIND, 0))
+                .await
+                .unwrap();
+            let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+            let upstream_task =
+                tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+            let (kp, seal_pk) = seal_pair();
+            let gateway = boot_self_host_gateway(
+                &upstream_url,
+                kp,
+                vec![(
+                    "pi-credential".into(),
+                    kind,
+                    airlock::wire::CredentialPayload::Bearer {
+                        access_token: REAL_TOKEN.into(),
+                    },
+                )],
+            )
+            .await;
+            let cfg = AirlockConfig::self_host(
+                &resolved("pi-credential", kind, &gateway, seal_pk),
+                WorkRef::Direct,
+            );
+            let broker = RunBroker::start_pi(Some(cfg)).await.unwrap();
+            let invocation = broker.begin_invocation();
+            let run = tempfile::tempdir_in(&target).unwrap();
+            let run_path = std::fs::canonicalize(run.path()).unwrap();
+            let config = run_path.join("config");
+            std::fs::create_dir(&config).unwrap();
+            // Match provider::pi::configure: only selected-provider auth is
+            // configured, so Pi's catalog chooses its default model itself.
+            std::fs::write(config.join("models.json"), json!({"providers":{provider:{"baseUrl":invocation.endpoint.base_url,"apiKey":"$DUCKTAPE_MODEL_BROKER_TOKEN"}}}).to_string()).unwrap();
+            std::fs::write(config.join("settings.json"), json!({"defaultProvider":provider,"transport":"sse","enableInstallTelemetry":false}).to_string()).unwrap();
+            let mut command = std::process::Command::new(&executable);
+            command
+                .env_clear()
+                .env("HOME", &run_path)
+                .env("PATH", "/usr/bin:/bin")
+                .env("PI_CODING_AGENT_DIR", &config)
+                .env("PI_OFFLINE", "1")
+                .env(
+                    "DUCKTAPE_MODEL_BROKER_TOKEN",
+                    &invocation.endpoint.run_bearer,
+                )
+                .current_dir(&run_path)
+                .args([
+                    "--mode",
+                    "json",
+                    "--print",
+                    "--no-session",
+                    "--offline",
+                    "--no-extensions",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                    "--no-themes",
+                    "--no-tools",
+                    "Reply PI-AIRLOCK-OK",
+                ]);
+            let output = tokio::task::spawn_blocking(move || command.output())
+                .await
+                .unwrap()
+                .unwrap();
+            std::fs::write(
+                evidence.join(format!("real-pi-{provider}.stdout.jsonl")),
+                &output.stdout,
+            )
+            .unwrap();
+            std::fs::write(
+                evidence.join(format!("real-pi-{provider}.stderr.log")),
+                &output.stderr,
+            )
+            .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                output.status.success(),
+                "{provider} Pi failed: {stderr}\n{stdout}"
+            );
+            let messages: Vec<Value> = stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|event| {
+                    event["type"] == "message_end" && event["message"]["role"] == "assistant"
+                })
+                .collect();
+            assert_eq!(
+                messages.len(),
+                1,
+                "{provider} assistant completion missing: {stdout}\n{stderr}"
+            );
+            let message = &messages[0]["message"];
+            assert_eq!(message["provider"], provider);
+            assert_eq!(message["stopReason"], "stop", "{message}");
+            assert!(message["model"].as_str().is_some_and(|id| !id.is_empty()));
+            assert_eq!(message["content"][0]["text"], "PI-AIRLOCK-OK");
+            let (headers, body) = received.try_recv().expect("Pi must call the mock upstream");
+            assert_eq!(headers["authorization"], format!("Bearer {REAL_TOKEN}"));
+            assert!(!headers.contains_key("x-api-key"));
+            assert!(!body.windows(12).any(|bytes| bytes == b"ducktape-run"));
+            match kind {
+                CredentialKind::Claude => {
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    assert!(request["model"].as_str().is_some_and(|id| !id.is_empty()));
+                    assert!(!headers.contains_key("chatgpt-account-id"));
+                    assert!(
+                        headers["anthropic-beta"]
+                            .to_str()
+                            .unwrap()
+                            .contains("oauth-2025-04-20")
+                    );
+                }
+                CredentialKind::Codex => {
+                    assert_eq!(
+                        headers
+                            .get_all("chatgpt-account-id")
+                            .iter()
+                            .collect::<Vec<_>>(),
+                        vec!["real-account"]
+                    );
+                    assert_eq!(headers["openai-beta"], "responses=experimental");
+                }
+            }
+            assert!(
+                received.try_recv().is_err(),
+                "one request expected, no provider retries"
+            );
+            upstream_task.abort();
+        }
+    }
+
+    #[test]
+    fn pi_capabilities_preserve_run_entropy_without_exposing_credentials() {
+        for kind in [CredentialKind::Claude, CredentialKind::Codex] {
+            let first = BrokerClient::Pi.run_bearer(kind);
+            let second = BrokerClient::Pi.run_bearer(kind);
+            assert_ne!(first, second);
+            let entropy = &first[first.len() - 64..];
+            assert!(entropy.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            let native = BrokerClient::Native.run_bearer(kind);
+            assert_eq!(native.len(), 64);
+            assert!(native.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            match kind {
+                CredentialKind::Claude => assert!(first.starts_with("sk-ant-oat-ducktape-")),
+                CredentialKind::Codex => assert_eq!(first.split('.').count(), 3),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pi_both_wire_apis_round_trip_without_forwarding_dummy_auth_or_account() {
+        const REAL_TOKEN: &str = "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoicmVhbC1hY2NvdW50In19.vendor-signature";
+        for kind in [CredentialKind::Claude, CredentialKind::Codex] {
+            let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let handler = move |headers: HeaderMap, body: Bytes| {
+                let sent = sent.clone();
+                async move {
+                    sent.send((headers, body)).unwrap();
+                    ([("content-type", "text/event-stream")], "data: test\n\n")
+                }
+            };
+            let upstream_path = match kind {
+                CredentialKind::Claude => "/v1/messages",
+                CredentialKind::Codex => "/responses",
+            };
+            let app = Router::new().route(upstream_path, post(handler));
+            let listener = tokio::net::TcpListener::bind((BROKER_BIND, 0))
+                .await
+                .unwrap();
+            let upstream = format!("http://{}", listener.local_addr().unwrap());
+            let upstream_task =
+                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let (kp, seal_pk) = seal_pair();
+            let gateway = boot_self_host_gateway(
+                &upstream,
+                kp,
+                vec![(
+                    "pi-credential".into(),
+                    kind,
+                    airlock::wire::CredentialPayload::Bearer {
+                        access_token: REAL_TOKEN.into(),
+                    },
+                )],
+            )
+            .await;
+            let cfg = AirlockConfig::self_host(
+                &resolved("pi-credential", kind, &gateway, seal_pk),
+                WorkRef::Direct,
+            );
+            assert_eq!(cfg.credential_kind(), kind);
+            let broker = RunBroker::start_pi(Some(cfg)).await.unwrap();
+            assert_eq!(broker.endpoint.kind, kind);
+            let first = broker.begin_invocation();
+            let second = broker.begin_invocation();
+            assert_eq!(second.endpoint.kind, kind);
+            assert_eq!(first.endpoint.run_bearer, second.endpoint.run_bearer);
+            assert_ne!(first.endpoint.control_token, second.endpoint.control_token);
+            let suffix = match kind {
+                CredentialKind::Claude => "/v1/messages?beta=true",
+                CredentialKind::Codex => "/codex/responses",
+            };
+            let url = format!("{}{suffix}", second.endpoint.base_url);
+            let client = reqwest::Client::new();
+            assert_eq!(
+                client
+                    .post(&url)
+                    .bearer_auth("wrong-run")
+                    .body("{}")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            // Pi's SSE Codex transport may send a zstd body. The brokers must
+            // preserve both its bytes and content-encoding across body sealing.
+            let payload = b"opaque compressed request bytes";
+            let response = client
+                .post(&url)
+                .bearer_auth(&second.endpoint.run_bearer)
+                .header("chatgpt-account-id", "ducktape-run")
+                .header("chatgpt-account-id", "attacker-account")
+                .header("x-api-key", "child-api-key")
+                .header("content-encoding", "zstd")
+                .header("anthropic-beta", "oauth-2025-04-20")
+                .body(payload.as_slice())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.text().await.unwrap(), "data: test\n\n");
+            let (headers, body) = received.recv().await.unwrap();
+            assert_eq!(headers["authorization"], format!("Bearer {REAL_TOKEN}"));
+            assert!(!headers.contains_key("x-api-key"));
+            assert_eq!(headers["content-encoding"], "zstd");
+            assert_eq!(headers["anthropic-beta"], "oauth-2025-04-20");
+            assert_eq!(body.as_ref(), payload);
+            match kind {
+                CredentialKind::Claude => assert!(!headers.contains_key("chatgpt-account-id")),
+                CredentialKind::Codex => {
+                    let accounts: Vec<_> = headers.get_all("chatgpt-account-id").iter().collect();
+                    assert_eq!(accounts, vec!["real-account"]);
+                    assert!(
+                        second
+                            .endpoint
+                            .control_url
+                            .ends_with("/v1/control/provider-idle")
+                    );
+                    assert_eq!(
+                        client
+                            .post(format!("{}/responses", second.endpoint.base_url))
+                            .bearer_auth(&second.endpoint.run_bearer)
+                            .body("{}")
+                            .send()
+                            .await
+                            .unwrap()
+                            .status(),
+                        StatusCode::FORBIDDEN
+                    );
+                }
+            }
+            upstream_task.abort();
+        }
     }
 
     #[tokio::test]

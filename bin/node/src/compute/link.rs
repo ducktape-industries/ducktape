@@ -45,11 +45,36 @@ pub(crate) async fn attach(
     ws_url: String,
     hint: std::sync::Arc<Notify>,
     mut lines: mpsc::Receiver<OutputLine>,
+    token: String,
+    resync: std::sync::Arc<Notify>,
 ) {
     let mut failures: u64 = 0;
     loop {
         match tokio_tungstenite::connect_async(&ws_url).await {
-            Ok((socket, _)) => {
+            Ok((mut socket, _)) => {
+                let attach = serde_json::json!({"op":"compute_attach","token":token.trim()});
+                if socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        attach.to_string(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    tokio::time::sleep(REDIAL).await;
+                    continue;
+                }
+                for (run, line) in provider_host::run_session::active() {
+                    let frame = serde_json::json!({"op":"run_output","id":run,"stream":"stdout","line":line.to_string()});
+                    if socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            frame.to_string(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 if failures > 0 {
                     tracing::info!(
                         target: "ducktape::service",
@@ -57,7 +82,10 @@ pub(crate) async fn attach(
                     );
                 }
                 failures = 0;
-                pump(socket, &hint, &mut lines).await;
+                tokio::select! {
+                    _ = pump(socket, &hint, &mut lines) => {},
+                    _ = resync.notified() => {},
+                }
                 // a dropped link redials on the same pace as a failed dial:
                 // pump can return immediately (the node restarting mid-accept),
                 // and an unpaced success path dials at connect latency — the
@@ -96,12 +124,35 @@ where
 {
     use tokio_tungstenite::tungstenite::Message;
     let (mut tx, mut rx) = socket.split();
+    let mut pending = futures::stream::FuturesUnordered::new();
     loop {
         tokio::select! {
             frame = rx.next() => {
+                let command = frame.as_ref().and_then(|frame| frame.as_ref().ok())
+                    .and_then(|frame| frame.to_text().ok())
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                    .filter(|frame| frame["type"] == "run_control")
+                    .and_then(|frame| serde_json::from_value::<noded::run_control::Command>(frame["command"].clone()).ok());
+                if let Some(command) = command {
+                    if pending.len() >= 64 {
+                        let result: Result<serde_json::Value,String> = Err("Run control is busy.".into());
+                        let frame = serde_json::json!({"op":"run_control_reply","id":command.id,"result":result});
+                        if tx.send(Message::Text(frame.to_string())).await.is_err() { return; }
+                        continue;
+                    }
+                    pending.push(async move {
+                        let result = provider_host::run_session::control(&command.run,command.input).await;
+                        (command.id,result)
+                    });
+                    continue;
+                }
                 if !read_frame(frame, hint) {
                     return;
                 }
+            }
+            Some((id,result)) = pending.next() => {
+                let frame = serde_json::json!({"op":"run_control_reply","id":id,"result":result});
+                if tx.send(Message::Text(frame.to_string())).await.is_err() { return; }
             }
             line = lines.recv() => {
                 // a closed lane ends the LANE, not the link: nothing holds a
@@ -110,6 +161,10 @@ where
                 // made every successful dial drop instantly — an unpaced
                 // redial storm.
                 let Some(line) = line else { break };
+                let obsolete = serde_json::from_str::<serde_json::Value>(&line.line)
+                    .ok()
+                    .is_some_and(|event| !provider_host::run_session::current_control_event(&line.run_key, &event));
+                if obsolete { continue; }
                 let stream = if line.stderr { "stderr" } else { "stdout" };
                 let frame = serde_json::json!({
                     "op": "run_output",
@@ -161,6 +216,30 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::protocol::Role;
 
+    #[tokio::test]
+    async fn buffered_ready_for_a_closed_run_does_not_follow_a_reconnect_snapshot() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let (sender, mut lines) = mpsc::channel(2);
+        sender.send(OutputLine { run_key: "already-closed".into(), stderr: false, line: serde_json::json!({"type":"run_control","state":"ready","turn":"old","steers":true}).to_string() }).await.unwrap();
+        sender
+            .send(OutputLine {
+                run_key: "already-closed".into(),
+                stderr: false,
+                line: "retained output".into(),
+            })
+            .await
+            .unwrap();
+        let task = tokio::spawn(async move { pump(client, &Notify::new(), &mut lines).await });
+        let frame = server.next().await.unwrap().unwrap().into_text().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(value["line"], "retained output");
+        server.close(None).await.unwrap();
+        drop(server);
+        task.await.unwrap();
+    }
+
     /// the macOS bring-up storm: zero discovered providers drop every
     /// `OutputLine` sender before the link is even up, and a pump that treated
     /// the closed lane as a dead socket turned every successful dial into an
@@ -193,7 +272,10 @@ mod tests {
         }
 
         // the socket closing is what ends the pump.
-        server.close(None).await.expect("the server closes its side");
+        server
+            .close(None)
+            .await
+            .expect("the server closes its side");
         drop(server);
         pumping.await.expect("pump returns when the socket ends");
     }

@@ -7,7 +7,7 @@ use super::*;
 /// surface change without one. Compared for EQUALITY against
 /// [`NodeFacts::contract`] before a console opens — never a window, never
 /// "one behind still works": that would be the compat the repository forbids.
-pub const EXPECTED_NODE_CONTRACT: u32 = 3;
+pub const EXPECTED_NODE_CONTRACT: u32 = 5;
 
 /// The one three-way reading of a node's contract number against
 /// [`EXPECTED_NODE_CONTRACT`]. Only `Match` opens a console; the other two

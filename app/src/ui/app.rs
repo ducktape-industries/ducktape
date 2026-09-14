@@ -166,6 +166,17 @@ pub(crate) enum SettingsIntent {
     Notifications,
     Taste,
     Untaste,
+    UpdateCheck,
+    UpdateRestart,
+    UpdateRollback,
+}
+/// The update controls the reader can press; each is one `app_update::Event`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum UpdateAction {
+    CheckNow,
+    RestartToUpdate,
+    RollBack,
+    DismissRollbackNotice,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PagesIntent {
@@ -541,9 +552,12 @@ pub(crate) enum AppMessage {
     NodeViewEvent(crate::module_view::ModuleViewEvent),
     NodeFactsLoaded(crate::backend::NodeFacts),
     NodeFactsFailed(crate::backend::AppError),
-    /// An update job (manifest fetch, archive download) answered; `None`
-    /// when the network served nothing.
+    /// An update job (manifest fetch, archive download, verify) answered;
+    /// `None` when the network served nothing.
     UpdateJobReplied(Option<app_update::Event>),
+    /// The reader pressed one of the update controls (the console strip or
+    /// the Settings "Updates" section).
+    UpdateAction(UpdateAction),
     NodeStatusPushed(crate::backend::NodeFacts),
     SettingsLoaded(crate::backend::SettingsFacts),
     SettingsFailed(crate::backend::HydrationError),
@@ -690,6 +704,18 @@ impl Ducktape {
             Appearance::Light => false,
             Appearance::System => self.system_dark,
         }
+    }
+    /// The updater's reading, when the app was started through the launcher.
+    pub(crate) fn update_reading(&self) -> Option<crate::backend::update::UpdateReading> {
+        self.updater.as_ref().map(|updater| updater.reading())
+    }
+    /// The console's update strip, if a phase draws one.
+    pub(crate) fn update_strip(&self) -> Option<crate::backend::update::UpdateStrip> {
+        crate::backend::update::strip_of(self.update_reading().as_ref())
+    }
+    /// The Settings "Updates" section's facts.
+    pub(crate) fn update_facts(&self) -> crate::backend::update::UpdateFacts {
+        crate::backend::update::facts_of(self.update_reading().as_ref(), self.wall_now)
     }
     pub(crate) fn initial_state() -> Self {
         Self {

@@ -37,6 +37,12 @@ pub const MAX_WORKSPACE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// image is sized at exactly the payload.
 const IMAGE_METADATA_MARGIN_PERCENT: u64 = 20;
 
+/// Small images need a fixed allowance too: near 128 MiB the default ext4
+/// journal takes 16 MiB, and inode tables take roughly another 1/16 of the
+/// image. A 20% margin over a ~100 MiB payload cannot hold both. Reserve
+/// 32 MiB until the proportional allowance is larger.
+const MIN_IMAGE_METADATA_BYTES: u64 = 32 * 1024 * 1024;
+
 /// A writable tree gets the existing byte limit as sparse capacity. Input size
 /// does not predict output size: a small source checkout can produce a much
 /// larger build. Only written blocks consume host disk; the guest filesystem
@@ -48,7 +54,7 @@ pub fn sized_for(workdir: &Path) -> Result<u64, String> {
 }
 
 fn with_metadata(measured: u64) -> u64 {
-    let margin = measured / 100 * IMAGE_METADATA_MARGIN_PERCENT;
+    let margin = (measured / 100 * IMAGE_METADATA_MARGIN_PERCENT).max(MIN_IMAGE_METADATA_BYTES);
     measured.saturating_add(margin).max(MIN_WORKSPACE_BYTES)
 }
 
@@ -478,6 +484,19 @@ mod tests {
         dir
     }
 
+    /// A scratch root on the checkout's own disk rather than `std::env::temp_dir`.
+    /// A dense-image test writes hundreds of megabytes of REAL bytes, and `/tmp`
+    /// is commonly a memory-backed tmpfs under a user quota: there those bytes
+    /// cost RAM and exhaust the quota the other image tests build inside.
+    fn scratch_on_disk(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target/sandbox-image-tests")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
     fn have_e2fsprogs() -> bool {
         crate::host_tools::find_system_tool("mke2fs").is_some()
             && crate::host_tools::find_system_tool("debugfs").is_some()
@@ -696,6 +715,61 @@ mod tests {
             "…but still hold the payload: {read_only} < {payload}"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn metadata_allowance_has_a_floor_without_changing_large_image_sizing() {
+        let mib = 1024 * 1024;
+        assert_eq!(with_metadata(0), MIN_WORKSPACE_BYTES);
+        assert_eq!(with_metadata(1), 1 + 32 * mib);
+        assert_eq!(with_metadata(108 * mib), 140 * mib);
+        let large_payload = 512 * mib;
+        assert_eq!(
+            with_metadata(large_payload),
+            large_payload + large_payload / 100 * 20
+        );
+        assert_eq!(with_metadata(u64::MAX), u64::MAX);
+    }
+
+    /// A dense executable around 100 MiB needs more than 20% overhead: the
+    /// journal alone takes 16 MiB, before the inode tables and block bitmaps.
+    #[test]
+    fn a_dense_read_only_payload_fits_with_filesystem_metadata() {
+        use std::io::{Read as _, Write as _};
+        if !have_e2fsprogs() {
+            return;
+        }
+        let root = scratch_on_disk("ro-dense");
+        let src = root.join("src");
+        std::fs::create_dir(&src).expect("src");
+        let mut file = std::fs::File::create(src.join("pi")).expect("payload");
+        // Nonzero bytes force mke2fs to allocate every payload block; a sparse
+        // file would pass even when the image cannot hold a real executable.
+        // 108 MiB puts the old 20%-margin image above the journal's size step.
+        let block = [7u8; 64 * 1024];
+        let block_count = 108 * 1024 * 1024 / block.len();
+        for _ in 0..block_count {
+            file.write_all(&block).expect("write payload");
+        }
+        drop(file);
+
+        let image = root.join("assets.img");
+        let size = sized_for_read_only(&src).expect("read-only size");
+        build(&src, &image, size).expect("dense payload must fit");
+        let out = root.join("out");
+        read_back(&image, &out).expect("read back");
+        let mut restored = std::fs::File::open(out.join("pi")).expect("restored payload");
+        assert_eq!(restored.metadata().expect("stat").len(), 108 * 1024 * 1024);
+        let mut buffer = [0u8; 64 * 1024];
+        for index in 0..block_count {
+            restored.read_exact(&mut buffer).expect("read payload");
+            // Compared as a named predicate, never `assert_eq!` on the arrays:
+            // that prints both 64 KiB blocks per mismatch and once wrote a
+            // 201 MB log for one failure.
+            let block_survived = buffer == block;
+            assert!(block_survived, "payload block {index} did not survive");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
