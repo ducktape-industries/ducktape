@@ -941,8 +941,8 @@ pub fn registered_view_icon(module: &'static str) -> Option<Arc<Vec<u8>>> {
 /// The proposed hash `module`'s seat tastes, if it tastes one.
 pub fn tasting(module: &'static str) -> Option<[u8; 32]> {
     let mounted = mounted(module);
-    let tasting = mounted.lock().expect("module view lock").tasting;
-    tasting
+    let locked = mounted.lock().expect("module view lock");
+    locked.tasting
 }
 
 /// The tab's name with its taste on it: `Chat · proposed` while the seat
