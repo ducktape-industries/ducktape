@@ -149,11 +149,7 @@ impl PagesView {
                 },
             ));
         }
-        let mut list: Vec<Node> = self
-            .pages
-            .iter()
-            .map(|page| self.page_button(page))
-            .collect();
+        let mut list = self.page_tree_rows();
         if list.is_empty() && !self.loading {
             list.push(kit::padded(
                 kit::column(
@@ -187,13 +183,29 @@ impl PagesView {
         } else {
             &self.active_page_title
         };
+        // Notion's crumb: the parent by TITLE, a way back up the tree, and
+        // an ellipsis standing for everything above it — the row does not
+        // clip, so a deep tree must not spell its whole path into the
+        // controls beside it.
         let mut crumb = Vec::new();
-        if !self.active_page_parent.is_empty() {
-            crumb.push(kit::nowrap(kit::secondary(
-                "pages/toolbar/parent",
-                &self.active_page_parent,
+        let ancestors = crate::host::ancestors(&self.pages, &self.active_page_parent);
+        if ancestors.len() > 1 {
+            crumb.push(kit::nowrap(kit::caption("pages/toolbar/ellipsis", "…")));
+            crumb.push(kit::nowrap(kit::caption(
+                "pages/toolbar/ellipsis/crumb",
+                "/",
             )));
-            crumb.push(kit::nowrap(kit::caption("pages/toolbar/crumb", "/")));
+        }
+        if let Some(parent) = ancestors.last() {
+            let key = format!("pages/toolbar/parent/{}", parent.id);
+            crumb.push(kit::button(
+                key.clone(),
+                parent.title.clone(),
+                (!self.unavailable())
+                    .then(|| slots::message(Message::ChoosePage(parent.id.clone()))),
+                ButtonPreset::Subtle,
+            ));
+            crumb.push(kit::nowrap(kit::caption(format!("{key}/crumb"), "/")));
         }
         crumb.push(kit::nowrap(kit::strong("pages/toolbar/title", title)));
         let status = match self.autosave.as_str() {

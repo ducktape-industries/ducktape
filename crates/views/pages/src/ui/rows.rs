@@ -1,5 +1,39 @@
+/// One nesting step of the page tree, Notion's way: the row moves in and
+/// the fold toggle sits in the step it opened.
+const PAGE_TREE_STEP: f32 = 14.;
+/// The fold toggle's column. A leaf keeps the empty column so every title
+/// in the tree lines up whether or not its row has a toggle.
+const PAGE_FOLD_SLOT: f32 = 20.;
+
 impl PagesView {
-    fn page_button(&self, page: &crate::host::PageItem) -> Node {
+    /// The page tree's rows in order, with every row under a folded parent
+    /// left out. The index is already depth-first, so a folded parent hides
+    /// exactly the rows that follow it deeper than itself.
+    fn page_tree_rows(&self) -> Vec<Node> {
+        let mut rows = Vec::new();
+        let mut folded_at: Option<usize> = None;
+        for page in &self.pages {
+            let depth = page_depth(page);
+            let under_a_fold = folded_at.is_some_and(|fold| depth > fold);
+            if under_a_fold {
+                continue;
+            }
+            folded_at = None;
+            rows.push(self.page_row(page));
+            if self.page_folded(page) {
+                folded_at = Some(depth);
+            }
+        }
+        rows
+    }
+
+    fn page_folded(&self, page: &crate::host::PageItem) -> bool {
+        page.child_count > 0 && self.folded_pages.contains(&page.id)
+    }
+
+    /// One row of the tree: the fold toggle (a parent's own small button, a
+    /// leaf's empty slot), then the page itself, inset one step per depth.
+    fn page_row(&self, page: &crate::host::PageItem) -> Node {
         let selected = page.id == self.active_page;
         let title = if page.title.is_empty() {
             "Untitled"
@@ -7,37 +41,72 @@ impl PagesView {
             &page.title
         };
         let key = format!("{PAGE_KEY}/page/{}", page.id);
-        let depth = page.prefix.chars().count() as f32;
-        let mut line = vec![kit::sized(
-            kit::nowrap(kit::text(format!("{key}/title"), title)),
-            Some(Length::Fill),
-            None,
-        )];
-        if page.child_count > 0 {
-            line.push(kit::caption(
-                format!("{key}/children"),
-                page.child_count.to_string(),
-            ));
+        let available = !self.unavailable();
+        let slot = match page.child_count > 0 {
+            true => {
+                let folded = self.page_folded(page);
+                let caret = match folded {
+                    true => "▸",
+                    false => "▾",
+                };
+                let mut toggle = kit::button_child(
+                    format!("{key}/fold"),
+                    kit::caption(format!("{key}/caret"), caret),
+                    available.then(|| slots::message(Message::TogglePageFold(page.id.clone()))),
+                    ButtonPreset::Subtle,
+                );
+                if let Node::Button {
+                    width,
+                    padding,
+                    label,
+                    ..
+                } = &mut toggle
+                {
+                    *width = Some(Length::Fixed(PAGE_FOLD_SLOT));
+                    *padding = Some(wire::Edges {
+                        top: 2.,
+                        right: 0.,
+                        bottom: 2.,
+                        left: 0.,
+                    });
+                    let verb = match folded {
+                        true => "Expand",
+                        false => "Collapse",
+                    };
+                    *label = Some(format!("{verb} {title}"));
+                }
+                toggle
+            }
+            false => kit::space(Some(Length::Fixed(PAGE_FOLD_SLOT)), None),
+        };
+        let mut row = kit::list_row(
+            key.clone(),
+            kit::sized(
+                kit::nowrap(kit::text(format!("{key}/title"), title)),
+                Some(Length::Fill),
+                None,
+            ),
+            selected,
+            available.then(|| slots::message(Message::ChoosePage(page.id.clone()))),
+        );
+        if let Node::Button { label, padding, .. } = &mut row {
+            *label = Some(title.to_owned());
+            *padding = Some(wire::Edges {
+                top: 4.,
+                right: 8.,
+                bottom: 4.,
+                left: 4.,
+            });
         }
-        let content = kit::padded(
-            kit::spaced(kit::centered_row(format!("{key}/line"), line), 6.),
+        kit::padded(
+            kit::spaced(kit::centered_row(format!("{key}/row"), [slot, row]), 0.),
             wire::Edges {
                 top: 0.,
                 right: 0.,
                 bottom: 0.,
-                left: depth * 6.,
+                left: PAGE_TREE_STEP * page_depth(page) as f32,
             },
-        );
-        let mut node = kit::list_row(
-            key,
-            content,
-            selected,
-            (!self.unavailable()).then(|| slots::message(Message::ChoosePage(page.id.clone()))),
-        );
-        if let Node::Button { label, .. } = &mut node {
-            *label = Some(format!("{}{title}", page.prefix));
-        }
-        node
+        )
     }
 
     fn search_result(&self, hit: &crate::host::PageSearchHit) -> Node {
@@ -308,4 +377,9 @@ impl PagesView {
             2.,
         )
     }
+}
+
+/// A page's depth in the tree: the index spells it as two spaces a step.
+fn page_depth(page: &crate::host::PageItem) -> usize {
+    page.prefix.chars().count() / 2
 }
