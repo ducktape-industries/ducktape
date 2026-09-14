@@ -1316,6 +1316,12 @@ impl DesktopWindow {
         // The ring a plate wears while its person talks.
         let speaking_ring = hsla_of(design::palette(state.is_dark()).success);
         let mute = if state.call_muted { "Unmute" } else { "Mute" };
+        let deafen = if state.call_deafened {
+            "Undeafen"
+        } else {
+            "Deafen"
+        };
+        let deafened = state.call_deafened;
         let camera = if state.call_camera {
             "Stop camera"
         } else {
@@ -1385,11 +1391,12 @@ impl DesktopWindow {
                 rows[range]
                     .iter()
                     .map(|row| {
-                        let caption = match (row.person.is_you, row.muted) {
-                            (true, true) => "you · muted",
-                            (true, false) => "you",
-                            (false, true) => "muted",
-                            (false, false) => "",
+                        let caption = match (row.person.is_you, row.muted, deafened) {
+                            (true, _, true) => "you · deafened",
+                            (true, true, false) => "you · muted",
+                            (true, false, false) => "you",
+                            (false, true, _) => "muted",
+                            (false, false, _) => "",
                         };
                         let mut plate = div()
                             .flex_shrink_0()
@@ -1444,6 +1451,10 @@ impl DesktopWindow {
             .border_color(colors.border)
             .child(
                 self.action("huddle-mute", mute, Message::ToggleCallMute, false)
+                    .outline(),
+            )
+            .child(
+                self.action("huddle-deafen", deafen, Message::ToggleCallDeafen, false)
                     .outline(),
             )
             .child(
@@ -1572,6 +1583,7 @@ impl DesktopWindow {
             elapsed: crate::backend::mmss(state.huddle_now - state.huddle_joined_at),
             others: state.huddle_rows.len().saturating_sub(1),
             muted: state.call_muted,
+            deafened: state.call_deafened,
         });
         let success = hsla_of(palette.success);
         let danger = hsla_of(palette.danger);
@@ -2801,6 +2813,7 @@ struct VoiceDock {
     elapsed: String,
     others: usize,
     muted: bool,
+    deafened: bool,
 }
 
 impl DesktopWindow {
@@ -2821,6 +2834,7 @@ impl DesktopWindow {
             n => format!("with {n} others"),
         };
         let mute = if voice.muted { "Unmute" } else { "Mute" };
+        let deafen = if voice.deafened { "Undeafen" } else { "Deafen" };
         div()
             .id("rail-voice")
             .flex()
@@ -2867,6 +2881,11 @@ impl DesktopWindow {
                     .gap(px(4.))
                     .child(
                         self.action("rail-voice-mute", mute, Message::ToggleCallMute, false)
+                            .xsmall()
+                            .outline(),
+                    )
+                    .child(
+                        self.action("rail-voice-deafen", deafen, Message::ToggleCallDeafen, false)
                             .xsmall()
                             .outline(),
                     )

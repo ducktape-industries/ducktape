@@ -297,6 +297,7 @@ impl Ducktape {
             AppMessage::WelcomeReopened(id) => self.on_welcome_reopened(id),
             AppMessage::CallEvent(event) => self.on_call_event(event),
             AppMessage::ToggleCallMute => self.on_toggle_call_mute(),
+            AppMessage::ToggleCallDeafen => self.on_toggle_call_deafen(),
             AppMessage::ToggleCallCamera => self.on_toggle_call_camera(),
             AppMessage::ToggleCallScreen => self.on_toggle_call_screen(),
             AppMessage::ShowHuddle => self.on_show_huddle(),
@@ -5379,6 +5380,7 @@ impl Ducktape {
         self.huddle_rows = Vec::new();
         self.call_status = "".to_owned();
         self.call_muted = false;
+        self.call_deafened = false;
         self.call_speaking = false;
         self.call_camera = false;
         self.call_sharing = false;
@@ -5718,6 +5720,8 @@ impl Ducktape {
             crate::call::call_status_after(self.call_status.to_owned(), event.clone());
         self.call_muted =
             crate::backend::keep_bool(event.kind == "connecting", false, self.call_muted);
+        self.call_deafened =
+            crate::backend::keep_bool(event.kind == "connecting", false, self.call_deafened);
         self.call_camera =
             crate::backend::keep_bool(event.kind == "connecting", false, self.call_camera);
         self.call_sharing =
@@ -5745,6 +5749,24 @@ impl Ducktape {
             return Task::none();
         }
         self.call_muted = crate::call::call_set_muted(!self.call_muted);
+        self.huddle_rows = crate::call::huddle_tile_rows(
+            self.huddle_roster.clone(),
+            self.call_peers.clone(),
+            self.call_muted,
+            self.call_speaking,
+        );
+        Task::none()
+    }
+    /// Deafen mutes with it, the way Discord ties the two; undeafen leaves
+    /// the mic where it is, so a person who muted first stays muted.
+    fn on_toggle_call_deafen(&mut self) -> Task<AppMessage> {
+        if !self.huddle_joined {
+            return Task::none();
+        }
+        self.call_deafened = crate::call::call_set_deafened(!self.call_deafened);
+        if self.call_deafened {
+            self.call_muted = crate::call::call_set_muted(true);
+        }
         self.huddle_rows = crate::call::huddle_tile_rows(
             self.huddle_roster.clone(),
             self.call_peers.clone(),
@@ -5828,6 +5850,7 @@ impl Ducktape {
         self.mutation_phase = MutationPhase::Huddle;
         self.call_status = "".to_owned();
         self.call_muted = false;
+        self.call_deafened = false;
         self.call_speaking = false;
         self.call_camera = false;
         self.call_sharing = false;
