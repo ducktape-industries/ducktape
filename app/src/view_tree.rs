@@ -1295,6 +1295,14 @@ impl ViewTree {
         input.into_any_element()
     }
 
+    // A thin dispatcher, and it must stay thin: it recurses once per tree
+    // level (directly and through `mouse_area`, `virtual_scroll`, …), so its
+    // frame is multiplied by the depth of the tree. The dev build is
+    // opt-level 0, where every arm's builder temporaries get their own slot in
+    // the one frame, so an inlined body costs every level of every tree — a
+    // ~20-deep chat message overflowed the 8 MB main stack that way. Each arm
+    // body therefore lives in its own `#[inline(never)]` method and the arm is
+    // a single delegation.
     fn node(
         &mut self,
         node: &wire::Node,
@@ -1306,926 +1314,35 @@ impl ViewTree {
         }
         use wire::Node;
         match node {
-            Node::Text {
-                key,
-                content,
-                size,
-                color,
-                width,
-                font,
-                align_x,
-                options,
-                ..
-            } => {
-                let mut element = text_options(
-                    dimensions(div().min_w_0().max_w_full(), *width, options.height),
-                    *font,
-                    *align_x,
-                    options,
-                )
-                .child(content.clone());
-                let intrinsic_label = options.wrapping == Some(wire::Wrapping::None)
-                    && matches!(width, None | Some(wire::Length::Shrink));
-                if intrinsic_label {
-                    // Shrink-sized labels keep their natural width; a Fill
-                    // sibling takes the remaining space, not their letters.
-                    element = element.flex_shrink_0();
-                }
-                if let Some(size) = size {
-                    element = element.text_size(px(*size));
-                }
-                if let Some(color) = color {
-                    element = element.text_color(rgba(*color));
-                }
-                #[cfg(test)]
-                {
-                    element = element.relative().child(self.measure(key, cx));
-                }
-                #[cfg(not(test))]
-                let _ = key;
-                element.into_any_element()
-            }
+            Node::Text { .. } => self.node_text(node, cx),
             Node::Space { width, height } => dimensions(div(), *width, *height).into_any_element(),
-            Node::Linear {
-                axis,
-                spacing,
-                padding,
-                width,
-                height,
-                background,
-                border,
-                children,
-                align,
-                max_width,
-                clip,
-                wrap,
-                ..
-            } => {
-                let mut element = dimensions(div().flex(), *width, *height);
-                element = match axis {
-                    wire::Axis::Column => element.flex_col(),
-                    wire::Axis::Row => element.flex_row(),
-                };
-                if let Some(gap) = spacing {
-                    element = element.gap(px(*gap));
-                }
-                if let Some(width) = max_width {
-                    element = element.max_w(px(*width));
-                }
-                if *clip {
-                    element = element.overflow_hidden();
-                }
-                if wrap.is_some() {
-                    element = element.flex_wrap();
-                }
-                element = cross_align(element, *align);
-                element = decoration(pad(element, *padding), *background, *border);
-                for child in children {
-                    element = element.child(self.node(child, window, cx));
-                }
-                self.focusable_container(node, element, window, cx)
-            }
-            Node::KeyedColumn {
-                key,
-                keys,
-                spacing,
-                padding,
-                width,
-                height,
-                background,
-                border,
-                children,
-                align,
-                max_width,
-                ..
-            } => {
-                let mut element = decoration(
-                    pad(
-                        dimensions(div().flex().flex_col(), *width, *height),
-                        *padding,
-                    ),
-                    *background,
-                    *border,
-                );
-                if let Some(gap) = spacing {
-                    element = element.gap(px(*gap));
-                }
-                element = cross_align(element, *align);
-                if let Some(width) = max_width {
-                    element = element.max_w(px(*width));
-                }
-                for (index, child) in children.iter().enumerate() {
-                    let content = self.node(child, window, cx);
-                    let identity = keys.as_ref().and_then(|keys| keys.get(index));
-                    element = match identity {
-                        Some(identity) => {
-                            let row = format!("{key}/@row:{}", identity.virtual_key());
-                            element.child(
-                                div()
-                                    .relative()
-                                    .child(content)
-                                    .child(self.measure(&row, cx)),
-                            )
-                        }
-                        None => element.child(content),
-                    };
-                }
-                element.into_any_element()
-            }
-            Node::Container {
-                key,
-                content,
-                width,
-                height,
-                padding,
-                border,
-                background,
-                max_width,
-                max_height,
-                clip,
-                align_x,
-                align_y,
-                shadow,
-                ..
-            } => {
-                let color = match background {
-                    Some(wire::Background::Color(color)) => Some(*color),
-                    _ => None,
-                };
-                let mut element = shadows(
-                    decoration(
-                        pad(
-                            dimensions(div().relative().flex(), *width, *height),
-                            *padding,
-                        ),
-                        color,
-                        *border,
-                    ),
-                    *shadow,
-                );
-                element = horizontal_align(element, *align_x);
-                element = vertical_align(element, *align_y);
-                if let Some(width) = max_width {
-                    element = element.max_w(px(*width));
-                }
-                if let Some(height) = max_height {
-                    element = element.max_h(px(*height));
-                }
-                if *clip {
-                    element = element.overflow_hidden();
-                }
-                let element = element
-                    .child(self.node(content, window, cx))
-                    .child(self.measure(key, cx));
-                self.focusable_container(node, element, window, cx)
-            }
-            Node::Scroll {
-                key,
-                content,
-                width,
-                height,
-                direction,
-                anchor_x,
-                anchor_y,
-                auto_scroll,
-                on_scroll,
-                background,
-                border,
-                ..
-            } => {
-                let restored = self.presentation.scrolls.remove(key).filter(|saved| {
-                    saved.direction == *direction && saved.anchors == (*anchor_x, *anchor_y)
-                });
-                if *direction == wire::ScrollDirection::Vertical
-                    && let Some(rows) = virtual_rows(content)
-                {
-                    return self.virtual_scroll(
-                        key,
-                        rows,
-                        *anchor_y,
-                        *auto_scroll,
-                        *on_scroll,
-                        *width,
-                        *height,
-                        *background,
-                        *border,
-                        restored,
-                        cx,
-                    );
-                }
-                let handle = self.scrolls.entry(key.clone()).or_default().clone();
-                let element = decoration(
-                    dimensions(div().relative(), *width, *height),
-                    *background,
-                    *border,
-                )
-                .id(key.clone())
-                .track_scroll(&handle);
-                let element = match direction {
-                    wire::ScrollDirection::Vertical => element.overflow_y_scroll(),
-                    wire::ScrollDirection::Horizontal => element.overflow_x_scroll(),
-                    wire::ScrollDirection::Both => element.overflow_scroll(),
-                };
-                let route = key.clone();
-                let anchors = (*anchor_x, *anchor_y);
-                let follow = *auto_scroll;
-                let handler = *on_scroll;
-                let weak = cx.entity().downgrade();
-                let observe = canvas(
-                    |_, _, _| (),
-                    move |_, _, _, cx| {
-                        let maximum = handle.max_offset();
-                        let offset = handle.offset();
-                        let _ = weak.update(cx, |this, cx| {
-                            let previous = this.scroll_positions.get(&route).copied();
-                            let restored = restored.as_ref().filter(|saved| previous.is_none() && saved.rows.is_none());
-                            let mut next = offset;
-                            for (position, maximum, previous, anchor) in [
-                                (
-                                    &mut next.x,
-                                    maximum.x,
-                                    previous.map(|(offset, max)| (offset.x, max.x)),
-                                    anchors.0,
-                                ),
-                                (
-                                    &mut next.y,
-                                    maximum.y,
-                                    previous.map(|(offset, max)| (offset.y, max.y)),
-                                    anchors.1,
-                                ),
-                            ] {
-                                let at_end = previous.is_some_and(|(offset, max)| {
-                                    f32::from(offset + max).abs() < 2.0
-                                });
-                                let initialize_end =
-                                    previous.is_none() && anchor == wire::ScrollAnchor::End;
-                                if initialize_end || (follow && at_end) {
-                                    *position = -maximum;
-                                } else if anchor == wire::ScrollAnchor::Keep
-                                    && let Some((offset,old_maximum)) = previous
-                                        && offset < px(0.0) { *position = (*position-(maximum-old_maximum)).clamp(-maximum,px(0.0)); }
-                            }
-                            if let Some(saved) = restored {
-                                next = point(saved.offset.x.clamp(-maximum.x, px(0.)), saved.offset.y.clamp(-maximum.y, px(0.)));
-                            }
-                            if next != offset {
-                                handle.set_offset(next);
-                                cx.notify();
-                            }
-                            let changed = previous
-                                .is_none_or(|(offset, max)| offset != next || max != maximum);
-                            this.scroll_positions.insert(route.clone(), (next, maximum));
-                            if changed
-                                && let Some(handler) = handler {
-                                    let distance = |offset:Pixels,maximum:Pixels,anchor:wire::ScrollAnchor| match anchor {
-                                        wire::ScrollAnchor::End => f32::from(maximum+offset), _=>-f32::from(offset),
-                                    };
-                                    let x = distance(next.x,maximum.x,anchors.0);
-                                    let y = distance(next.y,maximum.y,anchors.1);
-                                    let relative_x = x / f32::from(maximum.x).max(1.0);
-                                    let relative_y = y / f32::from(maximum.y).max(1.0);
-                                    cx.emit(wire::Event::ScrollOffset {
-                                        handler,
-                                        x,
-                                        y,
-                                        relative_x,
-                                        relative_y,
-                                    });
-                                }
-                        });
-                    },
-                )
-                .absolute()
-                .inset_0();
-                element
-                    .child(self.node(content, window, cx))
-                    .child(observe)
-                    .into_any_element()
-            }
-            Node::Button {
-                key,
-                content,
-                label,
-                checked,
-                on_press,
-                width,
-                height,
-                padding,
-                style,
-                ..
-            } => {
-                let mut button = button_style(Button::new(key.clone()), style.preset)
-                    .disabled(on_press.is_none())
-                    .selected(checked.unwrap_or(false));
-                button = match content {
-                    wire::ButtonContent::Label(text) => button.label(text.clone()),
-                    wire::ButtonContent::Child(child) => {
-                        let fit_content = matches!(height, None | Some(wire::Length::Shrink));
-                        if fit_content {
-                            button = button.h_auto();
-                        }
-                        button.child(self.node(child, window, cx))
-                    }
-                };
-                if let Some(label) = label {
-                    button = button.accessibility_label(label.clone());
-                }
-                if let Some(message) = on_press {
-                    let message = *message;
-                    button = button.on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(wire::Event::Message(message));
-                        cx.stop_propagation();
-                    }));
-                }
-                dimensions(pad(button, *padding), *width, *height).into_any_element()
-            }
+            Node::Linear { .. } => self.node_linear(node, window, cx),
+            Node::KeyedColumn { .. } => self.node_keyed_column(node, window, cx),
+            Node::Container { .. } => self.node_container(node, window, cx),
+            Node::Scroll { .. } => self.node_scroll(node, window, cx),
+            Node::Button { .. } => self.node_button(node, window, cx),
             Node::Input { .. } => self.input(node, window, cx),
             Node::PickList { .. } | Node::ComboBox { .. } => self.picker(node, window, cx),
-            Node::Toggle {
-                key,
-                kind,
-                label,
-                checked,
-                on_toggle,
-                ..
-            } => {
-                if *kind == wire::ToggleKind::Switch {
-                    let mut toggle = gpui_kit::component::switch::Switch::new(key.clone())
-                        .label(label.clone())
-                        .checked(*checked)
-                        .disabled(on_toggle.is_none());
-                    if let Some(handler) = on_toggle {
-                        let handler = *handler;
-                        toggle = toggle.on_click(cx.listener(move |_, on, _, cx| {
-                            cx.emit(wire::Event::Toggle { handler, on: *on })
-                        }));
-                    }
-                    return toggle.into_any_element();
-                }
-                let mut checkbox = Checkbox::new(key.clone())
-                    .label(label.clone())
-                    .checked(*checked)
-                    .disabled(on_toggle.is_none());
-                if let Some(handler) = on_toggle {
-                    let handler = *handler;
-                    checkbox = checkbox.on_click(cx.listener(move |_, on, _, cx| {
-                        cx.emit(wire::Event::Toggle { handler, on: *on })
-                    }));
-                }
-                checkbox.into_any_element()
-            }
-            Node::Radio {
-                key,
-                label,
-                selected,
-                on_select,
-                ..
-            } => {
-                let message = *on_select;
-                Radio::new(key.clone())
-                    .label(label.clone())
-                    .checked(*selected)
-                    .on_click(
-                        cx.listener(move |_, _, _, cx| cx.emit(wire::Event::Message(message))),
-                    )
-                    .into_any_element()
-            }
-            Node::Rule {
-                axis,
-                thickness,
-                color,
-                ..
-            } => {
-                let element = div().bg(color.map(rgba).unwrap_or_else(|| {
-                    gpui_kit::component::Theme::global(cx).color_tokens().border
-                }));
-                match axis {
-                    wire::Axis::Column => element.w(px(*thickness)).h_full().into_any_element(),
-                    wire::Axis::Row => element.h(px(*thickness)).w_full().into_any_element(),
-                }
-            }
+            Node::Toggle { .. } => self.node_toggle(node, cx),
+            Node::Radio { .. } => self.node_radio(node, cx),
+            Node::Rule { .. } => self.node_rule(node, cx),
             Node::Lazy { content, .. } => self.node(content, window, cx),
-            Node::ResizeHandle {
-                key,
-                on_press,
-                on_release,
-                on_drag,
-                content,
-                cursor,
-            } => {
-                let press_key = key.clone();
-                let move_key = key.clone();
-                let release_key = key.clone();
-                let press = *on_press;
-                let release = *on_release;
-                let drag = *on_drag;
-                let view = cx.entity().downgrade();
-                let capture = canvas(
-                    |_, _, _| (),
-                    move |_, _, window, _| {
-                        let moving = view.clone();
-                        let move_key = move_key.clone();
-                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-                            if phase != gpui_kit::DispatchPhase::Capture {
-                                return;
-                            }
-                            let _ = moving.update(cx, |this, cx| {
-                                let Some(previous) = this.drags.get_mut(&move_key) else {
-                                    return;
-                                };
-                                if event.pressed_button != Some(MouseButton::Left) {
-                                    this.drags.remove(&move_key);
-                                    return;
-                                }
-                                let delta = event.position - *previous;
-                                *previous = event.position;
-                                if let Some(handler) = drag {
-                                    cx.emit(wire::Event::Drag {
-                                        handler,
-                                        dx: f32::from(delta.x) as f64,
-                                        dy: f32::from(delta.y) as f64,
-                                    });
-                                }
-                            });
-                        });
-                        let releasing = view.clone();
-                        let release_key = release_key.clone();
-                        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
-                            if phase != gpui_kit::DispatchPhase::Capture
-                                || event.button != MouseButton::Left
-                            {
-                                return;
-                            }
-                            let _ = releasing.update(cx, |this, cx| {
-                                let was_dragging = this.drags.remove(&release_key).is_some();
-                                if was_dragging && let Some(message) = release {
-                                    cx.emit(wire::Event::Message(message));
-                                }
-                            });
-                        });
-                    },
-                )
-                .absolute()
-                .inset_0();
-                let (width, height) = content_dimensions(content);
-                let element = dimensions(div(), width, height)
-                    .id(key.clone())
-                    .relative()
-                    .cursor(native_cursor(*cursor))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            this.drags.insert(press_key.clone(), event.position);
-                            if let Some(message) = press {
-                                cx.emit(wire::Event::Message(message));
-                            }
-                        }),
-                    )
-                    .child(self.node(content, window, cx))
-                    .child(capture);
-                #[cfg(test)]
-                let element = {
-                    use gpui_kit::test::TestSupportExt as _;
-                    element.test_support()
-                };
-                element.into_any_element()
-            }
-            Node::Responsive {
-                key,
-                content,
-                width,
-                height,
-            } => {
-                let weak = cx.entity().downgrade();
-                let key = key.clone();
-                let measure = canvas(
-                    move |bounds, _, cx| {
-                        let size = [
-                            f32::from(bounds.size.width) as f64,
-                            f32::from(bounds.size.height) as f64,
-                        ];
-                        let _ = weak.update(cx, |this, cx| {
-                            let changed = this.containers.get(&key) != Some(&size);
-                            if changed {
-                                this.containers.insert(key, size);
-                                cx.notify();
-                            }
-                        });
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .inset_0();
-                dimensions(div().relative(), *width, *height)
-                    .child(self.node(content, window, cx))
-                    .child(measure)
-                    .into_any_element()
-            }
-            Node::When {
-                condition,
-                children,
-                ..
-            } => {
-                let mut element = div().flex().flex_col();
-                if condition.matches(&self.containers) {
-                    for child in children {
-                        element = element.child(self.node(child, window, cx));
-                    }
-                }
-                element.into_any_element()
-            }
-            Node::Sensor {
-                key,
-                reset,
-                on_show,
-                on_resize,
-                on_hide,
-                anticipate,
-                delay,
-                child,
-                ..
-            } => {
-                let sensor = self.sensors.entry(key.clone()).or_insert(SensorState {
-                    reset: reset.clone(),
-                    size: None,
-                    on_hide: *on_hide,
-                    on_show: *on_show,
-                    on_resize: *on_resize,
-                    pending: None,
-                });
-                if sensor.reset != *reset {
-                    sensor.reset = reset.clone();
-                    sensor.size = None;
-                    sensor.pending = None;
-                }
-                sensor.on_hide = *on_hide;
-                sensor.on_show = *on_show;
-                sensor.on_resize = *on_resize;
-                let route = key.clone();
-                let show = *on_show;
-                let resize = *on_resize;
-                let anticipate = px(anticipate.unwrap_or_default());
-                let delay =
-                    std::time::Duration::from_secs_f32(delay.unwrap_or_default().max(0.0) / 1000.0);
-                let weak = cx.entity().downgrade();
-                let measure = canvas(
-                    move |bounds, window, cx| {
-                        let viewport = window.content_mask().bounds;
-                        let visible_bounds = Bounds::new(
-                            bounds.origin - point(anticipate, anticipate),
-                            bounds.size + size(anticipate * 2.0, anticipate * 2.0),
-                        );
-                        let visible = viewport.intersects(&visible_bounds);
-                        let _ = weak.update(cx, |this, cx| {
-                            this.bounds.insert(route.clone(), bounds);
-                            let Some(sensor) = this.sensors.get_mut(&route) else {
-                                return;
-                            };
-                            if !visible {
-                                sensor.pending = None;
-                                if sensor.size.take().is_some()
-                                    && let Some(message) = sensor.on_hide
-                                {
-                                    cx.emit(wire::Event::Message(message));
-                                }
-                                return;
-                            }
-                            let unchanged = sensor.size == Some(bounds.size);
-                            if unchanged {
-                                sensor.pending = None;
-                                return;
-                            }
-                            if !delay.is_zero() {
-                                let waiting = sensor
-                                    .pending
-                                    .as_ref()
-                                    .is_some_and(|(size, _)| *size == bounds.size);
-                                if waiting {
-                                    return;
-                                }
-                                let route = route.clone();
-                                let size = bounds.size;
-                                let timer = cx.background_executor().timer(delay);
-                                let pending = cx.spawn(async move |this, cx| {
-                                    timer.await;
-                                    let _ = this.update(cx, |this, cx| {
-                                        let Some(sensor) = this.sensors.get_mut(&route) else {
-                                            return;
-                                        };
-                                        let current = sensor
-                                            .pending
-                                            .as_ref()
-                                            .is_some_and(|(pending, _)| *pending == size);
-                                        if !current {
-                                            return;
-                                        }
-                                        let handler = match sensor.size {
-                                            None => sensor.on_show,
-                                            Some(_) => sensor.on_resize,
-                                        };
-                                        sensor.size = Some(size);
-                                        sensor.pending = None;
-                                        if let Some(handler) = handler {
-                                            cx.emit(wire::Event::Size {
-                                                handler,
-                                                width: f32::from(size.width),
-                                                height: f32::from(size.height),
-                                            });
-                                        }
-                                    });
-                                });
-                                sensor.pending = Some((size, pending));
-                                return;
-                            }
-                            let handler = match sensor.size {
-                                None => show,
-                                Some(previous) if previous != bounds.size => resize,
-                                Some(_) => None,
-                            };
-                            sensor.size = Some(bounds.size);
-                            if let Some(handler) = handler {
-                                cx.emit(wire::Event::Size {
-                                    handler,
-                                    width: f32::from(bounds.size.width),
-                                    height: f32::from(bounds.size.height),
-                                });
-                            }
-                        });
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .inset_0();
-                // A sensor is layout-transparent. In particular, a fill spacer
-                // must not collapse inside an auto-sized measurement wrapper.
-                let (width, height) = content_dimensions(child);
-                dimensions(div().relative(), width, height)
-                    .child(self.node(child, window, cx))
-                    .child(measure)
-                    .into_any_element()
-            }
+            Node::ResizeHandle { .. } => self.node_resize_handle(node, window, cx),
+            Node::Responsive { .. } => self.node_responsive(node, window, cx),
+            Node::When { .. } => self.node_when(node, window, cx),
+            Node::Sensor { .. } => self.node_sensor(node, window, cx),
             Node::MouseArea { .. } => self.mouse_area(node, window, cx),
             Node::Slider { .. } => self.slider(node, window, cx),
             Node::RichText { .. } => self.rich_text(node, window, cx),
             Node::Flex { .. } => self.flex(node, window, cx),
-            Node::Grid {
-                key,
-                children,
-                width,
-                height,
-                padding,
-                spacing,
-                columns,
-                fluid,
-                aspect,
-                background,
-                border,
-            } => {
-                let available = self
-                    .bounds
-                    .get(key)
-                    .map_or(f32::from(window.viewport_size().width), |bounds| {
-                        f32::from(bounds.size.width)
-                    });
-                let columns = fluid
-                    .filter(|value| *value > 0.0)
-                    .map_or(columns.unwrap_or(1), |value| {
-                        (available / value).ceil().max(1.0) as u32
-                    })
-                    .max(1);
-                let mut grid = decoration(
-                    pad(
-                        dimensions(div().flex().flex_wrap(), *width, *height),
-                        *padding,
-                    ),
-                    *background,
-                    *border,
-                );
-                let gap = spacing.unwrap_or_default();
-                grid = grid.gap(px(gap));
-                let cell_width = ((available - gap * columns.saturating_sub(1) as f32)
-                    / columns as f32)
-                    .max(0.0);
-                for child in children {
-                    let cell = div()
-                        .w(px(cell_width))
-                        .h(px(cell_width / aspect.unwrap_or(1.0).max(0.001)));
-                    grid = grid.child(cell.child(self.node(child, window, cx)));
-                }
-                grid.relative()
-                    .child(self.measure(key, cx))
-                    .into_any_element()
-            }
-            Node::Hover {
-                key,
-                children,
-                open,
-                width,
-                height,
-                padding,
-                background,
-                border,
-                tint,
-                radius,
-            } => {
-                let route = key.clone();
-                let mut element = decoration(
-                    pad(dimensions(div().relative(), *width, *height), *padding),
-                    *background,
-                    *border,
-                )
-                .id(key.clone());
-                let reveal = *open || self.hovered.contains(key);
-                if let Some(base) = children.first() {
-                    element = element.child(self.node(base, window, cx));
-                }
-                if reveal && let Some(child) = children.get(1) {
-                    let mut layer = div().absolute().inset_0().rounded(px(*radius));
-                    if let Some(color) = tint {
-                        layer = layer.bg(rgba(*color));
-                    }
-                    element = element.child(layer.child(self.node(child, window, cx)));
-                }
-                let element = element.on_hover(cx.listener(move |this, hovered, _, cx| {
-                    match hovered {
-                        true => {
-                            this.hovered.insert(route.clone());
-                        }
-                        false => {
-                            this.hovered.remove(&route);
-                        }
-                    }
-                    cx.notify();
-                }));
-                #[cfg(test)]
-                let element = {
-                    use gpui_kit::test::TestSupportExt as _;
-                    element.test_support()
-                };
-                element.into_any_element()
-            }
-            Node::Tooltip {
-                key,
-                children,
-                delay_ms,
-                ..
-            } => {
-                let Some(content) = children.first() else {
-                    return div().into_any_element();
-                };
-                let mut element = div()
-                    .id(key.clone())
-                    .tooltip_show_delay(std::time::Duration::from_millis(*delay_ms))
-                    .child(self.node(content, window, cx));
-                if let Some(tip) = children.get(1) {
-                    let tip = tip.clone();
-                    element =
-                        element.tooltip(move |_, cx| cx.new(|_| ViewTree::new(tip.clone())).into());
-                }
-                element.into_any_element()
-            }
-            Node::Float {
-                key,
-                content,
-                x,
-                y,
-                scale: _,
-                shadow,
-                radius,
-            } => {
-                let bounds = self.bounds.get(key).copied().unwrap_or_default();
-                let viewport = window.viewport_size();
-                let geometry = [
-                    f32::from(bounds.origin.x) as f64,
-                    f32::from(bounds.origin.y) as f64,
-                    f32::from(bounds.size.width) as f64,
-                    f32::from(bounds.size.height) as f64,
-                    0.0,
-                    0.0,
-                    f32::from(viewport.width) as f64,
-                    f32::from(viewport.height) as f64,
-                ];
-                let mut element = shadows(
-                    div()
-                        .relative()
-                        .bg(gpui_kit::component::Theme::global(cx)
-                            .color_tokens()
-                            .surface)
-                        .text_color(
-                            gpui_kit::component::Theme::global(cx)
-                                .color_tokens()
-                                .surface_foreground,
-                        )
-                        .left(px(x.evaluate(geometry)))
-                        .top(px(y.evaluate(geometry))),
-                    *shadow,
-                );
-                if let Some(radius) = radius {
-                    element = decoration(
-                        element,
-                        None,
-                        Some(wire::Border {
-                            color: None,
-                            width: None,
-                            radius: Some(*radius),
-                        }),
-                    );
-                }
-                // A press inside a floated card is the card's: it never
-                // reaches what the card floats over (a dismissing backdrop,
-                // the document under a comment card).
-                element = element
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
-                // Authored floating rails use unit scale; their measurement is
-                // outside the translated child to avoid positional feedback.
-                div()
-                    .relative()
-                    .child(element.child(self.node(content, window, cx)))
-                    .child(self.measure(key, cx))
-                    .into_any_element()
-            }
-            Node::Image {
-                hash,
-                data,
-                width,
-                height,
-                fit,
-                opacity,
-                ..
-            } => self.picture(
-                *hash,
-                data.as_ref(),
-                *width,
-                *height,
-                *fit,
-                opacity.unwrap_or(1.0),
-            ),
+            Node::Grid { .. } => self.node_grid(node, window, cx),
+            Node::Hover { .. } => self.node_hover(node, window, cx),
+            Node::Tooltip { .. } => self.node_tooltip(node, window, cx),
+            Node::Float { .. } => self.node_float(node, window, cx),
+            Node::Image { .. } => self.node_image(node),
             Node::ImageViewer { .. } => self.image_viewer(node, window, cx),
-            Node::Svg {
-                hash,
-                bytes,
-                color,
-                inherit_button_ink,
-                fit,
-                width,
-                height,
-                opacity,
-                ..
-            } => {
-                if let Some(bytes) = bytes {
-                    self.remember_vector(*hash, bytes);
-                }
-                let mut element =
-                    dimensions(div(), *width, *height).opacity(opacity.unwrap_or(1.0));
-                if let Some(bytes) = self.vectors.get(hash) {
-                    let monochrome = color.is_some() || *inherit_button_ink;
-                    if monochrome {
-                        let ink = color.map(rgba).unwrap_or_else(|| window.text_style().color);
-                        element = element.child(svg().data(bytes).size_full().text_color(ink));
-                    } else {
-                        // GPUI's SVG icon renderer is an alpha mask. Untinted
-                        // artwork instead uses its native full-color image decoder.
-                        element = element.child(
-                            img(Arc::new(Image::from_bytes(
-                                ImageFormat::Svg,
-                                bytes.to_vec(),
-                            )))
-                            .size_full()
-                            .object_fit(object_fit(*fit)),
-                        );
-                    }
-                }
-                element.into_any_element()
-            }
-            Node::Canvas {
-                key,
-                width,
-                height,
-                commands,
-                ..
-            } => {
-                let bounds = self.bounds.get(key).copied().unwrap_or_default();
-                let known = |length: Option<wire::Length>, measured: Pixels| match length {
-                    Some(wire::Length::Fixed(value)) => value,
-                    _ => f32::from(measured).max(1.0),
-                };
-                dimensions(div().relative(), *width, *height)
-                    .child(
-                        img(Arc::new(Image::from_bytes(
-                            ImageFormat::Svg,
-                            canvas_svg(
-                                commands,
-                                known(*width, bounds.size.width),
-                                known(*height, bounds.size.height),
-                            ),
-                        )))
-                        .size_full()
-                        .object_fit(ObjectFit::Fill),
-                    )
-                    .child(self.measure(key, cx))
-                    .into_any_element()
-            }
+            Node::Svg { .. } => self.node_svg(node, window),
+            Node::Canvas { .. } => self.node_canvas(node, cx),
             Node::Qr { code, .. } => qr(code),
             Node::Surface { key, name, .. } => match self.surfaces.get(key) {
                 Some(surface) => surface.clone().into_any_element(),
@@ -2233,136 +1350,9 @@ impl ViewTree {
                     .child(format!("Unavailable host surface: {name}"))
                     .into_any_element(),
             },
-            Node::Stack {
-                children,
-                width,
-                height,
-                padding,
-                background,
-                border,
-                clip,
-                under,
-                ..
-            } => {
-                let mut element = decoration(
-                    pad(dimensions(div().relative(), *width, *height), *padding),
-                    *background,
-                    *border,
-                );
-                if *clip {
-                    element = element.overflow_hidden();
-                }
-                if *under == 0 {
-                    element = element.grid().grid_cols(1).grid_rows(1);
-                }
-                for (index, child) in children.iter().enumerate() {
-                    let content = self.node(child, window, cx);
-                    element = match (*under, index) {
-                        (0, _) => element.child(div().col_start(1).row_start(1).child(content)),
-                        (base, index) if index == base as usize => element.child(content),
-                        _ => element.child(div().absolute().inset_0().child(content)),
-                    };
-                }
-                element.into_any_element()
-            }
-            Node::Overlay {
-                key,
-                children,
-                backdrop,
-                padding,
-                align_x,
-                align_y,
-                on_dismiss,
-            } => {
-                let mut element = div().relative().size_full();
-                if let Some(base) = children.first() {
-                    element = element.child(self.node(base, window, cx));
-                }
-                if let Some(modal) = children.get(1) {
-                    let shade = div()
-                        .id(format!("{key}/backdrop"))
-                        .absolute()
-                        .inset_0()
-                        .bg(rgba(*backdrop));
-                    let mut layer = div()
-                        .id(format!("{key}/layer"))
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .p(px(*padding));
-                    if let Some(message) = on_dismiss {
-                        let message = *message;
-                        layer = layer.on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |_, _, _, cx| cx.emit(wire::Event::Message(message))),
-                        );
-                    }
-                    layer = match align_x {
-                        wire::AlignX::Left => layer.justify_start(),
-                        wire::AlignX::Center => layer.justify_center(),
-                        wire::AlignX::Right => layer.justify_end(),
-                    };
-                    layer = match align_y {
-                        wire::AlignY::Top => layer.items_start(),
-                        wire::AlignY::Center => layer.items_center(),
-                        wire::AlignY::Bottom => layer.items_end(),
-                    };
-                    element = element.child(shade).child(
-                        layer.child(
-                            div()
-                                .bg(gpui_kit::component::Theme::global(cx)
-                                    .color_tokens()
-                                    .surface)
-                                .text_color(
-                                    gpui_kit::component::Theme::global(cx)
-                                        .color_tokens()
-                                        .surface_foreground,
-                                )
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(self.node(modal, window, cx)),
-                        ),
-                    );
-                }
-                element.into_any_element()
-            }
-            Node::Progress {
-                value,
-                min,
-                max,
-                axis,
-                length,
-                girth,
-                background,
-                bar,
-                border,
-                ..
-            } => {
-                let span = max - min;
-                let valid = span.is_finite() && span > 0.0;
-                let fraction = match valid {
-                    true => ((value - min) / span).clamp(0.0, 1.0),
-                    false => 0.0,
-                };
-                let fill = div().bg(bar.map(rgba).unwrap_or_else(|| {
-                    gpui_kit::component::Theme::global(cx)
-                        .color_tokens()
-                        .primary
-                }));
-                match axis {
-                    wire::Axis::Row => {
-                        decoration(dimensions(div(), *length, *girth), *background, *border)
-                            .child(fill.w(relative(fraction)).h_full())
-                            .into_any_element()
-                    }
-                    wire::Axis::Column => decoration(
-                        dimensions(div().flex().flex_col().justify_end(), *girth, *length),
-                        *background,
-                        *border,
-                    )
-                    .child(fill.h(relative(fraction)).w_full())
-                    .into_any_element(),
-                }
-            }
+            Node::Stack { .. } => self.node_stack(node, window, cx),
+            Node::Overlay { .. } => self.node_overlay(node, window, cx),
+            Node::Progress { .. } => self.node_progress(node, cx),
             Node::Pin {
                 content,
                 x,
@@ -2374,6 +1364,1257 @@ impl ViewTree {
                 .child(self.node(content, window, cx))
                 .into_any_element(),
             Node::Editor { .. } => self.editor(node, window, cx),
+        }
+    }
+
+    #[inline(never)]
+    fn node_text(&mut self, node: &wire::Node, cx: &mut Context<Self>) -> AnyElement {
+        let wire::Node::Text {
+            key,
+            content,
+            size,
+            color,
+            width,
+            font,
+            align_x,
+            options,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        let mut element = text_options(
+            dimensions(div().min_w_0().max_w_full(), *width, options.height),
+            *font,
+            *align_x,
+            options,
+        )
+        .child(content.clone());
+        let intrinsic_label = options.wrapping == Some(wire::Wrapping::None)
+            && matches!(width, None | Some(wire::Length::Shrink));
+        if intrinsic_label {
+            // Shrink-sized labels keep their natural width; a Fill
+            // sibling takes the remaining space, not their letters.
+            element = element.flex_shrink_0();
+        }
+        if let Some(size) = size {
+            element = element.text_size(px(*size));
+        }
+        if let Some(color) = color {
+            element = element.text_color(rgba(*color));
+        }
+        #[cfg(test)]
+        {
+            element = element.relative().child(self.measure(key, cx));
+        }
+        #[cfg(not(test))]
+        let _ = (key, cx);
+        element.into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_linear(
+        &mut self,
+        node: &wire::Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let wire::Node::Linear {
+            axis,
+            spacing,
+            padding,
+            width,
+            height,
+            background,
+            border,
+            children,
+            align,
+            max_width,
+            clip,
+            wrap,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        let mut element = dimensions(div().flex(), *width, *height);
+        element = match axis {
+            wire::Axis::Column => element.flex_col(),
+            wire::Axis::Row => element.flex_row(),
+        };
+        if let Some(gap) = spacing {
+            element = element.gap(px(*gap));
+        }
+        if let Some(width) = max_width {
+            element = element.max_w(px(*width));
+        }
+        if *clip {
+            element = element.overflow_hidden();
+        }
+        if wrap.is_some() {
+            element = element.flex_wrap();
+        }
+        element = cross_align(element, *align);
+        element = decoration(pad(element, *padding), *background, *border);
+        for child in children {
+            element = element.child(self.node(child, window, cx));
+        }
+        self.focusable_container(node, element, window, cx)
+    }
+
+    #[inline(never)]
+    fn node_keyed_column(
+        &mut self,
+        node: &wire::Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let wire::Node::KeyedColumn {
+            key,
+            keys,
+            spacing,
+            padding,
+            width,
+            height,
+            background,
+            border,
+            children,
+            align,
+            max_width,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        let mut element = decoration(
+            pad(
+                dimensions(div().flex().flex_col(), *width, *height),
+                *padding,
+            ),
+            *background,
+            *border,
+        );
+        if let Some(gap) = spacing {
+            element = element.gap(px(*gap));
+        }
+        element = cross_align(element, *align);
+        if let Some(width) = max_width {
+            element = element.max_w(px(*width));
+        }
+        for (index, child) in children.iter().enumerate() {
+            let content = self.node(child, window, cx);
+            let identity = keys.as_ref().and_then(|keys| keys.get(index));
+            element = match identity {
+                Some(identity) => {
+                    let row = format!("{key}/@row:{}", identity.virtual_key());
+                    element.child(
+                        div()
+                            .relative()
+                            .child(content)
+                            .child(self.measure(&row, cx)),
+                    )
+                }
+                None => element.child(content),
+            };
+        }
+        element.into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_container(
+        &mut self,
+        node: &wire::Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let wire::Node::Container {
+            key,
+            content,
+            width,
+            height,
+            padding,
+            border,
+            background,
+            max_width,
+            max_height,
+            clip,
+            align_x,
+            align_y,
+            shadow,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        let color = match background {
+            Some(wire::Background::Color(color)) => Some(*color),
+            _ => None,
+        };
+        let mut element = shadows(
+            decoration(
+                pad(
+                    dimensions(div().relative().flex(), *width, *height),
+                    *padding,
+                ),
+                color,
+                *border,
+            ),
+            *shadow,
+        );
+        element = horizontal_align(element, *align_x);
+        element = vertical_align(element, *align_y);
+        if let Some(width) = max_width {
+            element = element.max_w(px(*width));
+        }
+        if let Some(height) = max_height {
+            element = element.max_h(px(*height));
+        }
+        if *clip {
+            element = element.overflow_hidden();
+        }
+        let element = element
+            .child(self.node(content, window, cx))
+            .child(self.measure(key, cx));
+        self.focusable_container(node, element, window, cx)
+    }
+
+    #[inline(never)]
+    fn node_scroll(
+        &mut self,
+        node: &wire::Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let wire::Node::Scroll {
+            key,
+            content,
+            width,
+            height,
+            direction,
+            anchor_x,
+            anchor_y,
+            auto_scroll,
+            on_scroll,
+            background,
+            border,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        let restored = self.presentation.scrolls.remove(key).filter(|saved| {
+            saved.direction == *direction && saved.anchors == (*anchor_x, *anchor_y)
+        });
+        if *direction == wire::ScrollDirection::Vertical
+            && let Some(rows) = virtual_rows(content)
+        {
+            return self.virtual_scroll(
+                key,
+                rows,
+                *anchor_y,
+                *auto_scroll,
+                *on_scroll,
+                *width,
+                *height,
+                *background,
+                *border,
+                restored,
+                cx,
+            );
+        }
+        let handle = self.scrolls.entry(key.clone()).or_default().clone();
+        let element = decoration(
+            dimensions(div().relative(), *width, *height),
+            *background,
+            *border,
+        )
+        .id(key.clone())
+        .track_scroll(&handle);
+        let element = match direction {
+            wire::ScrollDirection::Vertical => element.overflow_y_scroll(),
+            wire::ScrollDirection::Horizontal => element.overflow_x_scroll(),
+            wire::ScrollDirection::Both => element.overflow_scroll(),
+        };
+        let route = key.clone();
+        let anchors = (*anchor_x, *anchor_y);
+        let follow = *auto_scroll;
+        let handler = *on_scroll;
+        let weak = cx.entity().downgrade();
+        let observe = canvas(
+            |_, _, _| (),
+            move |_, _, _, cx| {
+                let maximum = handle.max_offset();
+                let offset = handle.offset();
+                let _ = weak.update(cx, |this, cx| {
+                    let previous = this.scroll_positions.get(&route).copied();
+                    let restored = restored.as_ref().filter(|saved| previous.is_none() && saved.rows.is_none());
+                    let mut next = offset;
+                    for (position, maximum, previous, anchor) in [
+                        (
+                            &mut next.x,
+                            maximum.x,
+                            previous.map(|(offset, max)| (offset.x, max.x)),
+                            anchors.0,
+                        ),
+                        (
+                            &mut next.y,
+                            maximum.y,
+                            previous.map(|(offset, max)| (offset.y, max.y)),
+                            anchors.1,
+                        ),
+                    ] {
+                        let at_end = previous.is_some_and(|(offset, max)| {
+                            f32::from(offset + max).abs() < 2.0
+                        });
+                        let initialize_end =
+                            previous.is_none() && anchor == wire::ScrollAnchor::End;
+                        if initialize_end || (follow && at_end) {
+                            *position = -maximum;
+                        } else if anchor == wire::ScrollAnchor::Keep
+                            && let Some((offset,old_maximum)) = previous
+                                && offset < px(0.0) { *position = (*position-(maximum-old_maximum)).clamp(-maximum,px(0.0)); }
+                    }
+                    if let Some(saved) = restored {
+                        next = point(saved.offset.x.clamp(-maximum.x, px(0.)), saved.offset.y.clamp(-maximum.y, px(0.)));
+                    }
+                    if next != offset {
+                        handle.set_offset(next);
+                        cx.notify();
+                    }
+                    let changed = previous
+                        .is_none_or(|(offset, max)| offset != next || max != maximum);
+                    this.scroll_positions.insert(route.clone(), (next, maximum));
+                    if changed
+                        && let Some(handler) = handler {
+                            let distance = |offset:Pixels,maximum:Pixels,anchor:wire::ScrollAnchor| match anchor {
+                                wire::ScrollAnchor::End => f32::from(maximum+offset), _=>-f32::from(offset),
+                            };
+                            let x = distance(next.x,maximum.x,anchors.0);
+                            let y = distance(next.y,maximum.y,anchors.1);
+                            let relative_x = x / f32::from(maximum.x).max(1.0);
+                            let relative_y = y / f32::from(maximum.y).max(1.0);
+                            cx.emit(wire::Event::ScrollOffset {
+                                handler,
+                                x,
+                                y,
+                                relative_x,
+                                relative_y,
+                            });
+                        }
+                });
+            },
+        )
+        .absolute()
+        .inset_0();
+        element
+            .child(self.node(content, window, cx))
+            .child(observe)
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_button(
+        &mut self,
+        node: &wire::Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let wire::Node::Button {
+            key,
+            content,
+            label,
+            checked,
+            on_press,
+            width,
+            height,
+            padding,
+            style,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        let mut button = button_style(Button::new(key.clone()), style.preset)
+            .disabled(on_press.is_none())
+            .selected(checked.unwrap_or(false));
+        button = match content {
+            wire::ButtonContent::Label(text) => button.label(text.clone()),
+            wire::ButtonContent::Child(child) => {
+                let fit_content = matches!(height, None | Some(wire::Length::Shrink));
+                if fit_content {
+                    button = button.h_auto();
+                }
+                button.child(self.node(child, window, cx))
+            }
+        };
+        if let Some(label) = label {
+            button = button.accessibility_label(label.clone());
+        }
+        if let Some(message) = on_press {
+            let message = *message;
+            button = button.on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(wire::Event::Message(message));
+                cx.stop_propagation();
+            }));
+        }
+        dimensions(pad(button, *padding), *width, *height).into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_toggle(&mut self, node: &wire::Node, cx: &mut Context<Self>) -> AnyElement {
+        let wire::Node::Toggle {
+            key,
+            kind,
+            label,
+            checked,
+            on_toggle,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        if *kind == wire::ToggleKind::Switch {
+            let mut toggle = gpui_kit::component::switch::Switch::new(key.clone())
+                .label(label.clone())
+                .checked(*checked)
+                .disabled(on_toggle.is_none());
+            if let Some(handler) = on_toggle {
+                let handler = *handler;
+                toggle = toggle.on_click(cx.listener(move |_, on, _, cx| {
+                    cx.emit(wire::Event::Toggle { handler, on: *on })
+                }));
+            }
+            return toggle.into_any_element();
+        }
+        let mut checkbox = Checkbox::new(key.clone())
+            .label(label.clone())
+            .checked(*checked)
+            .disabled(on_toggle.is_none());
+        if let Some(handler) = on_toggle {
+            let handler = *handler;
+            checkbox = checkbox.on_click(cx.listener(move |_, on, _, cx| {
+                cx.emit(wire::Event::Toggle { handler, on: *on })
+            }));
+        }
+        checkbox.into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_radio(&mut self, node: &wire::Node, cx: &mut Context<Self>) -> AnyElement {
+        let wire::Node::Radio {
+            key,
+            label,
+            selected,
+            on_select,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        let message = *on_select;
+        Radio::new(key.clone())
+            .label(label.clone())
+            .checked(*selected)
+            .on_click(cx.listener(move |_, _, _, cx| cx.emit(wire::Event::Message(message))))
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_rule(&mut self, node: &wire::Node, cx: &mut Context<Self>) -> AnyElement {
+        let wire::Node::Rule {
+            axis,
+            thickness,
+            color,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        let element = div().bg(color.map(rgba).unwrap_or_else(|| {
+            gpui_kit::component::Theme::global(cx).color_tokens().border
+        }));
+        match axis {
+            wire::Axis::Column => element.w(px(*thickness)).h_full().into_any_element(),
+            wire::Axis::Row => element.h(px(*thickness)).w_full().into_any_element(),
+        }
+    }
+
+    #[inline(never)]
+    fn node_resize_handle(
+        &mut self,
+        node: &wire::Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let wire::Node::ResizeHandle {
+            key,
+            on_press,
+            on_release,
+            on_drag,
+            content,
+            cursor,
+        } = node
+        else {
+            unreachable!()
+        };
+        let press_key = key.clone();
+        let move_key = key.clone();
+        let release_key = key.clone();
+        let press = *on_press;
+        let release = *on_release;
+        let drag = *on_drag;
+        let view = cx.entity().downgrade();
+        let capture = canvas(
+            |_, _, _| (),
+            move |_, _, window, _| {
+                let moving = view.clone();
+                let move_key = move_key.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase != gpui_kit::DispatchPhase::Capture {
+                        return;
+                    }
+                    let _ = moving.update(cx, |this, cx| {
+                        let Some(previous) = this.drags.get_mut(&move_key) else {
+                            return;
+                        };
+                        if event.pressed_button != Some(MouseButton::Left) {
+                            this.drags.remove(&move_key);
+                            return;
+                        }
+                        let delta = event.position - *previous;
+                        *previous = event.position;
+                        if let Some(handler) = drag {
+                            cx.emit(wire::Event::Drag {
+                                handler,
+                                dx: f32::from(delta.x) as f64,
+                                dy: f32::from(delta.y) as f64,
+                            });
+                        }
+                    });
+                });
+                let releasing = view.clone();
+                let release_key = release_key.clone();
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase != gpui_kit::DispatchPhase::Capture
+                        || event.button != MouseButton::Left
+                    {
+                        return;
+                    }
+                    let _ = releasing.update(cx, |this, cx| {
+                        let was_dragging = this.drags.remove(&release_key).is_some();
+                        if was_dragging && let Some(message) = release {
+                            cx.emit(wire::Event::Message(message));
+                        }
+                    });
+                });
+            },
+        )
+        .absolute()
+        .inset_0();
+        let (width, height) = content_dimensions(content);
+        let element = dimensions(div(), width, height)
+            .id(key.clone())
+            .relative()
+            .cursor(native_cursor(*cursor))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.drags.insert(press_key.clone(), event.position);
+                    if let Some(message) = press {
+                        cx.emit(wire::Event::Message(message));
+                    }
+                }),
+            )
+            .child(self.node(content, window, cx))
+            .child(capture);
+        #[cfg(test)]
+        let element = {
+            use gpui_kit::test::TestSupportExt as _;
+            element.test_support()
+        };
+        element.into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_responsive(
+        &mut self,
+        node: &wire::Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let wire::Node::Responsive {
+            key,
+            content,
+            width,
+            height,
+        } = node
+        else {
+            unreachable!()
+        };
+        let weak = cx.entity().downgrade();
+        let key = key.clone();
+        let measure = canvas(
+            move |bounds, _, cx| {
+                let size = [
+                    f32::from(bounds.size.width) as f64,
+                    f32::from(bounds.size.height) as f64,
+                ];
+                let _ = weak.update(cx, |this, cx| {
+                    let changed = this.containers.get(&key) != Some(&size);
+                    if changed {
+                        this.containers.insert(key, size);
+                        cx.notify();
+                    }
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0();
+        dimensions(div().relative(), *width, *height)
+            .child(self.node(content, window, cx))
+            .child(measure)
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_when(
+        &mut self,
+        node: &wire::Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let wire::Node::When {
+            condition,
+            children,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        let mut element = div().flex().flex_col();
+        if condition.matches(&self.containers) {
+            for child in children {
+                element = element.child(self.node(child, window, cx));
+            }
+        }
+        element.into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_sensor(
+        &mut self,
+        node: &wire::Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let wire::Node::Sensor {
+            key,
+            reset,
+            on_show,
+            on_resize,
+            on_hide,
+            anticipate,
+            delay,
+            child,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        let sensor = self.sensors.entry(key.clone()).or_insert(SensorState {
+            reset: reset.clone(),
+            size: None,
+            on_hide: *on_hide,
+            on_show: *on_show,
+            on_resize: *on_resize,
+            pending: None,
+        });
+        if sensor.reset != *reset {
+            sensor.reset = reset.clone();
+            sensor.size = None;
+            sensor.pending = None;
+        }
+        sensor.on_hide = *on_hide;
+        sensor.on_show = *on_show;
+        sensor.on_resize = *on_resize;
+        let route = key.clone();
+        let show = *on_show;
+        let resize = *on_resize;
+        let anticipate = px(anticipate.unwrap_or_default());
+        let delay =
+            std::time::Duration::from_secs_f32(delay.unwrap_or_default().max(0.0) / 1000.0);
+        let weak = cx.entity().downgrade();
+        let measure = canvas(
+            move |bounds, window, cx| {
+                let viewport = window.content_mask().bounds;
+                let visible_bounds = Bounds::new(
+                    bounds.origin - point(anticipate, anticipate),
+                    bounds.size + size(anticipate * 2.0, anticipate * 2.0),
+                );
+                let visible = viewport.intersects(&visible_bounds);
+                let _ = weak.update(cx, |this, cx| {
+                    this.bounds.insert(route.clone(), bounds);
+                    let Some(sensor) = this.sensors.get_mut(&route) else {
+                        return;
+                    };
+                    if !visible {
+                        sensor.pending = None;
+                        if sensor.size.take().is_some()
+                            && let Some(message) = sensor.on_hide
+                        {
+                            cx.emit(wire::Event::Message(message));
+                        }
+                        return;
+                    }
+                    let unchanged = sensor.size == Some(bounds.size);
+                    if unchanged {
+                        sensor.pending = None;
+                        return;
+                    }
+                    if !delay.is_zero() {
+                        let waiting = sensor
+                            .pending
+                            .as_ref()
+                            .is_some_and(|(size, _)| *size == bounds.size);
+                        if waiting {
+                            return;
+                        }
+                        let route = route.clone();
+                        let size = bounds.size;
+                        let timer = cx.background_executor().timer(delay);
+                        let pending = cx.spawn(async move |this, cx| {
+                            timer.await;
+                            let _ = this.update(cx, |this, cx| {
+                                let Some(sensor) = this.sensors.get_mut(&route) else {
+                                    return;
+                                };
+                                let current = sensor
+                                    .pending
+                                    .as_ref()
+                                    .is_some_and(|(pending, _)| *pending == size);
+                                if !current {
+                                    return;
+                                }
+                                let handler = match sensor.size {
+                                    None => sensor.on_show,
+                                    Some(_) => sensor.on_resize,
+                                };
+                                sensor.size = Some(size);
+                                sensor.pending = None;
+                                if let Some(handler) = handler {
+                                    cx.emit(wire::Event::Size {
+                                        handler,
+                                        width: f32::from(size.width),
+                                        height: f32::from(size.height),
+                                    });
+                                }
+                            });
+                        });
+                        sensor.pending = Some((size, pending));
+                        return;
+                    }
+                    let handler = match sensor.size {
+                        None => show,
+                        Some(previous) if previous != bounds.size => resize,
+                        Some(_) => None,
+                    };
+                    sensor.size = Some(bounds.size);
+                    if let Some(handler) = handler {
+                        cx.emit(wire::Event::Size {
+                            handler,
+                            width: f32::from(bounds.size.width),
+                            height: f32::from(bounds.size.height),
+                        });
+                    }
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0();
+        // A sensor is layout-transparent. In particular, a fill spacer
+        // must not collapse inside an auto-sized measurement wrapper.
+        let (width, height) = content_dimensions(child);
+        dimensions(div().relative(), width, height)
+            .child(self.node(child, window, cx))
+            .child(measure)
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_grid(
+        &mut self,
+        node: &wire::Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let wire::Node::Grid {
+            key,
+            children,
+            width,
+            height,
+            padding,
+            spacing,
+            columns,
+            fluid,
+            aspect,
+            background,
+            border,
+        } = node
+        else {
+            unreachable!()
+        };
+        let available = self
+            .bounds
+            .get(key)
+            .map_or(f32::from(window.viewport_size().width), |bounds| {
+                f32::from(bounds.size.width)
+            });
+        let columns = fluid
+            .filter(|value| *value > 0.0)
+            .map_or(columns.unwrap_or(1), |value| {
+                (available / value).ceil().max(1.0) as u32
+            })
+            .max(1);
+        let mut grid = decoration(
+            pad(
+                dimensions(div().flex().flex_wrap(), *width, *height),
+                *padding,
+            ),
+            *background,
+            *border,
+        );
+        let gap = spacing.unwrap_or_default();
+        grid = grid.gap(px(gap));
+        let cell_width =
+            ((available - gap * columns.saturating_sub(1) as f32) / columns as f32).max(0.0);
+        for child in children {
+            let cell = div()
+                .w(px(cell_width))
+                .h(px(cell_width / aspect.unwrap_or(1.0).max(0.001)));
+            grid = grid.child(cell.child(self.node(child, window, cx)));
+        }
+        grid.relative()
+            .child(self.measure(key, cx))
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_hover(
+        &mut self,
+        node: &wire::Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let wire::Node::Hover {
+            key,
+            children,
+            open,
+            width,
+            height,
+            padding,
+            background,
+            border,
+            tint,
+            radius,
+        } = node
+        else {
+            unreachable!()
+        };
+        let route = key.clone();
+        let mut element = decoration(
+            pad(dimensions(div().relative(), *width, *height), *padding),
+            *background,
+            *border,
+        )
+        .id(key.clone());
+        let reveal = *open || self.hovered.contains(key);
+        if let Some(base) = children.first() {
+            element = element.child(self.node(base, window, cx));
+        }
+        if reveal && let Some(child) = children.get(1) {
+            let mut layer = div().absolute().inset_0().rounded(px(*radius));
+            if let Some(color) = tint {
+                layer = layer.bg(rgba(*color));
+            }
+            element = element.child(layer.child(self.node(child, window, cx)));
+        }
+        let element = element.on_hover(cx.listener(move |this, hovered, _, cx| {
+            match hovered {
+                true => {
+                    this.hovered.insert(route.clone());
+                }
+                false => {
+                    this.hovered.remove(&route);
+                }
+            }
+            cx.notify();
+        }));
+        #[cfg(test)]
+        let element = {
+            use gpui_kit::test::TestSupportExt as _;
+            element.test_support()
+        };
+        element.into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_tooltip(
+        &mut self,
+        node: &wire::Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let wire::Node::Tooltip {
+            key,
+            children,
+            delay_ms,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        let Some(content) = children.first() else {
+            return div().into_any_element();
+        };
+        let mut element = div()
+            .id(key.clone())
+            .tooltip_show_delay(std::time::Duration::from_millis(*delay_ms))
+            .child(self.node(content, window, cx));
+        if let Some(tip) = children.get(1) {
+            let tip = tip.clone();
+            element = element.tooltip(move |_, cx| cx.new(|_| ViewTree::new(tip.clone())).into());
+        }
+        element.into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_float(
+        &mut self,
+        node: &wire::Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let wire::Node::Float {
+            key,
+            content,
+            x,
+            y,
+            scale: _,
+            shadow,
+            radius,
+        } = node
+        else {
+            unreachable!()
+        };
+        let bounds = self.bounds.get(key).copied().unwrap_or_default();
+        let viewport = window.viewport_size();
+        let geometry = [
+            f32::from(bounds.origin.x) as f64,
+            f32::from(bounds.origin.y) as f64,
+            f32::from(bounds.size.width) as f64,
+            f32::from(bounds.size.height) as f64,
+            0.0,
+            0.0,
+            f32::from(viewport.width) as f64,
+            f32::from(viewport.height) as f64,
+        ];
+        let mut element = shadows(
+            div()
+                .relative()
+                .bg(gpui_kit::component::Theme::global(cx)
+                    .color_tokens()
+                    .surface)
+                .text_color(
+                    gpui_kit::component::Theme::global(cx)
+                        .color_tokens()
+                        .surface_foreground,
+                )
+                .left(px(x.evaluate(geometry)))
+                .top(px(y.evaluate(geometry))),
+            *shadow,
+        );
+        if let Some(radius) = radius {
+            element = decoration(
+                element,
+                None,
+                Some(wire::Border {
+                    color: None,
+                    width: None,
+                    radius: Some(*radius),
+                }),
+            );
+        }
+        // A press inside a floated card is the card's: it never
+        // reaches what the card floats over (a dismissing backdrop,
+        // the document under a comment card).
+        element = element
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
+        // Authored floating rails use unit scale; their measurement is
+        // outside the translated child to avoid positional feedback.
+        div()
+            .relative()
+            .child(element.child(self.node(content, window, cx)))
+            .child(self.measure(key, cx))
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_image(&mut self, node: &wire::Node) -> AnyElement {
+        let wire::Node::Image {
+            hash,
+            data,
+            width,
+            height,
+            fit,
+            opacity,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        self.picture(
+            *hash,
+            data.as_ref(),
+            *width,
+            *height,
+            *fit,
+            opacity.unwrap_or(1.0),
+        )
+    }
+
+    #[inline(never)]
+    fn node_svg(&mut self, node: &wire::Node, window: &mut Window) -> AnyElement {
+        let wire::Node::Svg {
+            hash,
+            bytes,
+            color,
+            inherit_button_ink,
+            fit,
+            width,
+            height,
+            opacity,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        if let Some(bytes) = bytes {
+            self.remember_vector(*hash, bytes);
+        }
+        let mut element = dimensions(div(), *width, *height).opacity(opacity.unwrap_or(1.0));
+        if let Some(bytes) = self.vectors.get(hash) {
+            let monochrome = color.is_some() || *inherit_button_ink;
+            if monochrome {
+                let ink = color.map(rgba).unwrap_or_else(|| window.text_style().color);
+                element = element.child(svg().data(bytes).size_full().text_color(ink));
+            } else {
+                // GPUI's SVG icon renderer is an alpha mask. Untinted
+                // artwork instead uses its native full-color image decoder.
+                element = element.child(
+                    img(Arc::new(Image::from_bytes(
+                        ImageFormat::Svg,
+                        bytes.to_vec(),
+                    )))
+                    .size_full()
+                    .object_fit(object_fit(*fit)),
+                );
+            }
+        }
+        element.into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_canvas(&mut self, node: &wire::Node, cx: &mut Context<Self>) -> AnyElement {
+        let wire::Node::Canvas {
+            key,
+            width,
+            height,
+            commands,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        let bounds = self.bounds.get(key).copied().unwrap_or_default();
+        let known = |length: Option<wire::Length>, measured: Pixels| match length {
+            Some(wire::Length::Fixed(value)) => value,
+            _ => f32::from(measured).max(1.0),
+        };
+        dimensions(div().relative(), *width, *height)
+            .child(
+                img(Arc::new(Image::from_bytes(
+                    ImageFormat::Svg,
+                    canvas_svg(
+                        commands,
+                        known(*width, bounds.size.width),
+                        known(*height, bounds.size.height),
+                    ),
+                )))
+                .size_full()
+                .object_fit(ObjectFit::Fill),
+            )
+            .child(self.measure(key, cx))
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_stack(
+        &mut self,
+        node: &wire::Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let wire::Node::Stack {
+            children,
+            width,
+            height,
+            padding,
+            background,
+            border,
+            clip,
+            under,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        let mut element = decoration(
+            pad(dimensions(div().relative(), *width, *height), *padding),
+            *background,
+            *border,
+        );
+        if *clip {
+            element = element.overflow_hidden();
+        }
+        if *under == 0 {
+            element = element.grid().grid_cols(1).grid_rows(1);
+        }
+        for (index, child) in children.iter().enumerate() {
+            let content = self.node(child, window, cx);
+            element = match (*under, index) {
+                (0, _) => element.child(div().col_start(1).row_start(1).child(content)),
+                (base, index) if index == base as usize => element.child(content),
+                _ => element.child(div().absolute().inset_0().child(content)),
+            };
+        }
+        element.into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_overlay(
+        &mut self,
+        node: &wire::Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let wire::Node::Overlay {
+            key,
+            children,
+            backdrop,
+            padding,
+            align_x,
+            align_y,
+            on_dismiss,
+        } = node
+        else {
+            unreachable!()
+        };
+        let mut element = div().relative().size_full();
+        if let Some(base) = children.first() {
+            element = element.child(self.node(base, window, cx));
+        }
+        if let Some(modal) = children.get(1) {
+            let shade = div()
+                .id(format!("{key}/backdrop"))
+                .absolute()
+                .inset_0()
+                .bg(rgba(*backdrop));
+            let mut layer = div()
+                .id(format!("{key}/layer"))
+                .absolute()
+                .inset_0()
+                .flex()
+                .p(px(*padding));
+            if let Some(message) = on_dismiss {
+                let message = *message;
+                layer = layer.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |_, _, _, cx| cx.emit(wire::Event::Message(message))),
+                );
+            }
+            layer = match align_x {
+                wire::AlignX::Left => layer.justify_start(),
+                wire::AlignX::Center => layer.justify_center(),
+                wire::AlignX::Right => layer.justify_end(),
+            };
+            layer = match align_y {
+                wire::AlignY::Top => layer.items_start(),
+                wire::AlignY::Center => layer.items_center(),
+                wire::AlignY::Bottom => layer.items_end(),
+            };
+            element = element.child(shade).child(
+                layer.child(
+                    div()
+                        .bg(gpui_kit::component::Theme::global(cx)
+                            .color_tokens()
+                            .surface)
+                        .text_color(
+                            gpui_kit::component::Theme::global(cx)
+                                .color_tokens()
+                                .surface_foreground,
+                        )
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(self.node(modal, window, cx)),
+                ),
+            );
+        }
+        element.into_any_element()
+    }
+
+    #[inline(never)]
+    fn node_progress(&mut self, node: &wire::Node, cx: &mut Context<Self>) -> AnyElement {
+        let wire::Node::Progress {
+            value,
+            min,
+            max,
+            axis,
+            length,
+            girth,
+            background,
+            bar,
+            border,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        let span = max - min;
+        let valid = span.is_finite() && span > 0.0;
+        let fraction = match valid {
+            true => ((value - min) / span).clamp(0.0, 1.0),
+            false => 0.0,
+        };
+        let fill = div().bg(bar.map(rgba).unwrap_or_else(|| {
+            gpui_kit::component::Theme::global(cx)
+                .color_tokens()
+                .primary
+        }));
+        match axis {
+            wire::Axis::Row => {
+                decoration(dimensions(div(), *length, *girth), *background, *border)
+                    .child(fill.w(relative(fraction)).h_full())
+                    .into_any_element()
+            }
+            wire::Axis::Column => decoration(
+                dimensions(div().flex().flex_col().justify_end(), *girth, *length),
+                *background,
+                *border,
+            )
+            .child(fill.h(relative(fraction)).w_full())
+            .into_any_element(),
         }
     }
 
