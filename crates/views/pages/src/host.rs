@@ -1027,6 +1027,45 @@ async fn create_page(title: String) -> Result<ActItem, String> {
     })
 }
 
+/// The title a subpage is born with; the writer replaces it in the title
+/// line.
+pub const NEW_SUBPAGE_TITLE: &str = "Untitled";
+
+/// `AddSubpage` — a page inside `parent`, after its last block, landed on
+/// as soon as it exists: the "+" on a sidebar row.
+pub fn create_subpage(parent: &str) -> bool {
+    let parent = parent.to_owned();
+    push_act(Box::pin(
+        async move { acted(create_subpage_in(parent).await) },
+    ))
+}
+
+async fn create_subpage_in(parent: String) -> Result<ActItem, String> {
+    if parent.is_empty() {
+        return Err("choose a page first".into());
+    }
+    let blocks = read_page_blocks(&parent).await?;
+    // The page's own record is element 0; its last top-level child is the
+    // anchor so the subpage lands at the end of the document.
+    let last = blocks
+        .iter()
+        .skip(1)
+        .rev()
+        .find(|block| block.parent.as_deref() == Some(parent.as_str()))
+        .map(|block| block.id.clone());
+    let page_id = mint("page").await?;
+    submit(json!({ "insert_block": {
+        "parent": parent,
+        "after": last,
+        "block": { "id": page_id, "kind": "page", "text": NEW_SUBPAGE_TITLE },
+    } }))
+    .await?;
+    Ok(ActItem {
+        page: page_id,
+        error: String::new(),
+    })
+}
+
 /// `RemoveBlock` on a page: the module takes its whole subtree with it.
 pub fn delete(page_id: &str) -> bool {
     let page_id = page_id.to_owned();
@@ -1528,6 +1567,43 @@ pub fn page_display_title(pages: &[PageItem], id: &str, current: &str) -> String
         .find(|page| page.id == id)
         .map(|page| page.title.clone())
         .unwrap_or_else(|| current.to_owned())
+}
+
+/// Where the view stands once `deleted` and its subtree are gone: the
+/// active page when it survives, else the deleted page's parent (the root
+/// list when it had none).
+pub fn page_after_delete(
+    pages: &[PageItem],
+    deleted: &str,
+    active: &str,
+    active_parent: &str,
+) -> String {
+    let active_gone = active == deleted
+        || ancestors(pages, active_parent)
+            .iter()
+            .any(|page| page.id == deleted);
+    if !active_gone {
+        return active.to_owned();
+    }
+    pages
+        .iter()
+        .find(|page| page.id == deleted)
+        .map(|page| page.parent.clone())
+        .unwrap_or_default()
+}
+
+/// Where a menu of `size` opens for a press at `press`: at the pointer,
+/// flipped left or up when it would run off the viewport.
+pub fn menu_origin(press: (f64, f64), size: (f64, f64), viewport: (f64, f64)) -> (f64, f64) {
+    const GUTTER: f64 = 8.0;
+    let (px, py) = press;
+    let (w, h) = size;
+    let (vw, vh) = viewport;
+    let fits_right = px + w + GUTTER <= vw;
+    let fits_below = py + h + GUTTER <= vh;
+    let x = if fits_right { px } else { px - w };
+    let y = if fits_below { py + 4.0 } else { py - h - 4.0 };
+    (x.max(GUTTER), y.max(GUTTER))
 }
 
 /// The pages above `parent`, root first, `parent` last: the breadcrumb. A
@@ -2070,6 +2146,46 @@ mod tests {
         assert!(ancestors(&pages, "unknown").is_empty());
         let looped = vec![page("a", "b"), page("b", "a")];
         assert_eq!(ancestors(&looped, "a").len(), 2);
+    }
+
+    /// Deleting a page under the reader's feet — the page itself or one
+    /// above it — lands on the deleted page's parent; deleting elsewhere
+    /// moves nothing.
+    #[test]
+    fn a_delete_lands_on_the_parent_only_when_it_takes_the_active_page() {
+        let page = |id: &str, parent: &str| PageItem {
+            id: id.into(),
+            title: id.to_uppercase(),
+            parent: parent.into(),
+            prefix: String::new(),
+            child_count: 0,
+        };
+        let pages = vec![
+            page("root", ""),
+            page("mid", "root"),
+            page("leaf", "mid"),
+            page("other", ""),
+        ];
+        assert_eq!(page_after_delete(&pages, "other", "leaf", "mid"), "leaf");
+        assert_eq!(page_after_delete(&pages, "leaf", "leaf", "mid"), "mid");
+        assert_eq!(page_after_delete(&pages, "mid", "leaf", "mid"), "root");
+        assert_eq!(page_after_delete(&pages, "root", "leaf", "mid"), "");
+    }
+
+    #[test]
+    fn a_menu_opens_at_the_pointer_and_flips_inside_the_viewport() {
+        assert_eq!(
+            menu_origin((10., 10.), (200., 100.), (800., 600.)),
+            (10., 14.)
+        );
+        assert_eq!(
+            menu_origin((700., 10.), (200., 100.), (800., 600.)),
+            (500., 14.)
+        );
+        assert_eq!(
+            menu_origin((10., 550.), (200., 100.), (800., 600.)),
+            (10., 446.)
+        );
     }
 
     #[test]

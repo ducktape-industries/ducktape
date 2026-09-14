@@ -62,12 +62,73 @@ impl PagesView {
                 children: vec![main, self.delete_dialog()],
             };
         }
-        fill(kit::spaced(
-            kit::row(PAGE_KEY, [sidebar, divider, main]),
-            0.,
-        ))
+        // Every press reports where it landed before the control under it
+        // answers, so a row's menu opens at the pointer.
+        let screen = Node::MouseArea {
+            key: format!("{PAGE_KEY}/press-area"),
+            on_press: None,
+            on_release: None,
+            on_double_click: None,
+            on_right_press: None,
+            on_right_release: None,
+            on_middle_press: None,
+            on_middle_release: None,
+            on_enter: None,
+            on_exit: None,
+            on_move: None,
+            on_press_at: Some(slots::handler::<(f32, f32), Message>(Box::new(|(x, y)| {
+                Some(Message::PressedAt(f64::from(x), f64::from(y)))
+            }))),
+            on_scroll: None,
+            content: Box::new(fill(kit::spaced(
+                kit::row(PAGE_KEY, [sidebar, divider, main]),
+                0.,
+            ))),
+        };
+        // The screen always sits in a stack: a mouse area reports no size of
+        // its own, so a sensor around it would collapse it. A row menu adds
+        // a transparent backdrop that closes it on any press, then the card
+        // floated at the press.
+        let mut layers = vec![screen];
+        if let Some(menu) = self.page_row_menu() {
+            layers.push(page_menu_backdrop());
+            layers.push(menu);
+        }
+        Node::Stack {
+            key: format!("{PAGE_KEY}/menu-stack"),
+            width: Some(Length::Fill),
+            height: Some(Length::Fill),
+            padding: None,
+            background: None,
+            border: None,
+            clip: false,
+            under: 1,
+            children: layers,
+        }
     }
+}
 
+/// The press-through sheet under an open row menu.
+fn page_menu_backdrop() -> Node {
+    Node::MouseArea {
+        key: format!("{PAGE_KEY}/menu-backdrop"),
+        on_press: Some(slots::message(Message::ClosePageMenu)),
+        on_release: None,
+        on_double_click: None,
+        on_right_press: Some(slots::message(Message::ClosePageMenu)),
+        on_right_release: None,
+        on_middle_press: None,
+        on_middle_release: None,
+        on_enter: None,
+        on_exit: None,
+        on_move: None,
+        on_press_at: None,
+        on_scroll: None,
+        content: Box::new(kit::space(Some(Length::Fill), Some(Length::Fill))),
+    }
+}
+
+impl PagesView {
     fn sidebar(&self) -> Node {
         if !self.connected {
             return fill(kit::spaced(
@@ -351,7 +412,7 @@ impl PagesView {
                     action(
                         "pages/menu/delete",
                         "Delete page",
-                        Message::ArmPageDelete,
+                        Message::ArmPageDelete(self.active_page.clone()),
                         !self.unavailable(),
                         ButtonPreset::Danger,
                     ),

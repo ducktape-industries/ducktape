@@ -23,8 +23,11 @@ impl PagesView {
             Message::PageAutosaveTick => self.on_page_autosave_tick(),
             Message::TogglePageCreate => self.on_toggle_page_create(),
             Message::CreatePageSubmit => self.on_create_page_submit(),
-            Message::ArmPageDelete => self.on_arm_page_delete(),
+            Message::ArmPageDelete(id) => self.on_arm_page_delete(id),
             Message::DisarmPageDelete => self.on_disarm_page_delete(),
+            Message::AddSubpage(id) => self.on_add_subpage(id),
+            Message::OpenPageRowMenu(id) => self.on_open_page_row_menu(id),
+            Message::PressedAt(x, y) => self.on_pressed_at(x, y),
             Message::DeletePageSubmit => self.on_delete_page_submit(),
             Message::SearchPagesSubmit => self.on_search_pages_submit(),
             Message::ClearPageSearch => self.on_clear_page_search(),
@@ -227,6 +230,7 @@ impl PagesView {
         }
         self.page_create_open = false;
         self.page_delete_armed = false;
+        self.page_delete_page = "".to_owned();
         self.active_page =
             crate::host::keep_str(!(item.page).is_empty(), &(item.page), &(self.active_page));
         Task::none()
@@ -337,38 +341,85 @@ impl PagesView {
         crate::host::create(&(self.pending_page));
         Task::none()
     }
-    fn on_arm_page_delete(&mut self) -> Task<Message> {
+    fn on_arm_page_delete(&mut self, id: String) -> Task<Message> {
         if !(self.host_error).is_empty() {
             return Task::none();
         }
-        if (self.loading || self.busy) || (self.active_page).is_empty() {
+        if (self.loading || self.busy) || id.is_empty() {
             return Task::none();
         }
         self.page_menu_open = false;
+        self.page_menu_page = "".to_owned();
+        self.page_delete_page = id;
         self.page_delete_armed = true;
         Task::none()
     }
     fn on_disarm_page_delete(&mut self) -> Task<Message> {
         self.page_delete_armed = false;
+        self.page_delete_page = "".to_owned();
         Task::none()
     }
     fn on_delete_page_submit(&mut self) -> Task<Message> {
         if !(self.host_error).is_empty() {
             return Task::none();
         }
-        if ((self.loading || self.busy) || (self.active_page).is_empty())
+        if ((self.loading || self.busy) || (self.page_delete_page).is_empty())
             || (!self.page_delete_armed)
         {
             return Task::none();
         }
         self.busy = true;
         self.page_delete_armed = false;
-        self.orphaned_comment_drafts = crate::host::remember_draft(
-            &(self.orphaned_comment_drafts),
-            &(self.block_comment_draft),
+        let deleted = ::std::mem::take(&mut self.page_delete_page);
+        let landing = crate::host::page_after_delete(
+            &(self.pages),
+            &deleted,
+            &(self.active_page),
+            &(self.active_page_parent),
         );
-        self.block_comment_draft = "".to_owned();
-        crate::host::delete(&(self.active_page));
+        let active_gone = landing != self.active_page;
+        if active_gone {
+            self.orphaned_comment_drafts = crate::host::remember_draft(
+                &(self.orphaned_comment_drafts),
+                &(self.block_comment_draft),
+            );
+            self.block_comment_draft = "".to_owned();
+            self.active_page = landing;
+            self.active_page_title = crate::host::page_display_title(
+                &(self.pages),
+                &(self.active_page),
+                &(self.active_page_title),
+            );
+        }
+        crate::host::delete(&deleted);
+        Task::none()
+    }
+    fn on_add_subpage(&mut self, id: String) -> Task<Message> {
+        if !(self.host_error).is_empty() {
+            return Task::none();
+        }
+        if (self.loading || self.busy) || id.is_empty() {
+            return Task::none();
+        }
+        self.page_menu_page = "".to_owned();
+        self.folded_pages.retain(|folded| folded != &id);
+        self.busy = true;
+        crate::host::create_subpage(&id);
+        Task::none()
+    }
+    fn on_open_page_row_menu(&mut self, id: String) -> Task<Message> {
+        if !(self.host_error).is_empty() {
+            return Task::none();
+        }
+        self.page_menu_open = false;
+        self.page_menu_page = id;
+        self.page_menu_x = self.press_x;
+        self.page_menu_y = self.press_y;
+        Task::none()
+    }
+    fn on_pressed_at(&mut self, x: f64, y: f64) -> Task<Message> {
+        self.press_x = x;
+        self.press_y = y;
         Task::none()
     }
     fn on_search_pages_submit(&mut self) -> Task<Message> {
@@ -751,10 +802,12 @@ impl PagesView {
     }
     fn on_toggle_page_menu(&mut self) -> Task<Message> {
         self.page_menu_open = !self.page_menu_open;
+        self.page_menu_page = "".to_owned();
         Task::none()
     }
     fn on_close_page_menu(&mut self) -> Task<Message> {
         self.page_menu_open = false;
+        self.page_menu_page = "".to_owned();
         Task::none()
     }
     fn on_document_committed(
