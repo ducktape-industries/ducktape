@@ -382,28 +382,23 @@ impl FilesView {
         if self.listing.has_more() {
             children.push(native::caption(format!("{key}/more"), "· more not shown"));
         }
-        if !self.selected.is_empty() {
-            children.push(native::wrapping(native::caption(
-                format!("{key}/selected"),
-                self.selected.clone(),
-            )));
-        }
+        children.push(native::spacer());
         children.push(native::nowrap(native::caption(
             format!("{key}/drop-hint"),
             "Drop files here to upload",
         )));
         let mut bar = native::sized(
             native::padded(
-                native::spaced(native::wrapped_row(key, children), 8.),
+                native::spaced(native::centered_row(key, children), 8.),
                 wire::Edges {
-                    top: 4.,
+                    top: 0.,
                     right: 10.,
-                    bottom: 4.,
+                    bottom: 0.,
                     left: 10.,
                 },
             ),
             Some(wire::Length::Fill),
-            None,
+            Some(wire::Length::Fixed(24.)),
         );
         if let wire::Node::Linear {
             clip, background, ..
