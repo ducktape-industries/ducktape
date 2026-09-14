@@ -23,6 +23,7 @@ fn facts() -> Session {
         recovering: false,
         appearance: "system".into(),
         desktop_notifications: true,
+        desktop_notifications_host: "ready".into(),
         unlocked: true,
         seat_key: SEAT.into(),
         account_name: "duck".into(),
