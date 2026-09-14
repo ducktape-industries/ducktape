@@ -1768,7 +1768,9 @@ impl Ducktape {
     }
     /// One of the update controls. `CheckNow` is the only one that starts a
     /// job; the rest are events the machine answers with local writes or,
-    /// for a restart and a rollback, a relaunch through the launcher.
+    /// for a restart and a rollback, by spawning the launcher — then the
+    /// app leaves the way the tray's Quit does, so every lane retires and
+    /// the launcher's flip and exec follow a clean shutdown.
     fn on_update_action(&mut self, action: UpdateAction) -> Task<AppMessage> {
         let Some(updater) = self.updater.as_mut() else {
             return Task::none();
@@ -1781,6 +1783,10 @@ impl Ducktape {
                 updater.apply(app_update::Event::DismissRollbackNotice)
             }
         };
+        let launcher_takes_over = updater.take_relaunch();
+        if launcher_takes_over {
+            return Task::done(AppMessage::TrayQuit);
+        }
         let Some(job) = job else {
             return Task::none();
         };

@@ -23,10 +23,11 @@
 //! - `SealImmutable`, `Gc`, `Persist`, `PinSuccessor`, `Banner`: the local
 //!   writes and the reading the shell shows.
 //! - `Qualify`, `Flip`, `Exec`, `ResolveSwap`: the LAUNCHER's, at boot. The
-//!   app never flips: at the first of these it stops performing the list and
-//!   relaunches itself through `ducktape-launcher` beside its own executable,
-//!   argv passed through. What is on disk by then (`Staged`, or `Swapping`
-//!   for a rollback) is exactly what the launcher's `Boot` resumes from.
+//!   app never flips: at the first of these it stops performing the list,
+//!   spawns `ducktape-launcher` beside its own executable (argv passed
+//!   through) and asks the shell to quit. What is on disk by then (`Staged`,
+//!   or `Swapping` for a rollback) is exactly what the launcher's `Boot`
+//!   resumes from.
 //!
 //! Trust is the signature under the pinned key and the monotonic sequence:
 //! `/shared/**` is open-write on the files module, so what the node serves
@@ -116,6 +117,9 @@ pub struct Updater {
     last_check: Option<i64>,
     activity: Activity,
     banner: Option<UpdateBanner>,
+    /// The launcher was spawned; the app is to shut down so it can take
+    /// over. Read once by [`Updater::take_relaunch`].
+    relaunch_pending: bool,
 }
 
 /// The plain reading the shell shows: the phase, the last banner, when the
@@ -184,7 +188,15 @@ impl Updater {
             last_check: None,
             activity: Activity::Quiet,
             banner: None,
+            relaunch_pending: false,
         }
+    }
+
+    /// Whether the last event spawned the launcher: the caller shuts the
+    /// app down normally so the launcher's flip and exec follow. Cleared
+    /// by the read.
+    pub fn take_relaunch(&mut self) -> bool {
+        std::mem::take(&mut self.relaunch_pending)
     }
 
     pub fn reading(&self) -> UpdateReading {
@@ -263,7 +275,7 @@ impl Updater {
                     if let Some(written) = persisted {
                         self.phase = written;
                     }
-                    relaunch_through_launcher();
+                    self.relaunch_pending = relaunch_through_launcher();
                     return None;
                 }
             }
@@ -327,23 +339,42 @@ fn launcher_owned(command: &'static str, sha: Sha) -> Effect {
     Effect::Handover
 }
 
-/// Replace this process with `ducktape-launcher` beside our own executable,
-/// argv passed through (a `duck://` URL rides there). Returns only when the
-/// exec failed; the app then carries on, and the log says why.
-fn relaunch_through_launcher() {
+/// Start `ducktape-launcher` beside our own executable, argv passed
+/// through (a `duck://` URL rides there), detached in a session of its own;
+/// the caller then shuts the app down normally. Spawn-then-exit, never an
+/// in-process `exec`: a live NSApplication's AppKit state, Mach ports and
+/// Dock tile do not survive an exec cleanly, and the tray and notification
+/// state close properly only through the app's own shutdown. The launcher
+/// reads `state.json` at its boot and finishes what the app persisted.
+/// `true` when it is running; `false` is logged and the app carries on.
+fn relaunch_through_launcher() -> bool {
     use std::os::unix::process::CommandExt as _;
     let own = match std::env::current_exe() {
         Ok(own) => own,
         Err(error) => {
             warn!(target: "ducktape::update", event = "app_update_relaunch_failed", reason = "self_unknown", error = %error);
-            return;
+            return false;
         }
     };
     let launcher = own.with_file_name(stage::LAUNCHER_EXE);
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    info!(target: "ducktape::update", event = "app_update_relaunch");
-    let error = std::process::Command::new(&launcher).args(args).exec();
-    warn!(target: "ducktape::update", event = "app_update_relaunch_failed", reason = "exec_failed", error = %error);
+    let spawned = std::process::Command::new(&launcher)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn();
+    match spawned {
+        Ok(_child) => {
+            info!(target: "ducktape::update", event = "app_update_relaunch");
+            true
+        }
+        Err(error) => {
+            warn!(target: "ducktape::update", event = "app_update_relaunch_failed", reason = "spawn_failed", error = %error);
+            false
+        }
+    }
 }
 
 fn seal_release(paths: &UpdatePaths, sha: &Sha) {

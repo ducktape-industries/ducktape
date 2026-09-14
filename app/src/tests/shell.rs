@@ -564,6 +564,13 @@ fn update_facts_reach_settings_and_each_intent_is_one_action() {
         );
     }
     assert!(body.contains("updater.check_now(self.wall_now)"));
+    assert!(
+        body.contains("updater.take_relaunch()") && body.contains("AppMessage::TrayQuit"),
+        "a spawned launcher is followed by the app's own shutdown, never an exec"
+    );
+    let update = rust_tokens(include_str!("../backend/update.rs"));
+    assert!(!update.contains(".exec()"), "the app never execs in place");
+    assert!(update.contains(".process_group(0).spawn()"));
     let arms = handler_bodies()
         .into_iter()
         .find(|(name, _)| name == "SettingsViewEvent")
