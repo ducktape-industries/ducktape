@@ -58,6 +58,10 @@ pub struct PagesView {
     /// Where the last press landed on the view, so a menu opens there.
     pub(crate) press_x: f64,
     pub(crate) press_y: f64,
+    /// Where the open row menu was opened: the press that opened it, kept
+    /// so the presses on the menu itself do not move it.
+    pub(crate) page_menu_x: f64,
+    pub(crate) page_menu_y: f64,
     pub(crate) page_create_open: bool,
     pub(crate) active_page: String,
     pub(crate) active_page_title: String,
@@ -197,6 +201,8 @@ impl PagesView {
             page_delete_page: "".to_owned(),
             press_x: 0.,
             press_y: 0.,
+            page_menu_x: 0.,
+            page_menu_y: 0.,
             page_create_open: false,
             active_page: "".to_owned(),
             active_page_title: "".to_owned(),

@@ -413,6 +413,8 @@ impl PagesView {
         }
         self.page_menu_open = false;
         self.page_menu_page = id;
+        self.page_menu_x = self.press_x;
+        self.page_menu_y = self.press_y;
         Task::none()
     }
     fn on_pressed_at(&mut self, x: f64, y: f64) -> Task<Message> {

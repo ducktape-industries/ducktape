@@ -85,27 +85,15 @@ impl PagesView {
                 0.,
             ))),
         };
-        let Some(menu) = self.page_row_menu() else {
-            return screen;
-        };
-        // A row menu stacks over the screen: a transparent backdrop that
-        // closes it on any press, then the card floated at the press.
-        let backdrop = Node::MouseArea {
-            key: format!("{PAGE_KEY}/menu-backdrop"),
-            on_press: Some(slots::message(Message::ClosePageMenu)),
-            on_release: None,
-            on_double_click: None,
-            on_right_press: Some(slots::message(Message::ClosePageMenu)),
-            on_right_release: None,
-            on_middle_press: None,
-            on_middle_release: None,
-            on_enter: None,
-            on_exit: None,
-            on_move: None,
-            on_press_at: None,
-            on_scroll: None,
-            content: Box::new(kit::space(Some(Length::Fill), Some(Length::Fill))),
-        };
+        // The screen always sits in a stack: a mouse area reports no size of
+        // its own, so a sensor around it would collapse it. A row menu adds
+        // a transparent backdrop that closes it on any press, then the card
+        // floated at the press.
+        let mut layers = vec![screen];
+        if let Some(menu) = self.page_row_menu() {
+            layers.push(page_menu_backdrop());
+            layers.push(menu);
+        }
         Node::Stack {
             key: format!("{PAGE_KEY}/menu-stack"),
             width: Some(Length::Fill),
@@ -115,10 +103,32 @@ impl PagesView {
             border: None,
             clip: false,
             under: 1,
-            children: vec![screen, backdrop, menu],
+            children: layers,
         }
     }
+}
 
+/// The press-through sheet under an open row menu.
+fn page_menu_backdrop() -> Node {
+    Node::MouseArea {
+        key: format!("{PAGE_KEY}/menu-backdrop"),
+        on_press: Some(slots::message(Message::ClosePageMenu)),
+        on_release: None,
+        on_double_click: None,
+        on_right_press: Some(slots::message(Message::ClosePageMenu)),
+        on_right_release: None,
+        on_middle_press: None,
+        on_middle_release: None,
+        on_enter: None,
+        on_exit: None,
+        on_move: None,
+        on_press_at: None,
+        on_scroll: None,
+        content: Box::new(kit::space(Some(Length::Fill), Some(Length::Fill))),
+    }
+}
+
+impl PagesView {
     fn sidebar(&self) -> Node {
         if !self.connected {
             return fill(kit::spaced(

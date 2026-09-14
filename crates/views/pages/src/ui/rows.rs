@@ -109,7 +109,7 @@ impl PagesView {
         let menu_open = self.page_menu_page == page.id;
         let mut wash = kit::rgba(kit::palette().surface_raised);
         wash.0[3] = 0.6;
-        let actions = kit::spaced(
+        let mut actions = kit::spaced(
             kit::row(
                 format!("{key}/actions"),
                 [
@@ -131,6 +131,10 @@ impl PagesView {
             ),
             0.,
         );
+        // The bar shrinks to its two glyphs so the anchor can push it right.
+        if let Node::Linear { width, .. } = &mut actions {
+            *width = Some(Length::Shrink);
+        }
         let hover = Node::Hover {
             key: format!("{key}/hover"),
             width: Some(Length::Fill),
@@ -212,7 +216,7 @@ impl PagesView {
             f64::from(PAGE_MENU_INSET * 2. + items.len() as f32 * PAGE_MENU_ITEM_HEIGHT),
         );
         let (x, y) = crate::host::menu_origin(
-            (self.press_x, self.press_y),
+            (self.page_menu_x, self.page_menu_y),
             size,
             (self.pages_viewport_width, self.pages_viewport_height),
         );
@@ -532,12 +536,14 @@ fn page_row_actions(key: String, actions: Node) -> Node {
         align_x,
         align_y,
         padding,
+        width,
         height,
         ..
     } = &mut anchor
     {
         *align_x = Some(wire::AlignX::Right);
         *align_y = Some(wire::AlignY::Center);
+        *width = Some(Length::Fill);
         *height = Some(Length::Fill);
         *padding = Some(wire::Edges {
             top: HOVER_FLOAT_LIFT,
