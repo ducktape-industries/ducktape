@@ -2189,6 +2189,57 @@ async fn gateway_browser_proxy_is_duck_origin_scoped_and_cross_origin_safe() {
     assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
 }
 
+/// The browser door reads each request body under the RESOLVED route's own
+/// `max_request_bytes` — the per-lane cap — not under one router-wide
+/// limit. Over it is a named 413 before the request reaches the lane; the
+/// route's queries (resolve + get) are the only work done.
+#[tokio::test]
+async fn gateway_browser_proxy_reads_the_body_under_the_routes_own_cap() {
+    let (handle, cmds, _events) = local_node();
+    // resolve + get, and nothing after: the over-cap body never reaches
+    // proxy_current's own resolution.
+    spawn_duck_actor(cmds, 2);
+    let (lane, mut jobs) = tokio::sync::mpsc::channel::<noded::GatewayJob>(1);
+    let handle = handle
+        .with_gateway(lane)
+        .with_browser_gateway("127.0.0.1:49152".parse().unwrap());
+
+    let authority = "app.demo.duck";
+    let cap = gateway_route()
+        .statement
+        .route
+        .unwrap()
+        .policy
+        .max_request_bytes as usize;
+    let response = noded::gateway_browser_router(handle)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api")
+                .header("x-duck-authority", authority)
+                .header(header::ORIGIN, format!("duck://{authority}"))
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from(vec![7u8; cap + 1]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let error = body_json(response).await["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.starts_with("gateway_body_exceeds_route_cap"),
+        "{error}"
+    );
+    assert!(error.contains(&cap.to_string()), "{error}");
+    assert!(
+        jobs.try_recv().is_err(),
+        "an over-cap body must never become a gateway job"
+    );
+}
+
 /// a GET carrying the RFC 6455 upgrade headers axum's `WebSocketUpgrade`
 /// extractor checks. NOTE the oneshot transport can never actually upgrade:
 /// hyper's `OnUpgrade` state only exists on a real served connection, so the

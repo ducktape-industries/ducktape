@@ -105,8 +105,22 @@ pub type GatewayLane = tokio::sync::mpsc::Sender<GatewayJob>;
 /// alone is not enough: a saturated plane stops draining the lane, and an
 /// un-deadlined `send` there hangs the axum handler with no response at all.
 const LANE_ADMIT_TIMEOUT: Duration = Duration::from_secs(15);
-/// How long a caller waits for the publisher's response head.
-const PROXY_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a caller waits for the publisher's response head. The body
+/// streams beyond it: an upstream whose answer takes longer than this (the
+/// airlock enclave signing a release under Apple's notary wait) commits its
+/// head first and carries its outcome in the stream, so no lane needs a
+/// longer head deadline.
+pub const PROXY_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+/// The JSON proxy lane's request cap (`/v1/gateway/proxy`, `body_b64`).
+/// That lane is buffered BY CONTRACT — one JSON blob in, one out — so it
+/// carries a model turn's multi-MB context and nothing bulkier; a route
+/// pinned above this (a release bundle) is reached through the browser
+/// door, which reads each request under the route's own cap.
+pub const JSON_LANE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+/// The browser door's own extractor cap: the `/.duck/ws-token` mint body (a
+/// small JSON). The proxied fallback reads its body itself, under the
+/// resolved route's `max_request_bytes`.
+const WS_TOKEN_REQUEST_BYTES: usize = 64 * 1024;
 /// WebSocket doors one page (an account's route) may hold open at once. The
 /// handshake `Origin` cannot key this — CEF sends the literal "null" for a
 /// `duck://` page — so the grant's route is the page.
@@ -462,9 +476,7 @@ pub fn gateway_browser_router(handle: NodeHandle) -> Router {
         .route("/.duck/ws-token", post(gateway_ws_token_mint))
         .route("/.duck/ws/{token}", get(gateway_ws_door))
         .fallback(gateway_browser_proxy)
-        .layer(DefaultBodyLimit::max(
-            gateway::MAX_REQUEST_BODY_BYTES as usize,
-        ))
+        .layer(DefaultBodyLimit::max(WS_TOKEN_REQUEST_BYTES))
         .with_state(handle)
 }
 
@@ -617,7 +629,10 @@ async fn gateway_browser_proxy(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    // The raw body, NOT `Bytes`: the router's `DefaultBodyLimit` is sized
+    // for the ws-token mint, and this lane's cap is the resolved route's
+    // own `max_request_bytes` — read below, once the record is known.
+    body: Body,
 ) -> Response {
     let Some(gateway) = handle.browser_gateway.clone() else {
         return error_response(
@@ -658,6 +673,10 @@ async fn gateway_browser_proxy(
     let record = match current_route(&handle, account_id, &name).await {
         Ok(record) => record,
         Err(failure) => return gateway_failure_response(failure),
+    };
+    let body = match read_body_under_route_cap(body, &record).await {
+        Ok(body) => body,
+        Err(response) => return response,
     };
     let forwarded = match gateway_request_headers(&headers) {
         Ok(headers) => headers,
@@ -750,6 +769,31 @@ async fn gateway_browser_proxy(
     builder
         .body(body)
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "invalid publisher response"))
+}
+
+/// Read the request body under the resolved route's signed `max_request_bytes`
+/// — the per-lane cap: a release-signing route admits a bundle, a model
+/// route a turn, and neither reads a byte past its own pin. Over it is a
+/// named 413 before the rest of the body is drained, not a 403 after the
+/// whole thing was buffered.
+async fn read_body_under_route_cap(
+    body: Body,
+    record: &gateway::RouteRecord,
+) -> Result<Bytes, Response> {
+    let cap = record
+        .statement
+        .route
+        .as_ref()
+        .expect("current_route rejects tombstones")
+        .policy
+        .max_request_bytes;
+    let limit = usize::try_from(cap).unwrap_or(usize::MAX);
+    axum::body::to_bytes(body, limit).await.map_err(|_| {
+        error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &format!("gateway_body_exceeds_route_cap: the route admits {cap} bytes per request"),
+        )
+    })
 }
 
 fn gateway_failure_response(failure: GatewayFailure) -> Response {

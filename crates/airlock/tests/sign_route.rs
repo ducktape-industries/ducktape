@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use tokio::net::TcpListener;
@@ -127,27 +128,56 @@ async fn post_sealed(
     (status, wire, binding)
 }
 
-fn open_reply(
-    keys: &airlock::handshake::SessionKeys,
-    binding: &[u8],
-    wire: &[u8],
-) -> (String, Vec<u8>) {
+/// What a sealed reply stream said, once opened to its end.
+struct Reply {
+    content_type: String,
+    data: Vec<u8>,
+    /// keepalives seen: empty data chunks the enclave sealed while the
+    /// pipeline ran.
+    keepalives: usize,
+    /// the refusal the `Final` carried, if the stream was withdrawn.
+    refused: Option<String>,
+}
+
+fn open_reply(keys: &airlock::handshake::SessionKeys, binding: &[u8], wire: &[u8]) -> Reply {
     let mut opener = bodyseal::StreamOpener::new(keys, binding);
     let items = opener.feed(wire).unwrap();
     assert!(
         opener.finished(),
         "the sealed stream must end with the Final marker"
     );
-    let mut content_type = String::new();
-    let mut data = Vec::new();
+    let mut reply = Reply {
+        content_type: String::new(),
+        data: Vec::new(),
+        keepalives: 0,
+        refused: None,
+    };
     for item in items {
         match item {
-            OpenedItem::Head(ct) => content_type = ct,
-            OpenedItem::Data(bytes) => data.extend(bytes),
+            OpenedItem::Head(ct) => reply.content_type = ct,
+            OpenedItem::Data(bytes) if bytes.is_empty() => reply.keepalives += 1,
+            OpenedItem::Data(bytes) => reply.data.extend(bytes),
             OpenedItem::Final => {}
+            OpenedItem::Refused(reason) => reply.refused = Some(reason),
         }
     }
-    (content_type, data)
+    reply
+}
+
+/// The pipeline's refusal, after the head: a `200` whose sealed stream ends
+/// in a `Final` carrying the token.
+async fn refused_in_band(
+    gateway_url: &str,
+    token: &str,
+    keys: &airlock::handshake::SessionKeys,
+    archive: &[u8],
+) -> String {
+    let (status, wire, binding) = post_sealed(gateway_url, token, keys, archive).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "the head is committed before the pipeline runs");
+    let reply = open_reply(keys, &binding, &wire);
+    assert_eq!(reply.content_type, "application/zstd");
+    assert!(reply.data.is_empty(), "a refused stream carries no archive");
+    reply.refused.expect("a refusal rides the Final marker")
 }
 
 fn rcodesign_verify(rcodesign: &Path, macho: &Path) {
@@ -189,8 +219,10 @@ async fn an_unsigned_bundle_comes_back_signed_and_verifies() {
         "{}",
         String::from_utf8_lossy(&wire)
     );
-    let (content_type, signed_archive) = open_reply(&keys, &binding, &wire);
-    assert_eq!(content_type, "application/zstd");
+    let reply = open_reply(&keys, &binding, &wire);
+    assert_eq!(reply.content_type, "application/zstd");
+    assert!(reply.refused.is_none());
+    let signed_archive = reply.data;
     assert!(
         !wire.windows(4).any(|w| w == b"\x28\xb5\x2f\xfd"),
         "the wire reply must not carry the zstd frame in the clear"
@@ -277,17 +309,13 @@ async fn refusals_are_named_tokens_and_the_work_dir_is_gone_after_each() {
         .unwrap();
     let stage = tempfile::tempdir().unwrap();
     let other = fixture::stage_bundle(stage.path(), "dev.ducktape.other");
-    let (status, wire, _) =
-        post_sealed(&gateway_url, &token, &keys, &fixture::archive(&other)).await;
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert_eq!(wire, b"bundle_shape_refused");
+    let reason = refused_in_band(&gateway_url, &token, &keys, &fixture::archive(&other)).await;
+    assert_eq!(reason, "bundle_shape_refused");
 
     let stage = tempfile::tempdir().unwrap();
     let bundle = fixture::stage_bundle(stage.path(), sign::BUNDLE_ID);
-    let (status, wire, _) =
-        post_sealed(&gateway_url, &token, &keys, &fixture::archive(&bundle)).await;
-    assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY);
-    assert_eq!(wire, b"notary_rejected");
+    let reason = refused_in_band(&gateway_url, &token, &keys, &fixture::archive(&bundle)).await;
+    assert_eq!(reason, "notary_rejected");
     assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 0);
 }
 
@@ -322,8 +350,64 @@ async fn a_missing_tool_is_refused_by_name() {
         .unwrap();
     let stage = tempfile::tempdir().unwrap();
     let bundle = fixture::stage_bundle(stage.path(), sign::BUNDLE_ID);
-    let (status, wire, _) =
-        post_sealed(&gateway_url, &token, &keys, &fixture::archive(&bundle)).await;
-    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(wire, b"tool_missing");
+    let reason = refused_in_band(&gateway_url, &token, &keys, &fixture::archive(&bundle)).await;
+    assert_eq!(reason, "tool_missing");
+}
+
+/// The head is committed before the pipeline runs and the stream stays live
+/// while it does: a notary that answers after two keepalive intervals is
+/// preceded by keepalives on the wire, and the archive still arrives whole.
+/// The only wait here is the stub's own delay.
+#[tokio::test]
+async fn the_head_is_committed_before_the_pipeline_and_keepalives_span_the_wait() {
+    let work = tempfile::tempdir().unwrap();
+    let enclave = enclave();
+    let delay = sign::KEEPALIVE_INTERVAL * 2 + Duration::from_millis(500);
+    let gateway_url = boot_gateway(
+        &enclave,
+        Some(tools(work.path(), StubNotary::AcceptsAfter(delay))),
+    )
+    .await;
+    let gw = Gateway::local(gateway_url.clone());
+    let seal_pk = attested_seal_pk(&gw, &enclave).await;
+    upload_identity(&gw, &seal_pk, "release-sign").await;
+    let stage = tempfile::tempdir().unwrap();
+    let bundle = fixture::stage_bundle(stage.path(), sign::BUNDLE_ID);
+    let archive = fixture::archive(&bundle);
+    let (token, keys) = gw
+        .open_session_sealed(&seal_pk, "release-sign", &WorkRef::Direct)
+        .await
+        .unwrap();
+
+    let aad = bodyseal::request_aad("POST", ROUTE);
+    let sealed = bodyseal::seal_request(&keys, &aad, &archive);
+    let binding = bodyseal::request_binding(&sealed);
+    let resp = reqwest::Client::new()
+        .post(format!("{gateway_url}{ROUTE}"))
+        .bearer_auth(&token)
+        .header(bodyseal::SEAL_HEADER, bodyseal::SEAL_V1)
+        .body(sealed)
+        .send()
+        .await
+        .unwrap();
+    // the head, well before the notary answered
+    let head_at = std::time::Instant::now();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let mut opener = bodyseal::StreamOpener::new(&keys, &binding);
+    let mut resp = resp;
+    let first = resp.chunk().await.unwrap().expect("the sealed head chunk");
+    let items = opener.feed(&first).unwrap();
+    assert!(
+        matches!(items.first(), Some(OpenedItem::Head(ct)) if ct == "application/zstd"),
+        "{items:?}"
+    );
+    assert!(
+        head_at.elapsed() < delay,
+        "the head must not wait for the notary"
+    );
+    let wire = resp.bytes().await.unwrap();
+    let reply = open_reply(&keys, &binding, &[first.to_vec(), wire.to_vec()].concat());
+    assert!(reply.keepalives >= 1, "keepalives: {}", reply.keepalives);
+    assert!(reply.refused.is_none());
+    assert!(!reply.data.is_empty(), "the archive follows the wait");
 }

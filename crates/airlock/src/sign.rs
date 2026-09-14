@@ -93,6 +93,15 @@ const NESTED_EXECUTABLE: &str = "Contents/MacOS/ducktape-app";
 /// the opener's 2 MiB ciphertext ceiling.
 pub const RESPONSE_CHUNK_BYTES: usize = 1024 * 1024;
 
+/// How often the signing route seals a keepalive into its reply while the
+/// pipeline runs. The head goes out before a byte of the bundle is signed,
+/// and the archive follows minutes later (Apple's notary wait); in between,
+/// every hop on the way back — the publisher node's per-read deadline on its
+/// loopback upstream, the overlay drain — needs to see bytes inside its own
+/// idle ceiling. `bin/node`'s gateway plane asserts this sits under its
+/// `BODY_IDLE_TIMEOUT`.
+pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What the tools in the gateway image are, and where the enclave may write.
 /// Parsed ONCE at the binary's boundary (`bin/airlock-gateway`); this module
 /// never reads the environment.
@@ -130,6 +139,10 @@ pub enum Notary {
 pub enum StubNotary {
     /// Notarized and stapled.
     Accepts,
+    /// Notarized and stapled, after Apple's wait: the notarize step holds
+    /// the pipeline for `delay` first. The seam a test uses to make the
+    /// answer arrive later than a proxy's head deadline.
+    AcceptsAfter(std::time::Duration),
     /// The submission is rejected.
     Rejects,
     /// Notarized, but the ticket cannot be stapled.
@@ -345,6 +358,12 @@ impl Job<'_> {
             #[cfg(any(test, feature = "testkit"))]
             Notary::Stub(answer) => match answer {
                 StubNotary::Accepts | StubNotary::StapleFails => StepOutcome::Advanced,
+                StubNotary::AcceptsAfter(delay) => {
+                    // the pipeline runs on a blocking thread; Apple's wait is
+                    // a blocking wait there too.
+                    std::thread::sleep(*delay);
+                    StepOutcome::Advanced
+                }
                 StubNotary::Rejects => StepOutcome::Refused(Refusal::NotaryRejected {
                     submission_id: None,
                 }),
@@ -379,7 +398,9 @@ impl Job<'_> {
             // a rejected submission never reaches this stage: the table
             // sent it to `Refuse` from `Signed`.
             Notary::Stub(answer) => match answer {
-                StubNotary::Accepts | StubNotary::Rejects => StepOutcome::Advanced,
+                StubNotary::Accepts | StubNotary::AcceptsAfter(_) | StubNotary::Rejects => {
+                    StepOutcome::Advanced
+                }
                 StubNotary::StapleFails => StepOutcome::Refused(Refusal::StapleFailed),
             },
         }

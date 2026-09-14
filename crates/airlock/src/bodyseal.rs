@@ -37,7 +37,10 @@ pub const SEAL_V1: &str = "v1";
 const REQ_LABEL: &[u8] = b"airlock-body-req-v1";
 const STREAM_LABEL: &[u8] = b"airlock-body-stream-v1";
 const SALT_LEN: usize = 16;
-/// Plaintext chunk framing: one marker byte, then payload.
+/// Plaintext chunk framing: one marker byte, then payload. A `MARK_FINAL`
+/// payload is empty on a completed stream and carries a refusal token when
+/// the enclave gave up after the head was already committed (a signing
+/// pipeline that refuses minutes in); the opener tells the two apart.
 const MARK_HEAD: u8 = 0x02;
 const MARK_DATA: u8 = 0x00;
 const MARK_FINAL: u8 = 0x01;
@@ -135,9 +138,24 @@ impl StreamSealer {
         self.seal_marked(MARK_DATA, data)
     }
 
+    /// An empty, authenticated data chunk: liveness on a stream whose next
+    /// bytes are minutes away (a notary wait), so every hop's idle deadline
+    /// sees progress. Opens as an empty [`OpenedItem::Data`], which a reader
+    /// appends as nothing.
+    pub fn seal_keepalive(&mut self) -> Vec<u8> {
+        self.seal_chunk(&[])
+    }
+
     /// Authenticated end-of-stream. MUST be sent; its absence = truncation.
     pub fn seal_final(&mut self) -> Vec<u8> {
         self.seal_marked(MARK_FINAL, &[])
+    }
+
+    /// Authenticated end-of-stream that REFUSES: the head is already out, so
+    /// the outcome rides in the Final marker as the refusal's token. Opens as
+    /// [`OpenedItem::Refused`]; the stream is finished either way.
+    pub fn seal_refused(&mut self, reason: &str) -> Vec<u8> {
+        self.seal_marked(MARK_FINAL, reason.as_bytes())
     }
 }
 
@@ -149,6 +167,10 @@ pub enum OpenedItem {
     Data(Vec<u8>),
     /// Authenticated EOF. Anything after it is an error.
     Final,
+    /// Authenticated EOF that withdraws the stream: the enclave refused after
+    /// its head was committed, and this is the refusal's token. The data
+    /// before it is not an answer.
+    Refused(String),
 }
 
 /// Broker side: incremental parser over arbitrary byte splits.
@@ -227,7 +249,15 @@ impl StreamOpener {
                 MARK_DATA => bail!("sealed stream: data chunk before the head"),
                 MARK_FINAL => {
                     self.finished = true;
-                    items.push(OpenedItem::Final);
+                    let completed = payload.is_empty();
+                    if completed {
+                        items.push(OpenedItem::Final);
+                    } else {
+                        items.push(OpenedItem::Refused(
+                            String::from_utf8(payload.to_vec())
+                                .context("refusal token utf8")?,
+                        ));
+                    }
                 }
                 other => bail!("sealed stream: unknown chunk marker {other}"),
             }
@@ -283,6 +313,24 @@ mod tests {
             OpenedItem::Final,
         ]);
         assert!(opener.finished());
+    }
+
+    #[test]
+    fn a_keepalive_opens_as_empty_data_and_a_refused_final_carries_its_token() {
+        let keys = keys();
+        let (mut sealer, mut wire) = StreamSealer::new(&keys, b"");
+        wire.extend(sealer.seal_head("application/zstd"));
+        wire.extend(sealer.seal_keepalive());
+        wire.extend(sealer.seal_refused("notary_rejected"));
+        let mut opener = StreamOpener::new(&keys, b"");
+        let items = opener.feed(&wire).unwrap();
+        assert_eq!(items, vec![
+            OpenedItem::Head("application/zstd".into()),
+            OpenedItem::Data(Vec::new()),
+            OpenedItem::Refused("notary_rejected".into()),
+        ]);
+        assert!(opener.finished(), "a refused stream is finished, not truncated");
+        assert!(opener.feed(b"x").is_err(), "nothing may follow a refusal");
     }
 
     #[test]

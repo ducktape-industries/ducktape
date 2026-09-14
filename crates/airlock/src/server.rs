@@ -953,7 +953,10 @@ async fn proxy(
 /// body is the `.tar.zst` of the bundle, the reply the `.tar.zst` of the
 /// finished one, sealed under the response stream key exactly as a proxied
 /// model reply is. One request = one signature; the session's `max_requests`
-/// caps signatures per session. Refusals are `sign::Refusal` tokens.
+/// caps signatures per session. Refusals are `sign::Refusal` tokens: before
+/// the pipeline starts (the session, its kind, the body's admission) they
+/// are the HTTP status and body; once it runs the head is already committed
+/// and a refusal is the sealed stream's `Final` carrying the token.
 async fn sign_macos_bundle(
     State(st): State<Arc<AppState>>,
     method: Method,
@@ -1016,14 +1019,86 @@ async fn sign_macos_bundle_inner(
         size = body.len(),
         "release signing requested"
     );
-    // The pipeline is blocking work (process spawns, tmpfs IO) and may run
-    // for minutes under Apple's notary wait; it gets a blocking thread.
+    // The head goes out NOW, before a byte is signed. The pipeline is
+    // blocking work (process spawns, tmpfs IO) that runs for minutes under
+    // Apple's notary wait, and every hop between here and the caller bounds
+    // its wait for a response head in seconds; the outcome rides the sealed
+    // stream instead — the archive as data chunks then Final, a refusal as a
+    // Final carrying its token — with a keepalive sealed in every
+    // `sign::KEEPALIVE_INTERVAL` so no hop's idle deadline fires meanwhile.
+    let (mut sealer, salt) = bodyseal::StreamSealer::new(&keys, &binding);
+    let mut opening = salt;
+    opening.extend(sealer.seal_head("application/zstd"));
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tx.try_send(Ok(Bytes::from(opening)))
+        .expect("a fresh channel takes its first item");
     let pipeline_identity = identity.clone();
-    let signed =
-        tokio::task::spawn_blocking(move || sign::sign_bundle(&tools, &pipeline_identity, &body))
-            .await
-            .map_err(|_| AppErr(StatusCode::INTERNAL_SERVER_ERROR, "codesign_failed".into()))?;
-    let signed = match signed {
+    let pipeline =
+        tokio::task::spawn_blocking(move || sign::sign_bundle(&tools, &pipeline_identity, &body));
+    let audit = SignAudit {
+        sub: claims.sub.clone(),
+        session: claims.eph.clone(),
+        sha256_in,
+        team_id: identity.team_id().to_string(),
+    };
+    tokio::spawn(stream_signing_reply(sealer, pipeline, tx, audit));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")))
+}
+
+/// What the signing audit lines name: the session and the request's
+/// identity, fixed before the pipeline starts.
+struct SignAudit {
+    sub: String,
+    session: String,
+    sha256_in: String,
+    team_id: String,
+}
+
+/// What the running pipeline sends next on the sealed reply stream.
+enum SignEvent {
+    /// The pipeline is still running; the stream must show liveness.
+    Keepalive,
+    /// The pipeline ended, with the archive or a refusal.
+    Finished(Result<sign::Signed, sign::Refusal>),
+}
+
+/// Drain the pipeline onto the sealed reply stream: keepalives while it
+/// runs, then the archive and `Final`, or the refusal token as the `Final`.
+/// A caller that went away ends the drain; the pipeline runs to its end on
+/// its blocking thread regardless (its work dir is dropped there).
+async fn stream_signing_reply(
+    mut sealer: bodyseal::StreamSealer,
+    pipeline: tokio::task::JoinHandle<Result<sign::Signed, sign::Refusal>>,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    audit: SignAudit,
+) {
+    let mut ticks = tokio::time::interval(sign::KEEPALIVE_INTERVAL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticks.tick().await; // the first tick is immediate; the head just went out
+    tokio::pin!(pipeline);
+    let outcome = loop {
+        let event = tokio::select! {
+            joined = &mut pipeline => SignEvent::Finished(
+                // a panicked pipeline is a codesign failure: the thread died
+                // before it could name anything better.
+                joined.unwrap_or(Err(sign::Refusal::CodesignFailed)),
+            ),
+            _ = ticks.tick() => SignEvent::Keepalive,
+        };
+        match event {
+            SignEvent::Keepalive => {
+                if tx.send(Ok(Bytes::from(sealer.seal_keepalive()))).await.is_err() {
+                    return;
+                }
+            }
+            SignEvent::Finished(outcome) => break outcome,
+        }
+    };
+    let signed = match outcome {
         Ok(signed) => signed,
         Err(refusal) => {
             let submission_id = match &refusal {
@@ -1037,63 +1112,43 @@ async fn sign_macos_bundle_inner(
             tracing::warn!(
                 target: "ducktape::airlock",
                 event = "release_sign_refused",
-                sub = %claims.sub,
-                session = %claims.eph,
-                sha256_in = %sha256_in,
+                sub = %audit.sub,
+                session = %audit.session,
+                sha256_in = %audit.sha256_in,
                 reason = %refusal.as_str(),
                 submission_id = %submission_id.unwrap_or_default(),
                 "release signing refused"
             );
-            return Err(AppErr(refusal_status(&refusal), refusal.as_str().into()));
+            let _ = tx.send(Ok(Bytes::from(sealer.seal_refused(refusal.as_str())))).await;
+            return;
         }
     };
     let sha256_out = sign::sha256_hex(&signed.archive);
     tracing::info!(
         target: "ducktape::airlock",
         event = "release_sign_signed",
-        sub = %claims.sub,
-        session = %claims.eph,
-        sha256_in = %sha256_in,
+        sub = %audit.sub,
+        session = %audit.session,
+        sha256_in = %audit.sha256_in,
         sha256_out = %sha256_out,
-        team_id = %identity.team_id(),
+        team_id = %audit.team_id,
         "release bundle signed"
     );
     tracing::info!(
         target: "ducktape::airlock",
         event = "release_sign_notarized",
-        sub = %claims.sub,
-        session = %claims.eph,
+        sub = %audit.sub,
+        session = %audit.session,
         sha256_out = %sha256_out,
         submission_id = %signed.submission_id.clone().unwrap_or_default(),
         "release bundle notarized and stapled"
     );
-    // The reply is the finished archive as a sealed chunk stream, the shape
-    // a proxied model reply has: salt, head (content type), data, Final.
-    let (mut sealer, salt) = bodyseal::StreamSealer::new(&keys, &binding);
-    let mut wire = salt;
-    wire.extend(sealer.seal_head("application/zstd"));
     for chunk in sign::response_chunks(&signed.archive) {
-        wire.extend(sealer.seal_chunk(chunk));
+        if tx.send(Ok(Bytes::from(sealer.seal_chunk(chunk)))).await.is_err() {
+            return;
+        }
     }
-    wire.extend(sealer.seal_final());
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/octet-stream")
-        .body(Body::from(wire))
-        .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")))
-}
-
-/// The status each signing refusal answers with: the caller's fault is 4xx,
-/// Apple's answer is 502, a gateway that cannot sign at all is 503.
-fn refusal_status(refusal: &sign::Refusal) -> StatusCode {
-    match refusal {
-        sign::Refusal::BundleShapeRefused => StatusCode::BAD_REQUEST,
-        sign::Refusal::BundleTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-        sign::Refusal::CodesignFailed => StatusCode::INTERNAL_SERVER_ERROR,
-        sign::Refusal::NotaryRejected { .. } => StatusCode::BAD_GATEWAY,
-        sign::Refusal::StapleFailed => StatusCode::BAD_GATEWAY,
-        sign::Refusal::ToolMissing => StatusCode::SERVICE_UNAVAILABLE,
-    }
+    let _ = tx.send(Ok(Bytes::from(sealer.seal_final()))).await;
 }
 
 /// Map the caller's request path onto the vendor upstream. Anthropic serves the
