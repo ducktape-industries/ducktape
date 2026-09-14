@@ -24,6 +24,24 @@ const GUTTER: f32 = 16.;
 /// The type size a stat tile's number is set at.
 const TILE_VALUE_SIZE: f32 = 22.;
 
+// Every cell of a row is ONE LINE. The rows are built at a fixed height
+// (`LIST_ROW`) and a card in a three-column pane is narrow: a height, a
+// count or a digest allowed to wrap breaks onto a second line under the
+// next row. The one text that may wrap — a notice — says so with
+// `kit::wrapping`, which overrides this.
+
+fn text(key: impl Into<String>, content: impl Into<String>) -> Node {
+    kit::nowrap(kit::text(key, content))
+}
+
+fn mono(key: impl Into<String>, content: impl Into<String>) -> Node {
+    kit::nowrap(kit::mono(key, content))
+}
+
+fn secondary(key: impl Into<String>, content: impl Into<String>) -> Node {
+    kit::nowrap(kit::secondary(key, content))
+}
+
 impl HomeView {
     pub(crate) fn view(&self) -> Node {
         kit::set_dark(self.dark);
@@ -45,7 +63,7 @@ impl HomeView {
         if !self.host_error.is_empty() {
             body.push(kit::notice(
                 "home/error",
-                kit::wrapping(kit::text(
+                kit::wrapping(text(
                     "home/error-text",
                     format!("Could not read the session: {}", self.host_error),
                 )),
@@ -189,7 +207,7 @@ impl HomeView {
             kit::column(
                 format!("{key}/body"),
                 [
-                    kit::text_size(kit::mono(format!("{key}/value"), value), TILE_VALUE_SIZE),
+                    kit::text_size(mono(format!("{key}/value"), value), TILE_VALUE_SIZE),
                     kit::caption(format!("{key}/label"), label),
                 ],
             ),
@@ -211,7 +229,7 @@ impl HomeView {
         if let Some(error) = self.errors.get(name) {
             children.push(kit::notice(
                 format!("{key}/error"),
-                kit::wrapping(kit::secondary(
+                kit::wrapping(secondary(
                     format!("{key}/error-text"),
                     format!("Not read: {error}"),
                 )),
@@ -241,7 +259,7 @@ impl HomeView {
                     kit::kv(
                         format!("{key}/reading"),
                         name,
-                        kit::mono(format!("{key}/value"), host::short_label(digest)),
+                        mono(format!("{key}/value"), host::short_label(digest)),
                     ),
                     Some(Length::Fill),
                     None,
@@ -265,17 +283,17 @@ impl HomeView {
             Self::reading(
                 "home/node/height",
                 "Height",
-                kit::mono("home/node/height/value", host::height_label(facts.height)),
+                mono("home/node/height/value", host::height_label(facts.height)),
             ),
             Self::reading(
                 "home/node/sync",
                 "Doing",
-                kit::text("home/node/sync/value", &facts.sync_line),
+                text("home/node/sync/value", &facts.sync_line),
             ),
             Self::reading(
                 "home/node/chain",
                 "Network",
-                kit::mono("home/node/chain/value", self.chain_id()),
+                mono("home/node/chain/value", self.chain_id()),
             ),
         ];
         // consensus facts are a validator's alone: the projection leaves the
@@ -284,11 +302,11 @@ impl HomeView {
         if signs {
             readings.push(Self::reading(
                 "home/node/quorum",
-                "Quorum",
-                kit::mono(
+                "Reachable",
+                mono(
                     "home/node/quorum/value",
                     format!(
-                        "{} reachable of {} needed",
+                        "{} of {} for quorum",
                         host::grouped_digits(facts.reachable_validators),
                         host::grouped_digits(facts.quorum)
                     ),
@@ -298,7 +316,7 @@ impl HomeView {
         readings.push(Self::reading(
             "home/node/checkpoint",
             "Checkpoint",
-            kit::mono(
+            mono(
                 "home/node/checkpoint/value",
                 host::height_label(facts.checkpoint_height),
             ),
@@ -318,7 +336,7 @@ impl HomeView {
         if !facts.sync_last_error.is_empty() {
             readings.push(kit::notice(
                 "home/node/sync-error",
-                kit::wrapping(kit::secondary(
+                kit::wrapping(secondary(
                     "home/node/sync-error/text",
                     format!(
                         "Sync failed {} times; last: {}",
@@ -348,7 +366,7 @@ impl HomeView {
                 Self::reading(
                     "home/members/validators",
                     "Validators",
-                    kit::mono(
+                    mono(
                         "home/members/validators/value",
                         host::grouped_digits(roster.validators),
                     ),
@@ -356,7 +374,7 @@ impl HomeView {
                 Self::reading(
                     "home/members/residents",
                     "Residents",
-                    kit::mono(
+                    mono(
                         "home/members/residents/value",
                         host::grouped_digits(roster.residents),
                     ),
@@ -369,7 +387,7 @@ impl HomeView {
                 Self::reading(
                     "home/members/account",
                     "Signed in as",
-                    kit::mono(
+                    mono(
                         "home/members/account/value",
                         match self.account.is_empty() {
                             true => "—".to_owned(),
@@ -396,11 +414,11 @@ impl HomeView {
                         format!("{key}/row"),
                         [
                             kit::sized(
-                                kit::mono(format!("{key}/key"), host::short_label(&peer.key)),
+                                mono(format!("{key}/key"), host::short_label(&peer.key)),
                                 Some(Length::Fill),
                                 None,
                             ),
-                            kit::secondary(format!("{key}/role"), host::capitalized(&peer.role)),
+                            secondary(format!("{key}/role"), host::capitalized(&peer.role)),
                             kit::badge(format!("{key}/state"), state, tone),
                         ],
                     ),
@@ -433,13 +451,13 @@ impl HomeView {
                     kit::centered_row(
                         format!("{key}/row"),
                         [
-                            kit::mono(format!("{key}/height"), host::height_label(block.height)),
+                            mono(format!("{key}/height"), host::height_label(block.height)),
                             kit::sized(
-                                kit::mono(format!("{key}/hash"), host::short_label(&block.hash)),
+                                mono(format!("{key}/hash"), host::short_label(&block.hash)),
                                 Some(Length::Fill),
                                 None,
                             ),
-                            kit::secondary(
+                            secondary(
                                 format!("{key}/ops"),
                                 format!("{} ops", host::grouped_digits(block.op_count)),
                             ),
@@ -475,11 +493,11 @@ impl HomeView {
                         format!("{key}/row"),
                         [
                             kit::sized(
-                                kit::nowrap(kit::text(format!("{key}/id"), &module.id)),
+                                text(format!("{key}/id"), &module.id),
                                 Some(Length::Fill),
                                 None,
                             ),
-                            kit::secondary(
+                            secondary(
                                 format!("{key}/category"),
                                 host::capitalized(&module.category),
                             ),
@@ -511,14 +529,14 @@ impl HomeView {
         for (room, moved) in rooms.iter().take(host::ROOM_ROWS) {
             let key = format!("home/room/{}", room.id);
             let mut cells = vec![kit::sized(
-                kit::nowrap(kit::text(format!("{key}/name"), format!("#{}", room.name))),
+                text(format!("{key}/name"), format!("#{}", room.name)),
                 Some(Length::Fill),
                 None,
             )];
             if *moved {
                 cells.push(kit::badge(format!("{key}/new"), "New", Tone::Success));
             }
-            cells.push(kit::mono(
+            cells.push(mono(
                 format!("{key}/head"),
                 format!("{} messages", host::grouped_digits(room.head_seq)),
             ));
@@ -560,12 +578,12 @@ impl HomeView {
                         format!("{key}/row"),
                         [
                             kit::sized(
-                                kit::nowrap(kit::text(format!("{key}/agent"), &run.agent_id)),
+                                text(format!("{key}/agent"), &run.agent_id),
                                 Some(Length::Fill),
                                 None,
                             ),
                             kit::badge(format!("{key}/state"), host::capitalized(&run.state), tone),
-                            kit::mono(
+                            mono(
                                 format!("{key}/height"),
                                 host::height_label(run.dispatched_height),
                             ),
@@ -605,7 +623,7 @@ impl HomeView {
                         format!("{key}/row"),
                         [
                             kit::sized(
-                                kit::nowrap(kit::text(format!("{key}/action"), &proposal.action)),
+                                text(format!("{key}/action"), &proposal.action),
                                 Some(Length::Fill),
                                 None,
                             ),
@@ -614,7 +632,7 @@ impl HomeView {
                                 format!("{} approvals", proposal.approvals),
                                 Tone::Neutral,
                             ),
-                            kit::mono(
+                            mono(
                                 format!("{key}/deadline"),
                                 format!("expires {}", host::height_label(proposal.deadline)),
                             ),
@@ -653,14 +671,14 @@ impl HomeView {
                     kit::centered_row(
                         format!("{key}/row"),
                         [
-                            kit::mono(format!("{key}/id"), &snapshot.short_id),
+                            mono(format!("{key}/id"), &snapshot.short_id),
                             kit::sized(
-                                kit::nowrap(kit::text(format!("{key}/message"), message)),
+                                text(format!("{key}/message"), message),
                                 Some(Length::Fill),
                                 None,
                             ),
-                            kit::secondary(format!("{key}/author"), &snapshot.author),
-                            kit::mono(format!("{key}/height"), host::height_label(snapshot.height)),
+                            secondary(format!("{key}/author"), &snapshot.author),
+                            mono(format!("{key}/height"), host::height_label(snapshot.height)),
                         ],
                     ),
                     8.,
