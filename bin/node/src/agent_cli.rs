@@ -3,12 +3,12 @@
 //!
 //! Two session verbs, one credential+targeting story:
 //!
-//! - `agent pty [<provider>] [--host-node <hex>] [--cred <name>] [--cpu <n>] [--mem <gb>]`
+//! - `agent pty [<harness>] [--host-node <hex>] [--cred <name>] [--cpu <n>] [--mem <gb>]`
 //!   attaches THIS terminal to a provider running in a microVM on a host
 //!   node (default: this node). The CLI talks ONLY to its own node's ws surface
 //!   (`/v1/ws`); the node does the cross-node mesh. Raw terminal mode + resize
 //!   forwarding make it feel like ssh.
-//! - `agent sched [<provider>] --cred <name> [--host-node <hex>] [--cpu] [--mem] -- "<prompt>"`
+//! - `agent sched [<harness>] --cred <name> [--host-node <hex>] [--cpu] [--mem] -- "<prompt>"`
 //!   submits a durable, node-pinned headless run (a `saga::SagaMsg::Trigger`)
 //!   as a frame the USER key signs, and prints its run id. The saga's origin is
 //!   the user key, so the lender attributes the run to the user's account
@@ -44,9 +44,9 @@
 //! back `unknown run: ext:<hex>…`. That sentence means "not your run", not "no
 //! such run" — sign with the key that submitted the `agent sched`.
 //!
-//! `<provider>` is optional when `--cred` names a credential: the registry
-//! record's kind decides what to launch; an explicit provider contradicting the
-//! cred is an error.
+//! `<harness>` is optional when `--cred` names a credential: the registry
+//! record's kind infers Claude/Codex, or selects explicit Pi's backend at runtime.
+//! A native harness contradicting the credential is an error.
 //!
 //! TWO addressing inputs, deliberately two names. `--node`/`-n`/`DUCKTAPE_NODE`
 //! (the shared [`NodeAddr`] group) say which node this CLI DIALS — an http base.
@@ -66,7 +66,7 @@ use commonware_cryptography::Signer as _;
 
 use crate::cli_args::NodeAddr;
 use crate::config::{self, hex_bytes};
-use crate::cred_cli::{ProviderArg, VerbCtx, query_node};
+use crate::cred_cli::{VerbCtx, query_node};
 use crate::userkey_cli::{load_user_signer, user_frame};
 
 type AgentResult = Result<(), Box<dyn std::error::Error>>;
@@ -138,10 +138,28 @@ pub(crate) struct ReassignArgs {
     attempt: u32,
 }
 
+/// The executable harness, independent of the credential's backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum HarnessArg {
+    Claude,
+    Codex,
+    Pi,
+}
+
+impl HarnessArg {
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Pi => "pi",
+        }
+    }
+}
+
 #[derive(Debug, clap::Args)]
 pub(crate) struct PtyArgs {
-    /// provider to launch (`claude`|`codex`); optional when `--cred` names one
-    provider: Option<ProviderArg>,
+    /// harness to launch (claude|codex|pi); omitted = infer from --cred
+    harness: Option<HarnessArg>,
     /// host node to RUN on: its raw 64-hex node key (omitted = this node).
     /// NOT `--node`, which is the http base this CLI dials.
     #[arg(long = "host-node", value_name = "HEX")]
@@ -159,8 +177,8 @@ pub(crate) struct PtyArgs {
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct SchedArgs {
-    /// provider to launch (`claude`|`codex`); optional — the `--cred` kind decides
-    provider: Option<ProviderArg>,
+    /// harness to launch (claude|codex|pi); omitted = infer from --cred
+    harness: Option<HarnessArg>,
     /// credential name (required: a headless guest run must bring a credential).
     /// With `--host-node`, THIS RUN LETS THAT NODE SPEND YOUR SUBSCRIPTION: the
     /// lender admits the executing node on YOUR grant, for this credential and
@@ -244,7 +262,7 @@ fn cmd_pty(args: PtyArgs, base: &str, addr: &NodeAddr) -> AgentResult {
     // CLI acts as the operator of the node it just addressed, and the proof is
     // the same directory read the ws topic already needs.
     let operator = workspace_operator(addr);
-    let provider = resolve_provider(base, args.provider, args.cred.as_deref())?;
+    let capability = resolve_harness(base, args.harness, args.cred.as_deref())?;
     let host_hex = match args.host_node.as_deref() {
         Some(hex) => Some(hex_bytes(&host_node_key(hex)?)),
         None => None,
@@ -253,7 +271,7 @@ fn cmd_pty(args: PtyArgs, base: &str, addr: &NodeAddr) -> AgentResult {
     let created = create_session(
         base,
         operator.as_deref(),
-        provider.token(),
+        capability,
         host_hex.as_deref(),
         args.cred.as_deref(),
         args.cpu,
@@ -494,8 +512,7 @@ fn window_size(fd: i32) -> (u16, u16) {
 
 fn cmd_sched(args: SchedArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> AgentResult {
     let base = &ctx.http_base()?;
-    let provider = resolve_provider(base, args.provider, Some(&args.cred))?;
-    let tag = provider.token();
+    let tag = resolve_harness(base, args.harness, Some(&args.cred))?;
 
     let target = match args.host_node.as_deref() {
         Some(hex) => host_node_key(hex)?.to_vec(),
@@ -798,38 +815,39 @@ fn own_node_key(base: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     config::unhex(hex).map_err(|e| format!("node key hex: {e}").into())
 }
 
-/// Resolve the pty/sched provider: `--cred`'s registered kind decides, and an
-/// explicit provider contradicting it is an error. Without `--cred`, a provider
-/// is required.
-fn resolve_provider(
+/// Resolve a harness and credential backend to the capability the host offers.
+fn resolve_harness(
     base: &str,
-    provider: Option<ProviderArg>,
+    harness: Option<HarnessArg>,
     cred: Option<&str>,
-) -> Result<ProviderArg, Box<dyn std::error::Error>> {
+) -> Result<&'static str, Box<dyn std::error::Error>> {
     let Some(name) = cred else {
-        return provider
-            .ok_or_else(|| "a provider (claude|codex) is required without --cred".into());
+        return Ok(harness_capability(harness, None)?);
     };
     let record = query_credential(base, name)?
         .ok_or_else(|| format!("unknown credential {name:?} — {}", credential_hint(base)))?;
-    let from_cred = provider_from_kind(record.kind);
-    if let Some(explicit) = provider
-        && explicit != from_cred
-    {
-        return Err(format!(
-            "provider {} contradicts credential {name:?} (kind {})",
-            explicit.token(),
-            from_cred.token()
-        )
-        .into());
-    }
-    Ok(from_cred)
+    harness_capability(harness, Some(record.kind))
+        .map_err(|e| format!("credential {name:?}: {e}").into())
 }
 
-fn provider_from_kind(kind: gateway::CredentialKind) -> ProviderArg {
-    match kind {
-        gateway::CredentialKind::Claude => ProviderArg::Claude,
-        gateway::CredentialKind::Codex => ProviderArg::Codex,
+fn harness_capability(
+    harness: Option<HarnessArg>,
+    kind: Option<gateway::CredentialKind>,
+) -> Result<&'static str, String> {
+    use gateway::CredentialKind;
+    match (harness, kind) {
+        (Some(HarnessArg::Pi), _) => Ok("pi"),
+        (None | Some(HarnessArg::Claude), Some(CredentialKind::Claude))
+        | (Some(HarnessArg::Claude), None) => Ok("claude"),
+        (None | Some(HarnessArg::Codex), Some(CredentialKind::Codex))
+        | (Some(HarnessArg::Codex), None) => Ok("codex"),
+        (Some(HarnessArg::Claude), Some(CredentialKind::Codex)) => {
+            Err("harness claude contradicts credential kind codex".into())
+        }
+        (Some(HarnessArg::Codex), Some(CredentialKind::Claude)) => {
+            Err("harness codex contradicts credential kind claude".into())
+        }
+        (None, None) => Err("a harness (claude|codex|pi) is required without --cred".into()),
     }
 }
 
@@ -1007,16 +1025,62 @@ mod tests {
     }
 
     #[test]
-    fn cred_kind_wins_and_contradiction_is_an_error() {
-        // The reverse map is the whole authority when a provider is omitted.
+    fn harness_and_credential_select_the_capability() {
+        use gateway::CredentialKind::{Claude, Codex};
+        for (harness, kind, expected) in [
+            (None, Claude, "claude"),
+            (None, Codex, "codex"),
+            (Some(HarnessArg::Claude), Claude, "claude"),
+            (Some(HarnessArg::Codex), Codex, "codex"),
+            (Some(HarnessArg::Pi), Claude, "pi"),
+            (Some(HarnessArg::Pi), Codex, "pi"),
+        ] {
+            assert_eq!(harness_capability(harness, Some(kind)).unwrap(), expected);
+        }
+        for (harness, kind) in [(HarnessArg::Claude, Codex), (HarnessArg::Codex, Claude)] {
+            assert!(
+                harness_capability(Some(harness), Some(kind))
+                    .unwrap_err()
+                    .contains("contradicts")
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_harnesses_work_without_a_credential() {
+        for harness in [HarnessArg::Claude, HarnessArg::Codex, HarnessArg::Pi] {
+            assert_eq!(
+                harness_capability(Some(harness), None).unwrap(),
+                harness.token()
+            );
+        }
+        assert!(harness_capability(None, None).is_err());
+    }
+
+    #[test]
+    fn pty_and_sched_accept_pi_positionally() {
+        use clap::{Args as _, FromArgMatches as _};
+        let pty = PtyArgs::augment_args(clap::Command::new("pty"))
+            .try_get_matches_from(["pty", "pi", "--cred", "work"])
+            .unwrap();
         assert_eq!(
-            provider_from_kind(gateway::CredentialKind::Claude),
-            ProviderArg::Claude
+            PtyArgs::from_arg_matches(&pty).unwrap().harness,
+            Some(HarnessArg::Pi)
         );
+        let sched = SchedArgs::augment_args(clap::Command::new("sched"))
+            .try_get_matches_from(["sched", "pi", "--cred", "work", "--", "hello"])
+            .unwrap();
         assert_eq!(
-            provider_from_kind(gateway::CredentialKind::Codex),
-            ProviderArg::Codex
+            SchedArgs::from_arg_matches(&sched).unwrap().harness,
+            Some(HarnessArg::Pi)
         );
+    }
+
+    #[test]
+    fn pi_is_a_harness_not_a_credential_kind() {
+        use clap::ValueEnum as _;
+        assert_eq!(HarnessArg::from_str("pi", false).unwrap(), HarnessArg::Pi);
+        assert!(crate::cred_cli::ProviderArg::from_str("pi", false).is_err());
     }
 
     #[test]

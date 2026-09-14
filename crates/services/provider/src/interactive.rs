@@ -684,6 +684,7 @@ mod tests {
         assert_eq!(bare, vec!["--foo".to_string()]);
 
         let endpoint = crate::broker::BrokerEndpoint {
+            kind: crate::CredentialKind::Codex,
             base_url: "http://127.0.0.1:9/v1".into(),
             run_bearer: "b".into(),
             control_url: String::new(),
@@ -711,6 +712,20 @@ mod tests {
             Some(BrokerKind::AnthropicMessages),
         );
         assert_eq!(claude, vec!["--foo".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn pi_shared_session_is_refused_before_starting_any_process() {
+        let spec = crate::spec::builtin_specs()
+            .into_iter()
+            .find(|spec| spec.tag == "pi")
+            .unwrap();
+        let provider = CliProvider::from_spec(spec, "/nonexistent/pi".into(), SandboxBackend::Bare);
+        let result = provider.spawn_interactive_session(&RunContext::default(), true).await;
+        let Err(error) = result else {
+            panic!("Pi must not advertise a shared read-only session");
+        };
+        assert!(error.contains("shared/command-lane session unsupported"), "{error}");
     }
 
     // ---- where the live coverage lives --------------------------------------

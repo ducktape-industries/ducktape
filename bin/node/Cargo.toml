@@ -161,6 +161,9 @@ reqwest = { workspace = true }
 # WebSocket bridge to a route's loopback upstream (ws://127.0.0.1, no TLS).
 tokio-tungstenite = "0.24"
 sha2 = { workspace = true }
+# Validate standalone executor archives before extracting their runtime assets.
+tar = "0.4"
+flate2 = "1"
 toml = "0.8"
 # identity keygen entropy (`Signer::random`).
 rand = "0.8"
