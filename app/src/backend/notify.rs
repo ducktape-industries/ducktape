@@ -15,15 +15,24 @@
 //! THE NOTIFIER IS WHAT THE HOST OFFERS. On macOS it is the notification
 //! center, which terminates a process that has no bundle identifier — and
 //! `cargo test` is exactly such a process — so the bundle is checked before
-//! the framework is touched, and a bare binary degrades to a `debug!` line.
-//! Everywhere else it is the freedesktop notifications service on the session
-//! bus; a host with no session bus degrades the same way.
+//! the framework is touched, and a bare binary (`make dev`) says so ONCE at
+//! boot and stays silent. Everywhere else it is the freedesktop notifications
+//! service on the session bus; a host with no session bus degrades the same
+//! way.
+//!
+//! THE HOST IS ASKED AT BOOT, not at the first mention. macOS prompts the
+//! person once per bundle id and stores the answer; a request submitted while
+//! the prompt is still up is refused (`UNErrorCodeNotificationsNotAllowed`),
+//! and a stored "Don't Allow" refuses every request after it. Asking in
+//! [`boot_desktop_notifications`] puts the prompt at launch, where the person expects it, and the
+//! answer where they can read it: one log line per boot and the Settings tab
+//! ([`desktop_notifications_host`]), which names what to do about a refusal.
 
 use super::*;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// How much of a message body a notification carries. A banner shows two or
 /// three lines; past that the excerpt is only paying for itself in memory.
@@ -152,6 +161,75 @@ pub async fn load_desktop_notifications() -> bool {
     notifications_enabled()
 }
 
+// ============================================================================
+// what the host answered
+// ============================================================================
+
+/// WHETHER THIS HOST WILL RAISE A BANNER, as it last told us. One
+/// discriminant: the Settings tab draws one sentence per variant, and a new
+/// answer has to be routed there rather than folded into a boolean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HostNotifier {
+    /// asked, not yet answered — the prompt may be on screen
+    Pending = 0,
+    /// the host will show them
+    Ready = 1,
+    /// this process is not an app bundle (`make dev`): macOS attributes a
+    /// banner to a bundle id and refuses a process without one
+    Unbundled = 2,
+    /// the person (or a past answer) refused, in System Settings
+    Denied = 3,
+    /// no notification service on this desktop (no session bus)
+    Unavailable = 4,
+}
+
+impl HostNotifier {
+    /// The wire token the Settings view receives. Stable: the view matches on
+    /// it.
+    pub fn token(self) -> &'static str {
+        match self {
+            HostNotifier::Pending => "pending",
+            HostNotifier::Ready => "ready",
+            HostNotifier::Unbundled => "unbundled",
+            HostNotifier::Denied => "denied",
+            HostNotifier::Unavailable => "unavailable",
+        }
+    }
+
+    fn from_u8(value: u8) -> HostNotifier {
+        match value {
+            1 => HostNotifier::Ready,
+            2 => HostNotifier::Unbundled,
+            3 => HostNotifier::Denied,
+            4 => HostNotifier::Unavailable,
+            _ => HostNotifier::Pending,
+        }
+    }
+}
+
+/// The host's latest answer. Written by the boot request and by every post's
+/// completion, both of which land on framework threads; read by the Settings
+/// props on each draw.
+static HOST: AtomicU8 = AtomicU8::new(HostNotifier::Pending as u8);
+
+fn record_host(answer: HostNotifier) {
+    HOST.store(answer as u8, Ordering::Relaxed);
+}
+
+/// What the host last said about raising banners.
+pub fn desktop_notifications_host() -> HostNotifier {
+    HostNotifier::from_u8(HOST.load(Ordering::Relaxed))
+}
+
+/// ASK THE HOST ONCE, AT LAUNCH. Requests authorization where the platform
+/// needs it and logs the answer once per boot; the answer is then readable
+/// through [`desktop_notifications_host`]. Never blocks: the platform answers on its own
+/// thread.
+pub fn boot_desktop_notifications() {
+    platform::boot();
+}
+
 /// Persist it. Best-effort like `save_appearance`: a failed write costs the
 /// NEXT boot's default and nothing this session shows.
 pub async fn save_desktop_notifications(enabled: bool) -> bool {
@@ -274,6 +352,15 @@ pub(crate) fn notify_chat_op(
     platform::post(&notice);
 }
 
+/// How many posts the host has refused this boot. The first refusal is a
+/// `warn!`; the rest are `debug!` carrying this count, so a standing refusal
+/// is one line in the ring and not a line per mention.
+fn count_refusal() -> u64 {
+    use std::sync::atomic::AtomicU64;
+    static REFUSED: AtomicU64 = AtomicU64::new(0);
+    REFUSED.fetch_add(1, Ordering::Relaxed) + 1
+}
+
 /// Notification identity comes from the source's canonical post assignment,
 /// including its account-resolved mentions, just like the settled timeline.
 pub(crate) fn chat_arrival(
@@ -316,8 +403,7 @@ pub(crate) fn chat_arrival(
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::DesktopNotice;
-    use std::sync::Once;
+    use super::{DesktopNotice, HostNotifier, count_refusal, record_host};
 
     use objc2::rc::Retained;
     use objc2::runtime::Bool;
@@ -330,29 +416,65 @@ mod platform {
     /// UNUserNotificationCenter TERMINATES a process with no bundle
     /// identifier — it is not an error a caller can catch, the process dies.
     /// `cargo test`, `cargo run` and any bare binary are exactly that process,
-    /// so the identifier is read first and its absence is a `debug!` line.
+    /// so the identifier is read first; `boot` says so once and `post` skips.
     fn bundled() -> bool {
         // SAFETY: reading the main bundle's identifier is valid on any thread.
         unsafe { NSBundle::mainBundle().bundleIdentifier().is_some() }
     }
 
-    /// Ask once per process. macOS remembers the answer per bundle id; asking
-    /// again is a no-op, but doing it once keeps the prompt off every message.
-    fn authorize(center: &UNUserNotificationCenter) {
-        static ASKED: Once = Once::new();
-        ASKED.call_once(|| {
-            let options = UNAuthorizationOptions::UNAuthorizationOptionAlert
-                | UNAuthorizationOptions::UNAuthorizationOptionSound;
-            let handler = block2::RcBlock::new(|granted: Bool, _error: *mut NSError| {
-                tracing::debug!(
+    /// An NSError as two loggable fields: its domain and code. `UNErrorDomain`
+    /// code 1 is "notifications are not allowed for this application" — the
+    /// person refused, or the prompt is still up.
+    fn error_fields(error: *mut NSError) -> (String, isize) {
+        if error.is_null() {
+            return (String::new(), 0);
+        }
+        // SAFETY: the framework hands a live NSError for the handler's duration.
+        let error = unsafe { &*error };
+        (error.domain().to_string(), error.code())
+    }
+
+    /// ASK AT LAUNCH. macOS prompts the first time a bundle id asks and stores
+    /// the answer; every later ask returns the stored answer without a prompt.
+    /// The answer lands in one log line and in `HOST`.
+    pub(super) fn boot() {
+        if !bundled() {
+            record_host(HostNotifier::Unbundled);
+            tracing::info!(
+                target: "ducktape::app",
+                reason = "no_bundle_identifier",
+                "desktop notifications are off: this process is not an app bundle — `make install` and launch Ducktape.app"
+            );
+            return;
+        }
+        let options = UNAuthorizationOptions::UNAuthorizationOptionAlert
+            | UNAuthorizationOptions::UNAuthorizationOptionSound;
+        let handler = block2::RcBlock::new(|granted: Bool, error: *mut NSError| {
+            let (error_domain, error_code) = error_fields(error);
+            if granted.as_bool() {
+                record_host(HostNotifier::Ready);
+                tracing::info!(
                     target: "ducktape::app",
-                    granted = granted.as_bool(),
-                    "desktop notification authorization answered"
+                    reason = "authorized",
+                    "desktop notifications are on"
                 );
-            });
-            // SAFETY: the center is a live object and the block outlives the call.
-            unsafe { center.requestAuthorizationWithOptions_completionHandler(options, &handler) };
+                return;
+            }
+            record_host(HostNotifier::Denied);
+            tracing::warn!(
+                target: "ducktape::app",
+                reason = "authorization_denied",
+                error_domain = %error_domain,
+                error_code,
+                "desktop notifications are off: allow Ducktape in System Settings → Notifications"
+            );
         });
+        // SAFETY: a plain framework call; the center is thread-safe by
+        // contract and the block is copied by the framework.
+        unsafe {
+            UNUserNotificationCenter::currentNotificationCenter()
+                .requestAuthorizationWithOptions_completionHandler(options, &handler);
+        }
     }
 
     pub(super) fn post(notice: &DesktopNotice) {
@@ -360,15 +482,51 @@ mod platform {
             tracing::debug!(
                 target: "ducktape::app",
                 reason = "no_bundle_identifier",
+                room = %notice.thread,
                 "skipped a desktop notification"
             );
             return;
         }
+        let room = notice.thread.clone();
+        // The host's word on THIS request: a refusal names why in the ring,
+        // and an acceptance heals a stale `Denied` — a person who allowed the
+        // app in System Settings after boot is not made to relaunch.
+        let handler = block2::RcBlock::new(move |error: *mut NSError| {
+            if error.is_null() {
+                record_host(HostNotifier::Ready);
+                return;
+            }
+            record_host(HostNotifier::Denied);
+            let (error_domain, error_code) = error_fields(error);
+            let attempts = count_refusal();
+            let first_refusal = attempts == 1;
+            if first_refusal {
+                tracing::warn!(
+                    target: "ducktape::app",
+                    reason = "notify_refused",
+                    error_domain = %error_domain,
+                    error_code,
+                    attempts,
+                    room = %room,
+                    "the host refused a desktop notification"
+                );
+                return;
+            }
+            tracing::debug!(
+                target: "ducktape::app",
+                reason = "notify_refused",
+                error_domain = %error_domain,
+                error_code,
+                attempts,
+                room = %room,
+                "the host refused a desktop notification"
+            );
+        });
         // SAFETY: every call below is a plain framework call on objects this
-        // function owns; the center is thread-safe by contract.
+        // function owns; the center is thread-safe by contract and copies the
+        // block.
         unsafe {
             let center = UNUserNotificationCenter::currentNotificationCenter();
-            authorize(&center);
             let content = UNMutableNotificationContent::new();
             content.setTitle(&NSString::from_str(&notice.title));
             content.setSubtitle(&NSString::from_str(&notice.subtitle));
@@ -378,7 +536,7 @@ mod platform {
             let id = NSString::from_str(&format!("ducktape-{}", fresh_notice_id()));
             let request: Retained<UNNotificationRequest> =
                 UNNotificationRequest::requestWithIdentifier_content_trigger(&id, &content, None);
-            center.addNotificationRequest_withCompletionHandler(&request, None);
+            center.addNotificationRequest_withCompletionHandler(&request, Some(&*handler));
         }
     }
 
@@ -397,7 +555,7 @@ mod platform {
 /// under the accessibility stack.
 #[cfg(not(target_os = "macos"))]
 mod platform {
-    use super::DesktopNotice;
+    use super::{DesktopNotice, HostNotifier, count_refusal, record_host};
     use std::collections::HashMap;
     use std::sync::OnceLock;
 
@@ -405,15 +563,18 @@ mod platform {
     /// is what gives it this app's icon and lets the desktop group it.
     const DESKTOP_ENTRY: &str = "dev.ducktape.app";
 
-    /// One session-bus connection per process, opened on the first banner. A
-    /// host with no session bus answers every banner with the same skip, and
-    /// says so once.
+    /// One session-bus connection per process, opened at boot. A host with no
+    /// session bus answers every banner with the same skip, and says so once.
     fn session_bus() -> Option<&'static zbus::blocking::Connection> {
         static BUS: OnceLock<Option<zbus::blocking::Connection>> = OnceLock::new();
         BUS.get_or_init(|| match zbus::blocking::Connection::session() {
-            Ok(connection) => Some(connection),
+            Ok(connection) => {
+                record_host(HostNotifier::Ready);
+                Some(connection)
+            }
             Err(error) => {
-                tracing::debug!(
+                record_host(HostNotifier::Unavailable);
+                tracing::info!(
                     target: "ducktape::app",
                     reason = "no_session_bus",
                     %error,
@@ -423,6 +584,12 @@ mod platform {
             }
         })
         .as_ref()
+    }
+
+    /// The session bus is the whole authorization here: opening it is the
+    /// ask, and the answer is logged where it is learned.
+    pub(super) fn boot() {
+        let _ = session_bus();
     }
 
     /// The freedesktop body is markup for the servers that render it, so the
@@ -449,15 +616,30 @@ mod platform {
         // The live fold must not wait on the bus: the call runs on its own
         // thread and reports there.
         std::thread::spawn(move || {
-            if let Err(error) = notify(&bus, &notice) {
-                tracing::debug!(
+            let Err(error) = notify(&bus, &notice) else {
+                return;
+            };
+            let attempts = count_refusal();
+            let first_refusal = attempts == 1;
+            if first_refusal {
+                tracing::warn!(
                     target: "ducktape::app",
                     reason = "notify_refused",
+                    attempts,
                     room = %notice.thread,
                     %error,
-                    "skipped a desktop notification"
+                    "the notification daemon refused a desktop notification"
                 );
+                return;
             }
+            tracing::debug!(
+                target: "ducktape::app",
+                reason = "notify_refused",
+                attempts,
+                room = %notice.thread,
+                %error,
+                "the notification daemon refused a desktop notification"
+            );
         });
     }
 
@@ -506,6 +688,24 @@ mod tests {
         assert!(app_focused());
         let _ = note_window_focus(false);
         assert!(!app_focused());
+    }
+
+    /// The host's answer crosses to the Settings view as a stable token, one
+    /// per variant, and round-trips through the byte it is stored as.
+    #[test]
+    fn every_host_answer_has_its_own_token_and_survives_storage() {
+        let answers = [
+            HostNotifier::Pending,
+            HostNotifier::Ready,
+            HostNotifier::Unbundled,
+            HostNotifier::Denied,
+            HostNotifier::Unavailable,
+        ];
+        let tokens: BTreeSet<&str> = answers.iter().map(|answer| answer.token()).collect();
+        assert_eq!(tokens.len(), answers.len(), "two answers share a token");
+        for answer in answers {
+            assert_eq!(HostNotifier::from_u8(answer as u8), answer);
+        }
     }
 
     /// A message's own markup characters reach the freedesktop body escaped,

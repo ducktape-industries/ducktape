@@ -20,6 +20,8 @@ pub struct SettingsView {
     pub(crate) recovering: bool,
     pub(crate) appearance: String,
     pub(crate) desktop_notifications: bool,
+    /// the host's word on raising banners (`host::Session::desktop_notifications_host`)
+    pub(crate) desktop_notifications_host: String,
     pub(crate) unlocked: bool,
     pub(crate) seat_key: String,
     pub(crate) account_name: String,
@@ -104,6 +106,7 @@ impl SettingsView {
             recovering: false,
             appearance: "system".to_owned(),
             desktop_notifications: true,
+            desktop_notifications_host: "pending".to_owned(),
             unlocked: false,
             seat_key: "".to_owned(),
             account_name: "".to_owned(),
@@ -182,6 +185,21 @@ impl SettingsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The note under the toggle names a refusal and what to do; it says
+    /// nothing when banners are off by choice, ready, or still being decided.
+    #[test]
+    fn the_host_note_speaks_only_to_a_refusal_the_reader_can_act_on() {
+        assert_eq!(host_notifier_note(true, "ready"), "");
+        assert_eq!(host_notifier_note(true, "pending"), "");
+        assert!(host_notifier_note(true, "denied").contains("System Settings"));
+        assert!(host_notifier_note(true, "unbundled").contains("Ducktape.app"));
+        assert!(!host_notifier_note(true, "unavailable").is_empty());
+        assert_eq!(
+            host_notifier_note(false, "denied"),
+            "",
+            "off by choice: the host is moot"
+        );
+    }
     #[test]
     fn snapshot_preserves_account_drafts_and_selected_settings_pane() {
         let (mut view, _) = SettingsView::boot();
@@ -299,6 +317,7 @@ impl SettingsView {
         self.recovering = next.recovering;
         self.appearance = next.appearance.to_owned();
         self.desktop_notifications = next.desktop_notifications;
+        self.desktop_notifications_host = next.desktop_notifications_host.to_owned();
         self.unlocked = next.unlocked;
         self.seat_key = next.seat_key.to_owned();
         self.account_name = next.account_name.to_owned();
@@ -584,6 +603,25 @@ fn settings_choice(
         }),
     )
 }
+/// WHAT THE HOST SAID about banners, as the one line under the toggle that
+/// tells the reader what to do. Silent when the toggle is off (the host's
+/// answer is moot) and when the host is ready or still deciding. The tokens
+/// are `host::Session::desktop_notifications_host`'s.
+fn host_notifier_note(enabled: bool, host: &str) -> &'static str {
+    if !enabled {
+        return "";
+    }
+    match host {
+        "denied" => {
+            "macOS has notifications off for Ducktape — allow it under System Settings → Notifications → Ducktape."
+        }
+        "unbundled" => {
+            "This process is not an app bundle, so macOS cannot raise a banner — run the installed Ducktape.app, not `make dev`."
+        }
+        "unavailable" => "No notification service on this desktop.",
+        _ => "",
+    }
+}
 /// One setting on its own row: what it is and why on the left, the control
 /// that changes it on the right.
 fn setting_row(key: &str, name: &str, detail: &str, note: &str, control: wire::Node) -> wire::Node {
@@ -775,7 +813,10 @@ impl SettingsView {
                     "settings/notification",
                     "Mentions and direct messages",
                     banner,
-                    "",
+                    host_notifier_note(
+                        self.desktop_notifications,
+                        &self.desktop_notifications_host,
+                    ),
                     notifications,
                 ),
             ],
