@@ -1567,6 +1567,36 @@ impl Cluster {
         )
     }
 
+    /// run a ducktape VERB with extra environment and a piped stdin (the
+    /// `user`/`cred` families read a key password there) and return
+    /// (success, combined output).
+    pub fn run_verb_with(&self, args: &[&str], env: &[(&str, &str)], stdin: &str) -> (bool, String) {
+        use std::io::Write as _;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .args(args)
+            .envs(env.iter().copied())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn ducktape verb");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(stdin.as_bytes())
+            .expect("write the verb's stdin");
+        let out = child.wait_with_output().expect("run ducktape verb");
+        (
+            out.status.success(),
+            format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    }
+
     /// wait for node `idx` to exit ON ITS OWN (a graceful shutdown path) and
     /// reap it — the counterpart of [`Self::kill`] for restart tests.
     pub fn wait_exit(&mut self, idx: usize, timeout: Duration) {

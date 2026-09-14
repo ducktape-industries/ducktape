@@ -313,10 +313,11 @@ fn verify(args: VerifyArgs) -> CommandResult {
 // sign-bundle
 // ============================================================================
 
-/// The gateway route the enclave is served under: `<AIRLOCK_ROUTE>.<owner
-/// handle>.duck`, the label the lender daemon and the credential resolver both
-/// use (`bin/node/src/compute/cred.rs`).
-const AIRLOCK_ROUTE: &str = crate::airlock::AIRLOCK_ROUTE;
+/// The gateway route the enclave's SIGNING lane is served under:
+/// `<AIRLOCK_SIGN_ROUTE>.<owner handle>.duck` — the same enclave a provider
+/// run reaches under `airlock.<handle>.duck` (`bin/node/src/compute/cred.rs`),
+/// under the label whose signed policy admits a bundle rather than a turn.
+const AIRLOCK_SIGN_ROUTE: &str = crate::airlock::AIRLOCK_SIGN_ROUTE;
 /// The enclave's signing route.
 const SIGN_ROUTE: &str = "/sign/macos-bundle";
 /// Total deadline for the one signing request. Apple's notary wait runs
@@ -334,7 +335,7 @@ const VERSION_KEYS: [&str; 2] = ["CFBundleShortVersionString", "CFBundleVersion"
 /// route, the route's policy caps the request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SigningGateway {
-    /// `airlock.<owner-handle>.duck`
+    /// `airlock-sign.<owner-handle>.duck`
     authority: String,
     /// this node's browser-gateway base — the transport onto the overlay
     via: String,
@@ -472,7 +473,7 @@ fn resolve_signing_gateway(
         .into());
     }
     let handle = owner_handle(base, record.owner_account)?;
-    let name = gateway::RouteName::named(AIRLOCK_ROUTE);
+    let name = gateway::RouteName::named(AIRLOCK_SIGN_ROUTE);
     let route = match crate::cred_cli::query_gateway(
         base,
         &gateway::GatewayQuery::Get {
@@ -487,7 +488,7 @@ fn resolve_signing_gateway(
         .and_then(|route| route.statement.route)
         .map(|definition| definition.policy)
         .ok_or_else(|| {
-            format!("credential owner ({handle}.duck) publishes no {AIRLOCK_ROUTE} route")
+            format!("credential owner ({handle}.duck) publishes no {AIRLOCK_SIGN_ROUTE} route")
         })?;
     let via = crate::node_http::get_json(base, "/v1/gateway/browser")
         .map_err(|error| format!("read this node's browser gateway base: {error}"))?["base"]
@@ -495,7 +496,7 @@ fn resolve_signing_gateway(
         .ok_or("this node serves no browser gateway, so it cannot route a .duck authority")?
         .to_string();
     Ok(SigningGateway {
-        authority: format!("{AIRLOCK_ROUTE}.{handle}.duck"),
+        authority: format!("{AIRLOCK_SIGN_ROUTE}.{handle}.duck"),
         via,
         seal_pk: record.seal_pk,
         max_request_bytes: policy.max_request_bytes,
@@ -597,7 +598,20 @@ async fn request_signature(
         );
         return Err(format!("the gateway refused signing ({status}): {reason}").into());
     }
-    let signed = open_signed_reply(&keys, &binding, &wire)?;
+    let signed = match open_signed_reply(&keys, &binding, &wire) {
+        Ok(signed) => signed,
+        Err(error) => {
+            tracing::warn!(
+                target: "ducktape::gateway",
+                event = "release_sign_refused",
+                credential = %credential,
+                status = status.as_u16(),
+                reason = %error,
+                "release signing refused"
+            );
+            return Err(error);
+        }
+    };
     tracing::info!(
         target: "ducktape::gateway",
         event = "release_sign_received",
@@ -627,8 +641,15 @@ fn open_signed_reply(
     for item in items {
         match item {
             bodyseal::OpenedItem::Head(kind) => content_type = Some(kind),
+            // keepalives open as empty data and add nothing
             bodyseal::OpenedItem::Data(bytes) => archive.extend(bytes),
             bodyseal::OpenedItem::Final => {}
+            // The enclave commits its head before the pipeline runs, so a
+            // pipeline refusal (`bundle_shape_refused`, `notary_rejected`,
+            // …) arrives as the Final carrying the token, on a 200.
+            bodyseal::OpenedItem::Refused(reason) => {
+                return Err(format!("the gateway refused signing: {reason}").into());
+            }
         }
     }
     let is_archive = content_type.as_deref() == Some("application/zstd");
@@ -911,7 +932,7 @@ mod tests {
 
     fn target(max_request_bytes: u64) -> SigningGateway {
         SigningGateway {
-            authority: "airlock.alice.duck".into(),
+            authority: "airlock-sign.alice.duck".into(),
             via: "http://127.0.0.1:1".into(),
             seal_pk: [7; 32],
             max_request_bytes,
@@ -925,7 +946,7 @@ mod tests {
         assert!(error.starts_with("bundle_exceeds_route_cap"), "{error}");
         assert!(error.contains("1025 bytes"), "{error}");
         assert!(error.contains("admits 1024"), "{error}");
-        assert!(error.contains("airlock.alice.duck"), "{error}");
+        assert!(error.contains("airlock-sign.alice.duck"), "{error}");
     }
 
     #[test]
@@ -947,6 +968,44 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.starts_with("reply_truncated"), "{error}");
+    }
+
+    #[test]
+    fn a_refusal_after_the_head_is_refused_by_its_token_and_keepalives_add_nothing() {
+        let keys = airlock::handshake::client_handshake(&[9; 32]).1;
+        let (mut sealer, salt) = bodyseal::StreamSealer::new(&keys, b"b");
+        let mut refused = salt;
+        refused.extend(sealer.seal_head("application/zstd"));
+        refused.extend(sealer.seal_keepalive());
+        refused.extend(sealer.seal_keepalive());
+        refused.extend(sealer.seal_refused("notary_rejected"));
+        let error = open_signed_reply(&keys, b"b", &refused)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "the gateway refused signing: notary_rejected");
+
+        let (mut sealer, salt) = bodyseal::StreamSealer::new(&keys, b"c");
+        let mut completed = salt;
+        completed.extend(sealer.seal_head("application/zstd"));
+        completed.extend(sealer.seal_keepalive());
+        completed.extend(sealer.seal_chunk(b"archive"));
+        completed.extend(sealer.seal_final());
+        assert_eq!(open_signed_reply(&keys, b"c", &completed).unwrap(), b"archive");
+    }
+
+    /// The signing lane's three caps are one number: what the enclave reads
+    /// (`sign::MAX_BUNDLE_BYTES`), what the `airlock-sign` route pins, and
+    /// the module ceiling a policy may pin at all.
+    #[test]
+    fn the_signing_lane_caps_agree() {
+        assert_eq!(
+            sign::MAX_BUNDLE_BYTES as u64,
+            crate::airlock::AIRLOCK_SIGN_REQUEST_BYTES
+        );
+        assert_eq!(
+            crate::airlock::AIRLOCK_SIGN_REQUEST_BYTES,
+            gateway::MAX_REQUEST_BODY_BYTES
+        );
     }
 
     #[test]

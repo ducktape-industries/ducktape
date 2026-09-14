@@ -73,7 +73,8 @@ pub mod gateway_ws_token;
 pub mod origin_guard;
 pub use gateway_http::{
     GatewayBody, GatewayFailure, GatewayJob, GatewayLane, GatewayProxyReply, GatewayProxyRequest,
-    GatewayResponse, GatewayWsMsg, collect_body, gateway_browser_router, serve_browser_gateway,
+    GatewayResponse, GatewayWsMsg, PROXY_REPLY_TIMEOUT, collect_body, gateway_browser_router,
+    serve_browser_gateway,
 };
 // git smart-HTTP: forge as a full push+fetch remote over /forge/{repo}/….
 mod git_http;

@@ -57,8 +57,29 @@ use crate::services::{AIRLOCK_KIND, ServiceGrant};
 use crate::work_admission::{CommittedReader, account_of_key};
 
 /// The gateway route label this daemon publishes its loopback port under. A
-/// borrower resolves `<AIRLOCK_ROUTE>.<owner-handle>.duck` to it.
+/// borrower resolves `<AIRLOCK_ROUTE>.<owner-handle>.duck` to it. This is
+/// the MODEL lane: its signed policy admits [`AIRLOCK_MODEL_REQUEST_BYTES`]
+/// per request.
 pub(crate) const AIRLOCK_ROUTE: &str = "airlock";
+/// What the model lane admits per request: a `claude` turn carries multi-MB
+/// conversation context and nothing bulkier. Pinned in the `airlock` route's
+/// signed policy; the module ceiling (`gateway::MAX_REQUEST_BODY_BYTES`) is
+/// sized for the signing lane and is not this lane's number.
+pub(crate) const AIRLOCK_MODEL_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
+/// The SIGNING lane: the same enclave, under its own label, so a release
+/// bundle's cap is the sign route's and never the model lane's. Only a TEE
+/// gateway (`bin/airlock-gateway`) mounts `POST /sign/macos-bundle`, so only
+/// `cred seal --vendor apple-codesign` publishes this route; the node the
+/// enclave is fronted by binds the label to the same loopback port as
+/// `airlock`. `ducktape release sign-bundle` resolves
+/// `<AIRLOCK_SIGN_ROUTE>.<owner-handle>.duck`.
+pub(crate) const AIRLOCK_SIGN_ROUTE: &str = "airlock-sign";
+/// What the signing lane admits per request: the sealed `.tar.zst` of an
+/// unsigned bundle, the enclave's own `sign::MAX_BUNDLE_BYTES` — which is the
+/// module ceiling (`release_cli` asserts the three agree).
+pub(crate) const AIRLOCK_SIGN_REQUEST_BYTES: u64 = gateway::MAX_REQUEST_BODY_BYTES;
+// the model lane is the smaller one, or the split is pointless
+const _: () = assert!(AIRLOCK_MODEL_REQUEST_BYTES < AIRLOCK_SIGN_REQUEST_BYTES);
 
 /// How long the grant gate waits on its node.
 ///

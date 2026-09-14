@@ -271,7 +271,10 @@ async fn boot_gateway_and_upstream() -> (String, u16) {
 /// An attested gateway carrying the SIGNING toolchain (`POST /sign/macos-bundle`
 /// mounted), with Apple stubbed: `rcodesign sign` is real, the notary answers
 /// `Accepts`. The shape `bin/airlock-gateway` serves, minus Apple.
-async fn boot_signing_gateway(work_root: &std::path::Path) -> (String, u16) {
+async fn boot_signing_gateway(
+    work_root: &std::path::Path,
+    notary: airlock::sign::StubNotary,
+) -> (String, u16) {
     let (app, vendor) = server::build_with_quoter(
         GatewayConfig {
             attest: AttestMode::Tsm("snp".into()),
@@ -288,7 +291,7 @@ async fn boot_signing_gateway(work_root: &std::path::Path) -> (String, u16) {
                 entitlements: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("../../app/packaging/entitlements.plist"),
                 work_root: work_root.to_path_buf(),
-                notary: airlock::sign::Notary::Stub(airlock::sign::StubNotary::Accepts),
+                notary: airlock::sign::Notary::Stub(notary),
             }),
         },
         "snp",
@@ -370,13 +373,15 @@ fn credential_registered(cluster: &Cluster, reader: usize, name: &str) -> Option
     }
 }
 
-/// One validator node serving a loopback gateway under `airlock.alice.duck`:
-/// alice's account and handle, the port bound under the `airlock` label, the
-/// signed route committed. Returns alice's key, account and node identity.
-fn alice_serves_airlock(
+/// One validator node with alice's account and handle, and the enclave's
+/// port bound under BOTH airlock labels (`airlock`, the model lane, and
+/// `airlock-sign`, the signing lane — one gateway, two signed caps). Returns
+/// alice's account and node identity; the routes are the caller's to publish.
+fn alice_fronts_the_gateway(
     cluster: &mut Cluster,
     gw_port: u16,
-) -> (ed25519::PrivateKey, u64, Vec<u8>) {
+    alice: &ed25519::PrivateKey,
+) -> (u64, Vec<u8>) {
     // No peer, so no handshake ever completes — but the gateway plane still
     // binds and serves the node's own routes locally.
     cluster.wireguard = true;
@@ -385,14 +390,13 @@ fn alice_serves_airlock(
     cluster.wait_marker(0, "converged root_hash=", READY);
     cluster.wait_marker(0, "gateway plane: overlay stream bound", READY);
 
-    let alice = ed25519::PrivateKey::from_seed(42);
     let alice_node = Cluster::identity(0);
-    let alice_account = create_account(cluster, 0, &alice, "alice");
+    let alice_account = create_account(cluster, 0, alice, "alice");
 
     submit_frame(
         cluster,
         0,
-        &alice,
+        alice,
         "gateway",
         &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("alice".into()),
@@ -403,22 +407,35 @@ fn alice_serves_airlock(
     });
 
     let workspace = cluster.workspace(0);
-    let (ok, output) = cluster.run_verb(&[
-        "gateway",
-        "bind",
-        "--workspace",
-        workspace.to_str().unwrap(),
-        "--label",
-        "airlock",
-        "--port",
-        &gw_port.to_string(),
-        // whose signed route this node serves under the label — stated, so
-        // the harness inherits no active wallet from the host keystore.
-        "--account",
-        &alice_account.to_string(),
-    ]);
-    assert!(ok, "airlock gateway port bind failed: {output}");
+    for label in ["airlock", "airlock-sign"] {
+        let (ok, output) = cluster.run_verb(&[
+            "gateway",
+            "bind",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--label",
+            label,
+            "--port",
+            &gw_port.to_string(),
+            // whose signed route this node serves under the label — stated, so
+            // the harness inherits no active wallet from the host keystore.
+            "--account",
+            &alice_account.to_string(),
+        ]);
+        assert!(ok, "airlock gateway port bind ({label}) failed: {output}");
+    }
+    (alice_account, alice_node)
+}
 
+/// One validator node serving a loopback gateway under `airlock.alice.duck`:
+/// alice's account and handle, the port bound under the `airlock` label, the
+/// signed route committed. Returns alice's key, account and node identity.
+fn alice_serves_airlock(
+    cluster: &mut Cluster,
+    gw_port: u16,
+) -> (ed25519::PrivateKey, u64, Vec<u8>) {
+    let alice = ed25519::PrivateKey::from_seed(42);
+    let (alice_account, alice_node) = alice_fronts_the_gateway(cluster, gw_port, &alice);
     submit_frame(
         cluster,
         0,
@@ -438,40 +455,71 @@ fn alice_serves_airlock(
     (alice, alice_account, alice_node)
 }
 
-/// `ducktape release sign-bundle` through one real node: the verb resolves
-/// the credential's on-chain record to `airlock.alice.duck`, opens a sealed
-/// session through the node's browser gateway, and the enclave signs the
-/// fixture bundle with a throwaway Developer-ID-shaped identity. What comes
-/// back unpacks to a bundle `rcodesign verify` accepts, in place of the
-/// unsigned one — the `make release-app` sequence under
-/// `DUCKTAPE_SIGN_VIA=airlock`, minus `archive.sh`'s macOS-only checks.
+/// The published `max_request_bytes` of one of alice's routes.
+fn route_request_cap(cluster: &Cluster, account: u64, name: &str) -> Option<u64> {
+    let bytes = cluster.query(
+        0,
+        "gateway",
+        &gateway::encode_query(&GatewayQuery::Get {
+            account_id: account,
+            name: RouteName::named(name),
+        }),
+    )?;
+    match gateway::decode_reply(&bytes).ok()? {
+        GatewayReply::Route(record) => {
+            Some((*record)?.statement.route?.policy.max_request_bytes)
+        }
+        _ => None,
+    }
+}
+
+/// Incompressible bytes: a cap or a size on an archive is measured after
+/// zstd, which folds a constant fill to nothing.
+fn incompressible(len: usize) -> Vec<u8> {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    std::iter::repeat_with(|| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    })
+    .take(len)
+    .collect()
+}
+
+/// `ducktape release sign-bundle` through one real node, at release size and
+/// on Apple's clock: the operator enrols the identity with `cred seal
+/// --vendor apple-codesign` (the quote verified against roots given out of
+/// band, the record and both routes committed by the verb — nothing
+/// hand-signed), then the verb resolves the credential's on-chain record to
+/// `airlock-sign.alice.duck`, opens a sealed session through the node's
+/// browser gateway, and the enclave signs a ≥48 MB bundle with a throwaway
+/// Developer-ID-shaped identity while the stubbed notary answers later than
+/// the proxy's head deadline. What comes back unpacks to a bundle `rcodesign
+/// verify` accepts, in place of the unsigned one — the `make release-app`
+/// sequence under `DUCKTAPE_SIGN_VIA=airlock`, minus `archive.sh`'s
+/// macOS-only checks.
 #[test]
 fn release_sign_bundle_round_trips_through_the_node() {
     use airlock::codesign::fixture::{self as cred, Marker};
-    use airlock::sign::{self, fixture};
+    use airlock::sign::{self, StubNotary, fixture};
 
     let rt = Runtime::new().unwrap();
     let work = tempfile::tempdir().unwrap();
-    let (gw_base, gw_port) = rt.block_on(boot_signing_gateway(work.path()));
+    // Apple answers after the proxy's head deadline: the head must already
+    // be committed and the stream kept live for the reply to arrive at all.
+    let notary_delay = noded::PROXY_REPLY_TIMEOUT + Duration::from_secs(5);
+    let (gw_base, gw_port) = rt.block_on(boot_signing_gateway(
+        work.path(),
+        StubNotary::AcceptsAfter(notary_delay),
+    ));
 
-    // Credential Provider: verify the quote, seal the signing identity in.
+    // a model credential beside the signing identity, for the kind refusal
+    // below; sealed in by the client and hand-registered, as a model
+    // credential's record is not `cred seal`'s to write.
     let seal_pk = rt.block_on(async {
         let gw = AirlockClient::local(gw_base.clone());
         let seal_pk = attested_seal_pk(&gw).await;
-        gw.upload_sealed_credential(
-            &seal_pk,
-            "release-sign",
-            CredentialKind::AppleCodesign,
-            &CredentialPayload::AppleCodesign {
-                p12_b64: cred::p12_b64(cred::TEAM_ID, Marker::DeveloperIdApplication),
-                p12_password: cred::P12_PASSWORD.into(),
-                api_key_json: cred::api_key_json(),
-                team_id: cred::TEAM_ID.into(),
-            },
-        )
-        .await
-        .unwrap();
-        // a model credential beside it, for the kind refusal below
         gw.upload_sealed_credential(
             &seal_pk,
             "compute-node",
@@ -486,39 +534,165 @@ fn release_sign_bundle_round_trips_through_the_node() {
     });
 
     let mut cluster = Cluster::new(&[0], &[0]);
-    let (alice, alice_account, alice_node) = alice_serves_airlock(&mut cluster, gw_port);
-    for (name, kind) in [
-        ("release-sign", gateway::CredentialKind::AppleCodesign),
-        ("compute-node", gateway::CredentialKind::Claude),
-    ] {
-        submit_frame(
-            &cluster,
-            0,
+    // alice's wallet as the operator holds it: an encrypted key file the
+    // verbs open with the password on stdin.
+    let wallet = cluster.workspace(0).join("alice.key");
+    std::fs::create_dir_all(cluster.workspace(0)).unwrap();
+    let (_, alice) = keystore::userkey::mint_user_key(&wallet, "alice-fixture-password")
+        .expect("mint alice's wallet");
+    let (alice_account, alice_node) = alice_fronts_the_gateway(&mut cluster, gw_port, &alice);
+    submit_frame(
+        &cluster,
+        0,
+        &alice,
+        "gateway",
+        &gateway::encode_msg(&signed_set_credential(
             &alice,
-            "gateway",
-            &gateway::encode_msg(&signed_set_credential(
-                &alice,
-                &cluster.namespace,
-                alice_account,
-                &alice_node,
-                name,
-                kind,
-                seal_pk,
-            )),
-        );
-        cluster.await_committed(
-            0,
-            &format!("credential {name} registered"),
-            FINALIZE,
-            || credential_registered(&cluster, 0, name),
-        );
-    }
+            &cluster.namespace,
+            alice_account,
+            &alice_node,
+            "compute-node",
+            gateway::CredentialKind::Claude,
+            seal_pk,
+        )),
+    );
+    cluster.await_committed(0, "credential compute-node registered", FINALIZE, || {
+        credential_registered(&cluster, 0, "compute-node")
+    });
 
+    // Credential Provider: `cred seal --vendor apple-codesign` verifies the
+    // quote against the test chain's roots (given out of band, as an
+    // air-gapped operator gives AMD's), seals the identity in, and writes
+    // the on-chain half: the record under the attested seal key and the
+    // account's two airlock routes.
+    let material = tempfile::tempdir().unwrap();
+    let (ark, ask, vcek) = test_enclave().root_files().unwrap();
+    let file = |name: &str, bytes: &[u8]| -> String {
+        let path = material.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path.to_str().unwrap().to_string()
+    };
+    use base64::Engine as _;
+    let p12 = base64::engine::general_purpose::STANDARD
+        .decode(cred::p12_b64(cred::TEAM_ID, Marker::DeveloperIdApplication))
+        .unwrap();
+    let ark = file("ark.pem", &ark);
+    let ask = file("ask.pem", &ask);
+    let vcek = file("vcek.der", &vcek);
+    let p12 = file("id.p12", &p12);
+    let p12_password = file("p12.password", format!("{}\n", cred::P12_PASSWORD).as_bytes());
+    let api_key = file("AuthKey.json", cred::api_key_json().as_bytes());
+    let node = cluster.http_base(0);
+    let measurement = measurement_hex();
+    let (ok, output) = cluster.run_verb_with(
+        &[
+            "user",
+            "cred",
+            "seal",
+            "--host",
+            &gw_base,
+            "--attest",
+            "snp",
+            "--snp-product",
+            "genoa",
+            "--snp-ark",
+            &ark,
+            "--snp-ask",
+            &ask,
+            "--snp-vcek",
+            &vcek,
+            "--measurement",
+            &measurement,
+            "--vendor",
+            "apple-codesign",
+            "--name",
+            "release-sign",
+            "--p12",
+            &p12,
+            "--p12-password-file",
+            &p12_password,
+            "--api-key",
+            &api_key,
+            "--team-id",
+            cred::TEAM_ID,
+            "--key",
+            wallet.to_str().unwrap(),
+            "--node",
+            &node,
+        ],
+        &[],
+        "alice-fixture-password\n",
+    );
+    assert!(ok, "cred seal: {output}\n{}", cluster.all_log_tails(40));
+    assert!(output.contains("quote verified"), "{output}");
+    assert!(output.contains("registered release-sign"), "{output}");
+    assert!(output.contains("published airlock route"), "{output}");
+    assert!(output.contains("published airlock-sign route"), "{output}");
+    cluster.await_committed(0, "credential release-sign registered", FINALIZE, || {
+        credential_registered(&cluster, 0, "release-sign")
+    });
+    cluster.await_committed(0, "both airlock routes published", FINALIZE, || {
+        let model = route_request_cap(&cluster, alice_account, "airlock")?;
+        let sign = route_request_cap(&cluster, alice_account, "airlock-sign")?;
+        (model == 16 * 1024 * 1024 && sign == 256 * 1024 * 1024).then_some(())
+    });
+
+    // a wrong measurement never releases the identity: refused by name
+    // before anything is uploaded or registered
+    let (ok, output) = cluster.run_verb_with(
+        &[
+            "user",
+            "cred",
+            "seal",
+            "--host",
+            &gw_base,
+            "--attest",
+            "snp",
+            "--snp-product",
+            "genoa",
+            "--snp-ark",
+            &ark,
+            "--snp-ask",
+            &ask,
+            "--snp-vcek",
+            &vcek,
+            "--measurement",
+            &"22".repeat(attest::MRTD_LEN),
+            "--vendor",
+            "apple-codesign",
+            "--name",
+            "release-sign-2",
+            "--p12",
+            &p12,
+            "--p12-password-file",
+            &p12_password,
+            "--api-key",
+            &api_key,
+            "--team-id",
+            cred::TEAM_ID,
+            "--key",
+            wallet.to_str().unwrap(),
+            "--node",
+            &node,
+        ],
+        &[],
+        "alice-fixture-password\n",
+    );
+    assert!(!ok, "{output}");
+    assert!(output.contains("attestation_unverified"), "{output}");
+    assert!(!output.contains("registered release-sign-2"), "{output}");
+
+    // A release-size bundle: the fixture's shape carrying 48 MB of
+    // incompressible views, well past the model lane's 16 MiB.
     let stage = tempfile::tempdir().unwrap();
     let unsigned = fixture::stage_bundle(stage.path(), sign::BUNDLE_ID);
+    std::fs::write(
+        unsigned.join("Contents/Resources/views/huge.wasm"),
+        incompressible(48 * 1024 * 1024),
+    )
+    .unwrap();
     let unsigned_app = std::fs::read(unsigned.join("Contents/MacOS/ducktape-app")).unwrap();
     let out = stage.path().join("Ducktape-signed.tar.zst");
-    let node = cluster.http_base(0);
     let bundle_arg = unsigned.to_str().unwrap();
     let out_arg = out.to_str().unwrap();
     let stage_arg = stage.path().to_str().unwrap();
@@ -556,6 +730,7 @@ fn release_sign_bundle_round_trips_through_the_node() {
     assert!(output.contains("release-sign"), "{output}");
 
     // the round trip, unpacked in place of the unsigned bundle
+    let started = std::time::Instant::now();
     let (ok, output) = cluster.run_verb(&[
         "release",
         "sign-bundle",
@@ -570,15 +745,30 @@ fn release_sign_bundle_round_trips_through_the_node() {
         &node,
     ]);
     assert!(ok, "sign-bundle: {output}\n{}", cluster.all_log_tails(40));
+    assert!(
+        started.elapsed() >= notary_delay,
+        "the reply cannot precede the notary's answer"
+    );
+    assert!(output.contains("airlock-sign.alice.duck"), "{output}");
     assert!(output.contains("release_sign_submitted"), "{output}");
     assert!(output.contains("release_sign_received"), "{output}");
     let signed_archive = std::fs::read(&out).unwrap();
-    assert!(!signed_archive.is_empty());
+    assert!(
+        signed_archive.len() >= 48 * 1024 * 1024,
+        "the signed archive carries the views back ({} bytes)",
+        signed_archive.len()
+    );
 
     let signed = stage.path().join(sign::BUNDLE_NAME);
     sign::validate_layout(&signed).unwrap();
     let signed_app = std::fs::read(signed.join("Contents/MacOS/ducktape-app")).unwrap();
     assert_ne!(signed_app, unsigned_app, "the executable came back signed");
+    assert_eq!(
+        std::fs::metadata(signed.join("Contents/Resources/views/huge.wasm"))
+            .unwrap()
+            .len(),
+        48 * 1024 * 1024
+    );
     for executable in ["ducktape-launcher", "ducktape-app"] {
         let verify = std::process::Command::new(fixture::rcodesign())
             .arg("verify")
@@ -601,34 +791,6 @@ fn release_sign_bundle_round_trips_through_the_node() {
         std::fs::read_dir(work.path()).unwrap().next().is_none(),
         "the enclave's work dir is empty after the request"
     );
-
-    // a bundle past the route's published per-request cap (1 MiB here) is
-    // refused by name before anything is sent. Incompressible bytes: the
-    // cap is on the archive, and zstd folds a constant fill to nothing.
-    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-    let huge: Vec<u8> = std::iter::repeat_with(|| {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state as u8
-    })
-    .take(2 * 1024 * 1024)
-    .collect();
-    std::fs::write(signed.join("Contents/Resources/views/huge.wasm"), huge).unwrap();
-    let (ok, output) = cluster.run_verb(&[
-        "release",
-        "sign-bundle",
-        bundle_arg,
-        "--credential",
-        "release-sign",
-        "--out",
-        out_arg,
-        "--node",
-        &node,
-    ]);
-    assert!(!ok, "{output}");
-    assert!(output.contains("bundle_exceeds_route_cap"), "{output}");
-    assert!(output.contains("airlock.alice.duck"), "{output}");
 }
 
 // TODO(full-spec, needs hardware): this proves the node-to-node overlay hop with
