@@ -549,7 +549,17 @@ impl PagesView {
     fn on_select_reply_thread(&mut self, id: String) -> Task<Message> {
         self.reply_draft = "".to_owned();
         self.reply_thread = crate::host::reply_thread_after_press(&(self.reply_thread), &(id));
-        Task::none()
+        let closed = self.reply_thread.is_empty();
+        if closed {
+            return Task::none();
+        }
+        // The reply box opened to be written in: the keyboard moves to it, or
+        // the next keystroke lands in the page composer below.
+        ::ducktape_view_guest::widget::perform::<Message>(
+            ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                target: format!("{PAGE_KEY}/thread-reply({id})"),
+            },
+        )
     }
     fn on_toggle_thread_replies(&mut self, id: String) -> Task<Message> {
         self.expanded_threads =

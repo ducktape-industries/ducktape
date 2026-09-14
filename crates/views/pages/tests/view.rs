@@ -481,6 +481,14 @@ fn the_foot_composer_opens_a_new_thread_on_the_scope() {
 fn a_reply_inherits_its_threads_own_anchor() {
     let frame = page_card();
     let frame = tick_native(press(&frame, "Reply to this thread"));
+    // the reply box opened to be written in: the keyboard moves to it
+    let focus = request(&frame, "host.widget");
+    assert_eq!(
+        wire::decode::<wire::WidgetCommand>(&focus.payload).unwrap(),
+        wire::WidgetCommand::Focus {
+            target: "PagesView/root/pages/thread-reply(t-page)".into()
+        }
+    );
     let frame = tick_native(type_into(&frame, "Reply…", "agreed"));
     let frame = tick_native(press(&frame, "Post reply"));
 
