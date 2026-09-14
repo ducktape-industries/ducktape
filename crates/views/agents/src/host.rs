@@ -1526,7 +1526,20 @@ impl LiveRun {
     pub fn process_label(&self, running: bool) -> String {
         if let Some(ms) = self.elapsed_ms {
             let seconds = ms / 1000;
-            return format!("Worked for {}m {}s", seconds / 60, seconds % 60);
+            let minutes = seconds / 60;
+            let hours = minutes / 60;
+            let days = hours / 24;
+            return match (days, hours, minutes) {
+                (0, 0, 0) => format!("Worked for {seconds}s"),
+                (0, 0, _) => format!("Worked for {minutes}m {}s", seconds % 60),
+                (0, _, _) => format!("Worked for {hours}h {}m {}s", minutes % 60, seconds % 60),
+                _ => format!(
+                    "Worked for {days}d {}h {}m {}s",
+                    hours % 24,
+                    minutes % 60,
+                    seconds % 60,
+                ),
+            };
         }
         match running {
             true => "Working…".into(),
@@ -2691,6 +2704,36 @@ mod process_tests {
                 .all(|step| step.body.len() <= MAX_TRACE_EVENT_BYTES + '…'.len_utf8())
         );
         assert!(run.process.last().unwrap().body.ends_with('…'));
+    }
+
+    #[test]
+    fn elapsed_labels_carry_seconds_minutes_hours_and_days_at_their_boundaries() {
+        for (elapsed_ms, expected) in [
+            (0, "Worked for 0s"),
+            (999, "Worked for 0s"),
+            (1_000, "Worked for 1s"),
+            (59_999, "Worked for 59s"),
+            (60_000, "Worked for 1m 0s"),
+            (3_599_999, "Worked for 59m 59s"),
+            (3_600_000, "Worked for 1h 0m 0s"),
+            (3_661_999, "Worked for 1h 1m 1s"),
+            (86_399_999, "Worked for 23h 59m 59s"),
+            (86_400_000, "Worked for 1d 0h 0m 0s"),
+            (90_061_999, "Worked for 1d 1h 1m 1s"),
+            (172_800_000, "Worked for 2d 0h 0m 0s"),
+            (u64::MAX, "Worked for 213503982334d 14h 25m 51s"),
+        ] {
+            let mut run = LiveRun::default();
+            output(
+                &mut run,
+                json!({"type":"run_control","state":"closed","elapsed_ms":elapsed_ms}),
+            );
+            assert_eq!(
+                run.process_label(false),
+                expected,
+                "elapsed_ms={elapsed_ms}"
+            );
+        }
     }
 
     #[test]

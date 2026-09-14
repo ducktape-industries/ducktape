@@ -1004,9 +1004,14 @@ fn claude_thinking_tools_and_steering_share_the_process_without_ending_on_interr
             .any(|text| text.contains("app.rs") && text.contains("the file contents"))
     );
     let frame = tick_native(vec![line(
-        json!({"type":"run_control","state":"closed","elapsed_ms":3601000}),
+        json!({"type":"run_control","state":"closed","elapsed_ms":90061000}),
     )]);
-    assert!(has_text(&frame, "▾ Worked for 60m 1s"));
+    assert!(has_text(&frame, "▾ Worked for 1d 1h 1m 1s"));
+    let frame = tick_native(press(&frame, "▾ Worked for 1d 1h 1m 1s"));
+    assert!(has_text(&frame, "▸ Worked for 1d 1h 1m 1s"));
+    assert!(!markdown_texts(&frame).contains(&"Inspect **wrapping** first.".into()));
+    let frame = tick_native(press(&frame, "▸ Worked for 1d 1h 1m 1s"));
+    assert!(markdown_texts(&frame).contains(&"Inspect **wrapping** first.".into()));
     let frame = tick_native(press(&frame, "Close journal"));
-    assert!(!has_text(&frame, "▾ Worked for 60m 1s"));
+    assert!(!has_text(&frame, "▾ Worked for 1d 1h 1m 1s"));
 }
