@@ -1343,6 +1343,8 @@ impl DesktopWindow {
         };
         let stage = state.huddle_stage.clone();
         let video_live = state.call_video_live;
+        let invitees =
+            crate::backend::huddle_invitees(&state.huddle_invitees, &state.huddle_roster);
         let (muted, camera_on, sharing) = (state.call_muted, state.call_camera, state.call_sharing);
         let rows = state.huddle_rows.clone();
         let row_count = rows.len();
@@ -1450,6 +1452,42 @@ impl DesktopWindow {
             .flex_1()
             .min_h_0(),
         );
+        // The room's members not seated yet, one chip each: a press posts a
+        // mention into the room that says come join, and the chip is gone —
+        // an invite is sent once.
+        if !invitees.is_empty() {
+            use gpui_kit::component::Sizable as _;
+            let mut chips = div().flex().flex_wrap().gap_1();
+            for member in invitees {
+                chips = chips.child(
+                    self.action(
+                        format!("huddle-invite-{}", member.key),
+                        member.label.clone(),
+                        Message::InviteToHuddle(member.key.clone()),
+                        false,
+                    )
+                    .outline()
+                    .xsmall(),
+                );
+            }
+            body = body.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(colors.border)
+                    .child(
+                        div()
+                            .pb_1()
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(colors.muted_foreground)
+                            .child("Invite"),
+                    )
+                    .child(chips),
+            );
+        }
         // The control bar reads left to right as media, then the room, then
         // the exit: a toggle that is ON is filled so its state is visible
         // without reading the label (a muted mic is the red one).
@@ -1521,17 +1559,8 @@ impl DesktopWindow {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(
-                        div()
-                            .size(px(8.))
-                            .rounded_full()
-                            .bg(live_dot),
-                    )
-                    .child(
-                        div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(title),
-                    )
+                    .child(div().size(px(8.)).rounded_full().bg(live_dot))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(title))
                     .child(
                         div()
                             .font_family(design::fonts::FAMILY_MONO)
@@ -1683,7 +1712,11 @@ impl DesktopWindow {
         } else {
             modifiers.control = true;
         }
-        let shortcut = if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl K" };
+        let shortcut = if cfg!(target_os = "macos") {
+            "⌘K"
+        } else {
+            "Ctrl K"
+        };
         let ink = RailInk {
             fg: ink_fg,
             muted: ink_muted,
@@ -1729,13 +1762,7 @@ impl DesktopWindow {
             live,
         )
         .when(bell_unread > 0, |row| {
-            row.child(
-                div()
-                    .flex_shrink_0()
-                    .size(px(6.))
-                    .rounded_full()
-                    .bg(accent),
-            )
+            row.child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(accent))
         })
         .on_click(cx.listener(move |this, _, _, cx| {
             cx.stop_propagation();
@@ -1990,9 +2017,14 @@ impl DesktopWindow {
                             .shadow_md()
                             .child(div().flex_1().text_size(px(12.5)).child(toast))
                             .child(
-                                self.action("toast-dismiss", "Dismiss", Message::DismissToast, false)
-                                    .ghost()
-                                    .h_7(),
+                                self.action(
+                                    "toast-dismiss",
+                                    "Dismiss",
+                                    Message::DismissToast,
+                                    false,
+                                )
+                                .ghost()
+                                .h_7(),
                             ),
                     )
                 }),
@@ -2457,7 +2489,10 @@ mod close_tests {
                 assert_eq!(theme.radius, gpui_kit::px(design::radius::CONTROL as f32));
                 assert_eq!(theme.radius_lg, gpui_kit::px(design::radius::CARD as f32));
                 assert_eq!(theme.highlight_theme.appearance, mode);
-                assert_eq!(theme.highlight_theme.style.editor_background, Some(theme.background));
+                assert_eq!(
+                    theme.highlight_theme.style.editor_background,
+                    Some(theme.background)
+                );
                 let background: gpui_kit::Rgba = theme.background.into();
                 let [r, g, b, _] = palette.background;
                 let close = |a: f32, b: f32| (a - b).abs() < 1.5 / 255.;

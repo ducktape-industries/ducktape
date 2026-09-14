@@ -61,6 +61,41 @@ pub(crate) fn huddle_roster(
         .collect()
 }
 
+/// Who the huddle window offers to invite: the room's members not yet seated,
+/// the reader included among the seated. A member row's key is a bare user
+/// key or an `acct:` handle; a seat's is a party handle — `member_id` makes
+/// them comparable.
+// ponytail: a voice room's seats (`roster_of_seats`) carry the NODE key, not
+// the party, so those match by label — both come off the one name directory.
+// Carry the party on `HuddleSeat` when a same-named pair shows up (a module
+// byte change, so a pin move).
+pub(crate) fn huddle_invitees(
+    members: &[ChatMember],
+    roster: &[HuddleParticipant],
+) -> Vec<ChatMember> {
+    members
+        .iter()
+        .filter(|member| {
+            let seated = roster
+                .iter()
+                .any(|seat| member_id(&seat.key) == member.key || seat.label == member.label);
+            !seated
+        })
+        .cloned()
+        .collect()
+}
+
+/// The invite is a post in the room addressed to the person: the mention is
+/// what reaches them (the desktop banner names the room and the sender), and
+/// the room's own timeline shows who was asked. `key` is a member row's key.
+pub(crate) fn huddle_invite_text(key: &str, room: &str) -> String {
+    let mention = match key.strip_prefix("acct:") {
+        Some(account) => format!("<@{account}>"),
+        None => format!("<@key:{key}>"),
+    };
+    format!("{mention} come join the huddle in #{room}")
+}
+
 /// The roster as the room list shows it under the room: a name, its
 /// initials, and whether the seat is the reader's own.
 pub(crate) fn huddle_seats(
@@ -525,4 +560,41 @@ pub async fn search_pages(
     }
     .await;
     result.map_err(app_error)
+}
+
+#[cfg(test)]
+mod invite_tests {
+    use super::*;
+
+    #[test]
+    fn invitees_are_the_unseated_members_and_the_invite_mentions_them() {
+        let member = |key: &str| ChatMember {
+            key: key.into(),
+            label: key.into(),
+        };
+        let seat = |key: &str| HuddleParticipant {
+            key: key.into(),
+            label: String::new(),
+            initials: String::new(),
+            is_agent: false,
+            is_you: false,
+            joined_at: 0,
+            node: String::new(),
+        };
+        let members = [member("aa"), member("bb"), member("acct:7")];
+        let roster = [seat("user:aa"), seat("acct:7")];
+        let left: Vec<_> = huddle_invitees(&members, &roster)
+            .into_iter()
+            .map(|member| member.key)
+            .collect();
+        assert_eq!(left, vec!["bb"]);
+        assert_eq!(
+            huddle_invite_text("bb", "lounge"),
+            "<@key:bb> come join the huddle in #lounge"
+        );
+        assert_eq!(
+            huddle_invite_text("acct:7", "lounge"),
+            "<@7> come join the huddle in #lounge"
+        );
+    }
 }
