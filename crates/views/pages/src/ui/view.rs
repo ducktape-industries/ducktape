@@ -51,6 +51,13 @@ pub struct PagesView {
     pub(crate) pages_pane_width: f64,
     pub(crate) sidebar_width: f64,
     pub(crate) page_menu_open: bool,
+    /// The sidebar row whose "…" menu is open; empty when none is.
+    pub(crate) page_menu_page: String,
+    /// The page the delete dialog asks about; empty when it is closed.
+    pub(crate) page_delete_page: String,
+    /// Where the last press landed on the view, so a menu opens there.
+    pub(crate) press_x: f64,
+    pub(crate) press_y: f64,
     pub(crate) page_create_open: bool,
     pub(crate) active_page: String,
     pub(crate) active_page_title: String,
@@ -102,8 +109,11 @@ pub enum Message {
     PageAutosaveTick,
     TogglePageCreate,
     CreatePageSubmit,
-    ArmPageDelete,
+    ArmPageDelete(String),
     DisarmPageDelete,
+    AddSubpage(String),
+    OpenPageRowMenu(String),
+    PressedAt(f64, f64),
     DeletePageSubmit,
     SearchPagesSubmit,
     ClearPageSearch,
@@ -183,6 +193,10 @@ impl PagesView {
             pages_pane_width: 1280.0,
             sidebar_width: 230.0,
             page_menu_open: false,
+            page_menu_page: "".to_owned(),
+            page_delete_page: "".to_owned(),
+            press_x: 0.,
+            press_y: 0.,
             page_create_open: false,
             active_page: "".to_owned(),
             active_page_title: "".to_owned(),
@@ -391,6 +405,84 @@ mod tests {
         let restored = PagesView::restore(&snapshot).unwrap();
         assert_eq!(restored.snapshot().unwrap(), snapshot);
     }
+    /// A sidebar row carries "…" and "+": the "+" asks the host for a page
+    /// inside and unfolds the parent so the newcomer shows; the "…" (or a
+    /// right press) opens the row's own menu at the last press, whose
+    /// Delete arms the dialog for THAT page, not the open one.
+    #[test]
+    fn a_sidebar_row_adds_a_subpage_and_opens_its_own_menu() {
+        use ducktape_view_guest::testing::keys;
+        let page = |id: &str, parent: &str, depth: usize, children: i64| crate::host::PageItem {
+            id: id.into(),
+            title: id.to_uppercase(),
+            parent: parent.into(),
+            prefix: "  ".repeat(depth),
+            child_count: children,
+        };
+        let (mut app, _) = PagesView::boot();
+        app.connected = true;
+        app.active_page = "alpha".into();
+        app.pages = vec![
+            page("alpha", "", 0, 1),
+            page("alpha-child", "alpha", 1, 0),
+            page("beta", "", 0, 0),
+        ];
+        app.update(Message::TogglePageFold("alpha".into()));
+        let frame = wire::Frame {
+            root: Some(app.view()),
+            ..Default::default()
+        };
+        let present = keys(&frame);
+        let has = |present: &[String], key: &str| present.iter().any(|k| k == key);
+        assert!(has(&present, "PagesView/root/pages/page/beta/add"));
+        assert!(has(&present, "PagesView/root/pages/page/beta/more"));
+        assert!(has(&present, "PagesView/root/pages/page/beta/area"));
+        assert!(!has(&present, "PagesView/root/pages/page/beta/menu"));
+        assert!(!has(&present, "PagesView/root/pages/menu-backdrop"));
+
+        app.update(Message::AddSubpage("alpha".into()));
+        assert!(app.busy, "the host is asked for the page");
+        assert!(
+            app.folded_pages.is_empty(),
+            "the parent unfolds for its newcomer"
+        );
+
+        app.busy = false;
+        app.update(Message::PressedAt(120., 200.));
+        app.update(Message::OpenPageRowMenu("beta".into()));
+        let frame = wire::Frame {
+            root: Some(app.view()),
+            ..Default::default()
+        };
+        let opened = keys(&frame);
+        assert!(has(&opened, "PagesView/root/pages/page/beta/menu"));
+        assert!(has(&opened, "PagesView/root/pages/page/beta/menu/delete"));
+        assert!(has(&opened, "PagesView/root/pages/menu-backdrop"));
+
+        app.update(Message::ArmPageDelete("beta".into()));
+        assert!(app.page_delete_armed);
+        assert_eq!(app.page_delete_page, "beta");
+        assert_eq!(app.page_menu_page, "", "the menu closes behind the dialog");
+        assert_eq!(app.active_page, "alpha", "the open page is not the target");
+        let frame = wire::Frame {
+            root: Some(app.view()),
+            ..Default::default()
+        };
+        assert!(!has(&keys(&frame), "PagesView/root/pages/page/beta/menu"));
+
+        app.update(Message::DeletePageSubmit);
+        assert!(app.busy);
+        assert_eq!(app.active_page, "alpha", "deleting a sibling moves nothing");
+
+        app.busy = false;
+        app.update(Message::ArmPageDelete("alpha".into()));
+        app.update(Message::DeletePageSubmit);
+        assert_eq!(
+            app.active_page, "",
+            "deleting the open root lands on the list"
+        );
+    }
+
     /// The sidebar is Notion's page tree: a child sits one step under its
     /// parent, a parent carries a fold toggle, and folding it hides its
     /// whole subtree — and only that.
