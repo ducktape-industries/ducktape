@@ -5489,11 +5489,14 @@ pub(crate) mod tests {
     }
 
     /// A load starts at a view's source event and never at a draw: the only
-    /// callers of `spawn_load` are the boot, the connect and the block
-    /// check (the registry-listed seats they share, `seat_registered_views`,
-    /// is called by the connect's registry read and the block check alone),
-    /// and the views the shell draws by name are exactly the ones those ask
-    /// for — a registered view is drawn by the id the registry listed.
+    /// callers of `spawn_load` are the boot, the connect, the block check
+    /// (the registry-listed seats they share, `seat_registered_views`, is
+    /// called by the connect's registry read and the block check alone),
+    /// and a taste — the member's own act (`retaste`) or the connect's
+    /// registry read seating what the device remembered
+    /// (`seat_remembered_tastes`). The views the shell draws by name are
+    /// exactly the ones those ask for — a registered view is drawn by the
+    /// id the registry listed.
     #[test]
     fn a_load_starts_at_a_source_event_never_at_a_draw() {
         use crate::backend::view_source::{DESKTOP_OWNED, MODULE_OWNED};
@@ -5528,9 +5531,11 @@ pub(crate) mod tests {
                 "booted",
                 "connected",
                 "deployments_check",
-                "seat_registered_views"
+                "retaste",
+                "seat_registered_views",
+                "seat_remembered_tastes",
             ]),
-            "a load started outside the boot, the connect and the block check"
+            "a load started outside the boot, the connect, the block check and a taste"
         );
         let registered_callers: BTreeSet<&str> = shell
             .lines()

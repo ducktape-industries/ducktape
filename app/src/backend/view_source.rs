@@ -579,7 +579,10 @@ pub(crate) mod tests {
 
         /// Every `rpc.query` for `target` answers `reply` from now on.
         pub(crate) fn answer_query(&self, target: &str, reply: serde_json::Value) {
-            self.queries.lock().unwrap().insert(target.to_owned(), reply);
+            self.queries
+                .lock()
+                .unwrap()
+                .insert(target.to_owned(), reply);
         }
 
         /// Every `files.get` on `lane` answers `reply` from now on.
@@ -690,9 +693,11 @@ pub(crate) mod tests {
                             .next()
                             .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
                             .and_then(|ask| ask["target"].as_str().map(str::to_owned));
-                        let answered = target
-                            .and_then(|target| deployment.queries.lock().unwrap().get(&target).cloned());
-                        let reply = answered.unwrap_or_else(|| deployment.status.lock().unwrap().clone());
+                        let answered = target.and_then(|target| {
+                            deployment.queries.lock().unwrap().get(&target).cloned()
+                        });
+                        let reply =
+                            answered.unwrap_or_else(|| deployment.status.lock().unwrap().clone());
                         ("200 OK", reply.to_string().into_bytes())
                     } else if let Some(digest) = route.strip_prefix("/v1/files/blob/") {
                         let hold = deployment.hold.lock().unwrap().take();
@@ -722,9 +727,7 @@ pub(crate) mod tests {
                             .rsplit("\r\n\r\n")
                             .next()
                             .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
-                            .and_then(|ask| {
-                                ask.as_object()?.keys().next().cloned()
-                            });
+                            .and_then(|ask| ask.as_object()?.keys().next().cloned());
                         let answered = shape.and_then(|shape| {
                             let views = deployment.index_views.lock().unwrap();
                             views.get(module)?.get(&shape).cloned()
@@ -819,7 +822,11 @@ pub(crate) mod tests {
                     index += 3;
                 }
                 None => {
-                    out.push(if bytes[index] == b'+' { b' ' } else { bytes[index] });
+                    out.push(if bytes[index] == b'+' {
+                        b' '
+                    } else {
+                        bytes[index]
+                    });
                     index += 1;
                 }
             }
@@ -842,7 +849,11 @@ pub(crate) mod tests {
             let head = String::from_utf8_lossy(&request[..head_end]).into_owned();
             let content_length = head
                 .lines()
-                .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(str::to_owned))
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::to_owned)
+                })
                 .and_then(|value| value.trim().parse::<usize>().ok())
                 .unwrap_or(0);
             let complete = request.len() >= head_end + 4 + content_length;
@@ -1115,7 +1126,12 @@ pub(crate) mod tests {
             }
         );
         let (_, rows) = taste_set(&client, &entries).await.unwrap();
-        assert_eq!(rows[0].stage, Stage::Scheduled { activation_height: 40 });
+        assert_eq!(
+            rows[0].stage,
+            Stage::Scheduled {
+                activation_height: 40
+            }
+        );
         assert_eq!(rows[0].proposal, None);
         assert_eq!(rows.len(), 2);
         // past its height and never latched: stale, and nobody's to taste

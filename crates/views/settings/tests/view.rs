@@ -617,8 +617,16 @@ fn proposed_views_are_tried_and_left_from_the_network_tab() {
     };
     let (frame, props, _) = connected(&session, 1);
     let frame = tick_native(press(&frame, "Network"));
-    for expected in ["Proposed views", "Chat", "abababababab · proposal prop-code · on the ballot"] {
-        assert!(has_text(&frame, expected), "missing {expected:?} in {:?}", texts(&frame));
+    for expected in [
+        "Proposed views",
+        "Chat",
+        "abababababab · proposal prop-code · on the ballot",
+    ] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
     }
     let frame = tick_native(press(&frame, "Try this view"));
     let taste: settings_view::host::Taste =
@@ -631,7 +639,11 @@ fn proposed_views_are_tried_and_left_from_the_network_tab() {
         ..facts()
     };
     let frame = tick_native(vec![item(props, &encoded(&tasting))]);
-    assert!(has_text(&frame, "You are trying this view"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "You are trying this view"),
+        "{:?}",
+        texts(&frame)
+    );
     assert!(!has_text(&frame, "Try this view"), "{:?}", texts(&frame));
     let frame = tick_native(press(&frame, "Back to current"));
     let untaste: settings_view::host::Untaste =

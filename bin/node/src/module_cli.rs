@@ -1079,8 +1079,8 @@ mod tests {
             Ok(Precheck::Proceed)
         ));
         let live = vec!["identity".to_string()];
-        let err = registry_precheck(Verb::Register, &[], &live, "identity", module, &ours)
-            .unwrap_err();
+        let err =
+            registry_precheck(Verb::Register, &[], &live, "identity", module, &ours).unwrap_err();
         assert!(err.contains("already registered"), "{err}");
         let err =
             registry_precheck(Verb::Update, &[], &live, "identity", module, &ours).unwrap_err();
@@ -1108,7 +1108,9 @@ mod tests {
         let same_update = matches_module_action(Verb::Update, "hello", &hash, 100);
         assert!(same_update(&update));
         assert!(!same_update(&register), "register is not update");
-        assert!(!same_update(&Verb::Update.action("other", module, 100, hash)));
+        assert!(!same_update(
+            &Verb::Update.action("other", module, 100, hash)
+        ));
         assert!(!same_update(&Verb::Update.action(
             "hello",
             module,
@@ -1118,7 +1120,9 @@ mod tests {
         // activation_lead is now a fixed part of the action's identity (it is
         // relative to the EXECUTE height, so it never goes stale): a
         // different lead is a DIFFERENT proposal, not one to join.
-        assert!(!same_update(&Verb::Update.action("hello", module, 999, hash)));
+        assert!(!same_update(
+            &Verb::Update.action("hello", module, 999, hash)
+        ));
         let same_register = matches_module_action(Verb::Register, "hello", &hash, 100);
         assert!(same_register(&register));
         assert!(!same_register(&update));

@@ -491,10 +491,7 @@ impl GovernanceView {
             Some(slots::message(message)),
             wire::ButtonPreset::Secondary,
         );
-        kit::centered_row(
-            format!("{key}/taste"),
-            [status, kit::spacer(), button],
-        )
+        kit::centered_row(format!("{key}/taste"), [status, kit::spacer(), button])
     }
     /// The validator's controls on one open proposal: a note while an op
     /// is out, then Reject and Approve, or Settle once the rule is met.

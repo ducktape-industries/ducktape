@@ -1113,10 +1113,7 @@ impl SettingsView {
             return network;
         }
         kit::spaced(
-            kit::column(
-                "settings/network-panes",
-                [network, self.proposed_views()],
-            ),
+            kit::column("settings/network-panes", [network, self.proposed_views()]),
             24.,
         )
     }

@@ -299,25 +299,29 @@ fn forget_in(prefs: &mut serde_json::Value, chain_id: &str, module: &str) {
 // ---------- the notices ----------
 
 /// A sentence for the member about their taste — the proposed view was
-/// withdrawn, or became the current one — on its way to the app's toast.
-fn notices() -> &'static (
-    tokio::sync::mpsc::UnboundedSender<String>,
-    Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
-) {
-    static NOTICES: OnceLock<(
-        tokio::sync::mpsc::UnboundedSender<String>,
-        Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
-    )> = OnceLock::new();
+/// withdrawn, or became the current one — on its way to the app's toast:
+/// the sender every seat writes, and the receiver the one subscriber
+/// takes.
+struct Notices {
+    sender: tokio::sync::mpsc::UnboundedSender<String>,
+    receiver: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+}
+
+fn notices() -> &'static Notices {
+    static NOTICES: OnceLock<Notices> = OnceLock::new();
     NOTICES.get_or_init(|| {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        (sender, Mutex::new(Some(receiver)))
+        Notices {
+            sender,
+            receiver: Mutex::new(Some(receiver)),
+        }
     })
 }
 
 pub(crate) fn notice(text: String) {
     #[cfg(test)]
     noticed().lock().expect("taste notices").push(text.clone());
-    let _ = notices().0.send(text);
+    let _ = notices().sender.send(text);
 }
 
 /// Every notice so far, for a test to read: the stream is one
@@ -337,7 +341,7 @@ pub(crate) fn take_notices() -> Vec<String> {
 /// Every notice, as a stream the app subscribes to once: the receiver is
 /// taken by the first subscriber, and a second gets nothing.
 pub(crate) fn notice_stream() -> impl futures::Stream<Item = String> {
-    let receiver = notices().1.lock().expect("taste notices").take();
+    let receiver = notices().receiver.lock().expect("taste notices").take();
     futures::stream::unfold(receiver, |receiver| async move {
         let mut receiver = receiver?;
         let text = receiver.recv().await?;

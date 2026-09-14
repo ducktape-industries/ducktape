@@ -171,7 +171,8 @@ mod tests {
             index: Some(vec![9]),
             view: Some(view.clone()),
         });
-        let frame = |artifact: &Artifact| verified_frame(&artifact.encode(), artifact.hash()).unwrap();
+        let frame =
+            |artifact: &Artifact| verified_frame(&artifact.encode(), artifact.hash()).unwrap();
         assert_eq!(frame(&with).core, Some(without.hash()));
         assert_eq!(frame(&without).core, Some(without.hash()));
         assert_ne!(frame(&other_core).core, frame(&with).core);
