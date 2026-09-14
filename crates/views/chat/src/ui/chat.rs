@@ -293,8 +293,9 @@ impl ChatView {
         } else if !self.active_channel.is_empty() {
             header.push(self.start_huddle(format!("{key}/huddle"), || Message::JoinHuddleSubmit));
         }
-        header.push(subtle(
+        header.push(glyph(
             format!("{key}/details"),
+            "Details",
             "Channel details",
             Message::ToggleChannelSettings,
             self.active_channel.is_empty(),
@@ -727,7 +728,13 @@ impl ChatView {
         } = &mut scroll
         {
             *virtual_rows = true;
-            *anchor_y = wire::ScrollAnchor::End;
+            // a room grows upward from its composer; a thread reads down
+            // from its root, and new replies are paged in after it
+            *anchor_y = if thread {
+                wire::ScrollAnchor::Start
+            } else {
+                wire::ScrollAnchor::End
+            };
             if !thread {
                 *on_scroll = Some(slots::handler::<(f32, f32, f32, f32), Message>(Box::new(
                     |(x, y, rx, ry)| {
@@ -951,32 +958,37 @@ impl ChatView {
         )
     }
     fn channel_details(&self, key: String) -> wire::Node {
-        let mut about = vec![native::heading(
+        // the room by its name, its badges beside it, and the link action
+        // on its own left-aligned row (a lone button would centre itself)
+        let mut title = vec![native::nowrap(native::heading(
             format!("{key}/name"),
-            &self.active_channel_name,
-        )];
-        let mut badges = Vec::new();
+            format!("#{}", self.active_channel_name),
+        ))];
         if self.active_channel_archived {
-            badges.push(self.archived_badge(format!("{key}/archived")));
+            title.push(self.archived_badge(format!("{key}/archived")));
         }
         if self.active_channel_members_only {
-            badges.push(self.private_badge(format!("{key}/private")));
+            title.push(self.private_badge(format!("{key}/private")));
         }
-        if !badges.is_empty() {
-            about.push(native::row(format!("{key}/badges"), badges));
-        }
-        about.push(subtle(
-            format!("{key}/link"),
-            "Copy channel link",
-            Message::CopyToClipboard(
-                crate::host::duck_channel_link(
-                    self.active_channel.clone(),
-                    self.network_chain_id.clone(),
-                ),
-                "Channel link copied".into(),
+        let about = vec![
+            native::spaced(native::centered_row(format!("{key}/title-row"), title), 8.),
+            native::row(
+                format!("{key}/link-row"),
+                [glyph(
+                    format!("{key}/link"),
+                    "🔗 Copy link",
+                    "Copy channel link",
+                    Message::CopyToClipboard(
+                        crate::host::duck_channel_link(
+                            self.active_channel.clone(),
+                            self.network_chain_id.clone(),
+                        ),
+                        "Channel link copied".into(),
+                    ),
+                    false,
+                )],
             ),
-            false,
-        ));
+        ];
         let rename = native::column(
             format!("{key}/rename-section"),
             [
