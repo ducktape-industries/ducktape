@@ -243,7 +243,7 @@ impl ChatView {
             on_move: None,
             on_press_at: None,
             on_scroll: None,
-            content: Box::new(Self::message_body(
+            content: Box::new(self.message_body(
                 format!("{key}/body"),
                 &message.blocks,
                 Some(slots::handler::<String, Message>(Box::new(|link| {
@@ -344,6 +344,7 @@ impl ChatView {
         native::spaced(native::column(key, children), 3.)
     }
     pub(super) fn message_body(
+        &self,
         key: String,
         blocks: &[crate::host::ChatBlock],
         on_link: Option<u32>,
@@ -354,7 +355,12 @@ impl ChatView {
             let scope = format!("{key}/block/{index}");
             let content = match block.kind.as_str() {
                 "divider" => native::divider(scope),
-                "attachment" => Self::attachment_card(scope, block),
+                "attachment" => match self.pictures.get(&block.link) {
+                    Some(&(width, height)) if width > 0 && height > 0 => {
+                        Self::attachment_picture(scope, block, width, height)
+                    }
+                    _ => Self::attachment_card(scope, block),
+                },
                 "code" => {
                     let mut children = Vec::new();
                     if !block.lang.is_empty() {
@@ -418,6 +424,66 @@ impl ChatView {
     }
     /// A file that came with the message: its name over what it is, in a
     /// bordered plate that opens it in Files. Slack's file card, one line.
+    /// A picture that came with the message, drawn in the flow at its
+    /// thumbnail size with its name under it; pressing it opens the file.
+    fn attachment_picture(
+        key: String,
+        block: &crate::host::ChatBlock,
+        width: i64,
+        height: i64,
+    ) -> wire::Node {
+        let p = native::palette();
+        let (box_width, box_height) = crate::host::picture_box(width, height);
+        let surface = wire::Node::Surface {
+            key: format!("{key}/picture"),
+            name: "picture".into(),
+            args: vec![
+                wire::SurfaceValue::Str(crate::host::PICTURE_SURFACE.into()),
+                wire::SurfaceValue::Str(crate::host::attachment_file_path(&block.link)),
+            ],
+            on_event: None,
+        };
+        let mut frame = native::container(format!("{key}/frame"), surface);
+        if let wire::Node::Container {
+            width: frame_width,
+            height: frame_height,
+            border,
+            ..
+        } = &mut frame
+        {
+            *frame_width = Some(wire::Length::Fixed(box_width));
+            *frame_height = Some(wire::Length::Fixed(box_height));
+            *border = Some(wire::Border {
+                color: Some(native::rgba(p.border)),
+                width: Some(1.),
+                radius: Some([native::radius::CARD as f32; 4]),
+            });
+        }
+        let action = Some(slots::message(Message::OpenMessageLink(block.link.clone())));
+        let mut open = native::button_child(
+            format!("{key}/open"),
+            frame,
+            action,
+            wire::ButtonPreset::Subtle,
+        );
+        if let wire::Node::Button { label, padding, .. } = &mut open {
+            *label = Some(format!("Open {}", block.text));
+            *padding = Some(wire::Edges::all(0.));
+        }
+        let column = native::spaced(
+            native::column(
+                format!("{key}/stack"),
+                [
+                    // A row hugs the button; a column would stretch it and
+                    // float the picture to its middle.
+                    native::row(format!("{key}/hug"), [open]),
+                    native::nowrap(native::caption(format!("{key}/name"), &block.text)),
+                ],
+            ),
+            3.,
+        );
+        native::row(key, [column])
+    }
     fn attachment_card(key: String, block: &crate::host::ChatBlock) -> wire::Node {
         let p = native::palette();
         let kind = attachment_kind(&block.text);

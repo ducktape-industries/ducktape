@@ -9,7 +9,8 @@ impl super::ChatView {
                 self.on_chat_viewport_changed(width, height)
             }
             Message::PressedAt(x, y) => self.on_pressed_at(x, y),
-            Message::SessionArrived(item) => self.on_session_arrived(item),
+            Message::PictureLoaded(link, drawn) => self.on_picture_loaded(link, drawn),
+            Message::SessionArrived(item) => self.on_session_arrived(*item),
             Message::SessionSettled(moved_room) => self.on_session_settled(moved_room),
             Message::SnapStream(moved) => self.on_snap_stream(moved),
             Message::RevealStream(target_key) => self.on_reveal_stream(target_key),
@@ -126,6 +127,36 @@ impl super::ChatView {
     fn on_pressed_at(&mut self, x: f64, y: f64) -> ducktape_view_guest::Task<Message> {
         self.press_x = x;
         self.press_y = y;
+        ::ducktape_view_guest::Task::none()
+    }
+    /// Every picture attachment on screen the host has not been asked for
+    /// yet: one `picture.load` each, answered as `PictureLoaded`.
+    fn picture_tasks(&mut self) -> ducktape_view_guest::Task<Message> {
+        let links = crate::host::picture_links(&self.messages, &self.thread_messages);
+        let mut tasks = Vec::new();
+        for link in links {
+            let known = self.pictures.contains_key(&link) || self.pictures_pending.contains(&link);
+            if known {
+                continue;
+            }
+            self.pictures_pending.insert(link.clone());
+            let path = crate::host::attachment_file_path(&link);
+            tasks.push(::ducktape_view_guest::Task::perform(
+                crate::host::picture_load(path),
+                move |drawn| Message::PictureLoaded(link.clone(), drawn),
+            ));
+        }
+        ::ducktape_view_guest::Task::batch(tasks)
+    }
+    /// A picture that did not decode stays a file card: (0, 0) says so and
+    /// keeps it from being asked for again.
+    fn on_picture_loaded(
+        &mut self,
+        link: String,
+        drawn: Result<(i64, i64), String>,
+    ) -> ducktape_view_guest::Task<Message> {
+        self.pictures_pending.remove(&link);
+        self.pictures.insert(link, drawn.unwrap_or((0, 0)));
         ::ducktape_view_guest::Task::none()
     }
     /// A menu opens where the pointer pressed and stays there: a press on
@@ -376,7 +407,8 @@ impl super::ChatView {
             self.land_seq,
             self.land_seq > 0,
         );
-        match crate::host::landing_thread(item.thread_root) {
+        let pictures = self.picture_tasks();
+        let landed = match crate::host::landing_thread(item.thread_root) {
             LandingThread::Absent => {
                 self.thread_key = crate::host::thread_key(
                     self.connection_serial + self.room_serial,
@@ -405,7 +437,8 @@ impl super::ChatView {
                 (::ducktape_view_guest::Task::done(self.stream_reveal_key))
                     .map(Message::RevealStream)
             }
-        }
+        };
+        ::ducktape_view_guest::Task::batch([landed, pictures])
     }
     fn on_thread_arrived(
         &mut self,
@@ -438,7 +471,10 @@ impl super::ChatView {
             item.target_seq,
             item.target_seq > 0,
         );
-        (::ducktape_view_guest::Task::done(self.thread_reveal_key)).map(Message::RevealThread)
+        ::ducktape_view_guest::Task::batch([
+            (::ducktape_view_guest::Task::done(self.thread_reveal_key)).map(Message::RevealThread),
+            self.picture_tasks(),
+        ])
     }
     fn on_search_arrived(
         &mut self,
