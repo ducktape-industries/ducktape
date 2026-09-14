@@ -11,7 +11,8 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::component::{ActiveTheme, Disableable, Sizable as _};
 use gpui_kit::{
-    App, AppContext, ClipboardItem, Context, Entity, EventEmitter, FontWeight, HighlightStyle,
+    App, AppContext, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, FontWeight,
+    HighlightStyle,
     InteractiveElement, IntoElement, KeyDownEvent, Keystroke, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, Window, div, px,
 };
@@ -200,6 +201,64 @@ fn attachment_of(path: &str) -> Result<Attachment, String> {
         bytes: meta.len(),
         state: AttachState::Uploading,
     })
+}
+
+/// What a paste attaches: a copied picture (its bytes and extension) or a
+/// copied file (its path). Text on the clipboard is not an attachment.
+enum Pasted {
+    Picture { extension: &'static str, bytes: Vec<u8> },
+    File(String),
+}
+
+fn pasted_attachments(item: &ClipboardItem) -> Vec<Pasted> {
+    let mut pasted = Vec::new();
+    for entry in item.entries() {
+        match entry {
+            ClipboardEntry::Image(image) => pasted.push(Pasted::Picture {
+                extension: image.format().extension(),
+                bytes: image.bytes().to_vec(),
+            }),
+            ClipboardEntry::ExternalPaths(paths) => pasted.extend(
+                paths
+                    .paths()
+                    .iter()
+                    .filter_map(|path| path.to_str().map(str::to_owned))
+                    .map(Pasted::File),
+            ),
+            ClipboardEntry::String(_) => {}
+        }
+    }
+    pasted
+}
+
+/// A pasted picture becomes a file the upload can read: it is written under
+/// the cache directory, named by the moment it was pasted.
+fn pasted_paths(pasted: Vec<Pasted>) -> Result<Vec<String>, String> {
+    let dir = crate::backend::cache_dir()?.join("pasted");
+    pasted
+        .into_iter()
+        .map(|item| match item {
+            Pasted::File(path) => Ok(path),
+            Pasted::Picture { extension, bytes } => park_pasted_picture(&dir, extension, &bytes),
+        })
+        .collect()
+}
+
+fn park_pasted_picture(
+    dir: &std::path::Path,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
+    std::fs::create_dir_all(dir).map_err(|error| format!("cannot keep the pasted picture: {error}"))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("pasted-{stamp}.{extension}"));
+    std::fs::write(&path, bytes).map_err(|error| format!("cannot keep the pasted picture: {error}"))?;
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "the cache path is not unicode".to_owned())
 }
 
 /// The event the app runs an upload on: the composer's scope, the upload
@@ -770,7 +829,23 @@ impl ComposerView {
         if self.args.blocked {
             return;
         }
-        let Some(body) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        // "Content" attaches like a file: a copied screenshot or a file list
+        // on the clipboard goes into the standby zone, not the text.
+        let pasted = pasted_attachments(&item);
+        if self.attaches() && !pasted.is_empty() {
+            match pasted_paths(pasted) {
+                Ok(paths) => self.attach_paths(paths, cx),
+                Err(note) => {
+                    lock(&self.shared).document.attach_note = note;
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        let Some(body) = item.text() else {
             return;
         };
         let (_, names) = names_at();
@@ -1485,6 +1560,19 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pasted picture lands as a readable file named by its format; text on
+    /// the clipboard attaches nothing.
+    #[test]
+    fn a_pasted_picture_becomes_a_file_and_text_attaches_nothing() {
+        let dir = std::env::temp_dir().join(format!("composer-paste-{}", std::process::id()));
+        let path = park_pasted_picture(&dir, "png", b"not really a png").expect("parked");
+        assert!(path.ends_with(".png"));
+        assert_eq!(std::fs::read(&path).expect("readable"), b"not really a png");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+        assert!(pasted_attachments(&ClipboardItem::new_string("hello".into())).is_empty());
+    }
+
     #[test]
     fn mention_identity_survives_multibyte_edits_and_partial_copy() {
         let party = chat::Party::Account(5);
