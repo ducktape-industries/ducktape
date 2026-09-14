@@ -404,16 +404,23 @@ impl ChatView {
                 children.push(self.message_menu(key, false));
             }
         }
+        // a room that refuses posts shows why where the composer would be;
+        // a disabled composer under the reason would only repeat it
         if !self.post_refusal.is_empty() {
             children.push(native::padded(
                 self.composer_gate(format!("{key}/refusal")),
                 wire::Edges {
-                    top: 0.,
+                    top: 8.,
                     right: 16.,
-                    bottom: 8.,
+                    bottom: 16.,
                     left: 16.,
                 },
             ));
+            return native::sized(
+                native::spaced(native::column(format!("{key}/room"), children), 0.),
+                Some(wire::Length::Fill),
+                Some(wire::Length::Fill),
+            );
         }
         children.push(wire::Node::Surface {
             key: format!("{key}/composer"),
