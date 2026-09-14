@@ -2124,6 +2124,7 @@ impl Ducktape {
                         channel.to_owned(),
                         op.to_owned(),
                         (body).trim().to_owned(),
+                        Vec::new(),
                     ),
                     move |result| match result {
                         Ok(value) => AppMessage::ForgeNoteSent(send_operation.clone(), value),
@@ -3672,6 +3673,11 @@ impl Ducktape {
         pending_id: String,
         scope: String,
     ) -> Task<AppMessage> {
+        // the files the submit queued, and the body that links them
+        let attachments = crate::composer_surface::take_attachments(&pending_id);
+        let names: Vec<String> = attachments.iter().map(|a| a.name.clone()).collect();
+        let paths: Vec<String> = attachments.into_iter().map(|a| a.path).collect();
+        let pending_body = crate::backend::attachment_body(pending_body, &pending_id, &names);
         match kind {
             ComposerKind::Message => {
                 match crate::backend::submit_verdict(
@@ -3707,6 +3713,7 @@ impl Ducktape {
                                 self.active_channel.to_owned(),
                                 pending_id.to_owned(),
                                 pending_body.to_owned(),
+                                paths,
                             ),
                             |result| match result {
                                 Ok(value) => AppMessage::MessageSent(value),
@@ -3753,6 +3760,7 @@ impl Ducktape {
                                 thread_seq,
                                 pending_id.to_owned(),
                                 pending_body.to_owned(),
+                                paths,
                             ),
                             |result| match result {
                                 Ok(value) => AppMessage::ThreadReplySent(value),
