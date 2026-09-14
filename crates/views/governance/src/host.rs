@@ -149,7 +149,6 @@ pub struct Session {
     pub admin: bool,
     pub dark: bool,
     /// The taste set: what a member may try before the ballot settles.
-    #[serde(default)]
     pub tasting: Vec<TasteRow>,
 }
 

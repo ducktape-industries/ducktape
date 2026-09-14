@@ -4757,7 +4757,8 @@ pub(crate) mod tests {
                 "account_busy": false, "account_ticket": "",
                 "update_state": "unavailable", "update_current": "", "update_previous": "",
                 "update_staged_display": "", "update_channel": "stable",
-                "update_checked": "", "update_note": "", "update_busy": false
+                "update_checked": "", "update_note": "", "update_busy": false,
+                "tasting": []
             }))
             .expect("props encode"),
         );
@@ -5204,7 +5205,7 @@ pub(crate) mod tests {
     fn session_props() -> Option<Vec<u8>> {
         Some(
             serde_json::to_vec(&serde_json::json!({
-                "admin": true, "connected": true, "dark": false
+                "admin": true, "connected": true, "dark": false, "tasting": []
             }))
             .expect("props encode"),
         )

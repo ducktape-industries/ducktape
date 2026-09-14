@@ -92,7 +92,6 @@ pub struct Session {
     pub update_busy: bool,
     /// The taste set: the views a code ballot or a scheduled swap would
     /// install, which a member may try before they land.
-    #[serde(default)]
     pub tasting: Vec<TasteRow>,
 }
 
