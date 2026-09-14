@@ -24,6 +24,18 @@ the platform's application directories (`~/.config`, `~/.local/state` and
 `~/Library/Caches` on macOS; an `XDG_*` variable wins on either), never under
 the home.
 
+Agents opens an existing run's journal, recent provider trace, and session controls.
+The process disclosure shows provider thinking as Markdown and groups tool inputs
+with their results. The executor's elapsed time labels the closed session
+(`Worked for 2m 5s`); the answer remains visible when the process is collapsed.
+Raw events have their own disclosure inside the process.
+The run creator can add instructions, stop the run, and answer pending tool
+approvals. Codex steers its active turn; Claude interrupts the current response
+and accepts the instruction in the same process and session. Controls require a
+compute worker attached to the connected node; a peer's mirrored output alone
+does not provide a control connection. Trace is a bounded live buffer and can
+expire. Settled runs retain creator-only access to any output still buffered.
+
 ## Module-owned views
 
 The Approvals, Members, Agents, Node, Explorer, Settings, Chat, Files,

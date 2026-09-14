@@ -4,10 +4,10 @@ A **capability spec** is a TOML file that teaches a Ducktape node how to run
 one executor — an installed CLI that can turn a prompt into text. Everything
 the node needs is in the file: how to detect the binary, where its Linux
 build comes from, the exact argv to invoke it, and how to parse its output.
-**Adding an executor is a config
-change, never a code change** — the embedded built-ins are themselves spec
-files globbed out of `crates/services/provider/specs/` at build time; no
-Rust source names an executor.
+An executor using one of the supported output protocols is configured entirely
+through its spec. The embedded built-ins are spec files globbed out of
+`crates/services/provider/specs/` at build time. A new bidirectional protocol
+requires a host driver as well as its spec.
 
 Specs are the data half of the capability system:
 
@@ -248,7 +248,13 @@ this format does not have (`[sandbox]`, `[models]`, `[session]`,
 
 | Field | Type | Required | Rules |
 |---|---|---|---|
-| `format` | string | yes | `"jsonl-events"` \| `"json-result"` \| `"text"` |
+| `format` | string | yes | `"codex-session"` \| `"claude-session"` \| `"jsonl-events"` \| `"json-result"` \| `"text"` |
+
+`codex-session` uses App Server JSON-RPC stdin; `claude-session` uses persistent
+stream-json stdin. They carry the prompt, steering, interrupt and approval replies
+inside the same provider process. The built-in specs select these protocols.
+The sandbox and credential broker still wrap the process; the driver enforces
+idle and hard deadlines and reports the provider's final token counters.
 
 ### `[isolation]`
 

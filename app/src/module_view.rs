@@ -757,13 +757,17 @@ fn surface_bool(args: &[wire::SurfaceValue], index: usize) -> bool {
 }
 
 fn surface_allowed(module: &str, surface: &str) -> bool {
-    match (module, surface) {
-        (_, "artifact_svg" | "artifact_image") => true,
-        ("chat", "chat_composer" | "picture") => true,
-        ("forge", "forge_composer" | "picture" | "forge_markdown" | "forge_code") => true,
-        ("files", "picture" | "forge_code" | "agent_markdown") => true,
-        _ => false,
-    }
+    matches!(
+        (module, surface),
+        (_, "artifact_svg" | "artifact_image")
+            | ("chat", "chat_composer" | "picture")
+            | (
+                "forge",
+                "forge_composer" | "picture" | "forge_markdown" | "forge_code"
+            )
+            | ("files", "picture" | "forge_code" | "agent_markdown")
+            | ("agents", "agent_markdown")
+    )
 }
 
 /// The operations a view may ask of the app, by module. An intent outside
