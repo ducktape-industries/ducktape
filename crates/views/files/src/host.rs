@@ -1,41 +1,44 @@
 //! What the view asks of the host kernel, and the readings the browser folds
 //! off the duckfs it reads for itself.
 //!
-//! The kernel pushes only session facts (`files.props`: connected, dark, and
-//! the chain a draft belongs to). Everything on the screen is this view's own:
-//! it lists a directory, reads a preview, walks the snapshot history and diffs
-//! a snapshot through `files.get`, re-reads on every `rpc.live` hit for the
-//! files plane, and a mkdir / new file / delete / save leaves as `op.submit`
-//! carrying the duckfs commit the kernel signs with the seated key — the view
-//! never sees the key, the endpoint or the password.
+//! The kernel pushes only session facts (`files.props`: connected, dark, the
+//! chain a draft belongs to, and the account whose home is "mine"). Everything
+//! on the screen is this view's own: it lists a directory, reads a preview,
+//! walks the snapshot history, asks which snapshot last touched a path and
+//! diffs a snapshot through `files.get`, re-reads on every `rpc.live` hit for
+//! the files plane, and a mkdir / new file / rename / delete / save leaves as
+//! `op.submit` carrying the duckfs commit the kernel signs with the seated
+//! key — the view never sees the key, the endpoint or the password.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
+use ducktape_view_guest::host;
 use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use ducktape_view_guest::host;
 
 /// The head of a text preview, in bytes — the `read` lane's own page.
 const PREVIEW_BYTES: i64 = 65_536;
 /// How many committed snapshots the history rail carries.
 const HISTORY_LIMIT: i64 = 50;
-/// How many rows one list may put in a frame. The tree wire charges every
-/// row's text to the frame it draws, so a directory of ten thousand entries
-/// is bounded HERE, where the fold is, and the rows left out are counted.
-const MAX_ROWS: usize = 400;
+/// One `ls` page. The node caps a page at 256; the view asks for a round
+/// number under it so `pages` reads as "pages of two hundred".
+pub const PAGE_ROWS: i64 = 200;
+/// How many diff pages one comparison may put on screen.
+const MAX_DIFF_ROWS: usize = 400;
+/// How far back the provenance walk looks for the snapshot that last
+/// touched a path: one bounded diff per snapshot, newest first.
+pub const PROVENANCE_DEPTH: usize = 8;
 /// How much of a preview is DISPLAYED. `text` stays whole — it is the editor's
 /// seed and the save's source; only the run that crosses to the reader and to
 /// the code/Markdown surfaces is cut.
 const MAX_DISPLAY_BYTES: usize = 8 << 10;
 
 /// One files-browser row.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsEntry {
-    pub key: i64,
     pub path: String,
     pub name: String,
     pub kind: String,
@@ -43,10 +46,17 @@ pub struct FsEntry {
     pub object: String,
 }
 
+impl FsEntry {
+    pub fn is_dir(&self) -> bool {
+        self.kind == "dir"
+    }
+}
+
 /// One committed duckfs snapshot.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsSnapshot {
     pub id: String,
+    pub parent: String,
     pub short_id: String,
     pub author: String,
     pub height: i64,
@@ -54,7 +64,7 @@ pub struct FsSnapshot {
 }
 
 /// One Added/Removed/Modified leaf between a snapshot and the head.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsDiffEntry {
     pub path: String,
     pub kind: String,
@@ -63,23 +73,25 @@ pub struct FsDiffEntry {
 // ---------- the session ----------
 
 /// The session facts the kernel pushes, one item per change. `chain` is the
-/// network an unsaved draft belongs to: a draft parks when it moves. `route`
-/// is where a `duck://files/...` link sent the reader — the shell resolves the
-/// address and moves the tab, so the path arrives here rather than being
-/// navigated to — and `route_serial` counts those pushes, because the same
-/// path twice has to land twice and the path alone would not have changed.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+/// network an unsaved draft belongs to: a draft parks when it moves.
+/// `account` is the reader's account number, which names her home under
+/// `/home`. `route` is where a `duck://files/...` link sent the reader — the
+/// shell resolves the address and moves the tab, so the path arrives here
+/// rather than being navigated to — and `route_serial` counts those pushes,
+/// because the same path twice has to land twice and the path alone would not
+/// have changed.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub connected: bool,
     pub dark: bool,
     pub chain: String,
+    pub account: String,
     pub route: String,
     pub route_serial: i64,
 }
 
-
 /// One item of the session subscription: the facts, or why not.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub struct SessionItem {
     pub next: Session,
     pub error: String,
@@ -106,92 +118,127 @@ pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     })
 }
 
-/// The read generation moves when the session comes up, so a reconnect reads
-/// the directory afresh.
-pub fn generation_after(was_connected: bool, connected: bool, generation: i64) -> i64 {
-    let came_up = connected && !was_connected;
-    match came_up {
-        true => generation + 1,
-        false => generation,
+/// The reader's own home directory, or "" while the session names no account.
+pub fn home_of(account: &str) -> String {
+    match account.is_empty() {
+        true => String::new(),
+        false => format!("/home/acct:{account}"),
     }
 }
 
-// ---------- the listing ----------
+// ---------- the workspace ----------
 
-/// One item of the listing subscription: this directory's rows and the
-/// snapshot history beside them, or why not.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
-pub struct ListingItem {
+/// One directory as read: its rows, the cursor past them, or why not.
+/// `next` is the cursor of the page after the last one walked — "" when the
+/// directory ended — so the screen can offer to load more instead of
+/// silently cutting the directory short.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct DirectoryRead {
+    pub path: String,
     pub entries: Vec<FsEntry>,
-    pub directories: Vec<FsEntry>,
-    pub history: Vec<FsSnapshot>,
-    pub omitted: i64,
+    pub next: String,
     pub error: String,
 }
 
-/// This directory now and after every files block: read once per generation,
-/// then again on each `rpc.live` hit for the files plane.
-pub fn listing(generation: i64, path: String) -> ducktape_view_guest::Subscription<ListingItem> {
-    ducktape_view_guest::Subscription::run_with((generation, path), |(_, path)| {
-        let path = path.clone();
-        let live = host::subscribe("rpc.live", b"files");
-        stream::once(load_listing(path.clone())).chain(live.then(move |_| load_listing(path.clone())))
-    })
+/// One item of the workspace subscription: the current directory, the
+/// directories open beside it in column view, every member home the node
+/// lists under `/home`, and the committed snapshot window — each read on
+/// its own, so a directory that refuses does not take the sidebar with it.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct WorkspaceItem {
+    pub directory: DirectoryRead,
+    pub columns: Vec<DirectoryRead>,
+    pub homes: Vec<FsEntry>,
+    pub history: Vec<FsSnapshot>,
+    pub history_error: String,
 }
 
-async fn load_listing(path: String) -> ListingItem {
-    match read_listing(&path).await {
-        Ok(item) => item,
-        Err(error) => ListingItem {
+/// The workspace now and after every files block: read once per generation,
+/// then again on each `rpc.live` hit for the files plane — ONE live
+/// subscription for everything the screen lists. `pages` is how many pages
+/// of [`PAGE_ROWS`] the current directory walks — one at first, one more per
+/// "load more"; a column walks one.
+pub fn workspace(
+    generation: i64,
+    path: String,
+    pages: i64,
+    columns: Vec<String>,
+) -> ducktape_view_guest::Subscription<WorkspaceItem> {
+    ducktape_view_guest::Subscription::run_with(
+        (generation, path, pages, columns),
+        |(_, path, pages, columns)| {
+            let path = path.clone();
+            let pages = *pages;
+            let columns = columns.clone();
+            let live = host::subscribe("rpc.live", b"files");
+            stream::once(load_workspace(path.clone(), pages, columns.clone()))
+                .chain(live.then(move |_| load_workspace(path.clone(), pages, columns.clone())))
+        },
+    )
+}
+
+async fn load_workspace(path: String, pages: i64, columns: Vec<String>) -> WorkspaceItem {
+    let directory = read_directory(path, pages).await;
+    let mut column_reads = Vec::with_capacity(columns.len());
+    for column in columns {
+        column_reads.push(read_directory(column, 1).await);
+    }
+    let homes = match list_directory("/home", 1).await {
+        Ok((homes, _)) => homes.into_iter().filter(FsEntry::is_dir).collect(),
+        // a refusal leaves the sidebar with the home it can name on its own
+        Err(_) => Vec::new(),
+    };
+    let (history, history_error) = match read_history().await {
+        Ok(history) => (history, String::new()),
+        Err(error) => (Vec::new(), format!("Could not read the history: {error}")),
+    };
+    WorkspaceItem {
+        directory,
+        columns: column_reads,
+        homes,
+        history,
+        history_error,
+    }
+}
+
+async fn read_directory(path: String, pages: i64) -> DirectoryRead {
+    match list_directory(&path, pages).await {
+        Ok((entries, next)) => DirectoryRead {
+            path,
+            entries,
+            next,
+            error: String::new(),
+        },
+        Err(error) => DirectoryRead {
+            path,
             error: format!("Could not list this directory: {error}"),
-            ..ListingItem::default()
+            ..DirectoryRead::default()
         },
     }
 }
 
-async fn read_listing(path: &str) -> Result<ListingItem, String> {
-    let entries = list_directory(path).await?;
-    let history = read_history().await?;
-    let (entries, omitted) = bounded(entries);
-    let directories: Vec<FsEntry> = entries
-        .iter()
-        .filter(|entry| entry.kind == "dir")
-        .cloned()
-        .collect();
-    Ok(ListingItem {
-        entries,
-        directories,
-        history,
-        omitted,
-        error: String::new(),
-    })
-}
-
-/// EVERY page of one directory (committed head), name order. The node answers
-/// `ls` a page at a time and hands back a `next` cursor to echo as `after`; a
-/// partial directory presented as complete hides files, so the pages are
-/// walked here.
-async fn list_directory(path: &str) -> Result<Vec<FsEntry>, String> {
-    let listed = files_get("ls", serde_json::json!({ "path": path })).await;
-    let mut reply = match listed {
-        Ok(reply) => reply,
-        // A CLIENT reads an uncommitted path as an empty directory, not an
-        // error: a fresh workspace has no `/shared` until something writes
-        // under it. Any other refusal still surfaces.
-        Err(error) => {
-            let uncommitted_path = error.contains("path not found");
-            match uncommitted_path {
-                true => return Ok(Vec::new()),
-                false => return Err(error),
-            }
+/// The first `pages` pages of one directory (committed head), name order,
+/// and the cursor of the page after them. The node answers `ls` a page at a
+/// time and hands back a `next` cursor to echo as `after`; a huge directory
+/// is bounded HERE, by how many pages the reader asked for, and the cursor
+/// says whether there is more. A missing path is the node's refusal and
+/// surfaces as one: namespace roots list empty on their own.
+async fn list_directory(path: &str, pages: i64) -> Result<(Vec<FsEntry>, String), String> {
+    let mut entries = Vec::new();
+    let mut after = String::new();
+    for _ in 0..pages.max(1) {
+        let mut params = serde_json::json!({ "path": path, "limit": PAGE_ROWS });
+        if !after.is_empty() {
+            params["after"] = serde_json::Value::String(after.clone());
         }
-    };
-    let mut entries = fold_entries(&reply);
-    while let Some(after) = reply["next"].as_str().map(str::to_owned) {
-        reply = files_get("ls", serde_json::json!({ "path": path, "after": after })).await?;
+        let reply = files_get("ls", params).await?;
         entries.extend(fold_entries(&reply));
+        after = reply["next"].as_str().unwrap_or_default().to_owned();
+        if after.is_empty() {
+            break;
+        }
     }
-    Ok(entries)
+    Ok((entries, after))
 }
 
 /// The `entries` array of an ls reply as rows.
@@ -203,10 +250,8 @@ pub fn fold_entries(reply: &serde_json::Value) -> Vec<FsEntry> {
         .iter()
         .map(|entry| {
             let path = entry["path"].as_str().unwrap_or_default().to_string();
-            let name = path.rsplit('/').next().unwrap_or(path.as_str()).to_string();
             FsEntry {
-                key: row_key(&path),
-                name,
+                name: fs_name(&path),
                 kind: entry["kind"].as_str().unwrap_or_default().to_string(),
                 size: entry["size"].as_i64().unwrap_or(0),
                 object: entry["object"].as_str().unwrap_or_default().to_string(),
@@ -216,7 +261,6 @@ pub fn fold_entries(reply: &serde_json::Value) -> Vec<FsEntry> {
         .collect()
 }
 
-/// The committed snapshot window, newest first.
 async fn read_history() -> Result<Vec<FsSnapshot>, String> {
     let reply = files_get("history", serde_json::json!({ "limit": HISTORY_LIMIT })).await?;
     Ok(fold_history(&reply))
@@ -232,7 +276,8 @@ pub fn fold_history(reply: &serde_json::Value) -> Vec<FsSnapshot> {
             let id = snapshot["id"].as_str().unwrap_or_default().to_string();
             FsSnapshot {
                 short_id: short_digest(&id),
-                author: short_digest(snapshot["author"].as_str().unwrap_or_default()),
+                parent: snapshot["parent"].as_str().unwrap_or_default().to_string(),
+                author: fold_author(&snapshot["author"]),
                 height: snapshot["height"].as_i64().unwrap_or(0),
                 message: snapshot["message"].as_str().unwrap_or_default().to_string(),
                 id,
@@ -241,12 +286,110 @@ pub fn fold_history(reply: &serde_json::Value) -> Vec<FsSnapshot> {
         .collect()
 }
 
+/// A snapshot's author, as duckfs spells its `Actor` on the wire: an
+/// externally tagged enum — `{"Account":7}`, `{"Key":[..bytes..]}`,
+/// `{"Module":"chat"}` or the bare string `"System"` — read into the label
+/// the module itself prints (`acct:7`, `ext:<hex>`, `module:chat`, `system`).
+pub fn fold_author(author: &serde_json::Value) -> String {
+    if author.as_str() == Some("System") {
+        return "system".into();
+    }
+    if let Some(account) = author["Account"].as_u64() {
+        return format!("acct:{account}");
+    }
+    if let Some(module) = author["Module"].as_str() {
+        return format!("module:{module}");
+    }
+    if let Some(key) = author["Key"].as_array() {
+        let hex: String = key
+            .iter()
+            .filter_map(serde_json::Value::as_u64)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        return format!("ext:{}", short_digest(&hex));
+    }
+    String::new()
+}
+
+// ---------- the provenance ----------
+
+/// One item of the provenance subscription: the newest snapshot within
+/// [`PROVENANCE_DEPTH`] that touched the path, or "" when none of them did.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct ProvenanceItem {
+    pub path: String,
+    pub snapshot: FsSnapshot,
+    pub searched: i64,
+    pub error: String,
+}
+
+/// Which snapshot last changed `path`, found by diffing each snapshot
+/// against its parent under that prefix, newest first. The listing wire
+/// carries no author or height per entry, so this is how Get Info earns
+/// its "Modified" line — one bounded walk for the one selected path.
+pub fn provenance(
+    generation: i64,
+    path: String,
+    history: Vec<FsSnapshot>,
+) -> ducktape_view_guest::Subscription<ProvenanceItem> {
+    ducktape_view_guest::Subscription::run_with(
+        (generation, path, history),
+        |(_, path, history)| stream::once(load_provenance(path.clone(), history.clone())),
+    )
+}
+
+async fn load_provenance(path: String, history: Vec<FsSnapshot>) -> ProvenanceItem {
+    let mut searched = 0;
+    for snapshot in history.iter().take(PROVENANCE_DEPTH) {
+        searched += 1;
+        let touched = match snapshot_touches(snapshot, &path).await {
+            Ok(touched) => touched,
+            Err(error) => {
+                return ProvenanceItem {
+                    path,
+                    searched,
+                    error: format!("Could not read the file's history: {error}"),
+                    ..ProvenanceItem::default()
+                };
+            }
+        };
+        if touched {
+            return ProvenanceItem {
+                path,
+                snapshot: snapshot.clone(),
+                searched,
+                error: String::new(),
+            };
+        }
+    }
+    ProvenanceItem {
+        path,
+        searched,
+        ..ProvenanceItem::default()
+    }
+}
+
+/// Did this snapshot change anything under `path`? The first snapshot has
+/// no parent and touched everything it holds.
+async fn snapshot_touches(snapshot: &FsSnapshot, path: &str) -> Result<bool, String> {
+    if snapshot.parent.is_empty() {
+        return Ok(true);
+    }
+    let reply = files_get(
+        "diff",
+        serde_json::json!({ "from": snapshot.parent, "to": snapshot.id, "prefix": path }),
+    )
+    .await?;
+    let entries = reply["entries"].as_array().cloned().unwrap_or_default();
+    Ok(!entries.is_empty())
+}
+
 // ---------- the preview ----------
 
 /// One item of the preview subscription: the open file, or why not. `text` is
 /// the WHOLE read — the editor's seed and the save's source; `display_text` is
 /// the bounded run the reader and the code/Markdown surfaces get.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub struct PreviewItem {
     pub path: String,
     pub base: String,
@@ -299,7 +442,7 @@ async fn read_text(path: &str) -> Result<PreviewItem, String> {
     let bytes = base64_decode(reply["b64"].as_str().unwrap_or_default())
         .ok_or("The node's read page is not valid base64")?;
     let eof = reply["eof"].as_bool().unwrap_or(true);
-    let (text, binary) = readable(bytes);
+    let (text, binary) = readable(bytes, eof);
     let (display_text, clipped) = head_within(&text, MAX_DISPLAY_BYTES);
     Ok(PreviewItem {
         path: path.to_owned(),
@@ -319,9 +462,17 @@ async fn read_text(path: &str) -> Result<PreviewItem, String> {
 /// What the binary plate says under its title.
 pub const BINARY_PLATE: &str = "This file is not text, so there is nothing to show here.";
 
-/// A file that is text, or the plate that says it is not.
-fn readable(bytes: Vec<u8>) -> (String, bool) {
-    let Ok(text) = String::from_utf8(bytes) else {
+/// A file that is text, or the plate that says it is not. A page that ended
+/// before the file did may have cut a multi-byte character in half: the
+/// tail after the last complete character is dropped before the bytes are
+/// judged, so a long UTF-8 document never reads as binary for where the
+/// page happened to end.
+pub fn readable(bytes: Vec<u8>, eof: bool) -> (String, bool) {
+    let decoded = match eof {
+        true => String::from_utf8(bytes),
+        false => String::from_utf8(complete_prefix(bytes)),
+    };
+    let Ok(text) = decoded else {
         return (BINARY_PLATE.into(), true);
     };
     let control = text
@@ -330,6 +481,22 @@ fn readable(bytes: Vec<u8>) -> (String, bool) {
     match control {
         true => (BINARY_PLATE.into(), true),
         false => (text, false),
+    }
+}
+
+/// The bytes up to the last complete UTF-8 character. A partial character
+/// at the very end is the page's cut, not the file's; a partial character
+/// anywhere else stays and fails the decode, which is the honest answer.
+fn complete_prefix(mut bytes: Vec<u8>) -> Vec<u8> {
+    match std::str::from_utf8(&bytes) {
+        Ok(_) => bytes,
+        Err(error) => {
+            let cut_at_end = error.error_len().is_none();
+            if cut_at_end {
+                bytes.truncate(error.valid_up_to());
+            }
+            bytes
+        }
     }
 }
 
@@ -368,21 +535,30 @@ async fn read_picture(path: &str) -> Result<PreviewItem, String> {
 /// Does the path name a picture the host's viewer decodes? The extension is
 /// the path's call — the read wire only says binary-or-text.
 pub fn picture_path(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or_default();
-    let Some((_, extension)) = name.rsplit_once('.') else {
-        return false;
-    };
     matches!(
-        extension.to_ascii_lowercase().as_str(),
+        extension_of(path).as_str(),
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
     )
+}
+
+pub fn markdown_path(path: &str) -> bool {
+    matches!(extension_of(path).as_str(), "md" | "markdown")
+}
+
+/// The lower-cased extension of a path's last segment, or "".
+pub fn extension_of(path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or_default();
+    match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => extension.to_ascii_lowercase(),
+        _ => String::new(),
+    }
 }
 
 // ---------- the diff ----------
 
 /// One item of the diff subscription: the leaves between a snapshot and the
 /// head, or why not.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub struct DiffItem {
     pub entries: Vec<FsDiffEntry>,
     pub omitted: i64,
@@ -407,9 +583,9 @@ async fn load_diff(from: String) -> DiffItem {
 }
 
 async fn read_diff(from: &str) -> Result<DiffItem, String> {
-    let head = head_snapshot().await?.ok_or("nothing is committed yet")?;
+    let head = head_snapshot().await?.ok_or("nothing committed yet")?;
     let reply = files_get("diff", serde_json::json!({ "from": from, "to": head })).await?;
-    let entries = reply["entries"]
+    let mut entries: Vec<FsDiffEntry> = reply["entries"]
         .as_array()
         .cloned()
         .unwrap_or_default()
@@ -419,28 +595,50 @@ async fn read_diff(from: &str) -> Result<DiffItem, String> {
             kind: entry["kind"].as_str().unwrap_or_default().to_string(),
         })
         .collect();
-    let (entries, omitted) = bounded(entries);
+    let omitted = entries.len().saturating_sub(MAX_DIFF_ROWS);
+    entries.truncate(MAX_DIFF_ROWS);
     Ok(DiffItem {
         entries,
-        omitted,
+        omitted: i64::try_from(omitted).unwrap_or(i64::MAX),
         error: String::new(),
     })
 }
 
+/// The word a diff kind reads as.
+pub fn diff_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "added" => "Added",
+        "removed" => "Removed",
+        "modified" => "Modified",
+        _ => "Changed",
+    }
+}
+
 // ---------- the writes ----------
 
+/// Which write a commit is. The queue carries it and hands it back with
+/// the outcome, so a completion never decodes a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Act {
+    Mkdir,
+    NewFile,
+    Rename,
+    Delete,
+    Save,
+}
+
 /// One finished write: which act it was, and the refusal if any.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct ActItem {
-    pub kind: String,
+    pub act: Act,
     pub error: String,
 }
 
-type Act = Pin<Box<dyn Future<Output = Result<(), String>>>>;
+type Pending = Pin<Box<dyn Future<Output = Result<(), String>>>>;
 
 #[derive(Default)]
 struct Acts {
-    pending: Vec<(String, Act)>,
+    pending: Vec<(Act, Pending)>,
     waker: Option<Waker>,
 }
 
@@ -456,20 +654,27 @@ thread_local! {
 pub fn make_dir(dir: &str, name: &str) -> bool {
     let path = fs_child(dir, name);
     let change = serde_json::json!({ "mkdir": { "path": path } });
-    act("mkdir", format!("mkdir {path}"), change)
+    act(Act::Mkdir, format!("mkdir {path}"), change)
 }
 
 /// Creates an empty file under `dir`.
 pub fn make_file(dir: &str, name: &str) -> bool {
     let path = fs_child(dir, name);
     let change = put_change(&path, "");
-    act("new_file", format!("write {path}"), change)
+    act(Act::NewFile, format!("write {path}"), change)
 }
 
 /// Removes a file or a whole subtree.
 pub fn delete_object(path: &str) -> bool {
     let change = serde_json::json!({ "rm": { "path": path } });
-    act("delete", format!("rm {path}"), change)
+    act(Act::Delete, format!("rm {path}"), change)
+}
+
+/// Moves a file or a whole subtree to another path — a rename when only the
+/// last segment changes, a move when the directory does.
+pub fn move_object(from: &str, to: &str) -> bool {
+    let change = serde_json::json!({ "mv": { "from": from, "to": to } });
+    act(Act::Rename, format!("mv {from} {to}"), change)
 }
 
 /// Writes the edited body back to its path, against the SNAPSHOT ITS TEXT WAS
@@ -479,7 +684,7 @@ pub fn save(path: &str, base: &str, text: &str) -> bool {
     let message = format!("write {path}");
     let base = base.to_owned();
     queue(
-        "save",
+        Act::Save,
         Box::pin(async move { submit_commit(Some(base), message, change).await }),
     )
 }
@@ -497,9 +702,9 @@ fn put_change(path: &str, text: &str) -> serde_json::Value {
 
 /// A write that lands on the CURRENT head: the head is read here, so two
 /// members' commits do not silently clobber each other.
-fn act(kind: &str, message: String, change: serde_json::Value) -> bool {
+fn act(act: Act, message: String, change: serde_json::Value) -> bool {
     queue(
-        kind,
+        act,
         Box::pin(async move {
             let head = head_snapshot().await?;
             submit_commit(head, message, change).await
@@ -507,9 +712,9 @@ fn act(kind: &str, message: String, change: serde_json::Value) -> bool {
     )
 }
 
-fn queue(kind: &str, act: Act) -> bool {
+fn queue(act: Act, pending: Pending) -> bool {
     ACTS.with_borrow_mut(|acts| {
-        acts.pending.push((kind.to_owned(), act));
+        acts.pending.push((act, pending));
         if let Some(waker) = acts.waker.take() {
             waker.wake();
         }
@@ -557,34 +762,12 @@ impl Stream for ActStream {
                 acts.waker = Some(cx.waker().clone());
                 return Poll::Pending;
             };
-            let (kind, _) = acts.pending.remove(index);
-            let error = answer
-                .err()
-                .map(|error| act_failure(&kind, &error))
-                .unwrap_or_default();
-            Poll::Ready(Some(ActItem { kind, error }))
+            let (act, _) = acts.pending.remove(index);
+            Poll::Ready(Some(ActItem {
+                act,
+                error: answer.err().unwrap_or_default(),
+            }))
         })
-    }
-}
-
-/// A refused write, as a sentence that says which write it was.
-pub fn act_failure(kind: &str, error: &str) -> String {
-    let verb = match kind {
-        "mkdir" => "Could not create the folder",
-        "new_file" => "Could not create the file",
-        "delete" => "Could not delete the object",
-        "save" => "Could not save the file",
-        _ => "The write was refused",
-    };
-    format!("{verb}: {error}")
-}
-
-/// A diff leaf's kind as a word: `A`/`added` → Added.
-pub fn diff_kind_label(kind: &str) -> &'static str {
-    match kind {
-        "added" | "A" => "Added",
-        "removed" | "deleted" | "D" => "Removed",
-        _ => "Changed",
     }
 }
 
@@ -658,8 +841,8 @@ fn root_refusal(writable: bool, root: &str) -> String {
     }
 }
 
-/// The breadcrumb path one level up. The root is `/` — duckfs only accepts
-/// absolute paths, and "" earns a 400 from the node on every root open.
+/// The path one level up. The root is `/` — duckfs only accepts absolute
+/// paths, and "" earns a 400 from the node on every root open.
 pub fn fs_parent(path: &str) -> String {
     match path.rfind('/') {
         Some(0) | None => "/".to_string(),
@@ -674,25 +857,38 @@ pub fn fs_child(dir: &str, name: &str) -> String {
     format!("{dir}/{name}")
 }
 
-/// `12 files, 3 folders` — the crumb bar's subtitle, and "" whenever the rows
-/// on hand are not this path's: with the node down nobody asked, and
-/// mid-navigation the rows still belong to the directory you left.
-pub fn fs_counts_summary(connected: bool, listed: bool, entries: &[FsEntry]) -> String {
-    if !connected || !listed || entries.is_empty() {
-        return String::new();
+/// The last segment of a path; the root's name is `/`.
+pub fn fs_name(path: &str) -> String {
+    match path.rsplit('/').next() {
+        Some(name) if !name.is_empty() => name.to_owned(),
+        _ => "/".to_owned(),
     }
-    let dirs = entries.iter().filter(|entry| entry.kind == "dir").count() as i64;
-    let files = entries.len() as i64 - dirs;
-    format!(
-        "{}, {}",
-        plural(files, "file", "files"),
-        plural(dirs, "folder", "folders")
-    )
 }
 
-fn plural(count: i64, one: &str, many: &str) -> String {
-    let noun = if count == 1 { one } else { many };
-    format!("{count} {noun}")
+/// One clickable segment of the path bar.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct Crumb {
+    pub name: String,
+    pub path: String,
+}
+
+/// The path bar's segments, root first: `/shared/docs` is `/`, `shared`,
+/// `docs`, each carrying the directory it opens.
+pub fn crumbs(path: &str) -> Vec<Crumb> {
+    let mut crumbs = vec![Crumb {
+        name: "/".into(),
+        path: "/".into(),
+    }];
+    let mut so_far = String::new();
+    for segment in path.split('/').filter(|part| !part.is_empty()) {
+        so_far.push('/');
+        so_far.push_str(segment);
+        crumbs.push(Crumb {
+            name: segment.to_owned(),
+            path: so_far.clone(),
+        });
+    }
+    crumbs
 }
 
 pub fn size_label(bytes: i64) -> String {
@@ -710,7 +906,7 @@ pub fn size_label(bytes: i64) -> String {
 /// `h 84,912`; a snapshot without a height prints `h —`.
 pub fn height_label(height: i64) -> String {
     if height < 0 {
-        return "block —".into();
+        return "h —".into();
     }
     let digits = height.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
@@ -720,31 +916,11 @@ pub fn height_label(height: i64) -> String {
         }
         grouped.push(digit);
     }
-    format!("block {grouped}")
+    format!("h {grouped}")
 }
 
 pub fn picture_caption(width: i64, height: i64) -> String {
     format!("{width} × {height}")
-}
-
-pub fn markdown_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".md") || lower.ends_with(".markdown")
-}
-
-pub fn tree_width_after_delta(width: f64, delta: f64, viewport: f64, object: f64) -> f64 {
-    let maximum = (viewport - object - 20.0 - 360.0).clamp(160.0, 360.0);
-    (width + delta).clamp(160.0, maximum)
-}
-
-pub fn preview_height_after_delta(height: f64, delta: f64, viewport: f64) -> f64 {
-    let maximum = (viewport - 300.0).clamp(180.0, 560.0);
-    (height + delta).clamp(180.0, maximum)
-}
-
-pub fn object_width_after_delta(width: f64, delta: f64, viewport: f64, tree: f64) -> f64 {
-    let maximum = (viewport - tree - 20.0 - 360.0).clamp(240.0, 520.0);
-    (width + delta).clamp(240.0, maximum)
 }
 
 /// The entry `path` names in the rows on hand, or a blank one.
@@ -756,36 +932,12 @@ pub fn entry_named(entries: &[FsEntry], path: &str) -> FsEntry {
         .unwrap_or_default()
 }
 
-pub fn no_fs_entry() -> FsEntry {
-    FsEntry::default()
-}
-
 /// A rendered button names both its document and this occurrence of the draft.
 pub fn edit_token(chain: &str, path: &str, base: &str, draft: i64) -> String {
     serde_json::to_string(&(chain, path, base, draft)).expect("edit identity encodes")
 }
 
-pub fn keep_str(take: bool, next: &str, previous: &str) -> String {
-    if take { next.into() } else { previous.into() }
-}
-
-/// The draft as it stands, or nothing once a write consumed it.
-pub fn keep_draft(consumed: bool, draft: &str) -> String {
-    if consumed {
-        String::new()
-    } else {
-        draft.into()
-    }
-}
-
 // ---------- the folds' own small parts ----------
-
-/// The first [`MAX_ROWS`] of a list, and how many it left out.
-fn bounded<T>(mut rows: Vec<T>) -> (Vec<T>, i64) {
-    let omitted = rows.len().saturating_sub(MAX_ROWS);
-    rows.truncate(MAX_ROWS);
-    (rows, i64::try_from(omitted).unwrap_or(i64::MAX))
-}
 
 /// The head of `text` within `limit` BYTES, cut on a character boundary, and
 /// whether anything was cut.
@@ -796,30 +948,12 @@ fn head_within(text: &str, limit: usize) -> (String, bool) {
     (text[..text.floor_char_boundary(limit)].to_owned(), true)
 }
 
-/// The first 12 characters of a digest, with an ellipsis when it goes on —
-/// what a row cell shows; the full id belongs to the object panel.
 pub fn short_digest(digest: &str) -> String {
     let mut short: String = digest.chars().take(12).collect();
     if digest.chars().count() > 12 {
         short.push('…');
     }
     short
-}
-
-/// A session-stable identity per path, for keyed rendering: the same path is
-/// the same row across every re-read, so the virtual list keeps its place.
-fn row_key(path: &str) -> i64 {
-    thread_local! {
-        static KEYS: RefCell<BTreeMap<String, i64>> = RefCell::default();
-    }
-    KEYS.with_borrow_mut(|keys| {
-        if let Some(key) = keys.get(path) {
-            return *key;
-        }
-        let key = i64::try_from(keys.len()).unwrap_or(i64::MAX);
-        keys.insert(path.to_owned(), key);
-        key
-    })
 }
 
 /// The files read lane's wire: standard alphabet, padded — the same engine

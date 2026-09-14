@@ -693,10 +693,11 @@ pub fn chat_composer_roster(scope: &str, members: &[crate::backend::ChatMember])
 // ---------- the files seat ----------
 
 /// The Files tab, drawn by the `files` view over the KERNEL CONTRACT: the app
-/// pushes session facts only, and the view lists the directory, reads the
-/// preview, walks the snapshot history and diffs a snapshot for itself through
-/// `files.get` / `rpc.live`, writing through `op.submit` signed here with the
-/// seated key. Two events come back, both OS doors the app owns: `open_link`
+/// pushes session facts only — `account` among them, the reader's own, which
+/// names her home under `/home` for the view's sidebar — and the view lists
+/// the directory, reads the preview, walks the snapshot history and diffs a
+/// snapshot for itself through `files.get` / `rpc.live`, writing through
+/// `op.submit` signed here with the seated key. Two events come back, both OS doors the app owns: `open_link`
 /// for a link the Markdown reader activated, and `at` naming the directory a
 /// file dropped on the window lands in. The picture viewer, the highlighted
 /// reader and the Markdown document are host surfaces defined in `surfaces.rs`.
@@ -710,6 +711,7 @@ pub fn files_view(
     dark: bool,
     connected: bool,
     chain: &str,
+    account: &str,
     route: &str,
     route_serial: i64,
 ) -> ViewSpec {
@@ -717,6 +719,7 @@ pub fn files_view(
         "connected": connected,
         "dark": dark,
         "chain": chain,
+        "account": account,
         "route": route,
         "route_serial": route_serial,
     });
@@ -4855,7 +4858,7 @@ pub(crate) mod tests {
         Some(
             serde_json::to_vec(&serde_json::json!({
                 "connected": true, "dark": false, "chain": "chain-a",
-                "route": "", "route_serial": 0
+                "account": "7", "route": "", "route_serial": 0
             }))
             .expect("props encode"),
         )

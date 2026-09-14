@@ -85,6 +85,7 @@ impl Ducktape {
                     self.is_dark(),
                     self.connected,
                     &self.network_chain_id,
+                    &self.account_number,
                     &self.fs_route,
                     self.fs_route_serial,
                 ),

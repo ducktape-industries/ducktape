@@ -1,9 +1,12 @@
-//! Files as a module-owned view on the kernel contract: the duckfs browser —
-//! one directory at a time, its preview, its history and the write bar.
+//! Files as a module-owned view on the kernel contract: a Finder-style
+//! browser over duckfs — a sidebar of places, a toolbar with the trail and
+//! the path bar, the directory as a sortable list or as Miller columns, an
+//! inspector over the chosen entry, and a status bar.
 //!
-//! The kernel pushes session facts only (`files.props`: connected, dark, and
-//! the chain a draft belongs to). The view lists the directory, reads the
-//! preview, walks the snapshot history and diffs a snapshot for itself through
+//! The kernel pushes session facts only (`files.props`: connected, dark, the
+//! chain a draft belongs to, and the reader's account). The view lists the
+//! directory, the homes and the snapshot history, reads the preview, asks
+//! which snapshot last touched a path and diffs a snapshot for itself through
 //! `files.get`, re-reads on every files block (`rpc.live`), and every write
 //! leaves as `op.submit` carrying the duckfs commit the kernel signs with the
 //! seated key. The pictures, the highlighted reader and the Markdown document
@@ -15,11 +18,11 @@ pub mod host;
 
 #[path = "ui/app.rs"]
 mod app;
-pub use app::{FilesView, Message};
+pub use app::{FilesView, Message, browse};
 
 ducktape_view_guest::export_app!(
     FilesView,
     "Files",
-    "The duckfs browser: one directory at a time, its preview, its history and its writes.",
+    "The duckfs browser: places, the trail, the directory as rows or columns, and the chosen entry.",
     ["files"]
 );
