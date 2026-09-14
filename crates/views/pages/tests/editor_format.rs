@@ -70,6 +70,26 @@ fn without_a_selection_the_word_under_the_caret_takes_the_mark() {
         after.cursor.position.column, 6,
         "the caret waits inside the empty pair"
     );
+    assert!(after.cursor.selection.is_none(), "a caret stays a caret");
+    // The caret keeps its place in the word through the wrap and the unwrap,
+    // so the next keystroke goes on the word, never over it.
+    let end_of_word = doc("Title\nwith a bold word", 1, 11);
+    let wrapped = apply(&end_of_word, format::toggle(&end_of_word, Wrap::Bold));
+    assert_eq!(wrapped.text, "Title\nwith a **bold** word");
+    assert_eq!(wrapped.cursor.position.column, 13);
+    assert!(wrapped.cursor.selection.is_none());
+    // At the end of the run, a second toggle LEAVES the mark: the words stay
+    // bold and the caret steps past the fence, so what is typed next is plain.
+    let left = apply(&wrapped, format::toggle(&wrapped, Wrap::Bold));
+    assert_eq!(left.text, "Title\nwith a **bold** word");
+    assert_eq!(left.cursor.position.column, 15);
+    assert!(left.cursor.selection.is_none());
+    // Mid-run, the toggle still unwraps the word and the caret keeps its place.
+    let mid_run = doc("Title\nwith a **bold** word", 1, 11);
+    let unwrapped = apply(&mid_run, format::toggle(&mid_run, Wrap::Bold));
+    assert_eq!(unwrapped.text, "Title\nwith a bold word");
+    assert_eq!(unwrapped.cursor.position.column, 9);
+    assert!(unwrapped.cursor.selection.is_none());
 }
 
 #[test]
