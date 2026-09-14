@@ -398,7 +398,7 @@ fn the_resolved_toggle_opens_the_settled_threads() {
     let frame = page_card();
     let frame = tick_native(press(&frame, "Resolved threads"));
     assert!(
-        has_text(&frame, "settled already") && has_text(&frame, "Reopen"),
+        has_text(&frame, "settled already") && has_text(&frame, "↺"),
         "{:?}",
         texts(&frame)
     );
@@ -485,20 +485,17 @@ fn the_foot_composer_opens_a_new_thread_on_the_scope() {
 
 /// A REPLY NAMES ITS THREAD AND INHERITS ITS ANCHOR — the node validates the
 /// pair, so a block-anchored thread replied to with the page id is refused.
+/// Every open thread carries its own reply box; typing in one makes that
+/// thread the one being answered.
 #[test]
 fn a_reply_inherits_its_threads_own_anchor() {
     let frame = page_card();
-    let frame = tick_native(press(&frame, "Reply to this thread"));
-    // the reply box opened to be written in: the keyboard moves to it
-    let focus = request(&frame, "host.widget");
-    assert_eq!(
-        wire::decode::<wire::WidgetCommand>(&focus.payload).unwrap(),
-        wire::WidgetCommand::Focus {
-            target: "PagesView/root/pages/thread-reply(t-page)".into()
-        }
-    );
-    let frame = tick_native(type_into(&frame, "Reply…", "agreed"));
-    let frame = tick_native(press(&frame, "Post reply"));
+    let frame = tick_native(type_into(
+        &frame,
+        "PagesView/root/pages/thread-reply(t-page)",
+        "agreed",
+    ));
+    let frame = tick_native(press(&frame, "Reply"));
 
     let mint = request(&frame, "host.id");
     assert_eq!(
