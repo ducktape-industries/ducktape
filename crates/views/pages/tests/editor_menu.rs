@@ -457,8 +457,16 @@ fn ask_ai_lists_the_agents_and_addresses_the_comment_to_the_one_picked() {
         (Some(1), None, 9)
     );
 
+    // with nobody to ask the picker says so, and that row asks nobody
     let mut nobody = menu::Menu::default();
     nobody.format(&selection);
     let (_, picker) = nobody.pick(&selection, "ai");
-    assert!(picker.current(&selection).is_none(), "no agents, no picker");
+    let view = picker.current(&selection).expect("the picker opens on its one row");
+    assert_eq!(tags(&view), vec!["none"]);
+    assert_eq!(view.items[0].1, "No active agents");
+    let intent = picker.intent(&selection, "none");
+    assert_eq!((intent.comment_line, intent.mention), (None, 0));
+    let (decision, closed) = picker.pick(&selection, "none");
+    assert_eq!(decision, EditorDecision::Noop);
+    assert!(!closed.is_open());
 }

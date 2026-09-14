@@ -873,6 +873,7 @@ impl Menu {
             }
             (Kind::Link { line, column }, "open") => intent.link = link_at(document, line, column),
             (Kind::Link { line, column }, "copy") => intent.copy = link_at(document, line, column),
+            (Kind::Ai { .. }, NO_AGENTS) => {}
             // An agent pick is a comment addressed to that agent: on the
             // selection from the toolbar, on the whole block otherwise.
             (Kind::Ai { line, block }, account) => {
@@ -892,12 +893,20 @@ impl Menu {
 }
 
 /// The agent picker's rows: the account as the tag, the name as the label.
+/// With nobody to ask the picker still opens, on one row that says so — a
+/// pick that did nothing at all reads as a broken menu.
 fn agent_items(agents: &[(String, u64)]) -> Vec<(String, String)> {
+    if agents.is_empty() {
+        return vec![(NO_AGENTS.to_owned(), "No active agents".to_owned())];
+    }
     agents
         .iter()
         .map(|(name, account)| (account.to_string(), name.clone()))
         .collect()
 }
+
+/// The tag of the empty roster's one row: picking it asks nobody.
+const NO_AGENTS: &str = "none";
 
 /// The selection's byte columns on `line`, when the whole selection sits on it.
 fn selection_columns(document: &Doc, line: usize) -> Option<std::ops::Range<usize>> {
