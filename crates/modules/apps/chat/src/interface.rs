@@ -209,6 +209,9 @@ pub struct Channel {
     /// roster is consensus state (who is in the room); the audio itself rides
     /// the off-consensus voice plane.
     pub huddle: Vec<HuddleMember>,
+    /// a voice room: opened by `CreateVoiceChannel`, entered by joining its
+    /// huddle rather than by reading it.
+    pub voice: bool,
     /// the party that created the channel. a person owner is the only person
     /// who may administer it (rename, archive, roster, hooks); a module or
     /// system owner admits no person at all, and module and system parties
@@ -282,6 +285,11 @@ pub enum ChatMsg {
         name: String,
         post_policy: PostPolicy,
     },
+    /// open a voice room: a channel whose point is its huddle, listed under
+    /// its own heading and entered by joining. it posts `PostPolicy::Open`
+    /// like any channel; `Channel::voice` is what sets it apart. the same
+    /// id and namespace rules as `CreateChannel`.
+    CreateVoiceChannel { channel_id: String, name: String },
     /// open the two-party room with `counterpart`. the module derives the id
     /// itself — `client::dm_channel_id(creator account, counterpart)`, the
     /// creator being the ACCOUNT the origin resolved to — so the id can never

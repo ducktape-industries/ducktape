@@ -19,6 +19,7 @@ fn a_dm_id_is_pair_derived_and_cannot_be_forged() {
         archived: false,
         members_only: false,
         huddle_count: 0,
+        voice: false,
         huddle: Vec::new(),
         head_seq: 0,
     };
@@ -330,6 +331,7 @@ fn a_cold_start_lands_on_a_room_with_something_in_it() {
         archived,
         members_only: false,
         huddle_count: 0,
+        voice: false,
         huddle: Vec::new(),
         head_seq: head,
     };
@@ -379,6 +381,7 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
         archived: false,
         members_only: false,
         huddle_count: 0,
+        voice: false,
         huddle: Vec::new(),
         head_seq: head,
     };

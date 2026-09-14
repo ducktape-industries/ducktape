@@ -82,8 +82,8 @@ serde_json = "1"
 # `/v1/call/ws` socket the node's call hub serves.
 cpal = "0.15"
 tokio-tungstenite = "0.24"
-# The camera leg (`src/video.rs`): capture + the pure-Rust intra-only JPEG
-# codec v1 (see the module doc for the codec seam).
+# The camera leg (`src/video.rs`): capture. The JPEG codec it feeds is
+# `media_service::video::codec`, deliberately NOT a dep here (see that module).
 nokhwa = { version = "0.10", features = ["input-native"] }
 # The screen-share leg (`src/video.rs`): a root-window grab over X11. Already
 # in this binary under winit, and pure Rust — the portal/pipewire route would
@@ -91,8 +91,6 @@ nokhwa = { version = "0.10", features = ["input-native"] }
 # Wayland session's X root holds X clients only, so the share refuses there
 # rather than grab a black desktop (`ScreenSource::open`).
 x11rb = "0.13"
-jpeg-encoder = "0.6"
-zune-jpeg = "0.4"
 # The picture viewer (`src/backend/picture.rs`) decodes to RGBA off-thread;
 # GPUI receives the decoded pixels.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }

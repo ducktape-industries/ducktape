@@ -116,12 +116,54 @@ impl ChatView {
             native::list_row(key.clone(), content, selected, action),
             channel.name,
         );
-        if channel.huddle.is_empty() {
+        self.with_seats(key, row, &channel.huddle)
+    }
+
+    /// A voice room in the list pane: the speaker mark, the name, and the
+    /// people in it. Pressing it joins (the row the reader sits in is the
+    /// selected one); the huddle window is where the call itself lives.
+    pub(super) fn voice_button(
+        &self,
+        key: String,
+        channel: crate::host::ChatChannel,
+        joined: bool,
+    ) -> wire::Node {
+        let p = native::palette();
+        let mut children = vec![
+            native::nowrap(native::colored(
+                native::text(format!("{key}/mark"), "🔊"),
+                p.muted,
+            )),
+            native::nowrap(native::text(format!("{key}/name"), &channel.name)),
+        ];
+        if channel.archived {
+            children.push(native::nowrap(native::caption(
+                format!("{key}/archived"),
+                "Archived",
+            )));
+        }
+        let can_join = !(self.busy || channel.archived);
+        let action = can_join.then(|| slots::message(Message::JoinVoice(channel.id)));
+        let content = native::spaced(native::centered_row(format!("{key}/row"), children), 6.);
+        let row = sidebar_row(
+            native::list_row(key.clone(), content, joined, action),
+            channel.name,
+        );
+        self.with_seats(key, row, &channel.huddle)
+    }
+
+    /// The people in the room's huddle, under the room like a voice channel.
+    fn with_seats(
+        &self,
+        key: String,
+        row: wire::Node,
+        huddle: &[crate::host::HuddleSeat],
+    ) -> wire::Node {
+        if huddle.is_empty() {
             return row;
         }
-        // the people in the room's huddle, under the room like a voice channel
         let mut seats = vec![row];
-        for (index, seat) in channel.huddle.iter().enumerate() {
+        for (index, seat) in huddle.iter().enumerate() {
             seats.push(self.huddle_seat(format!("{key}/seat/{index}"), seat));
         }
         native::spaced(native::column(format!("{key}/with-huddle"), seats), 2.)

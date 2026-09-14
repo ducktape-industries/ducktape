@@ -829,6 +829,7 @@ impl Chat {
         channel_id: String,
         name: String,
         post_policy: PostPolicy,
+        voice: bool,
         created_at: u64,
     ) -> Result<Report, Error> {
         let channel = Channel {
@@ -840,6 +841,7 @@ impl Chat {
             hooks: Vec::new(),
             pinned: Vec::new(),
             huddle: Vec::new(),
+            voice,
             owner: party.clone(),
             archived: false,
             revision: 1,
@@ -858,6 +860,7 @@ impl Chat {
         channel_id: String,
         name: String,
         post_policy: PostPolicy,
+        voice: bool,
         created_at: u64,
     ) -> Result<Report, Error> {
         validate_object_id("channel_id", &channel_id)?;
@@ -878,7 +881,8 @@ impl Chat {
             )));
         }
         self.check_creator_cap(party).await?;
-        let report = self.stage_new_channel(party, channel_id, name, post_policy, created_at)?;
+        let report =
+            self.stage_new_channel(party, channel_id, name, post_policy, voice, created_at)?;
         self.bump_creator_count(party).await?;
         Ok(report)
     }
@@ -933,6 +937,7 @@ impl Chat {
             channel_id.clone(),
             name,
             PostPolicy::MembersOnly,
+            false,
             created_at,
         )?;
         self.store(member_key(&channel_id, party), &true);
@@ -1575,7 +1580,14 @@ impl Chat {
                 post_policy,
             } => {
                 let report = self
-                    .stage_channel(&party, channel_id, name, post_policy, now)
+                    .stage_channel(&party, channel_id, name, post_policy, false, now)
+                    .await?;
+                self.report(ctx, &party, report);
+                Ok(())
+            }
+            ChatMsg::CreateVoiceChannel { channel_id, name } => {
+                let report = self
+                    .stage_channel(&party, channel_id, name, PostPolicy::Open, true, now)
                     .await?;
                 self.report(ctx, &party, report);
                 Ok(())

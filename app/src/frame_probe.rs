@@ -100,6 +100,7 @@ fn probe_channel_with_head(index: i64, head_seq: i64) -> backend::ChatChannel {
         archived: false,
         members_only: false,
         huddle_count: 0,
+        voice: false,
         huddle: Vec::new(),
         head_seq,
     }

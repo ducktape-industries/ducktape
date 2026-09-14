@@ -212,13 +212,28 @@ impl ChatView {
                 self.loading || self.busy,
             )),
         )];
-        for room in &self.rooms {
+        let (voice_rooms, text_rooms): (Vec<_>, Vec<_>) =
+            self.rooms.iter().partition(|room| room.channel.voice);
+        for room in text_rooms {
             rooms.push(self.channel_button(
                 format!("{key}/channel/{}", room.channel.id),
                 Message::ChooseChannel,
                 room.channel.clone(),
                 room.channel.id == self.active_channel,
                 room.unread,
+            ));
+        }
+        // voice rooms sit under their own heading, the way a voice channel
+        // does: a press joins the room's huddle instead of opening it
+        if !voice_rooms.is_empty() {
+            rooms.push(native::gap(8.));
+            rooms.push(section_row(format!("{key}/voice-heading-row"), "Voice", None));
+        }
+        for room in voice_rooms {
+            rooms.push(self.voice_button(
+                format!("{key}/voice/{}", room.channel.id),
+                room.channel.clone(),
+                room.channel.id == self.huddle_channel,
             ));
         }
         if !self.dm_rows.is_empty() {
@@ -290,7 +305,10 @@ impl ChatView {
             header.push(self.private_badge(format!("{key}/private")));
         }
         header.push(native::spacer());
-        if self.huddle_joined {
+        // the header speaks for THIS room's huddle: seated elsewhere (a voice
+        // room), the room on screen still offers its own to join
+        let seated_here = self.huddle_joined && self.huddle_channel == self.active_channel;
+        if seated_here {
             header.push(self.huddle_controls(
                 format!("{key}/huddle"),
                 || Message::LeaveHuddleHere,

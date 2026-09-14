@@ -88,6 +88,67 @@ fn empty_state(key: &str, title: &str, description: &str) -> Node {
     kit::empty_state(key, title, description)
 }
 
+/// One row of a dropdown: a glyph column, then the words left-aligned.
+fn menu_item(key: String, glyph: &str, label: &str, message: Message, disabled: bool) -> Node {
+    let content = kit::spaced(
+        kit::centered_row(
+            format!("{key}/row"),
+            [
+                kit::sized(
+                    kit::nowrap(kit::text(format!("{key}/glyph"), glyph)),
+                    Some(Length::Fixed(20.)),
+                    None,
+                ),
+                kit::nowrap(kit::text(format!("{key}/label"), label)),
+            ],
+        ),
+        8.,
+    );
+    let mut button = kit::button_child(
+        key,
+        content,
+        (!disabled).then(|| slots::message(message)),
+        ButtonPreset::Subtle,
+    );
+    if let Node::Button {
+        label: accessible,
+        width,
+        padding,
+        ..
+    } = &mut button
+    {
+        *accessible = Some(label.into());
+        *width = Some(Length::Fill);
+        *padding = Some(wire::Edges {
+            top: 4.,
+            right: 8.,
+            bottom: 4.,
+            left: 8.,
+        });
+    }
+    button
+}
+
+/// A small icon button: a glyph with an accessible name.
+fn glyph(key: String, glyph: &str, label: &str, message: Message, disabled: bool) -> Node {
+    let mut button = action(key, glyph, message, !disabled, ButtonPreset::Subtle);
+    if let Node::Button {
+        label: accessible,
+        padding,
+        ..
+    } = &mut button
+    {
+        *accessible = Some(label.into());
+        *padding = Some(wire::Edges {
+            top: 1.,
+            right: 5.,
+            bottom: 1.,
+            left: 5.,
+        });
+    }
+    button
+}
+
 /// A modal card: surface, border, the card radius, a fixed width.
 fn modal(key: &str, child: Node, width: f32) -> Node {
     let mut card = kit::card(key, child);
@@ -131,10 +192,15 @@ impl PagesView {
     }
 
     fn delete_dialog(&self) -> Node {
-        let title = if self.active_page_title.is_empty() {
+        let target = crate::host::page_display_title(
+            &self.pages,
+            &self.page_delete_page,
+            &self.active_page_title,
+        );
+        let title = if target.is_empty() {
             "Untitled"
         } else {
-            &self.active_page_title
+            target.as_str()
         };
         let contents = kit::spaced(
             kit::column(

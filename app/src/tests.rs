@@ -172,6 +172,7 @@ fn room(id: &str, head: i64) -> backend::ChatChannel {
         archived: false,
         members_only: false,
         huddle_count: 0,
+        voice: false,
         huddle: Vec::new(),
         head_seq: head,
     }
@@ -309,6 +310,34 @@ pub(crate) fn handler_bodies() -> Vec<(String, String)> {
     assert!(!found.bodies.is_empty(), "real native handlers are present");
     found.bodies
 }
+/// One named method of the native update impl, whitespace stripped like a
+/// handler body — for the helpers several handlers delegate to.
+pub(crate) fn fn_body(name: &str) -> String {
+    use quote::ToTokens;
+    let source = syn::parse_file(include_str!("ui/app_update.rs")).expect("native update Rust");
+    source
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Impl(item) => Some(&item.items),
+            _ => None,
+        })
+        .flatten()
+        .find_map(|item| match item {
+            syn::ImplItem::Fn(function) if function.sig.ident == name => Some(
+                function
+                    .block
+                    .to_token_stream()
+                    .to_string()
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing native method {name}"))
+}
+
 pub(crate) fn handler_body(variant: &str) -> String {
     let mut found = handler_bodies()
         .into_iter()

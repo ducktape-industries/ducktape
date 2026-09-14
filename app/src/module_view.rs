@@ -646,6 +646,7 @@ pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
         "show_huddle" => Intent::ShowHuddle,
         "leave_huddle" => Intent::LeaveHuddle,
         "join_huddle" => Intent::JoinHuddle,
+        "join_voice" => Intent::JoinVoice,
         "scrolled" => Intent::Scrolled,
         "open_link" => Intent::OpenLink,
         "copy" => Intent::Copy,
@@ -694,10 +695,11 @@ pub fn chat_composer_roster(scope: &str, members: &[crate::backend::ChatMember])
 // ---------- the files seat ----------
 
 /// The Files tab, drawn by the `files` view over the KERNEL CONTRACT: the app
-/// pushes session facts only, and the view lists the directory, reads the
-/// preview, walks the snapshot history and diffs a snapshot for itself through
-/// `files.get` / `rpc.live`, writing through `op.submit` signed here with the
-/// seated key. Two events come back, both OS doors the app owns: `open_link`
+/// pushes session facts only — `account` among them, the reader's own, which
+/// names her home under `/home` for the view's sidebar — and the view lists
+/// the directory, reads the preview, walks the snapshot history and diffs a
+/// snapshot for itself through `files.get` / `rpc.live`, writing through
+/// `op.submit` signed here with the seated key. Two events come back, both OS doors the app owns: `open_link`
 /// for a link the Markdown reader activated, and `at` naming the directory a
 /// file dropped on the window lands in. The picture viewer, the highlighted
 /// reader and the Markdown document are host surfaces defined in `surfaces.rs`.
@@ -711,6 +713,7 @@ pub fn files_view(
     dark: bool,
     connected: bool,
     chain: &str,
+    account: &str,
     route: &str,
     route_serial: i64,
 ) -> ViewSpec {
@@ -718,6 +721,7 @@ pub fn files_view(
         "connected": connected,
         "dark": dark,
         "chain": chain,
+        "account": account,
         "route": route,
         "route_serial": route_serial,
     });
@@ -781,6 +785,7 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "show_huddle",
             "leave_huddle",
             "join_huddle",
+            "join_voice",
             "scrolled",
             "open_link",
             "copy",
@@ -3108,7 +3113,7 @@ pub(crate) mod tests {
         // the agents view signs its own pause and save through `op.submit`
         assert_eq!(intents_of("agents"), ["register", "open_run", "open_link"]);
         let chat = intents_of("chat");
-        assert_eq!(chat.len(), 14);
+        assert_eq!(chat.len(), 15);
         // the writes the view signs for itself are nobody's intent
         for signed in ["react", "edit", "delete", "rename", "search", "mark_read"] {
             assert!(!chat.contains(&signed), "{signed} is an op.submit now");
@@ -4856,7 +4861,7 @@ pub(crate) mod tests {
         Some(
             serde_json::to_vec(&serde_json::json!({
                 "connected": true, "dark": false, "chain": "chain-a",
-                "route": "", "route_serial": 0
+                "account": "7", "route": "", "route_serial": 0
             }))
             .expect("props encode"),
         )

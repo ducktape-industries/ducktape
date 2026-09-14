@@ -1,658 +1,795 @@
+//! Every message the browser answers, one handler per variant. A handler
+//! decides with the pure model in `browse.rs` and then writes state; every
+//! move of the reader goes through [`FilesView::land`], the one place the
+//! per-directory state resets.
+
 use super::*;
-impl super::FilesView {
-    pub(crate) fn update(&mut self, message: Message) -> ducktape_view_guest::Task<Message> {
+use ::ducktape_view_guest::Task;
+
+impl FilesView {
+    pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::TreeResized(dx, _dy) => self.on_tree_resized(dx, _dy),
-            Message::PreviewResized(_dx, dy) => self.on_preview_resized(_dx, dy),
-            Message::ObjectResized(dx, _dy) => self.on_object_resized(dx, _dy),
-            Message::ViewportChanged(width, height) => self.on_viewport_changed(width, height),
             Message::SessionArrived(item) => self.on_session_arrived(item),
             Message::RouteTo(target) => self.on_route_to(target),
-            Message::ListingArrived(item) => self.on_listing_arrived(item),
+            Message::WorkspaceArrived(item) => self.on_workspace_arrived(item),
             Message::PreviewArrived(item) => self.on_preview_arrived(item),
+            Message::ProvenanceArrived(item) => self.on_provenance_arrived(item),
             Message::DiffArrived(item) => self.on_diff_arrived(item),
             Message::ActDone(item) => self.on_act_done(item),
-            Message::OpenDirAt(target) => self.on_open_dir_at(target),
-            Message::OpenFileAt(target) => self.on_open_file_at(target),
-            Message::MkdirSubmit => self.on_mkdir_submit(),
-            Message::NewFileSubmit => self.on_new_file_submit(),
-            Message::ArmDeleteAt(target) => self.on_arm_delete_at(target),
-            Message::DisarmDeleteNow => self.on_disarm_delete_now(),
+            Message::Navigate(target) => self.on_navigate(target),
+            Message::Back => self.on_back(),
+            Message::Forward => self.on_forward(),
+            Message::Parent => self.on_parent(),
+            Message::Refresh => self.on_refresh(),
+            Message::LoadMore => self.on_load_more(),
+            Message::Select(path) => self.on_select(path),
+            Message::Open(path) => self.on_open(path),
+            Message::KeyPressed(key) => self.on_key_pressed(key),
+            Message::SetViewMode(mode) => self.on_set_view_mode(mode),
+            Message::SortBy(key) => self.on_sort_by(key),
+            Message::FilterChanged(filter) => self.on_filter_changed(filter),
+            Message::ToggleSidebar => self.on_toggle_sidebar(),
+            Message::ToggleInspector => self.on_toggle_inspector(),
+            Message::Prompt(prompt) => self.on_prompt(prompt),
+            Message::NameChanged(name) => self.on_name_changed(name),
+            Message::NameSubmit => self.on_name_submit(),
+            Message::ArmDelete(target) => self.on_arm_delete(target),
+            Message::DisarmDelete => self.on_disarm_delete(),
             Message::DeleteSubmit => self.on_delete_submit(),
-            Message::CloseDiffNow => self.on_close_diff_now(),
             Message::ShowDiffOf(id) => self.on_show_diff_of(id),
+            Message::CloseDiff => self.on_close_diff(),
             Message::BeginEdit(token) => self.on_begin_edit(token),
             Message::CancelEdit(token) => self.on_cancel_edit(token),
             Message::DiscardDraft(id) => self.on_discard_draft(id),
             Message::SaveEdit(token) => self.on_save_edit(token),
-            Message::OpenLinkAt(url) => self.on_open_link_at(url),
-            Message::ToggleHistory => self.on_toggle_history(),
-            Message::NewNameChanged(value) => self.on_new_name_changed(value),
-            Message::DraftTransaction(transaction) => self.on_draft_transaction(transaction),
             Message::EditDraft(document) => self.on_edit_draft(document),
+            Message::DraftTransaction(transaction) => self.on_draft_transaction(transaction),
+            Message::OpenLinkAt(url) => self.on_open_link_at(url),
+            Message::SidebarResized(dx, _dy) => self.on_sidebar_resized(dx),
+            Message::InspectorResized(dx, _dy) => self.on_inspector_resized(dx),
+            Message::ViewportChanged(width, height) => self.on_viewport_changed(width, height),
         }
-    }
-    fn on_tree_resized(&mut self, dx: f64, _dy: f64) -> ducktape_view_guest::Task<Message> {
-        self.tree_width = crate::host::tree_width_after_delta(
-            self.tree_width,
-            dx,
-            self.viewport_width,
-            self.object_width,
-        );
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_preview_resized(&mut self, _dx: f64, dy: f64) -> ducktape_view_guest::Task<Message> {
-        self.preview_pane_height = crate::host::preview_height_after_delta(
-            self.preview_pane_height,
-            -dy,
-            self.viewport_height,
-        );
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_object_resized(&mut self, dx: f64, _dy: f64) -> ducktape_view_guest::Task<Message> {
-        self.object_width = crate::host::object_width_after_delta(
-            self.object_width,
-            -dx,
-            self.viewport_width,
-            self.tree_width,
-        );
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_viewport_changed(
-        &mut self,
-        width: f64,
-        height: f64,
-    ) -> ducktape_view_guest::Task<Message> {
-        self.viewport_width = width;
-        self.viewport_height = height;
-        self.tree_width =
-            crate::host::tree_width_after_delta(self.tree_width, 0.0, width, self.object_width);
-        self.preview_pane_height =
-            crate::host::preview_height_after_delta(self.preview_pane_height, 0.0, height);
-        self.object_width =
-            crate::host::object_width_after_delta(self.object_width, 0.0, width, self.tree_width);
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_session_arrived(
-        &mut self,
-        item: crate::host::SessionItem,
-    ) -> ducktape_view_guest::Task<Message> {
-        self.notice = crate::host::keep_str(
-            !(item.error).is_empty(),
-            ::std::convert::AsRef::as_ref(&(item.error)),
-            ::std::convert::AsRef::as_ref(&(self.notice)),
-        );
-        if !(item.error).is_empty() {
-            return ::ducktape_view_guest::Task::none();
-        }
-        let next = item.next.clone();
-        self.generation =
-            crate::host::generation_after(self.connected, next.connected, self.generation);
-        {
-            let next = self.listed && next.connected;
-            if ::ducktape_view_guest::state_changed!(self.listed, next) {
-                self.listed = next;
-                self.derived.loading.take();
-            }
-        }
-        {
-            let next = next.connected;
-            if ::ducktape_view_guest::state_changed!(self.connected, next) {
-                self.connected = next;
-                self.derived.loading.take();
-            }
-        }
-        {
-            let next = next.chain.to_owned();
-            if ::ducktape_view_guest::state_changed!(self.chain, next) {
-                self.chain = next;
-                self.derived.draft_here.take();
-                self.derived.draft_parked.take();
-                self.derived.edit_context.take();
-            }
-        }
-        self.dark = next.dark;
-        let routed = (next.route_serial != self.route_serial) && (!(next.route).is_empty());
-        self.route_serial = next.route_serial;
-        let landing = crate::host::keep_str(
-            routed,
-            ::std::convert::AsRef::as_ref(&(next.route)),
-            ::std::convert::AsRef::as_ref(&("")),
-        );
-        ducktape_view_guest::Task::done(Message::RouteTo(landing))
     }
 
-    fn on_route_to(&mut self, target: String) -> ducktape_view_guest::Task<Message> {
-        if (target).is_empty() {
-            return ::ducktape_view_guest::Task::none();
+    // ---- the one reset ----
+
+    /// The reader has moved: everything that belonged to the directory she
+    /// left goes with it, the new directory is asked for, and the window's
+    /// drop door is told where the view now stands.
+    fn land(&mut self) {
+        self.listing = Listing::Pending;
+        self.pages = 1;
+        self.columns.clear();
+        self.column_listings.clear();
+        self.filter.clear();
+        self.clear_choice();
+        self.notice.clear();
+        self.name_prompt = NamePrompt::Closed;
+        self.name_draft.clear();
+        self.sent = crate::host::at(&self.nav.path);
+    }
+
+    /// Nothing is chosen: no preview, no provenance, no comparison.
+    fn clear_choice(&mut self) {
+        self.selected.clear();
+        self.preview = Preview::default();
+        self.provenance = Provenance::default();
+    }
+
+    /// The chosen row is `path`: a file is previewed, a folder is inspected.
+    /// In column view a chosen folder also opens to the right.
+    fn choose(&mut self, entry: FsEntry) {
+        self.selected = entry.path.clone();
+        self.provenance = Provenance::default();
+        self.preview = match entry.is_dir() {
+            true => Preview::default(),
+            false => Preview::of(&entry.path),
+        };
+        let in_columns = self.view_mode == ViewMode::Columns;
+        match (in_columns, entry.is_dir()) {
+            (true, true) => self.open_column(&entry.path),
+            (true, false) => self.close_columns_after(&entry.path),
+            (false, _) => {}
         }
-        self.notice = "".to_owned();
+    }
+
+    /// The columns to the right of the one holding `path` close: a chosen
+    /// file ends the chain at its own column.
+    fn close_columns_after(&mut self, path: &str) {
+        let keep = self.column_owning(path).unwrap_or(0);
+        self.columns.truncate(keep);
+        self.column_listings
+            .retain(|column, _| self.columns.contains(column));
+    }
+
+    /// The columns to the right of the current directory end at the parent
+    /// of `path` and continue with it.
+    fn open_column(&mut self, path: &str) {
+        let parent = crate::host::fs_parent(path);
+        let keep = self
+            .columns
+            .iter()
+            .position(|column| *column == parent)
+            .map_or(0, |index| index + 1);
+        self.columns.truncate(keep);
+        self.columns.push(path.to_owned());
+        self.column_listings
+            .retain(|column, _| self.columns.contains(column));
+    }
+
+    // ---- the readings ----
+
+    fn on_session_arrived(&mut self, item: crate::host::SessionItem) -> Task<Message> {
+        if !item.error.is_empty() {
+            self.notice = item.error;
+            return Task::none();
+        }
+        let next = item.next;
+        let came_up = next.connected && !self.connected;
+        if came_up {
+            self.generation += 1;
+        }
+        // rows read over a connection that dropped are no longer this path's
+        let dropped = !next.connected && self.connected;
+        if dropped {
+            self.listing = Listing::Pending;
+            self.column_listings.clear();
+        }
+        self.connected = next.connected;
+        self.chain = next.chain;
+        self.account = next.account;
+        self.dark = next.dark;
+        // A duck:// LINK LANDS ON THE FILE. The shell resolved the address and
+        // moved the tab; the path itself is a session fact, and the SERIAL —
+        // not the path — says a push happened, so the same file twice opens
+        // twice.
+        let routed = next.route_serial != self.route_serial && !next.route.is_empty();
+        self.route_serial = next.route_serial;
+        match routed {
+            true => Task::done(Message::RouteTo(next.route)),
+            false => Task::none(),
+        }
+    }
+
+    /// WHERE THE LINK SENT THE READER. The address names a FILE: its directory
+    /// is what the browser lists, the file itself is what the inspector
+    /// reads. The same address twice is the same two subscription keys, so
+    /// the generation is what makes the second push read again.
+    fn on_route_to(&mut self, target: String) -> Task<Message> {
         self.generation += 1;
-        {
-            let next = crate::host::fs_parent(::std::convert::AsRef::as_ref(&(target)));
-            if ::ducktape_view_guest::state_changed!(self.path, next) {
-                self.path = next;
-                self.derived.refusal.take();
-            }
-        }
-        {
-            let next = false;
-            if ::ducktape_view_guest::state_changed!(self.listed, next) {
-                self.listed = next;
-                self.derived.loading.take();
-            }
-        }
-        self.entries = Vec::new();
-        self.directories = Vec::new();
-        self.omitted = 0;
-        self.diff_from = "".to_owned();
-        self.diff = Vec::new();
-        self.diff_omitted = 0;
-        {
-            let next = target.to_owned();
-            if ::ducktape_view_guest::state_changed!(self.preview_path, next) {
-                self.preview_path = next;
-                self.derived.draft_here.take();
-                self.derived.draft_parked.take();
-                self.derived.edit_context.take();
-            }
-        }
-        self.preview_entry = crate::host::no_fs_entry();
-        {
-            let next = "".to_owned();
-            if ::ducktape_view_guest::state_changed!(self.preview_base, next) {
-                self.preview_base = next;
-                self.derived.edit_context.take();
-            }
-        }
-        self.preview_text = "".to_owned();
-        {
-            let next = "".to_owned();
-            if ::ducktape_view_guest::state_changed!(self.preview_display_text, next) {
-                self.preview_display_text = next;
-            }
-        }
-        self.preview_clipped = false;
-        self.preview_truncated = false;
-        self.preview_binary = false;
-        self.preview_picture = false;
-        self.preview_width = 0;
-        self.preview_height = 0;
-        self.sent = crate::host::at(::std::convert::AsRef::as_ref(&(self.path)));
-        ::ducktape_view_guest::Task::none()
+        self.nav.go(&crate::host::fs_parent(&target));
+        self.land();
+        self.selected = target.clone();
+        self.preview = Preview::of(&target);
+        Task::none()
     }
-    fn on_listing_arrived(
-        &mut self,
-        item: crate::host::ListingItem,
-    ) -> ducktape_view_guest::Task<Message> {
-        self.notice = crate::host::keep_str(
-            !(item.error).is_empty(),
-            ::std::convert::AsRef::as_ref(&(item.error)),
-            ::std::convert::AsRef::as_ref(&(self.notice)),
-        );
-        if !(item.error).is_empty() {
-            return ::ducktape_view_guest::Task::none();
+
+    fn on_workspace_arrived(&mut self, item: crate::host::WorkspaceItem) -> Task<Message> {
+        let for_here = item.directory.path == self.nav.path;
+        if !for_here {
+            return Task::none();
         }
-        {
-            let next = true;
-            if ::ducktape_view_guest::state_changed!(self.listed, next) {
-                self.listed = next;
-                self.derived.loading.take();
-            }
+        self.listing = listing_of(item.directory);
+        self.column_listings = item
+            .columns
+            .into_iter()
+            .filter(|column| self.columns.contains(&column.path))
+            .map(|column| (column.path.clone(), listing_of(column)))
+            .collect();
+        self.homes = item.homes;
+        self.history_error = item.history_error;
+        if self.history_error.is_empty() {
+            self.history = item.history;
         }
-        self.entries = item.entries.clone();
-        self.directories = item.directories.clone();
-        self.history = item.history.clone();
-        self.omitted = item.omitted;
-        self.preview_entry = crate::host::entry_named(
-            ::std::convert::AsRef::as_ref(&(item.entries)),
-            ::std::convert::AsRef::as_ref(&(self.preview_path)),
-        );
-        ::ducktape_view_guest::Task::none()
+        // a chosen row its directory no longer holds is no longer chosen —
+        // judged only against a directory read WHOLE: a refusal or a page
+        // not yet walked says nothing about the row
+        let owner = self.listing_owning(&self.selected).cloned();
+        let complete = matches!(&owner, Some(Listing::Listed { next, .. }) if next.is_empty());
+        let gone = complete && self.selected_entry().path.is_empty();
+        if gone {
+            self.clear_choice();
+        }
+        Task::none()
     }
-    fn on_preview_arrived(
-        &mut self,
-        item: crate::host::PreviewItem,
-    ) -> ducktape_view_guest::Task<Message> {
-        if item.path != self.preview_path {
-            return ::ducktape_view_guest::Task::none();
+
+    /// The listing of the directory `path` sits in: the current one, or an
+    /// open column's; `None` when neither is on screen.
+    fn listing_owning(&self, path: &str) -> Option<&Listing> {
+        let parent = crate::host::fs_parent(path);
+        if parent == self.nav.path {
+            return Some(&self.listing);
         }
-        self.notice = crate::host::keep_str(
-            !(item.error).is_empty(),
-            ::std::convert::AsRef::as_ref(&(item.error)),
-            ::std::convert::AsRef::as_ref(&(self.notice)),
-        );
-        if !(item.error).is_empty() {
-            // a pane that never got its page would say "Reading…" forever:
-            // it closes, the notice says why, and the row presses again
-            {
-                let next = "".to_owned();
-                if ::ducktape_view_guest::state_changed!(self.preview_path, next) {
-                    self.preview_path = next;
-                    self.derived.draft_here.take();
-                    self.derived.draft_parked.take();
-                    self.derived.edit_context.take();
-                }
-            }
-            return ::ducktape_view_guest::Task::none();
-        }
-        {
-            let next = item.base.to_owned();
-            if ::ducktape_view_guest::state_changed!(self.preview_base, next) {
-                self.preview_base = next;
-                self.derived.edit_context.take();
-            }
-        }
-        self.preview_text = item.text.to_owned();
-        {
-            let next = item.display_text.to_owned();
-            if ::ducktape_view_guest::state_changed!(self.preview_display_text, next) {
-                self.preview_display_text = next;
-            }
-        }
-        self.preview_clipped = item.clipped;
-        self.preview_truncated = item.truncated;
-        self.preview_binary = item.binary;
-        self.preview_picture = item.picture;
-        self.preview_width = item.width;
-        self.preview_height = item.height;
-        ::ducktape_view_guest::Task::none()
+        self.column_listings.get(&parent)
     }
-    fn on_diff_arrived(
-        &mut self,
-        item: crate::host::DiffItem,
-    ) -> ducktape_view_guest::Task<Message> {
-        self.notice = crate::host::keep_str(
-            !(item.error).is_empty(),
-            ::std::convert::AsRef::as_ref(&(item.error)),
-            ::std::convert::AsRef::as_ref(&(self.notice)),
-        );
-        if !(item.error).is_empty() {
-            return ::ducktape_view_guest::Task::none();
+
+    /// Which column the row `path` belongs to: 0 for the current directory,
+    /// `i + 1` for the column opened for `columns[i]`, `None` for a row no
+    /// column shows.
+    fn column_owning(&self, path: &str) -> Option<usize> {
+        let parent = crate::host::fs_parent(path);
+        if parent == self.nav.path {
+            return Some(0);
         }
-        self.diff = item.entries.clone();
+        self.columns
+            .iter()
+            .position(|column| *column == parent)
+            .map(|index| index + 1)
+    }
+
+    /// The rows column `index` shows: the current directory takes the
+    /// filter and the sort, an open column is name order.
+    pub(super) fn rows_of_column(&self, index: usize) -> Vec<FsEntry> {
+        if index == 0 {
+            return self.rows();
+        }
+        let Some(path) = self.columns.get(index - 1) else {
+            return Vec::new();
+        };
+        let entries = self
+            .column_listings
+            .get(path)
+            .map(Listing::entries)
+            .unwrap_or_default();
+        browse::visible_rows(entries, "", Sort::BY_NAME)
+    }
+
+    fn on_preview_arrived(&mut self, item: crate::host::PreviewItem) -> Task<Message> {
+        if item.path != self.preview.path {
+            return Task::none();
+        }
+        self.preview = Preview {
+            path: item.path,
+            base: item.base,
+            text: item.text,
+            display_text: item.display_text,
+            clipped: item.clipped,
+            truncated: item.truncated,
+            binary: item.binary,
+            picture: item.picture,
+            width: item.width,
+            height: item.height,
+            error: item.error,
+        };
+        Task::none()
+    }
+
+    fn on_provenance_arrived(&mut self, item: crate::host::ProvenanceItem) -> Task<Message> {
+        if item.path != self.selected {
+            return Task::none();
+        }
+        self.provenance = Provenance {
+            path: item.path,
+            snapshot: item.snapshot,
+            searched: item.searched,
+            answered: true,
+            error: item.error,
+        };
+        Task::none()
+    }
+
+    fn on_diff_arrived(&mut self, item: crate::host::DiffItem) -> Task<Message> {
+        if !item.error.is_empty() {
+            self.notice = item.error;
+            return Task::none();
+        }
+        self.diff = item.entries;
         self.diff_omitted = item.omitted;
-        ::ducktape_view_guest::Task::none()
+        Task::none()
     }
-    fn on_act_done(&mut self, item: crate::host::ActItem) -> ducktape_view_guest::Task<Message> {
-        self.notice = item.error.to_owned();
-        let ok = (item.error).is_empty();
-        let saved = item.kind == "save";
-        let named = (item.kind == "mkdir") || (item.kind == "new_file");
-        {
-            let next = self.acting && saved;
-            if ::ducktape_view_guest::state_changed!(self.acting, next) {
-                self.acting = next;
-                self.derived.loading.take();
-            }
+
+    /// EVERY WRITE'S OUTCOME IS THIS VIEW'S OWN. A committed write consumes
+    /// the prompt it came from, and moves the generation so the directory,
+    /// the history and the open preview are read again. A refused write
+    /// leaves the prompt or the confirm OPEN with the refusal inside it, so
+    /// the reader fixes the name or backs out from where she stands.
+    fn on_act_done(&mut self, item: crate::host::ActItem) -> Task<Message> {
+        self.notice = item.error.clone();
+        self.writing = Writing::Idle;
+        let committed = item.error.is_empty();
+        if !committed {
+            return Task::none();
         }
-        {
-            let next = self.saving && (!saved);
-            if ::ducktape_view_guest::state_changed!(self.saving, next) {
-                self.saving = next;
-                self.derived.loading.take();
-            }
+        match item.act {
+            Act::Mkdir | Act::NewFile => self.name_committed(),
+            Act::Rename => self.rename_committed(),
+            Act::Delete => self.delete_committed(),
+            Act::Save => self.save_committed(),
         }
-        {
-            let next = self.editing && (!(saved && ok));
-            if ::ducktape_view_guest::state_changed!(self.editing, next) {
-                self.editing = next;
-                self.derived.draft_here.take();
-                self.derived.draft_parked.take();
-            }
-        }
-        self.delete_target = crate::host::keep_str(
-            (item.kind == "delete") && ok,
-            ::std::convert::AsRef::as_ref(&("")),
-            ::std::convert::AsRef::as_ref(&(self.delete_target)),
-        );
-        self.new_name =
-            crate::host::keep_draft(named && ok, ::std::convert::AsRef::as_ref(&(self.new_name)));
         self.generation += 1;
-        ::ducktape_view_guest::Task::none()
+        Task::none()
     }
-    fn on_open_dir_at(&mut self, target: String) -> ducktape_view_guest::Task<Message> {
-        if ((*self.derived_loading()) || (!self.connected)) || (target == self.path) {
-            return ::ducktape_view_guest::Task::none();
-        }
-        self.notice = "".to_owned();
-        {
-            let next = target.to_owned();
-            if ::ducktape_view_guest::state_changed!(self.path, next) {
-                self.path = next;
-                self.derived.refusal.take();
-            }
-        }
-        {
-            let next = false;
-            if ::ducktape_view_guest::state_changed!(self.listed, next) {
-                self.listed = next;
-                self.derived.loading.take();
-            }
-        }
-        self.entries = Vec::new();
-        self.directories = Vec::new();
-        self.omitted = 0;
-        self.diff_from = "".to_owned();
-        self.diff = Vec::new();
-        self.diff_omitted = 0;
-        {
-            let next = "".to_owned();
-            if ::ducktape_view_guest::state_changed!(self.preview_path, next) {
-                self.preview_path = next;
-                self.derived.draft_here.take();
-                self.derived.draft_parked.take();
-                self.derived.edit_context.take();
-            }
-        }
-        self.preview_entry = crate::host::no_fs_entry();
-        {
-            let next = "".to_owned();
-            if ::ducktape_view_guest::state_changed!(self.preview_base, next) {
-                self.preview_base = next;
-                self.derived.edit_context.take();
-            }
-        }
-        self.preview_text = "".to_owned();
-        {
-            let next = "".to_owned();
-            if ::ducktape_view_guest::state_changed!(self.preview_display_text, next) {
-                self.preview_display_text = next;
-            }
-        }
-        self.preview_picture = false;
-        self.preview_binary = false;
-        self.preview_truncated = false;
-        self.sent = crate::host::at(::std::convert::AsRef::as_ref(&(self.path)));
-        ::ducktape_view_guest::Task::none()
+
+    fn name_committed(&mut self) {
+        self.name_prompt = NamePrompt::Closed;
+        self.name_draft.clear();
     }
-    fn on_open_file_at(&mut self, target: String) -> ducktape_view_guest::Task<Message> {
-        if ((*self.derived_loading()) || (!self.connected)) || (target == self.preview_path) {
-            return ::ducktape_view_guest::Task::none();
-        }
-        self.notice = "".to_owned();
-        {
-            let next = target.to_owned();
-            if ::ducktape_view_guest::state_changed!(self.preview_path, next) {
-                self.preview_path = next;
-                self.derived.draft_here.take();
-                self.derived.draft_parked.take();
-                self.derived.edit_context.take();
+
+    fn rename_committed(&mut self) {
+        let NamePrompt::Rename(from) = std::mem::replace(&mut self.name_prompt, NamePrompt::Closed)
+        else {
+            return;
+        };
+        let to = crate::host::fs_child(&crate::host::fs_parent(&from), &self.name_draft);
+        self.name_draft.clear();
+        let chosen = self.selected == from;
+        if chosen {
+            self.selected = to.clone();
+            let previewing = !self.preview.path.is_empty();
+            if previewing {
+                self.preview = Preview::of(&to);
             }
+            self.provenance = Provenance::default();
         }
-        self.preview_entry = crate::host::entry_named(
-            ::std::convert::AsRef::as_ref(&(self.entries)),
-            ::std::convert::AsRef::as_ref(&(target)),
-        );
-        {
-            let next = "".to_owned();
-            if ::ducktape_view_guest::state_changed!(self.preview_base, next) {
-                self.preview_base = next;
-                self.derived.edit_context.take();
+    }
+
+    /// The deleted object, or anything under it, can no longer be the
+    /// chosen row — the preview would show a file that is gone.
+    fn delete_committed(&mut self) {
+        let target = std::mem::take(&mut self.delete_target);
+        let under = format!("{}/", target.trim_end_matches('/'));
+        let chosen = self.selected == target || self.selected.starts_with(&under);
+        if chosen {
+            self.clear_choice();
+        }
+        let columns_under = self
+            .columns
+            .iter()
+            .any(|column| *column == target || column.starts_with(&under));
+        if columns_under {
+            self.columns.clear();
+            self.column_listings.clear();
+        }
+    }
+
+    fn save_committed(&mut self) {
+        self.editing = false;
+    }
+
+    // ---- the navigation ----
+
+    fn on_navigate(&mut self, target: String) -> Task<Message> {
+        if !self.connected {
+            return Task::none();
+        }
+        let moved = self.nav.go(&target);
+        if moved {
+            self.land();
+        }
+        Task::none()
+    }
+
+    fn on_back(&mut self) -> Task<Message> {
+        if self.connected && self.nav.back() {
+            self.land();
+        }
+        Task::none()
+    }
+
+    fn on_forward(&mut self) -> Task<Message> {
+        if self.connected && self.nav.forward() {
+            self.land();
+        }
+        Task::none()
+    }
+
+    fn on_parent(&mut self) -> Task<Message> {
+        if self.nav.at_root() {
+            return Task::none();
+        }
+        self.on_navigate(crate::host::fs_parent(&self.nav.path))
+    }
+
+    /// Ask again, keeping the reader's place: a failed listing's way back.
+    fn on_refresh(&mut self) -> Task<Message> {
+        if !self.connected {
+            return Task::none();
+        }
+        self.notice.clear();
+        self.generation += 1;
+        self.listing = Listing::Pending;
+        self.column_listings.clear();
+        Task::none()
+    }
+
+    fn on_load_more(&mut self) -> Task<Message> {
+        if self.connected && self.listing.has_more() {
+            self.pages += 1;
+        }
+        Task::none()
+    }
+
+    fn on_select(&mut self, path: String) -> Task<Message> {
+        if !self.connected {
+            return Task::none();
+        }
+        let entry = self.entry_at(&path);
+        let already = entry.path == self.selected;
+        if entry.path.is_empty() || already {
+            return Task::none();
+        }
+        self.choose(entry);
+        Task::none()
+    }
+
+    /// A double-click or Enter: a folder becomes the directory, a file is
+    /// chosen and previewed.
+    fn on_open(&mut self, path: String) -> Task<Message> {
+        let entry = self.entry_at(&path);
+        match entry.is_dir() {
+            true => self.on_navigate(path),
+            false => self.on_select(path),
+        }
+    }
+
+    /// The entry `path` names in any listing on screen.
+    pub(super) fn entry_at(&self, path: &str) -> FsEntry {
+        let here = crate::host::entry_named(self.listing.entries(), path);
+        if !here.path.is_empty() {
+            return here;
+        }
+        self.column_listings
+            .values()
+            .map(|listing| crate::host::entry_named(listing.entries(), path))
+            .find(|entry| !entry.path.is_empty())
+            .unwrap_or_default()
+    }
+
+    fn on_key_pressed(&mut self, key: BrowseKey) -> Task<Message> {
+        let modal = self.name_prompt.is_open() || !self.delete_target.is_empty();
+        if modal || self.draft_here() {
+            return Task::none();
+        }
+        match key {
+            BrowseKey::Up => self.step_selection(-1),
+            BrowseKey::Down => self.step_selection(1),
+            BrowseKey::Left => self.step_left(),
+            BrowseKey::Right => self.step_right(),
+            BrowseKey::Open => self.open_selection(),
+            BrowseKey::Parent => self.on_parent(),
+            BrowseKey::Back => self.on_back(),
+            BrowseKey::Forward => self.on_forward(),
+            BrowseKey::Ignored => Task::none(),
+        }
+    }
+
+    /// ↑/↓ move within the column that owns the choice; with nothing chosen
+    /// the first row of the current directory is next.
+    fn step_selection(&mut self, step: i64) -> Task<Message> {
+        let column = self.column_owning(&self.selected).unwrap_or(0);
+        let rows = self.rows_of_column(column);
+        match browse::neighbour(&rows, &self.selected, step) {
+            Some(path) => self.on_select(path),
+            None => Task::none(),
+        }
+    }
+
+    /// ← in column view chooses the folder that opened the choice's column;
+    /// in list view it is nothing.
+    fn step_left(&mut self) -> Task<Message> {
+        let in_columns = self.view_mode == ViewMode::Columns;
+        let Some(column) = self.column_owning(&self.selected).filter(|_| in_columns) else {
+            return Task::none();
+        };
+        match column {
+            0 => Task::none(),
+            index => self.on_select(self.columns[index - 1].clone()),
+        }
+    }
+
+    /// → in column view moves into the column the chosen folder opened;
+    /// in list view it is nothing.
+    fn step_right(&mut self) -> Task<Message> {
+        let in_columns = self.view_mode == ViewMode::Columns;
+        let opened = self
+            .columns
+            .iter()
+            .position(|column| *column == self.selected);
+        let Some(index) = opened.filter(|_| in_columns) else {
+            return Task::none();
+        };
+        let rows = self.rows_of_column(index + 1);
+        match rows.first() {
+            Some(first) => self.on_select(first.path.clone()),
+            None => Task::none(),
+        }
+    }
+
+    fn open_selection(&mut self) -> Task<Message> {
+        if self.selected.is_empty() {
+            return Task::none();
+        }
+        self.on_open(self.selected.clone())
+    }
+
+    // ---- the pane ----
+
+    fn on_set_view_mode(&mut self, mode: ViewMode) -> Task<Message> {
+        self.view_mode = mode;
+        self.columns.clear();
+        self.column_listings.clear();
+        let chosen = self.selected_entry();
+        let reopen = mode == ViewMode::Columns && chosen.is_dir();
+        if reopen {
+            self.open_column(&chosen.path);
+        }
+        Task::none()
+    }
+
+    fn on_sort_by(&mut self, key: SortKey) -> Task<Message> {
+        self.sort = self.sort.toggled(key);
+        Task::none()
+    }
+
+    fn on_filter_changed(&mut self, filter: String) -> Task<Message> {
+        self.filter = filter;
+        Task::none()
+    }
+
+    fn on_toggle_sidebar(&mut self) -> Task<Message> {
+        self.sidebar_open = !self.sidebar_open;
+        Task::none()
+    }
+
+    fn on_toggle_inspector(&mut self) -> Task<Message> {
+        self.inspector_open = !self.inspector_open;
+        Task::none()
+    }
+
+    // ---- the writes ----
+
+    fn on_prompt(&mut self, prompt: NamePrompt) -> Task<Message> {
+        let closing = !prompt.is_open();
+        if closing {
+            self.name_prompt = NamePrompt::Closed;
+            self.name_draft.clear();
+            return Task::none();
+        }
+        if !self.connected || self.loading() {
+            return Task::none();
+        }
+        self.notice.clear();
+        self.name_draft = match &prompt {
+            NamePrompt::Rename(path) => crate::host::fs_name(path),
+            NamePrompt::NewFolder | NamePrompt::NewFile | NamePrompt::Closed => String::new(),
+        };
+        self.name_prompt = prompt;
+        Task::none()
+    }
+
+    fn on_name_changed(&mut self, name: String) -> Task<Message> {
+        self.name_draft = name;
+        Task::none()
+    }
+
+    /// The prompt's name leaves as the commit its kind means. The module's
+    /// own write rule is checked first, so a directory nothing may be
+    /// written in refuses before a signature.
+    fn on_name_submit(&mut self) -> Task<Message> {
+        let name = self.name_draft.trim().to_owned();
+        let malformed = name.is_empty() || name.contains('/');
+        if !self.connected || self.loading() || malformed {
+            return Task::none();
+        }
+        let (act, refusal) = match &self.name_prompt {
+            NamePrompt::Closed => return Task::none(),
+            NamePrompt::NewFolder => (Act::Mkdir, self.refusal()),
+            NamePrompt::NewFile => (Act::NewFile, self.refusal()),
+            NamePrompt::Rename(from) => (
+                Act::Rename,
+                crate::host::write_refusal(&crate::host::fs_parent(from)),
+            ),
+        };
+        if !refusal.is_empty() {
+            self.notice = refusal;
+            return Task::none();
+        }
+        self.notice.clear();
+        self.writing = Writing::Busy(act);
+        self.sent = match &self.name_prompt {
+            NamePrompt::NewFolder => crate::host::make_dir(&self.nav.path, &name),
+            NamePrompt::NewFile => crate::host::make_file(&self.nav.path, &name),
+            NamePrompt::Rename(from) => {
+                let to = crate::host::fs_child(&crate::host::fs_parent(from), &name);
+                crate::host::move_object(from, &to)
             }
-        }
-        self.preview_text = "".to_owned();
-        {
-            let next = "".to_owned();
-            if ::ducktape_view_guest::state_changed!(self.preview_display_text, next) {
-                self.preview_display_text = next;
-            }
-        }
-        self.preview_clipped = false;
-        self.preview_truncated = false;
-        self.preview_binary = false;
-        self.preview_picture = false;
-        self.preview_width = 0;
-        self.preview_height = 0;
-        ::ducktape_view_guest::Task::none()
+            NamePrompt::Closed => false,
+        };
+        Task::none()
     }
-    fn on_mkdir_submit(&mut self) -> ducktape_view_guest::Task<Message> {
-        if (((*self.derived_loading()) || (!self.connected))
-            || ((self.new_name).trim().to_owned()).is_empty())
-            || (!(*self.derived_refusal()).is_empty())
-        {
-            return ::ducktape_view_guest::Task::none();
+
+    fn on_arm_delete(&mut self, target: String) -> Task<Message> {
+        if !self.connected || self.loading() {
+            return Task::none();
         }
-        self.notice = "".to_owned();
-        {
-            let next = true;
-            if ::ducktape_view_guest::state_changed!(self.acting, next) {
-                self.acting = next;
-                self.derived.loading.take();
-            }
-        }
-        self.sent = crate::host::make_dir(
-            ::std::convert::AsRef::as_ref(&(self.path)),
-            ::std::convert::AsRef::as_ref(&((self.new_name).trim().to_owned())),
-        );
-        ::ducktape_view_guest::Task::none()
+        self.delete_target = target;
+        Task::none()
     }
-    fn on_new_file_submit(&mut self) -> ducktape_view_guest::Task<Message> {
-        if (((*self.derived_loading()) || (!self.connected))
-            || ((self.new_name).trim().to_owned()).is_empty())
-            || (!(*self.derived_refusal()).is_empty())
-        {
-            return ::ducktape_view_guest::Task::none();
-        }
-        self.notice = "".to_owned();
-        {
-            let next = true;
-            if ::ducktape_view_guest::state_changed!(self.acting, next) {
-                self.acting = next;
-                self.derived.loading.take();
-            }
-        }
-        self.sent = crate::host::make_file(
-            ::std::convert::AsRef::as_ref(&(self.path)),
-            ::std::convert::AsRef::as_ref(&((self.new_name).trim().to_owned())),
-        );
-        ::ducktape_view_guest::Task::none()
+
+    fn on_disarm_delete(&mut self) -> Task<Message> {
+        self.delete_target.clear();
+        Task::none()
     }
-    fn on_arm_delete_at(&mut self, target: String) -> ducktape_view_guest::Task<Message> {
-        self.delete_target = target.to_owned();
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_disarm_delete_now(&mut self) -> ducktape_view_guest::Task<Message> {
-        self.delete_target = "".to_owned();
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_delete_submit(&mut self) -> ducktape_view_guest::Task<Message> {
-        if ((*self.derived_loading()) || (!self.connected)) || (self.delete_target).is_empty() {
-            return ::ducktape_view_guest::Task::none();
+
+    fn on_delete_submit(&mut self) -> Task<Message> {
+        if !self.connected || self.loading() || self.delete_target.is_empty() {
+            return Task::none();
         }
-        self.notice = crate::host::write_refusal(::std::convert::AsRef::as_ref(
-            &(crate::host::fs_parent(::std::convert::AsRef::as_ref(&(self.delete_target)))),
-        ));
-        if !(self.notice).is_empty() {
+        let refusal = crate::host::write_refusal(&crate::host::fs_parent(&self.delete_target));
+        if !refusal.is_empty() {
             // the refusal is a notice behind the dialog's backdrop: the
             // dialog closes so the reader sees it
-            self.delete_target = "".to_owned();
-            return ::ducktape_view_guest::Task::none();
+            self.notice = refusal;
+            self.delete_target.clear();
+            return Task::none();
         }
-        {
-            let next = true;
-            if ::ducktape_view_guest::state_changed!(self.acting, next) {
-                self.acting = next;
-                self.derived.loading.take();
-            }
-        }
-        self.sent =
-            crate::host::delete_object(::std::convert::AsRef::as_ref(&(self.delete_target)));
-        ::ducktape_view_guest::Task::none()
+        self.notice.clear();
+        self.writing = Writing::Busy(Act::Delete);
+        self.sent = crate::host::delete_object(&self.delete_target);
+        Task::none()
     }
-    fn on_close_diff_now(&mut self) -> ducktape_view_guest::Task<Message> {
-        self.diff_from = "".to_owned();
-        self.diff = Vec::new();
+
+    // ---- the history ----
+
+    fn on_show_diff_of(&mut self, id: String) -> Task<Message> {
+        if !self.connected {
+            return Task::none();
+        }
+        self.notice.clear();
+        self.diff.clear();
         self.diff_omitted = 0;
-        ::ducktape_view_guest::Task::none()
+        self.diff_from = id;
+        self.inspector_open = true;
+        Task::none()
     }
-    fn on_show_diff_of(&mut self, id: String) -> ducktape_view_guest::Task<Message> {
-        if (*self.derived_loading()) || (!self.connected) {
-            return ::ducktape_view_guest::Task::none();
-        }
-        self.notice = "".to_owned();
-        self.diff = Vec::new();
+
+    fn on_close_diff(&mut self) -> Task<Message> {
+        self.diff_from.clear();
+        self.diff.clear();
         self.diff_omitted = 0;
-        self.diff_from = id.to_owned();
-        ::ducktape_view_guest::Task::none()
+        Task::none()
     }
-    fn on_begin_edit(&mut self, token: String) -> ducktape_view_guest::Task<Message> {
-        if (((((((((token != (*self.derived_edit_context())) || self.editing)
-            || (*self.derived_loading()))
-            || (!self.connected))
-            || (self.chain).is_empty())
-            || (self.preview_base).is_empty())
-            || self.preview_binary)
-            || self.preview_picture)
-            || self.preview_truncated)
-            || (self.preview_path).is_empty()
-        {
-            return ::ducktape_view_guest::Task::none();
+
+    // ---- the editor ----
+
+    fn on_begin_edit(&mut self, token: String) -> Task<Message> {
+        let stale = token != self.edit_context();
+        let not_text = self.preview.binary || self.preview.picture;
+        let not_whole = self.preview.truncated;
+        let not_read = self.preview.base.is_empty() || self.preview.path.is_empty();
+        let unreadable = not_text || not_whole || not_read;
+        let no_network = !self.connected || self.chain.is_empty();
+        let mid_flight = self.editing || self.loading();
+        if stale || unreadable || no_network || mid_flight {
+            return Task::none();
         }
-        {
-            let next = true;
-            if ::ducktape_view_guest::state_changed!(self.editing, next) {
-                self.editing = next;
-                self.derived.draft_here.take();
-                self.derived.draft_parked.take();
-            }
-        }
-        {
-            let next = self.draft_id + 1;
-            if ::ducktape_view_guest::state_changed!(self.draft_id, next) {
-                self.draft_id = next;
-                self.derived.edit_context.take();
-            }
-        }
-        {
-            let next = self.chain.to_owned();
-            if ::ducktape_view_guest::state_changed!(self.draft_chain, next) {
-                self.draft_chain = next;
-                self.derived.draft_here.take();
-                self.derived.draft_parked.take();
-            }
-        }
-        {
-            let next = self.preview_path.to_owned();
-            if ::ducktape_view_guest::state_changed!(self.draft_path, next) {
-                self.draft_path = next;
-                self.derived.draft_here.take();
-                self.derived.draft_parked.take();
-            }
-        }
-        self.draft_base = self.preview_base.to_owned();
-        self.notice = "".to_owned();
-        {
-            let reset = self.draft.reset_revision();
-            let next = ::ducktape_view_guest::Editor::new(self.preview_text.to_owned());
-            self.draft.replace(next, reset);
-        };
-        ::ducktape_view_guest::Task::none()
+        self.editing = true;
+        self.draft_id += 1;
+        self.draft_chain = self.chain.clone();
+        self.draft_path = self.preview.path.clone();
+        self.draft_base = self.preview.base.clone();
+        self.notice.clear();
+        self.replace_draft(self.preview.text.clone());
+        Task::none()
     }
-    fn on_cancel_edit(&mut self, token: String) -> ducktape_view_guest::Task<Message> {
-        if token != (*self.derived_edit_context()) {
-            return ::ducktape_view_guest::Task::none();
+
+    fn on_cancel_edit(&mut self, token: String) -> Task<Message> {
+        if token != self.edit_context() {
+            return Task::none();
         }
-        {
-            let next = false;
-            if ::ducktape_view_guest::state_changed!(self.editing, next) {
-                self.editing = next;
-                self.derived.draft_here.take();
-                self.derived.draft_parked.take();
-            }
-        }
-        {
-            let next = false;
-            if ::ducktape_view_guest::state_changed!(self.saving, next) {
-                self.saving = next;
-                self.derived.loading.take();
-            }
-        }
-        self.notice = "".to_owned();
-        {
-            let reset = self.draft.reset_revision();
-            let next = ::ducktape_view_guest::Editor::new("".to_owned());
-            self.draft.replace(next, reset);
-        };
-        ::ducktape_view_guest::Task::none()
+        self.close_draft();
+        Task::none()
     }
-    fn on_discard_draft(&mut self, id: i64) -> ducktape_view_guest::Task<Message> {
+
+    fn on_discard_draft(&mut self, id: i64) -> Task<Message> {
         if id != self.draft_id {
-            return ::ducktape_view_guest::Task::none();
+            return Task::none();
         }
-        {
-            let next = false;
-            if ::ducktape_view_guest::state_changed!(self.editing, next) {
-                self.editing = next;
-                self.derived.draft_here.take();
-                self.derived.draft_parked.take();
-            }
+        self.close_draft();
+        Task::none()
+    }
+
+    fn close_draft(&mut self) {
+        self.editing = false;
+        if self.writing == Writing::Busy(Act::Save) {
+            self.writing = Writing::Idle;
         }
-        {
-            let next = false;
-            if ::ducktape_view_guest::state_changed!(self.saving, next) {
-                self.saving = next;
-                self.derived.loading.take();
-            }
+        self.notice.clear();
+        self.replace_draft(String::new());
+    }
+
+    fn replace_draft(&mut self, text: String) {
+        let reset = self.draft.reset_revision();
+        self.draft
+            .replace(::ducktape_view_guest::Editor::new(text), reset);
+    }
+
+    /// Keep the original bytes and base until this exact draft is committed.
+    fn on_save_edit(&mut self, token: String) -> Task<Message> {
+        let stale = token != self.edit_context();
+        let no_draft = !self.draft_here() || self.draft_base.is_empty();
+        let cannot_send = self.loading() || !self.connected;
+        if stale || no_draft || cannot_send {
+            return Task::none();
         }
-        self.notice = "".to_owned();
-        {
-            let reset = self.draft.reset_revision();
-            let next = ::ducktape_view_guest::Editor::new("".to_owned());
-            self.draft.replace(next, reset);
-        };
-        ::ducktape_view_guest::Task::none()
+        self.notice.clear();
+        self.writing = Writing::Busy(Act::Save);
+        self.sent = crate::host::save(&self.draft_path, &self.draft_base, &self.draft.text());
+        Task::none()
     }
-    fn on_save_edit(&mut self, token: String) -> ducktape_view_guest::Task<Message> {
-        if ((((token != (*self.derived_edit_context())) || (!(*self.derived_draft_here())))
-            || (*self.derived_loading()))
-            || (!self.connected))
-            || (self.draft_base).is_empty()
-        {
-            return ::ducktape_view_guest::Task::none();
-        }
-        self.notice = "".to_owned();
-        {
-            let next = true;
-            if ::ducktape_view_guest::state_changed!(self.saving, next) {
-                self.saving = next;
-                self.derived.loading.take();
-            }
-        }
-        self.sent = crate::host::save(
-            ::std::convert::AsRef::as_ref(&(self.draft_path)),
-            ::std::convert::AsRef::as_ref(&(self.draft_base)),
-            ::std::convert::AsRef::as_ref(&((self.draft).text())),
-        );
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_open_link_at(&mut self, url: String) -> ducktape_view_guest::Task<Message> {
-        self.sent = crate::host::open_link(::std::convert::AsRef::as_ref(&(url)));
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_toggle_history(&mut self) -> ducktape_view_guest::Task<Message> {
-        self.history_open = !self.history_open;
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_new_name_changed(&mut self, value: String) -> ducktape_view_guest::Task<Message> {
-        self.new_name = value;
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_draft_transaction(
-        &mut self,
-        transaction: ::ducktape_view_guest::EditorTransaction<Message>,
-    ) -> ducktape_view_guest::Task<Message> {
-        let route = transaction.apply(&mut self.draft);
-        route.map_or_else(
-            ::ducktape_view_guest::Task::none,
-            ::ducktape_view_guest::Task::done,
-        )
-    }
+
     fn on_edit_draft(
         &mut self,
         document: ::ducktape_view_guest::EditorDocumentUpdate,
-    ) -> ducktape_view_guest::Task<Message> {
+    ) -> Task<Message> {
         document.apply(&mut self.draft);
-        ::ducktape_view_guest::Task::none()
+        Task::none()
     }
+
+    fn on_draft_transaction(
+        &mut self,
+        transaction: ::ducktape_view_guest::EditorTransaction<Message>,
+    ) -> Task<Message> {
+        let route = transaction.apply(&mut self.draft);
+        route.map_or_else(Task::none, Task::done)
+    }
+
+    // ---- the app's doors ----
+
+    fn on_open_link_at(&mut self, url: String) -> Task<Message> {
+        self.sent = crate::host::open_link(&url);
+        Task::none()
+    }
+
+    // ---- the geometry ----
+
+    fn on_sidebar_resized(&mut self, dx: f64) -> Task<Message> {
+        self.sidebar_width = sidebar_width_within(
+            self.sidebar_width + dx,
+            self.viewport_width,
+            self.inspector_width,
+        );
+        Task::none()
+    }
+
+    fn on_inspector_resized(&mut self, dx: f64) -> Task<Message> {
+        self.inspector_width = inspector_width_within(
+            self.inspector_width - dx,
+            self.viewport_width,
+            self.sidebar_width,
+        );
+        Task::none()
+    }
+
+    fn on_viewport_changed(&mut self, width: f64, height: f64) -> Task<Message> {
+        self.viewport_width = width;
+        self.viewport_height = height;
+        self.sidebar_width = sidebar_width_within(self.sidebar_width, width, self.inspector_width);
+        self.inspector_width =
+            inspector_width_within(self.inspector_width, width, self.sidebar_width);
+        Task::none()
+    }
+}
+
+fn listing_of(read: crate::host::DirectoryRead) -> Listing {
+    match read.error.is_empty() {
+        true => Listing::Listed {
+            entries: read.entries,
+            next: read.next,
+        },
+        false => Listing::Failed(read.error),
+    }
+}
+
+/// The main pane never drops under this, whatever the rails take.
+const MAIN_PANE_MIN: f64 = 360.;
+
+pub(crate) fn sidebar_width_within(width: f64, viewport: f64, inspector: f64) -> f64 {
+    let maximum = (viewport - inspector - MAIN_PANE_MIN).clamp(160., 320.);
+    width.clamp(160., maximum)
+}
+
+pub(crate) fn inspector_width_within(width: f64, viewport: f64, sidebar: f64) -> f64 {
+    let maximum = (viewport - sidebar - MAIN_PANE_MIN).clamp(260., 640.);
+    width.clamp(260., maximum)
 }
