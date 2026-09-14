@@ -31,10 +31,10 @@ pub fn decode(text: &str) -> Result<Phase, serde_json::Error> {
 mod tests {
     use super::*;
     use crate::manifest::SuccessorKey;
-    use crate::minisign::testkit::key_pair;
     use crate::phase::{
         Downloading, Idle, PendingHealthy, RollbackReason, RolledBack, Staged, Swapping,
     };
+    use crate::release::{PublicKey, testkit::key_pair};
     use crate::sha::Sha;
 
     fn every_phase() -> Vec<Phase> {
@@ -56,13 +56,12 @@ mod tests {
                 previous: Some(b),
                 pinned_sequence: 17,
                 target: Sha::digest(b"c"),
-                url: "https://example.invalid/c.tar.zst".into(),
                 size: 12345,
                 sequence: 18,
                 display: "2026.09.2+abc".into(),
                 node_contract: 4,
                 successor_key: Some(SuccessorKey {
-                    pubkey: key_pair(5).public,
+                    pubkey: PublicKey::of(&key_pair(5)),
                     from_sequence: 20,
                 }),
             }),

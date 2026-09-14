@@ -249,6 +249,7 @@ mod search;
 mod shell;
 mod storage;
 mod style;
+pub mod update;
 mod view_artifact;
 pub mod view_source;
 
