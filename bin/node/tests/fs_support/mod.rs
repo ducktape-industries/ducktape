@@ -16,7 +16,7 @@ use noded::testkit::InProcDaemon;
 
 /// the password this harness's wallet is minted under. `ducktape fs commit`
 /// SIGNS, so it opens that wallet and asks for this on stdin.
-const WALLET_PASSWORD: &str = "harness-wallet";
+pub const WALLET_PASSWORD: &str = "harness-wallet";
 
 /// a running in-process node plus the CLI-under-test's path.
 pub struct Harness {
@@ -92,7 +92,7 @@ impl Harness {
     /// the harness wallet's key file, handed to every verb as
     /// `DUCKTAPE_USER_KEY`: a verb's own ladder finds a key through the
     /// workspace behind the node it dials, and this node has none.
-    fn user_key(&self) -> std::path::PathBuf {
+    pub fn user_key(&self) -> std::path::PathBuf {
         keystore::wallet::key_file(&self.workspace(), "harness")
     }
 

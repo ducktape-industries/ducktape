@@ -7722,6 +7722,7 @@ dependencies = [
  "anstream",
  "anstyle",
  "anyhow",
+ "app-update",
  "argon2",
  "async-trait",
  "attribution",
