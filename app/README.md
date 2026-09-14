@@ -221,15 +221,31 @@ any `DUCKTAPE_NOTARY_*` is refused as `sign_path_conflict` before anything
 builds (the Makefile and `ops/bundle-app-macos.sh` both check).
 
 1. **Enrol the identity** into the gateway, once, from any machine that holds
-   the material (`ducktape user cred seal --vendor apple-codesign`, which
-   verifies the enclave's quote against the pinned measurement first):
+   the material. Only the TEE gateway mounts the signing route (the
+   self-host lender daemon `ducktape service run airlock` holds an
+   `apple-codesign` credential from `cred add apple-codesign` but serves no
+   `/sign/macos-bundle`), so the verb is `ducktape user cred seal --vendor
+   apple-codesign`: it verifies the enclave's quote against the pinned
+   measurement (refusing `attestation_unverified` otherwise), seals the
+   identity in, then submits the credential record under the attested seal
+   key and publishes the account's `airlock` and `airlock-sign` routes, both
+   served by the node it dials:
 
    ```sh
-   ducktape user cred seal --remote airlock.<handle>.duck --attest snp --snp-product genoa \
+   # on the node fronting the enclave: both labels onto its loopback port
+   ducktape gateway bind --workspace <node-workspace> --label airlock --port 9100 --account <account>
+   ducktape gateway bind --workspace <node-workspace> --label airlock-sign --port 9100 --account <account>
+   # enrol: quote verified, identity sealed, record + routes committed
+   ducktape user cred seal --host http://127.0.0.1:9100 --attest snp --snp-product genoa \
      --measurement <audited image measurement> --vendor apple-codesign --name release-sign \
      --p12 DeveloperID.p12 --p12-password-file p12.password \
      --api-key AuthKey.json --team-id TEAMID -n <chain-id>
+   # lend it to the account that releases (the release wallet's account)
+   ducktape user cred grant release-sign <account> -n <chain-id>
    ```
+
+   (`--remote airlock.<handle>.duck` in place of `--host` reaches an enclave
+   already published, through this node's browser gateway.)
 
 2. **Build, sign, pack.** The bundle script stages `Ducktape.app` unsigned
    (no `codesign`, no DMG), `ducktape release sign-bundle` sends it and
@@ -243,18 +259,24 @@ builds (the Makefile and `ops/bundle-app-macos.sh` both check).
 
    The verb resolves `release-sign` from committed state on `NODE` the way a
    provider run resolves a lent credential — the credential record names its
-   owner, the owner's handle names the `airlock.<handle>.duck` route, the
-   record's `seal_pk` is the pinned trust anchor — opens a sealed session on
-   it through the node's browser gateway and streams the `.tar.zst` up and
-   the signed one down. What comes back is checked to be the same bundle
+   owner, the owner's handle names the `airlock-sign.<handle>.duck` route
+   (the enclave's signing lane, whose signed policy admits a 256 MiB bundle
+   where the `airlock` model lane admits 16 MiB), the record's `seal_pk` is
+   the pinned trust anchor — opens a sealed session on it through the node's
+   browser gateway and streams the `.tar.zst` up and the signed one down.
+   The enclave commits its reply head before it signs and keeps the stream
+   live through Apple's notary wait, so no proxy deadline between the two
+   is reached; the verb's own ceiling is 30 minutes. What comes back is
+   checked to be the same bundle
    (identifier, version keys, executables, views) before it replaces the
    staged one; the archive the enclave returned is kept beside it as
    `target/app-bundle/Ducktape-signed.tar.zst`. The gateway's refusals come
    back by name (`bundle_shape_refused`, `bundle_too_large`,
-   `codesign_failed`, `notary_rejected`, `staple_failed`, `tool_missing`);
-   the verb's own are `credential_kind_mismatch` (the name is a model
-   credential), `bundle_exceeds_route_cap` (the archive is over the
-   `airlock` route's published `max_request_bytes`) and
+   `codesign_failed`, `notary_rejected`, `staple_failed`, `tool_missing` —
+   the last five ride the sealed stream's `Final` marker, since the head is
+   already out); the verb's own are `credential_kind_mismatch` (the name is
+   a model credential), `bundle_exceeds_route_cap` (the archive is over the
+   `airlock-sign` route's published `max_request_bytes`) and
    `bundle_shape_changed`. Its progress is logged under
    `ducktape::gateway` (`release_sign_resolved`, `release_sign_submitted`,
    `release_sign_received`, `release_sign_refused`).
