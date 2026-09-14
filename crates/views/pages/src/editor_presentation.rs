@@ -12,17 +12,8 @@ pub fn paint(
     menu: MenuState,
     dark: bool,
     commented: Vec<i64>,
-    focused: bool,
 ) -> EditorPresentation {
-    build(
-        state,
-        menu,
-        dark,
-        commented,
-        focused,
-        EditorReserve::default(),
-    )
-    .unwrap_or_default()
+    build(state, menu, dark, commented, EditorReserve::default()).unwrap_or_default()
 }
 
 /// The line's own padding, as the host reads it: the LAST non-zero one of the
@@ -47,7 +38,6 @@ pub fn build(
     menu: MenuState,
     dark: bool,
     commented: Vec<i64>,
-    focused: bool,
     reserve: EditorReserve,
 ) -> Result<EditorPresentation, PresentationError> {
     // Keep one paint pass inside the desktop tick budget. The canonical editor
@@ -64,13 +54,7 @@ pub fn build(
         top: 0.0,
         bottom: 0.0,
     });
-    let caret = markdown::Caret {
-        focused,
-        line: state.cursor.position.line as usize,
-        column: state.cursor.position.column as usize,
-        dark,
-        commented,
-    };
+    let caret = markdown::Caret { dark, commented };
     let mut highlighter = markdown::DocumentHighlighter::new(&caret);
     let mut formats = HashMap::new();
     for (line, text) in wire::editor_lines(state.text).enumerate() {
@@ -160,19 +144,6 @@ pub fn build(
                 line: line as u32,
                 plus: true,
                 handle: true,
-            });
-        }
-        let trimmed = text.trim_start_matches([' ', '\t']);
-        let todo = ["- [ ] ", "- [x] ", "- [X] "]
-            .iter()
-            .any(|prefix| trimmed.starts_with(prefix));
-        if todo {
-            let start = (text.len() - trimmed.len() + 2) as u32;
-            result.affordances.hits.push(EditorHit {
-                line: line as u32,
-                start,
-                end: start + 3,
-                tag: 1,
             });
         }
         result.affordances.hits.extend(links);
