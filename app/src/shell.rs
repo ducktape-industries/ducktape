@@ -1470,6 +1470,7 @@ impl DesktopWindow {
         };
         let controls = div()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_2()
             .p_3()

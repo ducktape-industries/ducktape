@@ -1093,6 +1093,7 @@ impl Ducktape {
                 );
                 self.channels = folded_chat.channels.clone();
                 self.channel_members = folded_chat.channel_members.clone();
+                self.follow_voice_room_roster();
                 crate::module_view::chat_composer_roster(
                     &(crate::backend::composer_scope(&self.connected_rpc, &self.active_channel)),
                     &self.channel_members,
@@ -3678,6 +3679,11 @@ impl Ducktape {
         {
             return Task::none();
         }
+        // already seated elsewhere (a voice room): this is a move, not a join
+        if self.huddle_joined {
+            let here = self.active_channel.to_owned();
+            return self.on_join_voice(here);
+        }
         self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         self.mutation_phase = MutationPhase::Huddle;
@@ -3742,6 +3748,29 @@ impl Ducktape {
             .map_or_else(|| id.clone(), |channel| channel.name.clone());
         self.seat_in_huddle(id, name)
     }
+    /// A huddle in a room the reader is not looking at (a voice room) has no
+    /// window load to carry its roster: it follows the room list's seats,
+    /// which every chat block refreshes.
+    fn follow_voice_room_roster(&mut self) {
+        let seated_elsewhere = self.huddle_joined && (self.huddle_channel != self.active_channel);
+        if !seated_elsewhere {
+            return;
+        }
+        let Some(room) = self
+            .channels
+            .iter()
+            .find(|channel| channel.id == self.huddle_channel)
+        else {
+            return;
+        };
+        self.huddle_roster = crate::backend::roster_of_seats(&room.huddle);
+        self.huddle_rows = crate::call::huddle_tile_rows(
+            self.huddle_roster.clone(),
+            self.call_peers.clone(),
+            self.call_muted,
+            self.call_speaking,
+        );
+    }
     /// The reader is seated in `channel`'s huddle: open the huddle window and
     /// re-read the room on screen so its seats catch up.
     fn seat_in_huddle(&mut self, channel: String, name: String) -> Task<AppMessage> {
@@ -3751,6 +3780,7 @@ impl Ducktape {
         self.huddle_channel = channel;
         self.huddle_channel_name = name;
         self.huddle_joined_at = self.huddle_now;
+        self.follow_voice_room_roster();
         self.chat_generation += 1;
         Task::batch([Task::done(AppMessage::ShowHuddle), {
             let pending_task = Task::perform(

@@ -305,7 +305,10 @@ impl ChatView {
             header.push(self.private_badge(format!("{key}/private")));
         }
         header.push(native::spacer());
-        if self.huddle_joined {
+        // the header speaks for THIS room's huddle: seated elsewhere (a voice
+        // room), the room on screen still offers its own to join
+        let seated_here = self.huddle_joined && self.huddle_channel == self.active_channel;
+        if seated_here {
             header.push(self.huddle_controls(
                 format!("{key}/huddle"),
                 || Message::LeaveHuddleHere,
