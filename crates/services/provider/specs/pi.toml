@@ -1,0 +1,44 @@
+# Pi is the harness; the borrowed credential selects Anthropic or OpenAI Codex.
+# Without --cred, the host Anthropic broker supplies auth. No upstream credential
+# or host Pi configuration enters the guest.
+spec = 1
+
+[capability]
+tag = "pi"
+description = "Pi coding agent with host-brokered Anthropic or OpenAI Codex auth"
+
+[detect]
+bin = "pi"
+env = "DUCKTAPE_PI_BIN"
+
+[source]
+# The standalone executable needs its sibling package metadata, themes, and
+# native modules. Preserve the official bundle instead of flattening it.
+kind = "github-bundle"
+repo = "earendil-works/pi"
+asset = "pi-linux-{arch}.tar.gz"
+sums = "SHA256SUMS"
+root = "pi"
+
+[invoke]
+# JSON events keep the idle deadline alive through tool calls and give exact
+# per-turn usage. The runner stages and explicitly loads the Ducktape extension.
+args = ["--mode", "json", "--print", "--no-session", "--offline", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes"]
+prompt = "stdin"
+timeout_secs = 600
+
+[output]
+format = "pi-json"
+
+[interactive]
+args = ["--offline", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes"]
+# Solo only. Pi's --tools allowlist does not fence its interactive !shell
+# commands, so it cannot satisfy a shared command-lane's read-only contract.
+# No restricted_args means the host explicitly refuses shared sessions.
+
+[isolation]
+config_home_env = "PI_CODING_AGENT_DIR"
+broker = "pi"
+
+[context]
+path = "config-home:AGENTS.md"

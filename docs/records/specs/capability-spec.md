@@ -4,10 +4,11 @@ A **capability spec** is a TOML file that teaches a Ducktape node how to run
 one executor — an installed CLI that can turn a prompt into text. Everything
 the node needs is in the file: how to detect the binary, where its Linux
 build comes from, the exact argv to invoke it, and how to parse its output.
-An executor using one of the supported output protocols is configured entirely
-through its spec. The embedded built-ins are spec files globbed out of
-`crates/services/provider/specs/` at build time. A new bidirectional protocol
-requires a host driver as well as its spec.
+An executor using one of the supported output protocols and an implemented
+credential broker is configured entirely through its spec. The embedded
+built-ins are spec files globbed out of `crates/services/provider/specs/` at
+build time. A new bidirectional protocol requires a host driver as well as its
+spec, and a new authentication contract requires host code and tests.
 
 Specs are the data half of the capability system:
 
@@ -74,8 +75,8 @@ in the same trust class as a shell profile or a systemd unit:
   process. A run-scoped, loopback-only broker serves the model API, and the
   child gets only an unrelated opaque run bearer, a localhost base URL, and a
   **fresh, empty config home** (which is what stops the CLI reading the
-  operator's real one and forces it through the broker). Codex and Claude
-  are both here.
+  operator's real one and forces it through the broker). Codex, Claude Code,
+  and Pi all use this path.
 
 **A spec cannot ask for a host directory instead.** A run executes inside its
 own microVM, which shares no filesystem with the host — the only things that
@@ -228,12 +229,13 @@ this format does not have (`[sandbox]`, `[models]`, `[session]`,
 
 | Field | Type | Required | Rules |
 |---|---|---|---|
-| `kind` | string | yes | `"claude-releases"` \| `"github-release"`; the rest of the table is that kind's fields, any other field is unknown |
+| `kind` | string | yes | `"claude-releases"` \| `"github-release"` \| `"github-bundle"`; the rest of the table is that kind's fields, any other field is unknown |
 | `base` | string | `claude-releases` | https url of the feed: `<base>/latest`, `<base>/<version>/manifest.json`, `<base>/<version>/<platform>/<bin>`; `detect.companions` must be empty |
-| `repo` | string | `github-release` | `owner/name` |
-| `asset` | string | `github-release` | the release's gzipped-tar asset name, with `{arch}` where the Rust triple's arch goes (`x86_64` \| `aarch64`) |
-| `sums` | string | `github-release` | the release's sha256 sums file, `<hex>  <asset>` per line |
+| `repo` | string | either GitHub kind | `owner/name` |
+| `asset` | string | either GitHub kind | gzipped-tar asset name with `{arch}`: `x86_64` \| `aarch64` for `github-release`, `x64` \| `arm64` for `github-bundle` |
+| `sums` | string | either GitHub kind | the release's sha256 sums file, `<hex>  <asset>` per line |
 | `members` | string array | `github-release` | archive paths of exactly `detect.bin` and every `detect.companions` entry |
+| `root` | string | `github-bundle` | one safe archive directory containing `detect.bin`; its entire tree is preserved, and `detect.companions` must be empty |
 
 ### `[invoke]`
 
@@ -248,7 +250,7 @@ this format does not have (`[sandbox]`, `[models]`, `[session]`,
 
 | Field | Type | Required | Rules |
 |---|---|---|---|
-| `format` | string | yes | `"codex-session"` \| `"claude-session"` \| `"jsonl-events"` \| `"json-result"` \| `"text"` |
+| `format` | string | yes | `"codex-session"` \| `"claude-session"` \| `"pi-json"` \| `"jsonl-events"` \| `"json-result"` \| `"text"` |
 
 `codex-session` uses App Server JSON-RPC stdin; `claude-session` uses persistent
 stream-json stdin. They carry the prompt, steering, interrupt and approval replies
@@ -261,7 +263,17 @@ idle and hard deadlines and reports the provider's final token counters.
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `config_home_env` | string | no | executor config-home env name such as `CODEX_HOME`; must match `[A-Z_][A-Z0-9_]*` |
-| `broker` | string | no | `"codex-responses"` \| `"anthropic-messages"`; credentials remain in the host process |
+| `broker` | string | no | `"codex-responses"` \| `"anthropic-messages"` \| `"pi"`; credentials remain in the host process |
+
+Pi's `pi` broker selects Anthropic or OpenAI Codex from the borrowed credential;
+without an explicit credential it uses the host Anthropic path. The runner
+writes a fresh `PI_CODING_AGENT_DIR` with a model endpoint override and SSE
+transport. Headless Pi runs explicitly load the staged Ducktape MCP extension;
+interactive runs do not. Pi is solo-only: it declares no `restricted_args`, since
+its interactive shell bypasses model-tool allowlists. Shared sessions are refused.
+`pi-json` extracts the last completed assistant answer,
+refuses failed or unfinished turns, and sums authoritative per-message usage
+without counting streaming snapshots or repeated lifecycle events.
 
 ### `[tools]`
 
@@ -292,7 +304,7 @@ in a spec or in Rust: what installs is whatever is current when the operator
 approves it, and a receipt behind the channel's latest is offered as a bump on
 the next install.
 
-Two channel kinds exist:
+Three channel kinds exist:
 
 - `claude-releases` — Anthropic's feed: `<base>/latest` is the version,
   `<base>/<version>/manifest.json` carries `platforms.<platform>.checksum`,
@@ -306,6 +318,11 @@ Two channel kinds exist:
   a source that delivered fewer would leave a declared companion missing, and
   one that delivered more would bake an undeclared executable into the guest
   image.
+
+- `github-bundle` — a GitHub release with a standalone executable and required
+  sibling assets. The installer preserves `root` as a private package directory
+  and exposes `detect.bin` through a relative symlink. Pi uses this source;
+  copying only its executable loses package metadata and native modules.
 
 A spec with no `[source]` is still a complete executor: the operator puts the
 Linux build in the executors directory themselves, and `agent install`

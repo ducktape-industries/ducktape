@@ -736,11 +736,10 @@ async fn watch_live_output(
                 continue;
             };
             // A PENDING RUN DOES NOT NAME ITS PROVIDER (`PendingRun` carries
-            // the agent and the anchor, not the worker), and the parse only
-            // branches on the provider for Claude message/result events —
-            // Codex item events are read independently of that argument. So
-            // this reads one more line than a Codex run would emit and loses
-            // nothing; it is not a claim about which worker took the run.
+            // the agent and the anchor, not the worker). Passing Claude enables
+            // its message/result parsing; distinct Codex item and Pi message_end
+            // and tool_execution_start/end shapes are read independently of that
+            // argument. This is not a claim about which worker took the run.
             if let Some(event) = provider_output_event("claude", line, id) {
                 id += 1;
                 fold(&event);

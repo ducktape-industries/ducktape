@@ -51,20 +51,20 @@ use std::path::{Path, PathBuf};
 use provider_host::{CapabilitySpec, ReleaseSource, SpecSet};
 use sha2::{Digest as _, Sha256};
 
-use crate::cred_cli::ProviderArg;
+use crate::agent_cli::HarnessArg;
 
 type InstallResult = Result<(), Box<dyn std::error::Error>>;
 
 /// Every provider that has a guest CLI. Adding one here is what makes it
 /// offerable; its capability spec's `[source]` is what makes it installable.
-const ALL: [ProviderArg; 2] = [ProviderArg::Claude, ProviderArg::Codex];
+const ALL: [HarnessArg; 3] = [HarnessArg::Claude, HarnessArg::Codex, HarnessArg::Pi];
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct InstallArgs {
     /// which CLIs to install (omitted = a checklist of what is missing or
     /// behind the vendor's latest release)
     #[arg(value_name = "NAME")]
-    providers: Vec<ProviderArg>,
+    providers: Vec<HarnessArg>,
 }
 
 /// The guest's architecture — the HOST's, because there is no cross-hypervisor:
@@ -93,6 +93,14 @@ impl GuestArch {
         }
     }
 
+    /// Standalone JavaScript-runtime bundles use Node's architecture names.
+    fn bundle_arch(self) -> &'static str {
+        match self {
+            Self::Aarch64 => "arm64",
+            Self::X86_64 => "x64",
+        }
+    }
+
     /// the arch as Anthropic's release feed spells its Linux platforms.
     fn claude_platform(self) -> &'static str {
         match self {
@@ -111,6 +119,8 @@ enum Payload {
     Binary(String),
     /// members to lift out of a gzipped tar, by their path inside the archive.
     TarGz(Vec<String>),
+    /// A standalone executable with sibling runtime assets; keep its tree.
+    Bundle { root: String, bin: String },
 }
 
 /// One vendor release, resolved: the channel's latest, and everything the
@@ -130,6 +140,7 @@ impl Release {
         match &self.payload {
             Payload::Binary(name) => vec![name.as_str()],
             Payload::TarGz(members) => members.iter().map(|m| base_name(m)).collect(),
+            Payload::Bundle { bin, .. } => vec![bin.as_str()],
         }
     }
 }
@@ -186,7 +197,26 @@ impl Vendors {
                 asset,
                 sums,
                 members,
-            } => self.latest_github_release(repo, asset, sums, members, arch),
+            } => self.latest_github_release(
+                repo,
+                &asset.replace("{arch}", arch.rust_triple_arch()),
+                sums,
+                Payload::TarGz(members.clone()),
+            ),
+            ReleaseSource::GithubBundle {
+                repo,
+                asset,
+                sums,
+                root,
+            } => self.latest_github_release(
+                repo,
+                &asset.replace("{arch}", arch.bundle_arch()),
+                sums,
+                Payload::Bundle {
+                    root: root.clone(),
+                    bin: spec.bin.clone(),
+                },
+            ),
         }
     }
 
@@ -218,21 +248,19 @@ impl Vendors {
         repo: &str,
         asset: &str,
         sums: &str,
-        members: &[String],
-        arch: GuestArch,
+        payload: Payload,
     ) -> Result<Release, String> {
         let landing = self.get(&format!("https://github.com/{repo}/releases/latest"))?;
         let tag = release_tag(landing.url().path())?;
-        let asset = asset.replace("{arch}", arch.rust_triple_arch());
         let downloads = format!("https://github.com/{repo}/releases/download/{tag}");
         let sums_text = self.text(&format!("{downloads}/{sums}"))?;
         let sha256 =
-            sums_checksum(&sums_text, &asset).map_err(|e| format!("{downloads}/{sums}: {e}"))?;
+            sums_checksum(&sums_text, asset).map_err(|e| format!("{downloads}/{sums}: {e}"))?;
         Ok(Release {
             version: tag,
             url: format!("{downloads}/{asset}"),
             sha256,
-            payload: Payload::TarGz(members.to_vec()),
+            payload,
         })
     }
 }
@@ -396,7 +424,7 @@ impl Installed {
     }
 }
 
-fn installed(provider: ProviderArg, latest: &Release, dir: &Path, receipts: &Receipts) -> Installed {
+fn installed(provider: HarnessArg, latest: &Release, dir: &Path, receipts: &Receipts) -> Installed {
     // A partial install reports as missing rather than as present: codex
     // without its Code Mode companion is a codex that dies at startup inside
     // the guest.
@@ -430,7 +458,7 @@ fn is_executable(path: &Path) -> bool {
 /// One provider's row in the survey: what the vendor has, and what the
 /// directory holds against it.
 struct Surveyed {
-    provider: ProviderArg,
+    provider: HarnessArg,
     latest: Release,
     state: Installed,
 }
@@ -574,7 +602,7 @@ fn install_all(vendors: &Vendors, chosen: &[&Surveyed], dir: &Path) -> InstallRe
 
 fn install_one(
     vendors: &Vendors,
-    provider: ProviderArg,
+    provider: HarnessArg,
     latest: &Release,
     dir: &Path,
     cache: &Path,
@@ -590,6 +618,7 @@ fn install_one(
     match &latest.payload {
         Payload::Binary(name) => install_file(&artifact, &dir.join(name))?,
         Payload::TarGz(members) => unpack_into(&artifact, members, dir)?,
+        Payload::Bundle { root, bin } => unpack_bundle(&artifact, root, bin, dir)?,
     }
     for file in latest.files() {
         println!("  installed {}", dir.join(file).display());
@@ -760,6 +789,154 @@ fn unpack_into(archive: &Path, members: &[String], dir: &Path) -> Result<(), Str
     Ok(())
 }
 
+/// Preserve the vendor's complete standalone distribution, including its runtime
+/// assets. A relative symlink keeps PATH lookup working after the directory is
+/// copied into the guest image; its target is the vendor's Linux ELF, not a host
+/// Node launcher. Bun resolves package assets beside the real executable.
+fn unpack_bundle(archive: &Path, root: &str, bin: &str, dir: &Path) -> Result<(), String> {
+    let names_are_safe = safe_component(root) && safe_component(bin);
+    if !names_are_safe {
+        return Err("bundle root and executable must be plain path components".into());
+    }
+    let unpack = dir.with_extension(format!(
+        "staging-{}-{:x}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir(&unpack).map_err(|e| format!("create {}: {e}", unpack.display()))?;
+    let result = install_bundle_tree(archive, root, bin, dir, &unpack);
+    let recovery_needed = result.is_err() && unpack.join("previous").exists();
+    if recovery_needed {
+        return result.map_err(|e| {
+            format!(
+                "{e}; previous bundle retained at {}",
+                unpack.join("previous").display()
+            )
+        });
+    }
+    let _ = std::fs::remove_dir_all(&unpack);
+    result
+}
+
+fn install_bundle_tree(
+    archive: &Path,
+    root: &str,
+    bin: &str,
+    dir: &Path,
+    unpack: &Path,
+) -> Result<(), String> {
+    let content = unpack.join("content");
+    std::fs::create_dir(&content).map_err(|e| format!("create bundle staging: {e}"))?;
+    extract_bundle(archive, root, &content)?;
+    let tree = content.join(root);
+    let executable = tree.join(bin);
+    let mut magic = [0; 4];
+    let read = std::fs::File::open(&executable)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut magic));
+    let is_linux_executable = is_executable(&executable) && read.is_ok() && magic == *b"\x7fELF";
+    if !is_linux_executable {
+        return Err(format!("bundle contains no Linux executable {root}/{bin}"));
+    }
+    let bundle_name = format!(".{bin}");
+    let bundle = dir.join(&bundle_name);
+    let previous = match std::fs::symlink_metadata(&bundle) {
+        Ok(meta) => {
+            if !meta.is_dir() {
+                return Err(format!("{} is not a bundle directory", bundle.display()));
+            }
+            let previous = unpack.join("previous");
+            std::fs::rename(&bundle, &previous)
+                .map_err(|e| format!("move {}: {e}", bundle.display()))?;
+            Some(previous)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("inspect {}: {e}", bundle.display())),
+    };
+    if let Err(e) = std::fs::rename(&tree, &bundle) {
+        restore_bundle(previous.as_deref(), &bundle)?;
+        return Err(format!("install {}: {e}", bundle.display()));
+    }
+    let link = unpack.join("entrypoint");
+    let publish = std::os::unix::fs::symlink(Path::new(&bundle_name).join(bin), &link)
+        .and_then(|()| std::fs::rename(&link, dir.join(bin)));
+    if let Err(e) = publish {
+        let _ = std::fs::remove_dir_all(&bundle);
+        restore_bundle(previous.as_deref(), &bundle)?;
+        return Err(format!("publish {bin}: {e}"));
+    }
+    Ok(())
+}
+
+fn restore_bundle(previous: Option<&Path>, bundle: &Path) -> Result<(), String> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    std::fs::rename(previous, bundle).map_err(|e| format!("restore {}: {e}", bundle.display()))
+}
+
+fn safe_component(name: &str) -> bool {
+    let mut parts = Path::new(name).components();
+    matches!(parts.next(), Some(std::path::Component::Normal(_)))
+        && parts.next().is_none()
+        && !name.contains(['/', '\\'])
+}
+
+/// Inspect structured tar entries before writing. No links, devices, absolute
+/// paths or parent traversal are accepted, even from a checksum-verified vendor.
+fn extract_bundle(archive: &Path, root: &str, unpack: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(archive).map_err(|e| format!("open archive: {e}"))?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("read archive: {e}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("read archive entry: {e}"))?;
+        let path = entry
+            .path()
+            .map_err(|e| format!("read archive path: {e}"))?
+            .into_owned();
+        let normal_components = path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)));
+        let within_root = path.starts_with(root) && normal_components;
+        if !within_root {
+            return Err(format!(
+                "bundle path escapes root {root}: {}",
+                path.display()
+            ));
+        }
+        let kind = entry.header().entry_type();
+        let supported_entry = kind.is_file() || kind.is_dir();
+        if !supported_entry {
+            return Err(format!(
+                "bundle links and special files are refused: {}",
+                path.display()
+            ));
+        }
+        let mode = entry
+            .header()
+            .mode()
+            .map_err(|e| format!("read archive mode: {e}"))?;
+        let extracted = entry
+            .unpack_in(unpack)
+            .map_err(|e| format!("extract {}: {e}", path.display()))?;
+        if !extracted {
+            return Err(format!("bundle path was not extracted: {}", path.display()));
+        }
+        let permissions = if kind.is_dir() {
+            0o755
+        } else {
+            0o644 | (mode & 0o111)
+        };
+        std::fs::set_permissions(
+            unpack.join(path),
+            std::fs::Permissions::from_mode(permissions),
+        )
+        .map_err(|e| format!("set bundle permissions: {e}"))?;
+    }
+    Ok(())
+}
+
 fn install_file(src: &Path, dest: &Path) -> Result<(), String> {
     std::fs::copy(src, dest)
         .map_err(|e| format!("install {} -> {}: {e}", src.display(), dest.display()))?;
@@ -770,6 +947,245 @@ fn install_file(src: &Path, dest: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bundle_archive(dir: &Path, entries: &[(&str, &[u8], tar::EntryType, u32)]) -> PathBuf {
+        let path = dir.join("bundle.tar.gz");
+        let gzip = flate2::write::GzEncoder::new(
+            std::fs::File::create(&path).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut archive = tar::Builder::new(gzip);
+        for (name, bytes, kind, mode) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(*mode);
+            header.set_entry_type(*kind);
+            if kind.is_symlink() || kind.is_hard_link() {
+                header.set_link_name("../../outside").unwrap();
+            }
+            // Raw names deliberately exercise hostile paths the builder's
+            // normal set_path API would reject before the extractor sees them.
+            header.as_mut_bytes()[..name.len()].copy_from_slice(name.as_bytes());
+            header.set_cksum();
+            archive.append(&header, *bytes).unwrap();
+        }
+        archive.into_inner().unwrap().finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn bundle_preserves_assets_and_relative_entrypoint_after_relocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("executors");
+        std::fs::create_dir(&dir).unwrap();
+        let archive = bundle_archive(
+            temp.path(),
+            &[
+                ("pi/pi", b"\x7fELFbinary", tar::EntryType::Regular, 0o755),
+                (
+                    "pi/package.json",
+                    b"{\"version\":\"1.0\"}",
+                    tar::EntryType::Regular,
+                    0o644,
+                ),
+                ("pi/theme/dark.json", b"{}", tar::EntryType::Regular, 0o644),
+                (
+                    "pi/photon_rs_bg.wasm",
+                    b"wasm",
+                    tar::EntryType::Regular,
+                    0o644,
+                ),
+                (
+                    "pi/node_modules/native/addon.node",
+                    b"addon",
+                    tar::EntryType::Regular,
+                    0o644,
+                ),
+            ],
+        );
+        unpack_bundle(&archive, "pi", "pi", &dir).unwrap();
+        assert_eq!(
+            std::fs::read_link(dir.join("pi")).unwrap(),
+            Path::new(".pi/pi")
+        );
+        assert!(is_executable(&dir.join("pi")));
+        assert!(!is_executable(&dir.join(".pi/package.json")));
+        let relocated = temp.path().join("guest-executors");
+        std::fs::rename(&dir, &relocated).unwrap();
+        let executable = std::fs::canonicalize(relocated.join("pi")).unwrap();
+        let package = executable.parent().unwrap();
+        assert_eq!(
+            std::fs::read(package.join("theme/dark.json")).unwrap(),
+            b"{}"
+        );
+        assert_eq!(
+            std::fs::read(package.join("node_modules/native/addon.node")).unwrap(),
+            b"addon"
+        );
+        // Updating replaces the complete tree, rather than retaining old deps.
+        let archive = bundle_archive(
+            temp.path(),
+            &[
+                ("pi/pi", b"\x7fELFupdated", tar::EntryType::Regular, 0o755),
+                ("pi/package.json", b"{}", tar::EntryType::Regular, 0o644),
+            ],
+        );
+        unpack_bundle(&archive, "pi", "pi", &relocated).unwrap();
+        assert!(!relocated.join(".pi/theme").exists());
+        assert_eq!(
+            std::fs::read(relocated.join("pi")).unwrap(),
+            b"\x7fELFupdated"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires PI_TEST_ARCHIVE pointing to the official host-arch Linux Pi tarball"]
+    fn official_pi_bundle_runs_without_a_host_node_runtime() {
+        let archive =
+            PathBuf::from(std::env::var_os("PI_TEST_ARCHIVE").expect("set PI_TEST_ARCHIVE"));
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("executors");
+        std::fs::create_dir(&dir).unwrap();
+        unpack_bundle(&archive, "pi", "pi", &dir).unwrap();
+        let output = std::process::Command::new(dir.join("pi"))
+            .arg("--version")
+            .env_clear()
+            .env("HOME", temp.path())
+            .env("PATH", "/nonexistent")
+            .env("PI_OFFLINE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let version = String::from_utf8(output.stdout).unwrap();
+        assert!(!version.trim().is_empty());
+        assert_ne!(
+            version.trim(),
+            "0.0.0",
+            "Pi did not find its sibling package.json"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires e2fsprogs (mke2fs and debugfs)"]
+    fn bundle_survives_the_guest_image_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("executors");
+        std::fs::create_dir(&dir).unwrap();
+        let archive = bundle_archive(
+            temp.path(),
+            &[
+                ("pi/pi", b"\x7fELFbinary", tar::EntryType::Regular, 0o755),
+                ("pi/package.json", b"{}", tar::EntryType::Regular, 0o644),
+                (
+                    "pi/theme/dark.json",
+                    b"theme",
+                    tar::EntryType::Regular,
+                    0o644,
+                ),
+            ],
+        );
+        unpack_bundle(&archive, "pi", "pi", &dir).unwrap();
+        let image = sandbox_host::executor_image::ensure(&dir).unwrap().unwrap();
+        let guest = temp.path().join("guest");
+        sandbox_host::workspace_image::read_back(&image, &guest).unwrap();
+        assert_eq!(
+            std::fs::read_link(guest.join("pi")).unwrap(),
+            Path::new(".pi/pi")
+        );
+        assert!(is_executable(&guest.join("pi")));
+        assert_eq!(
+            std::fs::read(guest.join(".pi/theme/dark.json")).unwrap(),
+            b"theme"
+        );
+    }
+
+    #[test]
+    fn bundle_refuses_traversal_links_and_special_files_before_publication() {
+        use tar::EntryType;
+        for (name, kind) in [
+            ("../outside", EntryType::Regular),
+            ("/absolute", EntryType::Regular),
+            ("pi/../../outside", EntryType::Regular),
+            ("other/file", EntryType::Regular),
+            ("pi/link", EntryType::Symlink),
+            ("pi/link", EntryType::Link),
+            ("pi/device", EntryType::Char),
+            ("pi/fifo", EntryType::Fifo),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = temp.path().join("executors");
+            std::fs::create_dir(&dir).unwrap();
+            let archive = bundle_archive(temp.path(), &[(name, b"", kind, 0o755)]);
+            assert!(
+                unpack_bundle(&archive, "pi", "pi", &dir).is_err(),
+                "accepted {name} {kind:?}"
+            );
+            assert!(!dir.join("pi").exists());
+            assert!(!temp.path().join("outside").exists());
+        }
+    }
+
+    #[test]
+    fn bundle_refuses_unsafe_names_and_non_linux_entrypoints() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("executors");
+        std::fs::create_dir(&dir).unwrap();
+        let archive = bundle_archive(
+            temp.path(),
+            &[(
+                "pi/pi",
+                b"#!/usr/bin/env node",
+                tar::EntryType::Regular,
+                0o755,
+            )],
+        );
+        for name in ["../pi", "/pi", ".", "..", "pi/sub", "pi\\sub", ""] {
+            assert!(unpack_bundle(&archive, name, "pi", &dir).is_err());
+            assert!(unpack_bundle(&archive, "pi", name, &dir).is_err());
+        }
+        assert!(
+            unpack_bundle(&archive, "pi", "pi", &dir)
+                .unwrap_err()
+                .contains("Linux executable")
+        );
+        assert!(!dir.join("pi").exists());
+    }
+
+    #[test]
+    fn bundle_refuses_an_existing_directory_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("executors");
+        std::fs::create_dir(&dir).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join(".pi")).unwrap();
+        let archive = bundle_archive(
+            temp.path(),
+            &[("pi/pi", b"\x7fELFbinary", tar::EntryType::Regular, 0o755)],
+        );
+        assert!(unpack_bundle(&archive, "pi", "pi", &dir).is_err());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn bundle_arch_names_and_pi_install_selection() {
+        assert_eq!(GuestArch::Aarch64.bundle_arch(), "arm64");
+        assert_eq!(GuestArch::X86_64.bundle_arch(), "x64");
+        assert!(ALL.contains(&HarnessArg::Pi));
+        use clap::{Args as _, FromArgMatches as _};
+        let matches = InstallArgs::augment_args(clap::Command::new("install"))
+            .try_get_matches_from(["install", "pi"])
+            .unwrap();
+        assert_eq!(
+            InstallArgs::from_arg_matches(&matches).unwrap().providers,
+            vec![HarnessArg::Pi]
+        );
+    }
 
     fn scratch(test: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("dt-exec-{test}-{}", std::process::id()));
@@ -916,12 +1332,12 @@ mod tests {
 
         stand_in(&dir, "codex");
         assert_eq!(
-            installed(ProviderArg::Codex, &latest, &dir, &receipts),
+            installed(HarnessArg::Codex, &latest, &dir, &receipts),
             Installed::Missing
         );
         stand_in(&dir, "codex-code-mode-host");
         assert!(matches!(
-            installed(ProviderArg::Codex, &latest, &dir, &receipts),
+            installed(HarnessArg::Codex, &latest, &dir, &receipts),
             Installed::Foreign { .. }
         ));
 
@@ -952,7 +1368,7 @@ mod tests {
             },
         );
         assert_eq!(
-            installed(ProviderArg::Claude, &latest, &dir, &receipts),
+            installed(HarnessArg::Claude, &latest, &dir, &receipts),
             Installed::Current {
                 sha256: sha256.clone()
             }
@@ -960,15 +1376,15 @@ mod tests {
 
         receipts.providers.get_mut("claude").unwrap().version = "2.1.231".into();
         assert_eq!(
-            installed(ProviderArg::Claude, &latest, &dir, &receipts),
+            installed(HarnessArg::Claude, &latest, &dir, &receipts),
             Installed::Behind {
                 installed: "2.1.231".into()
             }
         );
-        assert!(installed(ProviderArg::Claude, &latest, &dir, &receipts).is_offered());
+        assert!(installed(HarnessArg::Claude, &latest, &dir, &receipts).is_offered());
 
         receipts.providers.get_mut("claude").unwrap().sha256 = "0".repeat(64);
-        let own = installed(ProviderArg::Claude, &latest, &dir, &receipts);
+        let own = installed(HarnessArg::Claude, &latest, &dir, &receipts);
         assert_eq!(own, Installed::Foreign { sha256 });
         assert!(!own.is_offered());
 

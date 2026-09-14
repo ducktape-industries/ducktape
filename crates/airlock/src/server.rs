@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, OriginalUri, State};
-use axum::http::{header::AUTHORIZATION, HeaderMap, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::Json;
@@ -977,11 +977,26 @@ async fn proxy_inner(
     for (name, value) in headers.iter() {
         if matches!(
             name.as_str(),
-            "authorization" | "host" | "content-length" | "accept-encoding" | "x-airlock-body-seal"
+            "authorization"
+                | "x-api-key"
+                | "chatgpt-account-id"
+                | "host"
+                | "content-length"
+                | "accept-encoding"
+                | "x-airlock-body-seal"
         ) {
             continue;
         }
         rb = rb.header(name, value);
+    }
+    // Account routing belongs to the credential holder, never the child or
+    // the broker (Pi supplies a deliberately fictitious account in its token).
+    let account_id = match entry.kind {
+        CredentialKind::Claude => None,
+        CredentialKind::Codex => codex_account_id(&access),
+    };
+    if let Some(account_id) = account_id {
+        rb = rb.header("chatgpt-account-id", account_id);
     }
     let resp = rb
         .bearer_auth(&access)
@@ -1041,6 +1056,24 @@ async fn proxy_inner(
         .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")))
 }
 
+/// Read account routing metadata only from the credential we hold. This does
+/// not authenticate a JWT: the vendor validates the bearer. An opaque bearer
+/// carries no account metadata and must never inherit a caller's account.
+fn codex_account_id(access: &str) -> Option<String> {
+    let mut parts = access.split('.');
+    let (_header, payload, _signature) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let account_id = claims["https://api.openai.com/auth"]["chatgpt_account_id"].as_str()?;
+    let usable_account = !account_id.is_empty() && HeaderValue::from_str(account_id).is_ok();
+    usable_account.then(|| account_id.to_owned())
+}
+
 /// Exchange one credential's refresh token for a fresh access token (and rotated
 /// refresh token), single-flighted per credential so concurrent callers never
 /// double-spend it.
@@ -1087,6 +1120,32 @@ async fn refresh_now(cfg: &Config, http: &reqwest::Client, entry: &CredEntry) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_account_metadata_comes_only_from_a_well_formed_credential() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let payload = URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"real-account"}}"#);
+        assert_eq!(
+            codex_account_id(&format!("e30.{payload}.sig")).as_deref(),
+            Some("real-account")
+        );
+        for invalid in [
+            "opaque-bearer",
+            "e30.bad.sig",
+            "e30.e30.sig",
+            "e30.e30.sig.extra",
+        ] {
+            assert_eq!(codex_account_id(invalid), None);
+        }
+        for account in ["", "bad\naccount"] {
+            let payload = URL_SAFE_NO_PAD.encode(
+                serde_json::json!({"https://api.openai.com/auth": {"chatgpt_account_id": account}})
+                    .to_string(),
+            );
+            assert_eq!(codex_account_id(&format!("e30.{payload}.sig")), None);
+        }
+    }
 
     #[test]
     fn codex_upstream_path_strips_v1_but_claude_passes_through() {
@@ -1138,6 +1197,97 @@ mod tests {
             grant_check: None,
             reload: None,
         })
+    }
+
+    #[tokio::test]
+    async fn gateway_replaces_caller_account_headers_with_credential_metadata() {
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let upstream = Router::new().route(
+            "/responses",
+            post(move |headers: HeaderMap| {
+                let sent = sent.clone();
+                async move {
+                    sent.send(headers).unwrap();
+                    "ok"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"real-account"}}"#);
+        for access in [format!("e30.{payload}.sig"), "opaque-bearer".into()] {
+            let mut st = test_state("a", 8);
+            Arc::get_mut(&mut st).unwrap().cfg.openai_base = url.clone();
+            st.creds.lock().unwrap().insert(
+                "a".into(),
+                Arc::new(
+                    cred_entry(
+                        CredentialKind::Codex,
+                        CredentialPayload::Bearer {
+                            access_token: access.clone(),
+                        },
+                    )
+                    .unwrap(),
+                ),
+            );
+            let (eph, keys) = handshake::client_handshake(&st.seal_kp.public_bytes());
+            let eph = BASE64.encode(eph);
+            let _session = session(
+                State(st.clone()),
+                HeaderMap::new(),
+                Json(SessionRequest {
+                    sub: "a".into(),
+                    client_eph_pk_b64: eph.clone(),
+                    body_seal: true,
+                    work: WorkRef::Direct,
+                }),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("session: {}", error.1));
+            let token = token::issue(
+                &st.sess_sk,
+                &Claims {
+                    sub: "a".into(),
+                    iat: now_secs(),
+                    exp: now_secs() + 3600,
+                    eph,
+                    seal: true,
+                },
+            );
+            let mut headers = sealed_headers(&token);
+            headers.append("chatgpt-account-id", "dummy-pi-account".parse().unwrap());
+            headers.append("chatgpt-account-id", "attacker-account".parse().unwrap());
+            headers.insert("x-api-key", "attacker-key".parse().unwrap());
+            let aad = bodyseal::request_aad("POST", "/v1/responses");
+            let body = bodyseal::seal_request(&keys, &aad, b"{}");
+            let response = proxy_inner(
+                &st,
+                Method::POST,
+                &"/v1/responses".parse().unwrap(),
+                &headers,
+                Bytes::from(body),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("proxy: {}", error.1));
+            assert_eq!(response.status(), StatusCode::OK);
+            // Drain the sealed response to synchronize with the upstream task.
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let headers = received.recv().await.unwrap();
+            assert_eq!(headers["authorization"], format!("Bearer {access}"));
+            assert!(!headers.contains_key("x-api-key"));
+            let accounts: Vec<_> = headers.get_all("chatgpt-account-id").iter().collect();
+            match codex_account_id(&access) {
+                Some(account) => assert_eq!(accounts, vec![account.as_str()]),
+                None => assert!(accounts.is_empty()),
+            }
+        }
+        task.abort();
     }
 
     fn recorded_nonces(st: &AppState, sub: &str, eph_b64: &str) -> usize {
