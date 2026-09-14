@@ -834,6 +834,7 @@ impl Pair {
             op!(
                 "agent",
                 &agent::AgentMsg::Provision {
+                    request_id: id.into(),
                     name: id.into(),
                     program: runs::model_program(id),
                 },

@@ -310,7 +310,7 @@ curl -fsS -X PUT "$URL/v1/files/object/shared/skills/$AGENT_ID/SKILL.md" \
   --data-binary @"$SCRIPT_DIR/chiefduck/SKILL.md" >/dev/null \
   || die "cannot stage the $AGENT_NAME persona skill"
 PROGRAM=$("$NODE_BIN" agent model-program "$AGENT_ID") || die "cannot encode the default model program"
-PROVISION=$(printf '%s' "$PROGRAM" | bun -e 'process.stdout.write(JSON.stringify({provision:{name:process.argv[1],program:await Bun.stdin.json()}}))' "$AGENT_NAME") || die "invalid program"
+PROVISION=$(printf '%s' "$PROGRAM" | bun -e 'process.stdout.write(JSON.stringify({provision:{request_id:process.argv[1],name:process.argv[2],program:await Bun.stdin.json()}}))' "$AGENT_ID" "$AGENT_NAME") || die "invalid program"
 submit_user agent "$PROVISION"
 MODEL_ACCOUNT=$(query identity "{\"controlled\":{\"by\":$CONTROLLER,\"from\":0,\"limit\":256}}" | bun -e '
   const matches=(await Bun.stdin.json()).accounts.filter(account=>account.name===process.argv[1] && account.control.program?.executor==="agent");

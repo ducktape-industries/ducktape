@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 import ducktapeExtension from "./ducktape.ts";
+import type { DucktapeNetworkService } from "./ducktape.ts";
 
 // --- Test setup -----------------------------------------------------------
 
@@ -46,7 +47,12 @@ const harness = (t: TestContext, mode = "normal", binary?: string) => Promise.re
     const hooks = new Map<string, Hook>();
     const tools = new Map<string, ToolDefinition>();
     const active = new Set(["read", "bash"]);
+    const events = new Map<string, (value: unknown) => void>();
     const pi = {
+      events: { on: (name: string, handler: (value: unknown) => void) => {
+        events.set(name, handler);
+        return () => { events.delete(name); };
+      } },
       on: (event: string, hook: Hook) => hooks.set(event, hook),
       registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
       getActiveTools: () => [...active],
@@ -70,7 +76,13 @@ const harness = (t: TestContext, mode = "normal", binary?: string) => Promise.re
       return tool.execute("call", { operation }, signal, undefined, {} as never);
     };
     t.after(() => invoke("session_shutdown"));
-    return { cwd, tools, active, invoke, call };
+    const bind = (): DucktapeNetworkService => {
+      const binding: { service?: DucktapeNetworkService } = {};
+      events.get("ducktape:network:bind")?.({ accept: (service: DucktapeNetworkService) => { binding.service = service; } });
+      assert.ok(binding.service);
+      return binding.service;
+    };
+    return { cwd, tools, active, invoke, call, bind, events };
   });
 
 const contentText = (result: { content: Array<{ type: string; text?: string }> }): string => {
@@ -226,4 +238,48 @@ test("compiled Ducktape MCP catalog and unbound refusal round-trip", { skip: !re
   const action = h.tools.get("ducktape_action");
   assert.ok(action);
   await assert.rejects(action.execute("id", {}, undefined, undefined, {} as never));
+});
+
+// --- Generic package service ----------------------------------------------
+
+test("package service binds before startup, waits for discovery, and retains full envelopes", async (t) => {
+  const h = await harness(t);
+  const service = h.bind();
+  const pending = service.callTool("ducktape_fixture", { operation: "large" });
+  await h.invoke("session_start");
+  const result = await pending;
+  assert.equal(result.isError, false);
+  assert.equal(result.content[0].type, "text");
+  assert.equal(result.content[0].text, "[redacted]\n" + "αβγ😀".repeat(30_000));
+  const refused = await service.callTool("ducktape_fixture", { operation: "error" });
+  assert.equal(refused.isError, true);
+  assert.equal(refused.content[0].text, "operation refused [redacted]");
+  await assert.rejects(service.callTool("not_discovered", {}), /not discovered/);
+  await assert.rejects(service.callTool("ducktape_fixture", { operation: "protocol_error" }), /protocol error/);
+  const controller = new AbortController();
+  const cancelled = assert.rejects(service.callTool("ducktape_fixture", { operation: "hold" }, controller.signal), /cancelled/);
+  await service.callTool("ducktape_fixture", { operation: "barrier" });
+  controller.abort();
+  await cancelled;
+  await h.invoke("session_shutdown");
+  await assert.rejects(service.callTool("ducktape_fixture", {}), /closed/);
+  assert.equal(h.events.has("ducktape:network:bind"), false);
+});
+
+test("package service startup wait can be cancelled before a session starts", async (t) => {
+  const h = await harness(t);
+  const controller = new AbortController();
+  const pending = assert.rejects(h.bind().callTool("ducktape_fixture", {}, controller.signal), /cancelled/);
+  controller.abort();
+  await pending;
+  assert.equal(h.tools.size, 0);
+});
+
+test("package service startup failure rejects waiting and future calls", async (t) => {
+  const h = await harness(t, "missing");
+  const service = h.bind();
+  const pending = assert.rejects(service.callTool("ducktape_fixture", {}), /Could not start|exited|closed/);
+  await h.invoke("session_start");
+  await pending;
+  await assert.rejects(service.callTool("ducktape_fixture", {}));
 });

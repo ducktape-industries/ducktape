@@ -84,6 +84,84 @@ pub(crate) fn submit_frame(base: &str, frame: &[u8]) -> Result<u64, Box<dyn std:
     receipt_height(&text)
 }
 
+/// Resolve a signed op's assigned stamp from its applied index row, never a
+/// module's mutable latest state. Matching is scoped to the receipt's block,
+/// verified external signer and complete decoded payload. Identical duplicate
+/// dispatches are ambiguous and fail closed rather than choosing a newer row.
+/// An unavailable/lagging index is an error; callers may reconcile and retry.
+pub(crate) fn submit_frame_assigned(
+    base: &str,
+    frame: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let (origin, msg) = node::decode_frame(frame)?;
+    let expected_origin = noded::index_origin(&origin);
+    let payload: Option<serde_json::Value> = serde_json::from_slice(&msg.payload).ok();
+    let payload_hex = payload.is_none().then(|| noded::hex_bytes(&msg.payload));
+    let height = submit_frame(base, frame)?;
+    // This prefix sorts before sequence zero at exactly the committed height.
+    let mut after = format!("op/{height:016x}/");
+    let mut assigned = None;
+    loop {
+        let response = client()?
+            .get(format!("{base}/v1/index/{}/ops", msg.target))
+            .query(&[("after", after.as_str()), ("limit", "128")])
+            .send()?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!(
+                "applied receipt index unavailable ({status}); retry to reconcile"
+            )
+            .into());
+        }
+        let page: serde_json::Value = response.json()?;
+        let rows = page["ops"]
+            .as_array()
+            .ok_or("unexpected applied receipt page")?;
+        for row in rows {
+            let row_height = row["height"]
+                .as_u64()
+                .ok_or("missing applied receipt height")?;
+            if row_height > height {
+                return assigned.ok_or_else(|| {
+                    "signed op has no indexed assigned receipt; retry to reconcile".into()
+                });
+            }
+            let matching = row_height == height
+                && row["origin"] == serde_json::to_value(&expected_origin)?
+                && row.get("payload") == payload.as_ref()
+                && row.get("payload_hex").and_then(serde_json::Value::as_str)
+                    == payload_hex.as_deref();
+            if !matching {
+                continue;
+            }
+            if assigned.is_some() {
+                return Err("signed op has ambiguous applied receipts".into());
+            }
+            let stamp = match (
+                row.get("assigned"),
+                row.get("assigned_hex").and_then(serde_json::Value::as_str),
+            ) {
+                (Some(value), None) => serde_json::to_vec(value)?,
+                (None, Some(value)) => hex::decode(value)?,
+                _ => return Err("signed op has no assigned stamp".into()),
+            };
+            assigned = Some(stamp);
+        }
+        if page["has_more"] == false {
+            return assigned.ok_or_else(|| {
+                "signed op has no indexed assigned receipt; retry to reconcile".into()
+            });
+        }
+        let next = page["next_after"]
+            .as_str()
+            .ok_or("missing applied receipt cursor")?;
+        if next <= after.as_str() {
+            return Err("applied receipt cursor did not advance".into());
+        }
+        after = next.to_string();
+    }
+}
+
 /// the `height` of a `SubmitReceipt` body — both submit lanes answer with one.
 fn receipt_height(body: &str) -> Result<u64, Box<dyn std::error::Error>> {
     serde_json::from_str::<serde_json::Value>(body)

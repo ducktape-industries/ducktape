@@ -3,6 +3,7 @@ use futures::executor::block_on;
 use host::{BlockContext, Host};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sdk_testkit::MemStore;
+use sha2::{Digest, Sha256};
 use tasks::{JobsMsg, Party, TaskMsg, TaskQuery, TaskReply, TaskStatus, Tasks};
 
 struct Executor;
@@ -17,6 +18,64 @@ impl Module for Executor {
     async fn execute(&mut self, _: &mut dyn Ctx, _: &Msg) -> Result<(), Error> {
         Ok(())
     }
+}
+
+/// A real queued Attribution subscriber with commit/abort behavior. Tests
+/// observe authenticated deliveries here, not Tasks' emitted Attribute intents.
+#[derive(Default)]
+struct WorkerEvents {
+    committed: Vec<attribution::Change>,
+    staged: Vec<attribution::Change>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl Module for WorkerEvents {
+    fn id(&self) -> ModuleId {
+        "worker-events".into()
+    }
+    fn root(&self) -> StateRoot {
+        StateRoot(Sha256::digest(sdk::wire::encode(&self.committed)).into())
+    }
+    async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        let from_attribution = ctx.env().origin == Origin::Module("attribution".into());
+        if !from_attribution {
+            return Err(Error::Module("unauthenticated attribution delivery".into()));
+        }
+        let attribution::AttributionEvent::Changed(change) =
+            attribution::decode_event(&msg.payload).map_err(Error::Module)?;
+        self.staged.push(change);
+        Ok(())
+    }
+    async fn query(&self, _: &[u8]) -> Result<Vec<u8>, Error> {
+        Ok(sdk::wire::encode(&self.committed))
+    }
+    async fn commit_block(&mut self) -> Result<(), Error> {
+        self.committed.append(&mut self.staged);
+        Ok(())
+    }
+    async fn abort_block(&mut self) -> Result<(), Error> {
+        self.staged.clear();
+        Ok(())
+    }
+}
+
+async fn deliver_worker_events(host: &mut Host) {
+    host.submit_block(context(Origin::System), Vec::new())
+        .await
+        .unwrap();
+    assert!(
+        !host.has_pending_work().await.unwrap(),
+        "the committed delivery batch drained"
+    );
+}
+
+async fn received_worker_events(host: &Host) -> Vec<attribution::Change> {
+    let changes: Vec<attribution::Change> =
+        sdk::wire::decode(&host.query("worker-events", &[]).await.unwrap()).unwrap();
+    changes
+        .into_iter()
+        .filter(|change| change.source.kind == "job_event")
+        .collect()
 }
 
 fn context(origin: Origin) -> BlockContext {
@@ -279,6 +338,408 @@ fn claims_release_and_results_publish_full_relation_sets() {
         )
         .await;
         assert_eq!(relations(&host, "job", "job").await.revision, 7);
+    });
+}
+
+#[test]
+fn every_semantic_worker_event_is_delivered_once_from_an_immutable_source() {
+    block_on(async {
+        let mut host = arena().await;
+        host.register(Box::new(WorkerEvents::default()));
+        host.submit_at(
+            context(Origin::Module("worker-events".into())),
+            Msg {
+                target: "attribution".into(),
+                payload: attribution::encode_msg(&AttributionMsg::Subscribe {}),
+            },
+        )
+        .await
+        .unwrap();
+        job(
+            &mut host,
+            alice(),
+            JobsMsg::Submit {
+                job_id: "ordinary".into(),
+                kind: "research".into(),
+                spec: "One-shot work".into(),
+            },
+        )
+        .await;
+        deliver_worker_events(&mut host).await;
+        assert!(
+            received_worker_events(&host).await.is_empty(),
+            "ordinary Submit has no native job_event"
+        );
+        job(
+            &mut host,
+            bob(),
+            JobsMsg::Claim {
+                job_id: "ordinary".into(),
+                lease_views: 100,
+            },
+        )
+        .await;
+        job(
+            &mut host,
+            bob(),
+            JobsMsg::Finalize {
+                job_id: "ordinary".into(),
+                ok: true,
+                payload: "One-shot result".into(),
+            },
+        )
+        .await;
+        deliver_worker_events(&mut host).await;
+        assert!(
+            received_worker_events(&host).await.is_empty(),
+            "ordinary lifecycle has no native event deliveries"
+        );
+        let ordinary = relations(&host, "job", "ordinary").await;
+        assert_eq!(ordinary.revision, 3);
+        for (recipient, reason) in [
+            (1, Reason::Authorship),
+            (1, Reason::Ownership),
+            (2, Reason::Assignment),
+            (1, Reason::Result),
+        ] {
+            assert!(
+                ordinary
+                    .relations
+                    .iter()
+                    .any(|relation| relation.recipient == recipient && relation.reason == reason)
+            );
+        }
+        let delivered: Vec<attribution::Change> =
+            sdk::wire::decode(&host.query("worker-events", &[]).await.unwrap()).unwrap();
+        assert!(
+            delivered.iter().any(|change| change.source.kind == "job"
+                && change.source.object == "ordinary"
+                && change.reason == Reason::Result
+                && change.recipient == 1),
+            "ordinary Result still reaches subscribers on its original source"
+        );
+        job(
+            &mut host,
+            alice(),
+            JobsMsg::SubmitConversation {
+                job_id: "worker".into(),
+                kind: "research".into(),
+                spec: "Investigate".into(),
+            },
+        )
+        .await;
+        job(
+            &mut host,
+            Origin::Module("executor".into()),
+            JobsMsg::Claim {
+                job_id: "worker".into(),
+                lease_views: 100,
+            },
+        )
+        .await;
+        deliver_worker_events(&mut host).await;
+        assert_eq!(received_worker_events(&host).await.len(), 1);
+        let attribution_root = host.module_root("attribution").unwrap();
+        job(
+            &mut host,
+            Origin::Module("executor".into()),
+            JobsMsg::CheckpointNativeHistory {
+                job_id: "worker".into(),
+                attempt: 1,
+                run_id: "run-worker".into(),
+                execution_attempt: 0,
+                revision: 1,
+                snapshot: "snapshot-worker".into(),
+            },
+        )
+        .await;
+        deliver_worker_events(&mut host).await;
+        assert_eq!(host.module_root("attribution").unwrap(), attribution_root);
+        assert_eq!(relations(&host, "job", "worker").await.revision, 2);
+        let updates = [
+            (
+                Origin::Module("executor".into()),
+                JobsMsg::Checkpoint {
+                    job_id: "worker".into(),
+                    operation_id: "first".into(),
+                    attempt: 1,
+                    kind: tasks::WorkerReportKind::Checkpoint,
+                    payload: "Started investigation".into(),
+                },
+                "worker_checkpoint",
+            ),
+            (
+                Origin::Module("executor".into()),
+                JobsMsg::Checkpoint {
+                    job_id: "worker".into(),
+                    operation_id: "blocker".into(),
+                    attempt: 1,
+                    kind: tasks::WorkerReportKind::Checkpoint,
+                    payload: "Blocked: need the source data".into(),
+                },
+                "worker_checkpoint",
+            ),
+            (
+                Origin::Module("executor".into()),
+                JobsMsg::Checkpoint {
+                    job_id: "worker".into(),
+                    operation_id: "report".into(),
+                    attempt: 1,
+                    kind: tasks::WorkerReportKind::Report,
+                    payload: "Evidence retained".into(),
+                },
+                "worker_report",
+            ),
+            (
+                bob(),
+                JobsMsg::Control {
+                    job_id: "worker".into(),
+                    operation_id: "steer".into(),
+                    input: tasks::JobControlInput::Steer {
+                        text: "Use another source".into(),
+                    },
+                },
+                "worker_control",
+            ),
+            (
+                bob(),
+                JobsMsg::Control {
+                    job_id: "worker".into(),
+                    operation_id: "cancel".into(),
+                    input: tasks::JobControlInput::Cancel,
+                },
+                "worker_control",
+            ),
+            (
+                Origin::Module("executor".into()),
+                JobsMsg::AcknowledgeControl {
+                    job_id: "worker".into(),
+                    operation_id: "steer".into(),
+                    attempt: 1,
+                },
+                "worker_control_acknowledged",
+            ),
+            (
+                Origin::Module("executor".into()),
+                JobsMsg::AcknowledgeControl {
+                    job_id: "worker".into(),
+                    operation_id: "cancel".into(),
+                    attempt: 1,
+                },
+                "worker_control_acknowledged",
+            ),
+        ];
+        for (offset, (origin, operation, reason)) in updates.into_iter().enumerate() {
+            job(&mut host, origin.clone(), operation.clone()).await;
+            deliver_worker_events(&mut host).await;
+            let received = received_worker_events(&host).await;
+            assert_eq!(
+                received.len(),
+                offset + 2,
+                "every semantic update reaches the subscriber"
+            );
+            let change = received.last().unwrap();
+            assert_eq!(change.recipient, 1);
+            assert_eq!(change.reason, Reason::Defined(reason.into()));
+            assert_eq!(change.kind, attribution::ChangeKind::Added);
+            let detail: tasks::JobEventDetail = sdk::wire::decode(&change.detail).unwrap();
+            assert_eq!(detail.job_id, "worker");
+            assert_eq!(detail.conversation_id, "worker:1");
+            assert_eq!(detail.job_kind, "research");
+            assert_eq!(detail.created_at_revision, 1);
+            assert_eq!(detail.job_attempt, 1);
+            assert_eq!(detail.submitter, Party::Account(1));
+            assert_eq!(detail.actor, change.actor);
+            assert_eq!(detail.height, change.height);
+            assert_eq!(detail.operation, operation);
+            let source_root = host.module_root("attribution").unwrap();
+            let subscriber_root = host.module_root("worker-events").unwrap();
+            job(&mut host, origin, operation).await;
+            deliver_worker_events(&mut host).await;
+            assert_eq!(
+                host.module_root("attribution").unwrap(),
+                source_root,
+                "exact retry produces no new source revision or change"
+            );
+            assert_eq!(
+                host.module_root("worker-events").unwrap(),
+                subscriber_root,
+                "exact retry produces no delivery"
+            );
+        }
+        job(
+            &mut host,
+            Origin::Module("executor".into()),
+            JobsMsg::Release {
+                job_id: "worker".into(),
+            },
+        )
+        .await;
+        job(
+            &mut host,
+            Origin::Module("executor".into()),
+            JobsMsg::Claim {
+                job_id: "worker".into(),
+                lease_views: 100,
+            },
+        )
+        .await;
+        job(
+            &mut host,
+            Origin::Module("executor".into()),
+            JobsMsg::AcknowledgeControl {
+                job_id: "worker".into(),
+                operation_id: "cancel".into(),
+                attempt: 2,
+            },
+        )
+        .await;
+        deliver_worker_events(&mut host).await;
+        let received = received_worker_events(&host).await;
+        assert_eq!(
+            received.len(),
+            9,
+            "the same control acknowledged by a new attempt has its own source"
+        );
+        let detail: tasks::JobEventDetail =
+            sdk::wire::decode(&received.last().unwrap().detail).unwrap();
+        assert_eq!(detail.job_attempt, 2);
+        job(
+            &mut host,
+            Origin::Module("executor".into()),
+            JobsMsg::SettleCancellation {
+                job_id: "worker".into(),
+                operation_id: "cancel".into(),
+                attempt: 2,
+                payload: "Stopped safely".into(),
+            },
+        )
+        .await;
+        let settled = relations(&host, "job", "worker").await;
+        assert!(
+            settled
+                .relations
+                .iter()
+                .any(|relation| relation.recipient == 1 && relation.reason == Reason::Result)
+        );
+        assert!(
+            !settled
+                .relations
+                .iter()
+                .any(|relation| matches!(relation.reason, Reason::Defined(_))),
+            "mutable Job relations are not semantic event sources"
+        );
+        job(
+            &mut host,
+            bob(),
+            JobsMsg::Prune {
+                job_id: "worker".into(),
+            },
+        )
+        .await;
+        job(
+            &mut host,
+            bob(),
+            JobsMsg::Continue {
+                previous_job_id: "worker".into(),
+                job_id: "next".into(),
+                operation_id: "continue".into(),
+                kind: "writer".into(),
+                spec: "More".into(),
+            },
+        )
+        .await;
+        deliver_worker_events(&mut host).await;
+        let received = received_worker_events(&host).await;
+        assert_eq!(received.len(), 11);
+        let continued: tasks::JobEventDetail =
+            sdk::wire::decode(&received.last().unwrap().detail).unwrap();
+        assert_eq!(continued.job_id, "next");
+        assert_eq!(continued.job_kind, "writer");
+        assert_eq!(continued.conversation_id, "worker:1");
+        assert_eq!(continued.submitter, Party::Account(1));
+        for (reason, expected) in [
+            ("worker_checkpoint", 2),
+            ("worker_report", 1),
+            ("worker_control", 2),
+            ("worker_control_acknowledged", 3),
+        ] {
+            assert_eq!(
+                received
+                    .iter()
+                    .filter(|change| change.reason == Reason::Defined(reason.into()))
+                    .count(),
+                expected
+            );
+        }
+        let sources = received
+            .iter()
+            .map(|change| change.source.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(sources.len(), received.len());
+        for change in &received {
+            assert_eq!(change.revision, 1);
+            assert_eq!(change.source.module, "tasks");
+            assert_eq!(change.source.object.len(), 64);
+            assert_eq!(
+                change.kind,
+                attribution::ChangeKind::Added,
+                "pruning a Job never withdraws its event sources"
+            );
+            let immutable = relations(&host, "job_event", &change.source.object).await;
+            assert_eq!(immutable.revision, 1);
+            assert_eq!(immutable.changes, 1);
+            assert_eq!(immutable.relations[0].detail, change.detail);
+        }
+        let bytes = host
+            .query(
+                "attribution",
+                &attribution::encode_query(&AttributionQuery::ChangesFor {
+                    recipient: 1,
+                    after: 0,
+                    limit: 100,
+                }),
+            )
+            .await
+            .unwrap();
+        let AttributionReply::Changes(changes) = attribution::decode_reply(&bytes).unwrap() else {
+            panic!("changes");
+        };
+        let canonical = changes
+            .into_iter()
+            .map(|entry| entry.change)
+            .filter(|change| change.source.kind == "job_event")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            canonical, received,
+            "subscriber received each canonical immutable change, including the later blocker"
+        );
+        let bytes = host
+            .query(
+                "attribution",
+                &attribution::encode_query(&AttributionQuery::DeliveriesOf {
+                    subscriber: "worker-events".into(),
+                    after: 0,
+                    limit: 100,
+                }),
+            )
+            .await
+            .unwrap();
+        let AttributionReply::Deliveries(deliveries) = attribution::decode_reply(&bytes).unwrap()
+        else {
+            panic!("deliveries");
+        };
+        let event_seqs = received
+            .iter()
+            .map(|change| change.seq)
+            .collect::<std::collections::BTreeSet<_>>();
+        let receipts = deliveries
+            .into_iter()
+            .filter(|entry| event_seqs.contains(&entry.delivery.seq))
+            .collect::<Vec<_>>();
+        assert_eq!(receipts.len(), received.len());
+        assert!(receipts.iter().all(|entry| entry.delivery.state
+            == attribution::DeliveryState::Retired(sdk::DeliveryOutcome::Applied)));
     });
 }
 

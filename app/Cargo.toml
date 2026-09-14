@@ -71,6 +71,7 @@ dispatch.workspace = true
 run-envelope.workspace = true
 runs.workspace = true
 tasks.workspace = true
+attribution.workspace = true
 # the 32 random bytes of a fresh dispatch id.
 rand.workspace = true
 pages.workspace = true

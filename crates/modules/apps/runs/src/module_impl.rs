@@ -84,6 +84,10 @@ impl RunsModule {
             ));
         };
         let entry = self.pending_entry(&event.dispatch_id).cloned();
+        let attempt = entry
+            .as_ref()
+            .and_then(|entry| self.session(&entry.run_id))
+            .map(|session| session.lease.attempt);
         let mut effects = super::action_requests::EffectsCtx {
             inner: ctx,
             messages: Vec::new(),
@@ -123,6 +127,14 @@ impl RunsModule {
             )
             .await?;
         }
+        let outcome = self
+            .pending_history
+            .iter()
+            .find(|record| record.run_id == entry.run_id)
+            .map(|record| record.outcome)
+            .unwrap_or(crate::RunOutcome::Failed);
+        self.conversation_model_ended(effects.inner, &entry.run_id, attempt, outcome)
+            .await?;
         Ok(())
     }
 
@@ -140,11 +152,6 @@ impl RunsModule {
 
     fn drop_saga_callback(&mut self, ctx: &mut dyn Ctx) -> Result<(), Error> {
         self.note(ctx, "dropped a direct saga callback".into());
-        Ok(())
-    }
-
-    fn drop_chat_follow_up(&mut self, ctx: &mut dyn Ctx) -> Result<(), Error> {
-        self.note(ctx, "dropped a direct chat follow-up".into());
         Ok(())
     }
 
@@ -201,7 +208,7 @@ impl Module for RunsModule {
             ExecuteKind::Result => self.execute_result(ctx, &msg.payload).await,
             ExecuteKind::Jobs => self.execute_jobs(ctx, &msg.payload).await,
             ExecuteKind::Saga => self.drop_saga_callback(ctx),
-            ExecuteKind::Chat => self.drop_chat_follow_up(ctx),
+            ExecuteKind::Chat => self.conversation_chat_hook(ctx, &msg.payload).await,
             ExecuteKind::Admin => self.execute_admin(ctx, msg).await,
         };
         applied?;
@@ -211,7 +218,37 @@ impl Module for RunsModule {
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
-            RunsQuery::NodeWork { .. } => Err(Error::QueryUnsupported),
+            RunsQuery::NextConversationInputDue => Ok(encode_reply(
+                &RunsReply::NextConversationInputDue(self.next_conversation_input_due().await?),
+            )),
+            RunsQuery::ConversationSchedules { conversation_id } => {
+                Ok(encode_reply(&RunsReply::ConversationSchedules(
+                    self.conversation_schedules(&conversation_id).await?,
+                )))
+            }
+            RunsQuery::Conversation { conversation_id } => Ok(encode_reply(
+                &RunsReply::Conversation(self.conversation(&conversation_id).await?),
+            )),
+            RunsQuery::ConversationForChannel { channel_id } => Ok(encode_reply(
+                &RunsReply::Conversation(self.conversation_for_channel(&channel_id).await?),
+            )),
+            RunsQuery::ConversationEvents {
+                conversation_id,
+                from,
+                limit,
+            } => Ok(encode_reply(&RunsReply::ConversationEvents(
+                self.conversation_events(&conversation_id, from, limit)
+                    .await?,
+            ))),
+            RunsQuery::ConversationTurn {
+                conversation_id,
+                turn,
+            } => Ok(encode_reply(&RunsReply::ConversationTurn(
+                self.conversation_turn(&conversation_id, turn).await?,
+            ))),
+            RunsQuery::NodeWork { .. } | RunsQuery::WorkerControls { .. } => {
+                Err(Error::QueryUnsupported)
+            }
             RunsQuery::Catalog { filter } => Ok(encode_reply(&RunsReply::Catalog(crate::catalog(
                 filter.as_deref(),
             )))),
@@ -274,12 +311,21 @@ impl Module for RunsModule {
     }
 
     async fn pending_items(&self) -> Result<Vec<sdk::PendingItem>, Error> {
-        self.action_deliveries().await
+        let mut pending = self.action_deliveries().await?;
+        pending.extend(
+            self.conversation_deliveries(sdk::MAX_DELIVERIES_PER_BLOCK)
+                .await?,
+        );
+        pending.sort_by_key(|item| item.item);
+        pending.truncate(sdk::MAX_DELIVERIES_PER_BLOCK);
+        Ok(pending)
     }
 
     async fn acknowledge(&mut self, ctx: &mut dyn Ctx, ack: &sdk::Ack) -> Result<(), Error> {
         self.journal.clear();
-        self.acknowledge_action(ctx, ack).await?;
+        if !self.acknowledge_conversation(ctx, ack).await? {
+            self.acknowledge_action(ctx, ack).await?;
+        }
         self.stamp_journal(ctx);
         Ok(())
     }
@@ -293,6 +339,9 @@ impl Module for RunsModule {
             } => Ok(encode_reply(&RunsReply::NodeWork(
                 self.deployment_work(ctx, &node_key, height, consensus_time)
                     .await?,
+            ))),
+            RunsQuery::WorkerControls { run_id } => Ok(encode_reply(&RunsReply::WorkerControls(
+                self.worker_controls(ctx, &run_id).await?,
             ))),
             RunsQuery::ActionRequest { request_id } => Ok(encode_reply(&RunsReply::ActionRequest(
                 self.action_view(ctx, &request_id).await?,

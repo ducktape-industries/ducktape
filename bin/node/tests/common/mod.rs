@@ -2641,6 +2641,7 @@ pub fn provision_model_program(cluster: &Cluster, idx: usize, model: &str) -> u6
         idx,
         "agent",
         &agent::encode_msg(&agent::AgentMsg::Provision {
+            request_id: model.into(),
             name: model.into(),
             program: runs::model_program(model),
         }),

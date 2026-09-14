@@ -144,6 +144,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 topology = { workspace = true }
 
 [dev-dependencies]
+pages = { workspace = true }
+run-envelope = { workspace = true }
 wat = "1"
 # MemStore: the in-memory MerkleStore double behind store-backed modules in
 # the in-crate provision tests.

@@ -1149,10 +1149,11 @@ impl ValidatorRuntime<'_> {
 
         // the state-driven pumps, each its own method below: block
         // cadence/heartbeat, code readiness, capability announce,
-        // saga crank, dispatch delivery nudge.
+        // saga crank, conversation timers, dispatch delivery nudge.
         self.pump_heartbeat().await;
         self.pump_code_readiness().await;
         self.pump_saga_crank().await;
+        self.pump_conversation_inputs().await;
         self.pump_dispatch_nudge().await;
 
         let Self {
@@ -1677,6 +1678,36 @@ impl ValidatorRuntime<'_> {
         }
     }
 
+    /// This validator's consensus clock is its committed height. Inspect a
+    /// timer only when that clock changes, not when a host wall-clock tick
+    /// fires. Duplicate cranks from other validators are deterministic no-ops.
+    async fn pump_conversation_inputs(&mut self) {
+        let Some(height) = self.node.finalized().map(|block| block.height) else {
+            return;
+        };
+        let already_inspected = self.last_conversation_height == Some(height);
+        if already_inspected {
+            return;
+        }
+        self.last_conversation_height = Some(height);
+        let due = conversation_next_input_due(self.node.host()).await;
+        let Some(msg) = conversation_input_crank(height, due) else {
+            return;
+        };
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        if let Err(error) = self.node.submit(&self.signer, seq, msg).await {
+            tracing::debug!(
+                target: "ducktape::runs",
+                node = %self.label,
+                reason = "conversation_crank_submit_failed",
+                error = %error,
+                height,
+                "conversation timer submit failed; retrying at the next committed block"
+            );
+        }
+    }
+
     // DISPATCH DELIVERY NUDGE (never-pop-stack liveness): a
     // result committed into the dispatch mailbox delivers via
     // the drain's DeliverPending injection in the NEXT
@@ -1832,6 +1863,53 @@ pub(crate) async fn saga_next_expiry(host: &host::Host) -> Option<u64> {
     match decode_reply(&reply).ok()? {
         SagaReply::NextExpiry(v) => v,
         _ => None,
+    }
+}
+
+/// Earliest durable timer; absence of the Runs module requires no host work.
+async fn conversation_next_input_due(host: &host::Host) -> Option<u64> {
+    let reply = host
+        .query("runs", &runs::encode_query(&runs::RunsQuery::NextConversationInputDue))
+        .await
+        .ok()?;
+    let runs::RunsReply::NextConversationInputDue(due) = runs::decode_reply(&reply).ok()? else {
+        return None;
+    };
+    due
+}
+
+fn conversation_input_crank(height: u64, due: Option<u64>) -> Option<Msg> {
+    let due = due?;
+    let timer_ready = due <= height;
+    if !timer_ready {
+        return None;
+    }
+    Some(Msg {
+        target: "runs".into(),
+        payload: runs::encode_msg(&runs::RunsMsg::CrankConversationInputs),
+    })
+}
+
+#[cfg(test)]
+mod conversation_crank_tests {
+    use super::conversation_input_crank;
+
+    #[test]
+    fn no_timer_or_a_future_consensus_deadline_does_not_submit() {
+        assert!(conversation_input_crank(100, None).is_none());
+        assert!(conversation_input_crank(100, Some(101)).is_none());
+    }
+
+    #[test]
+    fn due_and_overdue_inputs_submit_the_permissionless_crank() {
+        for due in [99, 100] {
+            let msg = conversation_input_crank(100, Some(due)).unwrap();
+            assert_eq!(msg.target, "runs");
+            assert!(matches!(
+                runs::decode_msg(&msg.payload).unwrap(),
+                runs::RunsMsg::CrankConversationInputs
+            ));
+        }
     }
 }
 

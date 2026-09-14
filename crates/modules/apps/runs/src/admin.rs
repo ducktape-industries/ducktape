@@ -32,6 +32,124 @@ impl RunsModule {
         budget: &SiblingReadBudget,
     ) -> Result<(), Error> {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
+            RunsMsg::ConfigureConversation {
+                conversation_id,
+                agent_id,
+                source,
+                history_prefix,
+                session_path,
+                packages,
+            } => {
+                self.configure_conversation(
+                    ctx,
+                    conversation_id,
+                    agent_id,
+                    source,
+                    history_prefix,
+                    session_path,
+                    packages,
+                )
+                .await
+            }
+            RunsMsg::ActivateConversation {
+                conversation_id,
+                operation_id,
+                active,
+            } => {
+                self.activate_conversation(ctx, conversation_id, operation_id, active)
+                    .await
+            }
+            RunsMsg::AppendConversationInput {
+                conversation_id,
+                operation_id,
+                input,
+            } => {
+                self.append_conversation_input(ctx, conversation_id, operation_id, input)
+                    .await
+            }
+            RunsMsg::CheckpointConversation {
+                conversation_id,
+                run_id,
+                attempt,
+                operation_id,
+                history,
+                delivery,
+            } => {
+                self.checkpoint_conversation(
+                    ctx,
+                    conversation_id,
+                    crate::ConversationCheckpoint {
+                        run_id,
+                        attempt,
+                        operation_id,
+                        history,
+                        delivery,
+                    },
+                )
+                .await
+            }
+            RunsMsg::ReconcileConversation { conversation_id } => {
+                self.reconcile_conversation(ctx, conversation_id).await
+            }
+            RunsMsg::RequestConversationTurn {
+                conversation_id,
+                turn,
+            } => {
+                self.request_conversation_turn(ctx, conversation_id, turn)
+                    .await
+            }
+            RunsMsg::ScheduleConversationInput {
+                conversation_id,
+                operation_id,
+                schedule_id,
+                after_secs,
+                input,
+            } => {
+                self.schedule_conversation_input(
+                    ctx,
+                    conversation_id,
+                    operation_id,
+                    schedule_id,
+                    after_secs,
+                    input,
+                )
+                .await
+            }
+            RunsMsg::CrankConversationInputs => self.crank_conversation_inputs(ctx).await,
+            RunsMsg::RetryConversationTurn {
+                conversation_id,
+                operation_id,
+            } => {
+                self.retry_conversation_turn(ctx, conversation_id, operation_id)
+                    .await
+            }
+            RunsMsg::AcknowledgeJobControl {
+                run_id,
+                attempt,
+                operation_id,
+            } => {
+                self.acknowledge_job_control(ctx, run_id, attempt, operation_id)
+                    .await
+            }
+            RunsMsg::ReportJob {
+                run_id,
+                attempt,
+                operation_id,
+                kind,
+                payload,
+            } => {
+                self.report_job(ctx, run_id, attempt, operation_id, kind, payload)
+                    .await
+            }
+            RunsMsg::SettleJobCancellation {
+                run_id,
+                attempt,
+                operation_id,
+                payload,
+            } => {
+                self.settle_job_cancellation(ctx, run_id, attempt, operation_id, payload)
+                    .await
+            }
             RunsMsg::RequestModuleUpdate {
                 request_id,
                 run_id,
@@ -118,6 +236,15 @@ impl RunsModule {
                     other => canonical_origin(other)?,
                 };
                 reject_run_separator("channel_id", &channel_id)?;
+                let resident = self
+                    .conversation_for_channel(&channel_id)
+                    .await?
+                    .is_some_and(|state| state.agent_id == agent_id);
+                if resident {
+                    return Err(Error::Module(
+                        "resident channels use conversation intake, not one-shot RequestRun".into(),
+                    ));
+                }
                 // the requester's per-run skills, confined to the library by
                 // construction (names, not paths) — see `library_skills`.
                 let extra = envelope::library_skills(&skills).map_err(Error::Module)?;

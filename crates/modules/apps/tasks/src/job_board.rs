@@ -34,8 +34,10 @@
 //! shared board -- [`MAX_LIVE_JOBS_PER_SUBMITTER`], the task board's
 //! `MAX_OPEN_TASKS_PER_OWNER` shape), and the
 //! registered worker set in `w#`. a transition reads ONE record, rewrites it,
-//! and stages the result -- no board walk, and a `Prune` stages a delete that
-//! drops the key (and its bytes) from the root at commit. the census is a
+//! and stages the result -- no board walk. Each execution is also retained in
+//! `ja/`, with a bounded conversation index in `wc/` and latest-ID pointer in
+//! `jh/`. `Prune` deletes only the board record, not conversation history.
+//! The census is a
 //! counter because [`MAX_JOBS`] is checked per submit and the store cannot
 //! enumerate.
 //!
@@ -50,8 +52,9 @@ use sdk::{Ctx, Error, ModuleId, Msg, Origin, StagedStore};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Claim, Job, JobComment, JobResult, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, Party,
-    controls, encode_job_event, stage_record,
+    Claim, ControlAcknowledgement, Job, JobComment, JobControl, JobControlInput, JobExecution,
+    JobResult, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, NativeHistoryHead, Party,
+    WorkerHistory, WorkerReport, WorkerReportKind, controls, encode_job_event, stage_record,
 };
 
 /// max bytes of a `job_id` (non-empty).
@@ -62,7 +65,7 @@ pub const MAX_KIND: usize = 64;
 pub const MAX_SPEC: usize = 64 * 1024;
 /// max bytes of a finalize `payload`.
 pub const MAX_PAYLOAD: usize = 64 * 1024;
-/// Bounded discussion per job, retained until the job is pruned.
+/// Bounded discussion per execution, retained with its conversation.
 pub const MAX_JOB_COMMENTS: usize = 64;
 pub const MAX_JOB_COMMENT_TEXT_BYTES: usize = 4096;
 /// max distinct live job ids on the board.
@@ -88,6 +91,51 @@ pub const ATTEMPTS_EXHAUSTED_RESULT: &str = "attempts exhausted";
 pub const MAX_WORKERS: usize = 16;
 /// max bytes of a worker module id.
 pub const MAX_WORKER_MODULE_ID: usize = 256;
+/// Bounds are admission limits, never automatic archive deletion.
+pub const MAX_JOB_CONTROLS: usize = 32;
+pub const MAX_CONTROL_ACKNOWLEDGEMENTS: usize = 64;
+pub const MAX_WORKER_REPORTS: usize = 32;
+pub const MAX_WORKER_TEXT_BYTES: usize = 4096;
+pub const MAX_WORKER_EXECUTIONS: usize = 64;
+/// Native run keys are opaque and may contain Runs' internal separators.
+pub const MAX_NATIVE_RUN_ID_BYTES: usize = 1024;
+
+/// Only references are kept together; each retained execution has its own key.
+/// Continuing never rewrites the terminal predecessor's bytes.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Conversation {
+    conversation_id: String,
+    executions: Vec<(String, u64)>,
+}
+
+fn conversation_key(conversation_id: &str) -> Vec<u8> {
+    [b"wc/", conversation_id.as_bytes()].concat()
+}
+
+fn archive_key(job_id: &str, revision: u64) -> Vec<u8> {
+    [b"ja/".as_slice(), &sdk::wire::encode(&(job_id, revision))].concat()
+}
+
+fn latest_key(job_id: &str) -> Vec<u8> {
+    [b"jh/", job_id.as_bytes()].concat()
+}
+
+async fn retained(staged: &StagedStore, job_id: &str) -> Result<Option<Job>, Error> {
+    let Some(key) = staged.get(&latest_key(job_id)).await? else {
+        return Ok(None);
+    };
+    let Some(bytes) = staged.get(&key).await? else {
+        return Err(Error::Module("retained execution missing".into()));
+    };
+    decode_job(&bytes).map(Some)
+}
+
+async fn conversation(staged: &StagedStore, id: &str) -> Result<Conversation, Error> {
+    let Some(bytes) = staged.get(&conversation_key(id)).await? else {
+        return Err(Error::Module("worker conversation missing".into()));
+    };
+    sdk::wire::decode(&bytes).map_err(Error::Module)
+}
 
 /// one job record per id.
 const RECORD_PREFIX: &[u8] = b"j/";
@@ -206,12 +254,13 @@ fn stage_workers(staged: &mut StagedStore, workers: &BTreeSet<ModuleId>) -> Resu
 }
 
 fn stage_job(staged: &mut StagedStore, job: &Job) -> Result<(), Error> {
-    stage_record(
-        staged,
-        record_key(&job.job_id),
-        sdk::wire::encode(job),
-        "job record",
-    )
+    let bytes = sdk::wire::encode(job);
+    crate::check_record(&bytes, "job record")?;
+    let key = archive_key(&job.job_id, job.created_at_revision);
+    staged.stage(record_key(&job.job_id), bytes.clone());
+    staged.stage(key.clone(), bytes);
+    staged.stage(latest_key(&job.job_id), key);
+    Ok(())
 }
 
 fn worker_module_from_origin(origin: &Origin, module_id: &ModuleId) -> Result<ModuleId, Error> {
@@ -268,14 +317,53 @@ async fn unregister_worker(
 
 // ---- transitions (each fails the block on any guard violation) -------------
 
-async fn submit(
+enum Creation {
+    Fresh {
+        kind: String,
+        execution: JobExecution,
+    },
+    Continuation {
+        previous: Box<Job>,
+        operation_id: String,
+        kind: String,
+    },
+}
+
+async fn create_execution(
     staged: &mut StagedStore,
     job_id: String,
-    kind: String,
     spec: String,
+    creation: Creation,
     actor: &Party,
     height: u64,
 ) -> Result<JobsEvent, Error> {
+    let (kind, execution, submitter, previous_job_id, continuation_operation_id, mut history) =
+        match creation {
+            Creation::Fresh { kind, execution } => {
+                (kind, execution, actor.clone(), None, None, None)
+            }
+            Creation::Continuation {
+                previous,
+                operation_id,
+                kind,
+            } => {
+                let history = conversation(staged, &previous.conversation_id).await?;
+                let at_capacity = history.executions.len() >= MAX_WORKER_EXECUTIONS;
+                if at_capacity {
+                    return Err(Error::Module(
+                        "worker conversation execution cap reached".into(),
+                    ));
+                }
+                (
+                    kind,
+                    previous.execution,
+                    previous.submitter,
+                    Some(previous.job_id),
+                    Some(operation_id),
+                    Some(history),
+                )
+            }
+        };
     // enforce every size cap HERE, at execute time, with rejection -- so
     // oversized bytes never reach a committed record (the repo's poison-value
     // lesson).
@@ -304,7 +392,6 @@ async fn submit(
         )));
     }
 
-    let submitter = actor.clone();
     let submitter_live = submitter_count(staged, &submitter).await?;
     if submitter_live >= MAX_LIVE_JOBS_PER_SUBMITTER as u64 {
         return Err(Error::Module(format!(
@@ -313,10 +400,26 @@ async fn submit(
     }
     let spec_hash = Sha256::digest(spec.as_bytes()).to_vec();
     let (_, created_at_revision) = crate::next_revision(staged, "job", &job_id).await?;
+    let history = history.get_or_insert_with(|| Conversation {
+        conversation_id: format!("{job_id}:{created_at_revision}"),
+        executions: Vec::new(),
+    });
+    history
+        .executions
+        .push((job_id.clone(), created_at_revision));
+    let history_bytes = sdk::wire::encode(history);
+    crate::check_record(&history_bytes, "worker conversation")?;
     stage_job(
         staged,
         &Job {
             job_id: job_id.clone(),
+            execution,
+            conversation_id: history.conversation_id.clone(),
+            previous_job_id,
+            continuation_operation_id,
+            controls: Vec::new(),
+            reports: Vec::new(),
+            native_history: None,
             kind: kind.clone(),
             spec: spec.clone(),
             submitter: submitter.clone(),
@@ -330,6 +433,7 @@ async fn submit(
             updated_at_height: height,
         },
     )?;
+    staged.stage(conversation_key(&history.conversation_id), history_bytes);
     stage_count(staged, count + 1);
     stage_submitter_count(staged, &submitter, submitter_live + 1);
     Ok(JobsEvent::Submitted {
@@ -339,6 +443,433 @@ async fn submit(
         spec,
         spec_hash,
     })
+}
+
+async fn notify_workers(
+    staged: &StagedStore,
+    ctx: &mut dyn Ctx,
+    event: &JobsEvent,
+) -> Result<(), Error> {
+    for worker in load_workers(staged).await? {
+        ctx.emit_msg(Msg {
+            target: worker,
+            payload: encode_job_event(event),
+        });
+    }
+    Ok(())
+}
+
+async fn submit(
+    staged: &mut StagedStore,
+    ctx: &mut dyn Ctx,
+    job_id: String,
+    kind: String,
+    spec: String,
+    execution: JobExecution,
+    actor: &Party,
+) -> Result<(), Error> {
+    let event = create_execution(
+        staged,
+        job_id,
+        spec,
+        Creation::Fresh { kind, execution },
+        actor,
+        ctx.env().height,
+    )
+    .await?;
+    notify_workers(staged, ctx, &event).await
+}
+
+async fn continue_worker(
+    staged: &mut StagedStore,
+    ctx: &mut dyn Ctx,
+    msg: JobsMsg,
+    actor: &Party,
+) -> Result<(), Error> {
+    let JobsMsg::Continue {
+        previous_job_id,
+        job_id,
+        operation_id,
+        kind,
+        spec,
+    } = msg
+    else {
+        return Err(Error::Module("expected continuation".into()));
+    };
+    sdk::validate_id("operation_id", &operation_id, MAX_JOB_ID)?;
+    let Some(previous) = retained(staged, &previous_job_id).await? else {
+        return Err(Error::Module("previous execution not found".into()));
+    };
+    let is_conversation = previous.execution == JobExecution::Conversation;
+    if !is_conversation {
+        return Err(Error::Module(
+            "continue requires a conversation execution".into(),
+        ));
+    }
+    if !previous.status.is_terminal() {
+        return Err(Error::Module(
+            "continue requires a terminal execution".into(),
+        ));
+    }
+    let history = conversation(staged, &previous.conversation_id).await?;
+    let previous_ref = (previous.job_id.clone(), previous.created_at_revision);
+    let is_latest = history.executions.last() == Some(&previous_ref);
+    if !is_latest {
+        // A retry must match the original continuation exactly, never launch twice.
+        let Some(next) = retained(staged, &job_id).await? else {
+            return Err(Error::Module(
+                "continue requires the latest execution".into(),
+            ));
+        };
+        let same_continuation = next.conversation_id == previous.conversation_id
+            && next.previous_job_id.as_deref() == Some(previous_job_id.as_str())
+            && next.continuation_operation_id.as_deref() == Some(operation_id.as_str())
+            && next.kind == kind
+            && next.spec == spec;
+        if same_continuation {
+            return Ok(());
+        }
+        return Err(Error::Module(
+            "continue conflicts with an existing continuation".into(),
+        ));
+    }
+    let reused_id = retained(staged, &job_id).await?.is_some();
+    if reused_id {
+        return Err(Error::Module("continuation requires a fresh job_id".into()));
+    }
+    // Operation IDs are unique within a conversation, not just one predecessor.
+    for (id, revision) in &history.executions {
+        let Some(bytes) = staged.get(&archive_key(id, *revision)).await? else {
+            return Err(Error::Module("retained execution missing".into()));
+        };
+        let execution = decode_job(&bytes)?;
+        let reused_operation =
+            execution.continuation_operation_id.as_deref() == Some(operation_id.as_str());
+        if reused_operation {
+            return Err(Error::Module(
+                "continuation operation_id already exists".into(),
+            ));
+        }
+    }
+    let event = create_execution(
+        staged,
+        job_id,
+        spec,
+        Creation::Continuation {
+            previous: Box::new(previous),
+            operation_id,
+            kind,
+        },
+        actor,
+        ctx.env().height,
+    )
+    .await?;
+    notify_workers(staged, ctx, &event).await
+}
+
+fn require_claim_attempt(
+    job: &Job,
+    actor: &Party,
+    origin: &Origin,
+    attempt: u64,
+) -> Result<(), Error> {
+    let current_claim = job.status == JobStatus::Processing
+        && job.attempt == attempt
+        && job
+            .claim
+            .as_ref()
+            .is_some_and(|claim| controls(&claim.worker, actor, origin));
+    if !current_claim {
+        return Err(Error::Module(
+            "operation requires the current claimant and attempt".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_worker_text(text: &str) -> Result<(), Error> {
+    let valid = !text.trim().is_empty() && text.len() <= MAX_WORKER_TEXT_BYTES;
+    if !valid {
+        return Err(Error::Module(
+            "worker input requires non-empty text within the byte cap".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn control(
+    staged: &mut StagedStore,
+    ctx: &dyn Ctx,
+    job_id: String,
+    operation_id: String,
+    input: JobControlInput,
+    actor: &Party,
+) -> Result<(), Error> {
+    sdk::validate_id("operation_id", &operation_id, MAX_JOB_ID)?;
+    if let JobControlInput::Steer { text } = &input {
+        require_worker_text(text)?;
+    }
+    let mut job = require(staged, &job_id).await?;
+    if let Some(existing) = job
+        .controls
+        .iter()
+        .find(|control| control.operation_id == operation_id)
+    {
+        let identical = existing.input == input && existing.author == *actor;
+        if identical {
+            return Ok(());
+        }
+        return Err(Error::Module("control operation_id already exists".into()));
+    }
+    if job.status.is_terminal() {
+        return Err(Error::Module(
+            "controls require a nonterminal execution".into(),
+        ));
+    }
+    let at_capacity = job.controls.len() >= MAX_JOB_CONTROLS;
+    if at_capacity {
+        return Err(Error::Module("job control cap reached".into()));
+    }
+    let report_id = job
+        .reports
+        .iter()
+        .any(|report| report.operation_id == operation_id);
+    if report_id {
+        return Err(Error::Module(
+            "operation_id already used by a report".into(),
+        ));
+    }
+    job.controls.push(JobControl {
+        operation_id,
+        input,
+        author: actor.clone(),
+        height: ctx.env().height,
+        acknowledgements: Vec::new(),
+    });
+    job.updated_at_height = ctx.env().height;
+    stage_job(staged, &job)
+}
+
+async fn acknowledge_control(
+    staged: &mut StagedStore,
+    ctx: &dyn Ctx,
+    job_id: String,
+    operation_id: String,
+    attempt: u64,
+    actor: &Party,
+) -> Result<(), Error> {
+    let mut job = require(staged, &job_id).await?;
+    require_claim_attempt(&job, actor, &ctx.env().origin, attempt)?;
+    let Some(control) = job
+        .controls
+        .iter_mut()
+        .find(|control| control.operation_id == operation_id)
+    else {
+        return Err(Error::Module("control not found".into()));
+    };
+    let already_acknowledged = control
+        .acknowledgements
+        .iter()
+        .any(|ack| ack.attempt == attempt);
+    if already_acknowledged {
+        return Ok(());
+    }
+    let at_capacity = control.acknowledgements.len() >= MAX_CONTROL_ACKNOWLEDGEMENTS;
+    if at_capacity {
+        return Err(Error::Module("control acknowledgement cap reached".into()));
+    }
+    control.acknowledgements.push(ControlAcknowledgement {
+        worker: actor.clone(),
+        attempt,
+        height: ctx.env().height,
+    });
+    job.updated_at_height = ctx.env().height;
+    stage_job(staged, &job)
+}
+
+async fn settle_cancellation(
+    staged: &mut StagedStore,
+    ctx: &dyn Ctx,
+    job_id: String,
+    operation_id: String,
+    attempt: u64,
+    payload: String,
+    actor: &Party,
+) -> Result<(), Error> {
+    let mut job = require(staged, &job_id).await?;
+    require_claim_attempt(&job, actor, &ctx.env().origin, attempt)?;
+    let acknowledged_cancel = job.controls.iter().any(|control| {
+        control.operation_id == operation_id
+            && control.input == JobControlInput::Cancel
+            && control
+                .acknowledgements
+                .iter()
+                .any(|ack| ack.attempt == attempt)
+    });
+    if !acknowledged_cancel {
+        return Err(Error::Module(
+            "cancellation requires acknowledgement by the current attempt".into(),
+        ));
+    }
+    let oversized = payload.len() > MAX_PAYLOAD;
+    if oversized {
+        return Err(Error::Module(format!(
+            "payload exceeds {MAX_PAYLOAD} bytes"
+        )));
+    }
+    job.status = JobStatus::Cancelled;
+    job.result = Some(JobResult {
+        ok: false,
+        payload: payload.clone(),
+    });
+    // One reserved final report links settlement to its exact control request.
+    job.reports.push(WorkerReport {
+        operation_id,
+        worker: actor.clone(),
+        attempt,
+        height: ctx.env().height,
+        kind: WorkerReportKind::Report,
+        payload,
+    });
+    job.updated_at_height = ctx.env().height;
+    stage_job(staged, &job)
+}
+
+/// Native snapshots replace a bounded pointer; they never consume semantic
+/// report slots. The claimant fence applies even to an otherwise exact replay.
+async fn checkpoint_native_history(
+    staged: &mut StagedStore,
+    ctx: &dyn Ctx,
+    msg: JobsMsg,
+    actor: &Party,
+) -> Result<(), Error> {
+    let JobsMsg::CheckpointNativeHistory {
+        job_id,
+        attempt,
+        run_id,
+        execution_attempt,
+        revision,
+        snapshot,
+    } = msg
+    else {
+        return Err(Error::Module("expected native history checkpoint".into()));
+    };
+    let valid_run_id = !run_id.is_empty() && run_id.len() <= MAX_NATIVE_RUN_ID_BYTES;
+    if !valid_run_id {
+        return Err(Error::Module(format!(
+            "native run_id must be nonempty and at most {MAX_NATIVE_RUN_ID_BYTES} bytes"
+        )));
+    }
+    sdk::validate_id("snapshot", &snapshot, MAX_JOB_ID)?;
+    let positive_revision = revision > 0;
+    if !positive_revision {
+        return Err(Error::Module(
+            "native history revision must be positive".into(),
+        ));
+    }
+    let mut job = require(staged, &job_id).await?;
+    require_claim_attempt(&job, actor, &ctx.env().origin, attempt)?;
+    if let Some(head) = &job.native_history {
+        let same_claim = head.job_attempt == attempt;
+        let same_run = head.run_id == run_id;
+        let same_execution = head.execution_attempt == execution_attempt;
+        let identical = same_claim
+            && same_run
+            && same_execution
+            && head.revision == revision
+            && head.snapshot == snapshot;
+        if identical {
+            return Ok(());
+        }
+        let newer_revision = revision > head.revision;
+        if !newer_revision {
+            return Err(Error::Module(
+                "native history revision is stale or conflicting".into(),
+            ));
+        }
+        let changed_run_in_claim = same_claim && !same_run;
+        if changed_run_in_claim {
+            return Err(Error::Module(
+                "native history run is fenced to the current job claim".into(),
+            ));
+        }
+        let stale_execution = same_run && execution_attempt < head.execution_attempt;
+        if stale_execution {
+            return Err(Error::Module(
+                "native history execution attempt is stale".into(),
+            ));
+        }
+    }
+    job.native_history = Some(NativeHistoryHead {
+        job_attempt: attempt,
+        worker: actor.clone(),
+        run_id,
+        execution_attempt,
+        revision,
+        snapshot,
+        height: ctx.env().height,
+    });
+    job.updated_at_height = ctx.env().height;
+    stage_job(staged, &job)
+}
+
+async fn checkpoint(
+    staged: &mut StagedStore,
+    ctx: &dyn Ctx,
+    msg: JobsMsg,
+    actor: &Party,
+) -> Result<(), Error> {
+    let JobsMsg::Checkpoint {
+        job_id,
+        operation_id,
+        attempt,
+        kind,
+        payload,
+    } = msg
+    else {
+        return Err(Error::Module("expected checkpoint".into()));
+    };
+    sdk::validate_id("operation_id", &operation_id, MAX_JOB_ID)?;
+    require_worker_text(&payload)?;
+    let mut job = require(staged, &job_id).await?;
+    require_claim_attempt(&job, actor, &ctx.env().origin, attempt)?;
+    if let Some(existing) = job
+        .reports
+        .iter()
+        .find(|report| report.operation_id == operation_id)
+    {
+        let identical = existing.attempt == attempt
+            && existing.worker == *actor
+            && existing.kind == kind
+            && existing.payload == payload;
+        if identical {
+            return Ok(());
+        }
+        return Err(Error::Module("report operation_id already exists".into()));
+    }
+    let control_id = job
+        .controls
+        .iter()
+        .any(|control| control.operation_id == operation_id);
+    if control_id {
+        return Err(Error::Module(
+            "operation_id already used by a control".into(),
+        ));
+    }
+    let at_capacity = job.reports.len() >= MAX_WORKER_REPORTS;
+    if at_capacity {
+        return Err(Error::Module("worker report cap reached".into()));
+    }
+    job.reports.push(WorkerReport {
+        operation_id,
+        worker: actor.clone(),
+        attempt,
+        height: ctx.env().height,
+        kind,
+        payload,
+    });
+    job.updated_at_height = ctx.env().height;
+    stage_job(staged, &job)
 }
 
 async fn claim(
@@ -585,15 +1116,49 @@ pub(crate) async fn execute(
             .await
         }
         JobsMsg::Submit { job_id, kind, spec } => {
-            let workers = load_workers(staged).await?;
-            let event = submit(staged, job_id, kind, spec, actor, height).await?;
-            for worker in workers {
-                ctx.emit_msg(Msg {
-                    target: worker,
-                    payload: encode_job_event(&event),
-                });
-            }
-            Ok(())
+            submit(
+                staged,
+                ctx,
+                job_id,
+                kind,
+                spec,
+                JobExecution::OneShot,
+                actor,
+            )
+            .await
+        }
+        JobsMsg::SubmitConversation { job_id, kind, spec } => {
+            submit(
+                staged,
+                ctx,
+                job_id,
+                kind,
+                spec,
+                JobExecution::Conversation,
+                actor,
+            )
+            .await
+        }
+        msg @ JobsMsg::Continue { .. } => continue_worker(staged, ctx, msg, actor).await,
+        JobsMsg::Control {
+            job_id,
+            operation_id,
+            input,
+        } => control(staged, ctx, job_id, operation_id, input, actor).await,
+        JobsMsg::AcknowledgeControl {
+            job_id,
+            operation_id,
+            attempt,
+        } => acknowledge_control(staged, ctx, job_id, operation_id, attempt, actor).await,
+        JobsMsg::SettleCancellation {
+            job_id,
+            operation_id,
+            attempt,
+            payload,
+        } => settle_cancellation(staged, ctx, job_id, operation_id, attempt, payload, actor).await,
+        msg @ JobsMsg::Checkpoint { .. } => checkpoint(staged, ctx, msg, actor).await,
+        msg @ JobsMsg::CheckpointNativeHistory { .. } => {
+            checkpoint_native_history(staged, ctx, msg, actor).await
         }
         JobsMsg::Claim {
             job_id,
@@ -613,16 +1178,54 @@ pub(crate) async fn execute(
     }
 }
 
+async fn get_committed_job(staged: &StagedStore, job_id: &str) -> Result<JobsReply, Error> {
+    let Some(bytes) = staged.get_committed(&record_key(job_id)).await? else {
+        return Ok(JobsReply::Job(None));
+    };
+    decode_job(&bytes).map(|job| JobsReply::Job(Some(job)))
+}
+
+async fn get_worker(staged: &StagedStore, conversation_id: String) -> Result<JobsReply, Error> {
+    let Some(bytes) = staged
+        .get_committed(&conversation_key(&conversation_id))
+        .await?
+    else {
+        return Ok(JobsReply::Worker(None));
+    };
+    let history: Conversation = sdk::wire::decode(&bytes).map_err(Error::Module)?;
+    let mut executions = Vec::with_capacity(history.executions.len());
+    for (job_id, revision) in history.executions {
+        let Some(bytes) = staged
+            .get_committed(&archive_key(&job_id, revision))
+            .await?
+        else {
+            return Err(Error::Module("retained execution missing".into()));
+        };
+        executions.push(decode_job(&bytes)?);
+    }
+    Ok(JobsReply::Worker(Some(WorkerHistory {
+        conversation_id,
+        executions,
+    })))
+}
+
+async fn get_controls(staged: &StagedStore, job_id: &str) -> Result<JobsReply, Error> {
+    let Some(key) = staged.get_committed(&latest_key(job_id)).await? else {
+        return Ok(JobsReply::Controls(Vec::new()));
+    };
+    let Some(bytes) = staged.get_committed(&key).await? else {
+        return Err(Error::Module("retained execution missing".into()));
+    };
+    Ok(JobsReply::Controls(decode_job(&bytes)?.controls))
+}
+
 /// the read projection answers from COMMITTED state only -- never the staged
 /// overlay. a query must not observe a write that a block abort would take
 /// back; transition guards keep their own overlay-aware view above.
 pub(crate) async fn query(staged: &StagedStore, q: JobsQuery) -> Result<JobsReply, Error> {
     match q {
-        JobsQuery::Get { job_id } => {
-            let Some(bytes) = staged.get_committed(&record_key(&job_id)).await? else {
-                return Ok(JobsReply::Job(None));
-            };
-            decode_job(&bytes).map(|job| JobsReply::Job(Some(job)))
-        }
+        JobsQuery::Get { job_id } => get_committed_job(staged, &job_id).await,
+        JobsQuery::GetWorker { conversation_id } => get_worker(staged, conversation_id).await,
+        JobsQuery::Controls { job_id } => get_controls(staged, &job_id).await,
     }
 }

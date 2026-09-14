@@ -159,11 +159,96 @@ pub struct JobComment {
     pub height: u64,
 }
 
+/// An execution input, never inferred from discussion comments.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum JobControlInput {
+    Steer { text: String },
+    Cancel,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ControlAcknowledgement {
+    pub worker: Party,
+    pub attempt: u64,
+    pub height: u64,
+}
+
+/// An immutable request with acknowledgements fenced to individual claims.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct JobControl {
+    pub operation_id: String,
+    pub input: JobControlInput,
+    pub author: Party,
+    pub height: u64,
+    pub acknowledgements: Vec<ControlAcknowledgement>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerReportKind {
+    Checkpoint,
+    Report,
+}
+
+/// Claim-authenticated, append-only provenance retained after board pruning.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReport {
+    pub operation_id: String,
+    pub worker: Party,
+    pub attempt: u64,
+    pub height: u64,
+    pub kind: WorkerReportKind,
+    pub payload: String,
+}
+
+/// The latest native stream location, not a semantic progress report.
+/// Full stream bytes and their revisions live in Files/Runs.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NativeHistoryHead {
+    pub job_attempt: u64,
+    pub worker: Party,
+    /// Opaque Runs key, including internal separators, not a public identifier.
+    pub run_id: String,
+    pub execution_attempt: u32,
+    pub revision: u64,
+    pub snapshot: String,
+    pub height: u64,
+}
+
+/// The retained conversation and its executions, in creation order.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerHistory {
+    pub conversation_id: String,
+    pub executions: Vec<Job>,
+}
+
+/// Explicit execution semantics; neither job kind nor policy names select a runtime.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobExecution {
+    OneShot,
+    Conversation,
+}
+
 /// a single work item on the board.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
     pub job_id: String,
+    pub execution: JobExecution,
+    /// Stable across claims and continuations, distinct for a reused submit ID.
+    pub conversation_id: String,
+    pub previous_job_id: Option<String>,
+    pub continuation_operation_id: Option<String>,
+    pub controls: Vec<JobControl>,
+    pub reports: Vec<WorkerReport>,
+    pub native_history: Option<NativeHistoryHead>,
     pub kind: String,
     pub spec: String,
     pub submitter: Party,
@@ -198,6 +283,60 @@ pub enum JobsMsg {
         kind: String,
         spec: String,
     },
+    /// Start a retained native conversation explicitly. Ordinary Submit remains one-shot.
+    SubmitConversation {
+        job_id: String,
+        kind: String,
+        spec: String,
+    },
+    /// Request steering or cancellation without changing execution status.
+    Control {
+        job_id: String,
+        operation_id: String,
+        input: JobControlInput,
+    },
+    /// Receipt only: acknowledging cancellation does not settle the job.
+    AcknowledgeControl {
+        job_id: String,
+        operation_id: String,
+        attempt: u64,
+    },
+    /// Settle an acknowledged cancellation from the current claim attempt.
+    SettleCancellation {
+        job_id: String,
+        operation_id: String,
+        attempt: u64,
+        payload: String,
+    },
+    /// Append a checkpoint or report attributed to the current claim attempt.
+    Checkpoint {
+        job_id: String,
+        operation_id: String,
+        attempt: u64,
+        kind: WorkerReportKind,
+        payload: String,
+    },
+    /// Replace the machine history head without a semantic report or notification.
+    /// Revision increases across claim changes; exact duplicates are no-ops.
+    CheckpointNativeHistory {
+        job_id: String,
+        attempt: u64,
+        run_id: String,
+        execution_attempt: u32,
+        revision: u64,
+        snapshot: String,
+    },
+    /// Create a new execution after the conversation's latest terminal job.
+    /// OneShot predecessors cannot be continued.
+    /// The previous execution may have been pruned; it is never reopened.
+    /// `kind` selects the new worker independently of the predecessor's kind.
+    Continue {
+        previous_job_id: String,
+        job_id: String,
+        operation_id: String,
+        kind: String,
+        spec: String,
+    },
     /// claim a `Pending` job; a claim on a non-pending job is rejected -- the
     /// consensus order already picked the winner.
     Claim { job_id: String, lease_views: u64 },
@@ -213,13 +352,30 @@ pub enum JobsMsg {
     Reclaim { job_id: String },
     /// any member cancels a still-`Pending` job.
     Cancel { job_id: String },
-    /// any member removes a terminal job's record entirely; the slot freed
-    /// is the submitter's.
+    /// Any member removes a terminal job from the board, freeing its slot.
+    /// The conversation, controls, checkpoints and reports remain queryable.
     Prune { job_id: String },
     /// register the caller module as a worker notified on every successful submit.
     RegisterWorker {},
     /// remove the caller module as a worker. absent workers are deterministic no-ops.
     UnregisterWorker {},
+}
+
+/// An immutable semantic worker event attributed under the `job_event` kind.
+/// Its source object identifies the job incarnation, operation and claim attempt;
+/// consumers route using this payload rather than treating the object hash as a job ID.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct JobEventDetail {
+    pub job_id: String,
+    pub conversation_id: String,
+    pub job_kind: String,
+    pub created_at_revision: u64,
+    pub job_attempt: u64,
+    pub submitter: Party,
+    pub actor: Party,
+    pub height: u64,
+    pub operation: JobsMsg,
 }
 
 /// the notification payload sent by the job board to each registered worker
@@ -247,14 +403,29 @@ pub enum JobsEvent {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum JobsQuery {
-    Get { job_id: String },
+    Get {
+        job_id: String,
+    },
+    GetWorker {
+        conversation_id: String,
+    },
+    /// Controls of the live job, or its latest retained incarnation after prune.
+    Controls {
+        job_id: String,
+    },
 }
 
 /// replies to [`JobsQuery`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Point queries return one owned Job without a separate boxing allocation"
+)]
 pub enum JobsReply {
     Job(Option<Job>),
+    Worker(Option<WorkerHistory>),
+    Controls(Vec<JobControl>),
 }
 
 // ---- the unifying envelope ------------------------------------------------
@@ -279,6 +450,10 @@ pub enum WorkQuery {
 /// a reply from one of the two boards.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The envelope carries the by-value point-query reply without another allocation"
+)]
 pub enum WorkReply {
     Task(TaskReply),
     Job(JobsReply),

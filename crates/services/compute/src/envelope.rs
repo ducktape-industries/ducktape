@@ -55,6 +55,8 @@ struct WireEnvelope {
     instructions: String,
     contract: String,
     conversation: String,
+    /// A native multi-turn workflow, distinct from a rendered one-shot prompt.
+    native_conversation: Option<run_envelope::NativeConversation>,
     /// the deterministic forge item-context section (contract §1) — `None`
     /// (key absent) for every non-forge run. assembled into the provider
     /// input between the instructions and the contract; None-case assembly
@@ -151,13 +153,18 @@ pub fn prepare(input: &str) -> Result<Prepared, String> {
         agent_id: Some(envelope.agent_id),
         ..RunContext::default()
     };
-    let workspace = accept_portable_envelope(
+    let native_conversation = envelope.native_conversation;
+    if let Some(conversation) = &native_conversation {
+        conversation.validate()?;
+    }
+    let mut workspace = accept_portable_envelope(
         envelope.run_id,
         envelope.workspace,
         envelope.skills,
         envelope.result_contract,
         agent_display_name,
     )?;
+    workspace.native_conversation = native_conversation;
     // reading order: system instructions → item context (forge runs only: what
     // this run is working ON) → output contract → conversation. every section is
     // byte-exact from its envelope field, joined with the same "\n\n" delimiter;
@@ -171,16 +178,36 @@ pub fn prepare(input: &str) -> Result<Prepared, String> {
     // `instructions` is the generic fallback, and it is now UNCONDITIONAL: an
     // agent whose persona is an `always` skill gets that persona from its context
     // document instead. no field of this envelope can silently suppress another.
-    let input = [
-        Some(envelope.instructions.as_str()),
-        envelope.context.as_deref(),
-        Some(envelope.contract.as_str()),
-        Some(envelope.conversation.as_str()),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join("\n\n");
+    // Native history already carries previous turns. Only this turn's input
+    // enters it; the stable instructions/contract are a separate system prefix.
+    let input = if workspace.native_conversation.is_some() {
+        envelope.conversation.clone()
+    } else {
+        [
+            Some(envelope.instructions.as_str()),
+            envelope.context.as_deref(),
+            Some(envelope.contract.as_str()),
+            Some(envelope.conversation.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n")
+    };
+    let mut ctx = ctx;
+    if workspace.native_conversation.is_some() {
+        let has_dynamic_context = envelope
+            .context
+            .as_ref()
+            .is_some_and(|value| !value.is_empty());
+        if has_dynamic_context {
+            return Err("native conversation context must be delivered as queued input, not a changing system prefix".into());
+        }
+        ctx.context_doc = Some(format!(
+            "{}\n\n{}",
+            envelope.instructions, envelope.contract
+        ));
+    }
     Ok(Prepared {
         input,
         ctx,
@@ -234,6 +261,7 @@ fn accept_portable_envelope(
     // set NO workdir_override/env here (W1/M2) — the plan is data the pool
     // decides whether to act on.
     Ok(PortablePlan {
+        native_conversation: None,
         source,
         // the id CONSENSUS knows this run by — carried through to the
         // provisioner, which is the only thing that can name the run back to
@@ -386,6 +414,59 @@ mod tests {
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
         assert_eq!(workspace.agent_display_name, "BOT");
+    }
+
+    fn native_envelope() -> serde_json::Value {
+        let mut value: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
+        value["native_conversation"] = serde_json::json!({
+            "conversation_id": "resident-1",
+            "turn_id": "2",
+            "revision": 7,
+            "history_prefix": "/shared/conversations/resident-1",
+            "history_snapshot": "ab".repeat(32),
+            "session_path": "session.jsonl",
+            "packages": [{"name":"resident", "source_prefix":"/shared/packages/resident", "source_snapshot":"cd".repeat(32)}],
+            "events": [],
+        });
+        value
+    }
+
+    #[test]
+    fn native_turn_keeps_stable_prefix_out_of_current_input() {
+        let value = native_envelope();
+        let prepared = prepare(&value.to_string()).unwrap();
+        assert_eq!(prepared.input, "CONVERSATION");
+        assert_eq!(
+            prepared.ctx.context_doc.as_deref(),
+            Some("GENERIC\n\nCONTRACT")
+        );
+        let native = prepared.workspace.native_conversation.unwrap();
+        assert_eq!(native.conversation_id, "resident-1");
+        assert_eq!(native.turn_id, "2");
+        assert_eq!(native.revision, 7);
+        assert_eq!(native.packages[0].name, "resident");
+    }
+
+    #[test]
+    fn native_turn_refuses_changing_context_and_unpinned_packages() {
+        let mut value = native_envelope();
+        value["context"] = serde_json::json!("a changing full board snapshot");
+        assert!(
+            prepare(&value.to_string())
+                .unwrap_err()
+                .contains("queued input")
+        );
+        value.as_object_mut().unwrap().remove("context");
+        value["native_conversation"]["packages"][0]["source_snapshot"] = serde_json::Value::Null;
+        assert!(prepare(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn one_shot_has_no_native_history_or_system_prefix() {
+        let prepared = prepare(&envelope_json()).unwrap();
+        assert!(prepared.workspace.native_conversation.is_none());
+        assert!(prepared.ctx.native_conversation.is_none());
+        assert!(prepared.ctx.context_doc.is_none());
     }
 
     #[test]

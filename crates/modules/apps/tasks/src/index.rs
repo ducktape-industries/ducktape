@@ -308,10 +308,13 @@ fn decode_job_row(bytes: &[u8]) -> Result<JobRow, Fail> {
     serde_json::from_slice(bytes).map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))
 }
 
-/// stage the two entries one job row materializes to — point lookup +
-/// status partition.
+/// Stage board lookups plus retained submission ownership. Continuations can
+/// choose a different worker after pruning without redirecting the submitter.
 fn put_job_row(out: &mut Writes, row: &JobRow) -> Result<(), Fail> {
     let bytes = serde_json::to_vec(row).map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?;
+    let lineage = serde_json::to_vec(&row.submitter)
+        .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?;
+    index_guest::put(out, format!("job-lineage/{}", row.job_id), lineage);
     index_guest::put(out, job_key(&row.job_id), bytes.clone());
     index_guest::put(out, job_by_status_key(&row.status, &row.job_id), bytes);
     Ok(())
@@ -393,7 +396,8 @@ fn fold_job(op: &OpRow, read: &impl StateRead, msg: JobsMsg) -> Result<Writes, F
             row.updated_at = op.time;
             put_job_row(&mut out, &row)?;
         }
-        JobsMsg::Submit { job_id, kind, spec } => {
+        JobsMsg::Submit { job_id, kind, spec }
+        | JobsMsg::SubmitConversation { job_id, kind, spec } => {
             let row = JobRow {
                 job_id,
                 kind,
@@ -412,6 +416,59 @@ fn fold_job(op: &OpRow, read: &impl StateRead, msg: JobsMsg) -> Result<Writes, F
             move_job_count(read, &mut out, None, Some(&JobStatus::Pending));
             put_job_row(&mut out, &row)?;
         }
+        JobsMsg::Continue {
+            previous_job_id,
+            job_id,
+            kind,
+            spec,
+            ..
+        } => {
+            let already_created = read
+                .get(format!("job-lineage/{job_id}").as_bytes())
+                .is_some();
+            if already_created {
+                return Ok(out);
+            }
+            let Some(lineage) = read.get(format!("job-lineage/{previous_job_id}").as_bytes())
+            else {
+                return Ok(out);
+            };
+            let submitter: String = serde_json::from_slice(&lineage)
+                .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?;
+            let row = JobRow {
+                job_id,
+                kind,
+                spec,
+                submitter,
+                status: JobStatus::Pending,
+                attempt: 0,
+                claim: None,
+                result: None,
+                comments: Vec::new(),
+                created_height: op.height,
+                created_at: op.time,
+                updated_height: op.height,
+                updated_at: op.time,
+            };
+            move_job_count(read, &mut out, None, Some(&JobStatus::Pending));
+            put_job_row(&mut out, &row)?;
+        }
+        JobsMsg::SettleCancellation {
+            job_id, payload, ..
+        } => {
+            let Some(mut row) = load(&job_id)? else {
+                return Ok(out);
+            };
+            row.result = Some(JobResultRow { ok: false, payload });
+            row.claim = None;
+            transition_job(read, &mut out, row, JobStatus::Cancelled, op)?;
+        }
+        // Worker inputs/receipts/reports are read from retained consensus
+        // history. Discussion is deliberately not an execution input.
+        JobsMsg::Control { .. }
+        | JobsMsg::AcknowledgeControl { .. }
+        | JobsMsg::Checkpoint { .. }
+        | JobsMsg::CheckpointNativeHistory { .. } => {}
         JobsMsg::Claim {
             job_id,
             lease_views,
@@ -1047,6 +1104,90 @@ mod tests {
         assert!(
             failed[0].claim.is_some(),
             "the board keeps the claim on an exhausted job, for the record"
+        );
+    }
+
+    #[test]
+    fn cancellation_settlement_and_continuation_after_prune_fold_without_reopening() {
+        let mut map = BTreeMap::new();
+        fold_job_msg(
+            &mut map,
+            1,
+            &JobsMsg::SubmitConversation {
+                job_id: "first".into(),
+                kind: "research".into(),
+                spec: "Work".into(),
+            },
+        );
+        let original = jobs(&map, serde_json::json!({"jobs": {"status": "pending"}}))[0].clone();
+        fold_job_msg(
+            &mut map,
+            2,
+            &JobsMsg::Claim {
+                job_id: "first".into(),
+                lease_views: 100,
+            },
+        );
+        fold_job_msg(
+            &mut map,
+            3,
+            &JobsMsg::Control {
+                job_id: "first".into(),
+                operation_id: "stop".into(),
+                input: crate::JobControlInput::Cancel,
+            },
+        );
+        fold_job_msg(
+            &mut map,
+            4,
+            &JobsMsg::AcknowledgeControl {
+                job_id: "first".into(),
+                operation_id: "stop".into(),
+                attempt: 1,
+            },
+        );
+        assert_eq!(counts(&map).processing, 1);
+        fold_job_msg(
+            &mut map,
+            5,
+            &JobsMsg::SettleCancellation {
+                job_id: "first".into(),
+                operation_id: "stop".into(),
+                attempt: 1,
+                payload: "Stopped".into(),
+            },
+        );
+        assert_eq!(counts(&map).processing, 0);
+        assert_eq!(counts(&map).cancelled, 1);
+        let settled = jobs(&map, serde_json::json!({"jobs": {"status": "cancelled"}}));
+        assert_eq!(settled[0].result.as_ref().unwrap().payload, "Stopped");
+        fold_job_msg(
+            &mut map,
+            6,
+            &JobsMsg::Prune {
+                job_id: "first".into(),
+            },
+        );
+        let msg = JobsMsg::Continue {
+            previous_job_id: "first".into(),
+            job_id: "second".into(),
+            operation_id: "continue".into(),
+            kind: "writer".into(),
+            spec: "More work".into(),
+        };
+        let writes = fold_op(&job_op(7, OriginTag::module("other-member"), &msg), &map).unwrap();
+        index_guest::apply_to_map(&mut map, writes);
+        let continued = jobs(&map, serde_json::json!({"jobs": {"status": "pending"}}));
+        assert_eq!(continued.len(), 1);
+        assert_eq!(continued[0].job_id, "second");
+        assert_eq!(continued[0].submitter, original.submitter);
+        assert_eq!(continued[0].kind, "writer");
+        assert_eq!(counts(&map).pending, 1);
+        fold_job_msg(&mut map, 8, &msg);
+        assert_eq!(
+            counts(&map).pending,
+            1,
+            "continuation retry does not count twice"
         );
     }
 

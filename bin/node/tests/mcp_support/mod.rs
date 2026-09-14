@@ -153,6 +153,7 @@ impl Harness {
         let provisioned = self.submit(
             "agent",
             serde_json::to_value(agent::AgentMsg::Provision {
+                request_id: id.into(),
                 name: name.into(),
                 program: runs::model_program(id),
             })

@@ -36,8 +36,8 @@ _ducktape() {
     local service_flags="--config --workspace -n --network --json --yes -y --enable --no-enable"
     # every service verb takes a KIND now, `list`/`status` included.
     local service_kinds="compute agent airlock"
-    local agent_verbs="pty model-program sched install cancel reassign help"
-    local agent_flags="-n --network --node --key --host-node --cred --cpu --mem --attempt"
+    local agent_verbs="pty model-program sched install cancel reassign chief add status pause resume help"
+    local agent_flags="-n --network --node --key --host-node --cred --cpu --mem --attempt --package --worker --channel --retry-initialization --installed-by"
     local module_verbs="pack update register status help"
     local module_flags="--index --view --assets --out --after --config -n --network --json"
     local collab_verbs="query key attach send ack help"

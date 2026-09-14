@@ -20,7 +20,8 @@
 //!   check because a non-canonical image simply does not decode.
 //!
 //! there is no version byte: the frame is a fixed shape (head flag,
-//! four counted sections, then the source revision) that is never empty, so it self-separates from
+//! four counted sections, the source revision, then a retention-root flag) that
+//! is never empty, so it self-separates from
 //! zero-length input, and layout changes ride the flag-day reset rule (fresh
 //! genesis, no migrations) rather than an in-band version.
 
@@ -66,6 +67,9 @@ pub struct Refs {
     pub pins: BTreeMap<String, PinEntry>,
     pub staging: BTreeMap<ObjectId, Staged>,
     pub watches: BTreeSet<(String, String)>,
+    /// Internal copy-on-write catalog, separate from the collaborative head.
+    /// Its leaves name module-owned references and snapshot membership counts.
+    pub retention_root: Option<ObjectId>,
 }
 
 /// the canonical refs image — the exact `root_bytes` preimage and the exact
@@ -80,6 +84,7 @@ pub struct Refs {
 ///                                                            -- digest order
 /// watches : u32 count ‖ count × (prefix ‖ module_id)        -- tuple order
 /// source_revision : u64
+/// retention_root : u8 flag (1 = present) ‖ [32 B] present iff flag == 1
 /// ```
 pub fn encode_refs(r: &Refs) -> Vec<u8> {
     let mut out = Vec::new();
@@ -128,6 +133,13 @@ pub fn encode_refs(r: &Refs) -> Vec<u8> {
     }
 
     out.extend_from_slice(&r.source_revision.to_le_bytes());
+    match r.retention_root {
+        Some(root) => {
+            out.push(1);
+            out.extend_from_slice(&root);
+        }
+        None => out.push(0),
+    }
     out
 }
 
@@ -167,7 +179,8 @@ pub fn encoded_refs_len(r: &Refs) -> usize {
         .iter()
         .map(|(prefix, module_id)| watch_entry_len(prefix, module_id))
         .sum::<usize>();
-    head + window + pins + staging + watches + 8
+    let retention = 1 + r.retention_root.map_or(0, |_| 32);
+    head + window + pins + staging + watches + 8 + retention
 }
 
 /// strict decode of an [`encode_refs`] image; anything non-canonical rejects.
@@ -258,6 +271,11 @@ pub fn decode_refs(bytes: &[u8]) -> Result<Refs, String> {
     }
 
     let source_revision = r.u64()?;
+    let retention_root = if r.boolean()? {
+        Some(r.bytes32()?)
+    } else {
+        None
+    };
     r.finish()?;
     Ok(Refs {
         source_revision,
@@ -266,6 +284,7 @@ pub fn decode_refs(bytes: &[u8]) -> Result<Refs, String> {
         pins,
         staging,
         watches,
+        retention_root,
     })
 }
 

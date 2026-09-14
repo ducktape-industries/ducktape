@@ -98,6 +98,159 @@ pub struct Block {
     pub children: Vec<String>,
 }
 
+/// Attribution reason for discussion on a managed collection or record Page.
+/// Detail is the JSON-encoded immutable ManagedDiscussionSnapshot captured at
+/// the source revision. Comment.author and AttributionUpdate.actor are distinct:
+/// the latter identifies the actual authenticated mutator, including on edits.
+pub const MANAGED_RECORD_COMMENT_REASON: &str = "managed_record_comment";
+/// Raw snapshot ceiling. Full JSON source/update/batch envelopes are bounded
+/// independently because encoding detail bytes as integer arrays expands them.
+pub const MAX_MANAGED_DISCUSSION_BYTES: usize = 512 * 1024;
+/// Bounded caller-defined operation fingerprint/result retained in the receipt.
+pub const MAX_RECORD_METADATA_BYTES: usize = 8 * 1024;
+pub const MAX_RECORD_STATE_VALUE_BYTES: usize = 16 * 1024;
+pub const MAX_RECORD_STATE_KEYS: usize = 256;
+/// Immutable receipt-owned Files retention references per commit.
+pub const MAX_RECORD_ARTIFACTS: usize = 8;
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum DiscussionMutation {
+    Created,
+    Edited,
+    Retargeted,
+    Recreated,
+    ContextChanged,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedDiscussionSnapshot {
+    /// Only Created is a fresh, never-before-used comment identity. Edits,
+    /// retargeting and identity reuse must not be interpreted as fresh approval.
+    pub mutation: DiscussionMutation,
+    pub collection_page_id: String,
+    /// Owning ordinary Page ID of the target block at the source revision.
+    pub page_id: String,
+    pub comment: Comment,
+    pub thread: DiscussionThreadSnapshot,
+}
+
+/// Thread metadata at the source revision, without the comment-id roster.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DiscussionThreadSnapshot {
+    pub id: String,
+    pub target: String,
+    pub opener: Party,
+    pub created_at: u64,
+    pub anchor: Option<RelativeAnchor>,
+    pub resolved: bool,
+    pub resolved_by: Option<Party>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum RecordStateChange {
+    Put {
+        key: String,
+        value: serde_json::Value,
+    },
+    Delete {
+        key: String,
+    },
+}
+
+/// Protected operational state, not an ordinary document or business schema.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecordState {
+    pub key: String,
+    pub value: serde_json::Value,
+    pub revision: u64,
+}
+
+/// Maximum changes per atomic records commit, below the host read/write budget.
+pub const MAX_RECORD_CHANGES: usize = 16;
+/// Maximum serialized commit payload, including record data and documents.
+pub const MAX_RECORD_BATCH_BYTES: usize = 128 * 1024;
+/// Maximum serialized generic data in one record.
+pub const MAX_RECORD_DATA_BYTES: usize = 32 * 1024;
+/// Maximum flat, non-Page body blocks in one managed document.
+pub const MAX_RECORD_DOCUMENT_BLOCKS: usize = 16;
+/// Records consume ordinary Page slots, so the existing global page cap also applies.
+pub const MAX_RECORDS_PER_COLLECTION: usize = 1024;
+/// Query count bound; limit zero selects this maximum.
+pub const MAX_RECORD_QUERY_LIMIT: u16 = 32;
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecordCollection {
+    pub page_id: String,
+    pub writer: Party,
+    pub revision: u64,
+    pub record_count: u64,
+}
+
+/// Data is application-defined; Pages owns authorization, concurrency and the
+/// atomic ordinary document, never a record's business schema.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRecord {
+    /// Also the globally addressable ordinary Page block ID.
+    pub record_id: String,
+    pub data: serde_json::Value,
+    /// Collection revision at the last upsert of this record.
+    pub revision: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecordDocument {
+    pub title: String,
+    /// Flat ordinary non-Page blocks. Reused IDs preserve comments and authors;
+    /// omitted IDs are explicitly deleted, including their comments.
+    pub blocks: Vec<NewBlock>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum RecordChange {
+    Upsert {
+        record_id: String,
+        data: serde_json::Value,
+        document: RecordDocument,
+    },
+    Delete {
+        record_id: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecordReceipt {
+    pub page_id: String,
+    pub request_id: String,
+    pub revision: u64,
+    /// SHA-256 of the exact execute payload, as 32 JSON byte values.
+    pub payload_digest: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    /// Files snapshots retained permanently by this immutable receipt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecordPage {
+    pub revision: u64,
+    /// Sorted by record_id; after is an exclusive lexical cursor. Compare
+    /// revisions between pages and restart enumeration if the collection moved.
+    pub records: Vec<ManagedRecord>,
+    pub next_after: Option<String>,
+}
+
 /// the insert payload: a client-minted globally-unique id plus content.
 /// `parent`/`page`/`children` are derived by the module from the insert
 /// position; `checked` starts false ([`PageMsg::SetChecked`] flips it).
@@ -119,6 +272,29 @@ pub struct NewBlock {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PageMsg {
+    /// Attach managed records to a top-level Page owned by the authenticated
+    /// actor. Existing body blocks remain visible and become protected; nested
+    /// Pages must be absent. The writer is immutable and comes from Env.
+    CreateRecordCollection { page_id: String, request_id: String },
+    /// Atomically change records AND their ordinary Page documents. A successful
+    /// request consumes one collection revision and produces a RecordReceipt.
+    /// Exact payload-byte retries return that receipt before checking the CAS.
+    CommitRecords {
+        page_id: String,
+        expected_revision: u64,
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changes: Vec<RecordChange>,
+        /// Protected state and visible records share this ONE collection CAS.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        state_changes: Vec<RecordStateChange>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+        /// Existing committed Files candidate snapshots; Pages retains these
+        /// under module-owned receipt keys in the same host transaction.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifacts: Vec<String>,
+    },
     /// create a top-level page block carrying its initial body: `blocks` are
     /// its top-level children in document order, staged in the same op so a
     /// page with content exists whole or not at all. Subpages use
@@ -372,12 +548,34 @@ pub struct CommentThreadHead {
 
 /// the DISPATCH read surface — the point reads other modules' `execute()`
 /// paths resolve through `Ctx::query` (runs' block/comment probes and page
-/// context assembly). UI-shaped enumeration (the page list, per-target
+/// context assembly). Managed records also expose bounded canonical enumeration
+/// so writers can assemble a collection CAS without a lagging derived read.
+/// UI-shaped enumeration (the page list, per-target
 /// thread panels, search) is served by pages' index guest on the derived
 /// tier instead.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PageQuery {
+    RecordCollection {
+        page_id: String,
+    },
+    Records {
+        page_id: String,
+        after: Option<String>,
+        limit: u16,
+    },
+    Record {
+        page_id: String,
+        record_id: String,
+    },
+    RecordReceipt {
+        page_id: String,
+        request_id: String,
+    },
+    RecordState {
+        page_id: String,
+        key: String,
+    },
     /// One bounded page of blocks in PREORDER (root first, each block's
     /// subtree before its next sibling). `after` is the exclusive id of the
     /// last block returned; `limit == 0` selects [`MAX_PAGE_QUERY_LIMIT`]. An
@@ -424,6 +622,11 @@ pub struct PageBlockPage {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PageReply {
+    RecordCollection(Option<RecordCollection>),
+    Records(Option<RecordPage>),
+    Record(Option<ManagedRecord>),
+    RecordReceipt(Option<RecordReceipt>),
+    RecordState(Option<RecordState>),
     Page(Option<PageBlockPage>),
     Block(Option<Block>),
     CommentThread(Option<ThreadView>),

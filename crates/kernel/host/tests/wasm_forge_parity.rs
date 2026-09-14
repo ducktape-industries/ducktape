@@ -378,6 +378,7 @@ fn program_issue_and_pr_results_match_native_and_wasm() {
         Msg {
             target: "agent".into(),
             payload: agent::encode_msg(&AgentMsg::Provision {
+                request_id: "forge-program".into(),
                 name: "forge-program".into(),
                 program
             }),

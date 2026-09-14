@@ -36,6 +36,22 @@ fn call(module: &str, msg: Value, bind: &str, failure: u64) -> Step {
 /// executing its exact prepared message as this user. Every action, including its
 /// failure, reaches a verified runs receipt. Reports are the controller's choice.
 pub fn model_program(agent_id: &str) -> Program {
+    program(agent_id, Intake::Mention)
+}
+
+/// Resident coordination admits every authenticated source change into Runs'
+/// durable queue. Source identity, idempotency and self-reply suppression stay
+/// in Runs; the program carries no domain-specific event policy.
+pub fn conversation_program(agent_id: &str) -> Program {
+    program(agent_id, Intake::Conversation)
+}
+
+enum Intake {
+    Mention,
+    Conversation,
+}
+
+fn program(agent_id: &str, intake: Intake) -> Program {
     let request = || reference(&["change", "source", "object"]);
     let mut steps = vec![
         Step::Branch {
@@ -134,26 +150,31 @@ pub fn model_program(agent_id: &str) -> Program {
     ));
     steps.push(Step::Finish);
     let mention = steps.len() as u64;
-    steps.push(Step::Branch {
-        test: Predicate::All(vec![
-            equals(reference(&["change", "kind"]), text("added")),
-            Predicate::Any(vec![
-                Predicate::All(vec![
-                    equals(reference(&["change", "reason"]), text("mention")),
-                    Predicate::Any(vec![
-                        equals(reference(&["change", "source", "module"]), text("chat")),
-                        equals(reference(&["change", "source", "module"]), text("pages")),
-                    ]),
-                ]),
-                Predicate::All(vec![
-                    equals(reference(&["change", "source", "module"]), text("runs")),
-                    equals(
-                        reference(&["change", "source", "kind"]),
-                        text("run_request"),
-                    ),
+    let mention_intake = Predicate::All(vec![
+        equals(reference(&["change", "kind"]), text("added")),
+        Predicate::Any(vec![
+            Predicate::All(vec![
+                equals(reference(&["change", "reason"]), text("mention")),
+                Predicate::Any(vec![
+                    equals(reference(&["change", "source", "module"]), text("chat")),
+                    equals(reference(&["change", "source", "module"]), text("pages")),
                 ]),
             ]),
+            Predicate::All(vec![
+                equals(reference(&["change", "source", "module"]), text("runs")),
+                equals(
+                    reference(&["change", "source", "kind"]),
+                    text("run_request"),
+                ),
+            ]),
         ]),
+    ]);
+    let admission = match intake {
+        Intake::Mention => mention_intake,
+        Intake::Conversation => Predicate::Defined(reference(&["change", "seq"])),
+    };
+    steps.push(Step::Branch {
+        test: admission,
         then: mention + 1,
         or: mention + 2,
     });

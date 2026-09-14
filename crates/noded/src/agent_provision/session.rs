@@ -18,8 +18,9 @@
 //! additional controller signature.
 //!
 //! The child receives only a random token for a host endpoint. That endpoint
-//! accepts `RunsMsg::AgentAction` for exactly this run, signs it, waits for the
-//! committed receipt, and dies with the provisioned workspace. A shell can
+//! accepts `RunsMsg::AgentAction` and native history/control boundaries for
+//! exactly this run, signs them, waits for committed readback, and dies with
+//! the provisioned workspace. A shell can
 //! therefore act as the run but can never recover a general-purpose frame
 //! signer.
 //!
@@ -31,7 +32,15 @@ use commonware_cryptography::{Signer as _, ed25519};
 use compute_service::WorkspaceSpec;
 use futures::channel::oneshot;
 use futures::{SinkExt as _, StreamExt as _};
+use std::path::Path;
 use std::sync::Arc;
+
+#[path = "native.rs"]
+mod native;
+
+#[cfg(test)]
+#[path = "native_end_to_end_tests.rs"]
+mod native_end_to_end_tests;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
@@ -54,6 +63,7 @@ pub(super) const ENV_ACTION_TOKEN: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
 pub(super) struct RunSession {
     pub(super) action_url: String,
     pub(super) action_token: String,
+    pub(super) native_conversation: Option<provider_host::NativeConversationContext>,
     #[cfg(test)]
     local_addr: std::net::SocketAddr,
     shutdown: Option<oneshot::Sender<()>>,
@@ -75,6 +85,7 @@ struct ActionState {
     run_id: String,
     token: String,
     seq: tokio::sync::Mutex<u64>,
+    native: Option<native::NativeState>,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +99,7 @@ struct ActionRequest {
 pub(super) async fn open(
     node: &NodeLink,
     spec: &WorkspaceSpec,
+    workdir: &Path,
 ) -> Result<Option<RunSession>, String> {
     let Some(agent) = &spec.agent else {
         return Ok(None);
@@ -109,7 +121,8 @@ pub(super) async fn open(
         );
         format!("open agent session: {error}")
     })?;
-    start_action_server(node.clone(), key, agent.run_id.clone())
+    let native = native::prepare(node, spec, &key, workdir).await?;
+    start_action_server(node.clone(), key, agent.run_id.clone(), native)
         .await
         .inspect_err(|error| {
             tracing::warn!(
@@ -126,6 +139,7 @@ async fn start_action_server(
     node: NodeLink,
     signer: ed25519::PrivateKey,
     run_id: String,
+    native: Option<native::NativeState>,
 ) -> Result<RunSession, String> {
     // A child reaches this signer over a vsock tunnel that terminates on a
     // socket the host process owns, so it dials `127.0.0.1:<port>` exactly
@@ -140,16 +154,24 @@ async fn start_action_server(
     let mut secret = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
     let token = duckfs_core::to_hex(&secret);
+    let native_conversation = native.as_ref().map(|native| native.context.clone());
     let state = Arc::new(ActionState {
         node,
         signer,
         run_id: run_id.clone(),
         token: token.clone(),
         seq: tokio::sync::Mutex::new(0),
+        native,
     });
     let app = Router::new()
-        .route("/v1/run-action", post(run_action))
-        .layer(DefaultBodyLimit::max(MAX_ACTION_REQUEST_BYTES))
+        .route(
+            "/v1/run-action",
+            post(run_action).layer(DefaultBodyLimit::max(MAX_ACTION_REQUEST_BYTES)),
+        )
+        .route(
+            "/v1/native-conversation",
+            post(native::route).layer(DefaultBodyLimit::max(native::MAX_REQUEST_BYTES)),
+        )
         .with_state(state);
     let (shutdown, rx) = oneshot::channel();
     let task = tokio::spawn(async move {
@@ -162,6 +184,7 @@ async fn start_action_server(
     Ok(RunSession {
         action_url: format!("http://127.0.0.1:{}/v1/run-action", address.port()),
         action_token: token,
+        native_conversation,
         #[cfg(test)]
         local_addr: address,
         shutdown: Some(shutdown),
@@ -379,10 +402,14 @@ mod tests {
     #[tokio::test]
     async fn action_server_binds_loopback_only() {
         let signer = ed25519::PrivateKey::from_seed(1);
-        let session =
-            start_action_server(NodeLink::new("http://127.0.0.1:0"), signer, "run-1".into())
-                .await
-                .expect("bind scoped action signer");
+        let session = start_action_server(
+            NodeLink::new("http://127.0.0.1:0"),
+            signer,
+            "run-1".into(),
+            None,
+        )
+        .await
+        .expect("bind scoped action signer");
         assert!(session.local_addr.ip().is_loopback());
     }
 }

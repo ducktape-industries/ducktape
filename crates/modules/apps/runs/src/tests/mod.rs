@@ -58,6 +58,8 @@ struct CaptureCtx {
     dispatch_assignees: BTreeMap<String, Vec<u8>>,
     /// job_id -> board record served by the jobs arm (finalize guard).
     jobs: BTreeMap<String, Job>,
+    /// Real committed Jobs state for lifecycle/retained-proof regressions.
+    jobs_module: Option<tasks::Tasks>,
     /// repo -> born (branch, tip-hex) pairs, served by the "forge"
     /// ListRefs arm (the sink's branch-born probe and the compose lane's
     /// commit pinning).
@@ -114,6 +116,7 @@ impl CaptureCtx {
             taken_dispatches: BTreeSet::new(),
             dispatch_assignees: BTreeMap::new(),
             jobs: BTreeMap::new(),
+            jobs_module: None,
             forge_refs: BTreeMap::new(),
             forge_items: BTreeMap::new(),
             sagas: BTreeMap::new(),
@@ -303,6 +306,13 @@ impl CaptureCtx {
             job_id.into(),
             Job {
                 job_id: job_id.into(),
+                conversation_id: format!("{job_id}:1"),
+                execution: tasks::JobExecution::OneShot,
+                native_history: None,
+                previous_job_id: None,
+                continuation_operation_id: None,
+                controls: Vec::new(),
+                reports: Vec::new(),
                 kind: "agent/duck".into(),
                 spec: "spec".into(),
                 submitter: tasks::Party::Key(vec![1]),
@@ -551,11 +561,23 @@ impl Ctx for CaptureCtx {
                     Ok(tasks_encode_reply(&TaskReply::OwnerOpenCount(count)))
                 }
             },
-            "jobs" => match tasks::decode_job_query(req).map_err(Error::Module)? {
-                JobsQuery::Get { job_id } => Ok(jobs_encode_reply(&JobsReply::Job(
-                    self.jobs.get(&job_id).cloned(),
-                ))),
-            },
+            "jobs" => {
+                if let Some(module) = &self.jobs_module {
+                    return module.query(req).await;
+                }
+                match tasks::decode_job_query(req).map_err(Error::Module)? {
+                    JobsQuery::Get { job_id } => Ok(jobs_encode_reply(&JobsReply::Job(
+                        self.jobs.get(&job_id).cloned(),
+                    ))),
+                    JobsQuery::GetWorker { .. } => Ok(jobs_encode_reply(&JobsReply::Worker(None))),
+                    JobsQuery::Controls { job_id } => Ok(jobs_encode_reply(&JobsReply::Controls(
+                        self.jobs
+                            .get(&job_id)
+                            .map(|job| job.controls.clone())
+                            .unwrap_or_default(),
+                    ))),
+                }
+            }
             "dispatch" => match dispatch::decode_query(req).map_err(Error::Module)? {
                 DispatchQuery::Dispatch { dispatch_id, .. } => {
                     // an awaiting dispatch still names its saga (the lease lives
@@ -665,6 +687,11 @@ impl Ctx for CaptureCtx {
                 _ => Err(Error::QueryUnsupported),
             },
             "pages" => match pages::decode_query(req).map_err(Error::Module)? {
+                pages::PageQuery::RecordCollection { .. }
+                | pages::PageQuery::Records { .. }
+                | pages::PageQuery::Record { .. }
+                | pages::PageQuery::RecordReceipt { .. }
+                | pages::PageQuery::RecordState { .. } => Err(Error::QueryUnsupported),
                 pages::PageQuery::GetPage {
                     page_id,
                     after,
@@ -925,6 +952,34 @@ fn exec(m: &mut RunsModule, ctx: &mut CaptureCtx, op: &Msg) -> Result<(), Error>
         .cloned()
         .collect();
     if ctx.env.origin == Origin::Module("jobs".into()) {
+        let JobsEvent::Submitted {
+            job_id,
+            kind,
+            spec,
+            submitter,
+            ..
+        } = jobs_decode_event(&op.payload).unwrap();
+        ctx.jobs.entry(job_id.clone()).or_insert_with(|| Job {
+            conversation_id: format!("{job_id}:1"),
+            execution: tasks::JobExecution::OneShot,
+            native_history: None,
+            job_id,
+            kind,
+            spec,
+            submitter,
+            status: JobStatus::Pending,
+            attempt: 0,
+            claim: None,
+            result: None,
+            comments: Vec::new(),
+            created_at_revision: 1,
+            created_at_height: ctx.env.height,
+            updated_at_height: ctx.env.height,
+            previous_job_id: None,
+            continuation_operation_id: None,
+            controls: Vec::new(),
+            reports: Vec::new(),
+        });
         let origin = std::mem::replace(&mut ctx.env.origin, Origin::Program(2));
         let result = block_on(m.on_jobs_event(ctx, &op.payload));
         ctx.env.origin = origin;
@@ -1380,6 +1435,7 @@ mod job_runs;
 mod pages_actions;
 mod receipts;
 mod registry;
+mod resident;
 mod sessions;
 mod state;
 mod validation;

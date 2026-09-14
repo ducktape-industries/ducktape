@@ -362,6 +362,7 @@ impl RunsModule {
             return Ok(());
         };
         let run_id = entry.run_id();
+        let ending_attempt = self.session(&run_id).map(|session| session.lease.attempt);
         let ResultEvent {
             dispatch_id,
             outcome,
@@ -385,7 +386,10 @@ impl RunsModule {
                 self.deliver_delegated_result(ctx, &run_id, &entry, &bytes)
                     .await
             }
-            Ok(bytes) => self.deliver_run_result(ctx, &run_id, &entry, &bytes).await,
+            Ok(bytes) => {
+                self.deliver_run_result(ctx, &run_id, &entry, &bytes, ending_attempt)
+                    .await
+            }
             Err(reason) if entry.delegation_id.is_some() => {
                 self.fail_delegated_run(ctx, &run_id, &entry, reason).await
             }
@@ -469,6 +473,17 @@ impl RunsModule {
             Ok(result) => result,
             Err(reason) => return self.fail_delegated_run(ctx, run_id, entry, reason).await,
         };
+        let native_terminal = result.native_input_handled || result.native_cancelled;
+        if native_terminal {
+            return self
+                .fail_delegated_run(
+                    ctx,
+                    run_id,
+                    entry,
+                    "delegation is not a native conversation turn".into(),
+                )
+                .await;
+        }
         if result.status == WireStatus::Failed {
             return self
                 .fail_delegated_run(ctx, run_id, entry, "run reported a failed status".into())
@@ -649,11 +664,35 @@ impl RunsModule {
         run_id: &str,
         entry: &PendingState,
         bytes: &[u8],
+        ending_attempt: Option<u32>,
     ) {
         let result = match decode_run_result(bytes) {
             Ok(r) => r,
             Err(reason) => return self.fail_run(ctx, run_id, entry, reason).await,
         };
+        match (result.native_input_handled, result.native_cancelled) {
+            (false, false) => {}
+            (true, false) => {
+                return self
+                    .deliver_native_input_handled(ctx, run_id, entry, &result, ending_attempt)
+                    .await;
+            }
+            (false, true) => {
+                return self
+                    .deliver_native_cancelled(ctx, run_id, entry, &result, ending_attempt)
+                    .await;
+            }
+            (true, true) => {
+                return self
+                    .fail_run(
+                        ctx,
+                        run_id,
+                        entry,
+                        "conflicting native terminal dispositions".into(),
+                    )
+                    .await;
+            }
+        }
         // the host observation overrides a present message facet (R4).
         if result.status == WireStatus::Failed {
             return self
@@ -765,6 +804,94 @@ impl RunsModule {
         );
         self.emit_job_finalize_if_current_claimant(ctx, entry, true, payload)
             .await;
+    }
+
+    async fn deliver_native_input_handled(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        run_id: &str,
+        entry: &PendingState,
+        result: &crate::facets::RunnerResult,
+        attempt: Option<u32>,
+    ) {
+        let native_delivery = self
+            .has_native_turn_delivery(run_id, attempt)
+            .await
+            .unwrap_or(false);
+        let handled_without_model =
+            native_delivery && result.response_text.is_empty() && result.status == WireStatus::Ok;
+        if !handled_without_model {
+            return self.fail_run(ctx, run_id, entry, "native input handling requires a committed delivery checkpoint and no assistant response".into()).await;
+        }
+        let executing_node = self.executing_node(ctx, run_id).await;
+        self.record_settled(
+            RunRecord {
+                run_id: run_id.into(),
+                agent_id: entry.agent_id.clone(),
+                channel_id: entry.channel_id.clone(),
+                anchor_seq: entry.anchor_seq,
+                outcome: RunOutcome::ResultAccepted,
+                degraded: false,
+                created_at: entry.created_at,
+                delivered_at: ctx.env().consensus_time,
+                executing_node,
+                output_ref: output_ref_of(&result.workspace_receipt),
+                pr: None,
+            },
+            None,
+        );
+        let receipt = encode_delivery_receipt(
+            &AgentResponse::default(),
+            &result.workspace_receipt,
+            result.status,
+        );
+        self.emit_job_finalize_if_current_claimant(ctx, entry, true, receipt)
+            .await;
+    }
+
+    async fn deliver_native_cancelled(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        run_id: &str,
+        entry: &PendingState,
+        result: &crate::facets::RunnerResult,
+        attempt: Option<u32>,
+    ) {
+        let canonical_cancellation = self
+            .native_cancellation_settled(ctx, run_id, attempt)
+            .await
+            .unwrap_or(false);
+        let cancelled_without_model = canonical_cancellation
+            && result.response_text.is_empty()
+            && result.status == WireStatus::Ok;
+        if !cancelled_without_model {
+            return self
+                .fail_run(
+                    ctx,
+                    run_id,
+                    entry,
+                    "native cancellation requires committed history and fenced Jobs settlement"
+                        .into(),
+                )
+                .await;
+        }
+        let executing_node = self.executing_node(ctx, run_id).await;
+        self.record_settled(
+            RunRecord {
+                run_id: run_id.into(),
+                agent_id: entry.agent_id.clone(),
+                channel_id: entry.channel_id.clone(),
+                anchor_seq: entry.anchor_seq,
+                outcome: RunOutcome::Cancelled,
+                degraded: false,
+                created_at: entry.created_at,
+                delivered_at: ctx.env().consensus_time,
+                executing_node,
+                output_ref: output_ref_of(&result.workspace_receipt),
+                pr: None,
+            },
+            None,
+        );
     }
 
     /// deterministic response validation — THE safety boundary (design §5).

@@ -32,6 +32,22 @@ use saga::{
     SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,
 };
 
+/// The same authoritative allowance pays for tool actions and semantic worker
+/// reports. Decide the next value here; its writer shares the target's transaction.
+pub(super) fn reserve_session_action(session: &AgentSession) -> Result<AgentSession, Error> {
+    let at_capacity = session.actions >= MAX_ACTIONS_PER_SESSION;
+    if at_capacity {
+        return Err(Error::Module(format!(
+            "session for run {} has spent its budget of {MAX_ACTIONS_PER_SESSION} actions",
+            session.run_id
+        )));
+    }
+    Ok(AgentSession {
+        actions: session.actions + 1,
+        ..session.clone()
+    })
+}
+
 impl RunsModule {
     /// bind an ephemeral session key to a live run — the EXECUTING node's op.
     pub(super) async fn open_agent_session(
@@ -166,11 +182,7 @@ impl RunsModule {
             ctx.set_output(sdk::wire::encode(&serde_json::json!({"receipt_id": id})));
             return Ok(());
         }
-        if session.actions >= MAX_ACTIONS_PER_SESSION {
-            return Err(Error::Module(format!(
-                "session for run {run_id} has spent its budget of {MAX_ACTIONS_PER_SESSION} actions"
-            )));
-        }
+        let next_session = reserve_session_action(&session)?;
         let lane = Lane::Session(session.actions);
         let prepared = self
             .prepare_agent_action(&*ctx, &run_id, &request_id, &entry, lane, &envelope)
@@ -188,13 +200,7 @@ impl RunsModule {
         // record and the id salt the NEXT action mints from, so it must move on
         // every applied action and on no refused one (a refusal is an `Err`, and
         // the host rolls this op's staging back with it).
-        self.pending_sessions.insert(
-            run_id,
-            Some(AgentSession {
-                actions: session.actions + 1,
-                ..session
-            }),
-        );
+        self.pending_sessions.insert(run_id, Some(next_session));
         ctx.set_output(sdk::wire::encode(&serde_json::json!({"receipt_id": id})));
         Ok(())
     }

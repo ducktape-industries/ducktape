@@ -298,6 +298,8 @@ mod tests {
     struct TestCtx {
         env: Env,
         msgs: Vec<Msg>,
+        output: Vec<u8>,
+        assigned: Vec<u8>,
     }
 
     #[async_trait::async_trait(?Send)]
@@ -315,6 +317,12 @@ mod tests {
             self.msgs.push(msg);
         }
         fn emit_event(&mut self, _ev: Event) {}
+        fn set_output(&mut self, bytes: Vec<u8>) {
+            self.output = bytes;
+        }
+        fn set_assigned(&mut self, bytes: Vec<u8>) {
+            self.assigned = bytes;
+        }
     }
 
     fn ctx_at(height: u64, time: u64) -> TestCtx {
@@ -327,6 +335,8 @@ mod tests {
                 cause: sdk::Cause::Direct,
             },
             msgs: Vec::new(),
+            output: Vec::new(),
+            assigned: Vec::new(),
         }
     }
 
@@ -411,6 +421,111 @@ mod tests {
                 },
             }],
         })
+    }
+
+    #[test]
+    fn projection_and_protected_catalog_have_native_guest_root_parity() {
+        fn apply_pair(
+            native: &mut Fs<MemStore>,
+            lane: &mut GuestLane,
+            origin: Origin,
+            payload: &[u8],
+        ) -> Result<(), Error> {
+            let mut native_ctx = ctx_at(1, 1);
+            native_ctx.env.origin = origin.clone();
+            let mut guest_ctx = ctx_at(1, 1);
+            guest_ctx.env.origin = origin;
+            let native_result = futures::executor::block_on(crate::adapter::apply_op(
+                native,
+                &mut native_ctx,
+                payload,
+            ));
+            let guest_result = lane.dispatch_ctx(&mut guest_ctx, payload);
+            assert_eq!(format!("{native_result:?}"), format!("{guest_result:?}"));
+            assert_eq!(native_ctx.assigned, guest_ctx.assigned);
+            assert_eq!(native_ctx.output, guest_ctx.output);
+            assert_eq!(native_ctx.assigned, native_ctx.output);
+            assert_eq!(
+                encode_refs(native.pending_refs()),
+                encode_refs(&lane.refs())
+            );
+            native_result
+        }
+        let mut native = Fs::new(MemStore::new(), Refs::default());
+        let mut lane = GuestLane::new();
+        apply_pair(
+            &mut native,
+            &mut lane,
+            Origin::System,
+            &commit_inline("/shared/history/session.jsonl", b"native session\n"),
+        )
+        .unwrap();
+        let source = duckfs_core::to_hex(&native.pending_refs().head.unwrap());
+        let projection = encode_msg(&FilesMsg::ProjectSnapshot {
+            snapshot: source.clone(),
+            path: "/shared/history".into(),
+        });
+        apply_pair(&mut native, &mut lane, Origin::System, &projection).unwrap();
+        assert_eq!(
+            native.pending_refs().head,
+            duckfs_core::from_hex_32(&source)
+        );
+        let snapshot = duckfs_core::to_hex(native.pending_refs().window.back().unwrap());
+        let first = duckfs_core::RetentionReference {
+            snapshot: snapshot.clone(),
+            revision: 1,
+        };
+        let second = duckfs_core::RetentionReference {
+            snapshot,
+            revision: 2,
+        };
+        let create = FilesMsg::CompareExchangeRetention {
+            key: "head".into(),
+            expected: None,
+            replacement: Some(first.clone()),
+        };
+        let advance = FilesMsg::CompareExchangeRetention {
+            key: "head".into(),
+            expected: Some(first),
+            replacement: Some(second.clone()),
+        };
+        let archive = FilesMsg::CompareExchangeRetention {
+            key: "archive".into(),
+            expected: None,
+            replacement: Some(second.clone()),
+        };
+        let release = FilesMsg::CompareExchangeRetention {
+            key: "head".into(),
+            expected: Some(second),
+            replacement: None,
+        };
+        for message in [&create, &advance, &archive, &release] {
+            apply_pair(
+                &mut native,
+                &mut lane,
+                Origin::Module("owner".into()),
+                &encode_msg(message),
+            )
+            .unwrap();
+        }
+        apply_pair(
+            &mut native,
+            &mut lane,
+            Origin::Module("owner".into()),
+            &encode_msg(&advance),
+        )
+        .unwrap_err();
+        let (refs, _, objects) = native.commit_block().unwrap();
+        for (kind, body) in objects {
+            native.store_mut().put(kind, &body).unwrap();
+        }
+        native.adopt_refs(refs);
+        lane.end_block();
+        assert_eq!(encode_refs(native.refs()), encode_refs(&lane.refs()));
+        assert_eq!(
+            native.store_mut().list().unwrap(),
+            lane.store.list().unwrap()
+        );
     }
 
     /// the native block twin: one `Fs`, apply every op onto ONE pending, then

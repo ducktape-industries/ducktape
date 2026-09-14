@@ -362,6 +362,75 @@ async fn view_block(
     }
 }
 
+async fn bell_job(
+    rpc: &RpcClient,
+    job_id: &str,
+    entry: &mut BellPresentation,
+) -> Result<(), String> {
+    let reply: ::tasks::WorkReply = rpc
+        .query(
+            "tasks",
+            &::tasks::WorkQuery::Job(::tasks::JobsQuery::Get {
+                job_id: job_id.into(),
+            }),
+        )
+        .await?;
+    let ::tasks::WorkReply::Job(::tasks::JobsReply::Job(Some(job))) = reply else {
+        entry.detail = "Job not found".into();
+        return Ok(());
+    };
+    let matches_job = job.job_id == job_id;
+    if !matches_job {
+        return Err("wrong job".into());
+    }
+    let status = match job.status {
+        ::tasks::JobStatus::Pending => "Pending",
+        ::tasks::JobStatus::Processing => "In progress",
+        ::tasks::JobStatus::Done => "Done",
+        ::tasks::JobStatus::Failed => "Failed",
+        ::tasks::JobStatus::Cancelled => "Cancelled",
+    };
+    entry.detail = format!("{} · {status}", bell_title(&job.kind));
+    Ok(())
+}
+
+async fn bell_job_event(
+    rpc: &RpcClient,
+    item: &BellItem,
+    object: &str,
+    entry: &mut BellPresentation,
+) -> Result<(), String> {
+    let seq = u64::try_from(item.change_seq).map_err(|_| "invalid change sequence")?;
+    let after = seq.checked_sub(1).ok_or("invalid change sequence")?;
+    let reply: attribution::AttributionReply = rpc
+        .query(
+            "attribution",
+            &attribution::AttributionQuery::Changes { after, limit: 1 },
+        )
+        .await?;
+    let attribution::AttributionReply::Changes(changes) = reply else {
+        return Err("wrong attribution reply".into());
+    };
+    let [record] = changes.as_slice() else {
+        return Err("change not found".into());
+    };
+    let change = &record.change;
+    let expected_source = attribution::Source {
+        module: "tasks".into(),
+        kind: "job_event".into(),
+        object: object.into(),
+    };
+    let matches_source = change.source == expected_source;
+    let matches_sequence = record.at == seq && change.seq == seq;
+    let matches_change = matches_sequence && matches_source;
+    if !matches_change {
+        return Err("wrong change".into());
+    }
+    // The immutable source object is an event hash, never a job ID.
+    let detail: ::tasks::JobEventDetail = sdk::wire::decode(&change.detail)?;
+    bell_job(rpc, &detail.job_id, entry).await
+}
+
 async fn bell_source(
     rpc: &RpcClient,
     item: &BellItem,
@@ -512,31 +581,8 @@ async fn bell_source(
             };
             entry.detail = format!("{} · {status}", bell_preview(&task.title));
         }
-        ("tasks", "job") => {
-            let reply: ::tasks::WorkReply = rpc
-                .query(
-                    "tasks",
-                    &::tasks::WorkQuery::Job(::tasks::JobsQuery::Get {
-                        job_id: object.into(),
-                    }),
-                )
-                .await?;
-            let ::tasks::WorkReply::Job(::tasks::JobsReply::Job(Some(job))) = reply else {
-                entry.detail = "Job not found".into();
-                return Ok(());
-            };
-            if job.job_id != object {
-                return Err("wrong job".into());
-            }
-            let status = match job.status {
-                ::tasks::JobStatus::Pending => "Pending",
-                ::tasks::JobStatus::Processing => "In progress",
-                ::tasks::JobStatus::Done => "Done",
-                ::tasks::JobStatus::Failed => "Failed",
-                ::tasks::JobStatus::Cancelled => "Cancelled",
-            };
-            entry.detail = format!("{} · {status}", bell_title(&job.kind));
-        }
+        ("tasks", "job") => bell_job(rpc, object, entry).await?,
+        ("tasks", "job_event") => bell_job_event(rpc, item, object, entry).await?,
         ("runs", "action_request") => {
             let reply: ::runs::RunsReply = rpc
                 .query(

@@ -204,6 +204,7 @@ impl Bed {
             // the one `runs` resolves (a forge item run is a chat run on the
             // item's channel), never the host-local `run_id` above.
             agent: Some(compute_service::AgentExecution {
+                native_conversation: None,
                 run_id: runs::run_id_for(&format!("forge:{REPO}:7"), 1, AGENT),
                 attempt: 0,
                 agent_id: AGENT.into(),

@@ -95,6 +95,7 @@ fn frame(
         push_watch(&mut out, prefix, module_id);
     }
     push_u64(&mut out, 0);
+    out.push(0); // absent protected retention catalog
     out
 }
 
@@ -193,6 +194,24 @@ fn decode_is_strict_on_truncation_and_trailing() {
     }
     // and the full image decodes.
     assert!(decode_refs(&enc).is_ok());
+}
+
+#[test]
+fn retention_root_is_canonical_and_changes_the_root() {
+    let mut refs = populated();
+    let before = root_bytes(&refs);
+    refs.retention_root = Some([0x5a; 32]);
+    let encoded = encode_refs(&refs);
+    assert_eq!(encoded_refs_len(&refs), encoded.len());
+    assert_eq!(decode_refs(&encoded).unwrap(), refs);
+    assert_ne!(root_bytes(&refs), before);
+    let flag = encoded.len() - 33;
+    let mut invalid = encoded.clone();
+    invalid[flag] = 2;
+    assert!(decode_refs(&invalid).is_err());
+    for end in flag + 1..encoded.len() {
+        assert!(decode_refs(&encoded[..end]).is_err());
+    }
 }
 
 #[test]

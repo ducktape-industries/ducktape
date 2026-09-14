@@ -77,5 +77,5 @@ ducktape_module_sdk::store_guest! {
     id: MODULE_ID,
     module: Pages,
     shape: ducktape_module_sdk::store_shape(),
-    new: Pages::new(MODULE_ID, Box::new(WitStore)).with_identity("identity").with_attribution(ATTRIBUTION_ID),
+    new: Pages::new(MODULE_ID, Box::new(WitStore)).with_identity("identity").with_attribution(ATTRIBUTION_ID).with_files("files"),
 }

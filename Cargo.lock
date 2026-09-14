@@ -172,6 +172,7 @@ dependencies = [
  "sdk-testkit",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "statesync",
  "syn 2.0.119",
 ]
@@ -3725,6 +3726,7 @@ version = "0.1.0"
 dependencies = [
  "agent",
  "app-update",
+ "attribution",
  "authpage",
  "base64 0.22.1",
  "block2 0.5.1",
@@ -4238,6 +4240,7 @@ dependencies = [
  "attribution",
  "base64 0.22.1",
  "commonware-cryptography",
+ "dispatch 0.1.0",
  "duckfs-core",
  "duckfs-disk",
  "ducktape-module-sdk",
@@ -7777,6 +7780,7 @@ dependencies = [
  "base64 0.22.1",
  "bip39",
  "blobstore",
+ "borsh",
  "bytes",
  "capability",
  "chacha20poly1305 0.10.1",
@@ -7831,6 +7835,7 @@ dependencies = [
  "reachability",
  "recovery",
  "reqwest 0.12.28",
+ "run-envelope",
  "runs",
  "saga",
  "sandbox-host",
@@ -7907,9 +7912,11 @@ dependencies = [
  "nettest",
  "node",
  "node-work",
+ "pages",
  "provider-host",
  "rand 0.8.6",
  "reqwest 0.12.28",
+ "run-envelope",
  "runs",
  "saga",
  "sdk",
@@ -8986,6 +8993,7 @@ dependencies = [
  "attribution",
  "commonware-runtime",
  "ducktape-module-sdk",
+ "files",
  "host",
  "identity",
  "index-guest",
@@ -9684,6 +9692,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "broker-host",
  "capability",
  "futures",
@@ -9692,10 +9701,12 @@ dependencies = [
  "provider-host",
  "rand 0.8.6",
  "reqwest 0.12.28",
+ "run-envelope",
  "runs",
  "sandbox-host",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
  "tracing",
@@ -10512,6 +10523,7 @@ dependencies = [
 name = "run-envelope"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
 ]
 
@@ -10540,6 +10552,7 @@ dependencies = [
  "modules",
  "node-work",
  "pages",
+ "run-envelope",
  "saga",
  "sdk",
  "sdk-testkit",
@@ -10549,6 +10562,7 @@ dependencies = [
  "statesync",
  "syn 2.0.119",
  "tasks",
+ "tempfile",
  "valset",
 ]
 

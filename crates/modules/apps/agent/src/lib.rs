@@ -106,6 +106,7 @@ use sdk::{
 };
 
 use program::{Answer, End, Fact, Frame, Reads, Request, Run};
+use sha2::{Digest, Sha256};
 
 /// the field separator inside composite keys (the shared [`sdk::KEY_SEP`]).
 const SEP: char = sdk::KEY_SEP;
@@ -141,6 +142,28 @@ fn dispatch_correlation_key(dispatch_id: &str) -> Vec<u8> {
 
 fn provision_key(request: u64) -> Vec<u8> {
     format!("preq{SEP}{request}").into_bytes()
+}
+
+fn provision_receipt_key(controller: AccountNumber, request_id: &str) -> Vec<u8> {
+    format!("provision{SEP}{controller}{SEP}{request_id}").into_bytes()
+}
+
+fn initialization_key(account: AccountNumber, request_id: &str) -> Vec<u8> {
+    format!("initialize{SEP}{account}{SEP}{request_id}").into_bytes()
+}
+
+fn validate_provision_request_id(request_id: &str) -> Result<(), Error> {
+    let valid = !request_id.is_empty()
+        && request_id.len() <= MAX_PROVISION_REQUEST_ID_BYTES
+        && !request_id.contains(SEP);
+    if !valid {
+        return Err(module_error("invalid provision request_id"));
+    }
+    Ok(())
+}
+
+fn provision_digest(name: &str, program: &Program) -> [u8; 32] {
+    Sha256::digest(encode_record(&(name, program))).into()
 }
 
 /// the identifier this module queues an invocation's calls under: the
@@ -210,6 +233,8 @@ struct Correlation {
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 struct PendingProvision {
     controller: AccountNumber,
+    request_id: String,
+    request_digest: [u8; 32],
     program: Program,
 }
 
@@ -287,8 +312,14 @@ enum Source {
 enum AgentInput {
     Provision {
         by: Principal,
+        request_id: String,
         name: String,
         program: Program,
+    },
+    Initialize {
+        by: Principal,
+        account: AccountNumber,
+        request_id: String,
     },
     Replace {
         by: Principal,
@@ -344,6 +375,8 @@ impl Reads for CtxReads<'_> {
 /// answer will consume.
 fn decide_provision(
     controller: AccountNumber,
+    request_id: String,
+    request_digest: [u8; 32],
     program: Program,
     last_request: u64,
 ) -> Result<(u64, Plan), Error> {
@@ -355,6 +388,8 @@ fn decide_provision(
         provision_key(request),
         encode_record(&PendingProvision {
             controller,
+            request_id,
+            request_digest,
             program,
         }),
     )?;
@@ -364,17 +399,51 @@ fn decide_provision(
 
 /// the binding identity's answer completes: the pending record consumed,
 /// the binding written at its first revision.
-fn decide_bind(request: u64, account: AccountNumber, program: Program) -> Result<Plan, Error> {
+fn decide_bind(
+    request: u64,
+    account: AccountNumber,
+    pending: PendingProvision,
+) -> Result<Plan, Error> {
     let mut plan = Plan::default();
     plan.delete(provision_key(request));
     plan.put(
         binding_key(account),
         encode_record(&BindingRecord {
-            program,
+            program: pending.program,
             revision: 0,
         }),
     )?;
+    plan.put(
+        provision_receipt_key(pending.controller, &pending.request_id),
+        encode_record(&ProvisionReceipt {
+            account,
+            request_digest: pending.request_digest,
+        }),
+    )?;
     Ok(plan)
+}
+
+fn decide_initialize(receipt: &InitializationReceipt) -> Result<(Plan, AttributionMsg), Error> {
+    let mut plan = Plan::default();
+    plan.put(
+        initialization_key(receipt.account, &receipt.request_id),
+        encode_record(receipt),
+    )?;
+    let report = AttributionMsg::Attribute {
+        object: attribution::ObjectRef {
+            kind: INITIALIZATION_KIND.into(),
+            object: format!("{}/{}", receipt.account, receipt.request_id),
+        },
+        revision: 1,
+        actor: attribution::Actor::Account(receipt.controller),
+        relations: vec![attribution::Relation {
+            recipient: receipt.account,
+            reason: Reason::Defined(INITIALIZATION_REASON.into()),
+            detail: Vec::new(),
+        }],
+        transfers: Vec::new(),
+    };
+    Ok((plan, report))
 }
 
 /// a replacement: the binding at its next revision. the standing re-set
@@ -1069,9 +1138,24 @@ impl AgentModule {
                 Delivery::CallCompleted(completed) => AgentInput::CallCompleted { completed },
             },
             Source::Principal(by) => match decode_msg(payload).map_err(Error::Module)? {
-                AgentMsg::Provision { name, program } => {
-                    AgentInput::Provision { by, name, program }
-                }
+                AgentMsg::Provision {
+                    request_id,
+                    name,
+                    program,
+                } => AgentInput::Provision {
+                    by,
+                    request_id,
+                    name,
+                    program,
+                },
+                AgentMsg::Initialize {
+                    account,
+                    request_id,
+                } => AgentInput::Initialize {
+                    by,
+                    account,
+                    request_id,
+                },
                 AgentMsg::Replace { account, program } => AgentInput::Replace {
                     by,
                     account,
@@ -1091,13 +1175,37 @@ impl AgentModule {
         &mut self,
         ctx: &mut dyn Ctx,
         by: Principal,
+        request_id: String,
         name: String,
         program: Program,
     ) -> Result<(), Error> {
-        program::validate_program(&program, &self.id)?;
+        validate_provision_request_id(&request_id)?;
         let controller = self.acting_account(&CtxReads(&*ctx), &by).await?;
+        let request_digest = provision_digest(&name, &program);
+        let receipt: Option<ProvisionReceipt> = self
+            .record(&provision_receipt_key(controller, &request_id))
+            .await?;
+        if let Some(receipt) = receipt {
+            let same_request = receipt.request_digest == request_digest;
+            if !same_request {
+                return Err(module_error(
+                    "provision request_id was used with different content",
+                ));
+            }
+            ctx.set_assigned(encode_assigned(&AgentAssigned::Provisioned {
+                account: receipt.account,
+            }));
+            return Ok(());
+        }
+        program::validate_program(&program, &self.id)?;
         let last_request = self.last_request().await?;
-        let (request, plan) = decide_provision(controller, program, last_request)?;
+        let (request, plan) = decide_provision(
+            controller,
+            request_id,
+            request_digest,
+            program,
+            last_request,
+        )?;
         self.stage_plan(plan);
         self.emit_subscription(ctx);
         self.emit_identity(
@@ -1151,9 +1259,68 @@ impl AgentModule {
         if already_bound {
             return Err(module_error(format!("account {account} is already bound")));
         }
-        let plan = decide_bind(request, account, pending.program)?;
+        let plan = decide_bind(request, account, pending)?;
         self.stage_plan(plan);
         ctx.set_assigned(encode_assigned(&AgentAssigned::Provisioned { account }));
+        Ok(())
+    }
+
+    /// Initialization is an explicit controller input, never a boot hook.
+    /// The ordinary program decides what its attributed event should do.
+    async fn on_initialize(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        by: Principal,
+        account: AccountNumber,
+        request_id: String,
+    ) -> Result<(), Error> {
+        validate_provision_request_id(&request_id)?;
+        let reads = CtxReads(&*ctx);
+        let acting = self.acting_account(&reads, &by).await?;
+        let Executed::Live {
+            controller,
+            standing,
+            ..
+        } = self.executed_account(&reads, account).await?
+        else {
+            return Err(module_error("a revoked program cannot be initialized"));
+        };
+        let is_controller = acting == controller;
+        if !is_controller {
+            return Err(module_error(
+                "only the current controller initializes a program",
+            ));
+        }
+        let existing: Option<InitializationReceipt> = self
+            .record(&initialization_key(account, &request_id))
+            .await?;
+        if existing.is_some() {
+            ctx.set_assigned(encode_assigned(&AgentAssigned::Initialized {
+                account,
+                request_id,
+            }));
+            return Ok(());
+        }
+        let is_active = standing == ProgramStanding::Active;
+        if !is_active {
+            return Err(module_error("a suspended program cannot be initialized"));
+        }
+        let Some(binding) = self.binding(account).await? else {
+            return Err(module_error("an unbound program cannot be initialized"));
+        };
+        let receipt = InitializationReceipt {
+            account,
+            controller,
+            request_id: request_id.clone(),
+            binding_revision: binding.revision,
+        };
+        let (plan, report) = decide_initialize(&receipt)?;
+        self.stage_plan(plan);
+        self.emit_reports(ctx, vec![report]);
+        ctx.set_assigned(encode_assigned(&AgentAssigned::Initialized {
+            account,
+            request_id,
+        }));
         Ok(())
     }
 
@@ -1457,9 +1624,17 @@ impl AgentModule {
     /// lints this shape from source.
     async fn dispatch(&mut self, ctx: &mut dyn Ctx, input: AgentInput) -> Result<(), Error> {
         match input {
-            AgentInput::Provision { by, name, program } => {
-                self.on_provision(ctx, by, name, program).await
-            }
+            AgentInput::Provision {
+                by,
+                request_id,
+                name,
+                program,
+            } => self.on_provision(ctx, by, request_id, name, program).await,
+            AgentInput::Initialize {
+                by,
+                account,
+                request_id,
+            } => self.on_initialize(ctx, by, account, request_id).await,
             AgentInput::Replace {
                 by,
                 account,
@@ -1579,6 +1754,26 @@ impl Module for AgentModule {
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         let reply = match decode_query(req).map_err(Error::Module)? {
+            AgentQuery::Initialization {
+                account,
+                request_id,
+            } => {
+                validate_provision_request_id(&request_id)?;
+                AgentReply::Initialization(
+                    self.record(&initialization_key(account, &request_id))
+                        .await?,
+                )
+            }
+            AgentQuery::Provision {
+                controller,
+                request_id,
+            } => {
+                validate_provision_request_id(&request_id)?;
+                AgentReply::Provision(
+                    self.record(&provision_receipt_key(controller, &request_id))
+                        .await?,
+                )
+            }
             AgentQuery::Binding { account } => {
                 AgentReply::Binding(self.binding_view(account).await?)
             }
@@ -1843,10 +2038,12 @@ mod tests {
         /// the whole provisioning unit as the host runs it: the op, then
         /// identity founding the account and answering. returns the account.
         fn provision(&mut self, origin: Origin, program: Program) -> AccountNumber {
+            let request_id = format!("program-{}", self.directory.borrow().accounts.len());
             let ctx = self
                 .submit(
                     origin,
                     &AgentMsg::Provision {
+                        request_id,
                         name: "bot".into(),
                         program,
                     },
@@ -2110,12 +2307,209 @@ mod tests {
     // ---- provisioning ------------------------------------------------------------------
 
     #[test]
+    fn provision_retry_returns_the_committed_account_without_rebinding_or_emitting() {
+        let mut world = World::new();
+        let request_id = format!("program-{}", world.directory.borrow().accounts.len());
+        let program = finish_program();
+        let account = world.provision(alice(), program.clone());
+        let request = AgentMsg::Provision {
+            request_id: request_id.clone(),
+            name: "bot".into(),
+            program: program.clone(),
+        };
+        let root = world.module.root();
+        let ctx = world.submit(alice(), &request).unwrap();
+        assert!(ctx.msgs().is_empty());
+        assert_eq!(
+            decode_assigned(ctx.assigned().unwrap()).unwrap(),
+            AgentAssigned::Provisioned { account }
+        );
+        block_on(world.module.commit_block()).unwrap();
+        assert_eq!(world.module.root(), root);
+        assert_eq!(
+            world.query(&AgentQuery::Provision {
+                controller: ALICE,
+                request_id: request_id.clone(),
+            }),
+            AgentReply::Provision(Some(ProvisionReceipt {
+                account,
+                request_digest: provision_digest("bot", &program),
+            }))
+        );
+
+        let replacement = reply_program();
+        world
+            .submit(
+                alice(),
+                &AgentMsg::Replace {
+                    account,
+                    program: replacement.clone(),
+                },
+            )
+            .unwrap();
+        block_on(world.module.commit_block()).unwrap();
+        let replaced_root = world.module.root();
+        let retry = world.submit(alice(), &request).unwrap();
+        assert!(retry.msgs().is_empty());
+        block_on(world.module.commit_block()).unwrap();
+        assert_eq!(world.module.root(), replaced_root);
+        assert_eq!(
+            block_on(world.module.binding(account))
+                .unwrap()
+                .unwrap()
+                .program,
+            replacement
+        );
+    }
+
+    #[test]
+    fn provision_request_identity_is_controller_scoped_and_conflicting_reuse_is_refused() {
+        let mut world = World::new();
+        let request_id = format!("program-{}", world.directory.borrow().accounts.len());
+        let account = world.provision(alice(), finish_program());
+        let request = AgentMsg::Provision {
+            request_id: request_id.clone(),
+            name: "a different bot".into(),
+            program: finish_program(),
+        };
+        let root = world.module.root();
+        assert!(world.submit(alice(), &request).is_err());
+        block_on(world.module.commit_block()).unwrap();
+        assert_eq!(world.module.root(), root);
+
+        let ctx = world.submit(bob(), &request).unwrap();
+        let messages = identity_msgs(&ctx);
+        let [
+            IdentityMsg::CreateProgram {
+                controller,
+                request,
+                ..
+            },
+        ] = messages.as_slice()
+        else {
+            panic!("expected one provision for another controller");
+        };
+        assert_eq!(*controller, BOB);
+        let other = world.directory.borrow_mut().found_program(BOB, ME);
+        world.program_created(*request, other, BOB).unwrap();
+        block_on(world.module.commit_block()).unwrap();
+        assert_ne!(account, other);
+        let AgentReply::Provision(Some(receipt)) = world.query(&AgentQuery::Provision {
+            controller: BOB,
+            request_id,
+        }) else {
+            panic!("missing committed receipt");
+        };
+        assert_eq!(receipt.account, other);
+    }
+
+    #[test]
+    fn malformed_provision_request_ids_leave_no_pending_installation() {
+        for request_id in [
+            String::new(),
+            format!("bad{SEP}id"),
+            "x".repeat(MAX_PROVISION_REQUEST_ID_BYTES + 1),
+        ] {
+            let mut world = World::new();
+            let root = world.module.root();
+            assert!(
+                world
+                    .submit(
+                        alice(),
+                        &AgentMsg::Provision {
+                            request_id,
+                            name: "bot".into(),
+                            program: finish_program(),
+                        }
+                    )
+                    .is_err()
+            );
+            block_on(world.module.commit_block()).unwrap();
+            assert_eq!(world.module.root(), root);
+            assert_eq!(block_on(world.module.last_request()).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn initialization_is_explicit_controller_authorized_and_delivered_once() {
+        let mut world = World::new();
+        let account = world.provision(alice(), finish_program());
+        assert_eq!(
+            world.query(&AgentQuery::Invocations {
+                account,
+                after: 0,
+                limit: 10
+            }),
+            AgentReply::Invocations(Vec::new())
+        );
+        let request = AgentMsg::Initialize {
+            account,
+            request_id: "install".into(),
+        };
+        assert!(world.submit(bob(), &request).is_err());
+        let ctx = world.submit(alice(), &request).unwrap();
+        let reports = ctx
+            .msgs()
+            .iter()
+            .filter(|msg| msg.target == ATTRIBUTION)
+            .collect::<Vec<_>>();
+        assert_eq!(reports.len(), 1);
+        let AttributionMsg::Attribute {
+            object,
+            actor,
+            relations,
+            revision,
+            ..
+        } = attribution::decode_msg(&reports[0].payload).unwrap()
+        else {
+            panic!("initialization must be an attributed source event");
+        };
+        assert_eq!(
+            object,
+            attribution::ObjectRef {
+                kind: INITIALIZATION_KIND.into(),
+                object: format!("{account}/install")
+            }
+        );
+        assert_eq!(actor, attribution::Actor::Account(ALICE));
+        assert_eq!(revision, 1);
+        assert_eq!(
+            relations,
+            vec![attribution::Relation {
+                recipient: account,
+                reason: Reason::Defined(INITIALIZATION_REASON.into()),
+                detail: Vec::new()
+            }]
+        );
+        block_on(world.module.commit_block()).unwrap();
+        let root = world.module.root();
+        let retry = world.submit(alice(), &request).unwrap();
+        assert!(retry.msgs().is_empty());
+        block_on(world.module.commit_block()).unwrap();
+        assert_eq!(world.module.root(), root);
+        assert!(world.submit(bob(), &request).is_err());
+        assert_eq!(
+            world.query(&AgentQuery::Initialization {
+                account,
+                request_id: "install".into()
+            }),
+            AgentReply::Initialization(Some(InitializationReceipt {
+                account,
+                controller: ALICE,
+                request_id: "install".into(),
+                binding_revision: 0
+            }))
+        );
+    }
+
+    #[test]
     fn provision_stages_a_correlated_request_and_binds_on_the_authenticated_answer() {
         let mut world = World::new();
         let ctx = world
             .submit(
                 alice(),
                 &AgentMsg::Provision {
+                    request_id: "bot".into(),
                     name: "bot".into(),
                     program: reply_program(),
                 },
@@ -2168,6 +2562,7 @@ mod tests {
             .submit(
                 bob(),
                 &AgentMsg::Provision {
+                    request_id: "bot2".into(),
                     name: "bot2".into(),
                     program: finish_program(),
                 },
@@ -2190,6 +2585,7 @@ mod tests {
             .submit(
                 alice(),
                 &AgentMsg::Provision {
+                    request_id: "bot".into(),
                     name: "bot".into(),
                     program: finish_program(),
                 },
@@ -2301,6 +2697,7 @@ mod tests {
         let mut world = World::new();
         let program = finish_program();
         let msg = AgentMsg::Provision {
+            request_id: "bot".into(),
             name: "bot".into(),
             program,
         };
@@ -3283,6 +3680,7 @@ mod tests {
                     .submit(
                         alice(),
                         &AgentMsg::Provision {
+                            request_id: "invalid".into(),
                             name: "bot".into(),
                             program: program.clone(),
                         }
@@ -3675,7 +4073,7 @@ mod tests {
     #[test]
     fn dispatch_shape_is_one_arm_per_variant() {
         let (dispatch, variants) = parsed_dispatch();
-        assert_eq!(variants.len(), 7);
+        assert_eq!(variants.len(), 8);
         assert_eq!(dispatch_shape::check(&dispatch, &variants), Ok(()));
     }
 
@@ -3770,7 +4168,7 @@ mod tests {
                 wildcard_pattern,
                 "wildcard arm where Provision belongs",
             ),
-            ("a catch-all arm", catch_all_arm, "8 arms, 7 variants"),
+            ("a catch-all arm", catch_all_arm, "9 arms, 8 variants"),
             ("a guard", guarded_arm, "arm Provision has a guard"),
             (
                 "a mis-named handler",

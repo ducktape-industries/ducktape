@@ -68,7 +68,18 @@ pub(crate) fn query<S: ObjectStore>(fs: &Fs<S>, q: FilesQuery) -> Result<FilesRe
         FilesQuery::Diff { from, to, prefix } => diff(fs, &from, &to, &prefix),
         FilesQuery::Refs {} => refs(fs),
         FilesQuery::HasChunks { ids } => has_chunks(fs, &ids),
+        FilesQuery::Retention { module_id, key } => retention(fs, &module_id, &key),
     }
+}
+
+fn retention<S: ObjectStore>(fs: &Fs<S>, module: &str, key: &str) -> Result<FilesReply, String> {
+    let store = Store {
+        store: fs.store_ref(),
+        pending: &[],
+        budget: None,
+    };
+    crate::retention::get(&store, fs.refs_view().retention_root, module, key)
+        .map(FilesReply::Retention)
 }
 
 /// the client staging probe: for each requested chunk id, is it staged in the
@@ -101,8 +112,8 @@ fn has_chunks<S: ObjectStore>(fs: &Fs<S>, ids: &[String]) -> Result<FilesReply, 
 }
 
 /// resolve the committed snapshot a read runs against. `None` reads the committed
-/// head; `Some(hex)` must resolve to the head, the bounded history window, or a
-/// pin of the COMMITTED refs, else `snapshot not resolvable`. shared by every
+/// head; `Some(hex)` must resolve to the head, bounded history window, public pin,
+/// or protected reference of COMMITTED refs, else `snapshot not resolvable`. Shared by every
 /// snapshot-addressable read (stat/ls/read) so they agree on the membership rule.
 fn resolve_head<S: ObjectStore>(
     fs: &Fs<S>,
@@ -114,7 +125,12 @@ fn resolve_head<S: ObjectStore>(
         Some(hex) => {
             let id =
                 from_hex_32(hex).ok_or_else(|| "files: snapshot not resolvable".to_string())?;
-            if !refs_contains_snapshot(refs, &id) {
+            let store = Store {
+                store: fs.store_ref(),
+                pending: &[],
+                budget: None,
+            };
+            if !refs_contains_snapshot(refs, &store, &id)? {
                 return Err("files: snapshot not resolvable".into());
             }
             Ok(Some(id))

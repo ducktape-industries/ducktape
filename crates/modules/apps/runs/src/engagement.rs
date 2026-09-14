@@ -6,6 +6,11 @@ use super::*;
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum RunRequest {
+    Conversation {
+        agent_id: String,
+        conversation_id: String,
+        turn: u64,
+    },
     Manual {
         requester: RunOrigin,
         agent_id: String,
@@ -71,8 +76,27 @@ impl RunsModule {
             ));
         }
         let own_request = change.source.module == self.id && change.source.kind == "run_request";
+        if !own_request && let Some(conversation) = self.conversation_for_account(account).await? {
+            return self
+                .admit_conversation_attribution(ctx, &conversation, change)
+                .await;
+        }
         let run_id = if own_request {
             match sdk::wire::decode::<RunRequest>(&change.detail).map_err(Error::Module)? {
+                RunRequest::Conversation {
+                    agent_id: requested,
+                    conversation_id,
+                    turn,
+                } => {
+                    if requested != agent_id {
+                        return Err(Error::Module(
+                            "conversation request names another model".into(),
+                        ));
+                    }
+                    return self
+                        .request_conversation_turn(ctx, conversation_id, turn)
+                        .await;
+                }
                 RunRequest::Job {
                     agent_id: requested,
                     job_id,

@@ -320,6 +320,55 @@ pub(crate) fn render_payload(
     )
 }
 
+pub(crate) fn render_resident_payload(
+    agent: &ModelRecord,
+    run_id: &str,
+    state: &crate::ConversationView,
+    events: &[crate::ConversationEvent],
+    portable: PortableInputs,
+) -> Vec<u8> {
+    let input = serde_json::to_string(events).expect("conversation events serialize");
+    with_native_conversation(envelope(agent, run_id, input, portable), state, events)
+}
+
+pub(crate) fn with_native_conversation(
+    payload: String,
+    state: &crate::ConversationView,
+    events: &[crate::ConversationEvent],
+) -> Vec<u8> {
+    let from = events
+        .first()
+        .expect("native input is nonempty")
+        .sequence
+        .checked_sub(1)
+        .expect("native input sequences start at one");
+    let through = events.last().expect("native input is nonempty").sequence;
+    let native = run_envelope::NativeConversation {
+        conversation_id: state.conversation_id.clone(),
+        turn_id: crate::conversation_turn_id(from, through),
+        revision: state.history.as_ref().map(|h| h.revision).unwrap_or(0),
+        history_prefix: state.history_prefix.clone(),
+        history_snapshot: state.history.as_ref().map(|h| h.snapshot.clone()),
+        session_path: state.session_path.clone(),
+        packages: state.packages.clone(),
+        events: events
+            .iter()
+            .map(|event| run_envelope::NativeConversationEvent {
+                sequence: event.sequence,
+                operation_id: event.operation_id.clone(),
+                actor: serde_json::to_value(&event.actor).expect("origin serializes"),
+                input: serde_json::to_value(&event.input).expect("input serializes"),
+                admitted_at: event.admitted_at,
+            })
+            .collect(),
+    };
+    let mut value: serde_json::Value =
+        serde_json::from_str(&payload).expect("authored envelope is JSON");
+    value["native_conversation"] =
+        serde_json::to_value(native).expect("native descriptor serializes");
+    serde_json::to_vec(&value).expect("envelope serializes")
+}
+
 /// compose a job run's payload: same envelope, no thread key, and the
 /// conversation is the job's coordinates plus its FULL submitted spec.
 pub(crate) fn render_job_payload(

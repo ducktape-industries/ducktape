@@ -6,7 +6,8 @@ impl Pages {
     /// on error. `actor` is the canonical party the op is recorded under (the
     /// current account, or the signing key of one that has not joined an
     /// account): `CreatePage` records it as the page's author and the comment
-    /// ops record it on what they write; no op gates on a recorded author.
+    /// ops record it on what they write. Managed collections gate on their
+    /// recorded writer and reject all ordinary block mutation routes.
     /// `now` is consulted only by the comment ops (their stored timestamps).
     pub(super) async fn apply(
         &mut self,
@@ -19,6 +20,9 @@ impl Pages {
         // key lead with NUL, so rejecting NUL-prefixed ids here — BEFORE any
         // storage touch — keeps a block/comment write from ever clobbering them.
         let named: Vec<&str> = match &msg {
+            PageMsg::CreateRecordCollection { .. } | PageMsg::CommitRecords { .. } => {
+                return Err(PageError::InvalidRecordBatch);
+            }
             PageMsg::CreatePage {
                 page_id, blocks, ..
             } => std::iter::once(page_id.as_str())
@@ -56,6 +60,21 @@ impl Pages {
         };
         if named.iter().any(|id| id.starts_with('\u{0}')) {
             return Err(PageError::ReservedId);
+        }
+
+        match &msg {
+            PageMsg::InsertBlock { .. }
+            | PageMsg::UpdateText { .. }
+            | PageMsg::SetSpanMark { .. }
+            | PageMsg::SetKind { .. }
+            | PageMsg::SetChecked { .. }
+            | PageMsg::MoveBlock { .. }
+            | PageMsg::RemoveBlock { .. } => {
+                for id in named {
+                    self.guard_unmanaged_block(id).await?;
+                }
+            }
+            _ => {}
         }
 
         if matches!(

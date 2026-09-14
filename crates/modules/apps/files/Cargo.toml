@@ -49,6 +49,8 @@ commonware-cryptography = { workspace = true }
 # the host e2e + cross-host determinism suite stands the real `Files` module on
 # the deterministic kernel host and drives it through `submit_at`/`query`.
 host = { workspace = true }
+# Actual call receipts must carry minted snapshot IDs through assigned stamps.
+dispatch = { workspace = true }
 # the shared `TestCtx` the duckfs harness builds on (dev-only, Module Rule intact).
 sdk-testkit = { workspace = true }
 futures = "0.3"

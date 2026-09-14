@@ -80,14 +80,16 @@ pub(crate) struct AgentArgs {
     cmd: AgentCmd,
     #[command(flatten)]
     addr: NodeAddr,
-    /// path to the user key file that signs a `sched`, `cancel` or `reassign`
-    /// submit (defaults to the keystore's active wallet)
+    /// path to the user key file signing Chief, `sched`, `cancel` and
+    /// `reassign` submits (defaults to the keystore's active wallet)
     #[arg(long, value_name = "PATH", global = true)]
     key: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, clap::Subcommand)]
 pub(crate) enum AgentCmd {
+    /// explicitly install and control a network-resident Chief
+    Chief(crate::chief_cli::ChiefArgs),
     /// attach this terminal to a sandboxed provider (raw pty, resize-aware)
     Pty(PtyArgs),
     /// print the current default programmable model-user script as JSON
@@ -233,6 +235,7 @@ pub(crate) fn run(args: AgentArgs) -> AgentResult {
         // the node's WORKSPACE too (its 0600 service-link token admits the
         // session's ws topic), and only the ladder knows which workspace the
         // address it just resolved belongs to.
+        AgentCmd::Chief(chief) => crate::chief_cli::run(chief, &ctx, &mut stdin),
         AgentCmd::ModelProgram { model_id } => cmd_model_program(&model_id),
         AgentCmd::Pty(pty) => cmd_pty(pty, &ctx.http_base()?, &ctx.addr),
         AgentCmd::Sched(sched) => cmd_sched(sched, &ctx, &mut stdin),

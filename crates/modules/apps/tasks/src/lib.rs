@@ -46,9 +46,11 @@ mod job_board;
 mod task_board;
 
 pub use job_board::{
-    ATTEMPTS_EXHAUSTED_RESULT, MAX_ATTEMPTS, MAX_JOB_COMMENT_TEXT_BYTES, MAX_JOB_COMMENTS,
-    MAX_JOB_ID, MAX_JOBS, MAX_KIND, MAX_LEASE_VIEWS, MAX_LIVE_JOBS_PER_SUBMITTER, MAX_PAYLOAD,
-    MAX_SPEC, MAX_WORKER_MODULE_ID, MAX_WORKERS, MIN_LEASE_VIEWS,
+    ATTEMPTS_EXHAUSTED_RESULT, MAX_ATTEMPTS, MAX_CONTROL_ACKNOWLEDGEMENTS,
+    MAX_JOB_COMMENT_TEXT_BYTES, MAX_JOB_COMMENTS, MAX_JOB_CONTROLS, MAX_JOB_ID, MAX_JOBS, MAX_KIND,
+    MAX_LEASE_VIEWS, MAX_LIVE_JOBS_PER_SUBMITTER, MAX_NATIVE_RUN_ID_BYTES, MAX_PAYLOAD, MAX_SPEC,
+    MAX_WORKER_EXECUTIONS, MAX_WORKER_MODULE_ID, MAX_WORKER_REPORTS, MAX_WORKER_TEXT_BYTES,
+    MAX_WORKERS, MIN_LEASE_VIEWS,
 };
 pub use task_board::{MAX_LIST_LIMIT, MAX_OPEN_TASKS_PER_OWNER, MAX_TASK_ID, MAX_TASKS};
 
@@ -63,6 +65,8 @@ pub mod index;
 // (feature `index-guest`), never by the native build.
 #[cfg(feature = "index-guest")]
 mod index_guest;
+
+use sha2::{Digest, Sha256};
 
 use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
@@ -299,6 +303,92 @@ fn job_relations(job: &Job) -> Vec<attribution::Relation> {
     relations
 }
 
+/// Reasons remain static; operation identity belongs to the immutable source,
+/// not to a dynamic reason name or a detail-only update of a retained relation.
+fn worker_event_identity(msg: &JobsMsg) -> Option<(&'static str, &str)> {
+    match msg {
+        JobsMsg::Submit { .. } | JobsMsg::SubmitConversation { .. } => {
+            Some(("worker_submitted", ""))
+        }
+        JobsMsg::Continue { operation_id, .. } => Some(("worker_continued", operation_id)),
+        JobsMsg::Control { operation_id, .. } => Some(("worker_control", operation_id)),
+        JobsMsg::AcknowledgeControl { operation_id, .. } => {
+            Some(("worker_control_acknowledged", operation_id))
+        }
+        JobsMsg::Checkpoint {
+            kind, operation_id, ..
+        } => match kind {
+            WorkerReportKind::Checkpoint => Some(("worker_checkpoint", operation_id)),
+            WorkerReportKind::Report => Some(("worker_report", operation_id)),
+        },
+        JobsMsg::SettleCancellation { operation_id, .. } => {
+            Some(("worker_cancelled", operation_id))
+        }
+        JobsMsg::Cancel { .. } => Some(("worker_cancelled", "")),
+        JobsMsg::Finalize { .. } => Some(("worker_settled", "")),
+        JobsMsg::Comment { .. }
+        | JobsMsg::Claim { .. }
+        | JobsMsg::Release { .. }
+        | JobsMsg::Reclaim { .. }
+        | JobsMsg::Prune { .. }
+        | JobsMsg::RegisterWorker { .. }
+        | JobsMsg::UnregisterWorker { .. }
+        | JobsMsg::CheckpointNativeHistory { .. } => None,
+    }
+}
+
+/// Each conversation event adds a fresh relation, so every checkpoint and receipt
+/// is delivered even when its recipient and reason match an earlier event.
+/// One-shot jobs retain only their ordinary lifecycle and Result attribution.
+fn job_event_report(
+    job: &Job,
+    actor: &Party,
+    height: u64,
+    operation: JobsMsg,
+) -> Option<attribution::AttributionMsg> {
+    let is_conversation = job.execution == JobExecution::Conversation;
+    if !is_conversation {
+        return None;
+    }
+    let Party::Account(recipient) = &job.submitter else {
+        return None;
+    };
+    let (reason, operation_id) = worker_event_identity(&operation)?;
+    let identity = sdk::wire::encode(&(
+        &job.job_id,
+        job.created_at_revision,
+        reason,
+        operation_id,
+        job.attempt,
+    ));
+    let object = format!("{:x}", Sha256::digest(identity));
+    let detail = JobEventDetail {
+        job_id: job.job_id.clone(),
+        conversation_id: job.conversation_id.clone(),
+        job_kind: job.kind.clone(),
+        created_at_revision: job.created_at_revision,
+        job_attempt: job.attempt,
+        submitter: job.submitter.clone(),
+        actor: actor.clone(),
+        height,
+        operation,
+    };
+    Some(attribution::AttributionMsg::Attribute {
+        object: attribution::ObjectRef {
+            kind: "job_event".into(),
+            object,
+        },
+        revision: 1,
+        actor: actor.clone(),
+        relations: vec![attribution::Relation {
+            recipient: *recipient,
+            reason: attribution::Reason::Defined(reason.into()),
+            detail: sdk::wire::encode(&detail),
+        }],
+        transfers: Vec::new(),
+    })
+}
+
 impl Tasks {
     fn publish(
         &mut self,
@@ -366,11 +456,40 @@ impl Tasks {
         Ok(())
     }
 
+    /// Machine heads participate in consensus and retention, not in source
+    /// attribution: a snapshot boundary is not a semantic report to an account.
+    async fn on_native_history(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        job_id: String,
+        msg: JobsMsg,
+        actor: &Party,
+    ) -> Result<(), Error> {
+        job_board::execute(&mut self.staged, ctx, msg, actor, &self.id).await?;
+        let after = job_board::load(&self.staged, &job_id).await?;
+        ctx.set_assigned(encode_assigned(&WorkAssigned::Job {
+            actor: actor.clone(),
+        }));
+        ctx.set_output(encode_job_reply(&JobsReply::Job(after)));
+        Ok(())
+    }
+
     async fn on_job(&mut self, ctx: &mut dyn Ctx, msg: JobsMsg) -> Result<(), Error> {
         let actor = actor_from_origin(ctx, &self.identity).await?;
         let job_id = match &msg {
+            JobsMsg::CheckpointNativeHistory { job_id, .. } => {
+                return self
+                    .on_native_history(ctx, job_id.clone(), msg, &actor)
+                    .await;
+            }
             JobsMsg::Comment { job_id, .. }
             | JobsMsg::Submit { job_id, .. }
+            | JobsMsg::SubmitConversation { job_id, .. }
+            | JobsMsg::Continue { job_id, .. }
+            | JobsMsg::Control { job_id, .. }
+            | JobsMsg::AcknowledgeControl { job_id, .. }
+            | JobsMsg::SettleCancellation { job_id, .. }
+            | JobsMsg::Checkpoint { job_id, .. }
             | JobsMsg::Claim { job_id, .. }
             | JobsMsg::Finalize { job_id, .. }
             | JobsMsg::Release { job_id }
@@ -383,6 +502,7 @@ impl Tasks {
         };
         let revision = next_revision(&self.staged, "job", &job_id).await?;
         let before = job_board::load(&self.staged, &job_id).await?;
+        let worker_operation = worker_event_identity(&msg).map(|_| msg.clone());
         job_board::execute(&mut self.staged, ctx, msg, &actor, &self.id).await?;
         let after = job_board::load(&self.staged, &job_id).await?;
         ctx.set_assigned(encode_assigned(&WorkAssigned::Job {
@@ -393,6 +513,9 @@ impl Tasks {
             return Ok(());
         }
         let relations = after.as_ref().map(job_relations).unwrap_or_default();
+        let event = worker_operation.and_then(|operation| {
+            job_event_report(after.as_ref()?, &actor, ctx.env().height, operation)
+        });
         self.publish(
             ctx,
             actor,
@@ -403,6 +526,12 @@ impl Tasks {
             revision,
             relations,
         );
+        if let Some(event) = event {
+            ctx.emit_msg(Msg {
+                target: self.attribution.clone(),
+                payload: attribution::encode_msg(&event),
+            });
+        }
         Ok(())
     }
 }

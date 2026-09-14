@@ -216,6 +216,7 @@ impl Network {
             msg(
                 "agent",
                 &agent::AgentMsg::Provision {
+                    request_id: "builder".into(),
                     name: "Builder".into(),
                     program,
                 },

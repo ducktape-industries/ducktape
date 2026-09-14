@@ -267,6 +267,7 @@ fn duckfs_spec(agent: Option<&str>, mounts: Vec<RoMount>) -> WorkspaceSpec {
     WorkspaceSpec {
         run_id: "s1:0".into(),
         agent: agent.map(|id| compute_service::AgentExecution {
+            native_conversation: None,
             run_id: consensus_run_id(),
             attempt: 0,
             agent_id: id.into(),
@@ -705,10 +706,13 @@ async fn tool_http_waits_for_the_actual_committed_outcome_and_surfaces_target_fa
         let (handle, commands, hub) = NodeHandle::channel();
         let (actor, state, mut observed) = spawn_receipt_actor(commands);
         let link = test_link(handle).await;
-        let session = super::session::open(&link, &duckfs_spec(Some("quackbot"), Vec::new()))
-            .await
-            .unwrap()
-            .expect("agent session");
+        let workdir = tempfile::tempdir().unwrap();
+        let session = super::session::open(
+            &link, &duckfs_spec(Some("quackbot"), Vec::new()), workdir.path(),
+        )
+        .await
+        .unwrap()
+        .expect("agent session");
         let request = request_tool_action(&session);
         observed
             .recv()
@@ -786,10 +790,12 @@ async fn disconnecting_the_registered_receipt_stream_fails_the_pending_tool_requ
     });
     let link =
         NodeLink::new(format!("http://{address}")).with_workspace_credential(directory.path());
-    let session = super::session::open(&link, &duckfs_spec(Some("quackbot"), Vec::new()))
-        .await
-        .unwrap()
-        .expect("agent session");
+    let session = super::session::open(
+        &link, &duckfs_spec(Some("quackbot"), Vec::new()), directory.path(),
+    )
+    .await
+    .unwrap()
+    .expect("agent session");
     let request = request_tool_action(&session);
     observed.recv().await.unwrap();
     assert!(!request.is_finished());
