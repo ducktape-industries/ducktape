@@ -266,6 +266,17 @@ pub(crate) async fn load_channel_window_data(
     })
 }
 
+/// The huddle room's member roll, for the invite chips: the room the reader
+/// is seated in is not necessarily the one on screen (a voice room), so the
+/// active channel's roll cannot stand in for it.
+pub async fn load_huddle_invitees(
+    rpc: String,
+    channel_id: String,
+) -> Result<Vec<ChatMember>, String> {
+    let client = rpc_client(&rpc)?;
+    load_channel_members(&client, &channel_id, &names()).await
+}
+
 pub(crate) async fn load_channel_members(
     rpc: &RpcClient,
     channel_id: &str,
