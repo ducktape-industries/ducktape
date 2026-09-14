@@ -9,7 +9,7 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{
     Copy, Cut, Editor, EditorState, InputEvent, Paste, TextDecoration, TextDecorationCollection,
 };
-use gpui_kit::component::{ActiveTheme, Disableable};
+use gpui_kit::component::{ActiveTheme, Disableable, Sizable as _};
 use gpui_kit::{
     App, AppContext, ClipboardItem, Context, Entity, EventEmitter, FontWeight, HighlightStyle,
     InteractiveElement, IntoElement, KeyDownEvent, Keystroke, ParentElement, Render,
@@ -31,6 +31,17 @@ struct Document {
     menu: MenuState,
     handles: Vec<chat::client::MentionChoice>,
     mentions: Mentions,
+    /// Local files waiting to go with the next send. The paths never cross
+    /// the wire: the send uploads their bytes and links the copies.
+    attachments: Vec<Attachment>,
+    /// Why the last attach was refused; empty once one succeeds.
+    attach_note: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    pub path: String,
+    pub name: String,
+    pub bytes: u64,
 }
 #[derive(Default)]
 struct MenuState {
@@ -96,6 +107,66 @@ pub fn seed(scope: &str, body: &str) {
     slot.document.failed.clear();
     slot.focus_pending = true;
     slot.rev += 1;
+}
+
+thread_local! {
+    /// What a submitted send takes with it, keyed by the operation id the
+    /// submit minted: the app collects it when it runs the send, so the
+    /// intent wire stays the four fields it is.
+    static SENT_ATTACHMENTS: RefCell<HashMap<String, Vec<Attachment>>> = RefCell::default();
+}
+
+/// The files a submit with this operation id attached, handed over once.
+pub fn take_attachments(operation_id: &str) -> Vec<Attachment> {
+    SENT_ATTACHMENTS.with_borrow_mut(|sent| sent.remove(operation_id).unwrap_or_default())
+}
+
+/// Queue local files onto the composer under `scope`. A path that is not a
+/// readable file is refused with the reason; the rest are kept in order,
+/// a path already queued is not queued twice.
+pub fn attach(scope: &str, paths: &[String]) -> Result<(), String> {
+    let shared = slot(scope);
+    let mut slot = lock(&shared);
+    for path in paths {
+        let attachment = attachment_of(path)?;
+        let queued = slot.document.attachments.iter().any(|a| a.path == *path);
+        if queued {
+            continue;
+        }
+        slot.document.attachments.push(attachment);
+        slot.rev += 1;
+    }
+    Ok(())
+}
+
+fn attachment_of(path: &str) -> Result<Attachment, String> {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{path} has no file name"))?
+        .to_owned();
+    let meta = std::fs::metadata(path).map_err(|error| format!("cannot read {name}: {error}"))?;
+    if !meta.is_file() {
+        return Err(format!("{name} is not a file"));
+    }
+    Ok(Attachment {
+        path: path.to_owned(),
+        name,
+        bytes: meta.len(),
+    })
+}
+
+/// "12 B", "3.4 KB", "1.2 MB": a size a chip can carry.
+pub fn attachment_size(bytes: u64) -> String {
+    const KB: f64 = 1024.;
+    let bytes_f = bytes as f64;
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    if bytes_f < KB * KB {
+        return format!("{:.1} KB", bytes_f / KB);
+    }
+    format!("{:.1} MB", bytes_f / (KB * KB))
 }
 
 #[derive(Default)]
@@ -648,6 +719,53 @@ impl ComposerView {
         );
         self.replace_selection(range, text, mentions, window, cx);
     }
+    /// A send may carry files; an edit rewrites a body and never does.
+    fn attaches(&self) -> bool {
+        !matches!(self.args.kind.as_str(), "edit" | "thread_edit")
+    }
+    fn attach_paths(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
+        let note = attach(&self.args.scope, &paths).err().unwrap_or_default();
+        lock(&self.shared).document.attach_note = note;
+        cx.notify();
+    }
+    fn detach(&mut self, index: usize, cx: &mut Context<Self>) {
+        let mut slot = lock(&self.shared);
+        if index < slot.document.attachments.len() {
+            slot.document.attachments.remove(index);
+            slot.document.attach_note.clear();
+            slot.rev += 1;
+        }
+        drop(slot);
+        cx.notify();
+    }
+    fn prompt_attach(&mut self, cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let paths = match chosen.await {
+                Ok(Ok(Some(paths))) => paths,
+                Ok(Ok(None)) | Err(_) => return,
+                Ok(Err(error)) => {
+                    let _ = this.update(cx, |this, cx| {
+                        lock(&this.shared).document.attach_note =
+                            format!("The file picker could not open: {error}");
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let paths: Vec<String> = paths
+                .iter()
+                .filter_map(|path| path.to_str().map(str::to_owned))
+                .collect();
+            let _ = this.update(cx, |this, cx| this.attach_paths(paths, cx));
+        })
+        .detach();
+    }
     fn mark(&mut self, kind: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.args.blocked {
             return;
@@ -720,20 +838,36 @@ impl ComposerView {
 impl Render for ComposerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync(window, cx);
-        let (empty, failed, lines) = {
+        let (empty, failed, lines, attachments, attach_note) = {
             let slot = lock(&self.shared);
             (
                 slot.document.text.trim().is_empty(),
                 !slot.document.failed.is_empty(),
                 slot.document.text.lines().count().max(1),
+                slot.document.attachments.clone(),
+                slot.document.attach_note.clone(),
             )
         };
+        let sends_files = self.attaches() && !attachments.is_empty();
+        let empty = empty && !sends_files;
         let mut content = div()
             .id("composer")
             .flex()
             .flex_col()
             .w_full()
             .gap(px(8.))
+            .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, _, cx| {
+                cx.stop_propagation();
+                if !this.attaches() {
+                    return;
+                }
+                let paths: Vec<String> = paths
+                    .paths()
+                    .iter()
+                    .filter_map(|path| path.to_str().map(str::to_owned))
+                    .collect();
+                this.attach_paths(paths, cx);
+            }))
             .capture_key_down(cx.listener(Self::key_down))
             .capture_action(cx.listener(
                 |this, action: &gpui_kit::component::input::Enter, window, cx| {
@@ -864,7 +998,73 @@ impl Render for ComposerView {
                 .h(px((lines as f32 * 20. + 16.).clamp(40., 160.)))
                 .aria_label(self.args.hint.clone()),
         );
+        if !attachments.is_empty() {
+            let mut tray = div()
+                .id("attachments")
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.))
+                .pb(px(6.));
+            for (index, attachment) in attachments.into_iter().enumerate() {
+                tray = tray.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .pl(px(10.))
+                        .pr(px(4.))
+                        .py(px(3.))
+                        .rounded(px(design::radius::PILL as f32))
+                        .bg(cx.theme().muted)
+                        .text_size(px(12.5))
+                        .child(
+                            div()
+                                .max_w(px(220.))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(attachment.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(attachment_size(attachment.bytes)),
+                        )
+                        .child(
+                            Button::new(("detach", index))
+                                .label("×")
+                                .ghost()
+                                .xsmall()
+                                .accessibility_label(format!("Remove {}", attachment.name))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.detach(index, cx)
+                                })),
+                        ),
+                );
+            }
+            plate = plate.child(tray);
+        }
+        if !attach_note.is_empty() {
+            plate = plate.child(
+                div()
+                    .pb(px(6.))
+                    .text_size(px(12.))
+                    .text_color(cx.theme().danger)
+                    .child(attach_note),
+            );
+        }
         let mut toolbar = div().flex().items_center().gap(px(4.));
+        if self.attaches() {
+            toolbar = toolbar.child(
+                Button::new("attach")
+                    .label("+")
+                    .ghost()
+                    .accessibility_label("Attach a file")
+                    .disabled(self.args.blocked)
+                    .on_click(cx.listener(|this, _, _, cx| this.prompt_attach(cx))),
+            );
+        }
         for (kind, label, aria) in [
             ("bold", "B", "Bold"),
             ("italic", "I", "Italic"),
@@ -1062,25 +1262,29 @@ fn submit_document(
     let body = mention_body(&document.text, &document.mentions)
         .trim()
         .to_owned();
-    if body.is_empty() {
+    // an edit rewrites a body; a send may be files alone
+    let sends_files = !matches!(kind, "edit" | "thread_edit") && !document.attachments.is_empty();
+    if body.is_empty() && !sends_files {
         return None;
     }
+    let prefix = if kind == "reply" { "reply" } else { "message" };
+    let id = crate::backend::fresh_operation_id(prefix.into());
     if !matches!(kind, "edit" | "thread_edit") {
         document.text.clear();
         document.mentions.clear();
         document.menu = MenuState::default();
+        let attachments = std::mem::take(&mut document.attachments);
+        if !attachments.is_empty() {
+            SENT_ATTACHMENTS.with_borrow_mut(|sent| sent.insert(id.clone(), attachments));
+        }
     }
-    let prefix = if kind == "reply" { "reply" } else { "message" };
     Some(Value::Record {
         name: "composer".into(),
         fields: vec![
             ("scope".into(), Value::Str(scope.into())),
             ("kind".into(), Value::Str(kind.into())),
             ("body".into(), Value::Str(body)),
-            (
-                "id".into(),
-                Value::Str(crate::backend::fresh_operation_id(prefix.into())),
-            ),
+            ("id".into(), Value::Str(id)),
         ],
     })
 }
@@ -1183,6 +1387,33 @@ mod tests {
                 (11..17, chat::Party::Account(6))
             ]
         );
+    }
+    #[test]
+    fn a_send_may_be_files_alone_and_hands_them_over_by_operation_id() {
+        let file = std::env::temp_dir().join("composer-attach-test.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        attach("native-files", &[path.clone(), path.clone()]).unwrap();
+        assert_eq!(lock(&slot("native-files")).document.attachments.len(), 1);
+        assert!(attach("native-files", &[std::env::temp_dir().to_string_lossy().into_owned()]).is_err());
+        // an edit never takes files, a send with nothing typed still goes
+        assert!(testing::submit("native-files", "edit", false).is_none());
+        let sent = testing::submit("native-files", "message", false).expect("files alone send");
+        let Value::Record { fields, .. } = sent else {
+            panic!("not a record")
+        };
+        let Value::Str(id) = &fields[3].1 else {
+            panic!("no id")
+        };
+        let taken = take_attachments(id);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].name, "composer-attach-test.txt");
+        assert_eq!(taken[0].bytes, 5);
+        assert!(take_attachments(id).is_empty());
+        assert!(lock(&slot("native-files")).document.attachments.is_empty());
+        assert_eq!(attachment_size(5), "5 B");
+        assert_eq!(attachment_size(1536), "1.5 KB");
+        assert_eq!(attachment_size(3 * 1024 * 1024), "3.0 MB");
     }
     #[test]
     fn room_drafts_and_failed_bodies_remain_scope_local() {

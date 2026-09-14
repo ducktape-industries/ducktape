@@ -354,6 +354,7 @@ impl ChatView {
             let scope = format!("{key}/block/{index}");
             let content = match block.kind.as_str() {
                 "divider" => native::divider(scope),
+                "attachment" => Self::attachment_card(scope, block),
                 "code" => {
                     let mut children = Vec::new();
                     if !block.lang.is_empty() {
@@ -414,6 +415,63 @@ impl ChatView {
             children.push(content);
         }
         native::spaced(native::column(key, children), 6.)
+    }
+    /// A file that came with the message: its name over what it is, in a
+    /// bordered plate that opens it in Files. Slack's file card, one line.
+    fn attachment_card(key: String, block: &crate::host::ChatBlock) -> wire::Node {
+        let p = native::palette();
+        let kind = attachment_kind(&block.text);
+        let content = native::spaced(
+            native::centered_row(
+                format!("{key}/row"),
+                [
+                    native::text(format!("{key}/glyph"), "📄"),
+                    native::spaced(
+                        native::column(
+                            format!("{key}/name"),
+                            [
+                                native::nowrap(native::strong(format!("{key}/title"), &block.text)),
+                                native::nowrap(native::caption(format!("{key}/kind"), kind)),
+                            ],
+                        ),
+                        1.,
+                    ),
+                ],
+            ),
+            10.,
+        );
+        let action = Some(slots::message(Message::OpenMessageLink(block.link.clone())));
+        let mut card = native::button_child(
+            format!("{key}/card"),
+            content,
+            action,
+            wire::ButtonPreset::Secondary,
+        );
+        if let wire::Node::Button {
+            label,
+            padding,
+            width,
+            style,
+            ..
+        } = &mut card
+        {
+            *label = Some(format!("Open {}", block.text));
+            *padding = Some(wire::Edges {
+                top: 8.,
+                right: 14.,
+                bottom: 8.,
+                left: 12.,
+            });
+            *width = Some(wire::Length::Shrink);
+            style.active.background = Some(native::rgba(p.surface));
+            style.active.border = Some(wire::Border {
+                color: Some(native::rgba(p.border)),
+                width: Some(1.),
+                radius: Some([native::radius::CARD as f32; 4]),
+            });
+        }
+        // a column stretches its children; a row lets the card hug its name
+        native::row(key, [card])
     }
     pub(super) fn rich_line(
         key: String,
@@ -577,12 +635,17 @@ impl ChatView {
         key: String,
         join: impl Fn() -> Message + Clone + 'static,
     ) -> wire::Node {
-        native::button(
+        // one word in the header; the full name is what a reader hears
+        let mut button = native::button(
             key,
-            "Start a huddle",
+            "Huddle",
             Some(slots::message(join())),
             wire::ButtonPreset::Subtle,
-        )
+        );
+        if let wire::Node::Button { label, .. } = &mut button {
+            *label = Some("Start a huddle".into());
+        }
+        button
     }
 
     pub(super) fn disconnected(&self, key: String) -> wire::Node {
@@ -593,21 +656,37 @@ impl ChatView {
         )
     }
 
-    pub(super) fn empty_messages(&self, key: String) -> wire::Node {
-        native::empty_state(
-            key,
-            "No messages yet",
-            "Nobody has posted here. Send the first message below.",
-        )
-    }
-
+    /// What stands where the composer would: the room is archived, and the
+    /// way to reopen it is right there.
     pub(super) fn archived_notice(&self, key: String) -> wire::Node {
+        let mut reopen = native::button(
+            format!("{key}/unarchive"),
+            "Unarchive",
+            (!self.busy).then(|| slots::message(Message::UnarchiveChannelSubmit)),
+            wire::ButtonPreset::Secondary,
+        );
+        if let wire::Node::Button { label, .. } = &mut reopen {
+            *label = Some("Unarchive channel".into());
+        }
         native::notice(
             key.clone(),
-            native::wrapping(native::text(
-                format!("{key}/text"),
-                "This channel is archived. Unarchive it from Channel details to post here again.",
-            )),
+            native::spaced(
+                native::centered_row(
+                    format!("{key}/row"),
+                    [
+                        native::sized(
+                            native::wrapping(native::text(
+                                format!("{key}/text"),
+                                "This channel is archived. It keeps its history and takes no new messages.",
+                            )),
+                            Some(wire::Length::Fill),
+                            None,
+                        ),
+                        reopen,
+                    ],
+                ),
+                12.,
+            ),
             Tone::Neutral,
         )
     }
@@ -628,5 +707,14 @@ impl ChatView {
     }
     pub(super) fn members_label(&self, key: String) -> wire::Node {
         native::label(key, "Members")
+    }
+}
+
+/// What a file is, from its extension: the caption under its name.
+fn attachment_kind(name: &str) -> String {
+    let extension = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_uppercase());
+    match extension {
+        Some(ext) if !ext.is_empty() && ext.len() <= 5 => format!("{ext} file"),
+        _ => "File".into(),
     }
 }
