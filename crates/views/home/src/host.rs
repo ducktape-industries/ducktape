@@ -367,7 +367,7 @@ pub fn fold_rooms(reply: &serde_json::Value) -> Vec<RoomRow> {
         })
         .filter(|room| !room.archived && !room.voice && !is_dm_room(&room.id))
         .collect();
-    rows.sort_by(|left, right| right.head_seq.cmp(&left.head_seq));
+    rows.sort_by_key(|room| std::cmp::Reverse(room.head_seq));
     rows
 }
 
@@ -607,7 +607,7 @@ pub fn fold_proposals(reply: &serde_json::Value) -> Vec<ProposalRow> {
             }
         })
         .collect();
-    rows.sort_by(|left, right| left.deadline.cmp(&right.deadline));
+    rows.sort_by_key(|proposal| proposal.deadline);
     rows.truncate(PROPOSAL_ROWS);
     rows
 }

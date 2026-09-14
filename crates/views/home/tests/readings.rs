@@ -61,12 +61,12 @@ fn news_is_a_head_past_the_baseline() {
     };
     let seen = baseline_after_read(&[room(10)], &BTreeMap::new());
     assert_eq!(seen["general"], 10);
-    assert_eq!(rooms_with_news(&[room(10)], &seen)[0].1, false);
-    assert_eq!(rooms_with_news(&[room(12)], &seen)[0].1, true);
+    assert!(!rooms_with_news(&[room(10)], &seen)[0].1);
+    assert!(rooms_with_news(&[room(12)], &seen)[0].1);
     let again = baseline_after_read(&[room(12)], &seen);
     assert_eq!(again["general"], 10, "a re-read keeps the baseline");
     let unknown = BTreeMap::new();
-    assert_eq!(rooms_with_news(&[room(12)], &unknown)[0].1, false);
+    assert!(!rooms_with_news(&[room(12)], &unknown)[0].1);
 }
 
 #[test]
