@@ -12,7 +12,6 @@ CARGO ?= cargo
 # bytes are pinned by GENESIS_ROOT_HASH, so a silent re-resolution between two
 # operators moves the genesis hash with no source change.
 LOCKED ?= --locked
-APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
@@ -158,11 +157,14 @@ app-release:
 ## install the operator CLI and desktop app without requiring root
 install: install-node install-app
 
+## put the built bundle under the launcher: `ducktape-launcher install` seeds
+## it as a release, swaps it into /Applications (DUCKTAPE_INSTALL_DIR
+## overrides; the directory must be writable by this user) and writes the
+## update state the app and the launcher share. A bundle that carries no
+## launcher of its own gets this one copied into Contents/MacOS.
 install-app: app
-	mkdir -p "$(APP_DEST)"
-	rm -rf "$(APP_DEST)/Ducktape.app"
-	cp -R target/app-bundle/Ducktape.app "$(APP_DEST)/"
-	@echo "installed $(APP_DEST)/Ducktape.app"
+	$(CARGO) build $(LOCKED) --release -p app-launcher
+	target/release/ducktape-launcher install --from target/app-bundle/Ducktape.app
 else
 ## where the Linux desktop entry and its icon land — the XDG per-user roots,
 ## so `make install-app` needs no root.
@@ -172,27 +174,32 @@ ICON_DEST ?= $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/icons/
 ## install the ducktape operator CLI and the desktop app without requiring root
 install: install-node install-app
 
-## build the desktop app binary and the views it loads
+## build the desktop app binary, its launcher, and the views it loads
 app: prereqs views
-	$(CARGO) build $(LOCKED) --release -p ducktape-app
+	$(CARGO) build $(LOCKED) --release -p ducktape-app -p app-launcher
 
-## install the desktop app and REGISTER THE duck:// SCHEME with the desktop.
-## The `.desktop` entry's `MimeType=x-scheme-handler/duck` is what makes
-## `xdg-open 'duck://forge/ducktape/1?net=<digest>'` reach the app, and its
-## `%u` is what puts the URL in argv where the app reads it. `Exec=` is
-## rewritten to an absolute path: a desktop session inherits no shell PATH.
-## The entry is installed under the app id the window reports, so the running
-## window associates with it (icon, pinned-app identity).
+## install the desktop app under its launcher and REGISTER THE duck:// SCHEME
+## with the desktop. The release is staged whole (`ducktape-launcher`,
+## `ducktape-app`, `views/`) and `ducktape-launcher install` seeds it as
+## `$XDG_DATA_HOME/ducktape/releases/<sha>`, points `current` at it, writes
+## the update state, and installs the `.desktop` entry with `Exec=` at
+## `current/ducktape-launcher %u` — an absolute path, since a desktop
+## session inherits no shell PATH, and the launcher, since that is what
+## flips to a staged update and passes the URL on to the app. The entry's
+## `MimeType=x-scheme-handler/duck` is what makes
+## `xdg-open 'duck://forge/ducktape/1?net=<digest>'` reach the app; its
+## `%u` puts the URL in argv where the app reads it; its name is the app id
+## the window reports, so the running window associates with it (icon,
+## pinned-app identity).
 install-app: app
-	mkdir -p "$(BIN_DEST)" "$(DESKTOP_DEST)" "$(ICON_DEST)"
-	install -m 0755 target/release/ducktape-app "$(BIN_DEST)/ducktape-app"
-	mkdir -p "$(BIN_DEST)/views"
-	install -m 0644 target/views/*.wasm "$(BIN_DEST)/views/"
+	mkdir -p "$(ICON_DEST)"
 	install -m 0644 app/assets/icon.svg "$(ICON_DEST)/ducktape.svg"
-	sed 's|@EXEC@|$(BIN_DEST)/ducktape-app|' app/packaging/dev.ducktape.app.desktop \
-		> "$(DESKTOP_DEST)/dev.ducktape.app.desktop"
+	rm -rf target/app-release
+	mkdir -p target/app-release/views
+	install -m 0755 target/release/ducktape-app target/release/ducktape-launcher target/app-release/
+	install -m 0644 target/views/*.wasm target/app-release/views/
+	target/release/ducktape-launcher install --from target/app-release
 	-update-desktop-database "$(DESKTOP_DEST)"
-	@echo "installed $(BIN_DEST)/ducktape-app + $(DESKTOP_DEST)/dev.ducktape.app.desktop"
 endif
 
 # where `cargo install` puts the binary, and so where the installed binary

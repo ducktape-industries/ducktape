@@ -35,8 +35,8 @@ loads from a file at runtime (`src/module_view.rs`).
 `target/views/<module>_view.wasm`, where a built binary looks for it
 (`DUCKTAPE_VIEWS_DIR` overrides; the native packaging script carries the
 directory into `Ducktape.app` as resources linked beside the executable, and the Linux
-`make install-app` copies it beside the binary); `make dev` and `make app` run
-it first. A tab whose view is not
+`make install-app` stages it beside the binary in the release it seeds); `make dev`
+and `make app` run it first. A tab whose view is not
 staged says so in its place.
 
 Deployed views follow the module registry's active deployment hash on block
