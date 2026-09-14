@@ -541,7 +541,7 @@ macro_rules! export_app {
 
         const MANIFEST: &str = concat!("ice.manifest.v2\n", $name, "\n", $description, "\n" $(, $capability, ",")*, "\n");
 
-        #[unsafe(link_section = "ice.manifest")]
+        #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "ice.manifest"))]
         #[used]
         static MANIFEST_SECTION: [u8; MANIFEST.len() + <$app>::PREFERRED_WINDOW_SIZE.len() + 2 + $crate::wire::WIRE_EPOCH.ilog10() as usize] =
             $crate::manifest_bytes(MANIFEST, <$app>::PREFERRED_WINDOW_SIZE);

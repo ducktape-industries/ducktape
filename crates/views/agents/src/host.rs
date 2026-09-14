@@ -43,6 +43,9 @@ const MAX_TOUCHED_PLACES: usize = 128;
 /// The live panel's bounds: the steps it keeps, the answer it previews, and
 /// how much of a step's detail rides its label.
 const MAX_LIVE_ACTIVITY: usize = 12;
+const MAX_TRACE_EVENTS: usize = 128;
+const MAX_PROCESS_STEPS: usize = 32;
+const MAX_TRACE_EVENT_BYTES: usize = 16 * 1024;
 const MAX_LIVE_PREVIEW_BYTES: usize = 512;
 const ACTIVITY_DETAIL_CHARS: usize = 60;
 /// A step's raw detail, before the label clips it further.
@@ -1492,6 +1495,327 @@ pub struct LiveRun {
     pub status: String,
     pub activity: Vec<LiveActivity>,
     pub answer_preview: String,
+    /// Provider output available to the authenticated reader of this run.
+    pub trace: Vec<String>,
+    pub process: Vec<ProcessEntry>,
+    pub answer: String,
+    /// Executor-measured duration, available once the provider session closes.
+    pub elapsed_ms: Option<u64>,
+    pub control: Option<RunControl>,
+}
+
+/// A provider-disclosed step. Stable item ids let completion replace streaming
+/// content in place; control envelopes and token accounting stay in raw trace.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessEntry {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub code: bool,
+    pub state: ProcessState,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProcessState {
+    Running,
+    Completed,
+    Failed,
+}
+
+impl LiveRun {
+    pub fn process_label(&self, running: bool) -> String {
+        if let Some(ms) = self.elapsed_ms {
+            let seconds = ms / 1000;
+            return format!("Worked for {}m {}s", seconds / 60, seconds % 60);
+        }
+        match running {
+            true => "Working…".into(),
+            false => "Work details".into(),
+        }
+    }
+
+    fn step(&mut self, id: String, title: String, body: String, code: bool, state: ProcessState) {
+        let body = clip(&body, MAX_TRACE_EVENT_BYTES);
+        let existing = self
+            .process
+            .iter_mut()
+            .find(|step| !id.is_empty() && step.id == id);
+        match existing {
+            Some(step) => {
+                step.title = title;
+                let has_body_update = !body.is_empty() || state == ProcessState::Running;
+                if has_body_update {
+                    step.body = body;
+                }
+                step.code = code;
+                step.state = state;
+            }
+            None => self.process.push(ProcessEntry {
+                id,
+                title,
+                body,
+                code,
+                state,
+            }),
+        }
+        let overflow = self.process.len().saturating_sub(MAX_PROCESS_STEPS);
+        self.process.drain(..overflow);
+    }
+
+    fn delta(&mut self, id: String, title: &str, text: &str, code: bool) {
+        let body = self
+            .process
+            .iter()
+            .find(|step| step.id == id)
+            .map(|step| step.body.as_str())
+            .unwrap_or_default();
+        self.step(
+            id,
+            title.into(),
+            format!("{body}{text}"),
+            code,
+            ProcessState::Running,
+        );
+    }
+}
+
+fn readable_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(text) => text.clone(),
+        _ => serde_json::to_string_pretty(value).unwrap_or_default(),
+    }
+}
+
+fn reasoning_text(value: &serde_json::Value) -> String {
+    match value.as_array() {
+        Some(parts) => parts
+            .iter()
+            .filter_map(|part| part.as_str().or_else(|| part["text"].as_str()))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        None => value.as_str().unwrap_or_default().into(),
+    }
+}
+
+/// Only text the provider actually discloses is presented as thinking. Opaque
+/// reasoning payloads and protocol bookkeeping are never invented as prose.
+fn fold_process(run: &mut LiveRun, event: &serde_json::Value) {
+    let params = &event["params"];
+    match event["method"].as_str() {
+        Some("item/reasoning/summaryTextDelta") => {
+            let id = params["itemId"].as_str().unwrap_or_default();
+            run.delta(
+                format!("reasoning/{id}"),
+                "Thinking",
+                params["delta"].as_str().unwrap_or_default(),
+                false,
+            );
+            return;
+        }
+        Some("item/agentMessage/delta") => {
+            run.answer = clip(
+                &format!(
+                    "{}{}",
+                    run.answer,
+                    params["delta"].as_str().unwrap_or_default()
+                ),
+                MAX_TRACE_EVENT_BYTES,
+            );
+            return;
+        }
+        Some("item/started" | "item/completed") => {
+            codex_process(run, &params["item"], event["method"] == "item/completed");
+            return;
+        }
+        _ => {}
+    }
+    match event["type"].as_str() {
+        Some("assistant") => {
+            let message = &event["message"];
+            let text = message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if !text.is_empty() {
+                run.answer = clip(&text, MAX_TRACE_EVENT_BYTES);
+            }
+            for (index, block) in message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                let id = block["id"].as_str().map(str::to_owned).unwrap_or_else(|| {
+                    format!("{}/{index}", message["id"].as_str().unwrap_or_default())
+                });
+                match block["type"].as_str() {
+                    Some("thinking") => run.step(
+                        id,
+                        "Thinking".into(),
+                        block["thinking"].as_str().unwrap_or_default().into(),
+                        false,
+                        ProcessState::Completed,
+                    ),
+                    Some("tool_use") => run.step(
+                        id,
+                        block["name"].as_str().unwrap_or("Tool").into(),
+                        readable_json(&block["input"]),
+                        true,
+                        ProcessState::Running,
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        Some("user") => {
+            for block in event["message"]["content"].as_array().into_iter().flatten() {
+                if block["type"] != "tool_result" {
+                    continue;
+                }
+                let id = block["tool_use_id"].as_str().unwrap_or_default();
+                let previous = run.process.iter().find(|step| step.id == id);
+                let name = previous.map(|step| step.title.as_str()).unwrap_or("Tool");
+                let state = match block["is_error"] == true {
+                    true => ProcessState::Failed,
+                    false => ProcessState::Completed,
+                };
+                let title = name.into();
+                let input = previous.map(|step| step.body.as_str()).unwrap_or_default();
+                let output = readable_json(&block["content"]);
+                run.step(
+                    id.into(),
+                    title,
+                    format!("{input}\n\n{output}").trim().into(),
+                    true,
+                    state,
+                );
+            }
+        }
+        Some("result") => {
+            if let Some(answer) = event["result"].as_str() {
+                run.answer = clip(answer, MAX_TRACE_EVENT_BYTES);
+            }
+        }
+        Some("item.started" | "item.completed" | "item.updated") => {
+            codex_process(run, &event["item"], event["type"] == "item.completed");
+        }
+        Some("run_control") if event["state"] == "input" => {
+            let input = &event["input"];
+            if input["action"] == "steer" {
+                run.step(
+                    String::new(),
+                    "Additional instruction".into(),
+                    input["text"].as_str().unwrap_or_default().into(),
+                    false,
+                    ProcessState::Completed,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn codex_process(run: &mut LiveRun, item: &serde_json::Value, done: bool) {
+    let id = item["id"].as_str().unwrap_or_default().to_owned();
+    let kind = item["type"].as_str().unwrap_or_default();
+    let failed = item["status"] == "failed"
+        || item["success"] == false
+        || item.get("error").is_some_and(|error| !error.is_null())
+        || item["exitCode"]
+            .as_i64()
+            .or_else(|| item["exit_code"].as_i64())
+            .is_some_and(|code| code != 0);
+    let state = match (failed, done) {
+        (true, _) => ProcessState::Failed,
+        (false, true) => ProcessState::Completed,
+        (false, false) => ProcessState::Running,
+    };
+    let (title, body, code) = match kind {
+        "agentMessage" | "agent_message" => {
+            if let Some(answer) = item["text"].as_str() {
+                run.answer = clip(answer, MAX_TRACE_EVENT_BYTES);
+            }
+            return;
+        }
+        "reasoning" => {
+            let summary = reasoning_text(&item["summary"]);
+            let body = match summary.is_empty() {
+                true => reasoning_text(item.get("text").unwrap_or(&item["content"])),
+                false => summary,
+            };
+            run.step(
+                format!("reasoning/{id}"),
+                "Thinking".into(),
+                body,
+                false,
+                state,
+            );
+            return;
+        }
+        "commandExecution" | "command_execution" => {
+            let command = readable_json(&item["command"]);
+            let output = readable_json(
+                item.get("aggregatedOutput")
+                    .unwrap_or(&item["aggregated_output"]),
+            );
+            (
+                "Command".into(),
+                format!("{command}\n\n{output}").trim().into(),
+                true,
+            )
+        }
+        "mcpToolCall" | "mcp_tool_call" | "dynamicToolCall" => {
+            let tool = item["tool"].as_str().unwrap_or("Tool");
+            let input = readable_json(&item["arguments"]);
+            let output = readable_json(
+                item.get("error")
+                    .filter(|error| !error.is_null())
+                    .or_else(|| item.get("result"))
+                    .unwrap_or(&item["contentItems"]),
+            );
+            (
+                tool.into(),
+                format!("{input}\n\n{output}").trim().into(),
+                true,
+            )
+        }
+        "fileChange" | "file_change" => {
+            ("File changes".into(), readable_json(&item["changes"]), true)
+        }
+        "webSearch" | "web_search" => ("Web search".into(), readable_json(&item["query"]), false),
+        _ => return,
+    };
+    run.step(id, title, body, code, state);
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunControl {
+    pub turn: String,
+    pub steers: bool,
+    pub approvals: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub enum ControlState {
+    #[default]
+    Idle,
+    Sending,
+    Accepted,
+    Failed(String),
+}
+
+pub async fn control_run(run: String, input: serde_json::Value) -> Result<(), String> {
+    ask(
+        "rpc.admin",
+        &serde_json::json!({"route":"run-control","payload":{"run":run,"input":input}}),
+    )
+    .await
+    .map(|_| ())
 }
 
 pub fn empty_live() -> LiveRun {
@@ -1540,9 +1864,70 @@ fn fold_output(run: &mut LiveRun, topic: &str, frame: Result<Vec<u8>, String>) {
     if value["topic"].as_str() != Some(topic) {
         return;
     }
+    if value["type"] == "run_control_snapshot" {
+        let control = &value["control"];
+        run.control = control["turn"].as_str().map(|turn| RunControl {
+            turn: turn.into(),
+            steers: control["steers"].as_bool().unwrap_or(false),
+            approvals: control["approvals"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|approval| {
+                    (
+                        approval["request_id"].as_str().unwrap_or_default().into(),
+                        approval["detail"].to_string(),
+                    )
+                })
+                .collect(),
+        });
+        return;
+    }
     let Some(line) = value["item"]["line"].as_str() else {
         return;
     };
+    run.trace.push(clip(line, MAX_TRACE_EVENT_BYTES));
+    let overflow = run.trace.len().saturating_sub(MAX_TRACE_EVENTS);
+    run.trace.drain(..overflow);
+    if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+        fold_process(run, &event);
+        match (event["type"].as_str(), event["state"].as_str()) {
+            (Some("run_control"), Some("ready")) => {
+                if run.elapsed_ms.take().is_some() {
+                    run.process.clear();
+                    run.answer.clear();
+                    run.activity.clear();
+                    run.answer_preview.clear();
+                    run.present = false;
+                }
+                run.control = Some(RunControl {
+                    turn: event["turn"].as_str().unwrap_or_default().into(),
+                    steers: event["steers"].as_bool().unwrap_or(false),
+                    approvals: Vec::new(),
+                });
+            }
+            (Some("run_control"), Some("approval")) => {
+                if let Some(control) = &mut run.control {
+                    control.approvals.push((
+                        event["request_id"].as_str().unwrap_or_default().into(),
+                        event["detail"].to_string(),
+                    ));
+                }
+            }
+            (Some("run_control"), Some("approval_resolved")) => {
+                if let Some(control) = &mut run.control {
+                    control
+                        .approvals
+                        .retain(|(id, _)| Some(id.as_str()) != event["request_id"].as_str());
+                }
+            }
+            (Some("run_control"), Some("closed")) => {
+                run.control = None;
+                run.elapsed_ms = event["elapsed_ms"].as_u64();
+            }
+            _ => {}
+        }
+    }
     let Some(output) = provider_output(line) else {
         return;
     };
@@ -1590,10 +1975,28 @@ enum Output {
 }
 
 /// One line of a run's stdout, as the panel reads it. Tool NAMES describe
-/// observed activity; arguments, tool output and thinking blocks never
-/// reach the screen.
+/// observed activity; full provider events are available separately in Trace.
 fn provider_output(line: &str) -> Option<Output> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    match value["method"].as_str() {
+        Some("turn/started") => return Some(Output::Status("Working".into())),
+        Some("item/completed") if value["params"]["item"]["type"] == "agentMessage" => {
+            return Some(Output::Preview(
+                value["params"]["item"]["text"].as_str()?.into(),
+            ));
+        }
+        Some("item/started" | "item/completed") => {
+            return Some(Output::Activity {
+                title: value["params"]["item"]["type"].as_str()?.into(),
+                detail: value["params"]["item"]["command"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .into(),
+                done: value["method"] == "item/completed",
+            });
+        }
+        _ => {}
+    }
     let claude_kind = value["type"].as_str().unwrap_or_default();
     if claude_kind == "result" {
         return Some(Output::Preview(value["result"].as_str()?.to_owned()));
@@ -2244,4 +2647,101 @@ fn duck_link(path: &str, chain: &str) -> String {
         return format!("duck://{path}");
     }
     format!("duck://{path}?net={chain}")
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn output(run: &mut LiveRun, event: serde_json::Value) {
+        fold_output(
+            run,
+            "run-output:test",
+            Ok(
+                json!({"topic":"run-output:test","item":{"line":event.to_string()}})
+                    .to_string()
+                    .into_bytes(),
+            ),
+        );
+    }
+
+    #[test]
+    fn retained_steps_survive_transport_noise_and_stay_bounded() {
+        let mut run = LiveRun::default();
+        output(
+            &mut run,
+            json!({"method":"item/completed","params":{"item":{"id":"thought","type":"reasoning","summary":["Look at the wrapping constraint."]}}}),
+        );
+        for id in 0..200 {
+            output(&mut run, json!({"id":id,"result":{}}));
+        }
+        assert_eq!(run.trace.len(), MAX_TRACE_EVENTS);
+        assert_eq!(run.process[0].body, "Look at the wrapping constraint.");
+        for id in 0..40 {
+            output(
+                &mut run,
+                json!({"method":"item/completed","params":{"item":{"id":id.to_string(),"type":"commandExecution","command":"echo hello","aggregatedOutput":"한".repeat(MAX_TRACE_EVENT_BYTES)}}}),
+            );
+        }
+        assert_eq!(run.process.len(), MAX_PROCESS_STEPS);
+        assert!(
+            run.process
+                .iter()
+                .all(|step| step.body.len() <= MAX_TRACE_EVENT_BYTES + '…'.len_utf8())
+        );
+        assert!(run.process.last().unwrap().body.ends_with('…'));
+    }
+
+    #[test]
+    fn duration_is_unknown_until_executor_close_and_resets_for_a_new_attempt() {
+        let mut run = LiveRun::default();
+        assert_eq!(run.process_label(false), "Work details");
+        output(
+            &mut run,
+            json!({"type":"result","result":"first attempt","duration_ms":125000}),
+        );
+        assert_eq!(run.process_label(true), "Working…");
+        output(
+            &mut run,
+            json!({"type":"run_control","state":"closed","elapsed_ms":125999}),
+        );
+        assert_eq!(run.process_label(true), "Worked for 2m 5s");
+        output(
+            &mut run,
+            json!({"type":"run_control","state":"ready","turn":"next","steers":true}),
+        );
+        assert_eq!(run.process_label(true), "Working…");
+        assert!(run.answer.is_empty());
+    }
+
+    #[test]
+    fn completed_tools_with_errors_are_failed_steps() {
+        let mut run = LiveRun::default();
+        output(
+            &mut run,
+            json!({"method":"item/completed","params":{"item":{"id":"command","type":"commandExecution","command":"cargo test","exitCode":1}}}),
+        );
+        output(
+            &mut run,
+            json!({"method":"item/completed","params":{"item":{"id":"tool","type":"mcpToolCall","tool":"read","error":{"message":"permission denied"}}}}),
+        );
+        assert_eq!(run.process.len(), 2);
+        assert!(
+            run.process
+                .iter()
+                .all(|step| step.state == ProcessState::Failed)
+        );
+    }
+
+    #[test]
+    fn claude_text_blocks_are_kept_together_and_redacted_thinking_is_not_invented() {
+        let mut run = LiveRun::default();
+        output(
+            &mut run,
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"First paragraph."},{"type":"redacted_thinking","data":"opaque"},{"type":"text","text":"Second paragraph."}]}}),
+        );
+        assert_eq!(run.answer, "First paragraph.\n\nSecond paragraph.");
+        assert!(run.process.is_empty());
+    }
 }

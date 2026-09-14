@@ -61,7 +61,7 @@ const RUN_OUTPUT_ID_LEN: usize = 64;
 /// there would be the same stream teardown, one layer later. 16 KiB is far
 /// above any real provider line while leaving room for the peer forwarder's
 /// `[node xxxxxxxx] ` prefix and the json envelope.
-const MAX_RUN_OUTPUT_LINE: usize = 16 * 1024;
+pub(crate) const MAX_RUN_OUTPUT_LINE: usize = 16 * 1024;
 
 /// how long a command may wait to reach the attached service daemon before the
 /// link is declared wedged. Generous — a healthy daemon takes one in microseconds
@@ -79,6 +79,13 @@ const SERVICE_COMMAND_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientMsg {
+    ComputeAttach {
+        token: String,
+    },
+    RunControlReply {
+        id: u64,
+        result: Result<serde_json::Value, String>,
+    },
     /// join one or more topics. THIS is where a topic's admission is decided —
     /// see [`Topic::admission`] — so the handles this frame hands back are
     /// themselves the capability, and a family a caller was never admitted to
@@ -208,6 +215,10 @@ pub enum ClientMsg {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerFrame {
+    RunControlSnapshot {
+        topic: String,
+        control: Option<serde_json::Value>,
+    },
     Subscribed {
         /// admitted topic -> its start cursor. A REFUSED topic is not in here;
         /// it got its own `Error` frame, ahead of this one, naming the code.
@@ -816,6 +827,7 @@ pub(crate) fn resume_within(after: u64, floor: u64, head: u64) -> u64 {
 
 #[derive(Clone)]
 pub struct RunOutputRegistry {
+    pub(crate) controls: crate::run_control::Hub,
     inner: Arc<Mutex<RunOutputInner>>,
     watch: watch::Sender<u64>,
     appends: broadcast::Sender<RunOutputEvent>,
@@ -888,6 +900,7 @@ impl Default for RunOutputRegistry {
         let (watch, _) = watch::channel(0);
         let (appends, _) = broadcast::channel(RUN_OUTPUT_MAX_LINES);
         Self {
+            controls: crate::run_control::Hub::default(),
             inner: Arc::new(Mutex::new(RunOutputInner::default())),
             watch,
             appends,
@@ -1219,9 +1232,15 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle, reader_of
     // to a dead session's topic is told rather than left blocked.
     let mut attached: Option<crate::term::AttachGuard> = None;
     let mut service_rx: Option<mpsc::Receiver<agent_service::wire::Command>> = None;
+    let controls_changed = hub.run_output().controls.changed.clone();
+    let mut worker: Option<crate::run_control::Worker> = None;
+    let mut control_rx: Option<mpsc::Receiver<crate::run_control::Command>> = None;
 
     loop {
         tokio::select! {
+            _ = controls_changed.notified() => {
+                if !catch_up(&handle, &mut socket, &mut topics, Wake::RunOutput).await { return; }
+            }
             frame = socket.next() => {
                 let Some(frame) = frame else { return };
                 match frame {
@@ -1244,7 +1263,17 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle, reader_of
                             // same ring the in-process sink used to feed, so
                             // `run-output:<id>` subscribers cannot tell which
                             // process produced the line.
+                            Ok(ClientMsg::ComputeAttach { token }) => {
+                                let authorized = worker.is_none() && handle.workspace_secret_matches(&token);
+                                if !authorized { return; }
+                                let (attached, receiver) = hub.run_output().controls.attach();
+                                worker = Some(attached); control_rx = Some(receiver);
+                            }
+                            Ok(ClientMsg::RunControlReply { id, result }) => {
+                                if let Some(worker) = &worker { worker.reply(id,result); }
+                            }
                             Ok(ClientMsg::RunOutput { id, stream, line }) => {
+                                if let Some(worker) = &worker { worker.observe(&id,&line); }
                                 handle_run_output(&hub, id, stream, line);
                             }
                             // a service daemon claiming this connection as its
@@ -1377,6 +1406,16 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle, reader_of
             // them, permanently. A daemon that cannot accept a command in this
             // long is wedged; dropping the link ends its sessions cleanly
             // (`AttachGuard`) and lets it redial.
+            command = async {
+                match &mut control_rx {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(command) = command else { return; };
+                let frame = serde_json::json!({"type":"run_control","command":command});
+                if socket.send(Message::Text(frame.to_string().into())).await.is_err() { return; }
+            }
             command = next_service_command(&mut service_rx) => {
                 let sent = tokio::time::timeout(
                     SERVICE_COMMAND_WRITE_TIMEOUT,
@@ -1530,6 +1569,8 @@ fn handle_client_msg(
         ClientMsg::TermInput { .. }
         | ClientMsg::TermResize { .. }
         | ClientMsg::TermCommand { .. }
+        | ClientMsg::ComputeAttach { .. }
+        | ClientMsg::RunControlReply { .. }
         | ClientMsg::RunOutput { .. }
         | ClientMsg::ServiceAttach { .. }
         | ClientMsg::AgentEvent { .. } => Vec::new(),
@@ -2140,7 +2181,7 @@ fn refuse_topic(topic: &str, refusal: TopicRefusal) -> ServerFrame {
 /// stop a run; that arm needs an in-module `control_model` read this node cannot
 /// make, so it is left out. Leaving it out refuses a reader who could have been
 /// admitted; it admits nobody who could not.
-fn created_by(requester: &sdk::Origin, key: &[u8]) -> bool {
+pub(crate) fn created_by(requester: &sdk::Origin, key: &[u8]) -> bool {
     matches!(requester, sdk::Origin::External(id) if id == key)
 }
 
@@ -2173,15 +2214,15 @@ pub(crate) async fn admit_run_reader(
     let pending = pending_runs(handle).await.map_err(|reason| {
         crate::error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, &reason)
     })?;
-    let created = pending
-        .iter()
-        .find(|run| run.dispatch_id == dispatch)
-        .is_some_and(|run| created_by(&run.requester, &key));
+    let created = match pending.iter().find(|run| run.dispatch_id == dispatch) {
+        Some(run) => created_by(&run.requester, &key),
+        None => indexed_run_creator(handle, dispatch, &key).await?,
+    };
     if !created {
         // the same sentence the topic refusal carries, for the same reason: it
         // names what to present and never what this node holds. A run that has
-        // already settled is indistinguishable from one that was never this
-        // caller's — both are "not yours to read", and saying which would
+        // owned by someone else is indistinguishable from an unknown run —
+        // both are "not yours to read", and saying which would
         // answer a probe about runs the caller may not see.
         tracing::debug!(
             target: "ducktape::stream",
@@ -2197,8 +2238,62 @@ pub(crate) async fn admit_run_reader(
     Ok(())
 }
 
+/// Settled runs retain their creator in the materialized journal. Missing or
+/// evicted live output remains an empty trace, never a reason to widen access.
+async fn indexed_run_creator(
+    handle: &NodeHandle,
+    dispatch: &str,
+    key: &[u8],
+) -> Result<bool, axum::response::Response> {
+    let Some(store) = handle.index.clone() else {
+        return Ok(false);
+    };
+    let permit = handle
+        .index_view_gate
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            crate::error_response(
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "Run journal is busy.",
+            )
+        })?;
+    let request = serde_json::to_vec(&runs::index::RunsViewQuery::Run {
+        dispatch_id: dispatch.into(),
+    })
+    .expect("run query");
+    let reading = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        store.view_with_tip("runs", &request)
+    })
+    .await
+    .map_err(|_| {
+        crate::error_response(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Run journal unavailable.",
+        )
+    })?;
+    let reading = reading.map_err(|_| {
+        crate::error_response(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Run journal unavailable.",
+        )
+    })?;
+    let reply =
+        serde_json::from_slice::<runs::index::RunsViewReply>(&reading.bytes).map_err(|_| {
+            crate::error_response(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Run journal unavailable.",
+            )
+        })?;
+    match reply {
+        runs::index::RunsViewReply::Run(Some(detail)) => Ok(created_by(&detail.run.requester, key)),
+        runs::index::RunsViewReply::Run(None) | runs::index::RunsViewReply::Runs(_) => Ok(false),
+    }
+}
+
 /// every run `runs` has pending, as committed state.
-async fn pending_runs(handle: &NodeHandle) -> Result<Vec<runs::PendingRun>, String> {
+pub(crate) async fn pending_runs(handle: &NodeHandle) -> Result<Vec<runs::PendingRun>, String> {
     let (reply, rx) = futures::channel::oneshot::channel();
     handle
         .send(crate::NodeCommand::Query {
@@ -2462,6 +2557,15 @@ async fn catch_up(
         };
         if !send_frames(socket, result.frames).await {
             return false;
+        }
+        if let TopicState::RunOutput { id, .. } = state {
+            let frame = ServerFrame::RunControlSnapshot {
+                topic: topic.clone(),
+                control: hub.run_output().controls.reading(id),
+            };
+            if !send_frame(socket, frame).await {
+                return false;
+            }
         }
         if result.drop_topic {
             topics.remove(&topic);
