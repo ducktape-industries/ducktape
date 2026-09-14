@@ -45,11 +45,35 @@ pub(crate) async fn attach(
     ws_url: String,
     hint: std::sync::Arc<Notify>,
     mut lines: mpsc::Receiver<OutputLine>,
+    token: String,
 ) {
     let mut failures: u64 = 0;
     loop {
         match tokio_tungstenite::connect_async(&ws_url).await {
-            Ok((socket, _)) => {
+            Ok((mut socket, _)) => {
+                let attach = serde_json::json!({"op":"compute_attach","token":token.trim()});
+                if socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        attach.to_string(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    tokio::time::sleep(REDIAL).await;
+                    continue;
+                }
+                for (run, line) in provider_host::run_session::active() {
+                    let frame = serde_json::json!({"op":"run_output","id":run,"stream":"stdout","line":line.to_string()});
+                    if socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            frame.to_string(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 if failures > 0 {
                     tracing::info!(
                         target: "ducktape::service",
@@ -96,12 +120,35 @@ where
 {
     use tokio_tungstenite::tungstenite::Message;
     let (mut tx, mut rx) = socket.split();
+    let mut pending = futures::stream::FuturesUnordered::new();
     loop {
         tokio::select! {
             frame = rx.next() => {
+                let command = frame.as_ref().and_then(|frame| frame.as_ref().ok())
+                    .and_then(|frame| frame.to_text().ok())
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                    .filter(|frame| frame["type"] == "run_control")
+                    .and_then(|frame| serde_json::from_value::<noded::run_control::Command>(frame["command"].clone()).ok());
+                if let Some(command) = command {
+                    if pending.len() >= 64 {
+                        let result: Result<serde_json::Value,String> = Err("Run control is busy.".into());
+                        let frame = serde_json::json!({"op":"run_control_reply","id":command.id,"result":result});
+                        if tx.send(Message::Text(frame.to_string())).await.is_err() { return; }
+                        continue;
+                    }
+                    pending.push(async move {
+                        let result = provider_host::run_session::control(&command.run,command.input).await;
+                        (command.id,result)
+                    });
+                    continue;
+                }
                 if !read_frame(frame, hint) {
                     return;
                 }
+            }
+            Some((id,result)) = pending.next() => {
+                let frame = serde_json::json!({"op":"run_control_reply","id":id,"result":result});
+                if tx.send(Message::Text(frame.to_string())).await.is_err() { return; }
             }
             line = lines.recv() => {
                 // a closed lane ends the LANE, not the link: nothing holds a
@@ -193,7 +240,10 @@ mod tests {
         }
 
         // the socket closing is what ends the pump.
-        server.close(None).await.expect("the server closes its side");
+        server
+            .close(None)
+            .await
+            .expect("the server closes its side");
         drop(server);
         pumping.await.expect("pump returns when the socket ends");
     }

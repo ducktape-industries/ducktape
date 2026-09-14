@@ -795,3 +795,68 @@ fn the_open_run_draws_the_node_output_as_it_arrives() {
         texts(&frame)
     );
 }
+
+#[test]
+fn a_running_run_sends_steering_to_its_current_turn_and_preserves_new_typing() {
+    let (_frame, left) = connect(booted(), "7", "dispatch-live", 1);
+    let stream = left
+        .iter()
+        .find(|request| request.kind == "rpc.stream")
+        .unwrap();
+    let frame = tick_native(vec![item(
+        stream.id,
+        json!({
+            "type":"run_control_snapshot","topic":"run-output:dispatch-live",
+            "control":{"turn":"turn-a","steers":true,"approvals":[]}
+        })
+        .to_string()
+        .as_bytes(),
+    )]);
+    let frame = tick_native(type_into(
+        &frame,
+        "Add instructions to this run…",
+        "Check the wrap first",
+    ));
+    let frame = tick_native(press(&frame, "Send instructions"));
+    let request = request(&frame, "rpc.admin").clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&request.payload).unwrap(),
+        json!({
+            "route":"run-control","payload":{"run":"dispatch-live","input":{"action":"steer","expected_turn":"turn-a","text":"Check the wrap first"}}
+        })
+    );
+    let _frame = tick_native(type_into(
+        &frame,
+        "Add instructions to this run…",
+        "Also inspect trace",
+    ));
+    // Claude publishes a new response boundary within the same run before its acknowledgement.
+    let _frame = tick_native(vec![item(stream.id,json!({"type":"run_control_snapshot","topic":"run-output:dispatch-live","control":{"turn":"turn-b","steers":true,"approvals":[]}}).to_string().as_bytes())]);
+    let frame = tick_native(vec![answer(request.id, b"{}")]);
+    assert!(
+        has_text(&frame, "Received by the session"),
+        "{:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(press(&frame, "Send instructions"));
+    let next = request_payload(&frame, "rpc.admin");
+    assert_eq!(next["payload"]["input"]["text"], "Also inspect trace");
+}
+
+fn request_payload(frame: &Frame, kind: &str) -> Value {
+    serde_json::from_slice(&request(frame, kind).payload).unwrap()
+}
+
+#[test]
+fn trace_exposes_full_provider_details_only_when_opened() {
+    let (_frame, left) = connect(booted(), "7", "dispatch-gone", 1);
+    let stream = left
+        .iter()
+        .find(|request| request.kind == "rpc.stream")
+        .unwrap();
+    let detail = "very-long-output-".repeat(100);
+    let frame = tick_native(vec![item(stream.id,json!({"topic":"run-output:dispatch-gone","item":{"line":json!({"type":"tool_result","output":detail}).to_string()}}).to_string().as_bytes())]);
+    assert!(!texts(&frame).iter().any(|text| text.contains(&detail)));
+    let frame = tick_native(press(&frame, "Trace"));
+    assert!(texts(&frame).iter().any(|text| text.contains(&detail)));
+}

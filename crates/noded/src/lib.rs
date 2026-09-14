@@ -91,6 +91,7 @@ pub use module_code::{
 };
 // the node-local, off-chain interactive terminal-session plane. public so
 // `main.rs` can build the manager and wire it onto the handle.
+pub mod run_control;
 pub mod term;
 pub use term::{
     AttachGuard, CreatedSession, PeerAttach, TermChunkEvent, TermCommandEvent, TermCommandRing,
@@ -811,6 +812,7 @@ pub fn router(handle: NodeHandle) -> Router {
         // create returns {session_id, topic}; output rides the ws `term:<id>`
         // topic. same trusted-local gate as the other mutating /v1 routes (see
         // term.rs). close is idempotent.
+        .route("/v1/run-control", post(run_control::control))
         .route("/v1/term/sessions", post(term::create_session))
         .route("/v1/term/sessions/{id}/close", post(term::close_session))
         // ---- service signaling (node-local, off-chain, volatile) ----

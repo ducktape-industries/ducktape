@@ -38,9 +38,9 @@ base = "https://downloads.claude.ai/claude-code-releases"
 # Headless runs may use shell, file and MCP tools without a prompt.
 # The VM and committed run grant enforce access. Interactive args remain separate.
 # Stream events preserve progress and failures; the final result carries delivery.
-# Prompt arrives on stdin.
+# Prompt and run controls share persistent stream-json stdin.
 args = [
-    "-p",
+    "-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host",
     "--output-format",
     "stream-json",
     "--verbose",
@@ -56,7 +56,7 @@ timeout_secs = 600
 
 [output]
 # Extract the terminal `{"type":"result",...}` from the stream-json lines.
-format = "json-result"
+format = "claude-session"
 
 [interactive]
 # The pty-backed TUI argv, for interactive sessions (a member drives the claude
@@ -144,64 +144,64 @@ args = [
 
 [[variants]]
 suffix = "fable_low"
-args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "fable", "--effort", "low"]
+args = ["-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "fable", "--effort", "low"]
 
 [[variants]]
 suffix = "fable_medium"
-args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "fable", "--effort", "medium"]
+args = ["-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "fable", "--effort", "medium"]
 
 [[variants]]
 suffix = "fable_high"
-args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "fable", "--effort", "high"]
+args = ["-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "fable", "--effort", "high"]
 
 [[variants]]
 suffix = "fable_max"
-args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "fable", "--effort", "max"]
+args = ["-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "fable", "--effort", "max"]
 
 [[variants]]
 suffix = "opus_low"
-args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "opus", "--effort", "low"]
+args = ["-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "opus", "--effort", "low"]
 
 [[variants]]
 suffix = "opus_medium"
-args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "opus", "--effort", "medium"]
+args = ["-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "opus", "--effort", "medium"]
 
 [[variants]]
 suffix = "opus_high"
-args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "opus", "--effort", "high"]
+args = ["-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "opus", "--effort", "high"]
 
 [[variants]]
 suffix = "opus_max"
-args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "opus", "--effort", "max"]
+args = ["-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "opus", "--effort", "max"]
 
 [[variants]]
 suffix = "sonnet_low"
-args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "sonnet", "--effort", "low"]
+args = ["-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "sonnet", "--effort", "low"]
 
 [[variants]]
 suffix = "sonnet_medium"
-args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "sonnet", "--effort", "medium"]
+args = ["-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "sonnet", "--effort", "medium"]
 
 [[variants]]
 suffix = "sonnet_high"
-args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "sonnet", "--effort", "high"]
+args = ["-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "sonnet", "--effort", "high"]
 
 [[variants]]
 suffix = "sonnet_max"
-args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "sonnet", "--effort", "max"]
+args = ["-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "sonnet", "--effort", "max"]
 
 [[variants]]
 suffix = "haiku_low"
-args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "haiku", "--effort", "low"]
+args = ["-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "haiku", "--effort", "low"]
 
 [[variants]]
 suffix = "haiku_medium"
-args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "haiku", "--effort", "medium"]
+args = ["-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "haiku", "--effort", "medium"]
 
 [[variants]]
 suffix = "haiku_high"
-args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "haiku", "--effort", "high"]
+args = ["-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "haiku", "--effort", "high"]
 
 [[variants]]
 suffix = "haiku_max"
-args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "haiku", "--effort", "max"]
+args = ["-p", "--input-format", "stream-json", "--replay-user-messages", "--permission-prompts", "host", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__ducktape", "--model", "haiku", "--effort", "max"]

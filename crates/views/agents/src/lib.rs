@@ -60,19 +60,23 @@ fn field(key: &str, hint: &str, value: &str, message: fn(String) -> Message) -> 
 
 fn places(key: &str, links: &[host::RunLink]) -> Node {
     kit::spaced(
-        kit::wrapped_row(
+        kit::column(
             key,
             links.iter().enumerate().map(|(index, link)| {
                 let key = format!("{key}/{index}");
                 if link.url.is_empty() {
                     return kit::badge(key, &link.label, Tone::Neutral);
                 }
-                kit::button(
-                    key,
-                    &link.label,
+                let mut button = kit::button_child(
+                    &key,
+                    kit::wrapping(kit::text(format!("{key}/label"), &link.label)),
                     Some(slots::message(Message::OpenPlace(link.url.clone()))),
                     ButtonPreset::Text,
-                )
+                );
+                if let Node::Button { label, .. } = &mut button {
+                    *label = Some(link.label.clone());
+                }
+                kit::sized(button, Some(Length::Fill), None)
             }),
         ),
         6.,
@@ -430,12 +434,110 @@ impl AgentsView {
                 resize("agents/journal-resize", Message::JournalResized),
                 detail_pane(
                     "agents/journal",
-                    kit::scroll("agents/journal-scroll", self.journal_panel()),
+                    kit::sized(
+                        kit::column(
+                            "agents/journal-layout",
+                            [
+                                kit::scroll("agents/journal-scroll", self.journal_panel()),
+                                self.run_controls(),
+                            ],
+                        ),
+                        Some(Length::Fill),
+                        Some(Length::Fill),
+                    ),
                     self.journal_width,
                 ),
             )
         });
         self.split("agents/run-panes", list, rail)
+    }
+
+    fn run_controls(&self) -> Node {
+        let Some(control) = &self.live.control else {
+            let content = (self.open_row.state == "running").then(|| {
+                kit::wrapping(kit::secondary(
+                    "agents/control-unavailable",
+                    "This session is not connected for run control.",
+                ))
+            });
+            return kit::column("agents/no-controls", content);
+        };
+        let sending = matches!(self.control_state, host::ControlState::Sending);
+        let running = self.open_row.state == "running";
+        let can_send = running
+            && control.steers
+            && !sending
+            && !self.control_draft.trim().is_empty()
+            && self.control_draft.len() <= 8192;
+        let mut content = vec![];
+        for (id, detail) in control.approvals.iter().take(1) {
+            content.push(kit::sized(
+                kit::scroll(
+                    format!("agents/approval/{id}/scroll"),
+                    kit::wrapping(kit::text(format!("agents/approval/{id}"), detail)),
+                ),
+                Some(Length::Fill),
+                Some(Length::Fixed(120.)),
+            ));
+            content.push(kit::row(
+                format!("agents/approval/{id}/actions"),
+                [
+                    action(
+                        format!("agents/approval/{id}/allow"),
+                        "Allow",
+                        (!sending).then(|| Message::ControlApprove(id.clone(), true)),
+                    ),
+                    action(
+                        format!("agents/approval/{id}/deny"),
+                        "Decline",
+                        (!sending).then(|| Message::ControlApprove(id.clone(), false)),
+                    ),
+                ],
+            ));
+        }
+        if control.steers {
+            content.push(kit::input(
+                "agents/control-input",
+                "Add instructions to this run…",
+                &self.control_draft,
+                slots::handler(Box::new(|text| Some(Message::ControlDraft(text)))),
+                can_send.then(|| slots::message(Message::ControlSend)),
+            ));
+        }
+        content.push(kit::wrapped_row(
+            "agents/control-actions",
+            [
+                primary(
+                    "agents/control-send",
+                    "Send instructions",
+                    can_send.then_some(Message::ControlSend),
+                ),
+                action(
+                    "agents/control-stop",
+                    "Stop run",
+                    (running && !sending).then_some(Message::ControlInterrupt),
+                ),
+            ],
+        ));
+        match &self.control_state {
+            host::ControlState::Idle => {}
+            host::ControlState::Sending => {
+                content.push(kit::secondary("agents/control-status", "Sending…"))
+            }
+            host::ControlState::Accepted => content.push(kit::secondary(
+                "agents/control-status",
+                "Received by the session",
+            )),
+            host::ControlState::Failed(error) => content.push(kit::wrapping(kit::tone_text(
+                "agents/control-status",
+                error,
+                Tone::Danger,
+            ))),
+        }
+        kit::padded(
+            kit::column("agents/control-composer", content),
+            wire::Edges::all(12.),
+        )
     }
 
     fn journal_panel(&self) -> Node {
@@ -459,15 +561,24 @@ impl AgentsView {
                 ],
             ),
             kit::spaced(
-                kit::centered_row(
+                kit::wrapped_row(
                     "agents/journal-standing",
                     [
                         state_badge("agents/journal-state", &self.open_row.state),
-                        kit::nowrap(kit::secondary(
+                        kit::wrapping(kit::secondary(
                             "agents/journal-origin",
                             &self.open_row.origin,
                         )),
                         filler(),
+                        subtle(
+                            "agents/trace-toggle",
+                            if self.trace_open {
+                                "Hide trace"
+                            } else {
+                                "Trace"
+                            },
+                            Some(Message::ToggleTrace),
+                        ),
                         subtle(
                             "agents/receipt",
                             "Run details",
@@ -492,6 +603,28 @@ impl AgentsView {
             items.push(kit::card(
                 "agents/receipt-card",
                 kit::spaced(kit::column("agents/receipt-body", facts), 6.),
+            ));
+        }
+        if self.trace_open {
+            let events = match self.live.trace.is_empty() {
+                true => vec![kit::wrapping(kit::secondary(
+                    "agents/trace-empty",
+                    "No trace is available from this node. Older output may have expired.",
+                ))],
+                false => self
+                    .live
+                    .trace
+                    .iter()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        kit::wrapping(kit::mono(format!("agents/trace/{index}"), line))
+                    })
+                    .collect(),
+            };
+            items.push(section(
+                "agents/trace",
+                "Recent trace · up to 128 events",
+                events,
             ));
         }
         if self.live.present {
@@ -893,6 +1026,10 @@ pub struct AgentsView {
     pub(crate) editor_width: f64,
     pub(crate) viewport_width: f64,
     pub(crate) expanded_receipt: String,
+    pub(crate) trace_open: bool,
+    pub(crate) control_draft: String,
+    pub(crate) control_state: host::ControlState,
+    pub(crate) control_serial: u64,
     pub(crate) open_row: crate::host::RunRow,
     pub(crate) opened: i64,
     pub(crate) capabilities: Vec<String>,
@@ -929,6 +1066,12 @@ pub enum Message {
     EditorResized(f64, f64),
     ViewportChanged(f64, f64),
     ToggleReceipt(String),
+    ToggleTrace,
+    ControlDraft(String),
+    ControlSend,
+    ControlInterrupt,
+    ControlApprove(String, bool),
+    ControlDone(String, u64, serde_json::Value, Result<(), String>),
     SessionArrived(crate::host::SessionItem),
     RegisterArrived(crate::host::RegisterItem),
     JournalArrived(crate::host::JournalItem),
@@ -973,6 +1116,10 @@ impl AgentsView {
             editor_width: 400.0,
             viewport_width: 1280.0,
             expanded_receipt: "".to_owned(),
+            trace_open: false,
+            control_draft: String::new(),
+            control_state: host::ControlState::Idle,
+            control_serial: 0,
             open_row: crate::host::empty_run(),
             opened: 0,
             capabilities: Vec::new(),
@@ -1004,7 +1151,7 @@ impl AgentsView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "165a8c2b163b16b6eee611dd7fa68f512771c2fccdb283444299e7cad67bce23";
+        "352bbfe7ff7550c3671eb8064f9cfced5d2d88679ea8c7e87b2eda6b0a9e003f";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
@@ -1022,7 +1169,11 @@ impl AgentsView {
         let wire::SnapshotValue::Bytes(state) = snapshot.state else {
             return Err("invalid Agents snapshot".into());
         };
-        let state: Self = wire::decode(&state)?;
+        let mut state: Self = wire::decode(&state)?;
+        if matches!(state.control_state, host::ControlState::Sending) {
+            state.control_state = host::ControlState::Idle;
+            state.control_serial = state.control_serial.wrapping_add(1);
+        }
         state.validate_snapshot()?;
         Ok(state)
     }
@@ -1065,6 +1216,58 @@ impl AgentsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn long_reply_links_wrap_within_the_journal_width() {
+        let label =
+            "#Engineering · ChiefDuck: ".to_owned() + &"긴 답변 text without clipping ".repeat(80);
+        let mut node = places(
+            "places",
+            &[host::RunLink {
+                label: label.clone(),
+                url: "duck://chat/general/4".into(),
+                relation: "reply".into(),
+                kind: "chat".into(),
+            }],
+        );
+        let mut labels = 0;
+        node.for_each_mut(&mut |node| {
+            if let Node::Text {
+                content,
+                options,
+                width,
+                ..
+            } = node
+                && content == &label
+            {
+                labels += 1;
+                assert_eq!(options.wrapping, Some(wire::Wrapping::WordOrGlyph));
+                assert_eq!(*width, Some(Length::Fill));
+            }
+        });
+        assert_eq!(labels, 1);
+    }
+
+    #[test]
+    fn callbacks_from_a_previous_turn_do_not_change_the_current_composer() {
+        let (mut view, _) = AgentsView::boot();
+        view.open_run = "run".into();
+        view.live.control = Some(host::RunControl {
+            turn: "new-turn".into(),
+            steers: true,
+            approvals: vec![],
+        });
+        view.control_draft = "new draft".into();
+        view.control_state = host::ControlState::Sending;
+        let _ = view.on_control_done(
+            "run".into(),
+            9,
+            serde_json::json!({"action":"steer","text":"new draft"}),
+            Ok(()),
+        );
+        assert_eq!(view.control_draft, "new draft");
+        assert!(matches!(view.control_state, host::ControlState::Sending));
+    }
+
     #[test]
     fn snapshot_refuses_foreign_schema_corrupt_payload_and_nonfinite_geometry() {
         let (mut state, _) = AgentsView::boot();
@@ -1151,6 +1354,14 @@ impl AgentsView {
             Message::EditorResized(dx, _dy) => self.on_editor_resized(dx, _dy),
             Message::ViewportChanged(width, _height) => self.on_viewport_changed(width, _height),
             Message::ToggleReceipt(value) => self.on_toggle_receipt(value),
+            Message::ToggleTrace => self.on_toggle_trace(),
+            Message::ControlDraft(text) => self.on_control_draft(text),
+            Message::ControlSend => self.on_control_send(),
+            Message::ControlInterrupt => self.on_control_interrupt(),
+            Message::ControlApprove(id, allow) => self.on_control_approve(id, allow),
+            Message::ControlDone(run, serial, input, result) => {
+                self.on_control_done(run, serial, input, result)
+            }
             Message::SessionArrived(item) => self.on_session_arrived(item),
             Message::RegisterArrived(item) => self.on_register_arrived(item),
             Message::JournalArrived(item) => self.on_journal_arrived(item),
@@ -1222,6 +1433,91 @@ impl AgentsView {
             ::ducktape_view_guest::Task::none()
         }
     }
+    fn on_control_draft(&mut self, text: String) -> ducktape_view_guest::Task<Message> {
+        self.control_draft = text;
+        ducktape_view_guest::Task::none()
+    }
+    fn control_request(
+        &mut self,
+        action: &str,
+        payload: serde_json::Value,
+    ) -> ducktape_view_guest::Task<Message> {
+        let Some(control) = &self.live.control else {
+            return ducktape_view_guest::Task::none();
+        };
+        let allowed = !matches!(self.control_state, host::ControlState::Sending)
+            && self.open_row.state == "running";
+        if !allowed {
+            return ducktape_view_guest::Task::none();
+        }
+        let mut input = payload;
+        input["action"] = action.into();
+        input["expected_turn"] = control.turn.clone().into();
+        self.control_state = host::ControlState::Sending;
+        let run = self.open_run.clone();
+        self.control_serial = self.control_serial.wrapping_add(1);
+        let serial = self.control_serial;
+        ducktape_view_guest::Task::future(async move {
+            let result = host::control_run(run.clone(), input.clone()).await;
+            Message::ControlDone(run, serial, input, result)
+        })
+    }
+    fn on_control_send(&mut self) -> ducktape_view_guest::Task<Message> {
+        let allowed = self
+            .live
+            .control
+            .as_ref()
+            .is_some_and(|control| control.steers)
+            && !self.control_draft.trim().is_empty()
+            && self.control_draft.len() <= 8192;
+        if !allowed {
+            return ducktape_view_guest::Task::none();
+        }
+        self.control_request("steer", serde_json::json!({"text":self.control_draft}))
+    }
+    fn on_control_interrupt(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.control_request("interrupt", serde_json::json!({}))
+    }
+    fn on_control_approve(
+        &mut self,
+        id: String,
+        allow: bool,
+    ) -> ducktape_view_guest::Task<Message> {
+        self.control_request(
+            "approve",
+            serde_json::json!({"request_id":id,"allow":allow}),
+        )
+    }
+    fn on_control_done(
+        &mut self,
+        run: String,
+        serial: u64,
+        input: serde_json::Value,
+        result: Result<(), String>,
+    ) -> ducktape_view_guest::Task<Message> {
+        let current = run == self.open_run && serial == self.control_serial;
+        if !current {
+            return ducktape_view_guest::Task::none();
+        }
+        self.control_state = match result {
+            Ok(()) => {
+                let sent_draft = input["action"] == "steer"
+                    && input["text"].as_str() == Some(self.control_draft.as_str());
+                if sent_draft {
+                    self.control_draft.clear();
+                }
+                host::ControlState::Accepted
+            }
+            Err(error) => host::ControlState::Failed(error),
+        };
+        ducktape_view_guest::Task::none()
+    }
+
+    fn on_toggle_trace(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.trace_open = !self.trace_open;
+        ducktape_view_guest::Task::none()
+    }
+
     fn on_toggle_receipt(&mut self, value: String) -> ::ducktape_view_guest::Task<Message> {
         {
             {
@@ -1263,6 +1559,12 @@ impl AgentsView {
                 self.account = next.account.to_owned();
             }
             {
+                if self.open_run != next.open_run {
+                    self.control_state = host::ControlState::Idle;
+                    self.control_serial = self.control_serial.wrapping_add(1);
+                    self.control_draft.clear();
+                    self.live = host::LiveRun::default();
+                }
                 self.open_run = next.open_run.to_owned();
             }
             {
@@ -1414,6 +1716,11 @@ impl AgentsView {
     ) -> ::ducktape_view_guest::Task<Message> {
         {
             {
+                let closed = self.live.control.is_some() && item.control.is_none();
+                if closed {
+                    self.control_state = host::ControlState::Idle;
+                    self.control_serial = self.control_serial.wrapping_add(1);
+                }
                 self.live = item.clone();
             }
             ::ducktape_view_guest::Task::none()
@@ -1547,6 +1854,9 @@ impl AgentsView {
         {
             {
                 self.expanded_receipt = "".to_owned();
+                self.control_state = host::ControlState::Idle;
+                self.control_serial = self.control_serial.wrapping_add(1);
+                self.control_draft.clear();
             }
             {
                 self.open_row = crate::host::run_named(
@@ -1569,6 +1879,9 @@ impl AgentsView {
         {
             {
                 self.expanded_receipt = "".to_owned();
+                self.control_state = host::ControlState::Idle;
+                self.control_serial = self.control_serial.wrapping_add(1);
+                self.control_draft.clear();
             }
             {
                 self.open_run = "".to_owned();

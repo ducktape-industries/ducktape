@@ -43,6 +43,8 @@ const MAX_TOUCHED_PLACES: usize = 128;
 /// The live panel's bounds: the steps it keeps, the answer it previews, and
 /// how much of a step's detail rides its label.
 const MAX_LIVE_ACTIVITY: usize = 12;
+const MAX_TRACE_EVENTS: usize = 128;
+const MAX_TRACE_EVENT_BYTES: usize = 16 * 1024;
 const MAX_LIVE_PREVIEW_BYTES: usize = 512;
 const ACTIVITY_DETAIL_CHARS: usize = 60;
 /// A step's raw detail, before the label clips it further.
@@ -1492,6 +1494,34 @@ pub struct LiveRun {
     pub status: String,
     pub activity: Vec<LiveActivity>,
     pub answer_preview: String,
+    /// Provider output available to the authenticated reader of this run.
+    pub trace: Vec<String>,
+    pub control: Option<RunControl>,
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunControl {
+    pub turn: String,
+    pub steers: bool,
+    pub approvals: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub enum ControlState {
+    #[default]
+    Idle,
+    Sending,
+    Accepted,
+    Failed(String),
+}
+
+pub async fn control_run(run: String, input: serde_json::Value) -> Result<(), String> {
+    ask(
+        "rpc.admin",
+        &serde_json::json!({"route":"run-control","payload":{"run":run,"input":input}}),
+    )
+    .await
+    .map(|_| ())
 }
 
 pub fn empty_live() -> LiveRun {
@@ -1540,9 +1570,59 @@ fn fold_output(run: &mut LiveRun, topic: &str, frame: Result<Vec<u8>, String>) {
     if value["topic"].as_str() != Some(topic) {
         return;
     }
+    if value["type"] == "run_control_snapshot" {
+        let control = &value["control"];
+        run.control = control["turn"].as_str().map(|turn| RunControl {
+            turn: turn.into(),
+            steers: control["steers"].as_bool().unwrap_or(false),
+            approvals: control["approvals"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|approval| {
+                    (
+                        approval["request_id"].as_str().unwrap_or_default().into(),
+                        approval["detail"].to_string(),
+                    )
+                })
+                .collect(),
+        });
+        return;
+    }
     let Some(line) = value["item"]["line"].as_str() else {
         return;
     };
+    run.trace.push(clip(line, MAX_TRACE_EVENT_BYTES));
+    let overflow = run.trace.len().saturating_sub(MAX_TRACE_EVENTS);
+    run.trace.drain(..overflow);
+    if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+        match (event["type"].as_str(), event["state"].as_str()) {
+            (Some("run_control"), Some("ready")) => {
+                run.control = Some(RunControl {
+                    turn: event["turn"].as_str().unwrap_or_default().into(),
+                    steers: event["steers"].as_bool().unwrap_or(false),
+                    approvals: Vec::new(),
+                });
+            }
+            (Some("run_control"), Some("approval")) => {
+                if let Some(control) = &mut run.control {
+                    control.approvals.push((
+                        event["request_id"].as_str().unwrap_or_default().into(),
+                        event["detail"].to_string(),
+                    ));
+                }
+            }
+            (Some("run_control"), Some("approval_resolved")) => {
+                if let Some(control) = &mut run.control {
+                    control
+                        .approvals
+                        .retain(|(id, _)| Some(id.as_str()) != event["request_id"].as_str());
+                }
+            }
+            (Some("run_control"), Some("closed")) => run.control = None,
+            _ => {}
+        }
+    }
     let Some(output) = provider_output(line) else {
         return;
     };
@@ -1590,10 +1670,28 @@ enum Output {
 }
 
 /// One line of a run's stdout, as the panel reads it. Tool NAMES describe
-/// observed activity; arguments, tool output and thinking blocks never
-/// reach the screen.
+/// observed activity; full provider events are available separately in Trace.
 fn provider_output(line: &str) -> Option<Output> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    match value["method"].as_str() {
+        Some("turn/started") => return Some(Output::Status("Working".into())),
+        Some("item/completed") if value["params"]["item"]["type"] == "agentMessage" => {
+            return Some(Output::Preview(
+                value["params"]["item"]["text"].as_str()?.into(),
+            ));
+        }
+        Some("item/started" | "item/completed") => {
+            return Some(Output::Activity {
+                title: value["params"]["item"]["type"].as_str()?.into(),
+                detail: value["params"]["item"]["command"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .into(),
+                done: value["method"] == "item/completed",
+            });
+        }
+        _ => {}
+    }
     let claude_kind = value["type"].as_str().unwrap_or_default();
     if claude_kind == "result" {
         return Some(Output::Preview(value["result"].as_str()?.to_owned()));

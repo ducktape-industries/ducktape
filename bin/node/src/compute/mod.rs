@@ -130,7 +130,14 @@ async fn run(
     let offered = providers.capabilities();
 
     let hint = Arc::new(tokio::sync::Notify::new());
-    tokio::spawn(link::attach(ws_url(&http_base), hint.clone(), line_rx));
+    let link_token = std::fs::read_to_string(service.workspace.join("service-link.token"))
+        .map_err(|_| "compute service cannot read its node link credential")?;
+    tokio::spawn(link::attach(
+        ws_url(&http_base),
+        hint.clone(),
+        line_rx,
+        link_token,
+    ));
 
     let (mut pump, mut delivered) = build_pool(&node, &service, node_key, providers).await?;
 
