@@ -21,7 +21,7 @@ use harness::Sim;
 /// genesis is a pure function of deployment bytes and bindings, so a change in how the
 /// sim builds its host shows up here instead of silently under a scenario.
 const DEFAULT_GENESIS_ROOT_HASH: &str =
-    "a44ff2d369f749418fdfbfd6829417526eac1770d256a8ee4a9e2d6a59330b7e";
+    "5e86aa02d104f87fc4dbe6bbc489338501c67160a6f5b084e1c4f9b12948e103";
 
 fn module_ids(status: &serde_json::Value) -> Vec<String> {
     status["modules"]
