@@ -1793,7 +1793,8 @@ impl DesktopWindow {
             tabs = tabs.child(row);
         }
         // The foot of the rail: who is signed in. Pressing it opens the
-        // account screen — a sign-in when there is no account yet.
+        // account screen — a sign-in when there is no account yet. The update
+        // decides which (`on_open_account`); the row itself does not know.
         let account = div()
             .id("rail-account")
             .flex()
@@ -1807,9 +1808,8 @@ impl DesktopWindow {
             .hover(move |style| style.bg(ink_raised))
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                this.model.update(cx, |model, cx| {
-                    model.dispatch(Message::OpenAccountWelcome, cx)
-                });
+                this.model
+                    .update(cx, |model, cx| model.dispatch(Message::OpenAccount, cx));
             }))
             .child(
                 div()
