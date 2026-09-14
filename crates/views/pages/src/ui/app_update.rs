@@ -630,9 +630,19 @@ impl PagesView {
             return Task::none();
         }
         let same = self.comment_edit_id == id;
-        self.comment_edit_id = if same { String::new() } else { id };
-        self.comment_edit_draft = if same { String::new() } else { text };
-        Task::none()
+        if same {
+            self.comment_edit_id = String::new();
+            self.comment_edit_draft = String::new();
+            return Task::none();
+        }
+        self.comment_edit_id = id.clone();
+        self.comment_edit_draft = text;
+        // The edit box opened to be written in: the keyboard moves to it.
+        ::ducktape_view_guest::widget::perform::<Message>(
+            ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                target: format!("{PAGE_KEY}/comment-edit({id})"),
+            },
+        )
     }
     fn on_cancel_edit_comment(&mut self) -> Task<Message> {
         self.comment_edit_id = "".to_owned();

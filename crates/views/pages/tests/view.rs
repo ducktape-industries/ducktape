@@ -721,6 +721,14 @@ fn editing_a_comment_rewrites_it_in_place() {
         "the box replaces the words: {:?}",
         texts(&frame)
     );
+    // the box opened to be written in: the keyboard moves to it
+    let focus = request(&frame, "host.widget");
+    assert_eq!(
+        wire::decode::<wire::WidgetCommand>(&focus.payload).unwrap(),
+        wire::WidgetCommand::Focus {
+            target: "PagesView/root/pages/comment-edit(c1)".into()
+        }
+    );
     let frame = tick_native(type_into(&frame, "Edit comment", "the page reads better"));
     let frame = tick_native(press(&frame, "Save"));
     let submit = request(&frame, "op.submit");
