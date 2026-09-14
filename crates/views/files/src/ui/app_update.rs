@@ -347,7 +347,8 @@ impl FilesView {
             return Task::none();
         }
         let entry = self.entry_at(&path);
-        if entry.path.is_empty() {
+        let already = entry.path == self.selected;
+        if entry.path.is_empty() || already {
             return Task::none();
         }
         self.choose(entry);
