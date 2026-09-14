@@ -76,7 +76,7 @@ pub enum ViewSource {
 
 // `ModulesReply::ModuleStatus`, as `/v1/query` serializes it — mirrored
 // field for field from crates/modules/system/modules/src/interface.rs
-// (`ModuleCode`, `ScheduledSwap`, `Activation`) and refused on any drift:
+// (`ModuleCode`, `Kind`, `ScheduledSwap`, `Activation`) and refused on any drift:
 // a field this reader does not know is a registry it does not understand.
 
 #[derive(Deserialize)]
@@ -95,6 +95,11 @@ struct ModuleStatus {
 #[serde(deny_unknown_fields)]
 struct ModuleCode {
     module_id: String,
+    #[allow(
+        dead_code,
+        reason = "read for shape only: the seat set does not yet branch on kind"
+    )]
+    kind: Kind,
     active_code_hash: Vec<u8>,
     #[allow(
         dead_code,
@@ -103,6 +108,16 @@ struct ModuleCode {
     pending: Option<ScheduledSwap>,
     #[allow(dead_code, reason = "read for shape only")]
     history: Vec<Activation>,
+}
+
+/// What the entry's artifact is: a module (whose frame may embed a view) or
+/// a view alone.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code, reason = "read for shape only")]
+enum Kind {
+    Module,
+    View,
 }
 
 #[derive(Deserialize)]
@@ -303,7 +318,7 @@ pub(crate) mod tests {
 
     pub(crate) fn status_naming(module: &str, hash: &[u8]) -> serde_json::Value {
         serde_json::json!({"module_status": {"modules": [
-            {"module_id": module, "active_code_hash": hash, "pending": null,
+            {"module_id": module, "kind": "module", "active_code_hash": hash, "pending": null,
              "history": [{"height": 7, "code_hash": hash}]}
         ]}})
     }
@@ -431,9 +446,9 @@ pub(crate) mod tests {
 
     fn status_of(hash: &[u8]) -> serde_json::Value {
         serde_json::json!({"module_status": {"modules": [
-            {"module_id": "files", "active_code_hash": hash, "pending": null,
+            {"module_id": "files", "kind": "module", "active_code_hash": hash, "pending": null,
              "history": [{"height": 7, "code_hash": hash}]},
-            {"module_id": "chat", "active_code_hash": [], "pending": null, "history": []}
+            {"module_id": "chat", "kind": "module", "active_code_hash": [], "pending": null, "history": []}
         ]}})
     }
 
@@ -514,8 +529,22 @@ pub(crate) mod tests {
             (
                 "unknown field",
                 serde_json::json!({"module_status": {"modules": [
-                    {"module_id": "files", "active_code_hash": vec![7u8; 32], "pending": null,
+                    {"module_id": "files", "kind": "module", "active_code_hash": vec![7u8; 32], "pending": null,
                      "history": [], "extra": 1}
+                ]}}),
+            ),
+            (
+                "missing kind",
+                serde_json::json!({"module_status": {"modules": [
+                    {"module_id": "files", "active_code_hash": vec![7u8; 32], "pending": null,
+                     "history": []}
+                ]}}),
+            ),
+            (
+                "unknown kind",
+                serde_json::json!({"module_status": {"modules": [
+                    {"module_id": "files", "kind": "surface", "active_code_hash": vec![7u8; 32],
+                     "pending": null, "history": []}
                 ]}}),
             ),
             (
@@ -525,8 +554,8 @@ pub(crate) mod tests {
             (
                 "registered twice",
                 serde_json::json!({"module_status": {"modules": [
-                    {"module_id": "files", "active_code_hash": vec![7u8; 32], "pending": null, "history": []},
-                    {"module_id": "files", "active_code_hash": vec![8u8; 32], "pending": null, "history": []}
+                    {"module_id": "files", "kind": "module", "active_code_hash": vec![7u8; 32], "pending": null, "history": []},
+                    {"module_id": "files", "kind": "module", "active_code_hash": vec![8u8; 32], "pending": null, "history": []}
                 ]}}),
             ),
             (

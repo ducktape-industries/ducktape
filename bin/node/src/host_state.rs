@@ -1020,6 +1020,7 @@ mod tests {
                 10,
                 ModulesMsg::RegisterModule {
                     module_id: "hello".into(),
+                    kind: modules::Kind::Module,
                     code_hash: first.to_vec(),
                 },
             ),

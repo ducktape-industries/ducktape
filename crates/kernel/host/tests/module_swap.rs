@@ -98,6 +98,7 @@ fn host_with_wasm() -> Host {
         Origin::System,
         modules_msg(&ModulesMsg::RegisterModule {
             module_id: "hello".into(),
+            kind: modules::Kind::Module,
             code_hash: sha(HELLO_V1),
         }),
     );
@@ -341,6 +342,7 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
         Origin::System,
         modules_msg(&ModulesMsg::RegisterModule {
             module_id: "hello".into(),
+            kind: modules::Kind::Module,
             code_hash: sha(HELLO_V1),
         }),
     );
@@ -666,6 +668,7 @@ fn a_missing_second_module_realizes_neither() {
         Origin::System,
         modules_msg(&ModulesMsg::RegisterModule {
             module_id: "zz-hello".into(),
+            kind: modules::Kind::Module,
             code_hash: sha(HELLO_V1),
         }),
     );

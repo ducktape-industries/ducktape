@@ -267,6 +267,7 @@ mod tests {
     fn entry(pending: Option<[u8; 32]>, active: &[u8]) -> modules::ModuleCode {
         modules::ModuleCode {
             module_id: NETSTACK_MODULE_ID.into(),
+            kind: modules::Kind::Module,
             active_code_hash: active.to_vec(),
             pending: pending.map(|code_hash| modules::ScheduledSwap {
                 name: "netstack-v1".into(),
@@ -282,6 +283,7 @@ mod tests {
     fn other() -> modules::ModuleCode {
         modules::ModuleCode {
             module_id: "kanban".into(),
+            kind: modules::Kind::Module,
             active_code_hash: vec![9; 32],
             pending: None,
             history: Vec::new(),

@@ -288,6 +288,7 @@ mod tests {
     ) -> modules::ModuleCode {
         modules::ModuleCode {
             module_id: module.into(),
+            kind: modules::Kind::Module,
             active_code_hash: vec![0; 32],
             pending: Some(modules::ScheduledSwap {
                 name: name.into(),
@@ -383,6 +384,7 @@ mod tests {
         // no pending at all: silent.
         let idle = vec![modules::ModuleCode {
             module_id: "c".into(),
+            kind: modules::Kind::Module,
             active_code_hash: vec![0; 32],
             pending: None,
             history: Vec::new(),

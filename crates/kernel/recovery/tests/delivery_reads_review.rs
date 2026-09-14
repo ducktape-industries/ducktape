@@ -375,6 +375,7 @@ impl Module for RegistryBoundary {
                     &modules::ModulesReply::ModuleStatus {
                         modules: vec![modules::ModuleCode {
                             module_id: "receiver".into(),
+                            kind: modules::Kind::Module,
                             active_code_hash: vec![1; 32],
                             pending,
                             history: vec![modules::Activation {

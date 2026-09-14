@@ -4287,7 +4287,7 @@ pub(crate) mod tests {
         };
         let status = |artifact: &Artifact| {
             serde_json::json!({"module_status": {"modules": [
-                {"module_id": "forge", "active_code_hash": artifact.hash().to_vec(),
+                {"module_id": "forge", "kind": "module", "active_code_hash": artifact.hash().to_vec(),
                  "pending": null, "history": []}
             ]}})
         };

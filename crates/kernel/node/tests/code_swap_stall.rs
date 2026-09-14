@@ -56,7 +56,7 @@ async fn host_awaiting_code() -> Host {
         "valset",
         "governance",
     );
-    registry.seed("ghost", vec![9u8; 32]).await.expect("seed");
+    registry.seed("ghost", modules::Kind::Module, vec![9u8; 32]).await.expect("seed");
     registry.finish_seed().await.expect("finish seed");
     let mut host = Host::new();
     host.register(Box::new(registry));

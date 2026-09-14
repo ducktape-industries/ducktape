@@ -586,6 +586,7 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
                 modules::ModulesMsg::ScheduleRegister {
                     name: "deploy-pages".into(),
                     module_id: "pages".into(),
+                    kind: modules::Kind::Module,
                     activation_height: 10,
                     code_hash: indexed.to_vec(),
                 },
@@ -949,6 +950,7 @@ fn wasm_registry_activates_view_assets_and_reopens_after_view_removal() {
                 modules::ModulesMsg::ScheduleRegister {
                     name: "deploy-pages".into(),
                     module_id: "pages".into(),
+                    kind: modules::Kind::Module,
                     activation_height: 10,
                     code_hash: hashes[0].to_vec(),
                 },

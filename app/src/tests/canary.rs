@@ -113,8 +113,8 @@ fn a_capture_draws_the_module_it_names() {
     let node = FakeDeployment::serving("governance", &governance);
     node.artifacts.lock().unwrap().push(chat.clone());
     *node.status.lock().unwrap() = serde_json::json!({"module_status":{"modules":[
-        {"module_id":"governance","active_code_hash":governance.hash(),"pending":null,"history":[{"height":7,"code_hash":governance.hash()}]},
-        {"module_id":"chat","active_code_hash":chat.hash(),"pending":null,"history":[{"height":7,"code_hash":chat.hash()}]}
+        {"module_id": "governance", "kind": "module", "active_code_hash":governance.hash(),"pending":null,"history":[{"height":7,"code_hash":governance.hash()}]},
+        {"module_id": "chat", "kind": "module", "active_code_hash":chat.hash(),"pending":null,"history":[{"height":7,"code_hash":chat.hash()}]}
     ]}});
     let client = runtime.block_on(fake_node(node));
     crate::module_view::connected(&client).joined();

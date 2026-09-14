@@ -110,6 +110,22 @@ pub enum Start<'a, 'b> {
     },
 }
 
+/// the registry's genesis seed table for `bundle`: every founding deployment
+/// is a module — the founding set is composed of `<id>.component.wasm` files
+/// (`workspace_config::Genesis::compose`), so nothing else can be in it.
+pub fn genesis_seeds(bundle: &BTreeMap<String, [u8; 32]>) -> BTreeMap<String, modules::Seed> {
+    bundle
+        .iter()
+        .map(|(id, hash)| {
+            let seed = modules::Seed {
+                kind: modules::Kind::Module,
+                code_hash: hash.to_vec(),
+            };
+            (id.clone(), seed)
+        })
+        .collect()
+}
+
 /// Compose the boot mode's deployment set into a [`Host`];
 /// the boot mode supplies the authenticated module set and initialization or
 /// snapshot data. Every module uses the same Wasm constructor.
@@ -123,7 +139,7 @@ pub async fn compose(
     let mut host = Host::new();
     let parameters = match &boot {
         Boot::Genesis { validators, bundle } => sdk::genesis_config::encode_config(&[
-            ("modules", &sdk::wire::encode(bundle)),
+            ("modules", &sdk::wire::encode(&genesis_seeds(bundle))),
             ("validators", &sdk::wire::encode(validators)),
         ]),
         Boot::Reopen { .. } => sdk::genesis_config::encode_config(&[]),

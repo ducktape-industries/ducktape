@@ -139,6 +139,7 @@ impl Verb {
             Verb::Register => governance::GovAction::RegisterModule {
                 name,
                 module_id,
+                kind: modules::Kind::Module,
                 activation_lead,
                 code_hash,
             },
@@ -708,8 +709,12 @@ fn render_status(modules: &[modules::ModuleCode]) -> String {
         .max()
         .unwrap_or_default()
         .max(2);
-    let mut out = format!("{:<id_width$}  {:<SHORT_HASH$}  pending\n", "id", "active");
+    let mut out = format!(
+        "{:<id_width$}  {:<KIND_WIDTH$}  {:<SHORT_HASH$}  pending\n",
+        "id", "kind", "active"
+    );
     for m in modules {
+        let kind = kind_word(m.kind);
         // `module register` writes an EMPTY active hash and leaves it empty
         // until the swap activates — the first thing an operator looks at.
         let never_activated = m.active_code_hash.is_empty();
@@ -728,11 +733,22 @@ fn render_status(modules: &[modules::ModuleCode]) -> String {
             ),
         };
         out.push_str(&format!(
-            "{:<id_width$}  {active:<SHORT_HASH$}  {pending}\n",
+            "{:<id_width$}  {kind:<KIND_WIDTH$}  {active:<SHORT_HASH$}  {pending}\n",
             m.module_id
         ));
     }
     out
+}
+
+/// the `kind` column's width: the longer of its two words.
+const KIND_WIDTH: usize = 6;
+
+/// the registry kind as the status row prints it.
+fn kind_word(kind: modules::Kind) -> &'static str {
+    match kind {
+        modules::Kind::Module => "module",
+        modules::Kind::View => "view",
+    }
 }
 
 /// how far a pending swap's readiness has come: the count of validators that
@@ -837,6 +853,7 @@ mod tests {
         };
         let entry = |active: &[u8], pending: Option<ScheduledSwap>| ModuleCode {
             module_id: "hello".into(),
+            kind: modules::Kind::Module,
             active_code_hash: active.to_vec(),
             pending,
             history: Vec::new(),
@@ -949,12 +966,14 @@ mod tests {
         let modules = vec![
             ModuleCode {
                 module_id: "acl".into(),
+                kind: modules::Kind::Module,
                 active_code_hash: active.clone(),
                 pending: None,
                 history: Vec::new(),
             },
             ModuleCode {
                 module_id: "hello".into(),
+                kind: modules::Kind::Module,
                 active_code_hash: active.clone(),
                 pending: Some(ScheduledSwap {
                     name: "hello-2".into(),
@@ -968,6 +987,21 @@ mod tests {
             // `module register`: no active code at all until the swap lands.
             ModuleCode {
                 module_id: "runs".into(),
+                kind: modules::Kind::Module,
+                active_code_hash: Vec::new(),
+                pending: Some(ScheduledSwap {
+                    name: "runs-1".into(),
+                    activation_height: 120,
+                    code_hash: next.clone(),
+                    readiness: Vec::new(),
+                    ready_at: None,
+                }),
+                history: Vec::new(),
+            },
+            // a view-only entry: the kind column is how an operator tells it apart.
+            ModuleCode {
+                module_id: "home".into(),
+                kind: modules::Kind::View,
                 active_code_hash: Vec::new(),
                 pending: Some(ScheduledSwap {
                     name: "runs-1".into(),
@@ -981,17 +1015,21 @@ mod tests {
         ];
         let out = render_status(&modules);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0], "id     active        pending");
-        assert_eq!(lines[1], "acl    abababababab  —");
+        assert_eq!(lines[0], "id     kind    active        pending");
+        assert_eq!(lines[1], "acl    module  abababababab  —");
         assert_eq!(
             lines[2],
-            "hello  abababababab  cdcdcdcdcdcd  ready 2  activation 120"
+            "hello  module  abababababab  cdcdcdcdcdcd  ready 2  activation 120"
         );
         // the active column stays 12 wide even when it is a single dash, so
         // the pending hashes line up with the row above.
         assert_eq!(
             lines[3],
-            "runs   —             cdcdcdcdcdcd  ready 0  activation 120"
+            "runs   module  —             cdcdcdcdcdcd  ready 0  activation 120"
+        );
+        assert_eq!(
+            lines[4],
+            "home   view    —             cdcdcdcdcdcd  ready 0  activation 120"
         );
     }
 }

@@ -86,12 +86,16 @@ fn advance() -> Msg {
 // ---- module-code path helpers -----------------------------------------------
 
 fn register_module(lc: &mut Modules, module_id: &str, code: u8) {
+    register_kind(lc, module_id, Kind::Module, code);
+}
+fn register_kind(lc: &mut Modules, module_id: &str, kind: Kind, code: u8) {
     let mut sys = ctx(Origin::System, 0);
     run(
         lc,
         &mut sys,
         &msg(ModulesMsg::RegisterModule {
             module_id: module_id.into(),
+            kind,
             code_hash: hash(code),
         }),
     )
@@ -107,9 +111,13 @@ fn schedule_swap(module_id: &str, name: &str, ah: u64, code: u8) -> Msg {
     })
 }
 fn schedule_register(module_id: &str, name: &str, ah: u64, code: u8) -> Msg {
+    schedule_register_kind(module_id, Kind::Module, name, ah, code)
+}
+fn schedule_register_kind(module_id: &str, kind: Kind, name: &str, ah: u64, code: u8) -> Msg {
     msg(ModulesMsg::ScheduleRegister {
         name: name.into(),
         module_id: module_id.into(),
+        kind,
         activation_height: ah,
         code_hash: hash(code),
     })
@@ -172,6 +180,7 @@ fn a_non_governance_module_authors_nothing() {
     let refused = [
         msg(ModulesMsg::RegisterModule {
             module_id: "kanban".into(),
+            kind: Kind::Module,
             code_hash: hash(1),
         }),
         schedule_swap("governance", "capture", 10, 9),
@@ -209,6 +218,7 @@ fn register_and_schedule_origin_gate() {
             &mut ext,
             &msg(ModulesMsg::RegisterModule {
                 module_id: "hello".into(),
+                kind: Kind::Module,
                 code_hash: hash(1)
             })
         ),
@@ -220,6 +230,7 @@ fn register_and_schedule_origin_gate() {
         &mut gov,
         &msg(ModulesMsg::RegisterModule {
             module_id: "hello".into(),
+            kind: Kind::Module,
             code_hash: hash(1),
         }),
     )
@@ -266,6 +277,7 @@ fn register_rejects_reregistration_and_bad_hash() {
             &mut sys,
             &msg(ModulesMsg::RegisterModule {
                 module_id: "hello".into(),
+                kind: Kind::Module,
                 code_hash: hash(9)
             })
         )
@@ -277,6 +289,7 @@ fn register_rejects_reregistration_and_bad_hash() {
             &mut sys,
             &msg(ModulesMsg::RegisterModule {
                 module_id: "other".into(),
+                kind: Kind::Module,
                 code_hash: vec![1, 2, 3]
             })
         )
@@ -686,6 +699,144 @@ fn cancelled_admission_removes_entry() {
     assert!(module_status(&lc).is_empty());
 }
 
+// ---- kind ------------------------------------------------------------------
+
+/// what an entry IS travels with it: a seed, a register and an admission each
+/// record their kind, and status reports it.
+#[test]
+fn seed_register_and_admission_carry_kind_and_status_reports_it() {
+    let mut lc = fresh();
+    futures::executor::block_on(async {
+        lc.seed("chat", Kind::Module, hash(1)).await.unwrap();
+        lc.seed("home", Kind::View, hash(2)).await.unwrap();
+        lc.finish_seed().await.unwrap();
+    });
+    register_kind(&mut lc, "kanban", Kind::Module, 3);
+    register_kind(&mut lc, "board", Kind::View, 4);
+    let mut gov = ctx(Origin::Module("governance".into()), 0);
+    run(
+        &mut lc,
+        &mut gov,
+        &schedule_register_kind("later", Kind::View, "v1", 10, 5),
+    )
+    .unwrap();
+    commit(&mut lc);
+    let kinds: Vec<(String, Kind)> = module_status(&lc)
+        .into_iter()
+        .map(|entry| (entry.module_id, entry.kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("board".into(), Kind::View),
+            ("chat".into(), Kind::Module),
+            ("home".into(), Kind::View),
+            ("kanban".into(), Kind::Module),
+            ("later".into(), Kind::View),
+        ]
+    );
+}
+
+/// the kind is in the root: two registries that differ only in one entry's
+/// kind commit different state.
+#[test]
+fn kind_is_committed_state() {
+    let mut as_module = fresh();
+    register_kind(&mut as_module, "home", Kind::Module, 1);
+    let mut as_view = fresh();
+    register_kind(&mut as_view, "home", Kind::View, 1);
+    assert_ne!(as_module.root(), as_view.root());
+}
+
+/// a swap keeps the entry's kind: schedule, readiness, activation and the
+/// history behave for a `View` exactly as they do for a `Module`, and the
+/// kind never changes across the flip.
+#[test]
+fn a_swap_preserves_kind_and_a_view_swaps_like_a_module() {
+    let mut lc = fresh();
+    register_kind(&mut lc, "home", Kind::View, 1);
+    register_kind(&mut lc, "chat", Kind::Module, 1);
+    let mut gov = ctx(Origin::Module("governance".into()), 0);
+    for id in ["home", "chat"] {
+        run(&mut lc, &mut gov, &schedule_swap(id, "next", 10, 2)).unwrap();
+    }
+    commit(&mut lc);
+    for entry in module_status(&lc) {
+        assert_eq!(entry.pending.as_ref().unwrap().code_hash, hash(2));
+        assert_eq!(entry.active_code_hash, hash(1));
+    }
+    assert!(armed_at(&lc, 10).is_empty(), "not armed until ready");
+    make_swap_ready(&mut lc, "home", "next", 2);
+    make_swap_ready(&mut lc, "chat", "next", 2);
+    let armed: Vec<String> = armed_at(&lc, 10)
+        .into_iter()
+        .map(|swap| swap.module_id)
+        .collect();
+    assert_eq!(armed, ["chat", "home"]);
+    let mut at = ctx(Origin::System, 10);
+    run(&mut lc, &mut at, &advance()).unwrap();
+    commit(&mut lc);
+    let status = module_status(&lc);
+    let home = status.iter().find(|entry| entry.module_id == "home").unwrap();
+    let chat = status.iter().find(|entry| entry.module_id == "chat").unwrap();
+    assert_eq!(home.kind, Kind::View, "the swap kept the view's kind");
+    assert_eq!(chat.kind, Kind::Module);
+    for entry in [home, chat] {
+        assert_eq!(entry.active_code_hash, hash(2));
+        assert!(entry.pending.is_none());
+        assert_eq!(entry.history.len(), 2);
+    }
+    // the same gates: a no-op swap and a second in-flight pending refuse
+    // for a view exactly as for a module.
+    assert!(run(&mut lc, &mut gov, &schedule_swap("home", "same", 20, 2)).is_err());
+    run(&mut lc, &mut gov, &schedule_swap("home", "third", 20, 3)).unwrap();
+    commit(&mut lc);
+    assert!(run(&mut lc, &mut gov, &schedule_swap("home", "fourth", 30, 4)).is_err());
+    let mut sys = ctx(Origin::System, 0);
+    run(&mut lc, &mut sys, &cancel_swap("home", "third")).unwrap();
+    commit(&mut lc);
+    let home = module_status(&lc).into_iter().find(|entry| entry.module_id == "home").unwrap();
+    assert!(home.pending.is_none());
+    assert_eq!(home.kind, Kind::View);
+}
+
+/// an admission of a view realizes at its boundary like a module's, and a
+/// cancelled one leaves no entry behind.
+#[test]
+fn a_view_admission_realizes_and_cancels_like_a_module() {
+    let mut lc = fresh();
+    let mut gov = ctx(Origin::Module("governance".into()), 0);
+    run(
+        &mut lc,
+        &mut gov,
+        &schedule_register_kind("home", Kind::View, "v1", 10, 5),
+    )
+    .unwrap();
+    commit(&mut lc);
+    let home = &module_status(&lc)[0];
+    assert_eq!(home.kind, Kind::View);
+    assert!(home.active_code_hash.is_empty());
+    make_swap_ready(&mut lc, "home", "v1", 5);
+    let mut at = ctx(Origin::System, 10);
+    run(&mut lc, &mut at, &advance()).unwrap();
+    commit(&mut lc);
+    let home = &module_status(&lc)[0];
+    assert_eq!(home.kind, Kind::View);
+    assert_eq!(home.active_code_hash, hash(5));
+
+    let mut lc = fresh();
+    run(
+        &mut lc,
+        &mut gov,
+        &schedule_register_kind("home", Kind::View, "v1", 10, 5),
+    )
+    .unwrap();
+    commit(&mut lc);
+    run(&mut lc, &mut gov, &cancel_swap("home", "v1")).unwrap();
+    commit(&mut lc);
+    assert!(module_status(&lc).is_empty());
+}
+
 // ---- the activation history (code-at-height) --------------------------------
 
 fn activation(height: u64, code: u8) -> Activation {
@@ -699,6 +850,7 @@ fn activation(height: u64, code: u8) -> Activation {
 fn entry(history: &[(u64, u8)], pending: Option<ScheduledSwap>) -> ModuleCode {
     ModuleCode {
         module_id: "hello".into(),
+        kind: Kind::Module,
         active_code_hash: history.last().map(|(_, c)| hash(*c)).unwrap_or_default(),
         pending,
         history: history.iter().map(|(h, c)| activation(*h, *c)).collect(),
@@ -758,6 +910,7 @@ fn every_activation_is_appended_in_block_order() {
         &mut at7,
         &msg(ModulesMsg::RegisterModule {
             module_id: "hello".into(),
+            kind: Kind::Module,
             code_hash: hash(1),
         }),
     )
@@ -801,7 +954,7 @@ fn every_activation_is_appended_in_block_order() {
     // a genesis seed is the activation at block zero.
     let mut lc = fresh();
     futures::executor::block_on(async {
-        lc.seed("hello", hash(1)).await.unwrap();
+        lc.seed("hello", Kind::Module, hash(1)).await.unwrap();
         lc.finish_seed().await.unwrap();
     });
     assert_eq!(module_status(&lc)[0].history, [activation(0, 1)]);
@@ -833,8 +986,8 @@ fn root_empty_fresh_then_state_moves_it() {
 fn genesis_seed_publishes_once_and_reseeding_is_a_no_op() {
     let mut lc = fresh();
     futures::executor::block_on(async {
-        lc.seed("hello", hash(1)).await.unwrap();
-        lc.seed("directory", hash(2)).await.unwrap();
+        lc.seed("hello", Kind::Module, hash(1)).await.unwrap();
+        lc.seed("directory", Kind::Module, hash(2)).await.unwrap();
         lc.finish_seed().await.unwrap();
     });
     let seeded = lc.root();
@@ -844,7 +997,7 @@ fn genesis_seed_publishes_once_and_reseeding_is_a_no_op() {
     // a reopened workspace re-entering the genesis path re-seeds — the
     // idempotence gate must leave the store byte-untouched.
     futures::executor::block_on(async {
-        lc.seed("hello", hash(9)).await.unwrap();
+        lc.seed("hello", Kind::Module, hash(9)).await.unwrap();
         lc.finish_seed().await.unwrap();
     });
     assert_eq!(

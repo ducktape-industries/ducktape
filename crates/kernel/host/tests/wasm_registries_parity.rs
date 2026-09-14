@@ -141,9 +141,14 @@ fn registry_staged_queries_and_committed_advance_match_native() {
             modules::Modules::new("modules", Box::new(MemStore::new()), "valset", "governance");
         let mut wasm =
             WasmModule::with_store("modules", MODULES, Box::new(MemStore::new())).unwrap();
+        let seed = |kind, byte| modules::Seed {
+            kind,
+            code_hash: vec![byte; 32],
+        };
         let roster = std::collections::BTreeMap::from([
-            ("weather", vec![1u8; 32]),
-            ("modules", vec![2u8; 32]),
+            ("weather", seed(modules::Kind::Module, 1u8)),
+            ("modules", seed(modules::Kind::Module, 2u8)),
+            ("home", seed(modules::Kind::View, 4u8)),
         ]);
         let params =
             sdk::genesis_config::encode_config(&[("modules", &sdk::wire::encode(&roster))]);
@@ -166,6 +171,42 @@ fn registry_staged_queries_and_committed_advance_match_native() {
                     name: "weather-update".into(),
                     module_id: "weather".into(),
                     code_hash: vec![3; 32],
+                },
+            ),
+            // a view entry swaps through the same machinery, kind kept.
+            (
+                Origin::System,
+                modules::ModulesMsg::ScheduleSwap {
+                    name: "home-update".into(),
+                    module_id: "home".into(),
+                    activation_height: 5,
+                    code_hash: vec![5; 32],
+                },
+            ),
+            (
+                Origin::External(key(1)),
+                modules::ModulesMsg::SwapReady {
+                    name: "home-update".into(),
+                    module_id: "home".into(),
+                    code_hash: vec![5; 32],
+                },
+            ),
+            (
+                Origin::System,
+                modules::ModulesMsg::ScheduleRegister {
+                    name: "admit-board".into(),
+                    module_id: "board".into(),
+                    kind: modules::Kind::View,
+                    activation_height: 5,
+                    code_hash: vec![6; 32],
+                },
+            ),
+            (
+                Origin::External(key(1)),
+                modules::ModulesMsg::SwapReady {
+                    name: "admit-board".into(),
+                    module_id: "board".into(),
+                    code_hash: vec![6; 32],
                 },
             ),
         ];
@@ -215,6 +256,20 @@ fn registry_staged_queries_and_committed_advance_match_native() {
             .find(|module| module.module_id == "weather")
             .unwrap();
         assert_eq!(weather.active_code_hash, vec![3; 32]);
+        assert_eq!(weather.kind, modules::Kind::Module);
         assert_eq!(weather.history.last().unwrap().height, 5);
+        let home = modules
+            .iter()
+            .find(|module| module.module_id == "home")
+            .unwrap();
+        assert_eq!(home.kind, modules::Kind::View);
+        assert_eq!(home.active_code_hash, vec![5; 32]);
+        let board = modules
+            .iter()
+            .find(|module| module.module_id == "board")
+            .unwrap();
+        assert_eq!(board.kind, modules::Kind::View);
+        assert_eq!(board.active_code_hash, vec![6; 32]);
+        assert_eq!(board.history.len(), 1);
     });
 }
