@@ -407,8 +407,6 @@ pub struct Ducktape {
     pub(crate) huddle_now: i64,
     pub(crate) call_status: String,
     pub(crate) call_muted: bool,
-    /// Deafened: the speaker plays silence, and the mic is muted with it.
-    pub(crate) call_deafened: bool,
     /// This side's mic voice gate, as the session last reported it.
     pub(crate) call_speaking: bool,
     pub(crate) call_peers: Vec<crate::call::CallEvent>,
@@ -634,7 +632,6 @@ pub(crate) enum AppMessage {
     WelcomeReopened(crate::shell::WindowKey),
     CallEvent(crate::call::CallEvent),
     ToggleCallMute,
-    ToggleCallDeafen,
     ToggleCallCamera,
     ToggleCallScreen,
     ShowHuddle,
@@ -860,7 +857,6 @@ impl Ducktape {
             huddle_now: 0,
             call_status: "".to_owned(),
             call_muted: false,
-            call_deafened: false,
             call_speaking: false,
             call_peers: Vec::new(),
             call_camera: false,
