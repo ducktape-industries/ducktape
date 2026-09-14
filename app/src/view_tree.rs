@@ -237,6 +237,22 @@ impl EditorView {
         }
     }
 
+    /// The guest echoes which editor held focus when the frame was built,
+    /// so a rebuilt line editor can put its caret back. The notion editor is
+    /// one persistent entity: it keeps its own focus, and re-focusing it here
+    /// would steal the caret from whatever the guest focused this frame.
+    fn restore_focus(&self, key: &str, window: &mut Window, cx: &mut App) {
+        let Self::Wire(view) = self else {
+            return;
+        };
+        let focus = wire::WidgetCommand::Focus {
+            target: key.to_owned(),
+        };
+        view.update(cx, |editor, cx| {
+            editor.widget_command(&focus, window, cx);
+        });
+    }
+
     fn is_focused(&self, window: &Window, cx: &App) -> bool {
         match self {
             Self::Wire(view) => view.read(cx).is_focused(window, cx),
@@ -2700,10 +2716,7 @@ impl ViewTree {
         let editor = self.editors.get(key).expect("editor inserted");
         editor.view.sync(window, cx);
         if self.presentation.editors.remove(key).as_ref() == Some(document) {
-            let focus = wire::WidgetCommand::Focus {
-                target: key.clone(),
-            };
-            editor.view.widget_command(&focus, window, cx);
+            editor.view.restore_focus(key, window, cx);
         }
         let view = editor.view.element();
         let mut element = dimensions(

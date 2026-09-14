@@ -6,8 +6,9 @@
 //! tile, and the beacon's `camera_on`/`sharing` pair says which of the two the
 //! far end is looking at — so [`Source`] is one discriminant and starting
 //! either source ends the other. The camera is a device (`nokhwa`); the screen
-//! is a root-window grab over X11 (`x11rb`, already in this binary under
-//! winit — see [`ScreenSource`] for why not the portal).
+//! is the desktop: a root-window grab over X11 (`x11rb`, already in this
+//! binary under winit — see [`ScreenSource`] for why not the portal), or the
+//! main display through Core Graphics on macOS.
 //!
 //! CODEC v1 IS BASELINE JPEG, EVERY FRAME A KEYFRAME. The wire (ws
 //! `media_service::call_wire` and the mesh fragmentation in `media_service::video`) treats the
@@ -69,8 +70,6 @@ const WIRE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 /// not watched: ~10/s tracks a scroll and a typed line without spending a
 /// camera's bandwidth on a mostly-still picture.
 const SCREEN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-/// Tile width in the strip; height follows the frame's aspect.
-const TILE_WIDTH: f32 = 128.0;
 /// Capture ceiling, in pixels: the documented ~VGA budget whose q60 JPEG
 /// stays well under the mesh's MAX_FRAME_BYTES. A camera that only offers
 /// bigger modes is box-halved down to it before the encode.
@@ -472,6 +471,72 @@ fn refuse_source(
     SOURCE.store(Source::Off.code(), Ordering::Relaxed);
 }
 
+/// The screen source on macOS: the main display, one `CGDisplayCreateImage`
+/// per frame. `core-graphics` is already in this binary under gpui, so the
+/// desktop costs no new dependency. The image comes back in device pixels
+/// (a Retina desktop is 4× the points) as 32-bit BGRX rows that may carry
+/// padding; the grab strips the padding and halves onto the screen budget.
+///
+/// SCREEN RECORDING PERMISSION IS THE SYSTEM'S: without it macOS hands back
+/// the wallpaper with no windows on it and no error. The first share prompts
+/// once (the app must be launched from a bundle for the prompt to name it).
+// ponytail: the main display only — a per-display or per-window picker is
+// the obvious next step and wants a picker UI, not a different capture.
+#[cfg(target_os = "macos")]
+struct ScreenSource {
+    display: core_graphics::display::CGDisplay,
+}
+
+#[cfg(target_os = "macos")]
+impl ScreenSource {
+    fn open() -> Result<Self, String> {
+        let display = core_graphics::display::CGDisplay::main();
+        // one probe grab: a display that cannot be imaged (a headless run, a
+        // locked session) is refused at open, not on every frame
+        display
+            .image()
+            .ok_or_else(|| "the main display cannot be captured".to_string())?;
+        Ok(ScreenSource { display })
+    }
+
+    /// One grab, BGRA, already inside the wire budget.
+    fn grab(&self) -> Result<(Vec<u8>, u32, u32), String> {
+        let image = self
+            .display
+            .image()
+            .ok_or_else(|| "the display stopped answering".to_string())?;
+        let (width, height) = (image.width(), image.height());
+        let packed_32 = image.bits_per_pixel() == 32;
+        if !packed_32 {
+            return Err(format!(
+                "this display's {}-bit pixel layout is not one screen sharing can read",
+                image.bits_per_pixel()
+            ));
+        }
+        let data = image.data();
+        let bytes = data.bytes();
+        let stride = image.bytes_per_row();
+        let row = width * 4;
+        let mut pixels = Vec::with_capacity(row * height);
+        for y in 0..height {
+            let start = y * stride;
+            pixels.extend_from_slice(&bytes[start..start + row]);
+        }
+        let codec::Picture {
+            mut pixels,
+            width,
+            height,
+        } = codec::shrink_to_budget(pixels, width as u32, height as u32, SCREEN_PIXEL_BUDGET);
+        // Core Graphics hands back BGRX in memory (32-bit little-endian
+        // ARGB), which IS the renderer's and the encoder's order; only the
+        // alpha byte needs writing, over the small image.
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel[3] = 0xff;
+        }
+        Ok((pixels, width, height))
+    }
+}
+
 /// The screen source: one X11 connection, and a full-desktop grab per frame.
 ///
 /// X11 AND PURE RUST ON PURPOSE. `x11rb` is already in this binary (winit
@@ -483,11 +548,13 @@ fn refuse_source(
 // ponytail: the WHOLE root window, so a multi-head desktop shares every head
 // at once — a per-monitor or per-window picker is the obvious next step and
 // wants a picker UI, not a different capture.
+#[cfg(not(target_os = "macos"))]
 struct ScreenSource {
     connection: x11rb::rust_connection::RustConnection,
     root: x11rb::protocol::xproto::Window,
 }
 
+#[cfg(not(target_os = "macos"))]
 impl ScreenSource {
     fn open() -> Result<Self, String> {
         use x11rb::connection::Connection as _;
@@ -775,6 +842,11 @@ impl Render for VideoView {
         for handle in take_retired() {
             let _ = window.drop_image(handle);
         }
+        // EVERY SURFACE FILLS THE BOX IT IS GIVEN; the window decides the box.
+        // The stage is the picture, whole, in whatever room is left; the
+        // tiles are a strip under a stage, or an even grid of the room when
+        // there is none — so a bigger window is a bigger picture, never the
+        // same 128-pixel plate with more air around it.
         match &self.source {
             VideoDisplay::Stage(peer) => {
                 let Some((_, _, handle)) = stage_frame(peer) else {
@@ -782,8 +854,7 @@ impl Render for VideoView {
                 };
                 window.request_animation_frame();
                 img(handle)
-                    .w_full()
-                    .h_auto()
+                    .size_full()
                     .object_fit(ObjectFit::Contain)
                     .rounded(px(8.))
                     .into_any_element()
@@ -793,22 +864,59 @@ impl Render for VideoView {
                 if !tiles.is_empty() {
                     window.request_animation_frame();
                 }
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(TILE_GAP))
-                    .children(tiles.into_iter().map(|(_, _, handle)| {
-                        img(handle)
-                            .w(px(TILE_WIDTH))
-                            .h(px(TILE_HEIGHT))
-                            .object_fit(ObjectFit::Cover)
-                            .rounded(px(6.))
-                    }))
-                    .into_any_element()
+                let under_a_stage = !staged.is_empty();
+                if under_a_stage {
+                    return div()
+                        .w_full()
+                        .h(px(TILE_HEIGHT))
+                        .flex_shrink_0()
+                        .flex()
+                        .gap(px(TILE_GAP))
+                        .overflow_hidden()
+                        .children(tiles.into_iter().map(|(_, _, handle)| {
+                            img(handle)
+                                .w(px(TILE_HEIGHT * 4. / 3.))
+                                .h_full()
+                                .object_fit(ObjectFit::Cover)
+                                .rounded(px(6.))
+                        }))
+                        .into_any_element();
+                }
+                let (rows, cols) = grid_shape(tiles.len());
+                let mut grid = div().size_full().flex().flex_col().gap(px(TILE_GAP));
+                let mut tiles = tiles.into_iter();
+                for _ in 0..rows {
+                    let mut row = div().flex_1().min_h_0().flex().gap(px(TILE_GAP));
+                    for _ in 0..cols {
+                        let Some((_, _, handle)) = tiles.next() else {
+                            break;
+                        };
+                        row = row.child(
+                            img(handle)
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .object_fit(ObjectFit::Cover)
+                                .rounded(px(6.)),
+                        );
+                    }
+                    grid = grid.child(row);
+                }
+                grid.into_any_element()
             }
         }
     }
+}
+
+/// The grid a stage-less huddle lays its tiles in: as square as the count
+/// allows (1, 2 side by side, 2×2, 2×3, 3×3 …), rows filled left to right.
+fn grid_shape(tiles: usize) -> (usize, usize) {
+    if tiles == 0 {
+        return (0, 0);
+    }
+    let rows = (tiles as f32).sqrt().floor() as usize;
+    let cols = tiles.div_ceil(rows);
+    (rows, cols)
 }
 
 /// The stage's stand-in for "the screen this device is sharing" — a sentinel
@@ -828,8 +936,8 @@ pub(crate) fn stage_frame(peer: &str) -> Option<(u32, u32, Arc<RenderImage>)> {
     Some((frame.width, frame.height, frame.handle.clone()))
 }
 
-/// Displayed tile plate: fixed 4:3, the frame Cover-cropped onto it, wrapped
-/// into rows on the strip's width.
+/// The strip under a stage: 4:3 plates of this height, the frame
+/// Cover-cropped onto them. The stage-less grid ignores it and fills the room.
 const TILE_HEIGHT: f32 = 96.0;
 const TILE_GAP: f32 = 8.0;
 /// Peers in stable key order, the local preview last — the same order the
@@ -917,6 +1025,18 @@ mod tests {
             Some(mode(1280, 720, 60, FrameFormat::MJPEG))
         );
         assert_eq!(budget_format(&[], CAPTURE_PIXEL_BUDGET), None);
+    }
+
+    #[test]
+    fn the_grid_is_as_square_as_the_count_allows() {
+        assert_eq!(grid_shape(0), (0, 0));
+        assert_eq!(grid_shape(1), (1, 1));
+        assert_eq!(grid_shape(2), (1, 2));
+        assert_eq!(grid_shape(3), (1, 3));
+        assert_eq!(grid_shape(4), (2, 2));
+        assert_eq!(grid_shape(5), (2, 3));
+        assert_eq!(grid_shape(9), (3, 3));
+        assert_eq!(grid_shape(10), (3, 4));
     }
 
     /// One global store AND one global source, so this stays ONE test, in
