@@ -1,23 +1,27 @@
-//! The release manifest: one JSON document per channel, signed with minisign.
+//! The release manifest: one JSON document per channel, signed by the
+//! release wallet key (see [`crate::release`]).
 //!
 //! ```json
-//! { "schema": 1, "sequence": 17, "published_at": "…",
+//! { "schema": 1, "channel": "stable", "sequence": 17, "published_at": "…",
 //!   "release": { "sha256_id": "…", "display": "2026.09.2+9d71b254a",
 //!                "node_contract": 3, "notes_url": "…" },
-//!   "artifacts": { "macos-aarch64": { "url": "…", "sha256": "…", "size": 0 } },
+//!   "artifacts": { "macos-aarch64": { "sha256": "…", "size": 0 } },
 //!   "successor_key": null }
 //! ```
 //!
 //! Identity is the artifact sha256 (the `releases/<sha>` directory name);
-//! `display` is banner text and nothing reads it as a version. `sequence` is
-//! the monotonic downgrade guard. `node_contract` is the app↔node contract
-//! number the release expects, so the banner can warn before the restart.
+//! `display` is banner text and nothing reads it as a version. `channel` and
+//! `sequence` are inside the signed body: a signature cannot be replayed onto
+//! another channel or an older slot. `sequence` is the monotonic downgrade
+//! guard. `node_contract` is the app↔node contract number the release
+//! expects, so the banner can warn before the restart. An artifact names no
+//! location: its duckfs path is [`crate::layout::archive_path`] of its sha.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::minisign::PublicKey;
+use crate::release::PublicKey;
 use crate::sha::Sha;
 
 /// The only manifest schema; anything else is `schema_unsupported`.
@@ -26,6 +30,7 @@ pub const SCHEMA: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub schema: u32,
+    pub channel: String,
     pub sequence: u64,
     pub published_at: String,
     pub release: Release,
@@ -47,7 +52,6 @@ pub struct Release {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artifact {
-    pub url: String,
     pub sha256: Sha,
     pub size: u64,
 }
@@ -121,6 +125,7 @@ pub(crate) mod testkit {
     pub(crate) fn sample(sequence: u64, platform_key: &str, artifact: Sha) -> Manifest {
         Manifest {
             schema: SCHEMA,
+            channel: crate::layout::CHANNEL.into(),
             sequence,
             published_at: "2026-09-02T00:00:00Z".into(),
             release: Release {
@@ -132,7 +137,6 @@ pub(crate) mod testkit {
             artifacts: BTreeMap::from([(
                 platform_key.to_string(),
                 Artifact {
-                    url: "https://example.invalid/app.tar.zst".into(),
                     sha256: artifact,
                     size: 42,
                 },
@@ -154,7 +158,6 @@ mod tests {
         manifest.artifacts.insert(
             "aaa-first".into(),
             Artifact {
-                url: "u".into(),
                 sha256: Sha::digest(b"b"),
                 size: 1,
             },
@@ -185,6 +188,7 @@ mod tests {
         let manifest = sample(17, "macos-aarch64", Sha::digest(b"bundle"));
         let json = serde_json::to_string_pretty(&manifest).unwrap();
         assert!(json.contains("\"schema\": 1"));
+        assert!(json.contains("\"channel\": \"stable\""));
         assert!(json.contains("\"successor_key\": null"));
         assert!(json.contains("\"macos-aarch64\""));
         let back: Manifest = serde_json::from_str(&json).unwrap();

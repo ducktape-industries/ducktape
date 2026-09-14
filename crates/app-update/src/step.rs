@@ -32,7 +32,7 @@ use crate::phase::{
     SwapState, Swapping, UpdateBanner,
 };
 use crate::sha::Sha;
-use crate::verify::{Refusal, SignedManifest};
+use crate::verify::{Refusal, VerifiedManifest};
 
 /// Advance the machine by one event.
 pub fn step(phase: Phase, event: Event) -> (Phase, Vec<Command>) {
@@ -182,10 +182,10 @@ fn idle_tick(idle: Idle) -> (Phase, Vec<Command>) {
 
 fn idle_manifest_fetched(
     idle: Idle,
-    result: Result<SignedManifest, Refusal>,
+    result: Result<VerifiedManifest, Refusal>,
 ) -> (Phase, Vec<Command>) {
     match result {
-        Ok(signed) => idle_offer(idle, signed),
+        Ok(verified) => idle_offer(idle, verified),
         Err(refusal) => banner_only(Phase::Idle(idle), UpdateBanner::Refused(refusal)),
     }
 }
@@ -193,8 +193,8 @@ fn idle_manifest_fetched(
 /// A verified manifest: take it if it is not a downgrade, ships this
 /// platform, and names something other than what runs. Equal to the pin is
 /// re-offered on purpose — that is how a rolled-back release comes back.
-fn idle_offer(idle: Idle, signed: SignedManifest) -> (Phase, Vec<Command>) {
-    let manifest = signed.manifest;
+fn idle_offer(idle: Idle, verified: VerifiedManifest) -> (Phase, Vec<Command>) {
+    let manifest = verified.manifest;
     let is_downgrade = manifest.sequence < idle.pinned_sequence;
     if is_downgrade {
         return banner_only(
@@ -217,7 +217,6 @@ fn idle_offer(idle: Idle, signed: SignedManifest) -> (Phase, Vec<Command>) {
         previous: idle.previous,
         pinned_sequence: idle.pinned_sequence,
         target: artifact.sha256,
-        url: artifact.url.clone(),
         size: artifact.size,
         sequence: manifest.sequence,
         display: manifest.release.display.clone(),
@@ -225,7 +224,6 @@ fn idle_offer(idle: Idle, signed: SignedManifest) -> (Phase, Vec<Command>) {
         successor_key: manifest.successor_key.clone(),
     };
     let download = Command::Download {
-        url: downloading.url.clone(),
         sha: downloading.target,
         size: downloading.size,
     };
@@ -484,7 +482,6 @@ fn rolled_back_dismiss(rolled_back: RolledBack) -> (Phase, Vec<Command>) {
 mod tests {
     use super::*;
     use crate::manifest::testkit::sample;
-    use crate::verify::testkit::fixture;
 
     fn sha(name: &str) -> Sha {
         Sha::digest(name.as_bytes())
@@ -504,7 +501,6 @@ mod tests {
             previous: Some(sha("z")),
             pinned_sequence: 17,
             target: sha(target),
-            url: "https://example.invalid/b.tar.zst".into(),
             size: 42,
             sequence,
             display: "2026.09.2+b".into(),
@@ -553,11 +549,7 @@ mod tests {
 
     fn fetched(sequence: u64, platform_key: &str, artifact: &str) -> Event {
         let manifest = sample(sequence, platform_key, sha(artifact));
-        let signed = SignedManifest {
-            signed_by: fixture(manifest.clone()).signer.public.key_id(),
-            manifest,
-        };
-        Event::ManifestFetched(Ok(signed))
+        Event::ManifestFetched(Ok(VerifiedManifest { manifest }))
     }
 
     /// The whole flip, from `from` to `to`: swap bit, flip, pending, exec.
@@ -610,7 +602,6 @@ mod tests {
             previous: Some(sha("z")),
             pinned_sequence: 17,
             target: sha("b"),
-            url: "https://example.invalid/app.tar.zst".into(),
             size: 42,
             sequence: 18,
             display: "2026.09.2+9d71b254a".into(),
@@ -634,7 +625,6 @@ mod tests {
                     vec![
                         Command::Persist(Phase::Downloading(accepted.clone())),
                         Command::Download {
-                            url: accepted.url.clone(),
                             sha: sha("b"),
                             size: 42,
                         },
@@ -658,7 +648,6 @@ mod tests {
                             ..accepted.clone()
                         })),
                         Command::Download {
-                            url: accepted.url.clone(),
                             sha: sha("b"),
                             size: 42,
                         },
@@ -1029,9 +1018,9 @@ mod tests {
     #[test]
     fn verified_pins_the_announced_successor() {
         use crate::manifest::SuccessorKey;
-        use crate::minisign::testkit::key_pair;
+        use crate::release::{PublicKey, testkit::key_pair};
         let successor = SuccessorKey {
-            pubkey: key_pair(6).public,
+            pubkey: PublicKey::of(&key_pair(6)),
             from_sequence: 20,
         };
         let mut d = downloading("b", 18);
