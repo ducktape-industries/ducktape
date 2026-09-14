@@ -1,6 +1,7 @@
 //! Native layout and authored WASM presentation contracts.
 use super::*;
 use gpui_kit::{AppContext, px, size};
+use ui_lang_wire as wire;
 
 #[test]
 fn full_view_fits_the_default_test_stack() {
@@ -37,6 +38,66 @@ fn full_view_fits_the_default_test_stack() {
         .join()
         .unwrap();
 }
+/// The deepest tree the wire admits renders on the main thread's stack. The
+/// render recursion runs one `ViewTree::node` frame per nesting level, and an
+/// unoptimised build gives a frame the stack of everything it inlines: the
+/// thread here is the 8 MiB the platform gives `main`, not the test harness's
+/// (RUST_MIN_STACK on a developer box makes that one enormous).
+#[test]
+fn a_tree_at_the_wire_depth_cap_renders_on_the_main_thread_stack() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut root = wire::Node::Text {
+                key: "leaf".into(),
+                content: "deep".into(),
+                width: None,
+                size: None,
+                color: None,
+                font: Default::default(),
+                align_x: None,
+                options: Default::default(),
+            };
+            // Fill on both axes: a definite size at every level keeps the
+            // layout engine's cache warm, so the walk is linear in depth and
+            // the test measures the stack, not flexbox's auto-size re-measuring.
+            for level in 0..wire::MAX_DEPTH {
+                root = wire::Node::Linear {
+                    key: format!("level-{level}"),
+                    axis: wire::Axis::Column,
+                    spacing: None,
+                    padding: None,
+                    width: Some(wire::Length::Fill),
+                    height: Some(wire::Length::Fill),
+                    background: None,
+                    border: None,
+                    align: None,
+                    max_width: None,
+                    clip: false,
+                    wrap: None,
+                    children: vec![root],
+                };
+            }
+            let mut cx = crate::frame_probe::headless_context();
+            let window = cx
+                .open_window(size(px(800.), px(600.)), |_, cx| {
+                    cx.new(|_| crate::view_tree::ViewTree::new(root))
+                })
+                .expect("native window opens");
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .expect("the deepest tree draws");
+            let leaf = cx.update(|cx| {
+                window
+                    .read(cx)
+                    .expect("the tree is the window's root")
+                    .measured_bounds("leaf")
+            });
+            assert!(leaf.is_some(), "the leaf at the depth cap was laid out");
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
 #[test]
 fn native_editor_projects_document_lines_without_losing_source_positions() {
     let host = rust_tokens(include_str!("../editor/blocks.rs"));
@@ -53,6 +114,17 @@ fn shell_keeps_opaque_window_and_alpha_authored_content() {
     let renderer = rust_tokens(include_str!("../view_tree.rs"));
     assert!(renderer.contains("wire::Background::Color"));
     assert!(renderer.contains("let[r,g,b,a]=color.0"));
+}
+/// The editor's floating menu hangs below its row, over the rows that
+/// follow; those paint later, so the menu must paint last (deferred), take
+/// the clicks that land on it (occlude), and show the item the keys walked.
+#[test]
+fn the_editor_menu_paints_over_the_rows_below_it_and_shows_the_walked_item() {
+    let editor = rust_tokens(include_str!("../editor/blocks.rs"));
+    assert!(editor.contains("deferred(menu_view).with_priority(1)"));
+    assert!(editor.contains(".rounded(theme.radius_tokens().md).occlude()"));
+    assert!(editor.contains("letwalked=item_indexasu32==menu.selected;"));
+    assert!(editor.contains(".selected(walked)"));
 }
 #[test]
 fn persistent_split_panes_have_native_resize_handles_and_cursor_feedback() {

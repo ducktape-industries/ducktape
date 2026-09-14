@@ -5,13 +5,14 @@ use super::{EditorStore, Projection, offset, position};
 use gpui_kit::base::input::{
     Editor, EditorState, InputEditorStyle, TextDecoration, TextDecorationCollection,
 };
+use gpui_kit::component::Selectable as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Edges, Entity, EntityInputHandler as _,
     EventEmitter, Focusable as _, FontWeight, HighlightStyle, Hsla, InteractiveElement as _,
     IntoElement, KeyDownEvent, Keystroke, MouseButton, ParentElement as _, Pixels, Point, Render,
     ScrollHandle, SharedString, StatefulInteractiveElement as _, StrikethroughStyle, Styled as _,
-    Subscription, UnderlineStyle, Window, div, point, px,
+    Subscription, UnderlineStyle, Window, deferred, div, point, px,
 };
 use std::{ops::Range, sync::Arc};
 use ui_lang_wire as wire;
@@ -1187,12 +1188,15 @@ impl Render for WireEditor {
                         .text_color(colors.surface_foreground)
                         .border_1()
                         .border_color(colors.border)
-                        .rounded(theme.radius_tokens().md);
+                        .rounded(theme.radius_tokens().md)
+                        .occlude();
                     for (item_index, item) in menu.items.iter().enumerate() {
                         let tag = item.tag.clone();
+                        let walked = item_index as u32 == menu.selected;
                         menu_view = menu_view.child(
                             Button::new(("menu", item_index))
                                 .label(item.label.clone())
+                                .selected(walked)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.interaction(
                                         EditorInteraction::MenuPick { tag: tag.clone() },
@@ -1201,7 +1205,11 @@ impl Render for WireEditor {
                                 })),
                         );
                     }
-                    body = body.child(menu_view);
+                    // The menu hangs below its row, over the rows that follow.
+                    // Those rows paint after this one, so the menu paints
+                    // after all of them, or a code block's background wipes
+                    // its middle out.
+                    body = body.child(deferred(menu_view).with_priority(1));
                 }
             }
             content = content.child(body);

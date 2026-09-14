@@ -797,6 +797,13 @@ impl PagesView {
         self.comment_anchor_y = self.pointer_y;
         self.block_comments_open = true;
         self.comment_anchor_line = comment_line;
+        // The card opened to be written in: the keyboard moves to its
+        // composer, or the next keystroke lands in the document under it.
+        let focus_composer = ::ducktape_view_guest::widget::perform::<Message>(
+            ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                target: format!("{PAGE_KEY}/page-comment({})", self.active_page),
+            },
+        );
         let opened = crate::host::comments_reserve(
             self.pages_pane_width,
             true,
@@ -806,11 +813,11 @@ impl PagesView {
         if (opened.line == self.document_reserve.line)
             && (opened.height == self.document_reserve.height)
         {
-            return Task::none();
+            return focus_composer;
         }
         self.document_reserve = opened;
         self.refresh_document_presentation();
-        Task::none()
+        focus_composer
     }
     fn on_page_draft_changed(&mut self, value: String) -> Task<Message> {
         self.page_draft = value;

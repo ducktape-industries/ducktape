@@ -842,6 +842,23 @@ fn a_comment_from_the_format_menu_pins_to_the_selected_words() {
         "the pick opens the block's own conversation: {:?}",
         texts(&frame)
     );
+    // the card is as tall as its threads, under a ceiling the list scrolls in
+    let Some(Node::Container {
+        height: None,
+        max_height: Some(_),
+        ..
+    }) = find(&frame, "PagesView/root/pages/comments-card")
+    else {
+        panic!("the comment card is a content-sized container with a ceiling");
+    };
+    // the card opened to be written in: the keyboard moves to its composer
+    let focus = request(&frame, "host.widget");
+    assert_eq!(
+        wire::decode::<wire::WidgetCommand>(&focus.payload).unwrap(),
+        wire::WidgetCommand::Focus {
+            target: "PagesView/root/pages/page-comment(alpha)".into()
+        }
+    );
     let frame = tick_native(type_into(&frame, "Start a thread…", "first?"));
     let frame = tick_native(press(&frame, "Post"));
     let mint = request(&frame, "host.id");
