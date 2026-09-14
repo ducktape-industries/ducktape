@@ -117,6 +117,14 @@ pub struct ChatView {
     pub(crate) copy_surface: CopySurface,
     pub(crate) chat_viewport_width: f64,
     pub(crate) chat_viewport_height: f64,
+    /// The pictures the host has decoded for this view, by their duck link:
+    /// the drawn size, or (0, 0) for one that did not decode and stays a
+    /// file card. Not a snapshot's to keep: the host's store is not.
+    #[serde(skip)]
+    pub(crate) pictures: ::std::collections::BTreeMap<String, (i64, i64)>,
+    /// The pictures asked for and not yet answered.
+    #[serde(skip)]
+    pub(crate) pictures_pending: ::std::collections::BTreeSet<String>,
     /// Where the pointer last pressed, in chat-screen pixels: a message menu
     /// opens there.
     pub(crate) press_x: f64,
@@ -148,7 +156,10 @@ pub enum Message {
     ThreadResized(f64, f64),
     ChatViewportChanged(f64, f64),
     PressedAt(f64, f64),
-    SessionArrived(crate::host::SessionItem),
+    /// The host decoded (or refused) the picture behind a duck link.
+    PictureLoaded(String, Result<(i64, i64), String>),
+    /// Boxed: the session item dwarfs every other variant.
+    SessionArrived(Box<crate::host::SessionItem>),
     SessionSettled(bool),
     SnapStream(bool),
     RevealStream(i64),
@@ -295,6 +306,8 @@ impl ChatView {
             copy_surface: CopySurface::Nowhere,
             chat_viewport_width: 1280.0,
             chat_viewport_height: 800.0,
+            pictures: ::std::collections::BTreeMap::new(),
+            pictures_pending: ::std::collections::BTreeSet::new(),
             press_x: 0.0,
             press_y: 0.0,
             menu_x: 0.0,
@@ -362,7 +375,7 @@ impl ChatView {
 impl ChatView {
     pub(crate) fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
         ::ducktape_view_guest::Subscription::batch([
-            crate::host::session().map(Message::SessionArrived),
+            crate::host::session().map(|item| Message::SessionArrived(Box::new(item))),
             if self.connected {
                 ::ducktape_view_guest::Subscription::batch([crate::host::room(
                     self.room_key.clone(),

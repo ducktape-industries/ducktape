@@ -774,10 +774,11 @@ fn files_get(
 /// of the two [`crate::backend::picture`] draws — the store never grows a
 /// slot nothing paints.
 fn picture_surface(ask: &serde_json::Value) -> Option<&'static str> {
-    use crate::backend::{FILES_SURFACE, FORGE_SURFACE};
+    use crate::backend::{CHAT_SURFACE, FILES_SURFACE, FORGE_SURFACE};
     match ask["surface"].as_str()? {
         FILES_SURFACE => Some(FILES_SURFACE),
         FORGE_SURFACE => Some(FORGE_SURFACE),
+        CHAT_SURFACE => Some(CHAT_SURFACE),
         _ => None,
     }
 }
