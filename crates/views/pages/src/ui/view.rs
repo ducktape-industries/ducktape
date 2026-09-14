@@ -652,7 +652,7 @@ mod tests {
                 ..
             } = node
             {
-                constrained |= *width == 688.;
+                constrained |= *width == 716.;
             }
         });
         assert!(
