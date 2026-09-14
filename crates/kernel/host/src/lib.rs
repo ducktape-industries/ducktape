@@ -1979,6 +1979,12 @@ impl Host {
         // untouched registry: a miss anywhere returns Err having mutated nothing.
         let mut realizations: Vec<Realization> = Vec::new();
         for m in modules {
+            // a view entry has nothing to seat: its artifact is a UI the
+            // desktop fetches by the registry's hash, and no core runs here.
+            match m.kind {
+                modules::Kind::Module => {}
+                modules::Kind::View => continue,
+            }
             let Some(target) = modules::code_at(&m, height) else {
                 continue; // registered, never activated — nothing to realize.
             };

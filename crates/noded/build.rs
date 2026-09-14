@@ -73,16 +73,21 @@ fn stage_founding_set() {
         &checkout,
         &profile_dir.join("modules"),
         topology::PRODUCTION,
+        topology::VIEWS,
     );
     let simulation: Vec<&str> = topology::TOPOLOGY
         .modules
         .iter()
         .map(|module| module.id)
         .collect();
-    stage_preset(&checkout, &profile_dir.join("sim-modules"), &simulation);
+    stage_preset(&checkout, &profile_dir.join("sim-modules"), &simulation, &[]);
 }
 
-pub(crate) fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str]) {
+/// stage the module set `ids` and the view-only entries `views` into `dest`:
+/// a module's component, mapper and (declared) view; a view-only entry's view
+/// and assets alone, as `<id>.view.wasm` + `<id>.assets` with no component,
+/// which `workspace_config::Genesis::compose` reads as a `Kind::View` entry.
+pub(crate) fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str], views: &[&str]) {
     std::fs::create_dir_all(dest).expect("create the staged module directory");
     for entry in std::fs::read_dir(dest).expect("read staged module directory") {
         let path = entry.expect("read staged artifact").path();
@@ -96,7 +101,8 @@ pub(crate) fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str]) {
             .or_else(|| name.strip_suffix(".view.wasm"))
             .or_else(|| name.strip_suffix(".view.pending"))
             .or_else(|| name.strip_suffix(".assets"));
-        let obsolete = artifact_id.is_some_and(|id| id != "netstack" && !ids.contains(&id));
+        let obsolete = artifact_id
+            .is_some_and(|id| id != "netstack" && !ids.contains(&id) && !views.contains(&id));
         if obsolete {
             if std::fs::symlink_metadata(&path)
                 .expect("inspect obsolete staged artifact")
@@ -137,6 +143,13 @@ pub(crate) fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str]) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => panic!("remove obsolete mapper {}: {error}", index_path.display()),
         }
+    }
+    for id in views {
+        assert!(
+            topology::TOPOLOGY.spec(id).is_none(),
+            "view {id} is also a module in the topology"
+        );
+        view_staging::stage_view(checkout, dest, id).expect("stage founding view");
     }
     stage(
         &checkout.join("crates/networking/netstack-machine/component.wasm"),

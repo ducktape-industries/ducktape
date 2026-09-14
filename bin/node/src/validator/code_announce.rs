@@ -131,8 +131,9 @@ impl CodeReadinessSignaller {
     }
 
     /// the PURE decision core: given committed modules registry status and a
-    /// local verdict on each (module id, digest) — the bytes, and the id they
-    /// would run under — decide this tick's signals, fetches and refusals.
+    /// local verdict on each (entry, digest) — the bytes, and the registry
+    /// entry (id and kind) they would land under — decide this tick's
+    /// signals, fetches and refusals.
     /// truthful (signals only bytes that are held AND run here under that
     /// id), idempotent (committed readiness, the in-flight latch, the fetch
     /// dedupe and the unloadable latch all short-circuit), and quiet once a
@@ -141,7 +142,7 @@ impl CodeReadinessSignaller {
         &mut self,
         height: u64,
         modules: &[modules::ModuleCode],
-        mut verdict: impl FnMut(&str, &[u8; 32]) -> CodeVerdict,
+        mut verdict: impl FnMut(&modules::ModuleCode, &[u8; 32]) -> CodeVerdict,
     ) -> CodeActions {
         let mut actions = CodeActions::default();
         for m in modules {
@@ -185,7 +186,7 @@ impl CodeReadinessSignaller {
             // already known to run here skips the probe entirely.
             let answer = match self.loadable.contains(&latch) {
                 true => CodeVerdict::Loadable,
-                false => verdict(&m.module_id, &digest),
+                false => verdict(m, &digest),
             };
             match answer {
                 CodeVerdict::Loadable => {
@@ -334,6 +335,33 @@ mod tests {
         assert_eq!(acts.signals[0].0, key("missing", "replacement", 2));
     }
 
+    /// a `Kind::View` pending is decided like any other: the verdict is
+    /// asked with the registry ENTRY (its kind steers what "loadable" means
+    /// in the drain — the view ABI alone, no core, no running module asked),
+    /// and a loadable answer signals `SwapReady` for it, once.
+    #[test]
+    fn a_view_pending_is_probed_with_its_kind_and_signals_when_the_view_loads() {
+        let mut s = CodeReadinessSignaller::new(me());
+        let mut view = pending("home", "deploy-home", 3, false, &[]);
+        view.kind = modules::Kind::View;
+        let modules = vec![view];
+        let mut probed = Vec::new();
+        let acts = s.decide(1, &modules, |entry, digest| {
+            probed.push((entry.module_id.clone(), entry.kind, *digest));
+            CodeVerdict::Loadable
+        });
+        assert_eq!(
+            probed,
+            vec![("home".to_string(), modules::Kind::View, [3u8; 32])]
+        );
+        assert_eq!(acts.signals.len(), 1);
+        assert_eq!(acts.signals[0].0, key("home", "deploy-home", 3));
+        assert!(acts.refusals.is_empty());
+        // latched: the view is not probed again
+        let acts = s.decide(1, &modules, |_, _| panic!("a signalled view must not be re-probed"));
+        assert!(acts.signals.is_empty());
+    }
+
     /// BYTE RESIDENCY IS NOT READINESS. A validator whose binary cannot
     /// instantiate the staged component must stay silent: signalling arms a
     /// swap at R = n that this node then deterministically rejects every op
@@ -342,7 +370,7 @@ mod tests {
     fn code_this_binary_cannot_load_is_never_signalled_and_is_reported_once() {
         let mut s = CodeReadinessSignaller::new(me());
         let modules = vec![pending("chat", "replacement", 1, false, &[])];
-        let refuse = |_: &str, _: &[u8; 32]| CodeVerdict::Unloadable {
+        let refuse = |_: &modules::ModuleCode, _: &[u8; 32]| CodeVerdict::Unloadable {
             detail: "unknown import `ducktape:module/host@0.2.0`".into(),
         };
 

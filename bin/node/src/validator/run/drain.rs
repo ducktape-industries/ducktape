@@ -1607,15 +1607,23 @@ impl ValidatorRuntime<'_> {
         // and unloadable alike — and every validator pays it at the same
         // moment, right after the swap commits.
         let height = node.finalized().map_or(0, |f| f.height);
-        let actions = code_signaller.decide(height, &modules, |module_id, digest| {
+        let actions = code_signaller.decide(height, &modules, |entry, digest| {
             let Some(bytes) = blobs.get_chunk(digest) else {
                 return CodeVerdict::Absent;
             };
-            let realizable = noded::compose::validate_deployment(module_id, &bytes, index)
-                .and_then(|()| {
-                    node.check_module_replacement(module_id, &bytes)
-                        .map_err(|error| error.to_string())
-                });
+            let module_id = entry.module_id.as_str();
+            // what "this node can run it" means is the entry's kind: a
+            // module's bytes must instantiate here AND replace the running
+            // module's state shape; a view's bytes must speak the view ABI,
+            // and no running module is asked about them.
+            let realizable =
+                noded::compose::validate_deployment(module_id, entry.kind, &bytes, index)
+                    .and_then(|()| match entry.kind {
+                        modules::Kind::Module => node
+                            .check_module_replacement(module_id, &bytes)
+                            .map_err(|error| error.to_string()),
+                        modules::Kind::View => Ok(()),
+                    });
             match realizable {
                 Ok(()) => CodeVerdict::Loadable,
                 // the first line only: a wasmtime error carries a multi-line
