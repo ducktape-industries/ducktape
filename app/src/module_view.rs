@@ -3885,7 +3885,8 @@ pub(crate) mod tests {
         let props = chat_facts();
         guest.redraw(&props);
         let shown = texts(&guest);
-        for expected in ["Channels", "general", "ops", "Unread"] {
+        // (an unread room carries a dot, not a word)
+        for expected in ["Channels", "general", "ops"] {
             assert!(
                 shown.iter().any(|text| text == expected),
                 "missing {expected:?} in {shown:?}"

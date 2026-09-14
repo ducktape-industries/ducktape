@@ -2,6 +2,138 @@ use super::*;
 use ducktape_view_guest::kit::Tone;
 use ducktape_view_guest::slots;
 
+/// The avatar plate beside an author's first message, and the gap to the
+/// text. A continuation row keeps the same rail so bodies line up.
+pub(super) const AVATAR: f32 = 28.;
+pub(super) const RAIL_GAP: f32 = 10.;
+/// Where a message's text starts, from the row's left edge.
+pub(super) const RAIL: f32 = 16. + AVATAR + RAIL_GAP;
+
+/// A reaction as a pill: the emoji and its count on a 22px line inside a
+/// hairline, the reader's own in the accent wash. Without a count it is
+/// the "add one" chip that ends the row.
+fn reaction_pill(
+    key: String,
+    emoji: &str,
+    count: Option<i64>,
+    label: &str,
+    mine: bool,
+    on_press: Option<u32>,
+) -> wire::Node {
+    let p = native::palette();
+    let mut parts = vec![native::nowrap(native::text_size(
+        native::text(format!("{key}/emoji"), emoji),
+        13.,
+    ))];
+    if let Some(count) = count {
+        parts.push(native::nowrap(native::weighted(
+            native::colored(
+                native::text_size(
+                    native::text(format!("{key}/count"), count.to_string()),
+                    native::type_scale::SECONDARY as f32,
+                ),
+                if mine { p.accent_foreground } else { p.muted },
+            ),
+            wire::Weight::Medium,
+        )));
+    }
+    let mut button = native::button_child(
+        key.clone(),
+        native::spaced(native::centered_row(format!("{key}/label"), parts), 4.),
+        on_press,
+        wire::ButtonPreset::Subtle,
+    );
+    if let wire::Node::Button {
+        checked,
+        label: accessible,
+        description,
+        padding,
+        height,
+        ..
+    } = &mut button
+    {
+        *checked = Some(mine);
+        *accessible = Some(label.into());
+        *description = Some(emoji.into());
+        *height = Some(wire::Length::Fixed(22.));
+        *padding = Some(wire::Edges {
+            top: 0.,
+            right: 8.,
+            bottom: 0.,
+            left: 6.,
+        });
+    }
+    let mut pill = native::container(format!("{key}/pill"), button);
+    if let wire::Node::Container {
+        border,
+        background,
+        width,
+        ..
+    } = &mut pill
+    {
+        *border = Some(wire::Border {
+            color: Some(native::rgba(if mine { p.accent } else { p.border })),
+            width: Some(1.),
+            radius: Some([native::radius::PILL as f32; 4]),
+        });
+        *background = Some(wire::Background::Color(native::rgba(if mine {
+            p.accent_soft
+        } else {
+            p.surface
+        })));
+        *width = Some(wire::Length::Shrink);
+    }
+    pill
+}
+
+/// The way into a message's thread: the reply count in the accent, and
+/// beside it the invitation, on one quiet row.
+fn reply_link(key: String, replies: i64, open: Message) -> wire::Node {
+    let p = native::palette();
+    let content = native::spaced(
+        native::centered_row(
+            format!("{key}/row"),
+            [
+                native::nowrap(native::weighted(
+                    native::colored(
+                        native::text(
+                            format!("{key}/count"),
+                            crate::host::plural(replies, "reply", "replies"),
+                        ),
+                        p.link,
+                    ),
+                    wire::Weight::Medium,
+                )),
+                native::nowrap(native::caption(format!("{key}/hint"), "View thread ›")),
+            ],
+        ),
+        8.,
+    );
+    let mut button = native::button_child(
+        key,
+        content,
+        Some(slots::message(open)),
+        wire::ButtonPreset::Subtle,
+    );
+    if let wire::Node::Button {
+        label,
+        padding,
+        height,
+        ..
+    } = &mut button
+    {
+        *label = Some("Open thread".into());
+        *height = Some(wire::Length::Fixed(24.));
+        *padding = Some(wire::Edges {
+            top: 0.,
+            right: 8.,
+            bottom: 0.,
+            left: 6.,
+        });
+    }
+    native::sized(button, Some(wire::Length::Shrink), None)
+}
+
 impl ChatView {
     /// One message: the avatar rail, then the byline and body. A chosen or
     /// ranged row wears a wash instead of a caption.
@@ -26,7 +158,7 @@ impl ChatView {
             )
         } else {
             native::space(
-                Some(wire::Length::Fixed(24.)),
+                Some(wire::Length::Fixed(AVATAR)),
                 Some(wire::Length::Fixed(4.)),
             )
         };
@@ -39,11 +171,12 @@ impl ChatView {
             ..
         } = &mut row
         {
-            *spacing = Some(10.);
+            *spacing = Some(RAIL_GAP);
+            // a new author opens with air above; a continuation sits close
             *padding = Some(wire::Edges {
-                top: if message.show_author { 6. } else { 1. },
+                top: if message.show_author { 10. } else { 3. },
                 right: 16.,
-                bottom: 1.,
+                bottom: 3.,
                 left: 16.,
             });
             *align = Some(wire::AlignX::Left);
@@ -137,87 +270,73 @@ impl ChatView {
             } else {
                 Message::AddReactionAt(message.seq, reaction.emoji.clone())
             };
-            // A reaction reads as a tag: caption-sized, tight, inside a
-            // hairline. The one the reader owns carries the chosen wash the
-            // native kit paints on a checked control.
-            let mut button = native::button_child(
+            let label = if reaction.reacted_by_me {
+                "Remove reaction"
+            } else {
+                "Add reaction"
+            };
+            reactions.push(reaction_pill(
                 format!("{key}/reaction/{}", reaction.emoji),
-                native::spaced(
-                    native::centered_row(
-                        format!("{key}/reaction/{}/label", reaction.emoji),
-                        [
-                            native::nowrap(native::text_size(
-                                native::text(
-                                    format!("{key}/reaction/{}/emoji", reaction.emoji),
-                                    &reaction.emoji,
-                                ),
-                                native::type_scale::CAPTION as f32,
-                            )),
-                            native::nowrap(native::caption(
-                                format!("{key}/reaction/{}/count", reaction.emoji),
-                                reaction.count.to_string(),
-                            )),
-                        ],
-                    ),
-                    4.,
-                ),
-                Some(slots::message(event)),
-                wire::ButtonPreset::Subtle,
-            );
-            if let wire::Node::Button {
-                checked,
+                &reaction.emoji,
+                Some(reaction.count),
                 label,
-                description,
-                padding,
-                ..
-            } = &mut button
-            {
-                *checked = Some(reaction.reacted_by_me);
-                *label = Some(
-                    if reaction.reacted_by_me {
-                        "Remove reaction"
-                    } else {
-                        "Add reaction"
-                    }
-                    .into(),
-                );
-                *description = Some(reaction.emoji.clone());
-                *padding = Some(wire::Edges {
-                    top: 1.,
-                    right: 6.,
-                    bottom: 1.,
-                    left: 6.,
-                });
-            }
-            let mut tag =
-                native::container(format!("{key}/reaction/{}/tag", reaction.emoji), button);
-            if let wire::Node::Container { border, width, .. } = &mut tag {
-                *border = Some(wire::Border {
-                    color: Some(native::rgba(native::palette().border)),
-                    width: Some(1.),
-                    radius: Some([native::radius::CONTROL as f32; 4]),
-                });
-                *width = Some(wire::Length::Shrink);
-            }
-            reactions.push(tag);
+                reaction.reacted_by_me,
+                (!self.active_channel_archived).then(|| slots::message(event)),
+            ));
         }
+        // a row of reactions ends with the way to add one more
         if !reactions.is_empty() {
+            let open = match surface {
+                CopySurface::Thread => Message::OpenThreadMessageReactions(
+                    message.seq,
+                    message.body.clone(),
+                    message.rev,
+                ),
+                CopySurface::Timeline | CopySurface::Nowhere => Message::OpenMessageReactions(
+                    message.seq,
+                    message.body.clone(),
+                    message.rev,
+                ),
+            };
+            reactions.push(reaction_pill(
+                format!("{key}/reaction/add"),
+                "😀",
+                None,
+                "Add reaction",
+                false,
+                (!self.active_channel_archived).then(|| slots::message(open)),
+            ));
             children.push(native::spaced(
                 native::wrapped_row(format!("{key}/reactions"), reactions),
                 4.,
             ));
         }
-        if message.reply_count > 0 {
-            let mut button = native::button(
+        // in the timeline the count is the way into the thread; in the
+        // thread itself it is the rule between the root and its replies
+        let in_thread = surface == CopySurface::Thread;
+        match (message.reply_count > 0, in_thread) {
+            (false, _) => {}
+            (true, false) => children.push(reply_link(
                 format!("{key}/thread"),
-                crate::host::plural(message.reply_count, "reply", "replies"),
-                Some(slots::message(Message::OpenThreadFor(message.seq))),
-                wire::ButtonPreset::Text,
-            );
-            if let wire::Node::Button { label, .. } = &mut button {
-                *label = Some("Open thread".into());
-            }
-            children.push(native::row(format!("{key}/thread-row"), [button]));
+                message.reply_count,
+                Message::OpenThreadFor(message.seq),
+            )),
+            (true, true) => children.push(native::spaced(
+                native::centered_row(
+                    format!("{key}/thread"),
+                    [
+                        native::nowrap(native::caption(
+                            format!("{key}/thread/count"),
+                            crate::host::plural(message.reply_count, "reply", "replies"),
+                        )),
+                        native::container(
+                            format!("{key}/thread/line"),
+                            native::divider(format!("{key}/thread/rule")),
+                        ),
+                    ],
+                ),
+                8.,
+            )),
         }
         if message.pending {
             children.push(native::caption(format!("{key}/pending"), &message.meta));
@@ -360,6 +479,8 @@ impl ChatView {
             align_x: None,
         }
     }
+    /// The avatar beside a message: the kit's plate grown to the message
+    /// rail's 28px, a rounded square rather than a pill, initials to match.
     pub(super) fn principal_avatar(
         &self,
         key: String,
@@ -367,7 +488,27 @@ impl ChatView {
         agent: bool,
     ) -> wire::Node {
         let tone = if agent { Tone::Agent } else { Tone::Neutral };
-        native::avatar(key, initials, tone)
+        let mut avatar = native::avatar(key, initials, tone);
+        if let wire::Node::Container {
+            width,
+            height,
+            border,
+            content,
+            ..
+        } = &mut avatar
+        {
+            *width = Some(wire::Length::Fixed(AVATAR));
+            *height = Some(wire::Length::Fixed(AVATAR));
+            *border = Some(wire::Border {
+                color: None,
+                width: None,
+                radius: Some([native::radius::CARD as f32; 4]),
+            });
+            if let wire::Node::Text { size, .. } = content.as_mut() {
+                *size = Some(11.5);
+            }
+        }
+        avatar
     }
 
     pub(super) fn active_dm_avatar(&self, key: String) -> wire::Node {

@@ -2,6 +2,36 @@ use super::*;
 use ducktape_view_guest::kit::Tone;
 use ducktape_view_guest::slots;
 
+/// What marks an unread room: an 8px accent dot at the row's end. The
+/// name is already bold; the dot is what the eye catches in a long list.
+pub(super) fn unread_dot(key: String) -> wire::Node {
+    let mut dot = native::container(
+        key,
+        native::space(
+            Some(wire::Length::Fixed(8.)),
+            Some(wire::Length::Fixed(8.)),
+        ),
+    );
+    if let wire::Node::Container {
+        background,
+        border,
+        width,
+        ..
+    } = &mut dot
+    {
+        *background = Some(wire::Background::Color(native::rgba(
+            native::palette().accent,
+        )));
+        *border = Some(wire::Border {
+            color: None,
+            width: None,
+            radius: Some([native::radius::PILL as f32; 4]),
+        });
+        *width = Some(wire::Length::Shrink);
+    }
+    dot
+}
+
 /// A room in the list pane: a 28px row, its content centred on the row,
 /// the name as its accessible label.
 pub(super) fn sidebar_row(mut button: wire::Node, name: String) -> wire::Node {
@@ -69,7 +99,7 @@ impl ChatView {
         }
         if unread {
             children.push(native::spacer());
-            children.push(native::badge(format!("{key}/unread"), "Unread", Tone::Accent));
+            children.push(unread_dot(format!("{key}/unread")));
         }
         let action = if self.busy {
             None
