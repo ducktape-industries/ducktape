@@ -7,7 +7,7 @@ use super::*;
 use ducktape_view_guest::slots;
 
 const COLUMN_WIDTH: f32 = 230.;
-const ROW_HEIGHT: f32 = 26.;
+const ROW_HEIGHT: f32 = 32.;
 
 impl FilesView {
     pub(super) fn columns_pane(&self, key: String) -> wire::Node {
@@ -152,7 +152,8 @@ impl FilesView {
             chosen,
             Some(slots::message(Message::Select(entry.path.clone()))),
         );
-        if let wire::Node::Button { label, .. } = &mut button {
+        if let wire::Node::Button { label, height, .. } = &mut button {
+            *height = Some(wire::Length::Fixed(ROW_HEIGHT));
             *label = Some(match entry.is_dir() {
                 true => format!("Folder {}", entry.name),
                 false => format!("File {}", entry.name),
