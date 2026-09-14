@@ -205,6 +205,7 @@ async fn boot_gateway_and_upstream() -> (String, u16, Arc<MockUpstream>) {
             oauth_client_id: "test-client".into(),
             session_ttl_secs: 3600,
             max_requests: 100,
+            sign: None,
         },
         "snp",
         test_enclave().quoter(),

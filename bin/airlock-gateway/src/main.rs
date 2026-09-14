@@ -22,6 +22,16 @@
 use anyhow::{Context, Result};
 
 use airlock::server::{AttestMode, GatewayConfig};
+use airlock::sign::{Notary, Tools};
+
+/// Where `ops/airlock-gateway/build-image.sh` stages the signing toolchain
+/// beside this binary: the pinned `rcodesign` and the tree's
+/// `app/packaging/entitlements.plist`.
+const RCODESIGN_DEFAULT: &str = "/usr/local/bin/rcodesign";
+const ENTITLEMENTS_DEFAULT: &str = "/usr/local/share/airlock-gateway/entitlements.plist";
+/// The per-request work root: a tmpfs, so the identity written for one
+/// `rcodesign` run and the bundle it signs never reach a disk.
+const WORK_ROOT_DEFAULT: &str = "/dev/shm";
 
 /// `--flag value` / `--flag=value` lookup over argv (no clap — house rule).
 fn arg(name: &str) -> Option<String> {
@@ -79,10 +89,22 @@ async fn serve() -> Result<()> {
             .transpose()
             .context("--max-requests")?
             .unwrap_or(1000),
+        // The enclave image carries the signing toolchain, so this gateway
+        // always serves `POST /sign/macos-bundle`; a missing tool at request
+        // time is the `tool_missing` refusal, never a silent 404.
+        sign: Some(Tools {
+            rcodesign: arg_or("--rcodesign", RCODESIGN_DEFAULT).into(),
+            entitlements: arg_or("--entitlements", ENTITLEMENTS_DEFAULT).into(),
+            work_root: arg_or("--work-root", WORK_ROOT_DEFAULT).into(),
+            notary: Notary::Apple,
+        }),
     };
     let (app, vendor) = airlock::server::build(cfg)?;
     let listener = tokio::net::TcpListener::bind(arg_or("--listen", "127.0.0.1:9100")).await?;
-    eprintln!("[gateway] attest={vendor} listening on {}", listener.local_addr()?);
+    eprintln!(
+        "[gateway] attest={vendor} listening on {}",
+        listener.local_addr()?
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }

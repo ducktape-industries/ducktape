@@ -27,6 +27,7 @@ use crate::bodyseal;
 use crate::codesign;
 use crate::handshake;
 use crate::seal::{self, SealKeypair};
+use crate::sign;
 use crate::token::{self, Claims};
 use crate::wire::{
     AttestationResponse, CredentialKind, CredentialPayload, CredentialUpload, SessionRequest,
@@ -61,6 +62,11 @@ pub struct GatewayConfig {
     pub oauth_client_id: String,
     pub session_ttl_secs: u64,
     pub max_requests: u32,
+    /// The signing toolchain, when this gateway serves `POST /sign/macos-bundle`.
+    /// `None` mounts no signing route at all (see [`assemble`]): the model
+    /// lenders — the self-host daemon, the node embed, tests — hold no
+    /// `rcodesign`; the enclave image does, and names it here.
+    pub sign: Option<sign::Tools>,
 }
 
 struct Config {
@@ -103,13 +109,10 @@ enum CredMaterial {
         vendor: ModelVendor,
         state: OauthState,
     },
-    /// Held, validated, and read by no route: a signing identity is inert
-    /// until a signing route hands it to a signer. `expect` so the lint flips
-    /// the moment a route reads it.
-    AppleCodesign(
-        #[expect(dead_code, reason = "no signing route reads the identity yet")]
-        codesign::AppleCodesign,
-    ),
+    /// A signing identity, handed to the `/sign/macos-bundle` pipeline and
+    /// read by nothing else. Shared, so the pipeline's blocking task holds
+    /// it without the store's entry.
+    AppleCodesign(Arc<codesign::AppleCodesign>),
 }
 
 /// One named credential: its kind (what the audit line and the store loader
@@ -127,6 +130,18 @@ impl CredEntry {
         match &self.material {
             CredMaterial::Oauth { vendor, state } => Ok((*vendor, state)),
             CredMaterial::AppleCodesign(_) => Err(AppErr(
+                StatusCode::FORBIDDEN,
+                "credential_kind_mismatch".into(),
+            )),
+        }
+    }
+
+    /// The signing identity, or the refusal a model credential answers the
+    /// signing route with: the mirror of [`Self::oauth`].
+    fn apple_codesign(&self) -> Result<Arc<codesign::AppleCodesign>, AppErr> {
+        match &self.material {
+            CredMaterial::AppleCodesign(identity) => Ok(identity.clone()),
+            CredMaterial::Oauth { .. } => Err(AppErr(
                 StatusCode::FORBIDDEN,
                 "credential_kind_mismatch".into(),
             )),
@@ -184,6 +199,9 @@ struct AppState {
     /// added, rotated or REMOVED after boot takes effect without a restart.
     /// `None` on gateways with no backing store (TEE, tests).
     reload: Option<ReloadCredential>,
+    /// The signing toolchain behind `POST /sign/macos-bundle`; the route is
+    /// mounted only when this is `Some` (see [`GatewayConfig::sign`]).
+    sign: Option<Arc<sign::Tools>>,
 }
 
 fn now_secs() -> u64 {
@@ -486,6 +504,7 @@ fn assemble(assembly: Assembly) -> Result<(Router, String)> {
         seen_nonces: Mutex::new(HashMap::new()),
         grant_check,
         reload,
+        sign: cfg.sign.map(Arc::new),
     });
 
     let app = Router::new()
@@ -510,6 +529,17 @@ fn assemble(assembly: Assembly) -> Result<(Router, String)> {
     let app = match uploads {
         CredentialUploads::Accepted => app.route("/credential", post(credential)),
         CredentialUploads::Refused => app,
+    };
+    // Same rule for the signing route: mounted only where the image holds
+    // the toolchain. Its body is read by the handler under its own cap
+    // (`sign::MAX_BUNDLE_BYTES`) so the over-size answer is a named refusal,
+    // not the extractor's 413 text; it is not under `/v1`, which is the
+    // model surface.
+    let serves_signing = state.sign.is_some();
+    let app = if serves_signing {
+        app.route("/sign/macos-bundle", post(sign_macos_bundle))
+    } else {
+        app
     };
     Ok((app.with_state(state), vendor))
 }
@@ -555,12 +585,12 @@ fn cred_entry(kind: CredentialKind, payload: CredentialPayload) -> Result<CredEn
                 api_key_json,
                 team_id,
             },
-        ) => CredMaterial::AppleCodesign(codesign::AppleCodesign::admit(
+        ) => CredMaterial::AppleCodesign(Arc::new(codesign::AppleCodesign::admit(
             &p12_b64,
             &p12_password,
             &api_key_json,
             &team_id,
-        )?),
+        )?)),
         (CredentialKind::AppleCodesign, CredentialPayload::Bearer { .. })
         | (CredentialKind::AppleCodesign, CredentialPayload::Refresh { .. })
         | (CredentialKind::Claude, CredentialPayload::AppleCodesign { .. })
@@ -917,6 +947,155 @@ async fn proxy(
     }
 }
 
+/// `POST /sign/macos-bundle`: sign, notarize and staple an unsigned
+/// `Ducktape.app` with the session's `apple-codesign` identity, inside the
+/// enclave. The session must be a SEALED one on a signing credential; the
+/// body is the `.tar.zst` of the bundle, the reply the `.tar.zst` of the
+/// finished one, sealed under the response stream key exactly as a proxied
+/// model reply is. One request = one signature; the session's `max_requests`
+/// caps signatures per session. Refusals are `sign::Refusal` tokens.
+async fn sign_macos_bundle(
+    State(st): State<Arc<AppState>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    match sign_macos_bundle_inner(&st, method, &uri, &headers, body).await {
+        Ok(r) => r,
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn sign_macos_bundle_inner(
+    st: &AppState,
+    method: Method,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Response, AppErr> {
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path());
+    let Some(tools) = st.sign.clone() else {
+        // the route is only mounted with a toolchain (see `assemble`)
+        return Err(AppErr(StatusCode::NOT_FOUND, "not_found".into()));
+    };
+    // Resolve the session and its kind before the body is read at all: a
+    // model credential pointed here is refused by name, and costs nothing.
+    let (claims, entry) = resolve_session(st, headers)?;
+    let identity = entry.apple_codesign()?;
+    // A signing session is sealed or it is nothing: the identity's output
+    // rides back under the response stream key, and there is no plaintext
+    // shape of this exchange.
+    let Some(keys) = session_keys(st, &claims)? else {
+        return Err(AppErr(
+            StatusCode::BAD_REQUEST,
+            "airlock: signing requires a sealed session".into(),
+        ));
+    };
+    let body = axum::body::to_bytes(body, sign::MAX_BUNDLE_BYTES)
+        .await
+        .map_err(|_| AppErr(StatusCode::PAYLOAD_TOO_LARGE, "bundle_too_large".into()))?;
+    let AdmittedBody { body, binding } = admit_body(
+        st,
+        &claims,
+        Some(&keys),
+        &method,
+        path_and_query,
+        headers,
+        body,
+    )?;
+    let sha256_in = sign::sha256_hex(&body);
+    let caller_node = vouched_caller(headers).map(hex::encode).unwrap_or_default();
+    tracing::info!(
+        target: "ducktape::airlock",
+        event = "release_sign_requested",
+        sub = %claims.sub,
+        session = %claims.eph,
+        caller_node = %caller_node,
+        sha256_in = %sha256_in,
+        size = body.len(),
+        "release signing requested"
+    );
+    // The pipeline is blocking work (process spawns, tmpfs IO) and may run
+    // for minutes under Apple's notary wait; it gets a blocking thread.
+    let pipeline_identity = identity.clone();
+    let signed =
+        tokio::task::spawn_blocking(move || sign::sign_bundle(&tools, &pipeline_identity, &body))
+            .await
+            .map_err(|_| AppErr(StatusCode::INTERNAL_SERVER_ERROR, "codesign_failed".into()))?;
+    let signed = match signed {
+        Ok(signed) => signed,
+        Err(refusal) => {
+            let submission_id = match &refusal {
+                sign::Refusal::NotaryRejected { submission_id } => submission_id.clone(),
+                sign::Refusal::BundleShapeRefused
+                | sign::Refusal::BundleTooLarge
+                | sign::Refusal::CodesignFailed
+                | sign::Refusal::StapleFailed
+                | sign::Refusal::ToolMissing => None,
+            };
+            tracing::warn!(
+                target: "ducktape::airlock",
+                event = "release_sign_refused",
+                sub = %claims.sub,
+                session = %claims.eph,
+                sha256_in = %sha256_in,
+                reason = %refusal.as_str(),
+                submission_id = %submission_id.unwrap_or_default(),
+                "release signing refused"
+            );
+            return Err(AppErr(refusal_status(&refusal), refusal.as_str().into()));
+        }
+    };
+    let sha256_out = sign::sha256_hex(&signed.archive);
+    tracing::info!(
+        target: "ducktape::airlock",
+        event = "release_sign_signed",
+        sub = %claims.sub,
+        session = %claims.eph,
+        sha256_in = %sha256_in,
+        sha256_out = %sha256_out,
+        team_id = %identity.team_id(),
+        "release bundle signed"
+    );
+    tracing::info!(
+        target: "ducktape::airlock",
+        event = "release_sign_notarized",
+        sub = %claims.sub,
+        session = %claims.eph,
+        sha256_out = %sha256_out,
+        submission_id = %signed.submission_id.clone().unwrap_or_default(),
+        "release bundle notarized and stapled"
+    );
+    // The reply is the finished archive as a sealed chunk stream, the shape
+    // a proxied model reply has: salt, head (content type), data, Final.
+    let (mut sealer, salt) = bodyseal::StreamSealer::new(&keys, &binding);
+    let mut wire = salt;
+    wire.extend(sealer.seal_head("application/zstd"));
+    for chunk in sign::response_chunks(&signed.archive) {
+        wire.extend(sealer.seal_chunk(chunk));
+    }
+    wire.extend(sealer.seal_final());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(wire))
+        .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")))
+}
+
+/// The status each signing refusal answers with: the caller's fault is 4xx,
+/// Apple's answer is 502, a gateway that cannot sign at all is 503.
+fn refusal_status(refusal: &sign::Refusal) -> StatusCode {
+    match refusal {
+        sign::Refusal::BundleShapeRefused => StatusCode::BAD_REQUEST,
+        sign::Refusal::BundleTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        sign::Refusal::CodesignFailed => StatusCode::INTERNAL_SERVER_ERROR,
+        sign::Refusal::NotaryRejected { .. } => StatusCode::BAD_GATEWAY,
+        sign::Refusal::StapleFailed => StatusCode::BAD_GATEWAY,
+        sign::Refusal::ToolMissing => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
 /// Map the caller's request path onto the vendor upstream. Anthropic serves the
 /// `/v1/...` shape the caller sends, so it passes through. The ChatGPT Codex
 /// backend serves `/responses` under `/backend-api/codex` (no `/v1`), but codex
@@ -930,15 +1109,16 @@ fn upstream_path(vendor: ModelVendor, caller_path: &str) -> &str {
     }
 }
 
-async fn proxy_inner(
-    st: &AppState,
-    method: Method,
-    uri: &axum::http::Uri,
-    headers: &HeaderMap,
-    body: Bytes,
-) -> Result<Response, AppErr> {
-    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path());
-
+/// The session a bearer names, resolved to its claims and credential. Shared
+/// by the model proxy and the signing route: everything here happens before
+/// a body is opened or a budget spent, so a refusal costs the caller nothing.
+///
+/// The store gets first refusal here as it does at `/session`, and for the
+/// same reason: a token minted an hour ago says nothing about whether the
+/// credential still exists. Checking only at session open let `user cred
+/// remove` be followed by a whole TTL of spending on the deleted credential.
+/// One stat per request, the same one the session path pays.
+fn resolve_session(st: &AppState, headers: &HeaderMap) -> Result<(Claims, Arc<CredEntry>), AppErr> {
     let bearer = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -952,14 +1132,6 @@ async fn proxy_inner(
     if claims.exp < now {
         return Err(AppErr(StatusCode::UNAUTHORIZED, "session token expired".into()));
     }
-    // The session's `sub` names the credential it draws on; resolve it now — its
-    // kind selects the upstream and its own token state is what we refresh/spend.
-    //
-    // The store gets first refusal here as it does at `/session`, and for the
-    // same reason: a token minted an hour ago says nothing about whether the
-    // credential still exists. Checking only at session open let `user cred
-    // remove` be followed by a whole TTL of spending on the deleted credential.
-    // One stat per request, the same one the session path pays.
     refresh_credential(st, &claims.sub);
     let entry = st
         .creds
@@ -968,33 +1140,64 @@ async fn proxy_inner(
         .get(&claims.sub)
         .cloned()
         .ok_or_else(|| AppErr(StatusCode::NOT_FOUND, "credential_not_found".into()))?;
-    // Only a model credential has an upstream here. Decided before the body is
-    // opened or the budget spent: a signing identity pointed at `/v1/*` is
-    // refused by name, and costs the session nothing.
-    let (vendor, oauth) = entry.oauth()?;
-    // Sealed-body session: re-derive the handshake keys statelessly from the
-    // claims' ephemeral pk, unseal the request, and REFUSE plaintext — a
-    // stolen bearer alone (visible to path hosts) cannot produce a sealable
-    // body. A plaintext session must not send the seal header. The raw blob's
-    // nonce becomes (a) the per-sub replay-dedup key and (b) the binding the
-    // response stream key is derived under, so an authentic response cannot
-    // be replayed as the answer to a different request.
-    let seal_keys = if claims.seal {
-        let eph = BASE64
-            .decode(&claims.eph)
-            .ok()
-            .and_then(|v| <[u8; 32]>::try_from(v).ok())
-            .ok_or_else(|| AppErr(StatusCode::UNAUTHORIZED, "bad eph in claims".into()))?;
-        Some(handshake::enclave_session_keys(&st.seal_kp, &eph))
-    } else {
-        None
-    };
+    Ok((claims, entry))
+}
+
+/// The handshake keys of a sealed session, re-derived statelessly from the
+/// claims' ephemeral pk; `None` on a plaintext session.
+fn session_keys(st: &AppState, claims: &Claims) -> Result<Option<handshake::SessionKeys>, AppErr> {
+    if !claims.seal {
+        return Ok(None);
+    }
+    let eph = BASE64
+        .decode(&claims.eph)
+        .ok()
+        .and_then(|v| <[u8; 32]>::try_from(v).ok())
+        .ok_or_else(|| AppErr(StatusCode::UNAUTHORIZED, "bad eph in claims".into()))?;
+    Ok(Some(handshake::enclave_session_keys(&st.seal_kp, &eph)))
+}
+
+/// A request body the session admitted: opened if the session is sealed,
+/// as sent if not, with the budget spent and the nonce recorded.
+struct AdmittedBody {
+    /// The plaintext body.
+    body: Bytes,
+    /// The sealed request's nonce, which the response stream binds to.
+    binding: Vec<u8>,
+}
+
+/// Open one request body under the session's rules and charge it to the
+/// session — the three admission steps every credential-spending route
+/// shares, in the one order that keeps each free of the others' abuse:
+///
+/// 1. Sealed-body session (`seal_keys` from [`session_keys`]): unseal the
+///    request, and REFUSE plaintext — a stolen bearer alone (visible to path
+///    hosts) cannot produce a sealable body. A plaintext session must not
+///    send the seal header. The raw blob's nonce becomes (a) the per-sub
+///    replay-dedup key and (b) the binding the response stream key is
+///    derived under, so an authentic response cannot be replayed as the
+///    answer to a different request.
+/// 2. Budget spends only AFTER the sealed body validated — a path host
+///    feeding garbage blobs must not burn the session's requests.
+/// 3. Replay dedupe LAST: the AEAD proved the blob is this session's request,
+///    and the spend paid for it, so one entry here always costs one request
+///    of the budget. Recording the nonce first made an unauthenticated
+///    12-byte body a free, permanent allocation for any bearer holder.
+fn admit_body(
+    st: &AppState,
+    claims: &Claims,
+    seal_keys: Option<&handshake::SessionKeys>,
+    method: &Method,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<AdmittedBody, AppErr> {
     let sealed_request = headers
         .get(bodyseal::SEAL_HEADER)
         .and_then(|v| v.to_str().ok())
         == Some(bodyseal::SEAL_V1);
     let binding = bodyseal::request_binding(&body);
-    let body = match (&seal_keys, sealed_request) {
+    let body = match (seal_keys, sealed_request) {
         (Some(keys), true) => Bytes::from(
             bodyseal::open_request(keys, &bodyseal::request_aad(method.as_str(), path_and_query), &body)
                 .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("airlock: {e}")))?,
@@ -1022,8 +1225,6 @@ async fn proxy_inner(
         (None, false) => body,
     };
 
-    // Budget spends only AFTER the sealed body validated — a path host feeding
-    // garbage blobs must not burn the session's requests (review finding).
     {
         let mut b = st.budgets.lock().unwrap();
         let rem = b
@@ -1049,14 +1250,9 @@ async fn proxy_inner(
         *rem -= 1;
     }
 
-    // Replay dedupe, LAST of the three admission steps and deliberately so: the
-    // AEAD proved the blob is this session's request, and the spend above paid
-    // for it, so one entry here always costs one request of the budget — which
-    // is the whole of this session's entry's bound, since it only ever grows
-    // while THIS bearer (this `sub`+`eph` pair) is spending it, and only a
-    // credential removal or process restart clears it. Recording the nonce
-    // first made an unauthenticated 12-byte body a free, permanent allocation
-    // for any bearer holder.
+    // This session's entry only ever grows while THIS bearer (this `sub`+`eph`
+    // pair) is spending it, and only a credential removal or process restart
+    // clears it.
     if sealed_request {
         let fresh = st
             .seen_nonces
@@ -1072,8 +1268,36 @@ async fn proxy_inner(
             ));
         }
     }
+    Ok(AdmittedBody { body, binding })
+}
 
-    // Ensure a fresh access token, then swap session token -> real credential.
+async fn proxy_inner(
+    st: &AppState,
+    method: Method,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppErr> {
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path());
+    // The session's `sub` names the credential it draws on; resolve it now — its
+    // kind selects the upstream and its own token state is what we refresh/spend.
+    let (claims, entry) = resolve_session(st, headers)?;
+    // Only a model credential has an upstream here. Decided before the body is
+    // opened or the budget spent: a signing identity pointed at `/v1/*` is
+    // refused by name, and costs the session nothing.
+    let (vendor, oauth) = entry.oauth()?;
+    let seal_keys = session_keys(st, &claims)?;
+    let AdmittedBody { body, binding } = admit_body(
+        st,
+        &claims,
+        seal_keys.as_ref(),
+        &method,
+        path_and_query,
+        headers,
+        body,
+    )?;
+    let now = now_secs();
+
     let stale = {
         let o = oauth.oauth.lock().unwrap();
         o.access_token.is_empty() || o.expires_at <= now
@@ -1339,6 +1563,7 @@ mod tests {
             seen_nonces: Mutex::new(HashMap::new()),
             grant_check: None,
             reload: None,
+            sign: None,
         })
     }
 

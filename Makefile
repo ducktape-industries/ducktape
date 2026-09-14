@@ -15,7 +15,7 @@ LOCKED ?= --locked
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app app-release release-app publish-app views views-repro-check dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
+.PHONY: all app app-release release-app publish-app airlock-gateway-image rcodesign views views-repro-check dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
 
 ## the system packages a build needs and cargo cannot install: rustup (the
 ## pinned toolchain and its wasm32 target install themselves through it), a C
@@ -113,6 +113,18 @@ labs-gate:
 ## release build of the networked node (the app-facing daemon surface)
 node: prereqs
 	$(CARGO) build $(LOCKED) --release -p node-bin
+
+## stage the airlock enclave image root under target/airlock-gateway-image:
+## the release `airlock-gateway`, the pinned `rcodesign` it signs release
+## bundles with, and the entitlements it applies (ops/airlock-gateway/).
+airlock-gateway-image:
+	ops/airlock-gateway/stage-image.sh
+
+## the pinned `rcodesign` into $(BIN_DEST): what `cargo test -p airlock` signs
+## a fixture bundle with (the gateway's own `POST /sign/macos-bundle` path),
+## installed from the same pinned release the image carries.
+rcodesign:
+	ops/airlock-gateway/install-rcodesign.sh --prefix "$(patsubst %/,%,$(dir $(BIN_DEST)))"
 
 ## release build of the untrusted UDP coordinator
 coordinator:

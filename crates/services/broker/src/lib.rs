@@ -3654,6 +3654,7 @@ mod tests {
                 oauth_client_id: "test-client".into(),
                 session_ttl_secs: 3600,
                 max_requests: 100,
+                sign: None,
             },
             seeds,
         )
@@ -3731,6 +3732,7 @@ mod tests {
                 oauth_client_id: "test-client".into(),
                 session_ttl_secs: 3600,
                 max_requests,
+                sign: None,
             },
             seeds,
             Some(check),
@@ -3792,6 +3794,7 @@ mod tests {
                 oauth_client_id: "test-client".into(),
                 session_ttl_secs: 3600,
                 max_requests: 100,
+                sign: None,
             },
             vec![(
                 "owner-claude-1".into(),

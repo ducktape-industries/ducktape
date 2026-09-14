@@ -84,6 +84,7 @@ async fn boot_gateway(upstream: &str, enclave: &Arc<SnpTestEnclave>) -> String {
             oauth_client_id: "test-client".into(),
             session_ttl_secs: 3600,
             max_requests: 100,
+            sign: None,
         },
         "snp",
         enclave.quoter(),
@@ -496,6 +497,7 @@ async fn build_seeded_uses_the_initial_credential_without_upload() {
             oauth_client_id: "test-client".into(),
             session_ttl_secs: 3600,
             max_requests: 100,
+            sign: None,
         },
         "snp",
         enclave.quoter(),
@@ -613,6 +615,7 @@ fn self_host_cfg(
         oauth_client_id: String::new(),
         session_ttl_secs: 3600,
         max_requests: 100,
+        sign: None,
     }
 }
 

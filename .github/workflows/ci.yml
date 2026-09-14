@@ -45,6 +45,10 @@ jobs:
       # binary embeds one — the binary is not the module set. Text checks,
       # no toolchain.
       - run: make wasm-modules-check wasm-embed-check
+      # airlock's signing-route tests sign a fixture bundle with the pinned
+      # `rcodesign` the enclave image carries (ops/airlock-gateway/); the
+      # test refuses to skip without it.
+      - run: ops/airlock-gateway/install-rcodesign.sh --prefix "$HOME/.local" && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       # simnode's lib tests boot the sim, which mounts the view bundle; the
       # whole crate runs in nightly.yml after `make views`.
       - run: cargo test --locked --workspace --lib --exclude simnode --no-fail-fast

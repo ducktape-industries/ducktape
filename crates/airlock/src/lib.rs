@@ -32,5 +32,7 @@ pub mod handshake;
 pub mod seal;
 #[cfg(feature = "server")]
 pub mod server;
+#[cfg(feature = "codesign")]
+pub mod sign;
 pub mod token;
 pub mod wire;
