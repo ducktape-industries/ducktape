@@ -244,7 +244,8 @@ impl Desktop {
         let size = match kind {
             crate::shell::WindowKind::Onboarding => size(px(480.0), px(680.0)),
             crate::shell::WindowKind::Console => size(px(1280.0), px(800.0)),
-            crate::shell::WindowKind::Huddle => size(px(320.0), px(460.0)),
+            // room for a stage at a readable size; it resizes from here
+            crate::shell::WindowKind::Huddle => size(px(560.0), px(600.0)),
         };
         let model = cx.entity();
         let titlebar = match kind {
@@ -946,12 +947,9 @@ impl DesktopWindow {
                             )),
                     );
                 }
+                let refused = crate::backend::selected_network_refuses(&networks, &selected);
                 for network in networks {
-                    let label = match (network.probed, network.live) {
-                        (false, _) => format!("{} · checking", network.name),
-                        (true, true) => format!("{} · block {}", network.name, network.height),
-                        (true, false) => format!("{} · offline", network.name),
-                    };
+                    let label = crate::backend::network_row_label(&network);
                     let picked = network.id == selected;
                     recent = recent.child(
                         div()
@@ -981,7 +979,9 @@ impl DesktopWindow {
                             ),
                     );
                 }
-                let no_selection = busy || selected.is_empty();
+                // a measured contract mismatch disables the open the way no
+                // selection does: the row's own line says why.
+                let no_selection = busy || selected.is_empty() || refused;
                 if !empty {
                     recent = recent.child(
                         div()
@@ -1381,11 +1381,19 @@ impl DesktopWindow {
             .flex()
             .flex_col()
             .gap_3();
+        // The video takes the room the roster leaves: the stage whole in the
+        // largest box left, the tiles a strip under it or, with no stage, the
+        // grid in that box instead. The surfaces fill whatever box they get.
         if !stage.is_empty() {
-            body = body.child(picture.clone());
+            body = body.child(div().flex_1().min_h_0().w_full().child(picture.clone()));
         }
         if video_live {
-            body = body.child(tiles.clone());
+            let tiles_box = if stage.is_empty() {
+                div().flex_1().min_h_0()
+            } else {
+                div().flex_shrink_0()
+            };
+            body = body.child(tiles_box.w_full().child(tiles.clone()));
         }
         // The people, one a row, the way a voice channel lists them: the
         // plate, the name, and "you" / "muted" beside it. The list stays
@@ -1449,8 +1457,9 @@ impl DesktopWindow {
                     })
                     .collect()
             })
-            .flex_1()
-            .min_h_0(),
+            // with video on screen the list yields to it and scrolls instead
+            .when(video_live, |list| list.flex_shrink_0().max_h(px(150.)))
+            .when(!video_live, |list| list.flex_1().min_h_0()),
         );
         // The room's members not seated yet, one chip each: a press posts a
         // mention into the room that says come join, and the chip is gone —

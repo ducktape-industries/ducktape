@@ -8,6 +8,7 @@ fn a_pushed_status_moves_every_fact_it_carries() {
     let _ = app.update(AppMessage::NodeStatusPushed(backend::NodeFacts {
         public_key: "node-key".into(),
         version: "0.2.0".into(),
+        contract: backend::EXPECTED_NODE_CONTRACT,
         root_hash: "hash-new".into(),
         chain_id: "mynet#d0cdf950".into(),
         checkpoint_height: 512,

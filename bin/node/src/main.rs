@@ -724,6 +724,7 @@ fn run_node(
             ));
         }
         status.publish(noded::NodeStatus {
+            contract: noded::NODE_CONTRACT,
             version: build_version(),
             public_key: status_public_key.clone(),
             ..Default::default()

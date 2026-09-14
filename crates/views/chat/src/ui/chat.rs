@@ -227,7 +227,11 @@ impl ChatView {
         // does: a press joins the room's huddle instead of opening it
         if !voice_rooms.is_empty() {
             rooms.push(native::gap(8.));
-            rooms.push(section_row(format!("{key}/voice-heading-row"), "Voice", None));
+            rooms.push(section_row(
+                format!("{key}/voice-heading-row"),
+                "Voice",
+                None,
+            ));
         }
         for room in voice_rooms {
             rooms.push(self.voice_button(
@@ -510,10 +514,7 @@ impl ChatView {
                         format!("{key}/summary-box"),
                         native::label(
                             format!("{key}/summary"),
-                            crate::host::search_summary(
-                                self.search_hits.len(),
-                                &self.search_query,
-                            ),
+                            crate::host::search_summary(self.search_hits.len(), &self.search_query),
                         ),
                     ),
                     wire::Edges {
@@ -623,54 +624,26 @@ impl ChatView {
             if !thread && self.unread_boundary > 0 && message.seq == self.unread_marker_seq {
                 children.push(self.unread_marker(format!("{scope}/unread")));
             }
+            // A RUN IN FLIGHT ANSWERS INTO THE THREAD, so the timeline shows
+            // it the way it shows any thread: the reply chip under the
+            // message, counting the answer being written. The run's own card
+            // lives in the thread pane, once, at its tail (below).
+            let answering = self
+                .live_agents
+                .iter()
+                .filter(|live| crate::host::run_in_thread(live, message.seq))
+                .count() as i64;
+            let counted;
+            let message = if !thread && answering > 0 {
+                counted = crate::host::ChatMessage {
+                    reply_count: message.reply_count + answering,
+                    ..message.clone()
+                };
+                &counted
+            } else {
+                message
+            };
             let card = self.message_card(message, surface, plate);
-            // a live run answers the message, so it rides under the card as
-            // a message of its own — the agent's byline, what it has done so
-            // far, the answer as it is written — updating as the run goes,
-            // with its doors (the thread it will land in, or the run; Stop)
-            // on a quiet row beneath.
-            let mut run_hints = Vec::new();
-            for live in &self.live_agents {
-                if crate::host::run_in_thread(live, message.seq) {
-                    let run_key = format!("{scope}/run/{}", live.agent);
-                    let live_message = crate::host::live_run_message(live);
-                    run_hints.push(self.message_card(
-                        &live_message,
-                        surface,
-                        crate::host::message_plate(false, false, false),
-                    ));
-                    let door = if thread {
-                        subtle(
-                            format!("{run_key}/open"),
-                            "View run",
-                            Message::OpenRun(live.dispatch_id.clone()),
-                            false,
-                        )
-                    } else {
-                        subtle(
-                            format!("{run_key}/open"),
-                            &crate::host::live_thread_label(&live.agent),
-                            Message::OpenThreadFor(message.seq),
-                            false,
-                        )
-                    };
-                    let stop = subtle(
-                        format!("{run_key}/stop"),
-                        "Stop",
-                        Message::CancelRun(live.run_id.clone()),
-                        false,
-                    );
-                    run_hints.push(native::padded(
-                        native::spaced(native::row(format!("{run_key}/actions"), [door, stop]), 6.),
-                        wire::Edges {
-                            top: 0.,
-                            right: 16.,
-                            bottom: 4.,
-                            left: super::kit::RAIL,
-                        },
-                    ));
-                }
-            }
             let actions = if thread {
                 [
                     Message::OpenThreadMessageReactions(
@@ -749,7 +722,6 @@ impl ChatView {
                     ],
                 };
                 children.push(hover);
-                children.extend(run_hints);
                 let content =
                     native::spaced(native::column(format!("{scope}/content"), children), 0.);
                 rows.push(wire::Node::MouseArea {
@@ -770,10 +742,52 @@ impl ChatView {
                 });
             } else {
                 children.push(card);
-                children.extend(run_hints);
                 rows.push(native::spaced(native::column(scope, children), 0.));
             }
             keys.push(wire::ListKey::from(message.view_key));
+        }
+        // The runs answering into this thread ride at its tail, ONCE each —
+        // where the answer will land — as a message of their own: the
+        // agent's byline, what it has done so far, the answer as it is
+        // written, updating as the run goes, with its doors (the run; Stop)
+        // on a quiet row beneath. Not under the anchor AND the root: a run
+        // summoned from a reply has both in this pane.
+        if thread {
+            for live in &self.live_agents {
+                if !crate::host::run_in_thread(live, self.active_thread_seq) {
+                    continue;
+                }
+                let live_message = crate::host::live_run_message(live);
+                let run_key = format!("{key}/run/{}", live.agent);
+                let card = self.message_card(
+                    &live_message,
+                    surface,
+                    crate::host::message_plate(false, false, false),
+                );
+                let open = subtle(
+                    format!("{run_key}/open"),
+                    "View run",
+                    Message::OpenRun(live.dispatch_id.clone()),
+                    false,
+                );
+                let stop = subtle(
+                    format!("{run_key}/stop"),
+                    "Stop",
+                    Message::CancelRun(live.run_id.clone()),
+                    false,
+                );
+                let actions = native::padded(
+                    native::spaced(native::row(format!("{run_key}/actions"), [open, stop]), 6.),
+                    wire::Edges {
+                        top: 0.,
+                        right: 16.,
+                        bottom: 4.,
+                        left: super::kit::RAIL,
+                    },
+                );
+                rows.push(native::spaced(native::column(run_key, [card, actions]), 0.));
+                keys.push(wire::ListKey::from(live_message.view_key));
+            }
         }
         let list = wire::Node::KeyedColumn {
             key: format!("{key}/rows"),
@@ -1203,8 +1217,10 @@ impl ChatView {
     }
     /// Which message menu is open, and on which surface.
     fn open_menu(&self) -> OpenMenu {
-        let timeline = self.selected_message_seq > 0 && self.message_action != MessageAction::Toolbar;
-        let thread = self.thread_selected_seq > 0 && self.thread_message_action != MessageAction::Toolbar;
+        let timeline =
+            self.selected_message_seq > 0 && self.message_action != MessageAction::Toolbar;
+        let thread =
+            self.thread_selected_seq > 0 && self.thread_message_action != MessageAction::Toolbar;
         match (timeline, thread) {
             (true, _) => OpenMenu::Timeline(self.message_action),
             (false, true) => OpenMenu::Thread(self.thread_message_action),
@@ -1515,7 +1531,13 @@ fn picker_size(count: usize) -> (f64, f64) {
 }
 /// One row of a dropdown: a glyph, then the words, left-aligned across the
 /// menu's width.
-fn menu_item(key: String, glyph: &str, label: &str, message: Message, disabled: bool) -> wire::Node {
+fn menu_item(
+    key: String,
+    glyph: &str,
+    label: &str,
+    message: Message,
+    disabled: bool,
+) -> wire::Node {
     let content = native::spaced(
         native::centered_row(
             format!("{key}/row"),

@@ -1,0 +1,22 @@
+[package]
+name = "app-update"
+edition.workspace = true
+version.workspace = true
+
+# The desktop app's self-update, as a pure library: the update state machine
+# (`Phase` × `Event` → `Phase` + `Command`s), the signed release-manifest
+# codec + minisign verification, and the `state.json` codec. No I/O, no
+# clock, no network — the launcher (boot: flip/exec) and the app (running:
+# fetch/download/verify/stage/banner) each drive `step` with their own
+# executor and share nothing but `state.json`.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# sha256: artifact identity and the manifest's `release.sha256_id`.
+sha2 = { workspace = true }
+# minisign signs the Blake2b-512 of the file ("prehashed" mode), not the file.
+blake2 = { workspace = true }
+# the minisign `.minisig` / `.pub` line codec.
+base64 = { workspace = true }
+# raw ed25519 verify of the minisign signature and its global signature.
+ed25519-dalek = { workspace = true }

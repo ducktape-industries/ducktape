@@ -88,12 +88,6 @@ tokio-tungstenite = "0.24"
 # The camera leg (`src/video.rs`): capture. The JPEG codec it feeds is
 # `media_service::video::codec`, deliberately NOT a dep here (see that module).
 nokhwa = { version = "0.10", features = ["input-native"] }
-# The screen-share leg (`src/video.rs`): a root-window grab over X11. Already
-# in this binary under winit, and pure Rust — the portal/pipewire route would
-# put a build-time system library on every machine that builds this app. A
-# Wayland session's X root holds X clients only, so the share refuses there
-# rather than grab a black desktop (`ScreenSource::open`).
-x11rb = "0.13"
 # The picture viewer (`src/backend/picture.rs`) decodes to RGBA off-thread;
 # GPUI receives the decoded pixels.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
@@ -130,6 +124,9 @@ wasmtime.workspace = true
 # bare binary (every `cargo test`) degrades to a debug! line.
 [target.'cfg(target_os = "macos")'.dependencies]
 tray-icon = { version = "0.24", default-features = false }
+# The screen-share leg (`src/video.rs`): the main display through
+# `CGDisplayCreateImage`. Already in this binary's graph under gpui.
+core-graphics = "0.24"
 block2 = "0.5"
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", default-features = false, features = ["std", "NSBundle", "NSString", "NSError"] }
@@ -140,6 +137,12 @@ objc2-user-notifications = { version = "0.2", default-features = false, features
 # under the accessibility stack; this only names it.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 zbus = "5"
+# The screen-share leg (`src/video.rs`): a root-window grab over X11. Already
+# in this binary under winit, and pure Rust — the portal/pipewire route would
+# put a build-time system library on every machine that builds this app. A
+# Wayland session's X root holds X clients only, so the share refuses there
+# rather than grab a black desktop (`ScreenSource::open`).
+x11rb = "0.13"
 
 [dev-dependencies]
 gpui-kit = { version = "=0.6.1", features = ["test-support"] }
