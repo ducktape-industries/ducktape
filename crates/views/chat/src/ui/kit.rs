@@ -598,13 +598,37 @@ impl ChatView {
         )
     }
 
+    /// What stands where the composer would: the room is archived, and the
+    /// way to reopen it is right there.
     pub(super) fn archived_notice(&self, key: String) -> wire::Node {
+        let mut reopen = native::button(
+            format!("{key}/unarchive"),
+            "Unarchive",
+            (!self.busy).then(|| slots::message(Message::UnarchiveChannelSubmit)),
+            wire::ButtonPreset::Secondary,
+        );
+        if let wire::Node::Button { label, .. } = &mut reopen {
+            *label = Some("Unarchive channel".into());
+        }
         native::notice(
             key.clone(),
-            native::wrapping(native::text(
-                format!("{key}/text"),
-                "This channel is archived. Unarchive it from Channel details to post here again.",
-            )),
+            native::spaced(
+                native::centered_row(
+                    format!("{key}/row"),
+                    [
+                        native::sized(
+                            native::wrapping(native::text(
+                                format!("{key}/text"),
+                                "This channel is archived. It keeps its history and takes no new messages.",
+                            )),
+                            Some(wire::Length::Fill),
+                            None,
+                        ),
+                        reopen,
+                    ],
+                ),
+                12.,
+            ),
             Tone::Neutral,
         )
     }
