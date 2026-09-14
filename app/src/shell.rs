@@ -1343,6 +1343,7 @@ impl DesktopWindow {
         };
         let stage = state.huddle_stage.clone();
         let video_live = state.call_video_live;
+        let (muted, camera_on, sharing) = (state.call_muted, state.call_camera, state.call_sharing);
         let rows = state.huddle_rows.clone();
         let row_count = rows.len();
         let title = state.huddle_channel_name.clone();
@@ -1449,26 +1450,42 @@ impl DesktopWindow {
             .flex_1()
             .min_h_0(),
         );
+        // The control bar reads left to right as media, then the room, then
+        // the exit: a toggle that is ON is filled so its state is visible
+        // without reading the label (a muted mic is the red one).
+        let mute_button = self.action("huddle-mute", mute, Message::ToggleCallMute, false);
+        let mute_button = match muted {
+            true => mute_button.danger(),
+            false => mute_button.outline(),
+        };
+        let camera_button = self.action("huddle-camera", camera, Message::ToggleCallCamera, false);
+        let camera_button = match camera_on {
+            true => camera_button.primary(),
+            false => camera_button.outline(),
+        };
+        let screen_button = self.action("huddle-screen", screen, Message::ToggleCallScreen, false);
+        let screen_button = match sharing {
+            true => screen_button.primary(),
+            false => screen_button.outline(),
+        };
         let controls = div()
             .flex()
-            .flex_wrap()
+            .items_center()
             .gap_2()
             .p_3()
             .flex_shrink_0()
             .border_t_1()
             .border_color(colors.border)
             .child(
-                self.action("huddle-mute", mute, Message::ToggleCallMute, false)
-                    .outline(),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(mute_button)
+                    .child(camera_button)
+                    .child(screen_button),
             )
-            .child(
-                self.action("huddle-camera", camera, Message::ToggleCallCamera, false)
-                    .outline(),
-            )
-            .child(
-                self.action("huddle-screen", screen, Message::ToggleCallScreen, false)
-                    .outline(),
-            )
+            .child(div().flex_1())
             .child(
                 self.action(
                     "huddle-channel",
@@ -2188,16 +2205,31 @@ impl DesktopWindow {
             "channel_create" => {
                 let busy = state.mutation_phase != crate::MutationPhase::Idle;
                 let members_only = state.channel_create_members_only;
+                let voice = state.channel_create_voice;
                 body = body
                     .gap_3()
                     .px_4()
                     .pb_4()
                     .child(self.input("channel-draft", "Channel name", false, window, cx))
                     .child(
+                        gpui_kit::component::checkbox::Checkbox::new("channel-voice")
+                            .label("Voice room")
+                            .checked(voice)
+                            .disabled(busy)
+                            .on_click({
+                                let model = self.model.clone();
+                                move |_, _, cx| {
+                                    model.update(cx, |model, cx| {
+                                        model.dispatch(Message::ToggleChannelCreateVoice, cx)
+                                    })
+                                }
+                            }),
+                    )
+                    .child(
                         gpui_kit::component::checkbox::Checkbox::new("channel-private")
                             .label("Members only")
                             .checked(members_only)
-                            .disabled(busy)
+                            .disabled(busy || voice)
                             .on_click({
                                 let model = self.model.clone();
                                 move |_, _, cx| {
@@ -2214,7 +2246,10 @@ impl DesktopWindow {
                         div()
                             .text_size(px(12.5))
                             .text_color(muted)
-                            .child("A members-only channel is read and written by its roster alone."),
+                            .child(match voice {
+                                true => "A voice room is a huddle with a name: pick it in the list to join.",
+                                false => "A members-only channel is read and written by its roster alone.",
+                            }),
                     )
                     .child(
                         div()

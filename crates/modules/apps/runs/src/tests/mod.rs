@@ -499,6 +499,7 @@ impl Ctx for CaptureCtx {
                         hooks: Vec::new(),
                         pinned: Vec::new(),
                         huddle: Vec::new(),
+                        voice: false,
                         owner: chat::Party::System,
                         revision: 1,
                         archived: false,

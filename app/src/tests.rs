@@ -172,6 +172,7 @@ fn room(id: &str, head: i64) -> backend::ChatChannel {
         archived: false,
         members_only: false,
         huddle_count: 0,
+        voice: false,
         huddle: Vec::new(),
         head_seq: head,
     }

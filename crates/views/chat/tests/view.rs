@@ -351,6 +351,30 @@ fn the_composer_is_the_rooms_own_host_slot() {
     });
 }
 
+/// A voice room sits under its own heading, not among the channels, and a
+/// press on it asks the app to join — the room on screen is not what moves.
+#[test]
+fn a_voice_room_lists_under_voice_and_joins_on_press() {
+    on_a_deep_stack(|| {
+        let mut seated = session(true);
+        let mut lounge = sidebar_row("channel-v", "lounge", false);
+        lounge.channel.voice = true;
+        seated.rooms.push(lounge);
+        let (frame, _, _) = connected_room_with(&seated, roots());
+        assert!(has_text(&frame, "Voice"), "{:?}", texts(&frame));
+        let _ = node_ending(&frame, "voice/channel-v");
+        let frame = tick_native(press(&frame, "lounge"));
+        let intent = one_intent(&frame);
+        assert_eq!(intent.kind, "chat.join_voice");
+        assert_eq!(
+            serde_json::from_slice::<Channel>(&intent.payload).expect("decodes"),
+            Channel {
+                id: "channel-v".into()
+            }
+        );
+    });
+}
+
 /// The room the app is in stays the app's to move: several planes steer it.
 #[test]
 fn choosing_a_room_still_leaves_as_an_intent() {

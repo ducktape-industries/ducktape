@@ -170,6 +170,23 @@ pub async fn join_huddle(
     .await
 }
 
+/// Enter a voice room from the list: leave the huddle the reader is in (if
+/// any) and join `channel_id`'s. Two ops, in order — the roster is consensus
+/// state, so a person is never seated in two rooms at once. Answers the room
+/// joined.
+pub async fn move_huddle(
+    rpc: String,
+    password: String,
+    leaving: String,
+    channel_id: String,
+) -> Result<String, AppError> {
+    if !leaving.is_empty() {
+        leave_huddle(rpc.clone(), password.clone(), leaving).await?;
+    }
+    join_huddle(rpc, password, channel_id.clone()).await?;
+    Ok(channel_id)
+}
+
 pub async fn leave_huddle(
     rpc: String,
     password: String,

@@ -212,6 +212,9 @@ impl Ducktape {
             AppMessage::ToggleChannelCreate => self.on_toggle_channel_create(),
             AppMessage::JoinHuddleSubmit => self.on_join_huddle_submit(),
             AppMessage::HuddleJoinedAck(_result) => self.on_huddle_joined_ack(_result),
+            AppMessage::JoinVoice(id) => self.on_join_voice(id),
+            AppMessage::VoiceJoined(id) => self.on_voice_joined(id),
+            AppMessage::ToggleChannelCreateVoice => self.on_toggle_channel_create_voice(),
             AppMessage::ChatBeginEdit(scope, body, seq, rev) => {
                 self.on_chat_begin_edit(scope, body, seq, rev)
             }
@@ -3647,6 +3650,7 @@ impl Ducktape {
                 self.password.to_owned(),
                 self.pending_channel.to_owned(),
                 self.channel_create_members_only,
+                self.channel_create_voice,
                 self.chat_generation,
             ),
             |result| match result {
@@ -3657,6 +3661,10 @@ impl Ducktape {
     }
     fn on_toggle_channel_create_members_only(&mut self) -> Task<AppMessage> {
         self.channel_create_members_only = !self.channel_create_members_only;
+        Task::none()
+    }
+    fn on_toggle_channel_create_voice(&mut self) -> Task<AppMessage> {
+        self.channel_create_voice = !self.channel_create_voice;
         Task::none()
     }
     fn on_toggle_channel_create(&mut self) -> Task<AppMessage> {
@@ -3687,11 +3695,61 @@ impl Ducktape {
         )
     }
     fn on_huddle_joined_ack(&mut self, _result: bool) -> Task<AppMessage> {
+        let channel = self.active_channel.to_owned();
+        let name = self.active_channel_name.to_owned();
+        self.seat_in_huddle(channel, name)
+    }
+    /// A voice room pressed in the list: show the huddle if the reader is
+    /// already in it, otherwise move there — leaving the room they are in
+    /// first, since the roster seats a person once. The room on screen does
+    /// not change; the call subscription re-keys on the new channel.
+    fn on_join_voice(&mut self, id: String) -> Task<AppMessage> {
+        let busy = self.loading || (self.mutation_phase != MutationPhase::Idle);
+        if busy || id.is_empty() {
+            return Task::none();
+        }
+        let already_seated = self.huddle_joined && (self.huddle_channel == id);
+        if already_seated {
+            return Task::done(AppMessage::ShowHuddle);
+        }
+        let leaving = match self.huddle_joined {
+            true => self.huddle_channel.to_owned(),
+            false => "".to_owned(),
+        };
+        self.hydration_generation += 1;
+        self.hydration_retry_attempt = 0;
+        self.mutation_phase = MutationPhase::Huddle;
+        self.drop_call_state();
+        self.error = "".to_owned();
+        Task::perform(
+            crate::backend::move_huddle(
+                self.connected_rpc.to_owned(),
+                self.password.to_owned(),
+                leaving,
+                id,
+            ),
+            |result| match result {
+                Ok(value) => AppMessage::VoiceJoined(value),
+                Err(error) => AppMessage::MutationFailed(error),
+            },
+        )
+    }
+    fn on_voice_joined(&mut self, id: String) -> Task<AppMessage> {
+        let name = self
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .map_or_else(|| id.clone(), |channel| channel.name.clone());
+        self.seat_in_huddle(id, name)
+    }
+    /// The reader is seated in `channel`'s huddle: open the huddle window and
+    /// re-read the room on screen so its seats catch up.
+    fn seat_in_huddle(&mut self, channel: String, name: String) -> Task<AppMessage> {
         self.mutation_phase = MutationPhase::Idle;
         self.error = "".to_owned();
         self.huddle_joined = true;
-        self.huddle_channel = self.active_channel.to_owned();
-        self.huddle_channel_name = self.active_channel_name.to_owned();
+        self.huddle_channel = channel;
+        self.huddle_channel_name = name;
         self.huddle_joined_at = self.huddle_now;
         self.chat_generation += 1;
         Task::batch([Task::done(AppMessage::ShowHuddle), {
@@ -4111,6 +4169,7 @@ impl Ducktape {
         self.pending_channel = "".to_owned();
         self.channel_create_open = false;
         self.channel_create_members_only = false;
+        self.channel_create_voice = false;
         self.mutation_phase = MutationPhase::Idle;
         if next.generation != self.chat_generation {
             return Task::none();
@@ -4430,6 +4489,9 @@ impl Ducktape {
             ChatIntent::ShowHuddle => Task::done(AppMessage::ShowHuddle),
             ChatIntent::LeaveHuddle => Task::done(AppMessage::LeaveHuddleHere),
             ChatIntent::JoinHuddle => Task::done(AppMessage::JoinHuddleSubmit),
+            ChatIntent::JoinVoice => Task::done(AppMessage::JoinVoice(
+                crate::module_view::event_text(&(event), "id" ),
+            )),
             ChatIntent::Scrolled => {
                 let absolute_y = crate::module_view::event_num(&(event), "absolute_y" );
                 let relative_x = crate::module_view::event_num(&(event), "relative_x" );
@@ -5826,20 +5888,7 @@ impl Ducktape {
         self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         self.mutation_phase = MutationPhase::Huddle;
-        self.call_status = "".to_owned();
-        self.call_muted = false;
-        self.call_speaking = false;
-        self.call_camera = false;
-        self.call_sharing = false;
-        self.call_video_live = false;
-        self.huddle_stage = "".to_owned();
-        self.call_peers = Vec::new();
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
+        self.drop_call_state();
         self.error = "".to_owned();
         Task::batch([
             crate::shell::close::<AppMessage>(crate::backend::window_target(
@@ -5857,6 +5906,24 @@ impl Ducktape {
                 },
             ),
         ])
+    }
+    /// Forget the call in progress: the media state a leave (or a move to
+    /// another room) must not carry into the next session.
+    fn drop_call_state(&mut self) {
+        self.call_status = "".to_owned();
+        self.call_muted = false;
+        self.call_speaking = false;
+        self.call_camera = false;
+        self.call_sharing = false;
+        self.call_video_live = false;
+        self.huddle_stage = "".to_owned();
+        self.call_peers = Vec::new();
+        self.huddle_rows = crate::call::huddle_tile_rows(
+            self.huddle_roster.clone(),
+            self.call_peers.clone(),
+            self.call_muted,
+            self.call_speaking,
+        );
     }
     fn on_huddle_left(&mut self, _result: bool) -> Task<AppMessage> {
         self.huddle_joined = false;

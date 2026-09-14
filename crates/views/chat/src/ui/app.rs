@@ -180,6 +180,7 @@ pub enum Message {
     ShowHuddle,
     LeaveHuddleHere,
     JoinHuddleSubmit,
+    JoinVoice(String),
     OpenMessageLink(String),
     CopyToClipboard(String, String),
     CopyMessageLink(String),

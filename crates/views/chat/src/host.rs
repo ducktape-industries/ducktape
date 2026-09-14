@@ -47,6 +47,9 @@ pub struct ChatChannel {
     /// Who is in the room's huddle, join order.
     #[serde(default)]
     pub huddle: Vec<HuddleSeat>,
+    /// A voice room: listed under "Voice", entered by joining its huddle.
+    #[serde(default)]
+    pub voice: bool,
 }
 
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
@@ -1800,6 +1803,12 @@ pub fn send_leave_huddle() -> bool {
 
 pub fn send_join_huddle() -> bool {
     notify("chat.join_huddle", &())
+}
+
+/// Enter a voice room from the room list: the app joins (or moves to) its
+/// huddle without changing the room on screen.
+pub fn send_join_voice(id: &str) -> bool {
+    notify("chat.join_voice", &Channel { id: id.into() })
 }
 
 pub fn send_scrolled(absolute_x: f64, absolute_y: f64, relative_x: f64, relative_y: f64) -> bool {

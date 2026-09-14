@@ -212,13 +212,28 @@ impl ChatView {
                 self.loading || self.busy,
             )),
         )];
-        for room in &self.rooms {
+        let (voice_rooms, text_rooms): (Vec<_>, Vec<_>) =
+            self.rooms.iter().partition(|room| room.channel.voice);
+        for room in text_rooms {
             rooms.push(self.channel_button(
                 format!("{key}/channel/{}", room.channel.id),
                 Message::ChooseChannel,
                 room.channel.clone(),
                 room.channel.id == self.active_channel,
                 room.unread,
+            ));
+        }
+        // voice rooms sit under their own heading, the way a voice channel
+        // does: a press joins the room's huddle instead of opening it
+        if !voice_rooms.is_empty() {
+            rooms.push(native::gap(8.));
+            rooms.push(section_row(format!("{key}/voice-heading-row"), "Voice", None));
+        }
+        for room in voice_rooms {
+            rooms.push(self.voice_button(
+                format!("{key}/voice/{}", room.channel.id),
+                room.channel.clone(),
+                room.channel.id == self.huddle_channel,
             ));
         }
         if !self.dm_rows.is_empty() {

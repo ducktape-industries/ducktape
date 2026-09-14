@@ -274,6 +274,35 @@ pub(crate) fn notify_chat_op(
     platform::post(&notice);
 }
 
+/// A huddle starting in a room: the first seat taken, by someone else. One
+/// banner per huddle, never one per joiner — later seats are the roster's
+/// business, and the reader's own seat is not news to them.
+pub(crate) fn notify_huddle_started(channel: &ChatChannel) {
+    let Some(notice) = huddle_started_notice(channel, notifications_enabled()) else {
+        return;
+    };
+    platform::post(&notice);
+}
+
+/// The decision, pure: the room's first seat, taken by someone else.
+pub(crate) fn huddle_started_notice(channel: &ChatChannel, enabled: bool) -> Option<DesktopNotice> {
+    if !enabled {
+        return None;
+    }
+    let [first] = channel.huddle.as_slice() else {
+        return None;
+    };
+    if first.is_you {
+        return None;
+    }
+    Some(DesktopNotice {
+        title: format!("#{}", channel.name),
+        subtitle: format!("{} started a huddle", first.label),
+        body: "Join from the room list.".into(),
+        thread: channel.id.clone(),
+    })
+}
+
 /// Notification identity comes from the source's canonical post assignment,
 /// including its account-resolved mentions, just like the settled timeline.
 pub(crate) fn chat_arrival(
@@ -535,6 +564,36 @@ mod tests {
         )
         .expect("the daemon takes the banner");
         assert!(id > 0, "a banner has a nonzero id, got {id}");
+    }
+
+    /// The first seat in a room, taken by someone else, is the one banner a
+    /// huddle raises: a second joiner is not news, and neither is the
+    /// reader's own seat.
+    #[test]
+    fn a_huddle_banner_is_the_rooms_first_seat_taken_by_someone_else() {
+        let seat = |label: &str, is_you: bool| HuddleSeat {
+            label: label.into(),
+            initials: "A".into(),
+            is_you,
+            node: "aa".into(),
+        };
+        let room = |seats: Vec<HuddleSeat>| ChatChannel {
+            id: "channel-a".into(),
+            name: "general".into(),
+            huddle: seats,
+            ..ChatChannel::default()
+        };
+        let started = huddle_started_notice(&room(vec![seat("Ada", false)]), true)
+            .expect("the first seat is a banner");
+        assert_eq!(started.title, "#general");
+        assert_eq!(started.subtitle, "Ada started a huddle");
+        assert_eq!(started.thread, "channel-a");
+        assert!(huddle_started_notice(&room(vec![seat("Me", true)]), true).is_none());
+        assert!(
+            huddle_started_notice(&room(vec![seat("Ada", false), seat("Bob", false)]), true)
+                .is_none()
+        );
+        assert!(huddle_started_notice(&room(vec![seat("Ada", false)]), false).is_none());
     }
 
     #[test]
