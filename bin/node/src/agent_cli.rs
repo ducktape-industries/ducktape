@@ -812,7 +812,9 @@ fn resolve_provider(
     };
     let record = query_credential(base, name)?
         .ok_or_else(|| format!("unknown credential {name:?} — {}", credential_hint(base)))?;
-    let from_cred = provider_from_kind(record.kind);
+    let from_cred = provider_from_kind(record.kind).ok_or_else(|| {
+        format!("credential {name:?} is a signing identity, not a model provider")
+    })?;
     if let Some(explicit) = provider
         && explicit != from_cred
     {
@@ -826,10 +828,14 @@ fn resolve_provider(
     Ok(from_cred)
 }
 
-fn provider_from_kind(kind: gateway::CredentialKind) -> ProviderArg {
+/// The pty/sched provider a credential's kind implies, or `None` for a kind
+/// no provider runs on: an `apple-codesign` identity signs releases, it does
+/// not answer a model session.
+fn provider_from_kind(kind: gateway::CredentialKind) -> Option<ProviderArg> {
     match kind {
-        gateway::CredentialKind::Claude => ProviderArg::Claude,
-        gateway::CredentialKind::Codex => ProviderArg::Codex,
+        gateway::CredentialKind::Claude => Some(ProviderArg::Claude),
+        gateway::CredentialKind::Codex => Some(ProviderArg::Codex),
+        gateway::CredentialKind::AppleCodesign => None,
     }
 }
 
@@ -1011,11 +1017,15 @@ mod tests {
         // The reverse map is the whole authority when a provider is omitted.
         assert_eq!(
             provider_from_kind(gateway::CredentialKind::Claude),
-            ProviderArg::Claude
+            Some(ProviderArg::Claude)
         );
         assert_eq!(
             provider_from_kind(gateway::CredentialKind::Codex),
-            ProviderArg::Codex
+            Some(ProviderArg::Codex)
+        );
+        assert_eq!(
+            provider_from_kind(gateway::CredentialKind::AppleCodesign),
+            None
         );
     }
 

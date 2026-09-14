@@ -196,6 +196,7 @@ pub(crate) fn service_kind(kind: gateway::CredentialKind) -> CredentialKind {
     match kind {
         gateway::CredentialKind::Claude => CredentialKind::Claude,
         gateway::CredentialKind::Codex => CredentialKind::Codex,
+        gateway::CredentialKind::AppleCodesign => CredentialKind::AppleCodesign,
     }
 }
 
@@ -256,6 +257,10 @@ mod tests {
         assert_eq!(
             service_kind(gateway::CredentialKind::Codex),
             CredentialKind::Codex
+        );
+        assert_eq!(
+            service_kind(gateway::CredentialKind::AppleCodesign),
+            CredentialKind::AppleCodesign
         );
     }
 }

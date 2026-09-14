@@ -5,7 +5,8 @@
 //!
 //! One directory per credential under `<storage>/airlock-creds/<name>/`, holding
 //! the vendor's own login artifact (`.credentials.json` for claude, `auth.json`
-//! for codex) plus a `kind` marker naming which. `ducktape user cred add` writes
+//! for codex; for apple-codesign the four files [`apple_codesign_files`]
+//! names) plus a `kind` marker naming which. `ducktape user cred add` writes
 //! them; nothing here authors a credential.
 //!
 //! Beside them sits `seal.key` (0600): the x25519 secret this gateway seals
@@ -256,14 +257,26 @@ pub fn load_seeds(root: &Path) -> Result<Vec<(String, CredentialKind, Credential
 
 /// One credential dir → its seed, or `None` when incomplete. The `kind` marker
 /// selects which artifact to read: claude's `.credentials.json` yields a rotating
-/// `Refresh`, codex's `auth.json` a static `Bearer`.
+/// `Refresh`, codex's `auth.json` a static `Bearer`, apple-codesign's four
+/// files the signing identity the gateway re-validates at admission.
 fn load_cred_dir(dir: &Path) -> Option<(CredentialKind, CredentialPayload)> {
     let kind = read_kind(dir)?;
     let payload = match kind {
         CredentialKind::Claude => claude_refresh_payload(dir)?,
         CredentialKind::Codex => codex_bearer_payload(dir)?,
+        CredentialKind::AppleCodesign => apple_codesign_payload(dir)?,
     };
     Some((kind, payload))
+}
+
+/// The `kind` marker token for each kind — what `cred add` writes and
+/// [`load_cred_dir`] reads back.
+pub fn kind_token(kind: CredentialKind) -> &'static str {
+    match kind {
+        CredentialKind::Claude => "claude",
+        CredentialKind::Codex => "codex",
+        CredentialKind::AppleCodesign => "apple-codesign",
+    }
 }
 
 fn read_kind(dir: &Path) -> Option<CredentialKind> {
@@ -271,8 +284,49 @@ fn read_kind(dir: &Path) -> Option<CredentialKind> {
     match raw.trim() {
         "claude" => Some(CredentialKind::Claude),
         "codex" => Some(CredentialKind::Codex),
+        "apple-codesign" => Some(CredentialKind::AppleCodesign),
         _ => None,
     }
+}
+
+/// The files an `apple-codesign` credential dir holds beside its `kind`
+/// marker, each written 0600 by `cred add`: the Developer ID Application
+/// identity as PKCS#12, its password, the App Store Connect key JSON, and the
+/// Team ID the identity was enrolled under.
+pub struct AppleCodesignFiles {
+    pub p12: &'static str,
+    pub p12_password: &'static str,
+    pub api_key: &'static str,
+    pub team_id: &'static str,
+}
+
+pub const fn apple_codesign_files() -> AppleCodesignFiles {
+    AppleCodesignFiles {
+        p12: "identity.p12",
+        p12_password: "p12.password",
+        api_key: "api-key.json",
+        team_id: "team-id",
+    }
+}
+
+/// The signing identity out of its four files, as the sealed upload would
+/// carry it. Every file is required: a dir missing one is incomplete, not a
+/// credential with a defaulted field. The gateway's admission (`codesign`)
+/// re-runs every check on adopt, so a file edited by hand after `cred add` is
+/// refused there rather than served.
+fn apple_codesign_payload(dir: &Path) -> Option<CredentialPayload> {
+    use base64::Engine as _;
+    let files = apple_codesign_files();
+    let p12 = std::fs::read(dir.join(files.p12)).ok()?;
+    let p12_password = std::fs::read_to_string(dir.join(files.p12_password)).ok()?;
+    let api_key_json = std::fs::read_to_string(dir.join(files.api_key)).ok()?;
+    let team_id = std::fs::read_to_string(dir.join(files.team_id)).ok()?;
+    Some(CredentialPayload::AppleCodesign {
+        p12_b64: base64::engine::general_purpose::STANDARD.encode(p12),
+        p12_password: p12_password.trim_end_matches(['\r', '\n']).to_string(),
+        api_key_json,
+        team_id: team_id.trim().to_string(),
+    })
 }
 
 /// The claude login artifact (`.credentials.json`, `claudeAiOauth`) as a
@@ -401,8 +455,65 @@ mod tests {
     fn refresh_of(payload: &CredentialPayload) -> &str {
         match payload {
             CredentialPayload::Refresh { refresh_token, .. } => refresh_token,
-            CredentialPayload::Bearer { .. } => panic!("expected a refresh payload"),
+            CredentialPayload::Bearer { .. } | CredentialPayload::AppleCodesign { .. } => {
+                panic!("expected a refresh payload")
+            }
         }
+    }
+
+    fn seed_apple(root: &Path, name: &str) {
+        let dir = root.join(name);
+        let files = apple_codesign_files();
+        write(&dir.join("kind"), "apple-codesign\n");
+        std::fs::write(dir.join(files.p12), b"\x30\x82p12bytes").unwrap();
+        write(&dir.join(files.p12_password), "hunter2\n");
+        write(
+            &dir.join(files.api_key),
+            r#"{"key_id":"k","issuer_id":"i","private_key":"pem"}"#,
+        );
+        write(&dir.join(files.team_id), "ABCDE12345\n");
+    }
+
+    #[test]
+    fn apple_codesign_dir_loads_its_four_files_into_the_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cred_store_root(tmp.path());
+        seed_apple(&root, "release-sign");
+        let seeds = load_seeds(&root).unwrap();
+        assert_eq!(seeds.len(), 1);
+        let (name, kind, payload) = &seeds[0];
+        assert_eq!(name, "release-sign");
+        assert_eq!(*kind, CredentialKind::AppleCodesign);
+        let CredentialPayload::AppleCodesign {
+            p12_b64,
+            p12_password,
+            api_key_json,
+            team_id,
+        } = payload
+        else {
+            panic!("expected the apple-codesign arm");
+        };
+        assert_eq!(p12_b64, "MIJwMTJieXRlcw==");
+        assert_eq!(
+            p12_password, "hunter2",
+            "one trailing newline is the file's, not the password's"
+        );
+        assert!(api_key_json.contains("\"key_id\""));
+        assert_eq!(team_id, "ABCDE12345");
+    }
+
+    #[test]
+    fn apple_codesign_dir_missing_one_file_is_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cred_store_root(tmp.path());
+        seed_apple(&root, "release-sign");
+        std::fs::remove_file(
+            root.join("release-sign")
+                .join(apple_codesign_files().team_id),
+        )
+        .unwrap();
+        assert!(load_seeds(&root).unwrap().is_empty());
+        assert_eq!(count_credentials(&root), 1, "registered, but not servable");
     }
 
     #[test]

@@ -30,14 +30,20 @@ pub struct AttestationResponse {
     pub vendor: String,
 }
 
-/// Which vendor a credential belongs to. Selects the upstream base + auth shape
-/// the gateway proxies to (`Claude` → Anthropic, `Codex` → OpenAI) unless the
-/// operator redirected one with `DUCKTAPE_AIRLOCK_{ANTHROPIC,OPENAI}_BASE`.
+/// Which vendor a credential belongs to. For a model credential this selects
+/// the upstream base + auth shape the gateway proxies `/v1/*` to (`Claude` →
+/// Anthropic, `Codex` → OpenAI) unless the operator redirected one with
+/// `DUCKTAPE_AIRLOCK_{ANTHROPIC,OPENAI}_BASE`. `AppleCodesign` is not a model
+/// credential: it is the Developer ID signing identity + App Store Connect key
+/// a release is signed and notarized with, held by the gateway and never
+/// served on `/v1/*` (a session on it that hits the proxy is refused
+/// `credential_kind_mismatch`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialKind {
     Claude,
     Codex,
+    AppleCodesign,
 }
 
 /// `POST /credential` — the sealed credential, encrypted to the enclave's seal
@@ -67,6 +73,14 @@ pub struct CredentialUpload {
 /// writes both fields EXPLICITLY — an omitted one is a producer out of step, not
 /// a lazy credential. `Bearer` is a STATIC access token used as-is — no refresh,
 /// no rotation.
+///
+/// `AppleCodesign` is the whole signing identity in one blob: the Developer ID
+/// Application certificate + private key as a PKCS#12 (`p12_b64`, base64 of
+/// the `.p12` bytes) with its password, the App Store Connect API key as the
+/// one-file JSON `rcodesign encode-app-store-connect-api-key` writes
+/// (`{key_id, issuer_id, private_key}`), and the fixed `team_id` the
+/// certificate's subject OU must name. The gateway validates every field
+/// before it stores the entry (see `codesign::admit`).
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CredentialPayload {
@@ -77,6 +91,12 @@ pub enum CredentialPayload {
     },
     Bearer {
         access_token: String,
+    },
+    AppleCodesign {
+        p12_b64: String,
+        p12_password: String,
+        api_key_json: String,
+        team_id: String,
     },
 }
 
@@ -146,4 +166,45 @@ pub enum WorkRef {
 #[serde(deny_unknown_fields)]
 pub struct SessionResponse {
     pub sealed_token_b64: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apple_codesign_payload_round_trips_under_its_tag() {
+        let payload = CredentialPayload::AppleCodesign {
+            p12_b64: "cDEy".into(),
+            p12_password: "pw".into(),
+            api_key_json: r#"{"key_id":"k"}"#.into(),
+            team_id: "ABCDE12345".into(),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["kind"], "apple_codesign");
+        let back: CredentialPayload = serde_json::from_value(json).unwrap();
+        let CredentialPayload::AppleCodesign {
+            p12_b64,
+            p12_password,
+            api_key_json,
+            team_id,
+        } = back
+        else {
+            panic!("decoded as another arm");
+        };
+        assert_eq!((p12_b64.as_str(), p12_password.as_str()), ("cDEy", "pw"));
+        assert_eq!(api_key_json, r#"{"key_id":"k"}"#);
+        assert_eq!(team_id, "ABCDE12345");
+    }
+
+    #[test]
+    fn an_apple_codesign_payload_missing_a_field_is_a_decode_error() {
+        let missing_team =
+            r#"{"kind":"apple_codesign","p12_b64":"","p12_password":"","api_key_json":""}"#;
+        assert!(serde_json::from_str::<CredentialPayload>(missing_team).is_err());
+        assert_eq!(
+            serde_json::to_string(&CredentialKind::AppleCodesign).unwrap(),
+            r#""apple_codesign""#
+        );
+    }
 }

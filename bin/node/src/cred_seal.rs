@@ -90,9 +90,12 @@ pub(crate) struct SealArgs {
     /// the name the enclave stores it under (a session's `sub`)
     #[arg(long, value_name = "NAME", default_value = "compute-provider")]
     name: String,
-    /// which vendor the enclave routes this credential to
+    /// which vendor the enclave routes this credential to (`apple-codesign`
+    /// is a release-signing identity, given by the --p12/--api-key group)
     #[arg(long, value_name = "VENDOR", default_value = "claude")]
     vendor: VendorArg,
+    #[command(flatten)]
+    apple: SealAppleArgs,
     /// the measurement the quote must match, lowercase hex. `inspect` prints it.
     #[arg(long, value_name = "HEX")]
     measurement: String,
@@ -113,10 +116,30 @@ pub(crate) struct SealArgs {
     token_stdin: bool,
 }
 
+/// The `apple-codesign` identity for `--vendor apple-codesign`: the same four
+/// inputs `cred add apple-codesign` takes ([`crate::cred_cli::AppleCodesignArgs`]),
+/// each required exactly when that vendor is named and refused otherwise.
+#[derive(Debug, clap::Args)]
+pub(crate) struct SealAppleArgs {
+    /// the Developer ID Application certificate + key as PKCS#12
+    #[arg(long, value_name = "PATH", required_if_eq("vendor", "apple-codesign"))]
+    p12: Option<std::path::PathBuf>,
+    /// a file holding the PKCS#12 password (one line)
+    #[arg(long, value_name = "PATH", required_if_eq("vendor", "apple-codesign"))]
+    p12_password_file: Option<std::path::PathBuf>,
+    /// the App Store Connect API key JSON ({key_id, issuer_id, private_key})
+    #[arg(long, value_name = "PATH", required_if_eq("vendor", "apple-codesign"))]
+    api_key: Option<std::path::PathBuf>,
+    /// the Apple Team ID the certificate's OU must equal
+    #[arg(long, value_name = "ID", required_if_eq("vendor", "apple-codesign"))]
+    team_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum VendorArg {
     Claude,
     Codex,
+    AppleCodesign,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -258,10 +281,14 @@ pub(crate) fn cmd_seal(
     // measurement or an unreadable artifact must fail before a quote is fetched.
     let roots = attest_args.roots()?;
     let expected = Measurement::from_hex(&seal.measurement)?;
-    let credential = resolve_credential(&seal, stdin)?;
     let kind = match seal.vendor {
         VendorArg::Claude => CredentialKind::Claude,
         VendorArg::Codex => CredentialKind::Codex,
+        VendorArg::AppleCodesign => CredentialKind::AppleCodesign,
+    };
+    let credential = match kind {
+        CredentialKind::Claude | CredentialKind::Codex => resolve_credential(&seal, stdin)?,
+        CredentialKind::AppleCodesign => resolve_apple_codesign(&seal)?,
     };
     let gw = resolve_gateway(&gateway, node_base)?;
 
@@ -279,6 +306,7 @@ pub(crate) fn cmd_seal(
     let rotation = match &credential {
         CredentialPayload::Bearer { .. } => "static access token (no rotation)",
         CredentialPayload::Refresh { .. } => "refresh token (OAuth, rotates in-enclave)",
+        CredentialPayload::AppleCodesign { .. } => "apple-codesign identity (held for signing)",
     };
     println!(
         "sealed {rotation} and uploaded as {:?} (the gateway never sees it in clear)",
@@ -331,6 +359,30 @@ fn resolve_credential(
             expires_at: oauth["expiresAt"].as_u64().map(|ms| ms / 1000).unwrap_or(0),
         }),
     }
+}
+
+/// The signing identity out of the `--p12`/`--api-key` group, admitted
+/// locally by the gateway's own checks so a refusal is named before the
+/// quote is fetched.
+#[cfg(feature = "verify")]
+fn resolve_apple_codesign(
+    seal: &SealArgs,
+) -> Result<CredentialPayload, Box<dyn std::error::Error>> {
+    // clap requires all four under `--vendor apple-codesign`; a missing one
+    // here is a parser out of step, named as such.
+    let SealAppleArgs {
+        p12: Some(p12),
+        p12_password_file: Some(pw),
+        api_key: Some(key),
+        team_id: Some(team),
+    } = &seal.apple
+    else {
+        return Err(
+            "--vendor apple-codesign takes --p12, --p12-password-file, --api-key and --team-id"
+                .into(),
+        );
+    };
+    Ok(crate::cred_cli::read_and_admit_apple_codesign(p12, pw, key, team)?.payload())
 }
 
 /// The `cred` family is a synchronous CLI; the airlock client is async. One
