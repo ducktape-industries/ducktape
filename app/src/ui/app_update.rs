@@ -163,6 +163,7 @@ impl Ducktape {
             AppMessage::NodeViewEvent(event) => self.on_node_view_event(event),
             AppMessage::NodeFactsLoaded(next) => self.on_node_facts_loaded(next),
             AppMessage::UpdateJobReplied(reply) => self.on_update_job_replied(reply),
+            AppMessage::UpdateAction(action) => self.on_update_action(action),
             AppMessage::NodeFactsFailed(_cause) => self.on_node_facts_failed(_cause),
             AppMessage::NodeStatusPushed(next) => self.on_node_status_pushed(next),
             AppMessage::SettingsLoaded(next) => self.on_settings_loaded(next),
@@ -1765,6 +1766,35 @@ impl Ducktape {
         };
         self.run_update_job(job)
     }
+    /// One of the update controls. `CheckNow` is the only one that starts a
+    /// job; the rest are events the machine answers with local writes or,
+    /// for a restart and a rollback, a relaunch through the launcher.
+    fn on_update_action(&mut self, action: UpdateAction) -> Task<AppMessage> {
+        let Some(updater) = self.updater.as_mut() else {
+            return Task::none();
+        };
+        let job = match action {
+            UpdateAction::CheckNow => updater.check_now(self.wall_now),
+            UpdateAction::RestartToUpdate => updater.apply(app_update::Event::RestartToUpdate),
+            UpdateAction::RollBack => updater.apply(app_update::Event::UserRollback),
+            UpdateAction::DismissRollbackNotice => {
+                updater.apply(app_update::Event::DismissRollbackNotice)
+            }
+        };
+        let Some(job) = job else {
+            return Task::none();
+        };
+        self.run_update_job(job)
+    }
+    /// The healthy signal: the first window opened. In `PendingHealthy`
+    /// that settles the flipped release as `current` and collects the rest;
+    /// in any other phase it is nothing.
+    fn mark_update_rendered(&mut self) {
+        let Some(updater) = self.updater.as_mut() else {
+            return;
+        };
+        updater.apply(app_update::Event::Rendered);
+    }
     fn on_update_job_replied(&mut self, reply: Option<app_update::Event>) -> Task<AppMessage> {
         let Some(updater) = self.updater.as_mut() else {
             return Task::none();
@@ -1784,7 +1814,7 @@ impl Ducktape {
             crate::backend::update::run_job(
                 self.connected_rpc.to_owned(),
                 updater.keys().clone(),
-                updater.updates_dir().to_path_buf(),
+                updater.paths().clone(),
                 job,
             ),
             AppMessage::UpdateJobReplied,
@@ -3043,6 +3073,15 @@ impl Ducktape {
             }
             SettingsIntent::Light => Task::done(AppMessage::SetAppearanceLight),
             SettingsIntent::Dark => Task::done(AppMessage::SetAppearanceDark),
+            SettingsIntent::UpdateCheck => {
+                Task::done(AppMessage::UpdateAction(UpdateAction::CheckNow))
+            }
+            SettingsIntent::UpdateRestart => {
+                Task::done(AppMessage::UpdateAction(UpdateAction::RestartToUpdate))
+            }
+            SettingsIntent::UpdateRollback => {
+                Task::done(AppMessage::UpdateAction(UpdateAction::RollBack))
+            }
             SettingsIntent::Notifications => {
                 self.desktop_notifications = crate::module_view::event_flag(&(event), "enabled");
                 let pending_task = Task::perform(
@@ -4684,6 +4723,7 @@ impl Ducktape {
     }
     fn on_onboarding_opened(&mut self, id: crate::shell::WindowKey) -> Task<AppMessage> {
         self.onboarding_win = Some(id);
+        self.mark_update_rendered();
         Task::batch([
             {
                 let pending_task = Task::perform(crate::backend::load_appearance(), |value| {

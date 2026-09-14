@@ -1,5 +1,6 @@
 //! The app-side executor of the update machine (`app_update::step`): the
-//! network commands, over the connected network's duckfs.
+//! network commands over the connected network's duckfs, the staging on
+//! disk, and the hand-over to the launcher for the flip.
 //!
 //! The launcher hands a running app two env vars — `DUCKTAPE_RELEASE` (the
 //! sha of the release that is running) and `DUCKTAPE_UPDATE_STATE` (the
@@ -15,12 +16,17 @@
 //!   into `<updates>/releases/<sha>.partial`, resuming from the file's
 //!   length, sha256 running as it lands; answer `DownloadFinished` or
 //!   `DownloadFailed`. A mismatch deletes the partial.
-//! - `Persist`, `PinSuccessor`, `Banner`: the local writes and the reading
-//!   the shell shows.
-//!
-//! `Verify` onward (extract, seal, qualify, flip) is the next executor;
-//! here those commands are noted and left, so the machine stays in
-//! `Downloading` with a complete `.partial` on disk.
+//! - `Verify`: hash the partial again, extract it into `releases/<sha>/`
+//!   (the final directory the launcher flips), refuse anything that would
+//!   leave it, check the bundle signature on macOS
+//!   ([`stage`]); answer `Verified` or `VerifyRefused`.
+//! - `SealImmutable`, `Gc`, `Persist`, `PinSuccessor`, `Banner`: the local
+//!   writes and the reading the shell shows.
+//! - `Qualify`, `Flip`, `Exec`, `ResolveSwap`: the LAUNCHER's, at boot. The
+//!   app never flips: at the first of these it stops performing the list and
+//!   relaunches itself through `ducktape-launcher` beside its own executable,
+//!   argv passed through. What is on disk by then (`Staged`, or `Swapping`
+//!   for a rollback) is exactly what the launcher's `Boot` resumes from.
 //!
 //! Trust is the signature under the pinned key and the monotonic sequence:
 //! `/shared/**` is open-write on the files module, so what the node serves
@@ -30,12 +36,15 @@ use std::path::{Path, PathBuf};
 
 use app_update::layout;
 use app_update::{
-    Command, Event, Phase, Platform, PublicKey, Refusal, Sha, SignedManifest, SuccessorKey,
-    TrustedKeys, UpdateBanner, VerifiedManifest, step, verify_manifest,
+    Command, Event, Phase, Platform, PublicKey, Refusal, RollbackReason, Sha, SignedManifest,
+    SuccessorKey, TrustedKeys, UpdateBanner, VerifiedManifest, step, verify_manifest,
 };
 use tracing::{debug, info, warn};
 
 use super::{RpcClient, base64_decode, rpc_client};
+
+#[path = "update_stage.rs"]
+mod stage;
 
 /// How often a connected app asks the network for the manifest.
 pub(crate) const CHECK_INTERVAL_SECS: i64 = 60 * 60;
@@ -53,6 +62,7 @@ const STATE_ENV: &str = "DUCKTAPE_UPDATE_STATE";
 pub enum Job {
     Fetch,
     Download { sha: Sha, size: u64 },
+    Verify { sha: Sha },
 }
 
 /// What the executor is doing between events: the reason a tick does not
@@ -62,26 +72,70 @@ enum Activity {
     Quiet,
     Fetching,
     Downloading,
+    Verifying,
+}
+
+/// Where the updater's files are. `updates_dir` holds `state.json`, `keys/`
+/// and the `.partial` downloads; `releases_dir` holds `releases/<sha>/`,
+/// which is the LAUNCHER's layout: `<updates>/releases` on macOS,
+/// `$XDG_DATA_HOME/ducktape/releases` on Linux.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatePaths {
+    pub updates_dir: PathBuf,
+    pub releases_dir: PathBuf,
+    pub state_path: PathBuf,
+}
+
+impl UpdatePaths {
+    /// The macOS shape: everything under one directory. Tests use it on
+    /// every platform; only `from_env` reads the host's.
+    pub fn under(updates_dir: &Path) -> Self {
+        UpdatePaths {
+            updates_dir: updates_dir.to_path_buf(),
+            releases_dir: updates_dir.join("releases"),
+            state_path: updates_dir.join("state.json"),
+        }
+    }
+
+    fn release_dir(&self, sha: &Sha) -> PathBuf {
+        self.releases_dir.join(sha.to_string())
+    }
+
+    fn partial_dir(&self) -> PathBuf {
+        self.updates_dir.join("releases")
+    }
 }
 
 /// The machine plus its local files, owned by the app state and driven from
-/// the wall tick and the job replies.
+/// the wall tick, the UI and the job replies.
 #[derive(Debug, Clone)]
 pub struct Updater {
     phase: Phase,
     keys: TrustedKeys,
-    updates_dir: PathBuf,
-    state_path: PathBuf,
+    paths: UpdatePaths,
     last_check: Option<i64>,
     activity: Activity,
     banner: Option<UpdateBanner>,
 }
 
-/// The plain reading the shell shows: the phase, and the last banner.
+/// The plain reading the shell shows: the phase, the last banner, when the
+/// last check ran and whether a job is running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateReading {
     pub phase: Phase,
     pub banner: Option<UpdateBanner>,
+    pub last_check: Option<i64>,
+    pub busy: bool,
+}
+
+/// What performing one command asks of the caller.
+enum Effect {
+    /// Done here.
+    Nothing,
+    /// Start this job; its reply comes back through [`Updater::reply`].
+    Start(Job),
+    /// The launcher owns this command at boot: stop the list and relaunch.
+    Handover,
 }
 
 impl Updater {
@@ -99,15 +153,24 @@ impl Updater {
             warn!(target: "ducktape::update", event = "app_update_disabled", reason = "no_pinned_key");
             return None;
         };
+        let Some(releases_dir) = host_releases_dir(&updates_dir) else {
+            warn!(target: "ducktape::update", event = "app_update_disabled", reason = "no_data_dir");
+            return None;
+        };
         let phase = load_phase(&state_path).unwrap_or(Phase::Idle(app_update::Idle {
             current,
             previous: None,
             pinned_sequence: 0,
         }));
-        Some(Self::new(phase, keys, updates_dir, state_path))
+        let paths = UpdatePaths {
+            updates_dir,
+            releases_dir,
+            state_path,
+        };
+        Some(Self::new(phase, keys, paths))
     }
 
-    pub fn new(phase: Phase, keys: TrustedKeys, updates_dir: PathBuf, state_path: PathBuf) -> Self {
+    pub fn new(phase: Phase, keys: TrustedKeys, paths: UpdatePaths) -> Self {
         info!(
             target: "ducktape::update",
             event = "app_update_armed",
@@ -117,8 +180,7 @@ impl Updater {
         Updater {
             phase,
             keys,
-            updates_dir,
-            state_path,
+            paths,
             last_check: None,
             activity: Activity::Quiet,
             banner: None,
@@ -129,6 +191,8 @@ impl Updater {
         UpdateReading {
             phase: self.phase.clone(),
             banner: self.banner.clone(),
+            last_check: self.last_check,
+            busy: self.activity != Activity::Quiet,
         }
     }
 
@@ -136,8 +200,8 @@ impl Updater {
         &self.keys
     }
 
-    pub fn updates_dir(&self) -> &Path {
-        &self.updates_dir
+    pub fn paths(&self) -> &UpdatePaths {
+        &self.paths
     }
 
     /// The wall tick: a connected app checks once per [`CHECK_INTERVAL_SECS`]
@@ -146,9 +210,22 @@ impl Updater {
         let due = self
             .last_check
             .is_none_or(|last| now - last >= CHECK_INTERVAL_SECS);
-        let quiet = self.activity == Activity::Quiet;
-        let checks_now = connected && due && quiet;
+        let checks_now = connected && due;
         if !checks_now {
+            return None;
+        }
+        self.check(now)
+    }
+
+    /// The Settings "Check now" row: a check regardless of the interval,
+    /// still never on top of a running job.
+    pub fn check_now(&mut self, now: i64) -> Option<Job> {
+        self.check(now)
+    }
+
+    fn check(&mut self, now: i64) -> Option<Job> {
+        let quiet = self.activity == Activity::Quiet;
+        if !quiet {
             return None;
         }
         self.last_check = Some(now);
@@ -159,70 +236,250 @@ impl Updater {
     /// not answer; the machine is untouched and the next check is an
     /// interval away). Either way the executor is quiet again.
     pub fn reply(&mut self, reply: Option<Event>) -> Option<Job> {
+        self.activity = Activity::Quiet;
         match reply {
             Some(event) => self.apply(event),
-            None => {
-                self.activity = Activity::Quiet;
-                None
-            }
+            None => None,
         }
     }
 
     /// Feed one event through `step` and perform its commands. Returns the
-    /// job to start, if the commands asked for one.
+    /// job to start, if the commands asked for one. A list the launcher
+    /// must finish ends in a relaunch through it; if that relaunch fails
+    /// the phase held here is what `state.json` holds, not what `step`
+    /// returned — the flip did not happen.
     pub fn apply(&mut self, event: Event) -> Option<Job> {
-        self.activity = Activity::Quiet;
         let (phase, commands) = step(self.phase.clone(), event);
-        self.phase = phase;
+        let mut persisted = None;
         let mut job = None;
         for command in commands {
-            if let Some(asked) = self.perform(command) {
-                job = Some(asked);
+            if let Command::Persist(written) = &command {
+                persisted = Some(written.clone());
+            }
+            match self.perform(command) {
+                Effect::Nothing => {}
+                Effect::Start(asked) => job = Some(asked),
+                Effect::Handover => {
+                    if let Some(written) = persisted {
+                        self.phase = written;
+                    }
+                    relaunch_through_launcher();
+                    return None;
+                }
             }
         }
-        self.activity = match &job {
-            Some(Job::Fetch) => Activity::Fetching,
-            Some(Job::Download { .. }) => Activity::Downloading,
-            None => Activity::Quiet,
-        };
+        self.phase = phase;
+        if let Some(job) = &job {
+            self.activity = activity_of(job);
+        }
         job
     }
 
-    /// One command: the local effects happen here; the network ones become
-    /// the returned job.
-    fn perform(&mut self, command: Command) -> Option<Job> {
+    /// One command: the local effects happen here; a network or disk job
+    /// becomes the returned effect, and a launcher-owned command the
+    /// hand-over.
+    fn perform(&mut self, command: Command) -> Effect {
         match command {
             Command::Persist(phase) => {
-                persist(&self.state_path, &phase);
-                None
+                persist(&self.paths.state_path, &phase);
+                Effect::Nothing
             }
-            Command::Fetch => Some(Job::Fetch),
-            Command::Download { sha, size } => Some(Job::Download { sha, size }),
+            Command::Fetch => Effect::Start(Job::Fetch),
+            Command::Download { sha, size } => Effect::Start(Job::Download { sha, size }),
+            Command::Verify(sha) => Effect::Start(Job::Verify { sha }),
+            Command::SealImmutable(sha) => {
+                seal_release(&self.paths, &sha);
+                Effect::Nothing
+            }
             Command::PinSuccessor(successor) => {
-                pin_successor(&self.updates_dir, &successor);
+                pin_successor(&self.paths.updates_dir, &successor);
                 self.keys.successor = Some(successor);
-                None
+                Effect::Nothing
             }
             Command::Banner(banner) => {
                 note_banner(&banner);
                 self.banner = Some(banner);
-                None
+                Effect::Nothing
             }
-            Command::Verify(sha) => deferred("verify", sha),
-            Command::SealImmutable(sha) => deferred("seal_immutable", sha),
-            Command::Qualify(sha) => deferred("qualify", sha),
-            Command::Exec(sha) => deferred("exec", sha),
-            Command::ResolveSwap { from: _, to } => deferred("resolve_swap", to),
-            Command::Flip { from: _, to } => deferred("flip", to),
-            Command::Gc { keep: _ } => deferred("gc", self.phase.current()),
+            Command::Gc { keep } => {
+                stage::collect(&self.paths.releases_dir, &self.paths.partial_dir(), &keep);
+                Effect::Nothing
+            }
+            Command::Qualify(sha) => launcher_owned("qualify", sha),
+            Command::Exec(sha) => launcher_owned("exec", sha),
+            Command::ResolveSwap { from: _, to } => launcher_owned("resolve_swap", to),
+            Command::Flip { from: _, to } => launcher_owned("flip", to),
         }
     }
 }
 
-/// A command this executor does not perform yet: noted, never faked.
-fn deferred(command: &'static str, sha: Sha) -> Option<Job> {
-    debug!(target: "ducktape::update", event = "app_update_command_deferred", command, sha = %sha);
-    None
+fn activity_of(job: &Job) -> Activity {
+    match job {
+        Job::Fetch => Activity::Fetching,
+        Job::Download { .. } => Activity::Downloading,
+        Job::Verify { .. } => Activity::Verifying,
+    }
+}
+
+/// A command the launcher performs at boot: the app's part is to get there.
+fn launcher_owned(command: &'static str, sha: Sha) -> Effect {
+    info!(target: "ducktape::update", event = "app_update_handover", command, sha = %sha);
+    Effect::Handover
+}
+
+/// Replace this process with `ducktape-launcher` beside our own executable,
+/// argv passed through (a `duck://` URL rides there). Returns only when the
+/// exec failed; the app then carries on, and the log says why.
+fn relaunch_through_launcher() {
+    use std::os::unix::process::CommandExt as _;
+    let own = match std::env::current_exe() {
+        Ok(own) => own,
+        Err(error) => {
+            warn!(target: "ducktape::update", event = "app_update_relaunch_failed", reason = "self_unknown", error = %error);
+            return;
+        }
+    };
+    let launcher = own.with_file_name(stage::LAUNCHER_EXE);
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    info!(target: "ducktape::update", event = "app_update_relaunch");
+    let error = std::process::Command::new(&launcher).args(args).exec();
+    warn!(target: "ducktape::update", event = "app_update_relaunch_failed", reason = "exec_failed", error = %error);
+}
+
+fn seal_release(paths: &UpdatePaths, sha: &Sha) {
+    let dir = paths.release_dir(sha);
+    match stage::seal(&dir) {
+        Ok(()) => info!(target: "ducktape::update", event = "app_update_sealed", sha = %sha),
+        Err(error) => {
+            warn!(target: "ducktape::update", event = "app_update_seal_failed", sha = %sha, error = %error)
+        }
+    }
+}
+
+/// Where the launcher keeps `releases/<sha>/` on this host: beside the
+/// state on macOS, under the XDG data dir on Linux.
+fn host_releases_dir(updates_dir: &Path) -> Option<PathBuf> {
+    match cfg!(target_os = "macos") {
+        true => Some(updates_dir.join("releases")),
+        false => super::app_dirs::data_dir()
+            .ok()
+            .map(|data| data.join("releases")),
+    }
+}
+
+// ---- the reading the shell draws -------------------------------------------
+
+/// The strip across the top of the console: an update ready to restart
+/// into, or a rollback the reader has not dismissed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateStrip {
+    Ready { display: String },
+    RolledBack { failed: String, reason: String },
+}
+
+/// The strip a phase draws, if any.
+pub fn strip_of(reading: Option<&UpdateReading>) -> Option<UpdateStrip> {
+    let reading = reading?;
+    match &reading.phase {
+        Phase::Staged(staged) => Some(UpdateStrip::Ready {
+            display: staged.display.clone(),
+        }),
+        Phase::RolledBack(rolled_back) => Some(UpdateStrip::RolledBack {
+            failed: rolled_back.failed.short(),
+            reason: rollback_words(rolled_back.reason).to_string(),
+        }),
+        Phase::Idle(_) | Phase::Downloading(_) | Phase::Swapping(_) | Phase::PendingHealthy(_) => {
+            None
+        }
+    }
+}
+
+fn rollback_words(reason: RollbackReason) -> &'static str {
+    match reason {
+        RollbackReason::NeverRendered => "it never came up",
+    }
+}
+
+/// The Settings "Updates" section's facts. `state` is one of `unavailable`
+/// (not installed through the launcher), `idle`, `downloading`, `staged`,
+/// `swapping`, `pending_healthy`, `rolled_back`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpdateFacts {
+    pub state: String,
+    pub current: String,
+    pub previous: String,
+    pub staged_display: String,
+    pub channel: String,
+    pub checked: String,
+    pub note: String,
+    pub busy: bool,
+}
+
+pub fn facts_of(reading: Option<&UpdateReading>, now: i64) -> UpdateFacts {
+    let Some(reading) = reading else {
+        return UpdateFacts {
+            state: "unavailable".into(),
+            channel: layout::CHANNEL.into(),
+            ..UpdateFacts::default()
+        };
+    };
+    let (state, previous, staged_display) = match &reading.phase {
+        Phase::Idle(idle) => ("idle", idle.previous, String::new()),
+        Phase::Downloading(downloading) => (
+            "downloading",
+            downloading.previous,
+            downloading.display.clone(),
+        ),
+        Phase::Staged(staged) => ("staged", staged.previous, staged.display.clone()),
+        Phase::Swapping(_) => ("swapping", None, String::new()),
+        Phase::PendingHealthy(pending) => {
+            ("pending_healthy", Some(pending.previous), String::new())
+        }
+        Phase::RolledBack(rolled_back) => ("rolled_back", Some(rolled_back.failed), String::new()),
+    };
+    UpdateFacts {
+        state: state.into(),
+        current: reading.phase.current().short(),
+        previous: previous.map(|sha| sha.short()).unwrap_or_default(),
+        staged_display,
+        channel: layout::CHANNEL.into(),
+        checked: checked_words(reading.last_check, now),
+        note: banner_words(reading.banner.as_ref()),
+        busy: reading.busy,
+    }
+}
+
+/// "never", "just now", "N min ago", "N h ago".
+fn checked_words(last_check: Option<i64>, now: i64) -> String {
+    let Some(last) = last_check else {
+        return "never".into();
+    };
+    let elapsed = (now - last).max(0);
+    let minutes = elapsed / 60;
+    let hours = minutes / 60;
+    match (hours, minutes) {
+        (0, 0) => "just now".into(),
+        (0, minutes) => format!("{minutes} min ago"),
+        (hours, _) => format!("{hours} h ago"),
+    }
+}
+
+/// The last banner as the section's note: the refusal reason, or nothing.
+fn banner_words(banner: Option<&UpdateBanner>) -> String {
+    match banner {
+        None | Some(UpdateBanner::Ready { .. }) => String::new(),
+        Some(UpdateBanner::UpToDate) => "Up to date.".into(),
+        Some(UpdateBanner::Refused(refusal)) => format!("Last check refused: {refusal}."),
+        Some(UpdateBanner::DownloadFailed { reason, .. }) => {
+            format!("Download failed: {reason}.")
+        }
+        Some(UpdateBanner::VerifyRefused { reason, .. }) => {
+            format!("Verification refused: {reason}.")
+        }
+        Some(UpdateBanner::QualifyFailed { reason, .. }) => {
+            format!("The staged release failed to qualify: {reason}.")
+        }
+    }
 }
 
 fn note_banner(banner: &UpdateBanner) {
@@ -311,30 +568,69 @@ pub(crate) fn partial_path(updates_dir: &Path, sha: &Sha) -> PathBuf {
     updates_dir.join("releases").join(format!("{sha}.partial"))
 }
 
-// ---- the network jobs ------------------------------------------------------
+// ---- the jobs --------------------------------------------------------------
 
-/// Run one job against the node at `rpc`; the answer goes to
-/// [`Updater::reply`]. `None` is a check that did not happen (no client, no
-/// manifest served), which is not a refusal.
+/// Run one job; the answer goes to [`Updater::reply`]. `None` is a check
+/// that did not happen (no client, no manifest served), which is not a
+/// refusal. `Verify` needs no node: it is the disk work, off the runtime's
+/// blocking pool.
 pub async fn run_job(
     rpc: String,
     keys: TrustedKeys,
-    updates_dir: PathBuf,
+    paths: UpdatePaths,
     job: Job,
 ) -> Option<Event> {
-    let client = match rpc_client(&rpc) {
-        Ok(client) => client,
+    match job {
+        Job::Fetch => {
+            let client = client_for(&rpc)?;
+            fetch(&client, &keys).await.map(Event::ManifestFetched)
+        }
+        Job::Download { sha, size } => {
+            let client = client_for(&rpc)?;
+            match download(&client, &paths.updates_dir, sha, size).await {
+                Ok(()) => Some(Event::DownloadFinished { sha }),
+                Err(reason) => Some(Event::DownloadFailed { sha, reason }),
+            }
+        }
+        Job::Verify { sha } => Some(verify(paths, sha).await),
+    }
+}
+
+fn client_for(rpc: &str) -> Option<RpcClient> {
+    match rpc_client(rpc) {
+        Ok(client) => Some(client),
         Err(error) => {
             debug!(target: "ducktape::update", event = "app_update_job_skipped", reason = "no_client", error = %error);
-            return None;
+            None
         }
-    };
-    match job {
-        Job::Fetch => fetch(&client, &keys).await.map(Event::ManifestFetched),
-        Job::Download { sha, size } => match download(&client, &updates_dir, sha, size).await {
-            Ok(()) => Some(Event::DownloadFinished { sha }),
-            Err(reason) => Some(Event::DownloadFailed { sha, reason }),
-        },
+    }
+}
+
+/// `Verify`: the partial into `releases/<sha>/`, checked ([`stage::stage`]).
+/// A refusal removes what was extracted; the partial stays unless its bytes
+/// were the problem, so the next offer of the same release costs no
+/// second download.
+pub(crate) async fn verify(paths: UpdatePaths, sha: Sha) -> Event {
+    let archive = partial_path(&paths.updates_dir, &sha);
+    let release_dir = paths.release_dir(&sha);
+    let staged = tokio::task::spawn_blocking(move || stage::stage(&archive, sha, &release_dir))
+        .await
+        .unwrap_or_else(|_| Err("verify_panicked".into()));
+    match staged {
+        Ok(()) => {
+            info!(target: "ducktape::update", event = "app_update_verified", sha = %sha);
+            Event::Verified(sha)
+        }
+        Err(reason) => {
+            let leftover = paths.release_dir(&sha);
+            stage::unseal(&leftover);
+            let _ = std::fs::remove_dir_all(&leftover);
+            let bytes_are_wrong = reason == "sha256_mismatch";
+            if bytes_are_wrong {
+                let _ = std::fs::remove_file(partial_path(&paths.updates_dir, &sha));
+            }
+            Event::VerifyRefused { sha, reason }
+        }
     }
 }
 

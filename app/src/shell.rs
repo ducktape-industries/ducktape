@@ -1930,6 +1930,7 @@ impl DesktopWindow {
         let state = &self.model.read(cx).state;
         let error = state.error.clone();
         let toast = state.toast.clone();
+        let update_strip = state.update_strip();
         let needs_account =
             state.connected && !state.account_exists && !state.account_banner_dismissed;
         let mut content = div()
@@ -1985,6 +1986,9 @@ impl DesktopWindow {
                         .text_color(colors.muted_foreground),
                     ),
             );
+        }
+        if let Some(strip) = update_strip {
+            content = content.child(self.update_strip(strip, &colors, palette));
         }
         if !error.is_empty() {
             content = content.child(
@@ -2069,6 +2073,60 @@ impl DesktopWindow {
             root = root.child(overlay);
         }
         root.into_any_element()
+    }
+
+    /// The update strip across the top of the console: the same quiet
+    /// one-line band as the account notice. A staged release offers the
+    /// restart; a rollback says so until dismissed.
+    fn update_strip(
+        &self,
+        strip: crate::backend::update::UpdateStrip,
+        colors: &gpui_kit::component::ColorTokens,
+        palette: &design::Palette,
+    ) -> gpui_kit::AnyElement {
+        use gpui_kit::*;
+        let (words, tone, action) = match strip {
+            crate::backend::update::UpdateStrip::Ready { display } => (
+                format!("Ducktape {display} is ready"),
+                hsla_of(palette.accent_soft),
+                self.action(
+                    "update-restart",
+                    "Restart to update",
+                    Message::UpdateAction(crate::UpdateAction::RestartToUpdate),
+                    false,
+                ),
+            ),
+            crate::backend::update::UpdateStrip::RolledBack { failed, reason } => (
+                format!("Update {failed} was rolled back ({reason})"),
+                hsla_of(palette.warning_soft),
+                self.action(
+                    "update-rollback-dismiss",
+                    "Dismiss",
+                    Message::UpdateAction(crate::UpdateAction::DismissRollbackNotice),
+                    false,
+                ),
+            ),
+        };
+        div()
+            .id("update-strip")
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .h(px(32.))
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(colors.border)
+            .bg(tone)
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(12.))
+                    .text_color(colors.foreground)
+                    .child(words),
+            )
+            .child(action.outline().h_6().text_size(px(12.)))
+            .into_any_element()
     }
 
     fn overlay(

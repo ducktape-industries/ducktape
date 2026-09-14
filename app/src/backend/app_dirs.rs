@@ -31,6 +31,17 @@ pub(crate) fn cache_dir() -> Result<PathBuf, String> {
     platform_dir("XDG_CACHE_HOME", ".cache", "Library/Caches")
 }
 
+/// what the launcher installs: `releases/`, `current`, `previous`
+/// (`$XDG_DATA_HOME`, else `~/.local/share`; Linux only — macOS keeps
+/// releases beside the update state).
+pub(crate) fn data_dir() -> Result<PathBuf, String> {
+    platform_dir(
+        "XDG_DATA_HOME",
+        ".local/share",
+        "Library/Application Support",
+    )
+}
+
 /// the app's rotating log, under the state directory.
 pub fn app_log_path() -> Result<PathBuf, String> {
     Ok(state_dir()?.join("app.log"))

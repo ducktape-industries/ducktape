@@ -226,6 +226,10 @@ lru = "0.18"
 libc = "0.2"
 smallvec = "1"
 sha2 = "0.10"
+# the desktop app's release archives (`.tar.zst`): app/src/backend/update.rs
+# extracts a staged release out of one.
+tar = "0.4"
+zstd = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

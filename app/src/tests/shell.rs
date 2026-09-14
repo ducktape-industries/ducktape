@@ -474,3 +474,168 @@ fn passkey_ceremony_props_reach_settings_without_exposing_secrets() {
             .contains("never-in-props")
     );
 }
+/// THE UPDATE PLANE THROUGH THE SHELL: the Settings props carry the
+/// updater's facts (or `unavailable` for a bare `make dev` binary), each
+/// Settings intent lands as its own `UpdateAction`, the first window opened
+/// is the healthy signal that settles a flipped release, and the console
+/// strip draws only the two phases that ask something of the reader.
+#[test]
+fn update_facts_reach_settings_and_each_intent_is_one_action() {
+    use crate::backend::update::{UpdatePaths, Updater};
+    use app_update::{Phase, Sha, TrustedKeys};
+    use commonware_cryptography::{Signer as _, ed25519};
+
+    let mut app = Ducktape::initial_state();
+    app.shell_tab = ShellTab::Settings;
+    let (view, _) = app.native_view();
+    let props: serde_json::Value = serde_json::from_slice(&view.props).unwrap();
+    assert_eq!(
+        props["update_state"], "unavailable",
+        "a bare binary has no updater"
+    );
+    assert_eq!(props["update_channel"], "stable");
+    assert_eq!(app.update_strip(), None);
+
+    let updates = tempfile::tempdir().unwrap();
+    let keys = TrustedKeys {
+        pinned: app_update::PublicKey::of(&ed25519::PrivateKey::from_seed(1)),
+        successor: None,
+    };
+    let current = Sha::digest(b"new");
+    let previous = Sha::digest(b"old");
+    let pending = Phase::PendingHealthy(app_update::PendingHealthy {
+        current,
+        previous,
+        boots: 1,
+        pinned_sequence: 4,
+    });
+    app.updater = Some(Updater::new(
+        pending,
+        keys,
+        UpdatePaths::under(updates.path()),
+    ));
+    let (view, _) = app.native_view();
+    let props: serde_json::Value = serde_json::from_slice(&view.props).unwrap();
+    assert_eq!(props["update_state"], "pending_healthy");
+    assert_eq!(props["update_current"], current.short());
+    assert_eq!(props["update_previous"], previous.short());
+    assert_eq!(props["update_checked"], "never");
+
+    // the first window is the healthy signal
+    let _ = app.update(AppMessage::OnboardingOpened(
+        crate::shell::WindowKey::unique(),
+    ));
+    let reading = app.update_reading().expect("armed");
+    assert_eq!(
+        reading.phase,
+        Phase::Idle(app_update::Idle {
+            current,
+            previous: Some(previous),
+            pinned_sequence: 4,
+        })
+    );
+    let (view, _) = app.native_view();
+    let props: serde_json::Value = serde_json::from_slice(&view.props).unwrap();
+    assert_eq!(props["update_state"], "idle");
+
+    // each Settings intent is one action; the rollback intent leaves the
+    // machine alone here because there is no launcher to hand over to
+    // (the exec fails and the phase stays what state.json holds).
+    for (kind, action) in [
+        ("update_check", UpdateAction::CheckNow),
+        ("update_restart", UpdateAction::RestartToUpdate),
+        ("update_rollback", UpdateAction::RollBack),
+    ] {
+        let event = crate::module_view::view_event(kind.into(), "{}".into());
+        let intent = crate::module_view::settings_intent(&event);
+        let routed = match intent {
+            SettingsIntent::UpdateCheck => UpdateAction::CheckNow,
+            SettingsIntent::UpdateRestart => UpdateAction::RestartToUpdate,
+            SettingsIntent::UpdateRollback => UpdateAction::RollBack,
+            other => panic!("{kind} routed to {other:?}"),
+        };
+        assert_eq!(routed, action);
+    }
+    let body = handler_body("UpdateAction");
+    for event in ["RestartToUpdate", "UserRollback", "DismissRollbackNotice"] {
+        assert!(
+            body.contains(&format!("app_update::Event::{event}")),
+            "the action handler feeds {event}"
+        );
+    }
+    assert!(body.contains("updater.check_now(self.wall_now)"));
+    let arms = handler_bodies()
+        .into_iter()
+        .find(|(name, _)| name == "SettingsViewEvent")
+        .map(|(_, body)| body)
+        .expect("the settings event handler");
+    for action in ["CheckNow", "RestartToUpdate", "RollBack"] {
+        assert!(
+            arms.contains(&format!("UpdateAction::{action}")),
+            "the settings event handler routes {action}"
+        );
+    }
+
+    // Check now starts the fetch and is refused while it runs
+    let _ = app.update(AppMessage::UpdateAction(UpdateAction::CheckNow));
+    assert!(app.update_reading().unwrap().busy, "a fetch is in flight");
+    let (view, _) = app.native_view();
+    let props: serde_json::Value = serde_json::from_slice(&view.props).unwrap();
+    assert_eq!(props["update_busy"], true);
+    let _ = app.update(AppMessage::UpdateJobReplied(None));
+    assert!(!app.update_reading().unwrap().busy);
+
+    // the strip: Staged offers the restart, RolledBack the dismissal
+    let staged = Phase::Staged(app_update::Staged {
+        current,
+        previous: Some(previous),
+        pinned_sequence: 5,
+        staged: Sha::digest(b"next"),
+        sequence: 5,
+        display: "2026.09.3+abcdef0".into(),
+        node_contract: 1,
+    });
+    app.updater = Some(Updater::new(
+        staged,
+        app.updater.as_ref().unwrap().keys().clone(),
+        UpdatePaths::under(updates.path()),
+    ));
+    assert_eq!(
+        app.update_strip(),
+        Some(crate::backend::update::UpdateStrip::Ready {
+            display: "2026.09.3+abcdef0".into()
+        })
+    );
+    let rolled_back = Phase::RolledBack(app_update::RolledBack {
+        current,
+        failed: Sha::digest(b"next"),
+        reason: app_update::RollbackReason::NeverRendered,
+        pinned_sequence: 5,
+    });
+    app.updater = Some(Updater::new(
+        rolled_back,
+        app.updater.as_ref().unwrap().keys().clone(),
+        UpdatePaths::under(updates.path()),
+    ));
+    assert_eq!(
+        app.update_strip(),
+        Some(crate::backend::update::UpdateStrip::RolledBack {
+            failed: Sha::digest(b"next").short(),
+            reason: "it never came up".into()
+        })
+    );
+    let _ = app.update(AppMessage::UpdateAction(
+        UpdateAction::DismissRollbackNotice,
+    ));
+    assert_eq!(app.update_strip(), None);
+    assert!(matches!(
+        app.update_reading().unwrap().phase,
+        Phase::Idle(_)
+    ));
+
+    // the console draws the strip above the content, wired to the two actions
+    let shell = rust_tokens(include_str!("../shell.rs"));
+    assert!(shell.contains("letupdate_strip=state.update_strip();"));
+    assert!(shell.contains("Message::UpdateAction(crate::UpdateAction::RestartToUpdate)"));
+    assert!(shell.contains("Message::UpdateAction(crate::UpdateAction::DismissRollbackNotice)"));
+}
