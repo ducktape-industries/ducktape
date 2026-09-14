@@ -317,7 +317,7 @@ impl ChatView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "56f3386730ee16a2e2822c9384ff066a1362aeb15ce81c9fe835d0c49068fe02";
+        "1953070588debd12ecc5f5f4ce3a9d33cfa6adb135356e59ed5f41aae6b39389";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {

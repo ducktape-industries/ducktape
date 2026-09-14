@@ -78,7 +78,14 @@ pub struct ChatBlock {
     pub lang: String,
     pub rich: bool,
     pub spans: Vec<ChatSpan>,
+    /// An `attachment` block's destination: the file the send put beside
+    /// the message, which `text` names.
+    pub link: String,
 }
+
+/// Where a send puts a message's files; a paragraph that is one link into
+/// it reads as a file card, not a line of text.
+pub const ATTACHMENTS_PREFIX: &str = "duck://files/shared/attachments/";
 
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -1164,6 +1171,7 @@ fn block_view(block: &serde_json::Value, names: &Names) -> ChatBlock {
             lang: payload["lang"].as_str().unwrap_or_default().to_owned(),
             rich: false,
             spans: Vec::new(),
+            link: String::new(),
         },
         _ => ChatBlock {
             kind: "divider".into(),
@@ -1194,16 +1202,39 @@ fn rich_block(kind: &str, spans: &serde_json::Value, names: &Names) -> ChatBlock
     let marked = runs
         .iter()
         .any(|span| !span["marks"].as_array().is_none_or(Vec::is_empty));
+    let views = match marked {
+        true => run_spans(&runs, names),
+        false => Vec::new(),
+    };
+    if let Some(attachment) = attachment_block(kind, &views) {
+        return attachment;
+    }
     ChatBlock {
         kind: kind.into(),
         text: span_text(spans, names),
         lang: String::new(),
-        spans: match marked {
-            true => run_spans(&runs, names),
-            false => Vec::new(),
-        },
+        spans: views,
         rich: marked,
+        link: String::new(),
     }
+}
+
+/// A paragraph that is exactly one link into the attachments root: the
+/// card the send's link line becomes.
+fn attachment_block(kind: &str, spans: &[ChatSpan]) -> Option<ChatBlock> {
+    let [only] = spans else {
+        return None;
+    };
+    let is_file = kind == "paragraph" && only.link.starts_with(ATTACHMENTS_PREFIX);
+    if !is_file {
+        return None;
+    }
+    Some(ChatBlock {
+        kind: "attachment".into(),
+        text: only.link_text.clone(),
+        link: only.link.clone(),
+        ..ChatBlock::default()
+    })
 }
 
 fn span_text(spans: &serde_json::Value, names: &Names) -> String {
@@ -2125,6 +2156,22 @@ mod tests {
     /// CROSS: the "…" at a row's right end opens its menu to the left, a
     /// press near the bottom opens upward, and a corner press never leaves
     /// the screen.
+    /// The link line a send with files posts reads as a file card; any
+    /// other link, or a link with words around it, stays a line of text.
+    #[test]
+    fn a_lone_link_into_the_attachments_root_is_a_file_card() {
+        let names = Names::default();
+        let file = serde_json::json!({"paragraph": [{"text": "deck.pdf", "marks": [{"link": "duck://files/shared/attachments/message-1-2/deck.pdf"}]}]});
+        let block = block_view(&file, &names);
+        assert_eq!(block.kind, "attachment");
+        assert_eq!(block.text, "deck.pdf");
+        assert_eq!(block.link, "duck://files/shared/attachments/message-1-2/deck.pdf");
+        let web = serde_json::json!({"paragraph": [{"text": "site", "marks": [{"link": "https://example.com"}]}]});
+        assert_eq!(block_view(&web, &names).kind, "paragraph");
+        let worded = serde_json::json!({"paragraph": [{"text": "see ", "marks": []}, {"text": "deck.pdf", "marks": [{"link": "duck://files/shared/attachments/message-1-2/deck.pdf"}]}]});
+        assert_eq!(block_view(&worded, &names).kind, "paragraph");
+    }
+
     #[test]
     fn a_menu_opens_at_the_pointer_and_flips_away_from_the_edges() {
         let viewport = (1000.0, 600.0);

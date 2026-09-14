@@ -181,6 +181,7 @@ pub async fn send_message(
     channel_id: String,
     message_id: String,
     body: String,
+    attachments: Vec<String>,
 ) -> Result<SendReceipt, OptimisticMutationError> {
     let operation_id = message_id.clone();
     let operation_scope = channel_id.clone();
@@ -190,6 +191,10 @@ pub async fn send_message(
             return Err("choose a channel first".to_string().into());
         }
         let body = bounded_text(body, "message", 16 * 1024)?;
+        // the files first: a body that links them must never land alone
+        super::attach_files(&rpc, &password, &message_id, &attachments)
+            .await
+            .map_err(app_error)?;
         let rpc = rpc_client(&rpc)?;
         signed_write(
             &rpc,
@@ -230,6 +235,7 @@ pub async fn send_reply(
     root_seq: i64,
     message_id: String,
     body: String,
+    attachments: Vec<String>,
 ) -> Result<SendReceipt, OptimisticMutationError> {
     let operation_id = message_id.clone();
     let operation_scope = channel_id.clone();
@@ -238,6 +244,9 @@ pub async fn send_reply(
     let result = async {
         let root_seq = positive_sequence(root_seq)?;
         let body = bounded_text(body, "reply", 16 * 1024)?;
+        super::attach_files(&rpc, &password, &message_id, &attachments)
+            .await
+            .map_err(app_error)?;
         let rpc = rpc_client(&rpc)?;
         let message_id = required_id(message_id, "message")?;
         signed_write(

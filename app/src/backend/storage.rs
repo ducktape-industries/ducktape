@@ -78,6 +78,82 @@ pub async fn files_upload(
     dir: String,
     dropped: String,
 ) -> Result<bool, AppError> {
+    let name = file_name(&dropped).map_err(app_error)?;
+    files_put(rpc, password, dir, dropped, name)
+        .await
+        .map_err(app_error)?;
+    Ok(true)
+}
+
+/// Where a message's files live: one directory per message under the
+/// attachments root, the root `duck_uri::classify_files` opens.
+pub const ATTACHMENTS_ROOT: &str = "/shared/attachments";
+
+/// Upload each local file beside the message it goes with. Sequential on
+/// purpose: every put is its own head-based commit.
+pub async fn attach_files(
+    rpc: &str,
+    password: &str,
+    message_id: &str,
+    sources: &[String],
+) -> Result<(), String> {
+    let dir = format!("{ATTACHMENTS_ROOT}/{message_id}");
+    for source in sources {
+        let name = attachment_name(&file_name(source)?);
+        files_put(
+            rpc.to_owned(),
+            password.to_owned(),
+            dir.clone(),
+            source.clone(),
+            name,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// The body a send with files posts: the typed text, then one link line per
+/// file at the path `attach_files` puts it — so the row, the optimistic row
+/// and the runs injector all read the same address.
+pub fn attachment_body(body: String, message_id: &str, names: &[String]) -> String {
+    if names.is_empty() {
+        return body;
+    }
+    let mut lines: Vec<String> = body.lines().map(str::to_owned).collect();
+    for name in names {
+        let name = attachment_name(name);
+        lines.push(format!(
+            "[{name}](duck://files{ATTACHMENTS_ROOT}/{message_id}/{name})"
+        ));
+    }
+    lines.join("\n")
+}
+
+/// The name a file is stored and linked under: what a markdown link can
+/// carry — no whitespace, no brackets, no parens — with the rest kept.
+pub fn attachment_name(name: &str) -> String {
+    let safe = name.chars().map(|c| {
+        let breaks_link = c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '/');
+        if breaks_link { '_' } else { c }
+    });
+    safe.collect()
+}
+
+fn file_name(path: &str) -> Result<String, String> {
+    PathBuf::from(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| "dropped path has no file name".to_string())
+}
+
+async fn files_put(
+    rpc: String,
+    password: String,
+    dir: String,
+    dropped: String,
+    name: String,
+) -> Result<(), String> {
     // the node refuses to serve back any object larger than files_http's
     // MAX_OBJECT_BYTES, and every staged MiB is a consensus block — a cap
     // HERE turns "drop a video, drive 300 blocks, node RSS grows by 300 MB"
@@ -85,11 +161,6 @@ pub async fn files_upload(
     const MAX_DROP_BYTES: u64 = 64 * 1024 * 1024;
     async {
         let source = PathBuf::from(&dropped);
-        let name = source
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| "dropped path has no file name".to_string())?
-            .to_string();
         let size = std::fs::metadata(&source)
             .map_err(|error| format!("cannot read {dropped}: {error}"))?
             .len();
@@ -139,8 +210,6 @@ pub async fn files_upload(
         .await
     }
     .await
-    .map_err(app_error)?;
-    Ok(true)
 }
 
 /// The files read lane's wire: standard alphabet, padded — the same engine
