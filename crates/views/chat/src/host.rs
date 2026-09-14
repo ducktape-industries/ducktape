@@ -97,6 +97,68 @@ pub struct ChatBlock {
 /// it reads as a file card, not a line of text.
 pub const ATTACHMENTS_PREFIX: &str = "duck://files/shared/attachments/";
 
+/// The host picture slot this view draws into.
+pub const PICTURE_SURFACE: &str = "chat";
+/// The box a picture attachment is shown in: it fits inside, keeping its
+/// shape, and never grows past its own size.
+pub const PICTURE_BOX: (f64, f64) = (360., 280.);
+
+/// A file the host can decode for the timeline, by its name.
+pub fn is_picture(name: &str) -> bool {
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
+    )
+}
+
+/// The duckfs path behind an attachment link: the scheme and host dropped,
+/// the query too.
+pub fn attachment_file_path(link: &str) -> String {
+    let path = link.strip_prefix("duck://files").unwrap_or(link);
+    path.split('?').next().unwrap_or_default().to_owned()
+}
+
+/// Every picture attachment across the timeline and the thread, once each,
+/// in reading order.
+pub fn picture_links(messages: &[ChatMessage], thread: &[ChatMessage]) -> Vec<String> {
+    let mut links = Vec::new();
+    for message in messages.iter().chain(thread) {
+        for block in &message.blocks {
+            let picture = block.kind == "attachment" && is_picture(&block.text);
+            if picture && !links.contains(&block.link) {
+                links.push(block.link.clone());
+            }
+        }
+    }
+    links
+}
+
+/// The size a picture is drawn at in the timeline: inside [`PICTURE_BOX`],
+/// keeping its shape, and no larger than it is.
+pub fn picture_box(width: i64, height: i64) -> (f32, f32) {
+    let (width, height) = (width.max(1) as f64, height.max(1) as f64);
+    let scale = (PICTURE_BOX.0 / width).min(PICTURE_BOX.1 / height).min(1.);
+    ((width * scale).round() as f32, (height * scale).round() as f32)
+}
+
+/// Ask the host to decode a duckfs picture into this view's slot; the
+/// answer is the size it will be drawn at.
+pub async fn picture_load(path: String) -> Result<(i64, i64), String> {
+    let drawn = ask(
+        "picture.load",
+        &serde_json::json!({ "surface": PICTURE_SURFACE, "path": path }),
+    )
+    .await?;
+    Ok((
+        drawn["width"].as_i64().unwrap_or(0),
+        drawn["height"].as_i64().unwrap_or(0),
+    ))
+}
+
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: String,
@@ -2180,6 +2242,41 @@ mod tests {
         assert_eq!(block_view(&web, &names).kind, "paragraph");
         let worded = serde_json::json!({"paragraph": [{"text": "see ", "marks": []}, {"text": "deck.pdf", "marks": [{"link": "duck://files/shared/attachments/message-1-2/deck.pdf"}]}]});
         assert_eq!(block_view(&worded, &names).kind, "paragraph");
+    }
+
+    /// A picture attachment is asked for once by its link, fetched by its
+    /// duckfs path, and drawn inside the box keeping its shape.
+    #[test]
+    fn picture_attachments_are_found_once_and_fit_the_box() {
+        assert!(is_picture("Cover.PNG") && is_picture("a.jpeg") && !is_picture("deck.pdf"));
+        assert_eq!(
+            attachment_file_path("duck://files/shared/attachments/a-1/x.png?net=abcd1234"),
+            "/shared/attachments/a-1/x.png"
+        );
+        let block = |name: &str| ChatBlock {
+            kind: "attachment".into(),
+            text: name.into(),
+            link: format!("duck://files/shared/attachments/a-1/{name}"),
+            ..ChatBlock::default()
+        };
+        let message = |blocks: Vec<ChatBlock>| ChatMessage {
+            blocks,
+            ..ChatMessage::default()
+        };
+        let links = picture_links(
+            &[message(vec![block("x.png"), block("deck.pdf")])],
+            &[message(vec![block("x.png"), block("y.gif")])],
+        );
+        assert_eq!(
+            links,
+            vec![
+                "duck://files/shared/attachments/a-1/x.png".to_owned(),
+                "duck://files/shared/attachments/a-1/y.gif".to_owned()
+            ]
+        );
+        assert_eq!(picture_box(1200, 600), (360., 180.));
+        assert_eq!(picture_box(300, 900), (93., 280.));
+        assert_eq!(picture_box(200, 100), (200., 100.));
     }
 
     #[test]

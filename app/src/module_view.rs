@@ -732,7 +732,7 @@ fn surface_bool(args: &[wire::SurfaceValue], index: usize) -> bool {
 fn surface_allowed(module: &str, surface: &str) -> bool {
     match (module, surface) {
         (_, "artifact_svg" | "artifact_image") => true,
-        ("chat", "chat_composer") => true,
+        ("chat", "chat_composer" | "picture") => true,
         ("forge", "forge_composer" | "picture" | "forge_markdown" | "forge_code") => true,
         ("files", "picture" | "forge_code" | "agent_markdown") => true,
         _ => false,

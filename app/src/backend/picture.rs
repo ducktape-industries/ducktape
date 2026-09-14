@@ -21,6 +21,12 @@ pub const MAX_PICTURE_SIDE: u32 = 2048;
 pub const FILES_SURFACE: &str = "files";
 /// The Forge reader's slot.
 pub const FORGE_SURFACE: &str = "forge";
+/// The chat timeline's slot — many pictures at once, the ones on screen.
+pub const CHAT_SURFACE: &str = "chat";
+/// How many timeline pictures stay decoded; the oldest goes when one more
+/// lands. ponytail: enough for a screen of attachments; make it byte-bounded
+/// if a room of photos ever matters.
+pub const MAX_CHAT_PICTURES: usize = 24;
 /// How many of a Markdown document's in-repo pictures the loader fetches, in
 /// document order. ponytail: the rest keep their alt text; page them lazily
 /// if a README ever carries more.
@@ -160,8 +166,17 @@ pub async fn store_picture(
 }
 
 /// Park one decoded picture under `surface` as `path`'s, replacing whatever
-/// the surface held. The one writer to the store.
+/// the surface held. The one writer to the store. The chat slot is the
+/// exception: it keeps the last [`MAX_CHAT_PICTURES`], by path.
 pub(crate) fn park_picture(surface: &'static str, path: String, picture: Picture) {
+    if surface == CHAT_SURFACE {
+        let mut recent = chat_store().lock().expect("chat picture store");
+        recent.retain(|(stored, _)| *stored != path);
+        recent.push((path, picture));
+        let over = recent.len().saturating_sub(MAX_CHAT_PICTURES);
+        recent.drain(..over);
+        return;
+    }
     store()
         .lock()
         .expect("picture store")
@@ -171,12 +186,26 @@ pub(crate) fn park_picture(surface: &'static str, path: String, picture: Picture
 /// The picture parked under `surface`, only if it is still `path`'s — a slot
 /// holding the previous file never draws under the next file's name.
 pub fn stored_picture(surface: &str, path: &str) -> Option<Picture> {
+    if surface == CHAT_SURFACE {
+        return chat_store()
+            .lock()
+            .expect("chat picture store")
+            .iter()
+            .find(|(stored, _)| stored == path)
+            .map(|(_, picture)| picture.clone());
+    }
     store()
         .lock()
         .expect("picture store")
         .get(surface)
         .filter(|(stored, _)| stored == path)
         .map(|(_, picture)| picture.clone())
+}
+
+/// The timeline's pictures, oldest first.
+fn chat_store() -> &'static Mutex<Vec<(String, Picture)>> {
+    static STORE: OnceLock<Mutex<Vec<(String, Picture)>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Resolve a Markdown image URL against the document's place in the repo:
@@ -293,6 +322,17 @@ impl Render for PictureView {
                 .h(relative(self.scale))
                 .child(picture.element())
         });
+        // A timeline thumbnail is still: it fills the box the view gave it
+        // and leaves the wheel to the timeline's scroll.
+        let still = self.surface == CHAT_SURFACE;
+        if still {
+            return div()
+                .id("picture-thumbnail")
+                .relative()
+                .size_full()
+                .overflow_hidden()
+                .children(content);
+        }
         div()
             .id("picture-viewer")
             .relative()
@@ -415,6 +455,23 @@ mod tests {
     fn a_sideways_jpeg_decodes_upright_by_its_exif_orientation() {
         let picture = decode_picture(&sideways_jpeg()).expect("decodes");
         assert_eq!((picture.width, picture.height), (2, 3));
+    }
+
+    /// The chat slot keeps the last [`MAX_CHAT_PICTURES`] by path: a re-park
+    /// of a known path refreshes it, and the oldest goes once over the cap.
+    #[test]
+    fn the_chat_slot_keeps_the_most_recent_pictures_by_path() {
+        for index in 0..=MAX_CHAT_PICTURES {
+            let picture = decode_picture(&png(1, 1)).expect("decodes");
+            park_picture(CHAT_SURFACE, format!("/chat-test/{index}.png"), picture);
+        }
+        assert!(stored_picture(CHAT_SURFACE, "/chat-test/0.png").is_none());
+        assert!(stored_picture(CHAT_SURFACE, "/chat-test/1.png").is_some());
+        let again = decode_picture(&png(2, 1)).expect("decodes");
+        park_picture(CHAT_SURFACE, "/chat-test/1.png".into(), again);
+        let refreshed = stored_picture(CHAT_SURFACE, "/chat-test/1.png").expect("kept");
+        assert_eq!(refreshed.width, 2);
+        assert_eq!(chat_store().lock().expect("store").len(), MAX_CHAT_PICTURES);
     }
 
     #[test]
