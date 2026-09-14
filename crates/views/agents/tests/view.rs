@@ -6,11 +6,9 @@
 
 use agents_view::host::{Draft, OpenLink, OpenRun, Session};
 use agents_view::{boot_native, tick_native};
-use serde_json::{Value, json};
-use ducktape_view_guest::testing::{
-    answer, has_text, item, pick, press, texts, toggle, type_into,
-};
+use ducktape_view_guest::testing::{answer, has_text, item, pick, press, texts, toggle, type_into};
 use ducktape_view_guest::wire::{Event, Frame, Node, Request};
+use serde_json::{Value, json};
 
 /// Inputs are found by placeholder and pick lists by key.
 const AGENT_ID_HINT: &str = "a-dns-label, e.g. chiefduck";
@@ -126,7 +124,9 @@ fn reply_for(request: &Request) -> Option<Value> {
             Some(json!({ "runs": [running_run(), failed_run()] }))
         }
         ("rpc.view", "runs") if named("run") => Some(run_detail()),
-        ("rpc.view", "chat") if named("channel") => Some(json!({ "channel": { "name": "general" } })),
+        ("rpc.view", "chat") if named("channel") => {
+            Some(json!({ "channel": { "name": "general" } }))
+        }
         ("rpc.view", "chat") if named("messages_around") => Some(json!({ "messages": [] })),
         _ => None,
     }
@@ -301,7 +301,12 @@ fn a_live_hit_reads_the_register_again() {
     let (_, left) = registered("7");
     let live = live_ids(&left);
     let frame = tick_native(vec![item(live[0], b"{}")]);
-    assert_eq!(kinds(&frame.requests), ["rpc.query"], "{:?}", frame.requests);
+    assert_eq!(
+        kinds(&frame.requests),
+        ["rpc.query"],
+        "{:?}",
+        frame.requests
+    );
 }
 
 // ---------- the record ----------
@@ -766,13 +771,11 @@ fn the_open_run_draws_the_node_output_as_it_arrives() {
         "type": "result",
         "result": "the register is green",
     }))]);
-    for expected in ["Answering", "the register is green", "Command: cargo test"] {
-        assert!(
-            has_text(&frame, expected),
-            "missing {expected:?} in {:?}",
-            texts(&frame)
-        );
-    }
+    assert!(markdown_texts(&frame).contains(&"the register is green".into()));
+    assert!(
+        !has_text(&frame, "Command: cargo test"),
+        "process stays behind its disclosure"
+    );
 
     // a frame for another topic is not this run's
     let frame = tick_native(vec![item(
@@ -781,11 +784,7 @@ fn the_open_run_draws_the_node_output_as_it_arrives() {
             .to_string()
             .as_bytes(),
     )]);
-    assert!(
-        !has_text(&frame, "not ours"),
-        "{:?}",
-        texts(&frame)
-    );
+    assert!(!has_text(&frame, "not ours"), "{:?}", texts(&frame));
 
     // closing the run takes the panel with it
     let frame = tick_native(press(&frame, "Close journal"));
@@ -794,4 +793,225 @@ fn the_open_run_draws_the_node_output_as_it_arrives() {
         "{:?}",
         texts(&frame)
     );
+}
+
+#[test]
+fn a_running_run_sends_steering_to_its_current_turn_and_preserves_new_typing() {
+    let (_frame, left) = connect(booted(), "7", "dispatch-live", 1);
+    let stream = left
+        .iter()
+        .find(|request| request.kind == "rpc.stream")
+        .unwrap();
+    let frame = tick_native(vec![item(
+        stream.id,
+        json!({
+            "type":"run_control_snapshot","topic":"run-output:dispatch-live",
+            "control":{"turn":"turn-a","steers":true,"approvals":[]}
+        })
+        .to_string()
+        .as_bytes(),
+    )]);
+    let frame = tick_native(type_into(
+        &frame,
+        "Add instructions to this run…",
+        "Check the wrap first",
+    ));
+    let frame = tick_native(press(&frame, "Send instructions"));
+    let request = request(&frame, "rpc.admin").clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&request.payload).unwrap(),
+        json!({
+            "route":"run-control","payload":{"run":"dispatch-live","input":{"action":"steer","expected_turn":"turn-a","text":"Check the wrap first"}}
+        })
+    );
+    let _frame = tick_native(type_into(
+        &frame,
+        "Add instructions to this run…",
+        "Also inspect trace",
+    ));
+    // Claude publishes a new response boundary within the same run before its acknowledgement.
+    let _frame = tick_native(vec![item(stream.id,json!({"type":"run_control_snapshot","topic":"run-output:dispatch-live","control":{"turn":"turn-b","steers":true,"approvals":[]}}).to_string().as_bytes())]);
+    let frame = tick_native(vec![answer(request.id, b"{}")]);
+    assert!(
+        has_text(&frame, "Received by the session"),
+        "{:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(press(&frame, "Send instructions"));
+    let next = request_payload(&frame, "rpc.admin");
+    assert_eq!(next["payload"]["input"]["text"], "Also inspect trace");
+}
+
+fn request_payload(frame: &Frame, kind: &str) -> Value {
+    serde_json::from_slice(&request(frame, kind).payload).unwrap()
+}
+
+#[test]
+fn trace_exposes_full_provider_details_only_when_opened() {
+    let (_frame, left) = connect(booted(), "7", "dispatch-gone", 1);
+    let stream = left
+        .iter()
+        .find(|request| request.kind == "rpc.stream")
+        .unwrap();
+    let detail = "very-long-output-".repeat(100);
+    let frame = tick_native(vec![item(stream.id,json!({"topic":"run-output:dispatch-gone","item":{"line":json!({"type":"tool_result","output":detail}).to_string()}}).to_string().as_bytes())]);
+    assert!(!texts(&frame).iter().any(|text| text.contains(&detail)));
+    let frame = tick_native(press(&frame, "▸ Work details"));
+    assert!(!texts(&frame).iter().any(|text| text.contains(&detail)));
+    let frame = tick_native(press(&frame, "Show raw events"));
+    assert!(texts(&frame).iter().any(|text| text.contains(&detail)));
+}
+
+fn markdown_texts(frame: &Frame) -> Vec<String> {
+    fn collect(node: &Node, texts: &mut Vec<String>) {
+        if let Node::Surface { name, args, .. } = node
+            && name == "agent_markdown"
+            && let Some(ducktape_view_guest::wire::SurfaceValue::Str(text)) = args.first()
+        {
+            texts.push(text.clone());
+        }
+        for child in node.children() {
+            collect(child, texts);
+        }
+    }
+    let mut texts = Vec::new();
+    if let Some(root) = &frame.root {
+        collect(root, &mut texts);
+    }
+    texts
+}
+
+#[test]
+fn process_disclosure_renders_markdown_coalesces_steps_and_keeps_the_answer_visible() {
+    let (frame, left) = connect(booted(), "7", "dispatch-live", 1);
+    let stream = left
+        .iter()
+        .find(|request| request.kind == "rpc.stream")
+        .unwrap();
+    assert!(has_text(&frame, "▸ Working…"));
+    let line = |event: Value| {
+        item(
+            stream.id,
+            json!({"topic":"run-output:dispatch-live","item":{"line":event.to_string()}})
+                .to_string()
+                .as_bytes(),
+        )
+    };
+    let frame = tick_native(vec![
+        line(
+            json!({"method":"item/started","params":{"item":{"id":"think","type":"reasoning","summary":[]}}}),
+        ),
+        line(
+            json!({"method":"item/reasoning/summaryTextDelta","params":{"itemId":"think","delta":"**Check** "}}),
+        ),
+        line(
+            json!({"method":"item/reasoning/summaryTextDelta","params":{"itemId":"think","delta":"the layout."}}),
+        ),
+        line(
+            json!({"method":"item/started","params":{"item":{"id":"cmd","type":"commandExecution","command":"cargo test"}}}),
+        ),
+    ]);
+    assert!(
+        markdown_texts(&frame).is_empty(),
+        "thinking starts collapsed"
+    );
+    let frame = tick_native(press(&frame, "▸ Working…"));
+    assert_eq!(markdown_texts(&frame), ["**Check** the layout."]);
+    let frame = tick_native(vec![
+        line(
+            json!({"method":"item/completed","params":{"item":{"id":"think","type":"reasoning","summary":[]}}}),
+        ),
+        line(
+            json!({"method":"item/completed","params":{"item":{"id":"cmd","type":"commandExecution","command":"cargo test","aggregatedOutput":"20 passed","exitCode":0}}}),
+        ),
+        line(
+            json!({"method":"item/completed","params":{"item":{"id":"reply","type":"agentMessage","text":"## Fixed\nThe reply now wraps."}}}),
+        ),
+        line(json!({"type":"run_control","state":"closed","elapsed_ms":125900})),
+    ]);
+    assert!(has_text(&frame, "▾ Worked for 2m 5s"));
+    assert!(
+        markdown_texts(&frame).contains(&"**Check** the layout.".into()),
+        "a terminal item without a summary keeps streamed thinking"
+    );
+    assert_eq!(
+        texts(&frame)
+            .iter()
+            .filter(|text| text.as_str() == "✓ Thinking")
+            .count(),
+        1
+    );
+    assert_eq!(
+        texts(&frame)
+            .iter()
+            .filter(|text| text.as_str() == "✓ Command")
+            .count(),
+        1
+    );
+    assert!(has_text(&frame, "cargo test\n\n20 passed"));
+    assert!(markdown_texts(&frame).contains(&"## Fixed\nThe reply now wraps.".into()));
+    let frame = tick_native(press(&frame, "▾ Worked for 2m 5s"));
+    assert_eq!(markdown_texts(&frame), ["## Fixed\nThe reply now wraps."]);
+    assert!(!has_text(&frame, "✓ Thinking"));
+    let frame = tick_native(press(&frame, "▸ Worked for 2m 5s"));
+    assert!(has_text(&frame, "cargo test\n\n20 passed"));
+}
+
+#[test]
+fn claude_thinking_tools_and_steering_share_the_process_without_ending_on_interrupt() {
+    let (_frame, left) = connect(booted(), "7", "dispatch-live", 1);
+    let stream = left
+        .iter()
+        .find(|request| request.kind == "rpc.stream")
+        .unwrap();
+    let line = |event: Value| {
+        item(
+            stream.id,
+            json!({"topic":"run-output:dispatch-live","item":{"line":event.to_string()}})
+                .to_string()
+                .as_bytes(),
+        )
+    };
+    let frame = tick_native(vec![
+        line(
+            json!({"type":"assistant","message":{"id":"message","content":[{"type":"thinking","thinking":"Inspect **wrapping** first."},{"type":"tool_use","id":"tool-1","name":"Read","input":{"file_path":"app.rs"}}]}}),
+        ),
+        line(
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"the file contents","is_error":true}]}}),
+        ),
+        line(
+            json!({"type":"run_control","state":"input","input":{"action":"steer","text":"Keep the answer outside the disclosure."}}),
+        ),
+        line(json!({"type":"result","subtype":"error_during_execution","duration_ms":60000})),
+    ]);
+    assert!(
+        has_text(&frame, "▸ Working…"),
+        "a Claude response boundary is not the run duration"
+    );
+    let frame = tick_native(press(&frame, "▸ Working…"));
+    assert!(markdown_texts(&frame).contains(&"Inspect **wrapping** first.".into()));
+    assert!(markdown_texts(&frame).contains(&"Keep the answer outside the disclosure.".into()));
+    assert_eq!(
+        texts(&frame)
+            .iter()
+            .filter(|text| text.as_str() == "! Read · failed")
+            .count(),
+        1
+    );
+    assert!(
+        texts(&frame)
+            .iter()
+            .any(|text| text.contains("app.rs") && text.contains("the file contents"))
+    );
+    let frame = tick_native(vec![line(
+        json!({"type":"run_control","state":"closed","elapsed_ms":90061000}),
+    )]);
+    assert!(has_text(&frame, "▾ Worked for 1d 1h 1m 1s"));
+    let frame = tick_native(press(&frame, "▾ Worked for 1d 1h 1m 1s"));
+    assert!(has_text(&frame, "▸ Worked for 1d 1h 1m 1s"));
+    assert!(!markdown_texts(&frame).contains(&"Inspect **wrapping** first.".into()));
+    let frame = tick_native(press(&frame, "▸ Worked for 1d 1h 1m 1s"));
+    assert!(markdown_texts(&frame).contains(&"Inspect **wrapping** first.".into()));
+    let frame = tick_native(press(&frame, "Close journal"));
+    assert!(!has_text(&frame, "▾ Worked for 1d 1h 1m 1s"));
 }

@@ -260,6 +260,8 @@ pub enum BrokerKind {
 /// adding a name is a code change with tests — that is the point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
+    CodexSession,
+    ClaudeSession,
     /// a JSONL event stream; the LAST `agent_message` item wins.
     JsonlEvents,
     /// a single `{"type":"result",...}` object (the contract of
@@ -706,13 +708,15 @@ impl CapabilitySpec {
             ));
         }
         let output = match raw.output.format.as_str() {
+            "codex-session" => OutputFormat::CodexSession,
+            "claude-session" => OutputFormat::ClaudeSession,
             "jsonl-events" => OutputFormat::JsonlEvents,
             "json-result" => OutputFormat::JsonResult,
             "text" => OutputFormat::Text,
             other => {
                 return Err(format!(
                     "{origin}: output.format {other:?} is not a known parser \
-                     (want jsonl-events | json-result | text)"
+                     (want codex-session | claude-session | jsonl-events | json-result | text)"
                 ));
             }
         };
@@ -1369,12 +1373,7 @@ args = ["run", "--model", "m", "--hard", "-"]
                 "{}: tools right after args[0]",
                 spec.tag
             );
-            assert_eq!(
-                spec.args.last().unwrap(),
-                "-",
-                "{}: the stdin marker is still last",
-                spec.tag
-            );
+            assert_eq!(spec.args.last().unwrap(), "-");
         }
 
         // the variant argvs are otherwise verbatim — injection ADDS, never
@@ -1454,13 +1453,12 @@ args = ["run", "--model", "m", "--hard", "-"]
             );
         }
 
-        // every codex argv keeps its trailing bare "-" LAST — the reason the
-        // tool args splice after args[0] instead of being appended.
+        // App Server receives JSON-RPC on persistent stdin; it takes no prompt marker.
         for spec in specs.iter().filter(|s| s.tag.starts_with("codex")) {
             assert_eq!(
                 spec.args[..5],
                 [
-                    "exec",
+                    "app-server",
                     "-c",
                     "mcp_servers.ducktape.command=\"ducktape\"",
                     "-c",
@@ -1469,12 +1467,8 @@ args = ["run", "--model", "m", "--hard", "-"]
                 "{}: mcp override right after the subcommand",
                 spec.tag
             );
-            assert_eq!(
-                spec.args.last().unwrap(),
-                "-",
-                "{}: the stdin marker survives injection",
-                spec.tag
-            );
+            assert_eq!(spec.output, OutputFormat::CodexSession);
+            assert!(!spec.args.iter().any(|arg| arg == "-"));
         }
     }
 

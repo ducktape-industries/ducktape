@@ -3,8 +3,8 @@
 //! re-reads a card on its plane's `rpc.live` hit, and a pressed row leaves
 //! as `home.open_link` carrying a `duck://` address.
 
-use ducktape_view_guest::testing::{answer, has_text, item, press, refuse, texts};
-use ducktape_view_guest::wire::{Frame, Request};
+use ducktape_view_guest::testing::{answer, find, has_text, item, measure, press, refuse, texts};
+use ducktape_view_guest::wire::{Frame, Node, Request};
 use home_view::host::Session;
 use home_view::{boot_native, tick_native};
 
@@ -57,8 +57,38 @@ fn status() -> Vec<u8> {
         "public_key": "8c4fa211deadbeef",
         "height": 84912,
         "chain_id": "dev#a1b2c3d4",
-        "operations": { "phase": "validating", "sync": {} }
+        "version": "0.1.0",
+        "root_hash": "feedface00112233",
+        "modules": [
+            { "id": "chat", "category": "collaboration", "root": "" },
+            { "id": "valset", "category": "consensus", "root": "" }
+        ],
+        "operations": {
+            "phase": "validating",
+            "sync": {},
+            "consensus": { "quorum": 3, "reachable_validators": 2 },
+            "storage": { "checkpoint_height": 84900 }
+        }
     })
+    .to_string()
+    .into_bytes()
+}
+
+fn peers() -> Vec<u8> {
+    serde_json::json!({ "peers": [
+        { "peer": "0badf00d00000001", "role": "validator", "connected": false },
+        { "peer": "c0ffee0000000002", "role": "resident", "connected": true }
+    ]})
+    .to_string()
+    .into_bytes()
+}
+
+fn blocks() -> Vec<u8> {
+    serde_json::json!([
+        { "height": 84912, "hash": "", "commit_hash": "", "ops": [] },
+        { "height": 84911, "hash": "ab".repeat(32), "commit_hash": "",
+          "ops": [{ "op_hash": "1" }, { "op_hash": "2" }, { "op_hash": "3" }] }
+    ])
     .to_string()
     .into_bytes()
 }
@@ -109,10 +139,10 @@ fn history() -> Vec<u8> {
 }
 
 /// Answers every read a connected view asks on its first frame: `/v1/status`
-/// twice (the node card and the roster's own key read), the two valset
-/// queries, the governance query, the chat and runs views and the files
-/// history — and returns the frame with every card folded, plus the live
-/// subscriptions by plane.
+/// twice (the node card and the roster's own key read), the peers and the
+/// blocks, the two valset queries, the governance query, the chat and runs
+/// views and the files history — and returns the frame with every card
+/// folded, plus the live subscriptions by plane.
 fn connected_dashboard() -> (Frame, Vec<(String, u64)>) {
     let frame = boot();
     let session_id = request(&frame, "home.props").id;
@@ -149,6 +179,13 @@ fn connected_dashboard() -> (Frame, Vec<(String, u64)>) {
     }
     for (id, _) in requests_of(&frame, "files.get") {
         events.push(answer(id, &history()));
+    }
+    for (id, _) in requests_of(&frame, "rpc.peers") {
+        events.push(answer(id, &peers()));
+    }
+    for (id, body) in requests_of(&frame, "rpc.blocks") {
+        assert_eq!(body["limit"], 40, "a window wider than the card");
+        events.push(answer(id, &blocks()));
     }
     let mut frame = tick_native(events);
     // the roster read asked for its own status above; it goes on to the
@@ -216,6 +253,32 @@ fn a_connected_view_reads_every_card_through_the_kernel() {
         "notes for the week",
         "acct:7",
         "block 84,800",
+        // the head: the node's version beside the phase
+        "ducktape 0.1.0",
+        // the node card: consensus, checkpoint, root hash
+        "2 reachable of 3 needed",
+        "block 84,900",
+        "feedface",
+        // the peers card, connected first
+        "c0ffee00",
+        "Resident",
+        "Online",
+        "0badf00d",
+        "Offline",
+        // the blocks card: the op-carrying block alone
+        "abababab",
+        "3 ops",
+        // the modules card
+        "chat",
+        "Collaboration",
+        "valset",
+        "Consensus",
+        // the stat strip
+        "84,912",
+        "Peers online",
+        "1 / 2",
+        "Active runs",
+        "Open proposals",
     ] {
         assert!(
             has_text(&frame, expected),
@@ -223,16 +286,54 @@ fn a_connected_view_reads_every_card_through_the_kernel() {
             texts(&frame)
         );
     }
-    // a DM room, an archived room and a settled proposal are not on the
-    // dashboard
-    for absent in ["#two", "#old", "Signal"] {
-        assert!(!has_text(&frame, absent), "{absent} drawn: {:?}", texts(&frame));
+    // a DM room, an archived room, a settled proposal and an op-less block
+    // are not on the dashboard
+    for absent in ["#two", "#old", "Signal", "0 ops"] {
+        assert!(
+            !has_text(&frame, absent),
+            "{absent} drawn: {:?}",
+            texts(&frame)
+        );
     }
     assert!(
         frame.requests.is_empty(),
         "a folded dashboard asks nothing more: {:?}",
         frame.requests
     );
+}
+
+/// The cards stand in as many columns as the measured pane affords — one
+/// rail in a narrow pane, three in a wide one — and the stat tiles per
+/// line follow; before the sensor has measured, the page takes the wide
+/// layout so a wide window never flashes a single rail.
+#[test]
+fn the_columns_follow_the_measured_pane() {
+    let (frame, _) = connected_dashboard();
+    let rails = |frame: &Frame| match find(frame, "home/columns") {
+        Some(Node::Linear { children, .. }) => children.len(),
+        other => panic!("no columns row: {other:?}"),
+    };
+    let tiles = |frame: &Frame| match find(frame, "home/stats/0") {
+        Some(Node::Linear { children, .. }) => children.len(),
+        other => panic!("no stat line: {other:?}"),
+    };
+    assert_eq!((rails(&frame), tiles(&frame)), (3, 4), "unmeasured");
+    let frame = tick_native(measure(&frame, "home/viewport", 600., 800.));
+    assert_eq!((rails(&frame), tiles(&frame)), (1, 2), "narrow");
+    let frame = tick_native(measure(&frame, "home/viewport", 900., 800.));
+    assert_eq!((rails(&frame), tiles(&frame)), (2, 4), "medium");
+    let frame = tick_native(measure(&frame, "home/viewport", 1400., 800.));
+    assert_eq!((rails(&frame), tiles(&frame)), (3, 4), "wide");
+    for card in [
+        "This node",
+        "Members",
+        "Peers",
+        "Recent blocks",
+        "Recent files",
+    ] {
+        assert!(has_text(&frame, card), "{card} lost: {:?}", texts(&frame));
+    }
+    assert!(frame.requests.is_empty(), "a measurement reads nothing");
 }
 
 /// A pressed room leaves as `home.open_link` with the room's `duck://`

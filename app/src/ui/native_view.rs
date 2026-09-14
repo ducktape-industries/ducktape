@@ -157,6 +157,7 @@ impl Ducktape {
                     self.account_exists,
                     self.account_busy,
                     &self.account_ticket,
+                    &self.update_facts(),
                 ),
                 AppMessage::SettingsViewEvent,
             ),

@@ -4,11 +4,15 @@
 //!
 //! The kernel pushes session facts only (`home.props`: connected, dark, the
 //! chain id, the seated account). Everything drawn is read here through the
-//! kernel's doors — `rpc.status`, `rpc.query`, `rpc.view`, `files.get` —
-//! and re-read on every `rpc.live` hit for the plane that owns it. Every
-//! card is a summary and a door: a room or a run opens its own tab through
-//! `home.open_link` carrying a `duck://` address the shell's link plane
-//! routes. No op is ever addressed to this view and it submits nothing.
+//! kernel's doors — `rpc.status`, `rpc.peers`, `rpc.blocks`, `rpc.query`,
+//! `rpc.view`, `files.get` — and re-read on every `rpc.live` hit for the
+//! plane that owns it. Every card is a summary and a door: a room or a run
+//! opens its own tab through `home.open_link` carrying a `duck://` address
+//! the shell's link plane routes. No op is ever addressed to this view and
+//! it submits nothing.
+//!
+//! The page answers the pane it is drawn in: a sensor measures it, and the
+//! cards stand in one, two or three columns by that width.
 pub mod host;
 mod presentation;
 
@@ -23,7 +27,12 @@ pub struct HomeView {
     pub(crate) chain: String,
     pub(crate) account: String,
     pub(crate) connection_serial: i64,
+    /// the pane the dashboard was last measured at: what decides how many
+    /// columns the cards stand in
+    pub(crate) viewport_width: f64,
     pub(crate) facts: host::NodeFacts,
+    pub(crate) peers: Vec<host::PeerRow>,
+    pub(crate) blocks: Vec<host::BlockRow>,
     pub(crate) roster: host::Roster,
     pub(crate) rooms: Vec<host::RoomRow>,
     /// the head each room was first read at: what "new" is measured from
@@ -39,7 +48,7 @@ pub struct HomeView {
 #[derive(Clone, Debug)]
 pub enum Message {
     SessionArrived(host::SessionItem),
-    FactsArrived(host::FactsItem),
+    NodeArrived(host::NodeItem),
     RosterArrived(host::RosterItem),
     RoomsArrived(host::RoomsItem),
     FilesArrived(host::FilesItem),
@@ -48,6 +57,8 @@ pub enum Message {
     OpenRoom(String),
     OpenRun(String),
     CopyToClipboard(String, String),
+    /// the pane measured, by the sensor around the cards
+    ViewportChanged(f64, f64),
 }
 
 impl HomeView {
@@ -61,7 +72,10 @@ impl HomeView {
             chain: String::new(),
             account: String::new(),
             connection_serial: 0,
+            viewport_width: host::UNMEASURED_WIDTH,
             facts: host::NodeFacts::default(),
+            peers: Vec::new(),
+            blocks: Vec::new(),
             roster: host::Roster::default(),
             rooms: Vec::new(),
             rooms_seen: BTreeMap::new(),
@@ -117,7 +131,7 @@ impl HomeView {
         let serial = self.connection_serial;
         Subscription::batch([
             session,
-            host::facts(serial).map(Message::FactsArrived),
+            host::node(serial).map(Message::NodeArrived),
             host::roster(serial).map(Message::RosterArrived),
             host::rooms(serial).map(Message::RoomsArrived),
             host::files(serial).map(Message::FilesArrived),
@@ -129,7 +143,7 @@ impl HomeView {
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::SessionArrived(item) => self.on_session_arrived(item),
-            Message::FactsArrived(item) => self.on_facts_arrived(item),
+            Message::NodeArrived(item) => self.on_node_arrived(item),
             Message::RosterArrived(item) => self.on_roster_arrived(item),
             Message::RoomsArrived(item) => self.on_rooms_arrived(item),
             Message::FilesArrived(item) => self.on_files_arrived(item),
@@ -138,6 +152,7 @@ impl HomeView {
             Message::OpenRoom(channel) => self.on_open_room(channel),
             Message::OpenRun(dispatch_id) => self.on_open_run(dispatch_id),
             Message::CopyToClipboard(text, label) => self.on_copy_to_clipboard(text, label),
+            Message::ViewportChanged(width, height) => self.on_viewport_changed(width, height),
         }
     }
 
@@ -171,10 +186,39 @@ impl HomeView {
         !failed
     }
 
+    /// The three node readings ride one plane and land one at a time, each
+    /// in its own card.
+    fn on_node_arrived(&mut self, item: host::NodeItem) -> Task<Message> {
+        match item {
+            host::NodeItem::Facts(item) => self.on_facts_arrived(*item),
+            host::NodeItem::Peers(item) => self.on_peers_arrived(item),
+            host::NodeItem::Blocks(item) => self.on_blocks_arrived(item),
+        }
+    }
+
     fn on_facts_arrived(&mut self, item: host::FactsItem) -> Task<Message> {
         if self.card_read("node", item.error) {
             self.facts = item.facts;
         }
+        Task::none()
+    }
+
+    fn on_peers_arrived(&mut self, item: host::PeersItem) -> Task<Message> {
+        if self.card_read("peers", item.error) {
+            self.peers = item.rows;
+        }
+        Task::none()
+    }
+
+    fn on_blocks_arrived(&mut self, item: host::BlocksItem) -> Task<Message> {
+        if self.card_read("blocks", item.error) {
+            self.blocks = item.rows;
+        }
+        Task::none()
+    }
+
+    fn on_viewport_changed(&mut self, width: f64, _height: f64) -> Task<Message> {
+        self.viewport_width = width;
         Task::none()
     }
 
@@ -238,7 +282,7 @@ impl HomeView {
 ducktape_view_guest::export_app!(
     HomeView,
     "Home",
-    "The network at a glance: this node, its members, rooms, files, runs and open decisions.",
+    "The network at a glance: this node, its peers, blocks, modules, members, rooms, files, runs and open decisions.",
     ["home"]
 );
 
