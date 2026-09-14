@@ -1047,6 +1047,7 @@ mod tests {
         let action = |hash: [u8; 32]| GovAction::RegisterModule {
             name: "hello@x".into(),
             module_id: "hello".into(),
+            kind: modules::Kind::Module,
             activation_lead: 50,
             code_hash: hash.to_vec(),
         };
@@ -1152,6 +1153,7 @@ mod tests {
         registry.update(HashSet::from([old, active, cancelled]));
         let modules = vec![modules::ModuleCode {
             module_id: "hello".into(),
+            kind: modules::Kind::Module,
             active_code_hash: active.to_vec(),
             pending: None,
             history: vec![

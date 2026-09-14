@@ -1401,7 +1401,7 @@ mod tests {
         );
         assert_eq!(
             r.genesis.hashes["pages"],
-            module_artifact::ModuleArtifact::component(b"pages".to_vec()).hash(),
+            module_artifact::Artifact::module(b"pages".to_vec()).hash(),
             "each hash commits the whole deployment from disk"
         );
     }

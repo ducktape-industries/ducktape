@@ -891,7 +891,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "6c02bdaa3a43c9fbf1175769f74f6bbef91fed0e60359a748280baf8a183e738";
+        "25e4ffd5ba1436a90e54d484560e245c4ecdcb70a42d32cba698ed3c594dea60";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's genesis `__config`
@@ -1020,6 +1020,7 @@ mod tests {
                 10,
                 ModulesMsg::RegisterModule {
                     module_id: "hello".into(),
+                    kind: modules::Kind::Module,
                     code_hash: first.to_vec(),
                 },
             ),
@@ -1140,7 +1141,7 @@ mod tests {
         let genesis = Genesis {
             modules: vec![workspace_config::Artifact {
                 id: "pages".into(),
-                bytes: module_artifact::ModuleArtifact::component(b"pages-bytes".to_vec()).encode(),
+                bytes: module_artifact::Artifact::module(b"pages-bytes".to_vec()).encode(),
             }],
         };
         let bytes = genesis.encode();
@@ -1199,7 +1200,7 @@ mod tests {
         let mut want = std::collections::BTreeMap::new();
         want.insert(
             "pages".to_string(),
-            module_artifact::ModuleArtifact::component(b"pages-bytes".to_vec()).hash(),
+            module_artifact::Artifact::module(b"pages-bytes".to_vec()).hash(),
         );
         let blobs = blobstore::BlobHandle::default();
         seed_founding_set(&blobs, dir.path(), &want).expect("seed");

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
 
-use module_artifact::{MAX_ARTIFACT_BYTES, MAX_VIEW_ASSETS, ModuleArtifact, ViewArtifact};
+use module_artifact::{Artifact, MAX_ARTIFACT_BYTES, MAX_VIEW_ASSETS, ModuleArtifact, ViewArtifact};
 
 pub fn ensure_view_ready(dir: &Path, id: &str) -> Result<(), String> {
     crate::validate_module_id(id)?;
@@ -27,7 +27,7 @@ pub fn read_deployment_files(
     index: Option<&Path>,
     view: Option<&Path>,
     assets: Option<&Path>,
-) -> Result<ModuleArtifact, String> {
+) -> Result<Artifact, String> {
     if let Some(id) = component
         .file_name()
         .and_then(|s| s.to_str())
@@ -66,12 +66,12 @@ pub fn read_deployment_files(
             None
         }
     };
-    let artifact = ModuleArtifact {
+    let artifact = Artifact::Module(ModuleArtifact {
         component,
         index,
         view,
-    };
-    ModuleArtifact::decode(&artifact.encode())?;
+    });
+    Artifact::decode(&artifact.encode())?;
     Ok(artifact)
 }
 

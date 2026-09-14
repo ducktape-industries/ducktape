@@ -53,7 +53,7 @@ fn declared_views_become_pending_restore_and_remove_only_with_ownership() {
         assert!(!assets.join("old").exists());
         assert!(assets.join("new").exists());
         let artifact = workspace_config::read_module_artifact(&dest, id).unwrap();
-        assert_eq!(artifact.view.unwrap().component, b"restored");
+        assert_eq!(artifact.view().unwrap().component, b"restored");
         let genesis = workspace_config::Genesis::compose(&dest).unwrap();
         let restored = checkout.join(format!("restored-{id}"));
         std::fs::create_dir_all(restored.join(format!("{id}.assets"))).unwrap();
@@ -67,7 +67,7 @@ fn declared_views_become_pending_restore_and_remove_only_with_ownership() {
         assert_eq!(
             workspace_config::read_module_artifact(&restored, id)
                 .unwrap()
-                .view
+                .view()
                 .unwrap()
                 .assets["new"],
             b"new"
@@ -125,7 +125,11 @@ fn indexed_pages_and_chat_stage_views_before_index_branch_and_clean_removed_modu
     let dest = checkout.join("staged");
     build_script::stage_preset(checkout, &dest, &["pages", "chat"]);
     for id in ["pages", "chat"] {
-        let artifact = workspace_config::read_module_artifact(&dest, id).unwrap();
+        let module_artifact::Artifact::Module(artifact) =
+            workspace_config::read_module_artifact(&dest, id).unwrap()
+        else {
+            panic!("{id}: a staged component is a module artifact");
+        };
         assert_eq!(artifact.index.unwrap(), b"index");
         assert_eq!(
             artifact

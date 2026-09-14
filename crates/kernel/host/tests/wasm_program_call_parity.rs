@@ -68,7 +68,7 @@ impl Module for Native {
     fn code_hash(&self) -> Option<Vec<u8>> {
         // Compare execution under the same deployed code commitment.
         Some(
-            module_artifact::ModuleArtifact::component(HELLO.to_vec())
+            module_artifact::Artifact::module(HELLO.to_vec())
                 .hash()
                 .to_vec(),
         )

@@ -110,6 +110,22 @@ pub enum Start<'a, 'b> {
     },
 }
 
+/// the registry's genesis seed table for `bundle`: every founding deployment
+/// is a module — the founding set is composed of `<id>.component.wasm` files
+/// (`workspace_config::Genesis::compose`), so nothing else can be in it.
+pub fn genesis_seeds(bundle: &BTreeMap<String, [u8; 32]>) -> BTreeMap<String, modules::Seed> {
+    bundle
+        .iter()
+        .map(|(id, hash)| {
+            let seed = modules::Seed {
+                kind: modules::Kind::Module,
+                code_hash: hash.to_vec(),
+            };
+            (id.clone(), seed)
+        })
+        .collect()
+}
+
 /// Compose the boot mode's deployment set into a [`Host`];
 /// the boot mode supplies the authenticated module set and initialization or
 /// snapshot data. Every module uses the same Wasm constructor.
@@ -123,7 +139,7 @@ pub async fn compose(
     let mut host = Host::new();
     let parameters = match &boot {
         Boot::Genesis { validators, bundle } => sdk::genesis_config::encode_config(&[
-            ("modules", &sdk::wire::encode(bundle)),
+            ("modules", &sdk::wire::encode(&genesis_seeds(bundle))),
             ("validators", &sdk::wire::encode(validators)),
         ]),
         Boot::Reopen { .. } => sdk::genesis_config::encode_config(&[]),
@@ -361,7 +377,16 @@ pub fn validate_deployment(
     index: &indexer::IndexStore,
 ) -> Result<(), String> {
     workspace_config::validate_module_id(id)?;
-    let artifact = module_artifact::ModuleArtifactRef::decode(bytes)?;
+    // readiness is "a validator can run the core": a view-only frame has no
+    // core, so no validator may vote it ready under a module entry.
+    let artifact = match module_artifact::ArtifactRef::decode(bytes)? {
+        module_artifact::ArtifactRef::Module(module) => module,
+        module_artifact::ArtifactRef::View(_) => {
+            return Err(format!(
+                "view_artifact_has_no_component: {id} is a view-only artifact, not a module"
+            ));
+        }
+    };
     let shape =
         WasmModule::declared_shape(artifact.component).map_err(|error| error.to_string())?;
     check_realizable(id, &shape)?;
@@ -565,8 +590,19 @@ impl host::ModuleFactory for Admissions {
         // plane's record committed through the same id-generic registry. Skip
         // and latch — a hard error here is a permanent code stall on every
         // node, for bytes this boundary never owned.
-        let Ok(artifact) = module_artifact::ModuleArtifactRef::decode(bytes) else {
+        let Ok(artifact) = module_artifact::ArtifactRef::decode(bytes) else {
             return Ok(host::Admitted::ForeignAbi);
+        };
+        // a view-only frame is a module artifact by framing and no module by
+        // content: the registry names its kind, and this boundary seats
+        // modules only. fail closed rather than seat an empty core.
+        let artifact = match artifact {
+            module_artifact::ArtifactRef::Module(module) => module,
+            module_artifact::ArtifactRef::View(_) => {
+                return Err(sdk::Error::Module(format!(
+                    "view_artifact_has_no_component: {id} is a view-only artifact, not a module"
+                )));
+            }
         };
         let bindings = Bindings {
             invite: &self.invite,

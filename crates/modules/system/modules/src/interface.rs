@@ -22,6 +22,34 @@ pub const DEFAULT_MODULES_ID: &str = "modules";
 /// the length of a code hash: sha256 over the component bytes.
 pub const CODE_HASH_LEN: usize = 32;
 
+/// what a registry entry's artifact IS — fixed at admission (`seed`,
+/// `RegisterModule`, `ScheduleRegister`) and never changed by a swap: a
+/// swap that wants another kind is a new id, like a key-layout change. the
+/// kind steers who verifies the bytes (a validator runs a `Module`'s core;
+/// a `View` has no core and is verified as a view alone) and who seats
+/// them (the host boundary seats modules; the app seats views). the
+/// artifact frame carries the same tag, and the two must agree.
+#[derive(
+    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// consensus code with an optional mapper and an optional view.
+    Module,
+    /// a view and its assets, no consensus code and no state.
+    View,
+}
+
+/// one genesis seed: the `modules` genesis-config table maps each id to
+/// its kind and its initial deployment hash.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Seed {
+    pub kind: Kind,
+    /// the 32-byte sha256 of the deployment frame.
+    pub code_hash: Vec<u8>,
+}
+
 // ---- the module-code path shapes --------------------------------------------
 
 /// coordinates of a scheduled code swap for one module. **at most one** is ever
@@ -96,6 +124,7 @@ pub struct Activation {
 #[serde(deny_unknown_fields)]
 pub struct ModuleCode {
     pub module_id: String,
+    pub kind: Kind,
     /// the last activation's hash — a projection of `history`, empty only for
     /// an admission that has not reached its boundary.
     pub active_code_hash: Vec<u8>,
@@ -147,6 +176,7 @@ pub enum ModulesMsg {
     /// `Origin::Module("governance") | System` only.
     RegisterModule {
         module_id: String,
+        kind: Kind,
         code_hash: Vec<u8>,
     },
     /// schedule a height-gated code swap for a registered module.
@@ -166,6 +196,7 @@ pub enum ModulesMsg {
     ScheduleRegister {
         name: String,
         module_id: String,
+        kind: Kind,
         activation_height: u64,
         code_hash: Vec<u8>,
     },
@@ -238,6 +269,7 @@ mod tests {
     fn msg_query_reply_round_trip_every_variant() {
         rt_msg(ModulesMsg::RegisterModule {
             module_id: "hello".into(),
+            kind: Kind::Module,
             code_hash: vec![1u8; CODE_HASH_LEN],
         });
         rt_msg(ModulesMsg::ScheduleSwap {
@@ -249,8 +281,16 @@ mod tests {
         rt_msg(ModulesMsg::ScheduleRegister {
             name: "admit-kanban".into(),
             module_id: "kanban".into(),
+            kind: Kind::Module,
             activation_height: 10,
             code_hash: vec![5u8; CODE_HASH_LEN],
+        });
+        rt_msg(ModulesMsg::ScheduleRegister {
+            name: "admit-home".into(),
+            module_id: "home".into(),
+            kind: Kind::View,
+            activation_height: 10,
+            code_hash: vec![6u8; CODE_HASH_LEN],
         });
         rt_msg(ModulesMsg::CancelSwap {
             name: "swap-hello".into(),
@@ -273,6 +313,7 @@ mod tests {
         let r = ModulesReply::ModuleStatus {
             modules: vec![ModuleCode {
                 module_id: "hello".into(),
+                kind: Kind::Module,
                 active_code_hash: vec![1u8; CODE_HASH_LEN],
                 pending: None,
                 history: vec![Activation {
@@ -282,5 +323,21 @@ mod tests {
             }],
         };
         assert_eq!(decode_reply(&encode_reply(&r)).unwrap(), r);
+    }
+
+    #[test]
+    fn kind_is_snake_case_on_the_wire() {
+        assert_eq!(sdk::wire::encode(&Kind::Module), br#""module""#);
+        assert_eq!(sdk::wire::encode(&Kind::View), br#""view""#);
+        assert_eq!(borsh::to_vec(&Kind::Module).unwrap(), [0]);
+        assert_eq!(borsh::to_vec(&Kind::View).unwrap(), [1]);
+        let seed = Seed {
+            kind: Kind::View,
+            code_hash: vec![7u8; CODE_HASH_LEN],
+        };
+        assert_eq!(
+            sdk::wire::decode::<Seed>(&sdk::wire::encode(&seed)).unwrap(),
+            seed
+        );
     }
 }

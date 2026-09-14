@@ -1204,6 +1204,7 @@ impl Governance {
                 GovAction::RegisterModule {
                     name,
                     module_id,
+                    kind,
                     activation_lead,
                     code_hash,
                 } => match &self.code_registry_id {
@@ -1214,6 +1215,7 @@ impl Governance {
                             payload: modules_encode_msg(&ModulesMsg::ScheduleRegister {
                                 name: name.clone(),
                                 module_id: module_id.clone(),
+                                kind: *kind,
                                 activation_height,
                                 code_hash: code_hash.clone(),
                             }),
