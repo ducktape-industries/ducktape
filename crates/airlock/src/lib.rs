@@ -22,6 +22,8 @@ pub mod attest;
 pub mod bodyseal;
 #[cfg(feature = "client")]
 pub mod client;
+#[cfg(feature = "codesign")]
+pub mod codesign;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 #[cfg(feature = "verify")]

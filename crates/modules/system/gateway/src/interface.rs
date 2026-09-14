@@ -241,6 +241,9 @@ pub struct RouteSummary {
 pub enum CredentialKind {
     Claude,
     Codex,
+    /// A Developer ID signing identity + App Store Connect key, lent for
+    /// signing a release rather than for model calls.
+    AppleCodesign,
 }
 
 impl CredentialKind {
@@ -248,6 +251,7 @@ impl CredentialKind {
         match self {
             Self::Claude => 1,
             Self::Codex => 2,
+            Self::AppleCodesign => 3,
         }
     }
 }

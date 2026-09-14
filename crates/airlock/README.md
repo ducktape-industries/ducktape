@@ -193,7 +193,7 @@ the token.
 
 ## Credential the gateway holds
 
-`ducktape user cred seal` uploads one of two sealed credentials
+`ducktape user cred seal` uploads one of three sealed credentials
 (`CredentialPayload`):
 
 - **`Refresh`** — an OAuth refresh token; the gateway exchanges it for an access
@@ -202,6 +202,22 @@ the token.
   `seal --credentials <file> --cred-kind bearer` seals a live subscription's
   *current* access token without invalidating the token chain its owner is still
   using — the safe way to point a run at a real credential.
+- **`AppleCodesign`** (kind `apple-codesign`) — a Developer ID Application
+  signing identity: the certificate + key as PKCS#12 with its password, the App
+  Store Connect key as the JSON `rcodesign encode-app-store-connect-api-key`
+  writes, and the Team ID. Not a model credential: a session on it is refused
+  on `/v1/*` with `credential_kind_mismatch`. The gateway admits it only after
+  `codesign::AppleCodesign::admit` opens the PKCS#12 (PBES1, what Keychain
+  Access exports; `openssl pkcs12 -export -legacy` for the same), finds Apple's
+  Developer ID Application marker extension `1.2.840.113635.100.6.1.13` on the
+  leaf, and matches the leaf's subject OU to `team_id`; refusals are
+  `p12_unparseable`, `not_developer_id_application`, `team_id_mismatch`,
+  `api_key_malformed`. `ducktape user cred add apple-codesign --p12 <id.p12>
+  --p12-password-file <pw> --api-key <key.json> --team-id <TEAMID> [name]` runs
+  the same admission locally, writes the four files 0600 into this node's
+  store (`airlock_service::apple_codesign_files`), and registers the record;
+  `cred seal --vendor apple-codesign` with the same four flags seals it to a
+  TEE gateway. `cred grant` lends it like any other kind.
 
 ## Per-vendor attestation (`--attest tdx|snp`, gateway also `auto`)
 

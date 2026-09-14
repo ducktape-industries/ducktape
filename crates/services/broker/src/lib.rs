@@ -354,17 +354,23 @@ enum BrokerClient {
 impl BrokerClient {
     fn run_bearer(self, kind: CredentialKind) -> String {
         let secret = random_token();
-        match (self, kind) {
-            (Self::Native, _) => secret,
-            (Self::Pi, CredentialKind::Claude) => format!("sk-ant-oat-ducktape-{secret}"),
-            (Self::Pi, CredentialKind::Codex) => {
-                // Pi decodes this claim but does not verify a JWT signature. The
-                // account is deliberately fictitious; only the credential holder
-                // may supply the real upstream account header. This is a random
-                // broker capability, NOT an OAuth token or a signed JWT.
-                const PAYLOAD: &str = "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiZHVja3RhcGUtcnVuIn19";
-                format!("e30.{PAYLOAD}.{secret}")
-            }
+        match self {
+            Self::Native => secret,
+            Self::Pi => match kind {
+                CredentialKind::Claude => format!("sk-ant-oat-ducktape-{secret}"),
+                CredentialKind::Codex => {
+                    // Pi decodes this claim but does not verify a JWT signature. The
+                    // account is deliberately fictitious; only the credential holder
+                    // may supply the real upstream account header. This is a random
+                    // broker capability, NOT an OAuth token or a signed JWT.
+                    const PAYLOAD: &str = "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiZHVja3RhcGUtcnVuIn19";
+                    format!("e30.{PAYLOAD}.{secret}")
+                }
+                // No model lane exists for a signing identity (`start_pi`
+                // refuses it before a broker starts); a bare capability is
+                // what a client that never runs would be handed.
+                CredentialKind::AppleCodesign => secret,
+            },
         }
     }
 
@@ -391,6 +397,9 @@ impl RunBroker {
             CredentialKind::Codex => {
                 let (auth, url) = resolve_codex_upstream(airlock).await?;
                 Self::start_codex_for_client(auth, url, BrokerClient::Pi).await
+            }
+            CredentialKind::AppleCodesign => {
+                Err("credential kind apple-codesign is a signing identity, not a model lane".into())
             }
         }
     }
@@ -4256,6 +4265,7 @@ mod tests {
                 json!({"type":"response.output_item.done","output_index":0,"item":{"id":"msg_test","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"PI-AIRLOCK-OK","annotations":[]}]}}),
                 json!({"type":"response.completed","response":{"id":"resp_test","status":"completed","output":[{"id":"msg_test","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"PI-AIRLOCK-OK","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}),
             ],
+            CredentialKind::AppleCodesign => unreachable!("a signing identity has no model wire"),
         };
         events
             .into_iter()
@@ -4285,6 +4295,9 @@ mod tests {
             let (provider, upstream_path) = match kind {
                 CredentialKind::Claude => ("anthropic", "/v1/messages"),
                 CredentialKind::Codex => ("openai-codex", "/responses"),
+                CredentialKind::AppleCodesign => {
+                    unreachable!("a signing identity has no model wire")
+                }
             };
             let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
             let upstream = Router::new().route(
@@ -4418,6 +4431,9 @@ mod tests {
                     );
                     assert_eq!(headers["openai-beta"], "responses=experimental");
                 }
+                CredentialKind::AppleCodesign => {
+                    unreachable!("a signing identity has no model wire")
+                }
             }
             assert!(
                 received.try_recv().is_err(),
@@ -4441,6 +4457,9 @@ mod tests {
             match kind {
                 CredentialKind::Claude => assert!(first.starts_with("sk-ant-oat-ducktape-")),
                 CredentialKind::Codex => assert_eq!(first.split('.').count(), 3),
+                CredentialKind::AppleCodesign => {
+                    unreachable!("a signing identity has no model wire")
+                }
             }
         }
     }
@@ -4460,6 +4479,9 @@ mod tests {
             let upstream_path = match kind {
                 CredentialKind::Claude => "/v1/messages",
                 CredentialKind::Codex => "/responses",
+                CredentialKind::AppleCodesign => {
+                    unreachable!("a signing identity has no model wire")
+                }
             };
             let app = Router::new().route(upstream_path, post(handler));
             let listener = tokio::net::TcpListener::bind((BROKER_BIND, 0))
@@ -4496,6 +4518,9 @@ mod tests {
             let suffix = match kind {
                 CredentialKind::Claude => "/v1/messages?beta=true",
                 CredentialKind::Codex => "/codex/responses",
+                CredentialKind::AppleCodesign => {
+                    unreachable!("a signing identity has no model wire")
+                }
             };
             let url = format!("{}{suffix}", second.endpoint.base_url);
             let client = reqwest::Client::new();
@@ -4555,6 +4580,9 @@ mod tests {
                             .status(),
                         StatusCode::FORBIDDEN
                     );
+                }
+                CredentialKind::AppleCodesign => {
+                    unreachable!("a signing identity has no model wire")
                 }
             }
             upstream_task.abort();

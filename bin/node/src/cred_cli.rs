@@ -1,13 +1,17 @@
 //! `ducktape user cred` — named, grantable, owner-hosted API credentials.
 //!
-//! `cred add <provider>` wraps the vendor's OWN login CLI (`claude setup-token`,
+//! `cred add claude|codex` wraps the vendor's OWN login CLI (`claude auth login`,
 //! `codex login`) on a local pty, captures the login artifact directly into this
 //! node's disk-backed gateway store (`<storage>/airlock-creds/<name>/`), and
 //! registers the record on-chain (name → owner account, publisher node, kind,
 //! seal_pk) so any granted node's broker can resolve the name and complete a
 //! round-trip through the owner's co-hosted gateway WITHOUT ever holding the
-//! secret. `grant`/`revoke` lend/rescind by account; `list` reads committed
-//! records; `remove` tombstones one.
+//! secret. `cred add apple-codesign` enrols a Developer ID signing identity
+//! the same way, from files the operator exported (no vendor login exists),
+//! after running the gateway's own admission checks locally so a refused
+//! identity never reaches the store or the chain. `grant`/`revoke`
+//! lend/rescind by account; `list` reads committed records; `remove`
+//! tombstones one.
 //!
 //! `inspect`/`seal` are the ENCLAVE half of the same family and live in
 //! [`crate::cred_seal`]: they talk to a TEE airlock gateway
@@ -50,12 +54,10 @@ pub(crate) struct CredArgs {
 
 #[derive(Debug, clap::Subcommand)]
 pub(crate) enum CredCmd {
-    /// wrap the vendor login CLI, store the artifact, register the record
+    /// capture a credential into this node's store and register the record
     Add {
-        /// which vendor credential to capture
-        provider: ProviderArg,
-        /// the credential name (default `<display>-<provider>-<n>`)
-        name: Option<String>,
+        #[command(subcommand)]
+        what: AddCmd,
     },
     /// list every registered credential record
     List {
@@ -109,6 +111,127 @@ pub(crate) enum CredCmd {
         #[command(flatten)]
         seal: crate::cred_seal::SealArgs,
     },
+}
+
+/// What `cred add` captures. The two model vendors run their own login CLI;
+/// the signing identity is enrolled from exported files.
+#[derive(Debug, clap::Subcommand)]
+pub(crate) enum AddCmd {
+    /// wrap `claude auth login`, store the artifact, register the record
+    Claude {
+        /// the credential name (default `<display>-claude-<n>`)
+        name: Option<String>,
+    },
+    /// wrap `codex login`, store the artifact, register the record
+    Codex {
+        /// the credential name (default `<display>-codex-<n>`)
+        name: Option<String>,
+    },
+    /// enrol a Developer ID Application identity + App Store Connect key for
+    /// release signing (validated here exactly as the gateway validates it)
+    AppleCodesign {
+        /// the credential name (default `<display>-apple-codesign-<n>`)
+        name: Option<String>,
+        #[command(flatten)]
+        identity: AppleCodesignArgs,
+    },
+}
+
+/// The four inputs of an `apple-codesign` credential, as files: the PKCS#12
+/// and its password (a file, never argv — a password on argv is in `ps` and
+/// shell history), the App Store Connect key as the one-file JSON
+/// `rcodesign encode-app-store-connect-api-key` writes, and the Team ID the
+/// certificate must name. Shared by `cred add apple-codesign` (this node's
+/// store) and `cred seal --vendor apple-codesign` (a TEE gateway).
+#[derive(Debug, clap::Args)]
+pub(crate) struct AppleCodesignArgs {
+    /// the Developer ID Application certificate + key as PKCS#12
+    #[arg(long, value_name = "PATH")]
+    pub(crate) p12: std::path::PathBuf,
+    /// a file holding the PKCS#12 password (one line)
+    #[arg(long, value_name = "PATH")]
+    pub(crate) p12_password_file: std::path::PathBuf,
+    /// the App Store Connect API key JSON ({key_id, issuer_id, private_key})
+    #[arg(long, value_name = "PATH")]
+    pub(crate) api_key: std::path::PathBuf,
+    /// the Apple Team ID the certificate's OU must equal
+    #[arg(long, value_name = "ID")]
+    pub(crate) team_id: String,
+}
+
+/// The material an `apple-codesign` enrolment read and admitted: the wire
+/// payload the gateway takes, plus the raw bytes the store keeps.
+pub(crate) struct AppleCodesignMaterial {
+    pub(crate) p12: Vec<u8>,
+    pub(crate) p12_password: String,
+    pub(crate) api_key_json: String,
+    pub(crate) team_id: String,
+}
+
+impl AppleCodesignMaterial {
+    pub(crate) fn payload(&self) -> airlock::wire::CredentialPayload {
+        use base64::Engine as _;
+        airlock::wire::CredentialPayload::AppleCodesign {
+            p12_b64: base64::engine::general_purpose::STANDARD.encode(&self.p12),
+            p12_password: self.p12_password.clone(),
+            api_key_json: self.api_key_json.clone(),
+            team_id: self.team_id.clone(),
+        }
+    }
+}
+
+impl AppleCodesignArgs {
+    pub(crate) fn read_and_admit(
+        &self,
+    ) -> Result<AppleCodesignMaterial, Box<dyn std::error::Error>> {
+        read_and_admit_apple_codesign(
+            &self.p12,
+            &self.p12_password_file,
+            &self.api_key,
+            &self.team_id,
+        )
+    }
+}
+
+/// Read the four inputs and run the gateway's admission on them
+/// (`airlock::codesign`), so a refusal is named HERE by the same token the
+/// gateway would answer with, before anything is written, sealed or signed.
+pub(crate) fn read_and_admit_apple_codesign(
+    p12_path: &Path,
+    p12_password_file: &Path,
+    api_key_path: &Path,
+    team_id: &str,
+) -> Result<AppleCodesignMaterial, Box<dyn std::error::Error>> {
+    let read =
+        |path: &Path| std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()));
+    let p12 = read(p12_path)?;
+    let p12_password = String::from_utf8(read(p12_password_file)?)
+        .map_err(|_| format!("{}: not utf-8", p12_password_file.display()))?
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    let api_key_json = String::from_utf8(read(api_key_path)?)
+        .map_err(|_| format!("{}: not utf-8", api_key_path.display()))?;
+    let team_id = team_id.trim().to_string();
+    let material = AppleCodesignMaterial {
+        p12,
+        p12_password,
+        api_key_json,
+        team_id,
+    };
+    {
+        let airlock::wire::CredentialPayload::AppleCodesign {
+            p12_b64,
+            p12_password,
+            api_key_json,
+            team_id,
+        } = material.payload()
+        else {
+            unreachable!("payload() builds the apple-codesign arm");
+        };
+        airlock::codesign::AppleCodesign::admit(&p12_b64, &p12_password, &api_key_json, &team_id)
+            .map_err(|refusal| format!("apple-codesign identity refused: {refusal}"))?;
+    }
+    Ok(material)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -191,7 +314,13 @@ pub(crate) fn run(args: CredArgs, stdin: &mut impl BufRead) -> CredResult {
     let CredArgs { cmd, addr, key } = args;
     let ctx = VerbCtx { addr, key };
     match cmd {
-        CredCmd::Add { provider, name } => cmd_add(&ctx, provider, name, stdin),
+        CredCmd::Add { what } => match what {
+            AddCmd::Claude { name } => cmd_add(&ctx, ProviderArg::Claude, name, stdin),
+            AddCmd::Codex { name } => cmd_add(&ctx, ProviderArg::Codex, name, stdin),
+            AddCmd::AppleCodesign { name, identity } => {
+                cmd_add_apple_codesign(&ctx, name, &identity, stdin)
+            }
+        },
         CredCmd::List { json } => cmd_list(&ctx, json),
         CredCmd::Remove { name } => cmd_remove(&ctx, name, stdin),
         CredCmd::Grant { name, account } => cmd_grant(&ctx, name, account, stdin),
@@ -272,14 +401,11 @@ fn cmd_list(ctx: &VerbCtx, json: bool) -> CredResult {
         println!("no credentials registered");
         return Ok(());
     }
-    println!("{:<24} {:<8} {:<8} grants", "name", "kind", "owner");
+    println!("{:<24} {:<14} {:<8} grants", "name", "kind", "owner");
     for record in &records {
-        let kind = match record.kind {
-            gateway::CredentialKind::Claude => "claude",
-            gateway::CredentialKind::Codex => "codex",
-        };
+        let kind = airlock_service::kind_token(crate::compute::cred::service_kind(record.kind));
         println!(
-            "{:<24} {:<8} {:<8} {}",
+            "{:<24} {:<14} {:<8} {}",
             record.name,
             kind,
             record.owner_account,
@@ -425,12 +551,27 @@ fn remove_local_credential(storage: &Path, name: &str) -> Result<bool, Box<dyn s
 // add — preflight, pty login wrap, artifact capture, register
 // ============================================================================
 
-fn cmd_add(
+/// What every `cred add` resolves before it captures anything: the node, the
+/// workspace, the signing user, their account, and the (defaulted, validated)
+/// credential name with its 0700 store dir.
+struct Enrolment {
+    base: String,
+    resolved: config::Resolved,
+    user: commonware_cryptography::ed25519::PrivateKey,
+    account: identity::AccountView,
+    name: String,
+    store: std::path::PathBuf,
+    dir: std::path::PathBuf,
+}
+
+/// Resolve the enrolment context and prepare the credential's store dir.
+/// `kind_token` is the default name's middle (`<display>-<token>-<n>`).
+fn begin_enrolment(
     ctx: &VerbCtx,
-    provider: ProviderArg,
     name: Option<String>,
+    kind_token: &str,
     stdin: &mut impl BufRead,
-) -> CredResult {
+) -> Result<Enrolment, Box<dyn std::error::Error>> {
     let base = ctx.http_base()?;
     let resolved = ctx.workspace()?;
     let user = load_user_signer(&ctx.key_path()?, stdin)?;
@@ -443,18 +584,81 @@ fn cmd_add(
     let existing_names: Vec<&str> = existing.iter().map(|r| r.name.as_str()).collect();
     let name = match name {
         Some(name) => name,
-        None => derive_default_name(&account.name, provider, &existing_names),
+        None => derive_default_name(&account.name, kind_token, &existing_names),
     };
     gateway::validate_credential_name(&name)?;
 
-    // capture the login artifact into the on-disk store, keyed by name. Both
-    // `airlock-creds/` and the credential's own dir are 0700: the artifact
-    // inside is a live vendor OAuth secret, worth strictly more than the
-    // `seal.key` beside it.
+    // the on-disk store, keyed by name. Both `airlock-creds/` and the
+    // credential's own dir are 0700: what lands inside is a live vendor OAuth
+    // secret or a signing identity, worth strictly more than the `seal.key`
+    // beside it.
     let store = airlock_service::cred_store_root(&resolved.service.storage_dir);
     let dir = store.join(&name);
     airlock_service::create_private_dir(&store)?;
     airlock_service::create_private_dir(&dir)?;
+    Ok(Enrolment {
+        base,
+        resolved,
+        user,
+        account,
+        name,
+        store,
+        dir,
+    })
+}
+
+/// `cred add apple-codesign`: admit the identity locally, write its four
+/// files 0600 into the store, then register the record. The kind marker is
+/// written LAST, as every kind does, so the lender's loader never sees a
+/// half-written credential as a registered one.
+fn cmd_add_apple_codesign(
+    ctx: &VerbCtx,
+    name: Option<String>,
+    identity: &AppleCodesignArgs,
+    stdin: &mut impl BufRead,
+) -> CredResult {
+    // the cheapest refusal first: an identity the gateway would refuse must
+    // fail before a key password is asked for or a dir is created.
+    let material = identity.read_and_admit()?;
+    let kind = gateway::CredentialKind::AppleCodesign;
+    let enrolment = begin_enrolment(
+        ctx,
+        name,
+        airlock_service::kind_token(crate::compute::cred::service_kind(kind)),
+        stdin,
+    )?;
+    write_apple_codesign_files(&enrolment.dir, &material)?;
+    register_credential(&enrolment, kind)
+}
+
+/// Write the admitted identity into `dir` as the files the lender reads
+/// (`airlock_service::apple_codesign_files`). A retry after a failed attempt
+/// replaces every file, so a stale one never survives beside fresh ones.
+fn write_apple_codesign_files(dir: &Path, material: &AppleCodesignMaterial) -> CredResult {
+    let files = airlock_service::apple_codesign_files();
+    let entries: [(&str, &[u8]); 4] = [
+        (files.p12, &material.p12),
+        (files.p12_password, material.p12_password.as_bytes()),
+        (files.api_key, material.api_key_json.as_bytes()),
+        (files.team_id, material.team_id.as_bytes()),
+    ];
+    for (file, bytes) in entries {
+        let path = dir.join(file);
+        let _ = std::fs::remove_file(&path);
+        airlock_service::write_secret_0600(&path, bytes)?;
+    }
+    Ok(())
+}
+
+fn cmd_add(
+    ctx: &VerbCtx,
+    provider: ProviderArg,
+    name: Option<String>,
+    stdin: &mut impl BufRead,
+) -> CredResult {
+    let enrolment = begin_enrolment(ctx, name, provider.token(), stdin)?;
+    let dir = &enrolment.dir;
+    // capture the login artifact into the store dir.
     // `DUCKTAPE_CRED_REUSE_ARTIFACT=<path>` imports an ALREADY-authenticated
     // vendor login artifact (a `.credentials.json` / `auth.json` the operator
     // already produced) instead of driving the vendor's browser OAuth flow —
@@ -487,7 +691,7 @@ fn cmd_add(
             // is unambiguous — a stale file from a prior attempt would otherwise
             // read as instant success.
             let _ = std::fs::remove_file(dir.join(provider.artifact()));
-            run_vendor_login(provider, &dir)?
+            run_vendor_login(provider, dir)?
         }
     }
 
@@ -500,17 +704,39 @@ fn cmd_add(
         )
         .into());
     }
-    std::fs::write(dir.join("kind"), format!("{}\n", provider.token()))
-        .map_err(|e| format!("write kind marker: {e}"))?;
+    register_credential(&enrolment, provider.kind())
+}
+
+/// The registration tail every kind shares: the `kind` marker (written last,
+/// so the loader's "registered" test is the whole capture having landed), the
+/// on-chain record under this node's seal key, and the account's airlock route.
+fn register_credential(enrolment: &Enrolment, kind: gateway::CredentialKind) -> CredResult {
+    let Enrolment {
+        base,
+        resolved,
+        user,
+        account,
+        name,
+        store,
+        dir,
+    } = enrolment;
+    std::fs::write(
+        dir.join("kind"),
+        format!(
+            "{}\n",
+            airlock_service::kind_token(crate::compute::cred::service_kind(kind))
+        ),
+    )
+    .map_err(|e| format!("write kind marker: {e}"))?;
 
     // the seal PUBLIC key the node co-hosts under (minted on first add, then
     // stable) is what the record pins for the compute broker.
-    let seal = airlock_service::load_or_create_seal_keypair(&store)?;
+    let seal = airlock_service::load_or_create_seal_keypair(store)?;
     let record = gateway::CredentialRecord {
         name: name.clone(),
         owner_account: account.number,
         publisher_node: resolved.signer.public_key().as_ref().to_vec(),
-        kind: provider.kind(),
+        kind,
         seal_pk: seal.public_bytes(),
         grants: std::collections::BTreeSet::new(),
     };
@@ -521,15 +747,15 @@ fn cmd_add(
     let preimage = gateway::set_credential_preimage(&statement)?;
     let message = gateway::GatewayMsg::SetCredential {
         statement,
-        authorization: authorize(&user, &preimage),
+        authorization: authorize(user, &preimage),
     };
-    let height = submit_gateway(&base, &user, &message)?;
+    let height = submit_gateway(base, user, &message)?;
     println!("registered {name} at height {height}");
     // A lent credential is only reachable once the co-hosted airlock gateway has
     // a signed on-chain route. That route is per-ACCOUNT (one `airlock` route
     // serves every credential this account co-hosts), so publish it once and
     // skip on later `cred add`s — the operator never hand-signs a RouteStatement.
-    ensure_airlock_route(&base, &user, &resolved, account.number)?;
+    ensure_airlock_route(base, user, resolved, account.number)?;
     // The record and the route are committed, but neither LENDS anything: the
     // credential is only reachable while the daemon that serves the store runs,
     // and nothing else in this flow — nor `cred list`, nor `gateway list` —
@@ -767,8 +993,8 @@ fn mirror_stdout(bytes: &[u8]) -> CredResult {
 
 /// The default credential name `<display>-<provider>-<n>`, where `n` is one past
 /// the highest existing counter for that display+provider prefix (1 when none).
-fn derive_default_name(display: &str, provider: ProviderArg, existing: &[&str]) -> String {
-    let prefix = format!("{display}-{}-", provider.token());
+fn derive_default_name(display: &str, kind_token: &str, existing: &[&str]) -> String {
+    let prefix = format!("{display}-{kind_token}-");
     let highest = existing
         .iter()
         .filter_map(|name| name.strip_prefix(&prefix)?.parse::<u64>().ok())
@@ -896,21 +1122,175 @@ mod tests {
         );
     }
 
+    #[derive(clap::Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        cred: CredArgs,
+    }
+
+    fn parse(line: &str) -> Result<CredCmd, clap::Error> {
+        use clap::Parser as _;
+        TestCli::try_parse_from(line.split(' ')).map(|cli| cli.cred.cmd)
+    }
+
+    /// `cred add` names its kind as a subcommand: the two vendor logins keep
+    /// their `[NAME]`, and `apple-codesign` takes exactly the four identity
+    /// inputs — every one required, the password as a FILE, never a value.
+    #[test]
+    fn cred_add_parses_each_kind_and_apple_codesign_needs_all_four_inputs() {
+        assert!(matches!(
+            parse("t add claude").unwrap(),
+            CredCmd::Add {
+                what: AddCmd::Claude { name: None }
+            }
+        ));
+        assert!(matches!(
+            parse("t add codex alice-codex-9").unwrap(),
+            CredCmd::Add { what: AddCmd::Codex { name: Some(name) } } if name == "alice-codex-9"
+        ));
+        let CredCmd::Add {
+            what: AddCmd::AppleCodesign { name, identity },
+        } = parse(
+            "t add apple-codesign release-sign --p12 id.p12 --p12-password-file pw.txt \
+             --api-key key.json --team-id ABCDE12345",
+        )
+        .unwrap()
+        else {
+            panic!("the apple-codesign arm");
+        };
+        assert_eq!(name.as_deref(), Some("release-sign"));
+        assert_eq!(identity.p12, Path::new("id.p12"));
+        assert_eq!(identity.p12_password_file, Path::new("pw.txt"));
+        assert_eq!(identity.api_key, Path::new("key.json"));
+        assert_eq!(identity.team_id, "ABCDE12345");
+
+        let missing_key = parse(
+            "t add apple-codesign --p12 id.p12 --p12-password-file pw.txt --team-id ABCDE12345",
+        )
+        .unwrap_err();
+        assert_eq!(
+            missing_key.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        let password_on_argv = parse(
+            "t add apple-codesign --p12 id.p12 --p12-password hunter2 --api-key k --team-id T",
+        )
+        .unwrap_err();
+        assert_eq!(
+            password_on_argv.kind(),
+            clap::error::ErrorKind::UnknownArgument
+        );
+    }
+
+    /// A signing identity the gateway would refuse is refused HERE, by the
+    /// gateway's own token, before a store dir or an on-chain record exists.
+    #[test]
+    fn apple_codesign_enrolment_refuses_by_the_gateways_token_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p12 = tmp.path().join("id.p12");
+        let pw = tmp.path().join("pw");
+        let key = tmp.path().join("key.json");
+        std::fs::write(&p12, b"not a pkcs12").unwrap();
+        std::fs::write(&pw, "hunter2\n").unwrap();
+        std::fs::write(&key, r#"{"key_id":"k","issuer_id":"i","private_key":"-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----"}"#).unwrap();
+        let err = read_and_admit_apple_codesign(&p12, &pw, &key, "ABCDE12345")
+            .err()
+            .map(|e| e.to_string())
+            .expect("refused");
+        assert_eq!(err, "apple-codesign identity refused: p12_unparseable");
+        std::fs::write(&key, "{}").unwrap();
+        let err = read_and_admit_apple_codesign(&p12, &pw, &key, "ABCDE12345")
+            .err()
+            .map(|e| e.to_string())
+            .expect("refused");
+        assert_eq!(err, "apple-codesign identity refused: api_key_malformed");
+    }
+
+    /// The store files `cred add apple-codesign` writes are exactly what the
+    /// lender's loader reads back into the wire payload — and that payload
+    /// seals and unseals to the same bytes the attested upload would carry.
+    #[test]
+    fn apple_codesign_store_files_round_trip_through_the_loader_and_the_seal() {
+        let material = AppleCodesignMaterial {
+            p12: vec![0x30, 0x82, 0x01, 0x02],
+            p12_password: "hunter2".into(),
+            api_key_json: r#"{"key_id":"k","issuer_id":"i","private_key":"pem"}"#.into(),
+            team_id: "ABCDE12345".into(),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = airlock_service::cred_store_root(tmp.path());
+        let dir = root.join("release-sign");
+        airlock_service::create_private_dir(&dir).unwrap();
+        write_apple_codesign_files(&dir, &material).unwrap();
+        // a retry replaces, never fails on the leftover
+        write_apple_codesign_files(&dir, &material).unwrap();
+        std::fs::write(dir.join("kind"), "apple-codesign\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let files = airlock_service::apple_codesign_files();
+            for file in [files.p12, files.p12_password, files.api_key, files.team_id] {
+                let mode = std::fs::metadata(dir.join(file))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600, "{file} must be owner-only");
+            }
+        }
+        let seeds = airlock_service::load_seeds(&root).unwrap();
+        let (name, kind, loaded) = &seeds[0];
+        assert_eq!(name, "release-sign");
+        assert_eq!(*kind, airlock::wire::CredentialKind::AppleCodesign);
+        let expected = serde_json::to_vec(&material.payload()).unwrap();
+        assert_eq!(serde_json::to_vec(loaded).unwrap(), expected);
+
+        let keypair = airlock::seal::SealKeypair::generate();
+        let sealed = airlock::seal::seal(&keypair.public_bytes(), &expected);
+        assert_eq!(airlock::seal::unseal(&keypair, &sealed).unwrap(), expected);
+    }
+
+    /// The whole enrolment path on a throwaway Developer-ID-shaped identity:
+    /// read, admit, and the payload the gateway would open. Needs the airlock
+    /// testkit (the `verify` feature), which mints the identity in-process.
+    #[cfg(feature = "verify")]
+    #[test]
+    fn a_fixture_identity_is_admitted_and_its_payload_carries_the_p12() {
+        use airlock::codesign::fixture::{self, Marker};
+        let tmp = tempfile::tempdir().unwrap();
+        let p12 = tmp.path().join("id.p12");
+        let pw = tmp.path().join("pw");
+        let key = tmp.path().join("key.json");
+        let p12_bytes = fixture::p12(fixture::TEAM_ID, Marker::DeveloperIdApplication);
+        std::fs::write(&p12, &p12_bytes).unwrap();
+        std::fs::write(&pw, format!("{}\n", fixture::P12_PASSWORD)).unwrap();
+        std::fs::write(&key, fixture::api_key_json()).unwrap();
+        let material = read_and_admit_apple_codesign(&p12, &pw, &key, fixture::TEAM_ID).unwrap();
+        assert_eq!(material.p12, p12_bytes);
+        assert_eq!(
+            material.p12_password,
+            fixture::P12_PASSWORD,
+            "the file's newline is not the password's"
+        );
+        let err = read_and_admit_apple_codesign(&p12, &pw, &key, "OTHER00000")
+            .err()
+            .map(|e| e.to_string())
+            .expect("refused");
+        assert_eq!(err, "apple-codesign identity refused: team_id_mismatch");
+    }
+
     #[test]
     fn default_name_is_display_provider_counter() {
         let existing = ["alice-claude-1", "alice-claude-2", "alice-codex-1"];
         assert_eq!(
-            derive_default_name("alice", ProviderArg::Claude, &existing),
+            derive_default_name("alice", "claude", &existing),
             "alice-claude-3"
         );
         assert_eq!(
-            derive_default_name("alice", ProviderArg::Codex, &existing),
+            derive_default_name("alice", "codex", &existing),
             "alice-codex-2"
         );
-        assert_eq!(
-            derive_default_name("jess", ProviderArg::Claude, &[]),
-            "jess-claude-1"
-        );
+        assert_eq!(derive_default_name("jess", "claude", &[]), "jess-claude-1");
     }
 
     #[test]

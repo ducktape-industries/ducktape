@@ -21,6 +21,8 @@ airlock = { path = "../../airlock", features = ["server"] }
 axum = "0.8"
 # the vendor login artifacts (.credentials.json / auth.json) are JSON.
 serde_json = { workspace = true }
+# the apple-codesign identity rides the wire as base64 of the PKCS#12 file.
+base64 = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

@@ -4351,6 +4351,9 @@ broker = "anthropic-messages"
             let selected = match kind {
                 CredentialKind::Claude => "anthropic",
                 CredentialKind::Codex => "openai-codex",
+                CredentialKind::AppleCodesign => {
+                    unreachable!("a signing identity has no model wire")
+                }
             };
             assert_eq!(models["providers"].as_object().unwrap().len(), 1);
             assert_eq!(models["providers"][selected]["baseUrl"], endpoint.base_url);

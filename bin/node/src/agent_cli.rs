@@ -836,7 +836,18 @@ fn harness_capability(
 ) -> Result<&'static str, String> {
     use gateway::CredentialKind;
     match (harness, kind) {
-        (Some(HarnessArg::Pi), _) => Ok("pi"),
+        // a signing identity answers no harness: it signs releases, it does
+        // not run a model session.
+        (
+            None | Some(HarnessArg::Pi) | Some(HarnessArg::Claude) | Some(HarnessArg::Codex),
+            Some(CredentialKind::AppleCodesign),
+        ) => {
+            Err("credential kind apple-codesign is a signing identity, not a model provider".into())
+        }
+        (
+            Some(HarnessArg::Pi),
+            None | Some(CredentialKind::Claude) | Some(CredentialKind::Codex),
+        ) => Ok("pi"),
         (None | Some(HarnessArg::Claude), Some(CredentialKind::Claude))
         | (Some(HarnessArg::Claude), None) => Ok("claude"),
         (None | Some(HarnessArg::Codex), Some(CredentialKind::Codex))
@@ -1081,6 +1092,26 @@ mod tests {
         use clap::ValueEnum as _;
         assert_eq!(HarnessArg::from_str("pi", false).unwrap(), HarnessArg::Pi);
         assert!(crate::cred_cli::ProviderArg::from_str("pi", false).is_err());
+    }
+
+    /// An `apple-codesign` credential runs no harness, whichever one is
+    /// named — including pi, which otherwise takes any model credential.
+    #[test]
+    fn a_signing_credential_answers_no_harness() {
+        for harness in [
+            None,
+            Some(HarnessArg::Pi),
+            Some(HarnessArg::Claude),
+            Some(HarnessArg::Codex),
+        ] {
+            let err = harness_capability(harness, Some(gateway::CredentialKind::AppleCodesign))
+                .unwrap_err();
+            assert!(err.contains("signing identity"), "{harness:?}: {err}");
+        }
+        assert_eq!(
+            harness_capability(Some(HarnessArg::Pi), Some(gateway::CredentialKind::Claude)),
+            Ok("pi")
+        );
     }
 
     #[test]
