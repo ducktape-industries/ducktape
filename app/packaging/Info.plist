@@ -6,7 +6,7 @@
 <key>CFBundleName</key><string>Ducktape</string>
 <key>CFBundleDisplayName</key><string>Ducktape</string>
 <key>CFBundleIdentifier</key><string>dev.ducktape.app</string>
-<key>CFBundleExecutable</key><string>ducktape-app</string>
+<key>CFBundleExecutable</key><string>ducktape-launcher</string>
 <key>CFBundleIconFile</key><string>Ducktape</string>
 <key>LSMinimumSystemVersion</key><string>11.0</string>
 <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
