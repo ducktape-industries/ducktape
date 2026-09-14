@@ -101,6 +101,8 @@ impl Store {
             oauth_client_id: env_or("DUCKTAPE_AIRLOCK_OAUTH_CLIENT_ID", OAUTH_CLIENT_ID),
             session_ttl_secs: SESSION_TTL_SECS,
             max_requests: MAX_REQUESTS,
+            // the self-host lender holds no `rcodesign`; the enclave image does.
+            sign: None,
         };
         let (router, _vendor) = airlock::server::build_self_host_reloadable(
             cfg,

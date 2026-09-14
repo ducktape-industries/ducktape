@@ -219,6 +219,48 @@ the token.
   `cred seal --vendor apple-codesign` with the same four flags seals it to a
   TEE gateway. `cred grant` lends it like any other kind.
 
+## Release signing: `POST /sign/macos-bundle`
+
+The enclave gateway signs, notarizes and staples a release bundle with an
+`apple-codesign` credential it holds, so the identity never leaves it
+(`sign.rs`; mounted beside `/v1/{*rest}` only when the gateway was built with
+a `sign::Tools`, which `airlock-gateway` always is — the self-host lender
+mounts no such route). The caller opens a SEALED session (`body_seal: true`,
+`work: Direct`) on the signing credential — standing is the credential's
+grant, exactly as for a model credential — and posts the `.tar.zst` of an
+UNSIGNED `Ducktape.app` as the sealed body (`bodyseal::seal_request` under
+`POST\n/sign/macos-bundle`; cap `sign::MAX_BUNDLE_BYTES`, 256 MiB). The
+reply is the `.tar.zst` of the signed + notarized + stapled bundle as a sealed
+chunk stream (head content type `application/zstd`), and one request spends
+one of the session's `max_requests`. Inside, the pipeline is one state machine
+(`Received → Validated → Signed → Notarized → Stapled`): the bundle's shape is
+checked before the identity is touched (one top-level `Ducktape.app/`, no
+escaping path or symlink, `CFBundleIdentifier` `dev.ducktape.app`,
+`Contents/MacOS` exactly `ducktape-launcher`, `ducktape-app`, `views`), then
+the p12, its password and the App Store Connect key are written 0600 into a
+0700 directory under the tmpfs work root for `rcodesign sign
+--code-signature-flags runtime --entitlements-xml-file …` (the launcher and
+the nested `ducktape-app` both, as `ops/bundle-app-macos.sh` does),
+`rcodesign notary-submit --wait` and `rcodesign staple`, and the directory is
+removed on every exit path. Refusals are tokens in the body:
+`credential_kind_mismatch` (403, a model credential), `bundle_shape_refused`
+(400), `bundle_too_large` (413), `codesign_failed` (500), `notary_rejected`
+and `staple_failed` (502), `tool_missing` (503, the image lacks `rcodesign` or
+the entitlements). Audit under `target: "ducktape::airlock"`:
+`release_sign_requested`, `release_sign_signed`, `release_sign_notarized`,
+`release_sign_refused` — session, credential name, bundle SHA-256s, reason,
+submission id; never key material. The toolchain is part of the image, not
+the binary: `ops/airlock-gateway/install-rcodesign.sh` fetches the pinned
+`rcodesign` release and checks its SHA-256, `ops/airlock-gateway/stage-image.sh`
+(`make airlock-gateway-image`) stages it with the binary and
+`app/packaging/entitlements.plist` at the paths `airlock-gateway`'s
+`--rcodesign`/`--entitlements`/`--work-root` default to. `tests/sign_route.rs`
+drives the route end to end with a throwaway Developer-ID-shaped identity and
+the stubbed Apple seam (`sign::Notary::Stub`) — the real `rcodesign sign`, then
+`rcodesign verify` on what came back; it needs `rcodesign` on `PATH` or
+`DUCKTAPE_RCODESIGN` (`make rcodesign`). Notarization itself is only
+exercised against Apple, from the release lane.
+
 ## Per-vendor attestation (`--attest tdx|snp`, gateway also `auto`)
 
 Quote generation is vendor-generic via `configfs-tsm` (`tdx_guest`/`sev_guest`;

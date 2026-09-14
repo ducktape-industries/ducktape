@@ -51,6 +51,16 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 - `firecracker/` — `boot-bench.sh` and `snapshot-bench.sh`, the cold-boot and
   snapshot-restore timing lanes for the microVM sandbox.
 
+## Airlock enclave image
+
+- `airlock-gateway/install-rcodesign.sh` — the pinned `rcodesign` release
+  (SHA-256 checked) into `<prefix>/bin`; what the gateway's
+  `POST /sign/macos-bundle` signs with, and what `cargo test -p airlock`
+  needs on `PATH` (`make rcodesign`).
+- `airlock-gateway/stage-image.sh` (`make airlock-gateway-image`) — the
+  enclave image root: the release `airlock-gateway`, `rcodesign`, and
+  `app/packaging/entitlements.plist` at the binary's default paths.
+
 ## Forge
 
 - `dogfood-forge.sh` (`make dogfood-forge`) — mirror GitHub `origin/dev` into
