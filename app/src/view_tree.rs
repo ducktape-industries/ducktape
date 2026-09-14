@@ -1735,7 +1735,9 @@ impl ViewTree {
                 let offset = handle.offset();
                 let _ = weak.update(cx, |this, cx| {
                     let previous = this.scroll_positions.get(&route).copied();
-                    let restored = restored.as_ref().filter(|saved| previous.is_none() && saved.rows.is_none());
+                    let restored = restored
+                        .as_ref()
+                        .filter(|saved| previous.is_none() && saved.rows.is_none());
                     let mut next = offset;
                     for (position, maximum, previous, anchor) in [
                         (
@@ -1751,44 +1753,53 @@ impl ViewTree {
                             anchors.1,
                         ),
                     ] {
-                        let at_end = previous.is_some_and(|(offset, max)| {
-                            f32::from(offset + max).abs() < 2.0
-                        });
+                        let at_end = previous
+                            .is_some_and(|(offset, max)| f32::from(offset + max).abs() < 2.0);
                         let initialize_end =
                             previous.is_none() && anchor == wire::ScrollAnchor::End;
                         if initialize_end || (follow && at_end) {
                             *position = -maximum;
                         } else if anchor == wire::ScrollAnchor::Keep
-                            && let Some((offset,old_maximum)) = previous
-                                && offset < px(0.0) { *position = (*position-(maximum-old_maximum)).clamp(-maximum,px(0.0)); }
+                            && let Some((offset, old_maximum)) = previous
+                            && offset < px(0.0)
+                        {
+                            *position =
+                                (*position - (maximum - old_maximum)).clamp(-maximum, px(0.0));
+                        }
                     }
                     if let Some(saved) = restored {
-                        next = point(saved.offset.x.clamp(-maximum.x, px(0.)), saved.offset.y.clamp(-maximum.y, px(0.)));
+                        next = point(
+                            saved.offset.x.clamp(-maximum.x, px(0.)),
+                            saved.offset.y.clamp(-maximum.y, px(0.)),
+                        );
                     }
                     if next != offset {
                         handle.set_offset(next);
                         cx.notify();
                     }
-                    let changed = previous
-                        .is_none_or(|(offset, max)| offset != next || max != maximum);
+                    let changed =
+                        previous.is_none_or(|(offset, max)| offset != next || max != maximum);
                     this.scroll_positions.insert(route.clone(), (next, maximum));
-                    if changed
-                        && let Some(handler) = handler {
-                            let distance = |offset:Pixels,maximum:Pixels,anchor:wire::ScrollAnchor| match anchor {
-                                wire::ScrollAnchor::End => f32::from(maximum+offset), _=>-f32::from(offset),
+                    if changed && let Some(handler) = handler {
+                        let distance =
+                            |offset: Pixels, maximum: Pixels, anchor: wire::ScrollAnchor| {
+                                match anchor {
+                                    wire::ScrollAnchor::End => f32::from(maximum + offset),
+                                    _ => -f32::from(offset),
+                                }
                             };
-                            let x = distance(next.x,maximum.x,anchors.0);
-                            let y = distance(next.y,maximum.y,anchors.1);
-                            let relative_x = x / f32::from(maximum.x).max(1.0);
-                            let relative_y = y / f32::from(maximum.y).max(1.0);
-                            cx.emit(wire::Event::ScrollOffset {
-                                handler,
-                                x,
-                                y,
-                                relative_x,
-                                relative_y,
-                            });
-                        }
+                        let x = distance(next.x, maximum.x, anchors.0);
+                        let y = distance(next.y, maximum.y, anchors.1);
+                        let relative_x = x / f32::from(maximum.x).max(1.0);
+                        let relative_y = y / f32::from(maximum.y).max(1.0);
+                        cx.emit(wire::Event::ScrollOffset {
+                            handler,
+                            x,
+                            y,
+                            relative_x,
+                            relative_y,
+                        });
+                    }
                 });
             },
         )
@@ -1878,9 +1889,10 @@ impl ViewTree {
             .disabled(on_toggle.is_none());
         if let Some(handler) = on_toggle {
             let handler = *handler;
-            checkbox = checkbox.on_click(cx.listener(move |_, on, _, cx| {
-                cx.emit(wire::Event::Toggle { handler, on: *on })
-            }));
+            checkbox =
+                checkbox.on_click(cx.listener(move |_, on, _, cx| {
+                    cx.emit(wire::Event::Toggle { handler, on: *on })
+                }));
         }
         checkbox.into_any_element()
     }
@@ -2084,8 +2096,7 @@ impl ViewTree {
         let show = *on_show;
         let resize = *on_resize;
         let anticipate = px(anticipate.unwrap_or_default());
-        let delay =
-            std::time::Duration::from_secs_f32(delay.unwrap_or_default().max(0.0) / 1000.0);
+        let delay = std::time::Duration::from_secs_f32(delay.unwrap_or_default().max(0.0) / 1000.0);
         let weak = cx.entity().downgrade();
         let measure = canvas(
             move |bounds, window, cx| {
@@ -2228,9 +2239,8 @@ impl ViewTree {
         );
         let gap = spacing.unwrap_or_default();
         grid = grid.gap(px(gap));
-        let cell_width = ((available - gap * columns.saturating_sub(1) as f32)
-            / columns as f32)
-            .max(0.0);
+        let cell_width =
+            ((available - gap * columns.saturating_sub(1) as f32) / columns as f32).max(0.0);
         for child in children {
             let cell = div()
                 .w(px(cell_width))
@@ -2626,11 +2636,9 @@ impl ViewTree {
                 .primary
         }));
         match axis {
-            wire::Axis::Row => {
-                decoration(dimensions(div(), *length, *girth), *background, *border)
-                    .child(fill.w(relative(fraction)).h_full())
-                    .into_any_element()
-            }
+            wire::Axis::Row => decoration(dimensions(div(), *length, *girth), *background, *border)
+                .child(fill.w(relative(fraction)).h_full())
+                .into_any_element(),
             wire::Axis::Column => decoration(
                 dimensions(div().flex().flex_col().justify_end(), *girth, *length),
                 *background,
@@ -3043,20 +3051,31 @@ impl ViewTree {
         let selections = std::rc::Rc::new(std::cell::RefCell::new(Vec::<
             Option<std::ops::Range<usize>>,
         >::new()));
+        // ONE SPAN IS ONE PARAGRAPH, laid out by the text system: it wraps
+        // where a plain label would, with the same spacing, and the whole
+        // run is one selection layout. Only a paragraph of SEVERAL spans is
+        // cut into word fragments, so native flex can wrap across the style
+        // changes — the cut is what made a long plain message read
+        // differently from every other text on screen.
+        let whole = spans.len() == 1;
         for (span_index, span) in spans.iter().enumerate() {
             // Native flex wraps at Unicode word boundaries; padding is paint
             // geometry only, while every copied fragment retains source bytes.
-            let fragments = span.content.split_word_bounds().collect::<Vec<_>>();
+            let fragments = if whole {
+                vec![span.content.as_str()]
+            } else {
+                span.content.split_word_bounds().collect::<Vec<_>>()
+            };
             for (index, fragment) in fragments.iter().enumerate() {
                 let mut run_options = options.clone();
                 run_options.font = span.font.clone().or_else(|| options.font.clone());
                 run_options.line_height = span.line_height.or(options.line_height);
-                let mut paint = text_options(
-                    div().flex_shrink_0().max_w_full(),
-                    *font,
-                    None,
-                    &run_options,
-                );
+                let plate = if whole {
+                    div().min_w_0().w_full()
+                } else {
+                    div().flex_shrink_0().max_w_full()
+                };
+                let mut paint = text_options(plate, *font, None, &run_options);
                 if let Some(size) = span.size {
                     paint = paint.text_size(px(size));
                 }
@@ -3120,7 +3139,9 @@ impl ViewTree {
                                 });
                             }));
                 }
-                let newline = fragment.contains('\n');
+                // a whole paragraph keeps its newlines: the text system
+                // breaks the lines, and the selection layout spans them
+                let newline = !whole && fragment.contains('\n');
                 if newline {
                     // Explicit source line breaks remain real measured text, not
                     // injected spaces in the selection/copy representation.

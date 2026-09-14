@@ -1,5 +1,5 @@
-//! The browser's frame: sidebar | toolbar, path bar, the directory, the
-//! status bar | inspector — with the dialogs over it all.
+//! A shared toolbar above the sidebar, directory and inspector. Dialogs
+//! cover the browser; narrowing a pane never hides its navigation controls.
 
 use super::*;
 use ducktape_view_guest::{kit::Tone, slots};
@@ -54,10 +54,17 @@ impl FilesView {
             ));
             panes.push(self.inspector(format!("{key}/inspector")));
         }
-        let content = native::sized(
-            native::spaced(native::row(key.clone(), panes), 0.),
-            Some(wire::Length::Fill),
-            Some(wire::Length::Fill),
+        let content = kit::filled_column(
+            key.clone(),
+            vec![
+                self.toolbar(format!("{key}/toolbar")),
+                native::divider(format!("{key}/toolbar-rule")),
+                native::sized(
+                    native::spaced(native::row(format!("{key}/panes"), panes), 0.),
+                    Some(wire::Length::Fill),
+                    Some(wire::Length::Fill),
+                ),
+            ],
         );
         match self.modal() {
             Modal::Deleting => kit::modal(
@@ -105,14 +112,20 @@ impl FilesView {
         )
     }
 
-    /// The toolbar, the notices, the directory as rows or columns, and the
-    /// status bar under it.
+    /// The path, notices, directory as rows or columns, and status bar.
     fn main_pane(&self, key: String) -> wire::Node {
         let mut children = vec![
-            self.toolbar(format!("{key}/toolbar")),
             self.path_bar(format!("{key}/path-bar")),
             native::divider(format!("{key}/toolbar-rule")),
         ];
+        let entry = self.selected_entry();
+        let actions_here = !self.inspector_open && !entry.path.is_empty();
+        if actions_here {
+            children.push(kit::bar(
+                format!("{key}/selection"),
+                vec![self.row_actions(format!("{key}/selection/actions"), &entry)],
+            ));
+        }
         let notices = self.notices(&key);
         if !notices.is_empty() {
             children.push(native::padded(
@@ -142,7 +155,7 @@ impl FilesView {
                 format!("{key}/sidebar-toggle"),
                 "☰",
                 "Toggle sidebar",
-                Some(Message::ToggleSidebar),
+                (self.viewport_width >= app_update::SIDEBAR_MIN).then_some(Message::ToggleSidebar),
                 self.sidebar_open,
             ),
             kit::quiet(
@@ -210,7 +223,6 @@ impl FilesView {
             };
             children.push(native::secondary(format!("{key}/wait"), wait));
         }
-        children.push(native::spacer());
         let mut filter = native::input(
             format!("{key}/filter"),
             "Filter by name",
@@ -227,12 +239,15 @@ impl FilesView {
         children.push(filter);
         children.push(kit::quiet(
             format!("{key}/inspector-toggle"),
-            "ⓘ",
+            "Info",
             "Toggle inspector",
-            Some(Message::ToggleInspector),
+            (self.viewport_width >= app_update::INSPECTOR_MIN).then_some(Message::ToggleInspector),
             self.inspector_open,
         ));
-        kit::bar(key, children)
+        native::padded(
+            native::spaced(native::wrapped_row(key, children), 6.),
+            wire::Edges::all(8.),
+        )
     }
 
     /// One button per directory on the way here; the last is where the
@@ -368,15 +383,9 @@ impl FilesView {
             children.push(native::caption(format!("{key}/more"), "· more not shown"));
         }
         children.push(native::spacer());
-        if !self.selected.is_empty() {
-            children.push(native::nowrap(native::caption(
-                format!("{key}/selected"),
-                self.selected.clone(),
-            )));
-        }
         children.push(native::nowrap(native::caption(
             format!("{key}/drop-hint"),
-            "Drop a file on the window to upload it here",
+            "Drop files here to upload",
         )));
         let mut bar = native::sized(
             native::padded(

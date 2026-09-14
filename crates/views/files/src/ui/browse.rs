@@ -261,6 +261,7 @@ pub enum BrowseKey {
     Parent,
     Back,
     Forward,
+    Cancel,
     Ignored,
 }
 
@@ -273,6 +274,7 @@ pub fn browse_key(state: &ducktape_view_guest::wire::keyboard::KeyState) -> Brow
         Key::Named(Named::ArrowDown) if command => BrowseKey::Open,
         Key::Named(Named::ArrowDown) => BrowseKey::Down,
         Key::Named(Named::Enter) => BrowseKey::Open,
+        Key::Named(Named::Escape) => BrowseKey::Cancel,
         Key::Named(Named::Backspace) => BrowseKey::Parent,
         Key::Named(Named::ArrowLeft) if command => BrowseKey::Back,
         Key::Named(Named::ArrowRight) if command => BrowseKey::Forward,
