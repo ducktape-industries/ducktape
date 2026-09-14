@@ -1178,9 +1178,11 @@ fn signed_people_resident_turns_independent_jobs_and_snapshot_restart() {
             );
             let pending = network.run(&turn.run_id).await;
             let native = network.native_payload(&pending);
+            // The logical turn names its committed interval: the cursor it
+            // starts AFTER and the one it ends ON.
             assert_eq!(
                 native.turn_id,
-                runs::conversation_turn_id(turn.from_cursor + 1, turn.through_cursor)
+                runs::conversation_turn_id(turn.from_cursor, turn.through_cursor)
             );
             assert_eq!(native.events.len(), 1);
             assert_eq!(

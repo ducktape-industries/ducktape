@@ -52,7 +52,13 @@ fn wasm_runs() -> WasmModule {
     let mut module = WasmModule::from_bytes("runs", RUNS_WASM).expect("load component");
     // exactly what `noded::compose` seeds a Map-backed network-bound tenant
     // with at genesis; without it the guest refuses every dispatch.
-    let config = sdk::genesis_config::encode_config(&[("chain_id", PARITY_CHAIN_ID.as_bytes())]);
+    let config = sdk::genesis_config::encode_config(&[
+        ("chain_id", PARITY_CHAIN_ID.as_bytes()),
+        (
+            sdk::genesis_config::TIME_UNIT,
+            sdk::genesis_config::TimeUnit::Height.encode(),
+        ),
+    ]);
     let (bytes, root) =
         wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, config.as_slice())]);
     module.install(&bytes, root).expect("seed genesis config");
@@ -77,6 +83,7 @@ fn native_runs() -> RunsModule {
     .with_pages_module("pages")
     .with_collaboration_module("collaboration")
     .with_chain_id(PARITY_CHAIN_ID)
+    .with_time_unit(sdk::genesis_config::TimeUnit::Height)
 }
 
 /// the shared native sibling set under the production ids. `chat_label` /
@@ -104,7 +111,8 @@ async fn siblings(
         Box::new(
             Pages::new("pages", Box::new(pages_store))
                 .with_identity("identity")
-                .with_attribution("attribution"),
+                .with_attribution("attribution")
+                .with_files("files"),
         ),
         Box::new(
             AttributionModule::new("attribution", Box::new(sdk_testkit::MemStore::new()))
