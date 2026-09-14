@@ -102,6 +102,7 @@ pub(crate) async fn load_chat_data(
             break;
         }
     }
+    let facts = ReaderFacts::current().await;
     let channels = wire_channels
         .iter()
         .map(|info| ChatChannel {
@@ -111,6 +112,7 @@ pub(crate) async fn load_chat_data(
             members_only: info.channel.post_policy == PostPolicy::MembersOnly,
             huddle_count: count_i64(info.channel.huddle.len()),
             head_seq: number_i64(info.head_seq),
+            huddle: huddle_seats(&info.channel.huddle, facts.reader()),
         })
         .collect::<Vec<_>>();
     let active_channel = requested
@@ -135,7 +137,6 @@ pub(crate) async fn load_chat_data(
     let active_channel_archived = active_wire_channel.is_some_and(|info| info.channel.archived);
     let active_channel_members_only =
         active_wire_channel.is_some_and(|info| info.channel.post_policy == PostPolicy::MembersOnly);
-    let facts = ReaderFacts::current().await;
     let huddle_roster = active_wire_channel.map_or_else(Vec::new, |info| {
         huddle_roster(&info.channel.huddle, facts.reader())
     });
@@ -201,6 +202,7 @@ pub(crate) async fn load_channel_facts(
             members_only: info.channel.post_policy == PostPolicy::MembersOnly,
             huddle_count: count_i64(info.channel.huddle.len()),
             head_seq: number_i64(info.head_seq),
+            huddle: huddle_seats(&info.channel.huddle, reader),
         },
         roster,
     )))

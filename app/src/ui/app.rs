@@ -125,6 +125,7 @@ pub(crate) enum ForgeIntent {
     OpenLink,
     Copy,
     Composer,
+    Attach,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AgentsIntent {
@@ -177,6 +178,7 @@ pub(crate) enum ChatIntent {
     CancelRun,
     OpenRun,
     Composer,
+    Attach,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MutationPhase {
@@ -492,6 +494,10 @@ pub(crate) enum AppMessage {
     ForgeNoteFailed(String, String, crate::backend::OptimisticMutationError),
     FilesViewEvent(crate::module_view::ModuleViewEvent),
     FsFileDropped(String),
+    /// A file in a composer's standby zone: its scope, upload id, local path.
+    AttachmentQueued(String, String, String),
+    /// Where an upload landed (a `duck://` address), or why it did not.
+    AttachmentUploaded(String, String, Result<String, String>),
     FsDropped(bool),
     FsDropFailed(crate::backend::AppError),
     AccountLoaded(crate::backend::AccountData),

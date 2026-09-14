@@ -79,11 +79,16 @@ impl ChatView {
             native::nowrap(name),
         ];
         if channel.huddle_count > 0 {
-            children.push(native::badge(
-                format!("{key}/huddle"),
-                format!("Huddle {}", channel.huddle_count),
-                Tone::Success,
-            ));
+            children.push(native::nowrap(native::colored(
+                native::text_size(
+                    native::text(
+                        format!("{key}/huddle"),
+                        format!("🔊 {}", channel.huddle_count),
+                    ),
+                    native::type_scale::CAPTION as f32,
+                ),
+                p.success,
+            )));
         }
         if channel.members_only {
             children.push(native::nowrap(native::caption(
@@ -107,7 +112,50 @@ impl ChatView {
             Some(slots::message(choose(channel.id)))
         };
         let content = native::spaced(native::centered_row(format!("{key}/row"), children), 6.);
-        sidebar_row(native::list_row(key, content, selected, action), channel.name)
+        let row = sidebar_row(
+            native::list_row(key.clone(), content, selected, action),
+            channel.name,
+        );
+        if channel.huddle.is_empty() {
+            return row;
+        }
+        // the people in the room's huddle, under the room like a voice channel
+        let mut seats = vec![row];
+        for (index, seat) in channel.huddle.iter().enumerate() {
+            seats.push(self.huddle_seat(format!("{key}/seat/{index}"), seat));
+        }
+        native::spaced(native::column(format!("{key}/with-huddle"), seats), 2.)
+    }
+
+    /// One person in a huddle, as the room list shows them: a small plate,
+    /// the name, and "you" (muted or not) on the reader's own seat.
+    fn huddle_seat(&self, key: String, seat: &crate::host::HuddleSeat) -> wire::Node {
+        let mut children = vec![
+            native::avatar(format!("{key}/avatar"), seat.initials.clone(), Tone::Neutral),
+            native::nowrap(native::secondary(format!("{key}/name"), &seat.label)),
+        ];
+        let mine = match (seat.is_you, self.call_muted) {
+            (true, true) => "you · muted",
+            (true, false) => "you",
+            (false, _) => "",
+        };
+        if !mine.is_empty() {
+            children.push(native::nowrap(native::caption(format!("{key}/you"), mine)));
+        }
+        let mut row = native::centered_row(key, children);
+        if let wire::Node::Linear {
+            spacing, padding, ..
+        } = &mut row
+        {
+            *spacing = Some(8.);
+            *padding = Some(wire::Edges {
+                top: 2.,
+                right: 8.,
+                bottom: 2.,
+                left: 28.,
+            });
+        }
+        row
     }
 
     pub(super) fn loading_messages(&self, key: String) -> wire::Node {

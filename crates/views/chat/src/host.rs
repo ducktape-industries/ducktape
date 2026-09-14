@@ -44,6 +44,16 @@ pub struct ChatChannel {
     pub members_only: bool,
     pub huddle_count: i64,
     pub head_seq: i64,
+    /// Who is in the room's huddle, join order.
+    #[serde(default)]
+    pub huddle: Vec<HuddleSeat>,
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct HuddleSeat {
+    pub label: String,
+    pub initials: String,
+    pub is_you: bool,
 }
 
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]

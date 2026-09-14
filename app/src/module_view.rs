@@ -403,6 +403,7 @@ pub fn forge_intent(event: &ModuleViewEvent) -> crate::ForgeIntent {
     match event.kind.as_str() {
         "open_link" => Intent::OpenLink,
         "composer" => Intent::Composer,
+        "composer_attach" => Intent::Attach,
         _ => Intent::Copy,
     }
 }
@@ -642,6 +643,7 @@ pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
         "cancel_run" => Intent::CancelRun,
         "open_run" => Intent::OpenRun,
         "composer" => Intent::Composer,
+        "composer_attach" => Intent::Attach,
         _ => Intent::CopyLink,
     }
 }
@@ -3127,7 +3129,9 @@ pub(crate) mod tests {
         let other_route_only: [(&str, &str, &[&str]); 4] = [
             ("agents", "agents_intent", &[]),
             ("settings", "settings_intent", &[]),
-            ("forge", "forge_intent", &["composer"]),
+            // the composer's own events reach the app off its surface, not
+            // through the guest's door
+            ("forge", "forge_intent", &["composer", "composer_attach"]),
             ("pages", "pages_intent", &[]),
         ];
         let snake = |variant: &str| -> String {
