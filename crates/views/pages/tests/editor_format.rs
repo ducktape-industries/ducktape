@@ -166,6 +166,18 @@ fn a_link_names_the_selection_and_selects_the_url_slot() {
 }
 
 #[test]
+fn a_selection_that_swallows_the_block_prefix_marks_only_the_words() {
+    // Shift+Home on a quote takes the `> ` with it; the link names the words
+    let before = selected("Title\n> a quote", 1, 0, 9);
+    let after = apply(&before, format::link(&before));
+    assert_eq!(after.text, "Title\n> [a quote](url)");
+    // and a todo keeps its box outside the bold
+    let todo = selected("Title\n- [ ] do it", 1, 0, 11);
+    let bold = apply(&todo, format::toggle(&todo, Wrap::Bold));
+    assert_eq!(bold.text, "Title\n- [ ] **do it**");
+}
+
+#[test]
 fn unlink_keeps_the_label_and_a_bare_url_is_left_alone() {
     let before = doc("Title\nsee the [docs](https://x.y) now", 1, 10);
     let after = apply(&before, format::unlink(&before, 1, 10));
