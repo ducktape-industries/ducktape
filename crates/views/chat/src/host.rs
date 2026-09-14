@@ -54,6 +54,17 @@ pub struct HuddleSeat {
     pub label: String,
     pub initials: String,
     pub is_you: bool,
+    /// The seat's node key — what `speaking_peers` names.
+    pub node: String,
+}
+
+/// Is this seat talking: the reader's own seat reads the local voice gate,
+/// any other reads the peer beacons by node key.
+pub fn seat_speaking(seat: &HuddleSeat, call_speaking: bool, speaking_peers: &[String]) -> bool {
+    match seat.is_you {
+        true => call_speaking,
+        false => speaking_peers.contains(&seat.node),
+    }
 }
 
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
@@ -307,6 +318,10 @@ pub struct Session {
     pub huddle_joined_at: i64,
     pub huddle_now: i64,
     pub call_muted: bool,
+    /// the reader's own mic voice gate is open
+    pub call_speaking: bool,
+    /// the node keys of the peers whose call beacons say they are talking
+    pub speaking_peers: Vec<String>,
     /// the reader is holding ⇧: the copy range's gesture, and the guest sees
     /// no modifiers of its own
     pub shift_held: bool,
@@ -2246,6 +2261,23 @@ mod tests {
 
     /// A picture attachment is asked for once by its link, fetched by its
     /// duckfs path, and drawn inside the box keeping its shape.
+    /// The reader's seat lights from the local gate; a peer's from the
+    /// beacons, by node key.
+    #[test]
+    fn a_seat_lights_from_the_local_gate_or_the_peer_beacons() {
+        let seat = |is_you: bool, node: &str| HuddleSeat {
+            label: "A".into(),
+            initials: "A".into(),
+            is_you,
+            node: node.into(),
+        };
+        let peers = vec!["bb".to_owned()];
+        assert!(seat_speaking(&seat(true, "aa"), true, &peers));
+        assert!(!seat_speaking(&seat(true, "bb"), false, &peers));
+        assert!(seat_speaking(&seat(false, "bb"), false, &peers));
+        assert!(!seat_speaking(&seat(false, "aa"), true, &peers));
+    }
+
     #[test]
     fn picture_attachments_are_found_once_and_fit_the_box() {
         assert!(is_picture("Cover.PNG") && is_picture("a.jpeg") && !is_picture("deck.pdf"));

@@ -55,6 +55,7 @@ pub(crate) fn huddle_seats(
             label: seat.label,
             initials: seat.initials,
             is_you: seat.is_you,
+            node: seat.node,
         })
         .collect()
 }

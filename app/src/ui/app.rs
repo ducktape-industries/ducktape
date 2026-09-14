@@ -407,6 +407,8 @@ pub struct Ducktape {
     pub(crate) huddle_now: i64,
     pub(crate) call_status: String,
     pub(crate) call_muted: bool,
+    /// This side's mic voice gate, as the session last reported it.
+    pub(crate) call_speaking: bool,
     pub(crate) call_peers: Vec<crate::call::CallEvent>,
     pub(crate) call_camera: bool,
     pub(crate) call_sharing: bool,
@@ -855,6 +857,7 @@ impl Ducktape {
             huddle_now: 0,
             call_status: "".to_owned(),
             call_muted: false,
+            call_speaking: false,
             call_peers: Vec::new(),
             call_camera: false,
             call_sharing: false,

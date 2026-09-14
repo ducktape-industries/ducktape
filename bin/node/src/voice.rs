@@ -799,7 +799,7 @@ async fn run_session<T: DataPlaneTransport>(
     let mut frame_no: u32 = 0;
     let mut peer_lanes: HashMap<[u8; 32], PeerLane> = HashMap::new();
     // what the webview last told us — repeated at 1 Hz as our beacon.
-    let (mut muted, mut camera_on, mut sharing) = (true, false, false);
+    let (mut muted, mut camera_on, mut sharing, mut speaking) = (true, false, false, false);
     // rate hints RECEIVED from each peer about OUR sending; effective = min.
     let mut inbound_hints: HashMap<[u8; 32], u32> = HashMap::new();
     let mut effective_kbps: u32 = media_service::video::RATE_LADDER_KBPS[0];
@@ -946,9 +946,9 @@ async fn run_session<T: DataPlaneTransport>(
                             let _ = control_out.try_send(noded::CallControlOut::KeyframeRequest);
                         }
                     }
-                    media_service::video::CallControl::Beacon { muted, camera_on, sharing } => {
+                    media_service::video::CallControl::Beacon { muted, camera_on, sharing, speaking } => {
                         let _ = control_out.try_send(noded::CallControlOut::PeerBeacon {
-                            peer: peer.0, muted, camera_on, sharing,
+                            peer: peer.0, muted, camera_on, sharing, speaking,
                         });
                     }
                     media_service::video::CallControl::RateHint { max_kbps } => {
@@ -973,11 +973,11 @@ async fn run_session<T: DataPlaneTransport>(
             state = control_in.recv() => {
                 let Some(state) = state else { break };
                 match state {
-                    noded::CallControlIn::Beacon { muted: m, camera_on: c, sharing: s } => {
-                        (muted, camera_on, sharing) = (m, c, s);
+                    noded::CallControlIn::Beacon { muted: m, camera_on: c, sharing: s, speaking: v } => {
+                        (muted, camera_on, sharing, speaking) = (m, c, s, v);
                         // push immediately so toggles feel live; the 1 Hz
                         // tick keeps late joiners current.
-                        send_beacon(&ctl, &recipients, muted, camera_on, sharing).await;
+                        send_beacon(&ctl, &recipients, muted, camera_on, sharing, speaking).await;
                     }
                     noded::CallControlIn::KeyframeRequest { peer } => {
                         if let Some(lane) = peer_lanes.get_mut(&peer) {
@@ -1006,7 +1006,7 @@ async fn run_session<T: DataPlaneTransport>(
                     effective_kbps,
                     "call.stats"
                 );
-                send_beacon(&ctl, &recipients, muted, camera_on, sharing).await;
+                send_beacon(&ctl, &recipients, muted, camera_on, sharing, speaking).await;
                 // hints from peers no longer in the roster must not pin our rate.
                 let live: HashSet<[u8; 32]> = recipients.borrow().iter().copied().collect();
                 inbound_hints.retain(|peer, _| live.contains(peer));
@@ -1064,11 +1064,13 @@ async fn send_beacon<T: DataPlaneTransport>(
     muted: bool,
     camera_on: bool,
     sharing: bool,
+    speaking: bool,
 ) {
     let frame = media_service::video::CallControl::Beacon {
         muted,
         camera_on,
         sharing,
+        speaking,
     }
     .encode();
     let peers: Vec<PeerId> = recipients.borrow().iter().map(|raw| PeerId(*raw)).collect();
@@ -1843,6 +1845,7 @@ mod tests {
                 muted: false,
                 camera_on: true,
                 sharing: true,
+                speaking: true,
             })
             .await
             .expect("session a alive");
@@ -1860,12 +1863,13 @@ mod tests {
                 muted,
                 camera_on,
                 sharing,
+                speaking,
             } = msg
             {
-                break (peer, muted, camera_on, sharing);
+                break (peer, muted, camera_on, sharing, speaking);
             }
         };
-        assert_eq!(state, (key_a, false, true, true));
+        assert_eq!(state, (key_a, false, true, true, true));
 
         drop((req_a_tx, req_b_tx));
     }

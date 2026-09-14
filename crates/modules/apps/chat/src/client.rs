@@ -52,6 +52,9 @@ pub struct HuddleSeat {
     pub label: String,
     pub initials: String,
     pub is_you: bool,
+    /// The seat's NODE key (hex): what a call beacon names, so the room list
+    /// can light the seat that is talking.
+    pub node: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]

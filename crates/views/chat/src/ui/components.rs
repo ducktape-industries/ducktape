@@ -127,11 +127,17 @@ impl ChatView {
         native::spaced(native::column(format!("{key}/with-huddle"), seats), 2.)
     }
 
-    /// One person in a huddle, as the room list shows them: a small plate,
-    /// the name, and "you" (muted or not) on the reader's own seat.
+    /// One person in a huddle, as the room list shows them: a small plate
+    /// (lit while they talk), the name, and "you" (muted or not) on the
+    /// reader's own seat.
     fn huddle_seat(&self, key: String, seat: &crate::host::HuddleSeat) -> wire::Node {
+        let speaking = crate::host::seat_speaking(seat, self.call_speaking, &self.speaking_peers);
+        let tone = match speaking {
+            true => Tone::Success,
+            false => Tone::Neutral,
+        };
         let mut children = vec![
-            native::avatar(format!("{key}/avatar"), seat.initials.clone(), Tone::Neutral),
+            native::avatar(format!("{key}/avatar"), seat.initials.clone(), tone),
             native::nowrap(native::secondary(format!("{key}/name"), &seat.label)),
         ];
         let mine = match (seat.is_you, self.call_muted) {

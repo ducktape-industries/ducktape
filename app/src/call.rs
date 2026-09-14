@@ -35,8 +35,9 @@ use serde::{Deserialize, Serialize};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// One call-session event: `kind` picks the arm
-/// (`connecting` | `live` | `refused` | `closed` | `error` | `peer`),
-/// `message` carries refusal/error prose, the rest is a peer beacon.
+/// (`connecting` | `live` | `refused` | `closed` | `error` | `peer` | `self`),
+/// `message` carries refusal/error prose, the rest is a peer beacon — or,
+/// for `self`, this side's own voice gate in `speaking`.
 #[derive(Clone, Debug, Hash, PartialEq, Default)]
 pub struct CallEvent {
     pub kind: String,
@@ -45,6 +46,7 @@ pub struct CallEvent {
     pub muted: bool,
     pub camera_on: bool,
     pub sharing: bool,
+    pub speaking: bool,
 }
 
 impl CallEvent {
@@ -62,6 +64,15 @@ impl CallEvent {
             ..Self::default()
         }
     }
+
+    /// This side's own voice gate flipped.
+    fn speaking(open: bool) -> Self {
+        Self {
+            kind: "self".to_owned(),
+            speaking: open,
+            ..Self::default()
+        }
+    }
 }
 
 /// Client → hub control, mirroring `noded::CallClientControl`.
@@ -75,6 +86,7 @@ enum ClientControl {
         muted: bool,
         camera_on: bool,
         sharing: bool,
+        speaking: bool,
     },
 }
 
@@ -88,6 +100,7 @@ enum ServerControl {
         muted: bool,
         camera_on: bool,
         sharing: bool,
+        speaking: bool,
     },
     RateHint {
         #[allow(dead_code)]
@@ -100,6 +113,8 @@ enum ServerControl {
 /// time — the subscribe gate guarantees it.
 struct Handles {
     muted: Arc<AtomicBool>,
+    /// The mic's voice gate as the pump last read it — what our beacon says.
+    speaking: Arc<AtomicBool>,
     control: tokio::sync::mpsc::UnboundedSender<ClientControl>,
 }
 
@@ -131,7 +146,62 @@ pub(crate) fn beacon_state() {
         muted: handles.muted.load(Ordering::Relaxed),
         camera_on: source == crate::video::Source::Camera,
         sharing: source == crate::video::Source::Screen,
+        speaking: handles.speaking.load(Ordering::Relaxed),
     });
+}
+
+/// The mic's voice gate: open while captured frames carry sound, and closing
+/// [`VOICE_GATE_HANGOVER`] after the last one so a breath between words does
+/// not flicker the badge. `push`/`expire` answer the flips only — the caller
+/// beacons on a flip, not on every frame.
+#[derive(Default)]
+pub(crate) struct VoiceGate {
+    open: bool,
+    last_sound: Option<std::time::Instant>,
+}
+
+/// The RMS of a 20 ms mic frame (i16 samples) that counts as a voice —
+/// about -38 dBFS, above room tone and below a whisper into the mic.
+const VOICE_GATE_FLOOR: f64 = 400.;
+pub(crate) const VOICE_GATE_HANGOVER: std::time::Duration = std::time::Duration::from_millis(400);
+
+impl VoiceGate {
+    pub(crate) fn push(&mut self, frame: &[i16], now: std::time::Instant) -> Option<bool> {
+        if frame_rms(frame) < VOICE_GATE_FLOOR {
+            return self.expire(now);
+        }
+        self.last_sound = Some(now);
+        self.flip_to(true)
+    }
+
+    pub(crate) fn expire(&mut self, now: std::time::Instant) -> Option<bool> {
+        let quiet = self
+            .last_sound
+            .is_none_or(|at| now.duration_since(at) >= VOICE_GATE_HANGOVER);
+        match quiet {
+            true => self.flip_to(false),
+            false => None,
+        }
+    }
+
+    fn flip_to(&mut self, open: bool) -> Option<bool> {
+        if self.open == open {
+            return None;
+        }
+        self.open = open;
+        Some(open)
+    }
+}
+
+fn frame_rms(frame: &[i16]) -> f64 {
+    if frame.is_empty() {
+        return 0.;
+    }
+    let energy: f64 = frame
+        .iter()
+        .map(|sample| f64::from(*sample) * f64::from(*sample))
+        .sum();
+    (energy / frame.len() as f64).sqrt()
 }
 
 /// How often the live session re-reads its huddle's roster. The hub beacons
@@ -386,8 +456,14 @@ async fn run_session(
         .spawn(move || crate::video::capture_thread(video_tx, capture_shutdown_rx, capture_events))
         .ok();
 
+    let speaking = Arc::new(AtomicBool::new(false));
+    let mut voice_gate = VoiceGate::default();
+    // The gate's hangover has to run out even when the mic goes quiet — or
+    // mutes, which stops the frames that would have closed it.
+    let mut gate_tick = tokio::time::interval(VOICE_GATE_HANGOVER / 2);
     *handles().lock().expect("call handles") = Some(Handles {
         muted: muted.clone(),
+        speaking: speaking.clone(),
         control: control_tx.clone(),
     });
 
@@ -420,7 +496,7 @@ async fn run_session(
                 }
                 Some(Ok(WsMessage::Text(text))) => {
                     match serde_json::from_str::<ServerControl>(&text) {
-                        Ok(ServerControl::PeerBeacon { peer, muted, camera_on, sharing }) => {
+                        Ok(ServerControl::PeerBeacon { peer, muted, camera_on, sharing, speaking }) => {
                             // A SOURCE THAT WENT OFF TAKES ITS LAST FRAME WITH
                             // IT. Nothing arrives to replace a frame after the
                             // camera stops, so the tile would hold the moment
@@ -436,6 +512,7 @@ async fn run_session(
                                 muted,
                                 camera_on,
                                 sharing,
+                                speaking,
                             };
                             if events.send(event).await.is_err() {
                                 break;
@@ -464,6 +541,11 @@ async fn run_session(
             },
             frame = mic_rx.recv() => match frame {
                 Some(frame) => {
+                    if let Some(open) = voice_gate.push(&frame, std::time::Instant::now()) {
+                        speaking.store(open, Ordering::Relaxed);
+                        beacon_state();
+                        let _ = events.send(CallEvent::speaking(open)).await;
+                    }
                     let encoded = call_wire::encode_audio(&frame);
                     if ws_out.send(WsMessage::Binary(encoded)).await.is_err() {
                         let _ = events.send(CallEvent::of("closed")).await;
@@ -481,6 +563,13 @@ async fn run_session(
                     }
                 }
                 None => break,
+            },
+            _ = gate_tick.tick() => {
+                if let Some(open) = voice_gate.expire(std::time::Instant::now()) {
+                    speaking.store(open, Ordering::Relaxed);
+                    beacon_state();
+                    let _ = events.send(CallEvent::speaking(open)).await;
+                }
             },
             control = control_rx.recv() => match control {
                 Some(control) => {
@@ -879,24 +968,28 @@ pub fn huddle_stage_peer(peers: Vec<CallEvent>, local_sharing: bool) -> String {
     }
 }
 
-/// One huddle tile with its mute decision already attached.
+/// One huddle tile with its mute and voice decisions already attached.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct HuddleTileRow {
     pub person: crate::backend::HuddleParticipant,
     pub muted: bool,
+    pub speaking: bool,
 }
 
-/// Tile rows prepared whenever the roster, call beacons, or local mute moves.
+/// Tile rows prepared whenever the roster, call beacons, or local mute or
+/// voice gate moves.
 pub fn huddle_tile_rows(
     roster: Vec<crate::backend::HuddleParticipant>,
     peers: Vec<CallEvent>,
     local_muted: bool,
+    local_speaking: bool,
 ) -> Vec<HuddleTileRow> {
     let muted_peers: BTreeSet<String> = peers
-        .into_iter()
+        .iter()
         .filter(|peer| peer.muted)
-        .map(|peer| peer.peer)
+        .map(|peer| peer.peer.clone())
         .collect();
+    let speaking_peers = speaking_peers(&peers);
     roster
         .into_iter()
         .map(|person| HuddleTileRow {
@@ -905,8 +998,33 @@ pub fn huddle_tile_rows(
             } else {
                 muted_peers.contains(&person.node)
             },
+            speaking: if person.is_you {
+                local_speaking
+            } else {
+                speaking_peers.contains(&person.node)
+            },
             person,
         })
+        .collect()
+}
+
+/// This side's voice gate after a session event: a `self` event carries the
+/// flip, a session start or end clears it, and every other event keeps it.
+pub fn call_speaking_after(current: bool, event: &CallEvent) -> bool {
+    match event.kind.as_str() {
+        "self" => event.speaking,
+        "connecting" | "closed" | "refused" | "error" => false,
+        _ => current,
+    }
+}
+
+/// The node keys of every peer whose beacon says they are talking — the
+/// shape the chat view lights its seats from.
+pub fn speaking_peers(peers: &[CallEvent]) -> Vec<String> {
+    peers
+        .iter()
+        .filter(|peer| peer.speaking && !peer.muted)
+        .map(|peer| peer.peer.clone())
         .collect()
 }
 
@@ -945,6 +1063,38 @@ mod tests {
         let mut down = Resampler::new(96_000);
         let out = down.push(&[100; 960]);
         assert!((470..=490).contains(&out.len()), "got {}", out.len());
+    }
+
+    /// The gate opens on the first loud frame, ignores a breath inside the
+    /// hangover, and closes once the hangover runs out — flips only.
+    #[test]
+    fn the_voice_gate_opens_on_sound_and_closes_after_the_hangover() {
+        let start = std::time::Instant::now();
+        let loud = [3000i16; FRAME_SAMPLES];
+        let quiet = [20i16; FRAME_SAMPLES];
+        let mut gate = VoiceGate::default();
+        assert_eq!(gate.push(&quiet, start), None);
+        assert_eq!(gate.push(&loud, start), Some(true));
+        assert_eq!(gate.push(&loud, start), None);
+        assert_eq!(gate.push(&quiet, start + VOICE_GATE_HANGOVER / 2), None);
+        assert_eq!(gate.expire(start + VOICE_GATE_HANGOVER / 2), None);
+        assert_eq!(gate.expire(start + VOICE_GATE_HANGOVER), Some(false));
+        assert_eq!(gate.expire(start + VOICE_GATE_HANGOVER * 2), None);
+        let talking = |peer: &str, speaking: bool, muted: bool| CallEvent {
+            kind: "peer".into(),
+            peer: peer.into(),
+            speaking,
+            muted,
+            ..CallEvent::default()
+        };
+        assert_eq!(
+            speaking_peers(&[
+                talking("aa", true, false),
+                talking("bb", true, true),
+                talking("cc", false, false)
+            ]),
+            vec!["aa".to_owned()]
+        );
     }
 
     #[test]
@@ -1008,6 +1158,7 @@ mod tests {
             ],
             peers,
             true,
+            false,
         );
         assert!(!rows[0].muted);
         assert!(rows[1].muted);
@@ -1060,13 +1211,14 @@ mod tests {
             serde_json::to_string(&ClientControl::Beacon {
                 muted: true,
                 camera_on: false,
-                sharing: false
+                sharing: false,
+                speaking: false
             })
             .unwrap(),
-            r#"{"type":"beacon","muted":true,"camera_on":false,"sharing":false}"#
+            r#"{"type":"beacon","muted":true,"camera_on":false,"sharing":false,"speaking":false}"#
         );
         let beacon: ServerControl = serde_json::from_str(
-            r#"{"type":"peer_beacon","peer":"bb","muted":false,"camera_on":true,"sharing":false}"#,
+            r#"{"type":"peer_beacon","peer":"bb","muted":false,"camera_on":true,"sharing":false,"speaking":true}"#,
         )
         .unwrap();
         assert!(matches!(

@@ -298,9 +298,11 @@ fn a_huddle_lists_its_people_under_the_room() {
             label: label.into(),
             initials: label.chars().take(2).collect(),
             is_you,
+            node: label.to_ascii_lowercase(),
         };
         seated.rooms[1].channel.huddle_count = 2;
         seated.rooms[1].channel.huddle = vec![seat("Ada Lovelace", false), seat("Me", true)];
+        seated.speaking_peers = vec!["ada lovelace".into()];
         seated.huddle_joined = true;
         seated.call_muted = true;
         let (frame, _, _) = connected_room_with(&seated, roots());

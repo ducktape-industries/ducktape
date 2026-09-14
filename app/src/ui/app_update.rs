@@ -833,6 +833,7 @@ impl Ducktape {
             self.huddle_roster.clone(),
             self.call_peers.clone(),
             self.call_muted,
+            self.call_speaking,
         );
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
@@ -1406,6 +1407,7 @@ impl Ducktape {
             self.huddle_roster.clone(),
             self.call_peers.clone(),
             self.call_muted,
+            self.call_speaking,
         );
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
@@ -4073,6 +4075,7 @@ impl Ducktape {
             self.huddle_roster.clone(),
             self.call_peers.clone(),
             self.call_muted,
+            self.call_speaking,
         );
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
@@ -4170,6 +4173,7 @@ impl Ducktape {
             self.huddle_roster.clone(),
             self.call_peers.clone(),
             self.call_muted,
+            self.call_speaking,
         );
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
@@ -5375,6 +5379,7 @@ impl Ducktape {
         self.huddle_rows = Vec::new();
         self.call_status = "".to_owned();
         self.call_muted = false;
+        self.call_speaking = false;
         self.call_camera = false;
         self.call_sharing = false;
         self.call_video_live = false;
@@ -5717,12 +5722,14 @@ impl Ducktape {
             crate::backend::keep_bool(event.kind == "connecting", false, self.call_camera);
         self.call_sharing =
             crate::backend::keep_bool(event.kind == "connecting", false, self.call_sharing);
+        self.call_speaking = crate::call::call_speaking_after(self.call_speaking, &event);
         self.call_peers =
             crate::call::apply_call_peer(::std::mem::take(&mut self.call_peers), event.clone());
         self.huddle_rows = crate::call::huddle_tile_rows(
             self.huddle_roster.clone(),
             self.call_peers.clone(),
             self.call_muted,
+            self.call_speaking,
         );
         self.call_video_live = crate::call::call_video_live_after(
             self.call_peers.clone(),
@@ -5742,6 +5749,7 @@ impl Ducktape {
             self.huddle_roster.clone(),
             self.call_peers.clone(),
             self.call_muted,
+            self.call_speaking,
         );
         Task::none()
     }
@@ -5820,6 +5828,7 @@ impl Ducktape {
         self.mutation_phase = MutationPhase::Huddle;
         self.call_status = "".to_owned();
         self.call_muted = false;
+        self.call_speaking = false;
         self.call_camera = false;
         self.call_sharing = false;
         self.call_video_live = false;
@@ -5829,6 +5838,7 @@ impl Ducktape {
             self.huddle_roster.clone(),
             self.call_peers.clone(),
             self.call_muted,
+            self.call_speaking,
         );
         self.error = "".to_owned();
         Task::batch([

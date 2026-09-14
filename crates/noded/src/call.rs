@@ -33,11 +33,13 @@ use crate::{NodeHandle, error_response, hex_bytes};
 pub enum CallControlIn {
     /// our local presence/state, pushed immediately AND repeated at 1 Hz as
     /// this session's beacon to every recipient. `sharing` = the video lane is a
-    /// screen share rather than the camera.
+    /// screen share rather than the camera. `speaking` = the mic's voice gate
+    /// is open right now.
     Beacon {
         muted: bool,
         camera_on: bool,
         sharing: bool,
+        speaking: bool,
     },
     /// our decoder lost `peer`'s stream — ask `peer` for a fresh keyframe.
     KeyframeRequest { peer: [u8; 32] },
@@ -55,6 +57,7 @@ pub enum CallControlOut {
         muted: bool,
         camera_on: bool,
         sharing: bool,
+        speaking: bool,
     },
     /// the effective outbound bitrate cap (min of every peer's hint) — the
     /// webview retargets its encoder. emitted only when the value changes.
@@ -143,6 +146,8 @@ pub enum CallClientControl {
         camera_on: bool,
         #[serde(default)]
         sharing: bool,
+        #[serde(default)]
+        speaking: bool,
     },
     /// the decoder lost sync with `peer` — ask it for a keyframe.
     KeyframeRequest { peer: String },
@@ -160,6 +165,7 @@ pub enum CallServerControl {
         muted: bool,
         camera_on: bool,
         sharing: bool,
+        speaking: bool,
     },
     /// send at no more than this (min across peers' loss reports).
     RateHint {
@@ -453,11 +459,13 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
                             muted,
                             camera_on,
                             sharing,
+                            speaking,
                         }) => {
                             let _ = control_in.try_send(CallControlIn::Beacon {
                                 muted,
                                 camera_on,
                                 sharing,
+                                speaking,
                             });
                         }
                         Ok(CallClientControl::KeyframeRequest { peer }) => {
@@ -494,12 +502,13 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
                 Some(out) => {
                     let message = match out {
                         CallControlOut::KeyframeRequest => CallServerControl::KeyframeRequest,
-                        CallControlOut::PeerBeacon { peer, muted, camera_on, sharing } => {
+                        CallControlOut::PeerBeacon { peer, muted, camera_on, sharing, speaking } => {
                             CallServerControl::PeerBeacon {
                                 peer: hex_bytes(&peer),
                                 muted,
                                 camera_on,
                                 sharing,
+                                speaking,
                             }
                         }
                         CallControlOut::RateHint { max_kbps } => {
