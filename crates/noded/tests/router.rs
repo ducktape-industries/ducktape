@@ -2712,6 +2712,7 @@ fn spawn_huddle_actor(mut cmds: mpsc::Receiver<NodeCommand>) {
                         post_policy: chat::PostPolicy::Open,
                         hooks: vec![],
                         pinned: vec![],
+                        voice: false,
                         huddle: vec![chat::HuddleMember {
                             party: chat::Party::Account(MEMBER_ACCOUNT),
                             node: huddle_node_signer().public_key().as_ref().to_vec(),

@@ -398,16 +398,26 @@ fn joining_a_huddle_opens_the_call_window() {
     assert_eq!(app.huddle_channel, "general");
     assert_eq!(app.huddle_channel_name, "General");
     assert_eq!(app.huddle_joined_at, 123);
+    // the ack and a voice-room join seat the reader through one helper, and
+    // it is the helper that summons the window
     let ack = handler_body("HuddleJoinedAck");
-    assert!(ack.contains("ShowHuddle"));
-    assert!(!ack.contains("shell::open("));
+    assert!(ack.contains("seat_in_huddle("));
+    let seat = fn_body("seat_in_huddle");
+    assert!(seat.contains("ShowHuddle"));
+    assert!(!seat.contains("shell::open("));
+    let joined = handler_body("VoiceJoined");
+    assert!(joined.contains("seat_in_huddle("));
 }
 #[test]
 fn a_failed_huddle_leave_keeps_the_retained_roster_visible() {
+    // leaving and moving rooms forget the call through one helper
     let leave = handler_body("LeaveHuddleHere");
-    assert!(leave.contains("self.call_peers="));
-    assert!(leave.contains("huddle_tile_rows("));
-    assert!(!leave.contains("self.huddle_rows=::std::vec::Vec::new()"));
+    assert!(leave.contains("drop_call_state("));
+    assert!(handler_body("JoinVoice").contains("drop_call_state("));
+    let dropped = fn_body("drop_call_state");
+    assert!(dropped.contains("self.call_peers="));
+    assert!(dropped.contains("huddle_tile_rows("));
+    assert!(!dropped.contains("self.huddle_rows=::std::vec::Vec::new()"));
     let ack = handler_body("HuddleLeft");
     for field in [
         "huddle_joined",

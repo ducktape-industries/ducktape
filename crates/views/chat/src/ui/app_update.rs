@@ -31,6 +31,7 @@ impl super::ChatView {
             Message::ShowHuddle => self.on_show_huddle(),
             Message::LeaveHuddleHere => self.on_leave_huddle_here(),
             Message::JoinHuddleSubmit => self.on_join_huddle_submit(),
+            Message::JoinVoice(id) => self.on_join_voice(id),
             Message::OpenMessageLink(url) => self.on_open_message_link(url),
             Message::CopyToClipboard(text, label) => self.on_copy_to_clipboard(text, label),
             Message::CopyMessageLink(link) => self.on_copy_message_link(link),
@@ -599,6 +600,10 @@ impl super::ChatView {
     }
     fn on_join_huddle_submit(&mut self) -> ducktape_view_guest::Task<Message> {
         self.sent = crate::host::send_join_huddle();
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_join_voice(&mut self, id: String) -> ducktape_view_guest::Task<Message> {
+        self.sent = crate::host::send_join_voice(&id);
         ::ducktape_view_guest::Task::none()
     }
     fn on_open_message_link(&mut self, url: String) -> ducktape_view_guest::Task<Message> {

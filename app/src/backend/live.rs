@@ -623,6 +623,13 @@ pub(crate) async fn folded_update(
                         height,
                         "chat.channel_refresh"
                     );
+                    let a_join = matches!(
+                        chat::decode_msg(&payload),
+                        Ok(ChatMsg::JoinHuddle { .. })
+                    );
+                    if a_join {
+                        notify_huddle_started(&channel);
+                    }
                     ChatDelta::ChannelUpdated {
                         channel_id,
                         channel,
@@ -981,6 +988,7 @@ pub async fn create_channel(
     password: String,
     name: String,
     members_only: bool,
+    voice: bool,
     generation: i64,
 ) -> Result<ChatData, AppError> {
     async {
@@ -988,20 +996,27 @@ pub async fn create_channel(
         let landing_name = name.clone();
         let channel_id = fresh_id("channel");
         let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::CreateChannel {
+        let op = match voice {
+            true => ChatMsg::CreateVoiceChannel {
+                channel_id: channel_id.clone(),
+                name,
+            },
+            false => ChatMsg::CreateChannel {
                 channel_id: channel_id.clone(),
                 name,
                 post_policy: match members_only {
                     true => PostPolicy::MembersOnly,
                     false => PostPolicy::Open,
                 },
-            }),
-            password,
-        )
-        .await?;
+            },
+        };
+        signed_write(&rpc, "chat", chat::encode_msg(&op), password).await?;
+        // a voice room is entered, not read: the room on screen stays
+        if voice {
+            let mut data = load_chat_data(&rpc, None).await.map_err(committed_error)?;
+            data.generation = generation;
+            return Ok(data);
+        }
         let data = load_chat_data(&rpc, Some(&channel_id))
             .await
             .map_err(committed_error)?;

@@ -111,6 +111,7 @@ pub(crate) async fn load_chat_data(
             archived: info.channel.archived,
             members_only: info.channel.post_policy == PostPolicy::MembersOnly,
             huddle_count: count_i64(info.channel.huddle.len()),
+            voice: info.channel.voice,
             head_seq: number_i64(info.head_seq),
             huddle: huddle_seats(&info.channel.huddle, facts.reader()),
         })
@@ -201,6 +202,7 @@ pub(crate) async fn load_channel_facts(
             archived: info.channel.archived,
             members_only: info.channel.post_policy == PostPolicy::MembersOnly,
             huddle_count: count_i64(info.channel.huddle.len()),
+            voice: info.channel.voice,
             head_seq: number_i64(info.head_seq),
             huddle: huddle_seats(&info.channel.huddle, reader),
         },

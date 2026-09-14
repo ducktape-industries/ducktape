@@ -644,6 +644,7 @@ pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
         "show_huddle" => Intent::ShowHuddle,
         "leave_huddle" => Intent::LeaveHuddle,
         "join_huddle" => Intent::JoinHuddle,
+        "join_voice" => Intent::JoinVoice,
         "scrolled" => Intent::Scrolled,
         "open_link" => Intent::OpenLink,
         "copy" => Intent::Copy,
@@ -779,6 +780,7 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "show_huddle",
             "leave_huddle",
             "join_huddle",
+            "join_voice",
             "scrolled",
             "open_link",
             "copy",
@@ -3106,7 +3108,7 @@ pub(crate) mod tests {
         // the agents view signs its own pause and save through `op.submit`
         assert_eq!(intents_of("agents"), ["register", "open_run", "open_link"]);
         let chat = intents_of("chat");
-        assert_eq!(chat.len(), 14);
+        assert_eq!(chat.len(), 15);
         // the writes the view signs for itself are nobody's intent
         for signed in ["react", "edit", "delete", "rename", "search", "mark_read"] {
             assert!(!chat.contains(&signed), "{signed} is an op.submit now");

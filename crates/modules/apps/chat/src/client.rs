@@ -45,6 +45,8 @@ pub struct ChatChannel {
     /// Who is in the room's huddle, join order — what the room list shows
     /// under the room, the way a voice channel shows its people.
     pub huddle: Vec<HuddleSeat>,
+    /// A voice room: listed under its own heading, entered by joining.
+    pub voice: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
@@ -562,6 +564,19 @@ pub fn delta_from_op(
                 huddle_count: 0,
                 huddle: Vec::new(),
                 head_seq: 0,
+                voice: false,
+            },
+        },
+        ChatMsg::CreateVoiceChannel { channel_id, name } => ChatDelta::ChannelCreated {
+            channel: ChatChannel {
+                id: channel_id,
+                name,
+                archived: false,
+                members_only: false,
+                huddle_count: 0,
+                huddle: Vec::new(),
+                head_seq: 0,
+                voice: true,
             },
         },
         ChatMsg::CreateDmChannel {
@@ -580,6 +595,7 @@ pub fn delta_from_op(
                     huddle_count: 0,
                     head_seq: 0,
                     huddle: Vec::new(),
+                    voice: false,
                 },
             }
         }

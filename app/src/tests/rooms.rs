@@ -273,6 +273,7 @@ fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does
         archived: false,
         members_only: false,
         huddle_count: 0,
+        voice: false,
         huddle: Vec::new(),
         head_seq: head,
     };
@@ -746,6 +747,7 @@ fn another_members_dm_is_not_a_channel_of_mine() {
         archived: false,
         members_only: false,
         huddle_count: 0,
+        voice: false,
         huddle: Vec::new(),
         head_seq: 4,
     };
