@@ -562,10 +562,22 @@ opt-level = 3
 
 # The huddle's per-frame video codecs. Every captured frame pays an MJPEG
 # decode (mozjpeg's C, whose cc build inherits this profile's OPT_LEVEL) or a
-# YUYV conversion (nokhwa-core), a JPEG encode (jpeg-encoder), and every peer
-# frame a JPEG decode (zune-jpeg) — 25 times a second each. Unoptimized, the
-# encode alone runs 40-80 ms and eats the whole capture interval; that was
-# most of the "huddle video fps" report under `make dev`.
+# YUYV conversion (nokhwa-core), a JPEG encode, and every peer frame a JPEG
+# decode — 25 times a second each. Unoptimized, a VGA encode runs ~25 ms, a
+# decode ~44 ms and the channel swap ~24 ms, and the capture loop falls behind
+# the camera: the "huddle video latency" report under `make dev`.
+#
+# The pure-Rust codecs (jpeg-encoder, zune-jpeg) are GENERIC over their writer
+# and reader, so their entry points and everything inlined into them
+# instantiate in the crate that CALLS them — an override on the codec
+# packages alone left the app's O0 copy doing the work. That caller is
+# media-service (`video::codec`, non-generic entry points), optimized here so
+# the app crate stays at opt-level 0 and never touches a pixel loop; the codec
+# packages stay optimized too for the non-generic internals (IDCT, Huffman)
+# that are compiled in their own crate.
+[profile.dev.package.media-service]
+opt-level = 3
+
 [profile.dev.package.jpeg-encoder]
 opt-level = 3
 
