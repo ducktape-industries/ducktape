@@ -218,6 +218,47 @@ fn a_final_empty_line_is_a_block_and_survives_the_round_trip() {
 }
 
 #[test]
+fn a_merge_lands_each_readers_disjoint_edits_and_keeps_the_others_insertions_and_deletions() {
+    // Two readers open A / B; one rewrites A, the other commits B1.
+    let merged = merge_text("T\nA\nB", "T\nA1\nB", "T\nA\nB1");
+    assert_eq!(
+        merged,
+        Merge {
+            text: "T\nA1\nB1".into(),
+            conflicts: Vec::new()
+        }
+    );
+    // The other reader inserted a line and deleted another; ours survive.
+    let merged = merge_text("T\nA\nB\nC", "T\nA1\nB\nC", "T\nA\nX\nB");
+    assert_eq!(merged.text, "T\nA1\nX\nB");
+    assert!(merged.conflicts.is_empty());
+    // Our own deletion is a deletion, not a reason to rewrite their line.
+    assert_eq!(merge_text("T\nA\nB", "T\nB", "T\nA\nB1").text, "T\nB1");
+    // A reader who changed nothing gets the page as it stands.
+    assert_eq!(
+        merge_text("T\nA\nB", "T\nA\nB", "T2\nA\nB1\nC").text,
+        "T2\nA\nB1\nC"
+    );
+    // Both retitled it the same way: once.
+    assert_eq!(merge_text("T\nA", "T2\nA", "T2\nA").text, "T2\nA");
+}
+
+#[test]
+fn a_merge_keeps_the_readers_line_where_both_changed_it_and_names_it() {
+    let merged = merge_text("T\nA\nB", "T\nA1\nB", "T\nA2\nB");
+    assert_eq!(merged.text, "T\nA1\nB");
+    assert_eq!(merged.conflicts, vec!["A".to_string()]);
+    // Their deletion of a line we rewrote is the same disagreement.
+    let merged = merge_text("T\nA\nB", "T\nA1\nB", "T\nB");
+    assert_eq!(merged.text, "T\nA1\nB");
+    assert_eq!(merged.conflicts, vec!["A".to_string()]);
+    // Insertions at one spot keep both, the reader's first; theirs comes
+    // first only when it sits before a line the reader rewrote.
+    assert_eq!(merge_text("T\nA", "T\nX\nA", "T\nY\nA").text, "T\nX\nY\nA");
+    assert_eq!(merge_text("T\nA", "T\nA1", "T\nY\nA").text, "T\nY\nA1");
+}
+
+#[test]
 fn an_untouched_document_writes_nothing() {
     let have = vec![stored("a", "Text", "one"), stored("b", "Text", "two")];
     let want = vec![line("Text", "one"), line("Text", "two")];

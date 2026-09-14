@@ -4,7 +4,7 @@
 //! hit, and every act leaves as `op.submit` carrying the pages message.
 
 use ducktape_view_guest::testing::{
-    answer, find, has_text, item, measure, press, submit, texts, type_into,
+    answer, edit, find, has_text, item, measure, press, submit, texts, type_into,
 };
 use ducktape_view_guest::wire::{self, Event, Frame, Length, Node, Request};
 use pages_view::host::{
@@ -891,5 +891,102 @@ fn ask_ai_posts_the_comment_with_the_agent_mentioned() {
             "target": "alpha-1", "text": "tighten this?",
             "anchor": { "start": 4, "end": 9 }, "mentions": [7]
         })
+    );
+}
+
+/// Like `connected_with_register`, also handing back the autosave clock's
+/// subscription id, which the register's landing frame opened.
+fn connected_with_clock() -> (Frame, u64) {
+    let frame = boot();
+    let session_id = request(&frame, "pages.props").id;
+    let mut frame = tick_native(vec![item(session_id, &session(true))]);
+    let mut clock = None;
+    for _ in 0..16 {
+        if let Some(ticks) = frame.requests.iter().find(|one| one.kind == "clock.ticks") {
+            clock = Some(ticks.id);
+        }
+        let read = frame
+            .requests
+            .iter()
+            .find(|one| one.kind == "rpc.view" || one.kind == "rpc.query");
+        let Some(read) = read else {
+            return (frame, clock.expect("the open page arms the autosave clock"));
+        };
+        let reply = answered(read);
+        frame = tick_native(vec![answer(read.id, &reply)]);
+    }
+    panic!("the register never settled")
+}
+
+fn page_with(paragraphs: &[(&str, &str)]) -> Vec<u8> {
+    let children: Vec<&str> = paragraphs.iter().map(|(id, _)| *id).collect();
+    let mut blocks = vec![serde_json::json!({
+        "id": "alpha", "parent": null, "page": "alpha", "kind": "page",
+        "text": "Alpha", "checked": false, "children": children
+    })];
+    blocks.extend(paragraphs.iter().map(|(id, text)| {
+        serde_json::json!({
+            "id": id, "parent": "alpha", "page": "alpha", "kind": "paragraph",
+            "text": text, "checked": false, "children": []
+        })
+    }));
+    serde_json::json!({ "page": { "blocks": blocks, "next_after": null } })
+        .to_string()
+        .into_bytes()
+}
+
+/// THE SAVE WRITES ONLY WHAT THIS READER CHANGED. Someone else added a
+/// paragraph while this reader sharpened the first one: the save lands the
+/// sharpening alone, never a removal of the newcomer, and the buffer takes
+/// the newcomer in so the next tick does not read it as a deletion.
+#[test]
+fn a_save_lands_only_this_readers_edits_on_a_page_someone_else_moved() {
+    let (frame, clock) = connected_with_clock();
+    let before = "Alpha\nthe first paragraph";
+    let sharpened = "Alpha\nthe first paragraph, sharpened";
+    let _edited = tick_native(edit(&frame, "Write with Markdown…", before, sharpened));
+    let frame = tick_native(vec![item(clock, b"")]);
+    let moved = page_with(&[
+        ("alpha-1", "the first paragraph"),
+        ("alpha-2", "a second paragraph by someone else"),
+    ]);
+    // The save reads the page as it stands, then the block it rewrites.
+    let read = request(&frame, "rpc.view");
+    let frame = tick_native(vec![answer(read.id, &moved)]);
+    let read = request(&frame, "rpc.view");
+    let frame = tick_native(vec![answer(read.id, &moved)]);
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op,
+        serde_json::json!({ "target": "pages", "payload": { "update_text": {
+            "block_id": "alpha-1", "text": "the first paragraph, sharpened"
+        } } })
+    );
+    let frame = tick_native(vec![answer(submit.id, b"7")]);
+    assert!(
+        frame.requests.iter().all(|one| one.kind != "op.submit"),
+        "the other reader's paragraph is not written off: {:?}",
+        frame.requests
+    );
+    let landed = page_with(&[
+        ("alpha-1", "the first paragraph, sharpened"),
+        ("alpha-2", "a second paragraph by someone else"),
+    ]);
+    let read = request(&frame, "rpc.view");
+    let frame = tick_native(vec![answer(read.id, &landed)]);
+    let (document, _) = editor_of(&frame);
+    let rebased = "Alpha\nthe first paragraph, sharpened\na second paragraph by someone else";
+    assert_eq!(
+        document.byte_len as usize,
+        rebased.len(),
+        "the buffer took the newcomer in"
+    );
+    // Settled: the next tick has nothing to save.
+    let frame = tick_native(vec![item(clock, b"")]);
+    assert!(
+        frame.requests.iter().all(|one| one.kind != "rpc.view"),
+        "a rebased buffer is clean: {:?}",
+        frame.requests
     );
 }

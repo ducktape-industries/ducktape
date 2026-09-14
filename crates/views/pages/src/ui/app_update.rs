@@ -257,6 +257,10 @@ impl PagesView {
         );
         self.autosave = "saved".to_owned();
         self.register_serial += crate::host::keep_i64(item.written, 1, 0);
+        if item.merged {
+            self.page_refusal = crate::host::merge_notice(&(item.conflicts));
+            self.rebase_document(&(item.document));
+        }
         if (item.refusal).is_empty() {
             return Task::none();
         }
@@ -274,6 +278,25 @@ impl PagesView {
         };
         self.refresh_document_presentation();
         Task::none()
+    }
+    /// A save that merged someone else's edits leaves the buffer behind the
+    /// page: the next tick would read their lines as this reader's deletions
+    /// and write them off. So the buffer takes the same merge, keystrokes
+    /// typed during the round trip included, and the caret stays put.
+    fn rebase_document(&mut self, landed: &str) {
+        let now = crate::host::document_text(&(self.document));
+        let rebased = crate::host::rebased_buffer(&(self.page_inflight_text), &(now), landed);
+        if rebased == now {
+            return;
+        }
+        let cursor = self.document.cursor();
+        {
+            let reset = self.document.reset_revision();
+            let next = crate::host::document_editor(&(rebased));
+            self.document.replace(next, reset);
+        };
+        self.document.move_to(cursor);
+        self.refresh_document_presentation();
     }
     fn on_page_autosave_tick(&mut self) -> Task<Message> {
         if !(self.host_error).is_empty() {
@@ -581,7 +604,13 @@ impl PagesView {
         // composer post is on the whole scope again.
         let anchor = self.comment_anchor_range.take();
         let mention = std::mem::take(&mut self.comment_mention);
-        crate::host::post(&(self.pending_comment), &(fresh_target), "", anchor, mention);
+        crate::host::post(
+            &(self.pending_comment),
+            &(fresh_target),
+            "",
+            anchor,
+            mention,
+        );
         Task::none()
     }
     /// ONE COMMENT IS REWRITTEN AT A TIME: opening another box drops the last

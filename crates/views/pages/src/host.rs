@@ -885,6 +885,13 @@ pub struct SaveItem {
     pub refusal: String,
     /// The page's canonical text after the save.
     pub document: String,
+    /// Whether the page had moved under this reader since their baseline,
+    /// so the save landed their changes on the moved page instead of the
+    /// one they last saw. The buffer then owes itself the same merge.
+    pub merged: bool,
+    /// The lines both this reader and someone else changed: the reader's
+    /// spelling won, and the screen says so.
+    pub conflicts: Vec<String>,
     pub error: String,
 }
 
@@ -1180,12 +1187,29 @@ async fn save_document(page_id: String, text: String, saved: String) -> Result<S
         .map(|head| head.text.clone())
         .unwrap_or_default();
     let blocks = page_blocks(&current, &page_id);
-    let plan = document_plan(&stored_lines(&blocks), &document_body(&text));
+    // THE PLAN WRITES ONLY WHAT THIS READER CHANGED. The buffer is diffed
+    // against the page as the node holds it NOW, and that page may carry
+    // someone else's edit since this reader's baseline: planning the whole
+    // buffer against it would write the baseline's old words back over that
+    // edit. So the reader's own changes (baseline → buffer) are landed on
+    // the node's page first, and it is the merged document that is planned.
+    let node_text = page_document_text(&node_title, &blocks);
+    let page_moved_under_us = !saved.is_empty() && node_text != saved;
+    let merge = match page_moved_under_us {
+        true => document_sync::merge_text(&saved, &text, &node_text),
+        false => document_sync::Merge {
+            text: text.clone(),
+            conflicts: Vec::new(),
+        },
+    };
+    let plan = document_plan(&stored_lines(&blocks), &document_body(&merge.text));
     if !plan.refusal.is_empty() {
         return Ok(SaveItem {
             written: false,
             refusal: plan.refusal,
-            document: page_document_text(&node_title, &blocks),
+            document: node_text,
+            merged: page_moved_under_us,
+            conflicts: merge.conflicts,
             error: String::new(),
         });
     }
@@ -1207,7 +1231,9 @@ async fn save_document(page_id: String, text: String, saved: String) -> Result<S
         return Ok(SaveItem {
             written,
             refusal: String::new(),
-            document: page_document_text(&node_title, &blocks),
+            document: node_text,
+            merged: page_moved_under_us,
+            conflicts: merge.conflicts,
             error: String::new(),
         });
     }
@@ -1220,8 +1246,35 @@ async fn save_document(page_id: String, text: String, saved: String) -> Result<S
         written,
         refusal: String::new(),
         document: page_document_text(&landed_title, &page_blocks(&landed, &page_id)),
+        merged: page_moved_under_us,
+        conflicts: merge.conflicts,
         error: String::new(),
     })
+}
+
+/// The buffer after a save that merged: the keystrokes typed during the
+/// round trip (`inflight` → `now`) landed on the page the save left behind.
+pub fn rebased_buffer(inflight: &str, now: &str, landed: &str) -> String {
+    document_sync::merge_text(inflight, now, landed).text
+}
+
+/// What the screen says about the lines a merge could not keep both of.
+pub fn merge_notice(conflicts: &[String]) -> String {
+    let Some(first) = conflicts.first() else {
+        return String::new();
+    };
+    let summary = first.trim();
+    let named = match summary.is_empty() {
+        true => "a line".to_owned(),
+        false => format!("“{summary}”"),
+    };
+    match conflicts.len() {
+        1 => format!("Someone else also changed {named} — your version was kept"),
+        more => format!(
+            "Someone else also changed {named} and {} more — your versions were kept",
+            more - 1
+        ),
+    }
 }
 
 /// Whether this save owes the node a title write.
