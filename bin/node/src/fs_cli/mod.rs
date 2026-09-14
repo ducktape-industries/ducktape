@@ -232,10 +232,12 @@ pub(crate) struct UnpinArgs {
 /// drop the engine's events on the floor — and the one that matters most (the
 /// walk skipping a fifo it must never open) would be invisible exactly where a
 /// user is watching. one stderr sink at `warn`, `RUST_LOG` overrides it, and
-/// stdout stays the program output `cat`/`ls` write.
-fn install_log_sink() {
+/// stdout stays the program output `cat`/`ls` write. `ducktape release
+/// sign-bundle` installs the same sink at `info`: its lifecycle events are
+/// what an operator watches during a minutes-long notarization.
+pub(crate) fn install_log_sink(default_filter: &str) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -247,7 +249,7 @@ fn install_log_sink() {
 /// EMPTY error message prints nothing — a dirty `status` and a commit conflict
 /// each wrote their own output and only carry the exit code here.
 pub(crate) fn run(cmd: FsCmd) -> u8 {
-    install_log_sink();
+    install_log_sink("warn");
     let outcome = match cmd {
         FsCmd::Ls(a) => read_cmds::ls(a),
         FsCmd::Cat(a) => read_cmds::cat(a),

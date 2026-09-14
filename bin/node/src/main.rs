@@ -301,7 +301,7 @@ enum Family {
     /// live code swaps: update, register, status
     #[command(subcommand)]
     Module(module_cli::ModuleCmd),
-    /// the desktop app's release manifest: sign, verify
+    /// the desktop app's release: manifest sign/verify, bundle signing through the airlock gateway
     #[command(subcommand)]
     Release(release_cli::ReleaseCmd),
     /// the stdio MCP server an agent runner spawns

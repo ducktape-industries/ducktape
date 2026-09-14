@@ -166,17 +166,45 @@ app-release:
 	  { echo "app-release requires DUCKTAPE_CODESIGN_IDENTITY (Developer ID Application)" >&2; exit 1; }
 	@$(MAKE) app
 
-## the archive a release offers: `app-release` (Developer ID + notarized —
-## every offered release is; the three DUCKTAPE_NOTARY_* are required here,
-## not optional as for `app`), the ticket stapled to the bundle, then
-## ops/release/archive.sh packs Ducktape.app into
-## target/release-archive/Ducktape-<sha7>-macos-<arch>.tar.zst and refuses
-## an ad-hoc or unnotarized bundle by name. Publish it with `make publish-app`.
+## the archive a release offers: a Developer ID-signed, notarized bundle
+## (every offered release is), the ticket stapled to it, packed by
+## ops/release/archive.sh into
+## target/release-archive/Ducktape-<sha7>-macos-<arch>.tar.zst — the script
+## refuses an ad-hoc or unnotarized bundle by name, so it is the host-side
+## verifier on both paths below. Publish it with `make publish-app`.
+##
+## ONE signing path per environment, chosen by DUCKTAPE_SIGN_VIA:
+##   unset    the local Developer ID: `app-release` with the three
+##            DUCKTAPE_NOTARY_* required (not optional as for `app`).
+##   airlock  the airlock gateway signs: `app` stages Ducktape.app UNSIGNED,
+##            `ducktape release sign-bundle` sends it to the enclave holding
+##            the apple-codesign credential DUCKTAPE_SIGN_CREDENTIAL through
+##            NODE (the local node's http base) and unpacks the signed,
+##            notarized, stapled bundle back in place. Set together with
+##            DUCKTAPE_CODESIGN_IDENTITY or any DUCKTAPE_NOTARY_* it refuses
+##            (`sign_path_conflict`): there is no fallback from one to the other.
+##     DUCKTAPE_SIGN_VIA=airlock DUCKTAPE_SIGN_CREDENTIAL=release-sign NODE=http://127.0.0.1:8844 make release-app
+ifeq ($(DUCKTAPE_SIGN_VIA),airlock)
+release-app:
+	@test -z "$$DUCKTAPE_CODESIGN_IDENTITY" -a -z "$$DUCKTAPE_NOTARY_KEY" -a -z "$$DUCKTAPE_NOTARY_KEY_ID" -a -z "$$DUCKTAPE_NOTARY_ISSUER" || \
+	  { echo "release-app: sign_path_conflict: DUCKTAPE_SIGN_VIA=airlock with DUCKTAPE_CODESIGN_IDENTITY or DUCKTAPE_NOTARY_* set; one signing path per environment" >&2; exit 2; }
+	@test -n "$(DUCKTAPE_SIGN_CREDENTIAL)" -a -n "$(NODE)" || \
+	  { echo "release-app: DUCKTAPE_SIGN_VIA=airlock needs DUCKTAPE_SIGN_CREDENTIAL=<apple-codesign credential name> and NODE=<the local node's http base>" >&2; exit 2; }
+	@DUCKTAPE_SIGN_VIA=airlock $(MAKE) app
+	"$${DUCKTAPE_BIN:-$(CARGO_BIN)/ducktape}" release sign-bundle target/app-bundle/Ducktape.app \
+	  --credential "$(DUCKTAPE_SIGN_CREDENTIAL)" --node "$(NODE)" \
+	  --out target/app-bundle/Ducktape-signed.tar.zst --unpack-into target/app-bundle
+	bash ops/release/archive.sh --from target/app-bundle/Ducktape.app --out-dir "$(RELEASE_ARCHIVE_DIR)"
+else ifeq ($(DUCKTAPE_SIGN_VIA),)
 release-app:
 	@test -n "$$DUCKTAPE_NOTARY_KEY" -a -n "$$DUCKTAPE_NOTARY_KEY_ID" -a -n "$$DUCKTAPE_NOTARY_ISSUER" || \
 	  { echo "release-app requires DUCKTAPE_NOTARY_KEY, DUCKTAPE_NOTARY_KEY_ID and DUCKTAPE_NOTARY_ISSUER: a release is notarized" >&2; exit 1; }
 	@$(MAKE) app-release
 	bash ops/release/archive.sh --from target/app-bundle/Ducktape.app --out-dir "$(RELEASE_ARCHIVE_DIR)"
+else
+release-app:
+	@echo "release-app: DUCKTAPE_SIGN_VIA=$(DUCKTAPE_SIGN_VIA) is not a signing path (unset = local Developer ID, airlock = the airlock gateway)" >&2; exit 2
+endif
 
 ## install the operator CLI and desktop app without requiring root
 install: install-node install-app

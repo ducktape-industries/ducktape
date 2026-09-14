@@ -165,6 +165,9 @@ tokio-tungstenite = "0.24"
 sha2 = { workspace = true }
 # Validate standalone executor archives before extracting their runtime assets.
 tar = "0.4"
+# `release sign-bundle` unpacks the bundle it sends and the one it receives
+# into a scratch dir that goes away on every exit path.
+tempfile = "3"
 flate2 = "1"
 toml = "0.8"
 # identity keygen entropy (`Signer::random`).
