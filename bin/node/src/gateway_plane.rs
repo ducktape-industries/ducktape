@@ -33,6 +33,11 @@ const PROXY_IO_TIMEOUT: Duration = Duration::from_secs(15);
 /// emits events/keepalives well inside this; a silent-forever upstream would
 /// otherwise pin its accept permit (16 total) and its serve task for good.
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+// The airlock signing route answers its head at once and then goes quiet for
+// as long as Apple's notary takes, sealing a keepalive into its stream every
+// `KEEPALIVE_INTERVAL` so this per-read ceiling sees progress; a keepalive
+// slower than the ceiling would cut every real signing mid-wait.
+const _: () = assert!(airlock::sign::KEEPALIVE_INTERVAL.as_secs() < BODY_IDLE_TIMEOUT.as_secs());
 /// Two-way silence that ends a bridged WebSocket. Nothing else bounds one: a
 /// socket lives until a peer closes it, and an idle bridge otherwise parks its
 /// upgrade permit and both pump tasks for good.

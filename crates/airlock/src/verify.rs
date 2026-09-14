@@ -15,6 +15,12 @@ use sev::parser::Decoder;
 
 use crate::attest::{AttestMode, Measurement, REPORT_DATA_LEN};
 
+/// The ARK+ASK pair a VCEK chains to, for a caller that supplies roots out of
+/// band (`SnpRoots { ca, .. }`) instead of taking [`SnpRoots::amd`]'s
+/// builtins: `CaChain::from_pem(ark, ask)`. Re-exported so no caller links
+/// the `sev` crate for the one type.
+pub use sev::certs::snp::ca::Chain as CaChain;
+
 /// AMD EPYC generation whose pinned root keys the verifier trusts. Pinned by
 /// the operator beside the measurement — a measurement only means something on
 /// the platform generation it was audited for.

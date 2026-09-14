@@ -28,10 +28,15 @@ pub const MAX_SIGNATURE_BYTES: usize = 2048;
 pub const MAX_ROUTE_LABEL_BYTES: usize = 63;
 pub const MAX_ROUTES_PER_ACCOUNT: usize = 64;
 pub const MAX_AUDIENCE_ACCOUNTS: usize = 32;
-/// Request-body admission ceiling. 16 MiB: a `claude` turn carries multi-MB
-/// conversation context through airlock's LoopbackHttp lane; per-route signed
-/// policies may pin far lower. Requests stay buffered (one JSON blob).
-pub const MAX_REQUEST_BODY_BYTES: u64 = 16 * 1024 * 1024;
+/// Request-body admission ceiling: the most a signed route policy may pin
+/// as its `max_request_bytes`, and the most a proxy head may declare. 256
+/// MiB is a release bundle — the `.tar.zst` of an app the airlock enclave
+/// signs (`airlock::sign::MAX_BUNDLE_BYTES`, the same number). It is a
+/// ceiling, not a default: every route pins what its own lane carries (a
+/// model lane pins 16 MiB for a `claude` turn's multi-MB context), and each
+/// hop reads a request body under the resolved route's pin, never under
+/// this. Requests stay buffered at every hop.
+pub const MAX_REQUEST_BODY_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_RESPONSE_BODY_BYTES: u64 = 4 * 1024 * 1024;
 /// A statement now carries only scalars plus (at most) a 32-byte manifest hash,
 /// so it is tiny; the manifest and file table live off consensus.

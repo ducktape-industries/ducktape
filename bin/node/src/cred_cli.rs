@@ -335,7 +335,7 @@ pub(crate) fn run(args: CredArgs, stdin: &mut impl BufRead) -> CredResult {
             gateway,
             attest,
             seal,
-        } => crate::cred_seal::cmd_seal(gateway, attest, seal, || ctx.http_base(), stdin),
+        } => crate::cred_seal::cmd_seal(&ctx, gateway, attest, seal, stdin),
     }
 }
 
@@ -732,30 +732,21 @@ fn register_credential(enrolment: &Enrolment, kind: gateway::CredentialKind) -> 
     // the seal PUBLIC key the node co-hosts under (minted on first add, then
     // stable) is what the record pins for the compute broker.
     let seal = airlock_service::load_or_create_seal_keypair(store)?;
-    let record = gateway::CredentialRecord {
-        name: name.clone(),
-        owner_account: account.number,
-        publisher_node: resolved.signer.public_key().as_ref().to_vec(),
+    let publisher = Publisher::of_workspace(resolved);
+    submit_credential_record(
+        base,
+        user,
+        &publisher,
+        account.number,
+        name,
         kind,
-        seal_pk: seal.public_bytes(),
-        grants: std::collections::BTreeSet::new(),
-    };
-    let statement = gateway::SetCredentialStatement {
-        chain_id: resolved.service.chain_id.clone(),
-        record,
-    };
-    let preimage = gateway::set_credential_preimage(&statement)?;
-    let message = gateway::GatewayMsg::SetCredential {
-        statement,
-        authorization: authorize(user, &preimage),
-    };
-    let height = submit_gateway(base, user, &message)?;
-    println!("registered {name} at height {height}");
+        seal.public_bytes(),
+    )?;
     // A lent credential is only reachable once the co-hosted airlock gateway has
     // a signed on-chain route. That route is per-ACCOUNT (one `airlock` route
     // serves every credential this account co-hosts), so publish it once and
     // skip on later `cred add`s — the operator never hand-signs a RouteStatement.
-    ensure_airlock_route(base, user, resolved, account.number)?;
+    ensure_airlock_route(base, user, &publisher, account.number, AirlockLane::Model)?;
     // The record and the route are committed, but neither LENDS anything: the
     // credential is only reachable while the daemon that serves the store runs,
     // and nothing else in this flow — nor `cred list`, nor `gateway list` —
@@ -767,20 +758,121 @@ fn register_credential(enrolment: &Enrolment, kind: gateway::CredentialKind) -> 
     Ok(())
 }
 
-/// Publish the account's `airlock` gateway route if it is not already published
-/// — the one signed statement that makes this account's lender daemon reachable
-/// over the overlay. Idempotent: a route already present is left untouched.
-///
-/// The label is [`crate::airlock::AIRLOCK_ROUTE`], the same constant the daemon
-/// registers its loopback port under: one definition, so the publisher and the
-/// registrar cannot drift apart.
-fn ensure_airlock_route(
+/// One lane of the account's airlock gateway as a published route: its label
+/// and what the overlay admits per request on it. Two exist — the model
+/// lane every credential kind is lent over, and the signing lane a TEE-held
+/// `apple-codesign` identity is reached over — both dialing the same enclave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AirlockLane {
+    Model,
+    Sign,
+}
+
+impl AirlockLane {
+    /// The route label, the constant the daemon/operator binds the loopback
+    /// port under: one definition, so the publisher and the registrar cannot
+    /// drift apart.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Model => crate::airlock::AIRLOCK_ROUTE,
+            Self::Sign => crate::airlock::AIRLOCK_SIGN_ROUTE,
+        }
+    }
+
+    /// The signed per-request cap: a model turn, or a release bundle.
+    fn max_request_bytes(self) -> u64 {
+        match self {
+            Self::Model => crate::airlock::AIRLOCK_MODEL_REQUEST_BYTES,
+            Self::Sign => crate::airlock::AIRLOCK_SIGN_REQUEST_BYTES,
+        }
+    }
+}
+
+/// The node a credential record and an airlock route name as their
+/// publisher — the one whose loopback map carries the gateway's port — and
+/// the chain the statements are minted for.
+pub(crate) struct Publisher {
+    pub(crate) chain_id: String,
+    pub(crate) node: Vec<u8>,
+}
+
+impl Publisher {
+    /// The co-hosted workspace's own node: what `cred add` publishes under,
+    /// since the store it wrote lives beside that node.
+    pub(crate) fn of_workspace(resolved: &config::Resolved) -> Self {
+        Self {
+            chain_id: resolved.service.chain_id.clone(),
+            node: resolved.signer.public_key().as_ref().to_vec(),
+        }
+    }
+
+    /// The node this verb dials, as `/v1/status` reports it: what `cred
+    /// seal` publishes under, which holds no store and needs no workspace —
+    /// the operator binds the enclave's port on that node.
+    pub(crate) fn of_node(base: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let status = crate::node_http::get_json(base, "/v1/status")
+            .map_err(|error| format!("read the node's status: {error}"))?;
+        let chain_id = status["chain_id"]
+            .as_str()
+            .filter(|chain| !chain.is_empty())
+            .ok_or("the node serves no chain, so it can publish nothing")?
+            .to_string();
+        let node = status["public_key"]
+            .as_str()
+            .and_then(|key| hex::decode(key).ok())
+            .ok_or("the node reports no mesh identity, so it can serve no route")?;
+        Ok(Self { chain_id, node })
+    }
+}
+
+/// Submit the owner-signed on-chain record of one credential: its name, its
+/// kind, the node that serves the gateway holding it, and the seal PUBLIC key
+/// a borrower pins — the node's own store key for a self-hosted lender, the
+/// attested enclave key for a TEE-held credential. Grants come later, through
+/// `cred grant`. Returns nothing but prints the committed height.
+pub(crate) fn submit_credential_record(
     base: &str,
     user: &commonware_cryptography::ed25519::PrivateKey,
-    resolved: &config::Resolved,
-    account_id: u64,
+    publisher: &Publisher,
+    owner_account: u64,
+    name: &str,
+    kind: gateway::CredentialKind,
+    seal_pk: [u8; 32],
 ) -> CredResult {
-    let name = gateway::RouteName::named(crate::airlock::AIRLOCK_ROUTE);
+    let record = gateway::CredentialRecord {
+        name: name.to_string(),
+        owner_account,
+        publisher_node: publisher.node.clone(),
+        kind,
+        seal_pk,
+        grants: std::collections::BTreeSet::new(),
+    };
+    let statement = gateway::SetCredentialStatement {
+        chain_id: publisher.chain_id.clone(),
+        record,
+    };
+    let preimage = gateway::set_credential_preimage(&statement)?;
+    let message = gateway::GatewayMsg::SetCredential {
+        statement,
+        authorization: authorize(user, &preimage),
+    };
+    let height = submit_gateway(base, user, &message)?;
+    println!("registered {name} at height {height}");
+    Ok(())
+}
+
+/// Publish one lane of the account's airlock gateway route if it is not
+/// already published — the one signed statement that makes this account's
+/// enclave reachable over the overlay under that label. Idempotent: a route
+/// already present is left untouched.
+pub(crate) fn ensure_airlock_route(
+    base: &str,
+    user: &commonware_cryptography::ed25519::PrivateKey,
+    publisher: &Publisher,
+    account_id: u64,
+    lane: AirlockLane,
+) -> CredResult {
+    let name = gateway::RouteName::named(lane.label());
     let existing = query_gateway(
         base,
         &gateway::GatewayQuery::Get {
@@ -793,21 +885,22 @@ fn ensure_airlock_route(
     if already_published {
         return Ok(());
     }
-    // The airlock upstream is a streaming (SSE) loopback: unbounded response
-    // (`max_response_bytes = 0`), GET+POST, and it forwards the scoped session
-    // bearer (`allow_authorization`). Request cap is the module ceiling.
+    // The airlock upstream is a streaming loopback: unbounded response
+    // (`max_response_bytes = 0` — a model reply is SSE, a signed bundle is a
+    // sealed chunk stream), GET+POST, and it forwards the scoped session
+    // bearer (`allow_authorization`). The request cap is the lane's own.
     let statement = gateway::RouteStatement {
-        chain_id: resolved.service.chain_id.clone(),
+        chain_id: publisher.chain_id.clone(),
         account_id,
         name,
-        publisher_node: resolved.signer.public_key().as_ref().to_vec(),
+        publisher_node: publisher.node.clone(),
         revision: 1,
         route: Some(gateway::RouteDefinition {
             target: gateway::RouteTarget::LoopbackHttp,
             policy: gateway::RoutePolicy {
                 audience: gateway::RouteAudience::Network,
                 methods: vec![gateway::RouteMethod::Get, gateway::RouteMethod::Post],
-                max_request_bytes: gateway::MAX_REQUEST_BODY_BYTES,
+                max_request_bytes: lane.max_request_bytes(),
                 max_response_bytes: 0,
                 allow_authorization: true,
                 allow_upgrade: false,
@@ -826,7 +919,7 @@ fn ensure_airlock_route(
         },
     };
     let height = submit_gateway(base, user, &message)?;
-    println!("published airlock route at height {height}");
+    println!("published {} route at height {height}", lane.label());
     Ok(())
 }
 
@@ -1068,7 +1161,7 @@ fn query_owner_account(base: &str, member_key: &[u8]) -> Result<u64, Box<dyn std
     Ok(query_owner_account_view(base, member_key)?.number)
 }
 
-fn query_owner_account_view(
+pub(crate) fn query_owner_account_view(
     base: &str,
     member_key: &[u8],
 ) -> Result<identity::AccountView, Box<dyn std::error::Error>> {

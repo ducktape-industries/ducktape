@@ -96,9 +96,10 @@ fn management_replies_keep_the_small_external_json_shape() {
 }
 
 #[test]
-fn request_cap_admission_stops_exactly_at_the_16_mib_ceiling() {
-    // A claude turn's context is multi-MB; per-route policies may pin lower,
-    // but the ceiling itself is 16 MiB — one byte over is refused at ingest.
+fn request_cap_admission_stops_exactly_at_the_256_mib_ceiling() {
+    // A release bundle is the largest body any route carries; per-route
+    // policies pin lower (a model lane pins 16 MiB), but the ceiling itself
+    // is 256 MiB — one byte over is refused at ingest.
     let policy = |max_request_bytes| RoutePolicy {
         audience: RouteAudience::Network,
         methods: vec![RouteMethod::Get, RouteMethod::Head, RouteMethod::Post],
@@ -107,7 +108,7 @@ fn request_cap_admission_stops_exactly_at_the_16_mib_ceiling() {
         allow_authorization: false,
         allow_upgrade: false,
     };
-    assert_eq!(MAX_REQUEST_BODY_BYTES, 16 * 1024 * 1024);
+    assert_eq!(MAX_REQUEST_BODY_BYTES, 256 * 1024 * 1024);
     assert!(validate_policy(&policy(MAX_REQUEST_BODY_BYTES)).is_ok());
     assert!(validate_policy(&policy(MAX_REQUEST_BODY_BYTES + 1)).is_err());
 }

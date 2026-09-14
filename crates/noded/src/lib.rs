@@ -73,7 +73,8 @@ pub mod gateway_ws_token;
 pub mod origin_guard;
 pub use gateway_http::{
     GatewayBody, GatewayFailure, GatewayJob, GatewayLane, GatewayProxyReply, GatewayProxyRequest,
-    GatewayResponse, GatewayWsMsg, collect_body, gateway_browser_router, serve_browser_gateway,
+    GatewayResponse, GatewayWsMsg, PROXY_REPLY_TIMEOUT, collect_body, gateway_browser_router,
+    serve_browser_gateway,
 };
 // git smart-HTTP: forge as a full push+fetch remote over /forge/{repo}/….
 mod git_http;
@@ -748,7 +749,7 @@ pub fn router(handle: NodeHandle) -> Router {
         .route(
             "/v1/gateway/proxy",
             post(gateway_proxy).layer(DefaultBodyLimit::max(
-                gateway::MAX_REQUEST_BODY_BYTES as usize * 2 + gateway::MAX_PROXY_HEAD_BYTES,
+                gateway_http::JSON_LANE_REQUEST_BYTES * 2 + gateway::MAX_PROXY_HEAD_BYTES,
             )),
         )
         .route("/v1/gateway/browser", get(gateway_browser_base))

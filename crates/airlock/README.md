@@ -129,6 +129,18 @@ ducktape gateway bind --workspace <node-workspace> --label airlock --port 9100
 # node RPC (cmd:submit, target:"gateway"). Also SetHandle <handle> on duckdns.
 ```
 
+A model credential sealed this way is reached by measurement (the compute
+node pins `DUCKTAPE_AIRLOCK_MEASUREMENT`, below), so `cred seal` registers no
+record for it. An `apple-codesign` identity is reached by NAME (`ducktape
+release sign-bundle --credential <name>`), so `cred seal --vendor
+apple-codesign` also writes the on-chain half: the credential record under the
+attested seal key and the account's two airlock routes, both naming the node
+the verb dials as their publisher (its identity and chain read off
+`/v1/status`) — see "Release signing" below. The quote's roots are AMD's
+pinned in the binary; `--snp-ark <pem> --snp-ask <pem>` (with `--snp-vcek`)
+supply a chain out of band for an enclave that is not on AMD silicon, which
+weakens only the operator who passes it.
+
 `cred inspect`/`cred seal` reach a REMOTE enclave with `--remote <handle>.duck`
 instead of `--host`; the `via` is read from this node's own browser gateway, so
 the operator never pastes it. Attestation stays strictly bilateral either way —
@@ -157,8 +169,11 @@ so a relaying node cannot substitute its key or read the session token. The
 overlay proxy **streams** responses end to end: publish the route with
 `max_response_bytes: 0` (an unbounded stream, literally) for live SSE; a
 non-zero cap is enforced as a RUNNING total (declared over-length refused
-before the head; unsized overflow truncates the body mid-stream). The
-request-body admission ceiling is 16 MiB.
+before the head; unsized overflow truncates the body mid-stream). A request
+body is read at every hop under the route's own signed `max_request_bytes`:
+the `airlock` route pins 16 MiB (a model turn), the `airlock-sign` route 256
+MiB (a release bundle, `gateway::MAX_REQUEST_BODY_BYTES`, the most any policy
+may pin).
 
 ## Body AEAD (sealed sessions)
 
@@ -232,7 +247,20 @@ UNSIGNED `Ducktape.app` as the sealed body (`bodyseal::seal_request` under
 `POST\n/sign/macos-bundle`; cap `sign::MAX_BUNDLE_BYTES`, 256 MiB). The
 reply is the `.tar.zst` of the signed + notarized + stapled bundle as a sealed
 chunk stream (head content type `application/zstd`), and one request spends
-one of the session's `max_requests`. Inside, the pipeline is one state machine
+one of the session's `max_requests`. The head is committed BEFORE the
+pipeline runs — every hop between the enclave and the caller (the node's
+gateway proxy, its overlay drain) waits seconds for a response head, and
+Apple's notary takes minutes — and the outcome rides the stream: an empty
+sealed data chunk every `sign::KEEPALIVE_INTERVAL` while the pipeline runs
+(liveness for each hop's idle deadline; the node plane asserts the interval
+sits under its `BODY_IDLE_TIMEOUT`), then the archive and `Final`, or a
+refusal as the `Final` marker carrying its token
+(`bodyseal::StreamSealer::seal_refused`, opened as `OpenedItem::Refused`).
+Over the overlay the route is `airlock-sign.<handle>.duck`: the same
+enclave the model lane reaches under `airlock.<handle>.duck`, under its own
+label because its signed policy admits a bundle (256 MiB) where the model
+lane's admits a turn (16 MiB); the node fronting the enclave binds both labels
+to the same port. Inside, the pipeline is one state machine
 (`Received → Validated → Signed → Notarized → Stapled`): the bundle's shape is
 checked before the identity is touched (one top-level `Ducktape.app/`, no
 escaping path or symlink, `CFBundleIdentifier` `dev.ducktape.app`,
@@ -242,11 +270,13 @@ the p12, its password and the App Store Connect key are written 0600 into a
 --code-signature-flags runtime --entitlements-xml-file …` (the launcher and
 the nested `ducktape-app` both, as `ops/bundle-app-macos.sh` does),
 `rcodesign notary-submit --wait` and `rcodesign staple`, and the directory is
-removed on every exit path. Refusals are tokens in the body:
-`credential_kind_mismatch` (403, a model credential), `bundle_shape_refused`
-(400), `bundle_too_large` (413), `codesign_failed` (500), `notary_rejected`
-and `staple_failed` (502), `tool_missing` (503, the image lacks `rcodesign` or
-the entitlements). Audit under `target: "ducktape::airlock"`:
+removed on every exit path. Refusals are tokens: before the pipeline starts
+they are the HTTP status and body — `credential_kind_mismatch` (403, a model
+credential), `bundle_too_large` (413), a plaintext session (400); once it
+runs the head is out and the token is the stream's `Final` —
+`bundle_shape_refused`, `codesign_failed`, `notary_rejected`,
+`staple_failed`, `tool_missing` (the image lacks `rcodesign` or the
+entitlements). Audit under `target: "ducktape::airlock"`:
 `release_sign_requested`, `release_sign_signed`, `release_sign_notarized`,
 `release_sign_refused` — session, credential name, bundle SHA-256s, reason,
 submission id; never key material. The toolchain is part of the image, not

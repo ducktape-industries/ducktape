@@ -864,6 +864,11 @@ fn open_sealed_buffer(
             OpenedItem::Head(ct) => inner_ct = Some(ct),
             OpenedItem::Data(data) => out.extend_from_slice(&data),
             OpenedItem::Final => {}
+            // a model reply is never withdrawn after its head; the signing
+            // lane's refusal shape is a wrong answer here.
+            OpenedItem::Refused(reason) => {
+                return Err(format!("sealed response refused mid-stream: {reason}"));
+            }
         }
     }
     Ok((inner_ct, out))
@@ -2353,6 +2358,12 @@ async fn relay_sealed(
                         OpenedItem::Head(ct) => inner_ct = Some(ct),
                         OpenedItem::Data(data) => pending.push(Bytes::from(data)),
                         OpenedItem::Final => {}
+                        OpenedItem::Refused(reason) => {
+                            return response(
+                                StatusCode::BAD_GATEWAY,
+                                &format!("airlock: sealed response refused mid-stream: {reason}"),
+                            );
+                        }
                     }
                 }
             }
@@ -2392,20 +2403,30 @@ async fn relay_sealed(
                         }
                     };
                     for item in items {
-                        if let OpenedItem::Data(data) = item {
-                            seen = seen.saturating_add(data.len());
-                            if seen > MAX_RESPONSE_BYTES {
+                        let data = match item {
+                            OpenedItem::Data(data) => data,
+                            OpenedItem::Head(_) | OpenedItem::Final => continue,
+                            OpenedItem::Refused(reason) => {
                                 let _ = tx
-                                    .send(Err(std::io::Error::other(
-                                        "run broker response byte budget exhausted",
-                                    )))
+                                    .send(Err(std::io::Error::other(format!(
+                                        "airlock: sealed response refused mid-stream: {reason}"
+                                    ))))
                                     .await;
                                 return;
                             }
-                            state.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
-                            if tx.send(Ok(Bytes::from(data))).await.is_err() {
-                                return;
-                            }
+                        };
+                        seen = seen.saturating_add(data.len());
+                        if seen > MAX_RESPONSE_BYTES {
+                            let _ = tx
+                                .send(Err(std::io::Error::other(
+                                    "run broker response byte budget exhausted",
+                                )))
+                                .await;
+                            return;
+                        }
+                        state.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        if tx.send(Ok(Bytes::from(data))).await.is_err() {
+                            return;
                         }
                     }
                     if opener.finished() {
