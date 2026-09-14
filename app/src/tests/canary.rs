@@ -92,15 +92,15 @@ fn seal(colour: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-fn artifact(component: &[u8], code: Vec<u8>, seal: Vec<u8>) -> module_artifact::ModuleArtifact {
-    module_artifact::ModuleArtifact {
+fn artifact(component: &[u8], code: Vec<u8>, seal: Vec<u8>) -> module_artifact::Artifact {
+    module_artifact::Artifact::Module(module_artifact::ModuleArtifact {
         component: code,
         index: None,
         view: Some(module_artifact::ViewArtifact {
             component: component.to_vec(),
             assets: [("icons/seal.svg".to_owned(), seal)].into(),
         }),
-    }
+    })
 }
 
 #[test]
@@ -135,7 +135,7 @@ fn the_canary_captures_every_transition_of_a_deployment() {
     let a = artifact(&component, vec![1], seal("#d00000"));
     let b = artifact(&component, vec![2], seal("#d00000"));
     let bp = artifact(&component, vec![2], seal("#0000d0"));
-    let removed = module_artifact::ModuleArtifact::component(vec![3]);
+    let removed = module_artifact::Artifact::module(vec![3]);
     let node = FakeDeployment::serving("governance", &a);
     let client = runtime.block_on(fake_node(node.clone()));
     let transitions = tap();
@@ -182,7 +182,7 @@ fn the_canary_captures_every_transition_of_a_deployment() {
     assert!(frame("governance").is_none());
     assert!(!has(&captures[3], b"#0000d0"));
     if std::env::var_os("DUCKTAPE_CANARY_PIXELS").is_some() {
-        let pixels = |index, artifact: &module_artifact::ModuleArtifact, blue| {
+        let pixels = |index, artifact: &module_artifact::Artifact, blue| {
             let hash = crate::backend::hex_encode(&artifact.hash());
             image::open(out.path().join(format!("{index}-{hash}.png")))
                 .unwrap()
@@ -333,14 +333,14 @@ fn canary_follows_a_live_node() {
         let view = fixture.join(format!("view-{variant}.wasm"));
         let component = fixture.join("modules/chat.component.wasm");
         let index = fixture.join("modules/chat.index.wasm");
-        let artifact = module_artifact::ModuleArtifact {
+        let artifact = module_artifact::Artifact::Module(module_artifact::ModuleArtifact {
             component: std::fs::read(&component).unwrap(),
             index: Some(std::fs::read(&index).unwrap()),
             view: Some(module_artifact::ViewArtifact {
                 component: std::fs::read(&view).unwrap(),
                 assets: Default::default(),
             }),
-        };
+        });
         let expected_hash = artifact.hash();
         let deployed = std::process::Command::new(&cli)
             .env("DUCKTAPE_HOME", fixture.join("home"))

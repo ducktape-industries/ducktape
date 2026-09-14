@@ -4270,20 +4270,22 @@ pub(crate) mod tests {
     async fn a_load_the_previous_node_answers_late_is_not_installed() {
         let _turn = connection_turn().await;
         use crate::backend::view_source::tests::node;
-        use module_artifact::{ModuleArtifact, ViewArtifact};
+        use module_artifact::{Artifact, ModuleArtifact, ViewArtifact};
         let Some(staged) = staged("governance") else {
             return;
         };
         let component = std::fs::read(staged).expect("the staged view");
-        let deployment = |asset: &str| ModuleArtifact {
-            component: vec![1, 2, 3],
-            index: None,
-            view: Some(ViewArtifact {
-                component: component.clone(),
-                assets: [(asset.to_owned(), b"<svg/>".to_vec())].into(),
-            }),
+        let deployment = |asset: &str| {
+            Artifact::Module(ModuleArtifact {
+                component: vec![1, 2, 3],
+                index: None,
+                view: Some(ViewArtifact {
+                    component: component.clone(),
+                    assets: [(asset.to_owned(), b"<svg/>".to_vec())].into(),
+                }),
+            })
         };
-        let status = |artifact: &ModuleArtifact| {
+        let status = |artifact: &Artifact| {
             serde_json::json!({"module_status": {"modules": [
                 {"module_id": "forge", "active_code_hash": artifact.hash().to_vec(),
                  "pending": null, "history": []}
@@ -4392,15 +4394,15 @@ pub(crate) mod tests {
 
     /// A deployment of `module` on the fake node: the staged governance
     /// component as its view, told apart by the one asset it ships.
-    fn deployment(component: &[u8], asset: &str) -> module_artifact::ModuleArtifact {
-        module_artifact::ModuleArtifact {
+    fn deployment(component: &[u8], asset: &str) -> module_artifact::Artifact {
+        module_artifact::Artifact::Module(module_artifact::ModuleArtifact {
             component: vec![1, 2, 3],
             index: None,
             view: Some(module_artifact::ViewArtifact {
                 component: component.to_vec(),
                 assets: [(asset.to_owned(), b"<svg/>".to_vec())].into(),
             }),
-        }
+        })
     }
 
     fn slot_assets(mounted: &Arc<Mutex<Mounted>>) -> Vec<String> {
@@ -6233,7 +6235,7 @@ pub(crate) mod tests {
         };
         let component = std::fs::read(staged).expect("the staged view");
         let a = deployment(&component, "a.svg");
-        let removed = module_artifact::ModuleArtifact::component(vec![9, 9, 9]);
+        let removed = module_artifact::Artifact::module(vec![9, 9, 9]);
         let node = FakeDeployment::serving("forge", &a);
         let client = fake_node(node.clone()).await;
         let mounted = fresh("forge");
@@ -6365,7 +6367,7 @@ pub(crate) mod tests {
             deployment(&component, "a.svg"),
             deployment(&component, "c.svg"),
         );
-        let removed = module_artifact::ModuleArtifact::component(vec![9, 9, 9]);
+        let removed = module_artifact::Artifact::module(vec![9, 9, 9]);
         let node = FakeDeployment::serving("governance", &a);
         let client = fake_node(node.clone()).await;
         let mounted = fresh("governance");

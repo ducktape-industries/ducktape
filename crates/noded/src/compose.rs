@@ -361,7 +361,16 @@ pub fn validate_deployment(
     index: &indexer::IndexStore,
 ) -> Result<(), String> {
     workspace_config::validate_module_id(id)?;
-    let artifact = module_artifact::ModuleArtifactRef::decode(bytes)?;
+    // readiness is "a validator can run the core": a view-only frame has no
+    // core, so no validator may vote it ready under a module entry.
+    let artifact = match module_artifact::ArtifactRef::decode(bytes)? {
+        module_artifact::ArtifactRef::Module(module) => module,
+        module_artifact::ArtifactRef::View(_) => {
+            return Err(format!(
+                "view_artifact_has_no_component: {id} is a view-only artifact, not a module"
+            ));
+        }
+    };
     let shape =
         WasmModule::declared_shape(artifact.component).map_err(|error| error.to_string())?;
     check_realizable(id, &shape)?;
@@ -565,8 +574,19 @@ impl host::ModuleFactory for Admissions {
         // plane's record committed through the same id-generic registry. Skip
         // and latch — a hard error here is a permanent code stall on every
         // node, for bytes this boundary never owned.
-        let Ok(artifact) = module_artifact::ModuleArtifactRef::decode(bytes) else {
+        let Ok(artifact) = module_artifact::ArtifactRef::decode(bytes) else {
             return Ok(host::Admitted::ForeignAbi);
+        };
+        // a view-only frame is a module artifact by framing and no module by
+        // content: the registry names its kind, and this boundary seats
+        // modules only. fail closed rather than seat an empty core.
+        let artifact = match artifact {
+            module_artifact::ArtifactRef::Module(module) => module,
+            module_artifact::ArtifactRef::View(_) => {
+                return Err(sdk::Error::Module(format!(
+                    "view_artifact_has_no_component: {id} is a view-only artifact, not a module"
+                )));
+            }
         };
         let bindings = Bindings {
             invite: &self.invite,

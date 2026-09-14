@@ -1140,7 +1140,7 @@ mod tests {
         let genesis = Genesis {
             modules: vec![workspace_config::Artifact {
                 id: "pages".into(),
-                bytes: module_artifact::ModuleArtifact::component(b"pages-bytes".to_vec()).encode(),
+                bytes: module_artifact::Artifact::module(b"pages-bytes".to_vec()).encode(),
             }],
         };
         let bytes = genesis.encode();
@@ -1199,7 +1199,7 @@ mod tests {
         let mut want = std::collections::BTreeMap::new();
         want.insert(
             "pages".to_string(),
-            module_artifact::ModuleArtifact::component(b"pages-bytes".to_vec()).hash(),
+            module_artifact::Artifact::module(b"pages-bytes".to_vec()).hash(),
         );
         let blobs = blobstore::BlobHandle::default();
         seed_founding_set(&blobs, dir.path(), &want).expect("seed");

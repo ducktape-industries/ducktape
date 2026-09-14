@@ -200,7 +200,7 @@ pub async fn resolve(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use module_artifact::{ModuleArtifact, ViewArtifact};
+    use module_artifact::{Artifact, ModuleArtifact, ViewArtifact};
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -210,7 +210,7 @@ pub(crate) mod tests {
     /// blob is served only once it is notified.
     pub(crate) async fn node(
         status: serde_json::Value,
-        artifact: Option<ModuleArtifact>,
+        artifact: Option<Artifact>,
         hold: Option<Arc<tokio::sync::Notify>>,
     ) -> Client {
         let deployment = FakeDeployment {
@@ -233,7 +233,7 @@ pub(crate) mod tests {
     /// blob served.
     pub(crate) struct FakeDeployment {
         pub status: Mutex<serde_json::Value>,
-        pub artifacts: Mutex<Vec<ModuleArtifact>>,
+        pub artifacts: Mutex<Vec<Artifact>>,
         pub by_digest: bool,
         /// One-shot holds: the next blob, or status, answer waits on it.
         pub hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
@@ -257,7 +257,7 @@ pub(crate) mod tests {
     }
 
     impl FakeDeployment {
-        pub(crate) fn serving(module: &str, artifact: &ModuleArtifact) -> Arc<Self> {
+        pub(crate) fn serving(module: &str, artifact: &Artifact) -> Arc<Self> {
             Arc::new(Self {
                 status: Mutex::new(status_naming(module, &artifact.hash())),
                 artifacts: Mutex::new(vec![artifact.clone()]),
@@ -295,7 +295,7 @@ pub(crate) mod tests {
 
         /// The registry now names `artifact` as `module`'s active code,
         /// and the blob store has it.
-        pub(crate) fn deploy(&self, module: &str, artifact: &ModuleArtifact) {
+        pub(crate) fn deploy(&self, module: &str, artifact: &Artifact) {
             *self.status.lock().unwrap() = status_naming(module, &artifact.hash());
             self.artifacts.lock().unwrap().push(artifact.clone());
         }
@@ -437,15 +437,15 @@ pub(crate) mod tests {
         ]}})
     }
 
-    fn with_view() -> ModuleArtifact {
-        ModuleArtifact {
+    fn with_view() -> Artifact {
+        Artifact::Module(ModuleArtifact {
             component: vec![1, 2, 3],
             index: None,
             view: Some(ViewArtifact {
                 component: vec![4, 5, 6],
                 assets: [("icons/action.svg".to_owned(), b"<svg/>".to_vec())].into(),
             }),
-        }
+        })
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -459,14 +459,14 @@ pub(crate) mod tests {
             ViewSource::Ready {
                 hash: artifact.hash(),
                 component: vec![4, 5, 6],
-                assets: Arc::new(artifact.view.unwrap().assets),
+                assets: Arc::new(artifact.view().unwrap().assets.clone()),
             }
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_verified_deployment_without_a_view_is_missing_not_a_fallback() {
-        let artifact = ModuleArtifact::component(vec![1, 2, 3]);
+        let artifact = Artifact::module(vec![1, 2, 3]);
         let client = node(status_of(&artifact.hash()), Some(artifact.clone()), None).await;
         assert_eq!(
             resolve(&client, "files", &mut Asked::default())

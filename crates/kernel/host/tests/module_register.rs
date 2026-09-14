@@ -29,7 +29,7 @@ const COMPONENT: &[u8] = include_bytes!("fixtures/hello.component.wasm");
 const H: u64 = 10;
 
 fn deployment(bytes: &[u8]) -> Vec<u8> {
-    module_artifact::ModuleArtifact::component(bytes.to_vec()).encode()
+    module_artifact::Artifact::module(bytes.to_vec()).encode()
 }
 
 fn sha(bytes: &[u8]) -> Vec<u8> {
@@ -75,7 +75,9 @@ impl ModuleFactory for WasmFactory {
         // HERE stays fail-closed; bytes that are no module at all are another
         // plane's record (see `noded::compose::Admissions`) — including bytes
         // that carry no artifact frame in the first place.
-        let Ok(artifact) = module_artifact::ModuleArtifactRef::decode(bytes) else {
+        let Ok(module_artifact::ArtifactRef::Module(artifact)) =
+            module_artifact::ArtifactRef::decode(bytes)
+        else {
             return Ok(Admitted::ForeignAbi);
         };
         match wasm_host::CompiledModule::compile_artifact(bytes)

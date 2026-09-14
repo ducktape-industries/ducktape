@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use module_artifact::{ModuleArtifact, ModuleArtifactRef};
+use module_artifact::{ArtifactRef, ModuleArtifactRef};
 
 use crate::hex_bytes;
 
@@ -56,7 +56,7 @@ pub fn index_guest_path(dir: &Path, id: &str) -> PathBuf {
 }
 
 /// Package a module's component, optional mapper, view and assets from a directory.
-pub fn read_module_artifact(dir: &Path, id: &str) -> Result<ModuleArtifact, String> {
+pub fn read_module_artifact(dir: &Path, id: &str) -> Result<module_artifact::Artifact, String> {
     crate::ensure_view_ready(dir, id)?;
     let component = component_path(dir, id);
     let index = optional_path(index_guest_path(dir, id))?;
@@ -157,15 +157,22 @@ impl Genesis {
         self.validate()?;
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         for module in &self.modules {
-            let artifact = ModuleArtifactRef::decode(&module.bytes)?;
-            write_atomic(&component_path(dir, &module.id), artifact.component)?;
-            if let Some(index) = artifact.index {
-                write_atomic(&index_guest_path(dir, &module.id), index)?;
-            }
             let view_path = dir.join(format!("{}.view.wasm", module.id));
             let asset_path = dir.join(format!("{}.assets", module.id));
             let pending = dir.join(format!("{}.view.pending", module.id));
-            match artifact.view {
+            // a module writes its core (and mapper) first; a view-only entry
+            // owns no core file — the obsolete sweep below removes a stale one.
+            let view = match ArtifactRef::decode(&module.bytes)? {
+                ArtifactRef::Module(artifact) => {
+                    write_atomic(&component_path(dir, &module.id), artifact.component)?;
+                    if let Some(index) = artifact.index {
+                        write_atomic(&index_guest_path(dir, &module.id), index)?;
+                    }
+                    artifact.view
+                }
+                ArtifactRef::View(view) => Some(view),
+            };
+            match view {
                 Some(view) => {
                     write_atomic(&pending, b"view materialization pending")?;
                     crate::view_files::materialize_assets(dir, &module.id, &view.assets)?;
@@ -200,7 +207,7 @@ impl Genesis {
                 .any(|suffix| {
                     filename
                         .strip_suffix(suffix)
-                        .is_some_and(|id| self.component(id).is_none())
+                        .is_some_and(|id| self.artifact(id).is_none())
                 });
             let obsolete_artifact = obsolete_component || obsolete_index || obsolete_view;
             if obsolete_artifact {
@@ -230,7 +237,7 @@ impl Genesis {
         }
         for artifact in &self.modules {
             crate::validate_module_id(&artifact.id)?;
-            ModuleArtifactRef::decode(&artifact.bytes)?;
+            ArtifactRef::decode(&artifact.bytes)?;
         }
         Ok(())
     }
@@ -255,16 +262,21 @@ impl Genesis {
             .map(|module| module.bytes.as_slice())
     }
 
+    /// the module arm of `id`'s artifact; `None` for an absent id and for a
+    /// view-only entry, which has no core.
+    fn module(&self, id: &str) -> Option<ModuleArtifactRef<'_>> {
+        match ArtifactRef::decode(self.artifact(id)?).ok()? {
+            ArtifactRef::Module(module) => Some(module),
+            ArtifactRef::View(_) => None,
+        }
+    }
+
     pub fn component(&self, id: &str) -> Option<&[u8]> {
-        Some(
-            ModuleArtifactRef::decode(self.artifact(id)?)
-                .ok()?
-                .component,
-        )
+        Some(self.module(id)?.component)
     }
 
     pub fn index_guest(&self, id: &str) -> Option<&[u8]> {
-        ModuleArtifactRef::decode(self.artifact(id)?).ok()?.index
+        self.module(id)?.index
     }
 
     /// the deployments are exactly the descriptor's module set (`want`: id →
@@ -488,6 +500,42 @@ mod tests {
     }
 
     #[test]
+    fn a_view_only_entry_materializes_its_view_files_and_no_core() {
+        let genesis = Genesis {
+            modules: vec![Artifact {
+                id: "home".into(),
+                bytes: module_artifact::Artifact::View(module_artifact::ViewArtifact {
+                    component: b"H".to_vec(),
+                    assets: [("icons/tab.svg".to_owned(), b"<svg/>".to_vec())].into(),
+                })
+                .encode(),
+            }],
+        };
+        assert_eq!(genesis.component("home"), None, "a view has no core");
+        assert_eq!(genesis.index_guest("home"), None);
+        assert!(genesis.artifact("home").is_some());
+
+        let ws = tempfile::tempdir().unwrap();
+        let modules = modules_path(ws.path());
+        // a stale core under the id belongs to no entry: removed, never kept.
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(component_path(&modules, "home"), b"old").unwrap();
+        std::fs::write(index_guest_path(&modules, "home"), b"old-map").unwrap();
+        genesis.materialize(&modules).unwrap();
+        assert!(!component_path(&modules, "home").exists());
+        assert!(!index_guest_path(&modules, "home").exists());
+        assert_eq!(
+            std::fs::read(modules.join("home.view.wasm")).unwrap(),
+            b"H"
+        );
+        assert_eq!(
+            std::fs::read(modules.join("home.assets/icons/tab.svg")).unwrap(),
+            b"<svg/>"
+        );
+        assert!(!modules.join("home.view.pending").exists());
+    }
+
+    #[test]
     fn compose_accepts_unfamiliar_modules_and_excludes_the_reachability_plane() {
         let dir = tempfile::tempdir().unwrap();
         founding_set(dir.path(), &[("weather", b"W")], &[("weather", b"mapper")]);
@@ -497,11 +545,11 @@ mod tests {
             genesis.modules,
             vec![Artifact {
                 id: "weather".into(),
-                bytes: ModuleArtifact {
+                bytes: module_artifact::Artifact::Module(module_artifact::ModuleArtifact {
                     view: None,
                     component: b"W".to_vec(),
                     index: Some(b"mapper".to_vec())
-                }
+                })
                 .encode()
             }]
         );
@@ -597,11 +645,11 @@ mod tests {
         let genesis = Genesis {
             modules: vec![Artifact {
                 id: "pages".into(),
-                bytes: ModuleArtifact {
+                bytes: module_artifact::Artifact::Module(module_artifact::ModuleArtifact {
                     view: None,
                     component: vec![1, 2, 3],
                     index: Some(vec![9]),
-                }
+                })
                 .encode(),
             }],
         };

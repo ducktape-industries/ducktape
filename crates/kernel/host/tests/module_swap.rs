@@ -39,7 +39,7 @@ const HELLO_REPLACEMENT: &[u8] = include_bytes!("fixtures/hello-replacement.comp
 const H: u64 = 10;
 
 fn deployment(bytes: &[u8]) -> Vec<u8> {
-    module_artifact::ModuleArtifact::component(bytes.to_vec()).encode()
+    module_artifact::Artifact::module(bytes.to_vec()).encode()
 }
 
 fn sha(bytes: &[u8]) -> Vec<u8> {

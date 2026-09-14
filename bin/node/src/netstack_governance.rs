@@ -159,8 +159,13 @@ pub(crate) async fn reconcile(
             );
             continue;
         };
-        let answer = match module_artifact::ModuleArtifact::decode(&component) {
-            Ok(artifact) => apply_netstack_artifact(artifact).await,
+        let answer = match module_artifact::Artifact::decode(&component) {
+            Ok(module_artifact::Artifact::Module(artifact)) => {
+                apply_netstack_artifact(artifact).await
+            }
+            Ok(module_artifact::Artifact::View(_)) => {
+                SwapAnswer::Refused("the reachability component is not a view".into())
+            }
             Err(error) => SwapAnswer::Refused(error),
         };
         crate::reachability_plane::record_swap(&metrics, &answer);

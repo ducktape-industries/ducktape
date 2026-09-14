@@ -45,7 +45,11 @@ fn pack_prepares_the_deployment_offline_with_or_without_a_mapper() {
         let result = command.output().unwrap();
         assert!(result.status.success(), "{:?}", result);
         let bytes = std::fs::read(&artifact).unwrap();
-        let decoded = module_artifact::ModuleArtifact::decode(&bytes).unwrap();
+        let module_artifact::Artifact::Module(decoded) =
+            module_artifact::Artifact::decode(&bytes).unwrap()
+        else {
+            panic!("pack writes a module artifact");
+        };
         assert_eq!(decoded.component, std::fs::read(&component).unwrap());
         assert_eq!(decoded.index, mapper.map(|_| b"mapper bytes".to_vec()));
         assert_eq!(
@@ -96,8 +100,8 @@ fn pack_includes_view_assets_and_refuses_pending_or_missing_declared_view() {
     let (ok, message) = pack();
     assert!(ok, "{message}");
     let saved = std::fs::read(&out).unwrap();
-    let artifact = module_artifact::ModuleArtifact::decode(&saved).unwrap();
-    let packaged = artifact.view.unwrap();
+    let artifact = module_artifact::Artifact::decode(&saved).unwrap();
+    let packaged = artifact.view().unwrap();
     assert_eq!(packaged.component, b"view");
     assert_eq!(packaged.assets["logo.svg"], b"svg");
     std::fs::write(dir.join("custom.view.pending"), b"pending").unwrap();
@@ -246,11 +250,11 @@ fn register_carries_a_mapper_and_update_can_remove_it() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../crates/modules/apps/pages/index.wasm"
     );
-    let artifact = module_artifact::ModuleArtifact {
+    let artifact = module_artifact::Artifact::Module(module_artifact::ModuleArtifact {
         view: None,
         component: std::fs::read(&component).unwrap(),
         index: Some(std::fs::read(mapper).unwrap()),
-    };
+    });
     let indexed = common::hex(&artifact.hash());
     let runs = run_on_each(
         &cluster,

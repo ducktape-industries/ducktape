@@ -1625,7 +1625,7 @@ async fn the_module_stage_body_cap_is_explicit_and_its_refusal_is_named() {
     spawn_fake_actor(cmd_rx, None);
     let response = noded::router(handle)
         .oneshot(stage(
-            module_artifact::ModuleArtifact::component(vec![7u8; 3 * 1024 * 1024]).encode(),
+            module_artifact::Artifact::module(vec![7u8; 3 * 1024 * 1024]).encode(),
         ))
         .await
         .unwrap();
