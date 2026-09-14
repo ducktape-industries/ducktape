@@ -661,23 +661,11 @@ impl PagesView {
     }
 
     fn comments_layer(&self) -> Node {
-        use wire::FloatOp::{Add, Geometry, Multiply, Number, Subtract};
+        use wire::FloatOp::Number;
         Node::Float {
             key: "pages/comments/anchor".into(),
             x: wire::FloatExpression {
-                ops: vec![
-                    Geometry(4),
-                    Geometry(6),
-                    Add,
-                    Geometry(0),
-                    Subtract,
-                    Geometry(2),
-                    Subtract,
-                    Number(crate::host::comments_right_anchor(self.pages_pane_width)),
-                    Multiply,
-                    Number(crate::host::comments_left_inset(self.pages_pane_width)),
-                    Add,
-                ],
+                ops: vec![Number(crate::host::comments_card_x(self.pages_pane_width))],
             },
             y: wire::FloatExpression {
                 ops: vec![Number(crate::host::comment_card_offset(

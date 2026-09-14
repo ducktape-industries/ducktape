@@ -657,17 +657,17 @@ fn the_comment_card_answers_the_pane_it_is_opened_in() {
     // header — this rail is page-scoped, so it has no line to sit on.
     let beside = at_pane(1200.0);
     assert_eq!(max_widths(beside.root.as_ref().unwrap()), vec![766.0]);
-    assert_eq!(card_width(&beside), 340.0);
-    assert_eq!(card_placed(&beside, 1200.0, 340.0), (1200.0 - 356.0, 16.0));
+    assert_eq!(card_width(&beside), 320.0);
+    assert_eq!(card_placed(&beside, 1200.0, 320.0), (1200.0 - 332.0, 12.0));
 
     // TIGHTER: no margin to float in, so the document gives up exactly the card
     // and its two gutters and the text reflows left of it.
     let squeeze = at_pane(1000.0);
-    let document = 1000.0 - 340.0 - 32.0;
+    let document = 1000.0 - 320.0 - 24.0;
     assert_eq!(max_widths(squeeze.root.as_ref().unwrap()), vec![document]);
-    assert_eq!(card_width(&squeeze), 340.0);
-    let (left, top) = card_placed(&squeeze, 1000.0, 340.0);
-    assert_eq!((left, top), (1000.0 - 356.0, 16.0));
+    assert_eq!(card_width(&squeeze), 320.0);
+    let (left, top) = card_placed(&squeeze, 1000.0, 320.0);
+    assert_eq!((left, top), (1000.0 - 332.0, 12.0));
     assert!(
         left >= document,
         "the card must not overlap the document it just squeezed"
@@ -676,10 +676,10 @@ fn the_comment_card_answers_the_pane_it_is_opened_in() {
     // NARROW: nothing is beside anything. The document takes its full width
     // back and the card drops onto its text column at full width, into the gap
     // the reserve opens under the title.
-    let inline = at_pane(900.0);
+    let inline = at_pane(800.0);
     assert_eq!(max_widths(inline.root.as_ref().unwrap()), vec![766.0]);
     assert_eq!(card_width(&inline), 766.0 - 62.0);
-    assert_eq!(card_placed(&inline, 900.0, 704.0), (22.0, 67.3));
+    assert_eq!(card_placed(&inline, 800.0, 704.0), (22.0, 65.3));
 }
 
 /// A PLACEMENT IS VIEW-LOCAL: crossing a threshold moves the card and nothing
@@ -697,7 +697,7 @@ fn crossing_a_placement_threshold_keeps_the_rail_and_what_is_typed_in_it() {
     let frame = tick_native(measure(
         &frame,
         "PagesView/root/pages/pane-measure",
-        900.0,
+        800.0,
         700.0,
     ));
     assert!(frame.requests.is_empty(), "a placement is view-local");
