@@ -442,10 +442,7 @@ fn an_archived_release_installs_under_the_launcher_it_ships() {
         fs::Permissions::from_mode(0o755),
     )
     .unwrap();
-    let script = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../ops/release/archive.sh"
-    );
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../ops/release/archive.sh");
     let out_dir = rig.home.join("archive");
     let packed = Command::new("bash")
         .arg(script)
