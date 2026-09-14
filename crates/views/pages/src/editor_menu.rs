@@ -475,6 +475,25 @@ enum Kind {
     },
 }
 
+impl Kind {
+    /// Whether this menu hangs on document line `line` rather than on the
+    /// caret: the block menu and its "Turn into…" do; every other kind
+    /// floats at the caret or over a selection and folds when it moves.
+    fn hangs_on(self, line: usize) -> bool {
+        match self {
+            Kind::Block { line: hung } | Kind::Turn { line: hung } => hung == line,
+            Kind::Slash { .. }
+            | Kind::Format { .. }
+            | Kind::Color { .. }
+            | Kind::Align { .. }
+            | Kind::Ai { .. }
+            | Kind::Link { .. }
+            | Kind::Mention { .. }
+            | Kind::Emoji { .. } => false,
+        }
+    }
+}
+
 pub struct MenuView {
     /// None anchors at the caret; Some anchors at the specified document line.
     pub line: Option<usize>,
@@ -542,10 +561,22 @@ impl Menu {
             .cursor
             .selection
             .is_some_and(|anchor| anchor != document.cursor.position);
-        match selecting {
-            true => self.format(document),
-            false => self.close(),
+        if selecting {
+            self.format(document);
+            return;
         }
+        // A right press on another row opens that row's block menu and, in
+        // the same gesture, lands the caret on it: a menu hung on the line the
+        // caret lands on stays; one hung on the caret folds.
+        let caret_line = document.cursor.position.line as usize;
+        let hung_on_caret_line = self
+            .open
+            .as_ref()
+            .is_some_and(|open| open.kind.hangs_on(caret_line));
+        if hung_on_caret_line {
+            return;
+        }
+        self.close();
     }
 
     pub fn is_open(&self) -> bool {

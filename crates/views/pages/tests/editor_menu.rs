@@ -283,6 +283,21 @@ fn a_pressed_link_opens_its_popover_and_the_picks_open_copy_or_unlink() {
     assert!(!prose.is_open(), "no popover where no link is");
 }
 
+/// A right press on another row opens that row's block menu and, in the same
+/// gesture, lands the caret on it: the menu hung on that line stays through
+/// the caret move; a caret landing anywhere else folds it.
+#[test]
+fn a_caret_landing_on_the_block_menus_own_line_keeps_it_open() {
+    let mut state = menu::Menu::default();
+    let document = doc("Title\nfirst\nsecond", 1, 0);
+    state.block(&document, 2);
+    assert!(state.is_open());
+    state.moved(&doc("Title\nfirst\nsecond", 2, 0));
+    assert!(state.is_open(), "the caret landed on the menu's own line");
+    state.moved(&doc("Title\nfirst\nsecond", 1, 0));
+    assert!(!state.is_open(), "the caret left the menu's line");
+}
+
 #[test]
 fn the_block_menu_copies_the_block_and_resets_its_formatting() {
     let document = doc("Title\n## a **bold** heading\n```\ncode\n```", 1, 0);
