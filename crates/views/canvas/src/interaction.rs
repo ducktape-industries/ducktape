@@ -1000,6 +1000,19 @@ impl BoardsView {
             self.inline = Some(inline);
             return Task::none();
         }
+        // Words are the whole of a text shape. One left with none is an empty
+        // hit box — invisible, still in the way of a click and still caught by
+        // a rubber band — so abandoning a text shape empty leaves nothing
+        // behind, the way it does on any canvas. A sticky with no words is
+        // still a sticky, and stays.
+        let vanished = self.kind_of(&inline.id) == Some(Kind::Text) && text.trim().is_empty();
+        if vanished {
+            self.selected.remove(&inline.id);
+            return Task::batch([
+                self.edit(Change::Delete { id: inline.id }),
+                self.hand_back_focus(),
+            ]);
+        }
         let save = if changed {
             self.edit(Change::Text {
                 id: inline.id,
@@ -1008,12 +1021,17 @@ impl BoardsView {
         } else {
             Task::none()
         };
-        Task::batch([
-            save,
-            ducktape_view_guest::widget::perform(wire::WidgetCommand::Focus {
-                target: "boards/canvas-layout".into(),
-            }),
-        ])
+        Task::batch([save, self.hand_back_focus()])
+    }
+    /// The canvas takes the keyboard back, so the next key is a shortcut
+    /// rather than a character nothing is listening for.
+    fn hand_back_focus(&self) -> Task<Message> {
+        ducktape_view_guest::widget::perform(wire::WidgetCommand::Focus {
+            target: "boards/canvas-layout".into(),
+        })
+    }
+    fn kind_of(&self, id: &str) -> Option<Kind> {
+        Some(self.visible()?.shapes.get(id)?.shape.kind)
     }
     pub(super) fn on_color(&mut self, color: u8) -> Task<Message> {
         self.palette = color;
