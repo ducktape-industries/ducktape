@@ -659,6 +659,26 @@ fn rich_trigger(before: &str, after: &Doc) -> Option<char> {
     single_trigger.then_some(trigger)
 }
 
+fn rich_input_rule(
+    before: &str,
+    edit: &wire::editor_rich::RichEdit,
+    doc: &Doc,
+) -> editor::EditorDecision {
+    let unchanged = before == doc.text;
+    if unchanged {
+        return editor::EditorDecision::Noop;
+    }
+    let code = edit
+        .document
+        .blocks
+        .get(edit.document.cursor.position.line as usize)
+        .is_some_and(|block| block.kind == "codeBlock");
+    if code {
+        return editor::EditorDecision::Noop;
+    }
+    crate::editor_menu::typography(doc)
+}
+
 /// A rich snapshot is still one canonical transaction, so draft, undo and
 /// replacement lifetime follow the same commit acknowledgment as native text.
 fn rich_decision(
@@ -675,7 +695,7 @@ fn rich_decision(
     };
     let decision = match (&edit.interaction, edit.action.as_str()) {
         (Some(action), _) => interaction(&doc, menu, action).0,
-        (None, "") => editor::EditorDecision::Noop,
+        (None, "") => rich_input_rule(state.text, edit, &doc),
         (None, tag) => {
             if !menu.is_open() {
                 menu.format(&doc);
@@ -702,6 +722,44 @@ fn rich_decision(
     }
 }
 
+/// A text insertion uses the source caret, which distinguishes the inside
+/// and outside of a closing delimiter even when both paint at the same pixel.
+fn rich_insertion(
+    state: ducktape_view_guest::EditorStateView<'_>,
+    edit: &wire::editor_rich::RichEdit,
+    base: &wire::editor_rich::RichDocument,
+) -> Option<Doc> {
+    let command = edit.interaction.is_some() || !edit.action.is_empty();
+    let selection = base.cursor.selection.is_some() || edit.document.cursor.selection.is_some();
+    if command || selection {
+        return None;
+    }
+    let index = base.cursor.position.line as usize;
+    let at = base.cursor.position.column as usize;
+    let before = base.blocks.get(index)?;
+    let after = edit.document.blocks.get(index)?;
+    let inserted = after
+        .text
+        .strip_prefix(before.text.get(..at)?)?
+        .strip_suffix(before.text.get(at..)?)?;
+    if inserted.is_empty() {
+        return None;
+    }
+    let mut expected = base.clone();
+    expected.blocks[index].text = after.text.clone();
+    expected.blocks[index].marks = after.marks.clone();
+    expected.cursor.position.column += u32::try_from(inserted.len()).ok()?;
+    let only_insertion = expected == edit.document;
+    if !only_insertion {
+        return None;
+    }
+    let mut source = document(state.text, state.cursor);
+    let at = source.offset(source.cursor.position);
+    source.text.insert_str(at, inserted);
+    source.cursor.position = source.position_at(at + inserted.len());
+    Some(source)
+}
+
 fn rebase_rich(
     state: ducktape_view_guest::EditorStateView<'_>,
     edit: &wire::editor_rich::RichEdit,
@@ -710,6 +768,11 @@ fn rebase_rich(
     let Some(base) = &edit.before else {
         return Some(incoming);
     };
+    let current_projection = crate::rich_document::presentation(state.text, state.cursor).document;
+    let current_base = *base == current_projection;
+    if current_base {
+        return Some(rich_insertion(state, edit, base).unwrap_or(incoming));
+    }
     let (text, cursor) = crate::rich_document::canonical(base).ok()?;
     if text == state.text {
         return Some(incoming);
@@ -923,6 +986,46 @@ mod rich_tests {
     }
 
     #[test]
+    fn rich_typography_is_guest_owned_and_leaves_code_literal() {
+        for (text, typed, expected) in [
+            ("T\n", "(c)", "T\n©"),
+            ("T\n", "한...", "T\n한…"),
+            ("T\n```\n\n```", "(c)", "T\n```\n(c)\n```"),
+            ("T\n```\n```", "(c)", "T\n```\n(c)\n```"),
+        ] {
+            let before = crate::rich_document::presentation(text, Default::default()).document;
+            let mut incoming = before.clone();
+            incoming.blocks[1].text = typed.into();
+            incoming.cursor.position = wire::EditorPosition {
+                line: 1,
+                column: typed.len() as u32,
+            };
+            let edit = wire::editor_rich::RichEdit {
+                before: Some(before),
+                document: incoming,
+                ..Default::default()
+            };
+            let state = ducktape_view_guest::EditorStateView {
+                text,
+                cursor: Default::default(),
+                reset: 1,
+                revision: 1,
+                text_revision: 1,
+            };
+            let EditorDecision::Apply {
+                patches, cursor, ..
+            } = rich_decision(state, &edit, Default::default())
+            else {
+                panic!("rich input decision");
+            };
+            assert_eq!(
+                wire::patched_editor_text(text, &patches, cursor).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn rich_caret_commit_closes_the_guest_mention_menu_without_editing_text() {
         let text = "T\n@";
         let cursor = wire::EditorCursor {
@@ -1060,6 +1163,50 @@ mod rich_tests {
             wire::decode(&update.interaction).unwrap();
         assert_eq!(navigation.comment_line, Some(1));
         assert_eq!(navigation.anchor, Some((2, 7)));
+    }
+
+    #[test]
+    fn rich_insertion_uses_the_source_cursor_for_mark_affinity() {
+        for (column, expected) in [
+            (8, "T\n**bold** plain"),
+            (6, "T\n**bold plain**"),
+            (4, "T\n**bo plainld**"),
+        ] {
+            let text = "T\n**bold**";
+            let cursor = wire::EditorCursor {
+                position: wire::EditorPosition { line: 1, column },
+                selection: None,
+            };
+            let before = crate::rich_document::presentation(text, cursor).document;
+            let mut incoming = before.clone();
+            let at = incoming.cursor.position.column as usize;
+            incoming.blocks[1].text.insert_str(at, " plain");
+            incoming.blocks[1].marks[0].end += 6;
+            incoming.cursor.position.column += 6;
+            let edit = wire::editor_rich::RichEdit {
+                before: Some(before),
+                document: incoming,
+                ..Default::default()
+            };
+            let state = ducktape_view_guest::EditorStateView {
+                text,
+                cursor,
+                reset: 1,
+                revision: 1,
+                text_revision: 1,
+            };
+            let EditorDecision::Apply {
+                patches, cursor, ..
+            } = rich_decision(state, &edit, Default::default())
+            else {
+                panic!("rich insertion decision");
+            };
+            assert_eq!(
+                wire::patched_editor_text(text, &patches, cursor).unwrap(),
+                expected
+            );
+            assert_eq!(cursor.position.column, column + 6);
+        }
     }
 
     #[test]

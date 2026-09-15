@@ -10,7 +10,7 @@ authors = ["Ducktape contributors"]
 gpui-kit = { version = "=0.6.1", features = ["tree-sitter-languages"] }
 # the pages document editor: Notion-shaped blocks, marks, slash menu and
 # toolbar on the same gpui-kit; the guest keeps the markdown canonical.
-gpui-notion = { git = "https://github.com/byeongsu-hong/gpui-notion", rev = "b5d15a659e55e92bb84fd107af708f7740340a76" }
+gpui-notion = { git = "https://github.com/byeongsu-hong/gpui-notion", rev = "2ef0e331838531a0ef8f4d4cc80655f5c4c99303" }
 unicode-segmentation = "1"
 ducktape-view-guest = { path = "../crates/views/support/guest" }
 qrcode = { version = "0.14", default-features = false }

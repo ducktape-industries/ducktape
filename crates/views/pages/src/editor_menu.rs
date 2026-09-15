@@ -36,6 +36,32 @@ fn replace(document: &Doc, range: Range<usize>, replacement: &str) -> Doc {
     next
 }
 
+/// Replace a completed punctuation shortcut at the caret in canonical source.
+pub fn typography(document: &Doc) -> EditorDecision {
+    const RULES: &[(&str, &str)] = &[
+        ("(c)", "©"),
+        ("(C)", "©"),
+        ("(r)", "®"),
+        ("(R)", "®"),
+        ("(tm)", "™"),
+        ("(TM)", "™"),
+        ("...", "…"),
+        ("<-", "←"),
+        ("->", "→"),
+        ("--", "–"),
+        ("!=", "≠"),
+        ("<=", "≤"),
+        (">=", "≥"),
+        ("+/-", "±"),
+    ];
+    let caret = document.offset(document.cursor.position);
+    let prefix = &document.text[..caret];
+    let Some((from, to)) = RULES.iter().find(|(from, _)| prefix.ends_with(from)) else {
+        return EditorDecision::Noop;
+    };
+    finish(document, replace(document, caret - from.len()..caret, to))
+}
+
 /// Rewrite one line's block marker while retaining its content and indentation.
 pub fn turn(document: &Doc, line: usize, tag: &str) -> EditorDecision {
     finish(document, turned(document, line, tag))

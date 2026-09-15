@@ -552,10 +552,13 @@ fn ime_observations_keep_unicode_selection_and_commit_order() {
 }
 
 #[gpui_kit::test]
-fn pages_wasm_owns_native_mention_menu_and_replacement(cx: &mut TestAppContext) {
+fn pages_wasm_owns_native_menu_and_input_rules(cx: &mut TestAppContext) {
     let _turn = tests::blocking_connection_turn();
     tests::can_a_commented_page();
-    tests::can_reads([("model", serde_json::json!({"model": {"agents": []}}))]);
+    tests::can_reads([
+        ("model", serde_json::json!({"model": {"agents": []}})),
+        ("op.submit", serde_json::json!(1)),
+    ]);
     let props = tests::pages_facts();
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/views/pages_view.wasm");
     let mut guest = Guest::load_from("pages", &path).expect("build current Pages view first");
@@ -599,7 +602,15 @@ fn pages_wasm_owns_native_mention_menu_and_replacement(cx: &mut TestAppContext) 
         assert!(guest.fault.is_none(), "{:?}", guest.fault);
         let mut result = None;
         guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
-            if let wire::Node::Editor { options, .. } = node {
+            if let wire::Node::Editor {
+                options, editable, ..
+            } = node
+            {
+                assert!(
+                    *editable,
+                    "the fixture remains editable: {:?}",
+                    tests::texts(guest)
+                );
                 result = Some((
                     options.rich.clone().unwrap(),
                     options.presentation.clone().unwrap(),
@@ -639,6 +650,43 @@ fn pages_wasm_owns_native_mention_menu_and_replacement(cx: &mut TestAppContext) 
         "the guest replaces the mention in its document: {:?}",
         rich.document
     );
+    native.update(|window, cx| {
+        assert!(
+            window.focused(cx).is_some(),
+            "menu selection preserves keyboard focus"
+        )
+    });
+    for (source, kind, text) in [
+        ("# Heading", "heading", "Heading"),
+        ("**bold** plain", "paragraph", "bold plain"),
+        ("(c)", "paragraph", "©"),
+    ] {
+        native.update(|window, cx| window.press("enter", cx));
+        settle_native_documents(&mut native, &seat);
+        for character in source.chars() {
+            native.update(|window, cx| window.input(&character.to_string(), cx));
+            settle_native_documents(&mut native, &seat);
+        }
+        let (rich, _) = projection();
+        let block = &rich.document.blocks[rich.document.cursor.position.line as usize];
+        assert_eq!(
+            block.kind, kind,
+            "guest interpretation of {source:?}: {block:?}"
+        );
+        assert_eq!(block.text, text, "guest interpretation of {source:?}");
+        if source.starts_with("**") {
+            assert_eq!(
+                block
+                    .marks
+                    .iter()
+                    .filter(|mark| mark.kind == "bold")
+                    .map(|mark| (mark.start, mark.end))
+                    .collect::<Vec<_>>(),
+                vec![(0, 4)],
+                "text after the completed delimiter stays plain"
+            );
+        }
+    }
 }
 
 fn settle_native_documents(native: &mut VisualTestContext, seat: &Arc<Mutex<Mounted>>) {

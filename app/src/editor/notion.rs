@@ -8,6 +8,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, canvas, div, px,
 };
 use gpui_notion::NotionEditor;
+use gpui_notion::editor::input_rules::InputRuleMode;
 use gpui_notion::editor::comments::{AnnotationMode, AnnotationRequested};
 use gpui_notion::editor::block::{BlockAttrs, BlockContent};
 use gpui_notion::editor::mark::{HighlightColor, Mark, MarkKind, MarkList, TextColor};
@@ -69,6 +70,7 @@ impl RichWireEditor {
             let mut editor = NotionEditor::new(window, cx);
             editor.set_annotation_mode(AnnotationMode::External);
             editor.set_application_menu(None, cx);
+            editor.set_input_rule_mode(InputRuleMode::Application);
             editor
         });
         let changes = cx.subscribe_in(

@@ -5245,7 +5245,7 @@ dependencies = [
 [[package]]
 name = "gpui-notion"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/gpui-notion?rev=b5d15a659e55e92bb84fd107af708f7740340a76#b5d15a659e55e92bb84fd107af708f7740340a76"
+source = "git+https://github.com/byeongsu-hong/gpui-notion?rev=2ef0e331838531a0ef8f4d4cc80655f5c4c99303#2ef0e331838531a0ef8f4d4cc80655f5c4c99303"
 dependencies = [
  "anyhow",
  "gpui-kit",
