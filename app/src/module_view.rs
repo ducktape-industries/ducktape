@@ -495,8 +495,8 @@ struct ChatProps<'a> {
     call_muted: bool,
     /// this side's mic voice gate, for the reader's own seat
     call_speaking: bool,
-    /// the node keys of the peers whose beacons say they are talking
-    speaking_peers: Vec<String>,
+    /// Peer observations passed unchanged to the Chat view.
+    call_peers: &'a [crate::call::CallPeer],
     shift_held: bool,
     copy_chord_serial: i64,
     sent_serial: i64,
@@ -568,7 +568,7 @@ pub fn chat_view(
         huddle_now,
         call_muted,
         call_speaking,
-        speaking_peers: crate::call::speaking_peers(call_peers),
+        call_peers,
         shift_held,
         copy_chord_serial,
         sent_serial,
@@ -6432,7 +6432,7 @@ pub(crate) mod tests {
             huddle_now: 0,
             call_muted: false,
             call_speaking: false,
-            speaking_peers: Vec::new(),
+            call_peers: &[],
             shift_held: false,
             copy_chord_serial: 0,
             sent_serial: 0,

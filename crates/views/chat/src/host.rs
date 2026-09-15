@@ -55,16 +55,25 @@ pub struct HuddleSeat {
     pub label: String,
     pub initials: String,
     pub is_you: bool,
-    /// The seat's node key — what `speaking_peers` names.
+    /// The seat's node key — what `call_peers` names.
     pub node: String,
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct CallPeer {
+    pub peer: String,
+    pub muted: bool,
+    pub speaking: bool,
 }
 
 /// Is this seat talking: the reader's own seat reads the local voice gate,
 /// any other reads the peer beacons by node key.
-pub fn seat_speaking(seat: &HuddleSeat, call_speaking: bool, speaking_peers: &[String]) -> bool {
+pub fn seat_speaking(seat: &HuddleSeat, call_speaking: bool, call_peers: &[CallPeer]) -> bool {
     match seat.is_you {
         true => call_speaking,
-        false => speaking_peers.contains(&seat.node),
+        false => call_peers
+            .iter()
+            .any(|peer| peer.peer == seat.node && peer.speaking && !peer.muted),
     }
 }
 
@@ -529,8 +538,8 @@ pub struct Session {
     pub call_muted: bool,
     /// the reader's own mic voice gate is open
     pub call_speaking: bool,
-    /// the node keys of the peers whose call beacons say they are talking
-    pub speaking_peers: Vec<String>,
+    /// The call guest's peer observations; this view owns their display rules.
+    pub call_peers: Vec<CallPeer>,
     /// the reader is holding ⇧: the copy range's gesture, and the guest sees
     /// no modifiers of its own
     pub shift_held: bool,
@@ -2727,11 +2736,29 @@ mod tests {
             is_you,
             node: node.into(),
         };
-        let peers = vec!["bb".to_owned()];
+        let peers = vec![
+            CallPeer {
+                peer: "bb".into(),
+                speaking: true,
+                muted: false,
+            },
+            CallPeer {
+                peer: "cc".into(),
+                speaking: true,
+                muted: true,
+            },
+            CallPeer {
+                peer: "dd".into(),
+                speaking: false,
+                muted: false,
+            },
+        ];
         assert!(seat_speaking(&seat(true, "aa"), true, &peers));
         assert!(!seat_speaking(&seat(true, "bb"), false, &peers));
         assert!(seat_speaking(&seat(false, "bb"), false, &peers));
         assert!(!seat_speaking(&seat(false, "aa"), true, &peers));
+        assert!(!seat_speaking(&seat(false, "cc"), true, &peers));
+        assert!(!seat_speaking(&seat(false, "dd"), true, &peers));
     }
 
     #[test]

@@ -309,13 +309,29 @@ fn disconnect_hides_retained_rooms_messages_and_composer() {
 fn a_huddle_lists_its_people_under_the_room() {
     on_a_deep_stack(|| {
         let mut seated = session(true);
-        seated.speaking_peers = vec!["ada lovelace".into()];
+        seated.call_peers = vec![chat_view::host::CallPeer {
+            peer: "ada lovelace".into(),
+            speaking: true,
+            muted: false,
+        }];
         seated.huddle_joined = true;
         seated.call_muted = true;
-        let (frame, _, _) = connected_room_with(&seated, roots());
+        let (frame, _, props) = connected_room_with(&seated, roots());
         assert!(has_text(&frame, "Ada Lovelace"), "{:?}", texts(&frame));
         assert!(has_text(&frame, "you · muted"), "{:?}", texts(&frame));
         let _ = node_ending(&frame, "channel/channel-b/seat/1");
+        let avatar_background =
+            |frame: &Frame| match node_ending(frame, "channel/channel-b/seat/0/avatar") {
+                Node::Container { background, .. } => *background,
+                _ => panic!("avatar container"),
+            };
+        let speaking_background = avatar_background(&frame);
+        seated.call_peers[0].muted = true;
+        let muted = tick_native(vec![item(props, &encoded(&seated))]);
+        assert_ne!(avatar_background(&muted), speaking_background);
+        seated.call_peers.clear();
+        let departed = tick_native(vec![item(props, &encoded(&seated))]);
+        assert_eq!(avatar_background(&departed), avatar_background(&muted));
         assert!(
             !has_text(&frame, "Huddle 2"),
             "the count is a caption, not a badge"
