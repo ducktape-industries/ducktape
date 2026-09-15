@@ -45,6 +45,10 @@ impl Publication for ModulePublication {
         let pack = pack(run, &head, refs.values().map(String::as_str))?;
         let runtime = tokio::runtime::Handle::current();
         let digest = runtime.block_on(self.node.put_blob(pack))?;
+        let required_blob: [u8; 32] = digest
+            .as_slice()
+            .try_into()
+            .map_err(|_| "invalid blob digest length")?;
         let oid = |hex: &str| {
             git2::Oid::from_str(hex)
                 .map(|oid| oid.as_bytes().to_vec())
@@ -60,7 +64,11 @@ impl Publication for ModulePublication {
             pack_digest: Some(digest),
             cert: None,
         };
-        runtime.block_on(self.node.submit("forge", &forge::encode_msg(&message)))?;
+        runtime.block_on(self.node.submit_with_blob(
+            "forge",
+            &forge::encode_msg(&message),
+            Some(required_blob),
+        ))?;
         Ok(())
     }
     fn fetch(&self, repo: &str, run: &Path, branch: &str) -> Result<(), String> {

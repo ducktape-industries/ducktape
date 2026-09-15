@@ -31,8 +31,10 @@ pub(crate) async fn seated_write(
     rpc: &RpcClient,
     target: &str,
     payload: Vec<u8>,
+    required_blob: Option<[u8; 32]>,
 ) -> Result<u64, String> {
-    if payload.is_empty() || payload.len() > ::node::MAX_PAYLOAD_BYTES {
+    let limit = ::node::MAX_PAYLOAD_BYTES - required_blob.map_or(0, |_| 32);
+    if payload.is_empty() || payload.len() > limit {
         return Err(format!(
             "{target} transaction exceeds the signed payload limit"
         ));
@@ -42,7 +44,7 @@ pub(crate) async fn seated_write(
         let Some(signer) = session.as_ref() else {
             return Err("the local user key is locked; enter its password".into());
         };
-        signer.sign(target, next_sequence(), &payload)
+        signer.sign_with_blob(target, next_sequence(), &payload, required_blob)
     };
     submit_raw_frame(rpc, target, frame).await
 }
@@ -268,15 +270,26 @@ impl Signer {
 
     /// One signed op frame, ready for `/v1/submit/frame`.
     pub(super) fn sign(&self, target: &str, seq: u64, payload: &[u8]) -> Vec<u8> {
+        self.sign_with_blob(target, seq, payload, None)
+    }
+
+    fn sign_with_blob(
+        &self,
+        target: &str,
+        seq: u64,
+        payload: &[u8],
+        required_blob: Option<[u8; 32]>,
+    ) -> Vec<u8> {
         // `::node`, not `node` — this backend has a module of its own by that
         // name, and it is the sibling that wins the bare path.
-        ::node::encode_frame(
+        ::node::encode_frame_with_blob(
             &self.key,
             seq,
             &sdk::Msg {
                 target: target.to_string(),
                 payload: payload.to_vec(),
             },
+            required_blob,
         )
     }
 }
@@ -712,6 +725,27 @@ pub(crate) fn count_i64(value: usize) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::user_error;
+    use commonware_cryptography::Signer as _;
+
+    #[test]
+    fn seated_signer_binds_the_declared_blob_for_an_arbitrary_module() {
+        let signer = super::Signer {
+            password: zeroize::Zeroizing::new(String::new()),
+            key: commonware_cryptography::ed25519::PrivateKey::from_seed(73),
+        };
+        let frame =
+            signer.sign_with_blob("independent-app", 7, b"opaque payload", Some([0xab; 32]));
+        let (_, msg, digest) = ::node::decode_frame_with_blob(&frame).unwrap();
+        assert_eq!(msg.target, "independent-app");
+        assert_eq!(msg.payload, b"opaque payload");
+        assert_eq!(digest, Some([0xab; 32]));
+        let mut changed = frame;
+        let digest_start = changed.len() - 64 - 32;
+        changed[digest_start] ^= 1;
+        assert!(::node::decode_frame_with_blob(&changed).is_err());
+        let ordinary = signer.sign("independent-app", 8, b"ordinary");
+        assert_eq!(::node::decode_frame_with_blob(&ordinary).unwrap().2, None);
+    }
 
     /// EVERY refusal a helper reported used to arrive WRAPPED in text naming
     /// that helper — `Signer::reap` built "ducktape signer refused the

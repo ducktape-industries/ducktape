@@ -23,6 +23,7 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                 NodeCommand::Submit {
                     target,
                     payload,
+                    required_blob: _,
                     origin,
                     reply,
                 } => {
@@ -224,7 +225,16 @@ async fn submit_stamps_the_client_origin() {
 async fn raw_submit_preserves_arbitrary_module_bytes_and_node_authority() {
     let (handle, mut commands, _events) = local_node();
     tokio::spawn(async move {
-        let NodeCommand::Submit { target, payload, origin, reply } = commands.next().await.unwrap() else { panic!("expected module submit"); };
+        let NodeCommand::Submit {
+            target,
+            payload,
+            required_blob: _,
+            origin,
+            reply,
+        } = commands.next().await.unwrap()
+        else {
+            panic!("expected module submit");
+        };
         assert_eq!(target, "new-product");
         assert_eq!(payload, vec![0, 255, 123, 0]);
         assert_eq!(origin, noded::DEFAULT_ORIGIN.as_bytes());
@@ -236,6 +246,135 @@ async fn raw_submit_preserves_arbitrary_module_bytes_and_node_authority() {
     let response = noded::router(handle).oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_json(response).await["height"], 8);
+}
+
+#[tokio::test]
+async fn operator_submit_accepts_an_explicit_generic_blob_prerequisite() {
+    let (handle, mut commands, _events) = local_node();
+    let stored = noded::router(handle.clone())
+        .oneshot(post("/v1/files/blob", serde_json::json!({"opaque":true})))
+        .await
+        .unwrap();
+    assert_eq!(stored.status(), StatusCode::OK);
+    let digest = body_json(stored).await["digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let expected_blob = duckfs_core::from_hex_32(&digest).unwrap();
+    tokio::spawn(async move {
+        let NodeCommand::Submit {
+            target,
+            payload,
+            required_blob,
+            reply,
+            ..
+        } = commands.next().await.unwrap()
+        else {
+            panic!("expected module submit");
+        };
+        assert_eq!(target, "unlisted-application");
+        assert_eq!(required_blob, Some(expected_blob));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&payload).unwrap(),
+            serde_json::json!({"publish":true})
+        );
+        reply
+            .send(Ok(BlockSummary {
+                height: 9,
+                root_hash: "ab".repeat(32),
+            }))
+            .unwrap();
+    });
+    let response = noded::router(handle)
+        .oneshot(post(
+            "/v1/submit",
+            serde_json::json!({
+                "target":"unlisted-application", "payload":{"publish":true},
+                "required_blob":digest,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["height"], 9);
+}
+
+#[tokio::test]
+async fn operator_submit_rejects_invalid_or_missing_blob_before_actor_dispatch() {
+    use futures::FutureExt as _;
+    for (digest, expected_status) in [
+        (serde_json::Value::Null, StatusCode::UNPROCESSABLE_ENTITY),
+        (
+            serde_json::json!("AA".repeat(32)),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (serde_json::json!("00"), StatusCode::UNPROCESSABLE_ENTITY),
+        (
+            serde_json::json!("gg".repeat(32)),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (serde_json::json!("00".repeat(32)), StatusCode::BAD_REQUEST),
+    ] {
+        let (handle, mut commands, _events) = local_node();
+        let response = noded::router(handle.clone()).oneshot(post("/v1/submit", serde_json::json!({
+            "target":"unlisted-application", "payload":{"publish":true}, "required_blob":digest,
+        }))).await.unwrap();
+        assert_eq!(response.status(), expected_status);
+        assert!(
+            commands.next().now_or_never().is_none(),
+            "invalid prerequisite reached actor"
+        );
+    }
+}
+
+#[tokio::test]
+async fn raw_submit_preserves_explicit_blob_and_opaque_bytes() {
+    let (handle, mut commands, _events) = local_node();
+    let stored = noded::router(handle.clone())
+        .oneshot(post("/v1/files/blob", serde_json::json!({"raw":true})))
+        .await
+        .unwrap();
+    assert_eq!(stored.status(), StatusCode::OK);
+    let digest = body_json(stored).await["digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let expected = duckfs_core::from_hex_32(&digest).unwrap();
+    let actor = tokio::spawn(async move {
+        let NodeCommand::Submit {
+            target,
+            payload,
+            required_blob,
+            reply,
+            ..
+        } = commands.next().await.unwrap()
+        else {
+            panic!("expected submit");
+        };
+        assert_eq!(target, "another-product");
+        assert_eq!(payload, [0, 255, 0]);
+        assert_eq!(required_blob, Some(expected));
+        reply
+            .send(Ok(BlockSummary {
+                height: 10,
+                root_hash: "ab".repeat(32),
+            }))
+            .unwrap();
+    });
+    let request = with_operator(with_peer(
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/v1/submit/raw/another-product?required_blob={digest}"
+            ))
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(vec![0, 255, 0]))
+            .unwrap(),
+        "127.0.0.1:40000",
+    ));
+    let response = noded::router(handle).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    actor.await.unwrap();
 }
 
 // ---- the signed-write gate over the mutating routes -------------------------
@@ -628,6 +767,50 @@ async fn a_signed_frame_lands_with_the_signers_key_as_the_origin() {
         Some(64),
         "the frame lane returns the same receipt shape"
     );
+}
+
+#[tokio::test]
+async fn signed_blob_prerequisite_requires_local_bytes_and_preserves_the_frame() {
+    use futures::FutureExt as _;
+    let (handle, mut commands, _events) = local_node();
+    let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
+    let stored = noded::router(handle.clone())
+        .oneshot(post("/v1/files/blob", serde_json::json!({"signed":true})))
+        .await
+        .unwrap();
+    let digest =
+        duckfs_core::from_hex_32(body_json(stored).await["digest"].as_str().unwrap()).unwrap();
+    let message = sdk::Msg {
+        target: "unknown-product".into(),
+        payload: vec![255, 0],
+    };
+    let unavailable = node::encode_frame_with_blob(&signer, 1, &message, Some([0; 32]));
+    let response = noded::router(handle.clone())
+        .oneshot(post_frame(unavailable))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(commands.next().now_or_never().is_none());
+    let frame = node::encode_frame_with_blob(&signer, 2, &message, Some(digest));
+    let expected = frame.clone();
+    let actor = tokio::spawn(async move {
+        let NodeCommand::SubmitFrame { frame, reply } = commands.next().await.unwrap() else {
+            panic!("expected signed frame");
+        };
+        assert_eq!(frame, expected);
+        reply
+            .send(Ok(BlockSummary {
+                height: 12,
+                root_hash: "ab".repeat(32),
+            }))
+            .unwrap();
+    });
+    let response = noded::router(handle)
+        .oneshot(post_frame(frame))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    actor.await.unwrap();
 }
 
 #[tokio::test]

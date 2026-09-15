@@ -29,6 +29,8 @@ pub enum NodeCommand {
     Submit {
         target: String,
         payload: Vec<u8>,
+        /// Opaque content that must be present before this operation is admitted.
+        required_blob: Option<[u8; 32]>,
         /// `Origin::External` bytes for this block: the key a request's
         /// signature proved possession of on a gated route
         /// ([`crate::signed_req::SignedBy`]), or — on the frameless

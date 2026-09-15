@@ -100,13 +100,14 @@ pub(crate) struct FrameArgs {
     key: PathBuf,
 }
 
-/// One `<target> <seq> <payload-hex>` request line off the signer's stdin.
+/// One `<target> <seq> <payload-hex> [required-blob-hex]` request line off the signer's stdin.
 /// `seq` is the frame's ordering/dedup tie-breaker (any u64); it is NOT
 /// tracked in state.
 struct FrameRequest {
     target: String,
     seq: u64,
     payload: Vec<u8>,
+    required_blob: Option<[u8; 32]>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -441,20 +442,33 @@ fn cmd_user_sign_gateway_route(
     Ok(())
 }
 
-/// Parse one request line. Whitespace-separated, exactly three fields — the
+/// Parse one request line. Whitespace-separated, three fields and an optional blob digest — the
 /// target and seq ride the line rather than flags precisely because the
 /// unlock is per PROCESS and the requests are per OP.
 fn parse_frame_request(line: &str) -> Result<FrameRequest, String> {
     let mut fields = line.split_whitespace();
-    let (Some(target), Some(seq), Some(payload_hex), None) =
-        (fields.next(), fields.next(), fields.next(), fields.next())
-    else {
-        return Err("frame request must be `<target> <seq> <payload-hex>`".into());
+    let (Some(target), Some(seq), Some(payload_hex), required_blob, None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return Err(
+            "frame request must be `<target> <seq> <payload-hex> [required-blob-hex]`".into(),
+        );
     };
     Ok(FrameRequest {
         target: target.to_string(),
         seq: seq.parse().map_err(|_| format!("frame seq: {seq:?}"))?,
         payload: config::unhex(payload_hex).map_err(|e| format!("payload hex: {e}"))?,
+        required_blob: required_blob
+            .map(|digest| {
+                duckfs_core::from_hex_32(digest).ok_or_else(|| {
+                    "required blob must be 64 lowercase hexadecimal characters".to_owned()
+                })
+            })
+            .transpose()?,
     })
 }
 
@@ -484,7 +498,15 @@ fn user_sign_frame(
     // would blow past OS argv limits.
     let user = load_user_signer(&args.key, stdin)?;
     while let Some(request) = read_frame_request(stdin)? {
-        let frame = user_frame_at(&user, request.seq, &request.target, request.payload);
+        let frame = node::encode_frame_with_blob(
+            &user,
+            request.seq,
+            &sdk::Msg {
+                target: request.target,
+                payload: request.payload,
+            },
+            request.required_blob,
+        );
         writeln!(out, "{}", hex_bytes(&frame))?;
         out.flush()?;
     }
@@ -525,7 +547,7 @@ fn user_frame_at(user: &ed25519::PrivateKey, seq: u64, target: &str, payload: Ve
 }
 
 /// `user-sign-frame --key <path>` — stdin: one password line, then one
-/// `<target> <seq> <payload-hex>` request line per frame; stdout: one frame
+/// `<target> <seq> <payload-hex> [required-blob-hex]` request line per frame; stdout: one frame
 /// hex line per request, in order.
 ///
 /// Wraps each payload in a `node` op frame signed by the user key. POSTed raw
@@ -634,6 +656,41 @@ mod userkey_verb_tests {
     // themselves get theirs from `keystore` now.
     use commonware_codec::DecodeExt as _;
     use std::io::Cursor;
+
+    #[test]
+    fn frame_request_declares_a_signed_generic_blob() {
+        let request =
+            parse_frame_request(&format!("new-product 7 ff00 {}", "ab".repeat(32))).unwrap();
+        assert_eq!(request.required_blob, Some([0xab; 32]));
+        let signer = ed25519::PrivateKey::decode(&[9u8; 32][..]).unwrap();
+        let frame = node::encode_frame_with_blob(
+            &signer,
+            request.seq,
+            &sdk::Msg {
+                target: request.target,
+                payload: request.payload,
+            },
+            request.required_blob,
+        );
+        let (_, message, digest) = node::decode_frame_with_blob(&frame).unwrap();
+        assert_eq!(message.target, "new-product");
+        assert_eq!(message.payload, vec![255, 0]);
+        assert_eq!(digest, Some([0xab; 32]));
+        assert_eq!(
+            parse_frame_request("new-product 7 ff00")
+                .unwrap()
+                .required_blob,
+            None
+        );
+        for suffix in [
+            "AB".repeat(32),
+            "ab".repeat(31),
+            "gg".repeat(32),
+            format!("{} extra", "ab".repeat(32)),
+        ] {
+            assert!(parse_frame_request(&format!("new-product 7 ff00 {suffix}")).is_err());
+        }
+    }
 
     /// a Parser wrapper so tests can exercise the derived verb SHAPE (kebab
     /// spellings, parse rejection) the same way `main.rs`'s integrator will.
@@ -943,9 +1000,13 @@ mod userkey_verb_tests {
         let payload: &[u8] = b"\x00raw chunk bytes";
         let frames = sign_frames(
             &key_path,
-            &[TEST_PASSWORD, &format!("files 42 {}", hex_bytes(payload))],
+            &[
+                TEST_PASSWORD,
+                &format!("files 42 {}", hex_bytes(payload)),
+                &format!("new-product 43 {} {}", hex_bytes(payload), "ab".repeat(32)),
+            ],
         );
-        assert_eq!(frames.len(), 1);
+        assert_eq!(frames.len(), 2);
 
         let (origin, msg) =
             node::decode_frame(&config::unhex(&frames[0]).unwrap()).expect("frame verifies");
@@ -956,6 +1017,12 @@ mod userkey_verb_tests {
         );
         assert_eq!(msg.target, "files");
         assert_eq!(msg.payload, payload);
+        let (blob_origin, blob_msg, required_blob) =
+            node::decode_frame_with_blob(&config::unhex(&frames[1]).unwrap()).unwrap();
+        assert_eq!(blob_origin, origin);
+        assert_eq!(blob_msg.target, "new-product");
+        assert_eq!(blob_msg.payload, payload);
+        assert_eq!(required_blob, Some([0xab; 32]));
     }
 
     /// THE session property: one password line, one key open, N frames — each

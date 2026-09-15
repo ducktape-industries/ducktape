@@ -47,6 +47,7 @@ async fn submit(handle: &NodeHandle, message: Submission) -> Result<(), String> 
     handle
         .command_sender()
         .send(NodeCommand::Submit {
+            required_blob: None,
             target: message.target,
             payload: message.payload,
             origin: key,
@@ -417,6 +418,7 @@ mod tests {
                 let NodeCommand::Submit {
                     target,
                     payload,
+                    required_blob: _,
                     origin,
                     reply,
                 } = commands.next().await.unwrap()

@@ -352,6 +352,7 @@ fn run_node(
                 NodeCommand::Submit {
                     target,
                     payload,
+                    required_blob: _,
                     origin,
                     reply,
                 } => {

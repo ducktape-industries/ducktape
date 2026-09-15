@@ -59,7 +59,7 @@ def main():
     message = {'push_refs': {'repo': args.repo, 'updates': [{
         'ref_name': args.branch, 'prev_oid': list(bytes.fromhex(previous)) if previous else None,
         'new_oid': list(bytes.fromhex(tip))}], 'pack_digest': list(bytes.fromhex(digest)), 'cert': None}}
-    post('/v1/submit', json.dumps({'target': 'forge', 'payload': message}).encode(), 'application/json')
+    post('/v1/submit', json.dumps({'target': 'forge', 'payload': message, 'required_blob': digest}).encode(), 'application/json')
     print(tip)
 
 

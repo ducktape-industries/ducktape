@@ -1135,6 +1135,7 @@ pub(super) async fn park(
                             noded::NodeCommand::Submit {
                                 target,
                                 payload,
+                                required_blob,
                                 origin: _,
                                 reply,
                             } => {
@@ -1142,12 +1143,13 @@ pub(super) async fn park(
                                     let _ =
                                         reply.send(Err(not_serving(resident_standing)));
                                 } else {
-                                    match resident_relay.submit(
+                                    match resident_relay.submit_with_blob(
                                         &signer,
                                         &announce_targets,
                                         &mut relay_tx,
                                         target,
                                         payload,
+                                        required_blob,
                                         relay_runtime::ResidentHold::Http(reply),
                                     ) {
                                         Ok(_) => {}

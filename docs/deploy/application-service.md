@@ -198,6 +198,14 @@ update additionally requires a user's Git SSH push certificate, verified by the
 service and again by the module. Node administrator tokens do not authorize an
 unsigned service push.
 
+A submission that needs an uploaded pack declares its digest in the signed
+frame's generic `required_blob` field. The node transports that blob before
+relaying the operation; it does not decode the product payload to discover it.
+Operator clients use `required_blob` (64 lowercase hexadecimal characters) in
+`POST /v1/submit` JSON, or the same query parameter on
+`POST /v1/submit/raw/{target}`. Upload the blob to the receiving node first;
+a declared blob absent from its verified store is refused.
+
 The service exposes `/{repo}/info/refs`, `/{repo}/git-receive-pack`, and
 `/{repo}/git-upload-pack`. Configure the signed Gateway route to allow GET/POST
 for the intended network audience. Stock Git can supply the route authority

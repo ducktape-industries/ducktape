@@ -2053,7 +2053,11 @@ fn seed_forge_at(port: u16, workspace: &Path, source: &Path, name: &str, branch:
         pack_digest: Some(duckfs_core::from_hex_32(&digest).unwrap().to_vec()),
         cert: None,
     });
-    request("/v1/submit/raw/forge", "application/octet-stream", &payload);
+    request(
+        &format!("/v1/submit/raw/forge?required_blob={digest}"),
+        "application/octet-stream",
+        &payload,
+    );
 }
 
 /// Read the peer's actual objects through the installed service protocol.

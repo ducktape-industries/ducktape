@@ -180,6 +180,7 @@ pub(crate) async fn ensure_channel(handle: &NodeHandle, channel: &str) -> Ensure
     });
     let sent = handle
         .send(NodeCommand::Submit {
+            required_blob: None,
             target: chat::DEFAULT_CHAT_TARGET.to_string(),
             payload,
             origin: crate::DEFAULT_ORIGIN.as_bytes().to_vec(),

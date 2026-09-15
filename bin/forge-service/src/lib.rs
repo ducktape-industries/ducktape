@@ -44,14 +44,19 @@ struct ServiceState {
 }
 
 impl ServiceState {
-    async fn submit(&self, payload: Vec<u8>) -> Result<u64, String> {
-        let frame = node::encode_frame(
+    async fn submit(
+        &self,
+        payload: Vec<u8>,
+        required_blob: Option<[u8; 32]>,
+    ) -> Result<u64, String> {
+        let frame = node::encode_frame_with_blob(
             &self.signer,
             self.sequence.fetch_add(1, Ordering::Relaxed),
             &sdk::Msg {
                 target: self.module.clone(),
                 payload,
             },
+            required_blob,
         );
         self.client
             .submit_frame(frame)

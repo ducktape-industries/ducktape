@@ -837,7 +837,12 @@ pub(crate) async fn git_receive_pack(
     let pack_digest = if updates.iter().any(|u| u.new_oid.is_some()) {
         match handle.client.put_blob(pack.to_vec()).await {
             Ok(digest) => match hex::decode(digest) {
-                Ok(digest) => Some(digest),
+                Ok(digest) => match <[u8; 32]>::try_from(digest) {
+                    Ok(digest) => Some(digest),
+                    Err(_) => {
+                        return error_response(StatusCode::BAD_GATEWAY, "invalid blob digest");
+                    }
+                },
                 Err(_) => return error_response(StatusCode::BAD_GATEWAY, "invalid blob digest"),
             },
             Err(error) => return error_response(StatusCode::BAD_GATEWAY, &error.to_string()),
@@ -850,10 +855,10 @@ pub(crate) async fn git_receive_pack(
     let payload = forge::encode_msg(&forge::ForgeMsg::PushRefs {
         repo: repo.clone(),
         updates,
-        pack_digest,
+        pack_digest: pack_digest.map(|digest| digest.to_vec()),
         cert,
     });
-    let submitted = handle.submit(payload).await;
+    let submitted = handle.submit(payload, pack_digest).await;
     let refnames: Vec<String> = cmds.into_iter().map(|(_, _, r)| r).collect();
     match submitted {
         Ok(height) => {

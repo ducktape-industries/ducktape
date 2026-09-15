@@ -1596,9 +1596,24 @@ async fn spawn_credential_capturing_remote(
         .route("/v1/files/blob", axum::routing::post(upload))
         .route(
             "/v1/submit",
-            axum::routing::post(|| async {
-                axum::Json(super::super::plane_tests::committed_block())
-            }),
+            axum::routing::post(
+                |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    let is_publication = body["target"] == "forge";
+                    if is_publication {
+                        let required = body["required_blob"]
+                            .as_str()
+                            .expect("publication declares the uploaded blob");
+                        let digest = duckfs_core::from_hex_32(required).unwrap();
+                        let message: forge::ForgeMsg =
+                            serde_json::from_value(body["payload"].clone()).unwrap();
+                        let forge::ForgeMsg::PushRefs { pack_digest, .. } = message else {
+                            panic!("expected publication");
+                        };
+                        assert_eq!(pack_digest.as_deref(), Some(digest.as_slice()));
+                    }
+                    axum::Json(super::super::plane_tests::committed_block())
+                },
+            ),
         );
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     address

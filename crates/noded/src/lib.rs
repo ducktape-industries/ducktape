@@ -609,6 +609,9 @@ pub struct SubmitRequest {
     pub target: String,
     /// the module's `*Msg` enum as a json value — encoded verbatim into `Msg.payload`.
     pub payload: serde_json::Value,
+    /// A transport prerequisite, independent of the module payload.
+    #[serde(default, deserialize_with = "deserialize_required_blob")]
+    pub required_blob: Option<[u8; 32]>,
     /// the submitter identity stamped into `Origin::External` on a daemon that
     /// honours it (the embedded one, and simnode).
     ///
@@ -630,6 +633,22 @@ pub struct SubmitRequest {
     /// symptom.
     #[serde(default)]
     pub origin: Option<String>,
+}
+
+fn deserialize_required_blob<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<[u8; 32]>, D::Error> {
+    let digest = String::deserialize(deserializer)?;
+    duckfs_core::from_hex_32(&digest).map(Some).ok_or_else(|| {
+        serde::de::Error::custom("required_blob must be 64 lowercase hexadecimal characters")
+    })
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubmitBlob {
+    #[serde(default, deserialize_with = "deserialize_required_blob")]
+    required_blob: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -876,7 +895,7 @@ async fn submit(
             .unwrap_or_else(|| DEFAULT_ORIGIN.to_string())
             .into_bytes(),
     };
-    submit_payload(&handle, req.target, payload, origin).await
+    submit_payload(&handle, req.target, payload, origin, req.required_blob).await
 }
 
 /// An operator-authorized arbitrary module op, authored as the node. User
@@ -884,6 +903,7 @@ async fn submit(
 async fn submit_raw(
     State(handle): State<NodeHandle>,
     axum::extract::Path(target): axum::extract::Path<String>,
+    axum::extract::Query(prerequisite): axum::extract::Query<SubmitBlob>,
     body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
     let bounded_target = !target.is_empty() && target.len() <= node::MAX_TARGET_BYTES;
@@ -892,15 +912,32 @@ async fn submit_raw(
         Ok(body) => body,
         Err(error) => return error_response(error.status(), &error.body_text()),
     };
-    submit_payload(&handle, target, body.to_vec(), signed_req::acting_origin(None)).await
+    submit_payload(
+        &handle,
+        target,
+        body.to_vec(),
+        signed_req::acting_origin(None),
+        prerequisite.required_blob,
+    )
+    .await
 }
 
-async fn submit_payload(handle: &NodeHandle, target: String, payload: Vec<u8>, origin: Vec<u8>) -> Response {
+async fn submit_payload(
+    handle: &NodeHandle,
+    target: String,
+    payload: Vec<u8>,
+    origin: Vec<u8>,
+    required_blob: Option<[u8; 32]>,
+) -> Response {
+    if let Err(reason) = require_local_blob(handle, required_blob.as_ref()) {
+        return error_response(StatusCode::BAD_REQUEST, reason);
+    }
     let (reply, rx) = oneshot::channel();
     if let Err(resp) = handle
         .send(NodeCommand::Submit {
             target,
             payload: payload.clone(),
+            required_blob,
             origin,
             reply,
         })
@@ -926,6 +963,15 @@ async fn submit_payload(handle: &NodeHandle, target: String, payload: Vec<u8>, o
     }
 }
 
+fn require_local_blob(handle: &NodeHandle, digest: Option<&[u8; 32]>) -> Result<(), &'static str> {
+    let Some(digest) = digest else { return Ok(()) };
+    let available = handle.blobs.has_verified_chunk(digest);
+    if !available {
+        return Err("required blob is not available on this node");
+    }
+    Ok(())
+}
+
 /// POST /v1/submit/frame — an ALREADY-SIGNED op frame (`application/octet-stream`,
 /// the exact bytes [`node::encode_frame`] produced), answered with the same
 /// [`SubmitReceipt`] `/v1/submit` returns.
@@ -934,7 +980,7 @@ async fn submit_payload(handle: &NodeHandle, target: String, payload: Vec<u8>, o
 /// the embedded daemon honours it, `bin/node` throws it away and signs with its
 /// own node key, so nothing submitted there can carry authorship consensus is
 /// able to check. a frame can — its origin IS its verified signer, bound to
-/// `(seq, target, payload)` under `FRAME_NS`, which every honest validator
+/// `(seq, target, payload, required_blob)` under `FRAME_NS`, which every honest validator
 /// re-verifies identically. that is what lets an agent's ephemeral session key
 /// act for itself instead of borrowing the node's identity.
 ///
@@ -951,13 +997,16 @@ async fn submit_frame(
         Ok(bytes) => bytes,
         Err(rejection) => return error_response(rejection.status(), &rejection.body_text()),
     };
-    let payload = match node::decode_frame(&frame) {
+    let (payload, required_blob) = match node::decode_frame_with_blob(&frame) {
         // the origin is DELIBERATELY dropped here: the http layer never tells an
         // actor who signed — the actor re-derives that from the bytes (or, on
         // the validator, `submit_frame` does). one authority on authorship.
-        Ok((_origin, msg)) => msg.payload,
+        Ok((_origin, msg, required_blob)) => (msg.payload, required_blob),
         Err(err) => return error_response(StatusCode::BAD_REQUEST, &err.to_string()),
     };
+    if let Err(reason) = require_local_blob(&handle, required_blob.as_ref()) {
+        return error_response(StatusCode::BAD_REQUEST, reason);
+    }
     let (reply, rx) = oneshot::channel();
     if let Err(resp) = handle
         .send(NodeCommand::SubmitFrame {

@@ -58,10 +58,11 @@
 //!   parked in a host picture surface's slot; answered with its drawn size.
 //! - `blob.put` `<raw bytes>` — a blob landed on the node, proven with the seated key;
 //!   answered with the digest.
-//! - `op.submit_bytes` `{target, body_b64}` — exact binary module payload.
-//! - `op.submit` `{target, payload}` — one JSON module op, signed with the
+//! - `op.submit_bytes` `{target, body_b64, required_blob?}` — exact binary module payload.
+//! - `op.submit` `{target, payload, required_blob?}` — one JSON module op, signed with the
 //!   SEATED key and submitted; answered with the block height. The view
-//!   never carries a password, an endpoint or a key.
+//!   never carries a password, an endpoint or a key. `required_blob` is a
+//!   64-character lowercase SHA256 hex digest bound into the signed frame.
 //! - `rpc.admin` `{route, payload}` — one POST to a `/v1` route that
 //!   mutates THE NODE rather than module state, signed with the SEATED key
 //!   exactly as the `ducktape node` verbs sign theirs; answered with the
@@ -1429,6 +1430,28 @@ fn blocks(
     })
 }
 
+fn required_blob_of(ask: &serde_json::Value) -> Result<Option<[u8; 32]>, String> {
+    let Some(value) = ask.get("required_blob") else {
+        return Ok(None);
+    };
+    let digest = value
+        .as_str()
+        .ok_or("required_blob must be a SHA256 hex string")?;
+    let canonical = digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !canonical {
+        return Err("required_blob must be 64 lowercase hexadecimal characters".into());
+    }
+    let mut bytes = [0; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(Some(bytes))
+}
+
 /// The envelope names only a module and exact bytes; the seated signer owns
 /// identity and sequence, just as it does for JSON operations.
 fn submit_bytes(
@@ -1441,7 +1464,9 @@ fn submit_bytes(
             .as_str()
             .ok_or("body_b64 must be a string")?;
         let payload = crate::backend::base64_decode(encoded).ok_or("invalid operation base64")?;
-        let height = crate::backend::seated_write(&client, &target, payload).await?;
+        let height =
+            crate::backend::seated_write(&client, &target, payload, required_blob_of(&ask)?)
+                .await?;
         Ok(height.to_string().into_bytes())
     })
 }
@@ -1453,7 +1478,9 @@ fn submit(
     Box::pin(async move {
         let target = target_of(&ask)?;
         let payload = serde_json::to_vec(&ask["payload"]).map_err(|error| error.to_string())?;
-        let height = crate::backend::seated_write(&client, &target, payload).await?;
+        let height =
+            crate::backend::seated_write(&client, &target, payload, required_blob_of(&ask)?)
+                .await?;
         Ok(height.to_string().into_bytes())
     })
 }
@@ -1643,6 +1670,23 @@ pub fn block_hit(height: i64, serial: i64) -> i64 {
 mod tests {
     use super::*;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn blob_prerequisite_accepts_only_an_exact_digest() {
+        assert_eq!(required_blob_of(&serde_json::json!({})).unwrap(), None);
+        let valid = serde_json::json!({"required_blob": "ab".repeat(32)});
+        assert_eq!(required_blob_of(&valid).unwrap(), Some([0xab; 32]));
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!(23),
+            serde_json::json!("ab"),
+            serde_json::json!("gg".repeat(32)),
+            serde_json::json!("AB".repeat(32)),
+            serde_json::json!("ab".repeat(33)),
+        ] {
+            assert!(required_blob_of(&serde_json::json!({"required_blob": invalid})).is_err());
+        }
+    }
 
     #[tokio::test]
     async fn old_view_cannot_continue_requests_on_a_new_network() {

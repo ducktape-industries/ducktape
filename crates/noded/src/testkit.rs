@@ -379,6 +379,7 @@ fn run_actor(mut host: Host, status_modules: Vec<String>, io: ActorIo) {
                 NodeCommand::Submit {
                     target,
                     payload,
+                    required_blob: _,
                     origin,
                     reply,
                 } => {

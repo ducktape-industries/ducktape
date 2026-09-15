@@ -907,7 +907,7 @@ fn run_sim(
                     None => break,
                 },
                 cmd = cmds.next() => match cmd {
-                    Some(NodeCommand::Submit { target, payload, origin, reply }) => {
+                    Some(NodeCommand::Submit { target, payload, required_blob: _, origin, reply }) => {
                         // the `hex:` origin escape resolves to raw bytes here, so a
                         // client can author as a real ed25519 key; malformed hex is
                         // a hard reject, never a literal-string fall-through.

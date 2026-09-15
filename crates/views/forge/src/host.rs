@@ -1089,7 +1089,17 @@ impl Stream for ActStream {
 }
 
 async fn submit(message: serde_json::Value) -> Result<(), String> {
-    let op = serde_json::json!({ "target": FORGE, "payload": message });
+    submit_with_blob(message, None).await
+}
+
+async fn submit_with_blob(
+    message: serde_json::Value,
+    required_blob: Option<&str>,
+) -> Result<(), String> {
+    let mut op = serde_json::json!({ "target": FORGE, "payload": message });
+    if let Some(digest) = required_blob {
+        op["required_blob"] = serde_json::Value::String(digest.to_owned());
+    }
     host::request("op.submit", &serde_json::to_vec(&op).expect("encodes"))
         .await
         .map(|_| ())
@@ -1266,7 +1276,7 @@ async fn merge_pr(
         "merge_oid": &merge_oid,
         "pack_digest": built["pack_digest"].as_str().unwrap_or_default(),
     }});
-    submit(message).await?;
+    submit_with_blob(message, built["pack_digest"].as_str()).await?;
     Ok(ActItem {
         kind: "merge".to_owned(),
         merge_oid,

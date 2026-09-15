@@ -86,11 +86,28 @@ impl ResidentRelay {
     where
         S: P2pSender<PublicKey = ed25519::PublicKey>,
     {
-        let (frame_id, frame, custodian) = match self.signed_frame(signer, targets, target, payload)
-        {
-            Ok(prepared) => prepared,
-            Err(detail) => return Err((hold, detail)),
-        };
+        self.submit_with_blob(signer, targets, relay_tx, target, payload, None, hold)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit_with_blob<S>(
+        &mut self,
+        signer: &ed25519::PrivateKey,
+        targets: &[ed25519::PublicKey],
+        relay_tx: &mut S,
+        target: String,
+        payload: Vec<u8>,
+        required_blob: Option<[u8; 32]>,
+        hold: ResidentHold,
+    ) -> Result<node::FrameId, (ResidentHold, String)>
+    where
+        S: P2pSender<PublicKey = ed25519::PublicKey>,
+    {
+        let (frame_id, frame, custodian) =
+            match self.signed_frame(signer, targets, target, payload, required_blob) {
+                Ok(prepared) => prepared,
+                Err(detail) => return Err((hold, detail)),
+            };
         self.relay_frame(frame_id, frame, custodian, targets, relay_tx, hold)
     }
 
@@ -118,7 +135,7 @@ impl ResidentRelay {
         self.relay_frame(frame_id, frame, custodian, targets, relay_tx, hold)
     }
 
-    /// The shared relay tail both submit paths take: fan a forge pack out to
+    /// The shared relay tail both submit paths take: fan a required blob out to
     /// every target first when the frame needs one, otherwise hand the frame
     /// straight to the custodian and hold the caller's reply against its id.
     fn relay_frame<S>(
@@ -138,7 +155,8 @@ impl ResidentRelay {
             let Some(bytes) = self.blobs.get_chunk(&digest) else {
                 return Err((
                     hold,
-                    "forge pack referenced by the submit is not in this node's blob store".into(),
+                    "required blob referenced by the submit is not in this node's blob store"
+                        .into(),
                 ));
             };
             if let Err(detail) = send_blob(relay_tx, targets, &frame, digest, &bytes) {
@@ -219,7 +237,7 @@ impl ResidentRelay {
                 ) {
                     fanout
                         .hold
-                        .fail("validator unreachable after forge pack fanout".into());
+                        .fail("validator unreachable after required blob fanout".into());
                 } else {
                     self.pending
                         .insert(frame_id, (fanout.hold, fanout.deadline));
@@ -250,15 +268,15 @@ impl ResidentRelay {
                 // push was otherwise EMPTY — this line is the server-side
                 // evidence.
                 tracing::warn!(
-                    target: "ducktape::forge",
+                    target: "ducktape::relay",
                     digest = %relay::encode_hex(&fanout.digest),
                     awaiting = fanout.awaiting.len(),
-                    reason = "forge_pack_fanout_expired",
-                    "forge pack fanout expired before every validator acked; the push fails and can be retried"
+                    reason = "blob_fanout_expired",
+                    "required blob fanout expired before every validator acked; the push fails and can be retried"
                 );
                 fanout
                     .hold
-                    .fail("timed out distributing the forge pack to validators".into());
+                    .fail("timed out distributing the required blob to validators".into());
             }
         }
 
@@ -283,12 +301,14 @@ impl ResidentRelay {
         targets: &[ed25519::PublicKey],
         target: String,
         payload: Vec<u8>,
+        required_blob: Option<[u8; 32]>,
     ) -> Result<(node::FrameId, Vec<u8>, ed25519::PublicKey), String> {
         let custodian = self.custodian(targets)?;
         self.seq += 1;
         std::fs::write(&self.seq_file, self.seq.to_string())
             .map_err(|e| format!("cannot persist the submit seq: {e}"))?;
-        let frame = node::encode_frame(signer, self.seq, &Msg { target, payload });
+        let frame =
+            node::encode_frame_with_blob(signer, self.seq, &Msg { target, payload }, required_blob);
         let frame_id = node::frame_id(&frame);
         Ok((frame_id, frame, custodian))
     }
@@ -372,7 +392,7 @@ impl ValidatorRelay {
     }
 
     /// Prepare a validator-local app submit. Ordinary ops and single-validator
-    /// Forge pushes return immediately; multi-validator Forge pushes remain
+    /// blob-dependent submits return immediately; multi-validator blob-dependent submits remain
     /// pending until every peer acknowledges the pack.
     pub(crate) fn prepare_local<S>(
         &mut self,
@@ -398,7 +418,8 @@ impl ValidatorRelay {
         let Some(pack) = self.blobs.get_chunk(&digest) else {
             return Err((
                 reply,
-                "forge pack referenced by the submit is not in this validator's blob store".into(),
+                "required blob referenced by the submit is not in this validator's blob store"
+                    .into(),
             ));
         };
         if peers.is_empty() {
@@ -466,7 +487,7 @@ impl ValidatorRelay {
                         &peer,
                         frame_id,
                         digest,
-                        Some("too many concurrent forge pack transfers".into()),
+                        Some("too many concurrent required blob transfers".into()),
                     );
                     return None;
                 }
@@ -582,7 +603,7 @@ impl ValidatorRelay {
                         &peer,
                         frame_id,
                         relay::RelayOutcome::Refused {
-                            detail: "forge pack was not prepared on this validator".into(),
+                            detail: "required blob was not prepared on this validator".into(),
                         },
                     );
                     return None;
@@ -613,14 +634,14 @@ impl ValidatorRelay {
         for id in expired_local {
             if let Some(fanout) = self.local_fanouts.remove(&id) {
                 tracing::warn!(
-                    target: "ducktape::forge",
+                    target: "ducktape::relay",
                     digest = %relay::encode_hex(&fanout.digest),
                     awaiting = fanout.awaiting.len(),
-                    reason = "forge_pack_fanout_expired",
-                    "forge pack fanout expired before every peer acked; the push fails and can be retried"
+                    reason = "blob_fanout_expired",
+                    "required blob fanout expired before every peer acked; the push fails and can be retried"
                 );
                 let _ = fanout.reply.send(Err(
-                    "timed out distributing the forge pack to validators".into(),
+                    "timed out distributing the required blob to validators".into(),
                 ));
             }
         }
@@ -637,17 +658,17 @@ impl ValidatorRelay {
                 // ride the p2p channel with no retransmit, so a tunnel that
                 // drops mid-transfer can never complete this assembly.
                 tracing::warn!(
-                    target: "ducktape::forge",
+                    target: "ducktape::relay",
                     digest = %relay::encode_hex(&incoming.digest),
-                    reason = "forge_pack_receive_expired",
-                    "forge pack receive expired mid-transfer; refusing so the pusher sees the timeout"
+                    reason = "blob_receive_expired",
+                    "required blob receive expired mid-transfer; refusing so the pusher sees the timeout"
                 );
                 send_blob_result(
                     relay_tx,
                     &incoming.peer,
                     id,
                     incoming.digest,
-                    Some("timed out receiving the forge pack".into()),
+                    Some("timed out receiving the required blob".into()),
                 );
             }
         }
@@ -666,7 +687,7 @@ where
 {
     if bytes.is_empty() || bytes.len() > relay::MAX_RELAY_BLOB_BYTES {
         return Err(format!(
-            "forge pack must be 1..={} bytes for node relay, got {}",
+            "required blob must be 1..={} bytes for node relay, got {}",
             relay::MAX_RELAY_BLOB_BYTES,
             bytes.len()
         ));
@@ -683,7 +704,7 @@ where
             },
         ) {
             return Err(format!(
-                "validator {target} unreachable during forge pack offer"
+                "validator {target} unreachable during required blob offer"
             ));
         }
         for (index, chunk) in bytes.chunks(relay::RELAY_BLOB_CHUNK_BYTES).enumerate() {
@@ -698,7 +719,7 @@ where
                 },
             ) {
                 return Err(format!(
-                    "validator {target} unreachable during forge pack transfer"
+                    "validator {target} unreachable during required blob transfer"
                 ));
             }
         }
@@ -763,6 +784,152 @@ where
 mod tests {
     use super::*;
     use sha2::{Digest as _, Sha256};
+
+    #[derive(Clone, Default)]
+    struct RecordingSender(std::sync::Arc<std::sync::Mutex<Vec<relay::RelayMsg>>>);
+
+    struct CheckedRecording {
+        sender: RecordingSender,
+        peers: Vec<ed25519::PublicKey>,
+    }
+
+    impl commonware_p2p::LimitedSender for RecordingSender {
+        type PublicKey = ed25519::PublicKey;
+        type Checked<'a> = CheckedRecording;
+
+        fn check(
+            &mut self,
+            recipients: Recipients<Self::PublicKey>,
+        ) -> Result<Self::Checked<'_>, SystemTime> {
+            let peers = match recipients {
+                Recipients::One(peer) => vec![peer],
+                Recipients::Some(peers) => peers,
+                Recipients::All => panic!("test must name its peers"),
+            };
+            Ok(CheckedRecording {
+                sender: self.clone(),
+                peers,
+            })
+        }
+    }
+
+    impl commonware_p2p::CheckedSender for CheckedRecording {
+        type PublicKey = ed25519::PublicKey;
+        fn recipients(&self) -> Vec<Self::PublicKey> {
+            self.peers.clone()
+        }
+        fn send(
+            self,
+            message: impl Into<commonware_runtime::IoBufs> + Send,
+            _: bool,
+        ) -> commonware_actor::Unreliable<commonware_actor::Feedback> {
+            let bytes = message.into().coalesce();
+            self.sender
+                .0
+                .lock()
+                .unwrap()
+                .push(relay::decode_msg(bytes.as_ref()).unwrap());
+            commonware_actor::Unreliable::new(commonware_actor::Feedback::Ok)
+        }
+    }
+
+    #[test]
+    fn arbitrary_module_blob_precedes_admission_and_every_peer_ack() {
+        use commonware_cryptography::Signer as _;
+        let author = ed25519::PrivateKey::from_seed(101);
+        let peers = [102, 103].map(|seed| ed25519::PrivateKey::from_seed(seed).public_key());
+        let outsider = ed25519::PrivateKey::from_seed(104).public_key();
+        let bytes = b"opaque application storage".to_vec();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let frame = node::encode_frame_with_blob(
+            &author,
+            1,
+            &Msg {
+                target: "new-storage-module".into(),
+                payload: b"arbitrary op".to_vec(),
+            },
+            Some(digest),
+        );
+        let frame_id = node::frame_id(&frame);
+        let blobs = std::sync::Arc::new(blobstore::BlobHandle::default());
+        let mut validator = ValidatorRelay::new(blobs.clone());
+        let mut sender = RecordingSender::default();
+        let now = SystemTime::UNIX_EPOCH;
+        let (reply, _) = oneshot::channel();
+        let missing =
+            validator.prepare_local(now, frame.clone(), reply, peers.to_vec(), &mut sender);
+        assert!(
+            matches!(missing, Err((_, detail)) if detail.contains("not in this validator's blob store"))
+        );
+        assert!(sender.0.lock().unwrap().is_empty());
+
+        // Remote custody also refuses a valid frame before its bytes arrive.
+        let standing = vec![peers[0].as_ref().to_vec()];
+        assert!(
+            validator
+                .on_message(
+                    now,
+                    peers[0].clone(),
+                    relay::RelayMsg::Submit {
+                        frame: frame.clone()
+                    },
+                    &standing,
+                    &[],
+                    &mut sender
+                )
+                .is_none()
+        );
+        assert!(matches!(
+            sender.0.lock().unwrap().last(),
+            Some(relay::RelayMsg::Reply {
+                outcome: relay::RelayOutcome::Refused { .. },
+                ..
+            })
+        ));
+        assert_eq!(blobs.put_chunk(bytes), digest);
+        let (reply, _) = oneshot::channel();
+        assert!(matches!(
+            validator.prepare_local(now, frame.clone(), reply, peers.to_vec(), &mut sender),
+            Ok(None)
+        ));
+        assert_eq!(validator.local_fanouts.len(), 1);
+        let acknowledgement = |digest| relay::RelayMsg::BlobResult {
+            frame_id,
+            digest,
+            error: None,
+        };
+        for (peer, acknowledged_digest) in [
+            (outsider, digest),
+            (peers[0].clone(), [0; 32]),
+            (peers[0].clone(), digest),
+            (peers[0].clone(), digest),
+        ] {
+            assert!(
+                validator
+                    .on_message(
+                        now,
+                        peer,
+                        acknowledgement(acknowledged_digest),
+                        &[],
+                        &[],
+                        &mut sender
+                    )
+                    .is_none()
+            );
+        }
+        let action = validator.on_message(
+            now,
+            peers[1].clone(),
+            acknowledgement(digest),
+            &[],
+            &[],
+            &mut sender,
+        );
+        assert!(
+            matches!(action, Some(ValidatorAction::SubmitLocal { frame: admitted, .. }) if admitted == frame)
+        );
+        assert!(validator.local_fanouts.is_empty());
+    }
 
     #[test]
     fn blob_digest_is_content_addressed() {

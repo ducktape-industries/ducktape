@@ -47,6 +47,7 @@ impl ActorNodeApi {
             let (reply, rx) = oneshot::channel();
             self.handle
                 .send(NodeCommand::Submit {
+                    required_blob: None,
                     target: FILES_MODULE.into(),
                     payload,
                     origin: self.origin.clone(),
