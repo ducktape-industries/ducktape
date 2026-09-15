@@ -197,6 +197,7 @@ members = [
     "bin/airlock-gateway",
     "bin/media-service",
     "bin/forge-service",
+    "bin/terminal-service",
     "bin/guest-builder",
     "bin/duck-guest-init",
     # the desktop app's boot-time executor (flip / rollback / exec)

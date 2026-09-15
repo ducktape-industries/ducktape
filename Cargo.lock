@@ -3878,6 +3878,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ducktape-terminal"
+version = "0.1.0"
+dependencies = [
+ "agent-service",
+ "async-trait",
+ "base64 0.22.1",
+ "provider-host",
+ "serde",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "ducktape-view-composer"
 version = "0.1.0"
 dependencies = [
