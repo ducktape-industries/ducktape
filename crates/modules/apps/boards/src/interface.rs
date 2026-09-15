@@ -114,6 +114,20 @@ pub enum Change {
         id: String,
         color: u8,
     },
+    /// A connector's run, restated: the samples, the box they span, and which
+    /// cards its ends hold. Dragging one end moves all of them together — a
+    /// re-route split into a move, a resize and a re-bind would be three undo
+    /// steps, and three chances for a reader to see the arrow half-moved.
+    Route {
+        id: String,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        points: Vec<[i32; 2]>,
+        from: Option<String>,
+        to: Option<String>,
+    },
     /// Raise these shapes, in this order, above everything else on the board.
     /// Naming every shape therefore states the whole stack — which is how a
     /// re-stack is undone exactly, rather than approximately.
@@ -186,6 +200,16 @@ impl Board {
             Change::Resize { id, width, height } => self.resize(id, *width, *height),
             Change::Text { id, text } => self.text(id, text),
             Change::Color { id, color } => self.color(id, *color),
+            Change::Route {
+                id,
+                x,
+                y,
+                width,
+                height,
+                points,
+                from,
+                to,
+            } => self.route(id, [*x, *y, *width, *height], points, from, to),
             Change::Order { ids } => self.order(ids),
             Change::Delete { id } => self.delete(id),
         }
@@ -267,6 +291,32 @@ impl Board {
         };
         let mut shape = record.shape.clone();
         shape.color = color;
+        self.replace(id, Some(shape))
+    }
+    /// A card has no run to re-route, so naming one here is a mistake worth
+    /// hearing about rather than a no-op that silently keeps the old arrow.
+    fn route(
+        &mut self,
+        id: &str,
+        box_: [i32; 4],
+        points: &[[i32; 2]],
+        from: &Option<String>,
+        to: &Option<String>,
+    ) -> Result<(), String> {
+        let Some(record) = self.shapes.get(id) else {
+            return Ok(());
+        };
+        if !record.shape.kind.is_path() {
+            return Err("Only a connector carries a run.".into());
+        }
+        let mut shape = record.shape.clone();
+        shape.x = box_[0];
+        shape.y = box_[1];
+        shape.width = box_[2];
+        shape.height = box_[3];
+        shape.points = points.to_vec();
+        shape.from = from.clone();
+        shape.to = to.clone();
         self.replace(id, Some(shape))
     }
     fn delete(&mut self, id: &str) -> Result<(), String> {

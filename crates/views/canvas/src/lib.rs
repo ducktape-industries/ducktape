@@ -76,6 +76,15 @@ enum Gesture {
     Erase {
         swept: BTreeSet<String>,
     },
+    /// One end of a connector, in hand. `end` indexes the sample being carried;
+    /// the rest of the run keeps its shape, and the end lets go of any card it
+    /// held the moment it moves, taking a new one only where it lands.
+    Endpoint {
+        id: String,
+        end: usize,
+        point: [f32; 2],
+        shape: Shape,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Inline {
@@ -665,6 +674,24 @@ fn inverse(board: &Board, change: &Change) -> Vec<Change> {
                 vec![Change::Text {
                     id: id.clone(),
                     text: r.shape.text.clone(),
+                }]
+            })
+            .unwrap_or_default(),
+        // A re-route restates the whole run, so the run as it stands puts it
+        // back — box, samples and bindings together, in one step.
+        Change::Route { id, .. } => board
+            .shapes
+            .get(id)
+            .map(|r| {
+                vec![Change::Route {
+                    id: id.clone(),
+                    x: r.shape.x,
+                    y: r.shape.y,
+                    width: r.shape.width,
+                    height: r.shape.height,
+                    points: r.shape.points.clone(),
+                    from: r.shape.from.clone(),
+                    to: r.shape.to.clone(),
                 }]
             })
             .unwrap_or_default(),

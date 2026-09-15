@@ -141,7 +141,7 @@ impl BoardsView {
         let board = self.visible()?;
         self.topmost(&board, point, |_| true)
     }
-    fn topmost(
+    pub(super) fn topmost(
         &self,
         board: &Board,
         point: [f32; 2],
@@ -226,6 +226,25 @@ impl BoardsView {
         // Handles sit outside a card: hit them before ordinary card selection.
         if let Some(id) = self.only_selected().cloned() {
             let shape = &board.shapes[&id].shape;
+            if shape.kind.is_path() {
+                // A connector is grabbed by its ends — that is where it
+                // reaches for a card, and the samples between them are the
+                // run itself rather than places to take hold of it.
+                let run = stroke(&board, shape);
+                let ends = [0, run.len().saturating_sub(1)];
+                for end in ends {
+                    let Some(target) = run.get(end) else { continue };
+                    if (point[0] - target[0]).hypot(point[1] - target[1]) <= 9. / self.zoom {
+                        self.gesture = Gesture::Endpoint {
+                            id,
+                            end,
+                            point,
+                            shape: shape.clone(),
+                        };
+                        return Task::none();
+                    }
+                }
+            }
             if free(shape) {
                 for corner in [[-1, -1], [1, -1], [-1, 1], [1, 1]] {
                     let target = corner_point(shape, corner);
@@ -402,7 +421,8 @@ impl BoardsView {
             }
             Gesture::Move { point: p, .. }
             | Gesture::Resize { point: p, .. }
-            | Gesture::Create { point: p, .. } => *p = point,
+            | Gesture::Create { point: p, .. }
+            | Gesture::Endpoint { point: p, .. } => *p = point,
             Gesture::Sketch { points } => {
                 // one sample per couple of screen pixels; the release thins
                 // the run down to what the shape of the stroke needs
@@ -435,8 +455,52 @@ impl BoardsView {
         }
         Task::none()
     }
+    /// The run a dragged endpoint makes: the carried sample follows the
+    /// pointer, the rest keep their places, and the end in hand holds no card
+    /// — it takes one again only where it is let go, which `held` names.
+    fn routed(
+        &self,
+        id: &str,
+        end: usize,
+        point: [f32; 2],
+        shape: &Shape,
+        held: Option<String>,
+    ) -> Option<Change> {
+        let mut run = path_points(shape);
+        let last = run.len().checked_sub(1)?;
+        let sample = run.get_mut(end)?;
+        *sample = point;
+        let next = self.path_shape(shape.kind, &run);
+        let carried = |mine: bool, standing: &Option<String>| {
+            if mine { held.clone() } else { standing.clone() }
+        };
+        let from = carried(end == 0, &shape.from);
+        let to = carried(end == last, &shape.to);
+        // both ends on one card is a loop the board cannot draw, so the end in
+        // hand stands on its own point rather than stealing the other's card
+        let looped = from.is_some() && from == to;
+        Some(Change::Route {
+            id: id.to_owned(),
+            x: next.x,
+            y: next.y,
+            width: next.width,
+            height: next.height,
+            points: next.points,
+            from: if looped && end == 0 { None } else { from },
+            to: if looped && end != 0 { None } else { to },
+        })
+    }
     pub(super) fn gesture_changes(&self) -> Vec<Change> {
         match &self.gesture {
+            Gesture::Endpoint {
+                id,
+                end,
+                point,
+                shape,
+            } => self
+                .routed(id, *end, *point, shape, None)
+                .into_iter()
+                .collect(),
             Gesture::Move {
                 start,
                 point,
@@ -598,6 +662,22 @@ impl BoardsView {
             shape.to = None;
         }
     }
+    /// Where an endpoint is let go decides what it holds: dropped on a card an
+    /// arrow takes it, dropped on the board it stands on its own point. A line
+    /// and a stroke never bind, so they only ever move their sample.
+    fn on_routed(&mut self, id: &str, end: usize, point: [f32; 2], shape: &Shape) -> Task<Message> {
+        let Some(board) = self.visible() else {
+            return Task::none();
+        };
+        let binds = shape.kind == Kind::Arrow;
+        let held = binds
+            .then(|| self.topmost(&board, point, |s: &Shape| !s.kind.is_path()))
+            .flatten();
+        let Some(change) = self.routed(id, end, point, shape, held) else {
+            return Task::none();
+        };
+        self.edit(change)
+    }
     pub(super) fn on_release(&mut self) -> Task<Message> {
         let changes = self.gesture_changes();
         let gesture = std::mem::take(&mut self.gesture);
@@ -621,6 +701,12 @@ impl BoardsView {
             Gesture::Create { kind, start, point } => self.on_created(kind, start, point),
             Gesture::Sketch { points } => self.on_sketched(&points),
             Gesture::Erase { swept } => self.on_swept(swept),
+            Gesture::Endpoint {
+                id,
+                end,
+                point,
+                shape,
+            } => self.on_routed(&id, end, point, &shape),
             Gesture::Idle
             | Gesture::Pan { .. }
             | Gesture::Marquee { .. }

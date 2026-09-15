@@ -695,3 +695,75 @@ fn arranging_lines_a_selection_up_and_spreads_it_evenly() {
     assert_eq!(board.shapes["b"].shape.x, 400);
     assert_eq!(board.shapes["c"].shape.x, 800);
 }
+
+/// An arrow bound a → b, selected, with the camera at rest: the end holding b
+/// sits on b's border facing a, at world (300, 70) and so at screen (380, 150).
+fn linked() -> BoardsView {
+    let mut view = view();
+    card(&mut view, "a", 0);
+    card(&mut view, "b", 300);
+    card(&mut view, "c", 600);
+    view.edit(Change::Create {
+        id: "edge".into(),
+        shape: Shape {
+            from: Some("a".into()),
+            to: Some("b".into()),
+            ..segment(Kind::Arrow)
+        },
+    });
+    view.selected = ["edge".into()].into();
+    view
+}
+
+#[test]
+fn dragging_an_arrows_end_onto_another_card_rebinds_that_end_and_leaves_the_far_one() {
+    let mut view = linked();
+    drag(&mut view, &[[380., 150.], [600., 150.], [780., 150.]]);
+    let board = view.visible().unwrap();
+    let edge = &board.shapes["edge"].shape;
+    assert_eq!(edge.from.as_deref(), Some("a"));
+    assert_eq!(edge.to.as_deref(), Some("c"));
+}
+
+#[test]
+fn dragging_a_bound_end_onto_open_board_frees_it_and_stands_it_on_its_own_point() {
+    let mut view = linked();
+    drag(&mut view, &[[380., 150.], [500., 400.], [520., 480.]]);
+    let board = view.visible().unwrap();
+    let edge = &board.shapes["edge"].shape;
+    assert_eq!(edge.from.as_deref(), Some("a"));
+    assert_eq!(edge.to, None);
+    // the end it let go of now stands where the pointer left it
+    let run = super::interaction::path_points(edge);
+    let end = run.last().copied().unwrap();
+    assert!((end[0] - 440.).abs() < 1.5, "x landed at {}", end[0]);
+    assert!((end[1] - 400.).abs() < 1.5, "y landed at {}", end[1]);
+}
+
+#[test]
+fn undo_after_a_reroute_puts_the_whole_run_back_in_one_step() {
+    let mut view = linked();
+    let before = view.visible().unwrap().shapes["edge"].shape.clone();
+    drag(&mut view, &[[380., 150.], [600., 150.], [780., 150.]]);
+    assert_ne!(view.visible().unwrap().shapes["edge"].shape, before);
+    view.on_undo();
+    assert_eq!(view.visible().unwrap().shapes["edge"].shape, before);
+}
+
+/// The painter and the inline editor lay out one label, so they must read one
+/// description of it. Two type sizes drifting apart is what made a label change
+/// size and jump corners the moment you started typing; a second literal here
+/// is that bug coming back.
+#[test]
+fn the_painter_and_the_editor_read_one_description_of_a_label() {
+    let source = include_str!("presentation.rs");
+    assert_eq!(
+        source.matches("self.lettering(").count(),
+        2,
+        "the painter asks once and the inline editor asks once"
+    );
+    assert!(
+        !source.contains("size: Some((14."),
+        "the inline editor must not carry a type size of its own"
+    );
+}
