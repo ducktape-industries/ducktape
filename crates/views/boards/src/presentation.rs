@@ -106,7 +106,7 @@ impl BoardsView {
             [
                 kit::sized(
                     kit::heading("boards/board-title", title),
-                    Some(Length::Fill),
+                    Some(Length::FillPortion(1)),
                     None,
                 ),
                 kit::caption("boards/sync", self.status()),
@@ -263,7 +263,7 @@ impl BoardsView {
                         sidebar,
                         kit::sized(
                             kit::column("boards/content", content),
-                            Some(Length::Fill),
+                            Some(Length::FillPortion(1)),
                             Some(Length::Fill),
                         ),
                     ],
@@ -469,7 +469,7 @@ impl BoardsView {
             content: Box::new(scene),
         };
         let measure = || Some(slots::handler(Box::new(|(w, h)| Some(Message::Size(w, h)))));
-        Node::Sensor {
+        let sensor = Node::Sensor {
             key: "boards/viewport".into(),
             reset: None,
             on_show: measure(),
@@ -477,8 +477,18 @@ impl BoardsView {
             on_hide: None,
             anticipate: None,
             delay: None,
-            child: Box::new(mouse),
-        }
+            // The native sensor takes dimensions from its immediate child.
+            child: Box::new(kit::sized(
+                kit::container("boards/mouse-layout", mouse),
+                Some(Length::Fill),
+                Some(Length::Fill),
+            )),
+        };
+        kit::sized(
+            kit::container("boards/canvas-layout", sensor),
+            Some(Length::Fill),
+            Some(Length::FillPortion(1)),
+        )
     }
 }
 pub(super) fn anchor(from: &Shape, to: &Shape) -> [f32; 2] {
