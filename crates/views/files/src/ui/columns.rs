@@ -163,10 +163,7 @@ impl FilesView {
                 None,
             ),
             native::sized(
-                native::nowrap(native::text_size(
-                    native::text(format!("{key}/name"), entry.name.clone()),
-                    14.,
-                )),
+                native::nowrap(native::text(format!("{key}/name"), entry.name.clone())),
                 Some(wire::Length::Fill),
                 None,
             ),

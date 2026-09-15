@@ -113,10 +113,7 @@ impl FilesView {
                         Some(wire::Length::Fixed(16.)),
                         None,
                     ),
-                    native::nowrap(native::text_size(
-                        native::text(format!("{key}/name"), name),
-                        14.,
-                    )),
+                    native::nowrap(native::text(format!("{key}/name"), name)),
                 ],
             ),
             6.,

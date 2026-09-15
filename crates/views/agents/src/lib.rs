@@ -399,10 +399,7 @@ impl AgentsView {
                 kit::column(
                     format!("{key}/identity"),
                     [
-                        kit::nowrap(kit::text_size(
-                            kit::strong(format!("{key}/name"), &agent.name),
-                            14.,
-                        )),
+                        kit::nowrap(kit::strong(format!("{key}/name"), &agent.name)),
                         kit::nowrap(kit::text_size(
                             kit::secondary(
                                 format!("{key}/meta"),
@@ -498,9 +495,9 @@ impl AgentsView {
                                 format!("{key}/heading"),
                                 [
                                     kit::sized(
-                                        kit::nowrap(kit::text_size(
-                                            kit::strong(format!("{key}/agent"), &run.agent_name),
-                                            14.,
+                                        kit::nowrap(kit::strong(
+                                            format!("{key}/agent"),
+                                            &run.agent_name,
                                         )),
                                         Some(Length::Fill),
                                         None,
