@@ -24,6 +24,7 @@ document nothing cites is deleted, not archived.
 | Run the untrusted coordinator (rendezvous + first-contact relay); stand up two NAT'd validators | [`deploy/coordinator.md`](deploy/coordinator.md) |
 | Front a validator with a sentry so it exposes no inbound port | [`deploy/sentry-deployment.md`](deploy/sentry-deployment.md) |
 | Run the dogfooding loop: this repo in its own forge, an agent working it | [`dogfood.md`](dogfood.md) |
+| Install and operate the shared resident Chief conversation and its Pages workspace | [`../agents/chief/README.md`](../agents/chief/README.md) |
 | Bring the microVM sandbox up on macOS (the vz shim) | [`sandbox-macos.md`](sandbox-macos.md) |
 | Which operator scripts, units and harnesses live under `ops/` | [`../ops/README.md`](../ops/README.md) |
 | The coordinator's deploy artifacts (unit, env file, Dockerfile) | [`../ops/coordinator/README.md`](../ops/coordinator/README.md) |

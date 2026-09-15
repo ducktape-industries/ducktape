@@ -30,6 +30,7 @@ fn expected() -> BTreeMap<String, Shape> {
         ("acl", shape(Backing::Store, NONE, false)),
         ("agent", shape(Backing::Store, NONE, false)),
         ("automations", shape(Backing::Store, NONE, false)),
+        ("boards", shape(Backing::Store, NONE, false)),
         ("capability", shape(Backing::Store, NONE, false)),
         ("chat", shape(Backing::Store, NONE, false)),
         // the network binding it refuses every op without, and the unit its
@@ -52,7 +53,8 @@ fn expected() -> BTreeMap<String, Shape> {
         ("valset", shape(Backing::Store, NONE, false)),
         ("noop", shape(Backing::Map, NONE, false)),
         ("pages", shape(Backing::Store, NONE, false)),
-        ("runs", shape(Backing::Map, CHAIN_ID, false)),
+        // the network binding, and the unit its conversation check-ins are in.
+        ("runs", shape(Backing::Map, CHAIN_ID_AND_TIME_UNIT, false)),
         ("saga", shape(Backing::Store, NONE, false)),
         ("attribution", shape(Backing::Store, NONE, false)),
         ("tasks", shape(Backing::Store, NONE, false)),

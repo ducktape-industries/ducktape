@@ -483,7 +483,9 @@ pub(crate) async fn drive(
                                     if status == "interrupted" { acknowledge_stop(&mut stop_id,&mut pending); }
                                     if status != "completed" { return Err(format!("provider turn {status}")); }
 
-                                    return Ok(crate::Invocation { text:answer, usage });
+                                    // A session driver answers; the native
+                                    // conversation dispositions belong to Pi.
+                                    return Ok(crate::Invocation { text:answer, usage, disposition:crate::OutputDisposition::Answer });
                                 }
                                 "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
                                     if approvals.len() >= 16 { return Err("Too many pending approvals".into()); }
@@ -518,7 +520,7 @@ pub(crate) async fn drive(
                                 if frame["is_error"] == true { return Err(frame["result"].as_str().unwrap_or("Provider run failed").into()); }
                                 let text = frame["result"].as_str().ok_or("missing result")?.into();
 
-                                return Ok(crate::Invocation { text, usage:crate::parse_token_usage(&raw) });
+                                return Ok(crate::Invocation { text, usage:crate::parse_token_usage(&raw), disposition:crate::OutputDisposition::Answer });
                             }
                             _ => {}
                         }

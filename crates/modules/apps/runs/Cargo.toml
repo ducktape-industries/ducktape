@@ -17,6 +17,7 @@ guest = ["dep:ducktape-module-sdk"]
 index-guest = ["index_guest/guest"]
 
 [dependencies]
+run-envelope = { workspace = true }
 node-work = { workspace = true }
 # wasm-only, behind `guest`: the port harness. a standalone-workspace path
 # crate, pulled only when the guest build compiles this crate for wasm32.
@@ -70,6 +71,8 @@ async-trait = { workspace = true }
 index_guest = { workspace = true }
 
 [dev-dependencies]
+files = { path = "../files", features = ["native"] }
+tempfile = { workspace = true }
 syn = { version = "2", features = ["full"] }
 # the host-side qmdb store handle the chat test fixtures inject.
 statesync = { workspace = true }

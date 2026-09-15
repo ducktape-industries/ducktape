@@ -382,7 +382,7 @@ pub(super) async fn provision(
     // the clone EXISTS now, so ask consensus to bind the run's agent session
     // — never before: a bind for a run that failed to materialize would spend an
     // op on a run that never starts.
-    let session = match super::session::open(&node, spec).await {
+    let session = match super::session::open(&node, spec, &workspace_args.run_dir).await {
         Ok(session) => session,
         Err(error) => {
             super::cleanup_dirs(workspace_args.run_dir.clone(), ro_dir.clone()).await;
@@ -1030,6 +1030,10 @@ impl ProvisionedWorkspace for ForgeWorkspace {
 
     fn context_doc(&self) -> Option<String> {
         self.context_doc.clone()
+    }
+
+    fn native_conversation(&self) -> Option<provider_host::NativeConversationContext> {
+        self._session.as_ref()?.native_conversation.clone()
     }
 
     fn operator_credential(&self) -> Option<OperatorCredential> {

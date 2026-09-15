@@ -450,6 +450,85 @@ fn the_two_lanes_agree_on_marks_and_checked_state() {
     });
 }
 
+#[test]
+fn managed_batches_and_stale_retries_preserve_ordinary_document_index_parity() {
+    use super::records::{commit, upsert};
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        let create = PageMsg::CreateRecordCollection {
+            page_id: "board".into(),
+            request_id: "create".into(),
+        };
+        let first = commit(
+            "first",
+            0,
+            vec![upsert("a", "hello world"), upsert("b", "remove me")],
+        );
+        let script = vec![
+            PageMsg::CreatePage {
+                page_id: "board".into(),
+                title: "Board".into(),
+                blocks: vec![para("intro", "Visible introduction")],
+            },
+            create.clone(),
+            first.clone(),
+            PageMsg::AddComment {
+                thread_id: "thread".into(),
+                comment_id: "comment".into(),
+                target: "a-body".into(),
+                text: "review".into(),
+                anchor: Some(RelativeAnchor { start: 6, end: 11 }),
+                mentions: vec![],
+            },
+            commit(
+                "second",
+                1,
+                vec![RecordChange::Upsert {
+                    record_id: "a".into(),
+                    data: serde_json::json!({"value": "changed"}),
+                    document: RecordDocument {
+                        title: "Updated title".into(),
+                        blocks: vec![
+                            para("a-new", "New first block"),
+                            para("a-body", "new hello world"),
+                        ],
+                    },
+                }],
+            ),
+            first.clone(),
+            create,
+            commit(
+                "third",
+                2,
+                vec![
+                    upsert("a", "hello world"),
+                    RecordChange::Delete {
+                        record_id: "b".into(),
+                    },
+                ],
+            ),
+            first,
+        ];
+        let map = run_script(&mut p, &script, &["board", "a", "b"]).await;
+        assert_eq!(get_block(&p, "a-body").await.unwrap().text, "hello world");
+        assert!(get_block(&p, "a-new").await.is_none());
+        let query = query_thread(&p, "thread").await.unwrap();
+        let bytes = index::serve_view(
+            &map,
+            &serde_json::to_vec(&PagesViewQuery::GetThread {
+                thread_id: "thread".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let PagesViewReply::Thread(Some(thread)) = serde_json::from_slice(&bytes).unwrap() else {
+            panic!("thread")
+        };
+        assert_eq!(thread.anchor, query.thread.anchor);
+        assert_eq!(thread.comments[0].text, query.comments[0].text);
+    });
+}
+
 /// THE BYTE BUDGET CUTS BOTH LANES AT THE SAME BLOCK. `MAX_PAGE_QUERY_BYTES`
 /// ends a cursor page before its limit does whenever the blocks are large, so
 /// a view that only mirrored the COUNT limit would hand back a different

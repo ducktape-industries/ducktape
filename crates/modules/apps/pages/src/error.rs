@@ -7,6 +7,19 @@ pub(super) enum PageError {
     /// insert/create of a block id already present ANYWHERE in the module —
     /// block ids are globally unique, that is the addressability contract.
     DuplicateBlock,
+    ManagedPage,
+    RecordUnauthorized,
+    RecordCollectionExists,
+    RecordCollectionNotFound,
+    InvalidRecordCollection,
+    RecordRevisionConflict,
+    RecordRequestConflict,
+    InvalidRecordBatch,
+    RecordNotFound,
+    RecordStateNotFound,
+    TooManyRecordStateKeys,
+    FilesNotConfigured,
+    TooManyRecords,
     /// update/move/remove/check of a block id not in the store.
     BlockNotFound,
     /// an insert/move named a parent block that does not exist.
@@ -94,6 +107,21 @@ impl core::fmt::Display for PageError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let s = match self {
             PageError::DuplicateBlock => "duplicate block id",
+            PageError::ManagedPage => "managed page requires commit_records",
+            PageError::RecordUnauthorized => "record writer is not authorized",
+            PageError::RecordCollectionExists => "record collection already exists",
+            PageError::RecordCollectionNotFound => "record collection not found",
+            PageError::InvalidRecordCollection => {
+                "collection requires a top-level page without nested pages"
+            }
+            PageError::RecordRevisionConflict => "record revision conflict",
+            PageError::RecordRequestConflict => "record request id reused with different payload",
+            PageError::InvalidRecordBatch => "invalid or oversized record batch",
+            PageError::RecordNotFound => "record not found",
+            PageError::RecordStateNotFound => "record state key not found",
+            PageError::TooManyRecordStateKeys => "too many record state keys",
+            PageError::FilesNotConfigured => "record artifacts require a configured files module",
+            PageError::TooManyRecords => "too many records in collection",
             PageError::BlockNotFound => "block not found",
             PageError::ParentNotFound => "parent block not found",
             PageError::AnchorNotFound => "after-anchor not found",

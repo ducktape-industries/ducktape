@@ -80,7 +80,9 @@ async fn job(module: &Tasks, job_id: &str) -> Option<Job> {
         }))
         .await
         .expect("get");
-    let JobsReply::Job(job) = decode_job_reply(&reply).expect("decode");
+    let JobsReply::Job(job) = decode_job_reply(&reply).expect("decode") else {
+        panic!("expected job reply")
+    };
     job
 }
 
@@ -136,7 +138,7 @@ fn synced_store_reconstructs_source_root_and_every_read() {
                 &mut src,
                 4,
                 ext("alice"),
-                encode_job_msg(&JobsMsg::Submit {
+                encode_job_msg(&JobsMsg::SubmitConversation {
                     job_id: id.into(),
                     kind: kind.into(),
                     spec: format!("spec-{id}"),
@@ -179,6 +181,75 @@ fn synced_store_reconstructs_source_root_and_every_read() {
             }),
         )
         .await;
+
+        for (origin, msg) in [
+            (
+                ext("alice"),
+                JobsMsg::Control {
+                    job_id: "build".into(),
+                    operation_id: "steer".into(),
+                    input: tasks::JobControlInput::Steer {
+                        text: "Retain the evidence".into(),
+                    },
+                },
+            ),
+            (
+                ext("bob"),
+                JobsMsg::AcknowledgeControl {
+                    job_id: "build".into(),
+                    operation_id: "steer".into(),
+                    attempt: 1,
+                },
+            ),
+            (
+                ext("bob"),
+                JobsMsg::Checkpoint {
+                    job_id: "build".into(),
+                    operation_id: "checkpoint".into(),
+                    attempt: 1,
+                    kind: tasks::WorkerReportKind::Checkpoint,
+                    payload: "Evidence survived restart".into(),
+                },
+            ),
+            (
+                ext("bob"),
+                JobsMsg::CheckpointNativeHistory {
+                    job_id: "build".into(),
+                    attempt: 1,
+                    run_id: "run-build".into(),
+                    execution_attempt: 2,
+                    revision: 77,
+                    snapshot: "snapshot-build".into(),
+                },
+            ),
+            (
+                ext("alice"),
+                JobsMsg::Continue {
+                    previous_job_id: "temp".into(),
+                    job_id: "temp-next".into(),
+                    operation_id: "continue".into(),
+                    kind: "tmp".into(),
+                    spec: "Continue after pruning".into(),
+                },
+            ),
+        ] {
+            apply(&mut src, 9, origin, encode_job_msg(&msg)).await;
+        }
+        let retained_queries = [
+            tasks::encode_job_query(&tasks::JobsQuery::GetWorker {
+                conversation_id: "build:1".into(),
+            }),
+            tasks::encode_job_query(&tasks::JobsQuery::GetWorker {
+                conversation_id: "temp:1".into(),
+            }),
+            tasks::encode_job_query(&tasks::JobsQuery::Controls {
+                job_id: "build".into(),
+            }),
+        ];
+        let mut retained_replies = Vec::new();
+        for query in &retained_queries {
+            retained_replies.push(src.query(query).await.unwrap());
+        }
 
         // the module is resolver-backed: there is NO byte snapshot to ship.
         match src.state_sync_handle().expect("handle") {
@@ -231,6 +302,17 @@ fn synced_store_reconstructs_source_root_and_every_read() {
             JobStatus::Processing
         );
         assert_eq!(job(&synced, "temp").await, None, "the pruned job is gone");
+        for (query, expected) in retained_queries.iter().zip(retained_replies) {
+            assert_eq!(
+                synced.query(query).await.unwrap(),
+                expected,
+                "retained conversation/controls survive proven state sync"
+            );
+        }
+        assert_eq!(
+            job(&synced, "temp-next").await.unwrap().conversation_id,
+            "temp:1"
+        );
         let mut write_ctx = ctx(9, ext("alice"));
         synced
             .execute(

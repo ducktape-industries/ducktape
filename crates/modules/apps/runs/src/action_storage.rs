@@ -259,6 +259,8 @@ impl RunsModule {
         self.staged_next_action_item = Some(next);
         // the one writer of a run's actions is the one writer of its `Acted`
         // facts: whatever lane admitted the request, the journal carries it.
+        self.conversation_track_action(None, &entry.run_id, id.clone())
+            .await?;
         self.record(
             &entry.run_id,
             RunFact::Acted {
@@ -355,6 +357,8 @@ impl RunsModule {
             }
         }
         self.stage_action_marker(&request).await?;
+        self.wake_conversation_for_run(ctx, &request.view.run_id)
+            .await?;
         self.receipts
             .stage(QUEUE_KEY.into(), sdk::wire::encode(&queue))
     }

@@ -565,14 +565,134 @@ fn move_block(
     put_row(out, &row)
 }
 
-/// fold one applied op into derived writes.
+/// Read-your-writes while one atomic managed request expands into ordinary
+/// document operations. Only bounded per-target comment scans reach this
+/// adapter; document blocks and token postings use point reads.
+struct DocumentRead<'a, R> {
+    base: &'a R,
+    overlay: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+}
+
+impl<R: StateRead> StateRead for DocumentRead<'_, R> {
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        match self.overlay.get(key) {
+            Some(value) => value.clone(),
+            None => self.base.get(key),
+        }
+    }
+
+    fn scan_page(&self, prefix: &[u8], after: Option<&[u8]>, limit: usize) -> index_guest::Page {
+        let mut rows = std::collections::BTreeMap::new();
+        let mut cursor = after.map(<[u8]>::to_vec);
+        loop {
+            let page = self
+                .base
+                .scan_page(prefix, cursor.as_deref(), index_guest::MAX_SCAN_LIMIT);
+            rows.extend(page.entries);
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next_after.map(String::into_bytes);
+        }
+        for (key, value) in &self.overlay {
+            let in_range =
+                key.starts_with(prefix) && after.is_none_or(|after| key.as_slice() > after);
+            if !in_range {
+                continue;
+            }
+            match value {
+                Some(value) => {
+                    rows.insert(key.clone(), value.clone());
+                }
+                None => {
+                    rows.remove(key);
+                }
+            }
+        }
+        rows.scan_page(prefix, after, limit)
+    }
+}
+
+fn fold_managed(op: &OpRow, msg: &PageMsg, read: &impl StateRead) -> Result<Writes, Fail> {
+    let (page_id, request_id) = crate::record_ops::request_ids(msg)
+        .ok_or_else(|| Fail::new(FAIL_OP_DECODE, "not a managed request"))?;
+    // The engine reserves NUL-prefixed keys; the canonical receipt's tuple
+    // encoding remains unambiguous under a mapper-owned printable namespace.
+    let receipt = format!(
+        "managed/{}",
+        crate::record_ops::receipt_key(page_id, request_id).trim_start_matches('\0')
+    );
+    if read.get(receipt.as_bytes()).is_some() {
+        return Ok(Writes::new());
+    }
+    let mut staged = DocumentRead {
+        base: read,
+        overlay: std::collections::BTreeMap::new(),
+    };
+    let mut out = Writes::new();
+    if let PageMsg::CommitRecords { changes, .. } = msg {
+        for change in changes {
+            let ops = match change {
+                crate::RecordChange::Upsert {
+                    record_id,
+                    document,
+                    ..
+                } => {
+                    let Some(parent) = read_row(&staged, page_id)? else {
+                        continue;
+                    };
+                    let existing = read_row(&staged, record_id)?.map(|row| row.to_block());
+                    crate::record_ops::document_ops(
+                        page_id,
+                        record_id,
+                        existing.as_ref(),
+                        document,
+                        parent.children.last().cloned(),
+                    )
+                }
+                crate::RecordChange::Delete { record_id } => vec![PageMsg::RemoveBlock {
+                    block_id: record_id.clone(),
+                }],
+            };
+            for msg in ops {
+                let writes = fold_document_op(op, msg, &staged)?;
+                for (key, value) in &writes {
+                    staged
+                        .overlay
+                        .insert(key.as_bytes().to_vec(), value.clone());
+                }
+                out.extend(writes);
+            }
+        }
+    }
+    out.push((receipt, Some(Vec::new())));
+    Ok(out)
+}
+
+/// Fold applied records requests through the same ordinary document projection,
+/// including durable request dedup so a stale retry cannot rewind visible prose.
 pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
-    let msg = decode_msg(&op.payload).map_err(|e| Fail::new(FAIL_OP_DECODE, e))?;
+    let msg = decode_msg(&op.payload).map_err(|error| Fail::new(FAIL_OP_DECODE, error))?;
+    match &msg {
+        PageMsg::CreateRecordCollection { .. } | PageMsg::CommitRecords { .. } => {
+            fold_managed(op, &msg, read)
+        }
+        _ => fold_document_op(op, msg, read),
+    }
+}
+
+fn fold_document_op(op: &OpRow, msg: PageMsg, read: &impl StateRead) -> Result<Writes, Fail> {
     let actor = crate::decode_assigned(&op.assigned)
         .map_err(|e| Fail::new(FAIL_OP_DECODE, e))?
         .actor;
     let mut out = Writes::new();
     match msg {
+        PageMsg::CreateRecordCollection { .. } | PageMsg::CommitRecords { .. } => {
+            return Err(Fail::new(
+                FAIL_OP_DECODE,
+                "managed request requires atomic document expansion",
+            ));
+        }
         PageMsg::CreatePage {
             page_id,
             title,

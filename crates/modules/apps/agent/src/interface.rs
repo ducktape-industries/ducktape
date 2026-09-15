@@ -368,7 +368,19 @@ pub enum AgentMsg {
     /// `program` to it, in one unit: identity founds the account and answers
     /// this module in the same unit, so the account and its binding commit
     /// together or not at all. stamps [`AgentAssigned::Provisioned`].
-    Provision { name: String, program: Program },
+    Provision {
+        /// Idempotent within the authenticated controller account. Identical
+        /// retries return the original account; conflicting reuse is refused.
+        request_id: String,
+        name: String,
+        program: Program,
+    },
+    /// Explicitly deliver one controller-authorized initialization event to
+    /// a program. Its durable request identity prevents boot/retry replay.
+    Initialize {
+        account: AccountNumber,
+        request_id: String,
+    },
     /// bind a new program to `account`. the account's standing is re-set,
     /// which advances its generation: every call queued under the old
     /// program is refused at execution and every running invocation of it
@@ -386,6 +398,14 @@ pub enum AgentMsg {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentQuery {
+    Initialization {
+        account: AccountNumber,
+        request_id: String,
+    },
+    Provision {
+        controller: AccountNumber,
+        request_id: String,
+    },
     Binding {
         account: AccountNumber,
     },
@@ -412,6 +432,8 @@ pub enum AgentQuery {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentReply {
+    Initialization(Option<InitializationReceipt>),
+    Provision(Option<ProvisionReceipt>),
     Binding(Option<BindingView>),
     Invocation(Option<InvocationView>),
     Invocations(Vec<InvocationEntry>),
@@ -424,7 +446,33 @@ pub enum AgentReply {
 pub enum AgentAssigned {
     /// the account identity founded for a [`AgentMsg::Provision`], bound.
     Provisioned { account: AccountNumber },
+    Initialized {
+        account: AccountNumber,
+        request_id: String,
+    },
 }
+
+/// Committed evidence of an idempotent account installation. The digest binds
+/// its original name and program, not the account's later binding or controller.
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionReceipt {
+    pub account: AccountNumber,
+    pub request_digest: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InitializationReceipt {
+    pub account: AccountNumber,
+    pub controller: AccountNumber,
+    pub request_id: String,
+    pub binding_revision: u64,
+}
+
+pub const INITIALIZATION_KIND: &str = "initialization";
+pub const INITIALIZATION_REASON: &str = "initialize";
+pub const MAX_PROVISION_REQUEST_ID_BYTES: usize = 64;
 
 // ---- codecs ---------------------------------------------------------------------------
 
@@ -565,6 +613,7 @@ mod tests {
         let program = sample_program();
         for m in [
             AgentMsg::Provision {
+                request_id: "bot".into(),
                 name: "bot".into(),
                 program: program.clone(),
             },

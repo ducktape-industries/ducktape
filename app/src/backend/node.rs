@@ -560,9 +560,9 @@ impl AgentDraft {
 
 /// Bring a new agent into the register: provision its keyless program account
 /// under the signing account (`controller`, the wallet's own account number),
-/// read that account back, and register the draft against it. Two committed
-/// writes and one read, in order; the first write is a full block, so the
-/// read never runs ahead of it.
+/// read its provisioning receipt, and register the draft against that account.
+/// Two committed writes and one read, in order; the first write is a full
+/// block, so the read never runs ahead of it.
 pub async fn register_agent(
     rpc: String,
     password: String,
@@ -585,13 +585,14 @@ pub async fn register_agent(
             &rpc,
             "agent",
             ::agent::encode_msg(&::agent::AgentMsg::Provision {
+                request_id: draft.agent_id.clone(),
                 name: display_name.clone(),
                 program: runs::model_program(&draft.agent_id),
             }),
             password.clone(),
         )
         .await?;
-        let account = newest_program_account(&rpc, controller, &display_name).await?;
+        let account = provisioned_program_account(&rpc, controller, &draft.agent_id).await?;
         let operation = runs::ModelMsg::RegisterModel {
             account,
             agent_id: draft.agent_id,
@@ -608,56 +609,29 @@ pub async fn register_agent(
     Ok(true)
 }
 
-/// The highest-numbered agent-executed program account named `name` under
-/// `controller`. Accounts are numbered upward with no gaps, so after a
-/// provision the newest match IS the account it minted, whatever older
-/// accounts share the name.
-async fn newest_program_account(
+/// The controller-scoped receipt is authoritative even when a retry returns
+/// an older account and newer accounts share its display name.
+async fn provisioned_program_account(
     rpc: &RpcClient,
     controller: u64,
-    name: &str,
+    request_id: &str,
 ) -> Result<u64, String> {
-    let page_limit =
-        usize::try_from(identity::MAX_QUERY_LIMIT).expect("the identity page cap fits a usize");
-    let mut newest = None;
-    let mut from: identity::AccountNumber = 0;
-    loop {
-        let reply: identity::IdentityReply = rpc
-            .query(
-                "identity",
-                &identity::IdentityQuery::Controlled {
-                    by: controller,
-                    from,
-                    limit: identity::MAX_QUERY_LIMIT,
-                },
-            )
-            .await?;
-        let identity::IdentityReply::Accounts(page) = reply else {
-            return Err("the identity module returned the wrong reply".to_string());
-        };
-        let page_is_last = page.len() < page_limit;
-        let Some(last) = page.last().map(|account| account.number) else {
-            break;
-        };
-        let runs_agent_program = |account: &identity::AccountView| {
-            matches!(
-                &account.control,
-                identity::Control::Program { executor, .. } if executor == "agent"
-            )
-        };
-        newest = page
-            .iter()
-            .filter(|account| account.name == name && runs_agent_program(account))
-            .map(|account| account.number)
-            .max()
-            .or(newest);
-        if page_is_last {
-            break;
-        }
-        from = last + 1;
-    }
-    newest
-        .ok_or_else(|| format!("the program account for {name:?} was not found after provisioning"))
+    let reply: ::agent::AgentReply = rpc
+        .query(
+            "agent",
+            &::agent::AgentQuery::Provision {
+                controller,
+                request_id: request_id.into(),
+            },
+        )
+        .await?;
+    let ::agent::AgentReply::Provision(receipt) = reply else {
+        return Err("the agent module returned the wrong provisioning reply".to_string());
+    };
+    let Some(receipt) = receipt else {
+        return Err("the agent provisioning receipt was not found after provisioning".to_string());
+    };
+    Ok(receipt.account)
 }
 
 /// The local account picture: whether the local user key belongs to an
@@ -1508,6 +1482,129 @@ pub async fn remove_account_key(
     .await
     .map_err(app_error)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod agent_registration_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+
+    const CONTROLLER: u64 = 7;
+    const REQUEST_ID: &str = "agent-a";
+    const ORIGINAL_ACCOUNT: u64 = 41;
+
+    /// A node with two same-name programs, but a receipt for the older one.
+    /// It serves exactly one query; closing the listener rejects any fallback.
+    async fn lookup_with_reply(
+        reply: ::agent::AgentReply,
+    ) -> (Result<u64, String>, serde_json::Value) {
+        let accounts =
+            [ORIGINAL_ACCOUNT, ORIGINAL_ACCOUNT + 1].map(|number| identity::AccountView {
+                number,
+                name: "Helper".into(),
+                control: identity::Control::Program {
+                    controller: CONTROLLER,
+                    executor: "agent".into(),
+                    generation: 0,
+                    standing: identity::ProgramStanding::Active,
+                },
+                keys: Vec::new(),
+                avatar: None,
+                bio: None,
+                updated_at: 0,
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc = RpcClient::new(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let serve = async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(listener);
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "POST /v1/query HTTP/1.1\r\n");
+            let mut content_length = None;
+            loop {
+                line.clear();
+                assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                let headers_complete = line == "\r\n";
+                if headers_complete {
+                    break;
+                }
+                let (name, value) = line.split_once(':').expect("HTTP header");
+                let is_content_length = name.eq_ignore_ascii_case("content-length");
+                if is_content_length {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut body = vec![0; content_length.expect("JSON content length")];
+            socket.read_exact(&mut body).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let response = match request["target"].as_str().expect("query target") {
+                "agent" => serde_json::to_string(&reply).unwrap(),
+                "identity" => {
+                    serde_json::to_string(&identity::IdentityReply::Accounts(accounts.to_vec()))
+                        .unwrap()
+                }
+                target => panic!("unexpected query target: {target}"),
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            );
+            socket
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+            request
+        };
+        tokio::join!(
+            provisioned_program_account(&rpc, CONTROLLER, REQUEST_ID),
+            serve
+        )
+    }
+
+    fn assert_receipt_query(request: &serde_json::Value) {
+        assert_eq!(
+            request,
+            &serde_json::json!({
+                "target": "agent",
+                "query": {"provision": {"controller": CONTROLLER, "request_id": REQUEST_ID}}
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_retry_uses_the_original_receipt_when_program_names_collide() {
+        let (result, request) = lookup_with_reply(::agent::AgentReply::Provision(Some(
+            ::agent::ProvisionReceipt {
+                account: ORIGINAL_ACCOUNT,
+                request_digest: [3; 32],
+            },
+        )))
+        .await;
+        assert_receipt_query(&request);
+        assert_eq!(result.unwrap(), ORIGINAL_ACCOUNT);
+    }
+
+    #[tokio::test]
+    async fn registration_refuses_missing_or_wrong_receipts_without_name_lookup() {
+        for (reply, expected_error) in [
+            (
+                ::agent::AgentReply::Provision(None),
+                "the agent provisioning receipt was not found after provisioning",
+            ),
+            (
+                ::agent::AgentReply::Binding(None),
+                "the agent module returned the wrong provisioning reply",
+            ),
+        ] {
+            let (result, request) = lookup_with_reply(reply).await;
+            assert_receipt_query(&request);
+            assert_eq!(result.unwrap_err(), expected_error);
+        }
+    }
 }
 
 #[cfg(test)]

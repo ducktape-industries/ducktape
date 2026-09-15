@@ -1,0 +1,26 @@
+{
+  "name": "@ducktape/chief",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Network-installed resident Chief policy for Pi",
+  "pi": { "extensions": ["./index.ts"] },
+  "files": ["*.ts", "!*.test.ts", "!test-support.ts", "!mcp.integration.ts", "README.md"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test *.test.ts",
+    "test:mcp": "node --experimental-strip-types mcp.integration.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-ai": "0.85.1",
+    "@types/node": "22.19.15",
+    "typescript": "5.9.3",
+    "typebox": "1.3.7"
+  }
+}

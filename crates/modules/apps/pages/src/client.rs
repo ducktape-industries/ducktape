@@ -47,7 +47,15 @@ pub fn delta_from_op(payload: &[u8]) -> Result<PagesDelta, String> {
             block_id,
             text,
         },
-        PageMsg::CreatePage { .. }
+        PageMsg::CommitRecords { changes, .. } => {
+            if changes.is_empty() {
+                PagesDelta::default()
+            } else {
+                touched("touched")
+            }
+        }
+        PageMsg::CreateRecordCollection { .. }
+        | PageMsg::CreatePage { .. }
         | PageMsg::InsertBlock { .. }
         | PageMsg::SetSpanMark { .. }
         | PageMsg::SetKind { .. }

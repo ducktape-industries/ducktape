@@ -653,6 +653,7 @@ async fn execute(
         run_id: format!("{}:{}", job.saga_id, job.attempt),
         agent: Some(crate::AgentExecution {
             run_id: plan.consensus_run_id,
+            native_conversation: plan.native_conversation,
             attempt: job.attempt,
             agent_id: ctx
                 .agent_id
@@ -701,6 +702,16 @@ async fn execute(
     };
     let ws: Arc<dyn crate::provision::ProvisionedWorkspace> = ws?.into();
     bind_workspace(ws.as_ref(), &mut ctx); // set workdir_override/env/path_entries
+    let native_artifacts_missing = spec
+        .agent
+        .as_ref()
+        .is_some_and(|agent| agent.native_conversation.is_some())
+        && ctx.native_conversation.is_none();
+    if native_artifacts_missing {
+        drop(permit.take());
+        ws.cleanup().await;
+        return Err("provisioner did not restore the requested native conversation".into());
+    }
     if cancellation.is_cancelled() {
         drop(permit.take());
         ws.cleanup().await;
@@ -714,6 +725,15 @@ async fn execute(
     let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
         match run_provider(provider, &input, &ctx, cancellation).await {
             Ok(output) => {
+                let native_terminal = ctx.native_conversation.is_some() && output.text.is_empty();
+                let invalid_terminal = match output.disposition {
+                    provider_host::OutputDisposition::Answer => false,
+                    provider_host::OutputDisposition::InputHandled => !native_terminal || output.usage.is_some(),
+                    provider_host::OutputDisposition::Cancelled => !native_terminal,
+                };
+                if invalid_terminal {
+                    return Err("provider returned an inconsistent native terminal result".into());
+                }
                 // The provider process/container has exited and been waited.
                 // Commit and cleanup are storage work, not provider concurrency.
                 drop(permit.take());
@@ -791,7 +811,17 @@ async fn execute(
                 };
                 // Echo the plan's requested sink so Runs can route delivery;
                 // Runs remains the sole owner of strict response parsing.
-                let bytes = assemble_runner_result(&output.text, &receipt, sink, status);
+                let bytes = match output.disposition {
+                    provider_host::OutputDisposition::Answer => {
+                        assemble_runner_result(&output.text, &receipt, sink, status)
+                    }
+                    provider_host::OutputDisposition::InputHandled => {
+                        crate::provision::assemble_handled_input_result(&receipt, sink, status)
+                    }
+                    provider_host::OutputDisposition::Cancelled => {
+                        crate::provision::assemble_cancelled_result(&receipt, sink, status)
+                    }
+                };
                 Ok(attempt_output(output, bytes))
             }
             Err(e) => Err(e), // failed run: no commit, no output_ref
@@ -1035,6 +1065,7 @@ format = "text"
                 .map(|text| provider_host::ProviderOutput {
                     text,
                     usage: self.usage,
+                    disposition: provider_host::OutputDisposition::Answer,
                 })
         }
     }
@@ -2865,6 +2896,36 @@ format = "text"
     }
 
     #[tokio::test]
+    async fn native_turn_refuses_a_provisioner_that_omits_native_artifacts() {
+        let (providers, probes) = slow_providers(Duration::ZERO, false);
+        let (provisioned, committed, cleaned) = flags();
+        let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
+            provisioned: provisioned.clone(),
+            committed: committed.clone(),
+            cleaned: cleaned.clone(),
+            fail_commit: None,
+        });
+        let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&v1_envelope_payload()).unwrap();
+        envelope["native_conversation"] = serde_json::json!({
+            "conversation_id":"resident-1", "turn_id":"1", "revision":0,
+            "history_prefix":"/shared/conversations/resident-1", "history_snapshot":null,
+            "session_path":"session.jsonl", "packages":[], "events":[],
+        });
+        let effect = effect_with_payload(
+            "native-1", 0, Some(b"me"), &serde_json::to_vec(&envelope).unwrap(),
+        );
+        pool.run(&effect).await.unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+        assert!(outcome.unwrap_err().contains("did not restore"));
+        assert!(provisioned.load(Ordering::SeqCst));
+        assert!(cleaned.load(Ordering::SeqCst));
+        assert!(!committed.load(Ordering::SeqCst));
+        assert!(probes.last_run.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn a_v1_run_with_a_provisioner_wired_provisions_binds_commits_and_wraps_the_result() {
         let (providers, probes) = slow_providers(Duration::from_millis(5), false);
         let (provisioned, committed, cleaned) = flags();
@@ -3584,6 +3645,10 @@ format = "text"
         struct RunsRunnerResult {
             ducktape_runner_result: u32,
             response_text: String,
+            #[serde(default)]
+            native_input_handled: bool,
+            #[serde(default)]
+            native_cancelled: bool,
             workspace_receipt: RunsWorkspaceReceipt,
             #[serde(default)]
             sink: RunsSink,
@@ -3650,6 +3715,17 @@ format = "text"
             .expect("minimal bytes deserialize into the runs contract");
         assert_eq!(parsed.ducktape_runner_result, 1);
         assert_eq!(parsed.response_text, "the answer");
+        assert!(!parsed.native_input_handled);
+        let handled = crate::provision::assemble_handled_input_result(&receipt, Sink::Chain, Status::Ok);
+        let handled: RunsRunnerResult = serde_json::from_slice(&handled).unwrap();
+        assert!(handled.native_input_handled);
+        assert!(handled.response_text.is_empty());
+        assert!(!handled.native_cancelled);
+        let cancelled = crate::provision::assemble_cancelled_result(&receipt, Sink::Chain, Status::Ok);
+        let cancelled: RunsRunnerResult = serde_json::from_slice(&cancelled).unwrap();
+        assert!(cancelled.native_cancelled);
+        assert!(!cancelled.native_input_handled);
+        assert!(cancelled.response_text.is_empty());
         assert_eq!(
             parsed.workspace_receipt.output_snapshot,
             Some("cc".repeat(32))

@@ -330,13 +330,39 @@ impl std::fmt::Debug for OperatorCredential {
     }
 }
 
-/// per-run, host-local context riding beside the prompt: which agent is
-/// running. populated by the worker from the run envelope; a run with no agent
-/// identity uses [`RunContext::default`]. NEVER consensus data — providers only
-/// use it to pick a workspace dir on this machine.
+pub use run_envelope::NativeConversationEvent;
+
+/// Attempt-local projection of a portable conversation. Only these explicitly
+/// materialized native artifacts may survive as network history; the fresh
+/// provider config home and all credentials remain outside it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NativeConversationContext {
+    pub conversation_id: String,
+    /// Logical frozen input range; deliberately independent of a retry run_id.
+    pub turn_id: String,
+    pub revision: u64,
+    pub session_path: PathBuf,
+    pub packages: Vec<NativePackage>,
+    pub events: Vec<NativeConversationEvent>,
+    /// Derived from the committed worker binding, never from model input.
+    pub job_reporting: bool,
+    pub system_prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NativePackage {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+/// Host-assembled execution context beside the current input. Committed intent
+/// and authenticated events may be projected here, but filesystem paths and
+/// capabilities are minted only after host provisioning. A run without an
+/// agent identity uses [`RunContext::default`].
 #[derive(Debug, Clone, Default)]
 pub struct RunContext {
     pub agent_id: Option<String>,
+    pub native_conversation: Option<NativeConversationContext>,
     /// the live-output registry key (the dispatch_id half of the saga id) —
     /// set by the oracle pool before provider.run so the output sink can key
     /// a per-run ring the app subscribes as run-output:<dispatch_id>.
@@ -418,10 +444,21 @@ pub struct TokenUsage {
     pub reasoning_output_tokens: u64,
 }
 
+/// Native execution may handle structured input without a model, or settle a
+/// cancellation at a safe boundary. These are distinct protocol results, never
+/// empty or fabricated assistant answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputDisposition {
+    Answer,
+    InputHandled,
+    Cancelled,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderOutput {
     pub text: String,
     pub usage: Option<TokenUsage>,
+    pub disposition: OutputDisposition,
 }
 
 /// optional live-tail callback for provider output. The run context is passed
@@ -464,7 +501,11 @@ pub trait Provider: Send + Sync {
     ) -> Result<ProviderOutput, String> {
         self.run(prompt, ctx)
             .await
-            .map(|text| ProviderOutput { text, usage: None })
+            .map(|text| ProviderOutput {
+                text,
+                usage: None,
+                disposition: OutputDisposition::Answer,
+            })
     }
     /// spawn an INTERACTIVE, pty-backed session driving this executor's TUI (see
     /// [`crate::interactive`]). The default refuses; a spec with an
@@ -1465,7 +1506,7 @@ impl CliProvider {
                 if let Some(config) = auth.config_home {
                     argv.extend([
                         "-e".into(),
-                        config.join(pi::TOOL_EXTENSION).display().to_string(),
+                        config.join(pi::extension(config)).display().to_string(),
                     ]);
                 }
                 return argv;
@@ -2611,6 +2652,7 @@ impl RunControl {
 struct Invocation {
     text: String,
     usage: Option<TokenUsage>,
+    disposition: OutputDisposition,
 }
 
 /// append one raw chunk to `pending` and forward every newline-completed
@@ -3097,21 +3139,38 @@ impl CliProvider {
             ));
         }
         let stdout = String::from_utf8_lossy(&out_bytes).into_owned();
-        let (text, usage) = match self.spec.output {
+        let (text, usage, disposition) = match self.spec.output {
             OutputFormat::PiJson => {
                 let output = pi::parse_output(&stdout)?;
-                (output.text, output.usage)
+                (output.text, output.usage, output.disposition)
             }
-            OutputFormat::JsonlEvents => (parse_jsonl_events(&stdout)?, parse_token_usage(&stdout)),
-            OutputFormat::JsonResult => (parse_json_result(&stdout)?, parse_token_usage(&stdout)),
+            OutputFormat::JsonlEvents => (
+                parse_jsonl_events(&stdout)?,
+                parse_token_usage(&stdout),
+                OutputDisposition::Answer,
+            ),
+            OutputFormat::JsonResult => (
+                parse_json_result(&stdout)?,
+                parse_token_usage(&stdout),
+                OutputDisposition::Answer,
+            ),
             // Plain stdout is model-authored answer text, not a provider
             // telemetry envelope. Never infer usage from answer content.
-            OutputFormat::Text => (parse_text_output(&stdout)?, None),
+            OutputFormat::Text => (parse_text_output(&stdout)?, None, OutputDisposition::Answer),
             OutputFormat::CodexSession | OutputFormat::ClaudeSession => {
                 unreachable!("session driver returned above")
             }
         };
-        Ok(Invocation { text, usage })
+        let unexpected_native_terminal = disposition != OutputDisposition::Answer
+            && ctx.native_conversation.is_none();
+        if unexpected_native_terminal {
+            return Err("provider returned a native terminal result outside a conversation".into());
+        }
+        Ok(Invocation {
+            text,
+            usage,
+            disposition,
+        })
     }
 
     async fn run_output(&self, prompt: &str, ctx: &RunContext) -> Result<ProviderOutput, String> {
@@ -3139,7 +3198,17 @@ impl CliProvider {
         // the CLI auto-loads, or the stdin prompt. the guard (held for the whole
         // call) removes a doc that lives outside the workdir, on every exit path.
         let _context = self.deliver_context(&workdir, config_home, ctx)?;
-        let prompt_buf = self.prompt_with_context(prompt, ctx);
+        let prompt_buf = match &ctx.native_conversation {
+            Some(conversation) => {
+                if self.spec.isolation.broker != Some(BrokerKind::Pi) {
+                    return Err("native conversations require the Pi provider".into());
+                }
+                let config = config_home
+                    .ok_or("native conversation requires a fresh Pi config home")?;
+                pi::prepare_conversation(config, conversation, prompt)?
+            }
+            None => self.prompt_with_context(prompt, ctx),
+        };
         let prompt = prompt_buf.as_str();
         // the per-run credential source rides `ctx.airlock` (unifies the
         // headless `sched --cred` and peer-attached spawn paths); `None` for
@@ -3147,8 +3216,8 @@ impl CliProvider {
         // unchanged. A present config takes precedence over env.
         let broker = self.start_broker(ctx.airlock.as_ref()).await?;
 
-        // ONE cold invocation, always: a run's whole continuity is its prompt
-        // envelope, which is what lets any assignee execute it.
+        // One invocation per execution attempt. A conversation's native SDK
+        // transport restores network history; an ordinary run remains cold.
         let run = self
             .invoke(
                 prompt,
@@ -3162,6 +3231,7 @@ impl CliProvider {
         Ok(ProviderOutput {
             text: run.text,
             usage: run.usage,
+            disposition: run.disposition,
         })
     }
 }
@@ -5600,6 +5670,7 @@ printf '%s\n' "$PATH"
         );
         let ctx = RunContext {
             agent_id: Some("bot".into()),
+            native_conversation: None,
             run_key: None,
             cancellation: None,
             executing_node: None,

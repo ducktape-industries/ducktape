@@ -15,6 +15,7 @@ impl Pages {
             staged: StagedStore::new(store),
             attribution: None,
             identity: None,
+            files: None,
         }
     }
 
@@ -26,6 +27,13 @@ impl Pages {
 
     pub fn with_identity(mut self, identity: impl Into<ModuleId>) -> Self {
         self.identity = Some(identity.into());
+        self
+    }
+
+    /// Retain committed artifact snapshots under immutable receipt-owned keys.
+    /// Artifact-bearing commits reject when this cross-module edge is absent.
+    pub fn with_files(mut self, files: impl Into<ModuleId>) -> Self {
+        self.files = Some(files.into());
         self
     }
 
@@ -83,7 +91,15 @@ impl Pages {
         &self,
         root: Block,
     ) -> Result<Vec<Block>, PageError> {
-        let mut reads = 0_usize;
+        self.preflight_removal_with_budget(root, &mut 0).await
+    }
+
+    /// Managed batches share ONE removal budget across all deleted documents.
+    pub(super) async fn preflight_removal_with_budget(
+        &self,
+        root: Block,
+        reads: &mut usize,
+    ) -> Result<Vec<Block>, PageError> {
         let mut frontier = vec![root];
         let mut blocks = Vec::new();
         while !frontier.is_empty() {
@@ -92,9 +108,9 @@ impl Pages {
             // already-visited tree and exhaust fuel on valid wide subtrees.
             let mut keys = Vec::new();
             for block in &frontier {
-                take_traversal_work(&mut reads, 1, PageError::RemoveSubtreeTooLarge)?;
+                take_traversal_work(reads, 1, PageError::RemoveSubtreeTooLarge)?;
                 take_traversal_work(
-                    &mut reads,
+                    reads,
                     block.children.len(),
                     PageError::RemoveSubtreeTooLarge,
                 )?;
@@ -105,7 +121,7 @@ impl Pages {
             let mut thread_ids = Vec::new();
             for block in &frontier {
                 let ids = self.load_target_index(&block.id).await?;
-                take_traversal_work(&mut reads, ids.len(), PageError::RemoveSubtreeTooLarge)?;
+                take_traversal_work(reads, ids.len(), PageError::RemoveSubtreeTooLarge)?;
                 thread_ids.extend(ids);
             }
             let keys: Vec<_> = thread_ids
@@ -119,7 +135,7 @@ impl Pages {
                     continue;
                 };
                 take_traversal_work(
-                    &mut reads,
+                    reads,
                     thread.comment_ids.len(),
                     PageError::RemoveSubtreeTooLarge,
                 )?;

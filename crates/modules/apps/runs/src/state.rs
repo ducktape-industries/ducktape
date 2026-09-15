@@ -439,6 +439,7 @@ pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
         insert_ascending(&mut delegations, id, state)?;
     }
     validate_decoded_delegations(&pending, &delegations)?;
+    super::conversations::validate_records(&action_requests)?;
 
     let models: BTreeMap<String, crate::ModelRecord> =
         sdk::wire::decode(&take_lp_bytes(&mut cur)?)?;

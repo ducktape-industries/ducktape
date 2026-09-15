@@ -27,6 +27,7 @@
 //! are the ones that reach real consensus.
 
 use crate::NodeHandle;
+use std::path::Path;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -56,7 +57,7 @@ const AGENT: &str = "quackbot";
 const CAPABILITY: &str = "mock-llm-1";
 /// 32 bytes: `Accept`'s standing gate requires a real valset-shaped key, and
 /// this is seeded into that valset (see `genesis`).
-const WORKER_NODE: &[u8] = &[0x77; 32];
+pub(in crate::agent_provision) const WORKER_NODE: &[u8] = &[0x77; 32];
 const CHANNEL: &str = "general";
 
 /// a provider that answers instantly and RECORDS the run context it was handed —
@@ -122,7 +123,13 @@ fn alice() -> Origin {
 
 /// the genesis set the collaboration loop runs on — chat + the attribution plane +
 /// the dispatch plane + the registry + runs.
-async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
+/// `files_root` is where this composition's Files module keeps its objects:
+/// runs is wired to `files`, so every genesis that runs a conversation needs
+/// the module that wiring names.
+pub(in crate::agent_provision) async fn genesis(
+    context: commonware_runtime::tokio::Context,
+    files_root: &Path,
+) -> Host {
     let chat = Chat::new(
         "chat",
         Box::new(QmdbStore::init(context.child("chat"), "chat").await),
@@ -192,13 +199,14 @@ async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
             "agent",
             Some("tasks".into()),
             Some("tasks".into()),
-        )),
+        ).with_files_module("files")),
         Box::new(Tasks::new(
             "tasks",
             "identity",
             "attribution",
             Box::new(sdk_testkit::MemStore::new()),
         )),
+        Box::new(files::Files::open("files", files_root.join("files")).expect("files module")),
     ])
     .expect("genesis")
 }
@@ -218,6 +226,7 @@ async fn mention_run(host: &mut Host) -> Event {
         Msg {
             target: "agent".into(),
             payload: agent::encode_msg(&agent::AgentMsg::Provision {
+                request_id: AGENT.into(),
                 name: "Quackbot".into(),
                 program: runs::model_program(AGENT),
             }),
@@ -334,7 +343,7 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
         .with_storage_directory(tmp.path().join("storage"));
     commonware_runtime::tokio::Runner::new(cfg).start(|context| async move {
         let runs_root = tmp.path().join("runs");
-        let mut host = genesis(context).await;
+        let mut host = genesis(context, tmp.path()).await;
 
         // ---- a real run, in flight -----------------------------------------
         let announce = mention_run(&mut host).await;

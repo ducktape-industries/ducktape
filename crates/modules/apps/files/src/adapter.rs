@@ -182,6 +182,30 @@ pub(crate) async fn apply_op<S: ObjectStore>(
                     snapshot: to_hex(&fs.pending_refs().head.expect("commit sets head")),
                 }
             }
+            FilesMsg::ProjectSnapshot { snapshot, path } => {
+                let snapshot = fs
+                    .project_snapshot(&authority, env.height, env.consensus_time, snapshot, path)
+                    .map_err(Error::Module)?;
+                WriteOutcome::ProjectSnapshot { snapshot }
+            }
+            FilesMsg::CompareExchangeRetention {
+                key,
+                expected,
+                replacement,
+            } => {
+                fs.compare_exchange_retention(
+                    &authority,
+                    env.height,
+                    key.clone(),
+                    expected,
+                    replacement.clone(),
+                )
+                .map_err(Error::Module)?;
+                WriteOutcome::CompareExchangeRetention {
+                    key,
+                    reference: replacement,
+                }
+            }
             FilesMsg::Pin { snapshot, name } => {
                 fs.pin(&authority, env.height, snapshot.clone(), name.clone())
                     .map_err(Error::Module)?;
@@ -210,10 +234,14 @@ pub(crate) async fn apply_op<S: ObjectStore>(
     };
     let after = fs.pending_refs();
     publish_changes(ctx, &actor, &before, after);
-    ctx.set_output(encode_write_output(&FilesWriteOutput {
+    let output = encode_write_output(&FilesWriteOutput {
         actor,
         source_revision: after.source_revision,
         outcome,
-    }));
+    });
+    // Generic action receipts keep the assigned stamp, not raw output bytes.
+    // Publish minted object IDs there as well; this never includes file bodies.
+    ctx.set_assigned(output.clone());
+    ctx.set_output(output);
     Ok(())
 }

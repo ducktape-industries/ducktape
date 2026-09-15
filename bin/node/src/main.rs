@@ -52,6 +52,7 @@ use commonware_runtime::{Metrics as _, Runner, Supervisor};
 mod account_cli;
 mod agent;
 mod agent_cli;
+mod chief_cli;
 mod agent_plane;
 mod airlock;
 mod announce;

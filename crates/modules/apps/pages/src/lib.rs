@@ -83,6 +83,7 @@ mod error;
 mod module_impl;
 mod ops;
 mod page_ops;
+mod record_ops;
 mod store;
 mod text_ranges;
 
@@ -164,6 +165,8 @@ pub struct Pages {
     /// Source-owned block and comment attribution, wired in production.
     attribution: Option<ModuleId>,
     identity: Option<ModuleId>,
+    /// Receipt-owned immutable artifact retention, emitted as this module.
+    files: Option<ModuleId>,
 }
 
 #[cfg(test)]

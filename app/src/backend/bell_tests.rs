@@ -182,6 +182,173 @@ async fn bell_message_preview_and_navigation_use_the_resolved_source() {
     assert!(bell_openable(&row, &[entry]));
 }
 
+// A finite RPC script: assertions and socket tasks are joined, never detached.
+async fn scripted_server(script: Vec<(Value, Value)>) -> (RpcClient, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rpc = rpc_client(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let task = tokio::spawn(async move {
+        for (expected, reply) in script {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let body: Value = loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                    continue;
+                };
+                let header = String::from_utf8_lossy(&bytes[..end]);
+                let length: usize = header
+                    .lines()
+                    .find_map(|line| {
+                        line.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|n| n.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                let complete = bytes.len() >= end + 4 + length;
+                if complete {
+                    break serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
+                }
+            };
+            assert_eq!(body, expected);
+            let body = reply.to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+    });
+    (rpc, task)
+}
+
+fn job_event_fixture() -> (BellItem, attribution::ChangeEntry) {
+    let object = "a".repeat(64);
+    let row = BellItem {
+        change_seq: 42,
+        source: format!("tasks/job_event/{object}"),
+        ..item(17, "ownership", "account:9")
+    };
+    let detail = ::tasks::JobEventDetail {
+        job_id: "resolved-job".into(),
+        conversation_id: "conversation".into(),
+        job_kind: "native_worker".into(),
+        created_at_revision: 3,
+        job_attempt: 1,
+        submitter: ::tasks::Party::Account(4),
+        actor: ::tasks::Party::Account(9),
+        height: 8,
+        operation: ::tasks::JobsMsg::Cancel {
+            job_id: "resolved-job".into(),
+        },
+    };
+    let record = attribution::ChangeEntry {
+        at: 42,
+        change: attribution::Change {
+            seq: 42,
+            source: attribution::Source {
+                module: "tasks".into(),
+                kind: "job_event".into(),
+                object,
+            },
+            revision: 1,
+            recipient: 4,
+            reason: attribution::Reason::Ownership,
+            kind: attribution::ChangeKind::Added,
+            detail: sdk::wire::encode(&detail),
+            actor: attribution::Actor::Account(9),
+            cause: sdk::Cause::Direct,
+            height: 8,
+        },
+    };
+    (row, record)
+}
+
+fn changes_request() -> Value {
+    json!({"target":"attribution", "query":{"changes":{"after":41,"limit":1}}})
+}
+
+fn job_request() -> Value {
+    json!({"target":"tasks", "query":{"job":{"get":{"job_id":"resolved-job"}}}})
+}
+
+fn job_reply() -> Value {
+    json!({"job":{"job":{
+        "job_id":"resolved-job", "execution":"conversation", "conversation_id":"conversation",
+        "previous_job_id":null, "continuation_operation_id":null, "controls":[], "reports":[],
+        "native_history":null, "kind":"native_worker", "spec":"", "submitter":{"account":4},
+        "status":"done", "attempt":1, "claim":null, "result":null, "comments":[],
+        "created_at_revision":3, "created_at_height":7, "updated_at_height":9
+    }}})
+}
+
+#[tokio::test]
+async fn bell_job_event_resolves_detail_job_id_and_matches_ordinary_job_preview() {
+    let (row, record) = job_event_fixture();
+    let reply = serde_json::to_value(attribution::AttributionReply::Changes(vec![record])).unwrap();
+    let (rpc, server) = scripted_server(vec![
+        (changes_request(), reply),
+        (job_request(), job_reply()),
+        (job_request(), job_reply()),
+    ])
+    .await;
+    let mut event = bell_summary(&row, "Alice");
+    bell_source(&rpc, &row, &mut event).await.unwrap();
+    let ordinary_row = BellItem {
+        source: "tasks/job/resolved-job".into(),
+        ..row.clone()
+    };
+    let mut ordinary = bell_summary(&ordinary_row, "Alice");
+    bell_source(&rpc, &ordinary_row, &mut ordinary)
+        .await
+        .unwrap();
+    server.await.unwrap();
+    assert_eq!(event, ordinary);
+    assert_eq!(event.detail, "Native worker · Done");
+    assert_eq!(event.target, BellTarget::Unavailable);
+    assert!(event.object.is_empty());
+    assert!(bell_link(&event, "demo#d0cdf950".into()).is_empty());
+    assert!(!bell_openable(&row, &[event]));
+}
+
+#[tokio::test]
+async fn bell_job_event_rejects_missing_mismatched_and_corrupt_changes() {
+    let (row, record) = job_event_fixture();
+    let mut cases = vec![(Vec::new(), "change not found".to_string())];
+    for field in ["seq", "at", "module", "kind", "object", "detail"] {
+        let mut wrong = record.clone();
+        match field {
+            "seq" => wrong.change.seq += 1,
+            "at" => wrong.at += 1,
+            "module" => wrong.change.source.module = "other".into(),
+            "kind" => wrong.change.source.kind = "job".into(),
+            "object" => wrong.change.source.object = "resolved-job".into(),
+            "detail" => wrong.change.detail = b"not wire data".to_vec(),
+            _ => unreachable!(),
+        }
+        let error = match field {
+            "detail" => {
+                sdk::wire::decode::<::tasks::JobEventDetail>(&wrong.change.detail).unwrap_err()
+            }
+            _ => "wrong change".into(),
+        };
+        cases.push((vec![wrong], error));
+    }
+    for (changes, error) in cases {
+        let reply = serde_json::to_value(attribution::AttributionReply::Changes(changes)).unwrap();
+        let (rpc, server) = scripted_server(vec![(changes_request(), reply)]).await;
+        let mut entry = bell_summary(&row, "Alice");
+        assert_eq!(
+            bell_source(&rpc, &row, &mut entry).await.unwrap_err(),
+            error
+        );
+        server.await.unwrap();
+        assert_eq!(entry.detail, "Task activity");
+        assert_eq!(entry.target, BellTarget::Unavailable);
+        assert!(entry.object.is_empty());
+        assert!(!bell_openable(&row, &[entry]));
+    }
+}
+
 #[test]
 fn bell_account_scope_rejects_a_wallet_switch_before_any_rpc_write() {
     assert!(ensure_bell_account("4", 4).is_ok());

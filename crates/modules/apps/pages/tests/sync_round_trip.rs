@@ -215,6 +215,191 @@ fn synced_store_reconstructs_source_root() {
     });
 }
 
+#[test]
+fn managed_records_documents_and_replay_receipts_survive_authenticated_snapshot_sync() {
+    use pages::{RecordChange, RecordDocument, RecordReceipt};
+    deterministic::Runner::default().start(|context| async move {
+        let mut src = Pages::new(
+            "src",
+            Box::new(QmdbStore::init(context.child("src"), "src").await),
+        );
+        apply_commit(
+            &mut src,
+            &PageMsg::CreatePage {
+                page_id: "board".into(),
+                title: "Board".into(),
+                blocks: Vec::new(),
+            },
+        )
+        .await;
+        apply_commit(
+            &mut src,
+            &PageMsg::CreateRecordCollection {
+                page_id: "board".into(),
+                request_id: "create".into(),
+            },
+        )
+        .await;
+        let first = PageMsg::CommitRecords {
+            page_id: "board".into(),
+            expected_revision: 0,
+            request_id: "first".into(),
+            artifacts: Vec::new(),
+            metadata: Some(serde_json::json!({"fingerprint": "first", "result": {"ok": true}})),
+            state_changes: vec![pages::RecordStateChange::Put {
+                key: "runner".into(),
+                value: serde_json::json!({"next": 1}),
+            }],
+            changes: vec![
+                RecordChange::Upsert {
+                    record_id: "record".into(),
+                    data: serde_json::json!({"value": 1}),
+                    document: RecordDocument {
+                        title: "A real page".into(),
+                        blocks: vec![para("body", "Human-readable document")],
+                    },
+                },
+                RecordChange::Upsert {
+                    record_id: "doomed".into(),
+                    data: serde_json::json!({}),
+                    document: RecordDocument {
+                        title: "Delete me".into(),
+                        blocks: Vec::new(),
+                    },
+                },
+            ],
+        };
+        apply_commit(&mut src, &first).await;
+        apply_commit(
+            &mut src,
+            &PageMsg::CommitRecords {
+                page_id: "board".into(),
+                expected_revision: 1,
+                request_id: "second".into(),
+                artifacts: Vec::new(),
+                metadata: Some(
+                    serde_json::json!({"fingerprint": "second", "result": {"ok": true}}),
+                ),
+                state_changes: vec![pages::RecordStateChange::Put {
+                    key: "runner".into(),
+                    value: serde_json::json!({"next": 2}),
+                }],
+                changes: vec![
+                    RecordChange::Upsert {
+                        record_id: "record".into(),
+                        data: serde_json::json!({"value": 2}),
+                        document: RecordDocument {
+                            title: "A real page".into(),
+                            blocks: vec![para("body", "Updated visible document")],
+                        },
+                    },
+                    RecordChange::Delete {
+                        record_id: "doomed".into(),
+                    },
+                ],
+            },
+        )
+        .await;
+        let queries = vec![
+            PageQuery::RecordState {
+                page_id: "board".into(),
+                key: "runner".into(),
+            },
+            PageQuery::RecordCollection {
+                page_id: "board".into(),
+            },
+            PageQuery::Records {
+                page_id: "board".into(),
+                after: None,
+                limit: 0,
+            },
+            PageQuery::Record {
+                page_id: "board".into(),
+                record_id: "record".into(),
+            },
+            PageQuery::Record {
+                page_id: "board".into(),
+                record_id: "doomed".into(),
+            },
+            PageQuery::RecordReceipt {
+                page_id: "board".into(),
+                request_id: "create".into(),
+            },
+            PageQuery::RecordReceipt {
+                page_id: "board".into(),
+                request_id: "first".into(),
+            },
+            PageQuery::RecordReceipt {
+                page_id: "board".into(),
+                request_id: "second".into(),
+            },
+            PageQuery::GetPage {
+                page_id: "record".into(),
+                after: None,
+                limit: 0,
+            },
+        ];
+        let mut expected = Vec::new();
+        for query in &queries {
+            expected.push(src.query(&encode_query(query)).await.unwrap());
+        }
+        let root = src.root();
+        drop(src);
+        let source = QmdbStore::init(context.child("serve"), "src").await;
+        assert_eq!(source.root(), root, "reopen restores every managed key");
+        let target = source.sync_boundary_target().await;
+        let store =
+            QmdbStore::sync_from(context.child("dst"), "dst", target, source.into_resolver())
+                .await
+                .unwrap();
+        let mut synced = Pages::new("dst", Box::new(store));
+        assert_eq!(synced.root(), root);
+        for (query, expected) in queries.iter().zip(expected) {
+            assert_eq!(synced.query(&encode_query(query)).await.unwrap(), expected);
+        }
+        let mut ctx = TestCtx::at_height(0);
+        synced
+            .execute(
+                &mut ctx,
+                &Msg {
+                    target: "dst".into(),
+                    payload: encode_msg(&first),
+                },
+            )
+            .await
+            .unwrap();
+        let receipt: RecordReceipt = sdk::wire::decode(ctx.output().unwrap()).unwrap();
+        assert_eq!(receipt.revision, 1);
+        assert_eq!(
+            receipt.metadata,
+            Some(serde_json::json!({"fingerprint": "first", "result": {"ok": true}}))
+        );
+        synced.commit_block().await.unwrap();
+        assert_eq!(
+            synced.root(),
+            root,
+            "recovered receipt must not replay old mutations"
+        );
+        assert_eq!(
+            get_page(&synced, "record").await.unwrap()[1].text,
+            "Updated visible document"
+        );
+        let error = synced
+            .execute(
+                &mut TestCtx::at_height(0),
+                &Msg {
+                    target: "dst".into(),
+                    payload: encode_msg(&PageMsg::RemoveBlock {
+                        block_id: "board".into(),
+                    }),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("requires commit_records"));
+    });
+}
+
 // the enumeration INDEX is ordinary store state (a reserved sentinel key), so
 // it state-syncs like any block: a joiner rebuilds a byte-identical root and
 // answers every kept query — each page's full tree — exactly like the source.

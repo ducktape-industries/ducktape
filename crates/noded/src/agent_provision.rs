@@ -742,6 +742,7 @@ mod tests {
         let spec = WorkspaceSpec {
             run_id: "s1:0".into(),
             agent: Some(compute_service::AgentExecution {
+                native_conversation: None,
                 run_id: "chat\u{1f}general\u{1f}2\u{1f}bot".into(),
                 attempt: 0,
                 agent_id: "bot".into(),

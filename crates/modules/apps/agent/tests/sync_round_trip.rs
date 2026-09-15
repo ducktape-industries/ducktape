@@ -215,6 +215,7 @@ fn synced_store_reconstructs_source_root_and_records() {
             &mut src,
             &mut ctx,
             encode_msg(&AgentMsg::Provision {
+                request_id: "bot".into(),
                 name: "bot".into(),
                 program: program("first"),
             }),
@@ -233,7 +234,17 @@ fn synced_store_reconstructs_source_root_and_records() {
             }),
         )
         .await;
-        let mut ctx = scripted.ctx(2, alice, Cause::Direct);
+        let mut ctx = scripted.ctx(2, alice.clone(), Cause::Direct);
+        apply_commit(
+            &mut src,
+            &mut ctx,
+            encode_msg(&AgentMsg::Initialize {
+                account,
+                request_id: "install".into(),
+            }),
+        )
+        .await;
+        let mut ctx = scripted.ctx(2, alice.clone(), Cause::Direct);
         apply_commit(
             &mut src,
             &mut ctx,
@@ -298,6 +309,16 @@ fn synced_store_reconstructs_source_root_and_records() {
         let src_root: StateRoot = src.root();
         assert_ne!(src_root, StateRoot::ZERO, "source must have a real root");
         let src_binding = query_reply(&src, &AgentQuery::Binding { account }).await;
+        let provision_query = AgentQuery::Provision {
+            controller: ALICE,
+            request_id: "bot".into(),
+        };
+        let initialization_query = AgentQuery::Initialization {
+            account,
+            request_id: "install".into(),
+        };
+        let src_provision = query_reply(&src, &provision_query).await;
+        let src_initialization = query_reply(&src, &initialization_query).await;
         let src_invocations = query_reply(
             &src,
             &AgentQuery::Invocations {
@@ -330,7 +351,7 @@ fn synced_store_reconstructs_source_root_and_records() {
         let store = QmdbStore::sync_from(context.child("dst"), "dst", target, resolver)
             .await
             .expect("sync_from");
-        let synced = AgentModule::new("agent", Box::new(store), siblings());
+        let mut synced = AgentModule::new("agent", Box::new(store), siblings());
 
         // THE PROPERTY: identical qmdb root — the root-hash linkage a joiner
         // needs at the boundary height.
@@ -342,6 +363,39 @@ fn synced_store_reconstructs_source_root_and_records() {
 
         // every committed mutation survived: the replaced binding at its
         // generation, the finished invocation with its bound outcome.
+        assert_eq!(query_reply(&synced, &provision_query).await, src_provision);
+        assert_eq!(
+            query_reply(&synced, &initialization_query).await,
+            src_initialization
+        );
+        let mut ctx = scripted.ctx(5, alice.clone(), Cause::Direct);
+        apply_commit(
+            &mut synced,
+            &mut ctx,
+            encode_msg(&AgentMsg::Provision {
+                request_id: "bot".into(),
+                name: "bot".into(),
+                program: program("first"),
+            }),
+        )
+        .await;
+        assert!(ctx.msgs().is_empty());
+        let mut ctx = scripted.ctx(5, alice, Cause::Direct);
+        apply_commit(
+            &mut synced,
+            &mut ctx,
+            encode_msg(&AgentMsg::Initialize {
+                account,
+                request_id: "install".into(),
+            }),
+        )
+        .await;
+        assert!(ctx.msgs().is_empty());
+        assert_eq!(
+            synced.root(),
+            src_root,
+            "retries after sync must not allocate or initialize again"
+        );
         let binding = query_reply(&synced, &AgentQuery::Binding { account }).await;
         assert_eq!(binding, src_binding);
         let AgentReply::Binding(Some(binding)) = binding else {

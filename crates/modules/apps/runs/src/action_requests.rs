@@ -417,6 +417,8 @@ impl RunsModule {
         request.view.status = ActionStatus::Completed { call, outcome };
         ctx.set_output(sdk::wire::encode(&request.view.status));
         self.stage_action_marker(&request).await?;
+        self.wake_conversation_for_run(ctx, &request.view.run_id)
+            .await?;
         Ok(())
     }
 
@@ -525,6 +527,8 @@ impl RunsModule {
         }
         request.view.status = ActionStatus::Rejected { reason };
         self.stage_action_marker(&request).await?;
+        self.wake_conversation_for_run(ctx, &request.view.run_id)
+            .await?;
         if matches!(request.scope, RequestScope::Result) {
             self.record_result_action_refused(&request);
         }

@@ -10,6 +10,9 @@ pub use model_config::{MAX_AGENT_ID_LEN, validate_agent_id};
 
 mod interface;
 pub use interface::*;
+mod conversation_interface;
+pub use conversation_interface::*;
+mod conversations;
 // the derived-tier run journal: the PURE decision core (fold + view over
 // index_guest::StateRead), compiled everywhere and unit-tested natively.
 // the engine shell that runs it inside the module's index database is
@@ -326,7 +329,7 @@ mod engagement;
 mod module_updates;
 mod receipts;
 mod workflow;
-pub use workflow::model_program;
+pub use workflow::{conversation_program, model_program};
 mod facets;
 use facets::WireSink;
 // the forge compose lane (M1): forge:<repo>:<n> channel detection, committed
@@ -412,7 +415,7 @@ impl PendingState {
                 thread_id: thread_id.into(),
             }),
             None => {
-                let has_source = !self.channel_id.is_empty() && self.anchor_seq != 0;
+                let has_source = !self.channel_id.is_empty();
                 if !has_source {
                     return Err("this run has no reply destination".into());
                 }
@@ -501,6 +504,8 @@ pub struct RunsModule {
     /// tests) renders the hand-typed form, which resolves against whichever
     /// network the reader is on.
     chain_id: String,
+    /// Genesis-bound clock scale; duration scheduling refuses absent wiring.
+    time_unit: Option<sdk::genesis_config::TimeUnit>,
     /// committed state — what `root()` and the root-hash commit to.
     models: BTreeMap<String, ModelRecord>,
     pending_models: BTreeMap<String, Option<ModelRecord>>,
@@ -607,6 +612,7 @@ impl RunsModule {
             pages: None,
             collaboration: None,
             chain_id: String::new(),
+            time_unit: None,
             models: BTreeMap::new(),
             pending_models: BTreeMap::new(),
             receipts: receipts::Receipts::default(),
@@ -750,6 +756,11 @@ impl RunsModule {
     /// collaborators so `new` and every existing call site stay untouched. the
     /// guest reads it out of the genesis `__config` record; unwired, produced
     /// links carry no `?net=`.
+    pub fn with_time_unit(mut self, unit: sdk::genesis_config::TimeUnit) -> Self {
+        self.time_unit = Some(unit);
+        self
+    }
+
     pub fn with_chain_id(mut self, chain_id: impl Into<String>) -> Self {
         self.chain_id = chain_id.into();
         self

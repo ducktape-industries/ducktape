@@ -106,6 +106,8 @@ workspace-config = { workspace = true }
 blobstore = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
+run-envelope = { workspace = true }
+borsh = { workspace = true }
 # the staged node-driven WireGuard plane: the reachability executor runs
 # on its own plain-tokio thread (mirroring the app-surface split) behind the
 # `wireguard_listen` node.toml key; the wireguard crate supplies the

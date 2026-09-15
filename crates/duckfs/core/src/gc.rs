@@ -21,7 +21,7 @@ use crate::wire::to_hex;
 
 /// mark: the id of every object reachable from the committed refs roots. roots
 /// are the head snapshot, every history-window snapshot, every pinned snapshot,
-/// and every staging digest (a putblob'd chunk awaiting a commit). the walk is
+/// every staging digest, and the protected retention catalog. The ordinary walk is
 ///
 /// ```text
 /// Snapshot -> root Tree -> entries -> {File,Symlink} FileObj -> chunks
@@ -29,10 +29,10 @@ use crate::wire::to_hex;
 ///
 /// with dir entries recursing into subtrees. a snapshot's PARENT pointer is
 /// deliberately NOT a gc edge: parents are commit-history metadata, not a
-/// storage edge. every still-live parent is already independently a window or
-/// pin root, so following the chain would resurrect the entire pre-window
-/// history that the bounded window exists to let go of — gc keeps exactly
-/// head + window + pins + staging and their transitive objects, nothing more.
+/// storage edge. Every still-live parent is independently retained by a window,
+/// pin, or protected reference. Following the chain would resurrect the entire
+/// pre-window history that the bounded window exists to let go of. Catalog
+/// records add explicit snapshot edges; ordinary file metadata never does.
 ///
 /// ANY reachable object that is missing — a root snapshot, a mid-walk tree, a
 /// fileobj, or a chunk — is a corruption of committed state and returns Err. gc
@@ -66,12 +66,19 @@ pub(crate) fn mark(refs: &Refs, store: &dyn ObjectStore) -> Result<BTreeSet<Obje
         mark_chunk(digest, store, &mut live)?;
     }
 
+    if let Some(root) = refs.retention_root {
+        let mut missing = BTreeSet::new();
+        collect_retention(&root, store, &mut live, &mut missing, false)?;
+        if let Some(id) = missing.first() {
+            return Err(format!("files: gc: root object missing: {}", to_hex(id)));
+        }
+    }
     Ok(live)
 }
 
 /// the reachability walk's twin for the self-heal lane (task 14): the ids of
 /// every object reachable from the SAME committed roots (head/window/pins/
-/// staging) that is NOT present in the store. where [`mark`] treats a missing
+/// staging/retention) that is NOT present in the store. where [`mark`] treats a missing
 /// reachable object as corruption and errors, `collect_missing` records it and
 /// stops descending — an absent object's children live inside its not-yet-fetched
 /// body, so they are undiscoverable until it arrives. the caller loops
@@ -130,7 +137,62 @@ fn collect(
     for digest in refs.staging.keys() {
         collect_chunk(digest, store, &mut visited, &mut missing, verify_chunks)?;
     }
+    if let Some(root) = refs.retention_root {
+        collect_retention(&root, store, &mut visited, &mut missing, verify_chunks)?;
+    }
     Ok(missing)
+}
+
+/// Interpret snapshot edges only beneath the protected catalog root. Catalog
+/// visitation is separate from ordinary object visitation: a user file can have
+/// identical bytes to a record, but visiting it must not suppress this edge.
+fn collect_retention(
+    root: &ObjectId,
+    store: &dyn ObjectStore,
+    visited: &mut BTreeSet<ObjectId>,
+    missing: &mut BTreeSet<ObjectId>,
+    verify_chunks: bool,
+) -> Result<(), String> {
+    let mut catalog = BTreeSet::new();
+    let mut stack = vec![(*root, Kind::Tree, 0usize)];
+    while let Some((id, kind, depth)) = stack.pop() {
+        let excessive_depth = depth > crate::retention::CATALOG_DEPTH;
+        if excessive_depth {
+            return Err("files: retention catalog depth exceeded".into());
+        }
+        if !catalog.insert(id) {
+            continue;
+        }
+        visited.insert(id);
+        if !store.has(&id) {
+            missing.insert(id);
+            continue;
+        }
+        let body = fetch(store, &id, kind)?;
+        match kind {
+            Kind::Tree => {
+                let tree = TreeObj::decode(&body)?;
+                for entry in tree.entries.values() {
+                    let child_kind = match entry.kind {
+                        EntryKind::Dir => Kind::Tree,
+                        EntryKind::File => Kind::File,
+                        EntryKind::Symlink => {
+                            return Err("files: symlink in retention catalog".into());
+                        }
+                    };
+                    stack.push((entry.id, child_kind, depth + 1));
+                }
+            }
+            Kind::File => {
+                let snapshot = crate::retention::decode_record(&body)?.snapshot();
+                collect_snapshot(&snapshot, store, visited, missing, verify_chunks)?;
+            }
+            Kind::Chunk | Kind::Snapshot => {
+                return Err("files: invalid retention catalog edge".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// walk a snapshot root for [`collect_missing`]: absent -> record and stop;

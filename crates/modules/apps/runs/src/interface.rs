@@ -50,8 +50,10 @@ pub enum RunOutcome {
     /// At least one proposed result action was refused by its program or target.
     /// The corresponding ActionRequest carries the authenticated reason.
     ActionRejected,
-    /// Worker error, timeout, cancellation, or failed result validation.
+    /// Worker error, timeout, or failed result validation.
     Failed,
+    /// Native cancellation was acknowledged and settled by the bound Jobs claimant.
+    Cancelled,
 }
 
 /// One terminal run in the history ring, recorded when its pending entry
@@ -220,6 +222,73 @@ pub struct DelegationView {
 // the same direct construction API as the other module operations.
 #[allow(clippy::large_enum_variant)]
 pub enum RunsMsg {
+    ConfigureConversation {
+        conversation_id: String,
+        agent_id: String,
+        source: crate::ConversationSource,
+        history_prefix: String,
+        session_path: String,
+        packages: Vec<run_envelope::ConversationPackage>,
+    },
+    ActivateConversation {
+        conversation_id: String,
+        operation_id: String,
+        active: bool,
+    },
+    AppendConversationInput {
+        conversation_id: String,
+        operation_id: String,
+        input: crate::ConversationInput,
+    },
+    CheckpointConversation {
+        conversation_id: String,
+        run_id: String,
+        attempt: u32,
+        operation_id: String,
+        history: crate::ConversationHistory,
+        delivery: bool,
+    },
+    ReconcileConversation {
+        conversation_id: String,
+    },
+    RequestConversationTurn {
+        conversation_id: String,
+        turn: u64,
+    },
+    ScheduleConversationInput {
+        conversation_id: String,
+        operation_id: String,
+        schedule_id: String,
+        after_secs: Option<u64>,
+        input: crate::ConversationInput,
+    },
+    CrankConversationInputs,
+    RetryConversationTurn {
+        conversation_id: String,
+        operation_id: String,
+    },
+    /// The provider acknowledges a control only after delivering it at a safe boundary.
+    AcknowledgeJobControl {
+        run_id: String,
+        attempt: u32,
+        operation_id: String,
+    },
+    /// Claim-fenced semantic worker progress. New reports spend the live session's
+    /// shared action budget; native history checkpoints do not.
+    ReportJob {
+        run_id: String,
+        attempt: u32,
+        operation_id: String,
+        kind: tasks::WorkerReportKind,
+        payload: String,
+    },
+    /// Cancellation settlement is distinct from both request and boundary acknowledgement.
+    SettleJobCancellation {
+        run_id: String,
+        attempt: u32,
+        operation_id: String,
+        payload: String,
+    },
     /// A program commits an immutable deployment request for the node executors.
     RequestModuleUpdate {
         request_id: String,
@@ -412,6 +481,28 @@ pub struct AgentSession {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunsQuery {
+    Conversation {
+        conversation_id: String,
+    },
+    ConversationForChannel {
+        channel_id: String,
+    },
+    ConversationEvents {
+        conversation_id: String,
+        from: u64,
+        limit: u64,
+    },
+    ConversationTurn {
+        conversation_id: String,
+        turn: u64,
+    },
+    WorkerControls {
+        run_id: String,
+    },
+    ConversationSchedules {
+        conversation_id: String,
+    },
+    NextConversationInputDue,
     NodeWork {
         node_key: Vec<u8>,
         height: u64,
@@ -458,6 +549,12 @@ pub enum RunsQuery {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunsReply {
+    Conversation(Option<crate::ConversationView>),
+    ConversationEvents(Vec<crate::ConversationEvent>),
+    ConversationTurn(Option<crate::ConversationTurn>),
+    WorkerControls(Option<crate::WorkerControls>),
+    ConversationSchedules(Vec<crate::ConversationSchedule>),
+    NextConversationInputDue(Option<u64>),
     NodeWork(Option<node_work::Directive>),
     ModuleUpdate(Option<ModuleUpdateView>),
     Model(crate::ModelReply),

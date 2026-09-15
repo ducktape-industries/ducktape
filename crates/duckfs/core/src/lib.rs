@@ -16,6 +16,7 @@ pub mod gc;
 pub mod objects;
 pub mod paths;
 pub mod queries;
+mod retention;
 pub mod state;
 pub mod store;
 mod tree;

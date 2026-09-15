@@ -203,6 +203,34 @@ const boundedText = (text: string): Promise<string> => {
     });
 };
 
+// --- Package service -------------------------------------------------------
+
+export interface MCPToolsCallResult {
+  content: Array<{ type: string; text: string }>;
+  isError: boolean;
+  [key: string]: unknown;
+}
+
+export interface DucktapeNetworkService {
+  callTool: (name: string, args: Record<string, unknown>, signal?: AbortSignal) => Promise<MCPToolsCallResult>;
+}
+
+const awaitStartup = (ready: Promise<void>, signal?: AbortSignal): Promise<void> => {
+  if (!signal) return ready;
+  const cancelled = Promise.withResolvers<void>();
+  const abort = () => cancelled.reject(new Error("Ducktape MCP call cancelled before startup"));
+  if (signal.aborted) abort();
+  signal.addEventListener("abort", abort, { once: true });
+  return Promise.race([ready, cancelled.promise]).finally(() => signal.removeEventListener("abort", abort));
+};
+
+const redactValue = (value: unknown, redact: (text: string) => string): unknown => {
+  if (typeof value === "string") return redact(value);
+  if (Array.isArray(value)) return value.map((entry) => redactValue(entry, redact));
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, redactValue(entry, redact)]));
+};
+
 // --- Pi lifecycle ----------------------------------------------------------
 
 const ducktapeExtension = (pi: ExtensionAPI): void => {
@@ -212,11 +240,45 @@ const ducktapeExtension = (pi: ExtensionAPI): void => {
   const tokens = [env.DUCKTAPE_RUN_ACTION_TOKEN, env.DUCKTAPE_PROVIDER_CONTROL_TOKEN]
     .filter((token): token is string => typeof token === "string" && token.length > 0);
   const redact = (text: string) => tokens.reduce((value, token) => value.replaceAll(token, "[redacted]"), text);
-  const state: { client?: ReturnType<typeof connect>; guidance?: string } = {};
+  const state: { client?: ReturnType<typeof connect>; guidance?: string; unavailable?: Error } = {};
+  const names = new Set<string>();
+  const ready = Promise.withResolvers<void>();
+  // A failed startup may have no package consumer. Attach rejection handling
+  // immediately, while retaining the rejecting promise for every actual caller.
+  ready.promise.catch(() => {});
+  const service: DucktapeNetworkService = {
+    callTool: (name, args, signal) => Promise.resolve()
+      .then(() => awaitStartup(ready.promise, signal))
+      .then(() => {
+        signal?.throwIfAborted();
+        if (state.unavailable) throw state.unavailable;
+        if (!names.has(name)) throw new Error("Ducktape MCP tool was not discovered");
+        if (!state.client) throw new Error("Ducktape MCP session is unavailable");
+        return state.client.request("tools/call", { name, arguments: args }, signal);
+      })
+      .then((value) => {
+        // Validate the server's exact text-only envelope without flattening or
+        // clipping it. Trusted packages need complete structured operation JSON.
+        toolResult(value);
+        return redactValue(value, redact) as MCPToolsCallResult;
+      })
+      .catch((error: unknown) => {
+        throw new Error(redact(error instanceof Error ? error.message : String(error)));
+      }),
+  };
+  const unbind = pi.events.on("ducktape:network:bind", (value) => {
+    const request = object(value);
+    if (typeof request.accept !== "function") throw new Error("Ducktape network binding requires accept");
+    request.accept(service);
+  });
 
   pi.on("session_start", (_event, ctx) => {
     const headless = ctx.mode === "print" || ctx.mode === "json";
-    if (!headless) return;
+    if (!headless) {
+      state.unavailable = new Error("Ducktape MCP is only available in headless sessions");
+      ready.reject(state.unavailable);
+      return;
+    }
     const client = connect(ctx.cwd, env);
     state.client = client;
     const startup = AbortSignal.timeout(10_000);
@@ -237,6 +299,7 @@ const ducktapeExtension = (pi: ExtensionAPI): void => {
       })
       .then(toolList)
       .then((tools) => {
+        tools.forEach((tool) => names.add(tool.name));
         tools.forEach((tool) => pi.registerTool({
           name: tool.name, label: tool.title,
           description: `${tool.description}\nOutput is capped at 2000 lines / 48 KiB; larger results are saved to a local file.`,
@@ -254,10 +317,13 @@ const ducktapeExtension = (pi: ExtensionAPI): void => {
             }),
         }));
         pi.setActiveTools([...new Set([...pi.getActiveTools(), ...tools.map((tool) => tool.name)])]);
+        ready.resolve();
       })
       .catch((error: unknown) => {
         const reason = redact(error instanceof Error ? error.message : String(error));
         state.guidance = `Ducktape tools are unavailable: ${reason}. Do not claim to have read or changed the network.`;
+        state.unavailable = new Error(reason);
+        ready.reject(state.unavailable);
         return client.close();
       });
   });
@@ -265,7 +331,12 @@ const ducktapeExtension = (pi: ExtensionAPI): void => {
     if (!state.guidance) return;
     return { systemPrompt: `${event.systemPrompt}\n\n${state.guidance}` };
   });
-  pi.on("session_shutdown", () => state.client?.close());
+  pi.on("session_shutdown", () => {
+    state.unavailable = new Error("Ducktape MCP session closed");
+    ready.reject(state.unavailable);
+    unbind();
+    return state.client?.close();
+  });
 };
 
 export default ducktapeExtension;

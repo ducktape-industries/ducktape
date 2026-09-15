@@ -183,7 +183,9 @@ async fn get(jobs: &Jobs, job_id: &str) -> Option<Job> {
             .await
             .expect("query get"),
     )
-    .expect("decode");
+    .expect("decode") else {
+        panic!("expected job reply")
+    };
     job
 }
 
@@ -1168,6 +1170,13 @@ fn claim_attempt_saturates_instead_of_wrapping() {
         let mut store = MemStore::new();
         let job = serde_json::json!({
             "job_id": "j1",
+            "conversation_id": "j1:1",
+            "execution": "one_shot",
+            "previous_job_id": null,
+            "continuation_operation_id": null,
+            "controls": [],
+            "reports": [],
+            "native_history": null,
             "kind": "k",
             "spec": "spec",
             "submitter": {"key": [0]},
@@ -1314,7 +1323,9 @@ async fn host_get(host: &Host, job_id: &str) -> Option<Job> {
         )
         .await
         .expect("host query");
-    let JobsReply::Job(job) = decode_reply(&bytes).expect("decode");
+    let JobsReply::Job(job) = decode_reply(&bytes).expect("decode") else {
+        panic!("expected job reply")
+    };
     job
 }
 
@@ -1616,6 +1627,1016 @@ fn a_job_comment_cannot_be_overwritten_by_another_actor() {
         let job = get(&jobs, "j").await.unwrap();
         assert_eq!(job.comments[0].author, actor("alice"));
         assert_eq!(job.comments[0].text, "Original");
+    });
+}
+
+async fn history(jobs: &Jobs, conversation_id: &str) -> tasks::WorkerHistory {
+    let bytes = jobs
+        .query(&encode_query(&JobsQuery::GetWorker {
+            conversation_id: conversation_id.into(),
+        }))
+        .await
+        .unwrap();
+    let JobsReply::Worker(Some(history)) = decode_reply(&bytes).unwrap() else {
+        panic!("worker history");
+    };
+    history
+}
+
+fn submit_conversation(job_id: &str, kind: &str, spec: &str) -> Msg {
+    jobs_msg(JobsMsg::SubmitConversation {
+        job_id: job_id.into(),
+        kind: kind.into(),
+        spec: spec.into(),
+    })
+}
+
+fn control(job_id: &str, operation_id: &str, input: tasks::JobControlInput) -> Msg {
+    jobs_msg(JobsMsg::Control {
+        job_id: job_id.into(),
+        operation_id: operation_id.into(),
+        input,
+    })
+}
+
+fn acknowledge(job_id: &str, operation_id: &str, attempt: u64) -> Msg {
+    jobs_msg(JobsMsg::AcknowledgeControl {
+        job_id: job_id.into(),
+        operation_id: operation_id.into(),
+        attempt,
+    })
+}
+
+fn checkpoint(job_id: &str, operation_id: &str, attempt: u64) -> Msg {
+    jobs_msg(JobsMsg::Checkpoint {
+        job_id: job_id.into(),
+        operation_id: operation_id.into(),
+        attempt,
+        kind: tasks::WorkerReportKind::Checkpoint,
+        payload: "Durable evidence".into(),
+    })
+}
+
+fn native_checkpoint(
+    job_id: &str,
+    attempt: u64,
+    run_id: &str,
+    execution_attempt: u32,
+    revision: u64,
+    snapshot: &str,
+) -> Msg {
+    jobs_msg(JobsMsg::CheckpointNativeHistory {
+        job_id: job_id.into(),
+        attempt,
+        run_id: run_id.into(),
+        execution_attempt,
+        revision,
+        snapshot: snapshot.into(),
+    })
+}
+
+fn settle(job_id: &str, operation_id: &str, attempt: u64) -> Msg {
+    jobs_msg(JobsMsg::SettleCancellation {
+        job_id: job_id.into(),
+        operation_id: operation_id.into(),
+        attempt,
+        payload: "Stopped at safe boundary".into(),
+    })
+}
+
+fn continuation(previous_job_id: &str, job_id: &str, operation_id: &str, kind: &str) -> Msg {
+    jobs_msg(JobsMsg::Continue {
+        previous_job_id: previous_job_id.into(),
+        job_id: job_id.into(),
+        operation_id: operation_id.into(),
+        kind: kind.into(),
+        spec: "Continue from retained evidence".into(),
+    })
+}
+
+async fn rejected(jobs: &mut Jobs, origin: Origin, msg: Msg) {
+    let root = jobs.root();
+    stage(jobs, 20, origin, msg).await.expect_err("must reject");
+    jobs.commit_block().await.unwrap();
+    assert_eq!(jobs.root(), root, "rejection stages nothing");
+}
+
+#[test]
+fn steering_is_explicit_and_acknowledged_only_by_current_claim_attempt() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        let worker = Origin::Module("runs".into());
+        apply(
+            &mut jobs,
+            1,
+            ext("alice"),
+            submit_conversation("j", "agent", "Work"),
+        )
+        .await;
+        apply(&mut jobs, 2, worker.clone(), claim("j", 100)).await;
+        let original = get(&jobs, "j").await.unwrap();
+        apply(
+            &mut jobs,
+            3,
+            ext("alice"),
+            jobs_msg(JobsMsg::Comment {
+                job_id: "j".into(),
+                created_at_revision: original.created_at_revision,
+                comment_id: "discussion".into(),
+                text: "Please change direction".into(),
+            }),
+        )
+        .await;
+        assert!(get(&jobs, "j").await.unwrap().controls.is_empty());
+        let steer = control(
+            "j",
+            "steer",
+            tasks::JobControlInput::Steer {
+                text: "Change direction".into(),
+            },
+        );
+        apply(&mut jobs, 4, ext("bob"), steer.clone()).await;
+        let root = jobs.root();
+        apply(&mut jobs, 5, ext("bob"), steer).await;
+        assert_eq!(jobs.root(), root, "identical control is idempotent");
+        rejected(&mut jobs, ext("eve"), acknowledge("j", "steer", 1)).await;
+        rejected(&mut jobs, worker.clone(), acknowledge("j", "missing", 1)).await;
+        rejected(&mut jobs, worker.clone(), acknowledge("j", "steer", 2)).await;
+        apply(&mut jobs, 6, worker.clone(), acknowledge("j", "steer", 1)).await;
+        let root = jobs.root();
+        apply(&mut jobs, 7, worker.clone(), acknowledge("j", "steer", 1)).await;
+        assert_eq!(jobs.root(), root, "receipt is idempotent");
+        apply(&mut jobs, 8, worker.clone(), release("j")).await;
+        apply(&mut jobs, 9, worker.clone(), claim("j", 100)).await;
+        rejected(&mut jobs, worker.clone(), acknowledge("j", "steer", 1)).await;
+        rejected(&mut jobs, worker.clone(), checkpoint("j", "old-attempt", 1)).await;
+        apply(&mut jobs, 10, worker.clone(), acknowledge("j", "steer", 2)).await;
+        apply(&mut jobs, 11, worker, checkpoint("j", "current", 2)).await;
+        let job = get(&jobs, "j").await.unwrap();
+        assert_eq!(job.conversation_id, original.conversation_id);
+        assert_eq!(job.status, JobStatus::Processing);
+        assert_eq!(job.controls[0].author, actor("bob"));
+        assert_eq!(
+            job.controls[0]
+                .acknowledgements
+                .iter()
+                .map(|ack| ack.attempt)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(job.reports[0].worker, tasks::Party::Module("runs".into()));
+        assert_eq!(job.reports[0].attempt, 2);
+        assert_eq!(job.reports[0].height, 11);
+    });
+}
+
+#[test]
+fn cancellation_request_acknowledgement_and_settlement_are_distinct() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        let worker = Origin::Module("runs".into());
+        apply(
+            &mut jobs,
+            1,
+            ext("alice"),
+            submit_conversation("j", "agent", "Work"),
+        )
+        .await;
+        apply(
+            &mut jobs,
+            2,
+            ext("bob"),
+            control("j", "stop", tasks::JobControlInput::Cancel),
+        )
+        .await;
+        assert_eq!(get(&jobs, "j").await.unwrap().status, JobStatus::Pending);
+        rejected(&mut jobs, worker.clone(), settle("j", "stop", 0)).await;
+        apply(&mut jobs, 3, worker.clone(), claim("j", 100)).await;
+        rejected(&mut jobs, worker.clone(), settle("j", "stop", 1)).await;
+        apply(&mut jobs, 4, worker.clone(), acknowledge("j", "stop", 1)).await;
+        let acknowledged = get(&jobs, "j").await.unwrap();
+        assert_eq!(acknowledged.status, JobStatus::Processing);
+        assert!(acknowledged.result.is_none());
+        apply(&mut jobs, 5, worker.clone(), release("j")).await;
+        apply(&mut jobs, 6, worker.clone(), claim("j", 100)).await;
+        rejected(&mut jobs, worker.clone(), settle("j", "stop", 1)).await;
+        rejected(&mut jobs, worker.clone(), settle("j", "stop", 2)).await;
+        apply(&mut jobs, 7, worker.clone(), acknowledge("j", "stop", 2)).await;
+        rejected(&mut jobs, ext("eve"), settle("j", "stop", 2)).await;
+        apply(&mut jobs, 8, worker.clone(), settle("j", "stop", 2)).await;
+        let settled = get(&jobs, "j").await.unwrap();
+        assert_eq!(settled.status, JobStatus::Cancelled);
+        assert_eq!(settled.result.unwrap().payload, "Stopped at safe boundary");
+        assert_eq!(settled.reports[0].operation_id, "stop");
+        assert_eq!(settled.reports[0].attempt, 2);
+        assert_eq!(
+            settled.reports[0].worker,
+            tasks::Party::Module("runs".into())
+        );
+        rejected(&mut jobs, worker.clone(), finalize("j", true, "late")).await;
+        rejected(&mut jobs, worker.clone(), checkpoint("j", "late", 2)).await;
+        rejected(&mut jobs, worker, settle("j", "stop", 2)).await;
+        rejected(
+            &mut jobs,
+            ext("alice"),
+            control("j", "late", tasks::JobControlInput::Cancel),
+        )
+        .await;
+    });
+}
+
+#[test]
+fn prune_retains_conversation_and_continue_creates_one_new_execution() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        apply(
+            &mut jobs,
+            1,
+            ext("alice"),
+            submit_conversation("original", "agent", "Work"),
+        )
+        .await;
+        rejected(
+            &mut jobs,
+            ext("bob"),
+            continuation("original", "next", "continue", "agent"),
+        )
+        .await;
+        apply(&mut jobs, 2, ext("worker"), claim("original", 100)).await;
+        apply(
+            &mut jobs,
+            3,
+            ext("worker"),
+            checkpoint("original", "evidence", 1),
+        )
+        .await;
+        apply(
+            &mut jobs,
+            3,
+            ext("worker"),
+            native_checkpoint("original", 1, "run-original", 0, 1, "snapshot-original"),
+        )
+        .await;
+        apply(
+            &mut jobs,
+            4,
+            ext("worker"),
+            finalize("original", true, "Complete"),
+        )
+        .await;
+        let original = get(&jobs, "original").await.unwrap();
+        apply(&mut jobs, 5, ext("bob"), prune("original")).await;
+        assert!(get(&jobs, "original").await.is_none());
+        assert_eq!(
+            history(&jobs, &original.conversation_id).await.executions,
+            vec![original.clone()]
+        );
+        apply(
+            &mut jobs,
+            6,
+            Origin::Module("runs".into()),
+            register_worker(),
+        )
+        .await;
+        let next = continuation("original", "next", "continue", "agent");
+        let mut dispatch = ctx(7, ext("bob"));
+        jobs.execute(&mut dispatch, &next).await.unwrap();
+        let notifications = dispatch
+            .msgs()
+            .iter()
+            .filter(|msg| msg.target == "runs")
+            .collect::<Vec<_>>();
+        assert_eq!(notifications.len(), 1);
+        let JobsEvent::Submitted {
+            job_id,
+            submitter,
+            spec,
+            ..
+        } = decode_jobs_event(&notifications[0].payload).unwrap();
+        assert_eq!(job_id, "next");
+        assert_eq!(submitter, original.submitter);
+        assert_eq!(spec, "Continue from retained evidence");
+        assert!(
+            get(&jobs, "next").await.is_none(),
+            "submit event does not expose uncommitted jobs"
+        );
+        jobs.commit_block().await.unwrap();
+        let execution = get(&jobs, "next").await.unwrap();
+        assert_eq!(execution.conversation_id, original.conversation_id);
+        assert_eq!(execution.execution, tasks::JobExecution::Conversation);
+        assert_eq!(execution.previous_job_id.as_deref(), Some("original"));
+        assert_eq!(
+            execution.continuation_operation_id.as_deref(),
+            Some("continue")
+        );
+        assert_eq!(execution.status, JobStatus::Pending);
+        assert_eq!(execution.attempt, 0);
+        assert!(execution.claim.is_none());
+        assert!(execution.controls.is_empty());
+        assert!(execution.reports.is_empty());
+        assert!(execution.native_history.is_none());
+        let root = jobs.root();
+        let mut retry = ctx(8, ext("bob"));
+        jobs.execute(&mut retry, &next).await.unwrap();
+        assert!(
+            retry.msgs().is_empty(),
+            "retry emits neither submit nor attribution"
+        );
+        jobs.commit_block().await.unwrap();
+        assert_eq!(jobs.root(), root);
+        rejected(
+            &mut jobs,
+            ext("bob"),
+            continuation("original", "fork", "other", "agent"),
+        )
+        .await;
+        assert_eq!(
+            history(&jobs, &original.conversation_id).await.executions,
+            vec![original.clone(), execution]
+        );
+        apply(
+            &mut jobs,
+            9,
+            ext("alice"),
+            submit("original", "different", "Fresh work"),
+        )
+        .await;
+        let reused = get(&jobs, "original").await.unwrap();
+        assert_ne!(reused.conversation_id, original.conversation_id);
+        assert_eq!(
+            history(&jobs, &original.conversation_id).await.executions[0],
+            original
+        );
+    });
+}
+
+#[test]
+fn continuation_selects_a_different_worker_kind_without_rewriting_predecessor_or_history() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        let worker = Origin::Module("runs".into());
+        apply(
+            &mut jobs,
+            1,
+            ext("alice"),
+            submit_conversation("research", "researcher", "Investigate"),
+        )
+        .await;
+        apply(&mut jobs, 2, worker.clone(), claim("research", 100)).await;
+        apply(
+            &mut jobs,
+            3,
+            worker.clone(),
+            native_checkpoint("research", 1, "run-research", 0, 17, "snapshot-research"),
+        )
+        .await;
+        apply(
+            &mut jobs,
+            4,
+            worker.clone(),
+            checkpoint("research", "evidence", 1),
+        )
+        .await;
+        apply(
+            &mut jobs,
+            5,
+            worker.clone(),
+            finalize("research", true, "Evidence ready"),
+        )
+        .await;
+        let predecessor = get(&jobs, "research").await.unwrap();
+        for kind in [String::new(), "x".repeat(MAX_KIND + 1)] {
+            rejected(
+                &mut jobs,
+                ext("bob"),
+                continuation("research", "write", "handoff", &kind),
+            )
+            .await;
+        }
+        apply(&mut jobs, 6, worker, register_worker()).await;
+        let next = continuation("research", "write", "handoff", "writer");
+        let mut dispatch = ctx(7, ext("bob"));
+        jobs.execute(&mut dispatch, &next).await.unwrap();
+        let notification = dispatch
+            .msgs()
+            .iter()
+            .find(|message| message.target == "runs")
+            .unwrap();
+        let JobsEvent::Submitted {
+            job_id,
+            kind,
+            submitter,
+            ..
+        } = decode_jobs_event(&notification.payload).unwrap();
+        assert_eq!(job_id, "write");
+        assert_eq!(kind, "writer");
+        assert_eq!(submitter, predecessor.submitter);
+        jobs.commit_block().await.unwrap();
+        let continued = get(&jobs, "write").await.unwrap();
+        assert_eq!(continued.kind, "writer");
+        assert_eq!(continued.execution, tasks::JobExecution::Conversation);
+        assert_eq!(continued.conversation_id, predecessor.conversation_id);
+        assert_eq!(continued.submitter, predecessor.submitter);
+        assert_eq!(continued.previous_job_id.as_deref(), Some("research"));
+        assert_eq!(
+            continued.continuation_operation_id.as_deref(),
+            Some("handoff")
+        );
+        assert_eq!(continued.attempt, 0);
+        assert!(continued.native_history.is_none());
+        assert_eq!(get(&jobs, "research").await, Some(predecessor.clone()));
+        assert_eq!(
+            history(&jobs, &predecessor.conversation_id)
+                .await
+                .executions,
+            vec![predecessor.clone(), continued.clone()]
+        );
+        let root = jobs.root();
+        let mut retry = ctx(8, ext("bob"));
+        jobs.execute(&mut retry, &next).await.unwrap();
+        assert!(
+            retry.msgs().is_empty(),
+            "same kind is an exact idempotent retry"
+        );
+        jobs.commit_block().await.unwrap();
+        assert_eq!(jobs.root(), root);
+        rejected(
+            &mut jobs,
+            ext("bob"),
+            continuation("research", "write", "handoff", "reviewer"),
+        )
+        .await;
+        assert_eq!(get(&jobs, "research").await, Some(predecessor.clone()));
+        apply(&mut jobs, 9, ext("bob"), prune("research")).await;
+        assert_eq!(
+            history(&jobs, &predecessor.conversation_id)
+                .await
+                .executions,
+            vec![predecessor, continued]
+        );
+    });
+}
+
+#[test]
+fn retained_inputs_are_committed_only_and_abort_discards_archive_changes() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        apply(
+            &mut jobs,
+            1,
+            ext("alice"),
+            submit_conversation("j", "agent", "Work"),
+        )
+        .await;
+        apply(&mut jobs, 2, ext("worker"), claim("j", 100)).await;
+        let original = get(&jobs, "j").await.unwrap();
+        let root = jobs.root();
+        stage(
+            &mut jobs,
+            3,
+            ext("alice"),
+            control(
+                "j",
+                "steer",
+                tasks::JobControlInput::Steer {
+                    text: "Change".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        stage(&mut jobs, 3, ext("worker"), acknowledge("j", "steer", 1))
+            .await
+            .unwrap();
+        stage(&mut jobs, 3, ext("worker"), checkpoint("j", "evidence", 1))
+            .await
+            .unwrap();
+        stage(
+            &mut jobs,
+            3,
+            ext("worker"),
+            native_checkpoint("j", 1, "run", 0, 1, "snapshot-1"),
+        )
+        .await
+        .unwrap();
+        let query = encode_query(&JobsQuery::Controls { job_id: "j".into() });
+        assert_eq!(
+            decode_reply(&jobs.query(&query).await.unwrap()).unwrap(),
+            JobsReply::Controls(Vec::new())
+        );
+        assert_eq!(
+            history(&jobs, &original.conversation_id).await.executions,
+            vec![original.clone()]
+        );
+        jobs.abort_block().await.unwrap();
+        jobs.commit_block().await.unwrap();
+        assert_eq!(jobs.root(), root);
+        assert_eq!(
+            history(&jobs, &original.conversation_id).await.executions,
+            vec![original]
+        );
+    });
+}
+
+#[test]
+fn control_and_checkpoint_caps_reject_conflicts_but_reserve_cancellation_report() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        apply(
+            &mut jobs,
+            1,
+            ext("alice"),
+            submit_conversation("j", "agent", "Work"),
+        )
+        .await;
+        apply(&mut jobs, 2, ext("worker"), claim("j", 100)).await;
+        rejected(
+            &mut jobs,
+            ext("alice"),
+            control(
+                "j",
+                "bad",
+                tasks::JobControlInput::Steer { text: " ".into() },
+            ),
+        )
+        .await;
+        rejected(
+            &mut jobs,
+            ext("alice"),
+            control(
+                "j",
+                "bad",
+                tasks::JobControlInput::Steer {
+                    text: "x".repeat(tasks::MAX_WORKER_TEXT_BYTES + 1),
+                },
+            ),
+        )
+        .await;
+        apply(
+            &mut jobs,
+            3,
+            ext("alice"),
+            control("j", "stop", tasks::JobControlInput::Cancel),
+        )
+        .await;
+        rejected(&mut jobs, ext("worker"), checkpoint("j", "stop", 1)).await;
+        for i in 1..tasks::MAX_JOB_CONTROLS {
+            apply(
+                &mut jobs,
+                3,
+                ext("alice"),
+                control("j", &format!("control-{i}"), tasks::JobControlInput::Cancel),
+            )
+            .await;
+        }
+        rejected(
+            &mut jobs,
+            ext("alice"),
+            control("j", "overflow", tasks::JobControlInput::Cancel),
+        )
+        .await;
+        rejected(
+            &mut jobs,
+            ext("bob"),
+            control("j", "stop", tasks::JobControlInput::Cancel),
+        )
+        .await;
+        for i in 0..tasks::MAX_WORKER_REPORTS {
+            apply(
+                &mut jobs,
+                4,
+                ext("worker"),
+                checkpoint("j", &format!("report-{i}"), 1),
+            )
+            .await;
+        }
+        let root = jobs.root();
+        apply(&mut jobs, 5, ext("worker"), checkpoint("j", "report-0", 1)).await;
+        assert_eq!(jobs.root(), root);
+        rejected(&mut jobs, ext("worker"), checkpoint("j", "overflow", 1)).await;
+        apply(&mut jobs, 6, ext("worker"), acknowledge("j", "stop", 1)).await;
+        apply(&mut jobs, 7, ext("worker"), settle("j", "stop", 1)).await;
+        let job = get(&jobs, "j").await.unwrap();
+        assert_eq!(job.reports.len(), tasks::MAX_WORKER_REPORTS + 1);
+        apply(&mut jobs, 8, ext("alice"), prune("j")).await;
+        let query = encode_query(&JobsQuery::Controls { job_id: "j".into() });
+        assert_eq!(
+            decode_reply(&jobs.query(&query).await.unwrap()).unwrap(),
+            JobsReply::Controls(job.controls.clone())
+        );
+        assert_eq!(
+            history(&jobs, &job.conversation_id).await.executions,
+            vec![job]
+        );
+    });
+}
+
+#[test]
+fn native_history_replaces_beyond_report_cap_without_notifications_or_source_revisions() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        let worker = Origin::Module("runs".into());
+        apply(
+            &mut jobs,
+            1,
+            ext("alice"),
+            submit_conversation("j", "worker", "Work"),
+        )
+        .await;
+        apply(&mut jobs, 2, worker.clone(), claim("j", 100)).await;
+        let before = get(&jobs, "j").await.unwrap();
+        let root = jobs.root();
+        for revision in 1..=70 {
+            let mut dispatch = ctx(3 + revision, worker.clone());
+            jobs.execute(
+                &mut dispatch,
+                &native_checkpoint("j", 1, "run", 0, revision, &format!("snapshot-{revision}")),
+            )
+            .await
+            .unwrap();
+            assert!(
+                dispatch.msgs().is_empty(),
+                "machine snapshots emit no attribution or worker notification"
+            );
+            jobs.commit_block().await.unwrap();
+        }
+        assert_ne!(jobs.root(), root, "native head is consensus state");
+        let current = get(&jobs, "j").await.unwrap();
+        assert!(current.reports.is_empty());
+        assert_eq!(
+            current.native_history,
+            Some(tasks::NativeHistoryHead {
+                job_attempt: 1,
+                worker: tasks::Party::Module("runs".into()),
+                run_id: "run".into(),
+                execution_attempt: 0,
+                revision: 70,
+                snapshot: "snapshot-70".into(),
+                height: 73,
+            })
+        );
+        assert_eq!(
+            history(&jobs, &before.conversation_id).await.executions,
+            vec![current.clone()]
+        );
+        let root = jobs.root();
+        apply(
+            &mut jobs,
+            74,
+            worker.clone(),
+            native_checkpoint("j", 1, "run", 0, 70, "snapshot-70"),
+        )
+        .await;
+        assert_eq!(
+            jobs.root(),
+            root,
+            "exact duplicate does not replace provenance"
+        );
+        let mut progress = ctx(75, worker.clone());
+        jobs.execute(&mut progress, &checkpoint("j", "semantic-0", 1))
+            .await
+            .unwrap();
+        let published = progress
+            .msgs()
+            .iter()
+            .find(|message| message.target == "attribution")
+            .unwrap();
+        let attribution::AttributionMsg::Attribute { revision, .. } =
+            attribution::decode_msg(&published.payload).unwrap()
+        else {
+            panic!("attribution");
+        };
+        assert_eq!(
+            revision, 3,
+            "machine heads do not consume ordinary source revisions"
+        );
+        jobs.commit_block().await.unwrap();
+        for i in 1..tasks::MAX_WORKER_REPORTS {
+            apply(
+                &mut jobs,
+                76,
+                worker.clone(),
+                checkpoint("j", &format!("semantic-{i}"), 1),
+            )
+            .await;
+        }
+        rejected(&mut jobs, worker.clone(), checkpoint("j", "overflow", 1)).await;
+        apply(
+            &mut jobs,
+            77,
+            worker,
+            native_checkpoint("j", 1, "run", 0, 71, "snapshot-71"),
+        )
+        .await;
+        assert_eq!(
+            get(&jobs, "j").await.unwrap().reports.len(),
+            tasks::MAX_WORKER_REPORTS
+        );
+        assert_eq!(
+            get(&jobs, "j")
+                .await
+                .unwrap()
+                .native_history
+                .unwrap()
+                .revision,
+            71
+        );
+    });
+}
+
+#[test]
+fn native_history_accepts_opaque_runs_keys_with_internal_separators_within_byte_cap() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        let worker = Origin::Module("runs".into());
+        let job_id = "j".repeat(tasks::MAX_JOB_ID);
+        let agent_id = "a".repeat(256);
+        let run_id = format!("job\u{1f}{job_id}\u{1f}{agent_id}\u{1f}2");
+        assert!(
+            run_id.len() > tasks::MAX_JOB_ID,
+            "a composed Runs key is longer than a public job ID"
+        );
+        let maximum = format!(
+            "job\u{1f}{}",
+            "x".repeat(tasks::MAX_NATIVE_RUN_ID_BYTES - 4)
+        );
+        for (job_id, run_id) in [(job_id.as_str(), run_id), ("maximum", maximum)] {
+            apply(
+                &mut jobs,
+                1,
+                ext("alice"),
+                submit_conversation(job_id, "worker", "Work"),
+            )
+            .await;
+            apply(&mut jobs, 2, worker.clone(), claim(job_id, 100)).await;
+            rejected(
+                &mut jobs,
+                worker.clone(),
+                native_checkpoint(job_id, 1, "", 0, 1, "snapshot"),
+            )
+            .await;
+            rejected(
+                &mut jobs,
+                worker.clone(),
+                native_checkpoint(
+                    job_id,
+                    1,
+                    &"x".repeat(tasks::MAX_NATIVE_RUN_ID_BYTES + 1),
+                    0,
+                    1,
+                    "snapshot",
+                ),
+            )
+            .await;
+            let snapshot = native_checkpoint(job_id, 1, &run_id, 0, 1, "snapshot");
+            rejected(&mut jobs, ext("intruder"), snapshot.clone()).await;
+            rejected(
+                &mut jobs,
+                worker.clone(),
+                native_checkpoint(job_id, 2, &run_id, 0, 1, "snapshot"),
+            )
+            .await;
+            apply(&mut jobs, 3, worker.clone(), snapshot.clone()).await;
+            let head = get(&jobs, job_id).await.unwrap().native_history.unwrap();
+            assert_eq!(head.run_id, run_id);
+            assert_eq!(head.job_attempt, 1);
+            assert_eq!(head.worker, tasks::Party::Module("runs".into()));
+            let root = jobs.root();
+            apply(&mut jobs, 4, worker.clone(), snapshot).await;
+            assert_eq!(
+                jobs.root(),
+                root,
+                "opaque-key exact replay is still idempotent"
+            );
+        }
+    });
+}
+
+#[test]
+fn native_history_fences_claim_run_execution_and_revision_and_survives_prune() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        let worker = Origin::Module("runs".into());
+        apply(
+            &mut jobs,
+            1,
+            ext("alice"),
+            submit_conversation("j", "worker", "Work"),
+        )
+        .await;
+        apply(&mut jobs, 2, worker.clone(), claim("j", 100)).await;
+        rejected(
+            &mut jobs,
+            worker.clone(),
+            native_checkpoint("j", 1, "run", 0, 0, "snapshot"),
+        )
+        .await;
+        rejected(
+            &mut jobs,
+            worker.clone(),
+            native_checkpoint("j", 1, "", 0, 1, "snapshot"),
+        )
+        .await;
+        rejected(
+            &mut jobs,
+            worker.clone(),
+            native_checkpoint("j", 1, "run", 0, 1, ""),
+        )
+        .await;
+        rejected(
+            &mut jobs,
+            worker.clone(),
+            native_checkpoint("j", 1, "run", 0, 1, &"x".repeat(257)),
+        )
+        .await;
+        apply(
+            &mut jobs,
+            3,
+            worker.clone(),
+            native_checkpoint("j", 1, "run", 2, 4, "snapshot-4"),
+        )
+        .await;
+        for msg in [
+            native_checkpoint("j", 1, "run", 2, 4, "conflict"),
+            native_checkpoint("j", 1, "run", 3, 3, "stale-revision"),
+            native_checkpoint("j", 1, "run", 1, 5, "stale-execution"),
+            native_checkpoint("j", 1, "other-run", 0, 5, "wrong-run"),
+            native_checkpoint("j", 2, "run", 2, 5, "wrong-claim"),
+        ] {
+            rejected(&mut jobs, worker.clone(), msg).await;
+        }
+        rejected(
+            &mut jobs,
+            ext("intruder"),
+            native_checkpoint("j", 1, "run", 2, 4, "snapshot-4"),
+        )
+        .await;
+        apply(
+            &mut jobs,
+            4,
+            worker.clone(),
+            native_checkpoint("j", 1, "run", 3, 5, "snapshot-5"),
+        )
+        .await;
+        apply(&mut jobs, 5, worker.clone(), release("j")).await;
+        apply(&mut jobs, 6, worker.clone(), claim("j", 100)).await;
+        rejected(
+            &mut jobs,
+            worker.clone(),
+            native_checkpoint("j", 1, "run", 3, 5, "snapshot-5"),
+        )
+        .await;
+        rejected(
+            &mut jobs,
+            worker.clone(),
+            native_checkpoint("j", 2, "new-run", 0, 5, "snapshot-5"),
+        )
+        .await;
+        apply(
+            &mut jobs,
+            7,
+            worker.clone(),
+            native_checkpoint("j", 2, "new-run", 0, 6, "snapshot-6"),
+        )
+        .await;
+        let head = get(&jobs, "j").await.unwrap().native_history.unwrap();
+        assert_eq!(head.job_attempt, 2);
+        assert_eq!(head.execution_attempt, 0);
+        assert_eq!(head.run_id, "new-run");
+        apply(
+            &mut jobs,
+            8,
+            worker.clone(),
+            finalize("j", true, "Finished"),
+        )
+        .await;
+        rejected(
+            &mut jobs,
+            worker,
+            native_checkpoint("j", 2, "new-run", 0, 7, "snapshot-7"),
+        )
+        .await;
+        let final_job = get(&jobs, "j").await.unwrap();
+        apply(&mut jobs, 9, ext("alice"), prune("j")).await;
+        assert_eq!(
+            history(&jobs, &final_job.conversation_id).await.executions,
+            vec![final_job]
+        );
+    });
+}
+
+#[test]
+fn submit_is_one_shot_and_only_explicit_conversations_can_continue() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        for (id, msg, expected) in [
+            (
+                "one-shot",
+                submit("one-shot", "agent", "Same kind"),
+                tasks::JobExecution::OneShot,
+            ),
+            (
+                "conversation",
+                submit_conversation("conversation", "agent", "Same kind"),
+                tasks::JobExecution::Conversation,
+            ),
+        ] {
+            apply(&mut jobs, 1, ext("alice"), msg).await;
+            assert_eq!(get(&jobs, id).await.unwrap().execution, expected);
+            apply(&mut jobs, 2, ext("alice"), cancel(id)).await;
+            apply(&mut jobs, 3, ext("alice"), prune(id)).await;
+        }
+        rejected(
+            &mut jobs,
+            ext("alice"),
+            continuation("one-shot", "forbidden", "continue", "agent"),
+        )
+        .await;
+        apply(
+            &mut jobs,
+            4,
+            ext("alice"),
+            continuation("conversation", "next", "continue", "agent"),
+        )
+        .await;
+        assert_eq!(
+            get(&jobs, "next").await.unwrap().execution,
+            tasks::JobExecution::Conversation
+        );
+    });
+}
+
+#[test]
+fn continuation_is_atomic_bounded_and_never_reuses_an_operation_or_execution_id() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        apply(
+            &mut jobs,
+            1,
+            ext("alice"),
+            submit_conversation("j-0", "worker", "Work"),
+        )
+        .await;
+        apply(&mut jobs, 2, ext("alice"), cancel("j-0")).await;
+        let first = get(&jobs, "j-0").await.unwrap();
+        let root = jobs.root();
+        stage(
+            &mut jobs,
+            3,
+            ext("bob"),
+            continuation("j-0", "j-1", "continue-1", "worker"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            history(&jobs, &first.conversation_id).await.executions,
+            vec![first.clone()]
+        );
+        jobs.abort_block().await.unwrap();
+        jobs.commit_block().await.unwrap();
+        assert_eq!(jobs.root(), root);
+        assert!(get(&jobs, "j-1").await.is_none());
+        for i in 1..tasks::MAX_WORKER_EXECUTIONS {
+            let previous = format!("j-{}", i - 1);
+            let next = format!("j-{i}");
+            apply(
+                &mut jobs,
+                4,
+                ext("bob"),
+                continuation(&previous, &next, &format!("continue-{i}"), "worker"),
+            )
+            .await;
+            apply(&mut jobs, 4, ext("alice"), cancel(&next)).await;
+            apply(&mut jobs, 4, ext("alice"), prune(&previous)).await;
+        }
+        let previous = format!("j-{}", tasks::MAX_WORKER_EXECUTIONS - 1);
+        rejected(
+            &mut jobs,
+            ext("bob"),
+            continuation(&previous, "overflow", "new-operation", "worker"),
+        )
+        .await;
+        rejected(
+            &mut jobs,
+            ext("bob"),
+            continuation(&previous, "another", "continue-1", "worker"),
+        )
+        .await;
+        rejected(
+            &mut jobs,
+            ext("bob"),
+            continuation(&previous, "j-0", "unused", "worker"),
+        )
+        .await;
+        let retained = history(&jobs, &first.conversation_id).await;
+        assert_eq!(retained.executions.len(), tasks::MAX_WORKER_EXECUTIONS);
+        assert_eq!(retained.executions[0], first);
+        assert!(
+            retained
+                .executions
+                .iter()
+                .all(|job| job.status == JobStatus::Cancelled)
+        );
     });
 }
 

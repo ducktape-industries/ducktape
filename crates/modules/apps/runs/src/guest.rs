@@ -40,6 +40,15 @@ const HISTORY_KEY: &[u8] = b"__history";
 
 struct Component;
 
+fn genesis_time_unit() -> Result<sdk::genesis_config::TimeUnit, host::Error> {
+    let raw = ducktape_module_sdk::load_config()
+        .ok_or_else(|| host::Error::Rejected("runs genesis config missing".into()))?;
+    let params = sdk::genesis_config::decode_config(&raw).map_err(to_wit_error)?;
+    let value = sdk::genesis_config::find(&params, sdk::genesis_config::TIME_UNIT)
+        .ok_or_else(|| host::Error::Rejected("runs genesis time_unit missing".into()))?;
+    sdk::genesis_config::TimeUnit::decode(value).map_err(to_wit_error)
+}
+
 /// the native module at THIS dispatch's state: genesis shape when nothing was
 /// ever persisted, else the persisted snapshot verify-then-adopted against its
 /// persisted root. an install failure is host-store corruption surfaced as a
@@ -65,7 +74,8 @@ fn loaded_module() -> Result<RunsModule, host::Error> {
     // `duck://` link the injector renders stamps its `?net=` half from it. a
     // missing or malformed record is host wiring corruption, refused
     // deterministically rather than silently producing network-less links.
-    .with_chain_id(ducktape_module_sdk::genesis_chain_id(MODULE_ID)?);
+    .with_chain_id(ducktape_module_sdk::genesis_chain_id(MODULE_ID)?)
+    .with_time_unit(genesis_time_unit()?);
     if let Some((bytes, root)) = load_state() {
         module
             .install(&bytes, StateRoot(root))
@@ -105,7 +115,10 @@ impl Guest for Component {
     /// bound to the network's chain id through its genesis config.
     fn shape() -> host::ModuleShape {
         host::ModuleShape {
-            config: vec![sdk::genesis_config::CHAIN_ID.into()],
+            config: vec![
+                sdk::genesis_config::CHAIN_ID.into(),
+                sdk::genesis_config::TIME_UNIT.into(),
+            ],
             ..ducktape_module_sdk::map_shape()
         }
     }

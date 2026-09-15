@@ -149,6 +149,19 @@ pub enum FilesMsg {
         message: String,
         changes: Vec<Change>,
     },
+    /// Create a detached snapshot of one path and its ancestor spine. The
+    /// candidate enters the history window without moving the public head.
+    ProjectSnapshot {
+        snapshot: DigestHex,
+        path: String,
+    },
+    /// Atomically replace a module-owned retention reference. The authenticated
+    /// module origin supplies the namespace; ordinary pins cannot remove it.
+    CompareExchangeRetention {
+        key: String,
+        expected: Option<RetentionReference>,
+        replacement: Option<RetentionReference>,
+    },
     Pin {
         snapshot: DigestHex,
         name: String,
@@ -246,6 +259,12 @@ pub enum FilesQuery {
         prefix: String,
     },
     Refs {},
+    /// Committed reference only. Writers derive their expected CAS value from
+    /// their own canonical state, not this preceding-boundary query.
+    Retention {
+        module_id: String,
+        key: String,
+    },
     /// the client staging probe: which of these chunk ids the cluster already
     /// holds (staged in refs OR durable in the odb). advisory — the reply can go
     /// stale between a gc sweep and the commit, which re-validates; a stale answer
@@ -309,6 +328,14 @@ pub struct GrepHit {
     pub locator: String,
 }
 
+/// A module-owned immutable snapshot reference. Replacements compare the whole
+/// previous value and advance its nonzero revision; release names that value too.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RetentionReference {
+    pub snapshot: DigestHex,
+    pub revision: u64,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RefsInfo {
     pub head: Option<DigestHex>,
@@ -339,13 +366,16 @@ pub enum FilesReply {
     History(Vec<SnapshotInfo>),
     Diff(Vec<DiffEntry>),
     Refs(RefsInfo),
+    Retention(Option<RetentionReference>),
     /// per-id presence, in request order — `present[i]` answers `ids[i]`.
     HasChunks {
         present: Vec<bool>,
     },
 }
 
-/// The actual result of an accepted write, declared in the dispatch receipt.
+/// The actual result of an accepted write. Identical metadata-only JSON bytes
+/// are published as both output and assigned stamp, so generic call/action
+/// summaries retain minted snapshot IDs without carrying file bodies.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct FilesWriteOutput {
     pub actor: crate::Actor,
@@ -356,12 +386,34 @@ pub struct FilesWriteOutput {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteOutcome {
-    PutBlob { chunk: DigestHex },
-    Commit { snapshot: DigestHex },
-    Pin { snapshot: DigestHex, name: String },
-    Unpin { name: String },
-    Watch { prefix: String, module_id: String },
-    Unwatch { prefix: String, module_id: String },
+    PutBlob {
+        chunk: DigestHex,
+    },
+    Commit {
+        snapshot: DigestHex,
+    },
+    ProjectSnapshot {
+        snapshot: DigestHex,
+    },
+    CompareExchangeRetention {
+        key: String,
+        reference: Option<RetentionReference>,
+    },
+    Pin {
+        snapshot: DigestHex,
+        name: String,
+    },
+    Unpin {
+        name: String,
+    },
+    Watch {
+        prefix: String,
+        module_id: String,
+    },
+    Unwatch {
+        prefix: String,
+        module_id: String,
+    },
 }
 
 pub fn encode_write_output(output: &FilesWriteOutput) -> Vec<u8> {
