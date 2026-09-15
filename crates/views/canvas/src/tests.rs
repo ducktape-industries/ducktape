@@ -2122,3 +2122,81 @@ fn the_gauge_carries_the_words_being_typed_and_not_the_ones_already_saved() {
         "the gauge is drawn in nothing, it read {ink}"
     );
 }
+#[test]
+fn a_shape_being_drawn_lines_up_with_the_board_the_way_a_moving_one_does() {
+    let mut view = view();
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    card(&mut view, "a", 0); // 0,0 out to 200,140
+    view.tool = Tool::Rectangle;
+    view.on_press(0., 300.);
+    view.on_move(197., 400.);
+    let Gesture::Create { start, point, .. } = &view.gesture else {
+        panic!("a shape tool draws on a drag");
+    };
+    let (start, point) = (*start, *point);
+    assert_eq!(
+        point[0], 200.,
+        "the corner in hand took the card's right edge"
+    );
+    assert_eq!(point[1], 400., "nothing on the board stood on that line");
+    assert_eq!(
+        view.guides.len(),
+        1,
+        "one line taken, one line drawn: {:?}",
+        view.guides
+    );
+    assert_eq!(
+        [view.guides[0][0], view.guides[0][2]],
+        [200., 200.],
+        "and the guide is the line it took"
+    );
+    let drawn = view
+        .drawn_shape(Kind::Rectangle, start, point)
+        .expect("a drag with a shape tool leaves a shape");
+    assert_eq!(
+        drawn.x + drawn.width,
+        200,
+        "what the drag leaves behind is what the guide showed"
+    );
+    view.on_release();
+    assert!(view.guides.is_empty(), "the guides go with the gesture");
+}
+#[test]
+fn an_edge_handle_lines_up_on_the_axis_it_moves_and_stays_quiet_on_the_other() {
+    let mut view = view();
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    card(&mut view, "a", 0); // 0,0 out to 200,140
+    card(&mut view, "b", 400); // 400,0 out to 600,140
+    view.selected = ["a".into()].into();
+    // Four pixels off the middle of a's right edge: a press takes a handle
+    // from nearby, and what lines up afterwards is the handle.
+    view.on_press(204., 70.);
+    assert!(
+        matches!(view.gesture, Gesture::Resize { corner: [1, 0], .. }),
+        "the press took the right edge, not {:?}",
+        view.gesture
+    );
+    view.on_move(400., 137.);
+    assert_eq!(
+        view.guides.len(),
+        1,
+        "an edge cannot travel on the other axis, so it promises nothing there: {:?}",
+        view.guides
+    );
+    assert_eq!(
+        [view.guides[0][0], view.guides[0][2]],
+        [400., 400.],
+        "the line it took is b's near edge"
+    );
+    view.on_release();
+    let board = view.visible().unwrap();
+    let a = &board.shapes["a"].shape;
+    assert_eq!(
+        a.x + a.width,
+        400,
+        "the edge landed on the line, not four pixels short of it"
+    );
+    assert_eq!(a.height, 140, "and the axis it never moved on stayed put");
+}
