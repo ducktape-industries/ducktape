@@ -423,7 +423,7 @@ pub struct Ducktape {
     pub(crate) call_muted: bool,
     /// This side's mic voice gate, as the session last reported it.
     pub(crate) call_speaking: bool,
-    pub(crate) call_peers: Vec<crate::call::CallEvent>,
+    pub(crate) call_peers: Vec<crate::call::CallPeer>,
     pub(crate) call_camera: bool,
     pub(crate) call_sharing: bool,
     pub(crate) call_video_live: bool,

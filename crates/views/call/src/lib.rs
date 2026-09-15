@@ -198,7 +198,8 @@ mod tests {
         assert!(
             host.effects
                 .iter()
-                .any(|(kind, body)| kind == "host.emit" && body["image"] == "opaque-image")
+                .any(|(kind, body)| kind == "host.emit"
+                    && body["peers"][0]["image"] == "opaque-image")
         );
     }
     #[test]
@@ -217,7 +218,7 @@ mod tests {
         host.item("call.props", json!({"channel":"room", "source":"off"}));
         assert_eq!(
             shown(&host),
-            json!({"kind":"presentation", "stage":"", "video_live":false})
+            json!({"kind":"presentation", "stage":"", "video_live":false, "peers":[]})
         );
         host.item("call.props", json!({"channel":"room", "source":"screen"}));
         host.item(
@@ -269,7 +270,44 @@ mod tests {
         host.item("call.props", json!({"channel":"room", "source":"off"}));
         assert_eq!(
             shown(&host),
-            json!({"kind":"presentation", "stage":"", "video_live":false})
+            json!({"kind":"presentation", "stage":"", "video_live":false, "peers":[]})
         );
+    }
+    #[test]
+    fn guest_presentation_replaces_peer_state_without_native_folding() {
+        fn peers(host: &Host) -> Value {
+            host.effects
+                .iter()
+                .rev()
+                .find(|(kind, body)| kind == "host.emit" && body["kind"] == "presentation")
+                .unwrap()
+                .1["peers"]
+                .clone()
+        }
+        let mut host = Host::new();
+        host.step(Vec::new());
+        host.item("call.props", json!({"channel":"room", "source":"off"}));
+        assert_eq!(peers(&host), json!([]));
+        let peer = "02".repeat(32);
+        for muted in [true, false] {
+            host.item("net.stream", json!({"text":json!({"type":"peer_beacon", "peer":peer, "muted":muted, "speaking":true}).to_string()}));
+            let list = peers(&host);
+            assert_eq!(list.as_array().unwrap().len(), 1);
+            assert_eq!(list[0]["peer"], peer);
+            assert_eq!(list[0]["muted"], muted);
+            assert_eq!(list[0]["speaking"], true);
+        }
+        let before = host.effects.len();
+        host.item("net.stream", json!({"text":json!({"type":"peer_beacon", "peer":peer, "muted":false, "speaking":true}).to_string()}));
+        assert!(
+            !host.effects[before..]
+                .iter()
+                .any(|(_, body)| body["kind"] == "presentation")
+        );
+        host.item(
+            "net.stream",
+            json!({"text":json!({"type":"peer_left", "peer":peer}).to_string()}),
+        );
+        assert_eq!(peers(&host), json!([]));
     }
 }

@@ -5360,13 +5360,15 @@ impl Ducktape {
                 self.call_camera = false;
                 self.call_sharing = false;
             }
-            "error" | "refused" => {
+            "error" | "refused" | "closed" => {
+                self.call_peers.clear();
                 self.huddle_stage.clear();
                 self.call_video_live = false;
             }
             "presentation" => {
                 self.huddle_stage = event.stage.clone();
                 self.call_video_live = event.video_live;
+                self.call_peers = event.peers.clone();
             }
             "self" => {
                 self.call_muted = event.muted;
@@ -5376,8 +5378,6 @@ impl Ducktape {
             _ => {}
         }
         self.call_speaking = crate::call::call_speaking_after(self.call_speaking, &event);
-        self.call_peers =
-            crate::call::apply_call_peer(::std::mem::take(&mut self.call_peers), event.clone());
         self.huddle_rows = crate::call::huddle_tile_rows(
             self.huddle_roster.clone(),
             self.call_peers.clone(),

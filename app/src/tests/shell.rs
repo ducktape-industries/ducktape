@@ -654,20 +654,33 @@ fn call_presentation_comes_from_the_deployed_guest() {
         kind: "presentation".into(),
         stage: "guest-selected-image".into(),
         video_live: true,
+        peers: vec![crate::call::CallPeer {
+            peer: "first-peer".into(),
+            ..Default::default()
+        }],
         ..Default::default()
     }));
     assert_eq!(app.huddle_stage, "guest-selected-image");
     assert!(app.call_video_live);
-    // Native peer observations cannot choose a different stage or hide the
+    assert_eq!(app.call_peers[0].peer, "first-peer");
+    // Native self observations cannot choose a different stage or hide the
     // strip. The next guest presentation owns that decision.
     let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
-        kind: "peer".into(),
-        peer: "remote".into(),
-        image: "other-image".into(),
+        kind: "self".into(),
         sharing: true,
         ..Default::default()
     }));
     assert_eq!(app.huddle_stage, "guest-selected-image");
+    let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
+        kind: "presentation".into(),
+        peers: vec![crate::call::CallPeer {
+            peer: "second-peer".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }));
+    assert_eq!(app.call_peers.len(), 1);
+    assert_eq!(app.call_peers[0].peer, "second-peer");
     // A host runtime trap cannot ask the retired guest to clear its own
     // presentation. Disposal still belongs to the native lifecycle adapter.
     let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
@@ -675,6 +688,7 @@ fn call_presentation_comes_from_the_deployed_guest() {
         message: "guest trapped".into(),
         ..Default::default()
     }));
+    assert!(app.call_peers.is_empty());
     assert!(app.huddle_stage.is_empty());
     assert!(!app.call_video_live);
     let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {

@@ -14,10 +14,20 @@ pub(crate) const FRAME_SAMPLES: usize = 960;
 pub struct CallEvent {
     pub kind: String,
     pub message: String,
-    pub peer: String,
-    pub image: String,
+    pub peers: Vec<CallPeer>,
     pub stage: String,
     pub video_live: bool,
+    pub muted: bool,
+    pub camera_on: bool,
+    pub sharing: bool,
+    pub speaking: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CallPeer {
+    pub peer: String,
+    pub image: String,
     pub muted: bool,
     pub camera_on: bool,
     pub sharing: bool,
@@ -431,35 +441,6 @@ pub fn call_status_after(current: String, event: CallEvent) -> String {
     }
 }
 
-/// One peer beacon folded into the presence list, keyed by node key. A
-/// session's end (closed/refused/error) clears it — stale badges on the next
-/// session's tiles would be someone else's state.
-pub fn apply_call_peer(peers: Vec<CallEvent>, event: CallEvent) -> Vec<CallEvent> {
-    match event.kind.as_str() {
-        "left" => peers
-            .into_iter()
-            .filter(|peer| peer.peer != event.peer)
-            .collect(),
-        "peer" => {
-            let mut peers: Vec<CallEvent> = peers
-                .into_iter()
-                .filter(|peer| peer.peer != event.peer)
-                .collect();
-            peers.push(event);
-            peers
-        }
-        // Someone left the huddle. A beacon is the only thing that can update
-        // a peer's row and theirs have stopped, so without this their badges,
-        // their frame and their claim on the stage outlive them.
-        "gone" => peers
-            .into_iter()
-            .filter(|peer| peer.peer != event.peer)
-            .collect(),
-        "closed" | "refused" | "error" => Vec::new(),
-        _ => peers,
-    }
-}
-
 /// One huddle tile with its mute and voice decisions already attached.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct HuddleTileRow {
@@ -472,7 +453,7 @@ pub struct HuddleTileRow {
 /// voice gate moves.
 pub fn huddle_tile_rows(
     roster: Vec<crate::backend::HuddleParticipant>,
-    peers: Vec<CallEvent>,
+    peers: Vec<CallPeer>,
     local_muted: bool,
     local_speaking: bool,
 ) -> Vec<HuddleTileRow> {
@@ -512,7 +493,7 @@ pub fn call_speaking_after(current: bool, event: &CallEvent) -> bool {
 
 /// The node keys of every peer whose beacon says they are talking — the
 /// shape the chat view lights its seats from.
-pub fn speaking_peers(peers: &[CallEvent]) -> Vec<String> {
+pub fn speaking_peers(peers: &[CallPeer]) -> Vec<String> {
     peers
         .iter()
         .filter(|peer| peer.speaking && !peer.muted)
@@ -586,24 +567,18 @@ mod tests {
             "nope"
         );
 
-        let beacon = |peer: &str, muted: bool| CallEvent {
-            kind: "peer".into(),
-            peer: peer.into(),
-            muted,
-            ..CallEvent::default()
-        };
-        let peers = apply_call_peer(Vec::new(), beacon("aa", true));
-        let peers = apply_call_peer(peers, beacon("bb", true));
-        let peers = apply_call_peer(peers, beacon("aa", false));
-        assert_eq!(peers.len(), 2);
-        // A peer who left stops beaconing, so their last beacon would stand
-        // for the rest of the call; the roster poll's `gone` is what ends it.
-        let mut left = CallEvent::of("gone");
-        left.peer = "bb".into();
-        let peers = apply_call_peer(peers, left);
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].peer, "aa");
-        let peers = apply_call_peer(peers, beacon("bb", true));
+        let peers = vec![
+            CallPeer {
+                peer: "aa".into(),
+                muted: false,
+                ..Default::default()
+            },
+            CallPeer {
+                peer: "bb".into(),
+                muted: true,
+                ..Default::default()
+            },
+        ];
         let participant = |node: &str, is_you: bool| crate::backend::HuddleParticipant {
             key: node.into(),
             label: node.into(),

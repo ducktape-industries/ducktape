@@ -123,9 +123,9 @@ async fn this_side_hears_and_sees_the_other_through_the_apps_own_leg() {
             if !event.message.is_empty() {
                 note = format!("{}: {}", event.kind, event.message);
             }
-            if event.peer == peer {
+            if let Some(other) = event.peers.iter().find(|other| other.peer == peer) {
                 seen_peer = true;
-                if !event.image.is_empty() { peer_image = event.image; }
+                peer_image = other.image.clone();
             }
             if !seen_peer {
                 continue;

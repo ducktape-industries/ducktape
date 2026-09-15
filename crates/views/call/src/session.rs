@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use ducktape_view_guest::host;
 use futures::{FutureExt as _, StreamExt as _, stream::LocalBoxStream};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::Message;
@@ -33,7 +33,22 @@ struct Session {
     machine: Machine,
     images: BTreeMap<String, (u64, String)>,
     preview: String,
-    presentation: Option<(String, bool)>,
+    presentation: Option<Presentation>,
+}
+
+#[derive(PartialEq, Eq, Serialize)]
+struct Peer {
+    peer: String,
+    image: String,
+    #[serde(flatten)]
+    beacon: Beacon,
+}
+
+#[derive(PartialEq, Eq)]
+struct Presentation {
+    stage: String,
+    video_live: bool,
+    peers: Vec<Peer>,
 }
 
 fn bytes(value: &Value) -> Vec<u8> {
@@ -87,7 +102,7 @@ pub fn run() -> LocalBoxStream<'static, Message> {
         let next = match next {
             Ok(next) => next,
             Err(error) => {
-                emit(json!({"kind":"presentation", "stage":"", "video_live":false}));
+                emit(json!({"kind":"presentation", "stage":"", "video_live":false, "peers":[]}));
                 status("error", &error);
                 host::notify("host.finish", &[]);
                 Run::End
@@ -265,8 +280,6 @@ impl Session {
                 Effect::SelfState(state) => emit(
                     json!({"kind": "self", "muted": state.muted, "camera_on": state.camera_on, "sharing": state.sharing, "speaking": state.speaking}),
                 ),
-                Effect::Peer { peer, beacon } => self.emit_peer(&peer, &beacon),
-                Effect::Left(peer) => emit(json!({"kind": "left", "peer": peer})),
                 Effect::Capture(source) => self.capture(&source),
                 Effect::Mute(muted) => notify(
                     "media.mute",
@@ -276,7 +289,7 @@ impl Session {
                     "media.play",
                     json!({"audio": self.audio.id(), "samples": samples}),
                 ),
-                Effect::Image { peer, jpeg, beacon } => self.picture(peer, jpeg, beacon).await?,
+                Effect::Image { peer, jpeg } => self.picture(peer, jpeg).await?,
                 Effect::DropImage(peer) => self.drop_picture(&peer),
             }
         }
@@ -301,25 +314,33 @@ impl Session {
             .peers
             .values()
             .any(|peer| peer.camera_on || peer.sharing);
-        let current = (stage, local_video || remote_video);
+        let peers = self
+            .machine
+            .peers
+            .iter()
+            .map(|(peer, beacon)| Peer {
+                peer: peer.clone(),
+                image: self
+                    .images
+                    .get(peer)
+                    .map(|(_, key)| key.clone())
+                    .unwrap_or_default(),
+                beacon: beacon.clone(),
+            })
+            .collect();
+        let current = Presentation {
+            stage,
+            video_live: local_video || remote_video,
+            peers,
+        };
         let unchanged = self.presentation.as_ref() == Some(&current);
         if unchanged {
             return;
         }
-        emit(json!({"kind":"presentation", "stage":current.0, "video_live":current.1}));
-        self.presentation = Some(current);
-    }
-
-    fn emit_peer(&self, peer: &str, beacon: &Beacon) {
-        let image = self
-            .images
-            .get(peer)
-            .map(|(_, key)| key.as_str())
-            .unwrap_or_default();
         emit(
-            json!({"kind": "peer", "peer": peer, "image": image, "muted": beacon.muted,
-            "camera_on": beacon.camera_on, "sharing": beacon.sharing, "speaking": beacon.speaking}),
+            json!({"kind":"presentation", "stage":current.stage, "video_live":current.video_live, "peers":current.peers}),
         );
+        self.presentation = Some(current);
     }
 
     fn capture(&mut self, source: &str) {
@@ -333,7 +354,7 @@ impl Session {
         }
     }
 
-    async fn picture(&mut self, peer: String, jpeg: Vec<u8>, beacon: Beacon) -> Result<(), String> {
+    async fn picture(&mut self, peer: String, jpeg: Vec<u8>) -> Result<(), String> {
         if !self.images.contains_key(&peer) {
             #[derive(Deserialize)]
             struct Image {
@@ -343,7 +364,6 @@ impl Session {
             let image = host::request("media.image", b"{}").await?;
             let image: Image = serde_json::from_slice(&image).map_err(|error| error.to_string())?;
             self.images.insert(peer.clone(), (image.image, image.key));
-            self.emit_peer(&peer, &beacon);
         }
         notify(
             "media.put",

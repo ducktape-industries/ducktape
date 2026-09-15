@@ -13,7 +13,7 @@ pub struct Props {
     pub source: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Beacon {
     pub muted: bool,
@@ -39,19 +39,10 @@ pub enum Effect {
     SendText(serde_json::Value),
     SendBinary(Vec<u8>),
     SelfState(Beacon),
-    Peer {
-        peer: String,
-        beacon: Beacon,
-    },
-    Left(String),
     Capture(String),
     Mute(bool),
     Play(Vec<i16>),
-    Image {
-        peer: String,
-        jpeg: Vec<u8>,
-        beacon: Beacon,
-    },
+    Image { peer: String, jpeg: Vec<u8> },
     DropImage(String),
 }
 
@@ -159,14 +150,13 @@ impl Machine {
         if !beacon.camera_on && !beacon.sharing {
             effects.push(Effect::DropImage(peer.clone()));
         }
-        effects.push(Effect::Peer { peer, beacon });
         effects
     }
 
     fn left(&mut self, peer: String) -> Vec<Effect> {
         self.peers.remove(&peer);
         self.audio.remove(&peer);
-        vec![Effect::DropImage(peer.clone()), Effect::Left(peer)]
+        vec![Effect::DropImage(peer)]
     }
 
     fn remote_audio(&mut self, peer: String, samples: Vec<i16>) -> Vec<Effect> {
@@ -190,11 +180,7 @@ impl Machine {
         if !capturing {
             return Vec::new();
         }
-        vec![Effect::Image {
-            peer,
-            jpeg,
-            beacon: beacon.clone(),
-        }]
+        vec![Effect::Image { peer, jpeg }]
     }
 
     fn tick(&mut self) -> Vec<Effect> {

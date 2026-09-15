@@ -539,7 +539,7 @@ pub fn chat_view(
     huddle_now: i64,
     call_muted: bool,
     call_speaking: bool,
-    call_peers: &[crate::call::CallEvent],
+    call_peers: &[crate::call::CallPeer],
     shift_held: bool,
     copy_chord_serial: i64,
     sent_serial: i64,
