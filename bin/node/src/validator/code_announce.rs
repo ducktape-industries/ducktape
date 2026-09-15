@@ -192,6 +192,16 @@ impl CodeReadinessSignaller {
         let mut actions = CodeActions::default();
         let mut wanted = BTreeSet::new();
         for m in modules {
+            // a view-only entry's ACTIVE frame has no component, so no fold
+            // ever pulls it the way a module's frame is pulled for its code;
+            // a node that joined after the register (or was down for it)
+            // would hold nothing under the hash the app asks its node for.
+            // wanted by every role, signalled by none: the swap that put it
+            // there is already decided.
+            let view_only = m.kind == modules::Kind::View;
+            if view_only && let Ok(active) = <[u8; 32]>::try_from(m.active_code_hash.as_slice()) {
+                self.want_bytes(&active, &mut held, &mut wanted, &mut actions);
+            }
             let Some(pending) = &m.pending else { continue };
             // past its activation height with no latch: the module itself
             // now refuses to arm this pending on a late signal (it is
@@ -709,6 +719,41 @@ mod tests {
             |_, _| panic!("a signalled view must not be re-probed"),
         );
         assert!(acts.signals.is_empty());
+    }
+
+    /// A VIEW-ONLY ENTRY'S ACTIVE BYTES ARE PULLED, NEVER SIGNALLED. No fold
+    /// asks for them (there is no component to run), so a node that joined
+    /// after the register holds nothing under the hash its app asks for —
+    /// the tab reads "view artifact not held by the node" forever. Every
+    /// role wants them; a module entry's active frame is left to the fold.
+    #[test]
+    fn a_view_only_entry_s_active_bytes_are_pulled_by_every_role() {
+        let mut s = CodeReadinessSignaller::new(me());
+        let mut view = idle("canvas");
+        view.kind = modules::Kind::View;
+        view.active_code_hash = vec![9; 32];
+        let mut module = idle("boards");
+        module.active_code_hash = vec![8; 32];
+        let modules = vec![view, module];
+        for role in [Role::Resident, Role::Validator] {
+            let mut s = CodeReadinessSignaller::new(me());
+            let acts = s.decide(role, 1, &modules, &no_proposals(), never_held, |_, _| {
+                panic!("an active view is never probed")
+            });
+            assert_eq!(acts.fetches, vec![[9u8; 32]], "{role:?}");
+            assert!(acts.signals.is_empty());
+        }
+        // held already: nothing to fetch, and the digest stays pinned.
+        let acts = s.decide(
+            Role::Resident,
+            1,
+            &modules,
+            &no_proposals(),
+            |d| d == &[9u8; 32],
+            |_, _| CodeVerdict::Absent,
+        );
+        assert!(acts.fetches.is_empty());
+        assert!(s.present.contains(&[9u8; 32]));
     }
 
     /// BYTE RESIDENCY IS NOT READINESS. A validator whose binary cannot
