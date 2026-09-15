@@ -849,3 +849,53 @@ fn a_landing_on_a_reply_reveals_it_inside_the_rail() {
         }
     });
 }
+
+/// A landing window whose slice holds the room's newest seq — a REPLY, which
+/// never becomes a root on screen — IS the latest: no "Jump to latest".
+/// The same slice under a head it does not reach still offers the jump.
+fn landed_general(head_seq: u64) -> Frame {
+    let landed = Session {
+        land_seq: 2,
+        ..session(true)
+    };
+    let rows = [
+        row(1, "first light"),
+        row(2, "second wind"),
+        reply(3, "an answer", 1),
+    ];
+    let record = serde_json::json!({ "channel": {
+        "id": "channel-a", "name": "general", "created_at": 1,
+        "post_policy": "open", "owner": "acct:7", "archived": false,
+        "hooks": [], "huddle": [], "head_seq": head_seq
+    }})
+    .to_string()
+    .into_bytes();
+    let (frame, _) = seated_view(&landed);
+    let names = request(&frame, "rpc.query").id;
+    let frame = tick_native(vec![answer(names, &accounts())]);
+    let channel = view_asking(&frame, "channel").id;
+    let frame = tick_native(vec![answer(channel, &record)]);
+    let read = view_asking(&frame, "messages_around").id;
+    let frame = tick_native(vec![answer(read, &around(&rows))]);
+    let older = view_asking(&frame, "roots").id;
+    let frame = tick_native(vec![answer(older, &no_older())]);
+    let roster = view_asking(&frame, "members").id;
+    tick_native(vec![answer(roster, &members())])
+}
+
+#[test]
+fn a_landing_holding_the_rooms_newest_reply_offers_no_jump() {
+    on_a_deep_stack(|| {
+        let frame = landed_general(3);
+        assert!(has_text(&frame, "second wind"), "{:?}", texts(&frame));
+        assert!(!has_text(&frame, "Jump to latest"), "{:?}", texts(&frame));
+    });
+}
+
+#[test]
+fn a_landing_short_of_the_rooms_head_offers_the_jump() {
+    on_a_deep_stack(|| {
+        let frame = landed_general(9);
+        assert!(has_text(&frame, "Jump to latest"), "{:?}", texts(&frame));
+    });
+}

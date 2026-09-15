@@ -328,7 +328,10 @@ REGISTER=$(bun -e 'process.stdout.write(JSON.stringify({configure_model:{operati
   skills:[{name:process.argv[2],source_prefix:`/shared/skills/${process.argv[2]}`,load:"always"}]
 }}}}))' "$MODEL_ACCOUNT" "$AGENT_ID" "$AGENT_NAME") || die "invalid registration"
 submit_user runs "$REGISTER"
-MENTION=$(bun -e 'process.stdout.write(JSON.stringify({post_message:{channel_id:"general",message_id:"g4",blocks:[{paragraph:[{text:`@${process.argv[2]} introduce yourself: what can you do on this network?`,marks:[{mention:{account:Number(process.argv[1])}}]}]}],thread:null}}))' "$MODEL_ACCOUNT" "$AGENT_ID")
+# A mention span holds ONLY the `@name` token — the chat view draws a
+# mention-marked span as the account's current name and nothing else, so
+# the rest of the sentence rides in its own plain span (the composer's shape).
+MENTION=$(bun -e 'process.stdout.write(JSON.stringify({post_message:{channel_id:"general",message_id:"g4",blocks:[{paragraph:[{text:`@${process.argv[2]}`,marks:[{mention:{account:Number(process.argv[1])}}]},{text:" introduce yourself: what can you do on this network?",marks:[]}]}],thread:null}}))' "$MODEL_ACCOUNT" "$AGENT_ID")
 submit chat "$MENTION"
 
 # forge — a playground repo, an issue on it, and a ChiefDuck mention in the
@@ -353,7 +356,7 @@ if command -v git >/dev/null; then
   submit forge "{\"open_issue\":{\"repo\":\"$PLAYGROUND\",\"title\":\"Say hello from a microVM\",\"body\":\"Mention @$AGENT_ID here: it clones this repo inside a microVM, adds a HELLO.md that says who it is, and opens a pull request.\"}}"
   ISSUE_CHANNEL=$(query forge "{\"get_item\":{\"repo\":\"$PLAYGROUND\",\"number\":1}}" | bun -e 'process.stdout.write(String((await Bun.stdin.json()).item?.channel_id ?? ""))')
   [ -n "$ISSUE_CHANNEL" ] || die "the $PLAYGROUND issue has no discussion channel"
-  ISSUE_MENTION=$(bun -e 'process.stdout.write(JSON.stringify({post_message:{channel_id:process.argv[2],message_id:"i1",blocks:[{paragraph:[{text:`@${process.argv[3]} say hello`,marks:[{mention:{account:Number(process.argv[1])}}]}]}],thread:null}}))' "$MODEL_ACCOUNT" "$ISSUE_CHANNEL" "$AGENT_ID")
+  ISSUE_MENTION=$(bun -e 'process.stdout.write(JSON.stringify({post_message:{channel_id:process.argv[2],message_id:"i1",blocks:[{paragraph:[{text:`@${process.argv[3]}`,marks:[{mention:{account:Number(process.argv[1])}}]},{text:" say hello",marks:[]}]}],thread:null}}))' "$MODEL_ACCOUNT" "$ISSUE_CHANNEL" "$AGENT_ID")
   submit chat "$ISSUE_MENTION"
 else
   log "no host git — skipping the $PLAYGROUND forge repo and its $AGENT_NAME issue"

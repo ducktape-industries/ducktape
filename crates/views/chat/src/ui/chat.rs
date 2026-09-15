@@ -398,13 +398,7 @@ impl ChatView {
             }
             // A landing or an older page that still reaches the room's head
             // IS the latest once scrolled to its tail: no jump to offer.
-            let head_seq = self
-                .rooms
-                .iter()
-                .find(|row| row.channel.id == self.active_channel)
-                .map_or(0, |row| row.channel.head_seq);
-            let behind_head =
-                self.history_view && !crate::host::window_reaches_head(&self.messages, head_seq);
+            let behind_head = self.history_view && !self.window_reaches_head;
             if !self.messages.is_empty() && (behind_head || !self.at_live_tail) {
                 children.push(native::padded(
                     native::aligned(

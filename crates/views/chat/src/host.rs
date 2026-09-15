@@ -61,18 +61,6 @@ pub struct HuddleSeat {
     pub node: String,
 }
 
-/// Does the window on screen run up to the room's head — its newest landed
-/// message is the room's newest? A landing or an older page can, and then
-/// its tail is the latest; a pending row (seq 0) never counts.
-pub fn window_reaches_head(messages: &[ChatMessage], head_seq: i64) -> bool {
-    let newest = messages
-        .iter()
-        .map(|message| message.seq)
-        .max()
-        .unwrap_or(0);
-    newest >= head_seq
-}
-
 /// Is this seat talking: the reader's own seat reads the local voice gate,
 /// any other reads the peer beacons by node key.
 pub fn seat_speaking(seat: &HuddleSeat, call_speaking: bool, speaking_peers: &[String]) -> bool {
@@ -781,6 +769,11 @@ pub struct RoomItem {
     pub members: Vec<ChatMember>,
     pub messages: Vec<ChatMessage>,
     pub has_older: bool,
+    /// the window runs up to the room's head: its tail IS the latest, so
+    /// there is no jump to offer. The tail read always does; a landing does
+    /// when the rows it centred on include the room's newest seq — a reply
+    /// counts, though it never becomes a root on screen.
+    pub reaches_head: bool,
     /// the thread a landing seq sits in, so a hit on a reply opens its rail
     pub thread_root: i64,
     pub error: String,
@@ -818,7 +811,8 @@ async fn read_room_now(key: &RoomKey, names: &Names) -> Result<RoomItem, String>
         serde_json::json!({ "channel": { "channel_id": key.channel } }),
     )
     .await?;
-    let window = read_window(key, names).await?;
+    let head_seq = record["head_seq"].as_i64().unwrap_or(0);
+    let window = read_window(key, names, head_seq).await?;
     Ok(RoomItem {
         channel: key.channel.clone(),
         name: record["name"].as_str().unwrap_or_default().to_owned(),
@@ -827,6 +821,7 @@ async fn read_room_now(key: &RoomKey, names: &Names) -> Result<RoomItem, String>
         members: read_members(&key.channel, names).await?,
         messages: window.messages,
         has_older: window.has_older,
+        reaches_head: window.reaches_head,
         thread_root: window.thread_root,
         error: String::new(),
     })
@@ -836,14 +831,15 @@ async fn read_room_now(key: &RoomKey, names: &Names) -> Result<RoomItem, String>
 struct Window {
     messages: Vec<ChatMessage>,
     has_older: bool,
+    reaches_head: bool,
     thread_root: i64,
 }
 
 /// The rows on screen: the live tail (plus every older page the reader has
 /// asked for), or the window centred on a landing seq.
-async fn read_window(key: &RoomKey, names: &Names) -> Result<Window, String> {
+async fn read_window(key: &RoomKey, names: &Names, head_seq: i64) -> Result<Window, String> {
     if key.land > 0 {
-        return read_landing_window(key, names).await;
+        return read_landing_window(key, names, head_seq).await;
     }
     let mut rows: Vec<serde_json::Value> = Vec::new();
     let mut before: Option<u64> = None;
@@ -872,13 +868,18 @@ async fn read_window(key: &RoomKey, names: &Names) -> Result<Window, String> {
     Ok(Window {
         messages,
         has_older: has_older || clipped,
+        reaches_head: true,
         thread_root: 0,
     })
 }
 
 /// A landing's window: the slice centred on the seq a hit named, and the
 /// thread that seq belongs to when it is a reply.
-async fn read_landing_window(key: &RoomKey, names: &Names) -> Result<Window, String> {
+async fn read_landing_window(
+    key: &RoomKey,
+    names: &Names,
+    head_seq: i64,
+) -> Result<Window, String> {
     let around = view(
         "messages",
         serde_json::json!({
@@ -892,6 +893,15 @@ async fn read_landing_window(key: &RoomKey, names: &Names) -> Result<Window, Str
         .find(|row| row["seq"].as_i64() == Some(key.land))
         .and_then(|row| row["thread"].as_i64())
         .unwrap_or(0);
+    // The head is judged on the RAW slice: the room's newest message is a
+    // reply as often as a root, and a reply never reaches the screen as a
+    // root — so the roots alone would call a fully caught-up window "behind".
+    let newest_seq = rows
+        .iter()
+        .filter_map(|row| row["seq"].as_i64())
+        .max()
+        .unwrap_or(0);
+    let reaches_head = newest_seq >= head_seq;
     let roots: Vec<serde_json::Value> = rows
         .iter()
         .filter(|row| row["thread"].is_null())
@@ -910,6 +920,7 @@ async fn read_landing_window(key: &RoomKey, names: &Names) -> Result<Window, Str
     Ok(Window {
         messages,
         has_older: has_older || clipped,
+        reaches_head,
         thread_root,
     })
 }
