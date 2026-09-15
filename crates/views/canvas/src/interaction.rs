@@ -79,8 +79,13 @@ impl BoardsView {
             (false, "h" | "2") if !repeat => self.on_tool(Tool::Hand),
             (false, "n" | "3") if !repeat => self.on_tool(Tool::Note),
             (false, "r" | "4") if !repeat => self.on_tool(Tool::Rectangle),
-            (false, "t" | "5") if !repeat => self.on_tool(Tool::Text),
-            (false, "a" | "6") if !repeat => self.on_tool(Tool::Connect),
+            (false, "o" | "5") if !repeat => self.on_tool(Tool::Ellipse),
+            (false, "d" | "6") if !repeat => self.on_tool(Tool::Diamond),
+            (false, "a" | "7") if !repeat => self.on_tool(Tool::Arrow),
+            (false, "l" | "8") if !repeat => self.on_tool(Tool::Line),
+            (false, "p" | "9") if !repeat => self.on_tool(Tool::Draw),
+            (false, "t") if !repeat => self.on_tool(Tool::Text),
+            (false, "e") if !repeat => self.on_tool(Tool::Eraser),
             (false, "q") if !repeat => self.on_lock_tool(),
             (false, "?") if !repeat => self.on_help(),
             (false, "0") => self.on_reset_zoom(),
@@ -98,7 +103,6 @@ impl BoardsView {
         }
         self.tool = tool;
         self.gesture = Gesture::Idle;
-        self.connection = None;
         self.guides.clear();
         self.help = false;
         save
@@ -126,26 +130,33 @@ impl BoardsView {
             (point[1] - self.camera[1]) / self.zoom,
         ]
     }
+    /// The topmost shape under a world point: a card by its own outline, a
+    /// connector by the stroke it actually draws.
     pub(super) fn hit(&self, point: [f32; 2]) -> Option<String> {
         let board = self.visible()?;
-        let ordered = board.ordered();
-        if let Some((id, _)) = ordered.iter().rev().find(|(_, record)| {
+        self.topmost(&board, point, |_| true)
+    }
+    fn topmost(
+        &self,
+        board: &Board,
+        point: [f32; 2],
+        eligible: impl Fn(&Shape) -> bool,
+    ) -> Option<String> {
+        // a stroke is thin: give it the same grab margin on screen at any zoom
+        let reach = 8. / self.zoom;
+        board.ordered().iter().rev().find_map(|(id, record)| {
             let s = &record.shape;
-            s.kind != Kind::Arrow && contains(rect(s), point)
-        }) {
-            return Some((*id).clone());
-        }
-        ordered.iter().rev().find_map(|(id, record)| {
-            let s = &record.shape;
-            let (Some(from), Some(to)) = (&s.from, &s.to) else {
+            if !eligible(s) {
                 return None;
+            }
+            let touched = if s.kind.is_path() {
+                stroke(board, s)
+                    .windows(2)
+                    .any(|step| line_distance(point, step[0], step[1]) <= reach)
+            } else {
+                covers(s, point)
             };
-            let (Some(a), Some(b)) = (board.shapes.get(from), board.shapes.get(to)) else {
-                return None;
-            };
-            let start = presentation::anchor(&a.shape, &b.shape);
-            let end = presentation::anchor(&b.shape, &a.shape);
-            (line_distance(point, start, end) <= 8. / self.zoom).then(|| (*id).clone())
+            touched.then(|| (*id).clone())
         })
     }
     pub(super) fn on_position(&mut self, x: f32, y: f32) -> Task<Message> {
@@ -189,11 +200,16 @@ impl BoardsView {
         let point = self.world([x, y]);
         let action = match self.tool {
             Tool::Select => self.select_press(point),
-            Tool::Connect => self.connect_press(point),
+            Tool::Hand => Task::none(),
+            Tool::Eraser => self.erase_press(point),
+            Tool::Draw => self.sketch_press(point),
             Tool::Note => self.create_press(Kind::Note, point),
             Tool::Rectangle => self.create_press(Kind::Rectangle, point),
+            Tool::Ellipse => self.create_press(Kind::Ellipse, point),
+            Tool::Diamond => self.create_press(Kind::Diamond, point),
             Tool::Text => self.create_press(Kind::Text, point),
-            Tool::Hand => Task::none(),
+            Tool::Arrow => self.create_press(Kind::Arrow, point),
+            Tool::Line => self.create_press(Kind::Line, point),
         };
         Task::batch([save, action])
     }
@@ -205,7 +221,7 @@ impl BoardsView {
         // Handles sit outside a card: hit them before ordinary card selection.
         if let Some(id) = self.only_selected().cloned() {
             let shape = &board.shapes[&id].shape;
-            if shape.kind != Kind::Arrow {
+            if free(shape) {
                 for corner in [[-1, -1], [1, -1], [-1, 1], [1, 1]] {
                     let target = corner_point(shape, corner);
                     if (point[0] - target[0]).hypot(point[1] - target[1]) <= 9. / self.zoom {
@@ -253,7 +269,7 @@ impl BoardsView {
                 board
                     .shapes
                     .get(id)
-                    .filter(|r| r.shape.kind != Kind::Arrow)
+                    .filter(|r| free(&r.shape))
                     .map(|r| (id.clone(), r.shape.clone()))
             })
             .collect();
@@ -264,37 +280,25 @@ impl BoardsView {
         };
         Task::none()
     }
-    fn connect_press(&mut self, point: [f32; 2]) -> Task<Message> {
-        let Some(id) = self.hit(point) else {
-            return Task::none();
-        };
-        let Some(board) = self.visible() else {
-            return Task::none();
-        };
-        if board.shapes[&id].shape.kind == Kind::Arrow {
-            return Task::none();
-        }
-        let Some(from) = self.connection.take() else {
-            self.connection = Some(id);
-            return Task::none();
-        };
-        if from == id {
-            self.connection = Some(from);
-            return Task::none();
-        }
-        self.mint_shape(Shape {
-            kind: Kind::Arrow,
-            color: self.palette,
-            from: Some(from),
-            to: Some(id),
-            ..Default::default()
-        })
-    }
     fn create_press(&mut self, kind: Kind, point: [f32; 2]) -> Task<Message> {
         self.gesture = Gesture::Create {
             kind,
             start: point,
             point,
+        };
+        Task::none()
+    }
+    fn sketch_press(&mut self, point: [f32; 2]) -> Task<Message> {
+        self.selected.clear();
+        self.gesture = Gesture::Sketch {
+            points: vec![point],
+        };
+        Task::none()
+    }
+    fn erase_press(&mut self, point: [f32; 2]) -> Task<Message> {
+        self.selected.clear();
+        self.gesture = Gesture::Erase {
+            swept: self.hit(point).into_iter().collect(),
         };
         Task::none()
     }
@@ -381,6 +385,11 @@ impl BoardsView {
             }
         }
         let board = self.visible();
+        // The eraser is the one gesture that asks what is under the pointer,
+        // and the hit test needs the board this borrow is about to lend out.
+        let swept_now = matches!(self.gesture, Gesture::Erase { .. })
+            .then(|| self.hit(point))
+            .flatten();
         match &mut self.gesture {
             Gesture::Idle => {}
             Gesture::Pan { start, camera } => {
@@ -389,6 +398,17 @@ impl BoardsView {
             Gesture::Move { point: p, .. }
             | Gesture::Resize { point: p, .. }
             | Gesture::Create { point: p, .. } => *p = point,
+            Gesture::Sketch { points } => {
+                // one sample per couple of screen pixels; the release thins
+                // the run down to what the shape of the stroke needs
+                let far = points.last().is_none_or(|last| {
+                    (point[0] - last[0]).hypot(point[1] - last[1]) * self.zoom >= 2.
+                });
+                if far && points.len() < MAX_SAMPLES {
+                    points.push(point);
+                }
+            }
+            Gesture::Erase { swept } => swept.extend(swept_now),
             Gesture::Marquee {
                 start,
                 point: p,
@@ -402,9 +422,7 @@ impl BoardsView {
                         board
                             .shapes
                             .iter()
-                            .filter(|(_, r)| {
-                                r.shape.kind != Kind::Arrow && intersects(bounds, rect(&r.shape))
-                            })
+                            .filter(|(_, r)| free(&r.shape) && intersects(bounds, rect(&r.shape)))
                             .map(|(id, _)| id.clone()),
                     );
                 }
@@ -480,17 +498,27 @@ impl BoardsView {
             Gesture::Idle
             | Gesture::Pan { .. }
             | Gesture::Marquee { .. }
+            | Gesture::Sketch { .. }
+            | Gesture::Erase { .. }
             | Gesture::Create { .. } => Vec::new(),
         }
     }
+    /// What a drag with a creating tool would leave behind. A card takes the
+    /// dragged box, or a comfortable default when the press was a click; a
+    /// connector is the run between the two points and never a click.
     pub(super) fn creation_shape(&self, kind: Kind, start: [f32; 2], point: [f32; 2]) -> Shape {
+        if kind.is_path() {
+            return self.segment_shape(kind, start, point);
+        }
         let b = points_rect(start, point);
         let dragged = (point[0] - start[0]).hypot(point[1] - start[1]) * self.zoom >= 4.;
         let (w, h) = match kind {
             Kind::Note => (220, 180),
             Kind::Rectangle => (240, 140),
+            Kind::Ellipse => (200, 200),
+            Kind::Diamond => (200, 160),
             Kind::Text => (280, 96),
-            Kind::Arrow => (200, 140),
+            Kind::Arrow | Kind::Line | Kind::Draw => (200, 140),
         };
         Shape {
             kind,
@@ -510,20 +538,119 @@ impl BoardsView {
             ..Default::default()
         }
     }
+    fn segment_shape(&self, kind: Kind, start: [f32; 2], point: [f32; 2]) -> Shape {
+        let end = if self.modifiers.shift {
+            straighten(start, point)
+        } else {
+            point
+        };
+        self.path_shape(kind, &[start, end])
+    }
+    /// A connector out of world points: the box is their span, the samples
+    /// are relative to it, so a later move carries them and a resize scales
+    /// them without the board ever rewriting the path.
+    fn path_shape(&self, kind: Kind, points: &[[f32; 2]]) -> Shape {
+        let b = points
+            .iter()
+            .fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |a, p| {
+                [
+                    a[0].min(p[0]),
+                    a[1].min(p[1]),
+                    a[2].max(p[0]),
+                    a[3].max(p[1]),
+                ]
+            });
+        // A run drawn wider than a shape may be is fitted whole rather than
+        // clipped: scaling keeps the drawing, truncating loses its tail.
+        let limit = boards::MAX_SIZE as f32;
+        let fit = (limit / (b[2] - b[0]).max(limit)).min(limit / (b[3] - b[1]).max(limit));
+        let size = |span: f32| (span * fit).round().clamp(0., limit);
+        Shape {
+            kind,
+            color: self.palette,
+            x: coordinate(b[0]),
+            y: coordinate(b[1]),
+            width: size(b[2] - b[0]) as i32,
+            height: size(b[3] - b[1]) as i32,
+            points: points
+                .iter()
+                .map(|p| [size(p[0] - b[0]) as i32, size(p[1] - b[1]) as i32])
+                .collect(),
+            ..Default::default()
+        }
+    }
+    /// An arrow drawn onto a card binds to it, so the connection survives the
+    /// card moving. Both ends on one card is a free arrow, not a loop.
+    fn bind(&self, shape: &mut Shape, start: [f32; 2], end: [f32; 2]) {
+        let Some(board) = self.visible() else {
+            return;
+        };
+        let card = |p| self.topmost(&board, p, |s: &Shape| !s.kind.is_path());
+        shape.from = card(start);
+        shape.to = card(end);
+        if shape.from.is_some() && shape.from == shape.to {
+            shape.from = None;
+            shape.to = None;
+        }
+    }
     pub(super) fn on_release(&mut self) -> Task<Message> {
         let changes = self.gesture_changes();
         let gesture = std::mem::take(&mut self.gesture);
         self.guides.clear();
         match gesture {
-            Gesture::Create { kind, start, point } => {
-                self.mint_shape(self.creation_shape(kind, start, point))
-            }
+            Gesture::Create { kind, start, point } => self.on_created(kind, start, point),
+            Gesture::Sketch { points } => self.on_sketched(&points),
+            Gesture::Erase { swept } => self.on_swept(swept),
             Gesture::Idle
             | Gesture::Pan { .. }
             | Gesture::Marquee { .. }
             | Gesture::Move { .. }
             | Gesture::Resize { .. } => self.edit_many(changes),
         }
+    }
+    /// What a finished drag with a creating tool leaves on the board, or
+    /// nothing when the gesture was too small to have meant anything.
+    pub(super) fn drawn_shape(
+        &self,
+        kind: Kind,
+        start: [f32; 2],
+        point: [f32; 2],
+    ) -> Option<Shape> {
+        let mut shape = self.creation_shape(kind, start, point);
+        if !kind.is_path() {
+            return Some(shape);
+        }
+        let drawn = (point[0] - start[0]).hypot(point[1] - start[1]) * self.zoom >= 8.;
+        if !drawn {
+            return None;
+        }
+        if kind == Kind::Arrow {
+            self.bind(&mut shape, start, point);
+        }
+        Some(shape)
+    }
+    fn on_created(&mut self, kind: Kind, start: [f32; 2], point: [f32; 2]) -> Task<Message> {
+        self.drawn_shape(kind, start, point)
+            .map_or_else(Task::none, |shape| self.mint_shape(shape))
+    }
+    /// What the pen leaves behind: the run thinned to the board's budget, or
+    /// a dot when the pen was tapped rather than drawn with.
+    pub(super) fn sketched_shape(&self, points: &[[f32; 2]]) -> Option<Shape> {
+        let first = points.first().copied()?;
+        let mut kept = simplify(points, 1.2 / self.zoom);
+        if kept.len() < 2 {
+            let dot = 1. / self.zoom;
+            kept = vec![first, [first[0] + dot, first[1] + dot]];
+        }
+        Some(self.path_shape(Kind::Draw, &kept))
+    }
+    fn on_sketched(&mut self, points: &[[f32; 2]]) -> Task<Message> {
+        self.sketched_shape(points)
+            .map_or_else(Task::none, |shape| self.mint_shape(shape))
+    }
+    fn on_swept(&mut self, swept: BTreeSet<String>) -> Task<Message> {
+        self.selected.retain(|id| !swept.contains(id));
+        self.edit_many(swept.into_iter().map(|id| Change::Delete { id }).collect())
     }
     pub(super) fn on_cancel(&mut self) -> Task<Message> {
         if self.inline.is_some() {
@@ -534,7 +661,6 @@ impl BoardsView {
             self.tool = Tool::Select;
         }
         self.gesture = Gesture::Idle;
-        self.connection = None;
         self.space_pan = false;
         self.guides.clear();
         self.help = false;
@@ -578,9 +704,7 @@ impl BoardsView {
         let shapes: Vec<_> = board
             .shapes
             .iter()
-            .filter(|(id, r)| {
-                r.shape.kind != Kind::Arrow && (!selected || self.selected.contains(*id))
-            })
+            .filter(|(id, r)| free(&r.shape) && (!selected || self.selected.contains(*id)))
             .map(|(_, r)| &r.shape)
             .collect();
         let Some(b) = bounds(shapes.into_iter()) else {
@@ -611,7 +735,7 @@ impl BoardsView {
         let Some(record) = board.shapes.get(&id) else {
             return Task::none();
         };
-        if record.shape.kind == Kind::Arrow || self.inline.is_some() {
+        if record.shape.kind.is_path() || self.inline.is_some() {
             return Task::none();
         }
         let text = record.shape.text.clone();
@@ -757,7 +881,7 @@ impl BoardsView {
                     board
                         .shapes
                         .get(id)
-                        .filter(|r| r.shape.kind != Kind::Arrow)
+                        .filter(|r| free(&r.shape))
                         .map(|r| Change::Move {
                             id: id.clone(),
                             x: coordinate((r.shape.x + x) as f32),
@@ -801,28 +925,28 @@ impl BoardsView {
         let Some(board) = self.visible() else {
             return Task::none();
         };
-        let cards: BTreeSet<_> = self
+        let picked: BTreeSet<_> = self
             .selected
             .iter()
-            .filter(|id| {
-                board
-                    .shapes
-                    .get(*id)
-                    .is_some_and(|r| r.shape.kind != Kind::Arrow)
-            })
+            .filter(|id| board.shapes.contains_key(*id))
             .cloned()
             .collect();
+        // A copy keeps a binding only when the card it names is copied too;
+        // an arrow left pointing outside the selection has no copy to make.
+        let whole = |s: &Shape| {
+            [&s.from, &s.to]
+                .into_iter()
+                .flatten()
+                .all(|id| picked.contains(id))
+        };
         let mut shapes: Vec<_> = board
             .ordered()
             .into_iter()
-            .filter(|(id, r)| {
-                cards.contains(*id)
-                    || r.shape.from.as_ref().is_some_and(|id| cards.contains(id))
-                        && r.shape.to.as_ref().is_some_and(|id| cards.contains(id))
-            })
+            .filter(|(id, r)| picked.contains(*id) && whole(&r.shape))
             .map(|(id, r)| (id.clone(), r.shape.clone()))
             .collect();
-        shapes.sort_by_key(|(_, s)| s.kind == Kind::Arrow);
+        // cards land before the arrows that name them
+        shapes.sort_by_key(|(_, s)| s.from.is_some() || s.to.is_some());
         if shapes.is_empty() {
             return Task::none();
         }
@@ -975,7 +1099,7 @@ impl BoardsView {
             board
                 .shapes
                 .get(id)
-                .filter(|r| r.shape.kind != Kind::Arrow)
+                .filter(|r| free(&r.shape))
                 .map(|r| &r.shape)
         })) else {
             return Task::none();
@@ -1016,7 +1140,7 @@ impl BoardsView {
         let mut adjustment = [0.; 2];
         let mut lines = [None, None];
         for (id, r) in &board.shapes {
-            if shapes.contains_key(id) || r.shape.kind == Kind::Arrow {
+            if shapes.contains_key(id) || r.shape.kind.is_path() {
                 continue;
             }
             let target = rect(&r.shape);
@@ -1056,6 +1180,141 @@ impl BoardsView {
             lines.into_iter().flatten().collect(),
         )
     }
+}
+/// The pen samples no more than this in one stroke; the release thins the run
+/// down to the board's point budget before anything leaves the view.
+const MAX_SAMPLES: usize = 4096;
+
+/// A shape the pointer moves and resizes on its own. A bound connector has no
+/// geometry of its own to drag: it follows the cards its ends name.
+pub(super) fn free(s: &Shape) -> bool {
+    s.from.is_none() && s.to.is_none()
+}
+pub(super) fn center(s: &Shape) -> [f32; 2] {
+    [
+        s.x as f32 + s.width as f32 / 2.,
+        s.y as f32 + s.height as f32 / 2.,
+    ]
+}
+/// Whether a card's own outline covers a point — the box for a note, the
+/// inscribed ellipse or diamond for the shapes that only fill part of it.
+pub(super) fn covers(s: &Shape, p: [f32; 2]) -> bool {
+    let unit = [
+        (p[0] - s.x as f32) / (s.width as f32).max(1.) * 2. - 1.,
+        (p[1] - s.y as f32) / (s.height as f32).max(1.) * 2. - 1.,
+    ];
+    match s.kind {
+        Kind::Note | Kind::Rectangle | Kind::Text => contains(rect(s), p),
+        Kind::Ellipse => unit[0] * unit[0] + unit[1] * unit[1] <= 1.,
+        Kind::Diamond => unit[0].abs() + unit[1].abs() <= 1.,
+        Kind::Arrow | Kind::Line | Kind::Draw => false,
+    }
+}
+/// A path's samples in world units. They are stored against the box they were
+/// drawn in, so a move carries them and a resize scales them.
+pub(super) fn path_points(s: &Shape) -> Vec<[f32; 2]> {
+    let span = s.points.iter().fold([0_f32; 2], |a, p| {
+        [a[0].max(p[0] as f32), a[1].max(p[1] as f32)]
+    });
+    let scale = |axis: usize, size: i32| {
+        if span[axis] > 0. {
+            size as f32 / span[axis]
+        } else {
+            1.
+        }
+    };
+    let (sx, sy) = (scale(0, s.width), scale(1, s.height));
+    s.points
+        .iter()
+        .map(|p| [s.x as f32 + p[0] as f32 * sx, s.y as f32 + p[1] as f32 * sy])
+        .collect()
+}
+/// The polyline a connector actually draws: its samples, with a bound end
+/// pulled onto the border of the card it names.
+pub(super) fn stroke(board: &Board, s: &Shape) -> Vec<[f32; 2]> {
+    let mut path = path_points(s);
+    if path.len() < 2 {
+        return Vec::new();
+    }
+    let card = |key: &Option<String>| {
+        key.as_ref()
+            .and_then(|k| board.shapes.get(k))
+            .map(|r| r.shape.clone())
+    };
+    let (from, to) = (card(&s.from), card(&s.to));
+    let last = path.len() - 1;
+    let toward_start = to.as_ref().map_or(path[last], center);
+    let toward_end = from.as_ref().map_or(path[0], center);
+    if let Some(card) = &from {
+        path[0] = border_point(card, toward_start);
+    }
+    if let Some(card) = &to {
+        path[last] = border_point(card, toward_end);
+    }
+    path
+}
+/// Where a ray out of a card's centre leaves it, so a connector stops at the
+/// edge instead of burying its head in the card.
+pub(super) fn border_point(s: &Shape, toward: [f32; 2]) -> [f32; 2] {
+    let c = center(s);
+    let d = [toward[0] - c[0], toward[1] - c[1]];
+    let scale = (s.width as f32 / 2. / d[0].abs().max(0.001))
+        .min(s.height as f32 / 2. / d[1].abs().max(0.001))
+        .min(1.);
+    [c[0] + d[0] * scale, c[1] + d[1] * scale]
+}
+/// Shift on a connector: the nearest eighth turn, so runs come out straight
+/// or squarely diagonal.
+fn straighten(start: [f32; 2], point: [f32; 2]) -> [f32; 2] {
+    let d = [point[0] - start[0], point[1] - start[1]];
+    let step = std::f32::consts::FRAC_PI_4;
+    let angle = (d[1].atan2(d[0]) / step).round() * step;
+    let length = d[0].hypot(d[1]);
+    [
+        start[0] + length * angle.cos(),
+        start[1] + length * angle.sin(),
+    ]
+}
+/// Ramer–Douglas–Peucker, run at a coarser tolerance until the stroke fits
+/// the board's point budget. A pen samples far more than a shape needs.
+fn simplify(points: &[[f32; 2]], tolerance: f32) -> Vec<[f32; 2]> {
+    let mut tolerance = tolerance.max(0.01);
+    loop {
+        let kept = thin(points, tolerance);
+        if kept.len() <= boards::MAX_POINTS {
+            return kept;
+        }
+        tolerance *= 2.;
+    }
+}
+pub(super) fn thin(points: &[[f32; 2]], tolerance: f32) -> Vec<[f32; 2]> {
+    if points.len() < 3 {
+        return points.to_vec();
+    }
+    let mut keep = vec![false; points.len()];
+    let last = points.len() - 1;
+    keep[0] = true;
+    keep[last] = true;
+    let mut spans = vec![(0, last)];
+    while let Some((start, end)) = spans.pop() {
+        let Some((index, distance)) = (start + 1..end)
+            .map(|i| (i, line_distance(points[i], points[start], points[end])))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+        else {
+            continue;
+        };
+        if distance <= tolerance {
+            continue;
+        }
+        keep[index] = true;
+        spans.push((start, index));
+        spans.push((index, end));
+    }
+    points
+        .iter()
+        .zip(keep)
+        .filter_map(|(p, kept)| kept.then_some(*p))
+        .collect()
 }
 pub(super) fn rect(s: &Shape) -> [f32; 4] {
     [

@@ -14,6 +14,24 @@ fn card(view: &mut BoardsView, id: &str, x: i32) -> Task<Message> {
         },
     })
 }
+fn segment(kind: Kind) -> Shape {
+    Shape {
+        kind,
+        width: 160,
+        height: 90,
+        points: vec![[0, 0], [160, 90]],
+        ..Default::default()
+    }
+}
+/// Press, drag through the given screen points, release.
+fn drag(view: &mut BoardsView, path: &[[f32; 2]]) {
+    let [first, rest @ ..] = path else { return };
+    view.on_press(first[0], first[1]);
+    for step in rest {
+        view.on_move(step[0], step[1]);
+    }
+    view.on_release();
+}
 #[test]
 fn optimistic_edits_remain_visible_while_waiting_for_consensus() {
     let mut view = view();
@@ -125,10 +143,9 @@ fn undo_delete_restores_attached_arrows_and_snapshot_keeps_pending_work() {
     view.edit(Change::Create {
         id: "edge".into(),
         shape: Shape {
-            kind: Kind::Arrow,
             from: Some("a".into()),
             to: Some("b".into()),
-            ..Default::default()
+            ..segment(Kind::Arrow)
         },
     });
     view.selected = ["a".into()].into();
@@ -388,4 +405,162 @@ fn help_uses_the_shifted_slash_key_and_prevents_edits_behind_it() {
         false,
     );
     assert!(!view.help);
+}
+
+#[test]
+fn an_arrow_drag_binds_the_cards_it_starts_and_ends_on() {
+    let mut view = view();
+    card(&mut view, "a", 0);
+    card(&mut view, "b", 600);
+    let between = view
+        .drawn_shape(Kind::Arrow, [100., 70.], [700., 70.])
+        .unwrap();
+    assert_eq!(
+        (between.from.as_deref(), between.to.as_deref()),
+        (Some("a"), Some("b"))
+    );
+    assert_eq!(between.points.len(), 2);
+    let leaving = view
+        .drawn_shape(Kind::Arrow, [100., 70.], [900., 400.])
+        .unwrap();
+    assert_eq!(
+        (leaving.from.as_deref(), leaving.to.clone()),
+        (Some("a"), None),
+        "an end in open space stands on its own point"
+    );
+    let inside = view
+        .drawn_shape(Kind::Arrow, [20., 20.], [150., 100.])
+        .unwrap();
+    assert_eq!(
+        (inside.from.clone(), inside.to.clone()),
+        (None, None),
+        "both ends on one card is a free arrow, not a loop the board refuses"
+    );
+    assert_eq!(
+        view.drawn_shape(Kind::Line, [10., 10.], [12., 12.]),
+        None,
+        "a click with a connector tool draws nothing"
+    );
+    // every connector a drag produces is one the board accepts
+    for shape in [between, leaving, inside] {
+        view.visible()
+            .unwrap()
+            .changed(&Change::Create {
+                id: "drawn".into(),
+                shape,
+            })
+            .unwrap();
+    }
+}
+#[test]
+fn the_pen_thins_a_run_to_the_boards_budget_and_a_tap_leaves_a_dot() {
+    let view = view();
+    let wavy: Vec<[f32; 2]> = (0..4000)
+        .map(|i| [i as f32 * 0.4, (i as f32 * 0.05).sin() * 60.])
+        .collect();
+    let stroke = view.sketched_shape(&wavy).unwrap();
+    assert_eq!(stroke.kind, Kind::Draw);
+    assert!(stroke.points.len() <= boards::MAX_POINTS);
+    assert!(stroke.points.len() > 8, "a wavy run keeps its shape");
+    assert!(
+        stroke.points.iter().flatten().all(|value| *value >= 0),
+        "samples are relative to the box that holds them"
+    );
+    view.visible()
+        .unwrap()
+        .changed(&Change::Create {
+            id: "stroke".into(),
+            shape: stroke,
+        })
+        .unwrap();
+    let dot = view.sketched_shape(&[[10., 10.]]).unwrap();
+    assert_eq!(dot.points.len(), 2);
+    assert_eq!(view.sketched_shape(&[]), None);
+}
+#[test]
+fn a_run_wider_than_a_shape_may_be_is_fitted_whole_rather_than_clipped() {
+    let view = view();
+    let long: Vec<[f32; 2]> = (0..200)
+        .map(|i| [i as f32 * 100., (i % 2) as f32 * 40.])
+        .collect();
+    let stroke = view.sketched_shape(&long).unwrap();
+    assert!(stroke.width <= boards::MAX_SIZE);
+    assert_eq!(
+        stroke.points.last().unwrap()[0],
+        stroke.width,
+        "the last sample still lands on the far edge of the box"
+    );
+}
+#[test]
+fn shapes_are_chosen_by_their_own_outline_and_strokes_by_their_line() {
+    let mut view = view();
+    view.edit(Change::Create {
+        id: "o".into(),
+        shape: Shape {
+            kind: Kind::Ellipse,
+            width: 200,
+            height: 200,
+            ..Default::default()
+        },
+    });
+    assert_eq!(view.hit([100., 100.]).as_deref(), Some("o"));
+    assert_eq!(view.hit([6., 6.]), None, "a corner is outside the ellipse");
+    let mut line = super::tests::view();
+    line.edit(Change::Create {
+        id: "l".into(),
+        shape: segment(Kind::Line),
+    });
+    let view = line;
+    assert_eq!(view.hit([80., 45.]).as_deref(), Some("l"));
+    assert_eq!(
+        view.hit([150., 10.]),
+        None,
+        "the box around a diagonal is not the line"
+    );
+}
+#[test]
+fn one_eraser_sweep_is_one_undo_step() {
+    let mut view = view();
+    view.camera = [0., 0.];
+    card(&mut view, "a", 0);
+    card(&mut view, "b", 300);
+    view.on_tool(Tool::Eraser);
+    drag(&mut view, &[[100., 70.], [250., 70.], [400., 70.]]);
+    assert!(view.visible().unwrap().shapes.is_empty());
+    view.on_undo();
+    assert_eq!(view.visible().unwrap().shapes.len(), 2);
+}
+#[test]
+fn a_board_of_strokes_stays_inside_the_hosts_geometry_budget() {
+    let mut view = view();
+    let mut board = view.confirmed.take().unwrap();
+    for i in 0..boards::MAX_SHAPES {
+        board = board
+            .changed(&Change::Create {
+                id: format!("stroke-{i}"),
+                shape: Shape {
+                    kind: Kind::Draw,
+                    x: (i as i32 % 16) * 45,
+                    y: (i as i32 / 16) * 35,
+                    width: 40,
+                    height: 30,
+                    points: (0..boards::MAX_POINTS)
+                        .map(|p| [(p % 40) as i32, (p * 7 % 30) as i32])
+                        .collect(),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+    }
+    view.confirmed = Some(board);
+    view.on_select_all();
+    view.on_fit();
+    let mut driver =
+        ducktape_view_guest::Driver::<BoardsView>::from_snapshot(&view.snapshot().unwrap(), false)
+            .unwrap();
+    let frame = driver.tick(Vec::new());
+    let tree = frame.root.unwrap();
+    let bytes = ducktape_view_guest::wire::encode(&tree);
+    ducktape_view_guest::wire::decode::<wire::Node>(&bytes)
+        .expect("the host decodes every piece of geometry the scene drew");
 }

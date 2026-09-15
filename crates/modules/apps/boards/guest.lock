@@ -37,7 +37,7 @@ dependencies = [
 [[package]]
 name = "boards"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#4d01bba1d288cb04faa033bf22a9954442942cc1"
+source = "git+https://github.com/orthory/ducktape#e17d17d88080b70ae8f8631ce60f477a2aca295f"
 dependencies = [
  "async-trait",
  "ducktape-module-sdk",
@@ -127,7 +127,7 @@ dependencies = [
 [[package]]
 name = "ducktape-module-sdk"
 version = "0.0.0"
-source = "git+https://github.com/orthory/ducktape#4d01bba1d288cb04faa033bf22a9954442942cc1"
+source = "git+https://github.com/orthory/ducktape#e17d17d88080b70ae8f8631ce60f477a2aca295f"
 dependencies = [
  "async-trait",
  "sdk",
@@ -276,7 +276,7 @@ dependencies = [
 [[package]]
 name = "sdk"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#4d01bba1d288cb04faa033bf22a9954442942cc1"
+source = "git+https://github.com/orthory/ducktape#e17d17d88080b70ae8f8631ce60f477a2aca295f"
 dependencies = [
  "async-trait",
  "borsh",
@@ -564,19 +564,19 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[patch.unused]]
 name = "blst"
 version = "0.3.16"
-source = "git+https://github.com/orthory/ducktape#4d01bba1d288cb04faa033bf22a9954442942cc1"
+source = "git+https://github.com/orthory/ducktape#e17d17d88080b70ae8f8631ce60f477a2aca295f"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.2.17"
-source = "git+https://github.com/orthory/ducktape#4d01bba1d288cb04faa033bf22a9954442942cc1"
+source = "git+https://github.com/orthory/ducktape#e17d17d88080b70ae8f8631ce60f477a2aca295f"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.3.4"
-source = "git+https://github.com/orthory/ducktape#4d01bba1d288cb04faa033bf22a9954442942cc1"
+source = "git+https://github.com/orthory/ducktape#e17d17d88080b70ae8f8631ce60f477a2aca295f"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.4.3"
-source = "git+https://github.com/orthory/ducktape#4d01bba1d288cb04faa033bf22a9954442942cc1"
+source = "git+https://github.com/orthory/ducktape#e17d17d88080b70ae8f8631ce60f477a2aca295f"

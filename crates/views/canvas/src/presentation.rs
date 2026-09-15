@@ -7,7 +7,7 @@ use ducktape_view_guest::{
     },
 };
 
-fn stroke(color: Rgba, width: f32) -> wire::CanvasStroke {
+fn pen(color: Rgba, width: f32) -> wire::CanvasStroke {
     wire::CanvasStroke {
         color,
         width,
@@ -22,7 +22,7 @@ fn line(from: [f32; 2], to: [f32; 2], color: Rgba, width: f32) -> Draw {
         shape: Geometry::Line { from, to },
         fill: None,
         even_odd: false,
-        stroke: Some(stroke(color, width)),
+        stroke: Some(pen(color, width)),
     }
 }
 fn rectangle(
@@ -31,16 +31,59 @@ fn rectangle(
     fill: Option<Rgba>,
     border: Rgba,
     width: f32,
+    radius: f32,
 ) -> Draw {
     Draw::Draw {
         shape: Geometry::Rectangle {
             position,
             size,
-            radius: [6.; 4],
+            radius: [radius; 4],
         },
         fill,
         even_odd: false,
-        stroke: Some(stroke(border, width)),
+        stroke: Some(pen(border, width)),
+    }
+}
+fn ellipse(
+    position: [f32; 2],
+    size: [f32; 2],
+    fill: Option<Rgba>,
+    border: Rgba,
+    width: f32,
+) -> Draw {
+    Draw::Draw {
+        shape: Geometry::Path(vec![wire::CanvasSegment::Ellipse {
+            center: [position[0] + size[0] / 2., position[1] + size[1] / 2.],
+            radius: [size[0] / 2., size[1] / 2.],
+            rotation: 0.,
+            start: 0.,
+            end: std::f32::consts::TAU,
+        }]),
+        fill,
+        even_odd: false,
+        stroke: Some(pen(border, width)),
+    }
+}
+fn diamond(
+    position: [f32; 2],
+    size: [f32; 2],
+    fill: Option<Rgba>,
+    border: Rgba,
+    width: f32,
+) -> Draw {
+    use wire::CanvasSegment as Segment;
+    let middle = [position[0] + size[0] / 2., position[1] + size[1] / 2.];
+    Draw::Draw {
+        shape: Geometry::Path(vec![
+            Segment::Move([middle[0], position[1]]),
+            Segment::Line([position[0] + size[0], middle[1]]),
+            Segment::Line([middle[0], position[1] + size[1]]),
+            Segment::Line([position[0], middle[1]]),
+            Segment::Close,
+        ]),
+        fill,
+        even_odd: false,
+        stroke: Some(pen(border, width)),
     }
 }
 /// The five card hues, softened onto the app's cool greys: a fill per
@@ -365,16 +408,15 @@ impl BoardsView {
         if !shown {
             return None;
         }
-        let name = if count == 1 {
-            self.only_selected()
-                .and_then(|id| board.shapes.get(id))
-                .map_or("Selection", |r| kind_name(r.shape.kind))
-                .to_owned()
-        } else {
-            format!("{count} selected")
+        let only = self.only_selected().and_then(|id| board.shapes.get(id));
+        let name = match only {
+            Some(record) => kind_name(record.shape.kind).to_owned(),
+            None => format!("{count} selected"),
         };
+        // a connector has no box to write in; the inspector does not offer one
+        let writable = only.is_some_and(|record| !record.shape.kind.is_path());
         Some(kit::sized(
-            self.inspector(name, count),
+            self.inspector(name, count, writable),
             Some(Length::Fixed(204.)),
             None,
         ))
@@ -449,14 +491,13 @@ impl BoardsView {
             Tool::Hand => "Drag to explore · Release Space to return to your tool",
             Tool::Note => "Click to place a note and start typing",
             Tool::Rectangle => "Drag to draw a box · Shift-resize to keep proportions",
-            Tool::Text => "Click to write · Double-click any card to edit",
-            Tool::Connect => {
-                if self.connection.is_some() {
-                    "Choose the destination card · Esc to cancel"
-                } else {
-                    "Choose two cards to connect"
-                }
-            }
+            Tool::Ellipse => "Drag to draw an ellipse · Shift-resize to keep proportions",
+            Tool::Diamond => "Drag to draw a diamond · double-click it to write",
+            Tool::Text => "Click to write · Double-click any shape to edit",
+            Tool::Arrow => "Drag between shapes to connect them · Shift for straight runs",
+            Tool::Line => "Drag to draw a line · Shift for straight runs",
+            Tool::Draw => "Draw freehand · release to keep the stroke",
+            Tool::Eraser => "Drag across what you want gone · release to erase",
         }
     }
     /// The prompt an empty board shows, centred on the stage.
@@ -522,7 +563,7 @@ impl BoardsView {
             None,
         ))
     }
-    fn inspector(&self, name: String, count: usize) -> Node {
+    fn inspector(&self, name: String, count: usize, writable: bool) -> Node {
         let mut properties = vec![
             kit::heading("boards/selection-title", name),
             kit::spaced(
@@ -534,7 +575,7 @@ impl BoardsView {
             ),
             kit::divider("boards/properties-rule"),
         ];
-        if count == 1 {
+        if writable {
             properties.push(wide(action(
                 "boards/edit-text",
                 "Edit text",
@@ -626,8 +667,13 @@ impl BoardsView {
             ("H / 2 · hold Space", "Pan"),
             ("N / 3", "Sticky note"),
             ("R / 4", "Rectangle"),
-            ("T / 5", "Text"),
-            ("A / 6", "Connector"),
+            ("O / 5", "Ellipse"),
+            ("D / 6", "Diamond"),
+            ("A / 7", "Arrow"),
+            ("L / 8", "Line"),
+            ("P / 9", "Draw freehand"),
+            ("T", "Text"),
+            ("E", "Eraser"),
             ("Q", "Keep tool active"),
             ("Shift-click / drag", "Multiple selection"),
             ("Enter / double-click", "Edit text"),
@@ -694,222 +740,61 @@ impl BoardsView {
             y * self.zoom + self.camera[1],
         ]
     }
+    /// The scene, bottom to top: the grid, then every shape as its own layer
+    /// with its words pinned straight over it, then one overlay for the marks
+    /// that belong to the pointer rather than to the board.
+    ///
+    /// A shape is a layer of its own because the alternative — one canvas of
+    /// bodies under one stack of labels — lets an earlier shape's text show
+    /// through a later shape that covers it.
     fn canvas(&self, board: &Board) -> Node {
-        let p = kit::palette();
-        let muted = Rgba(p.border_strong);
-        let accent = Rgba(p.accent);
-        let mut commands = Vec::new();
+        let erasing = match &self.gesture {
+            Gesture::Erase { swept } => swept.clone(),
+            _ => BTreeSet::new(),
+        };
+        let mut layers = Vec::new();
+        // The host decodes a fixed number of geometry pieces per frame and
+        // REFUSES the whole frame past it, so the budget is spent in priority
+        // order: the shapes first, each taking a fair share of what is left,
+        // then the pointer's marks, then the grid with the remainder.
+        let mut budget = PARTS;
+        let ordered = board.ordered();
+        for (index, (id, record)) in ordered.iter().enumerate() {
+            let s = &record.shape;
+            let Some(box_) = self.on_screen(board, s) else {
+                continue;
+            };
+            let opacity = if erasing.contains(*id) { 0.25 } else { 1. };
+            let share = budget / (ordered.len() - index);
+            let mut body = Vec::new();
+            self.paint(board, s, opacity, share, &mut body);
+            if cost(&body) > budget {
+                body.clear();
+            }
+            budget -= cost(&body);
+            if !body.is_empty() {
+                layers.push(Node::Canvas {
+                    key: format!("boards/body/{id}"),
+                    width: Some(Length::Fill),
+                    height: Some(Length::Fill),
+                    commands: body,
+                });
+            }
+            if let Some(label) = self.label(id, s, box_, opacity) {
+                layers.push(label);
+            }
+        }
         let mut top = Vec::new();
-        let mut labels = Vec::new();
-        let spacing = (32. * self.zoom).max(28.);
-        for col in 0..((self.viewport[0] / spacing).ceil() as usize).min(60) {
-            for row in 0..((self.viewport[1] / spacing).ceil() as usize).min(40) {
-                let center = [
-                    self.camera[0].rem_euclid(spacing) + col as f32 * spacing,
-                    self.camera[1].rem_euclid(spacing) + row as f32 * spacing,
-                ];
-                commands.push(Draw::Draw {
-                    shape: Geometry::Circle {
-                        center,
-                        radius: 0.7,
-                    },
-                    fill: Some(muted),
-                    even_odd: false,
-                    stroke: None,
-                });
-            }
-        }
-        for (id, record) in board.ordered() {
-            let s = &record.shape;
-            if s.kind != Kind::Arrow {
-                continue;
-            }
-            let (Some(from), Some(to)) = (&s.from, &s.to) else {
-                continue;
-            };
-            let (Some(a), Some(b)) = (board.shapes.get(from), board.shapes.get(to)) else {
-                continue;
-            };
-            let start = anchor(&a.shape, &b.shape);
-            let end = anchor(&b.shape, &a.shape);
-            let start = self.screen(start[0], start[1]);
-            let end = self.screen(end[0], end[1]);
-            let color = if self.selected.contains(id) {
-                accent
-            } else {
-                Rgba(tint(s.color))
-            };
-            commands.push(line(start, end, color, 1.5));
-            if !s.text.is_empty() {
-                labels.push(Node::Pin {
-                    key: format!("boards/arrow-label/{id}"),
-                    x: (start[0] + end[0]) / 2.,
-                    y: (start[1] + end[1]) / 2. - 20.,
-                    width: Some(Length::Fixed(180.)),
-                    height: Some(Length::Fixed(40.)),
-                    content: Box::new(kit::wrapping(kit::text(
-                        format!("boards/arrow-text/{id}"),
-                        excerpt(&s.text),
-                    ))),
-                });
-            }
-            let angle = (end[1] - start[1]).atan2(end[0] - start[0]);
-            for turn in [-0.5_f32, 0.5] {
-                commands.push(line(
-                    end,
-                    [
-                        end[0] - 12. * (angle + turn).cos(),
-                        end[1] - 12. * (angle + turn).sin(),
-                    ],
-                    color,
-                    1.5,
-                ));
-            }
-        }
-        for (id, record) in board.ordered() {
-            let s = &record.shape;
-            if s.kind == Kind::Arrow {
-                continue;
-            }
-            let pos = self.screen(s.x as f32, s.y as f32);
-            let size = [s.width as f32 * self.zoom, s.height as f32 * self.zoom];
-            let outside = pos[0] + size[0] < 0.
-                || pos[1] + size[1] < 0.
-                || pos[0] > self.viewport[0]
-                || pos[1] > self.viewport[1];
-            if outside {
-                continue;
-            }
-            let selected = self.selected.contains(id) || self.connection.as_ref() == Some(id);
-            let fill = match s.kind {
-                Kind::Note => Some(Rgba(fill(s.color))),
-                Kind::Rectangle => Some(Rgba(alpha(fill(s.color), 0.45))),
-                Kind::Text | Kind::Arrow => None,
-            };
-            let border = match s.kind {
-                Kind::Note => Some(Rgba(alpha(tint(s.color), 0.35))),
-                Kind::Rectangle => Some(Rgba(tint(s.color))),
-                Kind::Text | Kind::Arrow => None,
-            };
-            if selected {
-                top.push(rectangle(pos, size, None, accent, 1.5));
-            }
-            if selected && self.inline.is_none() && self.selected.len() == 1 {
-                for corner in [[-1, -1], [1, -1], [-1, 1], [1, 1]] {
-                    let world = interaction::corner_point(s, corner);
-                    let handle = self.screen(world[0], world[1]);
-                    top.push(Draw::Draw {
-                        shape: Geometry::Rectangle {
-                            position: [handle[0] - 3.5, handle[1] - 3.5],
-                            size: [7., 7.],
-                            radius: [1.5; 4],
-                        },
-                        fill: Some(Rgba(p.background)),
-                        even_odd: false,
-                        stroke: Some(stroke(accent, 1.5)),
-                    });
-                }
-            }
-            let editing = self.inline.as_ref().is_some_and(|inline| &inline.id == id);
-            let text = if s.text.is_empty() {
-                "Write a thought…"
-            } else {
-                excerpt(&s.text)
-            };
-            let label = if editing {
-                kit::space(None, None)
-            } else {
-                kit::colored(
-                    kit::text_size(
-                        kit::wrapping(kit::text(format!("boards/label/{id}"), text)),
-                        (if s.kind == Kind::Text { 20. } else { 14. } * self.zoom).clamp(8., 60.),
-                    ),
-                    if s.text.is_empty() {
-                        p.faint
-                    } else {
-                        p.foreground
-                    },
-                )
-            };
-            // THE BOX IS ITS OWN LAYER, TEXT INCLUDED: a later shape's fill
-            // covers an earlier one's words, which one canvas of fills under
-            // one stack of labels never could.
-            let mut card = kit::container(format!("boards/label-clip/{id}"), label);
-            if let Node::Container {
-                clip,
-                height,
-                padding,
-                background,
-                border: edge,
-                ..
-            } = &mut card
-            {
-                *clip = true;
-                *height = Some(Length::Fill);
-                *padding = Some(wire::Edges::all(CARD_INSET * self.zoom));
-                *background = fill.map(wire::Background::Color);
-                *edge = border.map(|color| wire::Border {
-                    radius: Some([6.; 4]),
-                    width: Some(1.),
-                    color: Some(color),
-                });
-            }
-            labels.push(Node::Pin {
-                key: format!("boards/pin/{id}"),
-                x: pos[0],
-                y: pos[1],
-                width: Some(Length::Fixed(size[0].max(1.))),
-                height: Some(Length::Fixed(size[1].max(1.))),
-                content: Box::new(card),
-            });
-        }
-        for guide in &self.guides {
-            top.push(line(
-                self.screen(guide[0], guide[1]),
-                self.screen(guide[2], guide[3]),
-                accent,
-                1.,
-            ));
-        }
-        if let Gesture::Marquee { start, point, .. } = &self.gesture {
-            let b = interaction::points_rect(*start, *point);
-            let pos = self.screen(b[0], b[1]);
-            top.push(rectangle(
-                pos,
-                [(b[2] - b[0]) * self.zoom, (b[3] - b[1]) * self.zoom],
-                Some(Rgba(alpha(p.accent, 0.08))),
-                accent,
-                1.,
-            ));
-        }
-        if let Gesture::Create { kind, start, point } = &self.gesture {
-            let shape = self.creation_shape(*kind, *start, *point);
-            let pos = self.screen(shape.x as f32, shape.y as f32);
-            top.push(rectangle(
-                pos,
-                [
-                    shape.width as f32 * self.zoom,
-                    shape.height as f32 * self.zoom,
-                ],
-                Some(Rgba(alpha(p.accent, 0.08))),
-                accent,
-                1.,
-            ));
-        }
-        if let Some(from) = self.connection.as_ref().and_then(|id| board.shapes.get(id)) {
-            let start = self.screen(
-                (from.shape.x + from.shape.width / 2) as f32,
-                (from.shape.y + from.shape.height / 2) as f32,
-            );
-            top.push(line(start, self.cursor, accent, 1.5));
-        }
+        self.paint_marks(board, budget, &mut top);
+        budget = budget.saturating_sub(cost(&top));
+        let grid = self.grid(budget);
         let mut children = vec![Node::Canvas {
-            key: "boards/geometry".into(),
+            key: "boards/grid".into(),
             width: Some(Length::Fill),
             height: Some(Length::Fill),
-            commands,
+            commands: grid,
         }];
-        children.extend(labels);
+        children.extend(layers);
         children.push(Node::Canvas {
             key: "boards/overlay".into(),
             width: Some(Length::Fill),
@@ -969,19 +854,393 @@ impl BoardsView {
             Some(Length::Fill),
         )
     }
+    /// The screen box a shape occupies, or nothing when it is off stage. A
+    /// connector's box is the stroke it draws, which a bound end moves.
+    fn on_screen(&self, board: &Board, s: &Shape) -> Option<[f32; 4]> {
+        let world = if s.kind.is_path() {
+            let path = interaction::stroke(board, s);
+            span(&path)?
+        } else {
+            interaction::rect(s)
+        };
+        let a = self.screen(world[0], world[1]);
+        let b = self.screen(world[2], world[3]);
+        let margin = 48.;
+        let shown = b[0] >= -margin
+            && b[1] >= -margin
+            && a[0] <= self.viewport[0] + margin
+            && a[1] <= self.viewport[1] + margin;
+        shown.then_some([a[0], a[1], b[0], b[1]])
+    }
+    /// A faint dot lattice that tracks the camera, drawn no denser than the
+    /// parts it was given.
+    fn grid(&self, budget: usize) -> Vec<Draw> {
+        let muted = Rgba(kit::palette().border_strong);
+        let mut spacing = (32. * self.zoom).max(28.);
+        let counts = |spacing: f32| {
+            [
+                (self.viewport[0] / spacing).ceil() as usize + 1,
+                (self.viewport[1] / spacing).ceil() as usize + 1,
+            ]
+        };
+        // widen the lattice rather than truncate it: half a grid reads as a bug
+        while counts(spacing)[0] * counts(spacing)[1] > budget {
+            if spacing > self.viewport[0].max(self.viewport[1]) {
+                return Vec::new();
+            }
+            spacing *= 2.;
+        }
+        let [columns, rows] = counts(spacing);
+        let mut dots = Vec::with_capacity(columns * rows);
+        for column in 0..columns {
+            for row in 0..rows {
+                dots.push(Draw::Draw {
+                    shape: Geometry::Circle {
+                        center: [
+                            self.camera[0].rem_euclid(spacing) + column as f32 * spacing,
+                            self.camera[1].rem_euclid(spacing) + row as f32 * spacing,
+                        ],
+                        radius: 0.7,
+                    },
+                    fill: Some(muted),
+                    even_odd: false,
+                    stroke: None,
+                });
+            }
+        }
+        dots
+    }
+    /// One shape's body, within `budget` pieces of geometry. `opacity` is
+    /// what the eraser has already swept.
+    fn paint(&self, board: &Board, s: &Shape, opacity: f32, budget: usize, out: &mut Vec<Draw>) {
+        let pos = self.screen(s.x as f32, s.y as f32);
+        let size = [s.width as f32 * self.zoom, s.height as f32 * self.zoom];
+        let body = |strength: f32| Rgba(alpha(fill(s.color), strength * opacity));
+        let edge = |strength: f32| Rgba(alpha(tint(s.color), strength * opacity));
+        let line_width = (1.5 * self.zoom).clamp(1., 8.);
+        let radius = (6. * self.zoom).clamp(2., 20.);
+        match s.kind {
+            Kind::Note => out.push(rectangle(pos, size, Some(body(1.)), edge(0.35), 1., radius)),
+            Kind::Rectangle => out.push(rectangle(
+                pos,
+                size,
+                Some(body(0.45)),
+                edge(1.),
+                line_width,
+                radius,
+            )),
+            Kind::Ellipse => out.push(ellipse(pos, size, Some(body(0.45)), edge(1.), line_width)),
+            Kind::Diamond => out.push(diamond(pos, size, Some(body(0.45)), edge(1.), line_width)),
+            // text carries no body: the words are the shape
+            Kind::Text => {}
+            Kind::Arrow | Kind::Line | Kind::Draw => {
+                let world = interaction::stroke(board, s);
+                let screen: Vec<_> = world.iter().map(|p| self.screen(p[0], p[1])).collect();
+                self.paint_stroke(s.kind, &screen, edge(1.), budget, out);
+            }
+        }
+    }
+    fn paint_stroke(
+        &self,
+        kind: Kind,
+        screen: &[[f32; 2]],
+        color: Rgba,
+        budget: usize,
+        out: &mut Vec<Draw>,
+    ) {
+        if screen.len() < 2 {
+            return;
+        }
+        // Samples finer than a pixel buy nothing; past that the budget decides.
+        // The run costs one command plus a segment each, and an arrowhead two
+        // more commands on top.
+        let head = if kind == Kind::Arrow { 2 } else { 0 };
+        let limit = budget.saturating_sub(1 + head);
+        if limit < 2 {
+            return;
+        }
+        let path = decimate(&interaction::thin(screen, 0.75), limit);
+        let end = path[path.len() - 1];
+        let weight = if kind == Kind::Draw { 2.5 } else { 1.8 };
+        let width = (weight * self.zoom).clamp(1.2, 14.);
+        out.push(Draw::Draw {
+            shape: Geometry::Path(polyline(&path)),
+            fill: None,
+            even_odd: false,
+            stroke: Some(pen(color, width)),
+        });
+        if kind != Kind::Arrow {
+            return;
+        }
+        let before = path[path.len() - 2];
+        let angle = (end[1] - before[1]).atan2(end[0] - before[0]);
+        let head = (12. * self.zoom).clamp(7., 30.);
+        for turn in [-0.5_f32, 0.5] {
+            out.push(line(
+                end,
+                [
+                    end[0] - head * (angle + turn).cos(),
+                    end[1] - head * (angle + turn).sin(),
+                ],
+                color,
+                width,
+            ));
+        }
+    }
+    /// A shape's words, pinned over its body and clipped to it.
+    fn label(&self, id: &str, s: &Shape, box_: [f32; 4], opacity: f32) -> Option<Node> {
+        let p = kit::palette();
+        let editing = self.inline.as_ref().is_some_and(|inline| inline.id == *id);
+        if editing {
+            return None;
+        }
+        // a connector's label rides its middle; it has no box to sit in
+        if s.kind.is_path() {
+            if s.text.is_empty() {
+                return None;
+            }
+            return Some(Node::Pin {
+                key: format!("boards/path-label/{id}"),
+                x: (box_[0] + box_[2]) / 2. - 90.,
+                y: (box_[1] + box_[3]) / 2. - 20.,
+                width: Some(Length::Fixed(180.)),
+                height: Some(Length::Fixed(40.)),
+                content: Box::new(kit::wrapping(kit::text(
+                    format!("boards/path-text/{id}"),
+                    excerpt(&s.text),
+                ))),
+            });
+        }
+        let blank = s.text.is_empty();
+        // a blank sticky invites a word; a blank outline is a drawing, not a card
+        let prompt = matches!(s.kind, Kind::Note | Kind::Text);
+        if blank && !prompt {
+            return None;
+        }
+        let text = if blank {
+            "Write a thought…"
+        } else {
+            excerpt(&s.text)
+        };
+        let ink = if blank { p.faint } else { p.foreground };
+        let label = kit::colored(
+            kit::text_size(
+                kit::wrapping(kit::text(format!("boards/label/{id}"), text)),
+                (if s.kind == Kind::Text { 20. } else { 14. } * self.zoom).clamp(8., 60.),
+            ),
+            alpha(ink, opacity),
+        );
+        let mut clip = kit::container(format!("boards/label-clip/{id}"), label);
+        if let Node::Container {
+            clip: clipped,
+            height,
+            padding,
+            align_y,
+            ..
+        } = &mut clip
+        {
+            *clipped = true;
+            *height = Some(Length::Fill);
+            *padding = Some(wire::Edges::all(CARD_INSET * self.zoom));
+            // an ellipse and a diamond pinch at the corners: centre their words
+            *align_y = (s.kind != Kind::Note).then_some(AlignY::Center);
+        }
+        Some(Node::Pin {
+            key: format!("boards/pin/{id}"),
+            x: box_[0],
+            y: box_[1],
+            width: Some(Length::Fixed((box_[2] - box_[0]).max(1.))),
+            height: Some(Length::Fixed((box_[3] - box_[1]).max(1.))),
+            content: Box::new(clip),
+        })
+    }
+    /// What belongs to the pointer, not to the board: the selection, its
+    /// handles, the snapping guides and whatever the current gesture is about
+    /// to leave behind.
+    fn paint_marks(&self, board: &Board, budget: usize, out: &mut Vec<Draw>) {
+        let p = kit::palette();
+        let accent = Rgba(p.accent);
+        let ring = (6. * self.zoom).clamp(2., 20.);
+        // leave the gesture and the guides their own room out of the budget
+        let rings = budget.saturating_sub(32);
+        for id in &self.selected {
+            if cost(out) >= rings {
+                break;
+            }
+            let Some(record) = board.shapes.get(id) else {
+                continue;
+            };
+            let s = &record.shape;
+            let Some(box_) = self.on_screen(board, s) else {
+                continue;
+            };
+            let inset = if s.kind.is_path() { 4. } else { 0. };
+            out.push(rectangle(
+                [box_[0] - inset, box_[1] - inset],
+                [
+                    box_[2] - box_[0] + inset * 2.,
+                    box_[3] - box_[1] + inset * 2.,
+                ],
+                None,
+                accent,
+                1.5,
+                ring,
+            ));
+            let handled = self.selected.len() == 1 && self.inline.is_none() && interaction::free(s);
+            if !handled {
+                continue;
+            }
+            for corner in [[-1, -1], [1, -1], [-1, 1], [1, 1]] {
+                let world = interaction::corner_point(s, corner);
+                let handle = self.screen(world[0], world[1]);
+                out.push(Draw::Draw {
+                    shape: Geometry::Rectangle {
+                        position: [handle[0] - 3.5, handle[1] - 3.5],
+                        size: [7., 7.],
+                        radius: [1.5; 4],
+                    },
+                    fill: Some(Rgba(p.background)),
+                    even_odd: false,
+                    stroke: Some(pen(accent, 1.5)),
+                });
+            }
+        }
+        for guide in &self.guides {
+            out.push(line(
+                self.screen(guide[0], guide[1]),
+                self.screen(guide[2], guide[3]),
+                accent,
+                1.,
+            ));
+        }
+        self.paint_gesture(board, out);
+    }
+    fn paint_gesture(&self, board: &Board, out: &mut Vec<Draw>) {
+        let p = kit::palette();
+        let accent = Rgba(p.accent);
+        let wash = Some(Rgba(alpha(p.accent, 0.08)));
+        match &self.gesture {
+            Gesture::Marquee { start, point, .. } => {
+                let b = interaction::points_rect(*start, *point);
+                out.push(rectangle(
+                    self.screen(b[0], b[1]),
+                    [(b[2] - b[0]) * self.zoom, (b[3] - b[1]) * self.zoom],
+                    wash,
+                    accent,
+                    1.,
+                    2.,
+                ));
+            }
+            Gesture::Create { kind, start, point } => {
+                let shape = self.creation_shape(*kind, *start, *point);
+                if kind.is_path() {
+                    let screen: Vec<_> = interaction::path_points(&shape)
+                        .iter()
+                        .map(|q| self.screen(q[0], q[1]))
+                        .collect();
+                    self.paint_stroke(*kind, &screen, accent, 8, out);
+                    return;
+                }
+                out.push(rectangle(
+                    self.screen(shape.x as f32, shape.y as f32),
+                    [
+                        shape.width as f32 * self.zoom,
+                        shape.height as f32 * self.zoom,
+                    ],
+                    wash,
+                    accent,
+                    1.,
+                    (6. * self.zoom).clamp(2., 20.),
+                ));
+            }
+            Gesture::Sketch { points } => {
+                let screen: Vec<_> = points.iter().map(|q| self.screen(q[0], q[1])).collect();
+                self.paint_stroke(
+                    Kind::Draw,
+                    &screen,
+                    Rgba(tint(self.palette)),
+                    boards::MAX_POINTS,
+                    out,
+                );
+            }
+            Gesture::Idle
+            | Gesture::Pan { .. }
+            | Gesture::Move { .. }
+            | Gesture::Resize { .. }
+            | Gesture::Erase { .. } => {
+                let _ = board;
+            }
+        }
+    }
 }
-pub(super) fn anchor(from: &Shape, to: &Shape) -> [f32; 2] {
-    let center = [
-        from.x as f32 + from.width as f32 / 2.,
-        from.y as f32 + from.height as f32 / 2.,
-    ];
-    let delta = [
-        to.x as f32 + to.width as f32 / 2. - center[0],
-        to.y as f32 + to.height as f32 / 2. - center[1],
-    ];
-    let scale = (from.width as f32 / 2. / delta[0].abs().max(0.001))
-        .min(from.height as f32 / 2. / delta[1].abs().max(0.001));
-    [center[0] + delta[0] * scale, center[1] + delta[1] * scale]
+/// The host decodes at most `MAX_CANVAS_PARTS` (4096) pieces of geometry per
+/// frame, shared across every canvas in it, and REFUSES a frame that exceeds
+/// it. Everything the scene draws is spent out of this one budget.
+const PARTS: usize = 3600;
+
+/// What geometry costs against that budget: the host charges for the command
+/// AND for every segment inside it.
+fn cost(commands: &[Draw]) -> usize {
+    commands
+        .iter()
+        .map(|command| {
+            let segments = match command {
+                Draw::Draw {
+                    shape: Geometry::Path(path),
+                    ..
+                } => path.len(),
+                _ => 0,
+            };
+            1 + segments
+        })
+        .sum()
+}
+/// Keep the ends and an even spread between them, so a stroke that cannot
+/// afford every sample this frame still reads as the same line.
+fn decimate(points: &[[f32; 2]], limit: usize) -> Vec<[f32; 2]> {
+    if points.len() <= limit || limit < 2 {
+        return points.to_vec();
+    }
+    let last = points.len() - 1;
+    (0..limit)
+        .map(|index| points[index * last / (limit - 1)])
+        .collect()
+}
+
+fn span(points: &[[f32; 2]]) -> Option<[f32; 4]> {
+    points
+        .iter()
+        .copied()
+        .map(|p| [p[0], p[1], p[0], p[1]])
+        .reduce(|a, b| {
+            [
+                a[0].min(b[0]),
+                a[1].min(b[1]),
+                a[2].max(b[2]),
+                a[3].max(b[3]),
+            ]
+        })
+}
+/// A run of points as one path: a straight segment between two, and a round
+/// one through the midpoints of a longer run, so a pen stroke reads as drawn.
+fn polyline(points: &[[f32; 2]]) -> Vec<wire::CanvasSegment> {
+    use wire::CanvasSegment as Segment;
+    let mut path = vec![Segment::Move(points[0])];
+    if points.len() == 2 {
+        path.push(Segment::Line(points[1]));
+        return path;
+    }
+    for pair in points.windows(2).skip(1) {
+        path.push(Segment::Quadratic {
+            control: pair[0],
+            end: [
+                (pair[0][0] + pair[1][0]) / 2.,
+                (pair[0][1] + pair[1][1]) / 2.,
+            ],
+        });
+    }
+    path.push(Segment::Line(points[points.len() - 1]));
+    path
 }
 
 // Keep every visible card below its share of the host's 64 KiB text budget.
@@ -994,20 +1253,31 @@ fn excerpt(text: &str) -> &str {
     &text[..end]
 }
 
-const TOOLS: [(Tool, &str, &str, &str); 6] = [
+/// The tool bar, in the order a canvas app prints it: what points, what pans,
+/// then the shapes, then the pen and what takes it back.
+const TOOLS: [(Tool, &str, &str, &str); 11] = [
     (Tool::Select, "Select", "V", "select"),
     (Tool::Hand, "Pan", "H", "hand"),
     (Tool::Note, "Note", "N", "note"),
     (Tool::Rectangle, "Box", "R", "box"),
+    (Tool::Ellipse, "Ellipse", "O", "ellipse"),
+    (Tool::Diamond, "Diamond", "D", "diamond"),
+    (Tool::Arrow, "Arrow", "A", "arrow"),
+    (Tool::Line, "Line", "L", "line"),
+    (Tool::Draw, "Draw", "P", "draw"),
     (Tool::Text, "Text", "T", "text"),
-    (Tool::Connect, "Connect", "A", "arrow"),
+    (Tool::Eraser, "Eraser", "E", "eraser"),
 ];
 fn kind_name(kind: Kind) -> &'static str {
     match kind {
         Kind::Note => "Sticky note",
         Kind::Rectangle => "Rectangle",
+        Kind::Ellipse => "Ellipse",
+        Kind::Diamond => "Diamond",
         Kind::Text => "Text",
-        Kind::Arrow => "Connector",
+        Kind::Arrow => "Arrow",
+        Kind::Line => "Line",
+        Kind::Draw => "Drawing",
     }
 }
 fn pin(key: &str, x: f32, y: f32, width: f32, content: Node) -> Node {
@@ -1124,6 +1394,11 @@ fn icon(name: &str) -> Node {
         }
         "note" => "<path d='M4 3h16v12l-5 6H4z'/><path d='M15 21v-6h5M8 8h8M8 12h5'/>",
         "box" => "<rect x='4' y='4' width='16' height='16' rx='3'/>",
+        "ellipse" => "<ellipse cx='12' cy='12' rx='9' ry='7'/>",
+        "diamond" => "<path d='M12 3 21 12 12 21 3 12z'/>",
+        "line" => "<path d='M4 20 20 4'/>",
+        "draw" => "<path d='M4 20h4L19 9l-4-4L4 16z'/><path d='m14 6 4 4M4 16l4 4'/>",
+        "eraser" => "<path d='m13 4 7 7-8 8H7l-4-4z'/><path d='M8 9l7 7M11 19h9'/>",
         "text" => "<path d='M4 6V4h16v2M12 4v16M8 20h8'/>",
         "arrow" => "<path d='M4 19 20 4M10 4h10v10'/>",
         "lock" => {
