@@ -30,6 +30,7 @@ fn expected() -> BTreeMap<String, Shape> {
         ("acl", shape(Backing::Store, NONE, false)),
         ("agent", shape(Backing::Store, NONE, false)),
         ("automations", shape(Backing::Store, NONE, false)),
+        ("boards", shape(Backing::Store, NONE, false)),
         ("capability", shape(Backing::Store, NONE, false)),
         ("chat", shape(Backing::Store, NONE, false)),
         // the network binding it refuses every op without, and the unit its
