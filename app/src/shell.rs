@@ -691,6 +691,7 @@ impl DesktopWindow {
         body = match step {
             HubStep::Loading => body.child(hint("Opening your workspace…".into())),
             HubStep::Wallets => {
+                let unlock_label = if busy { "Opening workspace…" } else { "Unlock" };
                 let state = &self.model.read(cx).state;
                 let selected = state.hub_wallet_selected.clone();
                 let wallets = state.hub_wallets.clone();
@@ -721,11 +722,12 @@ impl DesktopWindow {
                             .child(
                                 self.submit(
                                     "unlock-submit",
-                                    "Unlock",
+                                    unlock_label,
                                     busy,
                                     |this, cx| Message::UnlockSubmit(this.value("unlock", cx)),
                                     cx,
                                 )
+                                .loading(busy)
                                 .primary()
                                 .w_full()
                                 .h_8(),
