@@ -27,6 +27,51 @@ fn stack(board: &Board) -> Vec<&str> {
 }
 
 #[test]
+fn a_connector_is_re_routed_whole_and_a_card_has_no_run_to_re_route() {
+    let board = blank()
+        .changed_many(&[
+            create("card"),
+            Change::Create {
+                id: "edge".into(),
+                shape: path(Kind::Arrow),
+            },
+        ])
+        .unwrap();
+    let route = |id: &str, points: Vec<[i32; 2]>, to: Option<String>| Change::Route {
+        id: id.into(),
+        x: 40,
+        y: 60,
+        width: 200,
+        height: 120,
+        points,
+        from: None,
+        to,
+    };
+    let moved = board
+        .changed(&route(
+            "edge",
+            vec![[0, 0], [100, 60], [200, 120]],
+            Some("card".into()),
+        ))
+        .unwrap();
+    let edge = &moved.shapes["edge"].shape;
+    // box, samples and binding all arrive together, in one revision
+    assert_eq!(
+        [edge.x, edge.y, edge.width, edge.height],
+        [40, 60, 200, 120]
+    );
+    assert_eq!(edge.points, vec![[0, 0], [100, 60], [200, 120]]);
+    assert_eq!(edge.to.as_deref(), Some("card"));
+    assert_eq!(moved.revision, board.revision + 1);
+    // a card is a box, not a run: naming one here is a mistake, not a no-op
+    let refused = moved.changed(&route("card", vec![[0, 0], [10, 10]], None));
+    assert_eq!(refused, Err("Only a connector carries a run.".into()));
+    // and a re-route still answers to every rule a path is held to
+    let empty = moved.changed(&route("edge", vec![[0, 0]], None));
+    assert!(empty.is_err());
+}
+
+#[test]
 fn stacking_names_what_rises_and_naming_everything_states_the_whole_stack() {
     let board = blank()
         .changed_many(&[create("a"), create("b"), create("c")])

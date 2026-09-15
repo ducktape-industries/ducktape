@@ -138,6 +138,13 @@ fn alpha(mut color: [f32; 4], alpha: f32) -> [f32; 4] {
 }
 /// The inset a card keeps around its text, in board units.
 const CARD_INSET: f32 = 12.;
+/// One card's words, as both the painter and the editor must lay them out.
+struct Lettering {
+    /// Screen-space type size, already scaled by the camera.
+    size: f32,
+    /// How far in from the card's box the words start, on every side.
+    inset: f32,
+}
 /// The inset every island keeps from the stage's edge.
 const ISLAND: f32 = 12.;
 /// The side of an icon-only tool.
@@ -1000,6 +1007,30 @@ impl BoardsView {
             ));
         }
     }
+    /// How a card's words are laid out. The painter and the inline editor both
+    /// ask, and both get this answer, so a label never changes size or jumps to
+    /// a different corner the moment you start typing — which would read as the
+    /// editor having its own opinion about the text rather than showing yours.
+    /// Every card writes from the top of its box, because the native editor
+    /// fills the box it is given and cannot be centred in it: words that sat in
+    /// the middle when painted would jump to the top the instant a caret
+    /// appeared. So the painter writes where the editor can.
+    fn lettering(&self, kind: Kind, size: [f32; 2]) -> Lettering {
+        let plain = kind == Kind::Text;
+        let edge = CARD_INSET * self.zoom;
+        // an ellipse and a diamond pinch away from their corners, so their
+        // words start further in — far enough to sit on the body, not beside it
+        let pinch = match kind {
+            Kind::Ellipse => 0.14,
+            Kind::Diamond => 0.22,
+            Kind::Note | Kind::Rectangle | Kind::Text => 0.,
+            Kind::Arrow | Kind::Line | Kind::Draw => 0.,
+        };
+        Lettering {
+            size: (if plain { 20. } else { 14. } * self.zoom).clamp(8., 60.),
+            inset: edge + size[0].min(size[1]) * pinch,
+        }
+    }
     /// A shape's words, pinned over its body and clipped to it.
     fn label(&self, id: &str, s: &Shape, box_: [f32; 4], opacity: f32) -> Option<Node> {
         let p = kit::palette();
@@ -1036,10 +1067,11 @@ impl BoardsView {
             excerpt(&s.text)
         };
         let ink = if blank { p.faint } else { p.foreground };
+        let letters = self.lettering(s.kind, [box_[2] - box_[0], box_[3] - box_[1]]);
         let label = kit::colored(
             kit::text_size(
                 kit::wrapping(kit::text(format!("boards/label/{id}"), text)),
-                (if s.kind == Kind::Text { 20. } else { 14. } * self.zoom).clamp(8., 60.),
+                letters.size,
             ),
             alpha(ink, opacity),
         );
@@ -1054,9 +1086,8 @@ impl BoardsView {
         {
             *clipped = true;
             *height = Some(Length::Fill);
-            *padding = Some(wire::Edges::all(CARD_INSET * self.zoom));
-            // an ellipse and a diamond pinch at the corners: centre their words
-            *align_y = (s.kind != Kind::Note).then_some(AlignY::Center);
+            *padding = Some(wire::Edges::all(letters.inset));
+            *align_y = None;
         }
         Some(Node::Pin {
             key: format!("boards/pin/{id}"),
@@ -1099,23 +1130,35 @@ impl BoardsView {
                 1.5,
                 ring,
             ));
-            let handled = self.selected.len() == 1 && self.inline.is_none() && interaction::free(s);
-            if !handled {
+            let alone = self.selected.len() == 1 && self.inline.is_none();
+            if !alone {
+                continue;
+            }
+            let grip = |at: [f32; 2]| Draw::Draw {
+                shape: Geometry::Rectangle {
+                    position: [at[0] - 3.5, at[1] - 3.5],
+                    size: [7., 7.],
+                    radius: [1.5; 4],
+                },
+                fill: Some(Rgba(p.background)),
+                even_odd: false,
+                stroke: Some(pen(accent, 1.5)),
+            };
+            // A connector is taken by its ends, a card by its corners: the grip
+            // a shape offers is the edit it can be given, and they differ.
+            if s.kind.is_path() {
+                let run = interaction::stroke(board, s);
+                for end in [run.first(), run.last()].into_iter().flatten() {
+                    out.push(grip(self.screen(end[0], end[1])));
+                }
+                continue;
+            }
+            if !interaction::free(s) {
                 continue;
             }
             for corner in [[-1, -1], [1, -1], [-1, 1], [1, 1]] {
                 let world = interaction::corner_point(s, corner);
-                let handle = self.screen(world[0], world[1]);
-                out.push(Draw::Draw {
-                    shape: Geometry::Rectangle {
-                        position: [handle[0] - 3.5, handle[1] - 3.5],
-                        size: [7., 7.],
-                        radius: [1.5; 4],
-                    },
-                    fill: Some(Rgba(p.background)),
-                    even_odd: false,
-                    stroke: Some(pen(accent, 1.5)),
-                });
+                out.push(grip(self.screen(world[0], world[1])));
             }
         }
         for guide in &self.guides {
@@ -1175,6 +1218,33 @@ impl BoardsView {
                     boards::MAX_POINTS,
                     out,
                 );
+            }
+            // An endpoint in hand says what it would take hold of: the card it
+            // is over is ringed, so releasing is a decision you already made
+            // rather than one you find out about afterwards.
+            Gesture::Endpoint { point, shape, .. } => {
+                let binds = shape.kind == Kind::Arrow;
+                let Some(id) = binds
+                    .then(|| self.topmost(board, *point, |s: &Shape| !s.kind.is_path()))
+                    .flatten()
+                else {
+                    return;
+                };
+                let Some(record) = board.shapes.get(&id) else {
+                    return;
+                };
+                let card = &record.shape;
+                out.push(rectangle(
+                    self.screen(card.x as f32, card.y as f32),
+                    [
+                        card.width as f32 * self.zoom,
+                        card.height as f32 * self.zoom,
+                    ],
+                    wash,
+                    accent,
+                    2.,
+                    (6. * self.zoom).clamp(2., 20.),
+                ));
             }
             Gesture::Idle
             | Gesture::Pan { .. }
@@ -1715,14 +1785,12 @@ impl BoardsView {
             },
         )
         .register(std::convert::identity, Message::TextTransaction);
-        let color = if shape.kind == Kind::Note {
-            fill(shape.color)
-        } else {
-            self.canvas_color()
-        };
+        // The card is already painted underneath, fill and outline and all; an
+        // opaque field over it would replace the shape you are writing inside
+        // with a plain rectangle for as long as you typed.
         let style = wire::InputStyle {
             active: wire::InputFace {
-                background: Some(Rgba(color)),
+                background: Some(Rgba([0.; 4])),
                 value: Some(Rgba(kit::palette().foreground)),
                 border: Some(wire::Border {
                     width: Some(0.),
@@ -1734,25 +1802,31 @@ impl BoardsView {
             focus_border: Some(Rgba([0.; 4])),
             ..Default::default()
         };
+        let letters = self.lettering(shape.kind, size);
         let editor = Node::Editor {
             key: format!("boards/editor/{}", inline.id),
             document,
             on_document,
             editable: true,
             placeholder: "Write a thought…".into(),
-            width: Some((size[0] - 2. * CARD_INSET * self.zoom).max(40.)),
+            width: Some((size[0] - 2. * letters.inset).max(40.)),
             height: Some(Length::Fill),
-            min_height: Some(32.),
+            min_height: Some(letters.size * 1.6),
             max_height: None,
             options: Box::new(wire::EditorOptions {
                 binding: Some(Box::new(binding)),
-                size: Some((14. * self.zoom).clamp(10., 42.)),
+                size: Some(letters.size),
                 padding: Some(0.),
                 style,
                 ..Default::default()
             }),
         };
-        let inset = CARD_INSET * self.zoom;
+        let layout = kit::sized(
+            kit::container("boards/editor-layout", editor),
+            Some(Length::Fill),
+            Some(Length::Fill),
+        );
+        let inset = letters.inset;
         Node::Pin {
             key: "boards/editor-pin".into(),
             x: pos[0] + inset,
@@ -1769,11 +1843,7 @@ impl BoardsView {
                 on_hide: None,
                 anticipate: None,
                 delay: None,
-                child: Box::new(kit::sized(
-                    kit::container("boards/editor-layout", editor),
-                    Some(Length::Fill),
-                    Some(Length::Fill),
-                )),
+                child: Box::new(layout),
             }),
         }
     }
