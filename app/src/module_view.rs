@@ -4382,7 +4382,7 @@ pub(crate) mod tests {
     /// reference, and its bytes arrive over frames, so a test that reads
     /// the document right after the redraw that mounted the editor reads
     /// nothing. The pump is bounded by the frames a transfer can take.
-    fn settle_documents(guest: &mut Guest, props: &Option<Vec<u8>>) {
+    pub(super) fn settle_documents(guest: &mut Guest, props: &Option<Vec<u8>>) {
         for _ in 0..128 {
             let busy = guest.redraw(props);
             assert!(guest.fault.is_none(), "{:?}", guest.fault);
@@ -6122,7 +6122,7 @@ pub(crate) mod tests {
 
     /// The pages view's session facts: the chain because a `duck://page/…`
     /// address carries it, and the page a link asked the app to open.
-    fn pages_facts() -> Option<Vec<u8>> {
+    pub(super) fn pages_facts() -> Option<Vec<u8>> {
         Some(
             serde_json::to_vec(&serde_json::json!({
                 "dark": false, "connected": true, "chain": "mynet#d0cdf950",
@@ -6136,7 +6136,7 @@ pub(crate) mod tests {
     /// thread: a long page — a document that fills the pane at every window
     /// width the card is measured in — and a real conversation on one of its
     /// paragraphs, so the card in the picture is a card and not a plate.
-    fn can_a_commented_page() {
+    pub(super) fn can_a_commented_page() {
         let blocks = (1..=80).map(|n| {
             serde_json::json!({
                 "id": format!("alpha-{n}"), "parent": "alpha", "page": "alpha",

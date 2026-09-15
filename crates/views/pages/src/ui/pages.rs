@@ -628,6 +628,11 @@ impl PagesView {
             margin.line =
                 crate::rich_document::block_index(self.document.state_view().text, margin.line);
         }
+        if let Some(menu) = &mut presentation.affordances.menu
+            && let wire::editor_presentation::EditorMenuAnchor::Line(line) = &mut menu.anchor
+        {
+            *line = crate::rich_document::block_index(self.document.state_view().text, *line);
+        }
         let editable = self.connected
             && !self.loading
             && self.host_error.is_empty()

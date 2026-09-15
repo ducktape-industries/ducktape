@@ -13,7 +13,8 @@ use gpui_notion::editor::block::{BlockAttrs, BlockContent};
 use gpui_notion::editor::mark::{HighlightColor, Mark, MarkKind, MarkList, TextColor};
 use gpui_notion::editor::theme::ActiveEditorTheme as _;
 use gpui_notion::editor::toolbar::{ToolbarAction, ToolbarItem};
-use gpui_notion::editor::view::{Caret, DocumentChanged};
+use gpui_notion::editor::slash::{ApplicationMenu, ApplicationMenuAnchor, MenuAction};
+use gpui_notion::editor::view::{Caret, DocumentChanged, SelectionChanged};
 use ui_lang_wire as wire;
 use wire::editor_presentation::EditorMargin;
 
@@ -47,7 +48,10 @@ pub struct RichWireEditor {
     bounds: Option<Bounds<Pixels>>,
     /// Guest-authored margin badges indexed by rich block.
     margins: Vec<EditorMargin>,
+    menu: Option<wire::editor_presentation::EditorMenu>,
+    _menu_actions: Subscription,
     _changes: Subscription,
+    _selection: Subscription,
     _actions: Subscription,
     _annotations: Subscription,
 }
@@ -64,12 +68,18 @@ impl RichWireEditor {
         let editor = cx.new(|cx| {
             let mut editor = NotionEditor::new(window, cx);
             editor.set_annotation_mode(AnnotationMode::External);
+            editor.set_application_menu(None, cx);
             editor
         });
         let changes = cx.subscribe_in(
             &editor,
             window,
             |this, _, _: &DocumentChanged, window, cx| this.changed(String::new(), window, cx),
+        );
+        let selection = cx.subscribe_in(
+            &editor,
+            window,
+            |this, _, _: &SelectionChanged, window, cx| this.changed(String::new(), window, cx),
         );
         let actions = cx.subscribe_in(
             &editor,
@@ -83,6 +93,10 @@ impl RichWireEditor {
             window,
             |this, _, event: &AnnotationRequested, _, cx| this.annotation(event, cx),
         );
+        let menu_actions =
+            cx.subscribe_in(&editor, window, |this, _, action: &MenuAction, _, cx| {
+                this.menu_action(action, cx);
+            });
         let mut this = Self {
             key,
             store,
@@ -92,7 +106,10 @@ impl RichWireEditor {
             fault: None,
             bounds: None,
             margins: Vec::new(),
+            menu: None,
+            _menu_actions: menu_actions,
             _changes: changes,
+            _selection: selection,
             _actions: actions,
             _annotations: annotations,
         };
@@ -123,6 +140,35 @@ impl RichWireEditor {
         let Some(rich) = projection.options.rich.as_ref() else {
             return;
         };
+        let menu = projection
+            .options
+            .presentation
+            .as_ref()
+            .and_then(|paint| paint.affordances.menu.clone());
+        if self.menu != menu {
+            let native = menu.as_ref().map(|menu| ApplicationMenu {
+                anchor: match menu.anchor {
+                    wire::editor_presentation::EditorMenuAnchor::Caret => {
+                        ApplicationMenuAnchor::Caret
+                    }
+                    wire::editor_presentation::EditorMenuAnchor::Line(line) => {
+                        ApplicationMenuAnchor::Block(line as usize)
+                    }
+                },
+                items: menu
+                    .items
+                    .iter()
+                    .map(|item| ToolbarItem {
+                        tag: item.tag.clone().into(),
+                        label: item.label.clone().into(),
+                    })
+                    .collect(),
+                selected: menu.selected as usize,
+            });
+            self.editor
+                .update(cx, |editor, cx| editor.set_application_menu(native, cx));
+            self.menu = menu;
+        }
         self.editor.update(cx, |editor, cx| {
             editor.set_toolbar(
                 Some(
@@ -191,8 +237,11 @@ impl RichWireEditor {
 
     fn snapshot(&self, cx: &App) -> Result<wire::editor_rich::RichDocument, &'static str> {
         let editor = self.editor.read(cx);
+        // A newly installed, unfocused input has a local caret at zero.
+        // Only a focused input can replace the guest's supplied cursor.
         let cursor = editor
-            .selection(cx)
+            .focused_id()
+            .and_then(|_| editor.selection(cx))
             .and_then(|(id, range)| {
                 let index = editor.index_of(id)?;
                 let caret = editor.caret_offset(id, cx).unwrap_or(range.end);
@@ -223,6 +272,42 @@ impl RichWireEditor {
         })
     }
 
+    fn menu_action(&mut self, action: &MenuAction, cx: &mut Context<Self>) {
+        use wire::editor_presentation::EditorInteraction;
+        let interaction = match action {
+            MenuAction::Select(index) => EditorInteraction::MenuSelect {
+                index: *index as u32,
+            },
+            MenuAction::Pick(tag) => EditorInteraction::MenuPick {
+                tag: tag.to_string(),
+            },
+            MenuAction::Dismiss => EditorInteraction::MenuDismiss,
+            MenuAction::Open(trigger) => EditorInteraction::Action {
+                tag: trigger.to_string(),
+            },
+        };
+        let document = match self.snapshot(cx) {
+            Ok(document) => document,
+            Err(error) => {
+                self.note_fault(Some(error));
+                return;
+            }
+        };
+        self.store.request(
+            &self.key,
+            wire::EditorRequestInput::RichEdit {
+                edit: Box::new(wire::editor_rich::RichEdit {
+                    before: Some(self.installed.clone()),
+                    document,
+                    action: String::new(),
+                    interaction: Some(interaction),
+                }),
+            },
+        );
+        cx.emit(());
+        cx.notify();
+    }
+
     fn changed(&mut self, action: String, _window: &mut Window, cx: &mut Context<Self>) {
         let document = match self.snapshot(cx) {
             Ok(document) => document,
@@ -231,7 +316,7 @@ impl RichWireEditor {
                 return;
             }
         };
-        let unchanged = document.blocks == self.installed.blocks && action.is_empty();
+        let unchanged = document == self.installed && action.is_empty();
         if unchanged {
             return;
         }
@@ -643,6 +728,199 @@ fn restore_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui_kit::test]
+    fn rich_application_menu_returns_opaque_choice_through_the_document_queue(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        application_menu_request(cx, MenuGesture::Pick);
+    }
+
+    #[gpui_kit::test]
+    fn rich_application_menu_escape_uses_the_document_queue(cx: &mut gpui_kit::TestAppContext) {
+        application_menu_request(cx, MenuGesture::Dismiss);
+    }
+
+    #[gpui_kit::test]
+    fn rich_application_menu_receives_caret_movement(cx: &mut gpui_kit::TestAppContext) {
+        application_menu_request(cx, MenuGesture::Move);
+    }
+
+    #[gpui_kit::test]
+    fn rich_application_menu_uses_the_guest_line_anchor(cx: &mut gpui_kit::TestAppContext) {
+        application_menu_request(cx, MenuGesture::LinePick);
+    }
+
+    #[gpui_kit::test]
+    fn rich_application_menu_can_anchor_to_a_divider(cx: &mut gpui_kit::TestAppContext) {
+        application_menu_request(cx, MenuGesture::DividerPick);
+    }
+
+    #[derive(Clone, Copy)]
+    enum MenuGesture {
+        DividerPick,
+        LinePick,
+        Pick,
+        Dismiss,
+        Move,
+    }
+
+    fn application_menu_request(cx: &mut gpui_kit::TestAppContext, gesture: MenuGesture) {
+        use gpui_kit::test::TestWindowExt as _;
+        use wire::editor_presentation::{
+            EditorMenu, EditorMenuAnchor, EditorMenuItem, EditorPresentation, EditorInteraction,
+        };
+        cx.update(gpui_kit::init);
+        cx.update(init);
+        let store = EditorStore::new(93);
+        let source = match gesture {
+            MenuGesture::LinePick => "@\nsecond",
+            MenuGesture::DividerPick => "@\n---",
+            _ => "@",
+        };
+        let reference = wire::editor_document::EditorDocumentRef {
+            document: "application-document".into(),
+            reset: 1,
+            revision: 0,
+            text_revision: 0,
+            byte_len: source.len() as u32,
+            cursor: wire::EditorCursor {
+                position: wire::EditorPosition { line: 0, column: 1 },
+                selection: None,
+            },
+        };
+        let mut paint = EditorPresentation::default();
+        paint.affordances.menu = Some(EditorMenu {
+            anchor: match gesture {
+                MenuGesture::LinePick | MenuGesture::DividerPick => EditorMenuAnchor::Line(1),
+                _ => EditorMenuAnchor::Caret,
+            },
+            items: vec![EditorMenuItem {
+                tag: "opaque-choice".into(),
+                label: "Application person".into(),
+            }],
+            selected: 0,
+        });
+        let rich = wire::editor_rich::RichPresentation {
+            document: wire::editor_rich::RichDocument {
+                blocks: source
+                    .lines()
+                    .map(|text| match text {
+                        "---" => wire::editor_rich::RichBlock {
+                            kind: "horizontalRule".into(),
+                            ..Default::default()
+                        },
+                        _ => wire::editor_rich::RichBlock {
+                            kind: "paragraph".into(),
+                            text: text.into(),
+                            ..Default::default()
+                        },
+                    })
+                    .collect(),
+                cursor: reference.cursor,
+            },
+            ..Default::default()
+        };
+        {
+            let mut locked = store.lock();
+            locked.fields.insert(
+                "editor".into(),
+                crate::editor::wire::Field {
+                    reference: reference.clone(),
+                    handler: 1,
+                    editable: true,
+                    placeholder: String::new(),
+                    options: wire::EditorOptions {
+                        presentation: Some(Box::new(paint)),
+                        rich: Some(Box::new(rich)),
+                        binding: Some(Box::new(wire::EditorBinding {
+                            authored: true,
+                            on_request: 2,
+                            on_event: 3,
+                            claims: Vec::new(),
+                        })),
+                        ..Default::default()
+                    },
+                },
+            );
+            locked.documents.insert(
+                reference.document.clone(),
+                crate::editor::wire::Document {
+                    reference,
+                    text: Some(std::sync::Arc::from(source)),
+                    queue: Default::default(),
+                    queued_bytes: 0,
+                    phase: crate::editor::wire::Phase::Ready,
+                },
+            );
+        }
+        let window = cx.open_window(gpui_kit::size(px(600.), px(400.)), |window, cx| {
+            RichWireEditor::new("editor".into(), store.clone(), window, cx)
+        });
+        let editor = window.root(cx).unwrap();
+        let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        native.update(|window, cx| {
+            window.render_frame(cx);
+            let child = editor.read(cx).editor.clone();
+            child.update(cx, |child, cx| {
+                let id = child.block_id_at(0).unwrap();
+                child.focus_block(id, Caret::End, window, cx);
+            });
+            window.render_frame(cx);
+            assert!(
+                child.read(cx).suggestion_is_open(),
+                "the application supplied the menu"
+            );
+        });
+        native.run_until_parked();
+        let initial = store.drain();
+        assert!(
+            initial.is_empty(),
+            "initial projection must settle without an edit: {initial:?}"
+        );
+        native.update(|window, cx| {
+            window.render_frame(cx);
+            match gesture {
+                MenuGesture::LinePick | MenuGesture::DividerPick => {
+                    let menu = window.find(("application-suggestion", 0usize)).bounds();
+                    let block = window.find(("block", 3usize)).bounds();
+                    assert!(
+                        menu.top() >= block.bottom(),
+                        "menu {menu:?} must follow the supplied block {block:?}"
+                    );
+                    window.click(("application-suggestion", 0usize), cx);
+                }
+                MenuGesture::Pick => window.click(("application-suggestion", 0usize), cx),
+                MenuGesture::Dismiss => window.press("escape", cx),
+                MenuGesture::Move => window.press("left", cx),
+            }
+        });
+        native.run_until_parked();
+        let requests = store.drain();
+        let expected = match gesture {
+            MenuGesture::Pick | MenuGesture::LinePick | MenuGesture::DividerPick => {
+                Some(EditorInteraction::MenuPick {
+                    tag: "opaque-choice".into(),
+                })
+            }
+            MenuGesture::Dismiss => Some(EditorInteraction::MenuDismiss),
+            MenuGesture::Move => None,
+        };
+        assert!(
+            requests.iter().any(
+                |event| matches!(event, wire::Event::EditorRequest { request, .. }
+            if matches!(&request.input, wire::EditorRequestInput::RichEdit { edit }
+                if edit.interaction == expected && (expected.is_some() || edit.document.cursor.position.column == 0)))
+            ),
+            "menu choice must use the canonical document queue"
+        );
+        assert_eq!(
+            store.lock().documents["application-document"]
+                .text
+                .as_deref(),
+            Some(source)
+        );
+    }
 
     #[test]
     fn native_attributes_round_trip_through_the_rich_projection() {

@@ -201,7 +201,13 @@ impl BindingState {
             Some(wire::EditorRequestInput::RichEdit { edit }) => {
                 let native_edit = edit.action.is_empty() && edit.interaction.is_none();
                 if native_edit {
-                    self.menu.after_edit(&after_doc, None);
+                    let changed_text = before.text != after.text;
+                    if changed_text {
+                        self.menu
+                            .after_edit(&after_doc, rich_trigger(before.text, &after_doc));
+                    } else {
+                        self.menu.moved(&after_doc);
+                    }
                 }
             }
             Some(wire::EditorRequestInput::Key { .. }) | None => {
@@ -242,29 +248,39 @@ impl BindingState {
                     return None;
                 };
                 let doc = rebase_rich(before, edit, document(&text, cursor))?;
-                if matches!(
-                    edit.interaction,
-                    Some(wire::editor_presentation::EditorInteraction::Margin { .. })
-                ) {
-                    crate::document_sync::Navigation {
-                        comment_line: Some(doc.cursor.position.line),
-                        anchor: crate::document_sync::text_anchor(
-                            doc.line(doc.cursor.position.line as usize)
-                                .unwrap_or_default(),
-                            crate::editor_menu::selection_columns(
-                                &doc,
-                                doc.cursor.position.line as usize,
+                match &edit.interaction {
+                    Some(wire::editor_presentation::EditorInteraction::Margin { .. }) => {
+                        crate::document_sync::Navigation {
+                            comment_line: Some(doc.cursor.position.line),
+                            anchor: crate::document_sync::text_anchor(
+                                doc.line(doc.cursor.position.line as usize)
+                                    .unwrap_or_default(),
+                                crate::editor_menu::selection_columns(
+                                    &doc,
+                                    doc.cursor.position.line as usize,
+                                ),
                             ),
-                        ),
-                        ..Default::default()
+                            ..Default::default()
+                        }
                     }
-                } else {
-                    if !self.menu.is_open() {
-                        self.menu.format(&doc);
+                    Some(action) => {
+                        let navigation = match action {
+                            wire::editor_presentation::EditorInteraction::MenuPick { tag } => {
+                                self.menu.intent(&doc, tag)
+                            }
+                            _ => crate::document_sync::Navigation::default(),
+                        };
+                        self.menu = interaction(&doc, self.menu.clone(), action).1;
+                        navigation
                     }
-                    let navigation = self.menu.intent(&doc, &edit.action);
-                    self.menu = self.menu.pick(&doc, &edit.action).1;
-                    navigation
+                    None => {
+                        if !self.menu.is_open() {
+                            self.menu.format(&doc);
+                        }
+                        let navigation = self.menu.intent(&doc, &edit.action);
+                        self.menu = self.menu.pick(&doc, &edit.action).1;
+                        navigation
+                    }
                 }
             }
             _ => crate::document_sync::Navigation::default(),
@@ -452,10 +468,15 @@ fn interaction(
                 menu,
             )
         }
-        EditorInteraction::Action { tag } => {
-            menu.format(doc);
-            menu.pick(doc, tag)
-        }
+        EditorInteraction::Action { tag } => match tag.as_str() {
+            "/" => menu.open_trigger(doc, '/'),
+            "@" => menu.open_trigger(doc, '@'),
+            ":" => menu.open_trigger(doc, ':'),
+            _ => {
+                menu.format(doc);
+                menu.pick(doc, tag)
+            }
+        },
         EditorInteraction::MenuPick { tag } => menu.pick(doc, tag),
         EditorInteraction::MenuSelect { index } => {
             menu.select(doc, *index as usize);
@@ -619,6 +640,25 @@ fn wire_decision(doc: &Doc, decision: editor::EditorDecision) -> EditorDecision 
     }
 }
 
+/// A single inserted trigger opens suggestions. Bulk edits, deletion, and
+/// caret movement cannot turn existing source into a newly typed trigger.
+fn rich_trigger(before: &str, after: &Doc) -> Option<char> {
+    let patches = wire::editor_document::editor_changed_span(before, &after.text).ok()?;
+    let [patch] = patches.as_slice() else {
+        return None;
+    };
+    let inserted_at_caret = patch.start_byte == patch.end_byte
+        && after.offset(after.cursor.position)
+            == patch.start_byte as usize + patch.replacement.len();
+    if !inserted_at_caret {
+        return None;
+    }
+    let mut characters = patch.replacement.chars();
+    let trigger = characters.next()?;
+    let single_trigger = characters.next().is_none() && TRIGGERS.contains(&trigger);
+    single_trigger.then_some(trigger)
+}
+
 /// A rich snapshot is still one canonical transaction, so draft, undo and
 /// replacement lifetime follow the same commit acknowledgment as native text.
 fn rich_decision(
@@ -633,18 +673,21 @@ fn rich_decision(
     let Some(doc) = rebase_rich(state, edit, incoming) else {
         return EditorDecision::Noop;
     };
-    let after = if edit.action.is_empty() {
-        doc
-    } else {
-        if !menu.is_open() {
-            menu.format(&doc);
+    let decision = match (&edit.interaction, edit.action.as_str()) {
+        (Some(action), _) => interaction(&doc, menu, action).0,
+        (None, "") => editor::EditorDecision::Noop,
+        (None, tag) => {
+            if !menu.is_open() {
+                menu.format(&doc);
+            }
+            menu.pick(&doc, tag).0
         }
-        match menu.pick(&doc, &edit.action).0 {
-            editor::EditorDecision::Apply {
-                patches, cursor, ..
-            } => editor::apply(&doc, &patches, cursor),
-            editor::EditorDecision::Noop | editor::EditorDecision::DefaultEditorAction => doc,
-        }
+    };
+    let after = match decision {
+        editor::EditorDecision::Apply {
+            patches, cursor, ..
+        } => editor::apply(&doc, &patches, cursor),
+        editor::EditorDecision::Noop | editor::EditorDecision::DefaultEditorAction => doc,
     };
     let Ok(patches) = wire::editor_document::editor_changed_span(state.text, &after.text) else {
         return EditorDecision::Noop;
@@ -717,6 +760,237 @@ fn rebase_rich(
 #[cfg(test)]
 mod rich_tests {
     use super::*;
+
+    #[test]
+    fn rich_typing_opens_guest_suggestions_without_treating_paste_or_delete_as_typing() {
+        for (before_text, after_text, opens) in [
+            ("T\nhello ", "T\nhello @", true),
+            ("T\n", "T\n/", true),
+            ("T\nhello ", "T\nhello :", true),
+            ("T\n", "T\npasted @", false),
+            ("T\n@x", "T\n@", false),
+            ("T\n@", "T\n@", false),
+            ("T\naddress", "T\naddress@", false),
+        ] {
+            let view = |text| ducktape_view_guest::EditorStateView {
+                text,
+                cursor: wire::EditorCursor {
+                    position: wire::EditorPosition {
+                        line: 1,
+                        column: (text.len() - 2) as u32,
+                    },
+                    selection: None,
+                },
+                reset: 1,
+                revision: 1,
+                text_revision: 1,
+            };
+            let before = view(before_text);
+            let after = ducktape_view_guest::EditorStateView {
+                revision: 2,
+                text_revision: 2,
+                ..view(after_text)
+            };
+            let id = wire::EditorTransactionId {
+                instance: 1,
+                document: "doc".into(),
+                reset: 1,
+                sequence: 1,
+                attempt: 0,
+                text_revision: 1,
+                revision: 1,
+            };
+            let origin = wire::EditorRequestInput::RichEdit {
+                edit: Box::new(wire::editor_rich::RichEdit {
+                    document: crate::rich_document::presentation(after_text, after.cursor).document,
+                    ..Default::default()
+                }),
+            };
+            let mut binding = BindingState {
+                history: Default::default(),
+                menu: crate::editor_menu::Menu::default().with_names(&["Ada".into()]),
+            };
+            binding
+                .observe(EditorTransactionEvent::Commit {
+                    id: &id,
+                    before,
+                    after,
+                    origin: Some(&origin),
+                    kind: wire::EditorEditKind::GuestPatch,
+                    history: EditorHistoryEffect::Native,
+                    input_time_ms: 0,
+                })
+                .expect("rich edit observed");
+            assert_eq!(
+                binding.menu.is_open(),
+                opens,
+                "{before_text:?} -> {after_text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rich_menu_interactions_apply_guest_choices_and_open_triggers() {
+        use wire::editor_presentation::EditorInteraction;
+        for (text, action, expected, open_after) in [
+            (
+                "T\n@",
+                EditorInteraction::MenuPick { tag: "Ada".into() },
+                "T\n@Ada ",
+                false,
+            ),
+            (
+                "T\nhello",
+                EditorInteraction::Action { tag: "@".into() },
+                "T\nhello @",
+                true,
+            ),
+        ] {
+            let cursor = wire::EditorCursor {
+                position: wire::EditorPosition {
+                    line: 1,
+                    column: (text.len() - 2) as u32,
+                },
+                selection: None,
+            };
+            let doc = document(text, cursor);
+            let mut menu = crate::editor_menu::Menu::default().with_names(&["Ada".into()]);
+            menu.after_edit(&doc, Some('@'));
+            let state = ducktape_view_guest::EditorStateView {
+                text,
+                cursor,
+                reset: 1,
+                revision: 1,
+                text_revision: 1,
+            };
+            let rich = crate::rich_document::presentation(text, cursor).document;
+            let edit = wire::editor_rich::RichEdit {
+                before: Some(rich.clone()),
+                document: rich,
+                interaction: Some(action),
+                ..Default::default()
+            };
+            let mut binding = BindingState {
+                history: Default::default(),
+                menu: menu.clone(),
+            };
+            binding.history.at_reset(1);
+            let EditorDecision::Apply {
+                patches,
+                cursor,
+                history,
+            } = rich_decision(state, &edit, menu)
+            else {
+                panic!("rich interaction decision");
+            };
+            let actual = wire::patched_editor_text(text, &patches, cursor).unwrap();
+            assert_eq!(actual, expected);
+            let id = wire::EditorTransactionId {
+                instance: 1,
+                document: "doc".into(),
+                reset: 1,
+                sequence: 1,
+                attempt: 0,
+                revision: 1,
+                text_revision: 1,
+            };
+            let origin = wire::EditorRequestInput::RichEdit {
+                edit: Box::new(edit),
+            };
+            binding
+                .observe(EditorTransactionEvent::Commit {
+                    id: &id,
+                    before: state,
+                    after: ducktape_view_guest::EditorStateView {
+                        text: &actual,
+                        cursor,
+                        revision: 2,
+                        text_revision: 2,
+                        ..state
+                    },
+                    origin: Some(&origin),
+                    kind: wire::EditorEditKind::GuestPatch,
+                    history,
+                    input_time_ms: 0,
+                })
+                .unwrap();
+            assert_eq!(
+                binding.menu.is_open(),
+                open_after,
+                "commit installs the menu successor"
+            );
+        }
+    }
+
+    #[test]
+    fn rich_caret_commit_closes_the_guest_mention_menu_without_editing_text() {
+        let text = "T\n@";
+        let cursor = wire::EditorCursor {
+            position: wire::EditorPosition { line: 1, column: 1 },
+            selection: None,
+        };
+        let state = ducktape_view_guest::EditorStateView {
+            text,
+            cursor,
+            reset: 1,
+            revision: 1,
+            text_revision: 1,
+        };
+        let mut menu = crate::editor_menu::Menu::default().with_names(&["Ada".into()]);
+        menu.after_edit(&document(text, cursor), Some('@'));
+        assert!(menu.is_open());
+        let before = crate::rich_document::presentation(text, cursor).document;
+        let mut moved = before.clone();
+        moved.cursor.position.column = 0;
+        let edit = wire::editor_rich::RichEdit {
+            before: Some(before),
+            document: moved,
+            ..Default::default()
+        };
+        let EditorDecision::Apply {
+            patches,
+            cursor,
+            history,
+        } = rich_decision(state, &edit, menu.clone())
+        else {
+            panic!("rich caret decision");
+        };
+        assert!(patches.is_empty());
+        assert_eq!(cursor.position.column, 0);
+        let mut binding = BindingState {
+            history: Default::default(),
+            menu,
+        };
+        binding.history.at_reset(1);
+        let id = wire::EditorTransactionId {
+            instance: 1,
+            document: "doc".into(),
+            reset: 1,
+            sequence: 1,
+            attempt: 0,
+            revision: 1,
+            text_revision: 1,
+        };
+        let origin = wire::EditorRequestInput::RichEdit {
+            edit: Box::new(edit),
+        };
+        binding
+            .observe(EditorTransactionEvent::Commit {
+                id: &id,
+                before: state,
+                after: ducktape_view_guest::EditorStateView {
+                    cursor,
+                    revision: 2,
+                    ..state
+                },
+                origin: Some(&origin),
+                kind: wire::EditorEditKind::GuestPatch,
+                history,
+                input_time_ms: 0,
+            })
+            .unwrap();
+        assert!(!binding.menu.is_open());
+    }
 
     #[test]
     fn annotation_queued_behind_formatting_anchors_the_committed_selection() {

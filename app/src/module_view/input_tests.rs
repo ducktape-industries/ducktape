@@ -1,4 +1,4 @@
-//! The actual staged Chat view in native GPUI windows: no Iced renderer.
+//! Actual staged Chat and Pages views in native GPUI windows.
 use super::*;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{self as gpui, Entity, TestAppContext, VisualTestContext};
@@ -549,4 +549,124 @@ fn ime_observations_keep_unicode_selection_and_commit_order() {
             },
         ]
     );
+}
+
+#[gpui_kit::test]
+fn pages_wasm_owns_native_mention_menu_and_replacement(cx: &mut TestAppContext) {
+    let _turn = tests::blocking_connection_turn();
+    tests::can_a_commented_page();
+    tests::can_reads([("model", serde_json::json!({"model": {"agents": []}}))]);
+    let props = tests::pages_facts();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/views/pages_view.wasm");
+    let mut guest = Guest::load_from("pages", &path).expect("build current Pages view first");
+    tests::settle_documents(&mut guest, &props);
+    let seat = Arc::new(Mutex::new(Mounted {
+        changes: tokio::sync::watch::channel(()).0,
+        slot: Slot::Ready(Box::new(guest)),
+        props,
+        generation: 1,
+        hash: None,
+        in_flight: false,
+        wanted: None,
+        tasting: None,
+        waiting_since: None,
+        replacement: Replacement::Preserve,
+        retry: None,
+    }));
+    registry().lock().unwrap().insert("pages", seat.clone());
+    cx.update(gpui_kit::init);
+    cx.update(crate::editor::wire::init_notion);
+    let window = cx.open_window(gpui::size(gpui::px(1200.), gpui::px(800.)), |_, _| {
+        NativeModuleView::new("pages")
+    });
+    let mut native = VisualTestContext::from_window(window.into(), cx);
+    native.update(|window, cx| window.render_frame(cx));
+    settle_native_documents(&mut native, &seat);
+    native.update(|window, cx| {
+        window.render_frame(cx);
+        window.click(("block", 3usize), cx);
+        window.press("end", cx);
+        window.input(" ", cx);
+    });
+    settle_native_documents(&mut native, &seat);
+    native.update(|window, cx| window.input("@", cx));
+    settle_native_documents(&mut native, &seat);
+    let projection = || {
+        let locked = seat.lock().unwrap();
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("live Pages view");
+        };
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
+        let mut result = None;
+        guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+            if let wire::Node::Editor { options, .. } = node {
+                result = Some((
+                    options.rich.clone().unwrap(),
+                    options.presentation.clone().unwrap(),
+                ));
+            }
+        });
+        result.expect("Pages document editor")
+    };
+    let (rich, paint) = projection();
+    let menu = paint.affordances.menu.unwrap_or_else(|| {
+        panic!(
+            "the WASM opens the mention menu; first blocks: {:?}, cursor: {:?}",
+            &rich.document.blocks[..3],
+            rich.document.cursor
+        )
+    });
+    let row = menu
+        .items
+        .iter()
+        .position(|item| item.label.contains("Ada Lovelace"))
+        .expect("the WASM supplies the account directory");
+    native.update(|window, cx| {
+        window.render_frame(cx);
+        window.click(("application-suggestion", row), cx);
+    });
+    settle_native_documents(&mut native, &seat);
+    let (rich, paint) = projection();
+    assert!(
+        paint.affordances.menu.is_none(),
+        "the guest closes the committed menu"
+    );
+    assert!(
+        rich.document
+            .blocks
+            .iter()
+            .any(|block| block.text.ends_with(" @Ada Lovelace ")),
+        "the guest replaces the mention in its document: {:?}",
+        rich.document
+    );
+}
+
+fn settle_native_documents(native: &mut VisualTestContext, seat: &Arc<Mutex<Mounted>>) {
+    loop {
+        native.run_until_parked();
+        let ticks = {
+            let locked = seat.lock().unwrap();
+            let Slot::Ready(guest) = &locked.slot else {
+                panic!("seated view");
+            };
+            assert!(guest.fault.is_none(), "{:?}", guest.fault);
+            let pending = guest.frame.busy
+                || guest.inputs.pending()
+                || !guest.pending.is_empty()
+                || guest.inputs.ready() == Ok(false);
+            if !pending {
+                return;
+            }
+            guest.ticks
+        };
+        native.update(|window, cx| window.render_frame(cx));
+        let locked = seat.lock().unwrap();
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("seated view");
+        };
+        assert!(
+            guest.ticks > ticks,
+            "a requested native frame must advance the guest"
+        );
+    }
 }

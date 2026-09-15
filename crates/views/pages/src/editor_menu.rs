@@ -655,6 +655,29 @@ impl Menu {
         }
     }
 
+    pub fn open_trigger(&self, document: &Doc, trigger: char) -> (EditorDecision, Self) {
+        let offset = document.offset(document.cursor.position);
+        let prefix = &document.text[..offset];
+        let already_present = prefix.ends_with(trigger);
+        let next = if already_present {
+            document.clone()
+        } else {
+            let needs_space = prefix
+                .chars()
+                .next_back()
+                .is_some_and(|last| !last.is_whitespace());
+            let insertion = if needs_space {
+                format!(" {trigger}")
+            } else {
+                trigger.to_string()
+            };
+            replace(document, offset..offset, &insertion)
+        };
+        let mut menu = self.closed();
+        menu.after_edit(&next, Some(trigger));
+        (finish(document, next), menu)
+    }
+
     pub fn select(&mut self, document: &Doc, selected: usize) {
         if let Some(view) = self.current(document)
             && let Some(open) = self.open.as_mut()
