@@ -428,6 +428,7 @@ pub struct Ducktape {
     pub(crate) call_sharing: bool,
     pub(crate) call_video_live: bool,
     pub(crate) huddle_stage: String,
+    pub(crate) huddle_tiles: Vec<String>,
     pub(crate) huddle_roster: Vec<crate::backend::HuddleParticipant>,
     pub(crate) huddle_rows: Vec<crate::call::HuddleTileRow>,
     /// The huddle room's member roll, loaded on seating; the window offers
@@ -894,6 +895,7 @@ impl Ducktape {
             call_sharing: false,
             call_video_live: false,
             huddle_stage: "".to_owned(),
+            huddle_tiles: Vec::new(),
             huddle_roster: Vec::new(),
             huddle_rows: Vec::new(),
             huddle_invitees: Vec::new(),

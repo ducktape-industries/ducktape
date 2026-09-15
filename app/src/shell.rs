@@ -408,12 +408,14 @@ fn release_window_input(window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
     window.draw(cx).clear(cx);
 }
 
+struct VideoSurfaces {
+    selection: (String, Vec<String>),
+    tiles: Entity<crate::video::VideoView>,
+    picture: Entity<crate::video::VideoView>,
+}
+
 pub(crate) struct DesktopWindow {
-    video: Option<(
-        String,
-        Entity<crate::video::VideoView>,
-        Entity<crate::video::VideoView>,
-    )>,
+    video: Option<VideoSurfaces>,
     model: Entity<Desktop>,
     kind: WindowKind,
     module: Option<(&'static str, Entity<crate::module_view::NativeModuleView>)>,
@@ -1385,6 +1387,8 @@ impl DesktopWindow {
             "Share screen"
         };
         let stage = state.huddle_stage.clone();
+        let images = state.huddle_tiles.clone();
+        let selection = (stage.clone(), images.clone());
         let video_live = state.call_video_live;
         let invitees =
             crate::backend::huddle_invitees(&state.huddle_invitees, &state.huddle_roster);
@@ -1399,22 +1403,29 @@ impl DesktopWindow {
             String::new()
         };
         match &mut self.video {
-            Some((previous, tiles, picture)) => {
-                if previous != &stage {
-                    tiles.update(cx, |view, cx| view.replace_tiles(stage.clone(), cx));
+            Some(VideoSurfaces {
+                selection: previous,
+                tiles,
+                picture,
+            }) => {
+                if previous != &selection {
+                    tiles.update(cx, |view, cx| {
+                        view.replace_tiles(images.clone(), stage.clone(), cx)
+                    });
                     picture.update(cx, |view, cx| view.replace_stage(stage.clone(), cx));
-                    *previous = stage.clone();
+                    *previous = selection.clone();
                 }
             }
             None => {
-                self.video = Some((
-                    stage.clone(),
-                    cx.new(|_| crate::video::call_video_tiles(&stage)),
-                    cx.new(|_| crate::video::call_video_stage(&stage)),
-                ))
+                self.video = Some(VideoSurfaces {
+                    selection,
+                    tiles: cx.new(|_| crate::video::call_video_tiles(images, &stage)),
+                    picture: cx.new(|_| crate::video::call_video_stage(&stage)),
+                })
             }
         }
-        let (_, tiles, picture) = self.video.as_ref().expect("retained video surfaces");
+        let VideoSurfaces { tiles, picture, .. } =
+            self.video.as_ref().expect("retained video surfaces");
         let mut body = div()
             .id("huddle-stage")
             .flex_1()
@@ -2823,6 +2834,47 @@ mod close_tests {
             assert_eq!(
                 view.test_state(cx).bell_load_generation,
                 generation.wrapping_add(1)
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn huddle_replaces_tile_selection_without_a_stage_change(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        cx.update(gpui_kit::init);
+        let mut presenter = None;
+        let handle = cx.open_window(
+            gpui_kit::size(gpui_kit::px(560.), gpui_kit::px(600.)),
+            |window, cx| {
+                let (mut state, _) = Ducktape::boot();
+                state.call_video_live = true;
+                state.huddle_tiles = vec!["first-image".into()];
+                let view = test_window(state, WindowKind::Huddle, window, cx);
+                presenter = Some(view.clone());
+                gpui_kit::component::Root::new(view, window, cx)
+            },
+        );
+        let presenter = presenter.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        presenter.read_with(cx, |view, _| {
+            assert_eq!(
+                view.video.as_ref().unwrap().selection,
+                (String::new(), vec!["first-image".into()])
+            );
+        });
+        presenter.update(cx, |view, cx| {
+            view.model.update(cx, |model, cx| {
+                model.state.huddle_tiles = vec!["second-image".into()];
+                cx.notify();
+            });
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        presenter.read_with(cx, |view, _| {
+            assert_eq!(
+                view.video.as_ref().unwrap().selection,
+                (String::new(), vec!["second-image".into()])
             );
         });
     }

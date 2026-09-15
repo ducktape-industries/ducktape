@@ -5006,6 +5006,7 @@ impl Ducktape {
         self.call_sharing = false;
         self.call_video_live = false;
         self.huddle_stage = "".to_owned();
+        self.huddle_tiles.clear();
         self.call_peers = Vec::new();
         if (self.connected_rpc).is_empty() {
             return Task::none();
@@ -5363,10 +5364,12 @@ impl Ducktape {
             "error" | "refused" | "closed" => {
                 self.call_peers.clear();
                 self.huddle_stage.clear();
+                self.huddle_tiles.clear();
                 self.call_video_live = false;
             }
             "presentation" => {
                 self.huddle_stage = event.stage.clone();
+                self.huddle_tiles = event.tiles.clone();
                 self.call_video_live = event.video_live;
                 self.call_peers = event.peers.clone();
             }
@@ -5485,6 +5488,7 @@ impl Ducktape {
         self.call_sharing = false;
         self.call_video_live = false;
         self.huddle_stage = "".to_owned();
+        self.huddle_tiles.clear();
         self.call_peers = Vec::new();
         self.huddle_rows = crate::call::huddle_tile_rows(
             self.huddle_roster.clone(),

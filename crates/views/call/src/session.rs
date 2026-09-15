@@ -49,6 +49,7 @@ struct Presentation {
     stage: String,
     video_live: bool,
     peers: Vec<Peer>,
+    tiles: Vec<String>,
 }
 
 fn bytes(value: &Value) -> Vec<u8> {
@@ -102,7 +103,7 @@ pub fn run() -> LocalBoxStream<'static, Message> {
         let next = match next {
             Ok(next) => next,
             Err(error) => {
-                emit(json!({"kind":"presentation", "stage":"", "video_live":false, "peers":[]}));
+                emit(json!({"kind":"presentation", "stage":"", "video_live":false, "peers":[], "tiles":[]}));
                 status("error", &error);
                 host::notify("host.finish", &[]);
                 Run::End
@@ -328,17 +329,29 @@ impl Session {
                 beacon: beacon.clone(),
             })
             .collect();
+        let mut tiles: Vec<String> = self
+            .images
+            .values()
+            .map(|(_, key)| key)
+            .filter(|key| **key != stage)
+            .cloned()
+            .collect();
+        let show_preview = local_video && !self.preview.is_empty() && self.preview != stage;
+        if show_preview {
+            tiles.push(self.preview.clone());
+        }
         let current = Presentation {
             stage,
             video_live: local_video || remote_video,
             peers,
+            tiles,
         };
         let unchanged = self.presentation.as_ref() == Some(&current);
         if unchanged {
             return;
         }
         emit(
-            json!({"kind":"presentation", "stage":current.stage, "video_live":current.video_live, "peers":current.peers}),
+            json!({"kind":"presentation", "stage":current.stage, "video_live":current.video_live, "peers":current.peers, "tiles":current.tiles}),
         );
         self.presentation = Some(current);
     }

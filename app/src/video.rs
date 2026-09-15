@@ -779,13 +779,16 @@ pub struct VideoView {
     source: VideoDisplay,
 }
 enum VideoDisplay {
-    Tiles(String),
+    Tiles { images: Vec<String>, staged: String },
     Stage(String),
 }
 
-pub fn call_video_tiles(staged: &str) -> VideoView {
+pub fn call_video_tiles(images: Vec<String>, staged: &str) -> VideoView {
     VideoView {
-        source: VideoDisplay::Tiles(staged.to_owned()),
+        source: VideoDisplay::Tiles {
+            images,
+            staged: staged.to_owned(),
+        },
     }
 }
 pub fn call_video_stage(peer: &str) -> VideoView {
@@ -794,8 +797,8 @@ pub fn call_video_stage(peer: &str) -> VideoView {
     }
 }
 impl VideoView {
-    pub fn replace_tiles(&mut self, staged: String, cx: &mut Context<Self>) {
-        self.source = VideoDisplay::Tiles(staged);
+    pub fn replace_tiles(&mut self, images: Vec<String>, staged: String, cx: &mut Context<Self>) {
+        self.source = VideoDisplay::Tiles { images, staged };
         cx.notify();
     }
     pub fn replace_stage(&mut self, peer: String, cx: &mut Context<Self>) {
@@ -827,8 +830,8 @@ impl Render for VideoView {
                     .rounded(px(8.))
                     .into_any_element()
             }
-            VideoDisplay::Tiles(staged) => {
-                let tiles = tiles_snapshot(staged);
+            VideoDisplay::Tiles { images, staged } => {
+                let tiles = tiles_snapshot(images);
                 if !tiles.is_empty() {
                     window.request_animation_frame();
                 }
@@ -908,29 +911,10 @@ pub(crate) fn stage_frame(peer: &str) -> Option<(u32, u32, Arc<RenderImage>)> {
 /// Cover-cropped onto them. The stage-less grid ignores it and fills the room.
 const TILE_HEIGHT: f32 = 96.0;
 const TILE_GAP: f32 = 8.0;
-/// Peers in stable key order, the local preview last — the same order the
-/// row-based strip always drew, minus whatever the stage is showing whole.
-/// `Handle` is `Bytes`-backed (Arc) and its `Id` survives the clone, so each
-/// entry is a refcount bump that keeps pointing at the renderer's cached
-/// upload.
-fn tiles_snapshot(staged: &str) -> Vec<(u32, u32, Arc<RenderImage>)> {
-    let store = store().lock().expect("video store");
-    let mut ordered: Vec<(&String, &TileFrame)> = store
-        .peers
-        .iter()
-        .filter(|(node, _)| node.as_str() != staged)
-        .collect();
-    ordered.sort_by(|a, b| a.0.cmp(b.0));
-    let mut tiles: Vec<_> = ordered
-        .into_iter()
-        .map(|(_, frame)| (frame.width, frame.height, frame.handle.clone()))
-        .collect();
-    if staged != SELF_STAGE
-        && let Some(preview) = &store.preview
-    {
-        tiles.push((preview.width, preview.height, preview.handle.clone()));
-    }
-    tiles
+/// Resolve only the images named by the guest, preserving its display order.
+/// Missing decoded frames stay absent until a later paint.
+fn tiles_snapshot(images: &[String]) -> Vec<(u32, u32, Arc<RenderImage>)> {
+    images.iter().filter_map(|key| stage_frame(key)).collect()
 }
 
 #[cfg(test)]
@@ -1021,11 +1005,11 @@ mod tests {
                 .as_ref()
                 .map(|frame| frame.handle.id)
         };
-        // "" is "nothing is staged" — the strip's ordinary reading.
+        // A guest may select an image before its first decoded frame arrives.
         reset();
-        assert!(tiles_snapshot("").is_empty());
+        assert!(tiles_snapshot(&[SELF_STAGE.to_owned()]).is_empty());
         store_preview(vec![10, 20, 30, 0xff], 1, 1);
-        assert_eq!(tiles_snapshot("").len(), 1);
+        assert_eq!(tiles_snapshot(&[SELF_STAGE.to_owned()]).len(), 1);
         let first = preview_id().expect("preview");
         assert_eq!(first, preview_id().expect("preview"));
         store_preview(vec![40, 50, 60, 0xff], 1, 1);
@@ -1047,10 +1031,31 @@ mod tests {
         let (width, height, _) = stage_frame(SELF_STAGE).unwrap();
         assert_eq!((width, height), (2, 1));
         assert!(stage_frame("a-peer-nobody-sent").is_none());
-        // ...and what the stage shows whole, the strip leaves out, so a
-        // desktop is not also a cropped plate beside itself.
-        assert!(tiles_snapshot(SELF_STAGE).is_empty());
-        assert_eq!(tiles_snapshot("").len(), 1);
+        // An empty guest selection draws nothing, even with a stored preview.
+        assert!(tiles_snapshot(&[]).is_empty());
+        assert_eq!(tiles_snapshot(&[SELF_STAGE.to_owned()]).len(), 1);
+
+        let remote = render_bgra(vec![0xff; 4], 1, 1).unwrap();
+        let remote_id = remote.id;
+        store().lock().unwrap().peers.insert(
+            "remote-image".into(),
+            TileFrame {
+                width: 1,
+                height: 1,
+                handle: remote,
+            },
+        );
+        let selected =
+            tiles_snapshot(&["missing".into(), "remote-image".into(), SELF_STAGE.into()]);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(_, _, frame)| frame.id)
+                .collect::<Vec<_>>(),
+            vec![remote_id, preview_id().unwrap()]
+        );
+        assert!(tiles_snapshot(&[]).is_empty());
+        forget_peer("remote-image");
 
         // ONE SOURCE: starting either one ends the other, and either one off
         // is off — there is no state where both are live.

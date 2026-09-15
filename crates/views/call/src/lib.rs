@@ -218,7 +218,7 @@ mod tests {
         host.item("call.props", json!({"channel":"room", "source":"off"}));
         assert_eq!(
             shown(&host),
-            json!({"kind":"presentation", "stage":"", "video_live":false, "peers":[]})
+            json!({"kind":"presentation", "stage":"", "video_live":false, "peers":[], "tiles":[]})
         );
         host.item("call.props", json!({"channel":"room", "source":"screen"}));
         host.item(
@@ -226,6 +226,7 @@ mod tests {
             json!({"timestamp_ms":1, "jpeg":[9], "preview":"local-preview"}),
         );
         assert_eq!(shown(&host)["stage"], "local-preview");
+        assert_eq!(shown(&host)["tiles"], json!([]));
         assert_eq!(shown(&host)["video_live"], true);
         let peer = "02".repeat(32);
         host.item(
@@ -246,6 +247,7 @@ mod tests {
             "opaque-image",
             "remote share takes priority"
         );
+        assert_eq!(shown(&host)["tiles"], json!(["local-preview"]));
         let before = host
             .effects
             .iter()
@@ -267,10 +269,23 @@ mod tests {
             json!({"text":json!({"type":"peer_left", "peer":peer}).to_string()}),
         );
         assert_eq!(shown(&host)["stage"], "local-preview");
+        assert_eq!(shown(&host)["tiles"], json!([]));
+        host.item("call.props", json!({"channel":"room", "source":"camera"}));
+        assert_eq!(
+            shown(&host)["tiles"],
+            json!([]),
+            "old capture preview is retired"
+        );
+        host.item(
+            "media.video",
+            json!({"timestamp_ms":3, "jpeg":[9], "preview":"camera-preview"}),
+        );
+        assert_eq!(shown(&host)["stage"], "");
+        assert_eq!(shown(&host)["tiles"], json!(["camera-preview"]));
         host.item("call.props", json!({"channel":"room", "source":"off"}));
         assert_eq!(
             shown(&host),
-            json!({"kind":"presentation", "stage":"", "video_live":false, "peers":[]})
+            json!({"kind":"presentation", "stage":"", "video_live":false, "peers":[], "tiles":[]})
         );
     }
     #[test]

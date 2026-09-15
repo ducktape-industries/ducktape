@@ -16,6 +16,7 @@ pub struct CallEvent {
     pub message: String,
     pub peers: Vec<CallPeer>,
     pub stage: String,
+    pub tiles: Vec<String>,
     pub video_live: bool,
     pub muted: bool,
     pub camera_on: bool,

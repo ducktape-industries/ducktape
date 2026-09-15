@@ -653,6 +653,7 @@ fn call_presentation_comes_from_the_deployed_guest() {
     let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
         kind: "presentation".into(),
         stage: "guest-selected-image".into(),
+        tiles: vec!["second".into(), "first".into()],
         video_live: true,
         peers: vec![crate::call::CallPeer {
             peer: "first-peer".into(),
@@ -662,6 +663,7 @@ fn call_presentation_comes_from_the_deployed_guest() {
     }));
     assert_eq!(app.huddle_stage, "guest-selected-image");
     assert!(app.call_video_live);
+    assert_eq!(app.huddle_tiles, ["second", "first"]);
     assert_eq!(app.call_peers[0].peer, "first-peer");
     // Native self observations cannot choose a different stage or hide the
     // strip. The next guest presentation owns that decision.
@@ -673,6 +675,7 @@ fn call_presentation_comes_from_the_deployed_guest() {
     assert_eq!(app.huddle_stage, "guest-selected-image");
     let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
         kind: "presentation".into(),
+        tiles: vec!["replacement".into()],
         peers: vec![crate::call::CallPeer {
             peer: "second-peer".into(),
             ..Default::default()
@@ -689,6 +692,7 @@ fn call_presentation_comes_from_the_deployed_guest() {
         ..Default::default()
     }));
     assert!(app.call_peers.is_empty());
+    assert!(app.huddle_tiles.is_empty());
     assert!(app.huddle_stage.is_empty());
     assert!(!app.call_video_live);
     let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
