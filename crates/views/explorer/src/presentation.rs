@@ -15,6 +15,16 @@ const GUTTER: wire::Edges = wire::Edges {
     left: 12.,
 };
 
+// EVERY CELL OF A FIXED-HEIGHT ROW IS ONE LINE. The chrome bars (40 px), the
+// ledger rows (28 px), an operation's head line (28 px) and a search hit's line
+// (32 px) are each built at a stated height, and the kit's text constructors
+// wrap unless told otherwise — a hash, a snippet or a count that breaks onto a
+// second line in a narrow pane lands under the row below it. So a cell in one
+// of those rows goes through `kit::nowrap` (`kit::badge` and a `kit::kv` label
+// nowrap themselves). The texts that MUST wrap — a notice, a digest beside its
+// copy, a payload field, a dispatch line — say so with `kit::wrapping` and live
+// in rows with no fixed height, which is what lets them grow.
+
 impl ExplorerView {
     pub(crate) fn view(&self) -> Node {
         kit::set_dark(self.dark);
@@ -263,10 +273,10 @@ impl ExplorerView {
             kit::kv(
                 "explorer/block-ops",
                 "Operations",
-                kit::text(
+                kit::nowrap(kit::text(
                     "explorer/block-ops/value",
                     host::plural(block.op_count, "operation", "operations"),
-                ),
+                )),
             ),
         ];
         if !ops.is_empty() {
@@ -362,7 +372,7 @@ impl ExplorerView {
     fn payload(key: &str, payload: &host::Payload) -> Node {
         let fields = match payload {
             host::Payload::Text(text) if text.is_empty() => {
-                return kit::secondary(format!("{key}/payload/none"), "Nothing");
+                return kit::nowrap(kit::secondary(format!("{key}/payload/none"), "Nothing"));
             }
             host::Payload::Text(text) => {
                 return kit::card(
