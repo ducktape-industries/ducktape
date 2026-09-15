@@ -16,8 +16,13 @@ pub enum Tool {
     Hand,
     Note,
     Rectangle,
+    Ellipse,
+    Diamond,
     Text,
-    Connect,
+    Arrow,
+    Line,
+    Draw,
+    Eraser,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 enum Gesture {
@@ -48,6 +53,15 @@ enum Gesture {
         kind: Kind,
         start: [f32; 2],
         point: [f32; 2],
+    },
+    /// The pen, sampling world points until the button comes up.
+    Sketch {
+        points: Vec<[f32; 2]>,
+    },
+    /// The eraser, gathering what it has swept over; the board changes once,
+    /// on release, so one sweep is one undo step.
+    Erase {
+        swept: BTreeSet<String>,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -112,7 +126,6 @@ pub struct BoardsView {
     viewport: [f32; 2],
     cursor: [f32; 2],
     gesture: Gesture,
-    connection: Option<String>,
     undo: Vec<History>,
     redo: Vec<History>,
 }
@@ -207,7 +220,6 @@ impl BoardsView {
                 viewport: [800., 600.],
                 cursor: [0., 0.],
                 gesture: Gesture::Idle,
-                connection: None,
                 undo: Vec::new(),
                 redo: Vec::new(),
             },
@@ -318,7 +330,6 @@ impl BoardsView {
             self.gesture = Gesture::Idle;
             self.cameras.clear();
             self.space_pan = false;
-            self.connection = None;
         }
         self.session = next;
         self.pump()
@@ -583,7 +594,6 @@ impl BoardsView {
         self.error.clear();
 
         self.gesture = Gesture::Idle;
-        self.connection = None;
         self.undo.clear();
         self.redo.clear();
         Task::none()

@@ -2,11 +2,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const MAX_BOARDS: usize = 64;
-pub const MAX_SHAPES: usize = 128;
+pub const MAX_SHAPES: usize = 256;
 pub const MAX_TEXT: usize = 2048;
 pub const MAX_COORD: i32 = 1_000_000;
 pub const MAX_SIZE: i32 = 4000;
 pub const MAX_BOARD_BYTES: usize = 768 * 1024;
+/// A stroke's samples. A pen drawn at screen resolution is simplified to fit.
+pub const MAX_POINTS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -14,8 +16,20 @@ pub enum Kind {
     #[default]
     Note,
     Rectangle,
+    Ellipse,
+    Diamond,
     Text,
     Arrow,
+    Line,
+    Draw,
+}
+impl Kind {
+    /// The two families a board holds. A card is a box that carries text; a
+    /// path is a stroke through points. Nothing ever changes family: the
+    /// fields that make sense are disjoint, and so is every rule below.
+    pub fn is_path(self) -> bool {
+        matches!(self, Kind::Arrow | Kind::Line | Kind::Draw)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,7 +42,11 @@ pub struct Shape {
     pub height: i32,
     pub text: String,
     pub color: u8,
-    /// Arrow endpoints name shapes, so connections follow moved cards.
+    /// A path's samples, relative to `x`/`y` and spanning `width`/`height`,
+    /// so a move carries the stroke and a resize scales it. Cards hold none.
+    pub points: Vec<[i32; 2]>,
+    /// An arrow endpoint may name a card instead of standing on its own
+    /// point, so the connection follows the card when it moves.
     pub from: Option<String>,
     pub to: Option<String>,
 }
@@ -42,6 +60,7 @@ impl Default for Shape {
             height: 140,
             text: String::new(),
             color: 0,
+            points: Vec::new(),
             from: None,
             to: None,
         }
@@ -238,51 +257,72 @@ impl Board {
     }
 
     fn validate_shape(&self, id: &str, shape: &Shape) -> Result<(), String> {
+        // A path's box is the span of its samples, so a straight horizontal
+        // line is legitimately zero high; a card keeps a minimum both ways.
+        let minimum = if shape.kind.is_path() {
+            [0, 0]
+        } else {
+            [40, 32]
+        };
         let geometry_valid = shape.x.abs_diff(0) <= MAX_COORD as u32
             && shape.y.abs_diff(0) <= MAX_COORD as u32
-            && (40..=MAX_SIZE).contains(&shape.width)
-            && (32..=MAX_SIZE).contains(&shape.height);
+            && (minimum[0]..=MAX_SIZE).contains(&shape.width)
+            && (minimum[1]..=MAX_SIZE).contains(&shape.height);
         let content_valid = shape.text.len() <= MAX_TEXT && shape.color < 5;
         if !geometry_valid || !content_valid {
             return Err("Shape exceeds the geometry or text limits.".into());
         }
-        match shape.kind {
-            Kind::Arrow => {
-                let (Some(from), Some(to)) = (&shape.from, &shape.to) else {
-                    return Err("Choose two shapes to connect.".into());
-                };
-                let endpoints_valid = from != to
-                    && from != id
-                    && to != id
-                    && [from, to].iter().all(|key| {
-                        self.shapes
-                            .get(*key)
-                            .is_some_and(|record| record.shape.kind != Kind::Arrow)
-                    });
-                if !endpoints_valid {
-                    return Err("Connection endpoints must be existing cards.".into());
-                }
-            }
-            Kind::Note | Kind::Rectangle | Kind::Text => {
-                if shape.from.is_some() || shape.to.is_some() {
-                    return Err("Only arrows have endpoints.".into());
-                }
-                let was_connected_card = self
-                    .shapes
-                    .get(id)
-                    .is_some_and(|record| record.shape.kind == Kind::Arrow);
-                if was_connected_card {
-                    return Err("An arrow cannot become a card.".into());
-                }
-            }
+        let swapping_family = self
+            .shapes
+            .get(id)
+            .is_some_and(|record| record.shape.kind.is_path() != shape.kind.is_path());
+        if swapping_family {
+            return Err("A card and a connector are different shapes.".into());
         }
-        let changing_to_arrow = shape.kind == Kind::Arrow
-            && self
-                .shapes
-                .get(id)
-                .is_some_and(|record| record.shape.kind != Kind::Arrow);
-        if changing_to_arrow {
-            return Err("A card cannot become an arrow.".into());
+        if shape.kind.is_path() {
+            self.validate_path(id, shape)
+        } else {
+            self.validate_card(shape)
+        }
+    }
+    fn validate_card(&self, shape: &Shape) -> Result<(), String> {
+        let bare = shape.points.is_empty() && shape.from.is_none() && shape.to.is_none();
+        if !bare {
+            return Err("Only connectors carry points or endpoints.".into());
+        }
+        Ok(())
+    }
+    fn validate_path(&self, id: &str, shape: &Shape) -> Result<(), String> {
+        if !(2..=MAX_POINTS).contains(&shape.points.len()) {
+            return Err(format!(
+                "A connector needs between 2 and {MAX_POINTS} points."
+            ));
+        }
+        let inside = shape
+            .points
+            .iter()
+            .flatten()
+            .all(|value| value.abs_diff(0) <= MAX_SIZE as u32);
+        if !inside {
+            return Err("Connector points must stay inside the shape.".into());
+        }
+        let bindable = shape.kind == Kind::Arrow;
+        let bound = [&shape.from, &shape.to];
+        if !bindable && bound.iter().any(|end| end.is_some()) {
+            return Err("Only arrows bind to cards.".into());
+        }
+        if shape.from.is_some() && shape.from == shape.to {
+            return Err("An arrow connects two different cards.".into());
+        }
+        let endpoints_valid = bound.into_iter().flatten().all(|key| {
+            key != id
+                && self
+                    .shapes
+                    .get(key)
+                    .is_some_and(|record| !record.shape.kind.is_path())
+        });
+        if !endpoints_valid {
+            return Err("An arrow binds to an existing card.".into());
         }
         Ok(())
     }

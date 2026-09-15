@@ -10,6 +10,17 @@ fn create(id: &str) -> Change {
         shape: Shape::default(),
     }
 }
+/// A two-point path. Every connector carries its own samples; binding an
+/// endpoint to a card only overrides where that end is drawn.
+fn path(kind: Kind) -> Shape {
+    Shape {
+        kind,
+        width: 160,
+        height: 90,
+        points: vec![[0, 0], [160, 90]],
+        ..Default::default()
+    }
+}
 
 #[test]
 fn concurrent_fields_compose_and_same_field_follows_consensus_order() {
@@ -57,10 +68,9 @@ fn deleting_a_card_removes_connections_and_late_edits_do_not_resurrect_it() {
         .changed(&create("b"))
         .unwrap();
     let arrow = Shape {
-        kind: Kind::Arrow,
         from: Some("a".into()),
         to: Some("b".into()),
-        ..Default::default()
+        ..path(Kind::Arrow)
     };
     board = board
         .changed(&Change::Create {
@@ -97,9 +107,30 @@ fn invalid_geometry_content_and_edges_leave_state_untouched() {
             ..Default::default()
         },
         Shape {
-            kind: Kind::Arrow,
-            from: Some("a".into()),
             to: Some("missing".into()),
+            ..path(Kind::Arrow)
+        },
+        // a connector with no samples has nowhere to be drawn
+        Shape {
+            points: Vec::new(),
+            ..path(Kind::Arrow)
+        },
+        Shape {
+            points: vec![[0, 0]; MAX_POINTS + 1],
+            ..path(Kind::Draw)
+        },
+        // only arrows bind; a plain line and a card carry neither endpoint
+        Shape {
+            to: Some("a".into()),
+            ..path(Kind::Line)
+        },
+        Shape {
+            points: vec![[0, 0], [40, 40]],
+            ..Default::default()
+        },
+        // a card keeps a minimum box; a path's box is its samples' span
+        Shape {
+            height: 8,
             ..Default::default()
         },
     ] {
@@ -115,6 +146,74 @@ fn invalid_geometry_content_and_edges_leave_state_untouched() {
     }
     let encoded = serde_json::to_vec(&board).unwrap();
     assert_eq!(serde_json::from_slice::<Board>(&encoded).unwrap(), board);
+}
+#[test]
+fn a_flat_stroke_is_legal_and_a_shape_never_changes_family() {
+    let mut board = blank().changed(&create("card")).unwrap();
+    board = board
+        .changed(&Change::Create {
+            id: "flat".into(),
+            shape: Shape {
+                height: 0,
+                points: vec![[0, 0], [160, 0]],
+                ..path(Kind::Line)
+            },
+        })
+        .unwrap();
+    assert_eq!(board.shapes["flat"].shape.height, 0);
+    for (id, shape) in [("flat", Shape::default()), ("card", path(Kind::Draw))] {
+        assert!(
+            board
+                .changed(&Change::Create {
+                    id: id.into(),
+                    shape
+                })
+                .unwrap()
+                == board,
+            "create over an existing id is idempotent, never a family swap"
+        );
+    }
+    // resizing a stroke scales its samples; the module only moves the box
+    board = board
+        .changed(&Change::Resize {
+            id: "flat".into(),
+            width: 320,
+            height: 0,
+        })
+        .unwrap();
+    assert_eq!(board.shapes["flat"].shape.points, vec![[0, 0], [160, 0]]);
+}
+#[test]
+fn an_arrow_binds_one_end_and_stands_on_its_own_point_at_the_other() {
+    let board = blank()
+        .changed(&create("card"))
+        .unwrap()
+        .changed(&Change::Create {
+            id: "half".into(),
+            shape: Shape {
+                from: Some("card".into()),
+                ..path(Kind::Arrow)
+            },
+        })
+        .unwrap();
+    assert_eq!(board.shapes["half"].shape.to, None);
+    assert!(
+        board
+            .changed(&Change::Create {
+                id: "loop".into(),
+                shape: Shape {
+                    from: Some("card".into()),
+                    to: Some("card".into()),
+                    ..path(Kind::Arrow)
+                },
+            })
+            .is_err()
+    );
+    // the card goes, and with it every connector that named it
+    let after = board
+        .changed(&Change::Delete { id: "card".into() })
+        .unwrap();
+    assert!(after.shapes.is_empty());
 }
 #[test]
 fn board_caps_bound_storage_and_create_replay_is_idempotent() {
