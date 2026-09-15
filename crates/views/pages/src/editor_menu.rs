@@ -940,7 +940,7 @@ fn agent_items(agents: &[(String, u64)]) -> Vec<(String, String)> {
 const NO_AGENTS: &str = "none";
 
 /// The selection's byte columns on `line`, when the whole selection sits on it.
-fn selection_columns(document: &Doc, line: usize) -> Option<std::ops::Range<usize>> {
+pub(crate) fn selection_columns(document: &Doc, line: usize) -> Option<std::ops::Range<usize>> {
     let range = crate::format::target(document);
     let start = document.position_at(range.start);
     let end = document.position_at(range.end);
