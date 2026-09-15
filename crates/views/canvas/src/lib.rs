@@ -72,9 +72,12 @@ enum Gesture {
         points: Vec<[f32; 2]>,
     },
     /// The eraser, gathering what it has swept over; the board changes once,
-    /// on release, so one sweep is one undo step.
+    /// on release, so one sweep is one undo step. `last` is where the previous
+    /// sample landed, because the sweep erases along the step and not only at
+    /// its end.
     Erase {
         swept: BTreeSet<String>,
+        last: [f32; 2],
     },
     /// One end of a connector, in hand. `end` indexes the sample being carried;
     /// the rest of the run keeps its shape, and the end lets go of any card it
@@ -141,6 +144,9 @@ pub struct BoardsView {
     board_picker: bool,
     snap: bool,
     guides: Vec<[f32; 4]>,
+    /// What the pointer is over with nothing in hand. A canvas answers before
+    /// you commit — without it every click is a guess about what you will hit.
+    hover: Option<String>,
     /// What was copied, kept by the view: the host opens no clipboard door to
     /// a guest, so a cut travels between this network's boards and no further.
     /// The ids ride along because a connector in the set names its cards by
@@ -245,6 +251,7 @@ impl BoardsView {
                 board_picker: false,
                 snap: true,
                 guides: Vec::new(),
+                hover: None,
                 clipboard: Vec::new(),
                 cameras: BTreeMap::new(),
                 tool: Tool::Select,

@@ -767,3 +767,139 @@ fn the_painter_and_the_editor_read_one_description_of_a_label() {
         "the inline editor must not carry a type size of its own"
     );
 }
+
+#[test]
+fn shift_squares_a_drawn_box_and_a_click_centres_the_default_on_the_pointer() {
+    let mut view = view();
+    view.on_tool(Tool::Rectangle);
+    view.modifiers.shift = true;
+    // world (100,100) → (300,180): the short side grows to the long one
+    drag(&mut view, &[[180., 180.], [300., 220.], [380., 260.]]);
+    let square = view.creation_shape(Kind::Rectangle, [100., 100.], [300., 180.]);
+    assert_eq!(square.width, 200);
+    assert_eq!(square.height, 200);
+    // and it grows away from the corner the press anchored
+    assert_eq!([square.x, square.y], [100, 100]);
+    view.modifiers.shift = false;
+    let clicked = view.creation_shape(Kind::Rectangle, [500., 300.], [500., 300.]);
+    assert_eq!([clicked.width, clicked.height], [240, 140]);
+    assert_eq!([clicked.x, clicked.y], [380, 230]);
+}
+
+#[test]
+fn a_marquee_takes_a_bound_connector_because_it_is_drawn_between_the_cards_it_names() {
+    let mut view = linked();
+    view.selected.clear();
+    // a band over a and b: the arrow between them is drawn inside it, even
+    // though its own samples say otherwise
+    drag(&mut view, &[[60., 60.], [300., 150.], [620., 260.]]);
+    assert!(view.selected.contains("a"), "the band missed a card");
+    assert!(view.selected.contains("b"), "the band missed a card");
+    assert!(
+        view.selected.contains("edge"),
+        "the band missed the connector drawn between them"
+    );
+}
+
+#[test]
+fn the_pen_keeps_itself_and_every_other_tool_hands_back_to_select() {
+    let mut view = view();
+    view.tool = Tool::Draw;
+    view.on_minted(0, "room".into(), segment(Kind::Draw), Ok("mark".into()));
+    assert_eq!(
+        view.tool,
+        Tool::Draw,
+        "a second stroke needs no second pick"
+    );
+    view.tool = Tool::Rectangle;
+    view.on_minted(
+        0,
+        "room".into(),
+        Shape {
+            x: 400,
+            ..Default::default()
+        },
+        Ok("box".into()),
+    );
+    assert_eq!(view.tool, Tool::Select);
+}
+
+#[test]
+fn an_arrow_meets_a_circle_on_its_curve_and_a_diamond_on_its_point() {
+    let round = Shape {
+        kind: Kind::Ellipse,
+        width: 200,
+        height: 200,
+        ..Default::default()
+    };
+    // straight out to the right: every outline leaves at the same place
+    let east = super::interaction::border_point(&round, [1000., 100.]);
+    assert!((east[0] - 200.).abs() < 0.5, "east landed at {}", east[0]);
+    // on the diagonal a circle is further in than the box around it
+    let corner = super::interaction::border_point(&round, [1000., 1000.]);
+    let reach = (corner[0] - 100.).hypot(corner[1] - 100.);
+    assert!(
+        (reach - 100.).abs() < 0.5,
+        "the ray left the curve at {reach}"
+    );
+    let gem = Shape {
+        kind: Kind::Diamond,
+        ..round.clone()
+    };
+    let facet = super::interaction::border_point(&gem, [1000., 1000.]);
+    // a diamond's edge runs |dx| + |dy| = half, so the diagonal exit is nearer
+    assert!(
+        (facet[0] - 150.).abs() < 0.5,
+        "facet landed at {}",
+        facet[0]
+    );
+}
+
+#[test]
+fn the_pointer_says_what_it_would_take_before_you_press_and_only_when_picking() {
+    let mut view = view();
+    card(&mut view, "a", 0);
+    // over the card with Select armed: the board answers
+    view.on_move(180., 150.);
+    assert_eq!(view.hover.as_deref(), Some("a"));
+    // off it: nothing to say
+    view.on_move(900., 700.);
+    assert_eq!(view.hover, None);
+    // a shape tool is about to draw, so nothing under the pointer is its to
+    // offer, however squarely the pointer sits on a card
+    view.on_tool(Tool::Rectangle);
+    view.on_move(180., 150.);
+    assert_eq!(view.hover, None);
+    // and a gesture in progress is not a question about what is underneath
+    view.on_tool(Tool::Select);
+    drag(&mut view, &[[180., 150.], [260., 200.]]);
+    view.on_press(180., 150.);
+    view.on_move(200., 160.);
+    assert_eq!(view.hover, None);
+}
+
+#[test]
+fn a_handle_on_a_flat_line_stays_where_the_pointer_put_it() {
+    let mut view = view();
+    view.edit(Change::Create {
+        id: "rule".into(),
+        shape: Shape {
+            width: 300,
+            height: 0,
+            points: vec![[0, 0], [300, 0]],
+            ..segment(Kind::Line)
+        },
+    });
+    view.selected = ["rule".into()].into();
+    // drag the far end straight out along the line: a card's 32-unit floor
+    // would have thrown it down the moment it moved
+    drag(&mut view, &[[380., 80.], [440., 80.], [500., 80.]]);
+    let board = view.visible().unwrap();
+    let rule = &board.shapes["rule"].shape;
+    assert_eq!(rule.height, 0, "the run was forced off the flat");
+    assert!(
+        rule.width >= 400,
+        "the far end did not travel: {}",
+        rule.width
+    );
+}
