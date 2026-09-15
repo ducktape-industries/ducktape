@@ -408,16 +408,15 @@ impl BoardsView {
         if !shown {
             return None;
         }
-        let name = if count == 1 {
-            self.only_selected()
-                .and_then(|id| board.shapes.get(id))
-                .map_or("Selection", |r| kind_name(r.shape.kind))
-                .to_owned()
-        } else {
-            format!("{count} selected")
+        let only = self.only_selected().and_then(|id| board.shapes.get(id));
+        let name = match only {
+            Some(record) => kind_name(record.shape.kind).to_owned(),
+            None => format!("{count} selected"),
         };
+        // a connector has no box to write in; the inspector does not offer one
+        let writable = only.is_some_and(|record| !record.shape.kind.is_path());
         Some(kit::sized(
-            self.inspector(name, count),
+            self.inspector(name, count, writable),
             Some(Length::Fixed(204.)),
             None,
         ))
@@ -564,7 +563,7 @@ impl BoardsView {
             None,
         ))
     }
-    fn inspector(&self, name: String, count: usize) -> Node {
+    fn inspector(&self, name: String, count: usize, writable: bool) -> Node {
         let mut properties = vec![
             kit::heading("boards/selection-title", name),
             kit::spaced(
@@ -576,7 +575,7 @@ impl BoardsView {
             ),
             kit::divider("boards/properties-rule"),
         ];
-        if count == 1 {
+        if writable {
             properties.push(wide(action(
                 "boards/edit-text",
                 "Edit text",
@@ -1398,7 +1397,7 @@ fn icon(name: &str) -> Node {
         "ellipse" => "<ellipse cx='12' cy='12' rx='9' ry='7'/>",
         "diamond" => "<path d='M12 3 21 12 12 21 3 12z'/>",
         "line" => "<path d='M4 20 20 4'/>",
-        "draw" => "<path d='M3 21c3-1 4-3 6-7s4-8 7-9c2-1 3 1 2 3-2 4-7 7-9 11-1 2 1 3 3 2l3-2'/>",
+        "draw" => "<path d='M4 20h4L19 9l-4-4L4 16z'/><path d='m14 6 4 4M4 16l4 4'/>",
         "eraser" => "<path d='m13 4 7 7-8 8H7l-4-4z'/><path d='M8 9l7 7M11 19h9'/>",
         "text" => "<path d='M4 6V4h16v2M12 4v16M8 20h8'/>",
         "arrow" => "<path d='M4 19 20 4M10 4h10v10'/>",
