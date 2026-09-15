@@ -750,6 +750,274 @@ fn dragging_an_arrows_end_onto_another_card_rebinds_that_end_and_leaves_the_far_
 }
 
 #[test]
+fn an_arrow_bends_by_the_handle_on_its_line_and_straightens_when_you_put_it_back() {
+    let mut view = linked();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    let board = view.visible().unwrap();
+    let run = super::interaction::stroke(&board, &board.shapes["edge"].shape);
+    let middle = [
+        (run[0][0] + run[1][0]) / 2.,
+        (run[0][1] + run[1][1]) / 2.,
+    ];
+    // An arrow with no bend still offers one, on its line. Taking it and
+    // pulling puts a bend there — a straight arrow becomes a curved one with
+    // no separate verb for it.
+    drag(
+        &mut view,
+        &[middle, [middle[0], middle[1] - 80.], [middle[0], middle[1] - 160.]],
+    );
+    let board = view.visible().unwrap();
+    let bent = &board.shapes["edge"].shape;
+    let run = super::interaction::stroke(&board, bent);
+    assert_eq!(run.len(), 3, "the arrow did not bend: {run:?}");
+    assert!(
+        (run[1][1] - (middle[1] - 160.)).abs() < 2.,
+        "the bend is not where it was left: {:?}",
+        run[1]
+    );
+    // Its ends are where they were: a bend is a bend, not a re-route.
+    assert_eq!(bent.from.as_deref(), Some("a"));
+    assert_eq!(bent.to.as_deref(), Some("b"));
+    // And putting it back on the line takes it away again, rather than leaving
+    // a sample nobody can see.
+    drag(
+        &mut view,
+        &[[middle[0], middle[1] - 160.], middle, middle],
+    );
+    let board = view.visible().unwrap();
+    let run = super::interaction::stroke(&board, &board.shapes["edge"].shape);
+    assert_eq!(run.len(), 2, "the bend outlived the curve: {run:?}");
+}
+
+#[test]
+fn a_bend_dragged_across_a_card_binds_nothing() {
+    let mut view = linked();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    let board = view.visible().unwrap();
+    let edge = board.shapes["edge"].shape.clone();
+    let run = super::interaction::stroke(&board, &edge);
+    let middle = [
+        (run[0][0] + run[1][0]) / 2.,
+        (run[0][1] + run[1][1]) / 2.,
+    ];
+    // Card "c" sits at x 600. Drag the bend right over it and let go: the ends
+    // are what hold cards, so the arrow must still run a → b.
+    let over_c = [650., 60.];
+    drag(&mut view, &[middle, [500., 60.], over_c]);
+    let board = view.visible().unwrap();
+    let bent = &board.shapes["edge"].shape;
+    assert_eq!(bent.from.as_deref(), Some("a"));
+    assert_eq!(
+        bent.to.as_deref(),
+        Some("b"),
+        "the bend stole the far end's card"
+    );
+}
+
+#[test]
+fn words_on_an_arrow_take_the_middle_and_the_bend_handle_steps_aside() {
+    let mut view = linked();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    let board = view.visible().unwrap();
+    let plain = board.shapes["edge"].shape.clone();
+    let run = super::interaction::stroke(&board, &plain);
+    let middle = [
+        (run[0][0] + run[1][0]) / 2.,
+        (run[0][1] + run[1][1]) / 2.,
+    ];
+    let (_, _, bare) = view.bend(&plain, &run).expect("no handle on a bare arrow");
+    assert!(
+        (bare[0] - middle[0]).abs() < 0.5,
+        "a bare arrow bends at its middle, not at {bare:?}"
+    );
+    // Write on it and the handle moves off the plate: two things to take hold
+    // of in one place is one of them unreachable.
+    view.edit(Change::Text {
+        id: "edge".into(),
+        text: "blocks".into(),
+    });
+    let board = view.visible().unwrap();
+    let written = board.shapes["edge"].shape.clone();
+    let run = super::interaction::stroke(&board, &written);
+    // This arrow is short enough that the words cover the whole of it, so the
+    // bend is not offered at all: a handle you cannot take is worse than none.
+    let offered = view.bend(&written, &run);
+    let clear = offered.is_none_or(|(_, _, at)| {
+        !super::interaction::contains(super::interaction::plate(&run), at)
+    });
+    assert!(clear, "the handle is under the words");
+    // And a press on the words is a press on the words, whatever is near it.
+    view.selected = ["edge".into()].into();
+    view.on_press(middle[0], middle[1]);
+    assert!(
+        matches!(view.gesture, Gesture::Idle | Gesture::Move { .. }),
+        "pressing the label started {:?}",
+        view.gesture
+    );
+}
+
+#[test]
+fn zooming_by_the_buttons_keeps_what_is_in_the_middle_of_the_screen() {
+    let mut view = view();
+    view.on_size(1080., 800.);
+    card(&mut view, "a", 0);
+    view.on_fit();
+    let centre = [view.viewport[0] / 2., view.viewport[1] / 2.];
+    let looking_at = view.world(centre);
+    // Seven steps in and five back out. Whatever was under the middle of the
+    // screen has to still be under the middle of the screen: a zoom that walks
+    // off its own subject is a zoom you have to hunt your board back with.
+    for _ in 0..7 {
+        view.on_zoom(1.25);
+    }
+    let close = view.world(centre);
+    assert!(
+        (close[0] - looking_at[0]).abs() < 0.5 && (close[1] - looking_at[1]).abs() < 0.5,
+        "zooming in walked from {looking_at:?} to {close:?}"
+    );
+    for _ in 0..5 {
+        view.on_zoom(0.8);
+    }
+    let back = view.world(centre);
+    assert!(
+        (back[0] - looking_at[0]).abs() < 0.5 && (back[1] - looking_at[1]).abs() < 0.5,
+        "zooming back out walked from {looking_at:?} to {back:?}"
+    );
+    // And the card is still drawn, however much bigger than the screen it is.
+    let board = view.visible().unwrap();
+    assert!(
+        view.on_screen(&board, &board.shapes["a"].shape).is_some(),
+        "a card larger than the viewport was culled as off it"
+    );
+}
+
+#[test]
+fn a_bent_arrows_words_ride_its_curve_and_not_the_box_around_it() {
+    let mut view = linked();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    // Bend the arrow well below its ends, then write on it. The box around a
+    // curve has its centre out in the open air — words written there would be
+    // words beside the arrow, not on it.
+    view.edit(Change::Route {
+        id: "edge".into(),
+        x: 200,
+        y: 70,
+        width: 100,
+        height: 200,
+        points: vec![[0, 0], [50, 200], [100, 0]],
+        from: Some("a".into()),
+        to: Some("b".into()),
+    });
+    view.edit(Change::Text {
+        id: "edge".into(),
+        text: "waits for".into(),
+    });
+    let board = view.visible().unwrap();
+    let edge = &board.shapes["edge"].shape;
+    let run = super::interaction::stroke(&board, edge);
+    let at = super::interaction::plate(&run);
+    let middle = [(at[0] + at[2]) / 2., (at[1] + at[3]) / 2.];
+    let on_the_run = run
+        .windows(2)
+        .map(|step| super::interaction::line_distance(middle, step[0], step[1]))
+        .fold(f32::INFINITY, f32::min);
+    assert!(
+        on_the_run < 1.,
+        "the words sit {on_the_run} away from the line they belong to"
+    );
+    // And a press there takes the arrow, because that is where its words are.
+    assert_eq!(view.hit(middle).as_deref(), Some("edge"));
+    // The pin the painter hangs those words on is the same box, on screen: one
+    // answer to "where are the words", read by the painter, the hit test and
+    // the editor alike.
+    let json = serde_json::to_string(&view.view()).unwrap();
+    let pinned = json
+        .split("\"boards/pin/edge\"")
+        .nth(1)
+        .expect("the arrow's words are not pinned");
+    let corner = view.screen(at[0], at[1]);
+    let reads = |name: &str| -> f32 {
+        let tail = pinned.split(&format!("\"{name}\":")).nth(1).unwrap();
+        let end = tail.find([',', '}']).unwrap();
+        tail[..end].parse().unwrap()
+    };
+    assert!(
+        (reads("x") - corner[0]).abs() < 1. && (reads("y") - corner[1]).abs() < 1.,
+        "the words hang at {:?} and the plate is at {corner:?}",
+        [reads("x"), reads("y")]
+    );
+}
+
+#[test]
+fn bending_an_arrow_by_hand_leaves_a_run_the_words_can_ride() {
+    let mut view = linked();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    // The whole gesture, the way a hand does it: take the handle on the line
+    // and pull. What it leaves has to be a run the painter draws through and
+    // the words sit on — the two answers that used to disagree.
+    let board = view.visible().unwrap();
+    let run = super::interaction::stroke(&board, &board.shapes["edge"].shape);
+    let middle = [
+        (run[0][0] + run[1][0]) / 2.,
+        (run[0][1] + run[1][1]) / 2.,
+    ];
+    drag(
+        &mut view,
+        &[middle, [middle[0], middle[1] + 90.], [middle[0], middle[1] + 170.]],
+    );
+    view.edit(Change::Text {
+        id: "edge".into(),
+        text: "waits for".into(),
+    });
+    let board = view.visible().unwrap();
+    let edge = &board.shapes["edge"].shape;
+    let run = super::interaction::stroke(&board, edge);
+    assert_eq!(run.len(), 3, "a hand-bent arrow is three samples: {run:?}");
+    let at = super::interaction::plate(&run);
+    let seat = [(at[0] + at[2]) / 2., (at[1] + at[3]) / 2.];
+    assert!(
+        (seat[0] - run[1][0]).abs() < 2. && (seat[1] - run[1][1]).abs() < 2.,
+        "the words sit at {seat:?} and the bend is at {:?}",
+        run[1]
+    );
+}
+
+#[test]
+fn a_pen_stroke_has_no_bend_handle_because_its_run_is_the_drawing() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    view.edit(Change::Create {
+        id: "ink".into(),
+        shape: Shape {
+            kind: Kind::Draw,
+            width: 100,
+            height: 40,
+            points: vec![[0, 0], [50, 40], [100, 0]],
+            ..Default::default()
+        },
+    });
+    let board = view.visible().unwrap();
+    let ink = &board.shapes["ink"].shape;
+    let run = super::interaction::stroke(&board, ink);
+    assert!(
+        view.bend(ink, &run).is_none(),
+        "a pen stroke offered a handle in the middle of the drawing"
+    );
+}
+
+#[test]
 fn an_end_held_over_a_card_is_already_holding_it() {
     let mut view = linked();
     view.on_size(1400., 900.);
@@ -1599,7 +1867,7 @@ fn the_caret_hugs_an_arrows_words_and_takes_a_whole_card() {
     let edge = board.shapes["edge"].shape.clone();
     let run = super::interaction::stroke(&board, &edge);
     let box_ = super::interaction::plate(&run);
-    let (pos, room) = view.writing_box(box_, edge.kind);
+    let (pos, room) = view.writing_box(&board, &edge, box_);
     let inline = view.inline.clone().unwrap();
     assert_eq!(view.caret_box(&inline, edge.kind, pos, room), (pos, room));
     // Once the gauge has answered, the caret is as wide as the words and sits
@@ -1614,7 +1882,8 @@ fn the_caret_hugs_an_arrows_words_and_takes_a_whole_card() {
         "the caret is not centred where the plate will be"
     );
     // A card is written across the whole card whatever the gauge says.
-    let (pos, room) = view.writing_box([0., 0., 200., 120.], Kind::Note);
+    let card = board.shapes["a"].shape.clone();
+    let (pos, room) = view.writing_box(&board, &card, [0., 0., 200., 120.]);
     assert_eq!(view.caret_box(&inline, Kind::Note, pos, room), (pos, room));
 }
 

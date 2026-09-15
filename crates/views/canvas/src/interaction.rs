@@ -441,6 +441,21 @@ impl BoardsView {
                         return Task::none();
                     }
                 }
+                // And bent in the middle. The handle is on the line whether
+                // the connector has a bend yet or not: taking one that is not
+                // there puts it there, which is how a straight arrow becomes a
+                // curved one without a separate verb for it.
+                if let Some((bent, end, target)) = self.bend(shape, &run)
+                    && (point[0] - target[0]).hypot(point[1] - target[1]) <= 9. / self.zoom
+                {
+                    self.gesture = Gesture::Endpoint {
+                        id,
+                        end,
+                        point,
+                        shape: bent,
+                    };
+                    return Task::none();
+                }
             }
             if free(shape) {
                 for corner in HANDLES {
@@ -723,6 +738,7 @@ impl BoardsView {
         let last = run.len().checked_sub(1)?;
         let sample = run.get_mut(end)?;
         *sample = point;
+        let run = self.straightened(run);
         let next = self.path_shape(shape.kind, &run);
         let carried = |mine: bool, standing: &Option<String>| {
             if mine { held.clone() } else { standing.clone() }
@@ -969,6 +985,75 @@ impl BoardsView {
             shape.to = None;
         }
     }
+    /// A bend put back on the line between its neighbours is not a bend. The
+    /// run straightens rather than keep a sample nobody can see and nobody
+    /// asked for — the same door out of a curve that the drag in was.
+    ///
+    /// Only a three-sample run, which is the one bend a connector has. A pen
+    /// stroke's straight stretch is the drawing.
+    fn straightened(&self, run: Vec<[f32; 2]>) -> Vec<[f32; 2]> {
+        let [first, middle, last] = run[..] else {
+            return run;
+        };
+        let flat = line_distance(middle, first, last) * self.zoom <= 6.;
+        match flat {
+            true => vec![first, last],
+            false => run,
+        }
+    }
+    /// A connector's bend: the shape it would have with one, which sample that
+    /// is, and where the handle sits on the run as drawn. A connector without a
+    /// bend gets one at the middle of its line, so the handle is in the same
+    /// place whether or not it has been used yet — you drag it and the arrow
+    /// curves, the way it does everywhere else.
+    ///
+    /// `None` for anything with a run of its own to keep: a pen stroke is all
+    /// samples, and a bend handle in the middle of one would take hold of a
+    /// piece of the drawing rather than reshape it.
+    pub(super) fn bend(&self, s: &Shape, drawn: &[[f32; 2]]) -> Option<(Shape, usize, [f32; 2])> {
+        if s.kind == Kind::Draw {
+            return None;
+        }
+        let stored = path_points(s);
+        if stored.len() != drawn.len() || stored.len() > 3 {
+            return None;
+        }
+        if stored.len() == 3 {
+            return Some((s.clone(), 1, drawn[1]));
+        }
+        let [first, last] = [*drawn.first()?, *drawn.last()?];
+        // Words take the middle of a run, so the handle steps aside when there
+        // are any: two things to take hold of in the same place is one of them
+        // unreachable, and the words are the one you meant.
+        let along = match s.text.is_empty() {
+            true => 0.5,
+            false => 0.25,
+        };
+        let middle = [
+            first[0] + (last[0] - first[0]) * along,
+            first[1] + (last[1] - first[1]) * along,
+        ];
+        // On a short connector even the quarter point is under the plate, and
+        // there is no room for both: the words keep the line and the bend is
+        // not offered at all rather than offered where it cannot be taken.
+        if !s.text.is_empty() && contains(plate(drawn), middle) {
+            return None;
+        }
+        let mut bent = s.clone();
+        // The run it gets is the one on the board, ends included. A bound end's
+        // STORED sample is wherever the arrow was last dragged and the cards
+        // have overridden it ever since, so a bend measured against that would
+        // be measured against a line nobody can see — and would never read as
+        // straight again once put back.
+        let run = vec![first, middle, last];
+        let boxed = self.path_shape(s.kind, &run);
+        bent.x = boxed.x;
+        bent.y = boxed.y;
+        bent.width = boxed.width;
+        bent.height = boxed.height;
+        bent.points = boxed.points;
+        Some((bent, 1, middle))
+    }
     /// The card an endpoint over this point would take: a card for an arrow,
     /// nothing for a line or a stroke, which never bind.
     pub(super) fn holding(&self, board: &Board, kind: Kind, point: [f32; 2]) -> Option<String> {
@@ -989,7 +1074,9 @@ impl BoardsView {
         shape: &Shape,
     ) -> Option<Change> {
         let board = self.settled()?;
-        let held = self.holding(&board, shape.kind, point);
+        let held = reaches_for_a_card(shape, end)
+            .then(|| self.holding(&board, shape.kind, point))
+            .flatten();
         self.routed(id, end, point, shape, held)
     }
     /// Where an endpoint is let go decides what it holds: dropped on a card an
@@ -1766,6 +1853,33 @@ const MAX_SAMPLES: usize = 4096;
 /// plate is stated in board units by the painter, and it is drawn at the middle
 /// of the run rather than over the rectangle the samples were stored with, so
 /// this reads the run the same way the painter does.
+/// The point halfway ALONG a run, not the middle of the box drawn round it.
+/// They are the same thing for a straight line and nothing like it for a bent
+/// one: the box's centre of a curve is off in the open, and words written there
+/// would be words beside the arrow rather than on it.
+fn halfway(run: &[[f32; 2]]) -> Option<[f32; 2]> {
+    let span = |step: &[[f32; 2]]| (step[1][0] - step[0][0]).hypot(step[1][1] - step[0][1]);
+    let mut left: f32 = run.windows(2).map(span).sum::<f32>() / 2.;
+    for step in run.windows(2) {
+        let reach = span(step);
+        if reach >= left {
+            let part = if reach > 0. { left / reach } else { 0. };
+            return Some([
+                step[0][0] + (step[1][0] - step[0][0]) * part,
+                step[0][1] + (step[1][1] - step[0][1]) * part,
+            ]);
+        }
+        left -= reach;
+    }
+    run.first().copied()
+}
+/// Whether the sample in hand is one of the run's ends — the only two that can
+/// take hold of a card. A bend in the middle is a bend, and dragging it across
+/// a card binds nothing.
+pub(super) fn reaches_for_a_card(s: &Shape, end: usize) -> bool {
+    let last = path_points(s).len().saturating_sub(1);
+    end == 0 || end == last
+}
 fn labelled(s: &Shape, run: &[[f32; 2]], point: [f32; 2]) -> bool {
     !s.text.is_empty() && contains(plate(run), point)
 }
@@ -1774,16 +1888,9 @@ fn labelled(s: &Shape, run: &[[f32; 2]], point: [f32; 2]) -> bool {
 /// card it holds, so this is nowhere near the rectangle the samples were stored
 /// with, and everything that asks where the words are has to ask the run.
 pub(super) fn plate(run: &[[f32; 2]]) -> [f32; 4] {
-    let Some((first, rest)) = run.split_first() else {
+    let Some(middle) = halfway(run) else {
         return [0.; 4];
     };
-    let mut low = *first;
-    let mut high = *first;
-    for sample in rest {
-        low = [low[0].min(sample[0]), low[1].min(sample[1])];
-        high = [high[0].max(sample[0]), high[1].max(sample[1])];
-    }
-    let middle = [(low[0] + high[0]) / 2., (low[1] + high[1]) / 2.];
     let reach = [presentation::PLATE[0] / 2., presentation::PLATE[1] / 2.];
     [
         middle[0] - reach[0],
@@ -2075,7 +2182,7 @@ pub(super) const HANDLES: [[i32; 2]; 8] = [
     [-1, 1],
     [-1, 0],
 ];
-fn line_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+pub(super) fn line_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
     let d = [b[0] - a[0], b[1] - a[1]];
     let t = (((p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1])
         / (d[0] * d[0] + d[1] * d[1]).max(0.001))
