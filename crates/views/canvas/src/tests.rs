@@ -756,15 +756,98 @@ fn undo_after_a_reroute_puts_the_whole_run_back_in_one_step() {
 /// is that bug coming back.
 #[test]
 fn the_painter_and_the_editor_read_one_description_of_a_label() {
-    let source = include_str!("presentation.rs");
+    let painting = include_str!("presentation.rs");
     assert_eq!(
-        source.matches("self.lettering(").count(),
+        painting.matches("self.lettering(").count(),
         2,
         "the painter asks once and the inline editor asks once"
     );
     assert!(
-        !source.contains("size: Some((14."),
+        !painting.contains("size: Some((14."),
         "the inline editor must not carry a type size of its own"
+    );
+    // The editor fills the card it is opened over. Asking it to lay out to
+    // its own content instead collapses it to its first line on the native
+    // side, so five of a note's six lines go missing the moment a caret
+    // appears — the exact difference between editing and reading a card that
+    // this description exists to close.
+    assert!(
+        !painting.contains("height: Some(Length::Shrink)"),
+        "the inline editor fills its card; a shrunk one shows one line of many"
+    );
+}
+
+#[test]
+fn an_abandoned_text_shape_leaves_nothing_behind_and_an_empty_sticky_stays() {
+    let mut view = view();
+    view.edit(Change::Create {
+        id: "t".into(),
+        shape: Shape {
+            kind: Kind::Text,
+            width: 280,
+            height: 96,
+            ..Default::default()
+        },
+    });
+    view.selected = ["t".into()].into();
+    view.begin_text();
+    view.finish_text();
+    let board = view.visible().unwrap();
+    assert!(
+        !board.shapes.contains_key("t"),
+        "a text shape with no words is an invisible hit box, not a shape"
+    );
+    assert!(!view.selected.contains("t"));
+    // A sticky with no words is still a sticky: it has a body to show.
+    view.edit(Change::Create {
+        id: "n".into(),
+        shape: Shape {
+            kind: Kind::Note,
+            width: 220,
+            height: 180,
+            ..Default::default()
+        },
+    });
+    view.selected = ["n".into()].into();
+    view.begin_text();
+    view.finish_text();
+    assert!(view.visible().unwrap().shapes.contains_key("n"));
+}
+
+#[test]
+fn a_card_paints_every_word_its_editor_holds_and_the_marks_keep_their_own_room() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    let mut board = view.confirmed.take().unwrap();
+    // A board of ordinary size, each card carrying the most text one may.
+    for i in 0..12 {
+        board = board
+            .changed(&Change::Create {
+                id: format!("card-{i}"),
+                shape: Shape {
+                    x: (i % 4) * 260,
+                    y: (i / 4) * 200,
+                    text: "가".repeat(boards::MAX_TEXT / 3),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+    }
+    view.confirmed = Some(board);
+    view.selected = (0..12).map(|i| format!("card-{i}")).collect();
+    let json = serde_json::to_string(&view.view()).unwrap();
+    let painted = json.matches("가").count();
+    assert!(
+        painted >= 12 * (boards::MAX_TEXT / 3),
+        "every card paints the whole of what its editor would hold, not a prefix of it: {painted}"
+    );
+    // And the selection is still drawn over all of it — the marks are taken
+    // out of the frame's budget before the shapes, not left the remainder.
+    assert!(json.contains("boards/overlay"));
+    let overlay = json.split("boards/overlay").nth(1).unwrap();
+    assert!(
+        overlay.matches("Rectangle").count() >= 12,
+        "a ring for every selected card survives a board full of text"
     );
 }
 

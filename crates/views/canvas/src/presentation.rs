@@ -139,11 +139,11 @@ fn alpha(mut color: [f32; 4], alpha: f32) -> [f32; 4] {
 /// The inset a card keeps around its text, in board units.
 const CARD_INSET: f32 = 12.;
 /// One card's words, as both the painter and the editor must lay them out.
-struct Lettering {
+pub(super) struct Lettering {
     /// Screen-space type size, already scaled by the camera.
-    size: f32,
+    pub(super) size: f32,
     /// How far in from the card's box the words start, on every side.
-    inset: f32,
+    pub(super) inset: f32,
 }
 /// The inset every island keeps from the stage's edge.
 const ISLAND: f32 = 12.;
@@ -775,19 +775,32 @@ impl BoardsView {
         let mut layers = Vec::new();
         // The host decodes a fixed number of geometry pieces per frame and
         // REFUSES the whole frame past it, so the budget is spent in priority
-        // order: the shapes first, each taking a fair share of what is left,
-        // then the pointer's marks, then the grid with the remainder.
-        let mut budget = PARTS;
+        // order: the pointer's marks first, then the shapes, each taking a
+        // fair share of what is left, then the grid with the remainder.
+        //
+        // The marks come off the top rather than take what the shapes leave: a
+        // board dense enough to spend the whole budget is exactly the board
+        // where you cannot tell what is selected without them, and selection
+        // chrome that disappears as the work grows reads as broken.
         let ordered = board.ordered();
+        let mut budget = PARTS - MARKS;
+        // Cards off screen cost no words, so the text allowance is shared out
+        // among the ones actually drawn — on any ordinary board that is the
+        // whole of every card's text, which is the point.
+        let shown = ordered
+            .iter()
+            .filter(|(_, record)| self.on_screen(board, &record.shape).is_some())
+            .count();
+        let share = LETTERS / shown.max(1);
         for (index, (id, record)) in ordered.iter().enumerate() {
             let s = &record.shape;
             let Some(box_) = self.on_screen(board, s) else {
                 continue;
             };
             let opacity = if erasing.contains(*id) { 0.25 } else { 1. };
-            let share = budget / (ordered.len() - index);
+            let allowance = budget / (ordered.len() - index);
             let mut body = Vec::new();
-            self.paint(board, s, opacity, share, &mut body);
+            self.paint(board, s, opacity, allowance, &mut body);
             if cost(&body) > budget {
                 body.clear();
             }
@@ -800,14 +813,14 @@ impl BoardsView {
                     commands: body,
                 });
             }
-            if let Some(label) = self.label(id, s, box_, opacity) {
+            if let Some(label) = self.label(id, s, box_, opacity, share) {
                 layers.push(label);
             }
         }
         let mut top = Vec::new();
-        self.paint_marks(board, budget, &mut top);
-        budget = budget.saturating_sub(cost(&top));
-        let grid = self.grid(budget);
+        self.paint_marks(board, MARKS, &mut top);
+        let overrun = cost(&top).saturating_sub(MARKS);
+        let grid = self.grid(budget.saturating_sub(overrun));
         let mut children = vec![Node::Canvas {
             key: "boards/grid".into(),
             width: Some(Length::Fill),
@@ -1015,7 +1028,7 @@ impl BoardsView {
     /// fills the box it is given and cannot be centred in it: words that sat in
     /// the middle when painted would jump to the top the instant a caret
     /// appeared. So the painter writes where the editor can.
-    fn lettering(&self, kind: Kind, size: [f32; 2]) -> Lettering {
+    pub(super) fn lettering(&self, kind: Kind, size: [f32; 2]) -> Lettering {
         let plain = kind == Kind::Text;
         let edge = CARD_INSET * self.zoom;
         // an ellipse and a diamond pinch away from their corners, so their
@@ -1032,7 +1045,14 @@ impl BoardsView {
         }
     }
     /// A shape's words, pinned over its body and clipped to it.
-    fn label(&self, id: &str, s: &Shape, box_: [f32; 4], opacity: f32) -> Option<Node> {
+    fn label(
+        &self,
+        id: &str,
+        s: &Shape,
+        box_: [f32; 4],
+        opacity: f32,
+        share: usize,
+    ) -> Option<Node> {
         let p = kit::palette();
         let editing = self.inline.as_ref().is_some_and(|inline| inline.id == *id);
         if editing {
@@ -1051,7 +1071,7 @@ impl BoardsView {
                 height: Some(Length::Fixed(40.)),
                 content: Box::new(kit::wrapping(kit::text(
                     format!("boards/path-text/{id}"),
-                    excerpt(&s.text),
+                    excerpt(&s.text, share),
                 ))),
             });
         }
@@ -1064,7 +1084,7 @@ impl BoardsView {
         let text = if blank {
             "Write a thought…"
         } else {
-            excerpt(&s.text)
+            excerpt(&s.text, share)
         };
         let ink = if blank { p.faint } else { p.foreground };
         let letters = self.lettering(s.kind, [box_[2] - box_[0], box_[3] - box_[1]]);
@@ -1282,6 +1302,11 @@ impl BoardsView {
 /// frame, shared across every canvas in it, and REFUSES a frame that exceeds
 /// it. Everything the scene draws is spent out of this one budget.
 const PARTS: usize = 3600;
+/// Held back out of it for what belongs to the pointer — the selection, its
+/// handles, the guides and the gesture in flight. Enough for a wide selection
+/// and its grips, and it is taken before the shapes rather than after, so the
+/// answer to "what am I holding" does not vanish on a busy board.
+const MARKS: usize = 320;
 
 /// What geometry costs against that budget: the host charges for the command
 /// AND for every segment inside it.
@@ -1348,10 +1373,17 @@ fn polyline(points: &[[f32; 2]]) -> Vec<wire::CanvasSegment> {
     path
 }
 
-// Keep every visible card below its share of the host's 64 KiB text budget.
-// The inspector retains the full text for editing.
-fn excerpt(text: &str) -> &str {
-    let mut end = text.len().min(256);
+/// The host decodes at most 64 KiB of text per frame and refuses the whole
+/// frame past it. Most of that is the chrome's, which is short and fixed; the
+/// rest is the board's to share out among the cards actually on screen.
+const LETTERS: usize = 48 * 1024;
+/// One card's share of that, given how many are on screen with it. A board of
+/// a dozen cards gives every one of them room for its whole text — which is
+/// the point: what a card shows and what its editor holds are the same words.
+/// Only a screen packed past readability has to cut anything, and it cuts the
+/// tail rather than the frame.
+fn excerpt(text: &str, share: usize) -> &str {
+    let mut end = text.len().min(share);
     while !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -1832,6 +1864,10 @@ impl BoardsView {
             editable: true,
             placeholder: "Write a thought…".into(),
             width: Some((size[0] - 2. * letters.inset).max(40.)),
+            // The editor fills the card. It cannot be asked to lay out to its
+            // own content instead — a shrunk editor collapses to its first
+            // line on the native side, which is how a card would learn to
+            // hide five of the six lines it is holding.
             height: Some(Length::Fill),
             min_height: Some(letters.size * 1.6),
             max_height: None,
