@@ -264,10 +264,8 @@ impl InProcDaemon {
     /// what `NodeLink::files()` builds for a real daemon.
     pub fn files(&self) -> duckfs_client::http::HttpNode {
         let token = self.operator_token.clone();
-        duckfs_client::http::HttpNode::new(self.node_url()).with_write_auth(std::sync::Arc::new(
-            move |_method, _path, _body| {
-                vec![(crate::admin::ADMIN_TOKEN_HEADER.to_string(), token.clone())]
-            },
+        duckfs_client::http::HttpNode::new(self.node_url()).with_operator_credential(std::sync::Arc::new(
+            move || Some(token.clone()),
         ))
     }
 

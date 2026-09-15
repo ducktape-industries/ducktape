@@ -166,6 +166,7 @@ members = [
     "crates/modules/apps/forge",
     "crates/modules/apps/pages",
     "crates/modules/apps/chat",
+    "crates/modules/apps/chat/message",
     "crates/modules/apps/agent",
     "crates/modules/apps/runs",
     "crates/modules/apps/tasks",
@@ -194,6 +195,8 @@ members = [
     # bin — runnable binaries
     "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/airlock-gateway",
+    "bin/media-service",
+    "bin/forge-service",
     "bin/guest-builder",
     "bin/duck-guest-init",
     # the desktop app's boot-time executor (flip / rollback / exec)
@@ -206,7 +209,7 @@ members = [
 # the shipping workspace build. It stays in-tree and is gated via `make labs-gate`.
 # The shared design crate belongs to the views workspace so Cargo gives
 # its guest dependency a checkout-independent package identity.
-exclude = ["crates/labs", "crates/module-sdk", "crates/views/support/design", "crates/views/support/guest"]
+exclude = ["crates/labs", "crates/module-sdk", "crates/views/forge", "crates/views/support/design", "crates/views/support/guest", "crates/views/support/composer", "crates/views/support/files"]
 
 [workspace.package]
 edition = "2024"

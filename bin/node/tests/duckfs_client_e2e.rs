@@ -254,14 +254,13 @@ fn duckfs_workspace_rpc_over_the_cluster() {
         || {
             let (code, body) = cluster.http(
                 1,
-                "GET",
-                &format!("/v1/files/read?path={prefix}/data.txt"),
-                None,
+                "POST", "/v1/query",
+                Some(&serde_json::json!({"target":"files","query":{"read":{"path":format!("{prefix}/data.txt"),"snapshot":null,"offset":0,"len":1048576}}})),
             );
             if code != 200 {
                 return None;
             }
-            let b64 = body["b64"].as_str()?;
+            let b64 = body["read"]["b64"].as_str()?;
             STANDARD.decode(b64.as_bytes()).ok()
         },
     );

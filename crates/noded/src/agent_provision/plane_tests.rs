@@ -314,11 +314,6 @@ fn the_node_base_is_the_bare_http_root_the_forge_lane_hangs_off() {
         !base.contains("/forge"),
         "the node base carries no suffix: {base}"
     );
-    assert_eq!(
-        forge_push_base(Some("0.0.0.0:8844")).unwrap(),
-        format!("{base}/forge"),
-        "one derivation, two bases — the push lane is the node base plus /forge"
-    );
 }
 
 // ---- what a run actually gets ---------------------------------------------

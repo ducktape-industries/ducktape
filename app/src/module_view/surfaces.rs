@@ -10,11 +10,9 @@ pub(super) struct Surface {
     handler: Option<u32>,
     view: View,
     _events: Option<Subscription>,
-    _observations: Option<Subscription>,
 }
 
 enum View {
-    Composer(Entity<crate::composer_surface::ComposerView>),
     Markdown(Entity<crate::backend::MarkdownSurface>),
     Picture(Entity<crate::backend::PictureView>),
     Code(Entity<crate::backend::CodeView>),
@@ -24,7 +22,6 @@ enum View {
 impl View {
     fn any(&self) -> AnyView {
         match self {
-            Self::Composer(view) => view.clone().into(),
             Self::Markdown(view) => view.clone().into(),
             Self::Picture(view) => view.clone().into(),
             Self::Code(view) => view.clone().into(),
@@ -41,9 +38,8 @@ impl View {
         cx: &mut Context<NativeModuleView>,
     ) -> Result<(), String> {
         match self {
-            Self::Composer(view) => view.update(cx, |view, cx| view.replace(args, window, cx)),
             Self::Markdown(view) => {
-                let (source, doc, dark) = markdown_args(name, args);
+                let (source, doc, dark) = markdown_args(args);
                 view.update(cx, |view, cx| view.replace(source, doc, dark, cx));
                 Ok(())
             }
@@ -74,15 +70,12 @@ impl View {
     }
 }
 
-fn markdown_args(name: &str, args: &[wire::SurfaceValue]) -> (String, String, bool) {
-    match name {
-        "agent_markdown" => (surface_str(args, 0), String::new(), surface_bool(args, 1)),
-        _ => (
-            surface_str(args, 0),
-            surface_str(args, 1),
-            surface_bool(args, 2),
-        ),
-    }
+fn markdown_args(args: &[wire::SurfaceValue]) -> (String, String, bool) {
+    (
+        surface_str(args, 0),
+        surface_str(args, 1),
+        surface_bool(args, 2),
+    )
 }
 
 pub(super) fn asset_node(name: &str, args: &[wire::SurfaceValue], guest: &Guest) -> wire::Node {
@@ -137,7 +130,7 @@ impl NativeModuleView {
         self.surfaces
             .retain(|key, _| requests.iter().any(|request| &request.0 == key));
         for (key, name, args, handler) in requests {
-            if !surface_allowed(self.module, &name) {
+            if !surface_allowed(&name) {
                 continue;
             }
             let same_kind = self
@@ -147,15 +140,8 @@ impl NativeModuleView {
             if !same_kind {
                 let view =
                     match name.as_str() {
-                        "chat_composer" | "forge_composer" => {
-                            crate::composer_surface::validate_args(&args)?;
-                            View::Composer(cx.new(|cx| {
-                                crate::composer_surface::ComposerView::new(&args, window, cx)
-                                    .expect("validated composer arguments")
-                            }))
-                        }
-                        "agent_markdown" | "forge_markdown" => {
-                            let (source, doc, dark) = markdown_args(&name, &args);
+                        "markdown" => {
+                            let (source, doc, dark) = markdown_args(&args);
                             View::Markdown(cx.new(|cx| {
                                 crate::backend::MarkdownSurface::new(source, doc, dark, cx)
                             }))
@@ -166,7 +152,7 @@ impl NativeModuleView {
                                 surface_str(&args, 1),
                             )
                         })),
-                        "forge_code" => View::Code(cx.new(|cx| {
+                        "code" => View::Code(cx.new(|cx| {
                             crate::backend::CodeView::new(
                                 surface_str(&args, 0),
                                 surface_str(&args, 1),
@@ -182,7 +168,6 @@ impl NativeModuleView {
                         _ => continue,
                     };
                 let events = self.surface_subscription(&view, &key, handler, cx);
-                let observations = self.surface_observations(&view, &key, cx);
                 content.update(cx, |tree, cx| tree.set_surface(key.clone(), view.any(), cx));
                 self.surfaces.insert(
                     key,
@@ -192,7 +177,6 @@ impl NativeModuleView {
                         handler,
                         view,
                         _events: events,
-                        _observations: observations,
                     },
                 );
                 continue;
@@ -221,44 +205,9 @@ impl NativeModuleView {
         cx: &mut Context<Self>,
     ) -> Option<Subscription> {
         match view {
-            View::Composer(view) => Some(self.subscribe_surface(view, key, handler, cx)),
             View::Markdown(view) => Some(self.subscribe_surface(view, key, handler, cx)),
             View::Picture(_) | View::Code(_) | View::Asset(_) => None,
         }
-    }
-
-    fn surface_observations(
-        &self,
-        view: &View,
-        key: &str,
-        cx: &mut Context<Self>,
-    ) -> Option<Subscription> {
-        let View::Composer(view) = view else {
-            return None;
-        };
-        let seat = mounted(self.module);
-        let generation = self.generation;
-        let alive = self.alive.clone().expect("mounted guest");
-        let key = key.to_owned();
-        Some(cx.subscribe(view, move |this, _, event: &wire::Event, cx| {
-            if !this.surfaces.contains_key(&key) {
-                return;
-            }
-            let mut locked = seat.lock().expect("module view lock");
-            let Slot::Ready(guest) = &mut locked.slot else {
-                return;
-            };
-            if guest.seated_generation() != generation
-                || !Arc::ptr_eq(&alive, &guest.alive)
-                || guest.frame_rev != this.revision
-            {
-                cx.notify();
-                return;
-            }
-            if input::deliver(guest, event.clone()) {
-                cx.notify();
-            }
-        }))
     }
 
     fn subscribe_surface<V: EventEmitter<wire::SurfaceValue> + 'static>(

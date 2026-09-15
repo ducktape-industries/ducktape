@@ -1,0 +1,33 @@
+[package]
+name = "ducktape-forge-service"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+axum = "0.8"
+blobstore.workspace = true
+commonware-codec.workspace = true
+commonware-cryptography.workspace = true
+ducktape-rpc.workspace = true
+flate2 = "1"
+forge.workspace = true
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+hex = "0.4"
+keyscheme.workspace = true
+libc.workspace = true
+node.workspace = true
+sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+subtle = "2"
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+tempfile.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+forge-view = { path = "../../crates/views/forge" }
+ducktape-view-guest = { path = "../../crates/views/support/guest" }
+base64 = "0.22"

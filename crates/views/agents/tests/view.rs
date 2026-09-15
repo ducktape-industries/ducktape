@@ -918,7 +918,7 @@ fn trace_exposes_full_provider_details_only_when_opened() {
 fn markdown_texts(frame: &Frame) -> Vec<String> {
     fn collect(node: &Node, texts: &mut Vec<String>) {
         if let Node::Surface { name, args, .. } = node
-            && name == "agent_markdown"
+            && name == "markdown"
             && let Some(ducktape_view_guest::wire::SurfaceValue::Str(text)) = args.first()
         {
             texts.push(text.clone());

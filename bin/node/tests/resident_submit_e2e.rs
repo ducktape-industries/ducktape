@@ -165,16 +165,7 @@ fn resident_posts_to_chat_with_its_own_authorship() {
     git_ok(source.path(), &["add", "src/lib.rs"]);
     git_ok(source.path(), &["commit", "-m", "add source"]);
     let pushed_head = git_stdout(source.path(), &["rev-parse", "HEAD"]);
-    let resident_url = format!(
-        "http://127.0.0.1:{}/forge/resident-source",
-        cluster.http_ports[1]
-    );
-    git_ok(source.path(), &["remote", "add", "resident", &resident_url]);
-    git_push_ok(
-        cluster.git_push_env(1),
-        source.path(),
-        &["push", "resident", "main"],
-    );
+    cluster.seed_forge(1, source.path(), "resident-source", "main");
 
     for (idx, role) in [(0, "validator"), (1, "resident")] {
         let head = cluster.await_committed(
@@ -199,14 +190,7 @@ fn resident_posts_to_chat_with_its_own_authorship() {
 
         let checkout = tempfile::tempdir().expect("git checkout parent");
         let destination = checkout.path().join(role);
-        let url = format!(
-            "http://127.0.0.1:{}/forge/resident-source",
-            cluster.http_ports[idx]
-        );
-        git_ok(
-            checkout.path(),
-            &["clone", "--quiet", &url, destination.to_str().unwrap()],
-        );
+        cluster.clone_forge(idx, "resident-source", &destination);
         assert_eq!(
             std::fs::read_to_string(destination.join("src/lib.rs")).unwrap(),
             "pub fn actual_source() -> &'static str { \"visible\" }\n",
@@ -268,16 +252,7 @@ fn validator_push_fans_pack_to_every_validator_before_consensus() {
     git_ok(source.path(), &["add", "validator.rs"]);
     git_ok(source.path(), &["commit", "-m", "add validator source"]);
     let pushed_head = git_stdout(source.path(), &["rev-parse", "HEAD"]);
-    let receiving_validator = format!("{}/forge/validator-source", cluster.http_base(0));
-    git_ok(
-        source.path(),
-        &["remote", "add", "validator", &receiving_validator],
-    );
-    git_push_ok(
-        cluster.git_push_env(0),
-        source.path(),
-        &["push", "validator", "main"],
-    );
+    cluster.seed_forge(0, source.path(), "validator-source", "main");
 
     cluster.await_committed(
         1,
@@ -301,11 +276,7 @@ fn validator_push_fans_pack_to_every_validator_before_consensus() {
 
     let checkout = tempfile::tempdir().expect("git checkout parent");
     let destination = checkout.path().join("peer-validator");
-    let peer_url = format!("{}/forge/validator-source", cluster.http_base(1));
-    git_ok(
-        checkout.path(),
-        &["clone", "--quiet", &peer_url, destination.to_str().unwrap()],
-    );
+    cluster.clone_forge(1, "validator-source", &destination);
     assert_eq!(
         std::fs::read_to_string(destination.join("validator.rs")).unwrap(),
         "pub const SOURCE: bool = true;\n",
@@ -368,21 +339,6 @@ fn git_output(dir: &Path, args: &[&str]) -> Output {
 
 fn git_ok(dir: &Path, args: &[&str]) {
     let output = git_output(dir, args);
-    assert!(
-        output.status.success(),
-        "git {args:?} failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
-/// a `git push` carrying a node's operator credential (`cluster.git_push_env`)
-/// — the proof `git-receive-pack` now requires (#1292).
-fn git_push_ok(env: [(String, String); 3], dir: &Path, args: &[&str]) {
-    let output = git_command(dir, args)
-        .envs(env)
-        .output()
-        .expect("spawn git");
     assert!(
         output.status.success(),
         "git {args:?} failed:\nstdout:\n{}\nstderr:\n{}",

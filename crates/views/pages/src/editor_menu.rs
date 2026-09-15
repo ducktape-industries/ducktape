@@ -315,6 +315,10 @@ const FORMAT_ITEMS: &[(&str, &str)] = &[
     ("clear", "Clear formatting"),
 ];
 
+pub fn format_items() -> &'static [(&'static str, &'static str)] {
+    FORMAT_ITEMS
+}
+
 /// The alignment submenu: the three sides the wire can lay a line on.
 const ALIGN_ITEMS: &[(&str, &str)] = &[
     ("left", "Align left"),

@@ -27,6 +27,7 @@ struct Recorded {
     method: String,
     path: String,
     body: Vec<u8>,
+    operator_token: Option<String>,
 }
 
 /// a canned http server that records every request and answers each with a
@@ -105,11 +106,17 @@ fn read_request(stream: &mut TcpStream) -> Recorded {
     let path = parts.next().unwrap_or_default().to_string();
 
     let mut content_length = 0usize;
+    let mut operator_token = None;
     loop {
         let mut header = String::new();
         reader.read_line(&mut header).expect("header line");
         if header == "\r\n" || header.is_empty() {
             break;
+        }
+        if let Some((name, value)) = header.split_once(':')
+            && name.eq_ignore_ascii_case("x-ducktape-admin-token")
+        {
+            operator_token = Some(value.trim().to_owned());
         }
         if let Some(v) = header.to_ascii_lowercase().strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
@@ -119,7 +126,12 @@ fn read_request(stream: &mut TcpStream) -> Recorded {
     if content_length > 0 {
         reader.read_exact(&mut body).expect("request body");
     }
-    Recorded { method, path, body }
+    Recorded {
+        method,
+        path,
+        body,
+        operator_token,
+    }
 }
 
 /// write a canned http/1.1 response with an explicit content-length and a close.
@@ -134,34 +146,43 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &serde_json::Value)
     let _ = stream.flush();
 }
 
-#[test]
-fn stage_posts_raw_bytes_and_parses_the_digest() {
-    let stub =
-        Stub::new(|_method, _path, _body| (200, serde_json::json!({ "digest": "de".repeat(32) })));
-    let node = HttpNode::new(stub.url());
-
-    let digest = node.stage_chunk(b"abc").expect("stage ok");
-    assert_eq!(digest, "de".repeat(32));
-
-    let reqs = stub.requests();
-    assert_eq!(reqs.len(), 1);
-    assert_eq!(reqs[0].method, "POST");
-    assert_eq!(reqs[0].path, "/v1/files/stage");
-    // the raw chunk rides as the body VERBATIM (no json envelope, no base64).
-    assert_eq!(reqs[0].body, b"abc");
+fn signing_node(stub: &Stub) -> HttpNode {
+    HttpNode::new(stub.url()).with_frame_signer(std::sync::Arc::new(|target, payload| {
+        assert_eq!(target, "files");
+        [b"signed-frame:".as_slice(), payload.as_slice()].concat()
+    }))
 }
 
 #[test]
-fn commit_posts_snake_case_and_parses_camelcase_block() {
-    let stub = Stub::new(|_method, _path, _body| {
-        // the daemon answers a commit with a camelCase BlockSummary.
-        (
-            200,
-            serde_json::json!({ "height": 5, "root_hash": "ab".repeat(32) }),
-        )
-    });
-    let node = HttpNode::new(stub.url());
+fn stage_submits_the_exact_signed_binary_module_op() {
+    let stub = Stub::new(|_, _, _| (200, serde_json::json!({ "height": 4 })));
+    let node = signing_node(&stub);
+    let digest = node.stage_chunk(b"abc").unwrap();
+    assert_eq!(
+        digest,
+        duckfs_core::to_hex(&duckfs_core::objects::object_id(
+            duckfs_core::Kind::Chunk,
+            b"abc"
+        ))
+    );
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].path, "/v1/submit/frame");
+    assert_eq!(
+        requests[0].body,
+        [
+            b"signed-frame:".as_slice(),
+            &duckfs_core::encode_putblob(b"abc")
+        ]
+        .concat()
+    );
+}
 
+#[test]
+fn writes_are_module_messages_inside_opaque_signed_frames() {
+    let stub = Stub::new(|_, _, _| (200, serde_json::json!({ "height": 5 })));
+    let node = signing_node(&stub);
     let receipt = node
         .commit(
             Some("basesnap"),
@@ -175,116 +196,103 @@ fn commit_posts_snake_case_and_parses_camelcase_block() {
                 },
             }],
         )
-        .expect("commit ok");
+        .unwrap();
     assert_eq!(receipt.height, 5);
-
-    let reqs = stub.requests();
-    assert_eq!(reqs[0].method, "POST");
-    assert_eq!(reqs[0].path, "/v1/files/commit");
-    // the request body is the snake_case CommitBody the module wire speaks.
-    let sent: serde_json::Value = serde_json::from_slice(&reqs[0].body).expect("commit body json");
-    assert_eq!(sent["base_snapshot"], "basesnap");
-    assert_eq!(sent["message"], "hello");
-    assert_eq!(sent["changes"][0]["put"]["path"], "/shared/x");
-}
-
-#[test]
-fn unpin_posts_the_name_in_a_json_body_no_url_normalization_can_touch() {
-    // a path segment goes through `url` normalization before it leaves this
-    // process — `.`/`..` collapse into dot-segments, `/` splits into an extra
-    // segment. a JSON body is opaque to all of that, so every legal pin name
-    // (see `pin_apply`: non-empty + a byte cap, no charset restriction)
-    // round-trips unchanged.
     for name in [".", "..", "a/b", "café-🦆"] {
-        let stub = Stub::new(|_method, _path, _body| (200, serde_json::json!({ "height": 9 })));
-        let node = HttpNode::new(stub.url());
-
-        node.unpin(name).unwrap_or_else(|e| panic!("unpin {name:?} ok: {e:?}"));
-
-        let reqs = stub.requests();
-        assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0].method, "POST");
-        assert_eq!(reqs[0].path, "/v1/files/unpin");
-        let sent: serde_json::Value =
-            serde_json::from_slice(&reqs[0].body).expect("unpin body json");
-        assert_eq!(sent["name"], name);
+        node.unpin(name).unwrap();
+    }
+    let requests = stub.requests();
+    let decoded = |body: &[u8]| {
+        serde_json::from_slice::<serde_json::Value>(body.strip_prefix(b"signed-frame:").unwrap())
+            .unwrap()
+    };
+    let commit = decoded(&requests[0].body);
+    assert_eq!(commit["commit"]["base_snapshot"], "basesnap");
+    assert_eq!(commit["commit"]["changes"][0]["put"]["path"], "/shared/x");
+    for (request, name) in requests[1..].iter().zip([".", "..", "a/b", "café-🦆"]) {
+        assert_eq!(request.path, "/v1/submit/frame");
+        assert_eq!(decoded(&request.body)["unpin"]["name"], name);
     }
 }
 
 #[test]
-fn a_400_error_envelope_surfaces_as_rejected_verbatim() {
-    let stub = Stub::new(|_method, _path, _body| {
+fn module_rejection_is_preserved_and_missing_signer_sends_nothing() {
+    let stub = Stub::new(|_, _, _| {
         (
             400,
             serde_json::json!({ "error": "files: conflict: /x changed since base" }),
         )
     });
-    let node = HttpNode::new(stub.url());
-
-    let err = node
-        .commit(None, "m", Vec::new())
-        .expect_err("a 400 must reject");
-    // the conflict string passes through UNTOUCHED — the taxonomy keys on it.
+    let unsigned = HttpNode::new(stub.url());
+    assert!(unsigned.commit(None, "m", Vec::new()).is_err());
+    assert!(stub.requests().is_empty());
+    let node = signing_node(&stub);
     assert_eq!(
-        err,
+        node.commit(None, "m", Vec::new()).unwrap_err(),
         ApiError::Rejected("files: conflict: /x changed since base".into())
     );
 }
 
 #[test]
-fn stat_maps_404_to_ok_none() {
-    let stub = Stub::new(|_method, _path, _body| (404, serde_json::json!({ "error": "no entry" })));
+fn reads_use_generic_queries_and_decode_the_guest_reply() {
+    let stub = Stub::new(|method, path, body| {
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/v1/query");
+        let ask: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(ask["target"], "files");
+        let query = ask["query"].as_object().unwrap();
+        let (kind, _) = query.iter().next().unwrap();
+        let reply = match kind.as_str() {
+            "refs" => {
+                serde_json::json!({ "refs": { "head": "cd".repeat(32), "pins": {}, "window_len": 3 } })
+            }
+            "read" => {
+                serde_json::json!({ "read": { "b64": STANDARD.encode(b"hello"), "eof": true } })
+            }
+            "has_chunks" => serde_json::json!({ "has_chunks": { "present": [true, false] } }),
+            "stat" => serde_json::json!({ "stat": null }),
+            _ => panic!("unexpected query"),
+        };
+        (200, reply)
+    });
     let node = HttpNode::new(stub.url());
-
-    // a 404 on stat is "nothing there", NOT a transport failure.
-    let got = node.stat("/shared/missing", None).expect("stat ok");
-    assert!(got.is_none());
+    assert_eq!(node.refs().unwrap().window_len, 3);
+    assert_eq!(
+        node.read("/shared/x", Some("snapshot"), 4, 1024).unwrap(),
+        (b"hello".to_vec(), true)
+    );
+    assert_eq!(
+        node.has_chunks(&["aa".repeat(32), "bb".repeat(32)])
+            .unwrap(),
+        vec![true, false]
+    );
+    assert_eq!(node.stat("/shared/missing", None).unwrap(), None);
+    let requests = stub.requests();
+    let read: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(read["query"]["read"]["offset"], 4);
+    assert_eq!(read["query"]["read"]["snapshot"], "snapshot");
+    let chunks: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert_eq!(chunks["query"]["has_chunks"]["ids"][1], "bb".repeat(32));
 }
 
 #[test]
-fn refs_read_and_has_chunks_parse_their_replies() {
-    let stub = Stub::new(|_method, path, _body| {
-        if path.starts_with("/v1/files/refs") {
-            (
-                200,
-                serde_json::json!({ "head": "cd".repeat(32), "pins": {}, "window_len": 3 }),
-            )
-        } else if path.starts_with("/v1/files/read") {
-            (
-                200,
-                serde_json::json!({ "b64": STANDARD.encode(b"hello"), "eof": true }),
-            )
-        } else if path.starts_with("/v1/files/has-chunks") {
-            (200, serde_json::json!({ "present": [true, false] }))
-        } else {
-            (500, serde_json::json!({ "error": "unexpected" }))
-        }
+fn operator_stage_uses_generic_raw_transport_and_refreshes_credential() {
+    let stub = Stub::new(|method, path, body| {
+        assert_eq!((method, path), ("POST", "/v1/submit/raw/files"));
+        assert_eq!(body, duckfs_core::encode_putblob(b"chunk"));
+        (200, serde_json::json!({"height":1}))
     });
-    let node = HttpNode::new(stub.url());
-
-    let refs = node.refs().expect("refs ok");
-    assert_eq!(refs.head.as_deref(), Some(&*"cd".repeat(32)));
-    assert_eq!(refs.window_len, 3);
-
-    let (bytes, eof) = node.read("/shared/x", None, 0, 1024).expect("read ok");
-    assert_eq!(bytes, b"hello");
-    assert!(eof);
-
-    let present = node
-        .has_chunks(&["aa".repeat(32), "bb".repeat(32)])
-        .expect("has_chunks ok");
-    assert_eq!(present, vec![true, false]);
-
-    // the has-chunks ids ride as a comma-joined query param (percent-decoded
-    // server-side back to the request order).
-    let hc = stub
-        .requests()
-        .into_iter()
-        .find(|r| r.path.starts_with("/v1/files/has-chunks"))
-        .expect("a has-chunks request");
-    assert!(
-        hc.path.contains("ids="),
-        "ids ride in the query: {}",
-        hc.path
-    );
+    let credential = Arc::new(Mutex::new(Some("first".to_owned())));
+    let read = credential.clone();
+    let node = HttpNode::new(stub.url())
+        .with_operator_credential(Arc::new(move || read.lock().unwrap().clone()));
+    node.stage_chunk(b"chunk").unwrap();
+    *credential.lock().unwrap() = Some("second".into());
+    node.stage_chunk(b"chunk").unwrap();
+    *credential.lock().unwrap() = None;
+    assert!(node.stage_chunk(b"chunk").is_err());
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].operator_token.as_deref(), Some("first"));
+    assert_eq!(requests[1].operator_token.as_deref(), Some("second"));
 }

@@ -59,7 +59,7 @@ pub(crate) async fn run_validator(
     node_api_ports: Vec<u16>,
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
+    voice_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
     code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     blobs: noded::blobs::BlobHandle,
     overlay_slot: overlay_net::userspace::StackSlot,
@@ -147,6 +147,12 @@ pub(crate) async fn run_validator(
         voice_requests,
         overlay_slot.clone(),
         planes.clone(),
+        crate::netstack_governance::startup_backend(
+            &host,
+            resumed.as_ref().and_then(|r| r.height).unwrap_or(0),
+            &blobs,
+        )
+        .await,
     )
     .await;
     let wiring::RuntimeWiring {
@@ -663,6 +669,9 @@ pub(crate) async fn run_promoted(
                 reach_tx,
                 reach_rx,
                 None,
+                crate::reachability_plane::NetstackBoot::Selected(
+                    crate::netstack_governance::startup_backend(&host, height, &blobs).await,
+                ),
             ))
         }
         // no wireguard: no plane on either side. a reclaim timeout

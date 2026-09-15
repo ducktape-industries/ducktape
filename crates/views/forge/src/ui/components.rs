@@ -250,9 +250,9 @@ impl ForgeView {
                     content.push(wire::Node::Surface {
                         key: "forge/file-text".into(),
                         name: if markdown {
-                            "forge_markdown"
+                            "markdown"
                         } else {
-                            "forge_code"
+                            "code"
                         }
                         .into(),
                         args: vec![

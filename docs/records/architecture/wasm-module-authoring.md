@@ -118,6 +118,29 @@ And use the imports deliberately: `get-env` for the deterministic block env
 durable state; `emit-msg` for write intents at sibling modules (drained as
 follow-up ops, never reentrant); `emit-event` for observability records.
 
+### Application I/O and native boundaries
+
+Consensus guests remain deterministic. Off-chain application I/O runs in
+[independently installed service processes](../../deploy/application-service.md),
+addressed by a signed Gateway account and route name. A new application uses
+that common transport without a native service enum entry, endpoint handler, or
+topic parser. Its process owns request interpretation, live stream messages, and
+application authorization through committed module queries.
+
+WASM views call the common host operations in
+`app/src/module_view/kernel.rs`: `net.request` carries HTTP method, path, headers
+and body bytes; `net.stream` and `net.send` carry bidirectional framed traffic.
+The host resolves the current route and signs the exact request with the seated
+user key. That private key stays outside the view and service. Dropping a view cancels
+its requests and streams; an instance from a previous connection cannot submit
+work on the newly selected network.
+
+Native changes are still required for new storage engines, cryptographic
+schemes, consensus mechanisms, runtime imports, or device/rendering primitives.
+Application policy, query interpretation, service protocols, and screens use
+the existing capabilities. The [independent deployment example](../../../crates/examples/extension-probe/README.md)
+exercises module, view, and service replacement with fixed native executables.
+
 ### Sibling reads (`module-root` / `query-module`)
 
 Cross-module READS work from inside a guest: `module-root(target)` is the

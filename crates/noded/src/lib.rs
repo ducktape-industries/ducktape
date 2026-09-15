@@ -28,7 +28,7 @@ pub use admin::{AdminConfig, AdminExposure};
 // the per-request signature every MUTATING `/v1` route now carries, and the
 // verifier both it and `/v1/admin/*` share. reads stay open.
 pub mod signed_req;
-pub use signed_req::{OperatorCredential, SignedBy, WriteRefusal};
+pub use signed_req::{SignedBy, WriteRefusal};
 
 pub mod blobs;
 // the pieces every process needs AROUND the composer: the on-disk component
@@ -44,11 +44,6 @@ pub use stream::{
     BlockWake, ClientMsg, LogRing, RunOutputEvent, RunOutputRegistry, RunStream, ServerFrame,
     StreamErrorCode, StreamHub, StreamOpRow, StreamOrigin, StreamOriginKind, TailItem,
 };
-// the duckfs product surface lives in its own module; re-exported flat so the
-// router keeps its bare handler names and the public param structs stay at
-// `noded::CommitBody` &c.
-mod files_http;
-pub use files_http::*;
 // the workspace RPC (`/v1/fs/workspaces`) and its actor-lane `NodeApi` adapter.
 // crate-internal: the router registers the handlers and the adapter is used only
 // by the workspace handlers — nothing outside the crate touches either.
@@ -58,13 +53,11 @@ mod workspaces;
 // the D7 root). public so BOTH node binaries can build one and wire it into
 // their DispatchPool constructor.
 pub mod agent_provision;
-// realtime overlay websocket lanes: huddle and Pages-presence session/control types.
+// Pages presence session/control types.
 mod call;
 pub use call::{
-    CallClientControl, CallControlIn, CallControlOut, CallLane, CallParams, CallServerControl,
-    CallSession, CallSessionRequest, PageCursor, PresenceClientControl, PresenceControlIn,
-    PresenceControlOut, PresenceParams, PresenceServerControl, PresenceSession,
-    PresenceSessionRequest, RealtimeSessionRequest,
+    PageCursor, PresenceClientControl, PresenceControlIn, PresenceControlOut, PresenceLane,
+    PresenceParams, PresenceServerControl, PresenceSession, PresenceSessionRequest,
 };
 // the gateway lane: signed-route proxying + the isolated browser-gateway
 // origin (`gateway_http` because the `gateway` crate is a dependency).
@@ -74,11 +67,8 @@ pub mod origin_guard;
 pub use gateway_http::{
     GatewayBody, GatewayFailure, GatewayJob, GatewayLane, GatewayProxyReply, GatewayProxyRequest,
     GatewayResponse, GatewayWsMsg, PROXY_REPLY_TIMEOUT, collect_body, gateway_browser_router,
-    serve_browser_gateway,
+    gateway_caller_account, serve_browser_gateway,
 };
-// git smart-HTTP: forge as a full push+fetch remote over /forge/{repo}/….
-mod git_http;
-pub use git_http::InfoRefsParams;
 // the node-actor command lane and the router's shared state handle.
 mod handle;
 pub use handle::{
@@ -150,22 +140,16 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{DefaultBodyLimit, OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use commonware_cryptography::Signer as _;
-use duckfs_core::CHUNK_SIZE;
 use futures::channel::oneshot;
 use sdk::StateRoot;
 use serde::{Deserialize, Serialize};
 use workspace_config::{DEFAULT_INVITE_TTL_DAYS, INVITE_TTL_DAYS};
 
-use crate::call::{call_ws, presence_ws};
+use crate::call::presence_ws;
 use crate::gateway_http::{gateway_browser_base, gateway_proxy};
-use crate::git_http::{git_info_refs, git_receive_pack, git_upload_pack};
-// the forge pack ceiling the smart-HTTP lane accepts — re-exported so the
-// node's relay fan-out cap DERIVES from it (a pack the door took in must be
-// one the relay can carry; two numbers here once drifted 8x apart).
-pub use crate::git_http::GIT_PACK_BODY_LIMIT;
 use crate::index::{blocks, index_ops, index_scan, index_status, index_view};
 use crate::metrics::metrics;
 
@@ -472,8 +456,10 @@ pub struct OperationalStatus {
 /// swap this process performed.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetstackOperationalStatus {
-    /// `native` or `guest` — the machine driving the plane right now.
+    /// Actual execution: `starting`, `guest`, `stopped`, or `failed`.
     pub backend: String,
+    /// SHA-256 of the component actually running, absent when no guest runs.
+    pub code_hash: Option<String>,
     /// `null` until this process swaps once. A refused swap is recorded here
     /// AND leaves `backend` unchanged: the running machine continues.
     pub last_swap: Option<NetstackSwap>,
@@ -723,6 +709,7 @@ pub fn router(handle: NodeHandle) -> Router {
         // receipt out. distinct from `/v1/submit` above, whose `origin` is a
         // caller-supplied string.
         .route("/v1/submit/frame", post(submit_frame))
+        .route("/v1/submit/raw/{target}", post(submit_raw).layer(DefaultBodyLimit::max(node::MAX_PAYLOAD_BYTES)))
         .route("/v1/query", post(query))
         // the AUTHENTICATED read lane, to `/v1/query` what `/v1/submit/frame`
         // is to `/v1/submit`: the caller's own proof decides who is asking, so
@@ -744,7 +731,6 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/log-filter", post(log_filter))
         .route("/v1/huddle/node-proof", post(huddle_node_proof))
         .route("/v1/ws", get(ws))
-        .route("/v1/call/ws", get(call_ws))
         .route("/v1/presence/ws", get(presence_ws))
         .route(
             "/v1/gateway/proxy",
@@ -754,54 +740,16 @@ pub fn router(handle: NodeHandle) -> Router {
         )
         .route("/v1/gateway/browser", get(gateway_browser_base))
         .route(
+            "/v1/gateway/stream",
+            get(gateway_http::gateway_native_stream),
+        )
+        .route(
             "/v1/files/blob",
             // one receipt per request; the json routes keep axum's (smaller)
             // default limit.
             post(put_blob).layer(DefaultBodyLimit::max(MAX_BLOB_BODY_BYTES)),
         )
         .route("/v1/files/blob/{digest}", get(get_blob))
-        // ---- duckfs product surface ----
-        // thin convenience wrappers over the files module's ops/queries: each
-        // encodes the duckfs wire server-side and threads it through the SAME
-        // submit/query actor seam /v1/submit and /v1/query use — no new
-        // consensus path. distinct plane from the op-receipt /v1/files/blob lane
-        // above (the node-local blobstore), which these never touch.
-        .route(
-            "/v1/files/stage",
-            // one duckfs chunk per request, so the body cap IS the single-chunk
-            // cap (CHUNK_SIZE, the module's own putblob ceiling); a larger body
-            // could never be a valid staged chunk, so the layer rejects it 413.
-            post(files_stage).layer(DefaultBodyLimit::max(CHUNK_SIZE as usize)),
-        )
-        .route("/v1/files/commit", post(files_commit))
-        .route("/v1/files/pin", post(files_pin))
-        // the name rides a signed JSON body, not a path segment: `url`
-        // normalizes `%2E`/`%2E%2E` path segments as dot-segments before the
-        // request leaves the client, so a pin named `.` or `..` (both legal,
-        // see `pin_apply`) could reach a different route or fail signature
-        // verification through a path-shaped route.
-        .route("/v1/files/unpin", post(files_unpin))
-        .route("/v1/files/watch", post(files_watch))
-        .route("/v1/files/stat", get(files_stat))
-        .route("/v1/files/ls", get(files_ls))
-        .route("/v1/files/read", get(files_read))
-        .route("/v1/files/find", get(files_find))
-        .route("/v1/files/grep", get(files_grep))
-        .route("/v1/files/history", get(files_history))
-        // the S3-shaped object facade: one url = one object. PUT is a
-        // single-change commit (stage + put), GET streams the whole file,
-        // DELETE is a single-change rm; LIST is the existing /v1/files/ls.
-        .route(
-            "/v1/files/object/{*path}",
-            put(object_put)
-                .get(object_get)
-                .delete(object_delete)
-                .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES)),
-        )
-        // the read/probe surface the checkout/commit engine drives.
-        .route("/v1/files/refs", get(files_refs))
-        .route("/v1/files/diff", get(files_diff))
-        .route("/v1/files/has-chunks", get(files_has_chunks))
         // ---- duckfs workspace RPC (the jobs/sandbox seam) ----
         // managed checkouts under the injected root: create, commit (409 on a
         // structured conflict), delete. `None` root → 503.
@@ -830,22 +778,8 @@ pub fn router(handle: NodeHandle) -> Router {
         .route(
             "/v1/fs/workspaces/{id}",
             delete(workspaces::delete_workspace),
-        )
-        .route("/forge/{repo}/info/refs", get(git_info_refs))
-        // git smart-HTTP: forge is a full push+fetch remote over one route pair.
-        //   `git push  http://<node>/forge/<repo> main` — receive-pack (push)
-        //   `git clone http://<node>/forge/<repo>`      — upload-pack (fetch)
-        // the info/refs advertisement is tiny; both packfile POSTs carry a whole-
-        // repo pack, so their body caps are lifted far above the json/chunk
-        // defaults.
-        .route(
-            "/forge/{repo}/git-receive-pack",
-            post(git_receive_pack).layer(DefaultBodyLimit::max(GIT_PACK_BODY_LIMIT)),
-        )
-        .route(
-            "/forge/{repo}/git-upload-pack",
-            post(git_upload_pack).layer(DefaultBodyLimit::max(GIT_PACK_BODY_LIMIT)),
         );
+
     // EVERY mutating route above carries a credential; the reads do not. WHICH
     // credential is `signed_req::Lane::authority`'s call: a module-bound write
     // takes any acting key (the module decides), a node-level one takes this
@@ -857,6 +791,9 @@ pub fn router(handle: NodeHandle) -> Router {
     let public = public.route_layer(axum::middleware::from_fn_with_state(
         handle.clone(),
         signed_req::signed_write_guard,
+    )).route_layer(axum::middleware::from_fn_with_state(
+        std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+        limit_blob_uploads,
     ));
     // the owner-gated `/v1/admin/*` namespace — merged only when exposure is
     // enabled, so `Disabled` leaves the control surface simply ABSENT (a 404),
@@ -939,10 +876,30 @@ async fn submit(
             .unwrap_or_else(|| DEFAULT_ORIGIN.to_string())
             .into_bytes(),
     };
+    submit_payload(&handle, req.target, payload, origin).await
+}
+
+/// An operator-authorized arbitrary module op, authored as the node. User
+/// clients submit signed frames instead; this endpoint never claims a user.
+async fn submit_raw(
+    State(handle): State<NodeHandle>,
+    axum::extract::Path(target): axum::extract::Path<String>,
+    body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
+) -> Response {
+    let bounded_target = !target.is_empty() && target.len() <= node::MAX_TARGET_BYTES;
+    if !bounded_target { return error_response(StatusCode::BAD_REQUEST, "invalid module target"); }
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => return error_response(error.status(), &error.body_text()),
+    };
+    submit_payload(&handle, target, body.to_vec(), signed_req::acting_origin(None)).await
+}
+
+async fn submit_payload(handle: &NodeHandle, target: String, payload: Vec<u8>, origin: Vec<u8>) -> Response {
     let (reply, rx) = oneshot::channel();
     if let Err(resp) = handle
         .send(NodeCommand::Submit {
-            target: req.target,
+            target,
             payload: payload.clone(),
             origin,
             reply,
@@ -1324,7 +1281,21 @@ async fn mint_invite(
 
 /// body cap for the op-receipt blob lane. a receipt-lane bound only —
 /// unrelated to duckfs chunking, which rides the op stream.
-const MAX_BLOB_BODY_BYTES: usize = 4 * 1024 * 1024;
+async fn limit_blob_uploads(
+    State(slots): State<std::sync::Arc<tokio::sync::Semaphore>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let uploads_blob = request.method() == axum::http::Method::POST
+        && request.uri().path() == "/v1/files/blob";
+    if !uploads_blob { return next.run(request).await; }
+    let Ok(_permit) = slots.try_acquire() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "blob upload capacity exhausted");
+    };
+    next.run(request).await
+}
+
+const MAX_BLOB_BODY_BYTES: usize = blobstore::MAX_TRANSFER_BYTES;
 
 /// POST /v1/files/blob — raw receipt bytes in, `{"digest":"<64-hex>"}` out.
 ///

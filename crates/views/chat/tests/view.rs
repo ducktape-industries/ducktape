@@ -1,11 +1,11 @@
 //! The view driven natively through the wire: the kernel pushes session facts,
 //! the view reads the room it is on for itself through `rpc.view`, re-reads it
 //! on every `rpc.live` hit for the chat plane, and a reaction, a delete or a
-//! rename leaves as `op.submit` carrying chat's own message. The composers stay
-//! the host's slots, and the navigation the whole app shares stays an intent.
+//! rename leaves as `op.submit` carrying chat's own message. Composers use
+//! the shared editor transaction contract.
 
-use chat_view::host::{Channel, PendingSend, Session};
-use chat_view::{boot_native, tick_native};
+use chat_view::host::{Channel, Session};
+use chat_view::boot_native;
 use ducktape_view_guest::testing::{answer, has_text, item, press, texts, type_into};
 use ducktape_view_guest::wire::{Frame, Node, Request, SurfaceValue};
 
@@ -21,6 +21,31 @@ fn on_a_deep_stack(test: fn()) {
         .expect("the test thread finishes");
 }
 
+fn tick_native(input: Vec<ducktape_view_guest::wire::Event>) -> Frame {
+    let mut frame = chat_view::tick_native(input);
+    let sidebar = frame
+        .requests
+        .iter()
+        .find(|request| {
+            request.kind == "rpc.view"
+                && serde_json::from_slice::<serde_json::Value>(&request.payload)
+                    .is_ok_and(|query| query["query"].get("channels").is_some())
+        })
+        .cloned();
+    if let Some(request) = sidebar {
+        let rows: Vec<_> = [("channel-a", "general", false), ("channel-b", "ops", false), ("channel-v", "lounge", true)].into_iter().map(|(id,name,voice)| serde_json::json!({"channel":{"id":id,"name":name,"voice":voice,"post_policy":"open","archived":false,"huddle":if id == "channel-b" { serde_json::json!([{ "party":"acct:8", "node":"ada lovelace", "joined_at":1 },{ "party":"acct:7", "node":"me", "joined_at":2 }]) } else {serde_json::json!([])}},"head_seq":0})).collect();
+        let bytes = serde_json::to_vec(
+            &serde_json::json!({"channels":{"channels":rows,"has_more":false,"next_after":null}}),
+        )
+        .unwrap();
+        let mut next = chat_view::tick_native(vec![answer(request.id, &bytes)]);
+        next.requests
+            .extend(frame.requests.drain(..).filter(|old| old.id != request.id));
+        return next;
+    }
+    frame
+}
+
 fn session(connected: bool) -> Session {
     Session {
         connected,
@@ -31,23 +56,8 @@ fn session(connected: bool) -> Session {
         block_height: 84_912,
         me: "acct:7".into(),
         me_key: "aa".into(),
-        rooms: vec![
-            sidebar_row("channel-a", "general", false),
-            sidebar_row("channel-b", "ops", true),
-        ],
         active_channel: "channel-a".into(),
         ..Session::default()
-    }
-}
-
-fn sidebar_row(id: &str, name: &str, unread: bool) -> chat_view::host::ChatSidebarRow {
-    chat_view::host::ChatSidebarRow {
-        channel: chat_view::host::ChatChannel {
-            id: id.into(),
-            name: name.into(),
-            ..chat_view::host::ChatChannel::default()
-        },
-        unread,
     }
 }
 
@@ -103,7 +113,8 @@ fn surfaces(node: &Node, out: &mut Vec<(String, String)>) {
 fn accounts() -> Vec<u8> {
     serde_json::json!({ "accounts": [
         { "number": 7, "name": "mallard", "control": { "person": {} },
-          "keys": [{ "pubkey": [0xaa] }] }
+          "keys": [{ "pubkey": [0xaa] }] },
+        { "number": 8, "name": "Ada Lovelace", "control": { "person": {} }, "keys": [] }
     ]})
     .to_string()
     .into_bytes()
@@ -268,8 +279,7 @@ fn a_connected_view_reads_its_own_room() {
                 texts(&frame)
             );
         }
-        // the unread room carries its dot, not a word
-        let _ = node_ending(&frame, "/unread");
+        // First observation seeds the guest cursor at the committed head.
         assert!(
             frame.requests.is_empty(),
             "a settled room asks for nothing more: {:?}",
@@ -299,14 +309,6 @@ fn disconnect_hides_retained_rooms_messages_and_composer() {
 fn a_huddle_lists_its_people_under_the_room() {
     on_a_deep_stack(|| {
         let mut seated = session(true);
-        let seat = |label: &str, is_you: bool| chat_view::host::HuddleSeat {
-            label: label.into(),
-            initials: label.chars().take(2).collect(),
-            is_you,
-            node: label.to_ascii_lowercase(),
-        };
-        seated.rooms[1].channel.huddle_count = 2;
-        seated.rooms[1].channel.huddle = vec![seat("Ada Lovelace", false), seat("Me", true)];
         seated.speaking_peers = vec!["ada lovelace".into()];
         seated.huddle_joined = true;
         seated.call_muted = true;
@@ -337,20 +339,18 @@ fn a_live_hit_reads_the_room_again() {
     });
 }
 
-/// The two composers stay the host's slots, keyed by the room.
+/// The room renders the shared editor contract from its own guest state.
 #[test]
-fn the_composer_is_the_rooms_own_host_slot() {
+fn the_composer_is_owned_by_the_room_guest() {
     on_a_deep_stack(|| {
         let (frame, _) = connected_room();
         let mut slots = Vec::new();
         surfaces(frame.root.as_ref().expect("a tree"), &mut slots);
-        assert_eq!(
-            slots,
-            [(
-                "chat_composer".to_owned(),
-                "http://127.0.0.1:1\u{1f}channel-a".to_owned()
-            )]
-        );
+        assert!(slots.iter().all(|(name, _)| name != "chat_composer"));
+        assert!(matches!(
+            node_ending(&frame, "/composer/editor"),
+            Node::Editor { .. }
+        ));
     });
 }
 
@@ -359,10 +359,8 @@ fn the_composer_is_the_rooms_own_host_slot() {
 #[test]
 fn a_voice_room_lists_under_voice_and_joins_on_press() {
     on_a_deep_stack(|| {
-        let mut seated = session(true);
-        let mut lounge = sidebar_row("channel-v", "lounge", false);
-        lounge.channel.voice = true;
-        seated.rooms.push(lounge);
+        let seated = session(true);
+
         let (frame, _, _) = connected_room_with(&seated, roots());
         assert!(has_text(&frame, "Voice"), "{:?}", texts(&frame));
         let _ = node_ending(&frame, "voice/channel-v");
@@ -506,38 +504,149 @@ fn edited_annotations_reach_author_continuation_and_thread_rows() {
     });
 }
 
-/// A send in flight is a row at the tail: the app hands the body over as a
-/// session fact, and the committed row replaces it when the block lands.
+fn composer_commit(
+    frame: &Frame,
+    text: Option<&str>,
+    action: Option<&str>,
+) -> Vec<ducktape_view_guest::wire::Event> {
+    use ducktape_view_guest::wire;
+    let Node::Editor {
+        document, options, ..
+    } = node_ending(frame, "/composer/editor")
+    else {
+        panic!("composer editor")
+    };
+    let mut after = document.clone();
+    after.revision += 1;
+    let text = match action {
+        Some("send") => Some(""),
+        _ => text,
+    };
+    let patches = match text {
+        Some("") if document.byte_len == 0 => Vec::new(),
+        Some(text) => {
+            after.text_revision += 1;
+            after.byte_len = text.len() as u32;
+            after.cursor = wire::EditorCursor {
+                position: wire::EditorPosition {
+                    line: 0,
+                    column: text.len() as u32,
+                },
+                selection: None,
+            };
+            vec![wire::EditorPatch {
+                start_byte: 0,
+                end_byte: document.byte_len,
+                replacement: text.into(),
+            }]
+        }
+        None => Vec::new(),
+    };
+    vec![wire::Event::EditorTransaction {
+        handler: options.binding.as_ref().unwrap().on_event,
+        event: wire::EditorTransactionEvent::Commit {
+            id: wire::EditorTransactionId {
+                instance: 0,
+                document: document.document.clone(),
+                reset: document.reset,
+                sequence: document.revision + 1,
+                attempt: 0,
+                text_revision: document.text_revision,
+                revision: document.revision,
+            },
+            origin: action.map(|tag| wire::EditorRequestInput::Interaction {
+                action: wire::editor_presentation::EditorInteraction::Action { tag: tag.into() },
+            }),
+            before: document.clone(),
+            after,
+            patches,
+            kind: wire::EditorEditKind::GuestPatch,
+            history: wire::EditorHistoryEffect::Native,
+            input_time_ms: 0,
+        },
+    }]
+}
+
+/// A committed editor action drives the guest's pending row and module write.
 #[test]
 fn a_send_in_flight_paints_its_row_before_the_block() {
     on_a_deep_stack(|| {
-        boot_native();
-        let frame = tick_native(Vec::new());
-        let props = request(&frame, "chat.props").id;
-        let frame = tick_native(vec![item(props, &encoded(&session(true)))]);
-        let names = request(&frame, "rpc.query").id;
-        let frame = tick_native(vec![answer(names, &accounts())]);
-        let record = request(&frame, "rpc.view").id;
-        let frame = tick_native(vec![answer(record, &channel_record())]);
-        let window = request(&frame, "rpc.view").id;
-        let frame = tick_native(vec![answer(window, &roots())]);
-        let roster = request(&frame, "rpc.view").id;
-        let _ = tick_native(vec![answer(roster, &members())]);
-
-        let sending = Session {
-            pending_sends: vec![PendingSend {
-                id: "op-1".into(),
-                body: "third rail".into(),
-                thread_seq: 0,
-            }],
-            sent_serial: 1,
-            ..session(true)
+        let (frame, _) = connected_room();
+        let frame = tick_native(composer_commit(&frame, Some("third rail"), None));
+        let Node::Editor { document, .. } = node_ending(&frame, "/composer/editor") else {
+            panic!("composer")
         };
-        let frame = tick_native(vec![item(props, &encoded(&sending))]);
+        let reset = document.reset;
+        let frame = tick_native(composer_commit(&frame, None, Some("send")));
+        let Node::Editor { document, .. } = node_ending(&frame, "/composer/editor") else {
+            panic!("composer")
+        };
+        assert_eq!(
+            document.reset, reset,
+            "Send must preserve queued input in this document instance"
+        );
+        let mint = request(&frame, "host.id").id;
+        let frame = tick_native(vec![answer(mint, b"op-1")]);
+        assert!(has_text(&frame, "third rail"), "{:?}", texts(&frame));
+        let submit = request(&frame, "op.submit");
+        let payload: serde_json::Value = serde_json::from_slice(&submit.payload).unwrap();
+        assert_eq!(payload["payload"]["post_message"]["message_id"], "op-1");
+        assert_eq!(
+            payload["payload"]["post_message"]["channel_id"],
+            "channel-a"
+        );
+        let submit_id = submit.id;
+        let _ = tick_native(composer_commit(&frame, Some("new typing"), None));
+        let frame = tick_native(vec![ducktape_view_guest::wire::Event::Response {
+            id: submit_id,
+            result: Err("refused".into()),
+            done: true,
+        }]);
+        assert!(!has_text(&frame, "third rail"));
+        assert!(has_text(&frame, "Restore unsent message"));
+        let Node::Editor { document, .. } = node_ending(&frame, "/composer/editor") else {
+            panic!("composer")
+        };
+        assert_eq!(document.byte_len, "new typing".len() as u32);
+    });
+}
+
+#[test]
+fn attachment_upload_uses_file_grants_and_posts_a_guest_built_link() {
+    on_a_deep_stack(|| {
+        let (frame, _) = connected_room();
+        let frame = tick_native(composer_commit(&frame, None, Some("attach")));
+        let picker = request(&frame, "fs.pick").id;
+        let frame = tick_native(vec![answer(
+            picker,
+            br#"[{"token":"grant-a","name":"hello.txt","bytes":3}]"#,
+        )]);
+        let mint = request(&frame, "host.id").id;
+        let frame = tick_native(vec![answer(mint, b"attachment-1")]);
+        let refs = request(&frame, "rpc.query").id;
+        let frame = tick_native(vec![answer(refs, br#"{"refs":{"head":null}}"#)]);
+        let read = request(&frame, "fs.read");
+        let ask: serde_json::Value = serde_json::from_slice(&read.payload).unwrap();
+        assert_eq!(
+            ask,
+            serde_json::json!({"token":"grant-a","offset":0,"len":3})
+        );
+        let frame = tick_native(vec![answer(read.id, b"abc")]);
+        let write = request(&frame, "op.submit_bytes");
+        let ask: serde_json::Value = serde_json::from_slice(&write.payload).unwrap();
+        assert_eq!(ask["target"], "files");
+        let frame = tick_native(vec![answer(write.id, b"1")]);
+        let release = request(&frame, "fs.release");
+        assert_eq!(release.payload, b"grant-a");
+        let frame = tick_native(vec![answer(release.id, b"")]);
+        let frame = tick_native(composer_commit(&frame, None, Some("send")));
+        let mint = request(&frame, "host.id").id;
+        let frame = tick_native(vec![answer(mint, b"file-message")]);
+        let write = request(&frame, "op.submit");
+        let payload = String::from_utf8(write.payload.clone()).unwrap();
         assert!(
-            has_text(&frame, "third rail"),
-            "the pending row is on screen: {:?}",
-            texts(&frame)
+            payload.contains("duck://files/shared/attachments/attachment-1/hello.txt"),
+            "{payload}"
         );
     });
 }

@@ -2,9 +2,7 @@
 //! reads, and the writes that leave as `op.submit`.
 //!
 //! The kernel pushes SESSION facts only (`chat.props`): the connection, the
-//! reader, the sidebar the rest of the app also draws from, the huddle (native
-//! media), the agent runs in flight in this process, and the sends the
-//! composer surface has admitted but not yet landed. Everything ABOUT the room
+//! reader, the huddle media and agent runs in flight in this process. Everything ABOUT the room
 //! on screen — its record, its roster, its messages, its threads and its
 //! search — this view reads for itself through `rpc.view`, re-read on every
 //! `rpc.live` hit for the chat plane. A reaction, a delete, a rename, an
@@ -20,7 +18,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
 use ducktape_view_guest::host;
-use futures::{Stream, StreamExt, stream};
+use futures::{FutureExt, Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 
 /// One page of roots, replies or hits — chat's own index page size.
@@ -277,11 +275,18 @@ async fn read_text(path: &str) -> Result<PreviewItem, String> {
 }
 
 async fn files_get(lane: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
-    ask(
-        "files.get",
-        &serde_json::json!({ "lane": lane, "params": params }),
+    let reply = ask(
+        "rpc.query",
+        &serde_json::json!({
+            "target": "files", "query": {lane: params}
+        }),
     )
-    .await
+    .await?;
+    let value = reply.get(lane).cloned().ok_or("unexpected Files reply")?;
+    match lane {
+        "history" => Ok(serde_json::json!({"snapshots": value})),
+        _ => Ok(value),
+    }
 }
 
 /// A file that is text, or the plate that says it is not. A page that ended
@@ -488,8 +493,7 @@ pub fn run_of_message(id: &str) -> String {
 
 // ---------- the session ----------
 
-/// The facts the kernel pushes: the connection, the reader, the sidebar the
-/// bell and the tray share, the huddle's native media, this process's agent
+/// The facts the kernel pushes: the connection, the reader, the huddle media, this process's agent
 /// runs, and the room the app has navigated to. Never module data, never this
 /// screen's own UI state.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -507,10 +511,6 @@ pub struct Session {
     pub me_key: String,
     /// moves when the identity plane does, so the name directory is re-read
     pub names_serial: i64,
-    /// the sidebar, folded by the app because the bell, the tray and the
-    /// command palette read the same rows
-    pub rooms: Vec<ChatSidebarRow>,
-    pub dm_rows: Vec<DmSidebarRow>,
     pub channel_create_open: bool,
     /// the room the app is in — chosen here, but steered by `duck://` links,
     /// notifications and the tray as well
@@ -544,7 +544,6 @@ pub struct Session {
     pub copy_chord_serial: i64,
     /// moves once per admitted send: the view's cue to snap to the tail
     pub sent_serial: i64,
-    pub pending_sends: Vec<PendingSend>,
     /// the agent runs anchored in THIS room, live while they run
     pub live_agents: Vec<LiveRunHint>,
 }
@@ -554,6 +553,7 @@ pub struct Session {
 pub struct SessionItem {
     pub next: Session,
     pub error: String,
+    pub participation: Option<Participation>,
 }
 
 /// The session now, and again on every change the kernel sees.
@@ -561,16 +561,35 @@ pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     ducktape_view_guest::Subscription::run(|| {
         host::subscribe("chat.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
-                serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .map_err(|error| error.to_string())
             });
             match read {
-                Ok(next) => SessionItem {
-                    next,
-                    error: String::new(),
+                Ok(value) => match value.get("participation") {
+                    Some(intent) => match serde_json::from_value(intent.clone()) {
+                        Ok(participation) => SessionItem {
+                            participation: Some(participation),
+                            ..SessionItem::default()
+                        },
+                        Err(error) => SessionItem {
+                            error: error.to_string(),
+                            ..SessionItem::default()
+                        },
+                    },
+                    None => match serde_json::from_value(value) {
+                        Ok(next) => SessionItem {
+                            next,
+                            ..SessionItem::default()
+                        },
+                        Err(error) => SessionItem {
+                            error: error.to_string(),
+                            ..SessionItem::default()
+                        },
+                    },
                 },
                 Err(error) => SessionItem {
-                    next: Session::default(),
                     error,
+                    ..SessionItem::default()
                 },
             }
         })
@@ -680,6 +699,41 @@ thread_local! {
     /// registry: a wasm module has one thread, and every native test drives
     /// its own app on its own thread.
     static NAMES: RefCell<(i64, Names)> = RefCell::new((-1, Names::default()));
+    static NAMES_READ: RefCell<Option<(i64, futures::future::Shared<futures::future::LocalBoxFuture<'static, Names>>)>> = RefCell::new(None);
+}
+
+/// Canonical mention tokens come from the guest's identity directory.
+pub(crate) fn composer_choices(
+    members: &[ChatMember],
+) -> Vec<ducktape_view_composer::MentionChoice> {
+    NAMES.with_borrow(|(_, names)| {
+        let mut choices: BTreeMap<String, String> = names
+            .by_account
+            .iter()
+            .map(|(number, label)| (format!("<@{number}>"), label.clone()))
+            .collect();
+        for member in members {
+            let key = member.key.strip_prefix("user:").unwrap_or(&member.key);
+            let account = key
+                .strip_prefix("acct:")
+                .and_then(|number| number.parse::<u64>().ok())
+                .or_else(|| names.account_of(key));
+            let token = match account {
+                Some(number) => format!("<@{number}>"),
+                None => format!("<@key:{key}>"),
+            };
+            choices.entry(token).or_insert_with(|| member.label.clone());
+        }
+        choices
+            .into_iter()
+            .map(|(token, label)| ducktape_view_composer::MentionChoice { token, label })
+            .collect()
+    })
+}
+
+pub(crate) fn reset_directory() {
+    NAMES.with_borrow_mut(|names| *names = (-1, Names::default()));
+    NAMES_READ.with_borrow_mut(|pending| *pending = None);
 }
 
 /// The directory as of `serial`, read once per identity change. A directory
@@ -690,6 +744,18 @@ async fn names_at(serial: i64) -> Names {
     if let Some(names) = cached {
         return names;
     }
+    let pending = NAMES_READ.with_borrow_mut(|slot| {
+        if let Some((_, pending)) = slot.as_ref().filter(|(at, _)| *at == serial) {
+            return pending.clone();
+        }
+        let pending = read_names(serial).boxed_local().shared();
+        *slot = Some((serial, pending.clone()));
+        pending
+    });
+    pending.await
+}
+
+async fn read_names(serial: i64) -> Names {
     let mut accounts = Vec::new();
     let mut from = 0u64;
     loop {
@@ -714,6 +780,144 @@ async fn names_at(serial: i64) -> Names {
     let names = fold_names(&serde_json::Value::Array(accounts));
     NAMES.with_borrow_mut(|slot| *slot = (serial, names.clone()));
     names
+}
+
+/// Directory and channel projection owned by the deployed Chat guest.
+#[derive(Clone, Debug, Default)]
+pub struct SidebarItem {
+    pub channels: Vec<ChatChannel>,
+    pub peers: Vec<DmPeer>,
+    pub error: String,
+}
+
+pub fn sidebar(
+    serial: i64,
+    names: i64,
+    reader: String,
+) -> ducktape_view_guest::Subscription<SidebarItem> {
+    ducktape_view_guest::Subscription::run_with((serial, names, reader), |key| {
+        let key = key.clone();
+        let live = host::subscribe("rpc.live", b"chat");
+        stream::once(read_sidebar(key.1, key.2.clone()))
+            .chain(live.then(move |_| read_sidebar(key.1, key.2.clone())))
+    })
+}
+
+async fn read_sidebar(serial: i64, reader: String) -> SidebarItem {
+    match read_sidebar_now(serial, &reader).await {
+        Ok(item) => item,
+        Err(error) => SidebarItem {
+            error,
+            ..SidebarItem::default()
+        },
+    }
+}
+
+async fn read_sidebar_now(serial: i64, reader: &str) -> Result<SidebarItem, String> {
+    let mut channels = Vec::new();
+    let mut seats = BTreeMap::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = view(
+            "channels",
+            serde_json::json!({"channels":{"after":after,"limit":PAGE_LIMIT}}),
+        )
+        .await?;
+        let rows = page["channels"].as_array().ok_or("missing channels page")?;
+        for row in rows {
+            seats.insert(
+                row["channel"]["id"].as_str().unwrap_or_default().to_owned(),
+                row["channel"]["huddle"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+        channels.extend(rows.iter().map(|row| {
+            let channel = &row["channel"];
+            ChatChannel {
+                id: channel["id"].as_str().unwrap_or_default().into(),
+                name: channel["name"].as_str().unwrap_or_default().into(),
+                archived: channel["archived"].as_bool().unwrap_or_default(),
+                members_only: channel["post_policy"].as_str() == Some("members_only"),
+                huddle_count: channel["huddle"]
+                    .as_array()
+                    .map_or(0, |rows| count_i64(rows.len())),
+                head_seq: row["head_seq"].as_i64().unwrap_or_default(),
+                voice: channel["voice"].as_bool().unwrap_or_default(),
+                ..ChatChannel::default()
+            }
+        }));
+        if page["has_more"].as_bool() != Some(true) {
+            break;
+        }
+        let next = page["next_after"]
+            .as_str()
+            .ok_or("missing channels cursor")?;
+        let advances = after.as_deref().is_none_or(|previous| next > previous);
+        if !advances {
+            return Err("channels cursor did not advance".into());
+        }
+        after = Some(next.into());
+    }
+    let names = names_at(serial).await;
+    let me = ME.with_borrow(Clone::clone);
+    for channel in &mut channels {
+        channel.huddle = seats
+            .remove(&channel.id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|seat| {
+                let party = seat["party"].as_str().unwrap_or_default();
+                let label = names.member_label(party);
+                HuddleSeat {
+                    initials: sidebar_initials(&label),
+                    label,
+                    is_you: owns_handle(party, &me, &names),
+                    node: seat["node"].as_str().unwrap_or_default().into(),
+                }
+            })
+            .collect();
+    }
+    let mine = reader
+        .strip_prefix("acct:")
+        .and_then(|number| number.parse::<u64>().ok());
+    let peers = names
+        .by_account
+        .iter()
+        .filter(|(number, _)| Some(**number) != mine)
+        .map(|(number, name)| {
+            let key = number.to_string();
+            DmPeer {
+                channel_id: mine
+                    .map_or_else(String::new, |mine| dm_channel_id(&mine.to_string(), &key)),
+                key,
+                name: name.clone(),
+                initials: sidebar_initials(name),
+                is_agent: names.programs.contains(number),
+            }
+        })
+        .collect();
+    Ok(SidebarItem {
+        channels,
+        peers,
+        error: String::new(),
+    })
+}
+
+fn sidebar_initials(name: &str) -> String {
+    name.split_whitespace()
+        .filter_map(|word| word.chars().next())
+        .take(2)
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+fn dm_channel_id(a: &str, b: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let (low, high) = if a < b { (a, b) } else { (b, a) };
+    let digest = Sha256::digest(format!("{low}\u{1f}{high}").as_bytes());
+    format!("dm-{digest:x}")
 }
 
 // ---------- the reads ----------
@@ -1909,18 +2113,6 @@ pub struct EditSeed {
     pub rev: i64,
 }
 
-pub fn send_begin_edit(scope: &str, body: &str, seq: i64, rev: i64) -> bool {
-    notify(
-        "chat.begin_edit",
-        &EditSeed {
-            scope: scope.into(),
-            body: body.into(),
-            seq,
-            rev,
-        },
-    )
-}
-
 /// The editable markdown of one row, or "" when it may not be edited: a
 /// deleted row has none, a pending one has no sequence yet, and a row whose
 /// revision moved under the open menu would be saved over blind.
@@ -2613,4 +2805,109 @@ mod tests {
             serde_json::json!({ "key": vec![0xab_u8; 32] })
         );
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Participation {
+    Join { channel: String },
+    Move { from: String, channel: String },
+    Leave { channel: String },
+}
+
+#[derive(Debug, Serialize)]
+struct ParticipationError {
+    message: String,
+    committed: bool,
+}
+impl From<String> for ParticipationError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            committed: false,
+        }
+    }
+}
+
+fn participation_channel(channel: &str) -> Result<&str, String> {
+    let channel = channel.trim();
+    let valid = !channel.is_empty() && channel.len() <= 256;
+    if !valid {
+        return Err("a channel is required".into());
+    }
+    Ok(channel)
+}
+
+async fn participation_submit(operation: serde_json::Value) -> Result<(), String> {
+    ask(
+        "op.submit",
+        &serde_json::json!({"target":"chat", "payload":operation}),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn participation_join(channel: String) -> Result<String, ParticipationError> {
+    let channel = participation_channel(&channel)?;
+    let proof = ask(
+        "rpc.admin",
+        &serde_json::json!({"route":"/v1/huddle/node-proof", "payload":{"channel_id":channel}}),
+    )
+    .await?;
+    let node = proof["node"].as_str().unwrap_or_default();
+    let signature = proof["node_proof"].as_str().unwrap_or_default();
+    let canonical = |text: &str, len| {
+        text.len() == len
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if !canonical(node, 64) || !canonical(signature, 128) {
+        return Err("invalid node participation proof".to_owned().into());
+    }
+    participation_submit(serde_json::json!({"join_huddle":{"channel_id":channel,"node":hex_bytes(node),"node_proof":hex_bytes(signature)}})).await?;
+    Ok(channel.to_owned())
+}
+
+async fn participation_leave(channel: String) -> Result<String, ParticipationError> {
+    let channel = participation_channel(&channel)?;
+    participation_submit(serde_json::json!({"leave_huddle":{"channel_id":channel}})).await?;
+    Ok(channel.to_owned())
+}
+
+async fn participation_move(from: String, channel: String) -> Result<String, ParticipationError> {
+    let channel = participation_channel(&channel)?.to_owned();
+    if from == channel {
+        return Ok(channel);
+    }
+    if from.is_empty() {
+        return participation_join(channel).await;
+    }
+    participation_leave(from).await?;
+    participation_join(channel)
+        .await
+        .map_err(|error| ParticipationError {
+            committed: true,
+            ..error
+        })
+}
+
+async fn participate(intent: Participation) -> Result<String, ParticipationError> {
+    match intent {
+        Participation::Join { channel } => participation_join(channel).await,
+        Participation::Move { from, channel } => participation_move(from, channel).await,
+        Participation::Leave { channel } => participation_leave(channel).await,
+    }
+}
+
+pub async fn run_participation(intent: Participation) {
+    let output = match participate(intent).await {
+        Ok(channel) => serde_json::json!({"channel":channel}),
+        Err(error) => serde_json::json!({"error":error}),
+    };
+    host::notify(
+        "host.emit",
+        &serde_json::to_vec(&output).expect("participation result encodes"),
+    );
+    host::notify("host.finish", &[]);
 }

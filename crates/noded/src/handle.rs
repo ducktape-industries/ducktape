@@ -11,7 +11,7 @@ use axum::response::Response;
 use futures::SinkExt as _;
 use futures::channel::{mpsc, oneshot};
 
-use crate::call::CallLane;
+use crate::call::PresenceLane;
 use crate::gateway_http::{BrowserGateway, GatewayLane};
 use crate::gateway_ws_token::WsTokenStore;
 use crate::metrics::NodeMetrics;
@@ -152,8 +152,6 @@ struct StatusCellInner {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NetstackSwapRequest {
-    /// `"native"` — the machine compiled into the node binary.
-    Native,
     /// `{"component": "<path>"}` — a `ducktape:netstack` component on disk.
     Component(PathBuf),
     /// component bytes already in hand — the governance reconciler's variant:
@@ -331,15 +329,15 @@ pub struct NodeHandle {
     /// whose embedder configured no index (the router tests' fake actor) —
     /// index routes answer 503 there.
     pub(crate) index: Option<Arc<indexer::IndexStore>>,
-    /// the call hub's session-request lane. `None` on daemons without a mesh
-    /// (the embedded daemon, router tests) — `/v1/call/ws` answers 503 there.
-    pub(crate) call: Option<CallLane>,
+    /// Pages presence request lane; absent when no overlay runtime exists.
+    pub(crate) presence: Option<PresenceLane>,
     /// Purpose-specific gateway request lane. No raw peer, filesystem, or
     /// arbitrary socket proxy is exposed through the client surface.
     pub(crate) gateway: Option<GatewayLane>,
     /// Dedicated least-privilege browser origin for gateway rendering. It is
     /// a separate loopback listener, never the node API origin.
     pub(crate) browser_gateway: Option<BrowserGateway>,
+    pub(crate) application_doors: Arc<crate::gateway_http::WsDoorLimit>,
     /// the root dir the duckfs workspace RPC materializes managed checkouts
     /// under (`<storage>/duckfs-workspaces`). node-local disk state, threaded in
     /// like `forge_repo`; `None` on a handle that never serves the seam (the
@@ -412,9 +410,10 @@ impl NodeHandle {
             blobs: crate::blobs::BlobHandle::default(),
             forge_repo: None,
             index: None,
-            call: None,
+            presence: None,
             gateway: None,
             browser_gateway: None,
+            application_doors: Arc::default(),
             duckfs_workspaces: None,
             code_stage: None,
             admin: crate::admin::AdminConfig::default(),
@@ -459,11 +458,9 @@ impl NodeHandle {
         self
     }
 
-    /// point this handle at a call hub's session-request lane so
-    /// `/v1/call/ws` can open huddle sessions. only the p2p validator
-    /// wires one — it owns the mesh the audio/video rides.
-    pub fn with_call(mut self, call: CallLane) -> Self {
-        self.call = Some(call);
+    /// Connect the Pages presence overlay request lane.
+    pub fn with_presence(mut self, presence: PresenceLane) -> Self {
+        self.presence = Some(presence);
         self
     }
 

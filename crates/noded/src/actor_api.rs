@@ -21,7 +21,7 @@ use duckfs_core::{
 };
 use futures::channel::oneshot;
 
-use crate::files_http::FILES_MODULE;
+const FILES_MODULE: &str = "files";
 use crate::{BlockSummary, NodeCommand, NodeHandle};
 
 /// a `NodeApi` bound to one node's actor lane. cheap to clone (holds only the

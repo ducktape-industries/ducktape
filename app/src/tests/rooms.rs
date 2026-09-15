@@ -216,14 +216,6 @@ fn opening_a_network_clears_the_previous_networks_state() {
     app.forge_note_pending = "op-a".into();
     app.huddle_joined = true;
     app.huddle_channel = "chan-a".into();
-    // AND A COMPOSER WITH WORDS IN IT, typed against node A. A channel id is a
-    // user-chosen string, so both networks can hold a `#general` — the key
-    // carries the ENDPOINT for exactly that reason (ducktape-ui#697), and the
-    // assertions below drive both halves of the promise.
-    let node_a_composer = composer_scope(&app);
-    type_into(&node_a_composer, "node a draft");
-    assert_eq!(composer_text(&node_a_composer), "node a draft");
-
     let _ = app.update(AppMessage::NetworkEntered);
 
     assert_eq!(app.connected_rpc, "http://node-b");
@@ -232,25 +224,6 @@ fn opening_a_network_clears_the_previous_networks_state() {
     assert_eq!(app.chat_edit_rev, 0);
     assert_eq!(app.chat_land_seq, 0);
     assert!(app.page_route.is_empty());
-    // NODE B'S ROOM IS NODE B'S. Same channel id, other endpoint, other
-    // instance — and node A's words are still under node A's key, which is
-    // the half a `message_drafts = []` clear used to get wrong by throwing
-    // them away instead.
-    let node_b_composer = composer_scope(&app);
-    assert_ne!(
-        node_b_composer, node_a_composer,
-        "the endpoint is in the key, so #general on node B is not #general on \
-         node A"
-    );
-    assert!(
-        composer_text(&node_b_composer).is_empty(),
-        "a draft typed on node A is not node B's to hand back"
-    );
-    assert_eq!(
-        composer_text(&node_a_composer),
-        "node a draft",
-        "and it is still node A's, waiting where it was typed"
-    );
     // The forge screen is the Forge VIEW's: what the app clears is the link
     // it last routed there, which named node A, and the note it had in flight.
     assert!(app.forge_link.is_empty());

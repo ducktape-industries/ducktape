@@ -203,6 +203,18 @@ pub fn validate_origin_form(value: &str) -> Result<(), String> {
     {
         return Err("gateway proxy: invalid origin-form path/query".into());
     }
+    // URL clients remove these segments before sending. Refuse them so the
+    // path verified by the publisher is the path the upstream receives.
+    let path = value.split('?').next().unwrap_or(value);
+    let normalized_by_clients = path.split('/').any(|segment| {
+        matches!(
+            segment.to_ascii_lowercase().as_str(),
+            "." | ".." | "%2e" | ".%2e" | "%2e." | "%2e%2e"
+        )
+    });
+    if normalized_by_clients {
+        return Err("gateway proxy: path contains a URL-normalized segment".into());
+    }
     Ok(())
 }
 
@@ -336,6 +348,23 @@ mod tests {
 
     /// The name is remote input; the refusal describes it and never carries
     /// its bytes, so the detail downstream stays ASCII and bounded.
+    #[test]
+    fn signed_paths_are_not_normalized_by_url_clients() {
+        for path in [
+            "/a/../b",
+            "/a/./b",
+            "/%2e/b",
+            "/.%2E/b",
+            "/%2e./b",
+            "/%2e%2E/b",
+        ] {
+            assert!(validate_origin_form(path).is_err(), "accepted {path}");
+        }
+        for path in ["/a/b?next=../c", "/v1.0/item", "/a%20b", "/.../item"] {
+            assert!(validate_origin_form(path).is_ok(), "refused {path}");
+        }
+    }
+
     #[test]
     fn a_malformed_header_name_is_described_not_echoed() {
         let headers = vec![ProxyHeader {

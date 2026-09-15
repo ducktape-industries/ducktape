@@ -776,6 +776,7 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     let (ok, output) = cluster.run_verb(&[
         "gateway",
         "bind",
+        "--trusted-loopback",
         "--workspace",
         workspace.to_str().unwrap(),
         "--label",

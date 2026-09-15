@@ -67,62 +67,6 @@ fn forge_code_tokens_follow_the_path_and_rust_really_colors() {
     );
 }
 
-#[test]
-fn merge_builder_produces_the_cas_commit_and_its_minimal_pack() {
-    let dir = tempfile::tempdir().unwrap();
-    let mirror = git2::Repository::init_bare(dir.path()).unwrap();
-    let base = mirror_commit(&mirror, None, &[("a.txt", "base\n"), ("b.txt", "keep\n")]);
-    let ours = mirror_commit(
-        &mirror,
-        Some(base),
-        &[("a.txt", "ours\n"), ("b.txt", "keep\n")],
-    );
-    let theirs = mirror_commit(
-        &mirror,
-        Some(base),
-        &[("a.txt", "base\n"), ("b.txt", "theirs\n")],
-    );
-
-    let build = merge_against_mirror(&mirror, ours, theirs, "Merge pull request #1").unwrap();
-    let MergeBuild::Clean { merge_oid, pack } = build else {
-        panic!("disjoint edits must merge cleanly");
-    };
-
-    // land the pack in the mirror and read the merge commit back out —
-    // exactly what a validator does after the blob fan-out.
-    let odb = mirror.odb().unwrap();
-    let mut writepack = odb.packwriter().unwrap();
-    std::io::Write::write_all(&mut writepack, &pack).unwrap();
-    writepack.commit().unwrap();
-    let merged = mirror
-        .find_commit(git2::Oid::from_str(&merge_oid).unwrap())
-        .unwrap();
-    let parents: Vec<git2::Oid> = merged.parent_ids().collect();
-    assert_eq!(parents, vec![ours, theirs], "target first, source second");
-    let tree = merged.tree().unwrap();
-    let read = |path: &str| {
-        let entry = tree.get_path(Path::new(path)).unwrap();
-        String::from_utf8(mirror.find_blob(entry.id()).unwrap().content().to_vec()).unwrap()
-    };
-    assert_eq!(read("a.txt"), "ours\n");
-    assert_eq!(read("b.txt"), "theirs\n");
-}
-
-#[test]
-fn merge_builder_reports_conflicts_and_builds_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let mirror = git2::Repository::init_bare(dir.path()).unwrap();
-    let base = mirror_commit(&mirror, None, &[("a.txt", "base\n")]);
-    let ours = mirror_commit(&mirror, Some(base), &[("a.txt", "ours\n")]);
-    let theirs = mirror_commit(&mirror, Some(base), &[("a.txt", "theirs\n")]);
-
-    let build = merge_against_mirror(&mirror, ours, theirs, "Merge pull request #2").unwrap();
-    let MergeBuild::Conflicts(paths) = build else {
-        panic!("competing edits must conflict");
-    };
-    assert_eq!(paths, vec!["a.txt".to_string()]);
-}
-
 /// A WEB PICTURE IS ONE CAPPED GET. The bytes come back as served; a
 /// response that announces more than the viewer takes, one that streams more
 /// than it announced (or announced nothing), and one without a body to show

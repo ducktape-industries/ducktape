@@ -4,7 +4,6 @@ pub(crate) use app_state::*;
 
 mod backend;
 mod call;
-mod composer_surface;
 mod editor;
 mod module_view;
 mod shell;

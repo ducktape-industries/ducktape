@@ -1,0 +1,15 @@
+[package]
+name = "extension-view"
+version = "0.1.0"
+edition = "2024"
+[lib]
+crate-type = ["cdylib", "rlib"]
+[features]
+replacement = []
+[dependencies]
+ducktape-view-guest = { path = "../../../views/support/guest" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+base64 = "0.22"
+[workspace]

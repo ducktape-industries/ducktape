@@ -34,21 +34,6 @@ pub fn restore_draft(current: String, pending: String, keep_pending: bool) -> St
     if current.is_empty() { pending } else { current }
 }
 
-pub fn remember_failed_draft(
-    existing: String,
-    current: String,
-    pending: String,
-    committed: bool,
-) -> String {
-    if committed || current.is_empty() || pending.is_empty() {
-        return existing;
-    }
-    if existing.is_empty() {
-        return pending;
-    }
-    format!("{existing}\n{pending}")
-}
-
 pub fn mutation_failure_phase(committed: bool) -> crate::MutationPhase {
     if committed {
         crate::MutationPhase::Recovering
@@ -224,23 +209,6 @@ pub fn composer_scope(endpoint: &str, channel_id: &str) -> String {
     format!("{endpoint}\u{1f}{channel_id}")
 }
 
-/// The channel a composer scope names, or "" when the scope belongs to
-/// another endpoint. The forge view builds its note composer's scope itself
-/// ([`composer_scope`] over the item's channel), so the app reads the
-/// channel back out of the scope a send arrives with rather than
-/// remembering which item is open — a note written before the reader
-/// switched networks addresses a store this endpoint does not hold, and
-/// goes back to its own box.
-pub fn scope_channel(scope: &str, endpoint: &str) -> String {
-    let Some((wrote_at, channel)) = scope.split_once('\u{1f}') else {
-        return String::new();
-    };
-    match wrote_at == endpoint {
-        true => channel.to_owned(),
-        false => String::new(),
-    }
-}
-
 /// Whether a submitted body may be posted, decided ONCE at delivery from
 /// state that may have moved since the composer's frame drew its gate.
 ///
@@ -276,42 +244,6 @@ pub fn submit_verdict(
     }
 }
 
-/// The rail's key: a reply belongs to its THREAD, and the same seq under two
-/// rooms is two different threads.
-pub fn thread_scope(endpoint: &str, channel_id: &str, thread_seq: i64) -> String {
-    format!("{endpoint}\u{1f}{channel_id}#{thread_seq}")
-}
-
-pub fn edit_scope(endpoint: &str, channel_id: &str, seq: i64) -> String {
-    format!("{endpoint}\u{1f}{channel_id}#{seq}/edit")
-}
-
-/// The thread a reply composer's scope names — the `#<seq>` tail
-/// [`thread_scope`] appends — or 0 for a room's own box. The rail belongs to
-/// the view, so the thread a submitted reply is for is read back off the box
-/// it was written in rather than off any app state that may have moved.
-pub fn scope_thread_seq(scope: &str) -> i64 {
-    let Some((_, seq)) = scope.rsplit_once('#') else {
-        return 0;
-    };
-    seq.parse().unwrap_or_default()
-}
-
-/// The room a composer scope belongs to: a thread scope shorn of the
-/// `#<seq>` tail [`thread_scope`] appends, a room scope as it is. A room
-/// whose channel id itself ends in `#<digits>` is looked up under its own
-/// scope first, so the shearing only ever reaches a thread.
-pub fn room_scope(scope: &str) -> String {
-    let Some((room, seq)) = scope.rsplit_once('#') else {
-        return scope.to_owned();
-    };
-    let seq = seq.strip_suffix("/edit").unwrap_or(seq);
-    let seq_is_thread = !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit());
-    if seq_is_thread {
-        return room.to_owned();
-    }
-    scope.to_owned()
-}
 pub fn mark_channel_read(
     mut reads: Vec<ChannelRead>,
     channel: String,
@@ -338,38 +270,6 @@ pub struct PendingSend {
     pub id: String,
     pub body: String,
     pub thread_seq: i64,
-}
-
-/// A newly admitted send, at the end of the queue.
-pub fn send_pending(
-    mut sends: Vec<PendingSend>,
-    id: String,
-    body: String,
-    thread_seq: i64,
-) -> Vec<PendingSend> {
-    sends.push(PendingSend {
-        id,
-        body,
-        thread_seq,
-    });
-    sends
-}
-
-/// The queue without the send `id` names — it committed, or it failed and its
-/// words went back to the composer it was written in.
-pub fn send_settled(mut sends: Vec<PendingSend>, id: &str) -> Vec<PendingSend> {
-    sends.retain(|send| send.id != id);
-    sends
-}
-
-/// The queue after a send FAILED. A committed one stays: the block carrying it
-/// landed and only the read after it failed, so taking the row off now would
-/// blank the message she just sent until the recovery resync puts it back.
-pub fn send_failed(sends: Vec<PendingSend>, id: &str, committed: bool) -> Vec<PendingSend> {
-    match committed {
-        true => sends,
-        false => send_settled(sends, id),
-    }
 }
 
 /// One channel row with the unread decision already attached.

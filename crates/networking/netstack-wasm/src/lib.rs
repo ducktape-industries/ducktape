@@ -8,13 +8,16 @@
 //! instead of wedging the plane) and no ambient imports (the guest sees
 //! exactly `host.sign`, `host.identity`, and `host.log`). A trap, an
 //! exhausted budget, or an undecodable wire value is a [`StepError::Fault`]:
-//! the guest's state is unknown from then on and the executor fails over
-//! to the native machine.
+//! the guest's state is unknown from then on and the executor stops the
+//! plane. It never substitutes another protocol implementation.
 //!
 //! A guest can also start from a snapshot ([`NetstackGuest::restore`]) and
 //! hand one out ([`NetstackMachine::snapshot`]): the same wire value the
 //! native machine takes and gives, which is what lets a plane swap
-//! backends mid-epoch without touching a tunnel.
+//! backends mid-epoch without touching a tunnel. Snapshot bytes are opaque
+//! to this host: the candidate guest decides whether it can restore them.
+//! A guest state-layout change can refuse replacement without changing the
+//! host Event/Effect ABI. There is no implicit migration or fresh-state retry.
 
 use netstack_machine::wire;
 use netstack_machine::{Effect, Event, MachineConfig, NetstackMachine, StepError};

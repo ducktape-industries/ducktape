@@ -66,7 +66,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 [[package]]
 name = "index-guest"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#4d01bba1d288cb04faa033bf22a9954442942cc1"
+source = "git+https://github.com/orthory/ducktape#b8041ed8ac8fceeb15ea90915882876f5e7546da"
 dependencies = [
  "borsh",
  "fluent-guest",
@@ -166,7 +166,7 @@ dependencies = [
 [[package]]
 name = "testmap"
 version = "0.0.0"
-source = "git+https://github.com/orthory/ducktape#4d01bba1d288cb04faa033bf22a9954442942cc1"
+source = "git+https://github.com/orthory/ducktape#b8041ed8ac8fceeb15ea90915882876f5e7546da"
 dependencies = [
  "index-guest",
 ]
@@ -226,19 +226,19 @@ dependencies = [
 [[patch.unused]]
 name = "blst"
 version = "0.3.16"
-source = "git+https://github.com/orthory/ducktape#4d01bba1d288cb04faa033bf22a9954442942cc1"
+source = "git+https://github.com/orthory/ducktape#b8041ed8ac8fceeb15ea90915882876f5e7546da"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.2.17"
-source = "git+https://github.com/orthory/ducktape#4d01bba1d288cb04faa033bf22a9954442942cc1"
+source = "git+https://github.com/orthory/ducktape#b8041ed8ac8fceeb15ea90915882876f5e7546da"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.3.4"
-source = "git+https://github.com/orthory/ducktape#4d01bba1d288cb04faa033bf22a9954442942cc1"
+source = "git+https://github.com/orthory/ducktape#b8041ed8ac8fceeb15ea90915882876f5e7546da"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.4.3"
-source = "git+https://github.com/orthory/ducktape#4d01bba1d288cb04faa033bf22a9954442942cc1"
+source = "git+https://github.com/orthory/ducktape#b8041ed8ac8fceeb15ea90915882876f5e7546da"

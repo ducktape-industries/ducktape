@@ -2,6 +2,7 @@ use super::*;
 impl super::ChatView {
     pub(crate) fn update(&mut self, message: Message) -> ducktape_view_guest::Task<Message> {
         match message {
+            Message::Composer(message) => self.on_composer(*message),
             Message::SidebarResized(dx, _dy) => self.on_sidebar_resized(dx, _dy),
             Message::DetailsResized(dx, _dy) => self.on_details_resized(dx, _dy),
             Message::ThreadResized(dx, _dy) => self.on_thread_resized(dx, _dy),
@@ -14,7 +15,9 @@ impl super::ChatView {
             Message::ClosePreview => self.on_close_preview(),
             Message::PreviewArrived(item) => self.on_preview_arrived(item),
             Message::SessionArrived(item) => self.on_session_arrived(*item),
+            Message::SidebarArrived(item) => self.on_sidebar_arrived(item),
             Message::SessionSettled(moved_room) => self.on_session_settled(moved_room),
+            Message::ParticipationFinished => self.on_participation_finished(),
             Message::SnapStream(moved) => self.on_snap_stream(moved),
             Message::RevealStream(target_key) => self.on_reveal_stream(target_key),
             Message::RevealThread(target_key) => self.on_reveal_thread(target_key),
@@ -195,6 +198,12 @@ impl super::ChatView {
         &mut self,
         item: crate::host::SessionItem,
     ) -> ducktape_view_guest::Task<Message> {
+        if let Some(intent) = item.participation {
+            return ducktape_view_guest::Task::perform(
+                crate::host::run_participation(intent),
+                |_| Message::ParticipationFinished,
+            );
+        }
         self.host_error = crate::host::failure_note("Couldn’t read the session", &item.error);
         if !(item.error).is_empty() {
             return ::ducktape_view_guest::Task::none();
@@ -206,6 +215,24 @@ impl super::ChatView {
             (next.active_channel != self.active_channel) || (next.land_seq != self.land_seq);
         self.sent_serial = next.sent_serial;
         self.copy_chord_serial = next.copy_chord_serial;
+        let changed_reader = self.endpoint != next.endpoint
+            || self.network_chain_id != next.network_chain_id
+            || self.me_key != next.me_key;
+        let rebound = changed_reader || (!self.connected && next.connected);
+        if rebound {
+            self.upload_handles.clear();
+            for draft in self.composers.values_mut() {
+                draft.retire_device_requests();
+            }
+            self.sending.clear();
+        }
+        if changed_reader {
+            self.rooms.clear();
+            self.dm_rows.clear();
+            self.read_cursors.clear();
+            crate::host::reset_directory();
+            self.connection_serial += 1;
+        }
         self.connection_serial = crate::host::connection_serial_after(
             self.connected,
             next.connected,
@@ -225,8 +252,6 @@ impl super::ChatView {
             ::std::convert::AsRef::as_ref(&(next.me_key)),
         );
         self.names_serial = next.names_serial;
-        self.rooms = next.rooms.clone();
-        self.dm_rows = next.dm_rows.clone();
         self.channel_create_open = next.channel_create_open;
         self.active_channel = next.active_channel.to_owned();
         self.active_dm_peer = next.active_dm_peer.to_owned();
@@ -245,7 +270,7 @@ impl super::ChatView {
         self.call_speaking = next.call_speaking;
         self.speaking_peers = next.speaking_peers.clone();
         self.shift_held = next.shift_held;
-        self.pending_sends = next.pending_sends.clone();
+        self.refresh_pending();
         self.live_agents = next.live_agents.clone();
         self.loading = self.session_loading
             || ((!(self.active_channel).is_empty()) && (self.room_channel != self.active_channel));
@@ -255,6 +280,56 @@ impl super::ChatView {
             (::ducktape_view_guest::Task::done(chord_now)).map(Message::CopyChord),
         ])
     }
+    fn on_sidebar_arrived(
+        &mut self,
+        item: crate::host::SidebarItem,
+    ) -> ducktape_view_guest::Task<Message> {
+        if !item.error.is_empty() {
+            self.host_error = crate::host::failure_note("Couldn’t read the sidebar", &item.error);
+            return ducktape_view_guest::Task::none();
+        }
+        let mut heads = std::collections::BTreeMap::new();
+        for channel in &item.channels {
+            let cursor = self
+                .read_cursors
+                .entry(channel.id.clone())
+                .or_insert(channel.head_seq);
+            if channel.id == self.active_channel {
+                *cursor = channel.head_seq;
+            }
+            heads.insert(channel.id.clone(), channel.head_seq > *cursor);
+        }
+        self.dm_rows = item
+            .peers
+            .into_iter()
+            .map(|peer| crate::host::DmSidebarRow {
+                unread: heads.get(&peer.channel_id).copied().unwrap_or(false),
+                peer,
+            })
+            .collect();
+        self.rooms = item
+            .channels
+            .into_iter()
+            .filter(|channel| {
+                !channel.id.strip_prefix("dm-").is_some_and(|suffix| {
+                    suffix.len() == 64
+                        && suffix
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+            })
+            .map(|channel| crate::host::ChatSidebarRow {
+                unread: heads.get(&channel.id).copied().unwrap_or(false),
+                channel,
+            })
+            .collect();
+        ducktape_view_guest::Task::none()
+    }
+
+    fn on_participation_finished(&mut self) -> ducktape_view_guest::Task<Message> {
+        ducktape_view_guest::Task::none()
+    }
+
     fn on_session_settled(&mut self, moved_room: bool) -> ducktape_view_guest::Task<Message> {
         match crate::host::room_move(moved_room) {
             RoomMove::Stayed => {
@@ -395,6 +470,9 @@ impl super::ChatView {
             ::std::convert::AsRef::as_ref(&(item.members)),
             ::std::convert::AsRef::as_ref(&(self.me)),
         );
+        self.sending
+            .retain(|id, _| !item.messages.iter().any(|row| &row.id == id));
+        self.refresh_pending();
         self.room_messages = item.messages.clone();
         self.messages = crate::host::with_pending(
             ::std::convert::AsRef::as_ref(&(self.room_messages)),
@@ -459,6 +537,9 @@ impl super::ChatView {
         if !(item.error).is_empty() {
             return ::ducktape_view_guest::Task::none();
         }
+        self.sending
+            .retain(|id, _| !item.messages.iter().any(|row| &row.id == id));
+        self.refresh_pending();
         {
             let next = crate::host::with_pending(
                 ::std::convert::AsRef::as_ref(&(item.messages)),
@@ -784,18 +865,12 @@ impl super::ChatView {
         if (seed).is_empty() {
             return ::ducktape_view_guest::Task::none();
         }
-        self.sent = crate::host::send_begin_edit(
-            ::std::convert::AsRef::as_ref(
-                &(crate::host::edit_scope(
-                    ::std::convert::AsRef::as_ref(&(self.endpoint)),
-                    ::std::convert::AsRef::as_ref(&(self.active_channel)),
-                    seq,
-                )),
-            ),
-            ::std::convert::AsRef::as_ref(&(seed)),
-            seq,
-            rev,
-        );
+        let scope = crate::host::edit_scope(&self.endpoint, &self.active_channel, seq);
+        let choices = crate::host::composer_choices(&self.channel_members);
+        self.composers
+            .entry(scope)
+            .or_default()
+            .seed(&seed, &choices);
         self.selected_message_seq = seq;
         self.selected_message_rev = rev;
         self.message_action = MessageAction::Editing;
@@ -893,18 +968,12 @@ impl super::ChatView {
         if (seed).is_empty() {
             return ::ducktape_view_guest::Task::none();
         }
-        self.sent = crate::host::send_begin_edit(
-            ::std::convert::AsRef::as_ref(
-                &(crate::host::edit_scope(
-                    ::std::convert::AsRef::as_ref(&(self.endpoint)),
-                    ::std::convert::AsRef::as_ref(&(self.active_channel)),
-                    seq,
-                )),
-            ),
-            ::std::convert::AsRef::as_ref(&(seed)),
-            seq,
-            rev,
-        );
+        let scope = crate::host::edit_scope(&self.endpoint, &self.active_channel, seq);
+        let choices = crate::host::composer_choices(&self.channel_members);
+        self.composers
+            .entry(scope)
+            .or_default()
+            .seed(&seed, &choices);
         self.thread_selected_seq = seq;
         self.thread_selected_rev = rev;
         self.thread_message_action = MessageAction::Editing;

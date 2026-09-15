@@ -305,10 +305,7 @@ async fn build_pool(
             node.clone(),
             noded::agent_provision::agent_runs_root(&service.storage_dir)?,
         )
-        .with_forge(
-            noded::agent_provision::forge_push_base(service.http_listen.as_deref()),
-            config::hex_bytes(&node_key),
-        )
+        .with_forge(config::hex_bytes(&node_key))
         .with_node_url(noded::agent_provision::node_http_base(
             service.http_listen.as_deref(),
         )),

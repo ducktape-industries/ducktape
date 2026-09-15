@@ -27,13 +27,6 @@ pub(crate) enum SubmitVerdict {
     Refused,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum ComposerKind {
-    Message,
-    Reply,
-    Edit,
-    ThreadEdit,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum HubStep {
     Loading,
     Password,
@@ -133,8 +126,6 @@ pub(crate) enum RegisteredIntent {
 pub(crate) enum ForgeIntent {
     OpenLink,
     Copy,
-    Composer,
-    Attach,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AgentsIntent {
@@ -198,11 +189,8 @@ pub(crate) enum ChatIntent {
     OpenLink,
     Copy,
     CopyLink,
-    BeginEdit,
     CancelRun,
     OpenRun,
-    Composer,
-    Attach,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MutationPhase {
@@ -386,8 +374,6 @@ pub struct Ducktape {
     pub(crate) node_view_label: String,
     pub(crate) node_quorum_label: String,
     pub(crate) node_reachable_label: String,
-    pub(crate) fs_drop_dir: String,
-    pub(crate) fs_dropping: bool,
     pub(crate) fs_route: String,
     pub(crate) fs_route_serial: i64,
     pub(crate) palette_open: bool,
@@ -524,17 +510,7 @@ pub(crate) enum AppMessage {
     DismissError,
     ConnectFailed(crate::backend::HydrationError),
     ForgeViewEvent(crate::module_view::ModuleViewEvent),
-    ForgeComposerEvent(String, String),
-    ForgeNoteSent(String, crate::backend::SendReceipt),
-    ForgeNoteFailed(String, String, crate::backend::OptimisticMutationError),
     FilesViewEvent(crate::module_view::ModuleViewEvent),
-    FsFileDropped(String),
-    /// A file in a composer's standby zone: its scope, upload id, local path.
-    AttachmentQueued(String, String, String),
-    /// Where an upload landed (a `duck://` address), or why it did not.
-    AttachmentUploaded(String, String, Result<String, String>),
-    FsDropped(bool),
-    FsDropFailed(crate::backend::AppError),
     AccountLoaded(crate::backend::AccountData),
     AccountFailed(crate::backend::HydrationError),
     AccountRenamed(bool),
@@ -600,19 +576,11 @@ pub(crate) enum AppMessage {
     JoinVoice(String),
     VoiceJoined(String),
     ToggleChannelCreateVoice,
-    ChatBeginEdit(String, String, i64, i64),
-    ComposerSubmitted(ComposerKind, String, String, String),
-    EditMessageSubmit(String),
-    MessageSent(crate::backend::SendReceipt),
-    MessageSendFailed(crate::backend::OptimisticMutationError),
-    ThreadReplySendFailed(crate::backend::OptimisticMutationError),
-    ThreadReplySent(crate::backend::SendReceipt),
     ChatUpdated(crate::backend::ChatData),
     ChatLoadFailed(crate::backend::HydrationError),
     ChannelCreated(crate::backend::ChatData),
     LiveAgentsEvent(crate::backend::LiveAgentNotice),
     LiveCancelAcked(bool),
-    ChatAcked(bool),
     CopyMessageLink(String),
     OpenMessageLink(String),
     ChatScrolled(f64, f64, f64, f64),
@@ -875,8 +843,6 @@ impl Ducktape {
             node_view_label: "—".to_owned(),
             node_quorum_label: "—".to_owned(),
             node_reachable_label: "—".to_owned(),
-            fs_drop_dir: "/shared".to_owned(),
-            fs_dropping: false,
             fs_route: "".to_owned(),
             fs_route_serial: 0,
             palette_open: false,
@@ -982,8 +948,12 @@ impl Ducktape {
         if active_call {
             subscriptions.push(
                 Subscription::run_with(
-                    (self.connected_rpc.clone(), self.huddle_channel.clone()),
-                    |data: &(String, String)| {
+                    (
+                        self.connected_rpc.clone(),
+                        self.huddle_channel.clone(),
+                        self.connect_generation,
+                    ),
+                    |data: &(String, String, i64)| {
                         crate::call::call_session(data.0.clone(), data.1.clone())
                     },
                 )

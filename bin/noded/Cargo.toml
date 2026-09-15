@@ -38,12 +38,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync",
 tracing = { workspace = true }
 
 [dev-dependencies]
+commonware-cryptography = { workspace = true }
 # daemon_e2e spawns the real binary over http/ws and needs isolated storage
 # roots plus the duckfs client transport as the full-stack proof of the wire.
 base64 = { workspace = true }
 duckfs-client = { workspace = true }
-# the forge lanes are proven against a real libgit2 clone of the served repo.
-git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 nettest = { path = "../../crates/testing/nettest" }
 # typed programmable-user and attribution assertions over the real daemon.
 agent = { workspace = true }

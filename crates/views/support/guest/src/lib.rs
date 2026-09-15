@@ -24,8 +24,8 @@ mod editor_binding;
 mod editor_documents;
 pub use editor::Editor;
 pub use editor_binding::{
-    EditorBinding, EditorInteractionRequest, EditorKeyRequest, EditorStateView, EditorTransaction,
-    EditorTransactionEvent,
+    EditorBinding, EditorInteractionRequest, EditorKeyRequest, EditorRichRequest, EditorStateView,
+    EditorTransaction, EditorTransactionEvent,
 };
 pub use editor_documents::EditorDocumentUpdate;
 pub mod events;

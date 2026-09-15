@@ -2506,31 +2506,6 @@ impl Render for DesktopWindow {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .track_focus(&self.focus)
-            .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, _, cx| {
-                if this.kind != WindowKind::Console {
-                    return;
-                }
-                // The existing Files reducer owns the write gate and permits
-                // one upload at a time. Native paths never reach the WASM view.
-                for path in paths.paths() {
-                    let Some(path) = path.to_str() else {
-                        this.model.update(cx, |model, cx| {
-                            model.dispatch(
-                                Message::FsDropFailed(crate::backend::AppError {
-                                    message: "This file path cannot be represented as UTF-8."
-                                        .into(),
-                                    committed: false,
-                                }),
-                                cx,
-                            )
-                        });
-                        continue;
-                    };
-                    this.model.update(cx, |model, cx| {
-                        model.dispatch(Message::FsFileDropped(path.to_owned()), cx)
-                    });
-                }
-            }))
             .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
                 let key = KeyPress {
                     key: event.keystroke.key.clone(),
@@ -2787,9 +2762,9 @@ mod close_tests {
     }
 
     #[test]
-    fn native_drop_error_dismiss_and_bell_retry_reach_domain_handlers() {
+    fn native_error_dismiss_and_bell_retry_reach_domain_handlers() {
         use gpui_kit::test::TestWindowExt as _;
-        use gpui_kit::{ExternalPaths, FileDropEvent, InputEvent, point, px, size};
+        use gpui_kit::{px, size};
         assert!(tokio::runtime::Handle::try_current().is_err());
         let _turn = crate::module_view::tests::blocking_connection_turn();
         let mut cx = crate::frame_probe::headless_context();
@@ -2797,13 +2772,7 @@ mod close_tests {
         state.connected = true;
         state.connected_rpc = "http://127.0.0.1:0".into();
         state.shell_tab = ShellTab::Files;
-        state.settings_user_key = "invalid signing key".into();
-        state.fs_drop_dir = "/shared".into();
-        let expected = crate::backend::files_write_gate(
-            state.fs_drop_dir.clone(),
-            state.settings_user_key.clone(),
-        );
-        assert!(!expected.is_empty());
+        state.error = "Could not complete the request".into();
         let mut view = None;
         let handle = cx
             .open_window(size(px(1120.), px(720.)), |window, cx| {
@@ -2813,37 +2782,6 @@ mod close_tests {
             })
             .unwrap();
         let view = view.unwrap();
-        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
-            .unwrap();
-        let position = point(px(400.), px(350.));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.dispatch_event(
-                FileDropEvent::Entered {
-                    position,
-                    paths: ExternalPaths(
-                        [std::path::PathBuf::from("/local/report.txt")]
-                            .into_iter()
-                            .collect(),
-                    ),
-                }
-                .to_platform_input(),
-                cx,
-            )
-        })
-        .unwrap();
-        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
-            .unwrap();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.dispatch_event(FileDropEvent::Submit { position }.to_platform_input(), cx)
-        })
-        .unwrap();
-        view.read_with(&cx, |view, cx| {
-            assert_eq!(view.test_state(cx).error, expected);
-            assert!(
-                !view.test_state(cx).fs_dropping,
-                "write gate precedes local file I/O"
-            );
-        });
         cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
             .unwrap();
         cx.update_window(handle.into(), |_, window, cx| {

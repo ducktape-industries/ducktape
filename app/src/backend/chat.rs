@@ -182,84 +182,32 @@ pub(crate) async fn huddle_fanout_nodes(
 // The huddle's elapsed clock is a LOCAL session fact on a NATIVE `every 1s`
 // subscription — ui-lang ships one, so this app has no tick stream of its own.
 
-pub async fn join_huddle(
-    rpc: String,
-    password: String,
-    channel_id: String,
-) -> Result<bool, AppError> {
-    async {
-        let channel_id = required_id(channel_id, "channel")?;
-        let rpc = rpc_client(&rpc)?;
-        let status = rpc.status().await.map_err(|error| error.to_string())?;
-        let node = public_key(&status.public_key, "node public key")?;
-        // Proof of possession: THIS node signs the join under its own key —
-        // never asserted by the joiner — so the roster can only ever name a
-        // node that agreed to route this user's media (issue #1792). The mint
-        // is a SIGNED request: the node binds the key that signed it, which
-        // is what lets a device join through a node it does not host — no
-        // operator token, just the person's own account key.
-        let signed = rpc
-            .clone()
-            .with_write_auth(data_plane_signer(&rpc, password.clone()).await?);
-        let (_, node_proof_hex) = signed
-            .huddle_node_proof(&channel_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let node_proof = hex_decode(&node_proof_hex)
-            .map_err(|_| "huddle node proof must be hexadecimal".to_string())?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::JoinHuddle {
-                channel_id: channel_id.clone(),
-                node,
-                node_proof,
-            }),
-            password,
-        )
-        .await?;
-        Ok(true)
-    }
-    .await
+pub async fn join_huddle(rpc: String, password: String, channel_id: String) -> Result<bool, AppError> {
+    guest_participation(rpc, password, serde_json::json!({"kind":"join","channel":channel_id})).await?;
+    Ok(true)
 }
 
-/// Enter a voice room from the list: leave the huddle the reader is in (if
-/// any) and join `channel_id`'s. Two ops, in order — the roster is consensus
-/// state, so a person is never seated in two rooms at once. Answers the room
-/// joined.
-pub async fn move_huddle(
-    rpc: String,
-    password: String,
-    leaving: String,
-    channel_id: String,
-) -> Result<String, AppError> {
-    if !leaving.is_empty() {
-        leave_huddle(rpc.clone(), password.clone(), leaving).await?;
-    }
-    join_huddle(rpc, password, channel_id.clone()).await?;
-    Ok(channel_id)
+pub async fn move_huddle(rpc: String, password: String, leaving: String, channel_id: String) -> Result<String, AppError> {
+    guest_participation(rpc, password, serde_json::json!({"kind":"move","from":leaving,"channel":channel_id})).await
 }
 
-pub async fn leave_huddle(
-    rpc: String,
-    password: String,
-    channel_id: String,
-) -> Result<bool, AppError> {
-    async {
-        let channel_id = required_id(channel_id, "channel")?;
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::LeaveHuddle {
-                channel_id: channel_id.clone(),
-            }),
-            password,
-        )
-        .await?;
-        Ok(true)
+pub async fn leave_huddle(rpc: String, password: String, channel_id: String) -> Result<bool, AppError> {
+    guest_participation(rpc, password, serde_json::json!({"kind":"leave","channel":channel_id})).await?;
+    Ok(true)
+}
+
+/// The shell relays user intent; the deployed Chat component owns participation.
+async fn guest_participation(rpc: String, password: String, intent: serde_json::Value) -> Result<String, AppError> {
+    require_seated_signer(password).await?;
+    let props = serde_json::to_vec(&serde_json::json!({"participation":intent})).map_err(|error| error.to_string())?;
+    let mut session = crate::module_view::background::start("chat", props, &rpc)?;
+    let bytes = session.events.next().await.ok_or_else(|| "Chat participation ended without a result".to_owned())??;
+    let result: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if let Some(error) = result.get("error") {
+        return Err(AppError {message:error["message"].as_str().unwrap_or("Chat participation refused").into(),
+            committed:error["committed"].as_bool().unwrap_or(false)});
     }
-    .await
+    result["channel"].as_str().map(str::to_owned).ok_or_else(|| "invalid Chat participation result".to_owned().into())
 }
 
 pub async fn send_message(
@@ -308,84 +256,6 @@ pub async fn send_message(
             thread_seq: 0,
             body: operation_body,
         })
-}
-
-pub async fn send_reply(
-    rpc: String,
-    password: String,
-    channel_id: String,
-    root_seq: i64,
-    message_id: String,
-    body: String,
-) -> Result<SendReceipt, OptimisticMutationError> {
-    let operation_id = message_id.clone();
-    let operation_scope = channel_id.clone();
-    let operation_thread = root_seq;
-    let operation_body = body.clone();
-    let result = async {
-        let root_seq = positive_sequence(root_seq)?;
-        let body = bounded_text(body, "reply", 16 * 1024)?;
-        let rpc = rpc_client(&rpc)?;
-        let message_id = required_id(message_id, "message")?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::PostMessage {
-                channel_id: channel_id.clone(),
-                message_id: message_id.clone(),
-                blocks: ::chat::client::parse_message(&body),
-                thread: Some(root_seq),
-            }),
-            password,
-        )
-        .await?;
-        Ok(())
-    }
-    .await;
-    result
-        .map(|()| SendReceipt {
-            operation_id: operation_id.clone(),
-            channel_id: operation_scope.clone(),
-        })
-        .map_err(|cause: AppError| OptimisticMutationError {
-            message: cause.message,
-            committed: cause.committed,
-            operation_id,
-            scope_id: operation_scope,
-            thread_seq: operation_thread,
-            body: operation_body,
-        })
-}
-
-pub async fn edit_message(
-    rpc: String,
-    password: String,
-    channel_id: String,
-    seq: i64,
-    base_rev: i64,
-    body: String,
-) -> Result<bool, AppError> {
-    async {
-        let seq = positive_sequence(seq)?;
-        let base_rev =
-            u32::try_from(base_rev).map_err(|_| "invalid message revision".to_string())?;
-        let body = bounded_text(body, "message", 16 * 1024)?;
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::EditMessage {
-                channel_id: channel_id.clone(),
-                seq,
-                blocks: ::chat::client::parse_message(&body),
-                base_rev: Some(base_rev),
-            }),
-            password,
-        )
-        .await?;
-        Ok(true)
-    }
-    .await
 }
 
 /// THE COMMAND PALETTE'S CHAT SEARCH. The Chat tab searches the index for

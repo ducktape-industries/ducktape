@@ -2,6 +2,7 @@ use super::*;
 impl super::ForgeView {
     pub(crate) fn update(&mut self, message: Message) -> ducktape_view_guest::Task<Message> {
         match message {
+            Message::Composer(message) => self.on_composer(*message),
             Message::SessionArrived(item) => self.on_session_arrived(item),
             Message::ForgeLandLink(url) => self.on_forge_land_link(url),
             Message::ReposArrived(next) => self.on_repos_arrived(next),
@@ -46,6 +47,12 @@ impl super::ForgeView {
             return ::ducktape_view_guest::Task::none();
         }
         let next = item.next.clone();
+        let connection_changed = self.connected_rpc != next.connected_rpc || self.connected != next.connected;
+        if connection_changed {
+            self.upload_handles.clear();
+            for draft in self.composers.values_mut() { draft.retire_device_requests(); }
+        }
+
         self.connection_serial = crate::host::connection_serial_after(
             self.connected,
             next.connected,
@@ -203,15 +210,7 @@ impl super::ForgeView {
         }
         self.discussion = next.messages.clone();
         self.discussion_clipped = next.clipped;
-        self.roster_set = crate::host::seat_roster(
-            ::std::convert::AsRef::as_ref(
-                &(crate::host::composer_scope(
-                    ::std::convert::AsRef::as_ref(&(self.connected_rpc)),
-                    ::std::convert::AsRef::as_ref(&(self.forge_item_channel)),
-                )),
-            ),
-            ::std::convert::AsRef::as_ref(&(next.members)),
-        );
+        self.composer_choices = next.choices.clone();
         if self.focus_seq == 0 {
             return ::ducktape_view_guest::Task::none();
         }

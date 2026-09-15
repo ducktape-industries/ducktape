@@ -9,7 +9,6 @@
 
 use std::collections::BTreeMap;
 
-use borsh::{BorshDeserialize, BorshSerialize};
 use sdk::AccountNumber;
 use serde::{Deserialize, Serialize};
 
@@ -60,112 +59,7 @@ pub const PROGRAM_HUDDLE_JOIN_NS: &[u8] = b"ducktape/huddle-join/program/v1";
 /// `MAX_OPEN_TASKS_PER_OWNER`.
 pub const MAX_CHANNELS_PER_CREATOR: usize = 256;
 
-/// who acts on chat state — the ONE party shape every author, owner, member,
-/// huddle participant, reactor and mention target takes.
-///
-/// the module derives the acting party from `Env.origin` at write time, never
-/// from a payload: a member key resolves through identity to the account
-/// holding it, a program origin IS its account, a signed key that identity
-/// does not know stays a key (a node operating a channel under its own key
-/// holds no account and is never spelled as one), a module is itself. an
-/// account is the stable identity a person's many keys and a keyless program
-/// share, so it is what relations and rosters name whenever one exists.
-#[derive(
-    Serialize,
-    Deserialize,
-    BorshSerialize,
-    BorshDeserialize,
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum Party {
-    /// an identity account: a resolved member key, or the program account the
-    /// host ran the write as.
-    Account(AccountNumber),
-    /// an authenticated signing key that holds no account (non-empty).
-    Key(Vec<u8>),
-    /// a module that emitted the write as a follow-up.
-    Module(String),
-    /// genesis / system-internal.
-    System,
-}
-
-impl Party {
-    /// the account this party is, if it is one — the recipient an attribution
-    /// relation can name. a key, a module and the system are not accounts.
-    pub fn account(&self) -> Option<AccountNumber> {
-        match self {
-            Party::Account(account) => Some(*account),
-            Party::Key(_) | Party::Module(_) | Party::System => None,
-        }
-    }
-
-    /// a person's party — an account or a key — as opposed to trusted code.
-    /// post policy, the `:` channel namespace, creation caps and huddles all
-    /// distinguish people from modules and the system on exactly this line.
-    pub fn is_person(&self) -> bool {
-        match self {
-            Party::Account(_) | Party::Key(_) => true,
-            Party::Module(_) | Party::System => false,
-        }
-    }
-}
-
-/// inline formatting applied to a [`Span`]. mentions are structured so
-/// hook parsing stays deterministic.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum Mark {
-    Bold,
-    Italic,
-    Link(String),
-    /// a mention NAMES AN ACCOUNT: `Party::Account` names it directly and must
-    /// exist; `Party::Key` names the account holding that key and is resolved
-    /// at write time; a module or system mention is rejected. a write whose
-    /// mention resolves to no account is rejected whole.
-    Mention(Party),
-}
-
-/// a run of text with uniform marks.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Span {
-    pub text: String,
-    pub marks: Vec<Mark>,
-}
-
-impl Span {
-    /// a plain, unmarked span.
-    pub fn plain(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            marks: Vec::new(),
-        }
-    }
-}
-
-/// one block of a message body.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum Block {
-    Paragraph(Vec<Span>),
-    Code { lang: Option<String>, text: String },
-    Quote(Vec<Span>),
-    Divider,
-}
-
-impl Block {
-    /// a single-span plain paragraph.
-    pub fn paragraph(text: impl Into<String>) -> Self {
-        Self::Paragraph(vec![Span::plain(text)])
-    }
-}
+pub use chat_message::{Block, Mark, Party, Span};
 
 /// who may post (and react) in a channel.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

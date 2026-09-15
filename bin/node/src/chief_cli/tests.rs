@@ -37,7 +37,23 @@ impl HttpFixture {
                                     axum::body::to_bytes(request.into_body(), 2 * 1024 * 1024)
                                         .await
                                         .unwrap();
-                                let (status, value) = handler(&path, &body);
+                                let query = serde_json::from_slice::<Value>(&body).ok();
+                                let files_query = query.as_ref().filter(|query| {
+                                    path == "/v1/query" && query["target"] == "files"
+                                });
+                                let (status, value) = match files_query {
+                                    Some(query) => {
+                                        let query = query["query"].as_object().unwrap();
+                                        assert_eq!(query.len(), 1);
+                                        let (kind, params) = query.iter().next().unwrap();
+                                        let (status, value) = handler(
+                                            &format!("files:{kind}"),
+                                            &serde_json::to_vec(params).unwrap(),
+                                        );
+                                        (status, json!({kind:value}))
+                                    }
+                                    None => handler(&path, &body),
+                                };
                                 (
                                     axum::http::StatusCode::from_u16(status).unwrap(),
                                     axum::Json(value),
@@ -87,15 +103,15 @@ fn manifest(installer: u64, id: &str) -> cli::Manifest {
 }
 fn manifest_reply(path: &str, manifest: &cli::Manifest) -> Option<Value> {
     let bytes = serde_json::to_vec(manifest).unwrap();
-    if path == "/v1/files/refs" {
+    if path == "files:refs" {
         return Some(json!({"head":"c".repeat(64),"pins":{},"window_len":0}));
     }
-    if path.starts_with("/v1/files/stat?") {
+    if path.starts_with("files:stat") {
         return Some(
             json!({"path":"manifest.json","kind":"file","size":bytes.len(),"exec":false,"object":"d".repeat(64),"meta":{}}),
         );
     }
-    if path.starts_with("/v1/files/read?") {
+    if path.starts_with("files:read") {
         return Some(
             json!({"b64":base64::engine::general_purpose::STANDARD.encode(bytes),"eof":true}),
         );
@@ -174,20 +190,14 @@ fn forged_manifest_cannot_redirect_requested_chief_before_any_signed_submit() {
         let forged = manifest(7, "B");
         let submits = Arc::new(Mutex::new(0));
         let observed = submits.clone();
-        let http = HttpFixture::new(move |path, _| {
+        let http = HttpFixture::new(move |path, body| {
             if path == "/v1/submit/frame" {
                 *observed.lock().unwrap() += 1;
             }
-            if path.starts_with("/v1/files/stat?") || path.starts_with("/v1/files/read?") {
-                let url = reqwest::Url::parse(&format!("http://test{path}")).unwrap();
-                assert!(
-                    url.query_pairs()
-                        .any(|(k, v)| k == "path" && v == "/home/7/chief/A/manifest.json")
-                );
-                assert!(
-                    url.query_pairs()
-                        .any(|(k, v)| k == "snapshot" && v == "c".repeat(64))
-                );
+            if path.starts_with("files:stat") || path.starts_with("files:read") {
+                let params: Value = serde_json::from_slice(body).unwrap();
+                assert_eq!(params["path"], "/home/7/chief/A/manifest.json");
+                assert_eq!(params["snapshot"], "c".repeat(64));
             }
             (200, manifest_reply(path, &forged).unwrap_or(json!(null)))
         });
@@ -326,7 +336,7 @@ fn existing_stable_package_pin_wins_retries_and_mismatched_source_is_refused() {
     let pinned = "b".repeat(64);
     let expected = pinned.clone();
     let http = HttpFixture::new(move |path, _| {
-        if path == "/v1/files/refs" {
+        if path == "files:refs" {
             return (
                 200,
                 json!({"head":"c".repeat(64),"pins":{name.clone():pinned},"window_len":1}),
@@ -337,14 +347,14 @@ fn existing_stable_package_pin_wins_retries_and_mismatched_source_is_refused() {
             url.query_pairs()
                 .any(|(k, v)| k == "snapshot" && v == pinned)
         );
-        if path.starts_with("/v1/files/find?") {
+        if path.starts_with("files:find") {
             return (
                 200,
                 json!({"entries":[{"path":format!("{prefix}/index.ts"),"kind":"file","size":6,"exec":false,"object":"a".repeat(64),"meta":{}}],"next":null}),
             );
         }
         assert!(
-            path.starts_with("/v1/files/read?"),
+            path.starts_with("files:read"),
             "retry must not submit: {path}"
         );
         (
@@ -385,7 +395,7 @@ fn package_is_projected_before_pin_and_a_racing_stable_pin_wins() {
     let rows = Arc::new(Mutex::new(Vec::<Value>::new()));
     let pinned = Arc::new(Mutex::new(None::<String>));
     let http = HttpFixture::new(move |path, body| {
-        if path == "/v1/files/refs" {
+        if path == "files:refs" {
             let pins = pinned
                 .lock()
                 .unwrap()
@@ -449,16 +459,13 @@ fn package_is_projected_before_pin_and_a_racing_stable_pin_wins() {
                 json!({"ops":rows.lock().unwrap().clone(),"has_more":false}),
             );
         }
-        if path.starts_with("/v1/files/find?") {
+        if path.starts_with("files:find") {
             return (
                 200,
                 json!({"entries":[{"path":format!("{prefix}/index.ts"),"kind":"file","size":6,"exec":false,"object":"d".repeat(64),"meta":{}}],"next":null}),
             );
         }
-        assert!(
-            path.starts_with("/v1/files/read?"),
-            "unexpected request {path}"
-        );
+        assert!(path.starts_with("files:read"), "unexpected request {path}");
         (
             200,
             json!({"b64":base64::engine::general_purpose::STANDARD.encode("source"),"eof":true}),

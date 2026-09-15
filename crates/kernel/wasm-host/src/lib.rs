@@ -2092,7 +2092,7 @@ fn to_wit_ack(ack: &SdkAck) -> WitAck {
 /// code runs on every validator under the same fuel budget, so it traps at the
 /// same point. Surfaced as [`SdkError::Module`] → the host rolls the op back.
 fn module_err(e: impl std::fmt::Display) -> SdkError {
-    SdkError::Module(e.to_string())
+    SdkError::Module(format!("{e:#}"))
 }
 
 fn wit_err(e: WitError) -> SdkError {

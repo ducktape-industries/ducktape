@@ -128,23 +128,7 @@ impl Ducktape {
             AppMessage::DismissError => self.on_dismiss_error(),
             AppMessage::ConnectFailed(cause) => self.on_connect_failed(cause),
             AppMessage::ForgeViewEvent(event) => self.on_forge_view_event(event),
-            AppMessage::ForgeComposerEvent(scope, body) => {
-                self.on_forge_composer_event(scope, body)
-            }
-            AppMessage::ForgeNoteSent(op, next) => self.on_forge_note_sent(op, next),
-            AppMessage::ForgeNoteFailed(scope, op, cause) => {
-                self.on_forge_note_failed(scope, op, cause)
-            }
             AppMessage::FilesViewEvent(event) => self.on_files_view_event(event),
-            AppMessage::FsFileDropped(path) => self.on_fs_file_dropped(path),
-            AppMessage::AttachmentQueued(scope, id, path) => {
-                self.on_attachment_queued(scope, id, path)
-            }
-            AppMessage::AttachmentUploaded(scope, id, outcome) => {
-                self.on_attachment_uploaded(scope, id, outcome)
-            }
-            AppMessage::FsDropped(_result) => self.on_fs_dropped(_result),
-            AppMessage::FsDropFailed(cause) => self.on_fs_drop_failed(cause),
             AppMessage::AccountLoaded(next) => self.on_account_loaded(next),
             AppMessage::AccountFailed(cause) => self.on_account_failed(cause),
             AppMessage::AccountRenamed(_result) => self.on_account_renamed(_result),
@@ -220,23 +204,11 @@ impl Ducktape {
             AppMessage::JoinVoice(id) => self.on_join_voice(id),
             AppMessage::VoiceJoined(id) => self.on_voice_joined(id),
             AppMessage::ToggleChannelCreateVoice => self.on_toggle_channel_create_voice(),
-            AppMessage::ChatBeginEdit(scope, body, seq, rev) => {
-                self.on_chat_begin_edit(scope, body, seq, rev)
-            }
-            AppMessage::ComposerSubmitted(kind, pending_body, pending_id, scope) => {
-                self.on_composer_submitted(kind, pending_body, pending_id, scope)
-            }
-            AppMessage::EditMessageSubmit(text) => self.on_edit_message_submit(text),
-            AppMessage::MessageSent(next) => self.on_message_sent(next),
-            AppMessage::MessageSendFailed(cause) => self.on_message_send_failed(cause),
-            AppMessage::ThreadReplySendFailed(cause) => self.on_thread_reply_send_failed(cause),
-            AppMessage::ThreadReplySent(next) => self.on_thread_reply_sent(next),
             AppMessage::ChatUpdated(next) => self.on_chat_updated(next),
             AppMessage::ChatLoadFailed(cause) => self.on_chat_load_failed(cause),
             AppMessage::ChannelCreated(next) => self.on_channel_created(next),
             AppMessage::LiveAgentsEvent(next) => self.on_live_agents_event(next),
             AppMessage::LiveCancelAcked(_ok) => self.on_live_cancel_acked(_ok),
-            AppMessage::ChatAcked(_result) => self.on_chat_acked(_result),
             AppMessage::CopyMessageLink(link) => self.on_copy_message_link(link),
             AppMessage::OpenMessageLink(url) => self.on_open_message_link(url),
             AppMessage::ChatScrolled(_absolute_x, _absolute_y, _relative_x, relative_y) => {
@@ -851,10 +823,6 @@ impl Ducktape {
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
         self.channel_members = next.channel_members.clone();
-        crate::module_view::chat_composer_roster(
-            &(crate::backend::composer_scope(&self.connected_rpc, &self.active_channel)),
-            &self.channel_members,
-        );
         self.post_refusal = crate::backend::post_gate(
             self.active_channel_archived,
             self.active_channel_members_only,
@@ -1108,10 +1076,6 @@ impl Ducktape {
                 self.channels = folded_chat.channels.clone();
                 self.channel_members = folded_chat.channel_members.clone();
                 self.follow_voice_room_roster();
-                crate::module_view::chat_composer_roster(
-                    &(crate::backend::composer_scope(&self.connected_rpc, &self.active_channel)),
-                    &self.channel_members,
-                );
                 self.channel_reads = folded_chat.channel_reads.clone();
                 self.rooms = folded_chat.rooms.clone();
                 self.dm_rows = folded_chat.dm_rows.clone();
@@ -2163,26 +2127,6 @@ impl Ducktape {
             ForgeIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
                 crate::module_view::event_text(&(event), "url"),
             )),
-            ForgeIntent::Attach => Task::done(AppMessage::AttachmentQueued(
-                crate::module_view::event_text(&(event), "scope"),
-                crate::module_view::event_text(&(event), "id"),
-                crate::module_view::event_text(&(event), "path"),
-            )),
-            ForgeIntent::Composer => {
-                let scope = crate::module_view::event_text(&(event), "scope");
-                let submitted_scope = scope.to_owned();
-                // the files the submit sent, linked into the note's body
-                let links = crate::composer_surface::take_attachments(
-                    &crate::module_view::event_text(&(event), "id"),
-                );
-                Task::done(AppMessage::ForgeComposerEvent(
-                    submitted_scope.clone(),
-                    crate::backend::attachment_body(
-                        crate::module_view::event_text(&(event), "body"),
-                        &links,
-                    ),
-                ))
-            }
             ForgeIntent::Copy => {
                 self.toast = crate::module_view::event_text(&(event), "label");
                 self.toast_age = 0;
@@ -2193,82 +2137,10 @@ impl Ducktape {
             }
         }
     }
-    fn on_forge_composer_event(&mut self, scope: String, body: String) -> Task<AppMessage> {
-        let channel = crate::backend::scope_channel(&(scope), &self.connected_rpc);
-        match crate::backend::submit_verdict(
-            self.loading,
-            self.connected,
-            channel.to_owned(),
-            self.forge_note_pending.to_owned(),
-            !(channel).is_empty(),
-            scope.to_owned(),
-            scope.to_owned(),
-        ) {
-            SubmitVerdict::Refused => {
-                crate::module_view::chat_composer_unsent(&(scope), &(body), false);
-                Task::none()
-            }
-            SubmitVerdict::Admitted => {
-                let op = crate::backend::fresh_operation_id("forge-note".to_owned());
-                self.forge_note_pending = op.to_owned();
-                let send_operation = op.to_owned();
-                let receipt_scope = scope.to_owned();
-                let receipt_operation = op.to_owned();
-                Task::perform(
-                    crate::backend::send_message(
-                        self.connected_rpc.to_owned(),
-                        self.password.to_owned(),
-                        channel.to_owned(),
-                        op.to_owned(),
-                        (body).trim().to_owned(),
-                    ),
-                    move |result| match result {
-                        Ok(value) => AppMessage::ForgeNoteSent(send_operation.clone(), value),
-                        Err(error) => AppMessage::ForgeNoteFailed(
-                            receipt_scope.clone(),
-                            receipt_operation.clone(),
-                            error,
-                        ),
-                    },
-                )
-            }
-        }
-    }
-    fn on_forge_note_sent(
-        &mut self,
-        op: String,
-        _next: crate::backend::SendReceipt,
-    ) -> Task<AppMessage> {
-        if op != self.forge_note_pending {
-            return Task::none();
-        }
-        self.forge_note_pending = "".to_owned();
-        self.error = "".to_owned();
-        Task::none()
-    }
-    fn on_forge_note_failed(
-        &mut self,
-        scope: String,
-        op: String,
-        cause: crate::backend::OptimisticMutationError,
-    ) -> Task<AppMessage> {
-        crate::module_view::chat_composer_unsent(&(scope), &(cause.body), cause.committed);
-        if op != self.forge_note_pending {
-            return Task::none();
-        }
-        self.forge_note_pending = "".to_owned();
-        self.error = cause.message.to_owned();
-        Task::none()
-    }
     fn on_files_view_event(
         &mut self,
         event: crate::module_view::ModuleViewEvent,
     ) -> Task<AppMessage> {
-        self.fs_drop_dir = crate::backend::keep_str(
-            event.kind == "at",
-            &(crate::module_view::event_text(&(event), "path")),
-            &self.fs_drop_dir,
-        );
         if event.kind != "open_link" {
             return Task::none();
         }
@@ -2276,96 +2148,6 @@ impl Ducktape {
             &(event),
             "url",
         )))
-    }
-    fn on_fs_file_dropped(&mut self, path: String) -> Task<AppMessage> {
-        // a drop on the chat attaches to the room's composer
-        if self.shell_tab == ShellTab::Chat {
-            return self.on_chat_file_dropped(path);
-        }
-        if ((self.shell_tab != ShellTab::Files) || self.fs_dropping) || (!self.connected) {
-            return Task::none();
-        }
-        self.error = crate::backend::files_write_gate(
-            self.fs_drop_dir.to_owned(),
-            self.settings_user_key.to_owned(),
-        );
-        if !(self.error).is_empty() {
-            return Task::none();
-        }
-        self.fs_dropping = true;
-        Task::perform(
-            crate::backend::files_upload(
-                self.connected_rpc.to_owned(),
-                self.password.to_owned(),
-                self.fs_drop_dir.to_owned(),
-                path.to_owned(),
-            ),
-            |result| match result {
-                Ok(value) => AppMessage::FsDropped(value),
-                Err(error) => AppMessage::FsDropFailed(error),
-            },
-        )
-    }
-    /// A file dropped anywhere on the chat: into the standby zone of the
-    /// open room's composer, and on its way into DuckFS.
-    fn on_chat_file_dropped(&mut self, path: String) -> Task<AppMessage> {
-        if !self.connected || self.active_channel.is_empty() {
-            return Task::none();
-        }
-        let scope = crate::backend::composer_scope(&self.connected_rpc, &self.active_channel);
-        match crate::composer_surface::attach(&scope, &[path]) {
-            Ok(queued) => Task::batch(queued.into_iter().map(|attachment| {
-                Task::done(AppMessage::AttachmentQueued(
-                    scope.clone(),
-                    attachment.id,
-                    attachment.path,
-                ))
-            })),
-            Err(reason) => {
-                self.error = reason;
-                Task::none()
-            }
-        }
-    }
-    /// An attached file starts its upload under its own id.
-    fn on_attachment_queued(
-        &mut self,
-        scope: String,
-        id: String,
-        path: String,
-    ) -> Task<AppMessage> {
-        let answer_scope = scope.clone();
-        let answer_id = id.clone();
-        Task::perform(
-            crate::backend::attach_file(
-                self.connected_rpc.to_owned(),
-                self.password.to_owned(),
-                id,
-                path,
-            ),
-            move |outcome| {
-                AppMessage::AttachmentUploaded(answer_scope.clone(), answer_id.clone(), outcome)
-            },
-        )
-    }
-    /// Where the file landed, or why it did not, back to its chip.
-    fn on_attachment_uploaded(
-        &mut self,
-        scope: String,
-        id: String,
-        outcome: Result<String, String>,
-    ) -> Task<AppMessage> {
-        crate::composer_surface::attached(&scope, &id, outcome);
-        Task::none()
-    }
-    fn on_fs_dropped(&mut self, _result: bool) -> Task<AppMessage> {
-        self.fs_dropping = false;
-        Task::none()
-    }
-    fn on_fs_drop_failed(&mut self, cause: crate::backend::AppError) -> Task<AppMessage> {
-        self.fs_dropping = false;
-        self.error = cause.message.to_owned();
-        Task::none()
     }
     fn on_account_loaded(&mut self, next: crate::backend::AccountData) -> Task<AppMessage> {
         if next.generation != self.account_generation {
@@ -3942,298 +3724,6 @@ impl Ducktape {
             })
         }])
     }
-    fn on_chat_begin_edit(
-        &mut self,
-        scope: String,
-        body: String,
-        seq: i64,
-        rev: i64,
-    ) -> Task<AppMessage> {
-        if (body).is_empty() || (seq <= 0) {
-            return Task::none();
-        }
-        self.chat_edit_seq = seq;
-        self.chat_edit_rev = rev;
-        crate::module_view::chat_composer_seed(&(scope), &(body));
-        Task::none()
-    }
-    fn on_composer_submitted(
-        &mut self,
-        kind: ComposerKind,
-        pending_body: String,
-        pending_id: String,
-        scope: String,
-    ) -> Task<AppMessage> {
-        // the files the submit sent, already in DuckFS, and the body that links them
-        let links = crate::composer_surface::take_attachments(&pending_id);
-        let pending_body = crate::backend::attachment_body(pending_body, &links);
-        match kind {
-            ComposerKind::Message => {
-                match crate::backend::submit_verdict(
-                    self.loading,
-                    self.connected,
-                    self.active_channel.to_owned(),
-                    self.post_refusal.to_owned(),
-                    true,
-                    scope.to_owned(),
-                    crate::backend::composer_scope(&self.connected_rpc, &self.active_channel),
-                ) {
-                    SubmitVerdict::Refused => {
-                        crate::module_view::chat_composer_unsent(&(scope), &(pending_body), false);
-                        Task::none()
-                    }
-                    SubmitVerdict::Admitted => {
-                        self.hydration_generation += 1;
-                        self.hydration_retry_attempt = 0;
-                        self.chat_pending_sends = crate::backend::send_pending(
-                            ::std::mem::take(&mut self.chat_pending_sends),
-                            pending_id.to_owned(),
-                            pending_body.to_owned(),
-                            0,
-                        );
-                        self.error = "".to_owned();
-                        self.chat_at_tail = true;
-                        self.history_view = false;
-                        self.chat_sent_serial += 1;
-                        Task::perform(
-                            crate::backend::send_message(
-                                self.connected_rpc.to_owned(),
-                                self.password.to_owned(),
-                                self.active_channel.to_owned(),
-                                pending_id.to_owned(),
-                                pending_body.to_owned(),
-                            ),
-                            |result| match result {
-                                Ok(value) => AppMessage::MessageSent(value),
-                                Err(error) => AppMessage::MessageSendFailed(error),
-                            },
-                        )
-                    }
-                }
-            }
-            ComposerKind::Reply => {
-                let thread_seq = crate::backend::scope_thread_seq(&(scope));
-                match crate::backend::submit_verdict(
-                    false,
-                    self.connected,
-                    self.active_channel.to_owned(),
-                    self.post_refusal.to_owned(),
-                    thread_seq > 0,
-                    scope.to_owned(),
-                    crate::backend::thread_scope(
-                        &self.connected_rpc,
-                        &self.active_channel,
-                        thread_seq,
-                    ),
-                ) {
-                    SubmitVerdict::Refused => {
-                        crate::module_view::chat_composer_unsent(&(scope), &(pending_body), false);
-                        Task::none()
-                    }
-                    SubmitVerdict::Admitted => {
-                        self.hydration_generation += 1;
-                        self.hydration_retry_attempt = 0;
-                        self.chat_pending_sends = crate::backend::send_pending(
-                            ::std::mem::take(&mut self.chat_pending_sends),
-                            pending_id.to_owned(),
-                            pending_body.to_owned(),
-                            thread_seq,
-                        );
-                        self.error = "".to_owned();
-                        Task::perform(
-                            crate::backend::send_reply(
-                                self.connected_rpc.to_owned(),
-                                self.password.to_owned(),
-                                self.active_channel.to_owned(),
-                                thread_seq,
-                                pending_id.to_owned(),
-                                pending_body.to_owned(),
-                            ),
-                            |result| match result {
-                                Ok(value) => AppMessage::ThreadReplySent(value),
-                                Err(error) => AppMessage::ThreadReplySendFailed(error),
-                            },
-                        )
-                    }
-                }
-            }
-            ComposerKind::Edit => {
-                if scope
-                    != crate::backend::edit_scope(
-                        &self.connected_rpc,
-                        &self.active_channel,
-                        self.chat_edit_seq,
-                    )
-                {
-                    return Task::none();
-                }
-                Task::done(AppMessage::EditMessageSubmit(
-                    (pending_body).trim().to_owned(),
-                ))
-            }
-            ComposerKind::ThreadEdit => {
-                if scope
-                    != crate::backend::edit_scope(
-                        &self.connected_rpc,
-                        &self.active_channel,
-                        self.chat_edit_seq,
-                    )
-                {
-                    return Task::none();
-                }
-                Task::done(AppMessage::EditMessageSubmit(
-                    (pending_body).trim().to_owned(),
-                ))
-            }
-        }
-    }
-    fn on_edit_message_submit(&mut self, text: String) -> Task<AppMessage> {
-        if (((self.loading || (self.mutation_phase != MutationPhase::Idle))
-            || (self.active_channel).is_empty())
-            || (self.chat_edit_seq <= 0))
-            || ((text).trim().to_owned()).is_empty()
-        {
-            return Task::none();
-        }
-        self.hydration_generation += 1;
-        self.hydration_retry_attempt = 0;
-        self.mutation_phase = MutationPhase::MessageEdit;
-        self.error = "".to_owned();
-        Task::perform(
-            crate::backend::edit_message(
-                self.connected_rpc.to_owned(),
-                self.password.to_owned(),
-                self.active_channel.to_owned(),
-                self.chat_edit_seq,
-                self.chat_edit_rev,
-                (text).trim().to_owned(),
-            ),
-            |result| match result {
-                Ok(value) => AppMessage::ChatAcked(value),
-                Err(error) => AppMessage::MutationFailed(error),
-            },
-        )
-    }
-    fn on_message_sent(&mut self, next: crate::backend::SendReceipt) -> Task<AppMessage> {
-        self.chat_pending_sends = crate::backend::send_settled(
-            ::std::mem::take(&mut self.chat_pending_sends),
-            &(next.operation_id),
-        );
-        if self.active_channel != next.channel_id {
-            return Task::none();
-        }
-        self.error = "".to_owned();
-        Task::none()
-    }
-    fn on_message_send_failed(
-        &mut self,
-        cause: crate::backend::OptimisticMutationError,
-    ) -> Task<AppMessage> {
-        self.error = cause.message.to_owned();
-        self.chat_pending_sends = crate::backend::send_failed(
-            ::std::mem::take(&mut self.chat_pending_sends),
-            &(cause.operation_id),
-            cause.committed,
-        );
-        crate::module_view::chat_composer_unsent(
-            &(crate::backend::composer_scope(&self.connected_rpc, &(cause.scope_id))),
-            &(cause.body),
-            cause.committed,
-        );
-        if (self.active_channel != cause.scope_id) || (!cause.committed) {
-            return Task::none();
-        }
-        self.hydration_generation += 1;
-        self.hydration_retry_attempt = 0;
-        let pending_task = Task::perform(
-            crate::backend::live_resync_load(
-                self.connected_rpc.to_owned(),
-                self.active_channel.to_owned(),
-                true,
-                false,
-                self.hydration_generation,
-                0,
-            ),
-            |result| match result {
-                Ok(value) => AppMessage::LiveResynced(value),
-                Err(error) => AppMessage::LiveResyncFailed(error),
-            },
-        );
-        self.live_resync_generation = self.live_resync_generation.wrapping_add(1);
-        let request_generation = self.live_resync_generation;
-        let (pending_task, request_handle) = pending_task.abortable();
-        if let Some(previous_handle) = self
-            .live_resync_task
-            .replace(request_handle.abort_on_drop())
-        {
-            previous_handle.abort();
-        }
-        pending_task.map(move |reply_message| {
-            AppMessage::LiveResyncReply(request_generation, Box::new(reply_message))
-        })
-    }
-    fn on_thread_reply_send_failed(
-        &mut self,
-        cause: crate::backend::OptimisticMutationError,
-    ) -> Task<AppMessage> {
-        self.error = cause.message.to_owned();
-        self.chat_pending_sends = crate::backend::send_failed(
-            ::std::mem::take(&mut self.chat_pending_sends),
-            &(cause.operation_id),
-            cause.committed,
-        );
-        crate::module_view::chat_composer_unsent(
-            &(crate::backend::thread_scope(
-                &self.connected_rpc,
-                &(cause.scope_id),
-                cause.thread_seq,
-            )),
-            &(cause.body),
-            cause.committed,
-        );
-        if (self.active_channel != cause.scope_id) || (!cause.committed) {
-            return Task::none();
-        }
-        self.hydration_generation += 1;
-        self.hydration_retry_attempt = 0;
-        let pending_task = Task::perform(
-            crate::backend::live_resync_load(
-                self.connected_rpc.to_owned(),
-                self.active_channel.to_owned(),
-                true,
-                false,
-                self.hydration_generation,
-                0,
-            ),
-            |result| match result {
-                Ok(value) => AppMessage::LiveResynced(value),
-                Err(error) => AppMessage::LiveResyncFailed(error),
-            },
-        );
-        self.live_resync_generation = self.live_resync_generation.wrapping_add(1);
-        let request_generation = self.live_resync_generation;
-        let (pending_task, request_handle) = pending_task.abortable();
-        if let Some(previous_handle) = self
-            .live_resync_task
-            .replace(request_handle.abort_on_drop())
-        {
-            previous_handle.abort();
-        }
-        pending_task.map(move |reply_message| {
-            AppMessage::LiveResyncReply(request_generation, Box::new(reply_message))
-        })
-    }
-    fn on_thread_reply_sent(&mut self, next: crate::backend::SendReceipt) -> Task<AppMessage> {
-        self.chat_pending_sends = crate::backend::send_settled(
-            ::std::mem::take(&mut self.chat_pending_sends),
-            &(next.operation_id),
-        );
-        if self.active_channel != next.channel_id {
-            return Task::none();
-        }
-        self.error = "".to_owned();
-        Task::none()
-    }
     fn on_chat_updated(&mut self, next: crate::backend::ChatData) -> Task<AppMessage> {
         if next.generation != self.chat_generation {
             return Task::none();
@@ -4301,10 +3791,6 @@ impl Ducktape {
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
         self.channel_members = next.channel_members.clone();
-        crate::module_view::chat_composer_roster(
-            &(crate::backend::composer_scope(&self.connected_rpc, &self.active_channel)),
-            &self.channel_members,
-        );
         self.post_refusal = crate::backend::post_gate(
             self.active_channel_archived,
             self.active_channel_members_only,
@@ -4400,10 +3886,6 @@ impl Ducktape {
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
         self.channel_members = next.channel_members.clone();
-        crate::module_view::chat_composer_roster(
-            &(crate::backend::composer_scope(&self.connected_rpc, &self.active_channel)),
-            &self.channel_members,
-        );
         self.post_refusal = crate::backend::post_gate(
             self.active_channel_archived,
             self.active_channel_members_only,
@@ -4430,15 +3912,6 @@ impl Ducktape {
         Task::none()
     }
     fn on_live_cancel_acked(&mut self, _ok: bool) -> Task<AppMessage> {
-        self.error = "".to_owned();
-        Task::none()
-    }
-    fn on_chat_acked(&mut self, _result: bool) -> Task<AppMessage> {
-        self.chat_edit_seq = 0;
-        self.chat_edit_rev = 0;
-        self.pending_channel = "".to_owned();
-        self.channel_create_open = false;
-        self.mutation_phase = MutationPhase::Idle;
         self.error = "".to_owned();
         Task::none()
     }
@@ -4683,20 +4156,6 @@ impl Ducktape {
             ChatIntent::CopyLink => Task::done(AppMessage::CopyMessageLink(
                 crate::module_view::event_text(&(event), "link"),
             )),
-            ChatIntent::BeginEdit => {
-                let body = crate::module_view::event_text(&(event), "body");
-                let seq = crate::module_view::event_int(&(event), "seq");
-                let rev = crate::module_view::event_int(&(event), "rev");
-                let edit_body = body.to_owned();
-                let edit_sequence = seq;
-                let edit_revision = rev;
-                Task::done(AppMessage::ChatBeginEdit(
-                    crate::module_view::event_text(&(event), "scope"),
-                    edit_body.clone(),
-                    edit_sequence,
-                    edit_revision,
-                ))
-            }
             ChatIntent::CancelRun => Task::perform(
                 crate::backend::cancel_agent_run(
                     self.connected_rpc.to_owned(),
@@ -4711,25 +4170,6 @@ impl Ducktape {
             ChatIntent::OpenRun => Task::done(AppMessage::OpenRunPanel(
                 crate::module_view::event_text(&(event), "dispatch_id"),
             )),
-            ChatIntent::Attach => Task::done(AppMessage::AttachmentQueued(
-                crate::module_view::event_text(&(event), "scope"),
-                crate::module_view::event_text(&(event), "id"),
-                crate::module_view::event_text(&(event), "path"),
-            )),
-            ChatIntent::Composer => {
-                let kind = crate::module_view::chat_event_kind(&(event));
-                let id = crate::module_view::event_text(&(event), "id");
-                let scope = crate::module_view::event_text(&(event), "scope");
-                let reaction_kind = kind;
-                let reaction_id = id.to_owned();
-                let reaction_scope = scope.to_owned();
-                Task::done(AppMessage::ComposerSubmitted(
-                    reaction_kind,
-                    crate::module_view::event_text(&(event), "body"),
-                    reaction_id.clone(),
-                    reaction_scope.clone(),
-                ))
-            }
         }
     }
     fn on_pages_view_event(
@@ -5981,12 +5421,19 @@ impl Ducktape {
     fn on_call_event(&mut self, event: crate::call::CallEvent) -> Task<AppMessage> {
         self.call_status =
             crate::call::call_status_after(self.call_status.to_owned(), event.clone());
-        self.call_muted =
-            crate::backend::keep_bool(event.kind == "connecting", false, self.call_muted);
-        self.call_camera =
-            crate::backend::keep_bool(event.kind == "connecting", false, self.call_camera);
-        self.call_sharing =
-            crate::backend::keep_bool(event.kind == "connecting", false, self.call_sharing);
+        match event.kind.as_str() {
+            "connecting" => {
+                self.call_muted = false;
+                self.call_camera = false;
+                self.call_sharing = false;
+            }
+            "self" => {
+                self.call_muted = event.muted;
+                self.call_camera = event.camera_on;
+                self.call_sharing = event.sharing;
+            }
+            _ => {}
+        }
         self.call_speaking = crate::call::call_speaking_after(self.call_speaking, &event);
         self.call_peers =
             crate::call::apply_call_peer(::std::mem::take(&mut self.call_peers), event.clone());

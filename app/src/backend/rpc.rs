@@ -1,5 +1,4 @@
 use super::*;
-use ::chat;
 
 /// Sign and submit one module op, answering the height of the block that
 /// INCLUDED it.
@@ -315,33 +314,6 @@ pub(crate) async fn sign_add_key_consent(
     ))
 }
 
-/// The person's proof for a raw-bytes write (a staged chunk, a forge pack):
-/// this device's key signs each request, bound to the node it is sent to,
-/// through the one message the daemon verifies (`node::signed_req`). The
-/// same seat [`sign_frame`] uses, so it costs no argon2 pass of its own.
-pub(crate) async fn data_plane_signer(
-    rpc: &RpcClient,
-    password: String,
-) -> Result<ducktape_rpc::WriteAuth, String> {
-    let node_key = hex_decode(&rpc.status().await?.public_key)?;
-    let key = {
-        let session = seated_signer(password).await?;
-        session
-            .as_ref()
-            .expect("the session was seated above")
-            .key
-            .clone()
-    };
-    Ok(std::sync::Arc::new(
-        move |method: &str, path: &str, body: &[u8]| {
-            ::node::signed_req::request_headers(&key, method, path, &node_key, body)
-                .into_iter()
-                .map(|(name, value)| (name.to_string(), value))
-                .collect()
-        },
-    ))
-}
-
 /// Take the session seat: the key at `path`, opened under `password`. THE
 /// one place a key is opened for signing — the wallet ceremonies call it with
 /// the workspace's key file, having just proved the password on it — so a
@@ -381,6 +353,27 @@ pub(crate) async fn seated_request_headers(
     ))
 }
 
+/// Mint gateway caller authority without exposing the seated key to a view.
+pub(crate) async fn seated_gateway_proof(
+    publisher: &[u8],
+    head: &gateway::ProxyRequestHead,
+    body: &[u8],
+) -> Option<gateway::UserPop> {
+    let session = SIGNER.lock().await;
+    let signer = session.as_ref()?;
+    let ts = ::node::signed_req::now_secs();
+    let preimage = gateway::caller_pop_preimage(publisher, head, body, ts);
+    Some(gateway::UserPop {
+        key: signer.key.public_key().as_ref().to_vec(),
+        ts,
+        sig: signer
+            .key
+            .sign(gateway::GATEWAY_CALLER_NS, &preimage)
+            .as_ref()
+            .to_vec(),
+    })
+}
+
 /// This node's own public key — the bytes a data-plane signature is bound to, so
 /// a proof minted for one node cannot be replayed at another. Read off the
 /// node's own `status`, which is where every other signing caller reads it.
@@ -397,6 +390,12 @@ pub(crate) async fn node_public_key(rpc: &str) -> Result<Vec<u8>, String> {
 /// key instead of racing five argon2 passes into it. No seat, or another
 /// password, is the locked state: the launch window and Settings are where a
 /// seat is taken, never a write that happened to carry a password.
+/// Confirm the current user unlocked the signing seat for this action.
+pub(crate) async fn require_seated_signer(password: String) -> Result<(), String> {
+    drop(seated_signer(password).await?);
+    Ok(())
+}
+
 async fn seated_signer(
     password: String,
 ) -> Result<tokio::sync::MutexGuard<'static, Option<Signer>>, String> {
@@ -647,22 +646,6 @@ pub(crate) fn bounded_text(value: String, field: &str, limit: usize) -> Result<S
 
 pub(crate) fn required_id(value: String, subject: &str) -> Result<String, String> {
     bounded_text(value, &format!("{subject} id"), 512)
-}
-
-pub(crate) fn public_key(value: &str, field: &str) -> Result<Vec<u8>, String> {
-    let value = value.trim();
-    let expected = chat::HUDDLE_NODE_KEY_BYTES * 2;
-    if value.len() != expected {
-        return Err(format!("{field} must be {expected} hexadecimal characters"));
-    }
-    hex_decode(value).map_err(|_| format!("{field} must be hexadecimal"))
-}
-
-pub(crate) fn positive_sequence(value: i64) -> Result<u64, String> {
-    u64::try_from(value)
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| "message sequence must be positive".into())
 }
 
 /// One voice at the surface. The global banner prints whatever reaches an

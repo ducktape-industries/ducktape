@@ -189,26 +189,37 @@ impl BindingState {
             self.menu.close();
         }
         let after_doc = document(after.text, after.cursor);
-        if let Some(wire::EditorRequestInput::Interaction { action }) = origin {
-            let (_, successor) = interaction(
-                &document(before.text, before.cursor),
-                self.menu.clone(),
-                action,
-            );
-            self.menu = successor;
-        } else if opens_format_menu(origin) {
-            self.menu.format(&after_doc);
-        } else if matches!(kind, wire::EditorEditKind::Cursor) {
-            self.menu.moved(&after_doc);
-        } else {
-            let typed = matches!(kind, wire::EditorEditKind::Insert)
-                && after.text_revision != before.text_revision;
-            let trigger = after_doc
-                .line(after.cursor.position.line as usize)
-                .and_then(|line| line.get(..after.cursor.position.column as usize))
-                .and_then(|prefix| prefix.chars().next_back())
-                .filter(|last| typed && TRIGGERS.contains(last));
-            self.menu.after_edit(&after_doc, trigger);
+        match origin {
+            Some(wire::EditorRequestInput::Interaction { action }) => {
+                let (_, successor) = interaction(
+                    &document(before.text, before.cursor),
+                    self.menu.clone(),
+                    action,
+                );
+                self.menu = successor;
+            }
+            Some(wire::EditorRequestInput::RichEdit { edit }) => {
+                let native_edit = edit.action.is_empty() && edit.interaction.is_none();
+                if native_edit {
+                    self.menu.after_edit(&after_doc, None);
+                }
+            }
+            Some(wire::EditorRequestInput::Key { .. }) | None => {
+                if opens_format_menu(origin) {
+                    self.menu.format(&after_doc);
+                } else if matches!(kind, wire::EditorEditKind::Cursor) {
+                    self.menu.moved(&after_doc);
+                } else {
+                    let typed = matches!(kind, wire::EditorEditKind::Insert)
+                        && after.text_revision != before.text_revision;
+                    let trigger = after_doc
+                        .line(after.cursor.position.line as usize)
+                        .and_then(|line| line.get(..after.cursor.position.column as usize))
+                        .and_then(|prefix| prefix.chars().next_back())
+                        .filter(|last| typed && TRIGGERS.contains(last));
+                    self.menu.after_edit(&after_doc, trigger);
+                }
+            }
         }
         let changes_history = before.text_revision != after.text_revision
             || matches!(
@@ -223,7 +234,42 @@ impl BindingState {
                 input_time_ms,
             );
         }
-        Some(self.update(id, after, Vec::new()))
+        let navigation = match origin {
+            Some(wire::EditorRequestInput::RichEdit { edit })
+                if !edit.action.is_empty() || edit.interaction.is_some() =>
+            {
+                let Ok((text, cursor)) = crate::rich_document::document(edit) else {
+                    return None;
+                };
+                let doc = rebase_rich(before, edit, document(&text, cursor))?;
+                if matches!(
+                    edit.interaction,
+                    Some(wire::editor_presentation::EditorInteraction::Margin { .. })
+                ) {
+                    crate::document_sync::Navigation {
+                        comment_line: Some(doc.cursor.position.line),
+                        anchor: crate::document_sync::text_anchor(
+                            doc.line(doc.cursor.position.line as usize)
+                                .unwrap_or_default(),
+                            crate::editor_menu::selection_columns(
+                                &doc,
+                                doc.cursor.position.line as usize,
+                            ),
+                        ),
+                        ..Default::default()
+                    }
+                } else {
+                    if !self.menu.is_open() {
+                        self.menu.format(&doc);
+                    }
+                    let navigation = self.menu.intent(&doc, &edit.action);
+                    self.menu = self.menu.pick(&doc, &edit.action).1;
+                    navigation
+                }
+            }
+            _ => crate::document_sync::Navigation::default(),
+        };
+        Some(self.update(id, after, wire::encode(&navigation)))
     }
 }
 
@@ -312,6 +358,7 @@ pub fn keys(
     let state = Rc::new(RefCell::new(BindingState { history, menu }));
     let deciding = state.clone();
     let interacting = state.clone();
+    let rich = state.clone();
     let bare = Modifiers::default();
     let mut claims = [Named::Enter, Named::Tab, Named::Backspace]
         .into_iter()
@@ -357,6 +404,15 @@ pub fn keys(
         },
         move |event| state.borrow_mut().observe(event),
     )
+    .on_rich_edit(move |request| {
+        let state = rich.borrow();
+        let menu = if state.history.reset == Some(request.state.reset) {
+            state.menu.clone()
+        } else {
+            Default::default()
+        };
+        rich_decision(request.state, request.edit, menu)
+    })
     .on_interaction(move |request| {
         let state = interacting.borrow();
         let doc = document(request.state.text, request.state.cursor);
@@ -395,6 +451,10 @@ fn interaction(
                 crate::editor_menu::drop_move(doc, *from as usize, *boundary as usize),
                 menu,
             )
+        }
+        EditorInteraction::Action { tag } => {
+            menu.format(doc);
+            menu.pick(doc, tag)
         }
         EditorInteraction::MenuPick { tag } => menu.pick(doc, tag),
         EditorInteraction::MenuSelect { index } => {
@@ -556,5 +616,213 @@ fn wire_decision(doc: &Doc, decision: editor::EditorDecision) -> EditorDecision 
                 history: wire_history(history),
             }
         }
+    }
+}
+
+/// A rich snapshot is still one canonical transaction, so draft, undo and
+/// replacement lifetime follow the same commit acknowledgment as native text.
+fn rich_decision(
+    state: ducktape_view_guest::EditorStateView<'_>,
+    edit: &wire::editor_rich::RichEdit,
+    mut menu: crate::editor_menu::Menu,
+) -> EditorDecision {
+    let Ok((text, cursor)) = crate::rich_document::document(edit) else {
+        return EditorDecision::Noop;
+    };
+    let incoming = document(&text, cursor);
+    let Some(doc) = rebase_rich(state, edit, incoming) else {
+        return EditorDecision::Noop;
+    };
+    let after = if edit.action.is_empty() {
+        doc
+    } else {
+        if !menu.is_open() {
+            menu.format(&doc);
+        }
+        match menu.pick(&doc, &edit.action).0 {
+            editor::EditorDecision::Apply {
+                patches, cursor, ..
+            } => editor::apply(&doc, &patches, cursor),
+            editor::EditorDecision::Noop | editor::EditorDecision::DefaultEditorAction => doc,
+        }
+    };
+    let Ok(patches) = wire::editor_document::editor_changed_span(state.text, &after.text) else {
+        return EditorDecision::Noop;
+    };
+    EditorDecision::Apply {
+        patches,
+        cursor: wire::EditorCursor {
+            position: wire_position(after.cursor.position),
+            selection: after.cursor.selection.map(wire_position),
+        },
+        history: EditorHistoryEffect::Native,
+    }
+}
+
+fn rebase_rich(
+    state: ducktape_view_guest::EditorStateView<'_>,
+    edit: &wire::editor_rich::RichEdit,
+    incoming: Doc,
+) -> Option<Doc> {
+    let Some(base) = &edit.before else {
+        return Some(incoming);
+    };
+    let (text, cursor) = crate::rich_document::canonical(base).ok()?;
+    if text == state.text {
+        return Some(incoming);
+    }
+    let base = document(&text, cursor);
+    let current = document(state.text, state.cursor);
+    let before_caret = base.offset(base.cursor.position) as isize;
+    let current_caret = current.offset(current.cursor.position) as isize;
+    let patches = wire::editor_document::editor_changed_span(&base.text, &incoming.text).ok()?;
+    let source = patches.into_iter().next().unwrap_or(wire::EditorPatch {
+        start_byte: before_caret as u32,
+        end_byte: before_caret as u32,
+        replacement: String::new(),
+    });
+    let translated = |at: u32| u32::try_from(current_caret + at as isize - before_caret).ok();
+    let patch = wire::EditorPatch {
+        start_byte: translated(source.start_byte)?,
+        end_byte: translated(source.end_byte)?,
+        replacement: source.replacement,
+    };
+    let text = wire::patched_editor_text(
+        state.text,
+        std::slice::from_ref(&patch),
+        wire::EditorCursor::default(),
+    )
+    .ok()?;
+    let after = document(&text, Default::default());
+    let mapped = |position| {
+        let relative = incoming.offset(position) as isize - source.start_byte as isize;
+        let at = usize::try_from(patch.start_byte as isize + relative).ok()?;
+        if !after.text.is_char_boundary(at) {
+            return None;
+        }
+        Some(after.position_at(at))
+    };
+    Some(Doc::new(
+        &text,
+        editor::EditorCursor {
+            position: mapped(incoming.cursor.position)?,
+            selection: match incoming.cursor.selection {
+                Some(at) => Some(mapped(at)?),
+                None => None,
+            },
+        },
+    ))
+}
+
+#[cfg(test)]
+mod rich_tests {
+    use super::*;
+
+    #[test]
+    fn annotation_queued_behind_formatting_anchors_the_committed_selection() {
+        let cursor = wire::EditorCursor {
+            position: wire::EditorPosition { line: 1, column: 5 },
+            selection: Some(wire::EditorPosition { line: 1, column: 0 }),
+        };
+        let snapshot = crate::rich_document::presentation("T\nhello", cursor).document;
+        let before = ducktape_view_guest::EditorStateView {
+            text: "T\n**hello**",
+            cursor: wire::EditorCursor {
+                position: wire::EditorPosition { line: 1, column: 7 },
+                selection: Some(wire::EditorPosition { line: 1, column: 2 }),
+            },
+            reset: 1,
+            text_revision: 1,
+            revision: 1,
+        };
+        let edit = wire::editor_rich::RichEdit {
+            before: Some(snapshot.clone()),
+            document: snapshot,
+            interaction: Some(wire::editor_presentation::EditorInteraction::Margin { line: 1 }),
+            ..Default::default()
+        };
+        let EditorDecision::Apply {
+            patches,
+            cursor,
+            history,
+        } = rich_decision(before, &edit, Default::default())
+        else {
+            panic!("annotation decision");
+        };
+        assert!(patches.is_empty());
+        let after = ducktape_view_guest::EditorStateView {
+            cursor,
+            revision: 2,
+            ..before
+        };
+        let id = wire::EditorTransactionId {
+            instance: 1,
+            document: "doc".into(),
+            reset: 1,
+            sequence: 2,
+            attempt: 0,
+            text_revision: 1,
+            revision: 1,
+        };
+        let origin = wire::EditorRequestInput::RichEdit {
+            edit: Box::new(edit),
+        };
+        let mut binding = BindingState {
+            history: Default::default(),
+            menu: Default::default(),
+        };
+        let update = binding
+            .observe(EditorTransactionEvent::Commit {
+                id: &id,
+                origin: Some(&origin),
+                before,
+                after,
+                kind: wire::EditorEditKind::GuestPatch,
+                history,
+                input_time_ms: 0,
+            })
+            .unwrap();
+        let navigation: crate::document_sync::Navigation =
+            wire::decode(&update.interaction).unwrap();
+        assert_eq!(navigation.comment_line, Some(1));
+        assert_eq!(navigation.anchor, Some((2, 7)));
+    }
+
+    #[test]
+    fn typing_queued_behind_guest_formatting_preserves_the_accepted_mark() {
+        let before_cursor = wire::EditorCursor {
+            position: wire::EditorPosition { line: 1, column: 5 },
+            selection: Some(wire::EditorPosition { line: 1, column: 0 }),
+        };
+        let before = crate::rich_document::presentation("T\nhello", before_cursor).document;
+        let incoming_cursor = wire::EditorCursor {
+            position: wire::EditorPosition { line: 1, column: 1 },
+            selection: None,
+        };
+        let incoming = crate::rich_document::presentation("T\nx", incoming_cursor).document;
+        let state = ducktape_view_guest::EditorStateView {
+            text: "T\n**hello**",
+            cursor: wire::EditorCursor {
+                position: wire::EditorPosition { line: 1, column: 7 },
+                selection: Some(wire::EditorPosition { line: 1, column: 2 }),
+            },
+            reset: 1,
+            text_revision: 1,
+            revision: 1,
+        };
+        let edit = wire::editor_rich::RichEdit {
+            before: Some(before),
+            document: incoming,
+            ..Default::default()
+        };
+        let EditorDecision::Apply {
+            patches, cursor, ..
+        } = rich_decision(state, &edit, Default::default())
+        else {
+            panic!("typing decision");
+        };
+        let after = wire::patched_editor_text(state.text, &patches, cursor).unwrap();
+        assert_eq!(after, "T\n**x**");
+        assert_eq!(cursor.position, wire::EditorPosition { line: 1, column: 3 });
     }
 }

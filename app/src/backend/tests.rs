@@ -159,26 +159,6 @@ async fn submit_test(
 }
 
 /// One commit in `repo` holding exactly `files`, on top of `parent`.
-fn mirror_commit(
-    repo: &git2::Repository,
-    parent: Option<git2::Oid>,
-    files: &[(&str, &str)],
-) -> git2::Oid {
-    let mut tree = repo.treebuilder(None).unwrap();
-    for (path, contents) in files {
-        let blob = repo.blob(contents.as_bytes()).unwrap();
-        tree.insert(path, blob, 0o100644).unwrap();
-    }
-    let tree = repo.find_tree(tree.write().unwrap()).unwrap();
-    let signature = git2::Signature::now("mule", "mule@localhost").unwrap();
-    let parents: Vec<git2::Commit> = parent
-        .map(|oid| vec![repo.find_commit(oid).unwrap()])
-        .unwrap_or_default();
-    let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-    repo.commit(None, &signature, &signature, "mule", &tree, &parent_refs)
-        .unwrap()
-}
-
 /// A node whose page SEARCH answers and whose page LIST refuses — the exact
 /// split the title join has to survive. Answers one request per connection and
 /// closes, so the two views of a search never share a socket. Returns its

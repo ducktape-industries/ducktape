@@ -1,41 +1,18 @@
-//! git smart-HTTP: forge as a full push+fetch remote over `/forge/{repo}/…`.
+//! git smart-HTTP: forge as a full push+fetch remote over `/{repo}/…`.
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use futures::channel::oneshot;
 use serde::Deserialize;
 
-use crate::{DEFAULT_ORIGIN, NodeCommand, NodeHandle, actor_gone, error_response};
+use crate::{ServiceState, error_response};
 
-// ============================================================================
-// git smart-HTTP: forge is a full push+fetch remote.
-//
-// this is the ONE forge-specific corner of the surface (every other route is
-// module-agnostic opaque json). it speaks the git smart-HTTP protocol on both
-// sides so a stock `git` clones, pulls, and pushes `http://<node>/forge/<repo>`:
-//   GET  /forge/{repo}/info/refs?service=git-receive-pack — advertise for push
-//   GET  /forge/{repo}/info/refs?service=git-upload-pack  — advertise for fetch
-//   POST /forge/{repo}/git-receive-pack                   — receive a push
-//   POST /forge/{repo}/git-upload-pack                    — serve a fetch/clone
-//
-// PUSH bridges to forge's consensus `Push` op: the packfile bytes land in the
-// node-local blob store (never consensus); only the (prev_oid, new_oid,
-// pack_digest) CAS crosses into a block, and forge's in-module `materialize`
-// verifies the pack against the repo's objects.
-//
-// FETCH reads forge's git substrate DIRECTLY — the one route that opens the
-// on-disk repo (`<forge_repo>/<name>`, threaded onto the handle) instead of
-// talking to the actor. once the client sends `done`, the haves it advertised
-// bound the pack: every have this repo knows hides its closure from the walk,
-// so an up-to-date-ish client (the remote-view mirror re-syncing per head
-// movement) downloads only what moved, ACKed with the common base. a client
-// with no usable common base still gets the FULL self-contained closure after
-// a NAK. intermediate flush-ended rounds answer plain NAK, so stock git keeps
-// batching haves until it sends `done`.
-// ============================================================================
+// Git wire negotiation and ref policy live in this independently installed
+// process. Queries and submissions use the generic module API; pack bytes use
+// the generic content-addressed store. Fetch reads only the explicit read-only
+// tenant binding, so it advertises only object closures it can actually serve.
 
 /// the capabilities forge's receive-pack advertises. deliberately NO
 /// `side-band-64k`, so the client sends the report-status back as plain
@@ -50,17 +27,8 @@ const GIT_RECEIVE_PACK_CAPS: &str =
 /// filter): the answer is either the full closure or a have-bounded delta.
 const GIT_UPLOAD_PACK_CAPS: &str =
     "multi_ack_detailed side-band-64k thin-pack ofs-delta agent=ducktape-forge/0.1";
-/// the body cap for a git packfile POST — push (whole-repo pack) and fetch
-/// (want/have negotiation). sized to what the relay lane can DELIVER, not to
-/// the disk: a validator-bound pack fans out as 768 KiB chunks plus one offer
-/// into a 128-message inbound backlog that commonware DROPS on when full (the
-/// peer actor never blocks; bin/node's relay bridge is a 64-slot `try_send`
-/// on top), and nothing retransmits a dropped chunk — a pack past 127 chunks
-/// would not be refused but would hang its pusher for the whole transfer
-/// allowance with the pack pinned in memory. `bin/node/src/relay.rs` pins
-/// this under that backlog. A history whose first push packs larger than
-/// this (95.25 MiB) is refused whole; it lands pushed in parts.
-pub const GIT_PACK_BODY_LIMIT: usize = 127 * 768 * 1024;
+/// Uploads fit the common bounded blob relay transport.
+pub const GIT_PACK_BODY_LIMIT: usize = blobstore::MAX_TRANSFER_BYTES;
 /// max PACK bytes per side-band-64k data pkt-line: prefixed with the 1-byte band
 /// id, plus the 4-byte pkt length header, this yields a 65520-byte line — git's
 /// `LARGE_PACKET_MAX`, the ceiling a side-band-64k client accepts.
@@ -248,7 +216,7 @@ fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
 /// not just the branch that lagged. an older head is what any mirror serves,
 /// and the node's pack sweep catches it up within a tick.
 async fn advertised_refs(
-    handle: &NodeHandle,
+    handle: &ServiceState,
     repo: &str,
     service: GitService,
 ) -> Result<Vec<forge::RefHead>, Response> {
@@ -261,11 +229,8 @@ async fn advertised_refs(
 
 /// the fetch half of [`advertised_refs`], reading the same on-disk repo
 /// [`build_upload_pack`] packs from.
-fn servable_refs(handle: &NodeHandle, repo: &str) -> Result<Vec<forge::RefHead>, String> {
-    let Some(base) = handle.forge_repo.as_deref() else {
-        return Err("forge repo path not configured on this node".into());
-    };
-    on_disk_refs(base, repo).map_err(|e| format!("read forge refs: {e}"))
+fn servable_refs(handle: &ServiceState, repo: &str) -> Result<Vec<forge::RefHead>, String> {
+    on_disk_refs(&handle.forge_repo, repo).map_err(|e| format!("read forge refs: {e}"))
 }
 
 /// this node's on-disk branches for `repo`. a repo dir nothing has
@@ -288,29 +253,23 @@ fn on_disk_refs(base: &std::path::Path, repo: &str) -> Result<Vec<forge::RefHead
 
 /// query the forge module for a repo's committed branches (`[]` == unborn).
 /// errors surface as an http `Response` so callers can early-return them.
-async fn forge_refs(handle: &NodeHandle, repo: &str) -> Result<Vec<forge::RefHead>, Response> {
-    let req = forge::encode_query(&forge::ForgeQuery::ListRefs {
-        repo: repo.to_string(),
-    });
-    let (reply, rx) = oneshot::channel();
-    handle
-        .send(NodeCommand::Query {
-            target: "forge".into(),
-            req,
-            reply,
-        })
-        .await?;
-    let bytes = rx
-        .await
-        .map_err(|_| actor_gone())?
-        .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, &err))?;
-    match forge::decode_reply(&bytes) {
+async fn forge_refs(handle: &ServiceState, repo: &str) -> Result<Vec<forge::RefHead>, Response> {
+    let result = handle
+        .client
+        .query(
+            &handle.module,
+            &forge::ForgeQuery::ListRefs {
+                repo: repo.to_string(),
+            },
+        )
+        .await;
+    match result {
         Ok(forge::ForgeReply::Refs(refs)) => Ok(refs),
         Ok(_) => Err(error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "unexpected forge reply to ListRefs",
+            "unexpected ListRefs reply",
         )),
-        Err(err) => Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, &err)),
+        Err(error) => Err(error_response(StatusCode::BAD_GATEWAY, &error.to_string())),
     }
 }
 
@@ -328,17 +287,11 @@ const PUSH_CERT_LINE: &str = "push-cert";
 const PUSH_CERT_END: &str = "push-cert-end";
 const SSHSIG_ARMOR_BEGIN: &str = "-----BEGIN SSH SIGNATURE-----";
 
-/// cheap pre-check for whether a receive-pack request is even worth the
-/// certificate parse (base64 dearmor + certificate text parse in
-/// [`parse_push_commands`]): an operator credential header needs no body
-/// content at all, and a signed push is identifiable by its first command
-/// line alone, without decoding the certificate it introduces. a request
-/// with neither signal carries no possible proof and is refused here.
-fn push_may_carry_proof(commands: &[Vec<u8>], has_operator: bool) -> bool {
-    has_operator
-        || commands
-            .first()
-            .is_some_and(|first| command_text(first) == PUSH_CERT_LINE)
+/// Only a Git push certificate can authorize a service-submitted ref update.
+fn push_may_carry_proof(commands: &[Vec<u8>]) -> bool {
+    commands
+        .first()
+        .is_some_and(|first| command_text(first) == PUSH_CERT_LINE)
 }
 
 /// decode the command list. a stock push sends `<old> <new> <refname>` lines
@@ -519,7 +472,7 @@ impl GitService {
 /// offers `push-cert=<nonce>` — the invitation `git push --signed` needs
 /// (git refuses to sign a push the server did not offer a nonce for) — once
 /// this node knows its chain: the nonce is `<chain id>/<repo>`.
-fn advertised_caps(handle: &NodeHandle, repo: &str, service: GitService) -> String {
+fn advertised_caps(handle: &ServiceState, repo: &str, service: GitService) -> String {
     let base = service.caps();
     let nonce = match service {
         GitService::Receive => push_cert_nonce(handle, repo),
@@ -533,13 +486,13 @@ fn advertised_caps(handle: &NodeHandle, repo: &str, service: GitService) -> Stri
 
 /// the push-cert nonce this node offers for `repo`; `None` until the status
 /// cell names the chain (a node still booting offers no signed pushes).
-fn push_cert_nonce(handle: &NodeHandle, repo: &str) -> Option<String> {
-    let chain_id = handle.status.current().chain_id;
+fn push_cert_nonce(handle: &ServiceState, repo: &str) -> Option<String> {
+    let chain_id = &handle.chain_id;
     let named = !chain_id.is_empty();
-    named.then(|| forge::pushcert::nonce(&chain_id, repo))
+    named.then(|| forge::pushcert::nonce(chain_id, repo))
 }
 
-/// GET /forge/{repo}/info/refs?service=… — the smart-HTTP ref advertisement a
+/// GET /{repo}/info/refs?service=… — the smart-HTTP ref advertisement a
 /// `git push`/`git clone` fetches FIRST to learn the remote's current head.
 /// which heads those are differs per service (see [`advertised_refs`]). both
 /// receive-pack (push) and upload-pack (fetch) are served — the v0 banner we
@@ -556,7 +509,7 @@ fn push_cert_nonce(handle: &NodeHandle, repo: &str) -> Option<String> {
 /// refs the open upload-pack advertisement hands any clone. The proof is
 /// demanded where the mutation is — on the receive-pack POST.
 pub(crate) async fn git_info_refs(
-    State(handle): State<NodeHandle>,
+    State(handle): State<ServiceState>,
     Path(repo): Path<String>,
     Query(params): Query<InfoRefsParams>,
 ) -> Response {
@@ -583,7 +536,7 @@ pub(crate) async fn git_info_refs(
 /// committed branch; a fetch advertisement leads with a `HEAD` line at main's
 /// oid so `git clone` resolves the default branch to check out. capabilities
 /// ride the first emitted line after a NUL, per the v0 protocol.
-async fn git_advertise_refs(handle: &NodeHandle, repo: &str, service: GitService) -> Response {
+async fn git_advertise_refs(handle: &ServiceState, repo: &str, service: GitService) -> Response {
     let refs = match advertised_refs(handle, repo, service).await {
         Ok(refs) => refs,
         Err(resp) => return resp,
@@ -672,13 +625,11 @@ fn decode_git_body(headers: &HeaderMap, body: &[u8], cap: usize) -> Result<Vec<u
 /// one refused push, on the forge plane. the http funnel already records the
 /// status at `debug`; this is the plane's own line, with a `reason` an
 /// operator greps and counts. never the pack, never a path.
-fn push_refused(repo: &str, reason: &'static str, detail: &str) {
+fn push_refused(_repo: &str, reason: &'static str, _detail: &str) {
     tracing::warn!(
         target: "ducktape::forge",
         event = "forge_push_refused",
-        repo,
         reason,
-        detail,
         "push refused"
     );
 }
@@ -697,18 +648,20 @@ fn push_refusal_reason(message: &str) -> &'static str {
         ("certificate", "bad_cert"),
         ("too many ref updates", "too_many_refs"),
     ];
-    crate::log::reason_of(message, KNOWN, "rejected")
+    KNOWN
+        .iter()
+        .find_map(|(text, reason)| message.contains(text).then_some(*reason))
+        .unwrap_or("rejected")
 }
 
-/// POST /forge/{repo}/git-receive-pack — receive a push: parse the ref-update
+/// POST /{repo}/git-receive-pack — receive a push: parse the ref-update
 /// command list + packfile, stash the whole pack in the node-local blob store,
 /// and CAS every branch through ONE atomic forge `PushRefs` op (one submit ==
 /// one block). branch deletions (`:feature`) ride the same op pack-free. the
 /// response is a git `report-status` reflecting the push's shared fate.
 pub(crate) async fn git_receive_pack(
-    State(handle): State<NodeHandle>,
+    State(handle): State<ServiceState>,
     Path(repo): Path<String>,
-    operator: Option<axum::Extension<crate::signed_req::OperatorCredential>>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -777,27 +730,10 @@ pub(crate) async fn git_receive_pack(
     // A PUSH MUST PROVE ITSELF, exactly like every other mutating route — and
     // it proves itself one of the two ways git can carry:
     //
-    // * git's OWN push certificate (`git push --signed`), whose signer becomes
-    //   the acting principal on chain, or
-    // * this node's operator credential in a header, which a local operator
-    //   sets with git's `http.extraHeader` and which makes the NODE the
-    //   principal — right for a node seeding or republishing its own repo,
-    //   and what the agent-run lane pushing back into this node presents.
-    //
-    // A push with neither is refused rather than re-signed with the node's
-    // key: the signer is who the push is attributed to, and the node speaks
-    // for itself only when its operator says so. The data-plane signature is
-    // NOT a third way: it covers a body digest, and `git push` computes the
-    // packfile itself.
-    //
-    // checked here, BEFORE `parse_push_commands` (a signed push's certificate
-    // parse: base64 dearmor + certificate text parse), rather than after: a
-    // request with neither an operator header nor anything claiming to be a
-    // certificate is refused at the cost of a cheap peek at the first command
-    // line, not a full certificate parse.
-    if !push_may_carry_proof(&commands, operator.is_some()) {
-        const REFUSAL: &str = "this push carries no proof: sign it (`git push --signed`) \
-                               or present this node's operator credential";
+    // The installed service has its own transport key. User ref authority
+    // always comes from a Git certificate checked again by the guest.
+    if !push_may_carry_proof(&commands) {
+        const REFUSAL: &str = "this push carries no proof: use git push --signed";
         push_refused(&repo, "push_unauthenticated", REFUSAL);
         // CONSUME-AND-REFUSE, LIKE EVERY OTHER PUSH REFUSAL BELOW. The pack is
         // fully received by now, and an HTTP 401 at this point is what git
@@ -884,8 +820,7 @@ pub(crate) async fn git_receive_pack(
     // clean per-ref `ng` instead of a rejected block. every validator
     // re-verifies; this node is not trusted for it.
     if let Some(cert) = &cert
-        && let Err(reason) =
-            forge::pushcert::signer(cert, &handle.status.current().chain_id, &repo, &updates)
+        && let Err(reason) = forge::pushcert::signer(cert, &handle.chain_id, &repo, &updates)
     {
         push_refused(&repo, push_refusal_reason(&reason), &reason);
         let results: Vec<(String, Option<String>)> = cmds
@@ -900,7 +835,13 @@ pub(crate) async fn git_receive_pack(
     // a delete-only push carries no objects, so nothing is stashed.
     let pack_bytes = pack.len();
     let pack_digest = if updates.iter().any(|u| u.new_oid.is_some()) {
-        Some(handle.blobs.put_chunk(pack.to_vec()).to_vec())
+        match handle.client.put_blob(pack.to_vec()).await {
+            Ok(digest) => match hex::decode(digest) {
+                Ok(digest) => Some(digest),
+                Err(_) => return error_response(StatusCode::BAD_GATEWAY, "invalid blob digest"),
+            },
+            Err(error) => return error_response(StatusCode::BAD_GATEWAY, &error.to_string()),
+        }
     } else {
         None
     };
@@ -912,35 +853,24 @@ pub(crate) async fn git_receive_pack(
         pack_digest,
         cert,
     });
-    let (reply, rx) = oneshot::channel();
-    if let Err(resp) = handle
-        .send(NodeCommand::Submit {
-            target: "forge".into(),
-            payload,
-            origin: DEFAULT_ORIGIN.as_bytes().to_vec(),
-            reply,
-        })
-        .await
-    {
-        return resp;
-    }
+    let submitted = handle.submit(payload).await;
     let refnames: Vec<String> = cmds.into_iter().map(|(_, _, r)| r).collect();
-    match rx.await {
-        Ok(Ok(block)) => {
+    match submitted {
+        Ok(height) => {
             tracing::info!(
                 target: "ducktape::forge",
                 event = "forge_push_landed",
                 repo = %repo,
                 refs = refnames.len(),
                 pack_bytes,
-                height = block.height,
+                height,
                 "push landed"
             );
             let results: Vec<(String, Option<String>)> =
                 refnames.into_iter().map(|r| (r, None)).collect();
             git_report_status(&results)
         }
-        Ok(Err(reason)) => {
+        Err(reason) => {
             push_refused(&repo, push_refusal_reason(&reason), &reason);
             // a CAS mismatch's rejection carries "non-fast-forward" — surface
             // exactly that token so git prints its standard "fetch first" hint.
@@ -957,11 +887,10 @@ pub(crate) async fn git_receive_pack(
                 .collect();
             git_report_status(&results)
         }
-        Err(_) => actor_gone(),
     }
 }
 
-/// POST /forge/{repo}/git-upload-pack — serve a fetch/clone. parse the pkt-line
+/// POST /{repo}/git-upload-pack — serve a fetch/clone. parse the pkt-line
 /// negotiation (`want <oid>` lines, capabilities on the FIRST; flush-ended
 /// `have` rounds receive plain NAK so the client keeps batching), open
 /// `<forge_repo>/{repo}` READ-ONLY, and after `done` answer with the pack on
@@ -969,7 +898,7 @@ pub(crate) async fn git_receive_pack(
 /// repo knows any of the client's haves, or the full closure behind NAK when
 /// it knows none (see [`build_upload_pack`]).
 pub(crate) async fn git_upload_pack(
-    State(handle): State<NodeHandle>,
+    State(handle): State<ServiceState>,
     Path(repo): Path<String>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
@@ -977,12 +906,7 @@ pub(crate) async fn git_upload_pack(
     let Ok(repo) = forge::norm_repo(&repo) else {
         return error_response(StatusCode::NOT_FOUND, "no such repo");
     };
-    let Some(forge_repo) = handle.forge_repo.clone() else {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "forge repo path not configured on this node",
-        );
-    };
+    let forge_repo = handle.forge_repo.clone();
     let body = match body {
         Ok(bytes) => bytes,
         // the DefaultBodyLimit layer rejects an oversized request with 413.
@@ -1298,7 +1222,7 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
     fn a_credential_less_push_is_refused_before_the_certificate_parse() {
         let unparseable_junk = vec![b"junk\n".to_vec()];
         assert!(
-            !push_may_carry_proof(&unparseable_junk, false),
+            !push_may_carry_proof(&unparseable_junk),
             "no operator header and no push-cert claim: refused pre-parse"
         );
         assert!(
@@ -1307,11 +1231,7 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
         );
 
         assert!(
-            push_may_carry_proof(&unparseable_junk, true),
-            "an operator credential is proof enough regardless of body content"
-        );
-        assert!(
-            push_may_carry_proof(&signed_commands(), false),
+            push_may_carry_proof(&signed_commands()),
             "a body claiming push-cert earns the (cheap) certificate parse"
         );
     }

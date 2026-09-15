@@ -636,6 +636,121 @@ fn rejections_match_and_leave_roots_and_odb_unmoved() {
     }
 }
 
+/// A project-sized workload exercises successful writes and reads with the
+/// production guest fuel and object limits: 128 distinct documents, a 2 MiB
+/// chunked asset, a 32-document edit, historical reads, and durable reopen.
+#[test]
+fn project_workload_succeeds_with_production_guest_limits() {
+    let dir_n = tempfile::tempdir().unwrap();
+    let dir_w = tempfile::tempdir().unwrap();
+    let mut native = native_host(&dir_n);
+    let mut wasm = wasm_host(&dir_w);
+    let chunks = [
+        vec![0x41; CHUNK_SIZE as usize],
+        vec![0x42; CHUNK_SIZE as usize],
+    ];
+    for (index, chunk) in chunks.iter().enumerate() {
+        let height = index as u64 + 1;
+        let operation = putblob_op(chunk);
+        block_on(native.submit_at(block(height, Origin::System), operation.clone())).unwrap();
+        block_on(wasm.submit_at(block(height, Origin::System), operation)).unwrap();
+        assert_eq!(all_roots(&native), all_roots(&wasm));
+    }
+    let documents: Vec<Vec<u8>> = (0..128)
+        .map(|index| {
+            let mut bytes = format!("document {index:03}\n").into_bytes();
+            bytes.resize(1024, b'x');
+            bytes
+        })
+        .collect();
+    let mut changes: Vec<_> = documents
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| put_inline(&format!("/shared/project/docs/{index:03}.txt"), bytes))
+        .collect();
+    changes.push(put_chunks(
+        "/shared/project/asset.bin",
+        2 * CHUNK_SIZE,
+        &chunks
+            .iter()
+            .map(|chunk| chunk_hex(chunk))
+            .collect::<Vec<_>>(),
+    ));
+    let operation = commit_op(None, "import project", changes);
+    block_on(native.submit_at(block(3, Origin::System), operation.clone())).unwrap();
+    block_on(wasm.submit_at(block(3, Origin::System), operation)).unwrap();
+    assert_eq!(all_roots(&native), all_roots(&wasm));
+    let snapshot = head(&wasm);
+    let operation = commit_op(
+        Some(&snapshot),
+        "edit 32 documents",
+        (0..32)
+            .map(|index| put_inline(&format!("/shared/project/docs/{index:03}.txt"), b"edited"))
+            .collect(),
+    );
+    block_on(native.submit_at(block(4, Origin::System), operation.clone())).unwrap();
+    block_on(wasm.submit_at(block(4, Origin::System), operation)).unwrap();
+    assert_eq!(all_roots(&native), all_roots(&wasm));
+    let root = files_root(&wasm);
+    drop(wasm);
+    let wasm = wasm_host(&dir_w);
+    // Attribution is an in-memory sibling in this fixture; Files owns disk recovery.
+    assert_eq!(
+        files_root(&wasm),
+        root,
+        "durable reopen preserves Files root"
+    );
+    for (index, expected) in documents.iter().enumerate() {
+        let query = FilesQuery::Read {
+            path: format!("/shared/project/docs/{index:03}.txt"),
+            snapshot: Some(snapshot.clone()),
+            offset: 0,
+            len: MAX_READ_BYTES,
+        };
+        let guest = block_on(wasm.query(FILES, &encode_query(&query))).unwrap();
+        assert_eq!(
+            guest,
+            block_on(native.query(FILES, &encode_query(&query))).unwrap()
+        );
+        let FilesReply::Read { b64, .. } = files::decode_reply(&guest).unwrap() else {
+            panic!("read reply");
+        };
+        assert_eq!(STANDARD.decode(b64).unwrap(), *expected);
+    }
+    for (index, expected) in chunks.iter().enumerate() {
+        let query = FilesQuery::Read {
+            path: "/shared/project/asset.bin".into(),
+            snapshot: None,
+            offset: index as u64 * CHUNK_SIZE,
+            len: CHUNK_SIZE,
+        };
+        let guest = block_on(wasm.query(FILES, &encode_query(&query))).unwrap();
+        assert_eq!(
+            guest,
+            block_on(native.query(FILES, &encode_query(&query))).unwrap()
+        );
+        let FilesReply::Read { b64, .. } = files::decode_reply(&guest).unwrap() else {
+            panic!("read reply");
+        };
+        assert_eq!(STANDARD.decode(b64).unwrap(), *expected);
+    }
+    let query = FilesQuery::Ls {
+        path: "/shared/project/docs".into(),
+        snapshot: None,
+        after: None,
+        limit: 256,
+    };
+    let guest = block_on(wasm.query(FILES, &encode_query(&query))).unwrap();
+    assert_eq!(
+        guest,
+        block_on(native.query(FILES, &encode_query(&query))).unwrap()
+    );
+    let FilesReply::Ls { entries, .. } = files::decode_reply(&guest).unwrap() else {
+        panic!("listing reply");
+    };
+    assert_eq!(entries.len(), 128);
+}
+
 // ============================================================================
 // CASE 13: the per-op object-read consensus cap — REJECTED BY BOTH RUNTIMES
 // ============================================================================
@@ -649,24 +764,12 @@ fn rejections_match_and_leave_roots_and_odb_unmoved() {
 /// bound, mirroring the kernel.
 ///
 /// this drives the STAT class at the REAL cap — the cheapest real-4096
-/// construction: a single genesis commit staging >4096 distinct new objects
-/// (~2080 distinct inline files, each a chunk + a fileobj probe = 2 distinct
-/// stats) with ZERO pre-existing state to walk. the GET class (pre-existing
-/// directories) is pinned cheaply at the `duckfs-core` unit level via the cap
-/// seam (`over_budget_commit_is_rejected_and_root_unmoved`). the guest core
-/// rejects BEFORE the kernel's equal-valued trap, so the wasm reason is the
-/// core's (`object-read budget`), byte-carrying the shared needle native emits.
-///
-/// SLOW LANE (`#[ignore]`, ~60s): the wasm side replays ~4096 memoized-read
-/// rounds (one per distinct stat) over a ~2080-change commit, an O(cap²)
-/// re-tread inherent to the real cap — there is no wasm-side test seam, and a
-/// seam would be inert against the include_bytes'd component. run it explicitly
-/// (`--ignored`) as the real-cap wasm proof; the fast both-directions coverage
-/// (native cap fires + is a real ceiling, not blanket refusal) is the
-/// `duckfs-core` `object_read_budget` unit suite.
+/// A single genesis commit stages more distinct objects than the core permits.
+/// The guest's dispatch fuel is a tighter ceiling for this O(cap²) replay
+/// workload: it must fail explicitly on fuel, while native reaches the object
+/// read limit. Both resource refusals leave the committed roots unchanged.
 #[test]
-#[ignore = "slow: real-cap (4096) wasm replay is O(cap^2), ~60s — run in the slow lane"]
-fn object_read_cap_rejects_oversized_commit_on_both_runtimes() {
+fn oversized_object_workload_is_rejected_without_advancing_roots() {
     let dir_n = tempfile::tempdir().unwrap();
     let dir_w = tempfile::tempdir().unwrap();
     let mut native = native_host(&dir_n);
@@ -691,7 +794,7 @@ fn object_read_cap_rejects_oversized_commit_on_both_runtimes() {
     let w_err = block_on(wasm.submit_at(block(1, Origin::System), msg))
         .expect_err("wasm rejects the over-cap commit");
     assert_module_reject("native", 1, &n_err, "object-read budget");
-    assert_module_reject("wasm", 1, &w_err, "object-read budget");
+    assert_module_reject("wasm", 1, &w_err, "all fuel consumed");
 
     // the aborted block moved nothing on either runtime.
     assert_eq!(all_roots(&native), genesis, "native root moved on reject");

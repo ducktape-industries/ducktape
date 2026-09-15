@@ -42,6 +42,10 @@ pub(crate) enum LandingThread {
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ChatView {
+    #[serde(skip)]
+    pub(crate) upload_handles: std::collections::HashMap<String, ducktape_view_guest::task::Handle>,
+    pub(crate) sending: std::collections::BTreeMap<String, (String, crate::host::PendingSend)>,
+    pub(crate) composers: std::collections::BTreeMap<String, ducktape_view_composer::Draft>,
     pub(crate) endpoint: String,
     pub(crate) network_name: String,
     pub(crate) network_chain_id: String,
@@ -50,6 +54,8 @@ pub struct ChatView {
     pub(crate) connected: bool,
     pub(crate) session_loading: bool,
     pub(crate) session_busy: bool,
+    #[serde(default)]
+    pub(crate) read_cursors: std::collections::BTreeMap<String, i64>,
     pub(crate) rooms: Vec<crate::host::ChatSidebarRow>,
     pub(crate) dm_rows: Vec<crate::host::DmSidebarRow>,
     pub(crate) channel_create_open: bool,
@@ -163,6 +169,7 @@ impl ::std::fmt::Debug for ChatView {
 }
 #[derive(Clone)]
 pub enum Message {
+    Composer(Box<composer::ComposerMessage>),
     SidebarResized(f64, f64),
     DetailsResized(f64, f64),
     ThreadResized(f64, f64),
@@ -176,7 +183,9 @@ pub enum Message {
     PreviewArrived(crate::host::PreviewItem),
     /// Boxed: the session item dwarfs every other variant.
     SessionArrived(Box<crate::host::SessionItem>),
+    SidebarArrived(crate::host::SidebarItem),
     SessionSettled(bool),
+    ParticipationFinished,
     SnapStream(bool),
     RevealStream(i64),
     RevealThread(i64),
@@ -241,6 +250,9 @@ impl ::std::fmt::Debug for Message {
 impl ChatView {
     fn state() -> Self {
         Self {
+            composers: Default::default(),
+            sending: Default::default(),
+            upload_handles: Default::default(),
             endpoint: "".to_owned(),
             network_name: "".to_owned(),
             network_chain_id: "".to_owned(),
@@ -249,6 +261,7 @@ impl ChatView {
             connected: false,
             session_loading: false,
             session_busy: false,
+            read_cursors: Default::default(),
             rooms: Vec::new(),
             dm_rows: Vec::new(),
             channel_create_open: false,
@@ -371,7 +384,10 @@ impl ChatView {
         let wire::SnapshotValue::Bytes(state) = snapshot.state else {
             return Err("invalid Chat snapshot".into());
         };
-        let state: Self = wire::decode(&state)?;
+        let mut state: Self = wire::decode(&state)?;
+        for draft in state.composers.values_mut() {
+            draft.retire_device_requests();
+        }
         state.validate_snapshot()?;
         Ok(state)
     }
@@ -398,6 +414,13 @@ impl ChatView {
 impl ChatView {
     pub(crate) fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
         ::ducktape_view_guest::Subscription::batch([
+            self.composer_drops(),
+            if self.connected {
+                crate::host::sidebar(self.connection_serial, self.names_serial, self.me.clone())
+                    .map(Message::SidebarArrived)
+            } else {
+                ducktape_view_guest::Subscription::none()
+            },
             crate::host::session().map(|item| Message::SessionArrived(Box::new(item))),
             if self.connected {
                 ::ducktape_view_guest::Subscription::batch([crate::host::room(
@@ -439,6 +462,28 @@ impl ChatView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sidebar_reads_seed_cursors_then_mark_only_inactive_rooms_unread() {
+        let mut state = ChatView::state();
+        state.active_channel = "a".into();
+        let sidebar = |head| crate::host::SidebarItem {
+            channels: ["a", "b"]
+                .into_iter()
+                .map(|id| crate::host::ChatChannel {
+                    id: id.into(),
+                    head_seq: head,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let _ = state.update(Message::SidebarArrived(sidebar(4)));
+        assert!(state.rooms.iter().all(|row| !row.unread));
+        let _ = state.update(Message::SidebarArrived(sidebar(5)));
+        assert!(!state.rooms[0].unread);
+        assert!(state.rooms[1].unread);
+    }
+
     #[test]
     fn native_composition_retains_timeline_identity_unread_and_action_admission() {
         let mut state = ChatView::state();
@@ -919,7 +964,7 @@ mod tests {
             text: "fn main() {}".into(),
             ..Default::default()
         }));
-        assert_eq!(surfaces(&state), vec![("forge_code".to_owned(), false)]);
+        assert_eq!(surfaces(&state), vec![("code".to_owned(), false)]);
         let readme = "duck://files/shared/attachments/u1/README.md".to_owned();
         let _ = state.update(Message::OpenAttachment(readme));
         let _ = state.update(Message::PreviewArrived(crate::host::PreviewItem {
@@ -928,7 +973,7 @@ mod tests {
             text: "# hi".into(),
             ..Default::default()
         }));
-        assert_eq!(surfaces(&state), vec![("agent_markdown".to_owned(), true)]);
+        assert_eq!(surfaces(&state), vec![("markdown".to_owned(), true)]);
 
         let _ = state.update(Message::OpenAttachment(shot.clone()));
         assert!(
@@ -1012,5 +1057,6 @@ mod app_update;
 mod app_view;
 mod chat;
 mod components;
+mod composer;
 mod dm;
 mod kit;

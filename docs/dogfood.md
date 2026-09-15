@@ -55,44 +55,28 @@ make dogfood-forge
 from `DUCKTAPE_DEV_FORGE_URL` or, with exactly one workspace under the
 ducktape home, that workspace's `http_listen` in its `node.toml`, failing if
 neither resolves (the home is `$DUCKTAPE_HOME` when set, else `~/.ducktape`),
-registers a normal git remote `ducktape-dev` at `<base>/forge/ducktape`,
-fetches `origin/dev`, and reconciles it with the forge's `refs/heads/dev`.
-An HTTP 413 splits the push at ancestor commits and retries smaller portions
-of history. Accepted ancestors remain on Forge if a later push fails; rerunning
-resumes from that tip. A single oversized commit or merge fails with a diagnostic.
-It fast-forwards when possible, retains a Forge descendant, or joins equal-tree
-divergence with a two-parent bridge; differing-tree divergence fails. It reads
-the Forge ref back and verifies the selected tip. Repo creation is the first push — no separate
-create step. The whole packfile travels over git smart-HTTP and is stored
-node-locally; only a tiny `forge Push` (digest + oids) crosses consensus. Run
-this before creating or invoking agent work so a clean but stale local
-checkout cannot silently pin the run to obsolete source.
+fetches `origin/dev`, and reconciles it with Forge's committed `refs/heads/dev`.
+The local workspace's operator credential authorizes generic blob uploads and
+module submissions, so this automation publishes as the node. `ops/forge-import.py`
+builds bounded packs and submits exact previous/new ref comparisons. The script
+reads materialized objects from the workspace's configured storage directory.
 
-Knobs: `FORGE_REPO` (default `ducktape`), `FORGE_REMOTE` (default
-`ducktape-dev`), `SOURCE_REMOTE` (default `origin`), `SOURCE_BRANCH` (default
-`dev`), `SRC_REF` (explicit local-ref override), `DUCKTAPE_DEV_FORGE_URL`.
+An HTTP 413 splits the import at ancestor commits and retries smaller portions.
+Accepted ancestors remain committed if a later import fails. Re-running resumes
+from that tip. A single oversized commit or merge fails with a diagnostic.
+The script fast-forwards when possible, retains a Forge descendant, or joins
+equal-tree divergence with a two-parent bridge; differing-tree divergence fails.
+It queries the final ref and verifies the selected tip. Pack bytes remain in
+blob storage; the digest and ref comparisons cross consensus.
 
-Verify: the `ducktape` repo appears in the desktop **Forge** view with `dev`
-browsable. Re-run `make dogfood-forge` before later agent work; a raw
-`git push ducktape-dev dev` bypasses the fetch and reconciliation checks. Caveat: the
-remote lives in the shared `.git/config`, visible to every worktree of this
-repo — set `FORGE_REMOTE` per worktree if you run several nodes at once.
+Knobs: `FORGE_REPO` (default `ducktape`), `SOURCE_REMOTE` (default `origin`),
+`SOURCE_BRANCH` (default `dev`), `SRC_REF` (explicit local-ref override), and
+`DUCKTAPE_DEV_FORGE_URL`. A local workspace and its operator credential are required.
 
-**A push must prove itself.** `git-receive-pack` takes exactly two proofs:
-git's own push certificate (`git push --signed`, whose signer becomes the
-repo's owner on chain), or the node's operator credential, which makes the
-NODE the owner. `make dogfood-forge` presents the second — it is seeding the
-node's own mirror — and a bare `git push` at a node whose `admin.token` you
-cannot read is refused. To push by hand:
-
-```sh
-export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader
-export GIT_CONFIG_VALUE_0="x-ducktape-admin-token: $(cat <workspace>/admin.token)"
-git push ducktape-dev dev
-```
-
-`GIT_CONFIG_*` rather than `git -c`: an argv is world-readable through
-`/proc`, and this is a secret.
+Verify the repository in the desktop **Forge** view. Re-run `make dogfood-forge`
+before agent work. For user-owned Git push/clone access, install the
+[Git application service](deploy/application-service.md#git-service) and use
+SSH-signed pushes through its Gateway route.
 
 ## 2. Provision the dogfood model user
 
@@ -130,9 +114,9 @@ if [ -z "$CONTROLLER" ]; then
   CONTROLLER="$(query identity "{\"of_key\":{\"key\":$KEY_BYTES}}" | jq -er '.account.number')"
 fi
 
-curl -fsS -X PUT "$BASE/v1/files/object/shared/skills/dogfood/SKILL.md" \
-  -H "x-ducktape-admin-token: $OPERATOR" \
-  --data-binary 'You are the dogfooding duck. Work the referenced spec.'
+FILES_HEAD="$(query files '{"refs":{}}' | jq -c '.refs.head')"
+PERSONA_B64="$(printf '%s' 'You are the dogfooding duck. Work the referenced spec.' | base64 | tr -d '\n')"
+submit files "$(jq -nc --argjson head "$FILES_HEAD" --arg b64 "$PERSONA_B64" '{commit:{base_snapshot:$head,message:"Install dogfood persona",changes:[{put:{path:"/shared/skills/dogfood/SKILL.md",exec:false,meta:{},content:{inline:{b64:$b64}}}}]}}')"
 
 # Serialize the current default script; do not maintain a separate recipe copy.
 PROGRAM="$(ducktape agent model-program dogfood)"

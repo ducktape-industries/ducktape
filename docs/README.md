@@ -20,6 +20,7 @@ document nothing cites is deleted, not archived.
 | Question | Read |
 | --- | --- |
 | Keep a node and its service daemons up under systemd (Linux) or launchd (macOS); ports; logs; why three validators tolerate nothing | [`deploy/node-service.md`](deploy/node-service.md) |
+| Install isolated application executables behind authenticated Gateway HTTP/WebSocket routes; stop, restart, and replace them | [`deploy/application-service.md`](deploy/application-service.md) |
 | Which files are secrets, which are irreplaceable, what to copy, what a restore looks like | [`deploy/backup-and-keys.md`](deploy/backup-and-keys.md) |
 | Run the untrusted coordinator (rendezvous + first-contact relay); stand up two NAT'd validators | [`deploy/coordinator.md`](deploy/coordinator.md) |
 | Front a validator with a sentry so it exposes no inbound port | [`deploy/sentry-deployment.md`](deploy/sentry-deployment.md) |
@@ -29,6 +30,7 @@ document nothing cites is deleted, not archived.
 | Which operator scripts, units and harnesses live under `ops/` | [`../ops/README.md`](../ops/README.md) |
 | The coordinator's deploy artifacts (unit, env file, Dockerfile) | [`../ops/coordinator/README.md`](../ops/coordinator/README.md) |
 | The hosted WebAuthn auth page, its request/result shapes and its relay | [`../ops/auth-page/README.md`](../ops/auth-page/README.md) |
+| Verify independent module, view, and service replacement with fixed native binaries | [`../crates/examples/extension-probe/README.md`](../crates/examples/extension-probe/README.md) |
 | Build and register the shared canvas board | [`../crates/modules/apps/boards/README.md`](../crates/modules/apps/boards/README.md) |
 | Run the desktop app; which node it dials and which key it signs with | [`../app/README.md`](../app/README.md) |
 | Lend a credential to a sandbox through airlock, self-hosted or from an enclave | [`../crates/airlock/README.md`](../crates/airlock/README.md) |

@@ -568,9 +568,9 @@ const PACK_SWEEP_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 /// submitted the push; naming an enormous blob some colluding node will serve
 /// would otherwise have every node in the network stage it, every tick, before
 /// the hash check could reject it. Sizing the cap to what a real push can be
-/// — the smart-HTTP door's own ceiling, `noded::GIT_PACK_BODY_LIMIT` — keeps
+/// — the smart-HTTP door's own ceiling, `blobstore::MAX_TRANSFER_BYTES` — keeps
 /// that to one legitimate pack's worth of disk.
-pub const MAX_FORGE_PACK_BYTES: u64 = noded::GIT_PACK_BODY_LIMIT as u64;
+pub const MAX_FORGE_PACK_BYTES: u64 = blobstore::MAX_TRANSFER_BYTES as u64;
 
 /// keep this node's forge substrate healthy, forever: pull the packs forge is
 /// waiting on, then collapse the packs it has piled up.

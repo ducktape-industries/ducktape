@@ -102,22 +102,16 @@ tells the view which drafts it consumed. Files keeps an unsaved text edit with i
 original file and network when navigation changes. Returning to that file
 resumes the same edit; only an explicit discard or that save's successful
 reply clears it. Saving uses the snapshot that supplied the original text,
-so an intervening edit is refused without losing the draft. Pages owns its
-Markdown editor, selection and undo history in the guest. Initial source arrives
-in bounded chunks, and only an accepted canonical revision updates the app's
-save buffer. A replacement preserves that editor and undo history; old-instance
-notifications cannot overwrite it. Presentation that exceeds its bounds uses a
-plain editor with a visible notice, retaining all text and history. Page, search
-and comment drafts leave with the act that reads them; the app hands one back
-only by moving `seed_rev`.
-A view may also hand data to a
-host surface that reads it: Forge's code browse leaves slots for the
-decoded picture, the document-aware Markdown reader and the highlighted
-code reader, each painted by the app from the arguments the view passes,
-and the reader's links come back to the view's own handler. Forge's
-discussion note composer is the chat composer as a host surface
-(`forge_composer`) over the item's channel, so a note's words stay in the
-app and only its send crosses.
+so an intervening edit is refused without losing the draft. Pages owns Markdown
+conversion, toolbar actions, comment anchors and undo history in the guest. Its
+rich presentation supplies native blocks explicitly. The host validates those
+primitives and retains GPUI focus, IME and caret state. Bounded document transfers
+and ordered acknowledgements keep old-instance notifications from overwriting
+a replacement's canonical document.
+Views can use native surfaces for decoded pictures, Markdown display and
+highlighted code. Surface arguments describe the content, and link events return
+to the guest's own handler. Chat and Forge own their composer drafts, mentions,
+formatting, undo, attachments and message submission in WASM.
 Forge and Files project large read-only text and lists before sending props.
 The display counts omitted rows and labels shortened text; routing identifiers
 are kept intact. If the fixed metadata itself is too large, the view shows a
@@ -126,12 +120,12 @@ complete read separately as its editor seed: shortening the preview neither
 marks the read truncated nor disables Edit. These projections budget incoming
 facts, not arbitrary editor or input drafts.
 
-A view whose screen needs a widget
-the tree wire does not carry leaves that widget to the host too: the Chat
-view declares `chat_composer` as a host surface per room and per thread,
-and the app paints its rich composer there (`src/composer_surface.rs`),
-keeps every box's words for the life of the process, and hears a submit as
-the view's `composer` intent — the words themselves never cross the wire.
+The shared `Editor` contract keeps canonical documents and editing decisions in
+the guest. GPUI retains focus, IME, caret and native rendering; ordered editor
+actions preserve input arriving while a guest decision is pending. Native file
+pickers, drops and clipboard reads issue revocable file tokens scoped to one
+guest. Guests read bounded chunks and choose the module operations that upload
+or submit them. Replacing a guest revokes its device grants.
 The views workspace and desktop crate pin the same `ducktape-ui` revision for
 their shared wire vocabulary.
 

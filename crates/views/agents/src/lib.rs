@@ -683,9 +683,10 @@ impl AgentsView {
     fn markdown(&self, key: &str, text: &str) -> Node {
         Node::Surface {
             key: key.into(),
-            name: "agent_markdown".into(),
+            name: "markdown".into(),
             args: vec![
                 wire::SurfaceValue::Str(text.into()),
+                wire::SurfaceValue::Str(String::new()),
                 wire::SurfaceValue::Bool(self.dark),
             ],
             on_event: Some(slots::handler::<wire::SurfaceValue, Message>(Box::new(

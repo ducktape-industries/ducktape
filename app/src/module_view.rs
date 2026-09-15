@@ -14,7 +14,9 @@
 //! context, but the guest receives no signing secret or direct OS clock.
 //! A view that traps shows why in its place instead of taking the window with it.
 
+pub(crate) mod background;
 mod kernel;
+mod filesystem;
 mod taste;
 
 pub use kernel::{block_hit as view_block_hit, live_hit as view_live_hit};
@@ -419,14 +421,11 @@ pub fn forge_view(
     module_view("forge", serde_json::to_vec(&props).expect("props encode"))
 }
 
-/// The two OS doors the forge view asks the app for, plus its host
-/// composer's send. Everything else it does itself.
+/// OS navigation and clipboard doors requested by the Forge guest.
 pub fn forge_intent(event: &ModuleViewEvent) -> crate::ForgeIntent {
     use crate::ForgeIntent as Intent;
     match event.kind.as_str() {
         "open_link" => Intent::OpenLink,
-        "composer" => Intent::Composer,
-        "composer_attach" => Intent::Attach,
         _ => Intent::Copy,
     }
 }
@@ -483,8 +482,6 @@ struct ChatProps<'a> {
     me: String,
     me_key: &'a str,
     names_serial: i64,
-    rooms: &'a [crate::backend::ChatSidebarRow],
-    dm_rows: &'a [crate::backend::DmSidebarRow],
     channel_create_open: bool,
     active_channel: &'a str,
     active_dm_peer: &'a str,
@@ -506,7 +503,6 @@ struct ChatProps<'a> {
     shift_held: bool,
     copy_chord_serial: i64,
     sent_serial: i64,
-    pending_sends: &'a [crate::backend::PendingSend],
     /// THIS ROOM'S runs only, as hints: the reading is taken for the whole
     /// node and cut to `active_channel` on the way out.
     live_agents: Vec<crate::backend::LiveRunHint>,
@@ -521,12 +517,8 @@ struct ChatProps<'a> {
 /// What still comes back as an intent is what another plane of the app steers
 /// or owns: the room to open (`duck://` links, notifications, the tray), the
 /// huddle, a link or a copy, a run to stop or open, and the seed for the edit
-/// composer — because the composers are HOST SURFACES (`chat_composer`), whose
-/// submit arrives as `composer`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the caller supplies each screen property explicitly"
-)]
+/// The guest owns its editor documents and product actions.
+
 pub fn chat_view(
     dark: bool,
     connected: bool,
@@ -538,8 +530,6 @@ pub fn chat_view(
     account_number: &str,
     user_key: &str,
     names_serial: i64,
-    rooms: &[crate::backend::ChatSidebarRow],
-    dm_rows: &[crate::backend::DmSidebarRow],
     channel_create_open: bool,
     active_channel: &str,
     active_dm_peer: &str,
@@ -559,7 +549,6 @@ pub fn chat_view(
     shift_held: bool,
     copy_chord_serial: i64,
     sent_serial: i64,
-    pending_sends: &[crate::backend::PendingSend],
     live_agents: &[crate::backend::LiveAgentRow],
 ) -> ViewSpec {
     let props = ChatProps {
@@ -573,8 +562,6 @@ pub fn chat_view(
         me: reader_handle(account_number, user_key),
         me_key: user_key,
         names_serial,
-        rooms,
-        dm_rows,
         channel_create_open,
         active_channel,
         active_dm_peer,
@@ -594,7 +581,6 @@ pub fn chat_view(
         shift_held,
         copy_chord_serial,
         sent_serial,
-        pending_sends,
         // THIS IS THE ONLY PLACE A RUN IS MATCHED TO A ROOM: the reading
         // covers the whole node, so a row from a room the reader left cannot
         // reach the screen no matter which handler moved `active_channel`.
@@ -672,45 +658,10 @@ pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
         "open_link" => Intent::OpenLink,
         "copy" => Intent::Copy,
         "copy_link" => Intent::CopyLink,
-        "begin_edit" => Intent::BeginEdit,
         "cancel_run" => Intent::CancelRun,
         "open_run" => Intent::OpenRun,
-        "composer" => Intent::Composer,
-        "composer_attach" => Intent::Attach,
         _ => Intent::CopyLink,
     }
-}
-
-/// Which composer a `composer` intent came from.
-pub fn chat_event_kind(event: &ModuleViewEvent) -> crate::ComposerKind {
-    match event_text(event, "kind").as_str() {
-        "reply" => crate::ComposerKind::Reply,
-        "edit" => crate::ComposerKind::Edit,
-        "thread_edit" => crate::ComposerKind::ThreadEdit,
-        _ => crate::ComposerKind::Message,
-    }
-}
-
-/// A refused or failed body, handed back to the composer it was written in.
-pub fn chat_composer_unsent(scope: &str, text: &str, committed: bool) -> bool {
-    crate::composer_surface::unsent(scope, text, committed);
-    true
-}
-
-/// Open the native edit composer on the body the view handed over. The view
-/// decides WHETHER a row is editable (it holds the revisions); what it cannot
-/// do is type — the editor is a host surface with an IME and a retained
-/// document — so the markdown it opens on crosses as this seed.
-pub fn chat_composer_seed(scope: &str, body: &str) -> bool {
-    crate::composer_surface::seed(scope, body);
-    true
-}
-
-/// The room's explicit roster, as the app just read it, handed to the
-/// composers over that room (and its threads) for their mention menu.
-pub fn chat_composer_roster(scope: &str, members: &[crate::backend::ChatMember]) -> bool {
-    crate::composer_surface::roster(scope, members);
-    true
 }
 
 // ---------- the files seat ----------
@@ -765,21 +716,11 @@ fn surface_bool(args: &[wire::SurfaceValue], index: usize) -> bool {
     matches!(args.get(index), Some(wire::SurfaceValue::Bool(true)))
 }
 
-fn surface_allowed(module: &str, surface: &str) -> bool {
-    matches!(
-        (module, surface),
-        (_, "artifact_svg" | "artifact_image")
-            | (
-                "chat",
-                "chat_composer" | "picture" | "forge_code" | "agent_markdown"
-            )
-            | (
-                "forge",
-                "forge_composer" | "picture" | "forge_markdown" | "forge_code"
-            )
-            | ("files", "picture" | "forge_code" | "agent_markdown")
-            | ("agents", "agent_markdown")
-    )
+fn surface_allowed(surface: &str) -> bool {
+    match surface {
+        "artifact_svg" | "artifact_image" | "picture" | "code" | "markdown" => true,
+        _ => false,
+    }
 }
 
 /// The operations a view may ask of the app, by module. An intent outside
@@ -819,17 +760,15 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "open_link",
             "copy",
             "copy_link",
-            "begin_edit",
             "cancel_run",
             "open_run",
         ],
         // the forge view reads, folds and writes through the kernel: what is
-        // left at the door is the two OS doors. Its discussion composer is a
-        // host surface, so its submit crosses as the surface's own event.
+        // left at the door is the two OS doors.
         "forge" => &["open_link", "copy"],
         // the files view speaks the kernel contract: its reads and writes go
         // through the kernel, and the two events left are the app's own doors
-        "files" => &["open_link", "at"],
+        "files" => &["open_link"],
         "settings" => &[
             "tab",
             "reconnect",
@@ -1217,6 +1156,13 @@ pub fn connected(client: &ducktape_rpc::Client) -> Loads {
         connection.client = Some(client.clone());
         connection.clone()
     };
+    for mounted in registry.values() {
+        mounted
+            .lock()
+            .expect("module view lock")
+            .changes
+            .send_replace(());
+    }
     for module in crate::backend::view_source::MODULE_OWNED {
         registry.entry(module).or_insert_with(Mounted::seat);
     }
@@ -1224,7 +1170,11 @@ pub fn connected(client: &ducktape_rpc::Client) -> Loads {
     // their seats and tabs go now, and this node's come back once its own
     // registry has been read below
     for retired in registered().lock().expect("registered views").drain(..) {
-        registry.remove(retired);
+        if let Some(retired) = registry.remove(retired) {
+            let mut retired = retired.lock().expect("module view lock");
+            retired.slot = Slot::Empty;
+            retired.changes.send_replace(());
+        }
     }
     registered_modules().lock().expect("registered modules").clear();
     let mut loads: Vec<std::thread::JoinHandle<()>> = registry
@@ -1237,6 +1187,16 @@ pub fn connected(client: &ducktape_rpc::Client) -> Loads {
             // or on its way from the staged file, is left alone
             let left_alone = desktop_view && (seated || locked.in_flight);
             if left_alone {
+                if let Slot::Ready(guest) = &mut locked.slot {
+                    let ids: Vec<_> = guest.tasks.iter().map(|(id, _)| *id).collect();
+                    guest.tasks.clear();
+                    guest.sessions.clear();
+                    guest.filesystem = Default::default();
+                    for id in ids {
+                        guest.refuse(id, "network connection changed".into());
+                    }
+                    guest.connection_rev = snapshot.rev;
+                }
                 return None;
             }
             // a node-owned view is reloaded from this node's deployment;
@@ -1323,7 +1283,11 @@ fn seat_registered_views(
         .collect();
     let mut registered = registered().lock().expect("registered views");
     for retired in registered.iter().filter(|id| !listed.contains(id)) {
-        registry.remove(retired);
+        if let Some(retired) = registry.remove(retired) {
+            let mut retired = retired.lock().expect("module view lock");
+            retired.slot = Slot::Empty;
+            retired.changes.send_replace(());
+        }
     }
     let mut loads = Vec::new();
     for module in &listed {
@@ -1505,6 +1469,7 @@ fn connection() -> &'static Mutex<Connection> {
 }
 
 struct Mounted {
+    changes: tokio::sync::watch::Sender<()>,
     slot: Slot,
     props: Option<Vec<u8>>,
     generation: u64,
@@ -1570,6 +1535,7 @@ impl Mounted {
     /// asked, under generation 0, which no load answers for.
     fn seat() -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self {
+            changes: tokio::sync::watch::channel(()).0,
             slot: Slot::Loading,
             props: None,
             generation: 0,
@@ -1608,6 +1574,7 @@ impl Mounted {
     /// Opens the next generation for a load after `wanted` (None: whatever
     /// the node holds active), and names it.
     fn start(&mut self, wanted: Option<[u8; 32]>) -> u64 {
+        self.changes.send_replace(());
         self.generation += 1;
         self.in_flight = true;
         self.wanted = wanted;
@@ -1780,6 +1747,7 @@ fn spawn_load(
                 }
             }
         }
+        locked.changes.send_replace(());
     })
 }
 
@@ -2025,6 +1993,13 @@ struct HostState {
 type Restore = TypedFunc<(Vec<u8>, bool), (Result<(), String>,)>;
 
 struct Guest {
+    /// Shared immutable deployed code; isolated sessions own independent stores.
+    component: Component,
+    /// Node requests belong to the network selected when this instance starts.
+    connection_rev: u64,
+    session: Option<background::Attachment>,
+    user_activation: Option<()>,
+    sessions: std::collections::BTreeMap<u64, tokio::sync::watch::Sender<Vec<u8>>>,
     module: &'static str,
     /// The manifest's name: what a registered view's tab is called.
     name: String,
@@ -2061,9 +2036,10 @@ struct Guest {
     /// The guest's `rpc.live` subscriptions, each with the plane it named:
     /// told on every block that moves that plane.
     live_subscriptions: Vec<(u64, String)>,
-    /// The guest's `rpc.stream` subscriptions, each holding the node socket
+    /// Pending host requests and subscriptions, each owned by this guest
     /// the kernel opened for it: retired with the cancel, and with the guest.
-    streams: Vec<(u64, kernel::NodeStream)>,
+    tasks: Vec<(u64, kernel::NodeTask)>,
+    filesystem: filesystem::Filesystem,
     /// The guest's `clock.ticks` subscriptions: the period it asked for and
     /// the instant its next item is due. A module has no clock of its own,
     /// so periodic guest subscriptions use this list — driven from the window
@@ -2676,6 +2652,11 @@ impl Guest {
             .get_typed_func::<(Vec<u8>, bool), (Result<(), String>,)>(&mut store, "restore")
             .map_err(|error| format!("{shown}: {error}"))?;
         Ok(Self {
+            component: component.clone(),
+            connection_rev: connection().lock().expect("views rpc").rev,
+            session: None,
+            user_activation: None,
+            sessions: Default::default(),
             module,
             name: String::new(),
             store,
@@ -2699,7 +2680,8 @@ impl Guest {
             intents: Vec::new(),
             replies: Arc::default(),
             live_subscriptions: Vec::new(),
-            streams: Vec::new(),
+            tasks: Vec::new(),
+            filesystem: Default::default(),
             clocks: Vec::new(),
             fault: None,
             assets: Arc::default(),
@@ -2716,9 +2698,6 @@ impl Guest {
         if let Some(handler) = handler {
             self.pending.push(wire::Event::Surface { handler, value });
             return;
-        }
-        if matches!(self.module, "chat" | "forge") {
-            self.intents.extend(crate::composer_surface::intent(&value));
         }
     }
 
@@ -2784,7 +2763,9 @@ impl Guest {
                 false => self.refuse(request.id, "too many requests this tick".into()),
             }
         }
+        self.user_activation = None;
         for id in std::mem::take(&mut self.frame.cancels) {
+            self.filesystem.cancel(id);
             self.widget_commands
                 .retain(|(request, _, _)| *request != id);
             if self.props_subscription == Some(id) {
@@ -2793,8 +2774,12 @@ impl Guest {
             self.live_subscriptions.retain(|(live, _)| *live != id);
             // dropping the stream aborts it: the node socket goes with the
             // subscription the view abandoned
-            self.streams.retain(|(stream, _)| *stream != id);
+            self.tasks.retain(|(task, _)| *task != id);
             self.clocks.retain(|clock| clock.id != id);
+            self.sessions.remove(&id);
+            if let Some(session) = self.session.as_mut() {
+                session.media.cancel(id);
+            }
         }
         self.fault.is_none()
             && (self.frame.busy
@@ -2808,10 +2793,22 @@ impl Guest {
     /// goes to the log, and anything else is refused.
     fn answer(&mut self, request: wire::Request, props: &Option<Vec<u8>>) {
         let wire::Request { id, kind, payload } = request;
-        if payload.len() > MAX_PAYLOAD_BYTES {
+        let finished = self
+            .session
+            .as_ref()
+            .is_some_and(|session| !session.active());
+        if finished {
+            self.refuse(id, "session finished".into());
+            return;
+        }
+        let payload_limit = match kind.as_str() {
+            "op.submit_bytes" => ::node::MAX_PAYLOAD_BYTES.div_ceil(3) * 4 + 256,
+            _ => MAX_PAYLOAD_BYTES,
+        };
+        if payload.len() > payload_limit {
             self.refuse(
                 id,
-                format!("`{kind}` carries more than {MAX_PAYLOAD_BYTES} bytes"),
+                format!("`{kind}` carries more than {payload_limit} bytes"),
             );
             return;
         }
@@ -2829,6 +2826,8 @@ impl Guest {
         let own = capability == self.module;
         let declared_intent = own && intents_of(self.module).contains(&operation);
         match (capability, operation) {
+            ("host", "emit") => background::emit(self, id, payload),
+            ("host", "finish") => background::finish(self, id, &payload),
             ("host", "widget") => self.widget_request(id, &payload),
             _ if own && operation == "props" => {
                 self.props_subscription = Some(id);
@@ -2872,7 +2871,8 @@ impl Guest {
             use wire::WidgetCommand as C;
             let target = match &command {
                 C::FocusPrevious | C::FocusNext => None,
-                C::Focus { target }
+                C::EditorAction { target, .. }
+                | C::Focus { target }
                 | C::Focused { target }
                 | C::CursorFront { target }
                 | C::CursorEnd { target }
@@ -3230,6 +3230,7 @@ impl NativeModuleView {
         let generation = guest.seated_generation();
         let ticks = guest.ticks;
         let again = guest.redraw(props);
+        filesystem::mount(guest, cx);
         if again {
             window.request_animation_frame();
         }
@@ -3292,20 +3293,23 @@ impl NativeModuleView {
                     });
                     let seat = mounted.clone();
                     let alive = guest.alive.clone();
-                    self.subscription = Some(cx.subscribe(&content, move |this, _, event, cx| {
-                        let mut locked = seat.lock().expect("module view lock");
-                        let Slot::Ready(guest) = &mut locked.slot else {
-                            return;
-                        };
-                        let current_instance = guest.seated_generation() == generation
-                            && Arc::ptr_eq(&alive, &guest.alive);
-                        if !current_instance || guest.frame_rev != this.revision {
+                    self.subscription =
+                        Some(cx.subscribe(&content, move |this, source, event, cx| {
+                            let activation = source.read(cx).take_user_activation(event);
+                            let mut locked = seat.lock().expect("module view lock");
+                            let Slot::Ready(guest) = &mut locked.slot else {
+                                return;
+                            };
+                            let current_instance = guest.seated_generation() == generation
+                                && Arc::ptr_eq(&alive, &guest.alive);
+                            if !current_instance || guest.frame_rev != this.revision {
+                                cx.notify();
+                                return;
+                            }
+                            guest.user_activation = activation;
+                            input::deliver(guest, event.clone());
                             cx.notify();
-                            return;
-                        }
-                        input::deliver(guest, event.clone());
-                        cx.notify();
-                    }));
+                        }));
                     self.content = Some(content);
                 }
             }
@@ -3626,7 +3630,7 @@ pub(crate) mod tests {
         // the agents view signs its own pause and save through `op.submit`
         assert_eq!(intents_of("agents"), ["register", "open_run", "open_link"]);
         let chat = intents_of("chat");
-        assert_eq!(chat.len(), 15);
+        assert_eq!(chat.len(), 14);
         // the writes the view signs for itself are nobody's intent
         for signed in ["react", "edit", "delete", "rename", "search", "mark_read"] {
             assert!(!chat.contains(&signed), "{signed} is an op.submit now");
@@ -3638,15 +3642,14 @@ pub(crate) mod tests {
         );
         assert!(
             !chat.contains(&"composer"),
-            "a submit reaches the app only through the composer surface it was typed in"
+            "message submission belongs to the guest"
         );
     }
 
     /// Every kind a module's decoder names is admitted at that module's
     /// door, so a view never emits an intent the app knows how to decode
     /// but refuses to hear. The kinds a decoder names off its door are
-    /// exactly the ones that cross by another route: a host surface's own
-    /// event, or the composer's submit. In the other direction the door
+    /// exactly the ones that cross by another route. In the other direction the door
     /// admits nothing the decoder leaves to its wildcard, except the kind
     /// the wildcard's verdict itself names.
     #[test]
@@ -3658,9 +3661,7 @@ pub(crate) mod tests {
         let other_route_only: [(&str, &str, &[&str]); 4] = [
             ("agents", "agents_intent", &[]),
             ("settings", "settings_intent", &[]),
-            // the composer's own events reach the app off its surface, not
-            // through the guest's door
-            ("forge", "forge_intent", &["composer", "composer_attach"]),
+            ("forge", "forge_intent", &[]),
             ("pages", "pages_intent", &[]),
         ];
         let snake = |variant: &str| -> String {
@@ -4240,6 +4241,7 @@ pub(crate) mod tests {
             .live_subscriptions
             .push((CHAT_LIVE, "chat".to_owned()));
         let seat = Arc::new(Mutex::new(Mounted {
+            changes: tokio::sync::watch::channel(()).0,
             slot: Slot::Ready(Box::new(guest)),
             props: None,
             generation: 1,
@@ -4388,6 +4390,22 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
+    #[test]
+    fn common_surfaces_do_not_depend_on_the_module_name() {
+        for module in ["unlisted-application", "chat", "files", "forge"] {
+            for surface in [
+                "markdown",
+                "code",
+                "picture",
+                "artifact_svg",
+                "artifact_image",
+            ] {
+                assert!(surface_allowed(surface), "{module}/{surface}");
+            }
+            assert!(!surface_allowed("unknown-host-capability"));
+        }
+    }
+
     /// Every host surface in the guest's tree, by name.
     fn surface_names(guest: &Guest) -> Vec<String> {
         fn walk(node: &wire::Node, out: &mut Vec<String>) {
@@ -4497,7 +4515,7 @@ pub(crate) mod tests {
         );
         // The host paints nothing for this view: the document slot the app
         // used to own left with the loads.
-        assert!(!surface_allowed(guest.module, "page_document"));
+        assert!(!surface_allowed("page_document"));
 
         let props = pages_facts();
         guest.redraw(&props);
@@ -4528,168 +4546,19 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
-    /// The bundled Chat view through the host: the SESSION facts (the rooms
-    /// the bell and the tray share — the stream the view reads for itself),
-    /// a room pressed that leaves as `choose_channel`, the composer slot
-    /// the host paints per room, and its submit crossing as the `composer`
-    /// intent rather than a guest request.
     #[test]
-    fn the_staged_chat_view_boots_takes_the_facts_and_leaves_the_composer_to_the_host() {
+    fn surfaces_without_a_guest_handler_cannot_emit_product_intents() {
         let Some(staged) = staged("chat") else {
             return;
         };
-        // NO NODE, ON PURPOSE — and the turn is what makes that true. The view
-        // reads its own room through the kernel, so a sibling test's seated
-        // client would answer those reads off-thread and land their replies in
-        // the middle of this one.
-        let _turn = blocking_connection_turn();
         let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
-        assert!(surface_allowed(guest.module, "chat_composer"));
-        // the attachment preview card paints a code or Markdown file with
-        // the same host surfaces Files previews with
-        for surface in ["picture", "forge_code", "agent_markdown"] {
-            assert!(
-                surface_allowed(guest.module, surface),
-                "the host paints the {surface} slot the chat preview leaves"
-            );
-        }
-        guest.redraw(&None);
-        let props = chat_facts();
-        guest.redraw(&props);
-        let shown = texts(&guest);
-        // (an unread room carries a dot, not a word)
-        for expected in ["Channels", "general", "ops"] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected:?} in {shown:?}"
-            );
-        }
-        assert_eq!(surface_names(&guest), ["chat_composer"]);
-
-        guest
-            .pending
-            .push(wire::Event::Message(button_message(&guest, "ops")));
-        guest.redraw(&props);
-        assert_eq!(
-            std::mem::take(&mut guest.intents),
-            [ModuleViewEvent {
-                kind: "choose_channel".into(),
-                detail: r#"{"id":"channel-b"}"#.into(),
-            }]
-        );
-
-        // a submit in the host's composer is the `composer` intent, and an
-        // edit there never reaches the guest. What the ROOM's own reads left
-        // waiting is not the composer's doing, so the seam is what the two
-        // deliveries ADD — nothing.
-        let waiting = guest.pending.len();
-        guest.surface_event(
-            None,
-            wire::SurfaceValue::Record {
-                name: "composer".into(),
-                fields: vec![
-                    (
-                        "scope".into(),
-                        wire::SurfaceValue::Str("testnet\u{1f}channel-b".into()),
-                    ),
-                    ("kind".into(), wire::SurfaceValue::Str("message".into())),
-                    ("body".into(), wire::SurfaceValue::Str("hello".into())),
-                    ("id".into(), wire::SurfaceValue::Str("message-1".into())),
-                ],
-            },
-        );
-        guest.surface_event(None, wire::SurfaceValue::Unit);
-        assert_eq!(
-            guest.pending.len(),
-            waiting,
-            "the host's composer queued an event for the guest: {:?}",
-            guest.pending
-        );
-        assert_eq!(guest.intents.len(), 1);
-        assert_eq!(guest.intents[0].kind, "composer");
-        assert!(guest.intents[0].detail.contains(r#""body":"hello""#));
-        assert!(guest.fault.is_none());
+        assert!(!surface_allowed("chat_composer"));
+        assert!(!surface_allowed("forge_composer"));
+        guest.surface_event(None, wire::SurfaceValue::Str("unhandled".into()));
+        assert!(guest.pending.is_empty());
+        assert!(guest.intents.is_empty());
     }
 
-    #[gpui_kit::test]
-    fn a_chat_notification_scrolls_the_native_thread_to_its_target_once(cx: &mut TestAppContext) {
-        let _turn = blocking_connection_turn();
-        // The landing is a SESSION fact (`land_seq`) and the conversation is
-        // the view's own read: the notification names a reply, the window
-        // comes back around it, and the row's thread seats the rail.
-        let root = chat_row_of(1, "Root of the conversation", None);
-        let replies: Vec<_> = (2..=60)
-            .map(|seq| {
-                let body = format!("Reply {seq}: {}", "conversation context ".repeat(8));
-                chat_row_of(seq, &body, Some(1))
-            })
-            .collect();
-        let mut around = vec![root.clone()];
-        around.extend(replies.iter().cloned());
-        can_reads([
-            ("all", chat_accounts_reply()),
-            ("channel", chat_channel_reply()),
-            ("messages_around", serde_json::json!({ "messages": around })),
-            // a landing asks one more question than a tail read does: whether
-            // anything is older than the window it centred
-            (
-                "roots",
-                serde_json::json!({ "roots": { "roots": [], "has_more": false }}),
-            ),
-            ("members", chat_members_reply()),
-            (
-                "thread",
-                serde_json::json!({ "thread": { "root": root, "replies": replies,
-                    "has_more": false, "next_reply_seq": null }}),
-            ),
-        ]);
-        let props = chat_facts_in("channel-a", 31, &[]);
-        let path = staged("chat").expect("actual Chat Wasm is required");
-        let mut guest = Guest::load_from("chat", &path).unwrap();
-        guest.redraw(&None);
-        for _ in 0..32 {
-            if !guest.redraw(&props) {
-                break;
-            }
-        }
-        assert_eq!(guest.widget_commands.len(), 1, "{:?}", guest.fault);
-        assert!(matches!(
-            &guest.widget_commands[0].2,
-            wire::WidgetCommand::ScrollToKey { key: 31, .. }
-        ));
-        let target = match &guest.widget_commands[0].2 {
-            wire::WidgetCommand::ScrollToKey { target, .. } => target.clone(),
-            _ => unreachable!(),
-        };
-        let (view, mut native) = native_tree(
-            guest.frame.root.clone().unwrap(),
-            gpui::size(gpui::px(1280.), gpui::px(800.)),
-            cx,
-        );
-        guest.execute_widget_commands(|command| native_command(&view, &mut native, command));
-        let offset = view
-            .read_with(&native, |view, _| view.scroll_offset(&target))
-            .expect("thread scroll exists");
-        assert!(
-            offset.y < gpui::px(0.),
-            "target is inside the conversation: {offset:?}"
-        );
-        guest.redraw(&props);
-        assert!(
-            guest.widget_commands.is_empty(),
-            "an unchanged target must not reset reading position"
-        );
-        assert!(guest.fault.is_none());
-    }
-
-    /// The bundled Explorer view end to end through the host, on the kernel
-    /// contract: it boots on the offline plate, and once the session says
-    /// connected it reads the block window itself — an `rpc.live`
-    /// subscription on the `block` plane that the kernel keeps, and an
-    /// `rpc.blocks` the kernel refuses here (no node), so the refusal is what
-    /// the screen shows. A block on that plane makes it read again. What the
-    /// window folds to is pinned in the view's own tests, which drive the same
-    /// compiled Rust guest through the wire.
     #[test]
     fn the_staged_explorer_view_boots_and_reads_its_window_through_the_kernel() {
         let Some(staged) = staged("explorer") else {
@@ -5041,9 +4910,9 @@ pub(crate) mod tests {
         guest.redraw(&session);
         assert!(guest.ticks > ticks, "the live item ticked the view");
 
-        for surface in ["picture", "forge_markdown", "forge_code", "forge_composer"] {
+        for surface in ["picture", "markdown", "code"] {
             assert!(
-                surface_allowed("forge", surface),
+                surface_allowed(surface),
                 "the host paints the {surface} slot the view leaves"
             );
         }
@@ -5137,6 +5006,7 @@ pub(crate) mod tests {
         let mut guest = Guest::load_from("chat", &staged).expect("actual Chat guest");
         guest.pending.push(wire::Event::Resync);
         let seat = Arc::new(Mutex::new(Mounted {
+            changes: tokio::sync::watch::channel(()).0,
             slot: Slot::Ready(Box::new(guest)),
             props: Some(b"previous test props".to_vec()),
             generation: 9,
@@ -6453,26 +6323,6 @@ pub(crate) mod tests {
         land_seq: i64,
         live: &[crate::backend::LiveAgentRow],
     ) -> Option<Vec<u8>> {
-        let general = crate::backend::ChatChannel {
-            id: "channel-a".into(),
-            name: "general".into(),
-            ..Default::default()
-        };
-        let ops = crate::backend::ChatChannel {
-            id: "channel-b".into(),
-            name: "ops".into(),
-            ..Default::default()
-        };
-        let rooms = [
-            crate::backend::ChatSidebarRow {
-                channel: general,
-                unread: false,
-            },
-            crate::backend::ChatSidebarRow {
-                channel: ops,
-                unread: true,
-            },
-        ];
         let props = ChatProps {
             dark: false,
             connected: true,
@@ -6484,8 +6334,6 @@ pub(crate) mod tests {
             me: "acct:7".into(),
             me_key: "aa",
             names_serial: 0,
-            rooms: &rooms,
-            dm_rows: &[],
             channel_create_open: false,
             active_channel: room,
             active_dm_peer: "",
@@ -6505,7 +6353,6 @@ pub(crate) mod tests {
             shift_held: false,
             copy_chord_serial: 0,
             sent_serial: 0,
-            pending_sends: &[],
             live_agents: live_agents_within(live, room, LIVE_AGENT_TEXT_BUDGET),
         };
         Some(serde_json::to_vec(&props).expect("props encode"))
@@ -7715,6 +7562,46 @@ pub(crate) mod tests {
         assert_eq!(slot_assets(&mounted), ["b.svg"]);
     }
 
+    #[test]
+    fn asset_reads_use_only_the_requesting_guests_current_deployment() {
+        let Some(staged) = staged("pages") else {
+            return;
+        };
+        let mut first = Guest::load_from("pages", &staged).expect("first guest");
+        let mut second = Guest::load_from("pages", &staged).expect("second guest");
+        let assets = |bytes: &[u8]| Arc::new([("service.json".to_owned(), bytes.to_vec())].into());
+        first.deployed([1; 32], assets(b"first"));
+        second.deployed([2; 32], assets(b"second"));
+        let read = |guest: &mut Guest, path: &[u8]| {
+            assert!(kernel::answer(guest, "asset", "read", 17, path));
+            let wire::Event::Response { id, result, done } =
+                guest.pending.pop().expect("asset answer")
+            else {
+                panic!("response")
+            };
+            assert_eq!(id, 17);
+            assert!(done);
+            result
+        };
+        assert_eq!(read(&mut first, b"service.json").unwrap(), b"first");
+        assert_eq!(read(&mut second, b"service.json").unwrap(), b"second");
+        first.deployed([3; 32], assets(b"replacement"));
+        assert_eq!(read(&mut first, b"service.json").unwrap(), b"replacement");
+        assert_eq!(read(&mut second, b"service.json").unwrap(), b"second");
+        for path in [
+            b"../service.json".as_slice(),
+            b"/service.json",
+            b"./service.json",
+            b"https://example.test/service.json",
+            b"missing",
+            &[255],
+        ] {
+            assert!(read(&mut first, path).is_err(), "{path:?}");
+        }
+        first.deployed([4; 32], assets(&vec![0; (1 << 20) + 1]));
+        assert!(read(&mut first, b"service.json").is_err());
+    }
+
     /// An artifact asset is found by its canonical relative path, exactly.
     #[test]
     fn an_artifact_asset_is_an_exact_path_lookup() {
@@ -7750,15 +7637,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// The three doors the Forge view needed and the kernel did not have,
-    /// driven on the kernel's own runtime. None of them names a module:
-    /// `picture.put` stores decoded bytes under whatever surface the view
-    /// asks for (the pages are decoded one by one — each is padded base64
-    /// in its own right), and `host.roster` seats the mention roster for
-    /// whatever composer scope the view built. A door that is handed
-    /// nothing refuses rather than storing an empty slot.
+    /// Picture storage refuses an absent surface identity.
     #[test]
-    fn the_kernel_stores_a_picture_and_seats_a_composer_roster() {
+    fn the_kernel_stores_a_picture_under_its_surface_identity() {
         let Some(staged) = staged("forge") else {
             return;
         };
@@ -7819,99 +7700,6 @@ pub(crate) mod tests {
             panic!("one answer, got {landed:?}");
         };
         assert!(result.is_err(), "{result:?}");
-
-        // the composer roster is seated synchronously, under the scope the
-        // view built
-        let scope = "http://127.0.0.1:1\u{1f}forge:core:7";
-        let roster = serde_json::json!({
-            "scope": scope,
-            "members": [{ "key": "aa", "label": "Mallard" }],
-        });
-        assert!(kernel::answer(
-            &mut guest,
-            "host",
-            "roster",
-            9,
-            &serde_json::to_vec(&roster).expect("encodes")
-        ));
-        assert_eq!(
-            crate::composer_surface::testing::roster_of(scope),
-            ["Mallard"],
-            "the composer completes an `@` against what the view read"
-        );
-        assert!(kernel::answer(&mut guest, "host", "roster", 10, b"{}"));
-        // a synchronous door answers into the guest's own pending queue
-        assert!(
-            guest.pending.iter().any(|event| matches!(
-                event,
-                wire::Event::Response {
-                    id: 9,
-                    result: Ok(_),
-                    ..
-                }
-            )),
-            "the seated roster is answered: {:?}",
-            guest.pending
-        );
-        assert!(
-            guest.pending.iter().any(|event| matches!(
-                event,
-                wire::Event::Response {
-                    id: 10,
-                    result: Err(_),
-                    ..
-                }
-            )),
-            "a roster with no scope is refused: {:?}",
-            guest.pending
-        );
-    }
-
-    /// The Forge view leaves its discussion note composer to the host, the
-    /// way Chat does: a send in that surface crosses as the `composer`
-    /// intent carrying the scope it was typed under and its body, and the
-    /// typing itself never reaches the guest. The scope the view builds is
-    /// `<endpoint>\u{1f}<channel>`, which is what the app recovers the item's
-    /// channel from.
-    #[test]
-    fn the_staged_forge_view_hears_a_note_typed_in_the_hosts_composer() {
-        let Some(staged) = staged("forge") else {
-            return;
-        };
-        let mut guest = Guest::load_from("forge", &staged).expect("the view loads");
-        assert!(surface_allowed(guest.module, "forge_composer"));
-        guest.redraw(&None);
-        guest.surface_event(
-            None,
-            wire::SurfaceValue::Record {
-                name: "composer".into(),
-                fields: vec![
-                    (
-                        "scope".into(),
-                        wire::SurfaceValue::Str("http://127.0.0.1:1\u{1f}forge:core:7".into()),
-                    ),
-                    ("kind".into(), wire::SurfaceValue::Str("note".into())),
-                    ("body".into(), wire::SurfaceValue::Str("hi".into())),
-                    ("id".into(), wire::SurfaceValue::Str("note-1".into())),
-                ],
-            },
-        );
-        assert!(guest.pending.is_empty(), "the words never reach the guest");
-        assert_eq!(guest.intents.len(), 1);
-        assert_eq!(guest.intents[0].kind, "composer");
-        assert!(guest.intents[0].detail.contains(r#""body":"hi""#));
-        assert_eq!(
-            crate::backend::scope_channel(
-                serde_json::from_str::<serde_json::Value>(&guest.intents[0].detail)
-                    .expect("the intent decodes")["scope"]
-                    .as_str()
-                    .unwrap_or_default(),
-                "http://127.0.0.1:1"
-            ),
-            "forge:core:7",
-            "the app recovers the item's channel from the scope alone"
-        );
-        assert!(guest.fault.is_none());
     }
 
     #[test]
@@ -7965,3 +7753,6 @@ pub(crate) mod tests {
         assert_eq!(merge(&mut None, &mut patched), Err("no tree to patch"));
     }
 }
+
+#[cfg(test)]
+mod extension_tests;

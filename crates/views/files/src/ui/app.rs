@@ -100,6 +100,10 @@ pub struct FilesView {
     pub(crate) sidebar_open: bool,
     pub(crate) inspector_open: bool,
     // ---- the writes ----
+    #[serde(skip)]
+    pub(crate) upload: Option<ducktape_view_guest::task::Handle>,
+    #[serde(default)]
+    pub(crate) upload_serial: u64,
     pub(crate) name_prompt: NamePrompt,
     pub(crate) name_draft: String,
     pub(crate) delete_target: String,
@@ -135,6 +139,9 @@ impl ::std::fmt::Debug for FilesView {
 pub enum Message {
     // the readings
     SessionArrived(crate::host::SessionItem),
+    FilesDropped(Result<Vec<ducktape_view_files::SelectedFile>, String>),
+    FilesUploaded(u64, Result<(), String>),
+    GrantsReleased,
     RouteTo(String),
     WorkspaceArrived(crate::host::WorkspaceItem),
     PreviewArrived(crate::host::PreviewItem),
@@ -246,7 +253,7 @@ impl FilesView {
     }
 
     pub(crate) fn busy_writing(&self) -> bool {
-        self.writing != Writing::Idle
+        self.writing != Writing::Idle || self.upload.is_some()
     }
 
     pub(crate) fn draft_here(&self) -> bool {
@@ -341,6 +348,8 @@ impl FilesView {
             name_draft: String::new(),
             delete_target: String::new(),
             writing: Writing::Idle,
+            upload: None,
+            upload_serial: 0,
             notice: String::new(),
             draft: ::ducktape_view_guest::Editor::new(String::new()),
             editing: false,
@@ -380,6 +389,9 @@ impl FilesView {
         };
         Subscription::batch([
             crate::host::session().map(Message::SessionArrived),
+            gated(connected, || {
+                crate::host::drops().map(Message::FilesDropped)
+            }),
             gated(connected, || {
                 crate::host::workspace(self.generation, self.nav.path.clone(), self.pages, columns)
                     .map(Message::WorkspaceArrived)

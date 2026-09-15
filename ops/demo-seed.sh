@@ -305,10 +305,13 @@ AGENT_ID="chiefduck"
 AGENT_NAME="ChiefDuck"
 # The persona: an always-loaded skill in the shared library, which the host
 # assembles into the context document the CLI auto-loads for every run.
-curl -fsS -X PUT "$URL/v1/files/object/shared/skills/$AGENT_ID/SKILL.md" \
-  -H "x-ducktape-admin-token: $OPERATOR" \
-  --data-binary @"$SCRIPT_DIR/chiefduck/SKILL.md" >/dev/null \
-  || die "cannot stage the $AGENT_NAME persona skill"
+PERSONA_HEAD=$(query files '{"refs":{}}' | bun -e 'process.stdout.write(JSON.stringify((await Bun.stdin.json()).refs.head))') || die "cannot read Files head"
+PERSONA_COMMIT=$(bun -e '
+  const body=await Bun.file(process.argv[1]).arrayBuffer();
+  if(body.byteLength>65536) throw new Error("persona exceeds inline commit budget");
+  process.stdout.write(JSON.stringify({commit:{base_snapshot:JSON.parse(process.argv[3]),message:"Install persona",changes:[{put:{path:process.argv[2],exec:false,meta:{},content:{inline:{b64:Buffer.from(body).toString("base64")}}}}]}}));
+' "$SCRIPT_DIR/chiefduck/SKILL.md" "/shared/skills/$AGENT_ID/SKILL.md" "$PERSONA_HEAD") || die "cannot encode persona"
+submit_user files "$PERSONA_COMMIT"
 PROGRAM=$("$NODE_BIN" agent model-program "$AGENT_ID") || die "cannot encode the default model program"
 PROVISION=$(printf '%s' "$PROGRAM" | bun -e 'process.stdout.write(JSON.stringify({provision:{request_id:process.argv[1],name:process.argv[2],program:await Bun.stdin.json()}}))' "$AGENT_ID" "$AGENT_NAME") || die "invalid program"
 submit_user agent "$PROVISION"
@@ -348,8 +351,7 @@ if command -v git >/dev/null; then
     && printf '# %s\n\nA scratch repository the demo seeds for %s. Mention @%s on an issue here and it opens a pull request.\n' "$PLAYGROUND" "$AGENT_NAME" "$AGENT_ID" > README.md \
     && git add README.md \
     && git -c user.name="Demo seed" -c user.email="seed@demo.duck" -c commit.gpgsign=false commit -q -m "seed the playground" \
-    && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="x-ducktape-admin-token: $OPERATOR" \
-       git push -q "$URL/forge/$PLAYGROUND" HEAD:dev )
+    && python3 "$SCRIPT_DIR/forge-import.py" push --node-url "$URL" --token-file "$WSDIR/admin.token" --repo "$PLAYGROUND" --branch dev --tip HEAD )
   pushed=$?
   rm -rf "$SEED_REPO"
   [ "$pushed" -eq 0 ] || die "cannot push the $PLAYGROUND repo into the forge"

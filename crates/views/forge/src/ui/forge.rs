@@ -172,28 +172,13 @@ impl ForgeView {
         )
     }
 
-    /// The command that makes the first repository: a code box, and the one
-    /// control that puts it on the clipboard.
+    /// Git endpoint configuration belongs to the installed service.
     fn push_box(&self) -> wire::Node {
         let p = native::palette();
-        let command = host::forge_push_command(&self.connected_rpc);
+        let command = host::forge_push_instructions();
         let mut node = native::container(
             "forge/push-card",
-            native::centered_row(
-                "forge/push-row",
-                [
-                    native::sized(
-                        native::wrapping(native::mono("forge/push-command", &command)),
-                        Some(wire::Length::Fill),
-                        None,
-                    ),
-                    action(
-                        "forge/copy-push",
-                        "Copy command",
-                        Some(Message::CopyToClipboard(command, "Command copied".into())),
-                    ),
-                ],
-            ),
+            native::wrapping(native::text("forge/push-instructions", &command)),
         );
         if let wire::Node::Container {
             background,
@@ -508,27 +493,18 @@ impl ForgeView {
                 for note in &self.discussion {
                     discussion.push(self.note(format!("forge/note/{}", note.seq), note));
                 }
-                discussion.push(wire::Node::Surface {
-                    key: "forge/note-composer".into(),
-                    name: "forge_composer".into(),
-                    args: vec![
-                        wire::SurfaceValue::Str(host::composer_scope(
-                            &self.connected_rpc,
-                            &self.forge_item_channel,
-                        )),
-                        wire::SurfaceValue::Str("note".into()),
-                        wire::SurfaceValue::Bool(true),
-                        wire::SurfaceValue::Str("Write a note…".into()),
-                        wire::SurfaceValue::Bool(
-                            !self.connected
-                                || self.forge_item_channel.is_empty()
-                                || self.item_phase != "ready",
-                        ),
-                        wire::SurfaceValue::Bool(false),
-                        wire::SurfaceValue::Str("The note wasn’t sent".into()),
-                    ],
-                    on_event: None,
-                });
+                discussion.push(self.composer(
+                    "forge/note-composer".into(),
+                    host::composer_scope(&self.connected_rpc, &self.forge_item_channel),
+                    ducktape_view_composer::host::Target::Post {
+                        channel: self.forge_item_channel.clone(),
+                        thread: None,
+                    },
+                    "Write a note…",
+                    self.connected
+                        && !self.forge_item_channel.is_empty()
+                        && self.item_phase == "ready",
+                ));
                 content.push(section(
                     "forge/discussion",
                     native::heading("forge/discussion-title", "Discussion"),

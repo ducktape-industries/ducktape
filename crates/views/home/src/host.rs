@@ -120,11 +120,14 @@ async fn view(target: &str, query: serde_json::Value) -> Result<serde_json::Valu
 }
 
 async fn files_get(lane: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
-    ask(
-        "files.get",
-        &serde_json::json!({ "lane": lane, "params": params }),
-    )
-    .await
+    let reply = ask("rpc.query", &serde_json::json!({
+        "target": "files", "query": {lane: params}
+    })).await?;
+    let value = reply.get(lane).cloned().ok_or("unexpected Files reply")?;
+    match lane {
+        "history" => Ok(serde_json::json!({"snapshots": value})),
+        _ => Ok(value),
+    }
 }
 
 /// Every hit on `plane`, as the kernel reports it: the cadence a card's

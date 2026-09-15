@@ -34,6 +34,13 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
   workspace and hands it to `launchctl bootstrap gui/$(id -u)`
   (`--dry-run` prints the rendered plist, `--uninstall` boots it out).
 
+## Independent application services
+
+`application-service/install.py` verifies and installs an application executable
+with a systemd-held socket, private Gateway handoff credential, isolated Unix
+identity, and resource limits. See `docs/deploy/application-service.md` for the
+manifest, process contract, and install/activate/stop/restart commands.
+
 ## Sandbox (microVM) hosts
 
 - `build-guest-rootfs.sh` — builds one workspace's kernel and rootfs

@@ -5,7 +5,7 @@
 //! chain a draft belongs to, and the account whose home is "mine"). Everything
 //! on the screen is this view's own: it lists a directory, reads a preview,
 //! walks the snapshot history, asks which snapshot last touched a path and
-//! diffs a snapshot through `files.get`, re-reads on every `rpc.live` hit for
+//! diffs a snapshot through `rpc.query`, re-reads on every `rpc.live` hit for
 //! the files plane, and a mkdir / new file / rename / delete / save leaves as
 //! `op.submit` carrying the duckfs commit the kernel signs with the seated
 //! key — the view never sees the key, the endpoint or the password.
@@ -436,7 +436,7 @@ async fn read_text(path: &str) -> Result<PreviewItem, String> {
         .ok_or("The file has no committed snapshot")?;
     let reply = files_get(
         "read",
-        serde_json::json!({ "path": path, "len": PREVIEW_BYTES, "snapshot": base }),
+        serde_json::json!({ "path": path, "offset": 0, "len": PREVIEW_BYTES, "snapshot": base }),
     )
     .await?;
     let bytes = base64_decode(reply["b64"].as_str().unwrap_or_default())
@@ -584,7 +584,11 @@ async fn load_diff(from: String) -> DiffItem {
 
 async fn read_diff(from: &str) -> Result<DiffItem, String> {
     let head = head_snapshot().await?.ok_or("nothing committed yet")?;
-    let reply = files_get("diff", serde_json::json!({ "from": from, "to": head })).await?;
+    let reply = files_get(
+        "diff",
+        serde_json::json!({ "from": from, "to": head, "prefix": "/" }),
+    )
+    .await?;
     let mut entries: Vec<FsDiffEntry> = reply["entries"]
         .as_array()
         .cloned()
@@ -783,18 +787,6 @@ pub fn open_link(url: &str) -> bool {
     true
 }
 
-/// Where a file dropped on the WINDOW lands. The drop is an OS door and stays
-/// the app's; the directory it opens into is this view's, so the view says
-/// which one it is standing in.
-pub fn at(path: &str) -> bool {
-    let payload = serde_json::json!({ "path": path });
-    host::notify(
-        "files.at",
-        &serde_json::to_vec(&payload).expect("an intent encodes"),
-    );
-    true
-}
-
 // ---------- the kernel calls ----------
 
 async fn request(kind: &str, ask: &serde_json::Value) -> Result<serde_json::Value, String> {
@@ -803,11 +795,20 @@ async fn request(kind: &str, ask: &serde_json::Value) -> Result<serde_json::Valu
 }
 
 async fn files_get(lane: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
-    request(
-        "files.get",
-        &serde_json::json!({ "lane": lane, "params": params }),
+    let reply = request(
+        "rpc.query",
+        &serde_json::json!({ "target": "files", "query": { lane: params } }),
     )
-    .await
+    .await?;
+    let value = reply
+        .get(lane)
+        .ok_or("Unexpected Files module reply")?
+        .clone();
+    match lane {
+        "history" => Ok(serde_json::json!({ "snapshots": value })),
+        "diff" => Ok(serde_json::json!({ "entries": value })),
+        _ => Ok(value),
+    }
 }
 
 /// The head snapshot id for commit CAS; `None` while nothing is committed.
@@ -968,4 +969,48 @@ fn base64_encode(bytes: &[u8]) -> String {
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.decode(input).ok()
+}
+
+/// OS drops are opaque, guest-scoped grants; destination and commit policy stay here.
+pub fn drops()
+-> ducktape_view_guest::Subscription<Result<Vec<ducktape_view_files::SelectedFile>, String>> {
+    ducktape_view_guest::Subscription::run(|| {
+        host::subscribe("fs.drops", b"{}").map(|reply| {
+            reply
+                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
+        })
+    })
+}
+
+pub async fn upload_files(
+    files: Vec<ducktape_view_files::SelectedFile>,
+    directory: String,
+) -> Result<(), String> {
+    let refusal = write_refusal(&directory);
+    let safe_names = files.iter().all(|file| {
+        !file.name.is_empty() && file.name != "." && file.name != ".." && !file.name.contains('/')
+    });
+    if !refusal.is_empty() || !safe_names {
+        for file in files {
+            ducktape_view_files::release(&file.token).await;
+        }
+        return Err(if refusal.is_empty() {
+            "The dropped file name is invalid".into()
+        } else {
+            refusal
+        });
+    }
+    let mut files = files.into_iter();
+    while let Some(file) = files.next() {
+        let path = fs_child(&directory, &file.name);
+        let token = file.token.clone();
+        if let Err(error) = ducktape_view_files::upload(file, path).await {
+            ducktape_view_files::release(&token).await;
+            for pending in files {
+                ducktape_view_files::release(&pending.token).await;
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
 }

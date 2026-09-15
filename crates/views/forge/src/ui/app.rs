@@ -6,6 +6,10 @@ pub(crate) enum Act {
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ForgeView {
+    #[serde(skip)]
+    pub(crate) upload_handles: std::collections::HashMap<String, ducktape_view_guest::task::Handle>,
+    pub(crate) composers: std::collections::BTreeMap<String, ducktape_view_composer::Draft>,
+    pub(crate) composer_choices: Vec<ducktape_view_composer::MentionChoice>,
     pub(crate) connected: bool,
     pub(crate) dark: bool,
     pub(crate) org: String,
@@ -47,7 +51,6 @@ pub struct ForgeView {
     pub(crate) discussion: Vec<crate::host::ChatMessage>,
     pub(crate) discussion_clipped: bool,
     pub(crate) linked_note: Vec<crate::host::ChatMessage>,
-    pub(crate) roster_set: bool,
     pub(crate) focus_seq: i64,
     pub(crate) landed_tick: i64,
     pub(crate) focus_number: i64,
@@ -99,6 +102,7 @@ impl ::std::fmt::Debug for ForgeView {
 }
 #[derive(Clone)]
 pub enum Message {
+    Composer(Box<composer::ComposerMessage>),
     SessionArrived(crate::host::SessionItem),
     ForgeLandLink(String),
     ReposArrived(crate::host::RepoListItem),
@@ -139,6 +143,9 @@ impl ::std::fmt::Debug for Message {
 impl ForgeView {
     fn state() -> Self {
         Self {
+            composers: Default::default(),
+            upload_handles: Default::default(),
+            composer_choices: Vec::new(),
             connected: false,
             dark: false,
             org: "".to_owned(),
@@ -180,7 +187,6 @@ impl ForgeView {
             discussion: Vec::new(),
             discussion_clipped: false,
             linked_note: Vec::new(),
-            roster_set: false,
             focus_seq: 0,
             landed_tick: 0,
             focus_number: 0,
@@ -245,7 +251,10 @@ impl ForgeView {
         let wire::SnapshotValue::Bytes(state) = snapshot.state else {
             return Err("invalid Forge snapshot".into());
         };
-        let state: Self = wire::decode(&state)?;
+        let mut state: Self = wire::decode(&state)?;
+        for draft in state.composers.values_mut() {
+            draft.retire_device_requests();
+        }
         state.validate_snapshot()?;
         Ok(state)
     }
@@ -408,5 +417,6 @@ mod tests {
 mod app_update;
 mod app_view;
 mod components;
+mod composer;
 mod forge;
 mod kit;

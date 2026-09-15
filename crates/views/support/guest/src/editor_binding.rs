@@ -39,6 +39,13 @@ pub struct EditorInteractionRequest<'a> {
     pub input_time_ms: u64,
 }
 #[derive(Clone, Copy, Debug)]
+pub struct EditorRichRequest<'a> {
+    pub id: &'a wire::EditorTransactionId,
+    pub state: EditorStateView<'a>,
+    pub edit: &'a wire::editor_rich::RichEdit,
+    pub input_time_ms: u64,
+}
+#[derive(Clone, Copy, Debug)]
 pub enum EditorTransactionEvent<'a> {
     Interaction {
         id: &'a wire::EditorTransactionId,
@@ -66,16 +73,19 @@ pub enum EditorTransactionEvent<'a> {
 
 type Decide = Rc<dyn for<'a> Fn(EditorKeyRequest<'a>) -> EditorDecision>;
 type Interact = Rc<dyn for<'a> Fn(EditorInteractionRequest<'a>) -> EditorDecision>;
+type Rich = Rc<dyn for<'a> Fn(EditorRichRequest<'a>) -> EditorDecision>;
 type Observe<P> = Rc<dyn for<'a> Fn(EditorTransactionEvent<'a>) -> Option<P>>;
 pub struct EditorBinding<P> {
     claims: Vec<wire::EditorKeyClaim>,
     decide: Decide,
     interact: Option<Interact>,
+    rich: Option<Rich>,
     on_event: Observe<P>,
 }
 struct Callbacks<M> {
     decide: Decide,
     interact: Option<Interact>,
+    rich: Option<Rich>,
     on_event: Observe<M>,
 }
 impl<P: 'static> EditorBinding<P> {
@@ -92,8 +102,16 @@ impl<P: 'static> EditorBinding<P> {
             claims,
             decide: Rc::new(decide),
             interact: None,
+            rich: None,
             on_event: Rc::new(on_event),
         }
+    }
+    pub fn on_rich_edit(
+        mut self,
+        decide: impl for<'a> Fn(EditorRichRequest<'a>) -> EditorDecision + 'static,
+    ) -> Self {
+        self.rich = Some(Rc::new(decide));
+        self
     }
     pub fn on_interaction(
         mut self,
@@ -111,6 +129,7 @@ impl<P: 'static> EditorBinding<P> {
         let callbacks = Rc::new(Callbacks {
             decide: self.decide,
             interact: self.interact,
+            rich: self.rich,
             on_event: Rc::new(move |event| observe(event).map(&route)),
         });
         // Existing handler storage already supplies bounded frame-local lifetime
@@ -208,6 +227,24 @@ impl<M: 'static> EditorTransaction<M> {
                 }
                 let state = EditorStateView::new(editor.text_ref(), &request.state);
                 let decision = match &request.input {
+                    wire::EditorRequestInput::RichEdit { edit } => callbacks
+                        .rich
+                        .as_ref()
+                        .filter(|_| {
+                            edit.document.validate().is_ok()
+                                && edit
+                                    .before
+                                    .as_ref()
+                                    .is_none_or(|before| before.validate().is_ok())
+                        })
+                        .map_or(EditorDecision::Noop, |decide| {
+                            decide(EditorRichRequest {
+                                id: &request.id,
+                                state,
+                                edit,
+                                input_time_ms: request.input_time_ms,
+                            })
+                        }),
                     wire::EditorRequestInput::Key { key, repeat } => {
                         (callbacks.decide)(EditorKeyRequest {
                             id: &request.id,
@@ -338,6 +375,7 @@ mod tests {
         let callbacks = Rc::new(Callbacks::<()> {
             decide: Rc::new(|_| EditorDecision::Noop),
             interact: None,
+            rich: None,
             on_event: Rc::new(move |_| {
                 calls.set(calls.get() + 1);
                 None
@@ -384,6 +422,7 @@ mod tests {
         let callbacks = Rc::new(Callbacks::<()> {
             decide: Rc::new(|_| EditorDecision::Noop),
             interact: None,
+            rich: None,
             on_event: Rc::new(move |event| {
                 let EditorTransactionEvent::Commit { before, after, .. } = event else {
                     panic!("expected caret commit");

@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 /// Forge packs relayed by a resident or fanned out by a validator are bounded
-/// at exactly the smart-HTTP lane's ceiling (`noded::GIT_PACK_BODY_LIMIT`):
+/// at exactly the smart-HTTP lane's ceiling (`blobstore::MAX_TRANSFER_BYTES`):
 /// a pack the door accepted, hashed and stored is one the relay carries. The
 /// two were separate numbers once (64 MiB here, 512 MiB there) and this
 /// repository's own 83 MiB pack was refused by the relay after the door had
@@ -40,7 +40,7 @@ use sha2::{Digest as _, Sha256};
 /// with no chunk retransmit, and one sender can count on exactly its own
 /// quota burst of that mailbox (`constants::MESH_QUOTA_BURST`) — the pins
 /// below keep one offer plus a max-size pack's chunks inside it.
-pub const MAX_RELAY_BLOB_BYTES: usize = noded::GIT_PACK_BODY_LIMIT;
+pub const MAX_RELAY_BLOB_BYTES: usize = blobstore::MAX_TRANSFER_BYTES;
 
 /// 768 KiB raw -> 1.5 MiB hex plus a small JSON envelope, safely below the
 /// process-wide 2 MiB commonware message cap.
@@ -260,19 +260,21 @@ fn holds_node_standing(key: &[u8], members: &[Vec<u8>], residents: &[Vec<u8>]) -
 
 /// Blob offers may originate from a standing resident or a current validator
 /// (the latter is the direct-to-validator HTTP push path fanning out to its
-/// peers). The signed frame authorizes the offered digest before allocation.
+/// peers). Standing belongs to the authenticated courier; the original user
+/// frame keeps its own signature and binds the offered digest before allocation.
 pub fn verify_blob_offer(
+    courier: &[u8],
     frame: &[u8],
     digest: &[u8; 32],
     members: &[Vec<u8>],
     residents: &[Vec<u8>],
 ) -> Result<node::FrameId, String> {
     let (origin, _msg) = node::decode_frame(frame).map_err(|e| format!("bad frame: {e}"))?;
-    let sdk::Origin::External(origin_bytes) = origin else {
+    let sdk::Origin::External(_) = origin else {
         return Err("blob offers carry an external origin".into());
     };
-    if !holds_node_standing(&origin_bytes, members, residents) {
-        return Err("blob offer origin holds no committed node standing".into());
+    if !holds_node_standing(courier, members, residents) {
+        return Err("blob offer courier holds no committed node standing".into());
     }
     if required_blob_digest(frame).as_ref() != Some(digest) {
         return Err("blob offer digest is not referenced by its signed frame".into());
@@ -328,8 +330,8 @@ mod tests {
     fn the_relay_assembly_accepts_every_pack_the_door_does() {
         let digest = [1; 32];
         assert!(BlobAssembly::new(digest, 83 * 1024 * 1024).is_ok());
-        assert!(BlobAssembly::new(digest, noded::GIT_PACK_BODY_LIMIT as u64).is_ok());
-        assert!(BlobAssembly::new(digest, noded::GIT_PACK_BODY_LIMIT as u64 + 1).is_err());
+        assert!(BlobAssembly::new(digest, blobstore::MAX_TRANSFER_BYTES as u64).is_ok());
+        assert!(BlobAssembly::new(digest, blobstore::MAX_TRANSFER_BYTES as u64 + 1).is_err());
     }
 
     #[test]
@@ -440,10 +442,49 @@ mod tests {
             }),
         };
         let frame = node::encode_frame(&author, 1, &msg);
-        assert!(verify_blob_offer(&frame, &digest, std::slice::from_ref(&me), &[]).is_ok());
-        assert!(verify_blob_offer(&frame, &digest, &[], std::slice::from_ref(&me)).is_ok());
-        assert!(verify_blob_offer(&frame, &digest, &[], &[]).is_err());
-        assert!(verify_blob_offer(&frame, &[0; 32], std::slice::from_ref(&me), &[]).is_err());
+        let courier = sk(9).public_key().as_ref().to_vec();
+        let admitted = verify_blob_offer(
+            &courier,
+            &frame,
+            &digest,
+            std::slice::from_ref(&courier),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(admitted, node::frame_id(&frame));
+        assert!(
+            verify_blob_offer(
+                &courier,
+                &frame,
+                &[0; 32],
+                std::slice::from_ref(&courier),
+                &[]
+            )
+            .is_err()
+        );
+        assert_eq!(
+            node::decode_frame(&frame).unwrap().0,
+            sdk::Origin::External(me.clone())
+        );
+        assert!(
+            verify_blob_offer(&courier, &frame, &digest, std::slice::from_ref(&me), &[]).is_err()
+        );
+        let mut tampered = frame.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(
+            verify_blob_offer(
+                &courier,
+                &tampered,
+                &digest,
+                std::slice::from_ref(&courier),
+                &[]
+            )
+            .is_err()
+        );
+        assert!(verify_blob_offer(&me, &frame, &digest, std::slice::from_ref(&me), &[]).is_ok());
+        assert!(verify_blob_offer(&me, &frame, &digest, &[], std::slice::from_ref(&me)).is_ok());
+        assert!(verify_blob_offer(&me, &frame, &digest, &[], &[]).is_err());
+        assert!(verify_blob_offer(&me, &frame, &[0; 32], std::slice::from_ref(&me), &[]).is_err());
     }
 
     #[test]

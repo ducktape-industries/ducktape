@@ -18,6 +18,7 @@ fn seated(opened: &[&str]) -> Arc<Mutex<Mounted>> {
     }
     assert!(guest.fault.is_none());
     let seat = Arc::new(Mutex::new(Mounted {
+        changes: tokio::sync::watch::channel(()).0,
         slot: Slot::Ready(Box::new(guest)),
         props,
         generation: 1,

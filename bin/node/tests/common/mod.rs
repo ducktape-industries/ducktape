@@ -561,10 +561,24 @@ impl NetworkShapeCluster {
         }
     }
 
-    /// the `GIT_CONFIG_*` environment a push at node `idx` must carry — the
-    /// shape-cluster twin of [`Cluster::git_push_env`].
-    pub fn git_push_env(&self, idx: usize) -> [(String, String); 3] {
-        git_push_env_for(&self.workspace(idx))
+    /// Seed an automation-owned ref through generic node-origin transport.
+    pub fn seed_forge(&self, idx: usize, source: &Path, repo: &str, branch: &str) {
+        seed_forge_at(
+            self.http_ports[idx],
+            &self.workspace(idx),
+            source,
+            repo,
+            branch,
+        );
+    }
+
+    pub fn clone_forge(&self, idx: usize, repo: &str, destination: &Path) {
+        clone_forge_at(
+            self.http_ports[idx],
+            &self.workspace(idx),
+            repo,
+            destination,
+        );
     }
 
     /// one request against node `idx`'s app surface, carrying that node's
@@ -1900,26 +1914,31 @@ impl Cluster {
             .expect("the node minted an operator credential")
     }
 
-    /// the `GIT_CONFIG_*` environment a push at node `idx`'s smart-HTTP
-    /// surface must carry.
-    ///
-    /// `git-receive-pack` refuses a push that proves nothing (#1292): it takes
-    /// git's own push certificate, or this node's operator credential. A
-    /// harness pushing at a node it spawned IS its operator. `GIT_CONFIG_*`
-    /// rather than `git -c`, exactly as `ops/dogfood-forge.sh` sets it — an
-    /// argv is world-readable through /proc, and this is a secret.
-    pub fn git_push_env(&self, idx: usize) -> [(String, String); 3] {
-        git_push_env_for(&self.workspace(idx))
+    /// Seed an automation-owned ref through generic node-origin transport.
+    pub fn seed_forge(&self, idx: usize, source: &Path, repo: &str, branch: &str) {
+        seed_forge_at(
+            self.http_ports[idx],
+            &self.workspace(idx),
+            source,
+            repo,
+            branch,
+        );
+    }
+
+    pub fn clone_forge(&self, idx: usize, repo: &str, destination: &Path) {
+        clone_forge_at(
+            self.http_ports[idx],
+            &self.workspace(idx),
+            repo,
+            destination,
+        );
     }
 
     /// a duckfs transport for node `idx` whose writes it admits.
     pub fn files(&self, idx: usize) -> duckfs_client::http::HttpNode {
         let token = self.operator_token(idx);
-        duckfs_client::http::HttpNode::new(self.http_base(idx)).with_write_auth(
-            std::sync::Arc::new(move |_method, _path, _body| {
-                vec![(noded::admin::ADMIN_TOKEN_HEADER.to_string(), token.clone())]
-            }),
-        )
+        duckfs_client::http::HttpNode::new(self.http_base(idx))
+            .with_operator_credential(std::sync::Arc::new(move || Some(token.clone())))
     }
 
     /// GET a raw TEXT body from node `idx`'s app surface — for non-json
@@ -1984,22 +2003,103 @@ impl Cluster {
     }
 }
 
-/// the `GIT_CONFIG_*` environment carrying the operator credential minted into
-/// `workspace` — one implementation for both cluster shapes.
-fn git_push_env_for(workspace: &Path) -> [(String, String); 3] {
-    let token = noded::admin::read_operator_token(workspace)
-        .expect("the node minted an operator credential");
-    [
-        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
-        (
-            "GIT_CONFIG_KEY_0".to_string(),
-            "http.extraHeader".to_string(),
-        ),
-        (
-            "GIT_CONFIG_VALUE_0".to_string(),
-            format!("{}: {token}", noded::admin::ADMIN_TOKEN_HEADER),
-        ),
-    ]
+/// Seed an automation-owned ref through generic node-origin transport.
+fn seed_forge_at(port: u16, workspace: &Path, source: &Path, name: &str, branch: &str) {
+    let token = noded::admin::read_operator_token(workspace).unwrap();
+    let request = |path: &str, kind: &str, bytes: &[u8]| {
+        let (status, body) = nettest::try_http_bytes_with(
+            port,
+            "POST",
+            path,
+            kind,
+            &[(noded::admin::ADMIN_TOKEN_HEADER, &token)],
+            bytes,
+        )
+        .unwrap();
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+    };
+    let repo = git2::Repository::open(source).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap().id();
+    let pack = forge::pack_closure_many(&repo, &[head]).unwrap();
+    let digest = request("/v1/files/blob", "application/octet-stream", &pack)["digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let query = serde_json::json!({"target":"forge","query":{"list_refs":{"repo":name}}});
+    let reply = request(
+        "/v1/query",
+        "application/json",
+        &serde_json::to_vec(&query).unwrap(),
+    );
+    let previous = reply["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == branch)
+        .map(|item| {
+            git2::Oid::from_str(item["head"].as_str().unwrap())
+                .unwrap()
+                .as_bytes()
+                .to_vec()
+        });
+    let payload = forge::encode_msg(&forge::ForgeMsg::PushRefs {
+        repo: name.into(),
+        updates: vec![forge::RefUpdate {
+            ref_name: branch.into(),
+            prev_oid: previous,
+            new_oid: Some(head.as_bytes().to_vec()),
+        }],
+        pack_digest: Some(duckfs_core::from_hex_32(&digest).unwrap().to_vec()),
+        cert: None,
+    });
+    request("/v1/submit/raw/forge", "application/octet-stream", &payload);
+}
+
+/// Read the peer's actual objects through the installed service protocol.
+fn clone_forge_at(port: u16, workspace: &Path, name: &str, destination: &Path) {
+    let status = nettest::http_json(port, "GET", "/v1/status", None).1;
+    let config = ducktape_forge_service::Config {
+        node_url: format!("http://127.0.0.1:{port}"),
+        node_key: status["public_key"].as_str().unwrap().into(),
+        chain_id: status["chain_id"].as_str().unwrap().into(),
+        account: 1,
+        label: "git".into(),
+        module: "forge".into(),
+        git_store: workspace.join("forge-repo"),
+        signing_seed: "09".repeat(32),
+    };
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let worker = std::thread::spawn(move || {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let router = ducktape_forge_service::router(config, [b'a'; 64]).unwrap();
+                ready_tx
+                    .send(listener.local_addr().unwrap().port())
+                    .unwrap();
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+    });
+    let service_port = ready_rx.recv().unwrap();
+    let output = Command::new("git").args(["-c", "http.extraHeader=x-duck-upstream-token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "-c", "http.extraHeader=x-duck-route-account: 1", "-c", "http.extraHeader=x-duck-route-label: git",
+        "-c", "http.extraHeader=x-duck-route-revision: 1", "clone", "--quiet", &format!("http://127.0.0.1:{service_port}/{name}")])
+        .arg(destination).output().unwrap();
+    let _ = shutdown.send(());
+    worker.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn command_output(out: &std::process::Output) -> String {

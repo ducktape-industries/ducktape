@@ -2,9 +2,9 @@
 //! materializes them: libgit2 init (non-bare, initial_head main, hermetic),
 //! commits written straight into the odb with the ref set and NOTHING ever
 //! checked out. the provisioner ops run REAL host `git` (same as production);
-//! pushes rendezvous at a `file://` bare repo — the URL is config, production
-//! passes the loopback http URL (that lane is Task 6's e2e). stock git's
-//! fetch-first refusal on the bare remote is the CAS-reject stand-in.
+//! test publication uses a `file://` bare repo. Stock Git's fetch-first
+//! refusal is the compare-and-swap rejection stand-in; production uses
+//! generic blob upload and a committed Forge module operation.
 
 use super::super::NodedProvisioner;
 use super::super::plane_tests::{
@@ -151,7 +151,8 @@ impl Bed {
             crate::agent_provision::test_link(handle.with_forge_repo(&self.repo_base)).await,
             &self.runs_root,
         )
-        .with_forge(Some(self.push_base()), NODE_IDENT)
+        .with_forge(NODE_IDENT)
+        .with_test_publication(self.push_base())
     }
 
     /// A served actor with skill files. `reject_reads` fails their checkout
@@ -166,7 +167,8 @@ impl Bed {
             crate::agent_provision::test_link(handle.with_forge_repo(&self.repo_base)).await,
             &self.runs_root,
         )
-        .with_forge(Some(self.push_base()), NODE_IDENT);
+        .with_forge(NODE_IDENT)
+        .with_test_publication(self.push_base());
         (prov, actor)
     }
 
@@ -272,9 +274,7 @@ async fn a_failed_probe_is_permanent_and_loud_and_leaves_no_debris() {
         crate::agent_provision::test_link(handle.with_forge_repo(&bed.repo_base)).await,
         &bed.runs_root,
     )
-    .with_forge_probed(Some(bed.push_base()), NODE_IDENT, || {
-        Err("git probe exploded".into())
-    });
+    .with_forge_probed(NODE_IDENT, || Err("git probe exploded".into()));
     // PERMANENT: every forge attempt fails with the construction-time reason.
     for run in ["s1:0", "s1:1"] {
         let err = provision_err(prov.provision(&bed.spec(run, &bed.head, false)).await);
@@ -291,19 +291,6 @@ async fn a_failed_probe_is_permanent_and_loud_and_leaves_no_debris() {
 }
 
 #[tokio::test]
-async fn no_http_surface_means_a_clear_forge_provision_error() {
-    let bed = bed();
-    let (handle, _rx, _hub) = NodeHandle::channel();
-    let prov = NodedProvisioner::new(
-        crate::agent_provision::test_link(handle.with_forge_repo(&bed.repo_base)).await,
-        &bed.runs_root,
-    )
-    .with_forge(None, NODE_IDENT);
-    let err = provision_err(prov.provision(&bed.spec("s1:0", &bed.head, false)).await);
-    assert!(err.contains("no http surface"), "{err}");
-}
-
-#[tokio::test]
 async fn a_handle_without_a_forge_repo_base_is_a_clear_error() {
     let bed = bed();
     let (handle, _rx, _hub) = NodeHandle::channel(); // no with_forge_repo
@@ -311,37 +298,9 @@ async fn a_handle_without_a_forge_repo_base_is_a_clear_error() {
         crate::agent_provision::test_link(handle).await,
         &bed.runs_root,
     )
-    .with_forge(Some(bed.push_base()), NODE_IDENT);
+    .with_forge(NODE_IDENT);
     let err = provision_err(prov.provision(&bed.spec("s1:0", &bed.head, false)).await);
     assert!(err.contains("no forge repo base"), "{err}");
-}
-
-#[test]
-fn the_push_base_rewrites_wildcard_binds_to_loopback() {
-    assert_eq!(
-        forge_push_base(Some("0.0.0.0:8844")).as_deref(),
-        Some("http://127.0.0.1:8844/forge")
-    );
-    // a v6 wildcard rewrites to the v6 loopback: a bindv6only [::] listener
-    // refuses 127.0.0.1, which broke every push AND the mid-loop fetch dial.
-    assert_eq!(
-        forge_push_base(Some("[::]:9001")).as_deref(),
-        Some("http://[::1]:9001/forge")
-    );
-    assert_eq!(
-        forge_push_base(Some("127.0.0.1:8844")).as_deref(),
-        Some("http://127.0.0.1:8844/forge")
-    );
-    assert_eq!(
-        forge_push_base(Some("[::1]:8844")).as_deref(),
-        Some("http://[::1]:8844/forge")
-    );
-    // a hostname bind is trusted verbatim (the operator chose it).
-    assert_eq!(
-        forge_push_base(Some("localhost:8844")).as_deref(),
-        Some("http://localhost:8844/forge")
-    );
-    assert_eq!(forge_push_base(None), None);
 }
 
 #[test]
@@ -1608,77 +1567,40 @@ async fn cleanup_after_a_successful_push_leaves_only_the_branch_ref() {
 
 // ---- push credential is resolved at push time, never latched at provision --
 
-/// a minimal smart-HTTP git remote that captures the `x-ducktape-admin-token`
-/// header presented on every `git-receive-pack` POST, into `captured`. It
-/// advertises an unborn repo (so any push is a plain create) and never
-/// advertises `report-status`, so a real `git push` neither needs nor reads a
-/// structured result body — only that a request reached it and what it
-/// carried. This stands in for the node's OWN `/forge/{repo}/…` lane
-/// (`git_http.rs`) without needing that lane's consensus actor behind it.
+/// A generic module/blob endpoint captures the credential used at upload time.
 async fn spawn_credential_capturing_remote(
     captured: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
 ) -> std::net::SocketAddr {
-    fn pkt_line(data: &str) -> Vec<u8> {
-        let mut out = format!("{:04x}", data.len() + 4).into_bytes();
-        out.extend_from_slice(data.as_bytes());
-        out
-    }
-
-    async fn advertise() -> impl axum::response::IntoResponse {
-        let mut body = pkt_line("# service=git-receive-pack\n");
-        body.extend_from_slice(b"0000");
-        body.extend_from_slice(&pkt_line(&format!(
-            "{} capabilities^{{}}\0\n",
-            "0".repeat(40)
-        )));
-        body.extend_from_slice(b"0000");
-        (
-            axum::http::StatusCode::OK,
-            [(
-                axum::http::header::CONTENT_TYPE,
-                "application/x-git-receive-pack-advertisement",
-            )],
-            body,
-        )
-    }
-    let receive = move |headers: axum::http::HeaderMap, _body: axum::body::Bytes| {
+    let upload = move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
         let captured = captured.clone();
         async move {
-            let token = headers
-                .get(crate::admin::ADMIN_TOKEN_HEADER)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            captured.lock().unwrap().push(token);
-            (
-                axum::http::StatusCode::OK,
-                [(
-                    axum::http::header::CONTENT_TYPE,
-                    "application/x-git-receive-pack-result",
-                )],
-                b"0000".to_vec(),
-            )
+            use sha2::{Digest as _, Sha256};
+            captured.lock().unwrap().push(
+                headers
+                    .get(crate::admin::ADMIN_TOKEN_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+            );
+            axum::Json(serde_json::json!({"digest":format!("{:x}",Sha256::digest(&body))}))
         }
     };
-
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
-        .expect("bind a loopback test remote");
-    let address = listener.local_addr().expect("read the test remote address");
-    let app = axum::Router::new()
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = axum::Router::new()
+        .route(
+            "/v1/query",
+            axum::routing::post(|| async { axum::Json(serde_json::json!({"refs":[]})) }),
+        )
+        .route("/v1/files/blob", axum::routing::post(upload))
         .route(
             "/v1/submit",
             axum::routing::post(|| async {
                 axum::Json(super::super::plane_tests::committed_block())
             }),
-        )
-        .route(&format!("/{REPO}/info/refs"), axum::routing::get(advertise))
-        .route(
-            &format!("/{REPO}/git-receive-pack"),
-            axum::routing::post(receive),
         );
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     address
 }
 
@@ -1697,8 +1619,7 @@ async fn a_restart_mid_run_never_leaves_the_push_presenting_the_provision_time_t
     let link = NodeLink::new(format!("http://{remote}"))
         .with_workspace_credential(workspace.path())
         .with_forge_repo(bed.repo_base.clone());
-    let prov = NodedProvisioner::new(link, &bed.runs_root)
-        .with_forge(Some(format!("http://{remote}")), NODE_IDENT);
+    let prov = NodedProvisioner::new(link, &bed.runs_root).with_forge(NODE_IDENT);
 
     let ws = prov
         .provision(&bed.spec("s1:0", &bed.head, false))
@@ -1714,12 +1635,14 @@ async fn a_restart_mid_run_never_leaves_the_push_presenting_the_provision_time_t
     // commit_blocking's push presents whatever the SAME NodeLink reads right
     // now — never the value `provision` observed, because nothing captured
     // it into an owned field.
-    let _ = ws.commit("agent run s1:0", None).await;
+    ws.commit("agent run s1:0", None)
+        .await
+        .expect("generic module publication");
 
     let presented = captured.lock().unwrap().clone();
     assert!(
         !presented.is_empty(),
-        "the fake remote never saw a receive-pack POST"
+        "the fake node never saw a blob upload"
     );
     assert!(
         presented
@@ -1728,4 +1651,38 @@ async fn a_restart_mid_run_never_leaves_the_push_presenting_the_provision_time_t
         "every push attempt must present the CURRENT credential, never the \
          provision-time one: {presented:?}"
     );
+}
+
+struct GitPublication(String);
+impl super::super::forge_publication::Publication for GitPublication {
+    fn push(&self, repo: &str, run: &Path, branch: &str) -> Result<(), String> {
+        run_git(
+            run,
+            &[
+                "push",
+                &format!("{}/{repo}", self.0),
+                &format!("HEAD:refs/heads/{branch}"),
+            ],
+            &[],
+        )
+        .map(|_| ())
+    }
+    fn fetch(&self, repo: &str, run: &Path, branch: &str) -> Result<(), String> {
+        run_git(
+            run,
+            &[
+                "fetch",
+                &format!("{}/{repo}", self.0),
+                &format!("refs/heads/{branch}"),
+            ],
+            &[],
+        )
+        .map(|_| ())
+    }
+}
+impl NodedProvisioner {
+    fn with_test_publication(mut self, base: String) -> Self {
+        self.forge.as_mut().unwrap().publication = std::sync::Arc::new(GitPublication(base));
+        self
+    }
 }

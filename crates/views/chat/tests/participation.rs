@@ -1,0 +1,113 @@
+use chat_view::{boot_native, tick_native};
+use ducktape_view_guest::testing::{answer, item, refuse};
+use ducktape_view_guest::wire::{Frame, Request};
+use serde_json::{Value, json};
+
+fn request<'a>(frame: &'a Frame, kind: &str) -> &'a Request {
+    frame
+        .requests
+        .iter()
+        .find(|request| request.kind == kind)
+        .expect(kind)
+}
+fn payload(request: &Request) -> Value {
+    serde_json::from_slice(&request.payload).unwrap()
+}
+fn start(intent: Value) -> Frame {
+    boot_native();
+    let frame = tick_native(Vec::new());
+    tick_native(vec![item(
+        request(&frame, "chat.props").id,
+        &serde_json::to_vec(&json!({"participation":intent})).unwrap(),
+    )])
+}
+fn proof(frame: &Frame, channel: &str) -> Frame {
+    let request = request(frame, "rpc.admin");
+    assert_eq!(
+        payload(request),
+        json!({"route":"/v1/huddle/node-proof","payload":{"channel_id":channel}})
+    );
+    tick_native(vec![answer(
+        request.id,
+        &serde_json::to_vec(&json!({"node":"aa".repeat(32),"node_proof":"bb".repeat(64)})).unwrap(),
+    )])
+}
+fn on_stack(test: fn()) {
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(test)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn join_uses_the_node_proof_and_emits_completion_after_the_module_accepts() {
+    on_stack(|| {
+        let frame = proof(&start(json!({"kind":"join","channel":"room"})), "room");
+        let operation = request(&frame, "op.submit");
+        assert_eq!(
+            payload(operation),
+            json!({"target":"chat","payload":{"join_huddle":{
+            "channel_id":"room","node":vec![0xaa;32],"node_proof":vec![0xbb;64]}}})
+        );
+        assert!(
+            !frame
+                .requests
+                .iter()
+                .any(|request| request.kind == "host.finish")
+        );
+        let frame = tick_native(vec![answer(operation.id, br#"{"height":1}"#)]);
+        assert_eq!(
+            payload(request(&frame, "host.emit")),
+            json!({"channel":"room"})
+        );
+        assert!(request(&frame, "host.finish").payload.is_empty());
+    });
+}
+
+#[test]
+fn move_leaves_before_joining_and_reports_a_committed_leave_when_join_is_refused() {
+    on_stack(|| {
+        let frame = start(json!({"kind":"move","from":"old","channel":"new"}));
+        let leave = request(&frame, "op.submit");
+        assert_eq!(
+            payload(leave),
+            json!({"target":"chat","payload":{"leave_huddle":{"channel_id":"old"}}})
+        );
+        assert!(
+            !frame
+                .requests
+                .iter()
+                .any(|request| request.kind == "rpc.admin")
+        );
+        let frame = tick_native(vec![answer(leave.id, br#"{"height":1}"#)]);
+        let mint = request(&frame, "rpc.admin");
+        let frame = tick_native(vec![refuse(mint.id, "not seated")]);
+        assert_eq!(
+            payload(request(&frame, "host.emit")),
+            json!({"error":{"message":"not seated","committed":true}})
+        );
+    });
+}
+
+#[test]
+fn a_refused_leave_cannot_continue_to_join() {
+    on_stack(|| {
+        let frame = start(json!({"kind":"move","from":"old","channel":"new"}));
+        let frame = tick_native(vec![refuse(
+            request(&frame, "op.submit").id,
+            "leave refused",
+        )]);
+        assert!(
+            !frame
+                .requests
+                .iter()
+                .any(|request| request.kind == "rpc.admin")
+        );
+        assert_eq!(
+            payload(request(&frame, "host.emit")),
+            json!({"error":{"message":"leave refused","committed":false}})
+        );
+    });
+}

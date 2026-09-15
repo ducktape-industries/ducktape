@@ -383,6 +383,7 @@ pub(crate) fn wire_reachability_plane<S, R>(
         futures::channel::oneshot::Sender<S>,
         futures::channel::oneshot::Sender<R>,
     )>,
+    boot: NetstackBoot,
 ) -> tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>
 where
     S: P2pSender<PublicKey = ed25519::PublicKey> + Send + Sync + 'static,
@@ -408,6 +409,13 @@ where
     let key_file = wireguard_key_file.to_path_buf();
     let state_file = mesh_state_file.to_path_buf();
     let nudge_tx = cmd_tx.clone();
+    let (start, startup) = tokio::sync::oneshot::channel();
+    let generation = publish_live_plane(&cmd_tx, start);
+    match boot {
+        NetstackBoot::Bootstrap => start_pending_netstack(generation, netstack_backend()),
+        NetstackBoot::Selected(backend) => start_pending_netstack(generation, backend),
+        NetstackBoot::AwaitRegistry => {}
+    }
     std::thread::Builder::new()
         .name("reachability".into())
         .spawn(move || {
@@ -436,6 +444,8 @@ where
                     nudge_tx,
                     ev_tx,
                     reach_carrying,
+                    generation,
+                    startup,
                 ));
         })
         .expect("spawn reachability thread");
@@ -741,7 +751,6 @@ where
                 }
             });
     }
-    publish_live_plane(&cmd_tx);
     cmd_tx
 }
 
@@ -755,12 +764,130 @@ where
 /// is created and replaced exactly where it is replaced. It holds a WEAK
 /// sender: a torn-down plane's lane must not be kept alive by an operator
 /// route that may never be called.
-static LIVE_PLANE: std::sync::RwLock<
-    Option<tokio::sync::mpsc::WeakSender<reachability::ReachabilityCommand>>,
-> = std::sync::RwLock::new(None);
+pub(crate) enum NetstackBoot {
+    /// Only a joiner without restored chain state uses the staged bootstrap.
+    Bootstrap,
+    Selected(Result<reachability::NetstackBackend, String>),
+    AwaitRegistry,
+}
 
-fn publish_live_plane(cmds: &tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>) {
-    *LIVE_PLANE.write().expect("live plane lock poisoned") = Some(cmds.downgrade());
+type Startup = tokio::sync::oneshot::Sender<Result<reachability::NetstackBackend, String>>;
+struct LivePlane {
+    generation: u64,
+    commands: tokio::sync::mpsc::WeakSender<reachability::ReachabilityCommand>,
+    startup: Option<Startup>,
+}
+impl LivePlane {
+    fn take_start(&mut self, generation: u64) -> Option<Startup> {
+        if self.generation != generation {
+            return None;
+        }
+        self.startup.take()
+    }
+}
+static LIVE_PLANE: std::sync::RwLock<Option<LivePlane>> = std::sync::RwLock::new(None);
+
+/// Release a restored plane only after reading its authoritative registry.
+/// Already-running planes are replaced through the ordinary snapshot swap.
+pub(crate) fn start_pending_netstack(
+    generation: u64,
+    backend: Result<reachability::NetstackBackend, String>,
+) {
+    let start = LIVE_PLANE
+        .write()
+        .expect("live plane lock poisoned")
+        .as_mut()
+        .and_then(|live| live.take_start(generation));
+    if let Some(start) = start {
+        let _ = start.send(backend);
+    }
+}
+
+pub(crate) fn startup_pending(generation: u64) -> bool {
+    LIVE_PLANE
+        .read()
+        .expect("live plane lock poisoned")
+        .as_ref()
+        .is_some_and(|live| live.generation == generation && live.startup.is_some())
+}
+
+/// A publication identifies one plane life. Revision changes only when actual
+/// execution changes, so a refused deployment is retried after replacement.
+#[derive(Clone, Debug)]
+pub(crate) struct PlaneExecution {
+    pub generation: u64,
+    pub revision: u64,
+    pub status: reachability::BackendStatus,
+}
+
+impl PlaneExecution {
+    fn record(&mut self, generation: u64, status: reachability::BackendStatus) -> bool {
+        let same_plane = self.generation == generation;
+        let changed = self.status != status;
+        if !same_plane || !changed {
+            return false;
+        }
+        self.revision += 1;
+        self.status = status;
+        true
+    }
+}
+
+fn execution() -> &'static tokio::sync::watch::Sender<PlaneExecution> {
+    static EXECUTION: std::sync::OnceLock<tokio::sync::watch::Sender<PlaneExecution>> =
+        std::sync::OnceLock::new();
+    EXECUTION.get_or_init(|| {
+        tokio::sync::watch::channel(PlaneExecution {
+            generation: 0,
+            revision: 0,
+            status: reachability::BackendStatus::Stopped,
+        })
+        .0
+    })
+}
+
+pub(crate) fn watch_execution() -> tokio::sync::watch::Receiver<PlaneExecution> {
+    execution().subscribe()
+}
+
+pub(crate) async fn observe_execution(metrics: noded::NodeMetrics) {
+    let mut changes = watch_execution();
+    loop {
+        let current = changes.borrow_and_update().clone();
+        metrics.set_netstack_execution(
+            current.status.name(),
+            current
+                .status
+                .code_hash()
+                .map(|hash| crate::config::hex_bytes(&hash)),
+        );
+        if changes.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn publish_live_plane(
+    cmds: &tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
+    startup: Startup,
+) -> u64 {
+    static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    *LIVE_PLANE.write().expect("live plane lock poisoned") = Some(LivePlane {
+        generation,
+        commands: cmds.downgrade(),
+        startup: Some(startup),
+    });
+    execution().send_replace(PlaneExecution {
+        generation,
+        revision: 0,
+        status: reachability::BackendStatus::Starting,
+    });
+    generation
+}
+
+fn record_execution(generation: u64, status: reachability::BackendStatus) {
+    execution().send_if_modified(|live| live.record(generation, status));
 }
 
 /// What one swap attempt came to. THE distinction a retrying caller needs: a
@@ -790,7 +917,6 @@ pub(crate) enum SwapAnswer {
 /// its component is already a verified chunk on the blob plane.
 pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> SwapAnswer {
     let backend = match request {
-        noded::NetstackSwapRequest::Native => reachability::NetstackBackend::Native,
         noded::NetstackSwapRequest::Component(path) => {
             let component = match std::fs::read(&path) {
                 Ok(bytes) => bytes,
@@ -812,8 +938,8 @@ pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> SwapAn
     let lane = LIVE_PLANE
         .read()
         .expect("live plane lock poisoned")
-        .clone()
-        .and_then(|weak| weak.upgrade());
+        .as_ref()
+        .and_then(|live| live.commands.upgrade());
     let Some(lane) = lane else {
         return SwapAnswer::Unattempted("the reachability plane is not running".to_string());
     };
@@ -842,8 +968,7 @@ pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> SwapAn
 /// machine that was running still is.
 pub(crate) fn record_swap(metrics: &noded::NodeMetrics, answer: &SwapAnswer) {
     match answer {
-        SwapAnswer::Swapped(backend) => {
-            metrics.set_netstack_backend(backend.clone());
+        SwapAnswer::Swapped(_) => {
             metrics.record_netstack_swap(noded::NetstackSwapOutcome::Swapped, None);
         }
         SwapAnswer::Refused(reason) | SwapAnswer::Unattempted(reason) => {
@@ -886,8 +1011,40 @@ async fn reachability_plane(
     events: tokio::sync::mpsc::Sender<reachability::ReachabilityEvent>,
     // the handshake sampler's publication seam (see [`CarryingPeers`]).
     carrying: CarryingPeers,
+    generation: u64,
+    startup: tokio::sync::oneshot::Receiver<Result<reachability::NetstackBackend, String>>,
 ) {
     use std::net::ToSocketAddrs as _;
+    // Every early return marks this plane failed; successful shutdown is
+    // published by run_observed before this guard drops.
+    struct ExecutionGuard(u64);
+    impl Drop for ExecutionGuard {
+        fn drop(&mut self) {
+            let current = execution().borrow().clone();
+            let still_starting = current.status == reachability::BackendStatus::Starting;
+            if current.generation == self.0 && still_starting {
+                record_execution(
+                    self.0,
+                    reachability::BackendStatus::Failed("plane startup failed".into()),
+                );
+            }
+        }
+    }
+    let _execution_guard = ExecutionGuard(generation);
+    let backend = match startup
+        .await
+        .unwrap_or_else(|_| Err("netstack startup selection cancelled".into()))
+    {
+        Ok(backend) => backend,
+        Err(error) => {
+            record_execution(
+                generation,
+                reachability::BackendStatus::Failed(error.clone()),
+            );
+            tracing::error!(target: "ducktape::reachability", reason = "netstack_guest_unreadable", error = %error, "reachability plane cannot start");
+            return;
+        }
+    };
     let policy = reachability::open_port_policy();
     // the plane's records carry IP literals only (the endpoint parser
     // rejects DNS); a hostname ingress resolves ONCE at plane start.
@@ -1204,7 +1361,7 @@ async fn reachability_plane(
         // joiner's gossip arrives under its REAL key — the mesh re-track at
         // its Redeem grant is what admits it.
         gossip_ingress: None,
-        backend: netstack_backend(),
+        backend,
     };
     // the invite intro listener: a fresh joiner's first contact. one
     // datagram carries the token, the joiner's identity + proof, and its
@@ -1366,7 +1523,12 @@ async fn reachability_plane(
     );
     // take the probe BEFORE the effect is moved into the orchestrator.
     spawn_handshake_sampler(effect.probe_slot(), label.clone(), carrying);
-    if let Err(err) = reachability::run(config, effect, resolver, commands, events).await {
+    if let Err(err) =
+        reachability::run_observed(config, effect, resolver, commands, events, |status| {
+            record_execution(generation, status)
+        })
+        .await
+    {
         tracing::error!(
             target: "ducktape::reachability",
             node = %label,
@@ -1377,54 +1539,20 @@ async fn reachability_plane(
     }
 }
 
-/// Which machine drives the reachability plane. `DUCKTAPE_NETSTACK=guest`
-/// runs the wasm component; unset or `native` runs the machine compiled
-/// into this binary. Any other value is refused loudly and runs native —
-/// a typo must never pick a backend by accident.
-pub(crate) fn netstack_backend() -> reachability::NetstackBackend {
-    let requested = std::env::var("DUCKTAPE_NETSTACK").ok();
-    match requested.as_deref() {
-        Some("guest") => netstack_guest_backend(),
-        Some("native") | None => reachability::NetstackBackend::Native,
-        Some(_) => {
-            tracing::warn!(
-                target: "ducktape::reachability",
-                reason = "netstack_backend_unknown",
-                "DUCKTAPE_NETSTACK names no backend; running native"
-            );
-            reachability::NetstackBackend::Native
-        }
-    }
+/// The node always runs the staged WASM component. A joiner needs this file
+/// before it can reach the mesh and obtain genesis; no native fallback exists.
+pub(crate) fn netstack_backend() -> Result<reachability::NetstackBackend, String> {
+    let dir = workspace_config::modules_dir()?;
+    let path = workspace_config::netstack_component_path(&dir);
+    load_netstack_backend(&path)
 }
 
-/// The netstack guest: the reachability machine as a `ducktape:netstack`
-/// component, read from the founding set beside this binary
-/// (`netstack.component.wasm`, staged by the build from the machine crate's
-/// committed artifact). Not a genesis artifact: a joiner runs this machine to
-/// reach the mesh BEFORE it holds any genesis. A guest the founding set
-/// cannot supply is refused loudly and runs native, exactly like a backend
-/// name that names nothing — the operator asked for a machine this build
-/// did not stage.
-fn netstack_guest_backend() -> reachability::NetstackBackend {
-    let component = workspace_config::modules_dir().and_then(|dir| {
-        let path = workspace_config::netstack_component_path(&dir);
-        std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))
-    });
-    match component {
-        Ok(component) => reachability::NetstackBackend::Guest {
-            component,
-            step_fuel: reachability::NETSTACK_STEP_FUEL,
-        },
-        Err(error) => {
-            tracing::warn!(
-                target: "ducktape::reachability",
-                reason = "netstack_guest_unreadable",
-                error = %error,
-                "DUCKTAPE_NETSTACK=guest but the founding set has no readable netstack guest; running native"
-            );
-            reachability::NetstackBackend::Native
-        }
-    }
+fn load_netstack_backend(path: &std::path::Path) -> Result<reachability::NetstackBackend, String> {
+    let component = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(reachability::NetstackBackend::Guest {
+        component,
+        step_fuel: reachability::NETSTACK_STEP_FUEL,
+    })
 }
 
 /// how long a peer may hold NO live session before it is called DARK.
@@ -1575,4 +1703,55 @@ pub(crate) fn underlay_addr(
     addrs: impl IntoIterator<Item = std::net::SocketAddr>,
 ) -> Option<std::net::SocketAddr> {
     addrs.into_iter().find(std::net::SocketAddr::is_ipv4)
+}
+
+#[cfg(test)]
+mod netstack_execution_tests {
+    #[tokio::test]
+    async fn startup_selection_is_delivered_only_to_its_plane_generation() {
+        let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+        let (startup, selected) = tokio::sync::oneshot::channel();
+        let mut live = super::LivePlane {
+            generation: 2,
+            commands: commands.downgrade(),
+            startup: Some(startup),
+        };
+        assert!(live.take_start(1).is_none());
+        let start = live
+            .take_start(2)
+            .expect("the current generation is still gated");
+        start
+            .send(Err("designated component unavailable".into()))
+            .unwrap();
+        assert_eq!(
+            selected.await.unwrap().unwrap_err(),
+            "designated component unavailable"
+        );
+        assert!(live.take_start(2).is_none());
+    }
+
+    #[test]
+    fn execution_from_a_retired_plane_cannot_overwrite_its_successor() {
+        let mut live = super::PlaneExecution {
+            generation: 2,
+            revision: 0,
+            status: reachability::BackendStatus::Starting,
+        };
+        assert!(!live.record(1, reachability::BackendStatus::Failed("old plane".into())));
+        assert!(live.record(
+            2,
+            reachability::BackendStatus::Running { code_hash: [7; 32] }
+        ));
+        assert_eq!(live.status.code_hash(), Some([7; 32]));
+        assert!(!live.record(1, reachability::BackendStatus::Stopped));
+        assert_eq!(live.revision, 1);
+        assert!(live.record(2, reachability::BackendStatus::Failed("guest fault".into())));
+        assert_eq!(live.status.code_hash(), None);
+    }
+
+    #[test]
+    fn a_missing_boot_component_is_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(super::load_netstack_backend(&directory.path().join("missing.wasm")).is_err());
+    }
 }

@@ -239,8 +239,7 @@ pub struct Client {
     /// neither it nor a per-request user signature, so a client without one
     /// READS — its writes come back as the node's 401 naming the credential.
     operator_token: Option<String>,
-    /// The PERSON's proof for a raw-bytes write lane (`/v1/files/stage`,
-    /// `/v1/files/blob`): signs each request with the acting key, bound to the
+    /// The PERSON's proof for a raw-bytes write lane (`/v1/files/blob`): signs each request with the acting key, bound to the
     /// target node, so the node records the person as the writer and charges
     /// the write to them. Preferred over the operator credential when both
     /// are held — a credentialed write is the node's, not the person's.
@@ -533,55 +532,9 @@ impl Client {
         Ok(reply.blocks)
     }
 
-    /// One GET against a `/v1/files/*` read lane, query-string params, JSON
-    /// reply verbatim — the files browser's transport.
-    pub async fn files_get(
-        &self,
-        lane: &str,
-        params: &[(&str, &str)],
-    ) -> Result<serde_json::Value> {
-        let mut url = self.url(&format!("v1/files/{lane}"))?;
-        {
-            let mut pairs = url.query_pairs_mut();
-            for (key, value) in params {
-                pairs.append_pair(key, value);
-            }
-        }
-        let response = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| Error::new(format!("RPC files {lane} failed: {error}")))?;
-        decode_json(response).await
-    }
-
-    /// Stage one duckfs chunk (`POST /v1/files/stage`, raw bytes ≤ 1 MiB) —
-    /// returns the staged chunk's digest.
-    pub async fn files_stage(&self, bytes: Vec<u8>) -> Result<String> {
-        let response = self
-            .proven(
-                self.http.post(self.url("v1/files/stage")?),
-                "POST",
-                "/v1/files/stage",
-                &bytes,
-            )
-            .header("content-type", "application/octet-stream")
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|error| Error::new(format!("RPC files stage failed: {error}")))?;
-        #[derive(Deserialize)]
-        struct Staged {
-            digest: String,
-        }
-        let reply: Staged = decode_json(response).await?;
-        Ok(reply.digest)
-    }
-
     /// Land raw bytes in the node-local BLOB store (`POST /v1/files/blob`) —
     /// the op-receipt lane forge fetches `PushRefs`/`MergePr` packfiles from by
-    /// digest. A distinct plane from [`Self::files_stage`]'s duckfs chunk lane:
+    /// digest. A distinct plane from module-owned Files chunk staging:
     /// a pack staged there would never be found by a `pack_digest` lookup.
     pub async fn put_blob(&self, bytes: Vec<u8>) -> Result<String> {
         let response = self

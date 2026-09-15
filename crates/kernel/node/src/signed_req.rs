@@ -110,22 +110,22 @@ mod tests {
         let signer = ed25519::PrivateKey::from_seed(11);
         let node_key = [7u8; 32];
         let body = b"raw chunk bytes";
-        let headers = request_headers(&signer, "POST", "/v1/files/stage", &node_key, body);
+        let headers = request_headers(&signer, "POST", "/v1/files/blob", &node_key, body);
         let [(key_name, key_hex), (ts_name, ts), (sig_name, sig_hex)] = headers;
         assert_eq!((key_name, ts_name, sig_name), (KEY_HEADER, TS_HEADER, SIG_HEADER));
         assert_eq!(key_hex, hex(signer.public_key().as_ref()));
 
         let ts: u64 = ts.parse().expect("decimal seconds");
-        let sig = sign_request(&signer, "POST", "/v1/files/stage", &node_key, ts, body);
+        let sig = sign_request(&signer, "POST", "/v1/files/blob", &node_key, ts, body);
         assert_eq!(sig_hex, hex(sig.as_ref()), "the header carries this signature");
-        let message = request_message("POST", "/v1/files/stage", &node_key, ts, body);
+        let message = request_message("POST", "/v1/files/blob", &node_key, ts, body);
         assert!(signer.public_key().verify(DATA_REQ_NS, &message, &sig));
 
         // the body is inside the signed bytes: a swapped payload does not verify.
-        let swapped = request_message("POST", "/v1/files/stage", &node_key, ts, b"other");
+        let swapped = request_message("POST", "/v1/files/blob", &node_key, ts, b"other");
         assert!(!signer.public_key().verify(DATA_REQ_NS, &swapped, &sig));
         // and so is the node: the same request signed for another node fails.
-        let elsewhere = request_message("POST", "/v1/files/stage", &[8u8; 32], ts, body);
+        let elsewhere = request_message("POST", "/v1/files/blob", &[8u8; 32], ts, body);
         assert!(!signer.public_key().verify(DATA_REQ_NS, &elsewhere, &sig));
     }
 }

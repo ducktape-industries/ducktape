@@ -411,6 +411,7 @@ fn alice_fronts_the_gateway(
         let (ok, output) = cluster.run_verb(&[
             "gateway",
             "bind",
+        "--trusted-loopback",
             "--workspace",
             workspace.to_str().unwrap(),
             "--label",
@@ -874,6 +875,7 @@ fn airlock_over_gateway_two_wireguard_nodes() {
     let (ok, output) = cluster.run_verb(&[
         "gateway",
         "bind",
+        "--trusted-loopback",
         "--workspace",
         workspace.to_str().unwrap(),
         "--label",
@@ -1168,6 +1170,7 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
         let (ok, output) = cluster.run_verb(&[
             "gateway",
             "bind",
+        "--trusted-loopback",
             "--workspace",
             workspace.to_str().unwrap(),
             "--label",

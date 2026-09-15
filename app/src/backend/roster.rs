@@ -64,19 +64,6 @@ pub(crate) fn names() -> NameDirectory {
     read_names().directory.clone()
 }
 
-/// The generation the directory is at: it moves on every read that seats
-/// one, so a holder of [`names_at`]'s snapshot compares generations instead
-/// of directories.
-pub(crate) fn names_generation() -> u64 {
-    read_names().generation
-}
-
-/// The directory and the generation it is at, read together.
-pub(crate) fn names_at() -> (u64, NameDirectory) {
-    let names = read_names();
-    (names.generation, names.directory.clone())
-}
-
 /// Every identity account, paged the way the module serves them: numbered
 /// from 1 with no gaps, at most `MAX_QUERY_LIMIT` per page. THE ONE read of
 /// the identity roster; the name directory is rewritten from what it returns.

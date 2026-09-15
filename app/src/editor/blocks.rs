@@ -530,6 +530,10 @@ impl WireEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if let wire::WidgetCommand::EditorAction { tag, .. } = command {
+            self.interaction(EditorInteraction::Action { tag: tag.clone() }, cx);
+            return true;
+        }
         let at = |index: u32| {
             position(
                 &self.preview,

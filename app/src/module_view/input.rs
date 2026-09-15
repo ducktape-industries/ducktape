@@ -99,7 +99,8 @@ impl Route {
             });
             return;
         }
-        let accepted = deliver(guest, event);
+        let dropped = super::filesystem::observe_drop(guest, &event);
+        let accepted = deliver(guest, event) || dropped;
         drop(locked);
         if accepted {
             let view = self.view.clone();

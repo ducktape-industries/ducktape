@@ -286,7 +286,7 @@ fn submit(
     let request = collaboration::Request::new(network, op);
     let frame =
         crate::userkey_cli::user_frame(signer, COLLABORATION, collaboration::encode_msg(&request));
-    Ok(crate::node_http::submit_frame(base, &frame)?)
+    crate::node_http::submit_frame(base, &frame)
 }
 
 /// Submit one chat op the same way. A chat op carries no network name of its
@@ -299,7 +299,7 @@ fn submit_chat(
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let frame =
         crate::userkey_cli::user_frame(signer, chat::DEFAULT_CHAT_TARGET, chat::encode_msg(&op));
-    Ok(crate::node_http::submit_frame(base, &frame)?)
+    crate::node_http::submit_frame(base, &frame)
 }
 
 /// A participant flag as the party it names, or a refusal naming the flag.

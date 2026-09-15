@@ -31,11 +31,15 @@ A huddle is the one feature whose failure mode is BETWEEN two people, so its
 coverage is layered and the top layer has to be run by hand:
 
 ```bash
-cargo test -p node-bin --test huddle_media_e2e   # two real nodes, real overlay,
-                                                 # the late-joiner deadlock and its cure
+cargo test -p ducktape-media                    # auth, fanout, revocation, process restart
+cargo test --manifest-path crates/views/Cargo.toml -p call-view # guest/device contract
 ops/huddle-lane.sh                               # stands a two-node network up and
                                                  # prints one command per side
 ```
+
+Before the live lane, install and publish the media service for each channel
+owner and deploy the `call` view using `docs/deploy/application-service.md`. The
+helper launches nodes and apps; it does not install application services.
 
 `ops/huddle-lane.sh` is the live lane: two real nodes, one user key per side,
 and `app/src/tests/huddle_live.rs` run once per side (it is `#[ignore]`d, so it
@@ -231,10 +235,12 @@ is no longer the admin namespace's alone (below).
 `/v1` route takes EITHER a per-request signature or that same operator
 credential, in the same `x-ducktape-admin-token` header. Reads stay open.
 
-- MODULE-BOUND — `/v1/submit`, the duckfs writes, `/v1/files/object/{path}`
-  PUT/DELETE, `POST /v1/fs/workspaces` and its commit — take ANY key's
-  signature: the key becomes the op's origin and the module authorizes it.
-- NODE-LEVEL — `/v1/invite`, `/v1/log-filter`, `/v1/term/sessions`,
+- USER OPERATIONS — `/v1/submit/frame` verifies the operation's signed frame;
+  Files clients send module queries through `/v1/query` and writes through this
+  generic frame lane. No product-specific Files HTTP endpoints are registered.
+- ACTING KEY — the blob upload, `POST /v1/fs/workspaces` and its commit accept
+  a request signature; the workspace adapter carries that acting identity.
+- NODE-LEVEL — `/v1/submit`, `/v1/submit/raw/{target}`, `/v1/invite`, `/v1/log-filter`, `/v1/term/sessions`,
   `DELETE /v1/fs/workspaces/{id}` — take the operator credential or a signature
   by the node's own operator key (its active wallet key at boot). A signature by
   any other key is `403 not_operator`.

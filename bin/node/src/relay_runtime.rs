@@ -448,7 +448,9 @@ impl ValidatorRelay {
                 total,
             } => {
                 let frame_id = node::frame_id(&frame);
-                if let Err(detail) = relay::verify_blob_offer(&frame, &digest, members, residents) {
+                if let Err(detail) =
+                    relay::verify_blob_offer(peer.as_ref(), &frame, &digest, members, residents)
+                {
                     send_blob_result(relay_tx, &peer, frame_id, digest, Some(detail));
                     return None;
                 }

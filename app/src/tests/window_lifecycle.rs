@@ -294,19 +294,6 @@ fn the_command_chords_are_classified_in_one_extern() {
     assert!(route.contains("window_target(self.focused_win"));
 }
 #[test]
-fn a_dropped_file_starts_a_files_upload_only_on_the_files_tab() {
-    let mut app = Ducktape::initial_state();
-    app.connected = true;
-    app.shell_tab = ShellTab::Pages;
-    let _ = app.update(AppMessage::FsFileDropped("/tmp/notes.md".into()));
-    assert!(!app.fs_dropping);
-    app.shell_tab = ShellTab::Files;
-    app.fs_drop_dir = "/shared/reports".into();
-    let _ = app.update(AppMessage::FsFileDropped("/tmp/notes.md".into()));
-    assert!(app.fs_dropping);
-    assert!(handler_body("FsFileDropped").contains("self.fs_drop_dir"));
-}
-#[test]
 fn authentication_operations_always_have_replace_lanes() {
     for operation in ["register_passkey(", "login_with_passkey(", "link_wallet("] {
         let routes: Vec<_> = handler_bodies()
