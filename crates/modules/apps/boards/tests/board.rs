@@ -233,3 +233,32 @@ fn board_creator_uses_the_shared_actor_convention_for_passkeys() {
         assert_eq!(board.owner, owner);
     });
 }
+
+#[test]
+fn the_consensus_reducer_has_one_exhaustive_delegating_dispatch() {
+    let file = syn::parse_file(include_str!("../src/interface.rs")).unwrap();
+    let reducer = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Impl(item) => Some(item),
+            _ => None,
+        })
+        .flat_map(|item| &item.items)
+        .find_map(|item| match item {
+            syn::ImplItem::Fn(method) if method.sig.ident == "changed" => Some(method),
+            _ => None,
+        })
+        .unwrap();
+    let [syn::Stmt::Expr(syn::Expr::Match(dispatch), None)] = reducer.block.stmts.as_slice() else {
+        panic!("one dispatch only")
+    };
+    for arm in &dispatch.arms {
+        assert!(arm.guard.is_none());
+        assert!(!matches!(arm.pat, syn::Pat::Wild(_)));
+        assert!(
+            matches!(*arm.body, syn::Expr::MethodCall(_)),
+            "each event delegates to a named pure handler"
+        );
+    }
+}

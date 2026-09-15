@@ -62,7 +62,7 @@ impl Guest {
         if let Some(root) = &frame.root {
             self.tree = Some(root.clone());
         } else if !frame.patches.is_empty() {
-            wire::apply(self.tree.as_mut().unwrap(), &frame.patches).unwrap();
+            wire::apply(self.tree.as_mut().unwrap(), frame.patches.clone()).unwrap();
         }
         frame.root = self.tree.clone();
         assert!(!wire::sanitize(&mut frame).unwrap().display_text_truncated);
