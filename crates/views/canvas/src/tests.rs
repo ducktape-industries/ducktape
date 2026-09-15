@@ -1127,3 +1127,108 @@ fn a_nudge_shows_on_the_board_before_it_is_let_go_of() {
         "and nothing was sent for it yet"
     );
 }
+
+#[test]
+fn the_grid_is_a_ruler_the_camera_moves_over_and_not_wallpaper() {
+    let mut view = view();
+    view.on_size(1200., 800.);
+    // The step is read back off the dots: the gap between the first two in a
+    // row, divided by the zoom, is how many board units one square is worth.
+    let step = |view: &BoardsView| {
+        let dots = view.grid(3600);
+        let mut xs: Vec<f32> = dots
+            .iter()
+            .filter_map(|draw| match draw {
+                wire::CanvasCommand::Draw {
+                    shape: wire::CanvasShape::Circle { center, .. },
+                    ..
+                } => Some(center[0]),
+                _ => None,
+            })
+            .collect();
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        xs.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        assert!(xs.len() > 2, "the lattice is too sparse to measure");
+        (xs[1] - xs[0]) / view.zoom
+    };
+    for (zoom, expected) in [(1., 32.), (0.5, 64.), (0.25, 128.), (2., 32.), (8., 32.)] {
+        view.zoom = zoom;
+        assert_eq!(
+            step(&view),
+            expected,
+            "at {zoom}x a square should be {expected} board units"
+        );
+    }
+    // And whatever the step, the dots stay far enough apart to read as dots.
+    for zoom in [0.1, 0.35, 1.7, 6.] {
+        view.zoom = zoom;
+        assert!(
+            step(&view) * zoom >= 24.,
+            "the dots ran together at {zoom}x"
+        );
+    }
+}
+
+#[test]
+fn the_colour_for_the_next_shape_is_reachable_with_nothing_selected() {
+    let mut view = view();
+    assert!(view.selected.is_empty());
+    let json = serde_json::to_string(&view.view()).unwrap();
+    assert!(
+        json.contains("boards/colors"),
+        "the palette is the only way to choose a colour before drawing"
+    );
+    // and it is the colour the next shape is actually drawn in
+    view.on_color(3);
+    assert_eq!(
+        view.creation_shape(Kind::Rectangle, [0., 0.], [0., 0.])
+            .color,
+        3
+    );
+}
+
+#[test]
+fn a_card_too_long_to_save_can_still_be_left() {
+    let mut view = view();
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            text: "kept".into(),
+            ..Default::default()
+        },
+    });
+    view.selected = ["a".into()].into();
+    view.begin_text();
+    let overlong = "x".repeat(boards::MAX_TEXT + 10);
+    view.inline.as_mut().unwrap().document = Editor::new(overlong);
+    // Done keeps the words and says what is wrong, by how much, and the way out
+    view.finish_text();
+    assert!(view.inline.is_some(), "Done must not lose what you wrote");
+    assert!(view.error.contains(&format!("{}", boards::MAX_TEXT + 10)));
+    assert!(view.error.contains("Escape"));
+    // and Escape is that way out: the card goes back to what it held
+    view.on_cancel();
+    assert!(view.inline.is_none(), "Escape left the editor open");
+    assert!(view.error.is_empty());
+    assert_eq!(view.visible().unwrap().shapes["a"].shape.text, "kept");
+}
+
+#[test]
+fn the_two_keys_that_leave_a_card_are_not_the_same_answer() {
+    // The editor claims Escape and Command-Enter, and both arrive as one
+    // commit. They must part on the key that asked for it: Command-Enter
+    // keeps what you wrote, Escape is the way out of a card the board will
+    // not take. Routing both to the same message is what made an over-long
+    // card impossible to leave, and it is invisible in every other test —
+    // the claim is the host's side of a seam this crate cannot drive.
+    let source = include_str!("presentation.rs");
+    assert!(
+        source.contains("Named::Escape) =>"),
+        "the observer must tell Escape apart from the other claimed key"
+    );
+    assert_eq!(
+        source.matches("Some(Message::Cancel)").count(),
+        1,
+        "Escape leaves through the cancel path, once"
+    );
+}

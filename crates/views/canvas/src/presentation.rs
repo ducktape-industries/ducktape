@@ -138,6 +138,10 @@ fn alpha(mut color: [f32; 4], alpha: f32) -> [f32; 4] {
 }
 /// The inset a card keeps around its text, in board units.
 const CARD_INSET: f32 = 12.;
+/// The finest the board's lattice is drawn at, in board units. Every step the
+/// grid ever takes is this doubled, so a dot always stands on a coordinate a
+/// reader could name.
+const GRID: f32 = 32.;
 /// One card's words, as both the painter and the editor must lay them out.
 pub(super) struct Lettering {
     /// Screen-space type size, already scaled by the camera.
@@ -410,10 +414,20 @@ impl BoardsView {
     }
     /// Top-right, while cards are chosen: what can be done to them.
     fn inspector_island(&self, board: &Board) -> Option<Node> {
-        let count = self.selected.len();
-        let shown = count > 0 && self.inline.is_none();
-        if !shown {
+        if self.inline.is_some() {
             return None;
+        }
+        let count = self.selected.len();
+        // With nothing picked the palette still says what the next shape will
+        // be drawn in — and it was the one control on this panel you could not
+        // reach, so the only way to choose a colour was to draw something in
+        // the wrong one and recolour it. It stands on its own.
+        if count == 0 {
+            return Some(kit::sized(
+                self.next_color(),
+                Some(Length::Fixed(204.)),
+                None,
+            ));
         }
         let only = self.only_selected().and_then(|id| board.shapes.get(id));
         let name = match only {
@@ -440,7 +454,17 @@ impl BoardsView {
                     [
                         kit::nowrap(kit::caption(
                             "boards/typing-hint",
-                            format!("Enter for a new line · {length}/{}", boards::MAX_TEXT),
+                            // Past the limit the count stops being background
+                            // information and becomes the only thing that
+                            // matters, so it says what to do about it.
+                            if length > boards::MAX_TEXT {
+                                format!(
+                                    "{} too long · Escape leaves the card as it was",
+                                    length - boards::MAX_TEXT
+                                )
+                            } else {
+                                format!("Enter for a new line · {length}/{}", boards::MAX_TEXT)
+                            },
                         )),
                         kit::spacer(),
                         action(
@@ -570,16 +594,36 @@ impl BoardsView {
             None,
         ))
     }
+    /// The colour the next shape will be drawn in, on its own, for when there
+    /// is no selection to recolour.
+    fn next_color(&self) -> Node {
+        kit::card(
+            "boards/next-color",
+            kit::spaced(
+                kit::column(
+                    "boards/next-color-body",
+                    [
+                        kit::caption("boards/next-color-label", "New shape"),
+                        self.swatches(),
+                    ],
+                ),
+                6.,
+            ),
+        )
+    }
+    fn swatches(&self) -> Node {
+        kit::spaced(
+            kit::row(
+                "boards/colors",
+                (0..5).map(|color| swatch(color, self.palette == color)),
+            ),
+            4.,
+        )
+    }
     fn inspector(&self, name: String, count: usize, writable: bool) -> Node {
         let mut properties = vec![
             kit::heading("boards/selection-title", name),
-            kit::spaced(
-                kit::row(
-                    "boards/colors",
-                    (0..5).map(|color| swatch(color, self.palette == color)),
-                ),
-                4.,
-            ),
+            self.swatches(),
             kit::divider("boards/properties-rule"),
         ];
         if writable {
@@ -907,9 +951,18 @@ impl BoardsView {
     }
     /// A faint dot lattice that tracks the camera, drawn no denser than the
     /// parts it was given.
-    fn grid(&self, budget: usize) -> Vec<Draw> {
+    pub(super) fn grid(&self, budget: usize) -> Vec<Draw> {
         let muted = Rgba(kit::palette().border_strong);
-        let mut spacing = (32. * self.zoom).max(28.);
+        // A lattice the camera moves over, not wallpaper stuck to the screen:
+        // the step is always a whole number of board units, doubled until the
+        // dots are far enough apart to read. So zooming out coarsens the ruler
+        // by whole factors — every dot still stands on a round coordinate —
+        // instead of stretching the same dots over ever larger distances.
+        let mut step = GRID;
+        while step * self.zoom < 24. {
+            step *= 2.;
+        }
+        let mut spacing = step * self.zoom;
         let counts = |spacing: f32| {
             [
                 (self.viewport[0] / spacing).ceil() as usize + 1,
@@ -1862,10 +1915,20 @@ impl BoardsView {
                 },
             ],
             |_| wire::EditorDecision::Noop,
+            // Both claimed keys leave the card, and they are not the same
+            // answer: ⌘Enter keeps what you wrote, Escape is the way out when
+            // the board will not take it. The commit says which key asked, so
+            // this is where they part.
             |event| match event {
-                EditorTransactionEvent::Commit { origin, .. } => {
-                    origin.is_some().then_some(Message::FinishText)
-                }
+                EditorTransactionEvent::Commit { origin, .. } => match origin {
+                    Some(wire::EditorRequestInput::Key { key, .. })
+                        if key.key == Key::Named(Named::Escape) =>
+                    {
+                        Some(Message::Cancel)
+                    }
+                    Some(_) => Some(Message::FinishText),
+                    None => None,
+                },
                 _ => None,
             },
         )
