@@ -1640,19 +1640,22 @@ impl DesktopWindow {
             (ShellTab::Forge, label("forge")),
             (ShellTab::Agents, label("agents")),
             (ShellTab::Files, label("files")),
-            (ShellTab::Explorer, label("explorer")),
-            (ShellTab::Node, label("node")),
-            (ShellTab::Members, label("members")),
-            (ShellTab::Governance, label("governance")),
         ]);
-        // the other views the connected node's registry lists, after the
-        // built-in tabs and in the registry's order; named by their manifests
+        // the other views the connected node's registry lists are workspace
+        // tools: they follow the built-in workspace tabs, in the registry's
+        // order, named by their manifests
         navigation.extend(
             registered
                 .into_iter()
                 .filter(|module| *module != HOME_VIEW)
                 .map(|module| (ShellTab::Registered(module), label(module))),
         );
+        navigation.extend([
+            (ShellTab::Explorer, label("explorer")),
+            (ShellTab::Node, label("node")),
+            (ShellTab::Members, label("members")),
+            (ShellTab::Governance, label("governance")),
+        ]);
         navigation.push((ShellTab::Settings, label("settings")));
         let (sidebar, popover) = {
             let theme = gpui_kit::component::Theme::global(cx);
