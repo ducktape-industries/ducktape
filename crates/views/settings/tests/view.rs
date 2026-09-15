@@ -4,10 +4,10 @@
 //! every `rpc.live` hit), and every act leaves as an intent the kernel signs
 //! — the password crosses out and never back.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ducktape_view_guest::testing::{answer, has_text, item, press, submit, texts, type_into};
-use ducktape_view_guest::wire::{ButtonContent, Frame, Node, Request};
+use ducktape_view_guest::wire::{ButtonContent, Frame, Node, Request, Wrapping};
 use settings_view::host::{KeyAdd, Name, Session, Tab, TasteRow, Unlock};
 use settings_view::{boot_native, tick_native};
 
@@ -665,6 +665,130 @@ fn proposed_views_are_tried_and_left_from_the_network_tab() {
 
     let frame = tick_native(vec![item(props, &encoded(&facts()))]);
     assert!(!has_text(&frame, "Proposed views"), "{:?}", texts(&frame));
+}
+
+// ---------- one line per row ----------
+
+/// The texts of a settings pane that OWN THEIR LINE, by exact key: a
+/// sentence, an identifier too long to truncate, a heading. Every other text
+/// is a cell in a row and must keep one line, or it breaks onto a second and
+/// lands under the row below it.
+const MAY_WRAP: &[&str] = &[
+    "settings/error-text",          // why the node could not be read
+    "settings/network-name",        // the network's own name, as its heading
+    "settings/network-rpc",         // the endpoint, beside its Copy button
+    "settings/updates-unavailable", // there is no launcher, in a sentence
+    "settings/update-note",         // what the last check found
+    "settings/seat",                // the seated public key, 64 hex digits
+    "settings/key-path",            // the keystore's path on this device
+    "settings/signing",             // the seat's state, in a sentence
+    "settings/ticket-help",         // a sentence, beside Copy ticket
+    "settings/ceremony-detail",     // what to do with the QR, in a sentence
+    "settings/add-device",          // a section heading
+];
+
+/// The same permission by key suffix, for the texts a helper repeats per row.
+const MAY_WRAP_SUFFIX: &[&str] = &[
+    "/title",   // a page title, or an empty state's
+    "-title",   // a section heading
+    "/name",    // a setting row's title, above its own detail
+    "/detail",  // a setting row's explanation; an empty state's line
+    "/note",    // a setting row's hint
+    "/help",    // a section's lead sentence
+    "/label",   // a form label above its field
+    "/refused", // why a proposed view cannot be tried here
+    "/value",   // an account key's 64 hex digits, beside Remove
+];
+
+fn may_wrap(key: &str) -> bool {
+    MAY_WRAP.contains(&key) || MAY_WRAP_SUFFIX.iter().any(|end| key.ends_with(end))
+}
+
+/// This state with all four panes drawn, whichever one it arrives on.
+fn every_pane(frame: Frame) -> Vec<Frame> {
+    let mut frame = frame;
+    let mut drawn = Vec::new();
+    for pane in ["General", "Network", "Account", "Security"] {
+        frame = tick_native(press(&frame, pane));
+        drawn.push(frame.clone());
+    }
+    drawn
+}
+
+/// Every cell of every settings row keeps ONE LINE. The kit's text
+/// constructors wrap by default and a settings pane is narrow, so a reading
+/// left wrapping breaks out of its row's band and under the row below it.
+/// The texts that may wrap are named above, each one a sentence, a heading
+/// or an identifier — a new wrapping row cell fails here.
+#[test]
+fn every_row_cell_keeps_one_line() {
+    // installed, staged, a ticket minted, a ceremony in flight, a view proposed
+    let rich = Session {
+        update_state: "staged".into(),
+        update_current: "1a2b3c4".into(),
+        update_previous: "9f8e7d6".into(),
+        update_staged_display: "2026.09.2+abc1234".into(),
+        update_checked: "5 min ago".into(),
+        update_note: "Up to date.".into(),
+        account_ticket: r#"{"add_key":{}}"#.into(),
+        account_ceremony_phase: "show_qr".into(),
+        account_ceremony_qr: "https://auth.example/c".into(),
+        account_ceremony_detail: "Scan this with your phone.".into(),
+        account_ceremony_left: "1:07".into(),
+        tasting: vec![taste_row(true, "")],
+        ..facts()
+    };
+    // no account yet, the seat locked, a proposed view this node refuses
+    let enrol = Session {
+        account_exists: false,
+        account_number: String::new(),
+        unlocked: false,
+        desktop_notifications_host: "denied".into(),
+        tasting: vec![taste_row(false, "not_held")],
+        ..facts()
+    };
+    let mut drawn = Vec::new();
+    for session in [facts(), rich, enrol] {
+        drawn.extend(every_pane(connected(&session, 2).0));
+    }
+    // a session the view cannot read draws its error over the pane
+    let (_, props, _) = connected(&facts(), 2);
+    drawn.extend(every_pane(tick_native(vec![item(props, b"not a session")])));
+    // with no connection the panes are empty states
+    let offline = Session {
+        connected: false,
+        ..facts()
+    };
+    drawn.extend(every_pane(tick_native(vec![item(
+        props,
+        &encoded(&offline),
+    )])));
+
+    let mut wrapping = BTreeSet::new();
+    for frame in drawn {
+        let mut root = frame.root.clone().expect("a drawn page");
+        root.for_each_mut(&mut |node| {
+            let Node::Text { key, options, .. } = node else {
+                return;
+            };
+            if options.wrapping != Some(Wrapping::None) {
+                wrapping.insert(key.clone());
+            }
+        });
+    }
+    let cells: Vec<&String> = wrapping.iter().filter(|key| !may_wrap(key)).collect();
+    assert!(cells.is_empty(), "row cells that may wrap: {cells:?}");
+
+    // a permission nothing matches is stale: it would hide the next cell
+    let stale: Vec<&&str> = MAY_WRAP
+        .iter()
+        .chain(MAY_WRAP_SUFFIX)
+        .filter(|entry| !wrapping.iter().any(|key| key.ends_with(*entry)))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "nothing on the page wraps under {stale:?}"
+    );
 }
 
 // ---------- updates ----------

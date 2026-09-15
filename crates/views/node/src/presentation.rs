@@ -36,6 +36,27 @@ const READING_ROW: f32 = 24.;
 const LIST_ROW: f32 = 28.;
 const MODULE_ROW: f32 = 32.;
 
+// Every cell of a reading, a list row and a module row is ONE LINE. Those
+// rows are built at a fixed height (`READING_ROW`, `LIST_ROW`,
+// `MODULE_ROW`) and the panel is as narrow as the pane: a height, a count,
+// a digest or a capability name allowed to wrap breaks onto a second line
+// that lands under the next row. The texts that DO wrap — the page's error
+// strip, the sync-failure notice, the standing paragraph, the retune note
+// and a log message — sit in rows with no fixed height and say so with
+// `kit::wrapping`, which overrides this.
+
+fn text(key: impl Into<String>, content: impl Into<String>) -> Node {
+    kit::nowrap(kit::text(key, content))
+}
+
+fn mono(key: impl Into<String>, content: impl Into<String>) -> Node {
+    kit::nowrap(kit::mono(key, content))
+}
+
+fn caption(key: impl Into<String>, content: impl Into<String>) -> Node {
+    kit::nowrap(kit::caption(key, content))
+}
+
 impl NodeView {
     pub(crate) fn view(&self) -> Node {
         kit::set_dark(self.dark);
@@ -120,7 +141,7 @@ impl NodeView {
                     Self::reading(
                         "node/height",
                         "Height",
-                        kit::mono(
+                        mono(
                             "node/height/value",
                             host::height_label_short(facts.node_height),
                         ),
@@ -128,7 +149,7 @@ impl NodeView {
                     Self::reading(
                         "node/checkpoint",
                         "Checkpoint",
-                        kit::mono(
+                        mono(
                             "node/checkpoint/value",
                             host::height_label_short(facts.node_checkpoint),
                         ),
@@ -136,7 +157,7 @@ impl NodeView {
                     Self::reading(
                         "node/finalized",
                         "Last finalized",
-                        kit::text(
+                        text(
                             "node/finalized/value",
                             host::relative_time(facts.node_last_finalized, self.wall_now),
                         ),
@@ -144,7 +165,7 @@ impl NodeView {
                     Self::reading(
                         "node/quorum",
                         "Reachable / quorum",
-                        kit::mono(
+                        mono(
                             "node/quorum/value",
                             host::reading_pair(
                                 &facts.node_reachable_label,
@@ -155,12 +176,12 @@ impl NodeView {
                     Self::reading(
                         "node/sync",
                         "Synchronization",
-                        kit::text("node/sync/value", &facts.sync_line),
+                        text("node/sync/value", &facts.sync_line),
                     ),
                     Self::reading(
                         "node/phase-since",
                         "Phase since",
-                        kit::text(
+                        text(
                             "node/phase-since/value",
                             host::relative_time(facts.node_phase_since, self.wall_now),
                         ),
@@ -168,12 +189,12 @@ impl NodeView {
                     Self::reading(
                         "node/retries",
                         "Sync retries",
-                        kit::mono("node/retries/value", facts.node_sync_retries.to_string()),
+                        mono("node/retries/value", facts.node_sync_retries.to_string()),
                     ),
                     Self::reading(
                         "node/failures",
                         "Sync failures",
-                        kit::mono("node/failures/value", facts.node_sync_failures.to_string()),
+                        mono("node/failures/value", facts.node_sync_failures.to_string()),
                     ),
                 ],
             ),
@@ -185,7 +206,7 @@ impl NodeView {
             Self::reading(
                 "node/version",
                 "Version",
-                kit::mono("node/version/value", &facts.node_version),
+                mono("node/version/value", &facts.node_version),
             ),
             kit::gap(4.),
             kit::row(
@@ -235,10 +256,7 @@ impl NodeView {
                 &key,
                 [
                     kit::sized(
-                        kit::nowrap(kit::mono(
-                            format!("{key}/key"),
-                            host::short_label(&peer.key),
-                        )),
+                        mono(format!("{key}/key"), host::short_label(&peer.key)),
                         Some(Length::Fill),
                         None,
                     ),
@@ -316,11 +334,7 @@ impl NodeView {
             Self::list_row(
                 key,
                 [
-                    kit::sized(
-                        kit::text(format!("{key}/label"), name),
-                        Some(Length::Fill),
-                        None,
-                    ),
+                    kit::sized(text(format!("{key}/label"), name), Some(Length::Fill), None),
                     Self::mark(format!("{key}/validator"), tiers[0]),
                     Self::mark(format!("{key}/resident"), tiers[1]),
                     Self::mark(format!("{key}/guest"), tiers[2]),
@@ -340,7 +354,7 @@ impl NodeView {
                     Self::reading(
                         "node/admin",
                         "Node administration",
-                        kit::text("node/admin/value", admin),
+                        text("node/admin/value", admin),
                     ),
                     kit::gap(4.),
                     kit::wrapping(kit::secondary("node/standing-description", description)),
@@ -359,21 +373,21 @@ impl NodeView {
                         "node/permissions/header",
                         [
                             kit::sized(
-                                kit::caption("node/permissions/capability", "Capability"),
+                                caption("node/permissions/capability", "Capability"),
                                 Some(Length::Fill),
                                 None,
                             ),
                             Self::cell(
                                 "node/permissions/header/validator",
-                                kit::caption("node/permissions/validator", "Validator"),
+                                caption("node/permissions/validator", "Validator"),
                             ),
                             Self::cell(
                                 "node/permissions/header/resident",
-                                kit::caption("node/permissions/resident", "Resident"),
+                                caption("node/permissions/resident", "Resident"),
                             ),
                             Self::cell(
                                 "node/permissions/header/guest",
-                                kit::caption("node/permissions/guest", "Guest"),
+                                caption("node/permissions/guest", "Guest"),
                             ),
                         ],
                     ),
@@ -474,18 +488,18 @@ impl NodeView {
                 kit::centered_row(
                     format!("{key}/pending/row"),
                     [
-                        kit::nowrap(kit::mono(
+                        mono(
                             format!("{key}/pending/value"),
                             host::short_digest(&module.pending_hash),
-                        )),
-                        kit::caption(
+                        ),
+                        caption(
                             format!("{key}/activation"),
                             format!(
                                 "activates at {}",
                                 host::height_label_short(module.activation_height)
                             ),
                         ),
-                        kit::caption(
+                        caption(
                             format!("{key}/readiness"),
                             format!("{} signalled ready", module.readiness),
                         ),
@@ -728,7 +742,7 @@ impl NodeView {
 
     /// Whether a standing holds a capability.
     fn mark(key: String, allowed: bool) -> Node {
-        let text = match allowed {
+        let glyph = match allowed {
             true => kit::tone_text(format!("{key}/mark"), "✓", Tone::Success),
             false => kit::colored(
                 kit::text_size(
@@ -738,7 +752,7 @@ impl NodeView {
                 kit::palette().faint,
             ),
         };
-        Self::cell(key, text)
+        Self::cell(key, kit::nowrap(glyph))
     }
 
     /// A digest reading: the head of it on the row, all of it on the copy.
@@ -759,10 +773,10 @@ impl NodeView {
             return Self::reading(
                 key,
                 label,
-                kit::colored(
+                kit::nowrap(kit::colored(
                     kit::text(format!("{key}/value"), "Not reported"),
                     kit::palette().faint,
-                ),
+                )),
             );
         }
         let mut copy = kit::button(
@@ -784,6 +798,10 @@ impl NodeView {
         };
         *accessible = Some(format!("Copy {}", label.to_lowercase()));
         *height = Some(Length::Fixed(READING_ROW));
+        // THIS ROW CARRIES NO FIXED HEIGHT, which is what lets its value
+        // wrap: a node key, a root hash and a workspace path are read in
+        // full, so the row grows to hold them instead of clipping. Every
+        // reading built at `READING_ROW` keeps one line instead.
         kit::aligned(
             kit::kv(
                 key,
