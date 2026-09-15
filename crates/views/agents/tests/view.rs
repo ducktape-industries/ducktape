@@ -821,7 +821,7 @@ fn a_running_run_sends_steering_to_its_current_turn_and_preserves_new_typing() {
     assert_eq!(
         serde_json::from_slice::<Value>(&request.payload).unwrap(),
         json!({
-            "route":"run-control","payload":{"run":"dispatch-live","input":{"action":"steer","expected_turn":"turn-a","text":"Check the wrap first"}}
+            "route":"/v1/run-control","payload":{"run":"dispatch-live","input":{"action":"steer","expected_turn":"turn-a","text":"Check the wrap first"}}
         })
     );
     let _frame = tick_native(type_into(

@@ -1895,7 +1895,7 @@ pub enum ControlState {
 pub async fn control_run(run: String, input: serde_json::Value) -> Result<(), String> {
     ask(
         "rpc.admin",
-        &serde_json::json!({"route":"run-control","payload":{"run":run,"input":input}}),
+        &serde_json::json!({"route":"/v1/run-control","payload":{"run":run,"input":input}}),
     )
     .await
     .map(|_| ())
