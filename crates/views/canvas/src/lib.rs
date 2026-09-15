@@ -127,6 +127,15 @@ struct Inline {
     /// shorter side and so widens as the card gets taller. Keeping the high
     /// mark settles that in one step instead of letting it creep.
     grown: Option<f32>,
+    /// The width in board units the words on a connector's plate take, as the
+    /// host measured them. A card is written across the whole card, but a
+    /// connector's words hug a plate centred on its line, so the box the caret
+    /// lives in has to hug them too — otherwise the words sit at the left of
+    /// the room set aside for them while you type and jump to the middle of
+    /// the line the moment you stop. Unlike the height this tracks the words
+    /// down as well as up: a plate that kept the width of a phrase you deleted
+    /// would rub out the line for no one.
+    wide: Option<f32>,
 }
 mod editor_codec {
     use super::*;
@@ -562,6 +571,11 @@ impl BoardsView {
     fn grown_change(&self, board: &Board, inline: &Inline) -> Option<Change> {
         let grown = inline.grown?;
         let shape = &board.shapes.get(&inline.id)?.shape;
+        // A connector's box is the span of its run, not a box anyone chose, so
+        // there is nothing here to grow: its label rides a plate of its own.
+        if shape.kind.is_path() {
+            return None;
+        }
         let needed = grown.ceil().clamp(1., boards::MAX_SIZE as f32) as i32;
         (needed > shape.height).then(|| Change::Resize {
             id: inline.id.clone(),

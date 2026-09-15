@@ -142,6 +142,12 @@ const CARD_INSET: f32 = 12.;
 /// grid ever takes is this doubled, so a dot always stands on a coordinate a
 /// reader could name.
 const GRID: f32 = 32.;
+/// The plate a connector's words sit on, in board units. A connector has no
+/// box of its own to write in — its rectangle is only the span of its samples
+/// — so its label rides a plate of this size at the middle of the run. The
+/// painter draws it, the editor opens over it, and a press inside it takes the
+/// connector, so the size is stated once here.
+pub(super) const PLATE: [f32; 2] = [200., 56.];
 /// The smallest type the board will draw. Under it letters stop being letters
 /// and start being grey noise, so nothing is drawn at all.
 const SMALLEST: f32 = 8.;
@@ -183,15 +189,26 @@ impl BoardsView {
             ),
         ];
         if let Some(inline) = &self.inline
-            && let Some(record) = board
-                .as_ref()
-                .and_then(|board| board.shapes.get(&inline.id))
+            && let Some(live) = board.as_ref()
+            && let Some(record) = live.shapes.get(&inline.id)
         {
             let s = &record.shape;
-            let pos = self.screen(s.x as f32, s.y as f32);
-            let size = [s.width as f32 * self.zoom, s.height as f32 * self.zoom];
+            // The same box the painter writes this shape's words in, so the
+            // editor opens exactly over the label it replaces — for a
+            // connector that is the plate at the middle of the run, which is
+            // nowhere near the rectangle its samples were stored with.
+            let origin = self.screen(s.x as f32, s.y as f32);
+            let stored = [
+                origin[0],
+                origin[1],
+                origin[0] + s.width as f32 * self.zoom,
+                origin[1] + s.height as f32 * self.zoom,
+            ];
+            let box_ = self.on_screen(live, s).unwrap_or(stored);
+            let (pos, size) = self.writing_box(box_, s.kind);
             layers.push(self.text_gauge(inline, s, pos, size));
-            layers.push(self.inline_editor(s, pos, size));
+            let (caret, room) = self.caret_box(inline, s.kind, pos, size);
+            layers.push(self.inline_editor(s, caret, room));
         }
         if let Some(board) = &board {
             let hint_shown = !editing && !compact;
@@ -1111,6 +1128,53 @@ impl BoardsView {
             legible: asked >= SMALLEST,
         }
     }
+    /// The box a shape's words are written in, on screen: where the painter
+    /// writes them and where the editor opens over them. A card writes inside
+    /// its own outline. A connector has none to write in, so its words ride a
+    /// plate at the middle of the run — the middle of where the run is drawn
+    /// now, which a bound end moves every time the card it holds does.
+    pub(super) fn writing_box(&self, box_: [f32; 4], kind: Kind) -> ([f32; 2], [f32; 2]) {
+        if !kind.is_path() {
+            return (
+                [box_[0], box_[1]],
+                [(box_[2] - box_[0]).max(1.), (box_[3] - box_[1]).max(1.)],
+            );
+        }
+        // The plate rides the camera like everything else on the board: one
+        // that kept its pixels while the run under it shrank would swallow the
+        // whole drawing at a distance.
+        let plate = [PLATE[0] * self.zoom, PLATE[1] * self.zoom];
+        let middle = [(box_[0] + box_[2]) / 2., (box_[1] + box_[3]) / 2.];
+        (
+            [middle[0] - plate[0] / 2., middle[1] - plate[1] / 2.],
+            plate,
+        )
+    }
+    /// The box the caret lives in while you type, which is the room the words
+    /// are given for a card and the plate they hug for a connector. A card is
+    /// written across the whole card, so the two are the same thing; a
+    /// connector's words are centred on its line once saved, and an editor
+    /// given the whole room would write them from the room's left edge and
+    /// throw them a hundred units across the board the moment you were done.
+    /// The host does not centre text inside an editor, so the box is centred
+    /// instead — with a margin, because the editor wraps a shade tighter than
+    /// the label the gauge measures and a box trimmed to the last glyph would
+    /// break a line the painter keeps whole.
+    pub(super) fn caret_box(
+        &self,
+        inline: &Inline,
+        kind: Kind,
+        pos: [f32; 2],
+        room: [f32; 2],
+    ) -> ([f32; 2], [f32; 2]) {
+        let hugging = kind.is_path();
+        let Some(words) = inline.wide.filter(|_| hugging) else {
+            return (pos, room);
+        };
+        let letters = self.lettering(kind, room);
+        let width = (words * self.zoom + 2. * letters.size).clamp(1., room[0]);
+        ([pos[0] + (room[0] - width) / 2., pos[1]], [width, room[1]])
+    }
     /// A shape's words, pinned over its body and clipped to it.
     fn label(
         &self,
@@ -1129,32 +1193,9 @@ impl BoardsView {
         if !letters.legible {
             return None;
         }
-        // a connector's label rides its middle; it has no box to sit in
-        if s.kind.is_path() {
-            if s.text.is_empty() {
-                return None;
-            }
-            // The plate it is written on rides the camera like everything else
-            // on the board: a label that kept its pixels while the run under it
-            // shrank would swallow the whole drawing at a distance.
-            let plate = [180. * self.zoom, 40. * self.zoom];
-            return Some(Node::Pin {
-                key: format!("boards/path-label/{id}"),
-                x: (box_[0] + box_[2]) / 2. - plate[0] / 2.,
-                y: (box_[1] + box_[3]) / 2. - plate[1] / 2.,
-                width: Some(Length::Fixed(plate[0])),
-                height: Some(Length::Fixed(plate[1])),
-                content: Box::new(kit::text_size(
-                    kit::wrapping(kit::text(
-                        format!("boards/path-text/{id}"),
-                        excerpt(&s.text, share),
-                    )),
-                    letters.size,
-                )),
-            });
-        }
         let blank = s.text.is_empty();
-        // a blank sticky invites a word; a blank outline is a drawing, not a card
+        // a blank sticky invites a word; a blank outline is a drawing, not a
+        // card, and a connector with nothing written on it is just a line
         let prompt = matches!(s.kind, Kind::Note | Kind::Text);
         if blank && !prompt {
             return None;
@@ -1172,27 +1213,19 @@ impl BoardsView {
             ),
             alpha(ink, opacity),
         );
-        let mut clip = kit::container(format!("boards/label-clip/{id}"), label);
-        if let Node::Container {
-            clip: clipped,
-            height,
-            padding,
-            align_y,
-            ..
-        } = &mut clip
-        {
-            *clipped = true;
-            *height = Some(Length::Fill);
-            *padding = Some(wire::Edges::all(letters.inset));
-            *align_y = None;
-        }
+        let (pos, size) = self.writing_box(box_, s.kind);
+        let riding_a_line = s.kind.is_path();
+        let body = match riding_a_line {
+            true => plate(id, label, &letters, alpha(p.surface, opacity), size),
+            false => card_words(id, label, &letters),
+        };
         Some(Node::Pin {
             key: format!("boards/pin/{id}"),
-            x: box_[0],
-            y: box_[1],
-            width: Some(Length::Fixed((box_[2] - box_[0]).max(1.))),
-            height: Some(Length::Fixed((box_[3] - box_[1]).max(1.))),
-            content: Box::new(clip),
+            x: pos[0],
+            y: pos[1],
+            width: Some(Length::Fixed(size[0])),
+            height: Some(Length::Fixed(size[1])),
+            content: Box::new(body),
         })
     }
     /// What belongs to the pointer, not to the board: the selection, its
@@ -1571,6 +1604,67 @@ fn float(
         children: vec![base, card],
     }
 }
+/// A card's words: the top-left of its own box, clipped to it, because a card
+/// is a page and a page fills from its corner.
+fn card_words(id: &str, words: Node, letters: &Lettering) -> Node {
+    let mut clip = kit::container(format!("boards/label-clip/{id}"), words);
+    if let Node::Container {
+        clip: clipped,
+        height,
+        padding,
+        align_y,
+        ..
+    } = &mut clip
+    {
+        *clipped = true;
+        *height = Some(Length::Fill);
+        *padding = Some(wire::Edges::all(letters.inset));
+        *align_y = None;
+    }
+    clip
+}
+/// A connector's words on a plate at the middle of its run: the plate hugs the
+/// words rather than filling the room set aside for them, because the room is
+/// sized for the longest label a line could carry and a plate that big would
+/// rub out the line either side of a short one. The words are centred in that
+/// room, which is what puts them ON the line instead of beside it.
+fn plate(id: &str, words: Node, letters: &Lettering, wash: [f32; 4], room: [f32; 2]) -> Node {
+    let mut riding = kit::container(format!("boards/plate/{id}"), words);
+    if let Node::Container {
+        clip: clipped,
+        width,
+        height,
+        max_width,
+        padding,
+        background,
+        align_x,
+        align_y,
+        ..
+    } = &mut riding
+    {
+        *clipped = true;
+        *width = Some(Length::Shrink);
+        *height = Some(Length::Shrink);
+        *max_width = Some(room[0]);
+        *padding = Some(wire::Edges::all(letters.inset));
+        *background = Some(wire::Background::Color(Rgba(wash)));
+        *align_x = Some(wire::AlignX::Center);
+        *align_y = Some(wire::AlignY::Center);
+    }
+    let mut middle = kit::container(format!("boards/plate-centre/{id}"), riding);
+    if let Node::Container {
+        height,
+        align_x,
+        align_y,
+        ..
+    } = &mut middle
+    {
+        *height = Some(Length::Fill);
+        *align_x = Some(wire::AlignX::Center);
+        *align_y = Some(wire::AlignY::Center);
+    }
+    middle
+}
 /// An island: a card at a stage corner, its controls packed tight.
 fn island(key: &str, content: Node) -> Node {
     kit::padded(kit::card(key, content), wire::Edges::all(4.))
@@ -1943,7 +2037,12 @@ impl BoardsView {
             ),
             alpha(kit::palette().foreground, 0.),
         );
-        if let Node::Text { width, .. } = &mut gauge {
+        // A connector's plate is as wide as its words; a card is as wide as the
+        // card, so only one of the two has a width worth asking about.
+        let hugging = shape.kind.is_path();
+        if let Node::Text { width, .. } = &mut gauge
+            && !hugging
+        {
             // Narrower than the card by a margin, because the native editor
             // keeps room inside the box it is given that a plain label does
             // not: with the same words in the same column it takes one line
@@ -1956,17 +2055,31 @@ impl BoardsView {
             *width = Some(Length::Fixed(column.max(40.)));
         }
         let mut padded = kit::container("boards/gauge-pad", gauge);
-        if let Node::Container { padding, .. } = &mut padded {
+        if let Node::Container {
+            padding,
+            width,
+            max_width,
+            ..
+        } = &mut padded
+        {
             // The card is the words plus the room they are written in, so the
             // gauge carries the same inset and reports a card height, not a
             // text height.
             *padding = Some(wire::Edges::all(letters.inset));
+            if hugging {
+                *width = Some(Length::Shrink);
+                *max_width = Some(size[0].max(1.));
+            }
         }
         Node::Pin {
             key: "boards/gauge-pin".into(),
             x: pos[0],
             y: pos[1],
-            width: Some(Length::Fixed(size[0].max(1.))),
+            // A card is measured in its own column, so the gauge is held to it.
+            // A plate has no column — its width is the other half of the answer
+            // — so nothing holds the gauge but the room the plate may not
+            // exceed, which the container above carries.
+            width: (!hugging).then(|| Length::Fixed(size[0].max(1.))),
             // No height: this is the one node on the stage allowed to be as
             // tall as it likes, because its height is the answer.
             height: None,
