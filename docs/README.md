@@ -28,6 +28,7 @@ document nothing cites is deleted, not archived.
 | Which operator scripts, units and harnesses live under `ops/` | [`../ops/README.md`](../ops/README.md) |
 | The coordinator's deploy artifacts (unit, env file, Dockerfile) | [`../ops/coordinator/README.md`](../ops/coordinator/README.md) |
 | The hosted WebAuthn auth page, its request/result shapes and its relay | [`../ops/auth-page/README.md`](../ops/auth-page/README.md) |
+| Build and register the shared canvas board | [`../crates/modules/apps/boards/README.md`](../crates/modules/apps/boards/README.md) |
 | Run the desktop app; which node it dials and which key it signs with | [`../app/README.md`](../app/README.md) |
 | Lend a credential to a sandbox through airlock, self-hosted or from an enclave | [`../crates/airlock/README.md`](../crates/airlock/README.md) |
 

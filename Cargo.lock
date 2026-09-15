@@ -1312,6 +1312,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "boards"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ducktape-module-sdk",
+ "futures",
+ "sdk",
+ "sdk-testkit",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "borsh"
 version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13736,6 +13749,7 @@ dependencies = [
  "module-artifact",
  "sdk",
  "sdk-testkit",
+ "serde_json",
  "sha2 0.10.9",
  "tokio",
  "wasmtime",

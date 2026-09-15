@@ -1,0 +1,20 @@
+[package]
+name = "boards"
+edition.workspace = true
+version.workspace = true
+
+[features]
+default = ["native"]
+native = ["dep:sdk", "dep:async-trait"]
+guest = ["native", "dep:ducktape-module-sdk"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sdk = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+ducktape-module-sdk = { workspace = true, optional = true }
+
+[dev-dependencies]
+sdk-testkit.workspace = true
+futures = "0.3"
