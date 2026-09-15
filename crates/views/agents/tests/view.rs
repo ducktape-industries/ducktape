@@ -268,13 +268,11 @@ fn a_connected_view_reads_its_own_register() {
     for expected in [
         "2 agents · 1 working",
         "Reviewer Bot",
-        "review",
         "Active",
         "Paused",
         "Working",
-        "eddy",
-        // the count derives from the record: three skills
-        "3 skills",
+        // The secondary line keeps owner, capability and the derived skill count.
+        "eddy · review · 3 skills",
     ] {
         assert!(
             has_text(&frame, expected),

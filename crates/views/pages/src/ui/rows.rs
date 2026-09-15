@@ -93,7 +93,10 @@ impl PagesView {
         let mut row = kit::list_row(
             key.clone(),
             kit::sized(
-                kit::nowrap(kit::text(format!("{key}/title"), title)),
+                kit::nowrap(kit::text_size(
+                    kit::text(format!("{key}/title"), title),
+                    14.,
+                )),
                 Some(Length::Fill),
                 None,
             ),
@@ -103,9 +106,9 @@ impl PagesView {
         if let Node::Button { label, padding, .. } = &mut row {
             *label = Some(title.to_owned());
             *padding = Some(wire::Edges {
-                top: 4.,
+                top: 8.,
                 right: PAGE_ROW_ACTIONS_WIDTH,
-                bottom: 4.,
+                bottom: 8.,
                 left: 4.,
             });
         }
@@ -267,7 +270,10 @@ impl PagesView {
                             [
                                 kit::sized(
                                     kit::nowrap(kit::weighted(
-                                        kit::text(format!("{key}/title"), &hit.page_title),
+                                        kit::text_size(
+                                            kit::text(format!("{key}/title"), &hit.page_title),
+                                            14.,
+                                        ),
                                         wire::Weight::Medium,
                                     )),
                                     Some(Length::Fill),
@@ -287,18 +293,21 @@ impl PagesView {
                     )),
                 ],
             ),
-            2.,
+            4.,
         );
-        kit::list_row(
-            key,
-            content,
-            false,
-            (!self.unavailable()).then(|| {
-                slots::message(Message::OpenPageSearchHit(
-                    hit.page_id.clone(),
-                    hit.block_id.clone(),
-                ))
-            }),
+        kit::padded(
+            kit::list_row(
+                key,
+                content,
+                false,
+                (!self.unavailable()).then(|| {
+                    slots::message(Message::OpenPageSearchHit(
+                        hit.page_id.clone(),
+                        hit.block_id.clone(),
+                    ))
+                }),
+            ),
+            wire::Edges::all(8.),
         )
     }
 
