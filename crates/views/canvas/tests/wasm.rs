@@ -13,7 +13,7 @@ struct Guest {
 impl Guest {
     fn new() -> Self {
         let path =
-            std::env::var("BOARDS_VIEW_WASM").expect("set BOARDS_VIEW_WASM to the built component");
+            std::env::var("CANVAS_VIEW_WASM").expect("set CANVAS_VIEW_WASM to the built component");
         let mut config = wasmtime::Config::new();
         config.consume_fuel(true);
         let engine = Engine::new(&config).unwrap();
