@@ -97,6 +97,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "wasmtime",
 ]
 
 [[package]]

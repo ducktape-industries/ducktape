@@ -30,7 +30,7 @@ the founding set:
 
 ```sh
 ducktape module register boards crates/modules/apps/boards/component.wasm
-ducktape module register canvas --view target/views/boards_view.wasm
+ducktape module register canvas --view target/views/boards_view.wasm --assets crates/views/boards/assets
 ```
 
 The UI subscribes to `canvas.props` and reads/submits against `boards`. Its tab

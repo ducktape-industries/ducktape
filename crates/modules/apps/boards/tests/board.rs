@@ -199,3 +199,37 @@ fn real_module_stages_commits_aborts_and_rejects_unauthenticated_writes() {
     });
 }
 use sdk::Ctx;
+
+#[test]
+fn board_creator_uses_the_shared_actor_convention_for_passkeys() {
+    futures::executor::block_on(async {
+        let mut module = Boards::new(Box::new(MemStore::new()));
+        let mut env = TestCtx::at_height(1).env().clone();
+        env.origin = Origin::External(vec![2; 33]);
+        let owner = env.origin.actor_string();
+        let mut ctx = TestCtx::with_env(env);
+        let op = Operation::Create {
+            id: "passkey".into(),
+            title: "Passkey board".into(),
+        };
+        let message = Msg {
+            target: "boards".into(),
+            payload: serde_json::to_vec(&op).unwrap(),
+        };
+        module.execute(&mut ctx, &message).await.unwrap();
+        module.execute(&mut ctx, &message).await.unwrap();
+        let bytes = module
+            .query(
+                &serde_json::to_vec(&Query::Get {
+                    id: "passkey".into(),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let Reply::Board(Some(board)) = serde_json::from_slice(&bytes).unwrap() else {
+            panic!("board reply")
+        };
+        assert_eq!(board.owner, owner);
+    });
+}

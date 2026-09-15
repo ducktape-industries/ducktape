@@ -77,12 +77,13 @@ fn board_key(id: &str) -> Vec<u8> {
 fn actor(origin: &Origin) -> Result<String, Error> {
     match origin {
         Origin::External(key) => {
-            if key.len() != 32 {
+            let supported_key = matches!(key.len(), 32 | 33);
+            if !supported_key {
                 return Err(Error::Module("A signing key is required.".into()));
             }
-            Ok(key.iter().map(|byte| format!("{byte:02x}")).collect())
+            Ok(origin.actor_string())
         }
-        Origin::Program(account) => Ok(format!("account:{account}")),
+        Origin::Program(_) => Ok(origin.actor_string()),
         Origin::Module(_) | Origin::System => Err(Error::Module(
             "Boards require an authenticated user or program account.".into(),
         )),
