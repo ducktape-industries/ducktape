@@ -50,6 +50,7 @@ impl Default for Shape {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Record {
+    pub created: u64,
     pub revision: u64,
     pub shape: Shape,
 }
@@ -67,6 +68,7 @@ pub struct Board {
 pub enum Operation {
     Create { id: String, title: String },
     Edit { board: String, change: Change },
+    Batch { board: String, changes: Vec<Change> },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -115,6 +117,25 @@ impl Board {
     /// A pure reduction in consensus order. Field operations preserve unrelated
     /// concurrent edits; two writes to one field take the last ordered value.
     pub fn changed(&self, change: &Change) -> Result<Self, String> {
+        self.changed_many(std::slice::from_ref(change))
+    }
+    /// One user gesture is atomic, including multi-selection and its undo.
+    pub fn changed_many(&self, changes: &[Change]) -> Result<Self, String> {
+        let bounded = !changes.is_empty() && changes.len() <= MAX_SHAPES * 2;
+        if !bounded {
+            return Err("An edit must contain between 1 and 256 changes.".into());
+        }
+        let mut next = self.clone();
+        for change in changes {
+            next.apply(change)?;
+        }
+        let bytes = serde_json::to_vec(&next).map_err(|error| error.to_string())?;
+        if bytes.len() > MAX_BOARD_BYTES {
+            return Err("Board storage limit reached.".into());
+        }
+        Ok(next)
+    }
+    fn apply(&mut self, change: &Change) -> Result<(), String> {
         match change {
             Change::Create { id, shape } => self.create(id, shape),
             Change::Move { id, x, y } => self.move_shape(id, *x, *y),
@@ -124,56 +145,61 @@ impl Board {
             Change::Delete { id } => self.delete(id),
         }
     }
-    fn create(&self, id: &str, shape: &Shape) -> Result<Self, String> {
+    pub fn ordered(&self) -> Vec<(&String, &Record)> {
+        let mut shapes: Vec<_> = self.shapes.iter().collect();
+        shapes.sort_by_key(|(id, record)| (record.created, *id));
+        shapes
+    }
+    fn create(&mut self, id: &str, shape: &Shape) -> Result<(), String> {
         if self.shapes.contains_key(id) {
-            return Ok(self.clone());
+            return Ok(());
         }
         if self.shapes.len() >= MAX_SHAPES {
             return Err(format!("A board supports up to {MAX_SHAPES} shapes."));
         }
         self.replace(id, Some(shape.clone()))
     }
-    fn move_shape(&self, id: &str, x: i32, y: i32) -> Result<Self, String> {
+    fn move_shape(&mut self, id: &str, x: i32, y: i32) -> Result<(), String> {
         let Some(record) = self.shapes.get(id) else {
-            return Ok(self.clone());
+            return Ok(());
         };
         let mut shape = record.shape.clone();
         shape.x = x;
         shape.y = y;
         self.replace(id, Some(shape))
     }
-    fn resize(&self, id: &str, width: i32, height: i32) -> Result<Self, String> {
+    fn resize(&mut self, id: &str, width: i32, height: i32) -> Result<(), String> {
         let Some(record) = self.shapes.get(id) else {
-            return Ok(self.clone());
+            return Ok(());
         };
         let mut shape = record.shape.clone();
         shape.width = width;
         shape.height = height;
         self.replace(id, Some(shape))
     }
-    fn text(&self, id: &str, text: &str) -> Result<Self, String> {
+    fn text(&mut self, id: &str, text: &str) -> Result<(), String> {
         let Some(record) = self.shapes.get(id) else {
-            return Ok(self.clone());
+            return Ok(());
         };
         let mut shape = record.shape.clone();
         shape.text = text.to_owned();
         self.replace(id, Some(shape))
     }
-    fn color(&self, id: &str, color: u8) -> Result<Self, String> {
+    fn color(&mut self, id: &str, color: u8) -> Result<(), String> {
         let Some(record) = self.shapes.get(id) else {
-            return Ok(self.clone());
+            return Ok(());
         };
         let mut shape = record.shape.clone();
         shape.color = color;
         self.replace(id, Some(shape))
     }
-    fn delete(&self, id: &str) -> Result<Self, String> {
+    fn delete(&mut self, id: &str) -> Result<(), String> {
         if !self.shapes.contains_key(id) {
-            return Ok(self.clone());
+            return Ok(());
         }
         self.replace(id, None)
     }
-    fn replace(&self, id: &str, shape: Option<Shape>) -> Result<Self, String> {
+    fn replace(&mut self, id: &str, shape: Option<Shape>) -> Result<(), String> {
         if !valid_id(id) {
             return Err("Invalid shape id.".into());
         }
@@ -184,26 +210,31 @@ impl Board {
             .revision
             .checked_add(1)
             .ok_or("Board revision exhausted.")?;
-        let mut next = self.clone();
-        next.revision = revision;
+        self.revision = revision;
         match shape {
             Some(shape) => {
-                next.shapes
-                    .insert(id.to_owned(), Record { revision, shape });
+                let created = self
+                    .shapes
+                    .get(id)
+                    .map_or(revision, |record| record.created);
+                self.shapes.insert(
+                    id.to_owned(),
+                    Record {
+                        created,
+                        revision,
+                        shape,
+                    },
+                );
             }
             None => {
-                next.shapes.remove(id);
-                next.shapes.retain(|_, record| {
+                self.shapes.remove(id);
+                self.shapes.retain(|_, record| {
                     record.shape.from.as_deref() != Some(id)
                         && record.shape.to.as_deref() != Some(id)
                 });
             }
         }
-        let bytes = serde_json::to_vec(&next).map_err(|error| error.to_string())?;
-        if bytes.len() > MAX_BOARD_BYTES {
-            return Err("Board storage limit reached.".into());
-        }
-        Ok(next)
+        Ok(())
     }
 
     fn validate_shape(&self, id: &str, shape: &Shape) -> Result<(), String> {

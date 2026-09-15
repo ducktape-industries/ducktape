@@ -246,7 +246,7 @@ fn the_consensus_reducer_has_one_exhaustive_delegating_dispatch() {
         })
         .flat_map(|item| &item.items)
         .find_map(|item| match item {
-            syn::ImplItem::Fn(method) if method.sig.ident == "changed" => Some(method),
+            syn::ImplItem::Fn(method) if method.sig.ident == "apply" => Some(method),
             _ => None,
         })
         .unwrap();
@@ -261,4 +261,49 @@ fn the_consensus_reducer_has_one_exhaustive_delegating_dispatch() {
             "each event delegates to a named pure handler"
         );
     }
+}
+
+#[test]
+fn batch_is_atomic_and_editing_does_not_change_stacking_order() {
+    let original = Board::new("Board".into(), "owner".into()).unwrap();
+    let board = original
+        .changed_many(&[
+            Change::Create {
+                id: "z".into(),
+                shape: Shape::default(),
+            },
+            Change::Create {
+                id: "a".into(),
+                shape: Shape::default(),
+            },
+        ])
+        .unwrap();
+    let edited = board
+        .changed(&Change::Text {
+            id: "z".into(),
+            text: "Edited".into(),
+        })
+        .unwrap();
+    assert_eq!(
+        edited
+            .ordered()
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["z", "a"]
+    );
+    let failed = board.changed_many(&[
+        Change::Move {
+            id: "z".into(),
+            x: 70,
+            y: 10,
+        },
+        Change::Text {
+            id: "a".into(),
+            text: "x".repeat(boards::MAX_TEXT + 1),
+        },
+    ]);
+    assert!(failed.is_err());
+    assert_eq!(board.shapes["z"].shape.x, 0);
+    assert!(original.shapes.is_empty());
 }

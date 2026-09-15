@@ -52,7 +52,7 @@ impl Boards {
         self.write(writes);
         Ok(())
     }
-    async fn edit(&mut self, board: String, change: Change) -> Result<(), Error> {
+    async fn edit(&mut self, board: String, changes: Vec<Change>) -> Result<(), Error> {
         if !valid_id(&board) {
             return Err(Error::Module("Invalid board id.".into()));
         }
@@ -61,7 +61,7 @@ impl Boards {
             .read(&key)
             .await?
             .ok_or_else(|| Error::Module("Board no longer exists.".into()))?;
-        let next = current.changed(&change).map_err(Error::Module)?;
+        let next = current.changed_many(&changes).map_err(Error::Module)?;
         self.write([(key, sdk::wire::encode(&next))]);
         Ok(())
     }
@@ -111,7 +111,8 @@ impl Module for Boards {
         let operation: Operation = sdk::wire::decode(&msg.payload).map_err(Error::Module)?;
         match operation {
             Operation::Create { id, title } => self.create(id, title, owner).await,
-            Operation::Edit { board, change } => self.edit(board, change).await,
+            Operation::Edit { board, change } => self.edit(board, vec![change]).await,
+            Operation::Batch { board, changes } => self.edit(board, changes).await,
         }
     }
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
