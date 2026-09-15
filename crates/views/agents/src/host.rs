@@ -143,6 +143,7 @@ pub struct RunLink {
     pub kind: String,
     pub label: String,
     pub url: String,
+    pub preview: Option<String>,
 }
 
 /// The journal of one run. `dispatch_id` names the run it belongs to, so a
@@ -769,6 +770,7 @@ impl Chips {
             Target::Place(place) => self.place("target", place).await,
             Target::ForgeRepository(repo) => RunLink {
                 relation: "target".into(),
+                preview: None,
                 kind: "forge".into(),
                 label: format!("Repository {repo}"),
                 url: duck_link(&format!("forge/{repo}"), &self.chain),
@@ -781,6 +783,7 @@ impl Chips {
             } => self.forge_proposal(repo, source, target, candidates).await,
             Target::Label { kind, label } => RunLink {
                 relation: "target".into(),
+                preview: None,
                 kind,
                 label,
                 url: String::new(),
@@ -798,6 +801,7 @@ impl Chips {
         let text = |field: &str| place[field].as_str().unwrap_or_default().to_owned();
         let link = |chip: &str, label: String, url: String| RunLink {
             relation: relation.to_owned(),
+            preview: None,
             kind: chip.to_owned(),
             label,
             url,
@@ -943,7 +947,11 @@ impl Chips {
             (None, Some(seq)) => self.message_at(&channel, seq).await,
             (None, None) => None,
         };
-        let label = self.message_label(room, seq, message.as_ref());
+        let label = match seq {
+            Some(seq) => format!("{room} · Message {seq}"),
+            None => room,
+        };
+        let preview = seq.map(|_| self.message_preview(message.as_ref()));
         let url = match seq {
             Some(seq) => format!(
                 "{}#{seq}",
@@ -953,6 +961,7 @@ impl Chips {
         };
         RunLink {
             relation: "target".into(),
+            preview,
             kind: "chat".into(),
             label,
             url,
@@ -978,17 +987,9 @@ impl Chips {
             })
     }
 
-    fn message_label(
-        &self,
-        room: String,
-        seq: Option<u64>,
-        message: Option<&serde_json::Value>,
-    ) -> String {
+    fn message_preview(&self, message: Option<&serde_json::Value>) -> String {
         let Some(row) = message else {
-            return match seq {
-                Some(seq) => format!("{room} · message {seq} unavailable"),
-                None => room,
-            };
+            return "Message unavailable.".into();
         };
         let author = self
             .names
@@ -998,13 +999,10 @@ impl Chips {
             false => author,
         };
         let body = match row["deleted"].as_bool().unwrap_or(false) {
-            true => "Deleted message".to_owned(),
-            false => chip_label(row["text"].as_str().unwrap_or_default())
-                .chars()
-                .take(120)
-                .collect(),
+            true => "Deleted message",
+            false => row["text"].as_str().unwrap_or_default(),
         };
-        format!("{room} · {author}: {body}")
+        format!("{author}\n\n{body}")
     }
 
     async fn message(&self, channel: String, thread: Option<u64>, id: String) -> RunLink {
@@ -1059,12 +1057,14 @@ impl Chips {
         match matching.as_slice() {
             [(number, title)] => RunLink {
                 relation: "target".into(),
+                preview: None,
                 kind: "forge".into(),
                 label: format!("{repo}#{number} · {title}"),
                 url: duck_link(&format!("forge/{repo}/{number}"), &self.chain),
             },
             _ => RunLink {
                 relation: "target".into(),
+                preview: None,
                 kind: "forge".into(),
                 label: format!("{repo}: {source} into {target}"),
                 url: duck_link(&format!("forge/{repo}"), &self.chain),
@@ -1076,22 +1076,34 @@ impl Chips {
     /// touched in journal order.
     async fn run_links(&mut self, run: &serde_json::Value) -> Vec<RunLink> {
         let mut links = Vec::new();
+        let mut seen = Vec::new();
         let origin = run["origin"].clone();
         if origin.is_object() {
-            let mut link = self.cached(place_target(origin)).await;
+            let target = place_target(origin);
+            seen.push(target.clone());
+            let mut link = self.cached(target).await;
             link.relation = "from".into();
             links.push(link);
         }
-        let places: Vec<serde_json::Value> = run["places"]
+        let places: Vec<Target> = run["places"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .into_iter()
             .rev()
+            .map(place_target)
+            .filter(|target| {
+                let duplicate = seen.contains(target);
+                if duplicate {
+                    return false;
+                }
+                seen.push(target.clone());
+                true
+            })
             .take(MAX_TOUCHED_PLACES)
             .collect();
         for place in places {
-            let mut link = self.cached(place_target(place)).await;
+            let mut link = self.cached(place).await;
             link.relation = "touched".into();
             links.push(link);
         }

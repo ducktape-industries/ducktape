@@ -33,6 +33,9 @@ with their results. The executor's elapsed time labels the closed session
 Raw lists compact event rows; expanding a row shows its formatted JSON.
 Conversation renders reply blocks as Markdown and leaves execution metadata
 in Raw.
+Journal message references use compact channel and message labels, with inline
+previews and links to the original chat context. Repeated trigger references
+appear once in Relevant.
 The external requester, or the current controller of a program requester, can
 read its output, add instructions, stop the run, and answer pending tool
 approvals. Codex steers its active turn; Claude interrupts the current response

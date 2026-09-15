@@ -70,11 +70,12 @@ fn field(key: &str, hint: &str, value: &str, message: fn(String) -> Message) -> 
     )
 }
 
-fn places(key: &str, links: &[host::RunLink]) -> Node {
+fn places(key: &str, links: &[host::RunLink], opened: Option<&str>) -> Node {
     kit::spaced(
         kit::column(
             key,
             links.iter().enumerate().map(|(index, link)| {
+                let preview_key = format!("{key}/{}", link.url);
                 let key = format!("{key}/{index}");
                 if link.url.is_empty() {
                     return kit::badge(key, &link.label, Tone::Neutral);
@@ -88,7 +89,44 @@ fn places(key: &str, links: &[host::RunLink]) -> Node {
                 if let Node::Button { label, .. } = &mut button {
                     *label = Some(link.label.clone());
                 }
-                kit::sized(button, Some(Length::Fill), None)
+                let Some(preview) = &link.preview else {
+                    return kit::sized(button, Some(Length::Fill), None);
+                };
+                let button = kit::button(
+                    &key,
+                    &link.label,
+                    Some(slots::message(Message::OpenPlace(link.url.clone()))),
+                    ButtonPreset::Text,
+                );
+                let expanded = opened == Some(preview_key.as_str());
+                let mut content = vec![kit::spaced(
+                    kit::row(
+                        format!("{key}/header"),
+                        [
+                            button,
+                            kit::button(
+                                format!("{key}/toggle"),
+                                if expanded {
+                                    "Hide message"
+                                } else {
+                                    "View message"
+                                },
+                                Some(slots::message(Message::ToggleMessagePreview(preview_key))),
+                                ButtonPreset::Subtle,
+                            ),
+                        ],
+                    ),
+                    8.,
+                )];
+                if expanded {
+                    content.push(kit::wrapping(kit::text(format!("{key}/preview"), preview)));
+                    content.push(subtle(
+                        format!("{key}/open-chat"),
+                        "Open in chat",
+                        Some(Message::OpenPlace(link.url.clone())),
+                    ));
+                }
+                kit::spaced(kit::column(format!("{key}/message"), content), 8.)
             }),
         ),
         6.,
@@ -864,7 +902,11 @@ impl AgentsView {
             items.push(section(
                 "agents/relevant",
                 "Relevant",
-                [places("agents/places", &self.journal.links)],
+                [places(
+                    "agents/places",
+                    &self.journal.links,
+                    self.message_preview_open.as_deref(),
+                )],
             ));
         }
         if !self.open_row.reason.is_empty() {
@@ -920,7 +962,11 @@ impl AgentsView {
                     )));
                 }
                 if !entry.targets.is_empty() {
-                    lines.push(places(&format!("{key}/targets"), &entry.targets));
+                    lines.push(places(
+                        &format!("{key}/targets"),
+                        &entry.targets,
+                        self.message_preview_open.as_deref(),
+                    ));
                 }
                 let body = kit::spaced(kit::column(format!("{key}/body"), lines), 4.);
                 entries.push(kit::spaced(
@@ -1289,6 +1335,7 @@ pub struct AgentsView {
     pub(crate) trace_open: bool,
     pub(crate) run_tab: RunTab,
     pub(crate) raw_event_open: Option<String>,
+    pub(crate) message_preview_open: Option<String>,
     pub(crate) control_draft: String,
     pub(crate) control_state: host::ControlState,
     pub(crate) control_serial: u64,
@@ -1331,6 +1378,7 @@ pub enum Message {
     ToggleTrace,
     ChooseRunTab(RunTab),
     ToggleRawEvent(String),
+    ToggleMessagePreview(String),
     RetryTrace,
     ControlDraft(String),
     ControlSend,
@@ -1384,6 +1432,7 @@ impl AgentsView {
             trace_open: false,
             run_tab: RunTab::Conversation,
             raw_event_open: None,
+            message_preview_open: None,
             control_draft: String::new(),
             control_state: host::ControlState::Idle,
             control_serial: 0,
@@ -1418,7 +1467,7 @@ impl AgentsView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "84dedda8710b875d68034fa267fb15ad64388c35f199a5cf278e43def6981944";
+        "90861baea4a7d861997b4f106a9991cf39c4192cec2df39ef6433046e10c9ff5";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
@@ -1494,7 +1543,9 @@ mod tests {
                 url: "duck://chat/general/4".into(),
                 relation: "reply".into(),
                 kind: "chat".into(),
+                preview: None,
             }],
+            None,
         );
         let mut labels = 0;
         node.for_each_mut(&mut |node| {
@@ -1624,6 +1675,7 @@ impl AgentsView {
             Message::ToggleTrace => self.on_toggle_trace(),
             Message::ChooseRunTab(tab) => self.on_choose_run_tab(tab),
             Message::ToggleRawEvent(raw) => self.on_toggle_raw_event(raw),
+            Message::ToggleMessagePreview(key) => self.on_toggle_message_preview(key),
             Message::RetryTrace => self.on_retry_trace(),
             Message::ControlDraft(text) => self.on_control_draft(text),
             Message::ControlSend => self.on_control_send(),
@@ -1796,6 +1848,14 @@ impl AgentsView {
         }
         ducktape_view_guest::Task::none()
     }
+    fn on_toggle_message_preview(&mut self, key: String) -> ducktape_view_guest::Task<Message> {
+        self.message_preview_open = if self.message_preview_open.as_ref() == Some(&key) {
+            None
+        } else {
+            Some(key)
+        };
+        ducktape_view_guest::Task::none()
+    }
     fn on_toggle_raw_event(&mut self, raw: String) -> ducktape_view_guest::Task<Message> {
         self.raw_event_open = if self.raw_event_open.as_ref() == Some(&raw) {
             None
@@ -1858,6 +1918,7 @@ impl AgentsView {
                     self.live = host::LiveRun::default();
                     self.trace_open = false;
                     self.raw_event_open = None;
+                    self.message_preview_open = None;
                     self.run_tab = RunTab::Conversation;
                 }
                 self.open_run = next.open_run.to_owned();
@@ -2150,6 +2211,7 @@ impl AgentsView {
             {
                 self.trace_open = false;
                 self.raw_event_open = None;
+                self.message_preview_open = None;
                 self.run_tab = RunTab::Conversation;
                 self.expanded_receipt = "".to_owned();
                 self.control_state = host::ControlState::Idle;
@@ -2181,6 +2243,7 @@ impl AgentsView {
             {
                 self.trace_open = false;
                 self.raw_event_open = None;
+                self.message_preview_open = None;
                 self.run_tab = RunTab::Conversation;
                 self.expanded_receipt = "".to_owned();
                 self.control_state = host::ControlState::Idle;

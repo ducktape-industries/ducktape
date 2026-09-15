@@ -80,6 +80,8 @@ fn failed_run() -> Value {
         }},
         "actions": 0,
         "places": [
+            { "kind": "chat_message", "channel_id": "general", "seq": 9 },
+            { "kind": "chat_message", "channel_id": "general", "seq": 9 },
             { "kind": "page", "page_id": "p-9", "title": "Release notes" },
             { "kind": "file", "path": "/src/main.rs" },
         ],
@@ -127,7 +129,10 @@ fn reply_for(request: &Request) -> Option<Value> {
         ("rpc.view", "chat") if named("channel") => {
             Some(json!({ "channel": { "name": "general" } }))
         }
-        ("rpc.view", "chat") if named("messages_around") => Some(json!({ "messages": [] })),
+        ("rpc.view", "chat") if named("messages_around") => Some(json!({ "messages": [{
+            "channel_id":"general", "seq":9, "author":"7", "deleted":false,
+            "text":"Please inspect this trigger message.\nKeep its conversation context."
+        }] })),
         _ => None,
     }
 }
@@ -571,7 +576,7 @@ fn the_open_run_draws_its_places_as_chips() {
     let frame = tick_native(press(&frame, "Journal"));
     for expected in [
         "Relevant",
-        "#general · message 9 unavailable",
+        "#general · Message 9",
         "Release notes",
         "/src/main.rs",
     ] {
@@ -581,6 +586,42 @@ fn the_open_run_draws_its_places_as_chips() {
             texts(&frame)
         );
     }
+    let mut root = frame.root.clone().unwrap();
+    let mut trigger_links = 0;
+    root.for_each_mut(&mut |node| {
+        if let Node::Button {
+            label: Some(label), ..
+        } = node
+            && label == "#general · Message 9"
+        {
+            trigger_links += 1;
+        }
+    });
+    assert_eq!(trigger_links, 1);
+    assert!(
+        !texts(&frame)
+            .iter()
+            .any(|text| text.contains("Please inspect this trigger message."))
+    );
+    let frame = tick_native(press(&frame, "View message"));
+    assert!(
+        texts(&frame)
+            .iter()
+            .any(|text| text.contains("Please inspect this trigger message."))
+    );
+    let opened = tick_native(press(&frame, "Open in chat"));
+    assert_eq!(
+        serde_json::from_slice::<OpenLink>(&one_intent(&opened).payload)
+            .unwrap()
+            .url,
+        "duck://channel/general?net=a1b2c3d4#9"
+    );
+    let frame = tick_native(press(&opened, "Hide message"));
+    assert!(
+        !texts(&frame)
+            .iter()
+            .any(|text| text.contains("Please inspect this trigger message."))
+    );
     // a place the protocol cannot address yet is drawn, never offered
     assert!(
         !frame_has_button(&frame, "/src/main.rs"),
