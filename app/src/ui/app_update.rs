@@ -208,7 +208,6 @@ impl Ducktape {
             AppMessage::ChatLoadFailed(cause) => self.on_chat_load_failed(cause),
             AppMessage::ChannelCreated(next) => self.on_channel_created(next),
             AppMessage::LiveAgentsEvent(next) => self.on_live_agents_event(next),
-            AppMessage::LiveCancelAcked(_ok) => self.on_live_cancel_acked(_ok),
             AppMessage::CopyMessageLink(link) => self.on_copy_message_link(link),
             AppMessage::OpenMessageLink(url) => self.on_open_message_link(url),
             AppMessage::ChatScrolled(_absolute_x, _absolute_y, _relative_x, relative_y) => {
@@ -3846,10 +3845,6 @@ impl Ducktape {
         self.live_agents = next.rows.clone();
         Task::none()
     }
-    fn on_live_cancel_acked(&mut self, _ok: bool) -> Task<AppMessage> {
-        self.error = "".to_owned();
-        Task::none()
-    }
     fn on_copy_message_link(&mut self, link: String) -> Task<AppMessage> {
         if (link).is_empty() {
             return Task::none();
@@ -4091,17 +4086,6 @@ impl Ducktape {
             ChatIntent::CopyLink => Task::done(AppMessage::CopyMessageLink(
                 crate::module_view::event_text(&(event), "link"),
             )),
-            ChatIntent::CancelRun => Task::perform(
-                crate::backend::cancel_agent_run(
-                    self.connected_rpc.to_owned(),
-                    self.password.to_owned(),
-                    crate::module_view::event_text(&(event), "run_id"),
-                ),
-                |result| match result {
-                    Ok(value) => AppMessage::LiveCancelAcked(value),
-                    Err(error) => AppMessage::MutationFailed(error),
-                },
-            ),
             ChatIntent::OpenRun => Task::done(AppMessage::OpenRunPanel(
                 crate::module_view::event_text(&(event), "dispatch_id"),
             )),

@@ -218,6 +218,7 @@ pub enum Message {
     CopyToClipboard(String, String),
     CopyMessageLink(String),
     CancelRun(String),
+    RunCancelled(i64, crate::host::ActItem),
     OpenRun(String),
     ChatScrolled(f64, f64, f64, f64),
     LoadMoreHistory,
@@ -481,6 +482,35 @@ impl ChatView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn run_cancel_replies_preserve_edits_and_belong_to_their_connection() {
+        let mut state = ChatView::state();
+        state.connection_serial = 7;
+        state.message_edit_draft = "unfinished edit".into();
+        state.thread_edit_draft = "unfinished reply edit".into();
+        state.selected_message_seq = 12;
+        let _ = state.update(Message::RunCancelled(
+            7,
+            crate::host::ActItem {
+                error: "refused".into(),
+            },
+        ));
+        assert!(state.host_error.contains("refused"));
+        assert_eq!(state.message_edit_draft, "unfinished edit");
+        assert_eq!(state.thread_edit_draft, "unfinished reply edit");
+        assert_eq!(state.selected_message_seq, 12);
+        let _ = state.update(Message::RunCancelled(7, crate::host::ActItem::default()));
+        assert!(state.host_error.is_empty());
+        state.connection_serial = 8;
+        let _ = state.update(Message::RunCancelled(
+            7,
+            crate::host::ActItem {
+                error: "old refusal".into(),
+            },
+        ));
+        assert!(state.host_error.is_empty());
+    }
+
     #[test]
     fn dm_identity_comes_from_guest_directory_across_navigation_and_refresh() {
         let mut state = ChatView::state();

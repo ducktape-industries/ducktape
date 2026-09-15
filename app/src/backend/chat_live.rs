@@ -779,27 +779,6 @@ async fn watch_live_output(
     }
 }
 
-/// Stop an anchored run: the runs module gates the cancel to the requester
-/// or the agent's owner, so the signature is the reader's own.
-pub async fn cancel_agent_run(
-    rpc: String,
-    password: String,
-    run_id: String,
-) -> Result<bool, AppError> {
-    async {
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "runs",
-            runs::encode_msg(&runs::RunsMsg::CancelRun { run_id }),
-            password,
-        )
-        .await?;
-        Ok(true)
-    }
-    .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

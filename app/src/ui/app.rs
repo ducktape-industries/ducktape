@@ -189,7 +189,6 @@ pub(crate) enum ChatIntent {
     OpenLink,
     Copy,
     CopyLink,
-    CancelRun,
     OpenRun,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -579,7 +578,6 @@ pub(crate) enum AppMessage {
     ChatLoadFailed(crate::backend::HydrationError),
     ChannelCreated(crate::backend::ChatData),
     LiveAgentsEvent(crate::backend::LiveAgentNotice),
-    LiveCancelAcked(bool),
     CopyMessageLink(String),
     OpenMessageLink(String),
     ChatScrolled(f64, f64, f64, f64),

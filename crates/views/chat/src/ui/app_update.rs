@@ -43,6 +43,7 @@ impl super::ChatView {
             Message::CopyToClipboard(text, label) => self.on_copy_to_clipboard(text, label),
             Message::CopyMessageLink(link) => self.on_copy_message_link(link),
             Message::CancelRun(run_id) => self.on_cancel_run(run_id),
+            Message::RunCancelled(connection, item) => self.on_run_cancelled(connection, item),
             Message::OpenRun(dispatch_id) => self.on_open_run(dispatch_id),
             Message::ChatScrolled(absolute_x, absolute_y, relative_x, relative_y) => {
                 self.on_chat_scrolled(absolute_x, absolute_y, relative_x, relative_y)
@@ -807,8 +808,21 @@ impl super::ChatView {
         ::ducktape_view_guest::Task::none()
     }
     fn on_cancel_run(&mut self, run_id: String) -> ducktape_view_guest::Task<Message> {
-        self.sent = crate::host::send_cancel_run(::std::convert::AsRef::as_ref(&(run_id)));
-        ::ducktape_view_guest::Task::none()
+        let connection = self.connection_serial;
+        ducktape_view_guest::Task::perform(crate::host::cancel_run(run_id), move |item| {
+            Message::RunCancelled(connection, item)
+        })
+    }
+    fn on_run_cancelled(
+        &mut self,
+        connection: i64,
+        item: crate::host::ActItem,
+    ) -> ducktape_view_guest::Task<Message> {
+        let current_connection = connection == self.connection_serial;
+        if current_connection {
+            self.host_error = crate::host::failure_note("Couldn’t stop the run", &item.error);
+        }
+        ducktape_view_guest::Task::none()
     }
     fn on_open_run(&mut self, dispatch_id: String) -> ducktape_view_guest::Task<Message> {
         self.sent = crate::host::send_open_run(::std::convert::AsRef::as_ref(&(dispatch_id)));

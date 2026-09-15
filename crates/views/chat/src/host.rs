@@ -2123,12 +2123,6 @@ pub struct Link {
     pub link: String,
 }
 
-/// The run a Stop names.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct RunId {
-    pub run_id: String,
-}
-
 /// The run a "View run" or a message's run chip opens.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DispatchId {
@@ -2228,13 +2222,14 @@ pub fn send_copy_link(link: &str) -> bool {
     notify("chat.copy_link", &Link { link: link.into() })
 }
 
-pub fn send_cancel_run(run_id: &str) -> bool {
-    notify(
-        "chat.cancel_run",
-        &RunId {
-            run_id: run_id.into(),
-        },
-    )
+/// The runs module decides whether the seated signer may cancel this run.
+pub async fn cancel_run(run_id: String) -> ActItem {
+    let request = serde_json::json!({"target":"runs", "payload":{"cancel_run":{"run_id":run_id}}});
+    let response =
+        host::request("op.submit", &serde_json::to_vec(&request).expect("encodes")).await;
+    ActItem {
+        error: response.err().unwrap_or_default(),
+    }
 }
 
 /// Take the reader to a run's panel: the live hint's "View run", or the run

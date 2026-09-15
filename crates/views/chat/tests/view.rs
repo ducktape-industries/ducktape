@@ -761,8 +761,8 @@ fn the_channel_list_and_details_drawer_drag_with_horizontal_cursors() {
 /// a session fact; the timeline shows it the way it shows any thread — the
 /// reply chip under the message that summoned it, counting the answer to come
 /// — and never the run's card. Inside the thread the card rides at the tail,
-/// once, with its controls; Stop is the one intent the app signs, carrying the
-/// run it names. A run the app's reading no longer holds takes its card with
+/// once, with its controls; Stop submits a guest-authored cancellation through
+/// the common signing contract. A run the app's reading no longer holds takes its card with
 /// it.
 #[test]
 fn a_live_run_opens_its_thread_and_stop_leaves_as_a_cancel() {
@@ -808,11 +808,36 @@ fn a_live_run_opens_its_thread_and_stop_leaves_as_a_cancel() {
         assert_eq!(cards, 1, "one run card, in the thread: {:?}", texts(&frame));
 
         let frame = tick_native(press(&frame, "Stop"));
-        let intent = one_intent(&frame);
-        assert_eq!(intent.kind, "chat.cancel_run");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&intent.payload).expect("the intent decodes");
-        assert_eq!(payload["run_id"], CHIEF_RUN);
+        let cancel = request(&frame, "op.submit");
+        let payload: serde_json::Value = serde_json::from_slice(&cancel.payload).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({"target":"runs", "payload":{"cancel_run":{"run_id":CHIEF_RUN}}})
+        );
+        assert!(
+            !frame
+                .requests
+                .iter()
+                .any(|request| request.kind == "chat.cancel_run")
+        );
+        let frame = tick_native(vec![ducktape_view_guest::wire::Event::Response {
+            id: cancel.id,
+            result: Err("cancel refused".into()),
+            done: true,
+        }]);
+        assert!(
+            texts(&frame)
+                .iter()
+                .any(|text| text.contains("cancel refused"))
+        );
+
+        assert!(
+            !frame
+                .requests
+                .iter()
+                .any(|request| request.kind == "rpc.view"),
+            "cancellation must not reset the message editor or reload the room"
+        );
 
         // THE RUN SETTLED: the app's reading no longer holds it, so the card
         // goes with it.
