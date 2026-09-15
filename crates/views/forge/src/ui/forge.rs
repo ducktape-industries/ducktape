@@ -133,14 +133,17 @@ impl ForgeView {
                     format!("{key}/line"),
                     [
                         native::sized(
-                            native::strong(format!("forge/open/{}", repo.name), &repo.name),
+                            native::text_size(
+                                native::strong(format!("forge/open/{}", repo.name), &repo.name),
+                                14.,
+                            ),
                             Some(wire::Length::Fill),
                             None,
                         ),
                         native::nowrap(native::colored(
                             native::text_size(
                                 native::mono(format!("forge/head/{}", repo.name), &repo.head),
-                                native::type_scale::CAPTION as f32,
+                                12.,
                             ),
                             p.muted,
                         )),
@@ -149,7 +152,13 @@ impl ForgeView {
                 false,
                 Some(slots::message(Message::ForgeOpenRepo(repo.name.clone()))),
             );
-            if let wire::Node::Button { label, .. } = &mut row {
+            if let wire::Node::Button { label, padding, .. } = &mut row {
+                *padding = Some(wire::Edges {
+                    top: 10.,
+                    right: 10.,
+                    bottom: 10.,
+                    left: 10.,
+                });
                 *label = Some(repo.name.clone());
             }
             row
@@ -320,10 +329,8 @@ impl ForgeView {
         )
     }
 
-    /// The tracker: one line per item, its state read off the badge at the
-    /// left. The list is the screen — no card, no outer inset.
+    /// The tracker separates each title and state from its number and author.
     fn tracker_screen(&self, tab: &str) -> wire::Node {
-        let p = native::palette();
         let items = host::filter_forge_items(&self.items, tab);
         let mut content = Vec::new();
         match self.repo_phase.as_str() {
@@ -339,41 +346,44 @@ impl ForgeView {
                 }
                 for item in items {
                     let key = format!("forge/item/{}", item.number);
-                    let line = native::sized(
-                        native::centered_row(
+                    let line = native::spaced(
+                        native::column(
                             format!("{key}/line"),
                             [
-                                native::badge(
-                                    format!("{key}/state"),
-                                    host::state_label(&item.state),
-                                    state_tone(&item.state),
-                                ),
-                                native::sized(
-                                    native::nowrap(native::strong(
-                                        format!("{key}/open"),
-                                        &item.title,
-                                    )),
-                                    Some(wire::Length::Fill),
-                                    None,
-                                ),
-                                native::nowrap(native::colored(
-                                    native::text_size(
-                                        native::mono(
-                                            format!("{key}/number"),
-                                            format!("#{}", item.number),
-                                        ),
-                                        native::type_scale::CAPTION as f32,
+                                native::spaced(
+                                    native::centered_row(
+                                        format!("{key}/title-line"),
+                                        [
+                                            native::sized(
+                                                native::nowrap(native::text_size(
+                                                    native::strong(
+                                                        format!("{key}/open"),
+                                                        &item.title,
+                                                    ),
+                                                    14.,
+                                                )),
+                                                Some(wire::Length::Fill),
+                                                None,
+                                            ),
+                                            native::badge(
+                                                format!("{key}/state"),
+                                                host::state_label(&item.state),
+                                                state_tone(&item.state),
+                                            ),
+                                        ],
                                     ),
-                                    p.muted,
-                                )),
-                                native::nowrap(native::caption(
-                                    format!("{key}/author"),
-                                    &item.author_name,
-                                )),
+                                    8.,
+                                ),
+                                native::text_size(
+                                    native::secondary(
+                                        format!("{key}/meta"),
+                                        format!("#{} · {}", item.number, item.author_name),
+                                    ),
+                                    12.,
+                                ),
                             ],
                         ),
-                        Some(wire::Length::Fill),
-                        Some(wire::Length::Fixed(24.)),
+                        4.,
                     );
                     let mut row = native::list_row(
                         &key,
@@ -381,7 +391,13 @@ impl ForgeView {
                         false,
                         Some(slots::message(Message::ForgeOpenItem(item.number))),
                     );
-                    if let wire::Node::Button { label, .. } = &mut row {
+                    if let wire::Node::Button { label, padding, .. } = &mut row {
+                        *padding = Some(wire::Edges {
+                            top: 10.,
+                            right: 10.,
+                            bottom: 10.,
+                            left: 10.,
+                        });
                         *label = Some(item.title.clone());
                     }
                     content.push(row);

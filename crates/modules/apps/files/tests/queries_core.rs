@@ -322,21 +322,20 @@ fn ls_on_a_file_path_errors() {
     );
 }
 
-/// The two STRUCTURAL namespace roots list EMPTY on a fresh filesystem, exactly
-/// as `/` does — they are not directories anyone made.
-///
-/// `check_authority` refuses to write `/home` or `/shared` ("root is not
-/// writable") and nothing materializes them in the tree, so before the first
-/// write under one it exists in the rule and not in the store. Answering
-/// `path not found` there told a caller to create a directory the authority rule
-/// forbids it from creating — and it is what put an error banner on the Files
-/// pane of every fresh workspace.
+/// Namespace roots and individual homes are readable before their first write.
 #[test]
 fn a_namespace_root_lists_empty_before_anything_is_written_under_it() {
     let d = tempfile::tempdir().unwrap();
     let f = open_files(&d);
 
-    for root in ["/", "/shared", "/home"] {
+    for root in [
+        "/",
+        "/shared",
+        "/home",
+        "/home/acct:7",
+        "/home/ext:ab",
+        "/home/agent",
+    ] {
         let reply = ls_query(&f, root, None, None, 256).expect("a namespace root lists");
         assert!(
             matches!(&reply, FilesReply::Ls { entries, next } if entries.is_empty() && next.is_none()),
@@ -345,21 +344,54 @@ fn a_namespace_root_lists_empty_before_anything_is_written_under_it() {
     }
 }
 
-/// The teeth of the rule above: it is EXACTLY the one-segment roots. A path
-/// under one that nobody wrote is genuinely absent and must still say so, or the
-/// listing would silently answer empty for every typo.
+/// Only structural roots are empty; missing descendants still report absence.
 #[test]
 fn only_the_roots_themselves_list_empty_never_a_path_under_one() {
     let d = tempfile::tempdir().unwrap();
     let f = open_files(&d);
 
-    for absent in ["/shared/nope", "/home/nobody", "/shared/a/b", "/elsewhere"] {
+    for absent in [
+        "/shared/nope",
+        "/home/acct:7/nope",
+        "/shared/a/b",
+        "/elsewhere",
+    ] {
         let reply = ls_query(&f, absent, None, None, 256);
         assert!(
             matches!(&reply, Err(sdk::Error::Module(m)) if m.contains("path not found")),
             "{absent}: got {reply:?}"
         );
     }
+}
+
+#[test]
+fn a_home_lists_empty_then_its_first_committed_file() {
+    let d = tempfile::tempdir().unwrap();
+    let mut f = open_files(&d);
+    seed_bulk(&mut f);
+    let before = head(&f);
+    let home = "/home/acct:7";
+    assert!(ls(&f, home, None, None, 256).0.is_empty());
+    assert_eq!(
+        head(&f),
+        before,
+        "reading a home must not create a snapshot"
+    );
+
+    commit(
+        &mut f,
+        sdk::Origin::External(vec![7; 32]),
+        2,
+        Some(&before),
+        vec![put_inline("/home/acct:7/notes.txt", b"first note")],
+    )
+    .expect("write under an unmaterialized home");
+    commit_block(&mut f);
+    let (entries, next) = ls(&f, home, None, None, 256);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "/home/acct:7/notes.txt");
+    assert!(next.is_none());
+    assert!(ls(&f, home, Some(&before), None, 256).0.is_empty());
 }
 
 #[test]
