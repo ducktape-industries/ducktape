@@ -121,12 +121,15 @@ async function main() {
   const nodeBytes = (await query("valset", "validators")).validators[0];
   const nodeHex = Buffer.from(nodeBytes).toString("hex");
 
-  // Found the demo user's account from its own key (a user-signed Create),
-  // then resolve the key to its account NUMBER — the id every route carries.
-  run(["account", "create", "--name", requestedHandle, "--key", userKey, "--node", url]);
+  // Reuse the wallet account that owns the model user. Standalone gateway
+  // seeding may receive a fresh wallet, so only that case needs Create.
   const userPubHex = sign(["user", "key", "status", "--key", userKey]).split(" ").at(-1);
-  const resolved = await query("identity", { of_key: { key: [...Buffer.from(userPubHex, "hex")] } });
-  const account = resolved.account;
+  const ownerQuery = { of_key: { key: [...Buffer.from(userPubHex, "hex")] } };
+  let account = (await query("identity", ownerQuery)).account;
+  if (!account) {
+    run(["account", "create", "--name", requestedHandle, "--key", userKey, "--node", url]);
+    account = (await query("identity", ownerQuery)).account;
+  }
   if (!account) throw new Error("[gateway] the demo key founded no account");
   const accountId = account.number;
   console.log(`[gateway] account ${accountId} (${account.name}) founded by the demo key`);

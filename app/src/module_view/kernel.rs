@@ -990,8 +990,13 @@ fn admin(
         let signed = crate::backend::seated_request_headers("POST", &route, &node_key, &body)
             .await
             .ok_or_else(|| "`rpc.admin` needs the session key unlocked".to_owned())?;
+        let content_type = match &ask["payload"] {
+            serde_json::Value::String(_) => "text/plain; charset=utf-8",
+            _ => "application/json",
+        };
         let mut request = reqwest::Client::new()
             .post(format!("{}{route}", client.origin()))
+            .header(reqwest::header::CONTENT_TYPE, content_type)
             .body(body);
         for (name, value) in signed {
             request = request.header(name, value);

@@ -36,12 +36,24 @@ fn primary(key: impl Into<String>, label: &str, message: Option<Message>) -> Nod
 }
 
 fn subtle(key: impl Into<String>, label: &str, message: Option<Message>) -> Node {
-    kit::button(
-        key,
-        label,
+    let key = key.into();
+    let mut button = kit::button_child(
+        &key,
+        kit::sized(
+            kit::wrapping(kit::text(format!("{key}/label"), label)),
+            Some(Length::Fill),
+            None,
+        ),
         message.map(slots::message),
         ButtonPreset::Subtle,
-    )
+    );
+    if let Node::Button {
+        label: accessible, ..
+    } = &mut button
+    {
+        *accessible = Some(label.to_owned());
+    }
+    button
 }
 
 fn field(key: &str, hint: &str, value: &str, message: fn(String) -> Message) -> Node {
@@ -58,11 +70,12 @@ fn field(key: &str, hint: &str, value: &str, message: fn(String) -> Message) -> 
     )
 }
 
-fn places(key: &str, links: &[host::RunLink]) -> Node {
+fn places(key: &str, links: &[host::RunLink], opened: Option<&str>) -> Node {
     kit::spaced(
         kit::column(
             key,
             links.iter().enumerate().map(|(index, link)| {
+                let preview_key = format!("{key}/{}", link.url);
                 let key = format!("{key}/{index}");
                 if link.url.is_empty() {
                     return kit::badge(key, &link.label, Tone::Neutral);
@@ -76,7 +89,44 @@ fn places(key: &str, links: &[host::RunLink]) -> Node {
                 if let Node::Button { label, .. } = &mut button {
                     *label = Some(link.label.clone());
                 }
-                kit::sized(button, Some(Length::Fill), None)
+                let Some(preview) = &link.preview else {
+                    return kit::sized(button, Some(Length::Fill), None);
+                };
+                let button = kit::button(
+                    &key,
+                    &link.label,
+                    Some(slots::message(Message::OpenPlace(link.url.clone()))),
+                    ButtonPreset::Text,
+                );
+                let expanded = opened == Some(preview_key.as_str());
+                let mut content = vec![kit::spaced(
+                    kit::row(
+                        format!("{key}/header"),
+                        [
+                            button,
+                            kit::button(
+                                format!("{key}/toggle"),
+                                if expanded {
+                                    "Hide message"
+                                } else {
+                                    "View message"
+                                },
+                                Some(slots::message(Message::ToggleMessagePreview(preview_key))),
+                                ButtonPreset::Subtle,
+                            ),
+                        ],
+                    ),
+                    8.,
+                )];
+                if expanded {
+                    content.push(kit::wrapping(kit::text(format!("{key}/preview"), preview)));
+                    content.push(subtle(
+                        format!("{key}/open-chat"),
+                        "Open in chat",
+                        Some(Message::OpenPlace(link.url.clone())),
+                    ));
+                }
+                kit::spaced(kit::column(format!("{key}/message"), content), 8.)
             }),
         ),
         6.,
@@ -444,6 +494,13 @@ impl AgentsView {
                             Some(Length::Fill),
                             None,
                         ),
+                        kit::text_size(
+                            kit::secondary(
+                                format!("{key}/dispatched"),
+                                format!("Dispatched at · {}", run.dispatched),
+                            ),
+                            11.,
+                        ),
                     ],
                 ),
                 4.,
@@ -654,6 +711,10 @@ impl AgentsView {
                 ),
                 8.,
             ),
+            kit::secondary(
+                "agents/journal-dispatched",
+                format!("Dispatched at · {}", self.open_row.dispatched),
+            ),
         ];
         if self.expanded_receipt == self.open_run {
             let facts = host::run_facts(&self.open_row).into_iter().enumerate().map(
@@ -688,6 +749,42 @@ impl AgentsView {
                 Tone::Danger,
             ));
         }
+        items.push(kit::spaced(
+            kit::row(
+                "agents/run-tabs",
+                RunTab::ALL.into_iter().map(|tab| {
+                    kit::button(
+                        format!("agents/run-tab/{}", tab.label()),
+                        tab.label(),
+                        Some(slots::message(Message::ChooseRunTab(tab))),
+                        if self.run_tab == tab {
+                            ButtonPreset::Secondary
+                        } else {
+                            ButtonPreset::Subtle
+                        },
+                    )
+                }),
+            ),
+            6.,
+        ));
+        let content = match self.run_tab {
+            RunTab::Conversation => self.conversation_panel(),
+            RunTab::Trace => self.trace_panel(),
+            RunTab::Journal => self.journal_entries_panel(),
+            RunTab::Raw => self.raw_panel(),
+        };
+        items.push(content);
+        kit::spaced(
+            kit::padded(
+                kit::column("agents/journal-content", items),
+                wire::Edges::all(16.),
+            ),
+            14.,
+        )
+    }
+
+    fn trace_panel(&self) -> Node {
+        let mut items = Vec::new();
         let process_label = self.live.process_label(self.open_row.state == "running");
         items.push(subtle(
             "agents/trace-toggle",
@@ -729,28 +826,26 @@ impl AgentsView {
                     kit::spaced(kit::column(format!("{key}/content"), content), 6.),
                 ));
             }
-            steps.push(subtle(
-                "agents/raw-trace-toggle",
-                if self.raw_trace_open {
-                    "Hide raw events"
-                } else {
-                    "Show raw events"
-                },
-                Some(Message::ToggleRawTrace),
-            ));
-            if self.raw_trace_open {
-                steps.extend(self.live.trace.iter().enumerate().map(|(index, line)| {
-                    kit::wrapping(kit::mono(format!("agents/trace/{index}"), line))
-                }));
-            }
             steps.push(kit::wrapping(kit::caption(
                 "agents/process-retention",
                 "Recent output retained by this node",
             )));
             items.push(kit::spaced(kit::column("agents/process", steps), 8.));
         }
+        kit::spaced(kit::column("agents/trace-panel", items), 12.)
+    }
+
+    fn conversation_panel(&self) -> Node {
+        let mut items = vec![subtle(
+            "agents/conversation-work",
+            &self.live.process_label(self.open_row.state == "running"),
+            Some(Message::ChooseRunTab(RunTab::Trace)),
+        )];
         if !self.live.answer.is_empty() {
-            items.push(self.markdown("agents/answer-full", &self.live.answer));
+            items.push(self.markdown(
+                "agents/answer-full",
+                &host::answer_markdown(&self.live.answer),
+            ));
         }
         let show_progress =
             self.live.present && self.live.answer.is_empty() && self.live.elapsed_ms.is_none();
@@ -791,12 +886,27 @@ impl AgentsView {
                 Tone::Agent,
             ));
         }
+        if self.live.answer.is_empty() && !show_progress {
+            items.push(kit::secondary(
+                "agents/conversation-empty",
+                "No reply is available for this run.",
+            ));
+        }
+        kit::spaced(kit::column("agents/conversation-panel", items), 14.)
+    }
+
+    fn journal_entries_panel(&self) -> Node {
+        let mut items = Vec::new();
         let journal_ready = self.journal.dispatch_id == self.open_run;
         if journal_ready && !self.journal.links.is_empty() {
             items.push(section(
                 "agents/relevant",
                 "Relevant",
-                [places("agents/places", &self.journal.links)],
+                [places(
+                    "agents/places",
+                    &self.journal.links,
+                    self.message_preview_open.as_deref(),
+                )],
             ));
         }
         if !self.open_row.reason.is_empty() {
@@ -852,7 +962,11 @@ impl AgentsView {
                     )));
                 }
                 if !entry.targets.is_empty() {
-                    lines.push(places(&format!("{key}/targets"), &entry.targets));
+                    lines.push(places(
+                        &format!("{key}/targets"),
+                        &entry.targets,
+                        self.message_preview_open.as_deref(),
+                    ));
                 }
                 let body = kit::spaced(kit::column(format!("{key}/body"), lines), 4.);
                 entries.push(kit::spaced(
@@ -872,13 +986,60 @@ impl AgentsView {
             }
         }
         items.push(section("agents/journal-title-section", "Journal", entries));
-        kit::spaced(
-            kit::padded(
-                kit::column("agents/journal-content", items),
-                wire::Edges::all(16.),
-            ),
-            14.,
-        )
+        kit::spaced(kit::column("agents/journal-panel", items), 14.)
+    }
+
+    fn raw_panel(&self) -> Node {
+        let mut items = vec![kit::secondary(
+            "agents/raw-count",
+            format!("{} retained events", self.live.trace.len()),
+        )];
+        for (index, raw) in self.live.trace.iter().enumerate() {
+            let event = serde_json::from_str::<serde_json::Value>(raw).ok();
+            let kind = event
+                .as_ref()
+                .and_then(|event| event["method"].as_str().or_else(|| event["type"].as_str()))
+                .unwrap_or("event");
+            let expanded = self.raw_event_open.as_deref() == Some(raw.as_str());
+            let key = format!("agents/raw/{index}");
+            let label = format!(
+                "{} {} · {kind}",
+                if expanded { "▾" } else { "▸" },
+                index + 1
+            );
+            let mut toggle = kit::button_child(
+                format!("{key}/toggle"),
+                kit::sized(
+                    kit::wrapping(kit::text(format!("{key}/label"), &label)),
+                    Some(Length::Fill),
+                    None,
+                ),
+                Some(slots::message(Message::ToggleRawEvent(raw.clone()))),
+                ButtonPreset::Subtle,
+            );
+            if let Node::Button {
+                label: accessible, ..
+            } = &mut toggle
+            {
+                *accessible = Some(label);
+            }
+            let mut content = vec![toggle];
+            if expanded {
+                let body = event
+                    .as_ref()
+                    .map(|event| serde_json::to_string_pretty(event).unwrap_or_default())
+                    .unwrap_or_else(|| raw.clone());
+                content.push(
+                    self.markdown(&format!("{key}/body"), &format!("~~~~json\n{body}\n~~~~")),
+                );
+            }
+            content.push(kit::divider(format!("{key}/divider")));
+            items.push(kit::spaced(
+                kit::column(format!("{key}/content"), content),
+                6.,
+            ));
+        }
+        kit::spaced(kit::column("agents/raw-panel", items), 4.)
     }
 
     fn editor(&self) -> Node {
@@ -1141,6 +1302,24 @@ impl AgentsView {
         )
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RunTab {
+    Conversation,
+    Trace,
+    Journal,
+    Raw,
+}
+impl RunTab {
+    const ALL: [Self; 4] = [Self::Conversation, Self::Trace, Self::Journal, Self::Raw];
+    fn label(self) -> &'static str {
+        match self {
+            Self::Conversation => "Conversation",
+            Self::Trace => "Trace",
+            Self::Journal => "Journal",
+            Self::Raw => "Raw",
+        }
+    }
+}
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct AgentsView {
     pub(crate) rows: Vec<crate::host::AgentRow>,
@@ -1154,7 +1333,9 @@ pub struct AgentsView {
     pub(crate) viewport_width: f64,
     pub(crate) expanded_receipt: String,
     pub(crate) trace_open: bool,
-    pub(crate) raw_trace_open: bool,
+    pub(crate) run_tab: RunTab,
+    pub(crate) raw_event_open: Option<String>,
+    pub(crate) message_preview_open: Option<String>,
     pub(crate) control_draft: String,
     pub(crate) control_state: host::ControlState,
     pub(crate) control_serial: u64,
@@ -1195,7 +1376,9 @@ pub enum Message {
     ViewportChanged(f64, f64),
     ToggleReceipt(String),
     ToggleTrace,
-    ToggleRawTrace,
+    ChooseRunTab(RunTab),
+    ToggleRawEvent(String),
+    ToggleMessagePreview(String),
     RetryTrace,
     ControlDraft(String),
     ControlSend,
@@ -1247,7 +1430,9 @@ impl AgentsView {
             viewport_width: 1280.0,
             expanded_receipt: "".to_owned(),
             trace_open: false,
-            raw_trace_open: false,
+            run_tab: RunTab::Conversation,
+            raw_event_open: None,
+            message_preview_open: None,
             control_draft: String::new(),
             control_state: host::ControlState::Idle,
             control_serial: 0,
@@ -1282,7 +1467,7 @@ impl AgentsView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "5718f398eda6cf183db64765dcd7ae9674416bf9c32676c0e3f60fced7c56db0";
+        "90861baea4a7d861997b4f106a9991cf39c4192cec2df39ef6433046e10c9ff5";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
@@ -1358,7 +1543,9 @@ mod tests {
                 url: "duck://chat/general/4".into(),
                 relation: "reply".into(),
                 kind: "chat".into(),
+                preview: None,
             }],
+            None,
         );
         let mut labels = 0;
         node.for_each_mut(&mut |node| {
@@ -1486,7 +1673,9 @@ impl AgentsView {
             Message::ViewportChanged(width, _height) => self.on_viewport_changed(width, _height),
             Message::ToggleReceipt(value) => self.on_toggle_receipt(value),
             Message::ToggleTrace => self.on_toggle_trace(),
-            Message::ToggleRawTrace => self.on_toggle_raw_trace(),
+            Message::ChooseRunTab(tab) => self.on_choose_run_tab(tab),
+            Message::ToggleRawEvent(raw) => self.on_toggle_raw_event(raw),
+            Message::ToggleMessagePreview(key) => self.on_toggle_message_preview(key),
             Message::RetryTrace => self.on_retry_trace(),
             Message::ControlDraft(text) => self.on_control_draft(text),
             Message::ControlSend => self.on_control_send(),
@@ -1652,8 +1841,27 @@ impl AgentsView {
         ducktape_view_guest::Task::none()
     }
 
-    fn on_toggle_raw_trace(&mut self) -> ducktape_view_guest::Task<Message> {
-        self.raw_trace_open = !self.raw_trace_open;
+    fn on_choose_run_tab(&mut self, tab: RunTab) -> ducktape_view_guest::Task<Message> {
+        self.run_tab = tab;
+        if tab == RunTab::Trace {
+            self.trace_open = true;
+        }
+        ducktape_view_guest::Task::none()
+    }
+    fn on_toggle_message_preview(&mut self, key: String) -> ducktape_view_guest::Task<Message> {
+        self.message_preview_open = if self.message_preview_open.as_ref() == Some(&key) {
+            None
+        } else {
+            Some(key)
+        };
+        ducktape_view_guest::Task::none()
+    }
+    fn on_toggle_raw_event(&mut self, raw: String) -> ducktape_view_guest::Task<Message> {
+        self.raw_event_open = if self.raw_event_open.as_ref() == Some(&raw) {
+            None
+        } else {
+            Some(raw)
+        };
         ducktape_view_guest::Task::none()
     }
 
@@ -1709,7 +1917,9 @@ impl AgentsView {
                     self.control_draft.clear();
                     self.live = host::LiveRun::default();
                     self.trace_open = false;
-                    self.raw_trace_open = false;
+                    self.raw_event_open = None;
+                    self.message_preview_open = None;
+                    self.run_tab = RunTab::Conversation;
                 }
                 self.open_run = next.open_run.to_owned();
             }
@@ -2000,7 +2210,9 @@ impl AgentsView {
         {
             {
                 self.trace_open = false;
-                self.raw_trace_open = false;
+                self.raw_event_open = None;
+                self.message_preview_open = None;
+                self.run_tab = RunTab::Conversation;
                 self.expanded_receipt = "".to_owned();
                 self.control_state = host::ControlState::Idle;
                 self.control_serial = self.control_serial.wrapping_add(1);
@@ -2030,7 +2242,9 @@ impl AgentsView {
         {
             {
                 self.trace_open = false;
-                self.raw_trace_open = false;
+                self.raw_event_open = None;
+                self.message_preview_open = None;
+                self.run_tab = RunTab::Conversation;
                 self.expanded_receipt = "".to_owned();
                 self.control_state = host::ControlState::Idle;
                 self.control_serial = self.control_serial.wrapping_add(1);

@@ -862,14 +862,12 @@ async fn pump_frames(
             };
             match frame {
                 Frame::Stdout(bytes) => {
-                    if stdout.write_all(&bytes).await.is_err() {
-                        return;
-                    }
+                    // A session reader may finish at its result before the
+                    // CLI finishes cleanup. Keep draining to the exit frame.
+                    let _ = stdout.write_all(&bytes).await;
                 }
                 Frame::Stderr(bytes) => {
-                    if stderr.write_all(&bytes).await.is_err() {
-                        return;
-                    }
+                    let _ = stderr.write_all(&bytes).await;
                 }
                 // Last frame of the run, and closing here is the guest's
                 // signal that it may reset. Firecracker relays the guest's
@@ -1045,6 +1043,28 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), input_tx.closed())
             .await
             .expect("the feed task is still parked, holding the vsock write half");
+    }
+
+    #[tokio::test]
+    async fn closed_output_readers_do_not_discard_the_guest_exit() {
+        let (host, mut guest) = UnixStream::pair().expect("socketpair");
+        let (input_tx, input_rx) = tokio::sync::mpsc::channel(INPUT_QUEUE);
+        let (out_task, stdout) = tokio::io::duplex(1024);
+        let (err_task, stderr) = tokio::io::duplex(1024);
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+        drop(stdout);
+        drop(stderr);
+        let pump = tokio::spawn(pump_frames(host, input_rx, out_task, err_task, exit_tx));
+        for frame in [
+            Frame::Stdout(b"after result".to_vec()),
+            Frame::Stderr(b"cleanup".to_vec()),
+            Frame::Exit(0),
+        ] {
+            guest.write_all(&guest_proto::encode(&frame)).await.unwrap();
+        }
+        assert_eq!(exit_rx.await.expect("guest exit survives closed readers"), 0);
+        pump.await.unwrap();
+        input_tx.closed().await;
     }
 
     /// The two halves of the ownership contract `boot` documents: a directory

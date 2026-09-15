@@ -80,6 +80,8 @@ fn failed_run() -> Value {
         }},
         "actions": 0,
         "places": [
+            { "kind": "chat_message", "channel_id": "general", "seq": 9 },
+            { "kind": "chat_message", "channel_id": "general", "seq": 9 },
             { "kind": "page", "page_id": "p-9", "title": "Release notes" },
             { "kind": "file", "path": "/src/main.rs" },
         ],
@@ -127,7 +129,10 @@ fn reply_for(request: &Request) -> Option<Value> {
         ("rpc.view", "chat") if named("channel") => {
             Some(json!({ "channel": { "name": "general" } }))
         }
-        ("rpc.view", "chat") if named("messages_around") => Some(json!({ "messages": [] })),
+        ("rpc.view", "chat") if named("messages_around") => Some(json!({ "messages": [{
+            "channel_id":"general", "seq":9, "author":"7", "deleted":false,
+            "text":"Please inspect this trigger message.\nKeep its conversation context."
+        }] })),
         _ => None,
     }
 }
@@ -508,23 +513,13 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
         },
         "the other tabs follow the reader's press"
     );
-    assert!(
-        has_text(&frame, "Reading the journal…"),
-        "{:?}",
-        texts(&frame)
-    );
-    // the failure strip says what happened, then why
-    assert!(has_text(&frame, "This run failed"), "{:?}", texts(&frame));
-    assert!(has_text(&frame, "worker exploded"), "{:?}", texts(&frame));
-
-    // the journal is this view's own read, on the same cadence as the
-    // register — the press does not wait on the app
+    // Answer the subscription requests before a tab-only redraw.
     let (frame, _) = settle(frame);
-    assert!(
-        !has_text(&frame, "Reading the journal…"),
-        "{:?}",
-        texts(&frame)
-    );
+    assert!(!has_text(&frame, "Dispatched"));
+    let frame = tick_native(press(&frame, "Journal"));
+    assert!(!has_text(&frame, "Reading the journal…"));
+    assert!(has_text(&frame, "This run failed"));
+    assert!(has_text(&frame, "worker exploded"));
     for expected in ["Dispatched", "for reviewer-bot from Message 9", "Settled"] {
         assert!(
             has_text(&frame, expected),
@@ -578,9 +573,10 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
 #[test]
 fn the_open_run_draws_its_places_as_chips() {
     let (frame, _) = connect(booted(), "7", "dispatch-gone", 1);
+    let frame = tick_native(press(&frame, "Journal"));
     for expected in [
         "Relevant",
-        "#general · message 9 unavailable",
+        "#general · Message 9",
         "Release notes",
         "/src/main.rs",
     ] {
@@ -590,6 +586,42 @@ fn the_open_run_draws_its_places_as_chips() {
             texts(&frame)
         );
     }
+    let mut root = frame.root.clone().unwrap();
+    let mut trigger_links = 0;
+    root.for_each_mut(&mut |node| {
+        if let Node::Button {
+            label: Some(label), ..
+        } = node
+            && label == "#general · Message 9"
+        {
+            trigger_links += 1;
+        }
+    });
+    assert_eq!(trigger_links, 1);
+    assert!(
+        !texts(&frame)
+            .iter()
+            .any(|text| text.contains("Please inspect this trigger message."))
+    );
+    let frame = tick_native(press(&frame, "View message"));
+    assert!(
+        texts(&frame)
+            .iter()
+            .any(|text| text.contains("Please inspect this trigger message."))
+    );
+    let opened = tick_native(press(&frame, "Open in chat"));
+    assert_eq!(
+        serde_json::from_slice::<OpenLink>(&one_intent(&opened).payload)
+            .unwrap()
+            .url,
+        "duck://channel/general?net=a1b2c3d4#9"
+    );
+    let frame = tick_native(press(&opened, "Hide message"));
+    assert!(
+        !texts(&frame)
+            .iter()
+            .any(|text| text.contains("Please inspect this trigger message."))
+    );
     // a place the protocol cannot address yet is drawn, never offered
     assert!(
         !frame_has_button(&frame, "/src/main.rs"),
@@ -616,6 +648,11 @@ fn run_list_stays_compact_while_detail_fills_the_remaining_space() {
     use ducktape_view_guest::wire::{Length, mouse};
     let (frame, _) = connect(booted(), "7", "dispatch-gone", 1);
     assert!(!has_text(&frame, "dispatch-gone"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "Dispatched at · block 84,912"),
+        "{:?}",
+        texts(&frame)
+    );
     let frame = tick_native(press(&frame, "Run details"));
     assert!(has_text(&frame, "dispatch-gone"), "{:?}", texts(&frame));
 
@@ -825,7 +862,7 @@ fn a_running_run_sends_steering_to_its_current_turn_and_preserves_new_typing() {
     assert_eq!(
         serde_json::from_slice::<Value>(&request.payload).unwrap(),
         json!({
-            "route":"run-control","payload":{"run":"dispatch-live","input":{"action":"steer","expected_turn":"turn-a","text":"Check the wrap first"}}
+            "route":"/v1/run-control","payload":{"run":"dispatch-live","input":{"action":"steer","expected_turn":"turn-a","text":"Check the wrap first"}}
         })
     );
     let _frame = tick_native(type_into(
@@ -860,10 +897,22 @@ fn trace_exposes_full_provider_details_only_when_opened() {
     let detail = "very-long-output-".repeat(100);
     let frame = tick_native(vec![item(stream.id,json!({"topic":"run-output:dispatch-gone","item":{"line":json!({"type":"tool_result","output":detail}).to_string()}}).to_string().as_bytes())]);
     assert!(!texts(&frame).iter().any(|text| text.contains(&detail)));
-    let frame = tick_native(press(&frame, "▸ Work details"));
+    let frame = tick_native(press(&frame, "Trace"));
     assert!(!texts(&frame).iter().any(|text| text.contains(&detail)));
-    let frame = tick_native(press(&frame, "Show raw events"));
-    assert!(texts(&frame).iter().any(|text| text.contains(&detail)));
+    let frame = tick_native(press(&frame, "Raw"));
+    assert!(markdown_texts(&frame).is_empty());
+    let frame = tick_native(press(&frame, "▸ 1 · tool_result"));
+    assert!(
+        markdown_texts(&frame)
+            .iter()
+            .any(|text| text.contains(&detail) && text.starts_with("~~~~json\n{\n"))
+    );
+    let frame = tick_native(press(&frame, "Conversation"));
+    assert!(
+        !markdown_texts(&frame)
+            .iter()
+            .any(|text| text.contains(&detail))
+    );
 }
 
 fn markdown_texts(frame: &Frame) -> Vec<String> {
@@ -892,7 +941,7 @@ fn process_disclosure_renders_markdown_coalesces_steps_and_keeps_the_answer_visi
         .iter()
         .find(|request| request.kind == "rpc.stream")
         .unwrap();
-    assert!(has_text(&frame, "▸ Working…"));
+    assert!(has_text(&frame, "Working…"));
     let line = |event: Value| {
         item(
             stream.id,
@@ -919,7 +968,7 @@ fn process_disclosure_renders_markdown_coalesces_steps_and_keeps_the_answer_visi
         markdown_texts(&frame).is_empty(),
         "thinking starts collapsed"
     );
-    let frame = tick_native(press(&frame, "▸ Working…"));
+    let frame = tick_native(press(&frame, "Trace"));
     assert_eq!(markdown_texts(&frame), ["**Check** the layout."]);
     let frame = tick_native(vec![
         line(
@@ -953,9 +1002,12 @@ fn process_disclosure_renders_markdown_coalesces_steps_and_keeps_the_answer_visi
         1
     );
     assert!(has_text(&frame, "cargo test\n\n20 passed"));
-    assert!(markdown_texts(&frame).contains(&"## Fixed\nThe reply now wraps.".into()));
-    let frame = tick_native(press(&frame, "▾ Worked for 2m 5s"));
+    assert!(!markdown_texts(&frame).contains(&"## Fixed\nThe reply now wraps.".into()));
+    let frame = tick_native(press(&frame, "Conversation"));
     assert_eq!(markdown_texts(&frame), ["## Fixed\nThe reply now wraps."]);
+    let frame = tick_native(press(&frame, "Trace"));
+    let frame = tick_native(press(&frame, "▾ Worked for 2m 5s"));
+    assert!(markdown_texts(&frame).is_empty());
     assert!(!has_text(&frame, "✓ Thinking"));
     let frame = tick_native(press(&frame, "▸ Worked for 2m 5s"));
     assert!(has_text(&frame, "cargo test\n\n20 passed"));
@@ -989,10 +1041,10 @@ fn claude_thinking_tools_and_steering_share_the_process_without_ending_on_interr
         line(json!({"type":"result","subtype":"error_during_execution","duration_ms":60000})),
     ]);
     assert!(
-        has_text(&frame, "▸ Working…"),
+        has_text(&frame, "Working…"),
         "a Claude response boundary is not the run duration"
     );
-    let frame = tick_native(press(&frame, "▸ Working…"));
+    let frame = tick_native(press(&frame, "Trace"));
     assert!(markdown_texts(&frame).contains(&"Inspect **wrapping** first.".into()));
     assert!(markdown_texts(&frame).contains(&"Keep the answer outside the disclosure.".into()));
     assert_eq!(
@@ -1057,7 +1109,7 @@ fn stream_errors_show_outside_the_disclosure_and_reconnect_the_same_run() {
         .as_bytes(),
     )]);
     assert!(!has_text(&frame, "HTTP error: 403 Forbidden"));
-    let frame = tick_native(press(&frame, "▸ Working…"));
+    let frame = tick_native(press(&frame, "Trace"));
     assert!(has_text(
         &frame,
         "Connected to the session. Waiting for its first process details…"
