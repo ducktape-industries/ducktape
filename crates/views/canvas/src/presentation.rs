@@ -769,7 +769,7 @@ impl BoardsView {
     /// through a later shape that covers it.
     fn canvas(&self, board: &Board) -> Node {
         let erasing = match &self.gesture {
-            Gesture::Erase { swept } => swept.clone(),
+            Gesture::Erase { swept, .. } => swept.clone(),
             _ => BTreeSet::new(),
         };
         let mut layers = Vec::new();
@@ -1105,6 +1105,28 @@ impl BoardsView {
         let p = kit::palette();
         let accent = Rgba(p.accent);
         let ring = (6. * self.zoom).clamp(2., 20.);
+        // What a press would take, drawn faintly so it reads as an answer and
+        // not as a selection. Already-selected shapes wear the real ring.
+        if let Some(id) = self
+            .hover
+            .as_ref()
+            .filter(|id| !self.selected.contains(*id))
+            && let Some(record) = board.shapes.get(id)
+            && let Some(box_) = self.on_screen(board, &record.shape)
+        {
+            let inset = if record.shape.kind.is_path() { 4. } else { 0. };
+            out.push(rectangle(
+                [box_[0] - inset, box_[1] - inset],
+                [
+                    box_[2] - box_[0] + inset * 2.,
+                    box_[3] - box_[1] + inset * 2.,
+                ],
+                None,
+                Rgba(alpha(p.accent, 0.45)),
+                1.,
+                ring,
+            ));
+        }
         // leave the gesture and the guides their own room out of the budget
         let rings = budget.saturating_sub(32);
         for id in &self.selected {

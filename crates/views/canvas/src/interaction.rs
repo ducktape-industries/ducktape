@@ -323,6 +323,7 @@ impl BoardsView {
         self.selected.clear();
         self.gesture = Gesture::Erase {
             swept: self.hit(point).into_iter().collect(),
+            last: point,
         };
         Task::none()
     }
@@ -332,15 +333,12 @@ impl BoardsView {
             self.selected = [id].into();
             self.begin_text()
         } else {
+            // A double-click on open board writes, the way a canvas app does.
+            // It goes through the same creation the tools use, so the shape
+            // lands centred on the pointer and in the colour the palette is
+            // showing — a second, private idea of a new shape would drift.
             let p = self.world(self.cursor);
-            self.mint_shape(Shape {
-                kind: Kind::Text,
-                x: coordinate(p[0]),
-                y: coordinate(p[1]),
-                width: 260,
-                height: 96,
-                ..Default::default()
-            })
+            self.mint_shape(self.creation_shape(Kind::Text, p, p))
         }
     }
     pub(super) fn mint_shape(&self, shape: Shape) -> Task<Message> {
@@ -378,7 +376,11 @@ impl BoardsView {
         {
             return edit;
         }
-        if !self.tool_locked {
+        // The pen is the one tool you reach for to make several marks in a
+        // row, so it keeps itself; every other tool hands back to Select the
+        // way a canvas app does, unless the lock says otherwise.
+        let one_shot = kind != Kind::Draw;
+        if one_shot && !self.tool_locked {
             self.tool = Tool::Select;
         }
         let typing = matches!(kind, Kind::Note | Kind::Text);
@@ -411,9 +413,37 @@ impl BoardsView {
         let board = self.visible();
         // The eraser is the one gesture that asks what is under the pointer,
         // and the hit test needs the board this borrow is about to lend out.
-        let swept_now = matches!(self.gesture, Gesture::Erase { .. })
-            .then(|| self.hit(point))
-            .flatten();
+        // It asks along the whole step, not just where the step landed: a
+        // quick sweep reports a handful of far-apart samples, and testing only
+        // those leaves untouched shapes the stroke visibly went through.
+        let swept_now: BTreeSet<String> = match &self.gesture {
+            Gesture::Erase { last, .. } => {
+                let step = 6. / self.zoom;
+                let span = (point[0] - last[0]).hypot(point[1] - last[1]);
+                let stops = (span / step).ceil().clamp(1., 64.) as usize;
+                (0..=stops)
+                    .filter_map(|i| {
+                        let t = i as f32 / stops as f32;
+                        self.hit([
+                            last[0] + (point[0] - last[0]) * t,
+                            last[1] + (point[1] - last[1]) * t,
+                        ])
+                    })
+                    .collect()
+            }
+            _ => BTreeSet::new(),
+        };
+        // With nothing in hand, say what a press would take. The eraser and the
+        // arrow point at a card the way Select does; the shape tools are going
+        // to draw, so nothing under the pointer is theirs to highlight.
+        let picks = matches!(
+            self.tool,
+            Tool::Select | Tool::Eraser | Tool::Arrow | Tool::Line
+        );
+        self.hover = match (&self.gesture, picks) {
+            (Gesture::Idle, true) => self.hit(point),
+            _ => None,
+        };
         match &mut self.gesture {
             Gesture::Idle => {}
             Gesture::Pan { start, camera } => {
@@ -433,7 +463,10 @@ impl BoardsView {
                     points.push(point);
                 }
             }
-            Gesture::Erase { swept } => swept.extend(swept_now),
+            Gesture::Erase { swept, last } => {
+                swept.extend(swept_now);
+                *last = point;
+            }
             Gesture::Marquee {
                 start,
                 point: p,
@@ -443,11 +476,15 @@ impl BoardsView {
                 let bounds = points_rect(*start, point);
                 self.selected = previous.clone();
                 if let Some(board) = &board {
+                    // A rubber band asks what it went over, not what may be
+                    // dragged: a bound arrow is drawn where its cards put it,
+                    // so that is the geometry it is caught by. Sweeping a
+                    // diagram must take its edges or a recolour misses them.
                     self.selected.extend(
                         board
                             .shapes
                             .iter()
-                            .filter(|(_, r)| free(&r.shape) && intersects(bounds, rect(&r.shape)))
+                            .filter(|(_, r)| intersects(bounds, drawn_rect(board, &r.shape)))
                             .map(|(id, _)| id.clone()),
                     );
                 }
@@ -530,14 +567,22 @@ impl BoardsView {
                 if delta[0].hypot(delta[1]) * self.zoom < 3. {
                     return Vec::new();
                 }
+                // A card is never smaller than a card; a run may be perfectly
+                // flat, and clamping a horizontal line to a card's minimum
+                // would jump it thirty-two units the moment a handle moved.
+                let least = if shape.kind.is_path() {
+                    [0., 0.]
+                } else {
+                    [40., 32.]
+                };
                 let mut width = (shape.width as f32 + delta[0] * corner[0] as f32)
-                    .clamp(40., boards::MAX_SIZE as f32);
+                    .clamp(least[0], boards::MAX_SIZE as f32);
                 let mut height = (shape.height as f32 + delta[1] * corner[1] as f32)
-                    .clamp(32., boards::MAX_SIZE as f32);
-                if self.modifiers.shift {
+                    .clamp(least[1], boards::MAX_SIZE as f32);
+                if self.modifiers.shift && shape.width > 0 && shape.height > 0 {
                     let ratio = shape.width as f32 / shape.height as f32;
                     width = width.max(height * ratio).min(boards::MAX_SIZE as f32);
-                    height = (width / ratio).clamp(32., boards::MAX_SIZE as f32);
+                    height = (width / ratio).clamp(least[1], boards::MAX_SIZE as f32);
                 }
                 let x = shape.x
                     + if corner[0] < 0 {
@@ -579,31 +624,54 @@ impl BoardsView {
         if kind.is_path() {
             return self.segment_shape(kind, start, point);
         }
-        let b = points_rect(start, point);
+        let mut b = points_rect(start, point);
         let dragged = (point[0] - start[0]).hypot(point[1] - start[1]) * self.zoom >= 4.;
+        // Shift draws a square box — a circle from the ellipse, a regular
+        // diamond — by growing the short side to the long one, away from the
+        // corner the drag started at, so the anchor under the press stays put.
+        if dragged && self.modifiers.shift {
+            let side = (b[2] - b[0]).max(b[3] - b[1]);
+            let grow = |low: f32, high: f32, anchor: f32| {
+                if anchor <= low {
+                    [low, low + side]
+                } else {
+                    [high - side, high]
+                }
+            };
+            [b[0], b[2]] = grow(b[0], b[2], start[0]);
+            [b[1], b[3]] = grow(b[1], b[3], start[1]);
+        }
         let (w, h) = match kind {
-            Kind::Note => (220, 180),
-            Kind::Rectangle => (240, 140),
-            Kind::Ellipse => (200, 200),
-            Kind::Diamond => (200, 160),
-            Kind::Text => (280, 96),
-            Kind::Arrow | Kind::Line | Kind::Draw => (200, 140),
+            Kind::Note => (220., 180.),
+            Kind::Rectangle => (240., 140.),
+            Kind::Ellipse => (200., 200.),
+            Kind::Diamond => (200., 160.),
+            Kind::Text => (280., 96.),
+            Kind::Arrow | Kind::Line | Kind::Draw => (200., 140.),
+        };
+        // A click has no box to take, so the default one lands centred on the
+        // pointer: a shape that appeared below and right of where you clicked
+        // would read as having missed.
+        let size = if dragged {
+            [
+                (b[2] - b[0]).round().clamp(40., 4000.),
+                (b[3] - b[1]).round().clamp(32., 4000.),
+            ]
+        } else {
+            [w, h]
+        };
+        let corner = if dragged {
+            [b[0], b[1]]
+        } else {
+            [start[0] - size[0] / 2., start[1] - size[1] / 2.]
         };
         Shape {
             kind,
             color: self.palette,
-            x: coordinate(b[0]),
-            y: coordinate(b[1]),
-            width: if dragged {
-                (b[2] - b[0]).round().clamp(40., 4000.) as i32
-            } else {
-                w
-            },
-            height: if dragged {
-                (b[3] - b[1]).round().clamp(32., 4000.) as i32
-            } else {
-                h
-            },
+            x: coordinate(corner[0]),
+            y: coordinate(corner[1]),
+            width: size[0] as i32,
+            height: size[1] as i32,
             ..Default::default()
         }
     }
@@ -700,7 +768,7 @@ impl BoardsView {
             }
             Gesture::Create { kind, start, point } => self.on_created(kind, start, point),
             Gesture::Sketch { points } => self.on_sketched(&points),
-            Gesture::Erase { swept } => self.on_swept(swept),
+            Gesture::Erase { swept, .. } => self.on_swept(swept),
             Gesture::Endpoint {
                 id,
                 end,
@@ -1271,7 +1339,10 @@ impl BoardsView {
         let Some(b) = bounds(shapes.values()) else {
             return (delta, Vec::new());
         };
-        let Some(board) = &self.confirmed else {
+        // Snap against the board on screen, not the last one consensus agreed
+        // on: a card you drew a second ago is on screen and is exactly what you
+        // want to line the next one up with.
+        let Some(board) = self.visible() else {
             return (delta, Vec::new());
         };
         let mut best = [6. / self.zoom; 2];
@@ -1444,9 +1515,23 @@ pub(super) fn stroke(board: &Board, s: &Shape) -> Vec<[f32; 2]> {
 pub(super) fn border_point(s: &Shape, toward: [f32; 2]) -> [f32; 2] {
     let c = center(s);
     let d = [toward[0] - c[0], toward[1] - c[1]];
-    let scale = (s.width as f32 / 2. / d[0].abs().max(0.001))
-        .min(s.height as f32 / 2. / d[1].abs().max(0.001))
-        .min(1.);
+    // Each outline is a different curve, and an arrow that stops at a box
+    // around a circle stops visibly short of it. The same ray, scaled to
+    // where it leaves the outline the card is actually drawn with.
+    let half = [
+        (s.width as f32 / 2.).max(0.001),
+        (s.height as f32 / 2.).max(0.001),
+    ];
+    let unit = [d[0] / half[0], d[1] / half[1]];
+    let scale = match s.kind {
+        Kind::Ellipse => 1. / unit[0].hypot(unit[1]).max(0.001),
+        Kind::Diamond => 1. / (unit[0].abs() + unit[1].abs()).max(0.001),
+        Kind::Note | Kind::Rectangle | Kind::Text => {
+            (1. / unit[0].abs().max(0.001)).min(1. / unit[1].abs().max(0.001))
+        }
+        Kind::Arrow | Kind::Line | Kind::Draw => 1.,
+    };
+    let scale = scale.min(1.);
     [c[0] + d[0] * scale, c[1] + d[1] * scale]
 }
 /// Shift on a connector: the nearest eighth turn, so runs come out straight
@@ -1509,6 +1594,27 @@ pub(super) fn rect(s: &Shape) -> [f32; 4] {
         (s.x + s.width) as f32,
         (s.y + s.height) as f32,
     ]
+}
+/// The box a shape actually occupies on the board. A card's is its own; a
+/// connector's is the span of the stroke it draws, which for a bound end is
+/// wherever its card put it rather than where its samples say.
+pub(super) fn drawn_rect(board: &Board, s: &Shape) -> [f32; 4] {
+    if !s.kind.is_path() {
+        return rect(s);
+    }
+    let run = stroke(board, s);
+    let Some(first) = run.first() else {
+        return rect(s);
+    };
+    run.iter()
+        .fold([first[0], first[1], first[0], first[1]], |a, p| {
+            [
+                a[0].min(p[0]),
+                a[1].min(p[1]),
+                a[2].max(p[0]),
+                a[3].max(p[1]),
+            ]
+        })
 }
 pub(super) fn bounds<'a>(shapes: impl Iterator<Item = &'a Shape>) -> Option<[f32; 4]> {
     shapes.map(rect).reduce(|a, b| {
