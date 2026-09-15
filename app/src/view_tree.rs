@@ -2494,6 +2494,23 @@ impl ViewTree {
         else {
             unreachable!()
         };
+        // Primitive canvases paint in the current native frame. Recreating an
+        // asynchronous SVG image on every pointer move leaves blank drag frames.
+        if native_canvas_commands(commands) {
+            let commands = commands.clone();
+            return dimensions(div().relative().overflow_hidden(), *width, *height)
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            paint_canvas_commands(&commands, bounds.origin, window);
+                        },
+                    )
+                    .size_full(),
+                )
+                .child(self.measure(key, cx))
+                .into_any_element();
+        }
         let bounds = self.bounds.get(key).copied().unwrap_or_default();
         let known = |length: Option<wire::Length>, measured: Pixels| match length {
             Some(wire::Length::Fixed(value)) => value,
@@ -4155,6 +4172,101 @@ fn qr(code: &wire::Qr) -> AnyElement {
     .into_any_element()
 }
 
+fn native_canvas_commands(commands: &[wire::CanvasCommand]) -> bool {
+    commands.iter().all(|command| {
+        let wire::CanvasCommand::Draw { shape, stroke, .. } = command else {
+            return false;
+        };
+        let solid = stroke.as_ref().is_none_or(|s| s.dash.is_empty());
+        let primitive = match shape {
+            wire::CanvasShape::Rectangle { radius, .. } => radius.iter().all(|r| *r == radius[0]),
+            wire::CanvasShape::Circle { .. } => true,
+            wire::CanvasShape::Line { .. } => stroke
+                .as_ref()
+                .is_none_or(|s| s.cap != wire::CanvasLineCap::Square),
+            wire::CanvasShape::Path(_) => false,
+        };
+        solid && primitive
+    })
+}
+
+fn paint_canvas_commands(
+    commands: &[wire::CanvasCommand],
+    origin: Point<Pixels>,
+    window: &mut Window,
+) {
+    for command in commands {
+        let wire::CanvasCommand::Draw {
+            shape,
+            fill: background,
+            stroke,
+            ..
+        } = command
+        else {
+            continue;
+        };
+        let position = |p: [f32; 2]| origin + point(px(p[0]), px(p[1]));
+        let (bounds, radius) = match shape {
+            wire::CanvasShape::Rectangle {
+                position: p,
+                size: s,
+                radius,
+            } => (
+                Bounds::new(position(*p), size(px(s[0]), px(s[1]))),
+                radius[0],
+            ),
+            wire::CanvasShape::Circle { center, radius } => (
+                Bounds::new(
+                    position([center[0] - radius, center[1] - radius]),
+                    size(px(2. * radius), px(2. * radius)),
+                ),
+                *radius,
+            ),
+            wire::CanvasShape::Line { from, to } => {
+                if let Some(stroke) = stroke {
+                    let mut path = gpui_kit::PathBuilder::stroke(px(stroke.width));
+                    path.move_to(position(*from));
+                    path.line_to(position(*to));
+                    if let Ok(path) = path.build() {
+                        window.paint_path(path, rgba(stroke.color));
+                    }
+                    if stroke.cap == wire::CanvasLineCap::Round {
+                        let r = stroke.width / 2.;
+                        for p in [from, to] {
+                            window.paint_quad(
+                                fill(
+                                    Bounds::new(
+                                        position([p[0] - r, p[1] - r]),
+                                        size(px(2. * r), px(2. * r)),
+                                    ),
+                                    rgba(stroke.color),
+                                )
+                                .corner_radii(px(r)),
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+            wire::CanvasShape::Path(_) => continue,
+        };
+        // SVG strokes straddle the geometry; native quad borders are inset.
+        let border = stroke.as_ref().map_or(0., |s| s.width);
+        let expanded = Bounds::new(
+            bounds.origin - point(px(border / 2.), px(border / 2.)),
+            bounds.size + size(px(border), px(border)),
+        );
+        let color = background.map(rgba).unwrap_or_default();
+        let border_color = stroke.as_ref().map(|s| rgba(s.color)).unwrap_or_default();
+        window.paint_quad(
+            fill(expanded, color)
+                .corner_radii(px(radius + border / 2.))
+                .border_widths(px(border))
+                .border_color(border_color),
+        );
+    }
+}
+
 fn svg_color(color: wire::Rgba) -> String {
     let [r, g, b, a] = color.0;
     format!(
@@ -4461,6 +4573,61 @@ fn append_arc_to(
 mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt as _;
+
+    #[gpui_kit::test]
+    fn primitive_canvas_paints_in_the_first_frame_and_after_a_move(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let command = wire::CanvasCommand::Draw {
+            shape: wire::CanvasShape::Rectangle {
+                position: [10., 10.],
+                size: [40., 30.],
+                radius: [4.; 4],
+            },
+            fill: Some(wire::Rgba([1., 0., 0., 1.])),
+            stroke: None,
+            even_odd: false,
+        };
+        let node = wire::Node::Canvas {
+            key: "canvas".into(),
+            width: Some(wire::Length::Fixed(100.)),
+            height: Some(wire::Length::Fixed(80.)),
+            commands: vec![command.clone()],
+        };
+        let window = cx.open_window(size(px(100.), px(80.)), |_, _| ViewTree::new(node));
+        let tree = window.root(cx).unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(
+                !window.painted_quads().is_empty(),
+                "no asynchronous image load needed"
+            );
+            tree.update(cx, |tree, cx| {
+                if let wire::Node::Canvas { commands, .. } = &mut tree.root
+                    && let wire::CanvasCommand::Draw {
+                        shape: wire::CanvasShape::Rectangle { position, .. },
+                        ..
+                    } = &mut commands[0]
+                {
+                    *position = [40., 25.];
+                }
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+            assert!(
+                !window.painted_quads().is_empty(),
+                "moving keeps visible native geometry"
+            );
+        })
+        .unwrap();
+        let mut complex = vec![command];
+        complex.push(wire::CanvasCommand::Pop);
+        assert!(
+            !native_canvas_commands(&complex),
+            "transform stacks keep the complete SVG renderer"
+        );
+    }
 
     #[gpui_kit::test]
     fn untinted_svg_uses_native_color_decoder_and_retains_pixels_without_resent_bytes(

@@ -17,8 +17,10 @@ async fn boards_component_commits_collaborative_fields_and_rolls_back_rejections
     let operations = [
         serde_json::json!({"create":{"id":"room","title":"Planning"}}),
         serde_json::json!({"edit":{"board":"room","change":{"create":{"id":"a","shape":shape}}}}),
-        serde_json::json!({"edit":{"board":"room","change":{"move":{"id":"a","x":100,"y":50}}}}),
-        serde_json::json!({"edit":{"board":"room","change":{"text":{"id":"a","text":"같이 생각하기"}}}}),
+        serde_json::json!({"batch":{"board":"room","changes":[
+            {"move":{"id":"a","x":100,"y":50}},
+            {"text":{"id":"a","text":"같이 생각하기"}}
+        ]}}),
     ];
     for operation in operations {
         let msg = Msg {

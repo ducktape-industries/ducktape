@@ -1,11 +1,13 @@
 //! Optimistic native canvas. The guest owns editing; gpui-kit owns rendering,
 //! input and IME; the host signs field operations for consensus ordering.
 mod host;
+mod interaction;
 mod presentation;
 use boards::{Board, Change, Kind, Operation, Shape};
+use ducktape_view_guest::{Editor, wire};
 use ducktape_view_guest::{Subscription, Task};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Tool {
@@ -26,17 +28,49 @@ enum Gesture {
         camera: [f32; 2],
     },
     Move {
-        id: String,
         start: [f32; 2],
-        shape: Shape,
         point: [f32; 2],
+        shapes: BTreeMap<String, Shape>,
     },
     Resize {
         id: String,
+        corner: [i32; 2],
         start: [f32; 2],
+        point: [f32; 2],
         shape: Shape,
+    },
+    Marquee {
+        start: [f32; 2],
+        point: [f32; 2],
+        previous: BTreeSet<String>,
+    },
+    Create {
+        kind: Kind,
+        start: [f32; 2],
         point: [f32; 2],
     },
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Inline {
+    id: String,
+    original: String,
+    #[serde(with = "editor_codec")]
+    document: Editor,
+}
+mod editor_codec {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        editor: &Editor,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        editor.snapshot().serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Editor, D::Error> {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        Editor::restore(&bytes).ok_or_else(|| serde::de::Error::custom("invalid editor snapshot"))
+    }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 enum Delivery {
@@ -61,8 +95,17 @@ pub struct BoardsView {
     delivery: Delivery,
     error: String,
     title: String,
-    selected: Option<String>,
-    draft: String,
+    selected: BTreeSet<String>,
+    inline: Option<Inline>,
+    modifiers: wire::keyboard::Modifiers,
+    space_pan: bool,
+    tool_locked: bool,
+    palette: u8,
+    help: bool,
+    board_picker: bool,
+    snap: bool,
+    guides: Vec<[f32; 4]>,
+    cameras: BTreeMap<String, ([f32; 2], f32)>,
     tool: Tool,
     camera: [f32; 2],
     zoom: f32,
@@ -86,6 +129,33 @@ pub enum Message {
     Minted(u64, String, Shape, Result<String, String>),
     BoardMinted(u64, String, Result<String, String>),
     CreateBoard,
+    Key(wire::keyboard::Event, bool),
+    DoubleClick,
+    EditText,
+    FocusText,
+    FocusResult(String, Result<(), String>),
+    MiddleDown,
+    FinishText,
+    TextTransaction(ducktape_view_guest::EditorTransaction<Message>),
+    TextDocument(ducktape_view_guest::EditorDocumentUpdate),
+    Duplicate,
+    Duplicated(
+        u64,
+        String,
+        Vec<(String, Shape)>,
+        Result<Vec<String>, String>,
+    ),
+    LockTool,
+    Help,
+    BoardPicker,
+    Snap,
+    SelectAll,
+    FitSelection,
+    ResetZoom,
+    Align(bool),
+    QuickNote,
+    Template,
+
     Title(String),
     Open(String),
     Tool(Tool),
@@ -99,8 +169,6 @@ pub enum Message {
     Zoom(f32),
     Fit,
     Size(f32, f32),
-    Draft(String),
-    ApplyText,
     Color(u8),
     Delete,
     Undo,
@@ -122,8 +190,17 @@ impl BoardsView {
                 delivery: Delivery::Idle,
                 error: String::new(),
                 title: String::new(),
-                selected: None,
-                draft: String::new(),
+                selected: BTreeSet::new(),
+                inline: None,
+                modifiers: Default::default(),
+                space_pan: false,
+                tool_locked: false,
+                palette: 0,
+                help: false,
+                board_picker: false,
+                snap: true,
+                guides: Vec::new(),
+                cameras: BTreeMap::new(),
                 tool: Tool::Select,
                 camera: [80., 80.],
                 zoom: 1.,
@@ -144,7 +221,15 @@ impl BoardsView {
         serde_json::from_slice(bytes).map_err(|e| e.to_string())
     }
     fn subscription(&self) -> Subscription<Message> {
-        let session = host::session().map(Message::Session);
+        let session = Subscription::batch([
+            host::session().map(Message::Session),
+            Subscription::filter_events(|event| match event {
+                wire::Event::Keyboard { event, captured } => {
+                    Some(Message::Key(event.clone(), *captured))
+                }
+                _ => None,
+            }),
+        ]);
         if !self.session.connected {
             return session;
         }
@@ -164,6 +249,29 @@ impl BoardsView {
             Message::Minted(epoch, board, shape, id) => self.on_minted(epoch, board, shape, id),
             Message::BoardMinted(epoch, title, id) => self.on_board_minted(epoch, title, id),
             Message::CreateBoard => self.on_create_board(),
+            Message::Key(event, captured) => self.on_key(event, captured),
+            Message::DoubleClick => self.on_double_click(),
+            Message::EditText => self.begin_text(),
+            Message::FocusText => self.focus_text(),
+            Message::FocusResult(id, result) => self.on_focus_result(id, result),
+            Message::MiddleDown => self.on_middle_down(),
+            Message::FinishText => self.finish_text(),
+            Message::TextTransaction(transaction) => self.on_text_transaction(transaction),
+            Message::TextDocument(document) => self.on_text_document(document),
+            Message::Duplicate => self.on_duplicate(),
+            Message::Duplicated(epoch, board, shapes, ids) => {
+                self.on_duplicated(epoch, board, shapes, ids)
+            }
+            Message::LockTool => self.on_lock_tool(),
+            Message::Help => self.on_help(),
+            Message::BoardPicker => self.on_board_picker(),
+            Message::Snap => self.on_snap(),
+            Message::SelectAll => self.on_select_all(),
+            Message::FitSelection => self.on_fit_selection(),
+            Message::ResetZoom => self.on_reset_zoom(),
+            Message::Align(vertical) => self.on_align(vertical),
+            Message::QuickNote => self.on_quick_note(),
+            Message::Template => self.on_template(),
             Message::Title(title) => self.on_title(title),
             Message::Open(id) => self.on_open(id),
             Message::Tool(tool) => self.on_tool(tool),
@@ -177,8 +285,6 @@ impl BoardsView {
             Message::Zoom(factor) => self.on_zoom(factor),
             Message::Fit => self.on_fit(),
             Message::Size(w, h) => self.on_size(w, h),
-            Message::Draft(text) => self.on_draft(text),
-            Message::ApplyText => self.on_apply_text(),
             Message::Color(color) => self.on_color(color),
             Message::Delete => self.on_delete(),
             Message::Undo => self.on_undo(),
@@ -197,7 +303,7 @@ impl BoardsView {
         };
         let changed_network = next.chain != self.session.chain;
         if changed_network {
-            if !self.pending.is_empty() {
+            if !self.pending.is_empty() || self.inline.is_some() {
                 self.session.connected = false;
                 self.error = "Return to the previous network to finish saving this board.".into();
                 return Task::none();
@@ -206,10 +312,13 @@ impl BoardsView {
             self.current.clear();
             self.catalog.clear();
             self.confirmed = None;
-            self.selected = None;
+            self.selected.clear();
             self.undo.clear();
             self.redo.clear();
             self.gesture = Gesture::Idle;
+            self.cameras.clear();
+            self.space_pan = false;
+            self.connection = None;
         }
         self.session = next;
         self.pump()
@@ -231,12 +340,17 @@ impl BoardsView {
                     self.confirmed = None;
                 }
                 if let Some(board) = reading.board {
+                    let first_visit =
+                        self.confirmed.is_none() && !self.cameras.contains_key(&self.current);
                     let newer = self
                         .confirmed
                         .as_ref()
                         .is_none_or(|old| board.revision >= old.revision);
                     if newer {
                         self.confirmed = Some(board);
+                        if first_visit {
+                            self.on_fit();
+                        }
                     }
                 }
                 if self.current.is_empty()
@@ -269,9 +383,9 @@ impl BoardsView {
                         self.on_read(epoch, id, Ok(reading));
                     }
                     Err(error) => {
-                        if let Some(Operation::Edit { change, .. }) = acknowledged
+                        if let Some(operation) = acknowledged
                             && let Some(board) = &self.confirmed
-                            && let Ok(mut next) = board.changed(&change)
+                            && let Ok(mut next) = apply_operation(board, &operation)
                         {
                             // This is a local fallback, not a claimed remote revision.
                             next.revision = board.revision;
@@ -314,48 +428,54 @@ impl BoardsView {
             return Task::none();
         }
         self.pending.clear();
+        self.inline = None;
+        self.gesture = Gesture::Idle;
         self.confirmed = None;
         self.error.clear();
         self.delivery = Delivery::Idle;
         self.undo.clear();
         self.redo.clear();
-        self.selected = None;
-        self.draft.clear();
+        self.selected.clear();
         self.epoch += 1;
         Task::none()
     }
     fn visible(&self) -> Option<Board> {
         let mut board = self.confirmed.clone()?;
         for operation in &self.pending {
-            if let Operation::Edit { change, .. } = operation
-                && let Ok(next) = board.changed(change)
-            {
+            if let Ok(next) = apply_operation(&board, operation) {
                 board = next;
             }
         }
-        if let Some(change) = self.gesture_change()
-            && let Ok(next) = board.changed(&change)
-        {
+        if let Ok(next) = board.changed_many(&self.gesture_changes()) {
             board = next;
         }
         Some(board)
     }
-    fn enqueue(&mut self, change: Change) -> Task<Message> {
+    fn enqueue_many(&mut self, changes: Vec<Change>) -> Task<Message> {
+        if changes.is_empty() {
+            return Task::none();
+        }
         let Some(board) = self.visible() else {
             return Task::none();
         };
-        if let Err(error) = board.changed(&change) {
+        if let Err(error) = board.changed_many(&changes) {
             self.error = error;
             return Task::none();
         }
         self.error.clear();
-        self.pending.push_back(Operation::Edit {
+        self.pending.push_back(Operation::Batch {
             board: self.current.clone(),
-            change,
+            changes,
         });
         self.pump()
     }
     fn edit(&mut self, change: Change) -> Task<Message> {
+        self.edit_many(vec![change])
+    }
+    fn edit_many(&mut self, changes: Vec<Change>) -> Task<Message> {
+        if changes.is_empty() {
+            return Task::none();
+        }
         if self.pending.len() >= 64 {
             self.error =
                 "Waiting for earlier edits to save. Retry saving before adding more changes."
@@ -365,23 +485,38 @@ impl BoardsView {
         let Some(board) = self.visible() else {
             return Task::none();
         };
-        if let Err(error) = board.changed(&change) {
+        if let Err(error) = board.changed_many(&changes) {
             self.error = error;
             return Task::none();
         }
-        let undo = inverse(&board, &change);
-        if undo.as_slice() == [change.clone()] {
+        let mut undo = Vec::new();
+        let mut redo = Vec::new();
+        for change in changes {
+            let before = inverse(&board, &change);
+            if before.as_slice() == [change.clone()] {
+                continue;
+            }
+            let mut next_undo = before;
+            next_undo.extend(undo);
+            undo = next_undo;
+            redo.push(change);
+        }
+        if redo.is_empty() {
             return Task::none();
         }
+        undo.sort_by_key(
+            |change| matches!(change, Change::Create { shape, .. } if shape.kind == Kind::Arrow),
+        );
+        undo.dedup();
         self.undo.push(History {
             undo,
-            redo: vec![change.clone()],
+            redo: redo.clone(),
         });
         if self.undo.len() > 64 {
             self.undo.remove(0);
         }
         self.redo.clear();
-        self.enqueue(change)
+        self.enqueue_many(redo)
     }
     fn on_create_board(&mut self) -> Task<Message> {
         let allowed =
@@ -419,7 +554,7 @@ impl BoardsView {
         };
         self.current = id.clone();
         self.confirmed = Some(board);
-        self.selected = None;
+        self.selected.clear();
         self.catalog.insert(id.clone(), title.clone());
         self.title.clear();
         self.undo.clear();
@@ -435,354 +570,26 @@ impl BoardsView {
         if !self.pending.is_empty() {
             return Task::none();
         }
+        if self.inline.is_some() {
+            return self.finish_text();
+        }
+        self.cameras
+            .insert(self.current.clone(), (self.camera, self.zoom));
+        (self.camera, self.zoom) = self.cameras.get(&id).copied().unwrap_or(([80., 80.], 1.));
         self.current = id;
+        self.board_picker = false;
         self.confirmed = None;
-        self.selected = None;
-        self.draft.clear();
+        self.selected.clear();
         self.error.clear();
-        self.camera = [80., 80.];
-        self.zoom = 1.;
+
         self.gesture = Gesture::Idle;
         self.connection = None;
         self.undo.clear();
         self.redo.clear();
         Task::none()
     }
-    fn on_tool(&mut self, tool: Tool) -> Task<Message> {
-        self.tool = tool;
-        self.gesture = Gesture::Idle;
-        self.connection = None;
-        Task::none()
-    }
-    fn world(&self, point: [f32; 2]) -> [f32; 2] {
-        [
-            (point[0] - self.camera[0]) / self.zoom,
-            (point[1] - self.camera[1]) / self.zoom,
-        ]
-    }
-    fn hit(&self, point: [f32; 2]) -> Option<String> {
-        let board = self.visible()?;
-        let card = board.shapes.iter().rev().find(|(_, r)| {
-            let s = &r.shape;
-            s.kind != Kind::Arrow
-                && point[0] >= s.x as f32
-                && point[1] >= s.y as f32
-                && point[0] <= (s.x + s.width) as f32
-                && point[1] <= (s.y + s.height) as f32
-        });
-        if let Some((id, _)) = card {
-            return Some(id.clone());
-        }
-        board
-            .shapes
-            .iter()
-            .rev()
-            .find(|(_, record)| {
-                let s = &record.shape;
-                let (Some(from), Some(to)) = (&s.from, &s.to) else {
-                    return false;
-                };
-                let (Some(a), Some(b)) = (board.shapes.get(from), board.shapes.get(to)) else {
-                    return false;
-                };
-                let start = presentation::anchor(&a.shape, &b.shape);
-                let b = presentation::anchor(&b.shape, &a.shape);
-                let a = start;
-                let delta = [b[0] - a[0], b[1] - a[1]];
-                let length = delta[0] * delta[0] + delta[1] * delta[1];
-                let t = (((point[0] - a[0]) * delta[0] + (point[1] - a[1]) * delta[1])
-                    / length.max(0.001))
-                .clamp(0., 1.);
-                let distance =
-                    (point[0] - a[0] - t * delta[0]).hypot(point[1] - a[1] - t * delta[1]);
-                distance <= 8. / self.zoom
-            })
-            .map(|(id, _)| id.clone())
-    }
-    fn on_position(&mut self, x: f32, y: f32) -> Task<Message> {
-        self.cursor = [x, y];
-        Task::none()
-    }
-    fn on_begin(&mut self) -> Task<Message> {
-        self.on_press(self.cursor[0], self.cursor[1])
-    }
-    fn on_press(&mut self, x: f32, y: f32) -> Task<Message> {
-        let point = self.world([x, y]);
-        self.cursor = [x, y];
-        if self.tool == Tool::Hand {
-            self.gesture = Gesture::Pan {
-                start: [x, y],
-                camera: self.camera,
-            };
-            return Task::none();
-        }
-        let Some(board) = self.visible() else {
-            return Task::none();
-        };
-        let hit = self.hit(point);
-        match self.tool {
-            Tool::Select => {
-                self.selected = hit.clone();
-                let Some(id) = hit else {
-                    self.draft.clear();
-                    return Task::none();
-                };
-                let shape = board.shapes[&id].shape.clone();
-                self.draft = shape.text.clone();
-                if shape.kind == Kind::Arrow {
-                    self.gesture = Gesture::Idle;
-                    return Task::none();
-                }
-                let at_handle = (point[0] - (shape.x + shape.width) as f32).abs() < 14. / self.zoom
-                    && (point[1] - (shape.y + shape.height) as f32).abs() < 14. / self.zoom;
-                self.gesture = if at_handle {
-                    Gesture::Resize {
-                        id,
-                        start: point,
-                        point,
-                        shape,
-                    }
-                } else {
-                    Gesture::Move {
-                        id,
-                        start: point,
-                        point,
-                        shape,
-                    }
-                };
-                Task::none()
-            }
-            Tool::Connect => {
-                let Some(id) = hit else {
-                    return Task::none();
-                };
-                let Some(from) = self.connection.take() else {
-                    self.connection = Some(id);
-                    return Task::none();
-                };
-                if from == id {
-                    return Task::none();
-                }
-                self.mint_shape(Shape {
-                    kind: Kind::Arrow,
-                    from: Some(from),
-                    to: Some(id),
-                    ..Default::default()
-                })
-            }
-            Tool::Note | Tool::Rectangle | Tool::Text => {
-                let kind = match self.tool {
-                    Tool::Note => Kind::Note,
-                    Tool::Rectangle => Kind::Rectangle,
-                    _ => Kind::Text,
-                };
-                let shape = Shape {
-                    kind,
-                    x: coordinate(point[0]),
-                    y: coordinate(point[1]),
-                    ..Default::default()
-                };
-                self.mint_shape(shape)
-            }
-            Tool::Hand => Task::none(),
-        }
-    }
-    fn mint_shape(&self, shape: Shape) -> Task<Message> {
-        let epoch = self.epoch;
-        let board = self.current.clone();
-        Task::future(async move { Message::Minted(epoch, board, shape, host::mint().await) })
-    }
-    fn on_minted(
-        &mut self,
-        epoch: u64,
-        board: String,
-        shape: Shape,
-        id: Result<String, String>,
-    ) -> Task<Message> {
-        let standing = epoch == self.epoch && board == self.current;
-        if !standing {
-            return Task::none();
-        }
-        let id = match id {
-            Ok(id) => id,
-            Err(error) => {
-                self.error = error;
-                return Task::none();
-            }
-        };
-        self.selected = Some(id.clone());
-        self.draft = shape.text.clone();
-        self.tool = Tool::Select;
-        self.edit(Change::Create { id, shape })
-    }
-    fn on_move(&mut self, x: f32, y: f32) -> Task<Message> {
-        self.cursor = [x, y];
-        let point = self.world([x, y]);
-        match &mut self.gesture {
-            Gesture::Idle => {}
-            Gesture::Pan { start, camera } => {
-                self.camera = [camera[0] + x - start[0], camera[1] + y - start[1]]
-            }
-            Gesture::Move { point: latest, .. } | Gesture::Resize { point: latest, .. } => {
-                *latest = point
-            }
-        }
-        Task::none()
-    }
-    fn gesture_change(&self) -> Option<Change> {
-        match &self.gesture {
-            Gesture::Move {
-                id,
-                start,
-                shape,
-                point,
-            } => Some(Change::Move {
-                id: id.clone(),
-                x: coordinate(shape.x as f32 + point[0] - start[0]),
-                y: coordinate(shape.y as f32 + point[1] - start[1]),
-            }),
-            Gesture::Resize {
-                id,
-                start,
-                shape,
-                point,
-            } => Some(Change::Resize {
-                id: id.clone(),
-                width: (shape.width as f32 + point[0] - start[0])
-                    .round()
-                    .clamp(40., boards::MAX_SIZE as f32) as i32,
-                height: (shape.height as f32 + point[1] - start[1])
-                    .round()
-                    .clamp(32., boards::MAX_SIZE as f32) as i32,
-            }),
-            Gesture::Idle | Gesture::Pan { .. } => None,
-        }
-    }
-    fn on_release(&mut self) -> Task<Message> {
-        let change = self.gesture_change();
-        self.gesture = Gesture::Idle;
-        match change {
-            Some(change) => self.edit(change),
-            None => Task::none(),
-        }
-    }
-    fn on_cancel(&mut self) -> Task<Message> {
-        self.gesture = Gesture::Idle;
-        self.connection = None;
-        Task::none()
-    }
-    fn on_wheel(&mut self, x: f32, y: f32, lines: bool) -> Task<Message> {
-        let scale = if lines { 1. } else { 32. };
-        self.camera[0] += x * scale;
-        self.camera[1] += y * scale;
-        Task::none()
-    }
-    fn on_zoom(&mut self, factor: f32) -> Task<Message> {
-        let anchor = [self.viewport[0] / 2., self.viewport[1] / 2.];
-        let world = self.world(anchor);
-        self.zoom = (self.zoom * factor).clamp(0.2, 3.);
-        self.camera = [
-            anchor[0] - world[0] * self.zoom,
-            anchor[1] - world[1] * self.zoom,
-        ];
-        Task::none()
-    }
-    fn on_fit(&mut self) -> Task<Message> {
-        let Some(board) = self.visible() else {
-            return Task::none();
-        };
-        let mut bounds: Option<[f32; 4]> = None;
-        for record in board
-            .shapes
-            .values()
-            .filter(|r| r.shape.kind != Kind::Arrow)
-        {
-            let s = &record.shape;
-            let rect = [
-                s.x as f32,
-                s.y as f32,
-                (s.x + s.width) as f32,
-                (s.y + s.height) as f32,
-            ];
-            bounds = Some(match bounds {
-                None => rect,
-                Some(b) => [
-                    b[0].min(rect[0]),
-                    b[1].min(rect[1]),
-                    b[2].max(rect[2]),
-                    b[3].max(rect[3]),
-                ],
-            });
-        }
-        let Some(b) = bounds else {
-            self.camera = [80., 80.];
-            self.zoom = 1.;
-            return Task::none();
-        };
-        self.zoom = ((self.viewport[0] - 100.) / (b[2] - b[0]).max(1.))
-            .min((self.viewport[1] - 100.) / (b[3] - b[1]).max(1.))
-            .clamp(0.2, 3.);
-        self.camera = [
-            (self.viewport[0] - (b[2] - b[0]) * self.zoom) / 2. - b[0] * self.zoom,
-            (self.viewport[1] - (b[3] - b[1]) * self.zoom) / 2. - b[1] * self.zoom,
-        ];
-        Task::none()
-    }
-    fn on_size(&mut self, w: f32, h: f32) -> Task<Message> {
-        self.viewport = [w.max(1.), h.max(1.)];
-        Task::none()
-    }
-    fn on_draft(&mut self, text: String) -> Task<Message> {
-        self.draft = text;
-        Task::none()
-    }
-    fn on_apply_text(&mut self) -> Task<Message> {
-        let Some(id) = self.selected.clone() else {
-            return Task::none();
-        };
-        self.edit(Change::Text {
-            id,
-            text: self.draft.clone(),
-        })
-    }
-    fn on_color(&mut self, color: u8) -> Task<Message> {
-        let Some(id) = self.selected.clone() else {
-            return Task::none();
-        };
-        self.edit(Change::Color { id, color })
-    }
-    fn on_delete(&mut self) -> Task<Message> {
-        let Some(id) = self.selected.take() else {
-            return Task::none();
-        };
-        self.draft.clear();
-        self.edit(Change::Delete { id })
-    }
-    fn on_undo(&mut self) -> Task<Message> {
-        let Some(history) = self.undo.pop() else {
-            return Task::none();
-        };
-        let tasks = history
-            .undo
-            .iter()
-            .map(|change| self.enqueue(change.clone()))
-            .collect::<Vec<_>>();
-        self.redo.push(history);
-        Task::batch(tasks)
-    }
-    fn on_redo(&mut self) -> Task<Message> {
-        let Some(history) = self.redo.pop() else {
-            return Task::none();
-        };
-        let tasks = history
-            .redo
-            .iter()
-            .map(|change| self.enqueue(change.clone()))
-            .collect::<Vec<_>>();
-        self.undo.push(history);
-        Task::batch(tasks)
-    }
 }
+
 fn coordinate(value: f32) -> i32 {
     value
         .round()
@@ -865,3 +672,11 @@ ducktape_view_guest::export_app!(
 );
 #[cfg(test)]
 mod tests;
+
+fn apply_operation(board: &Board, operation: &Operation) -> Result<Board, String> {
+    match operation {
+        Operation::Edit { change, .. } => board.changed(change),
+        Operation::Batch { changes, .. } => board.changed_many(changes),
+        Operation::Create { .. } => Ok(board.clone()),
+    }
+}

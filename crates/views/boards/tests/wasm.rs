@@ -151,6 +151,7 @@ fn placing_a_note_draws_before_the_submit_receipt() {
     let wire::Node::MouseArea {
         on_press_at: Some(position),
         on_press: Some(press),
+        on_release: Some(release),
         ..
     } = testing::find(&frame, "boards/canvas").unwrap()
     else {
@@ -163,13 +164,52 @@ fn placing_a_note_draws_before_the_submit_receipt() {
             y: 200.,
         },
         wire::Event::Message(*press),
+        wire::Event::Message(*release),
     ]);
     let frame = guest.answer(&frame, "host.id", b"note-1".to_vec());
     assert!(frame.requests.iter().any(|r| r.kind == "op.submit"));
-    assert!(testing::find(&frame, "boards/label/note-1").is_some());
+    assert!(testing::find(&frame, "boards/editor/note-1").is_some());
     assert!(
         testing::texts(&frame)
             .iter()
-            .any(|text| text.contains("Saving"))
+            .any(|text| text.contains("Editing text"))
     );
+}
+
+#[test]
+fn full_board_selection_move_fits_a_native_frame() {
+    use wire::keyboard::*;
+    let mut board = Board::new("Planning".into(), "owner".into()).unwrap();
+    for i in 0..boards::MAX_SHAPES {
+        board = board
+            .changed(&Change::Create {
+                id: format!("card-{i}"),
+                shape: Shape {
+                    text: "한글🦆".repeat(200),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+    }
+    let (mut guest, _) = load(board);
+    let press = |key: Key, control| wire::Event::Keyboard {
+        captured: false,
+        event: Event::Press {
+            state: KeyState {
+                modified_key: key.clone(),
+                key,
+                physical_key: Physical::Unidentified(NativeCode::Unidentified),
+                location: Location::Standard,
+                modifiers: Modifiers {
+                    control,
+                    ..Default::default()
+                },
+            },
+            text: None,
+            repeat: false,
+        },
+    };
+    guest.frame(vec![press(Key::Character("a".into()), true)]);
+    let frame = guest.frame(vec![press(Key::Named(Named::ArrowRight), false)]);
+    assert!(frame.requests.iter().any(|r| r.kind == "op.submit"));
 }

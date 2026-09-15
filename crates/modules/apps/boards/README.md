@@ -4,16 +4,46 @@ Shared native canvases: notes, boxes, text and arrows whose endpoints follow
 cards. Every authenticated signer on the network can edit a board. Reads are
 public; the recorded creator is attribution, not a privacy boundary.
 
-`Operation::Edit` carries one field operation. The view applies it immediately
-and submits it in the background. Consensus orders writes to the same field;
-move, resize, text and color operations preserve other fields. Deleting a card
-also removes its arrows. Late field edits to deleted cards are no-ops.
+`Operation::Edit` carries a field operation; `Operation::Batch` applies a whole
+selection gesture atomically. The view applies changes immediately and submits
+in the background. Consensus orders writes to the same field; move, resize,
+text and color preserve other fields. Deleting a card also removes its arrows.
+Late field edits to deleted cards are no-ops. Creation order determines stacking;
+editing a card does not bring it to the front.
 
-The view uses the existing gpui-kit canvas, buttons, text input and theme through
-the WASM wire contract. Camera, selection, undo history and unfinished gestures
-are device-local. Text is applied with Enter or **Apply text**. Drag the lower
-right corner to resize, use **Pan** or the scroll wheel to move the canvas, and
-use **Fit** or the zoom buttons to frame it. **Connect** takes two card clicks.
+The view uses gpui-kit buttons, theme, native multiline Editor and Canvas through
+the WASM wire contract. Camera, selection, history and unfinished gestures stay
+local. Pending edits survive view snapshots, but are not persisted across app
+restarts. Remote cursors, comments and shape clipboard are not provided.
+
+## Controls
+
+| Action | Input |
+|---|---|
+| Select / pan / note / box / text / connect | V / H / N / R / T / A (also 1–6) |
+| Keep the creation tool active | Q or the lock button |
+| Temporary pan | Space + drag; middle-button drag |
+| Add/remove selection | Shift + click |
+| Area selection | Drag empty space with Select |
+| Select all / duplicate | Cmd/Ctrl+A / Cmd/Ctrl+D |
+| Edit text | Enter or double-click a card |
+| Text newline / finish | Enter / Cmd/Ctrl+Enter, Esc or Done |
+| Adjacent note | Cmd/Ctrl+Enter outside text editing |
+| Undo / redo | Cmd/Ctrl+Z / Cmd/Ctrl+Shift+Z (also Ctrl+Y) |
+| Move selection | Arrow keys; Shift moves 10 units |
+| Resize | Drag any corner; Shift preserves aspect ratio |
+| Bypass alignment snapping | Alt while dragging |
+| Pan / cursor-anchored zoom | Scroll / Cmd/Ctrl+scroll |
+| Fit board / fit selection / reset zoom | F / Shift+F / 0 |
+| Cancel gesture / clear selection | Esc |
+| Keyboard help | ? |
+
+Notes and text enter editing on creation. Native text input owns its keys; board
+shortcuts do not run while typing. Multiple cards move, change color, align,
+duplicate and delete together; their gesture is one history entry. Connections
+follow their endpoint cards. Undo submits inverse field operations: a concurrent
+edit to the same field can be overwritten by that inverse, following consensus
+order. Camera and remote updates do not enter local undo history.
 
 ## Build and register
 
