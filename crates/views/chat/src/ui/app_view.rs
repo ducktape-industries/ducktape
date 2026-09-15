@@ -18,9 +18,9 @@ impl super::ChatView {
             on_enter: None,
             on_exit: None,
             on_move: None,
-            on_press_at: Some(slots::handler::<(f32, f32), Message>(Box::new(
-                |(x, y)| Some(Message::PressedAt(f64::from(x), f64::from(y))),
-            ))),
+            on_press_at: Some(slots::handler::<(f32, f32), Message>(Box::new(|(x, y)| {
+                Some(Message::PressedAt(f64::from(x), f64::from(y)))
+            }))),
             on_scroll: None,
             content: Box::new(self.chat_screen(node_scope.clone())),
         };
@@ -54,7 +54,7 @@ impl super::ChatView {
         }
         // `under: 1`: the screen lies under the in-flow backdrop; the menu
         // floats over both.
-        let overlay = wire::Node::Stack {
+        let stack = wire::Node::Stack {
             key: format!("{node_scope}/menu-stack"),
             width: Some(wire::Length::Fill),
             height: Some(wire::Length::Fill),
@@ -64,6 +64,20 @@ impl super::ChatView {
             clip: false,
             under: 1,
             children: layers,
+        };
+        // An open attachment previews in a modal card over everything: the
+        // screen dims, and a press outside the card closes it.
+        let overlay = match self.attachment_preview(&node_scope) {
+            None => stack,
+            Some(card) => wire::Node::Overlay {
+                key: format!("{node_scope}/preview-overlay"),
+                padding: 30.,
+                backdrop: wire::Rgba([0., 0., 0., 0.55]),
+                align_x: wire::AlignX::Center,
+                align_y: wire::AlignY::Center,
+                on_dismiss: Some(slots::message(Message::ClosePreview)),
+                children: vec![stack, card],
+            },
         };
         wire::Node::Sensor {
             key: format!("{}/@sensor:906", "ChatView"),

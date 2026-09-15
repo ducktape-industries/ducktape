@@ -129,6 +129,15 @@ pub const PICTURE_SURFACE: &str = "chat";
 /// shape, and never grows past its own size.
 pub const PICTURE_BOX: (f64, f64) = (360., 280.);
 
+/// A file the preview card renders as Markdown rather than code, by its name.
+pub fn markdown_path(name: &str) -> bool {
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(extension.as_str(), "md" | "markdown")
+}
+
 /// A file the host can decode for the timeline, by its name.
 pub fn is_picture(name: &str) -> bool {
     let extension = name
@@ -186,6 +195,143 @@ pub async fn picture_load(path: String) -> Result<(i64, i64), String> {
         drawn["width"].as_i64().unwrap_or(0),
         drawn["height"].as_i64().unwrap_or(0),
     ))
+}
+
+// ---------- the attachment preview ----------
+
+/// The margin the preview card keeps from the chat screen's edges, and the
+/// room its header and caption take from the picture's box.
+const PREVIEW_INSET: (f64, f64) = (160., 200.);
+/// Bytes one preview read asks for, and the head of them it shows.
+const PREVIEW_BYTES: i64 = 65_536;
+const PREVIEW_DISPLAY_BYTES: usize = 16 << 10;
+/// What the binary plate says.
+pub const BINARY_PLATE: &str = "This file is not text, so there is nothing to show here.";
+
+/// The size a picture is drawn at in the preview card: inside the chat
+/// screen less [`PREVIEW_INSET`], keeping its shape, no larger than it is.
+pub fn preview_box(width: i64, height: i64, screen: (f64, f64)) -> (f32, f32) {
+    let (width, height) = (width.max(1) as f64, height.max(1) as f64);
+    let room = preview_room(screen);
+    let scale = (room.0 / width).min(room.1 / height).min(1.);
+    (
+        (width * scale).round() as f32,
+        (height * scale).round() as f32,
+    )
+}
+
+/// The most a preview's body may take of the chat screen: the screen less
+/// [`PREVIEW_INSET`], never smaller than a timeline thumbnail's box.
+pub fn preview_room(screen: (f64, f64)) -> (f64, f64) {
+    (
+        (screen.0 - PREVIEW_INSET.0).max(PICTURE_BOX.0),
+        (screen.1 - PREVIEW_INSET.1).max(PICTURE_BOX.1),
+    )
+}
+
+/// One reading of a non-picture attachment: the head of the file, or why
+/// not. `read` is false until the node has answered.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct PreviewItem {
+    pub path: String,
+    pub read: bool,
+    pub text: String,
+    pub clipped: bool,
+    pub binary: bool,
+    pub error: String,
+}
+
+/// The attachment open in the preview card, read once per open.
+pub fn preview(serial: i64, path: String) -> ducktape_view_guest::Subscription<PreviewItem> {
+    ducktape_view_guest::Subscription::run_with((serial, path), |(_, path)| {
+        stream::once(read_preview(path.clone()))
+    })
+}
+
+async fn read_preview(path: String) -> PreviewItem {
+    match read_text(&path).await {
+        Ok(item) => item,
+        Err(error) => PreviewItem {
+            path,
+            read: true,
+            error: format!("Could not read this file: {error}"),
+            ..PreviewItem::default()
+        },
+    }
+}
+
+/// The head of the file at the head snapshot, branded binary when it does
+/// not read as text.
+async fn read_text(path: &str) -> Result<PreviewItem, String> {
+    let refs = files_get("refs", serde_json::json!({})).await?;
+    let base = refs["head"]
+        .as_str()
+        .ok_or("The file has no committed snapshot")?
+        .to_owned();
+    let reply = files_get(
+        "read",
+        serde_json::json!({ "path": path, "len": PREVIEW_BYTES, "snapshot": base }),
+    )
+    .await?;
+    let bytes = base64_decode(reply["b64"].as_str().unwrap_or_default())
+        .ok_or("The node's read page is not valid base64")?;
+    let eof = reply["eof"].as_bool().unwrap_or(true);
+    let (text, binary) = readable(bytes, eof);
+    let (text, clipped) = head_within(&text, PREVIEW_DISPLAY_BYTES);
+    Ok(PreviewItem {
+        path: path.to_owned(),
+        read: true,
+        text,
+        clipped: clipped || !eof,
+        binary,
+        error: String::new(),
+    })
+}
+
+async fn files_get(lane: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    ask(
+        "files.get",
+        &serde_json::json!({ "lane": lane, "params": params }),
+    )
+    .await
+}
+
+/// A file that is text, or the plate that says it is not. A page that ended
+/// before the file did may have cut a multi-byte character in half: the
+/// tail after the last complete character is dropped before the bytes are
+/// judged.
+pub fn readable(mut bytes: Vec<u8>, eof: bool) -> (String, bool) {
+    let cut_at_end = match std::str::from_utf8(&bytes) {
+        Err(error) if !eof && error.error_len().is_none() => Some(error.valid_up_to()),
+        _ => None,
+    };
+    if let Some(valid) = cut_at_end {
+        bytes.truncate(valid);
+    }
+    let Ok(text) = String::from_utf8(bytes) else {
+        return (BINARY_PLATE.into(), true);
+    };
+    let control = text
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\t' | '\r'));
+    match control {
+        true => (BINARY_PLATE.into(), true),
+        false => (text, false),
+    }
+}
+
+/// The head of `text` within `limit` bytes, cut on a character boundary,
+/// and whether anything was cut.
+fn head_within(text: &str, limit: usize) -> (String, bool) {
+    if text.len() <= limit {
+        return (text.to_owned(), false);
+    }
+    (text[..text.floor_char_boundary(limit)].to_owned(), true)
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(input).ok()
 }
 
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]

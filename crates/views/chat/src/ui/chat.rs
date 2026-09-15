@@ -1527,6 +1527,133 @@ impl ChatView {
             | MessageAction::Delete => frame,
         }
     }
+    /// The file pressed, shown where the reader is: a picture at the size
+    /// the screen allows, a text file's head in a code plate, or the plate
+    /// that says there is nothing to show. Files is one press away, never
+    /// the destination of the press itself.
+    pub(super) fn attachment_preview(&self, key: &str) -> Option<wire::Node> {
+        if self.preview_link.is_empty() {
+            return None;
+        }
+        let key = format!("{key}/preview");
+        let link = self.preview_link.clone();
+        let path = crate::host::attachment_file_path(&link);
+        let name = path.rsplit('/').next().unwrap_or_default().to_owned();
+        let header = native::spaced(
+            native::centered_row(
+                format!("{key}/header"),
+                [
+                    native::sized(
+                        native::nowrap(native::strong(format!("{key}/name"), &name)),
+                        Some(wire::Length::Fill),
+                        None,
+                    ),
+                    subtle(
+                        format!("{key}/open-in-files"),
+                        "Open in Files",
+                        Message::OpenMessageLink(link),
+                        false,
+                    ),
+                    glyph(
+                        format!("{key}/close"),
+                        "✕",
+                        "Close preview",
+                        Message::ClosePreview,
+                        false,
+                    ),
+                ],
+            ),
+            8.,
+        );
+        let body = self.preview_body(&key, &path);
+        let card = native::spaced(native::column(key.clone(), [header, body]), 10.);
+        Some(native::padded(card, wire::Edges::all(14.)))
+    }
+    fn preview_body(&self, key: &str, path: &str) -> wire::Node {
+        let picture = self.pictures.get(&self.preview_link).copied();
+        if let Some((width, height)) = picture.filter(|&(w, h)| w > 0 && h > 0) {
+            let screen = (self.chat_viewport_width, self.chat_viewport_height);
+            let (box_width, box_height) = crate::host::preview_box(width, height, screen);
+            let surface = wire::Node::Surface {
+                key: format!("{key}/picture"),
+                name: "picture".into(),
+                args: vec![
+                    wire::SurfaceValue::Str(crate::host::PICTURE_SURFACE.into()),
+                    wire::SurfaceValue::Str(path.to_owned()),
+                ],
+                on_event: None,
+            };
+            return native::sized(
+                native::container(format!("{key}/frame"), surface),
+                Some(wire::Length::Fixed(box_width)),
+                Some(wire::Length::Fixed(box_height)),
+            );
+        }
+        let preview = &self.preview;
+        let screen = (self.chat_viewport_width, self.chat_viewport_height);
+        let (plate_width, plate_height) = crate::host::preview_room(screen);
+        let (plate_width, plate_height) = (plate_width as f32, plate_height as f32);
+        if !preview.error.is_empty() {
+            return native::notice(
+                format!("{key}/failed"),
+                native::wrapping(native::text(format!("{key}/reason"), &preview.error)),
+                Tone::Danger,
+            );
+        }
+        if !preview.read {
+            return native::secondary(format!("{key}/reading"), "Reading the file…");
+        }
+        if preview.binary {
+            return native::empty_state(
+                format!("{key}/binary"),
+                "No preview",
+                crate::host::BINARY_PLATE,
+            );
+        }
+        // Binary-or-text is the wire's call; markdown-vs-code is the path's.
+        // The same two host surfaces Files previews with: a link pressed in
+        // the markdown leaves through the app's router like any message link.
+        use wire::SurfaceValue::{Bool, Str};
+        let document = match crate::host::markdown_path(path) {
+            true => wire::Node::Surface {
+                key: format!("{key}/markdown"),
+                name: "agent_markdown".into(),
+                args: vec![Str(preview.text.clone()), Bool(self.dark)],
+                on_event: Some(slots::handler::<wire::SurfaceValue, Message>(Box::new(
+                    |value| match value {
+                        Str(link) => Some(Message::OpenMessageLink(link)),
+                        _ => None,
+                    },
+                ))),
+            },
+            false => wire::Node::Surface {
+                key: format!("{key}/code"),
+                name: "forge_code".into(),
+                args: vec![
+                    Str(preview.text.clone()),
+                    Str(path.to_owned()),
+                    Bool(self.dark),
+                ],
+                on_event: None,
+            },
+        };
+        let mut children = vec![native::sized(
+            native::container(format!("{key}/plate"), document),
+            Some(wire::Length::Fill),
+            Some(wire::Length::Fill),
+        )];
+        if preview.clipped {
+            children.push(native::caption(
+                format!("{key}/clipped"),
+                "Only the beginning is shown here. Open in Files for the whole file.",
+            ));
+        }
+        native::sized(
+            native::spaced(native::column(format!("{key}/document"), children), 6.),
+            Some(wire::Length::Fixed(plate_width)),
+            Some(wire::Length::Fixed(plate_height)),
+        )
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenMenu {
