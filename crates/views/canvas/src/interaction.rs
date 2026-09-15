@@ -1116,7 +1116,20 @@ impl BoardsView {
             id: id.clone(),
             original: text.clone(),
             document: Editor::new(text),
+            grown: None,
         });
+        Task::none()
+    }
+    /// What the host says the card's words come to, laid out at the size and
+    /// width the painter writes them in. It arrives in screen pixels because
+    /// that is what was measured; the board is in board units, so the zoom
+    /// comes back out of it here.
+    pub(super) fn on_measured(&mut self, _width: f32, height: f32) -> Task<Message> {
+        let Some(inline) = &mut self.inline else {
+            return Task::none();
+        };
+        let needed = height / self.zoom;
+        inline.grown = Some(inline.grown.map_or(needed, |seen| seen.max(needed)));
         Task::none()
     }
     pub(super) fn focus_text(&self) -> Task<Message> {
@@ -1197,8 +1210,16 @@ impl BoardsView {
             self.inline = Some(inline);
             return Task::none();
         }
+        // The card was drawn at the height its words need for as long as the
+        // editor was open. Saving keeps that height: a card that snapped back
+        // to clipping the moment you clicked away would have been lying the
+        // whole time you were typing. `self.inline` is already taken, so this
+        // reads the board as it will be without the editor over it.
+        let grow = self
+            .visible()
+            .and_then(|board| self.grown_change(&board, &inline));
         let changed = text != inline.original;
-        if changed && self.pending.len() >= 64 {
+        if (changed || grow.is_some()) && self.pending.len() >= 64 {
             self.error =
                 "Waiting for earlier edits to save. Retry saving before closing this card.".into();
             self.inline = Some(inline);
@@ -1217,15 +1238,15 @@ impl BoardsView {
                 self.hand_back_focus(),
             ]);
         }
-        let save = if changed {
-            self.edit(Change::Text {
+        let mut changes = Vec::new();
+        if changed {
+            changes.push(Change::Text {
                 id: inline.id,
                 text,
-            })
-        } else {
-            Task::none()
-        };
-        Task::batch([save, self.hand_back_focus()])
+            });
+        }
+        changes.extend(grow);
+        Task::batch([self.edit_many(changes), self.hand_back_focus()])
     }
     /// The canvas takes the keyboard back, so the next key is a shortcut
     /// rather than a character nothing is listening for.

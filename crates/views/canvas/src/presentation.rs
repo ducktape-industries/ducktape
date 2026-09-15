@@ -178,11 +178,10 @@ impl BoardsView {
                 .and_then(|board| board.shapes.get(&inline.id))
         {
             let s = &record.shape;
-            layers.push(self.inline_editor(
-                s,
-                self.screen(s.x as f32, s.y as f32),
-                [s.width as f32 * self.zoom, s.height as f32 * self.zoom],
-            ));
+            let pos = self.screen(s.x as f32, s.y as f32);
+            let size = [s.width as f32 * self.zoom, s.height as f32 * self.zoom];
+            layers.push(self.text_gauge(inline, s, pos, size));
+            layers.push(self.inline_editor(s, pos, size));
         }
         if let Some(board) = &board {
             let hint_shown = !editing && !compact;
@@ -1894,6 +1893,70 @@ fn swatch(color: u8, selected: bool) -> Node {
     node
 }
 impl BoardsView {
+    /// The card's words a second time, invisibly, laid out exactly the way the
+    /// painter writes them and left to take whatever height they need. The
+    /// host reports what that came to, and the card grows to it.
+    ///
+    /// The native editor cannot answer this itself: asked to lay out to its
+    /// own content it shows one line of however many it holds, and there is no
+    /// verb on the wire for measuring a document. So the gauge measures the
+    /// label instead — the same text node, the same size, the same width and
+    /// the same padding — which is the right authority anyway. The card ends
+    /// up as tall as the words it will be *drawn* with.
+    fn text_gauge(&self, inline: &Inline, shape: &Shape, pos: [f32; 2], size: [f32; 2]) -> Node {
+        let letters = self.lettering(shape.kind, size);
+        let words = inline.document.text();
+        let measure = || {
+            Some(slots::handler(Box::new(|(w, h)| {
+                Some(Message::Measured(w, h))
+            })))
+        };
+        let mut gauge = kit::colored(
+            kit::text_size(
+                kit::wrapping(kit::text("boards/gauge-text", excerpt(&words, LETTERS))),
+                letters.size,
+            ),
+            alpha(kit::palette().foreground, 0.),
+        );
+        if let Node::Text { width, .. } = &mut gauge {
+            // Narrower than the card by a margin, because the native editor
+            // keeps room inside the box it is given that a plain label does
+            // not: with the same words in the same column it takes one line
+            // more than the label does, and a card measured on the label alone
+            // comes up about half a line short of what the caret needs. The
+            // margin rides the type size so a card's height is the same
+            // whatever the camera is doing — a box that reflowed as you zoomed
+            // would resize itself for looking at it.
+            let column = size[0] - 2. * letters.inset - 2. * letters.size;
+            *width = Some(Length::Fixed(column.max(40.)));
+        }
+        let mut padded = kit::container("boards/gauge-pad", gauge);
+        if let Node::Container { padding, .. } = &mut padded {
+            // The card is the words plus the room they are written in, so the
+            // gauge carries the same inset and reports a card height, not a
+            // text height.
+            *padding = Some(wire::Edges::all(letters.inset));
+        }
+        Node::Pin {
+            key: "boards/gauge-pin".into(),
+            x: pos[0],
+            y: pos[1],
+            width: Some(Length::Fixed(size[0].max(1.))),
+            // No height: this is the one node on the stage allowed to be as
+            // tall as it likes, because its height is the answer.
+            height: None,
+            content: Box::new(Node::Sensor {
+                key: format!("boards/gauge/{}", inline.id),
+                reset: None,
+                on_show: measure(),
+                on_resize: measure(),
+                on_hide: None,
+                anticipate: None,
+                delay: None,
+                child: Box::new(padded),
+            }),
+        }
+    }
     fn inline_editor(&self, shape: &Shape, pos: [f32; 2], size: [f32; 2]) -> Node {
         use ducktape_view_guest::{EditorBinding, EditorTransactionEvent};
         use wire::keyboard::{Key, Named};

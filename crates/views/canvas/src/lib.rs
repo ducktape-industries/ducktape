@@ -115,6 +115,18 @@ struct Inline {
     original: String,
     #[serde(with = "editor_codec")]
     document: Editor,
+    /// The height in board units the words in this card need, as the host
+    /// measured them, and never less than it has already been asked for. The
+    /// card is drawn at least this tall for as long as the editor is open and
+    /// keeps the height when the card is saved; leaving by Escape drops it
+    /// with the words that asked for it.
+    ///
+    /// It only ever grows within one sitting. Nothing feeds back into the
+    /// measurement — the gauge is as wide as the card and the card's width
+    /// does not change — except a round shape's inset, which is taken off the
+    /// shorter side and so widens as the card gets taller. Keeping the high
+    /// mark settles that in one step instead of letting it creep.
+    grown: Option<f32>,
 }
 mod editor_codec {
     use super::*;
@@ -199,6 +211,7 @@ pub enum Message {
     DoubleClick,
     EditText,
     FocusText,
+    Measured(f32, f32),
     FocusResult(String, Result<(), String>),
     MiddleDown,
     FinishText,
@@ -325,6 +338,7 @@ impl BoardsView {
             Message::DoubleClick => self.on_double_click(),
             Message::EditText => self.begin_text(),
             Message::FocusText => self.focus_text(),
+            Message::Measured(width, height) => self.on_measured(width, height),
             Message::FocusResult(id, result) => self.on_focus_result(id, result),
             Message::MiddleDown => self.on_middle_down(),
             Message::FinishText => self.finish_text(),
@@ -524,7 +538,34 @@ impl BoardsView {
         if let Ok(next) = board.changed_many(&self.gesture_changes()) {
             board = next;
         }
+        let growing = self
+            .inline
+            .as_ref()
+            .and_then(|inline| self.grown_change(&board, inline));
+        if let Some(change) = growing
+            && let Ok(next) = board.changed(&change)
+        {
+            board = next;
+        }
         Some(board)
+    }
+    /// The card being written in, drawn tall enough to hold the words it is
+    /// holding — or nothing, when it already is. A card that cannot show what
+    /// you just typed is the same defect whether the words are clipped or the
+    /// editor scrolls them out of sight, so the card grows under the caret and
+    /// keeps the height when it is saved.
+    ///
+    /// It never shrinks. Deleting a line leaves the room it made, the way a
+    /// box you dragged wider stays wide.
+    fn grown_change(&self, board: &Board, inline: &Inline) -> Option<Change> {
+        let grown = inline.grown?;
+        let shape = &board.shapes.get(&inline.id)?.shape;
+        let needed = grown.ceil().clamp(1., boards::MAX_SIZE as f32) as i32;
+        (needed > shape.height).then(|| Change::Resize {
+            id: inline.id.clone(),
+            width: shape.width,
+            height: needed,
+        })
     }
     fn enqueue_many(&mut self, changes: Vec<Change>) -> Task<Message> {
         if changes.is_empty() {
