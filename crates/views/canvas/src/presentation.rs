@@ -824,7 +824,7 @@ impl BoardsView {
             }
         }
     }
-    fn screen(&self, x: f32, y: f32) -> [f32; 2] {
+    pub(super) fn screen(&self, x: f32, y: f32) -> [f32; 2] {
         [
             x * self.zoom + self.camera[0],
             y * self.zoom + self.camera[1],
@@ -1231,7 +1231,7 @@ impl BoardsView {
     /// What belongs to the pointer, not to the board: the selection, its
     /// handles, the snapping guides and whatever the current gesture is about
     /// to leave behind.
-    fn paint_marks(&self, board: &Board, budget: usize, out: &mut Vec<Draw>) {
+    pub(super) fn paint_marks(&self, board: &Board, budget: usize, out: &mut Vec<Draw>) {
         let p = kit::palette();
         let accent = Rgba(p.accent);
         let ring = (6. * self.zoom).clamp(2., 20.);
@@ -1352,6 +1352,30 @@ impl BoardsView {
         }
         self.paint_gesture(board, out);
     }
+    /// The card an arrow's end would take if it were let go here, ringed. An
+    /// end in hand says what it is about to hold, so releasing is a decision
+    /// you already made rather than one you find out about afterwards.
+    fn ring_the_card(&self, board: &Board, kind: Kind, point: [f32; 2], out: &mut Vec<Draw>) {
+        let p = kit::palette();
+        let Some(id) = self.holding(board, kind, point) else {
+            return;
+        };
+        let Some(record) = board.shapes.get(&id) else {
+            return;
+        };
+        let card = &record.shape;
+        out.push(rectangle(
+            self.screen(card.x as f32, card.y as f32),
+            [
+                card.width as f32 * self.zoom,
+                card.height as f32 * self.zoom,
+            ],
+            Some(Rgba(alpha(p.accent, 0.08))),
+            Rgba(p.accent),
+            2.,
+            (6. * self.zoom).clamp(2., 20.),
+        ));
+    }
     fn paint_gesture(&self, board: &Board, out: &mut Vec<Draw>) {
         let p = kit::palette();
         let accent = Rgba(p.accent);
@@ -1371,10 +1395,24 @@ impl BoardsView {
             Gesture::Create { kind, start, point } => {
                 let shape = self.creation_shape(*kind, *start, *point);
                 if kind.is_path() {
-                    let screen: Vec<_> = interaction::path_points(&shape)
-                        .iter()
-                        .map(|q| self.screen(q[0], q[1]))
-                        .collect();
+                    // An arrow being drawn says what it would take hold of at
+                    // both ends, the same way one being re-routed does: the
+                    // cards it is about to bind are ringed while you drag, not
+                    // reported by the line jumping to their edges after you let
+                    // go.
+                    for end in [*start, *point] {
+                        self.ring_the_card(board, *kind, end, out);
+                    }
+                    // And it is drawn as the shape it would become, stopping at
+                    // the borders of the cards it is taking rather than running
+                    // on into them and snapping back when you let go. Below the
+                    // threshold there is no shape yet, so the raw run stands in.
+                    let run = self.drawn_shape(*kind, *start, *point).map_or_else(
+                        || interaction::path_points(&shape),
+                        |bound| interaction::stroke(board, &bound),
+                    );
+                    let screen: Vec<_> =
+                        run.iter().map(|q| self.screen(q[0], q[1])).collect();
                     self.paint_stroke(*kind, &screen, accent, 8, out);
                     return;
                 }
@@ -1400,32 +1438,8 @@ impl BoardsView {
                     out,
                 );
             }
-            // An endpoint in hand says what it would take hold of: the card it
-            // is over is ringed, so releasing is a decision you already made
-            // rather than one you find out about afterwards.
             Gesture::Endpoint { point, shape, .. } => {
-                let binds = shape.kind == Kind::Arrow;
-                let Some(id) = binds
-                    .then(|| self.topmost(board, *point, |s: &Shape| !s.kind.is_path()))
-                    .flatten()
-                else {
-                    return;
-                };
-                let Some(record) = board.shapes.get(&id) else {
-                    return;
-                };
-                let card = &record.shape;
-                out.push(rectangle(
-                    self.screen(card.x as f32, card.y as f32),
-                    [
-                        card.width as f32 * self.zoom,
-                        card.height as f32 * self.zoom,
-                    ],
-                    wash,
-                    accent,
-                    2.,
-                    (6. * self.zoom).clamp(2., 20.),
-                ));
+                self.ring_the_card(board, shape.kind, *point, out)
             }
             Gesture::Idle
             | Gesture::Pan { .. }

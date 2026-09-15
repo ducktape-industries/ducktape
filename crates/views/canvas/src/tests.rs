@@ -750,6 +750,110 @@ fn dragging_an_arrows_end_onto_another_card_rebinds_that_end_and_leaves_the_far_
 }
 
 #[test]
+fn an_end_held_over_a_card_is_already_holding_it() {
+    let mut view = linked();
+    view.on_size(1400., 900.);
+    // Take the far end and hold it over card "c" without letting go. What the
+    // board shows while the pointer is down used to be a bare line to the
+    // pointer with no binding at all: the arrow jumped to the card's edge on
+    // release, so the picture you decided from was not the picture you got.
+    view.on_press(380., 150.);
+    view.on_move(600., 150.);
+    view.on_move(780., 150.);
+    let board = view.visible().unwrap();
+    let edge = &board.shapes["edge"].shape;
+    assert_eq!(
+        edge.to.as_deref(),
+        Some("c"),
+        "the end in hand was not holding the card it was over"
+    );
+    let run = super::interaction::stroke(&board, edge);
+    let end = run.last().copied().unwrap();
+    let c = &board.shapes["c"].shape;
+    let edge_of_c = c.x as f32;
+    assert!(
+        (end[0] - edge_of_c).abs() < 2.,
+        "the run ran to the pointer at 780 instead of the card's edge at \
+         {edge_of_c}: it landed at {}",
+        end[0]
+    );
+    // and letting go changes nothing, because it was already decided
+    view.on_release();
+    let board = view.visible().unwrap();
+    assert_eq!(board.shapes["edge"].shape.to.as_deref(), Some("c"));
+}
+
+#[test]
+fn both_ends_of_an_arrow_being_drawn_ring_the_cards_they_would_take() {
+    let mut view = linked();
+    view.on_size(1400., 900.);
+    view.selected = Default::default();
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    view.tool = Tool::Arrow;
+    // Drawing from inside one card to inside another binds both ends on
+    // release. While the drag is in flight both cards must say so.
+    view.on_press(60., 60.);
+    view.on_move(200., 100.);
+    view.on_move(360., 60.);
+    let board = view.visible().unwrap();
+    let mut marks = Vec::new();
+    view.paint_marks(&board, 3600, &mut marks);
+    let a = &board.shapes["a"].shape;
+    let b = &board.shapes["b"].shape;
+    for (name, card) in [("a", a), ("b", b)] {
+        let at = view.screen(card.x as f32, card.y as f32);
+        assert!(
+            marks.iter().any(|mark| rings(mark, at)),
+            "card {name} was about to be bound and said nothing"
+        );
+    }
+    // And it is drawn as the arrow it will become: stopping at the cards'
+    // borders rather than running on into them and snapping back on release.
+    let drawn_to = marks
+        .iter()
+        .find_map(|mark| match mark {
+            wire::CanvasCommand::Draw {
+                shape: wire::CanvasShape::Path(steps),
+                ..
+            } => steps.last(),
+            _ => None,
+        })
+        .expect("the arrow in flight was not drawn");
+    let wire::CanvasSegment::Line(head) = drawn_to else {
+        panic!("the run did not end in a line");
+    };
+    let border = view.screen(b.x as f32, 0.)[0];
+    assert!(
+        (head[0] - border).abs() < 2.,
+        "the arrow ran on to the pointer at 360 instead of stopping at card \
+         b's border at {border}: it reached {}",
+        head[0]
+    );
+    view.on_release();
+    let board = view.visible().unwrap();
+    let drawn = board
+        .shapes
+        .values()
+        .find(|record| record.shape.kind == Kind::Arrow && record.shape.from.is_some())
+        .expect("no arrow was drawn");
+    assert_eq!(drawn.shape.from.as_deref(), Some("a"));
+    assert_eq!(drawn.shape.to.as_deref(), Some("b"));
+}
+
+/// Whether a mark is a rectangle standing at this screen point.
+fn rings(mark: &wire::CanvasCommand, at: [f32; 2]) -> bool {
+    let wire::CanvasCommand::Draw {
+        shape: wire::CanvasShape::Rectangle { position, .. },
+        ..
+    } = mark
+    else {
+        return false;
+    };
+    (position[0] - at[0]).abs() < 1. && (position[1] - at[1]).abs() < 1.
+}
+
+#[test]
 fn dragging_a_bound_end_onto_open_board_frees_it_and_stands_it_on_its_own_point() {
     let mut view = linked();
     drag(&mut view, &[[380., 150.], [500., 400.], [520., 480.]]);
