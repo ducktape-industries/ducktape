@@ -19,6 +19,9 @@ mod taste;
 
 pub use kernel::{block_hit as view_block_hit, live_hit as view_live_hit};
 
+/// Shared HTTP connections need a continuously driven I/O runtime. Loader
+/// threads can compile or join child loads between requests; their own parked
+/// runtimes would strand the pooled sockets another loader reuses.
 pub(crate) fn runtime() -> tokio::runtime::Handle {
     kernel::runtime()
 }
@@ -1238,10 +1241,7 @@ fn spawn_registry_read(asked_of: Connection) -> std::thread::JoinHandle<()> {
         let Some(client) = asked_of.client.as_ref() else {
             return;
         };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a runtime for the registry read");
+        let runtime = runtime();
         let entries = match runtime.block_on(crate::backend::view_source::active_hashes(client)) {
             Ok(entries) => entries,
             Err(error) => {
@@ -2231,10 +2231,7 @@ impl Guest {
                 return Err(before_any_candidate(reason.to_owned()));
             }
         };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| before_any_candidate(error.to_string()))?;
+        let runtime = runtime();
         let started = Instant::now();
         let mut timing = LoadTiming {
             path: "first",
@@ -5240,6 +5237,41 @@ pub(crate) mod tests {
         let hold = Arc::new(tokio::sync::Notify::new());
         *node.hold_status.lock().unwrap() = Some(hold.clone());
         hold
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_registered_view_reuses_http_while_its_registry_thread_joins_it() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let component = std::fs::read(staged("governance").expect("build the governance view"))
+            .expect("the staged view");
+        let home = module_artifact::Artifact::View(module_artifact::ViewArtifact {
+            component,
+            assets: std::collections::BTreeMap::new(),
+        });
+        let node = FakeDeployment::serving("home", &home);
+        node.status.lock().unwrap()["module_status"]["modules"][0]["kind"] =
+            serde_json::json!("view");
+        node.answer_query("governance", serde_json::json!({"proposals": []}));
+        let client = fake_node(node).await;
+        // Only the registry talks first, so its HTTP pool is the one home
+        // inherits. Its loader thread then waits for home's nested load.
+        let asked_of = {
+            let mut current = connection().lock().unwrap();
+            current.rev += 1;
+            current.client = Some(client);
+            current.clone()
+        };
+        let loading = spawn_registry_read(asked_of);
+        tokio::task::spawn_blocking(move || loading.join().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(registered_views(), ["home"]);
+        assert_eq!(canary::seated_hash("home"), Some(home.hash()));
+        assert!(matches!(
+            mounted("home").lock().unwrap().slot,
+            Slot::Ready(_)
+        ));
     }
 
     /// The connect seats and loads every node-owned view, drawn or not —
