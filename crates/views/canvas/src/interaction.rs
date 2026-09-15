@@ -1013,6 +1013,18 @@ impl BoardsView {
         self.edit_many(swept.into_iter().map(|id| Change::Delete { id }).collect())
     }
     pub(super) fn on_cancel(&mut self) -> Task<Message> {
+        // A card the board will not take must still be one you can leave.
+        // Done keeps your words and asks you to shorten them; Escape is the
+        // other answer to that — put the card back the way it was and let go.
+        let overlong = self
+            .inline
+            .as_ref()
+            .is_some_and(|inline| inline.document.text().len() > boards::MAX_TEXT);
+        if overlong {
+            self.inline = None;
+            self.error.clear();
+            return self.hand_back_focus();
+        }
         if self.inline.is_some() {
             return self.finish_text();
         }
@@ -1172,9 +1184,15 @@ impl BoardsView {
         };
         let text = inline.document.text();
         if text.len() > boards::MAX_TEXT {
+            // Say by how much, and say the way out. Refusing to save without
+            // either is a card you cannot leave: every way out of the editor
+            // ends here, so a reader who does not know Escape discards is
+            // stuck deleting characters against a limit nobody named.
             self.error = format!(
-                "This card holds up to {} bytes of text. Shorten it before leaving.",
-                boards::MAX_TEXT
+                "This card holds {} bytes and there are {}. Shorten it, or press Escape to \
+                 leave the card as it was.",
+                boards::MAX_TEXT,
+                text.len()
             );
             self.inline = Some(inline);
             return Task::none();
