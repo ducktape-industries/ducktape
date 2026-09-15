@@ -131,10 +131,7 @@ impl ForgeView {
                 (true, false) => "▸",
                 (true, true) => "▾",
             };
-            let name = native::nowrap(native::text_size(
-                native::text(format!("{key}/name"), &entry.name),
-                14.,
-            ));
+            let name = native::nowrap(native::text(format!("{key}/name"), &entry.name));
             let name = if directory {
                 native::weighted(name, wire::Weight::Medium)
             } else {

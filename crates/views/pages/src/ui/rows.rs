@@ -93,10 +93,7 @@ impl PagesView {
         let mut row = kit::list_row(
             key.clone(),
             kit::sized(
-                kit::nowrap(kit::text_size(
-                    kit::text(format!("{key}/title"), title),
-                    14.,
-                )),
+                kit::nowrap(kit::text(format!("{key}/title"), title)),
                 Some(Length::Fill),
                 None,
             ),
@@ -270,10 +267,7 @@ impl PagesView {
                             [
                                 kit::sized(
                                     kit::nowrap(kit::weighted(
-                                        kit::text_size(
-                                            kit::text(format!("{key}/title"), &hit.page_title),
-                                            14.,
-                                        ),
+                                        kit::text(format!("{key}/title"), &hit.page_title),
                                         wire::Weight::Medium,
                                     )),
                                     Some(Length::Fill),
