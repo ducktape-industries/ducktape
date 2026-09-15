@@ -157,8 +157,15 @@ impl BindingState {
         };
         let (_, successor) = interaction(&doc, self.menu.clone(), action);
         self.menu = successor;
+        // A margin press with the selection on that line comments on the
+        // selected words (the host editor's "Comment" on a selection); with
+        // no selection it opens the block's threads.
         if let wire::editor_presentation::EditorInteraction::Margin { line } = action {
             navigation.comment_line = Some(*line);
+            navigation.anchor = crate::document_sync::text_anchor(
+                doc.line(*line as usize).unwrap_or_default(),
+                crate::editor_menu::selection_columns(&doc, *line as usize),
+            );
         }
         Some(self.update(id, state, wire::encode(&navigation)))
     }

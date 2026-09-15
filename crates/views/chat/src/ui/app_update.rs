@@ -10,9 +10,6 @@ impl super::ChatView {
             }
             Message::PressedAt(x, y) => self.on_pressed_at(x, y),
             Message::PictureLoaded(link, drawn) => self.on_picture_loaded(link, drawn),
-            Message::OpenAttachment(link) => self.on_open_attachment(link),
-            Message::ClosePreview => self.on_close_preview(),
-            Message::PreviewArrived(item) => self.on_preview_arrived(item),
             Message::SessionArrived(item) => self.on_session_arrived(*item),
             Message::SessionSettled(moved_room) => self.on_session_settled(moved_room),
             Message::SnapStream(moved) => self.on_snap_stream(moved),
@@ -609,43 +606,9 @@ impl super::ChatView {
         self.sent = crate::host::send_join_voice(&id);
         ::ducktape_view_guest::Task::none()
     }
-    /// A link leaves for the app's own router; a preview card gives way to
-    /// the tab it lands on.
     fn on_open_message_link(&mut self, url: String) -> ducktape_view_guest::Task<Message> {
-        self.preview_link = "".to_owned();
         self.sent = crate::host::send_open_link(::std::convert::AsRef::as_ref(&(url)));
         ::ducktape_view_guest::Task::none()
-    }
-    /// The preview card opens over the screen on the file pressed. A
-    /// picture is already decoded for its thumbnail; anything else is read
-    /// by the subscription this serial keys.
-    fn on_open_attachment(&mut self, link: String) -> ducktape_view_guest::Task<Message> {
-        self.preview_link = link;
-        self.preview_serial += 1;
-        self.preview = crate::host::PreviewItem::default();
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_close_preview(&mut self) -> ducktape_view_guest::Task<Message> {
-        self.preview_link = "".to_owned();
-        ::ducktape_view_guest::Task::none()
-    }
-    fn on_preview_arrived(
-        &mut self,
-        item: crate::host::PreviewItem,
-    ) -> ducktape_view_guest::Task<Message> {
-        let current = item.path == crate::host::attachment_file_path(&self.preview_link);
-        if current {
-            self.preview = item;
-        }
-        ::ducktape_view_guest::Task::none()
-    }
-    /// Does the open preview read its file? A picture draws from the host's
-    /// slot instead.
-    pub(crate) fn preview_reads(&self) -> bool {
-        let open = !self.preview_link.is_empty();
-        let picture =
-            matches!(self.pictures.get(&self.preview_link), Some(&(w, h)) if w > 0 && h > 0);
-        open && !picture
     }
     fn on_copy_to_clipboard(
         &mut self,

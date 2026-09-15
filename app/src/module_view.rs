@@ -6313,18 +6313,18 @@ pub(crate) mod tests {
             })
         };
         let (beside_editor, beside_card) = measured(1500.);
-        assert_eq!(f32::from(beside_editor.size.width), 704.);
+        assert_eq!(f32::from(beside_editor.size.width), 670.);
         assert_eq!(f32::from(beside_card.size.width), 320.);
         let (squeeze_editor, squeeze_card) = measured(1300.);
         assert_eq!(
             f32::from(squeeze_editor.size.width),
-            1066. - 320. - 24. - 62.
+            1066. - 320. - 24. - 96.
         );
         assert_eq!(f32::from(squeeze_card.size.width), 320.);
         assert!(squeeze_editor.size.width < beside_editor.size.width);
         // 1000 − 234 = 766 of pane: under the 844 squeeze floor, so inline.
         let (inline_editor, inline_card) = measured(1000.);
-        assert_eq!(f32::from(inline_editor.size.width), 704.);
+        assert_eq!(f32::from(inline_editor.size.width), 670.);
         assert_eq!(inline_card.size.width, inline_editor.size.width);
     }
 

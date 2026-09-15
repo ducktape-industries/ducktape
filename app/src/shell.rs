@@ -3163,7 +3163,9 @@ fn nav_icon(tab: ShellTab) -> gpui_kit::component::Icon {
 pub(crate) fn run() {
     // The kit's component icons (search, bell, folder, …) are SVGs the app
     // loads by path; without a source they draw as nothing.
-    let application = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    // The full Lucide catalog: gpui-notion names its toolbar, gutter and menu
+    // icons out of it, well past the default subset.
+    let application = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
     let (url_sender, mut urls) = mpsc::unbounded::<Vec<String>>();
     // Install before launching: macOS may deliver its initial URL before the
     // desktop actor exists. The channel keeps it until the actor can receive.

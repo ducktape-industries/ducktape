@@ -678,8 +678,8 @@ fn the_comment_card_answers_the_pane_it_is_opened_in() {
     // the reserve opens under the title.
     let inline = at_pane(800.0);
     assert_eq!(max_widths(inline.root.as_ref().unwrap()), vec![766.0]);
-    assert_eq!(card_width(&inline), 766.0 - 62.0);
-    assert_eq!(card_placed(&inline, 800.0, 704.0), (22.0, 65.3));
+    assert_eq!(card_width(&inline), 766.0 - 96.0);
+    assert_eq!(card_placed(&inline, 800.0, 670.0), (56.0, 65.3));
 }
 
 /// A PLACEMENT IS VIEW-LOCAL: crossing a threshold moves the card and nothing

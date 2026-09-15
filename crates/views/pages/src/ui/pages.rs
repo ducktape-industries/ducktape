@@ -535,7 +535,7 @@ impl PagesView {
                 top: 26.,
                 right: 40.,
                 bottom: 18.,
-                left: 22.,
+                left: 56.,
             },
         ));
         if let Node::Container { max_width, .. } = &mut surface {
