@@ -321,7 +321,25 @@ async fn chat_round_trips_over_signed_frames() {
     // the module views load from whatever node connects last: take the
     // turn the deployment tests take, so this node is not theirs
     let _turn = crate::module_view::tests::connection_turn().await;
-    let workspace = connect(origin.clone(), 0, 0).await.unwrap();
+    let mut opening = connect(origin.clone(), 0, 0).into_stream();
+    assert!(matches!(
+        opening.next().await,
+        Some(crate::AppMessage::ConnectionProgress(
+            0,
+            "Loading chat and workspace…"
+        ))
+    ));
+    assert!(matches!(
+        opening.next().await,
+        Some(crate::AppMessage::ConnectionProgress(
+            0,
+            "Preparing workspace screens…"
+        ))
+    ));
+    let Some(crate::AppMessage::WorkspaceConnected(workspace)) = opening.next().await else {
+        panic!("workspace connects after both progress publications");
+    };
+    assert!(opening.next().await.is_none());
     let mut live = live_events(origin.clone());
     let ready = next_change(&mut live).await;
     assert_eq!(ready.kind, crate::LiveKind::Ready);

@@ -7,7 +7,7 @@ use super::*;
 use ducktape_view_guest::slots;
 
 pub(super) const COLUMN_WIDTH: f64 = 230.;
-const ROW_HEIGHT: f32 = 32.;
+const ROW_HEIGHT: f32 = 40.;
 
 impl FilesView {
     pub(super) fn columns_pane(&self, key: String) -> wire::Node {
@@ -163,7 +163,10 @@ impl FilesView {
                 None,
             ),
             native::sized(
-                native::nowrap(native::text(format!("{key}/name"), entry.name.clone())),
+                native::nowrap(native::text_size(
+                    native::text(format!("{key}/name"), entry.name.clone()),
+                    14.,
+                )),
                 Some(wire::Length::Fill),
                 None,
             ),

@@ -86,7 +86,7 @@ impl FilesView {
             native::scroll(
                 format!("{key}/scroll"),
                 native::padded(
-                    native::spaced(native::column(format!("{key}/rows"), rows), 1.),
+                    native::spaced(native::column(format!("{key}/rows"), rows), 2.),
                     wire::Edges {
                         top: 0.,
                         right: 4.,
@@ -113,7 +113,10 @@ impl FilesView {
                         Some(wire::Length::Fixed(16.)),
                         None,
                     ),
-                    native::nowrap(native::text(format!("{key}/name"), name)),
+                    native::nowrap(native::text_size(
+                        native::text(format!("{key}/name"), name),
+                        14.,
+                    )),
                 ],
             ),
             6.,
@@ -124,7 +127,13 @@ impl FilesView {
             here,
             Some(slots::message(Message::Navigate(path.to_owned()))),
         );
-        if let wire::Node::Button { label, .. } = &mut row {
+        if let wire::Node::Button { label, padding, .. } = &mut row {
+            *padding = Some(wire::Edges {
+                top: 8.,
+                right: 8.,
+                bottom: 8.,
+                left: 8.,
+            });
             *label = Some(format!("Go to {path}"));
         }
         row
@@ -152,7 +161,7 @@ impl FilesView {
                     )),
                 ],
             ),
-            0.,
+            4.,
         );
         let mut row = native::list_row(
             key,
@@ -160,7 +169,13 @@ impl FilesView {
             self.diff_from == snapshot.id,
             Some(slots::message(Message::ShowDiffOf(snapshot.id.clone()))),
         );
-        if let wire::Node::Button { label, .. } = &mut row {
+        if let wire::Node::Button { label, padding, .. } = &mut row {
+            *padding = Some(wire::Edges {
+                top: 8.,
+                right: 8.,
+                bottom: 8.,
+                left: 8.,
+            });
             *label = Some(format!("Compare snapshot {}", snapshot.short_id));
         }
         row

@@ -670,98 +670,107 @@ pub(crate) mod tests {
         tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                // each request on its own: a held blob leaves the status
-                // answering, as a node does
+                // Keep connections alive as the real node does. Closing every
+                // response would hide clients reusing a parked runtime's socket.
                 let deployment = deployment.clone();
                 tokio::spawn(async move {
-                    let request = read_request(&mut socket).await;
-                    let head = String::from_utf8_lossy(&request).into_owned();
-                    let route = head.split(' ').nth(1).unwrap_or("").to_owned();
-                    let (status_line, body) = if route == "/v1/status" {
-                        let chain = deployment.chain.lock().unwrap().clone();
-                        ("200 OK", chain.to_string().into_bytes())
-                    } else if route == "/v1/query" {
-                        let hold = deployment.hold_status.lock().unwrap().take();
-                        if let Some(hold) = hold {
-                            deployment.held.notify_one();
-                            hold.notified().await;
+                    loop {
+                        let request = read_request(&mut socket).await;
+                        if request.is_empty() {
+                            break;
                         }
-                        // a view's own read names its module; anything
-                        // else is the app's registry read
-                        let target = head
-                            .rsplit("\r\n\r\n")
-                            .next()
-                            .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
-                            .and_then(|ask| ask["target"].as_str().map(str::to_owned));
-                        let answered = target.and_then(|target| {
-                            deployment.queries.lock().unwrap().get(&target).cloned()
-                        });
-                        let reply =
-                            answered.unwrap_or_else(|| deployment.status.lock().unwrap().clone());
-                        ("200 OK", reply.to_string().into_bytes())
-                    } else if let Some(digest) = route.strip_prefix("/v1/files/blob/") {
-                        let hold = deployment.hold.lock().unwrap().take();
-                        if let Some(hold) = hold {
-                            deployment.held.notify_one();
-                            hold.notified().await;
-                        }
-                        let artifacts = deployment.artifacts.lock().unwrap();
-                        let served = if deployment.by_digest {
-                            artifacts.iter().find(|artifact| {
-                                crate::backend::hex_encode(&artifact.hash()) == digest
-                            })
+                        let head = String::from_utf8_lossy(&request).into_owned();
+                        let route = head.split(' ').nth(1).unwrap_or("").to_owned();
+                        let (status_line, body) = if route == "/v1/status" {
+                            let chain = deployment.chain.lock().unwrap().clone();
+                            ("200 OK", chain.to_string().into_bytes())
+                        } else if route == "/v1/query" {
+                            let hold = deployment.hold_status.lock().unwrap().take();
+                            if let Some(hold) = hold {
+                                deployment.held.notify_one();
+                                hold.notified().await;
+                            }
+                            // a view's own read names its module; anything
+                            // else is the app's registry read
+                            let target = head
+                                .rsplit("\r\n\r\n")
+                                .next()
+                                .and_then(|body| {
+                                    serde_json::from_str::<serde_json::Value>(body).ok()
+                                })
+                                .and_then(|ask| ask["target"].as_str().map(str::to_owned));
+                            let answered = target.and_then(|target| {
+                                deployment.queries.lock().unwrap().get(&target).cloned()
+                            });
+                            let reply = answered
+                                .unwrap_or_else(|| deployment.status.lock().unwrap().clone());
+                            ("200 OK", reply.to_string().into_bytes())
+                        } else if let Some(digest) = route.strip_prefix("/v1/files/blob/") {
+                            let hold = deployment.hold.lock().unwrap().take();
+                            if let Some(hold) = hold {
+                                deployment.held.notify_one();
+                                hold.notified().await;
+                            }
+                            let artifacts = deployment.artifacts.lock().unwrap();
+                            let served = if deployment.by_digest {
+                                artifacts.iter().find(|artifact| {
+                                    crate::backend::hex_encode(&artifact.hash()) == digest
+                                })
+                            } else {
+                                artifacts.first()
+                            };
+                            match served {
+                                Some(artifact) => ("200 OK", artifact.encode()),
+                                None => ("404 Not Found", Vec::new()),
+                            }
+                        } else if let Some(module) = route
+                            .strip_prefix("/v1/index/")
+                            .and_then(|rest| rest.strip_suffix("/view"))
+                        {
+                            // a view's own index-tier read: the route names the
+                            // module, the body's first key names the shape
+                            let shape = head
+                                .rsplit("\r\n\r\n")
+                                .next()
+                                .and_then(|body| {
+                                    serde_json::from_str::<serde_json::Value>(body).ok()
+                                })
+                                .and_then(|ask| ask.as_object()?.keys().next().cloned());
+                            let answered = shape.and_then(|shape| {
+                                let views = deployment.index_views.lock().unwrap();
+                                views.get(module)?.get(&shape).cloned()
+                            });
+                            match answered {
+                                Some(reply) => ("200 OK", reply.to_string().into_bytes()),
+                                None => ("404 Not Found", Vec::new()),
+                            }
+                        } else if let Some(page) = route
+                            .strip_prefix("/v1/files/read?")
+                            .and_then(|query| file_page(&deployment, query))
+                        {
+                            // a byte-ranged read of a published file, as the
+                            // node's read lane answers it
+                            ("200 OK", page.to_string().into_bytes())
+                        } else if let Some(lane) = route.strip_prefix("/v1/files/") {
+                            // a view's own duckfs read: the lane names it, the
+                            // query string carries its params
+                            let lane = lane.split('?').next().unwrap_or_default();
+                            let answered =
+                                deployment.files_lanes.lock().unwrap().get(lane).cloned();
+                            match answered {
+                                Some(reply) => ("200 OK", reply.to_string().into_bytes()),
+                                None => ("404 Not Found", Vec::new()),
+                            }
                         } else {
-                            artifacts.first()
+                            ("404 Not Found", Vec::new())
                         };
-                        match served {
-                            Some(artifact) => ("200 OK", artifact.encode()),
-                            None => ("404 Not Found", Vec::new()),
-                        }
-                    } else if let Some(module) = route
-                        .strip_prefix("/v1/index/")
-                        .and_then(|rest| rest.strip_suffix("/view"))
-                    {
-                        // a view's own index-tier read: the route names the
-                        // module, the body's first key names the shape
-                        let shape = head
-                            .rsplit("\r\n\r\n")
-                            .next()
-                            .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
-                            .and_then(|ask| ask.as_object()?.keys().next().cloned());
-                        let answered = shape.and_then(|shape| {
-                            let views = deployment.index_views.lock().unwrap();
-                            views.get(module)?.get(&shape).cloned()
-                        });
-                        match answered {
-                            Some(reply) => ("200 OK", reply.to_string().into_bytes()),
-                            None => ("404 Not Found", Vec::new()),
-                        }
-                    } else if let Some(page) = route
-                        .strip_prefix("/v1/files/read?")
-                        .and_then(|query| file_page(&deployment, query))
-                    {
-                        // a byte-ranged read of a published file, as the
-                        // node's read lane answers it
-                        ("200 OK", page.to_string().into_bytes())
-                    } else if let Some(lane) = route.strip_prefix("/v1/files/") {
-                        // a view's own duckfs read: the lane names it, the
-                        // query string carries its params
-                        let lane = lane.split('?').next().unwrap_or_default();
-                        let answered = deployment.files_lanes.lock().unwrap().get(lane).cloned();
-                        match answered {
-                            Some(reply) => ("200 OK", reply.to_string().into_bytes()),
-                            None => ("404 Not Found", Vec::new()),
-                        }
-                    } else {
-                        ("404 Not Found", Vec::new())
-                    };
-                    let response = format!(
-                        "HTTP/1.1 {status_line}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-                        body.len()
-                    );
-                    socket.write_all(response.as_bytes()).await.unwrap();
-                    let _ = socket.write_all(&body).await;
-                    let _ = socket.shutdown().await;
+                        let response = format!(
+                            "HTTP/1.1 {status_line}\r\nConnection: keep-alive\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        socket.write_all(response.as_bytes()).await.unwrap();
+                        let _ = socket.write_all(&body).await;
+                    }
                 });
             }
         });

@@ -321,37 +321,56 @@ impl AgentsView {
             } else {
                 &agent.owner_handle
             };
+            let identity = kit::spaced(
+                kit::column(
+                    format!("{key}/identity"),
+                    [
+                        kit::nowrap(kit::text_size(
+                            kit::strong(format!("{key}/name"), &agent.name),
+                            14.,
+                        )),
+                        kit::nowrap(kit::text_size(
+                            kit::secondary(
+                                format!("{key}/meta"),
+                                format!(
+                                    "{} · {} · {}",
+                                    owner,
+                                    agent.capability,
+                                    host::plural(agent.skills.len() as i64, "skill", "skills")
+                                ),
+                            ),
+                            12.,
+                        )),
+                    ],
+                ),
+                4.,
+            );
             let mut line = vec![
                 kit::avatar(
                     format!("{key}/avatar"),
                     kit::initials(&agent.name),
                     Tone::Agent,
                 ),
-                kit::nowrap(kit::strong(format!("{key}/name"), &agent.name)),
-                kit::nowrap(kit::caption(format!("{key}/owner"), owner)),
-                kit::badge(
-                    format!("{key}/capability"),
-                    &agent.capability,
-                    Tone::Neutral,
-                ),
-                filler(),
+                kit::sized(identity, Some(Length::Fill), None),
             ];
             if agent.live {
                 line.push(kit::badge(format!("{key}/working"), "Working", Tone::Agent));
             }
-            line.push(kit::nowrap(kit::caption(
-                format!("{key}/skills"),
-                host::plural(agent.skills.len() as i64, "skill", "skills"),
-            )));
             line.push(state_badge(format!("{key}/standing"), &agent.status));
-            let summary = kit::spaced(kit::centered_row(format!("{key}/summary"), line), 8.);
+            let summary = kit::spaced(kit::centered_row(format!("{key}/summary"), line), 10.);
             let mut button = kit::list_row(
                 &key,
                 summary,
                 self.selected == agent.id,
                 Some(slots::message(Message::OpenAgent(agent.id.clone()))),
             );
-            if let Node::Button { label, .. } = &mut button {
+            if let Node::Button { label, padding, .. } = &mut button {
+                *padding = Some(wire::Edges {
+                    top: 10.,
+                    right: 10.,
+                    bottom: 10.,
+                    left: 10.,
+                });
                 *label = Some(agent.name.clone());
             }
             rows.push(button);
@@ -405,9 +424,9 @@ impl AgentsView {
                                 format!("{key}/heading"),
                                 [
                                     kit::sized(
-                                        kit::nowrap(kit::strong(
-                                            format!("{key}/agent"),
-                                            &run.agent_name,
+                                        kit::nowrap(kit::text_size(
+                                            kit::strong(format!("{key}/agent"), &run.agent_name),
+                                            14.,
                                         )),
                                         Some(Length::Fill),
                                         None,
@@ -418,7 +437,10 @@ impl AgentsView {
                             6.,
                         ),
                         kit::sized(
-                            kit::nowrap(kit::caption(format!("{key}/origin"), &run.origin)),
+                            kit::nowrap(kit::text_size(
+                                kit::secondary(format!("{key}/origin"), &run.origin),
+                                12.,
+                            )),
                             Some(Length::Fill),
                             None,
                         ),
@@ -432,7 +454,13 @@ impl AgentsView {
                 self.open_run == run.dispatch_id,
                 Some(slots::message(Message::OpenRunRow(run.run_id.clone()))),
             );
-            if let Node::Button { label, .. } = &mut button {
+            if let Node::Button { label, padding, .. } = &mut button {
+                *padding = Some(wire::Edges {
+                    top: 10.,
+                    right: 10.,
+                    bottom: 10.,
+                    left: 10.,
+                });
                 *label = Some(run.run_id.clone());
             }
             rows.push(button);

@@ -186,12 +186,8 @@ fn ls<S: ObjectStore>(
         (root_tree, String::new())
     } else {
         match entry_at(&store, root_tree, &segs)? {
-            // a STRUCTURAL namespace root (`/home`, `/shared`) that nothing has
-            // been written under yet: it exists in the authority rule and not in
-            // the tree, so listing it answers empty exactly as `/` does. saying
-            // `path not found` here told a caller to create a directory
-            // `check_authority` forbids it from creating — and it is what put an
-            // error banner on the Files pane of every fresh workspace.
+            // Namespace and home roots exist before their first child is
+            // written; members cannot create these roots directly.
             None if crate::paths::is_namespace_root(&segs) => {
                 (None, format!("/{}", segs.join("/")))
             }
