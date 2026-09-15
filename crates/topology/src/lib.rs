@@ -73,6 +73,7 @@ const MODULES: &[ModuleSpec] = &[
     wasm("agent"),
     wasm("attribution"),
     wasm("automations"),
+    wasm("boards"),
     wasm("capability"),
     wasm_indexed("chat"),
     wasm("collaboration"),
@@ -92,7 +93,7 @@ const MODULES: &[ModuleSpec] = &[
     wasm("valset"),
 ];
 
-/// Default founding set (20). An operator may compose a different set with
+/// Default founding set (21). An operator may compose a different set with
 /// `node init --modules`; each network pins the resulting deployments.
 pub const PRODUCTION: &[&str] = &[
     "pages",
@@ -121,6 +122,8 @@ pub const PRODUCTION: &[&str] = &[
     // target. It follows `runs` because a run's prepared send is the only thing
     // in this set that names it.
     "collaboration",
+    // the shared canvases; their UI is the `canvas` founding view below
+    "boards",
 ];
 
 /// The founding VIEW-ONLY entries: registry entries of `Kind::View` with no
@@ -129,7 +132,7 @@ pub const PRODUCTION: &[&str] = &[
 /// `crates/views/<id>`), and composed by `node init` into the same genesis.
 /// A view here draws a tab in the app off the registry alone; it must not
 /// also be a module id.
-pub const VIEWS: &[&str] = &["home"];
+pub const VIEWS: &[&str] = &["home", "canvas"];
 
 /// the DEFAULT set (16) simnode and the noded daemon compose at genesis —
 /// `bin/noded/tests/daemon_e2e.rs` pins the same `sim_base` against noded.
@@ -194,7 +197,7 @@ mod tests {
     /// here. Counts AND membership, so neither a stray add nor a silent drop slips.
     #[test]
     fn selections_pin_to_todays_sets() {
-        assert_eq!(PRODUCTION.len(), 20, "production is the 20-module set");
+        assert_eq!(PRODUCTION.len(), 21, "production is the 21-module set");
         assert_eq!(SIM_BASE.len(), 16, "sim_base is the default 16-module set");
         assert_eq!(SIM_VALSET.len(), 5, "sim_valset appends 5 system modules");
 
@@ -205,6 +208,7 @@ mod tests {
                 "acl",
                 "agent",
                 "automations",
+                "boards",
                 "capability",
                 "chat",
                 "collaboration",
@@ -302,7 +306,7 @@ mod tests {
     /// space: a view id that is also a module id would collide at genesis.
     #[test]
     fn founding_views_are_not_module_ids() {
-        assert_eq!(VIEWS, &["home"], "the founding view set");
+        assert_eq!(VIEWS, &["home", "canvas"], "the founding view set");
         assert!(!has_dups(VIEWS), "views has a duplicate id");
         for id in VIEWS {
             assert!(TOPOLOGY.spec(id).is_none(), "view {id} is also a module");

@@ -17,10 +17,10 @@ fn network_views() -> Vec<&'static str> {
 }
 
 #[test]
-fn the_network_views_are_the_five_module_owned_and_home() {
+fn the_network_views_are_the_five_module_owned_and_the_founding_views() {
     assert_eq!(
         network_views(),
-        ["pages", "chat", "forge", "governance", "files", "home"]
+        ["pages", "chat", "forge", "governance", "files", "home", "canvas"]
     );
     for id in network_views() {
         assert!(staging::founding_id(id), "{id}");

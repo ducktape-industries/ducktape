@@ -45,27 +45,22 @@ follow their endpoint cards. Undo submits inverse field operations: a concurrent
 edit to the same field can be overwritten by that inverse, following consensus
 order. Camera and remote updates do not enter local undo history.
 
-## Build and register
+## Build
 
-Build the consensus component from a committed, pushed revision:
+`boards` is a founding module and `canvas`, its UI, a founding view-only
+entry (`topology::PRODUCTION` and `topology::VIEWS`): `node init` composes
+both into every network's genesis out of the founding set the build stages.
+The consensus component builds from a committed, pushed revision; the view
+builds with the other network views:
 
 ```sh
 cargo run -p guest-builder -- crates/modules/apps/boards
-bash ops/build-views.sh -p boards-view
+make views
 ```
 
-The desktop discovers view-only registry entries. Register the core as `boards`
-and its UI as `canvas`; these are two ordinary deployments and do not change
-the founding set:
-
-```sh
-ducktape module register boards crates/modules/apps/boards/component.wasm
-ducktape module register canvas --view target/views/boards_view.wasm --assets crates/views/boards/assets
-```
-
-The UI subscribes to `canvas.props` and reads/submits against `boards`. Its tab
-appears through the existing registry view discovery after activation. All WASM
-bytes are loaded from files; no node or desktop binary embeds the board.
+The UI reads and submits against `boards` and refreshes on its `rpc.live`
+plane. Its tab sits under Workspace, after Files, named by its manifest. All
+WASM bytes are loaded from files; no node or desktop binary embeds the board.
 
 ## Bounds and checks
 
@@ -77,10 +72,10 @@ reopen simple; raising the board size requires revisiting that storage cost.
 ```sh
 cargo test -p boards
 cargo clippy -p boards --tests --no-deps
-cargo test --manifest-path crates/views/Cargo.toml -p boards-view
-cargo clippy --manifest-path crates/views/Cargo.toml -p boards-view --tests --no-deps
+cargo test --manifest-path crates/views/Cargo.toml -p canvas-view
+cargo clippy --manifest-path crates/views/Cargo.toml -p canvas-view --tests --no-deps
 cargo test -p wasm-host --test boards
-BOARDS_VIEW_WASM="$PWD/target/views/boards_view.wasm" cargo test \
-  --manifest-path crates/views/Cargo.toml -p boards-view \
+CANVAS_VIEW_WASM="$PWD/target/views/canvas_view.wasm" cargo test \
+  --manifest-path crates/views/Cargo.toml -p canvas-view \
   --features host-verification --test wasm
 ```
