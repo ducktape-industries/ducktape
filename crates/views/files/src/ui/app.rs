@@ -121,6 +121,8 @@ pub struct FilesView {
     pub(crate) viewport_height: f64,
     pub(crate) sidebar_width: f64,
     pub(crate) inspector_width: f64,
+    pub(crate) column_widths: Vec<f64>,
+    pub(crate) chosen_width: f64,
 }
 
 impl ::std::fmt::Debug for FilesView {
@@ -177,6 +179,8 @@ pub enum Message {
     // the geometry
     SidebarResized(f64, f64),
     InspectorResized(f64, f64),
+    ColumnResized(usize, f64, f64),
+    ChosenResized(f64, f64),
     ViewportChanged(f64, f64),
 }
 
@@ -215,8 +219,13 @@ impl FilesView {
             self.viewport_height,
             self.sidebar_width,
             self.inspector_width,
+            self.chosen_width,
         ];
-        if dimensions.into_iter().all(f64::is_finite) {
+        let finite = dimensions
+            .into_iter()
+            .chain(self.column_widths.iter().copied())
+            .all(f64::is_finite);
+        if finite {
             Ok(())
         } else {
             Err("snapshot number must be finite".into())
@@ -344,6 +353,8 @@ impl FilesView {
             viewport_height: 700.0,
             sidebar_width: 200.0,
             inspector_width: 340.0,
+            column_widths: Vec::new(),
+            chosen_width: 290.0,
         }
     }
 
@@ -480,9 +491,13 @@ mod tests {
         app.sort = Sort::BY_NAME.toggled(SortKey::Size);
         app.sidebar_width = 245.;
         app.inspector_width = 355.;
+        app.column_widths = vec![280., 360.];
+        app.chosen_width = 420.;
         let bytes = app.snapshot().unwrap();
         let restored = FilesView::restore(&bytes).unwrap();
         assert_eq!(restored.snapshot().unwrap(), bytes);
+        assert_eq!(restored.column_widths, [280., 360.]);
+        assert_eq!(restored.chosen_width, 420.);
         assert_eq!(restored.draft.text(), "unsaved 한글\nsecond line");
         assert_eq!(restored.draft_path, "/shared/draft.md");
         assert_eq!(restored.nav.path, "/shared/docs");

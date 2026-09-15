@@ -39,6 +39,35 @@ pub(super) fn quiet(
     button
 }
 
+/// Navigation stays legible with a 20px face and a 36px pointer target.
+pub(super) fn navigation(
+    key: String,
+    face: &str,
+    name: &str,
+    message: Option<Message>,
+) -> wire::Node {
+    let mut button = native::button_child(
+        key.clone(),
+        native::text_size(native::strong(format!("{key}/glyph"), face), 20.),
+        message.map(slots::message),
+        wire::ButtonPreset::Secondary,
+    );
+    if let wire::Node::Button {
+        label,
+        width,
+        height,
+        padding,
+        ..
+    } = &mut button
+    {
+        *label = Some(name.into());
+        *width = Some(wire::Length::Fixed(36.));
+        *height = Some(wire::Length::Fixed(36.));
+        *padding = Some(wire::Edges::all(4.));
+    }
+    button
+}
+
 /// A text or any other leaf, inset from its pane's edges.
 pub(super) fn inset(node: wire::Node, padding: wire::Edges) -> wire::Node {
     let key = format!("{}/inset", node.key().unwrap_or_default());
@@ -92,7 +121,7 @@ pub(super) fn header_strip(key: &str, cells: Vec<wire::Node>) -> wire::Node {
 /// A grabbed divider between two panes. The hairline is what shows; the
 /// 10px grip around it is what the pointer has to land on, since the handle
 /// takes its size from its child.
-pub(super) fn resize(key: String, route: fn(f64, f64) -> Message) -> wire::Node {
+pub(super) fn resize(key: String, route: impl Fn(f64, f64) -> Message + 'static) -> wire::Node {
     let content = native::sized(
         native::container(
             format!("{key}/grip"),

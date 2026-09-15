@@ -6,7 +6,7 @@
 use super::*;
 use ducktape_view_guest::slots;
 
-const COLUMN_WIDTH: f32 = 230.;
+pub(super) const COLUMN_WIDTH: f64 = 230.;
 const ROW_HEIGHT: f32 = 32.;
 
 impl FilesView {
@@ -25,15 +25,27 @@ impl FilesView {
                 .unwrap_or(Listing::Pending);
             columns.push(self.column(format!("{key}/column/{path}"), path, &listing, index + 1));
         }
+        // The scroll viewport measures its direct child, so the strip must
+        // retain the columns' combined width instead of shrinking to fit.
+        let mut strip_width: f64 = (0..=self.columns.len())
+            .map(|index| {
+                self.column_widths
+                    .get(index)
+                    .copied()
+                    .unwrap_or(COLUMN_WIDTH)
+                    + 10.
+            })
+            .sum();
         let chosen = self.selected_entry();
         if !chosen.path.is_empty() && !chosen.is_dir() {
+            strip_width += self.chosen_width + 10.;
             columns.push(self.last_column(format!("{key}/last"), &chosen));
         }
         let mut scroll = native::scroll(
             format!("{key}/scroll"),
             native::sized(
                 native::spaced(native::row(format!("{key}/row"), columns), 0.),
-                Some(wire::Length::Shrink),
+                Some(wire::Length::Fixed(strip_width as f32)),
                 Some(wire::Length::Fill),
             ),
         );
@@ -73,13 +85,23 @@ impl FilesView {
             ],
         );
         if let wire::Node::Linear { width, .. } = &mut column {
-            *width = Some(wire::Length::Fixed(COLUMN_WIDTH));
+            *width = Some(wire::Length::Fixed(
+                self.column_widths
+                    .get(index)
+                    .copied()
+                    .unwrap_or(COLUMN_WIDTH) as f32,
+            ));
         }
         native::sized(
             native::spaced(
                 native::row(
                     format!("{key}/framed"),
-                    [column, native::vertical_divider(format!("{key}/edge"))],
+                    [
+                        column,
+                        kit::resize(format!("{key}/resize"), move |dx, dy| {
+                            Message::ColumnResized(index, dx, dy)
+                        }),
+                    ],
                 ),
                 0.,
             ),
@@ -217,8 +239,21 @@ impl FilesView {
             ],
         );
         if let wire::Node::Linear { width, .. } = &mut column {
-            *width = Some(wire::Length::Fixed(COLUMN_WIDTH + 60.));
+            *width = Some(wire::Length::Fixed(self.chosen_width as f32));
         }
-        column
+        native::sized(
+            native::spaced(
+                native::row(
+                    format!("{key}/framed"),
+                    [
+                        column,
+                        kit::resize(format!("{key}/resize"), Message::ChosenResized),
+                    ],
+                ),
+                0.,
+            ),
+            Some(wire::Length::Shrink),
+            Some(wire::Length::Fill),
+        )
     }
 }

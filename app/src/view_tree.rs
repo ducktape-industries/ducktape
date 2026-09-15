@@ -3,6 +3,7 @@
 
 use gpui_kit::MouseUpEvent;
 use gpui_kit::component::radio::Radio;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{
     Disableable, Selectable,
@@ -1685,6 +1686,7 @@ impl ViewTree {
             on_scroll,
             background,
             border,
+            bar_hidden,
             ..
         } = node
         else {
@@ -1805,9 +1807,27 @@ impl ViewTree {
         )
         .absolute()
         .inset_0();
-        element
-            .child(self.node(content, window, cx))
-            .child(observe)
+        let content = element.child(self.node(content, window, cx)).child(observe);
+        let handle = self.scrolls[key].clone();
+        let scrollbar = match direction {
+            wire::ScrollDirection::Vertical => None,
+            wire::ScrollDirection::Horizontal => Some(Scrollbar::horizontal(&handle)),
+            wire::ScrollDirection::Both => Some(Scrollbar::new(&handle)),
+        }
+        .filter(|_| !bar_hidden);
+        let Some(scrollbar) = scrollbar else {
+            return content.into_any_element();
+        };
+        dimensions(div().relative(), *width, *height)
+            .child(content)
+            .child(
+                div().absolute().inset_0().child(
+                    scrollbar
+                        .id(format!("{key}/scrollbar"))
+                        .viewport_from_layout()
+                        .mode(ScrollbarMode::Always),
+                ),
+            )
             .into_any_element()
     }
 
@@ -4759,6 +4779,102 @@ mod tests {
             nowrap.text_style().text_overflow.is_some(),
             "the native text shaper must truncate glyphs, not only the containing box"
         );
+    }
+
+    #[gpui_kit::test]
+    fn horizontal_overflow_scrollbar_reveals_offscreen_columns(cx: &mut gpui_kit::TestAppContext) {
+        use ducktape_view_guest::kit;
+        use gpui_kit::InputEvent as _;
+        cx.update(gpui_kit::init);
+        let columns = kit::sized(
+            kit::row(
+                "columns",
+                (0..4).map(|index| {
+                    kit::sized(
+                        kit::container(
+                            format!("column-{index}"),
+                            kit::text(format!("name-{index}"), "Folder"),
+                        ),
+                        Some(wire::Length::Fixed(230.)),
+                        Some(wire::Length::Fill),
+                    )
+                }),
+            ),
+            Some(wire::Length::Fixed(920.)),
+            Some(wire::Length::Fill),
+        );
+        let mut root = kit::scroll("folders", kit::spaced(columns, 0.));
+        if let wire::Node::Scroll { direction, .. } = &mut root {
+            *direction = wire::ScrollDirection::Horizontal;
+        }
+        let root = kit::sized(
+            kit::column(
+                "main",
+                [
+                    kit::sized(
+                        kit::container("header", kit::text("header-text", "Header")),
+                        None,
+                        Some(wire::Length::Fixed(24.)),
+                    ),
+                    root,
+                    kit::sized(
+                        kit::container("footer", kit::text("footer-text", "Footer")),
+                        None,
+                        Some(wire::Length::Fixed(24.)),
+                    ),
+                ],
+            ),
+            Some(wire::Length::Fill),
+            Some(wire::Length::Fill),
+        );
+        let root = kit::spaced(root, 0.);
+        let window = cx.open_window(size(px(400.), px(200.)), |_, _| ViewTree::new(root));
+        let tree = window.root(cx).unwrap();
+        let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        native.update(|window, cx| window.render_frame(cx));
+        tree.read_with(&native, |tree, _| {
+            assert_eq!(tree.scrolls["folders"].max_offset().x, px(520.));
+            assert_eq!(tree.scrolls["folders"].bounds().size.height, px(152.));
+            assert_eq!(
+                tree.measured_bounds("column-0").unwrap().size.width,
+                px(230.)
+            );
+        });
+        native.update(|window, cx| window.render_frame(cx));
+        let position = point(px(350.), px(168.));
+        native.update(|window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    position,
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseUpEvent {
+                    position,
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+        });
+        tree.read_with(&native, |tree, _| {
+            assert!(
+                tree.scrolls["folders"].offset().x < px(-200.),
+                "scrollbar track click reveals offscreen columns: bounds={:?}, offset={:?}",
+                tree.scrolls["folders"].bounds(),
+                tree.scrolls["folders"].offset()
+            );
+            assert_eq!(tree.scrolls["folders"].offset().y, px(0.));
+        });
     }
 
     #[gpui_kit::test]
