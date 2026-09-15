@@ -57,58 +57,54 @@ pub(crate) fn batch_live_updates(updates: Vec<LiveUpdate>) -> Vec<LiveUpdate> {
     emitted
 }
 
-/// `attempt` backs the connect off exactly as `live_resync_load` backs off a
-/// live sync — 1s doubling to a 16s cap. The steady-state path has always
-/// retried forever; the connect that GETS you there gave up after one failure,
-/// which is the wrong way round. A transient failure is not rare: a `/v1/query`
-/// can block until the node writes its next checkpoint (issue #1018), which is
-/// longer than the RPC client's 30s timeout, so a healthy node hands the
-/// console an "error sending request" often enough to matter.
-///
-/// `generation` rides through to the reply so a connect answering for an
-/// endpoint you have since left is dropped unread — the same guard the page
-/// and chat planes learned in #970.
-pub async fn connect(
+/// Opening a workspace publishes the work it is waiting for before its result.
+/// The retry delay belongs to the same cancellable task as the reads; no detached
+/// worker may answer after the user has left this connection generation.
+pub fn connect(
     rpc: String,
     attempt: i64,
     generation: i64,
-) -> Result<WorkspaceData, HydrationError> {
-    if attempt > 0 {
-        tokio::time::sleep(retry_delay(u32::try_from(attempt).unwrap_or(u32::MAX))).await;
-    }
-    let result = async {
-        let rpc = rpc_client(&rpc)?;
-        // the node the module-owned views load their deployments from: the
-        // views load while the workspace does, and this answers with both
-        // in hand, so the tabs it opens onto never draw a view on its way
-        let views = crate::module_view::connected(&rpc);
-        let workspace = load_workspace(&rpc, None, generation).await?;
-        views.settled().await;
-        Ok::<_, String>(workspace)
-    }
-    .await;
-    // SAY WHAT ACTUALLY FAILED. This threw the cause away with `|_|` and
-    // asserted a diagnosis it had not made: "Check the endpoint and node" is
-    // the one thing the reader can act on, and it is wrong whenever the node is
-    // answering fine and the failure is a timeout, an unreadable reply, or a
-    // broken signer. Measured while debugging this very screen — the node was
-    // serving `/v1/status` in under a millisecond and the app still said to go
-    // check it.
-    //
-    // `user_error` is the translator the rest of the app already routes
-    // through: it names the signer, the key, a refused password, a slow node
-    // and a garbled reply, and falls through to the raw message rather than
-    // inventing one.
-    // A GENERATION, NOT AN `AppError`. The failure arm retries, so it must be
-    // able to tell ITS OWN failure from one belonging to a connect chain that
-    // has since been abandoned — otherwise two chains both retry forever and
-    // each one's generation bump can reject the other's success. `AppError`
-    // carries `committed`, which a read has no use for; `HydrationError` is
-    // what every other loader here already fails with.
-    result.map_err(|cause| HydrationError {
-        generation,
-        message: user_error(cause.to_string()),
-    })
+) -> ducktape_view_guest::Task<crate::AppMessage> {
+    use crate::AppMessage;
+    use ducktape_view_guest::Task;
+
+    let start = Task::perform(
+        async move {
+            if attempt > 0 {
+                tokio::time::sleep(retry_delay(u32::try_from(attempt).unwrap_or(u32::MAX))).await;
+            }
+        },
+        move |()| AppMessage::ConnectionProgress(generation, "Loading chat and workspace…"),
+    );
+    let load = Task::perform(
+        async move {
+            let rpc = rpc_client(&rpc)?;
+            // The views and workspace load concurrently, as they do on a warm
+            // connection. The next publication names the remaining view wait.
+            let views = crate::module_view::connected(&rpc);
+            let workspace = load_workspace(&rpc, None, generation).await?;
+            Ok::<_, String>((workspace, views))
+        },
+        |result| result,
+    )
+    .then(move |result| match result {
+        Ok((workspace, views)) => Task::done(AppMessage::ConnectionProgress(
+            generation,
+            "Preparing workspace screens…",
+        ))
+        .chain(Task::perform(
+            async move {
+                views.settled().await;
+                workspace
+            },
+            AppMessage::WorkspaceConnected,
+        )),
+        Err(cause) => Task::done(AppMessage::ConnectFailed(HydrationError {
+            generation,
+            message: user_error(cause.to_string()),
+        })),
+    });
+    start.chain(load)
 }
 
 pub fn live_events(rpc: String) -> futures::stream::BoxStream<'static, LiveUpdate> {

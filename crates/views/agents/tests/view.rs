@@ -268,13 +268,11 @@ fn a_connected_view_reads_its_own_register() {
     for expected in [
         "2 agents · 1 working",
         "Reviewer Bot",
-        "review",
         "Active",
         "Paused",
         "Working",
-        "eddy",
-        // the count derives from the record: three skills
-        "3 skills",
+        // The secondary line keeps owner, capability and the derived skill count.
+        "eddy · review · 3 skills",
     ] {
         assert!(
             has_text(&frame, expected),
@@ -484,7 +482,6 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
         "#general · Message 12",
         "Running",
         "Failed",
-        "block 84,912",
     ] {
         assert!(
             has_text(&frame, expected),
@@ -565,7 +562,7 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
     );
 
     // closing tells the app to stop reading it
-    let frame = tick_native(press(&frame, "Close journal"));
+    let frame = tick_native(press(&frame, "Close run"));
     let intent = one_intent(&frame);
     assert_eq!(intent.kind, "agents.open_run");
     assert_eq!(
@@ -612,10 +609,10 @@ fn the_open_run_draws_its_places_as_chips() {
     );
 }
 
-/// The journal pane's width is the reader's, and a receipt's identifiers
-/// stay behind the disclosure.
+/// The list stays narrow and resizable, the detail fills the main area, and
+/// receipt identifiers stay behind the disclosure.
 #[test]
-fn journal_drag_and_receipt_disclosure_keep_identifiers_out_of_the_summary() {
+fn run_list_stays_compact_while_detail_fills_the_remaining_space() {
     use ducktape_view_guest::wire::{Length, mouse};
     let (frame, _) = connect(booted(), "7", "dispatch-gone", 1);
     assert!(!has_text(&frame, "dispatch-gone"), "{:?}", texts(&frame));
@@ -631,36 +628,43 @@ fn journal_drag_and_receipt_disclosure_keep_identifiers_out_of_the_summary() {
         }
         find(frame.root.as_ref().unwrap(), suffix).expect("node exists")
     };
-    let width = |frame: &Frame| match node_ending(frame, "/journal") {
+    let width = |frame: &Frame| match node_ending(frame, "/run-list") {
         Node::Container {
             width: Some(Length::Fixed(width)),
             ..
         } => width,
-        node => panic!("fixed journal width: {node:?}"),
+        node => panic!("fixed run list width: {node:?}"),
     };
-    assert_eq!(width(&frame), 400.0);
+    assert_eq!(width(&frame), 260.0);
+    assert!(matches!(
+        node_ending(&frame, "/journal"),
+        Node::Container {
+            width: Some(Length::Fill),
+            ..
+        }
+    ));
     let Node::ResizeHandle {
         on_drag: Some(handler),
         cursor,
         ..
-    } = node_ending(&frame, "/journal-resize")
+    } = node_ending(&frame, "/run-list-resize")
     else {
         panic!("resize handle")
     };
     assert_eq!(cursor, Some(mouse::Cursor::ResizingHorizontally));
     let frame = tick_native(vec![Event::Drag {
         handler,
-        dx: -80.0,
+        dx: 40.0,
         dy: 0.0,
     }]);
-    assert_eq!(width(&frame), 480.0);
+    assert_eq!(width(&frame), 300.0);
     assert_eq!(
-        agents_view::host::journal_width_after_delta(480.0, 900.0, 900.0),
-        570.0
+        agents_view::host::run_list_width_after_delta(260.0, 900.0, 900.0),
+        315.0
     );
     assert_eq!(
-        agents_view::host::journal_width_after_delta(480.0, -900.0, 900.0),
-        280.0
+        agents_view::host::run_list_width_after_delta(260.0, -900.0, 900.0),
+        200.0
     );
 }
 
@@ -787,7 +791,7 @@ fn the_open_run_draws_the_node_output_as_it_arrives() {
     assert!(!has_text(&frame, "not ours"), "{:?}", texts(&frame));
 
     // closing the run takes the panel with it
-    let frame = tick_native(press(&frame, "Close journal"));
+    let frame = tick_native(press(&frame, "Close run"));
     assert!(
         !has_text(&frame, "the register is green"),
         "{:?}",
@@ -1012,6 +1016,50 @@ fn claude_thinking_tools_and_steering_share_the_process_without_ending_on_interr
     assert!(!markdown_texts(&frame).contains(&"Inspect **wrapping** first.".into()));
     let frame = tick_native(press(&frame, "▸ Worked for 1d 1h 1m 1s"));
     assert!(markdown_texts(&frame).contains(&"Inspect **wrapping** first.".into()));
-    let frame = tick_native(press(&frame, "Close journal"));
+    let frame = tick_native(press(&frame, "Close run"));
     assert!(!has_text(&frame, "▾ Worked for 1d 1h 1m 1s"));
+}
+
+#[test]
+fn stream_errors_show_outside_the_disclosure_and_reconnect_the_same_run() {
+    let (frame, left) = connect(booted(), "7", "dispatch-live", 1);
+    let stream = left
+        .iter()
+        .find(|request| request.kind == "rpc.stream")
+        .unwrap();
+    assert!(!has_text(&frame, "Connecting to the run output…"));
+    let frame = tick_native(vec![Event::Response {
+        id: stream.id,
+        result: Err("HTTP error: 403 Forbidden".into()),
+        done: true,
+    }]);
+    assert!(has_text(&frame, "HTTP error: 403 Forbidden"));
+    assert!(!has_text(
+        &frame,
+        "No process details are available from this node. Older output may have expired."
+    ));
+    let frame = tick_native(press(&frame, "Reconnect"));
+    let (_frame, left) = settle(frame);
+    let next = left
+        .iter()
+        .find(|request| request.kind == "rpc.stream")
+        .unwrap();
+    assert_ne!(next.id, stream.id);
+    let ask: Value = serde_json::from_slice(&next.payload).unwrap();
+    assert_eq!(ask["topic"], "run-output:dispatch-live");
+    let frame = tick_native(vec![item(
+        next.id,
+        json!({
+            "type":"run_control_snapshot", "topic":"run-output:dispatch-live",
+            "control":{"turn":"turn-after-reconnect", "steers":true, "approvals":[]}
+        })
+        .to_string()
+        .as_bytes(),
+    )]);
+    assert!(!has_text(&frame, "HTTP error: 403 Forbidden"));
+    let frame = tick_native(press(&frame, "▸ Working…"));
+    assert!(has_text(
+        &frame,
+        "Connected to the session. Waiting for its first process details…"
+    ));
 }

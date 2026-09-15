@@ -99,9 +99,9 @@ impl ForgeView {
     fn tree_rows(&self, dir: &str, depth: usize, rows: &mut Vec<wire::Node>) {
         let p = native::palette();
         let inset = |depth: usize| wire::Edges {
-            top: 4.,
+            top: 8.,
             right: 8.,
-            bottom: 4.,
+            bottom: 8.,
             left: 8. + 14. * depth as f32,
         };
         let Some(entries) = self.tree_children.get(dir) else {
@@ -131,7 +131,10 @@ impl ForgeView {
                 (true, false) => "▸",
                 (true, true) => "▾",
             };
-            let name = native::nowrap(native::text(format!("{key}/name"), &entry.name));
+            let name = native::nowrap(native::text_size(
+                native::text(format!("{key}/name"), &entry.name),
+                14.,
+            ));
             let name = if directory {
                 native::weighted(name, wire::Weight::Medium)
             } else {

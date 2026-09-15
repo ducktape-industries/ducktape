@@ -159,35 +159,25 @@ impl FilesView {
                 self.sidebar_open,
             ),
             native::sized(
-                native::padded(
-                    native::card(
-                        format!("{key}/history-group"),
-                        native::sized(
-                            native::spaced(
-                                native::centered_row(
-                                    format!("{key}/history"),
-                                    [
-                                        kit::navigation(
-                                            format!("{key}/back"),
-                                            "M15 5l-7 7 7 7",
-                                            "Back",
-                                            self.nav.can_back().then_some(Message::Back),
-                                        ),
-                                        kit::navigation(
-                                            format!("{key}/forward"),
-                                            "M9 5l7 7-7 7",
-                                            "Forward",
-                                            self.nav.can_forward().then_some(Message::Forward),
-                                        ),
-                                    ],
-                                ),
-                                0.,
+                native::spaced(
+                    native::centered_row(
+                        format!("{key}/history"),
+                        [
+                            kit::navigation(
+                                format!("{key}/back"),
+                                "M15 5l-7 7 7 7",
+                                "Back",
+                                self.nav.can_back().then_some(Message::Back),
                             ),
-                            Some(wire::Length::Shrink),
-                            None,
-                        ),
+                            kit::navigation(
+                                format!("{key}/forward"),
+                                "M9 5l7 7-7 7",
+                                "Forward",
+                                self.nav.can_forward().then_some(Message::Forward),
+                            ),
+                        ],
                     ),
-                    wire::Edges::all(2.),
+                    0.,
                 ),
                 Some(wire::Length::Shrink),
                 None,
@@ -204,44 +194,34 @@ impl FilesView {
                 "Refresh",
                 Some(Message::Refresh),
             ),
-            native::gap(12.),
+            native::gap(6.),
             native::sized(
-                native::padded(
-                    native::card(
-                        format!("{key}/view-group"),
-                        native::sized(
-                            native::spaced(
-                                native::centered_row(
-                                    format!("{key}/view-modes"),
-                                    [
-                                        kit::quiet(
-                                            format!("{key}/list-mode"),
-                                            "List",
-                                            "List view",
-                                            Some(Message::SetViewMode(ViewMode::List)),
-                                            self.view_mode == ViewMode::List,
-                                        ),
-                                        kit::quiet(
-                                            format!("{key}/columns-mode"),
-                                            "Columns",
-                                            "Column view",
-                                            Some(Message::SetViewMode(ViewMode::Columns)),
-                                            self.view_mode == ViewMode::Columns,
-                                        ),
-                                    ],
-                                ),
-                                2.,
+                native::spaced(
+                    native::centered_row(
+                        format!("{key}/view-modes"),
+                        [
+                            kit::quiet(
+                                format!("{key}/list-mode"),
+                                "List",
+                                "List view",
+                                Some(Message::SetViewMode(ViewMode::List)),
+                                self.view_mode == ViewMode::List,
                             ),
-                            Some(wire::Length::Shrink),
-                            None,
-                        ),
+                            kit::quiet(
+                                format!("{key}/columns-mode"),
+                                "Columns",
+                                "Column view",
+                                Some(Message::SetViewMode(ViewMode::Columns)),
+                                self.view_mode == ViewMode::Columns,
+                            ),
+                        ],
                     ),
-                    wire::Edges::all(2.),
+                    0.,
                 ),
                 Some(wire::Length::Shrink),
                 None,
             ),
-            native::gap(12.),
+            native::gap(6.),
             kit::action(
                 format!("{key}/new-folder"),
                 "New folder",
@@ -289,7 +269,12 @@ impl FilesView {
                 native::spaced(native::wrapped_row(key, children), 6.),
                 wire::AlignX::Center,
             ),
-            wire::Edges::all(8.),
+            wire::Edges {
+                top: 6.,
+                bottom: 6.,
+                left: 8.,
+                right: 8.,
+            },
         )
     }
 

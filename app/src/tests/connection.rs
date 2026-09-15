@@ -1,5 +1,114 @@
 use super::*;
 
+#[test]
+fn connection_progress_keeps_the_task_alive_and_retires_previous_attempt_errors() {
+    let (mut app, _) = Ducktape::boot();
+    app.rpc = "http://127.0.0.1:38259".into();
+    app.hub_step = HubStep::Wallets;
+    let _ = app.update(AppMessage::NetworkEntered);
+    let first_request = app.connection_generation;
+    let first_connect = app.connect_generation;
+    let _ = app.update(AppMessage::ConnectionReply(
+        first_request,
+        Some(Box::new(AppMessage::ConnectionProgress(
+            first_connect,
+            "Loading chat and workspace…",
+        ))),
+    ));
+    assert!(
+        app.connection_task.is_some(),
+        "progress must not abort its own connection"
+    );
+
+    let _ = app.update(AppMessage::ConnectionReply(
+        first_request,
+        Some(Box::new(AppMessage::ConnectFailed(
+            backend::HydrationError {
+                generation: first_connect,
+                message: "chat view failed".into(),
+            },
+        ))),
+    ));
+    assert_eq!(
+        app.connection_progress,
+        "Retrying automatically in 1s · retry 1"
+    );
+    assert_eq!(app.onboarding_error, "chat view failed");
+    let retry_request = app.connection_generation;
+    let retry_connect = app.connect_generation;
+    assert_ne!(retry_request, first_request);
+    let _ = app.update(AppMessage::ConnectionReply(first_request, None));
+    assert!(
+        app.connection_task.is_some(),
+        "the previous stream cannot cancel the retry"
+    );
+    let _ = app.update(AppMessage::ConnectionProgress(
+        first_connect,
+        "stale progress",
+    ));
+    assert_eq!(app.onboarding_error, "chat view failed");
+    assert_ne!(app.connection_progress, "stale progress");
+
+    let _ = app.update(AppMessage::ConnectionReply(
+        retry_request,
+        Some(Box::new(AppMessage::ConnectionProgress(
+            retry_connect,
+            "Preparing workspace screens…",
+        ))),
+    ));
+    assert_eq!(app.connection_progress, "Preparing workspace screens…");
+    assert!(app.onboarding_error.is_empty());
+    assert!(app.connection_task.is_some());
+    let _ = app.update(AppMessage::ConnectionReply(retry_request, None));
+    assert!(app.connection_task.is_none());
+}
+
+#[test]
+fn returning_to_networks_cancels_the_pending_connection_and_ignores_its_success() {
+    let (mut app, _) = Ducktape::boot();
+    app.rpc = "http://127.0.0.1:38259".into();
+    app.hub_step = HubStep::Wallets;
+    let _ = app.update(AppMessage::NetworkEntered);
+    let request = app.connection_generation;
+    let generation = app.connect_generation;
+    assert!(app.connection_task.is_some());
+    let _ = app.update(AppMessage::GoNetworks);
+    assert_eq!(app.console_entry, ConsoleEntry::Idle);
+    assert!(app.connection_task.is_none());
+    assert!(app.connection_progress.is_empty());
+    let mut late = workspace("late-channel");
+    late.generation = generation;
+    let _ = app.update(AppMessage::ConnectionReply(
+        request,
+        Some(Box::new(AppMessage::WorkspaceConnected(late.clone()))),
+    ));
+    let _ = app.update(AppMessage::WorkspaceConnected(late));
+    assert!(!app.connected);
+    assert_ne!(app.active_channel, "late-channel");
+    assert_eq!(app.hub_step, HubStep::Networks);
+}
+
+#[tokio::test]
+async fn a_connection_announces_its_work_before_returning_a_failure() {
+    use futures::StreamExt as _;
+    let mut task = backend::connect("not a node address".into(), 0, 7).into_stream();
+    assert!(matches!(
+        task.next().await,
+        Some(AppMessage::ConnectionProgress(
+            7,
+            "Loading chat and workspace…"
+        ))
+    ));
+    assert!(matches!(
+        task.next().await,
+        Some(AppMessage::ConnectFailed(backend::HydrationError {
+            generation: 7,
+            ..
+        }))
+    ));
+    assert!(task.next().await.is_none());
+}
+
 /// A FAILED PALETTE SEARCH MUST SAY SO. `palette_search_failed` returns the
 /// phase to idle and clears the hits, and idle under a live draft is reachable
 /// no other way — so the panel needs an arm for exactly that pair, and the arm
@@ -117,7 +226,7 @@ fn a_single_failed_load_does_not_report_the_connection_offline() {
 fn connect_reports_the_cause_instead_of_guessing_at_it() {
     const LIVE: &str = include_str!("../backend/live.rs");
     let connect = LIVE
-        .split("pub async fn connect(")
+        .split("pub fn connect(")
         .nth(1)
         .expect("connect is declared")
         .split("\npub ")
@@ -235,7 +344,9 @@ fn a_failed_connect_retries_instead_of_giving_up() {
     landed.generation = connect_gen;
     let rpc = landed.rpc.clone();
     wired.hydration_retry_attempt = 3;
+    wired.onboarding_error = "another wallet's error".into();
     let _ = wired.update(AppMessage::WorkspaceConnected(landed));
+    assert_eq!(wired.onboarding_error, "another wallet's error");
     assert_eq!(wired.connected_rpc, rpc);
     assert_eq!(
         wired.active_channel, "general",

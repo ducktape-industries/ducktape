@@ -419,6 +419,7 @@ pub struct Ducktape {
     pub(crate) onboarding_error: String,
     pub(crate) wallet_opening_status: &'static str,
     pub(crate) console_entry: ConsoleEntry,
+    pub(crate) connection_progress: String,
     pub(crate) invite_link: String,
     pub(crate) provision_steps: Vec<crate::backend::ProvisionStep>,
     pub(crate) provision_index: i64,
@@ -457,7 +458,8 @@ impl ::std::fmt::Debug for Ducktape {
 #[derive(Clone)]
 pub(crate) enum AppMessage {
     AppearanceSaveReply(u64, Box<AppMessage>),
-    ConnectionReply(u64, Box<AppMessage>),
+    ConnectionReply(u64, Option<Box<AppMessage>>),
+    ConnectionProgress(i64, &'static str),
     DmPeersLoadReply(u64, Box<AppMessage>),
     NodeFactsLoadReply(u64, Box<AppMessage>),
     BellLoadReply(u64, Box<AppMessage>),
@@ -907,6 +909,7 @@ impl Ducktape {
             onboarding_error: "".to_owned(),
             wallet_opening_status: "Unlocking wallet…",
             console_entry: ConsoleEntry::Idle,
+            connection_progress: String::new(),
             invite_link: "".to_owned(),
             provision_steps: Vec::new(),
             provision_index: 0,

@@ -692,12 +692,10 @@ impl DesktopWindow {
             HubStep::Loading => body.child(hint("Opening your workspace…".into())),
             HubStep::Wallets => {
                 let state = &self.model.read(cx).state;
-                let entering = state.console_entry == crate::ConsoleEntry::Entering;
-                let unlock_busy = busy || entering;
-                let unlock_label = match (state.console_entry, busy) {
-                    (crate::ConsoleEntry::Entering, _) => "Connecting to network…",
-                    (crate::ConsoleEntry::Idle, true) => state.wallet_opening_status,
-                    (crate::ConsoleEntry::Idle, false) => "Unlock",
+                let unlock_label = if busy {
+                    state.wallet_opening_status
+                } else {
+                    "Unlock"
                 };
                 let selected = state.hub_wallet_selected.clone();
                 let wallets = state.hub_wallets.clone();
@@ -729,11 +727,11 @@ impl DesktopWindow {
                                 self.submit(
                                     "unlock-submit",
                                     unlock_label,
-                                    unlock_busy,
+                                    busy,
                                     |this, cx| Message::UnlockSubmit(this.value("unlock", cx)),
                                     cx,
                                 )
-                                .loading(unlock_busy)
+                                .loading(busy)
                                 .primary()
                                 .w_full()
                                 .h_8(),
@@ -1237,6 +1235,30 @@ impl DesktopWindow {
                     )
             }
         };
+        let entering = self.model.read(cx).state.console_entry == crate::ConsoleEntry::Entering;
+        if entering {
+            body = div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .w_full()
+                .child(hero(
+                    "Opening workspace",
+                    "You can cancel and choose another network.",
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(gpui_kit::component::spinner::Spinner::new())
+                        .child(hint(self.model.read(cx).state.connection_progress.clone())),
+                )
+                .child(
+                    self.action("connection-cancel", "Cancel", Message::GoNetworks, false)
+                        .outline(),
+                );
+        }
         div()
             .size_full()
             .flex()

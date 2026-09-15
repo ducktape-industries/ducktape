@@ -53,9 +53,9 @@ const ACTIVITY_DETAIL_BYTES: usize = 1_200;
 /// A tool name is a label, not a transcript.
 const TOOL_NAME_BYTES: usize = 80;
 
-pub fn journal_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
-    let maximum = (viewport - 10.0 - 320.0).clamp(280.0, 800.0);
-    (width + delta).clamp(280.0, maximum)
+pub fn run_list_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
+    let maximum = (viewport * 0.35).clamp(200.0, 360.0);
+    (width + delta).clamp(200.0, maximum)
 }
 
 pub fn editor_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
@@ -1487,10 +1487,11 @@ pub struct LiveActivity {
 
 /// The progress of the run the reader has open: the node's own output for
 /// that dispatch, folded. `present` is false until a line arrives — a run
-/// that settled, was never dispatched here, or whose output this device may
-/// not read produces none, and the panel stays off rather than guessing.
+/// with no retained output stays distinct from a connection failure. Access
+/// errors remain visible so the reader can reconnect after resolving them.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveRun {
+    pub connection: OutputConnection,
     pub present: bool,
     pub status: String,
     pub activity: Vec<LiveActivity>,
@@ -1502,6 +1503,14 @@ pub struct LiveRun {
     /// Executor-measured duration, available once the provider session closes.
     pub elapsed_ms: Option<u64>,
     pub control: Option<RunControl>,
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutputConnection {
+    #[default]
+    Connecting,
+    Connected,
+    Failed(String),
 }
 
 /// A provider-disclosed step. Stable item ids let completion replace streaming
@@ -1523,6 +1532,30 @@ pub enum ProcessState {
 }
 
 impl LiveRun {
+    pub fn empty_process_message(&self, state: &str) -> &str {
+        match &self.connection {
+            OutputConnection::Connecting => "Connecting to the run output…",
+            OutputConnection::Failed(_) => {
+                "Run output could not be connected. See the error above."
+            }
+            OutputConnection::Connected if !self.trace.is_empty() => {
+                "This output contains no thinking or tool steps. Raw events are available below."
+            }
+            OutputConnection::Connected if self.control.is_some() => {
+                "Connected to the session. Waiting for its first process details…"
+            }
+            OutputConnection::Connected if state == "dispatched" => {
+                "Waiting for a worker to start this run."
+            }
+            OutputConnection::Connected if state == "running" => {
+                "No output has reached this node yet. Waiting for the executing worker…"
+            }
+            OutputConnection::Connected => {
+                "This node has no retained output for this run. Output is kept in memory and is lost when the node restarts or the buffer is evicted."
+            }
+        }
+    }
+
     pub fn process_label(&self, running: bool) -> String {
         if let Some(ms) = self.elapsed_ms {
             let seconds = ms / 1000;
@@ -1850,7 +1883,8 @@ pub fn live_run(open_run: String, connection: i64) -> ducktape_view_guest::Subsc
         let frames = host::subscribe(
             "rpc.stream",
             &serde_json::to_vec(&ask).expect("a request encodes"),
-        );
+        )
+        .chain(stream::once(std::future::ready(Ok(Vec::new()))));
         // the empty reading first: this subscription is keyed on the run, so
         // a door onto another one starts here and the run before it cannot
         // linger under the new name
@@ -1868,15 +1902,38 @@ pub fn live_run(open_run: String, connection: i64) -> ducktape_view_guest::Subsc
 /// A frame this view cannot read — another topic, a refusal, a line that is
 /// not a provider event — leaves the reading as it was.
 fn fold_output(run: &mut LiveRun, topic: &str, frame: Result<Vec<u8>, String>) {
-    let Ok(bytes) = frame else {
-        return;
+    let bytes = match frame {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            run.connection = OutputConnection::Failed(clip(&error, MAX_TRACE_EVENT_BYTES));
+            run.control = None;
+            return;
+        }
     };
+    if bytes.is_empty() {
+        if !matches!(run.connection, OutputConnection::Failed(_)) {
+            run.connection = OutputConnection::Failed(
+                "The run output connection closed. Reconnect to continue receiving updates.".into(),
+            );
+        }
+        run.control = None;
+        return;
+    }
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return;
     };
     if value["topic"].as_str() != Some(topic) {
         return;
     }
+    if value["type"] == "error" {
+        let detail = value["detail"]
+            .as_str()
+            .unwrap_or("The node refused this run output subscription.");
+        run.connection = OutputConnection::Failed(clip(detail, MAX_TRACE_EVENT_BYTES));
+        run.control = None;
+        return;
+    }
+    run.connection = OutputConnection::Connected;
     if value["type"] == "run_control_snapshot" {
         let control = &value["control"];
         run.control = control["turn"].as_str().map(|turn| RunControl {
@@ -2677,6 +2734,60 @@ mod process_tests {
                     .into_bytes(),
             ),
         );
+    }
+
+    #[test]
+    fn output_failures_are_visible_and_never_leave_stale_controls_enabled() {
+        let mut run = LiveRun::default();
+        let topic = "run-output:test";
+        fold_output(&mut run, topic, Err("HTTP error: 403 Forbidden".into()));
+        assert_eq!(
+            run.connection,
+            OutputConnection::Failed("HTTP error: 403 Forbidden".into())
+        );
+        fold_output(&mut run, topic, Ok(Vec::new()));
+        assert_eq!(
+            run.connection,
+            OutputConnection::Failed("HTTP error: 403 Forbidden".into())
+        );
+        let snapshot = json!({"type":"run_control_snapshot","topic":topic,"control":{"turn":"a","steers":true}});
+        fold_output(&mut run, topic, Ok(serde_json::to_vec(&snapshot).unwrap()));
+        assert_eq!(run.connection, OutputConnection::Connected);
+        assert!(run.control.is_some());
+        let refusal = json!({"type":"error","topic":topic,"detail":"not_this_runs_reader"});
+        fold_output(&mut run, topic, Ok(serde_json::to_vec(&refusal).unwrap()));
+        assert_eq!(
+            run.connection,
+            OutputConnection::Failed("not_this_runs_reader".into())
+        );
+        assert!(run.control.is_none());
+    }
+
+    #[test]
+    fn an_empty_trace_distinguishes_connection_waiting_and_retention() {
+        let mut run = LiveRun::default();
+        assert!(run.empty_process_message("running").contains("Connecting"));
+        let snapshot =
+            json!({"type":"run_control_snapshot","topic":"run-output:test","control":null});
+        fold_output(
+            &mut run,
+            "run-output:test",
+            Ok(serde_json::to_vec(&snapshot).unwrap()),
+        );
+        assert!(
+            run.empty_process_message("dispatched")
+                .contains("start this run")
+        );
+        assert!(
+            run.empty_process_message("running")
+                .contains("executing worker")
+        );
+        assert!(
+            run.empty_process_message("accepted")
+                .contains("retained output")
+        );
+        run.trace.push("{}".into());
+        assert!(run.empty_process_message("accepted").contains("Raw events"));
     }
 
     #[test]

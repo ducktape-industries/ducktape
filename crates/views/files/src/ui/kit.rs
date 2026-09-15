@@ -39,7 +39,7 @@ pub(super) fn quiet(
     button
 }
 
-/// Navigation uses a consistent stroke and a generous, quiet pointer target.
+/// Navigation matches the surrounding 26px controls with a 16px stroke icon.
 pub(super) fn navigation(
     key: String,
     path: &str,
@@ -61,8 +61,8 @@ pub(super) fn navigation(
         fit: None,
         rotation: None,
         opacity: message.is_none().then_some(0.35),
-        width: Some(wire::Length::Fixed(20.)),
-        height: Some(wire::Length::Fixed(20.)),
+        width: Some(wire::Length::Fixed(16.)),
+        height: Some(wire::Length::Fixed(16.)),
     };
     let mut button = native::button_child(
         key.clone(),
@@ -79,9 +79,9 @@ pub(super) fn navigation(
     } = &mut button
     {
         *label = Some(name.into());
-        *width = Some(wire::Length::Fixed(36.));
-        *height = Some(wire::Length::Fixed(36.));
-        *padding = Some(wire::Edges::all(4.));
+        *width = Some(wire::Length::Fixed(26.));
+        *height = Some(wire::Length::Fixed(26.));
+        *padding = Some(wire::Edges::all(5.));
     }
     wire::Node::Tooltip {
         key: format!("{key}/tooltip"),
