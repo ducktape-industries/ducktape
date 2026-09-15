@@ -87,6 +87,8 @@ pub struct ChatView {
     pub(crate) active_channel_members_only: bool,
     pub(crate) post_refusal: String,
     pub(crate) has_older_history: bool,
+    /// the window on screen runs up to the room's head (see `RoomItem`)
+    pub(crate) window_reaches_head: bool,
     pub(crate) loading: bool,
     pub(crate) busy: bool,
     pub(crate) thread_pages: i64,
@@ -284,6 +286,7 @@ impl ChatView {
             active_channel_members_only: false,
             post_refusal: "".to_owned(),
             has_older_history: false,
+            window_reaches_head: true,
             loading: false,
             busy: false,
             thread_pages: 0,

@@ -143,7 +143,15 @@ pub struct RunLink {
     pub kind: String,
     pub label: String,
     pub url: String,
-    pub preview: Option<String>,
+    /// the chat message a chip names, drawn in place on request
+    pub preview: Option<MessagePreview>,
+}
+
+/// One chat message as a chip previews it: who said it, and what.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessagePreview {
+    pub author: String,
+    pub body: String,
 }
 
 /// The journal of one run. `dispatch_id` names the run it belongs to, so a
@@ -987,9 +995,12 @@ impl Chips {
             })
     }
 
-    fn message_preview(&self, message: Option<&serde_json::Value>) -> String {
+    fn message_preview(&self, message: Option<&serde_json::Value>) -> MessagePreview {
         let Some(row) = message else {
-            return "Message unavailable.".into();
+            return MessagePreview {
+                author: String::new(),
+                body: "Message unavailable.".into(),
+            };
         };
         let author = self
             .names
@@ -999,10 +1010,10 @@ impl Chips {
             false => author,
         };
         let body = match row["deleted"].as_bool().unwrap_or(false) {
-            true => "Deleted message",
-            false => row["text"].as_str().unwrap_or_default(),
+            true => "Deleted message".to_owned(),
+            false => row["text"].as_str().unwrap_or_default().to_owned(),
         };
-        format!("{author}\n\n{body}")
+        MessagePreview { author, body }
     }
 
     async fn message(&self, channel: String, thread: Option<u64>, id: String) -> RunLink {

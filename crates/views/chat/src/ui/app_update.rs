@@ -407,6 +407,7 @@ impl super::ChatView {
             self.unread_boundary,
         );
         self.has_older_history = item.has_older;
+        self.window_reaches_head = item.reaches_head;
         self.history_view = (self.land_seq > 0) || (self.history_pages > 0);
         self.stream_reveal_key = crate::host::message_target_key(
             ::std::convert::AsRef::as_ref(&(self.messages)),

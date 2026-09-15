@@ -80,56 +80,80 @@ fn places(key: &str, links: &[host::RunLink], opened: Option<&str>) -> Node {
                 if link.url.is_empty() {
                     return kit::badge(key, &link.label, Tone::Neutral);
                 }
-                let mut button = kit::button_child(
-                    &key,
-                    kit::wrapping(kit::text(format!("{key}/label"), &link.label)),
-                    Some(slots::message(Message::OpenPlace(link.url.clone()))),
-                    ButtonPreset::Text,
-                );
-                if let Node::Button { label, .. } = &mut button {
-                    *label = Some(link.label.clone());
-                }
                 let Some(preview) = &link.preview else {
+                    let mut button = kit::button_child(
+                        &key,
+                        kit::wrapping(kit::text(format!("{key}/label"), &link.label)),
+                        Some(slots::message(Message::OpenPlace(link.url.clone()))),
+                        ButtonPreset::Text,
+                    );
+                    if let Node::Button { label, .. } = &mut button {
+                        *label = Some(link.label.clone());
+                    }
                     return kit::sized(button, Some(Length::Fill), None);
                 };
-                let button = kit::button(
-                    &key,
-                    &link.label,
-                    Some(slots::message(Message::OpenPlace(link.url.clone()))),
-                    ButtonPreset::Text,
-                );
                 let expanded = opened == Some(preview_key.as_str());
-                let mut content = vec![kit::spaced(
-                    kit::row(
-                        format!("{key}/header"),
-                        [
-                            button,
-                            kit::button(
-                                format!("{key}/toggle"),
-                                if expanded {
-                                    "Hide message"
-                                } else {
-                                    "View message"
-                                },
-                                Some(slots::message(Message::ToggleMessagePreview(preview_key))),
-                                ButtonPreset::Subtle,
-                            ),
-                        ],
-                    ),
-                    8.,
-                )];
-                if expanded {
-                    content.push(kit::wrapping(kit::text(format!("{key}/preview"), preview)));
-                    content.push(subtle(
-                        format!("{key}/open-chat"),
-                        "Open in chat",
-                        Some(Message::OpenPlace(link.url.clone())),
-                    ));
-                }
-                kit::spaced(kit::column(format!("{key}/message"), content), 8.)
+                message_chip(&key, link, preview, expanded, preview_key)
             }),
         ),
         6.,
+    )
+}
+
+/// A chat message's chip: a card headed by the message's address with the
+/// disclosure at its right edge; opened, the message reads as a quote —
+/// author over body — with the way into the room as a proper button.
+fn message_chip(
+    key: &str,
+    link: &host::RunLink,
+    preview: &host::MessagePreview,
+    expanded: bool,
+    preview_key: String,
+) -> Node {
+    let open = || Some(Message::OpenPlace(link.url.clone()));
+    let address = kit::button(
+        key,
+        &link.label,
+        open().map(slots::message),
+        ButtonPreset::Text,
+    );
+    let toggle = kit::button(
+        format!("{key}/toggle"),
+        if expanded {
+            "Hide message"
+        } else {
+            "View message"
+        },
+        Some(slots::message(Message::ToggleMessagePreview(preview_key))),
+        ButtonPreset::Subtle,
+    );
+    let header = kit::sized(
+        kit::centered_row(
+            format!("{key}/header"),
+            [address, kit::space(Some(Length::Fill), None), toggle],
+        ),
+        Some(Length::Fill),
+        None,
+    );
+    let mut content = vec![header];
+    if expanded {
+        let mut quote = Vec::new();
+        if !preview.author.is_empty() {
+            quote.push(kit::label(format!("{key}/author"), &preview.author));
+        }
+        quote.push(kit::wrapping(kit::text(
+            format!("{key}/preview"),
+            &preview.body,
+        )));
+        content.push(kit::spaced(kit::column(format!("{key}/quote"), quote), 4.));
+        content.push(kit::row(
+            format!("{key}/actions"),
+            [action(format!("{key}/open-chat"), "Open in chat", open())],
+        ));
+    }
+    kit::card(
+        format!("{key}/message"),
+        kit::spaced(kit::column(format!("{key}/body"), content), 8.),
     )
 }
 
