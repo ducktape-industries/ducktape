@@ -783,10 +783,11 @@ fn the_painter_and_the_editor_read_one_description_of_a_label() {
     let painting = include_str!("presentation.rs");
     assert_eq!(
         painting.matches("self.lettering(").count(),
-        3,
-        "the painter asks once, the inline editor once, and the gauge that \
-         decides how tall the card must be once — a gauge reading a second \
-         description would size the card for words nobody draws"
+        4,
+        "the painter asks once, the inline editor once, the gauge that decides \
+         how tall the card must be once, and the box the caret lives in once — \
+         any of them reading a second description would lay the words out for \
+         a card nobody draws"
     );
     assert!(
         !painting.contains("size: Some((14."),
@@ -1378,6 +1379,180 @@ fn every_way_of_arriving_at_a_board_points_the_keyboard_at_it() {
         2,
         "opening a board, and making one"
     );
+}
+
+#[test]
+fn an_arrow_can_be_written_on_and_the_words_ride_the_run_rather_than_its_stored_box() {
+    let mut view = linked();
+    view.on_size(1400., 900.);
+    view.selected = ["edge".into()].into();
+    // A connector could carry words — the painter drew them — and there was no
+    // way to type any: the one door into the editor turned a connector away.
+    view.begin_text();
+    assert!(view.inline.is_some(), "a connector would not open");
+    view.inline.as_mut().unwrap().document = Editor::new("holds");
+    view.finish_text();
+    let board = view.visible().unwrap();
+    assert_eq!(board.shapes["edge"].shape.text, "holds");
+    // Its box is the span of its run and nothing chose it, so writing on it
+    // must not resize it the way writing in a card does.
+    let edge = board.shapes["edge"].shape.clone();
+    assert_eq!(
+        [edge.width, edge.height],
+        [160, 90],
+        "a connector's geometry is its samples, not a box that grows"
+    );
+    // And the words ride the middle of the run, which is where the arrow is
+    // drawn — not the rectangle its samples were stored with.
+    let json = serde_json::to_string(&view.view()).unwrap();
+    assert!(json.contains("holds"));
+    // The plate is part of the connector: a press on the words takes it, the
+    // way a press on a card's words takes the card.
+    let board = view.visible().unwrap();
+    let run = super::interaction::stroke(&board, &edge);
+    let middle = [
+        (run[0][0] + run[run.len() - 1][0]) / 2.,
+        (run[0][1] + run[run.len() - 1][1]) / 2.,
+    ];
+    let beside = [middle[0], middle[1] - 20.];
+    assert_eq!(
+        view.hit(beside).as_deref(),
+        Some("edge"),
+        "the words were readable and unreachable"
+    );
+}
+
+#[test]
+fn an_arrows_words_ride_a_plate_that_hugs_them_and_a_cards_fill_its_box() {
+    let mut view = linked();
+    view.on_size(1400., 900.);
+    view.selected = Default::default();
+    view.edit(Change::Text {
+        id: "edge".into(),
+        text: "depends on".into(),
+    });
+    view.edit(Change::Text {
+        id: "a".into(),
+        text: "a thought".into(),
+    });
+    let json = serde_json::to_string(&view.view()).unwrap();
+    // The room a label is given is the longest one a line could carry. A plate
+    // filling that room rubs the line out either side of two short words, so
+    // the plate hugs the words and is centred in the room instead — which is
+    // also what puts them on the line rather than off to its left.
+    let plate = json
+        .split("boards/plate/edge")
+        .nth(1)
+        .expect("the arrow's words are not on a plate");
+    let plate = &plate[..plate.len().min(400)];
+    assert!(plate.contains("Shrink"), "the plate fills the room: {plate}");
+    assert!(plate.contains("Center"), "the plate is not centred: {plate}");
+    // A card is a page: its words start at its own corner and fill it.
+    let card = json
+        .split("boards/label-clip/a")
+        .nth(1)
+        .expect("the card's words are not in its box");
+    let card = &card[..card.len().min(400)];
+    assert!(
+        !card.contains("Shrink"),
+        "a card's words stopped filling it: {card}"
+    );
+}
+
+#[test]
+fn coming_back_to_a_card_puts_the_caret_after_the_words_it_already_holds() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            text: "first\nsecond".into(),
+            ..Default::default()
+        },
+    });
+    view.selected = ["a".into()].into();
+    view.begin_text();
+    let cursor = view.inline.as_ref().unwrap().document.cursor();
+    // Typing on a card you have written on adds to it. A caret left in front
+    // of the first letter put every new word ahead of every kept one.
+    assert_eq!(cursor.position.line, 1, "the caret is not on the last line");
+    assert_eq!(
+        cursor.position.column, 6,
+        "the caret is not after the last word"
+    );
+    assert_eq!(cursor.selection, None, "the caret arrived holding a selection");
+}
+
+#[test]
+fn the_caret_hugs_an_arrows_words_and_takes_a_whole_card() {
+    let mut view = linked();
+    view.on_size(1400., 900.);
+    // Nothing measured yet: the caret takes the room, because a plate hugging
+    // words nobody has measured would be a plate of no width at all.
+    view.selected = ["edge".into()].into();
+    view.begin_text();
+    let board = view.visible().unwrap();
+    let edge = board.shapes["edge"].shape.clone();
+    let run = super::interaction::stroke(&board, &edge);
+    let box_ = super::interaction::plate(&run);
+    let (pos, room) = view.writing_box(box_, edge.kind);
+    let inline = view.inline.clone().unwrap();
+    assert_eq!(view.caret_box(&inline, edge.kind, pos, room), (pos, room));
+    // Once the gauge has answered, the caret is as wide as the words and sits
+    // at the middle of the room — the same middle the painter centres the
+    // saved plate on, so the words do not jump when you stop typing.
+    view.on_measured(60., 24.);
+    let inline = view.inline.clone().unwrap();
+    let (caret, size) = view.caret_box(&inline, edge.kind, pos, room);
+    assert!(size[0] < room[0], "the caret still took the whole room");
+    assert!(
+        (caret[0] + size[0] / 2. - (pos[0] + room[0] / 2.)).abs() < 0.5,
+        "the caret is not centred where the plate will be"
+    );
+    // A card is written across the whole card whatever the gauge says.
+    let (pos, room) = view.writing_box([0., 0., 200., 120.], Kind::Note);
+    assert_eq!(view.caret_box(&inline, Kind::Note, pos, room), (pos, room));
+}
+
+#[test]
+fn a_press_in_an_arrows_label_keeps_the_editor_open_the_way_a_press_in_a_cards_does() {
+    let mut view = linked();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    view.selected = ["edge".into()].into();
+    view.begin_text();
+    assert!(view.inline.is_some(), "a connector would not open");
+    let board = view.visible().unwrap();
+    let edge = board.shapes["edge"].shape.clone();
+    let run = super::interaction::stroke(&board, &edge);
+    let middle = [
+        (run[0][0] + run[run.len() - 1][0]) / 2.,
+        (run[0][1] + run[run.len() - 1][1]) / 2.,
+    ];
+    // The host delivers a press around every double-click. For a card it lands
+    // inside the card's own box and is read as a press in the words you are
+    // typing. A bound connector's stored box is wherever it was first drawn —
+    // the ends have followed their cards since — so that press missed, counted
+    // as a press on the board, and shut the editor the instant it opened.
+    assert!(
+        !super::interaction::contains(super::interaction::rect(&edge), middle),
+        "this arrow's stored box still covers its run, so it proves nothing"
+    );
+    view.on_press(middle[0], middle[1]);
+    assert!(
+        view.inline.is_some(),
+        "the press on the words being typed shut the editor"
+    );
+    // Off the plate it is a press on the board again: the label saves and the
+    // editor closes, exactly as it does for a card.
+    view.inline.as_mut().unwrap().document = Editor::new("holds");
+    view.on_press(middle[0], middle[1] + 400.);
+    assert!(
+        view.inline.is_none(),
+        "a press out on the open board left the editor standing"
+    );
+    assert_eq!(view.visible().unwrap().shapes["edge"].shape.text, "holds");
 }
 
 #[test]

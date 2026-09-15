@@ -330,9 +330,15 @@ impl BoardsView {
                 return None;
             }
             let touched = if s.kind.is_path() {
-                stroke(board, s)
+                let run = stroke(board, s);
+                let on_the_run = run
                     .windows(2)
-                    .any(|step| line_distance(point, step[0], step[1]) <= reach)
+                    .any(|step| line_distance(point, step[0], step[1]) <= reach);
+                // The words on a connector are part of it. A label you can
+                // read but not press would be the one piece of a drawing you
+                // cannot take hold of — and it is the piece a pointer goes
+                // for, being the only part of an arrow bigger than a line.
+                on_the_run || labelled(s, &run, point)
             } else {
                 covers(s, point)
             };
@@ -353,12 +359,28 @@ impl BoardsView {
         };
         Task::none()
     }
+    /// The box a shape's words are written in, in board units: a card's own
+    /// outline, or the plate a connector's words ride at the middle of its run.
+    /// A press inside it is a press in the text you are writing rather than a
+    /// press on the board — which is the whole difference between a
+    /// double-click that opens a card and one that opens it and shuts it again.
+    fn writing_area(&self, board: &Board, s: &Shape) -> [f32; 4] {
+        if !s.kind.is_path() {
+            return rect(s);
+        }
+        plate(&stroke(board, s))
+    }
     pub(super) fn on_press(&mut self, x: f32, y: f32) -> Task<Message> {
         self.cursor = [x, y];
         let editing_here = self.inline.as_ref().is_some_and(|inline| {
-            self.visible()
-                .and_then(|board| board.shapes.get(&inline.id).cloned())
-                .is_some_and(|record| contains(rect(&record.shape), self.world([x, y])))
+            self.visible().is_some_and(|board| {
+                board
+                    .shapes
+                    .get(&inline.id)
+                    .is_some_and(|record| {
+                        contains(self.writing_area(&board, &record.shape), self.world([x, y]))
+                    })
+            })
         });
         if editing_here {
             return Task::none();
@@ -526,8 +548,8 @@ impl BoardsView {
             self.begin_text()
         } else {
             // A double-click on open board writes, the way a canvas app does.
-            // It goes through the same creation the tools use, so the shape
-            // lands centred on the pointer and in the colour the palette is
+            // It goes through the same creation the tools use, so the words
+            // start where the pointer is and in the colour the palette is
             // showing — a second, private idea of a new shape would drift.
             let p = self.world(self.cursor);
             self.mint_shape(self.creation_shape(Kind::Text, p, p))
@@ -1140,16 +1162,31 @@ impl BoardsView {
         let Some(record) = board.shapes.get(&id) else {
             return Task::none();
         };
-        if record.shape.kind.is_path() || self.inline.is_some() {
+        if self.inline.is_some() {
             return Task::none();
         }
         let text = record.shape.text.clone();
         self.gesture = Gesture::Idle;
+        let mut document = Editor::new(text.clone());
+        // The caret goes after the words already there. Opening a card you have
+        // written on is coming back to add to it, and an editor that started in
+        // front of the first letter would put everything you typed next ahead
+        // of everything you meant to keep. The position is clamped into the
+        // text, so asking for the far end of the last line is asking for the
+        // end of the words whatever they are.
+        document.move_to(wire::EditorCursor {
+            position: wire::EditorPosition {
+                line: u32::MAX,
+                column: u32::MAX,
+            },
+            selection: None,
+        });
         self.inline = Some(Inline {
             id: id.clone(),
-            original: text.clone(),
-            document: Editor::new(text),
+            original: text,
+            document,
             grown: None,
+            wide: None,
         });
         Task::none()
     }
@@ -1157,12 +1194,14 @@ impl BoardsView {
     /// width the painter writes them in. It arrives in screen pixels because
     /// that is what was measured; the board is in board units, so the zoom
     /// comes back out of it here.
-    pub(super) fn on_measured(&mut self, _width: f32, height: f32) -> Task<Message> {
+    pub(super) fn on_measured(&mut self, width: f32, height: f32) -> Task<Message> {
+        let zoom = self.zoom;
         let Some(inline) = &mut self.inline else {
             return Task::none();
         };
-        let needed = height / self.zoom;
+        let needed = height / zoom;
         inline.grown = Some(inline.grown.map_or(needed, |seen| seen.max(needed)));
+        inline.wide = Some(width / zoom);
         Task::none()
     }
     pub(super) fn focus_text(&self) -> Task<Message> {
@@ -1707,6 +1746,36 @@ impl BoardsView {
 /// down to the board's point budget before anything leaves the view.
 const MAX_SAMPLES: usize = 4096;
 
+/// Whether the point is on the plate a connector's words are written on. The
+/// plate is stated in board units by the painter, and it is drawn at the middle
+/// of the run rather than over the rectangle the samples were stored with, so
+/// this reads the run the same way the painter does.
+fn labelled(s: &Shape, run: &[[f32; 2]], point: [f32; 2]) -> bool {
+    !s.text.is_empty() && contains(plate(run), point)
+}
+/// The plate a connector's words ride, in board units: the painter's size,
+/// centred on the middle of the run as it is drawn now. A bound end follows the
+/// card it holds, so this is nowhere near the rectangle the samples were stored
+/// with, and everything that asks where the words are has to ask the run.
+pub(super) fn plate(run: &[[f32; 2]]) -> [f32; 4] {
+    let Some((first, rest)) = run.split_first() else {
+        return [0.; 4];
+    };
+    let mut low = *first;
+    let mut high = *first;
+    for sample in rest {
+        low = [low[0].min(sample[0]), low[1].min(sample[1])];
+        high = [high[0].max(sample[0]), high[1].max(sample[1])];
+    }
+    let middle = [(low[0] + high[0]) / 2., (low[1] + high[1]) / 2.];
+    let reach = [presentation::PLATE[0] / 2., presentation::PLATE[1] / 2.];
+    [
+        middle[0] - reach[0],
+        middle[1] - reach[1],
+        middle[0] + reach[0],
+        middle[1] + reach[1],
+    ]
+}
 /// A shape the pointer moves and resizes on its own. A bound connector has no
 /// geometry of its own to drag: it follows the cards its ends name.
 pub(super) fn free(s: &Shape) -> bool {
