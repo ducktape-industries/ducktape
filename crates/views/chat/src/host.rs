@@ -515,8 +515,6 @@ pub struct Session {
     /// the room the app is in — chosen here, but steered by `duck://` links,
     /// notifications and the tray as well
     pub active_channel: String,
-    pub active_dm_peer: String,
-    pub active_dm: DmPeer,
     /// the seq a landing (a search hit, a `duck://channel/…#seq`) asks the
     /// window to open around; 0 opens the live tail
     pub land_seq: i64,
@@ -785,6 +783,8 @@ async fn read_names(serial: i64) -> Names {
 /// Directory and channel projection owned by the deployed Chat guest.
 #[derive(Clone, Debug, Default)]
 pub struct SidebarItem {
+    pub connection_serial: i64,
+    pub names_serial: i64,
     pub channels: Vec<ChatChannel>,
     pub peers: Vec<DmPeer>,
     pub error: String,
@@ -798,22 +798,28 @@ pub fn sidebar(
     ducktape_view_guest::Subscription::run_with((serial, names, reader), |key| {
         let key = key.clone();
         let live = host::subscribe("rpc.live", b"chat");
-        stream::once(read_sidebar(key.1, key.2.clone()))
-            .chain(live.then(move |_| read_sidebar(key.1, key.2.clone())))
+        stream::once(read_sidebar(key.0, key.1, key.2.clone()))
+            .chain(live.then(move |_| read_sidebar(key.0, key.1, key.2.clone())))
     })
 }
 
-async fn read_sidebar(serial: i64, reader: String) -> SidebarItem {
-    match read_sidebar_now(serial, &reader).await {
+async fn read_sidebar(connection_serial: i64, names_serial: i64, reader: String) -> SidebarItem {
+    match read_sidebar_now(connection_serial, names_serial, &reader).await {
         Ok(item) => item,
         Err(error) => SidebarItem {
+            connection_serial,
+            names_serial,
             error,
             ..SidebarItem::default()
         },
     }
 }
 
-async fn read_sidebar_now(serial: i64, reader: &str) -> Result<SidebarItem, String> {
+async fn read_sidebar_now(
+    connection_serial: i64,
+    names_serial: i64,
+    reader: &str,
+) -> Result<SidebarItem, String> {
     let mut channels = Vec::new();
     let mut seats = BTreeMap::new();
     let mut after: Option<String> = None;
@@ -860,7 +866,7 @@ async fn read_sidebar_now(serial: i64, reader: &str) -> Result<SidebarItem, Stri
         }
         after = Some(next.into());
     }
-    let names = names_at(serial).await;
+    let names = names_at(names_serial).await;
     let me = ME.with_borrow(Clone::clone);
     for channel in &mut channels {
         channel.huddle = seats
@@ -899,6 +905,8 @@ async fn read_sidebar_now(serial: i64, reader: &str) -> Result<SidebarItem, Stri
         })
         .collect();
     Ok(SidebarItem {
+        connection_serial,
+        names_serial,
         channels,
         peers,
         error: String::new(),

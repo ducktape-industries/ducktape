@@ -1142,30 +1142,8 @@ pub fn dm_channel_id(a: String, b: String) -> String {
     chat::client::dm_channel_id(&a, &b)
 }
 
-/// THE DM PEER IS A READING OF THE ROOM ON SCREEN, NOT A FLAG THAT OUTLIVES IT.
-/// `peer` survives only while `channel` is that peer's own two-party channel;
-/// every other room answers "".
-///
-/// `active_dm_peer` decides the whole header, one step removed: it resolves the
-/// row (`dm_peer_named`) that the header actually branches on, so a peer this
-/// key names draws `DmHeader` with his avatar and name and SUPPRESSES the `#`
-/// glyph and `active_channel_name` — while a key whose peer has left the
-/// identity roster resolves to the blank row and falls THROUGH to that title
-/// in the Chat view, instead of drawing
-/// a nameless avatar plate the way branching on the key itself did.
-///
-/// Cleared by the channel picker alone, it rode a search hit, a create, a
-/// reconnect and every resync into another room — Alice's face over #general's
-/// timeline, with the room the composer actually posts into never named. So
-/// every landing that assigns `active_channel` from a reply re-derives the peer
-/// through here, and the field cannot disagree with the room again.
-///
-/// THE DIRECTORY'S OWN ID DECIDES, for the reason `chat_sidebar_rooms` gives:
-/// `DmPeer.channel_id` was derived once, in `load_dm_peers`, from the account
-/// number that load resolved for itself. Re-hashing it here against a separate
-/// `account_number` reading made the header disagree with the sidebar whenever
-/// that reading was late or missing — the peer's own room drew as a `#` channel
-/// under his name in DIRECT.
+/// Keep the shell's selected peer only while its directory entry owns this room.
+/// The view resolves its own DM presentation from its directory subscription.
 pub fn dm_peer_of_channel(peer: String, peers: Vec<DmPeer>, channel: String) -> String {
     let peer_owns_the_room = peers
         .iter()
@@ -1185,26 +1163,6 @@ pub fn dm_room_of_peer(peers: Vec<DmPeer>, peer: String) -> String {
         .find(|row| row.key == peer)
         .map(|row| row.channel_id)
         .unwrap_or_default()
-}
-
-/// THE DM HEADER'S OWN ROW, resolved where `active_dm_peer` is written.
-///
-/// The header used to be a filter — `for peer in dm_peers` / `if peer.key ==
-/// active_dm_peer` — which the extern-free view can express but which
-/// deep-clones every peer AND allocates a per-child scope String, per frame, so
-/// that at most one of them renders. A peer who has left the identity roster
-/// resolves to the blank row, and the header falls through to the `#` title the
-/// way the filter's no-match arm did.
-pub fn dm_peer_named(peers: Vec<DmPeer>, key: String) -> DmPeer {
-    peers
-        .into_iter()
-        .find(|peer| peer.key == key)
-        .unwrap_or_default()
-}
-
-/// The blank peer — "no DM on screen", and the state field's own default.
-pub fn no_dm_peer() -> DmPeer {
-    DmPeer::default()
 }
 
 /// Open the DM with one peer (an account number): resolve the deterministic

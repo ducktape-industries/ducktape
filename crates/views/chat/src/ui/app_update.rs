@@ -254,8 +254,7 @@ impl super::ChatView {
         self.names_serial = next.names_serial;
         self.channel_create_open = next.channel_create_open;
         self.active_channel = next.active_channel.to_owned();
-        self.active_dm_peer = next.active_dm_peer.to_owned();
-        self.active_dm = next.active_dm.clone();
+        self.refresh_active_dm();
         self.land_seq = next.land_seq;
         self.unread_boundary = next.unread_boundary;
         self.session_loading = next.loading;
@@ -284,6 +283,11 @@ impl super::ChatView {
         &mut self,
         item: crate::host::SidebarItem,
     ) -> ducktape_view_guest::Task<Message> {
+        let current_directory = item.connection_serial == self.connection_serial
+            && item.names_serial == self.names_serial;
+        if !current_directory {
+            return ducktape_view_guest::Task::none();
+        }
         if !item.error.is_empty() {
             self.host_error = crate::host::failure_note("Couldn’t read the sidebar", &item.error);
             return ducktape_view_guest::Task::none();
@@ -323,7 +327,20 @@ impl super::ChatView {
                 channel,
             })
             .collect();
+        self.refresh_active_dm();
         ducktape_view_guest::Task::none()
+    }
+
+    fn refresh_active_dm(&mut self) {
+        self.active_dm = self
+            .dm_rows
+            .iter()
+            .find(|row| {
+                !row.peer.channel_id.is_empty() && row.peer.channel_id == self.active_channel
+            })
+            .map(|row| row.peer.clone())
+            .unwrap_or_default();
+        self.active_dm_peer = self.active_dm.key.clone();
     }
 
     fn on_participation_finished(&mut self) -> ducktape_view_guest::Task<Message> {

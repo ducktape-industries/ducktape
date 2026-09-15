@@ -463,6 +463,63 @@ impl ChatView {
 mod tests {
     use super::*;
     #[test]
+    fn dm_identity_comes_from_guest_directory_across_navigation_and_refresh() {
+        let mut state = ChatView::state();
+        let session = |channel: &str, network: &str| {
+            Message::SessionArrived(Box::new(crate::host::SessionItem {
+                next: crate::host::Session {
+                    active_channel: channel.into(),
+                    network_chain_id: network.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+        };
+        let directory = |name: &str, connection_serial| {
+            Message::SidebarArrived(crate::host::SidebarItem {
+                connection_serial,
+                peers: vec![crate::host::DmPeer {
+                    key: "peer-key".into(),
+                    name: name.into(),
+                    initials: "PN".into(),
+                    channel_id: "private-room".into(),
+                    is_agent: true,
+                }],
+                ..Default::default()
+            })
+        };
+        let _ = state.update(session("private-room", "network"));
+        let _ = state.update(directory("Peer Name", state.connection_serial));
+        assert_eq!(state.active_dm.name, "Peer Name");
+        assert_eq!(state.active_dm_peer, "peer-key");
+        assert!(state.active_dm.is_agent);
+        let _ = state.update(directory("Renamed Peer", state.connection_serial));
+        assert_eq!(state.active_dm.name, "Renamed Peer");
+        let _ = state.update(session("public-room", "network"));
+        assert!(state.active_dm.name.is_empty());
+        assert!(state.active_dm_peer.is_empty());
+        let _ = state.update(session("private-room", "network"));
+        assert_eq!(state.active_dm.name, "Renamed Peer");
+        let delayed_directory = directory("Previous network peer", state.connection_serial);
+        let _ = state.update(session("private-room", "different-network"));
+        let _ = state.update(delayed_directory);
+        assert!(state.active_dm.name.is_empty());
+        assert!(state.active_dm_peer.is_empty());
+        let _ = state.update(directory("New network peer", state.connection_serial));
+        assert_eq!(state.active_dm.name, "New network peer");
+        let _ = state.update(session("", "different-network"));
+        let _ = state.update(Message::SidebarArrived(crate::host::SidebarItem {
+            connection_serial: state.connection_serial,
+            peers: vec![crate::host::DmPeer {
+                name: "Unresolved account".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+        assert!(state.active_dm.name.is_empty());
+    }
+
+    #[test]
     fn sidebar_reads_seed_cursors_then_mark_only_inactive_rooms_unread() {
         let mut state = ChatView::state();
         state.active_channel = "a".into();

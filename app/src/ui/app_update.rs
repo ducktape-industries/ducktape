@@ -701,7 +701,6 @@ impl Ducktape {
         self.unread_boundary = 0;
         self.active_channel = "".to_owned();
         self.active_dm_peer = "".to_owned();
-        self.active_dm = crate::backend::no_dm_peer();
         self.history_view = false;
         self.active_channel_name = "".to_owned();
         self.active_channel_archived = false;
@@ -795,8 +794,6 @@ impl Ducktape {
             self.dm_peers.clone(),
             self.active_channel.to_owned(),
         );
-        self.active_dm =
-            crate::backend::dm_peer_named(self.dm_peers.clone(), self.active_dm_peer.to_owned());
         self.active_channel_name = next.active_channel_name.to_owned();
         self.active_channel_archived = next.active_channel_archived;
         self.active_channel_members_only = next.active_channel_members_only;
@@ -1354,8 +1351,6 @@ impl Ducktape {
             )),
             &self.active_dm_peer,
         );
-        self.active_dm =
-            crate::backend::dm_peer_named(self.dm_peers.clone(), self.active_dm_peer.to_owned());
         self.active_channel_name = crate::backend::keep_str(
             next.chat_loaded,
             &(next.active_channel_name),
@@ -2431,8 +2426,6 @@ impl Ducktape {
             self.dm_peers.clone(),
             self.channel_reads.clone(),
         );
-        self.active_dm =
-            crate::backend::dm_peer_named(self.dm_peers.clone(), self.active_dm_peer.to_owned());
         Task::none()
     }
     fn on_dm_peers_failed(&mut self, cause: crate::backend::HydrationError) -> Task<AppMessage> {
@@ -3360,8 +3353,6 @@ impl Ducktape {
             self.dm_peers.clone(),
             self.active_channel.to_owned(),
         );
-        self.active_dm =
-            crate::backend::dm_peer_named(self.dm_peers.clone(), self.active_dm_peer.to_owned());
         self.active_channel_name = next_channel.name.to_owned();
         self.active_channel_archived = next_channel.archived;
         self.active_channel_members_only = next_channel.members_only;
@@ -3428,7 +3419,6 @@ impl Ducktape {
             return Task::none();
         }
         self.active_dm_peer = "".to_owned();
-        self.active_dm = crate::backend::no_dm_peer();
         self.history_view = false;
         self.chat_at_tail = true;
         self.chat_land_seq = 0;
@@ -3495,8 +3485,6 @@ impl Ducktape {
             previous_handle.abort();
         }
         self.active_dm_peer = peer_key.to_owned();
-        self.active_dm =
-            crate::backend::dm_peer_named(self.dm_peers.clone(), self.active_dm_peer.to_owned());
         let dm_room =
             crate::backend::dm_room_of_peer(self.dm_peers.clone(), self.active_dm_peer.to_owned());
         self.history_view = false;
@@ -3763,8 +3751,6 @@ impl Ducktape {
             self.dm_peers.clone(),
             self.active_channel.to_owned(),
         );
-        self.active_dm =
-            crate::backend::dm_peer_named(self.dm_peers.clone(), self.active_dm_peer.to_owned());
         self.active_channel_name = next.active_channel_name.to_owned();
         self.active_channel_archived = next.active_channel_archived;
         self.active_channel_members_only = next.active_channel_members_only;
@@ -3858,8 +3844,6 @@ impl Ducktape {
             self.dm_peers.clone(),
             self.active_channel.to_owned(),
         );
-        self.active_dm =
-            crate::backend::dm_peer_named(self.dm_peers.clone(), self.active_dm_peer.to_owned());
         self.active_channel_name = next.active_channel_name.to_owned();
         self.active_channel_archived = next.active_channel_archived;
         self.active_channel_members_only = next.active_channel_members_only;
@@ -5044,7 +5028,6 @@ impl Ducktape {
         self.unread_boundary = 0;
         self.active_channel = "".to_owned();
         self.active_dm_peer = "".to_owned();
-        self.active_dm = crate::backend::no_dm_peer();
         self.history_view = false;
         self.active_channel_name = "".to_owned();
         self.active_channel_archived = false;

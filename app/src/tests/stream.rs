@@ -3,7 +3,7 @@ use super::*;
 /// A MIRRORED VIEW READING IS ONLY AS GOOD AS ITS WRITERS, SO THE WRITERS ARE
 /// PINNED. These fields exist purely so the view stops paying for them —
 /// sidebar rows, page-comment anchors, huddle tile mute readings,
-/// `post_refusal`, and `active_dm` — because a
+/// and `post_refusal` — because a
 /// `sync` extern takes every list BY VALUE and a call in a view expression is
 /// therefore a deep clone per frame (the room projection also ran a SHA-256 per DM
 /// peer, twice a frame). The trade is real: a mirror that a writer forgets is a
@@ -22,7 +22,7 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
     // `channel_id` from the account number it resolved itself, and `account_number`
     // is Settings' reading alone; THIS DEVICE'S KEY decides whether it is seated
     // in a members-only room.
-    const MIRRORS: [(&str, &[&str]); 5] = [
+    const MIRRORS: [(&str, &[&str]); 4] = [
         ("rooms", &["channels", "dm_peers", "channel_reads"]),
         ("dm_rows", &["channels", "dm_peers", "channel_reads"]),
         (
@@ -38,7 +38,6 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
                 "settings_user_key",
             ],
         ),
-        ("active_dm", &["active_dm_peer", "dm_peers"]),
     ];
 
     let mut checked = 0;
