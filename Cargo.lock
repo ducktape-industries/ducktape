@@ -3887,6 +3887,7 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "gateway",
+ "libc",
  "provider-host",
  "serde",
  "serde_json",

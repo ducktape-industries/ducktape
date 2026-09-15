@@ -11,9 +11,10 @@ base64.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 serde_json.workspace = true
 subtle = "2"
+libc.workspace = true
 
 provider-host.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync", "net", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "net", "time", "signal", "rt-multi-thread"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["process"] }
