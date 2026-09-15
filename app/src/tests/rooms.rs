@@ -48,12 +48,10 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
     }
     for mover in movers {
         let body = handler_body(mover);
-        for reading in ["self.active_dm_peer=", "self.history_view="] {
-            assert!(
-                body.contains(reading),
-                "{mover} moves the room without its {reading} reading"
-            );
-        }
+        assert!(
+            body.contains("self.history_view="),
+            "{mover} moves the room without updating history mode"
+        );
     }
 }
 
@@ -98,103 +96,6 @@ fn the_composers_are_out_of_reach_of_every_handler() {
     }
 }
 
-/// THE DM HEADER NAMES A PEER, AND THE ROOM IT NAMES HIM FOR IS `active_channel`.
-///
-/// A non-empty `active_dm_peer` draws `DmHeader` AND suppresses both the `#`
-/// glyph and `active_channel_name`, so a peer that outlived the room he named
-/// put Alice's face over #general's timeline with the room the composer posts
-/// into never named — and left two sidebar rows reading as selected. It is a
-/// derivation of the room now, so no landing can disagree with the pane.
-#[test]
-fn a_landing_in_another_room_retires_the_dm_header() {
-    let me = "aa";
-    let peer = "bb";
-    let dm = backend::dm_channel_id(me.into(), peer.into());
-
-    let (mut app, _) = Ducktape::boot();
-    app.loading = false;
-    app.account_number = me.into();
-    // THE DIRECTORY IS WHAT SAYS A ROOM IS A DM — `load_dm_peers` stamps each
-    // row's `channel_id` from the account number IT resolved, and all three DM
-    // decisions read that one field. A fixture that only sets `account_number`
-    // is a console whose account load has not landed, which is exactly the state
-    // that used to scatter DMs into the room list.
-    app.dm_peers = vec![backend::DmPeer {
-        key: peer.into(),
-        name: "Peer".into(),
-        initials: "P".into(),
-        is_agent: false,
-        channel_id: dm.clone(),
-    }];
-    app.active_dm_peer = peer.into();
-    app.active_channel = dm.clone();
-
-    // a search hit jumps to an ordinary room…
-    let _ = app.update(AppMessage::ChatUpdated(chat_data("general")));
-    assert!(
-        app.active_dm_peer.is_empty(),
-        "the peer does not follow the reader into #general"
-    );
-
-    // …and a landing inside the DM itself keeps him
-    app.active_dm_peer = peer.into();
-    let _ = app.update(AppMessage::ChatUpdated(chat_data(&dm)));
-    assert_eq!(app.active_dm_peer, peer, "this room IS his DM");
-
-    // the resync is the landing with no launch behind it — it moves the room
-    // on its own, which is how the peer used to survive every other route
-    let _ = app.update(AppMessage::LiveResynced(live_refresh(
-        app.hydration_generation,
-        "general",
-    )));
-    assert!(app.active_dm_peer.is_empty());
-
-    // BUT A RESYNC THAT MOVED NO ROOM DERIVES NOTHING. `choose_dm` names the
-    // peer optimistically and leaves `active_channel` on the room being left
-    // for the several blocks `open_dm` takes to answer; a plane-only resync
-    // landing in that window would otherwise derive the peer against the OLD
-    // room and blank him, and `chat_updated` then derives "" from "" — the DM
-    // opens under a `#` for good.
-    app.active_dm_peer = peer.into();
-    app.active_channel = "general".into();
-    let _ = app.update(AppMessage::LiveResynced(backend::LiveRefresh {
-        chat_loaded: false,
-        ..live_refresh(app.hydration_generation, "general")
-    }));
-    assert_eq!(
-        app.active_dm_peer, peer,
-        "the room did not move, so nothing about it was re-read"
-    );
-
-    // NOR DOES A CHAT-CARRYING ONE INSIDE THAT SAME WINDOW. `live_resync_load`
-    // is launched with today's `active_channel`, so a `ready`/`Lagged{chat}`
-    // resync lands `chat_loaded` on the room being LEFT — deriving against it
-    // blanks the peer just as permanently as the plane-only case above.
-    app.active_dm_peer = peer.into();
-    app.active_channel = "general".into();
-    app.loading = true;
-    let _ = app.update(AppMessage::LiveResynced(live_refresh(
-        app.hydration_generation,
-        "general",
-    )));
-    assert_eq!(
-        app.active_dm_peer, peer,
-        "a landing is in flight — it answers for the peer, this resync does not"
-    );
-    app.loading = false;
-
-    // A DIRECTORY THAT RESOLVED NO ACCOUNT OF OURS carries no channel id, so it
-    // claims no room: an unresolved directory must not invent a DM identity.
-    app.dm_peers[0].channel_id = String::new();
-    app.active_dm_peer = peer.into();
-    let _ = app.update(AppMessage::ChatUpdated(chat_data(&dm)));
-    assert!(app.active_dm_peer.is_empty());
-}
-
-// Entering a (possibly different) network through the doors' landing clears
-// every reading and draft of the previous one — and the in-flight huddle —
-// while the KEY password survives: it unlocks this device's user.key, not an
-// endpoint.
 #[test]
 fn opening_a_network_clears_the_previous_networks_state() {
     let (mut app, _) = Ducktape::boot();

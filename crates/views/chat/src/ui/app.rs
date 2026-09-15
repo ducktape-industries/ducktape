@@ -776,6 +776,20 @@ mod tests {
         let _ = state.update(Message::SidebarArrived(sidebar(5)));
         assert!(!state.dm_rows[0].unread);
         assert_eq!(state.active_dm.channel_id, mine);
+        let _ = state.update(Message::SessionArrived(Box::new(
+            crate::host::SessionItem {
+                next: crate::host::Session {
+                    active_channel: "general".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )));
+        assert!(state.active_dm.channel_id.is_empty());
+        assert!(
+            state.active_dm_peer.is_empty(),
+            "a room change retires the DM header immediately"
+        );
     }
 
     #[test]

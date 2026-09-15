@@ -943,34 +943,9 @@ pub async fn load_channel_window(
     })
 }
 
-/// One peer of the DM directory. There is no `status`: presence has no source
-/// anywhere in the product, and a dot that always reads "offline" is a lie.
-///
-/// `is_agent` identifies a keyless program account from its control record.
-///
-/// `channel_id` is the pair's deterministic two-party channel id
-/// (`dm_channel_id(me, key)`), computed once at load time rather than at
-/// every render. The prepared DIRECT projection uses it to attach the row's
-/// scalar unread reading when channels or read cursors move.
-#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
-pub struct DmPeer {
-    pub key: String,
-    pub name: String,
-    pub initials: String,
-    pub is_agent: bool,
-    pub channel_id: String,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct DmPeersData {
-    pub generation: i64,
-    pub peers: Vec<DmPeer>,
-}
-
-/// One DM peer per identity account, including keyless program accounts.
-/// The row and deterministic channel are keyed by account number, so a new
-/// device on either account reaches the same room.
-pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, HydrationError> {
+/// Refresh account names and this reader's DM room labels for desktop notices.
+/// The deployed view reads and presents its own directory independently.
+pub async fn refresh_dm_notifications(rpc: String, generation: i64) -> Result<i64, HydrationError> {
     async {
         let client = rpc_client(&rpc)?;
         let me = local_user_key().await;
@@ -986,34 +961,18 @@ pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, 
             .iter()
             .find(|account| is_mine(account))
             .map(|account| account.number.to_string());
-        let mut peers: Vec<DmPeer> = Vec::new();
-        for account in accounts {
-            if is_mine(&account) {
-                continue;
+        let mut rooms = std::collections::BTreeMap::new();
+        if let Some(mine) = my_number {
+            for account in accounts {
+                if is_mine(&account) {
+                    continue;
+                }
+                let channel_id = dm_channel_id(mine.clone(), account.number.to_string());
+                rooms.insert(channel_id, account.name);
             }
-            let key = account.number.to_string();
-            let is_agent = matches!(
-                account.control,
-                identity::Control::Program { .. } | identity::Control::Revoked { .. }
-            );
-            let name = account.name;
-            let channel_id = my_number
-                .as_ref()
-                .map(|mine| dm_channel_id(mine.clone(), key.clone()))
-                .unwrap_or_default();
-            peers.push(DmPeer {
-                initials: initials_of(&name),
-                is_agent,
-                key,
-                name,
-                channel_id,
-            });
         }
-        // THE DM ROOMS RIDE THIS LOAD TOO, for the reason the directory does:
-        // the live decoder cannot ask which rooms are mine without a query
-        // inside the fold, and this load already derived every one of them.
-        note_dm_rooms(&peers);
-        Ok(DmPeersData { generation, peers })
+        note_dm_rooms(rooms);
+        Ok(generation)
     }
     .await
     .map_err(|message: String| HydrationError {
@@ -1031,18 +990,6 @@ pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, 
 /// key. `chat::client`'s test round-trips the minted id against that rule.
 pub fn dm_channel_id(a: String, b: String) -> String {
     chat::client::dm_channel_id(&a, &b)
-}
-
-/// Keep the shell's selected peer only while its directory entry owns this room.
-/// The view resolves its own DM presentation from its directory subscription.
-pub fn dm_peer_of_channel(peer: String, peers: Vec<DmPeer>, channel: String) -> String {
-    let peer_owns_the_room = peers
-        .iter()
-        .any(|row| row.key == peer && !row.channel_id.is_empty() && row.channel_id == channel);
-    match peer_owns_the_room {
-        true => peer,
-        false => String::new(),
-    }
 }
 
 /// Why the viewer may not post here, as a stable reason token — empty when

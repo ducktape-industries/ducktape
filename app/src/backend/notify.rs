@@ -266,18 +266,11 @@ pub(crate) fn note_rooms(channels: &[ChatChannel], active: &str) {
     }
 }
 
-/// Record this reader's own DM rooms and what to call them — the directory
-/// load already derives both (`DmPeer.channel_id`, `DmPeer.name`).
-pub(crate) fn note_dm_rooms(peers: &[DmPeer]) {
-    let mine: BTreeSet<String> = peers
-        .iter()
-        .map(|peer| peer.channel_id.clone())
-        .filter(|id| !id.is_empty())
-        .collect();
+/// Record this reader's DM room IDs and the names used by desktop notices.
+pub(crate) fn note_dm_rooms(rooms: BTreeMap<String, String>) {
+    let mine = rooms.keys().cloned().collect();
     if let Ok(mut names) = ROOM_NAMES.write() {
-        for peer in peers.iter().filter(|peer| !peer.channel_id.is_empty()) {
-            names.insert(peer.channel_id.clone(), peer.name.clone());
-        }
+        names.extend(rooms);
     }
     if let Ok(mut rooms) = MY_DM_ROOMS.write() {
         *rooms = mine;
@@ -708,6 +701,18 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_directory_updates_room_labels_and_retires_old_dm_membership() {
+        let id = "dm-notification-directory-test";
+        note_dm_rooms(BTreeMap::from([(id.into(), "Ada".into())]));
+        assert!(in_my_dm(id));
+        assert_eq!(room_name(id), "Ada");
+        note_dm_rooms(BTreeMap::from([(id.into(), "Ada Lovelace".into())]));
+        assert_eq!(room_name(id), "Ada Lovelace");
+        note_dm_rooms(BTreeMap::new());
+        assert!(!in_my_dm(id));
+    }
 
     /// The fold's "is anyone looking" is what the windows last reported, on
     /// every host: focus taken is looking, focus lost is elsewhere.
