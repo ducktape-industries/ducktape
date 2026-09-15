@@ -317,6 +317,65 @@ fn this_nodes_own_seat_reads_why_it_has_no_ballot() {
     );
 }
 
+/// Every text under a fixed-height box keeps ONE line. A roster row is
+/// built at 32 px, a record header at 40 px and a filter tab at 28 px: a
+/// name, a role word, a capability tag or a presence word allowed to wrap
+/// breaks onto a second line and lands under the next row, so the rows
+/// overlap. The texts that MUST wrap — the error notice, the 64-hex key,
+/// an agent's capability line and the gate captions — sit in boxes with no
+/// fixed height, which is what lets this walk carry no allow-list: a
+/// wrapping text found under a fixed height is the defect itself.
+#[test]
+fn every_row_cell_keeps_one_line() {
+    use ducktape_view_guest::wire::{Length, Wrapping};
+
+    fn fixed_height(node: &Node) -> bool {
+        matches!(
+            node,
+            Node::Container {
+                height: Some(Length::Fixed(_)),
+                ..
+            } | Node::Linear {
+                height: Some(Length::Fixed(_)),
+                ..
+            } | Node::Button {
+                height: Some(Length::Fixed(_)),
+                ..
+            }
+        )
+    }
+
+    fn walk(node: &Node, under_fixed: bool, wrapping: &mut Vec<String>) {
+        let under_fixed = under_fixed || fixed_height(node);
+        if let Node::Text { key, options, .. } = node {
+            let one_line = options.wrapping == Some(Wrapping::None);
+            if under_fixed && !one_line {
+                wrapping.push(key.clone());
+            }
+        }
+        for child in node.children() {
+            walk(child, under_fixed, wrapping);
+        }
+    }
+
+    // the whole roster is on screen behind each record: a validator (this
+    // node), a resident with a ballot, and the agent whose row carries a
+    // capability caption
+    for label in [THIS_NODE, RESIDENT, "Reviewer Bot"] {
+        let frame = opened(true, label);
+        let mut wrapping = Vec::new();
+        walk(
+            frame.root.as_ref().expect("a drawn page"),
+            false,
+            &mut wrapping,
+        );
+        assert!(
+            wrapping.is_empty(),
+            "cells that may wrap in a fixed-height box, with {label} open: {wrapping:?}"
+        );
+    }
+}
+
 /// An admin opens a ballot over a resident: `op.submit` carrying the
 /// governance proposal, its id minted from the height the roster was read
 /// at. A non-admin reads the rule instead.
