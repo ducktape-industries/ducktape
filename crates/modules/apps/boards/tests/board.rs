@@ -22,6 +22,48 @@ fn path(kind: Kind) -> Shape {
     }
 }
 
+fn stack(board: &Board) -> Vec<&str> {
+    board.ordered().iter().map(|(id, _)| id.as_str()).collect()
+}
+
+#[test]
+fn stacking_names_what_rises_and_naming_everything_states_the_whole_stack() {
+    let board = blank()
+        .changed_many(&[create("a"), create("b"), create("c")])
+        .unwrap();
+    assert_eq!(stack(&board), ["a", "b", "c"]);
+    let raised = board
+        .changed(&Change::Order {
+            ids: vec!["a".into()],
+        })
+        .unwrap();
+    assert_eq!(stack(&raised), ["b", "c", "a"]);
+    // to send "a" back is to raise everything else, in its own order
+    let sunk = raised
+        .changed(&Change::Order {
+            ids: vec!["b".into(), "c".into()],
+        })
+        .unwrap();
+    assert_eq!(stack(&sunk), ["a", "b", "c"]);
+    // naming the whole board restores an exact stack, which is how undo works
+    let restored = sunk
+        .changed(&Change::Order {
+            ids: vec!["b".into(), "c".into(), "a".into()],
+        })
+        .unwrap();
+    assert_eq!(stack(&restored), stack(&raised));
+    for ids in [
+        vec!["a".into(), "a".into()],
+        vec!["missing".into()],
+        vec!["a".into(); MAX_SHAPES + 1],
+    ] {
+        assert!(board.changed(&Change::Order { ids }).is_err());
+    }
+    // a new shape still lands on top of a renumbered board
+    let after = raised.changed(&create("d")).unwrap();
+    assert_eq!(stack(&after).last(), Some(&"d"));
+}
+
 #[test]
 fn concurrent_fields_compose_and_same_field_follows_consensus_order() {
     let initial = blank().changed(&create("a")).unwrap();

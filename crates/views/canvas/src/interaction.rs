@@ -59,6 +59,11 @@ impl BoardsView {
         }
         match (command, key.as_str()) {
             (true, "a") => self.on_select_all(),
+            (true, "c") if !repeat => self.on_copy(),
+            (true, "x") if !repeat => self.on_cut(),
+            (true, "v") if !repeat => self.on_paste(),
+            (true, "]") if !repeat => self.on_stack(true),
+            (true, "[") if !repeat => self.on_stack(false),
             (true, "d") if !repeat => self.on_duplicate(),
             (true, "z") if shift => self.on_redo(),
             (true, "z") => self.on_undo(),
@@ -377,7 +382,7 @@ impl BoardsView {
                     point[0] = start[0];
                 }
             }
-            if self.snap && !self.modifiers.alt && !self.modifiers.shift {
+            if self.snap && !self.modifiers.control && !self.modifiers.shift {
                 let (offset, guides) =
                     self.snap_delta(shapes, [point[0] - start[0], point[1] - start[1]]);
                 point = [start[0] + offset[0], start[1] + offset[1]];
@@ -598,6 +603,21 @@ impl BoardsView {
         let gesture = std::mem::take(&mut self.gesture);
         self.guides.clear();
         match gesture {
+            // Alt on a drag duplicates: the shapes it carried are planted
+            // where the pointer let them go and the originals never moved,
+            // which is the same picture as dragging a copy off them.
+            Gesture::Move { start, point, .. } if self.modifiers.alt => {
+                let Some(board) = self.visible() else {
+                    return Task::none();
+                };
+                self.plant(
+                    self.selection_shapes(&board),
+                    [
+                        coordinate(point[0] - start[0]),
+                        coordinate(point[1] - start[1]),
+                    ],
+                )
+            }
             Gesture::Create { kind, start, point } => self.on_created(kind, start, point),
             Gesture::Sketch { points } => self.on_sketched(&points),
             Gesture::Erase { swept } => self.on_swept(swept),
@@ -678,7 +698,7 @@ impl BoardsView {
     }
     pub(super) fn zoom_at(&mut self, factor: f32, anchor: [f32; 2]) -> Task<Message> {
         let world = self.world(anchor);
-        self.zoom = (self.zoom * factor).clamp(0.2, 3.);
+        self.zoom = (self.zoom * factor).clamp(0.1, 8.);
         self.camera = [
             anchor[0] - world[0] * self.zoom,
             anchor[1] - world[1] * self.zoom,
@@ -714,7 +734,7 @@ impl BoardsView {
         };
         self.zoom = ((self.viewport[0] - 200.) / (b[2] - b[0]).max(1.))
             .min((self.viewport[1] - 200.) / (b[3] - b[1]).max(1.))
-            .clamp(0.2, 1.5);
+            .clamp(0.1, 2.);
         self.camera = [
             (self.viewport[0] - (b[2] - b[0]) * self.zoom) / 2. - b[0] * self.zoom,
             (self.viewport[1] - (b[3] - b[1]) * self.zoom) / 2. - b[1] * self.zoom,
@@ -921,18 +941,17 @@ impl BoardsView {
         }
         task
     }
-    pub(super) fn on_duplicate(&mut self) -> Task<Message> {
-        let Some(board) = self.visible() else {
-            return Task::none();
-        };
+    /// The selection as a copyable set: in stacking order, with the cards
+    /// before the connectors that name them, and without any connector whose
+    /// ends do not both land inside the set — that arrow has nothing on the
+    /// far end to be copied against.
+    fn selection_shapes(&self, board: &Board) -> Vec<(String, Shape)> {
         let picked: BTreeSet<_> = self
             .selected
             .iter()
             .filter(|id| board.shapes.contains_key(*id))
             .cloned()
             .collect();
-        // A copy keeps a binding only when the card it names is copied too;
-        // an arrow left pointing outside the selection has no copy to make.
         let whole = |s: &Shape| {
             [&s.from, &s.to]
                 .into_iter()
@@ -945,13 +964,21 @@ impl BoardsView {
             .filter(|(id, r)| picked.contains(*id) && whole(&r.shape))
             .map(|(id, r)| (id.clone(), r.shape.clone()))
             .collect();
-        // cards land before the arrows that name them
         shapes.sort_by_key(|(_, s)| s.from.is_some() || s.to.is_some());
+        shapes
+    }
+    /// Put a set of shapes on the board under fresh ids, shifted by `offset`.
+    /// Every id is minted before anything is written, so a mint that fails
+    /// leaves the board untouched rather than half-planted.
+    fn plant(&mut self, shapes: Vec<(String, Shape)>, offset: [i32; 2]) -> Task<Message> {
         if shapes.is_empty() {
             return Task::none();
         }
+        let Some(board) = self.visible() else {
+            return Task::none();
+        };
         if board.shapes.len() + shapes.len() > boards::MAX_SHAPES {
-            self.error = "Not enough room to duplicate this selection.".into();
+            self.error = "Not enough room on this board for that many shapes.".into();
             return Task::none();
         }
         let epoch = self.epoch;
@@ -961,17 +988,20 @@ impl BoardsView {
             for _ in &shapes {
                 match host::mint().await {
                     Ok(id) => ids.push(id),
-                    Err(error) => return Message::Duplicated(epoch, current, shapes, Err(error)),
+                    Err(error) => {
+                        return Message::Planted(epoch, current, shapes, offset, Err(error));
+                    }
                 }
             }
-            Message::Duplicated(epoch, current, shapes, Ok(ids))
+            Message::Planted(epoch, current, shapes, offset, Ok(ids))
         })
     }
-    pub(super) fn on_duplicated(
+    pub(super) fn on_planted(
         &mut self,
         epoch: u64,
         board: String,
         shapes: Vec<(String, Shape)>,
+        offset: [i32; 2],
         ids: Result<Vec<String>, String>,
     ) -> Task<Message> {
         if epoch != self.epoch || board != self.current {
@@ -984,6 +1014,8 @@ impl BoardsView {
                 return Task::none();
             }
         };
+        // a binding that named a copied card now names its copy; one that
+        // named anything else was already dropped from the set
         let mapping: BTreeMap<_, _> = shapes
             .iter()
             .zip(&ids)
@@ -993,8 +1025,8 @@ impl BoardsView {
             .into_iter()
             .zip(&ids)
             .map(|((_, mut s), id)| {
-                s.x = coordinate((s.x + 24) as f32);
-                s.y = coordinate((s.y + 24) as f32);
+                s.x = coordinate((s.x + offset[0]) as f32);
+                s.y = coordinate((s.y + offset[1]) as f32);
                 s.from = s.from.and_then(|id| mapping.get(&id).cloned());
                 s.to = s.to.and_then(|id| mapping.get(&id).cloned());
                 Change::Create {
@@ -1006,6 +1038,58 @@ impl BoardsView {
         let task = self.edit_many(changes);
         self.selected = ids.into_iter().collect();
         task
+    }
+    pub(super) fn on_duplicate(&mut self) -> Task<Message> {
+        let Some(board) = self.visible() else {
+            return Task::none();
+        };
+        self.plant(self.selection_shapes(&board), [24, 24])
+    }
+    /// The copy keeps the ids it was taken under, because a connector in the
+    /// set names its cards by id and the paste remaps from exactly those.
+    pub(super) fn on_copy(&mut self) -> Task<Message> {
+        let Some(board) = self.visible() else {
+            return Task::none();
+        };
+        self.clipboard = self.selection_shapes(&board);
+        Task::none()
+    }
+    pub(super) fn on_cut(&mut self) -> Task<Message> {
+        let copied = self.on_copy();
+        Task::batch([copied, self.on_delete()])
+    }
+    /// Paste under the pointer: the copied set keeps its own arrangement,
+    /// moved so its top-left corner meets the cursor.
+    pub(super) fn on_paste(&mut self) -> Task<Message> {
+        let shapes = self.clipboard.clone();
+        let Some(b) = bounds(shapes.iter().map(|(_, s)| s)) else {
+            return Task::none();
+        };
+        let at = self.world(self.cursor);
+        let offset = [coordinate(at[0] - b[0]), coordinate(at[1] - b[1])];
+        self.plant(shapes, offset)
+    }
+    /// Stacking: raising the selection puts it on top, and sinking it is
+    /// raising everything else — one primitive, both directions.
+    pub(super) fn on_stack(&mut self, front: bool) -> Task<Message> {
+        let Some(board) = self.visible() else {
+            return Task::none();
+        };
+        let order: Vec<String> = board
+            .ordered()
+            .into_iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        let ids: Vec<String> = order
+            .iter()
+            .filter(|id| self.selected.contains(*id) == front)
+            .cloned()
+            .collect();
+        let movable = !ids.is_empty() && ids.len() < order.len();
+        if !movable {
+            return Task::none();
+        }
+        self.edit(Change::Order { ids })
     }
     pub(super) fn on_quick_note(&mut self) -> Task<Message> {
         let p = self.world([self.viewport[0] / 2. - 110., self.viewport[1] / 2. - 90.]);
@@ -1037,93 +1121,61 @@ impl BoardsView {
         })
     }
     pub(super) fn on_template(&mut self) -> Task<Message> {
-        let shapes = vec![
+        let column = |name: &str, prompt: &str, at: i32, color: u8| {
             (
-                "ideas".into(),
+                name.to_owned(),
                 Shape {
                     kind: Kind::Note,
-                    x: 0,
+                    x: at,
                     y: 80,
                     width: 240,
                     height: 200,
-                    text: "Ideas\n\nWhat could we try?".into(),
-                    color: 0,
+                    text: format!("{name}\n\n{prompt}"),
+                    color,
                     ..Default::default()
                 },
-            ),
-            (
-                "questions".into(),
-                Shape {
-                    kind: Kind::Note,
-                    x: 300,
-                    y: 80,
-                    width: 240,
-                    height: 200,
-                    text: "Questions\n\nWhat do we need to learn?".into(),
-                    color: 1,
-                    ..Default::default()
-                },
-            ),
-            (
-                "next".into(),
-                Shape {
-                    kind: Kind::Note,
-                    x: 600,
-                    y: 80,
-                    width: 240,
-                    height: 200,
-                    text: "Next steps\n\nChoose one thing to move forward.".into(),
-                    color: 2,
-                    ..Default::default()
-                },
-            ),
-        ];
-        let epoch = self.epoch;
-        let board = self.current.clone();
-        Task::future(async move {
-            let mut ids = Vec::new();
-            for _ in &shapes {
-                match host::mint().await {
-                    Ok(id) => ids.push(id),
-                    Err(e) => return Message::Duplicated(epoch, board, shapes, Err(e)),
-                }
-            }
-            Message::Duplicated(epoch, board, shapes, Ok(ids))
-        })
+            )
+        };
+        self.plant(
+            vec![
+                column("Ideas", "What could we try?", 0, 0),
+                column("Questions", "What do we need to learn?", 300, 1),
+                column("Next steps", "Choose one thing to move forward.", 600, 2),
+            ],
+            [0, 0],
+        )
     }
-    pub(super) fn on_align(&mut self, vertical: bool) -> Task<Message> {
+    /// Line a selection up, or spread it evenly. Every arrangement is a set
+    /// of moves against the selection's own bounding box.
+    pub(super) fn on_arrange(&mut self, how: Arrange) -> Task<Message> {
         let Some(board) = self.visible() else {
             return Task::none();
         };
-        let Some(b) = bounds(self.selected.iter().filter_map(|id| {
-            board
-                .shapes
-                .get(id)
-                .filter(|r| free(&r.shape))
-                .map(|r| &r.shape)
-        })) else {
+        let mut picked: Vec<(String, Shape)> = self
+            .selected
+            .iter()
+            .filter_map(|id| {
+                board
+                    .shapes
+                    .get(id)
+                    .filter(|r| free(&r.shape))
+                    .map(|r| (id.clone(), r.shape.clone()))
+            })
+            .collect();
+        let Some(b) = bounds(picked.iter().map(|(_, s)| s)) else {
             return Task::none();
         };
-        self.edit_many(
-            self.selected
-                .iter()
-                .filter_map(|id| {
-                    board.shapes.get(id).map(|r| Change::Move {
-                        id: id.clone(),
-                        x: if vertical {
-                            r.shape.x
-                        } else {
-                            coordinate(b[0])
-                        },
-                        y: if vertical {
-                            coordinate(b[1])
-                        } else {
-                            r.shape.y
-                        },
-                    })
-                })
-                .collect(),
-        )
+        let changes = match how {
+            Arrange::SpreadX => spread(&mut picked, b, 0),
+            Arrange::SpreadY => spread(&mut picked, b, 1),
+            Arrange::Left => line_up(&picked, 0, |_| b[0]),
+            Arrange::CentreX => line_up(&picked, 0, |size| (b[0] + b[2] - size) / 2.),
+            Arrange::Right => line_up(&picked, 0, |size| b[2] - size),
+            Arrange::Top => line_up(&picked, 1, |_| b[1]),
+            Arrange::CentreY => line_up(&picked, 1, |size| (b[1] + b[3] - size) / 2.),
+            Arrange::Bottom => line_up(&picked, 1, |size| b[3] - size),
+        };
+        self.edit_many(changes)
     }
     fn snap_delta(
         &self,
@@ -1189,6 +1241,54 @@ const MAX_SAMPLES: usize = 4096;
 /// geometry of its own to drag: it follows the cards its ends name.
 pub(super) fn free(s: &Shape) -> bool {
     s.from.is_none() && s.to.is_none()
+}
+fn axis_start(s: &Shape, axis: usize) -> f32 {
+    if axis == 0 { s.x as f32 } else { s.y as f32 }
+}
+fn axis_size(s: &Shape, axis: usize) -> f32 {
+    if axis == 0 {
+        s.width as f32
+    } else {
+        s.height as f32
+    }
+}
+/// Move every shape onto one line along `axis`; `place` says where a shape of
+/// a given size starts on it.
+fn line_up(picked: &[(String, Shape)], axis: usize, place: impl Fn(f32) -> f32) -> Vec<Change> {
+    picked
+        .iter()
+        .map(|(id, s)| {
+            let at = coordinate(place(axis_size(s, axis)));
+            Change::Move {
+                id: id.clone(),
+                x: if axis == 0 { at } else { s.x },
+                y: if axis == 1 { at } else { s.y },
+            }
+        })
+        .collect()
+}
+/// Even gaps along `axis`, the selection's own extent kept. Two shapes have
+/// only one gap and nothing to even out.
+fn spread(picked: &mut [(String, Shape)], b: [f32; 4], axis: usize) -> Vec<Change> {
+    if picked.len() < 3 {
+        return Vec::new();
+    }
+    picked.sort_by(|a, c| axis_start(&a.1, axis).total_cmp(&axis_start(&c.1, axis)));
+    let filled: f32 = picked.iter().map(|(_, s)| axis_size(s, axis)).sum();
+    let gap = (b[axis + 2] - b[axis] - filled) / (picked.len() - 1) as f32;
+    let mut at = b[axis];
+    picked
+        .iter()
+        .map(|(id, s)| {
+            let start = coordinate(at);
+            at += axis_size(s, axis) + gap;
+            Change::Move {
+                id: id.clone(),
+                x: if axis == 0 { start } else { s.x },
+                y: if axis == 1 { start } else { s.y },
+            }
+        })
+        .collect()
 }
 pub(super) fn center(s: &Shape) -> [f32; 2] {
     [

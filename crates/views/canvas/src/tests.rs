@@ -564,3 +564,134 @@ fn a_board_of_strokes_stays_inside_the_hosts_geometry_budget() {
     ducktape_view_guest::wire::decode::<wire::Node>(&bytes)
         .expect("the host decodes every piece of geometry the scene drew");
 }
+
+fn stacking(view: &BoardsView) -> Vec<String> {
+    let board = view.visible().unwrap();
+    board
+        .ordered()
+        .iter()
+        .map(|(id, _)| (*id).clone())
+        .collect()
+}
+#[test]
+fn a_pasted_connector_binds_to_the_copies_and_not_the_originals() {
+    let mut view = view();
+    card(&mut view, "a", 0);
+    card(&mut view, "b", 400);
+    view.edit(Change::Create {
+        id: "edge".into(),
+        shape: Shape {
+            from: Some("a".into()),
+            to: Some("b".into()),
+            ..segment(Kind::Arrow)
+        },
+    });
+    view.selected = ["a".into(), "edge".into()].into();
+    view.on_copy();
+    assert_eq!(
+        view.clipboard.len(),
+        1,
+        "an arrow with an end outside the copy has nothing to be copied against"
+    );
+    view.selected = ["a".into(), "b".into(), "edge".into()].into();
+    view.on_copy();
+    let taken = view.clipboard.clone();
+    assert_eq!(taken.len(), 3);
+    view.on_paste();
+    // the ids are minted off-thread; answer the way the host would
+    view.on_planted(
+        0,
+        "room".into(),
+        taken,
+        [40, 40],
+        Ok(vec!["a2".into(), "b2".into(), "e2".into()]),
+    );
+    let board = view.visible().unwrap();
+    let copy = &board.shapes["e2"].shape;
+    assert_eq!(
+        (copy.from.as_deref(), copy.to.as_deref()),
+        (Some("a2"), Some("b2"))
+    );
+    assert_eq!(board.shapes["a2"].shape.x, 40);
+    assert_eq!(board.shapes["a"].shape.x, 0, "the original stays put");
+    assert_eq!(
+        view.selected,
+        ["a2".into(), "b2".into(), "e2".into()].into()
+    );
+}
+#[test]
+fn alt_drag_leaves_the_original_and_plants_the_copy_where_the_pointer_let_go() {
+    let mut view = view();
+    view.camera = [0., 0.];
+    card(&mut view, "a", 0);
+    view.selected = ["a".into()].into();
+    view.modifiers.alt = true;
+    drag(&mut view, &[[100., 70.], [300., 170.]]);
+    assert_eq!(
+        view.visible().unwrap().shapes["a"].shape.x,
+        0,
+        "an alt-drag never commits the move it was previewing"
+    );
+    view.on_planted(
+        0,
+        "room".into(),
+        vec![("a".into(), Shape::default())],
+        [200, 100],
+        Ok(vec!["copy".into()]),
+    );
+    let board = view.visible().unwrap();
+    assert_eq!(board.shapes["copy"].shape.x, 200);
+    assert_eq!(board.shapes["copy"].shape.y, 100);
+    assert_eq!(board.shapes["a"].shape.x, 0);
+}
+#[test]
+fn stacking_moves_a_shape_and_undo_puts_the_whole_stack_back() {
+    let mut view = view();
+    card(&mut view, "a", 0);
+    card(&mut view, "b", 300);
+    card(&mut view, "c", 600);
+    assert_eq!(stacking(&view), ["a", "b", "c"]);
+    view.selected = ["a".into()].into();
+    view.on_stack(true);
+    assert_eq!(stacking(&view), ["b", "c", "a"]);
+    view.on_stack(false);
+    assert_eq!(stacking(&view), ["a", "b", "c"]);
+    view.on_undo();
+    assert_eq!(
+        stacking(&view),
+        ["b", "c", "a"],
+        "undoing a re-stack restores the stack exactly, not approximately"
+    );
+    view.on_select_all();
+    view.on_stack(true);
+    assert_eq!(
+        stacking(&view),
+        ["b", "c", "a"],
+        "raising everything moves nothing"
+    );
+}
+#[test]
+fn arranging_lines_a_selection_up_and_spreads_it_evenly() {
+    let mut lined = view();
+    for (id, x) in [("a", 0), ("b", 100), ("c", 900)] {
+        card(&mut lined, id, x);
+    }
+    lined.on_select_all();
+    lined.on_arrange(Arrange::Right);
+    let board = lined.visible().unwrap();
+    for id in ["a", "b", "c"] {
+        let s = &board.shapes[id].shape;
+        assert_eq!(s.x + s.width, 1100, "every right edge on the far edge");
+    }
+    let mut spread = view();
+    for (id, x) in [("a", 0), ("b", 100), ("c", 800)] {
+        card(&mut spread, id, x);
+    }
+    spread.on_select_all();
+    spread.on_arrange(Arrange::SpreadX);
+    let board = spread.visible().unwrap();
+    // 1000 wide, 600 of it filled: two gaps of 200, the outermost two kept
+    assert_eq!(board.shapes["a"].shape.x, 0);
+    assert_eq!(board.shapes["b"].shape.x, 400);
+    assert_eq!(board.shapes["c"].shape.x, 800);
+}

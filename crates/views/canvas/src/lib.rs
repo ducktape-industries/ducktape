@@ -24,6 +24,19 @@ pub enum Tool {
     Draw,
     Eraser,
 }
+/// What the inspector does to a selection of two or more. One tagged value,
+/// so the arrangement is decided once and carried out in one place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Arrange {
+    Left,
+    CentreX,
+    Right,
+    Top,
+    CentreY,
+    Bottom,
+    SpreadX,
+    SpreadY,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 enum Gesture {
     #[default]
@@ -119,6 +132,11 @@ pub struct BoardsView {
     board_picker: bool,
     snap: bool,
     guides: Vec<[f32; 4]>,
+    /// What was copied, kept by the view: the host opens no clipboard door to
+    /// a guest, so a cut travels between this network's boards and no further.
+    /// The ids ride along because a connector in the set names its cards by
+    /// id, and the paste remaps from exactly those.
+    clipboard: Vec<(String, Shape)>,
     cameras: BTreeMap<String, ([f32; 2], f32)>,
     tool: Tool,
     camera: [f32; 2],
@@ -152,10 +170,15 @@ pub enum Message {
     TextTransaction(ducktape_view_guest::EditorTransaction<Message>),
     TextDocument(ducktape_view_guest::EditorDocumentUpdate),
     Duplicate,
-    Duplicated(
+    Copy,
+    Cut,
+    Paste,
+    Stack(bool),
+    Planted(
         u64,
         String,
         Vec<(String, Shape)>,
+        [i32; 2],
         Result<Vec<String>, String>,
     ),
     LockTool,
@@ -165,7 +188,7 @@ pub enum Message {
     SelectAll,
     FitSelection,
     ResetZoom,
-    Align(bool),
+    Arrange(Arrange),
     QuickNote,
     Template,
 
@@ -213,6 +236,7 @@ impl BoardsView {
                 board_picker: false,
                 snap: true,
                 guides: Vec::new(),
+                clipboard: Vec::new(),
                 cameras: BTreeMap::new(),
                 tool: Tool::Select,
                 camera: [80., 80.],
@@ -271,8 +295,12 @@ impl BoardsView {
             Message::TextTransaction(transaction) => self.on_text_transaction(transaction),
             Message::TextDocument(document) => self.on_text_document(document),
             Message::Duplicate => self.on_duplicate(),
-            Message::Duplicated(epoch, board, shapes, ids) => {
-                self.on_duplicated(epoch, board, shapes, ids)
+            Message::Copy => self.on_copy(),
+            Message::Cut => self.on_cut(),
+            Message::Paste => self.on_paste(),
+            Message::Stack(front) => self.on_stack(front),
+            Message::Planted(epoch, board, shapes, offset, ids) => {
+                self.on_planted(epoch, board, shapes, offset, ids)
             }
             Message::LockTool => self.on_lock_tool(),
             Message::Help => self.on_help(),
@@ -281,7 +309,7 @@ impl BoardsView {
             Message::SelectAll => self.on_select_all(),
             Message::FitSelection => self.on_fit_selection(),
             Message::ResetZoom => self.on_reset_zoom(),
-            Message::Align(vertical) => self.on_align(vertical),
+            Message::Arrange(how) => self.on_arrange(how),
             Message::QuickNote => self.on_quick_note(),
             Message::Template => self.on_template(),
             Message::Title(title) => self.on_title(title),
@@ -650,6 +678,14 @@ fn inverse(board: &Board, change: &Change) -> Vec<Change> {
                 }]
             })
             .unwrap_or_default(),
+        // A re-stack names what rises; the stack as it stands puts it all back.
+        Change::Order { .. } => vec![Change::Order {
+            ids: board
+                .ordered()
+                .into_iter()
+                .map(|(id, _)| id.clone())
+                .collect(),
+        }],
         Change::Delete { id } => {
             let Some(record) = board.shapes.get(id) else {
                 return Vec::new();

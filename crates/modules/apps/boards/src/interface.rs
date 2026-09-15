@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_BOARDS: usize = 64;
 pub const MAX_SHAPES: usize = 256;
@@ -92,12 +92,37 @@ pub enum Operation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Change {
-    Create { id: String, shape: Shape },
-    Move { id: String, x: i32, y: i32 },
-    Resize { id: String, width: i32, height: i32 },
-    Text { id: String, text: String },
-    Color { id: String, color: u8 },
-    Delete { id: String },
+    Create {
+        id: String,
+        shape: Shape,
+    },
+    Move {
+        id: String,
+        x: i32,
+        y: i32,
+    },
+    Resize {
+        id: String,
+        width: i32,
+        height: i32,
+    },
+    Text {
+        id: String,
+        text: String,
+    },
+    Color {
+        id: String,
+        color: u8,
+    },
+    /// Raise these shapes, in this order, above everything else on the board.
+    /// Naming every shape therefore states the whole stack — which is how a
+    /// re-stack is undone exactly, rather than approximately.
+    Order {
+        ids: Vec<String>,
+    },
+    Delete {
+        id: String,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -161,6 +186,7 @@ impl Board {
             Change::Resize { id, width, height } => self.resize(id, *width, *height),
             Change::Text { id, text } => self.text(id, text),
             Change::Color { id, color } => self.color(id, *color),
+            Change::Order { ids } => self.order(ids),
             Change::Delete { id } => self.delete(id),
         }
     }
@@ -168,6 +194,37 @@ impl Board {
         let mut shapes: Vec<_> = self.shapes.iter().collect();
         shapes.sort_by_key(|(id, record)| (record.created, *id));
         shapes
+    }
+    /// Stacking IS the creation order, so a re-stack renumbers it: the named
+    /// shapes go on top in the order given, everything else keeps its own
+    /// order underneath. Renumbering densely rather than hunting for a free
+    /// stamp at one end leaves no gaps and no end to run out of.
+    fn order(&mut self, ids: &[String]) -> Result<(), String> {
+        let named: BTreeSet<&String> = ids.iter().collect();
+        let addressable = named.len() == ids.len()
+            && ids.len() <= MAX_SHAPES
+            && ids.iter().all(|id| self.shapes.contains_key(id));
+        if !addressable {
+            return Err("Stacking names each shape on the board at most once.".into());
+        }
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or("Board revision exhausted.")?;
+        self.revision = revision;
+        let mut stack: Vec<String> = self
+            .ordered()
+            .into_iter()
+            .map(|(id, _)| id.clone())
+            .filter(|id| !named.contains(id))
+            .collect();
+        stack.extend(ids.iter().cloned());
+        for (stamp, id) in stack.into_iter().enumerate() {
+            if let Some(record) = self.shapes.get_mut(&id) {
+                record.created = stamp as u64;
+            }
+        }
+        Ok(())
     }
     fn create(&mut self, id: &str, shape: &Shape) -> Result<(), String> {
         if self.shapes.contains_key(id) {
