@@ -200,7 +200,7 @@ pub(super) async fn fetch_and_hydrate_genesis<
         client,
         blobs,
         &hash,
-        crate::constants::MAX_MODULE_CODE_BYTES,
+        crate::constants::MAX_GENESIS_BYTES,
         crate::constants::BLOB_FETCH_ATTEMPTS,
     )
     .await
