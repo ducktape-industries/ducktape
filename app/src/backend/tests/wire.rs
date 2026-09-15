@@ -499,38 +499,25 @@ async fn a_runs_op_is_a_plane_signal_the_agents_view_reads_on() {
 /// topic dropped here fails nothing else.
 #[test]
 fn the_live_stream_subscribes_to_every_plane_the_console_reads() {
-    const LIVE: &str = include_str!("../live.rs");
-    let list = LIVE
-        .split_once("rpc.module_events(")
-        .expect("the subscribe call")
-        .1
-        .split_once("],")
-        .expect("the topic list")
-        .0;
-    let topics: Vec<&str> = list
-        .lines()
-        .filter_map(|line| {
-            line.trim()
-                .strip_prefix('"')?
-                .split_once("\".to_string(),")
-                .map(|(topic, _)| topic)
-        })
-        .collect();
-    assert_eq!(
-        topics,
-        [
-            "chat",
-            "pages",
-            "inbox",
-            "forge",
-            "valset",
-            "governance",
-            "identity",
-            "agent",
-            "runs",
-            "files",
-        ]
-    );
+    let built_in = [
+        "chat",
+        "pages",
+        "inbox",
+        "forge",
+        "valset",
+        "governance",
+        "identity",
+        "agent",
+        "runs",
+        "files",
+    ];
+    assert_eq!(crate::backend::live::subscribed_planes(&[]), built_in);
+    // a registry-listed id rides after the built-in planes, once: a
+    // registered view reads its module's plane through `rpc.live`
+    let registry = ["boards".to_string(), "canvas".to_string(), "chat".to_string()];
+    let mut expected: Vec<&str> = built_in.to_vec();
+    expected.extend(["boards", "canvas"]);
+    assert_eq!(crate::backend::live::subscribed_planes(&registry), expected);
 }
 
 #[tokio::test(flavor = "current_thread")]

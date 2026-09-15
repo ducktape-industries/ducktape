@@ -21,6 +21,35 @@ struct LiveEventState {
     pending: Option<PendingLiveEvent>,
     retry_attempt: u32,
     publication_gate: Arc<tokio::sync::Semaphore>,
+    /// the registry ids the open stream was subscribed with; a registry that
+    /// has since listed more reopens the stream (cursors carry over)
+    registry_subscribed: Vec<String>,
+}
+
+/// The planes every console draws. A registry-listed id joins the list at
+/// connect — a registered view reads its module's plane through `rpc.live`.
+const BUILT_IN_PLANES: [&str; 10] = [
+    "chat",
+    "pages",
+    "inbox",
+    "forge",
+    "valset",
+    "governance",
+    "identity",
+    "agent",
+    "runs",
+    "files",
+];
+
+pub(crate) fn subscribed_planes(registry: &[String]) -> Vec<String> {
+    let mut planes: Vec<String> = BUILT_IN_PLANES.iter().map(|id| (*id).to_string()).collect();
+    for id in registry {
+        let built_in = planes.iter().any(|plane| plane == id);
+        if !built_in {
+            planes.push(id.clone());
+        }
+    }
+    planes
 }
 
 /// Merge one later, consecutive chat publication into `batch` when the shared
@@ -116,6 +145,7 @@ pub fn live_events(rpc: String) -> futures::stream::BoxStream<'static, LiveUpdat
             pending: None,
             retry_attempt: 0,
             publication_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            registry_subscribed: Vec::new(),
         },
         |mut state| async move {
             // One subscription item may exist outside this stream at a time.
@@ -130,6 +160,17 @@ pub fn live_events(rpc: String) -> futures::stream::BoxStream<'static, LiveUpdat
             if state.stream.is_none() && state.retry_attempt > 0 {
                 tokio::time::sleep(retry_delay(state.retry_attempt)).await;
             }
+            // A MODULE REGISTERED AFTER THIS STREAM OPENED HAS NO TOPIC ON IT.
+            // The block check reads the registry every block; once it lists an
+            // id this stream never asked for, the stream is reopened with it,
+            // resuming every held cursor.
+            let registry = crate::module_view::registered_module_ids();
+            let registry_grew = registry
+                .iter()
+                .any(|id| !state.registry_subscribed.contains(id));
+            if state.stream.is_some() && registry_grew {
+                state.stream = None;
+            }
             if state.stream.is_none() {
                 let connected = async {
                     let rpc = rpc_client(&state.rpc)?;
@@ -141,27 +182,16 @@ pub fn live_events(rpc: String) -> futures::stream::BoxStream<'static, LiveUpdat
                     // stays cold (`ModuleEvent::Refused`). `bin/noded` indexes
                     // no `valset` and no `governance`, so this list is only
                     // safe at all because of that.
-                    rpc.module_events(
-                        vec![
-                            "chat".to_string(),
-                            "pages".to_string(),
-                            "inbox".to_string(),
-                            "forge".to_string(),
-                            "valset".to_string(),
-                            "governance".to_string(),
-                            "identity".to_string(),
-                            "agent".to_string(),
-                            "runs".to_string(),
-                            "files".to_string(),
-                        ],
-                        state.cursors.clone(),
-                    )
-                    .await
-                    .map_err(Into::into)
+                    rpc.module_events(subscribed_planes(&registry), state.cursors.clone())
+                        .await
+                        .map_err(Into::into)
                 }
                 .await;
                 match connected {
-                    Ok(stream) => state.stream = Some(stream),
+                    Ok(stream) => {
+                        state.stream = Some(stream);
+                        state.registry_subscribed = registry;
+                    }
                     Err(error) => {
                         state.retry_attempt = state.retry_attempt.saturating_add(1);
                         let mut update = live_retry(error);
@@ -691,10 +721,9 @@ pub(crate) async fn folded_update(
         // either any more: the plane arm is what tells a module view's
         // `rpc.live` subscription, and each view re-reads exactly what it
         // has open.
-        "valset" | "governance" | "identity" | "agent" | "runs" | "files" | "pages" | "forge" => {
-            Some(live_plane(module, height))
-        }
-        _ => None,
+        // and so does a registry-listed module (the only other id the lane
+        // subscribes): its registered view re-reads its own plane.
+        _ => Some(live_plane(module, height)),
     }
 }
 
