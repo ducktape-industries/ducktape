@@ -25,19 +25,23 @@ impl BoardsView {
                 continue;
             };
             let s = &record.shape;
-            // Only what the box will move is inside the box. A connector that
-            // holds a card is carried by the cards it names, so it is not a
+            // Only what the box will move is inside the box. A connector held
+            // at BOTH ends is carried by the cards it names, so it is not a
             // member — and its stored rectangle is left where it was drawn,
             // which the run itself long since left. Counting it stretched the
             // box up to a corner nothing stood in.
-            if !free(s) {
+            if !draggable(s) {
                 continue;
             }
+            // What a half-held connector brings to the box is the run on the
+            // board, not the rectangle it was stored with: one end is wherever
+            // its card is now.
+            let box_ = drawn_rect(board, s);
             bounds = [
-                bounds[0].min(s.x as f32),
-                bounds[1].min(s.y as f32),
-                bounds[2].max((s.x + s.width) as f32),
-                bounds[3].max((s.y + s.height) as f32),
+                bounds[0].min(box_[0]),
+                bounds[1].min(box_[1]),
+                bounds[2].max(box_[2]),
+                bounds[3].max(box_[3]),
             ];
             shapes.insert(id.clone(), s.clone());
         }
@@ -522,7 +526,7 @@ impl BoardsView {
                 board
                     .shapes
                     .get(id)
-                    .filter(|r| free(&r.shape))
+                    .filter(|r| draggable(&r.shape))
                     .map(|r| (id.clone(), r.shape.clone()))
             })
             .collect();
@@ -1495,7 +1499,7 @@ impl BoardsView {
                 board
                     .shapes
                     .get(id)
-                    .filter(|r| free(&r.shape))
+                    .filter(|r| draggable(&r.shape))
                     .map(|r| (id.clone(), r.shape.clone()))
             })
             .collect();
@@ -1903,6 +1907,16 @@ pub(super) fn plate(run: &[[f32; 2]]) -> [f32; 4] {
 /// geometry of its own to drag: it follows the cards its ends name.
 pub(super) fn free(s: &Shape) -> bool {
     s.from.is_none() && s.to.is_none()
+}
+/// Whether a drag has anything of this shape's own to carry. A card always
+/// does. A connector only owns the ends no card is holding: one that is held
+/// follows its card and always has, so an arrow bound at both ends has nothing
+/// to move and moving it would be a lie. One bound at a SINGLE end still has a
+/// far end standing on its own point, and a drag that left it where it was —
+/// which is what refusing every bound connector did — was an arrow you could
+/// select, see selected, and not move.
+pub(super) fn draggable(s: &Shape) -> bool {
+    s.from.is_none() || s.to.is_none()
 }
 /// A card's smallest size, which the module enforces, and a run's, which it
 /// does not — a straight horizontal line is legitimately zero high.

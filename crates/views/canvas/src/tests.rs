@@ -1689,6 +1689,98 @@ fn a_card_that_already_holds_its_words_is_left_alone_and_a_refused_one_gives_the
 }
 
 #[test]
+fn an_arrow_held_at_one_end_still_moves_the_end_it_owns() {
+    let mut view = linked();
+    view.snap = false;
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    // Free the far end and leave the near one held. The arrow now owns one
+    // point and a card owns the other, and a drag used to move neither: every
+    // bound connector was refused, so this was an arrow you could select, see
+    // selected, and not move.
+    view.edit(Change::Route {
+        id: "edge".into(),
+        x: 200,
+        y: 70,
+        width: 160,
+        height: 90,
+        points: vec![[0, 0], [160, 90]],
+        from: Some("a".into()),
+        to: None,
+    });
+    let board = view.visible().unwrap();
+    let before = super::interaction::stroke(&board, &board.shapes["edge"].shape);
+    let loose = *before.last().unwrap();
+    // A quarter of the way along: the middle of a connector is its bend
+    // handle, and the rest of the line is what moves it.
+    let on_the_line = [
+        before[0][0] + (loose[0] - before[0][0]) * 0.25,
+        before[0][1] + (loose[1] - before[0][1]) * 0.25,
+    ];
+    view.selected = ["edge".into()].into();
+    drag(
+        &mut view,
+        &[
+            on_the_line,
+            [on_the_line[0] + 40., on_the_line[1] + 40.],
+            [on_the_line[0] + 60., on_the_line[1] + 60.],
+        ],
+    );
+    let board = view.visible().unwrap();
+    let edge = &board.shapes["edge"].shape;
+    assert_eq!(edge.from.as_deref(), Some("a"), "the drag broke the binding");
+    let after = super::interaction::stroke(&board, edge);
+    let moved = *after.last().unwrap();
+    assert!(
+        (moved[0] - (loose[0] + 60.)).abs() < 2. && (moved[1] - (loose[1] + 60.)).abs() < 2.,
+        "the free end went from {loose:?} to {moved:?} on a 60-unit drag"
+    );
+    // The held end is still the card's business, not the drag's.
+    let card = &board.shapes["a"].shape;
+    assert!(
+        super::interaction::contains(super::interaction::rect(card), after[0])
+            || (after[0][0] - (card.x + card.width) as f32).abs() < 2.,
+        "the held end left its card at {:?}",
+        after[0]
+    );
+}
+
+#[test]
+fn a_selection_box_holds_the_half_held_arrow_it_carries() {
+    let mut view = view();
+    view.snap = false;
+    card(&mut view, "a", 0);
+    view.edit(Change::Create {
+        id: "edge".into(),
+        shape: Shape {
+            x: 200,
+            y: 400,
+            from: Some("a".into()),
+            to: None,
+            ..segment(Kind::Arrow)
+        },
+    });
+    view.selected = ["a".into(), "edge".into()].into();
+    let board = view.visible().unwrap();
+    let (bounds, members) = view.group(&board).expect("two selected have a box");
+    assert_eq!(
+        members.len(),
+        2,
+        "the arrow owns an end, so the box moves it and must hold it"
+    );
+    // The box has to reach the end the arrow owns — which is down at y 490,
+    // not up where a card ends.
+    let run = super::interaction::stroke(&board, &board.shapes["edge"].shape);
+    let low = run.iter().fold(f32::MIN, |a, p| a.max(p[1]));
+    assert!(
+        bounds[1] + bounds[3] >= low - 1.,
+        "the box stops at {} and the arrow reaches {low}",
+        bounds[1] + bounds[3]
+    );
+}
+
+#[test]
 fn the_box_drawn_round_a_selection_is_the_box_round_what_it_moves() {
     let mut view = view();
     view.snap = false;
