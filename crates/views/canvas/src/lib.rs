@@ -121,20 +121,21 @@ struct Inline {
     /// keeps the height when the card is saved; leaving by Escape drops it
     /// with the words that asked for it.
     ///
-    /// It only ever grows within one sitting. Nothing feeds back into the
-    /// measurement — the gauge is as wide as the card and the card's width
-    /// does not change — except a round shape's inset, which is taken off the
-    /// shorter side and so widens as the card gets taller. Keeping the high
-    /// mark settles that in one step instead of letting it creep.
+    /// On a card it only ever grows within one sitting: a round shape's inset
+    /// is taken off the shorter side and so widens as the card gets taller, and
+    /// keeping the high mark settles that in one step instead of letting it
+    /// creep. On a text shape it tracks the words down as well, because a text
+    /// shape has no box of its own — it IS its words — and the box it gives
+    /// back is board you could not otherwise click through.
     grown: Option<f32>,
     /// The width in board units the words on a connector's plate take, as the
     /// host measured them. A card is written across the whole card, but a
     /// connector's words hug a plate centred on its line, so the box the caret
     /// lives in has to hug them too — otherwise the words sit at the left of
     /// the room set aside for them while you type and jump to the middle of
-    /// the line the moment you stop. Unlike the height this tracks the words
-    /// down as well as up: a plate that kept the width of a phrase you deleted
-    /// would rub out the line for no one.
+    /// the line the moment you stop. It tracks the words down as well as up: a
+    /// plate that kept the width of a phrase you deleted would rub out the line
+    /// for no one, and it is also the width a text shape hugs its words with.
     wide: Option<f32>,
 }
 mod editor_codec {
@@ -576,8 +577,13 @@ impl BoardsView {
     /// editor scrolls them out of sight, so the card grows under the caret and
     /// keeps the height when it is saved.
     ///
-    /// It never shrinks. Deleting a line leaves the room it made, the way a
+    /// A card never shrinks. Deleting a line leaves the room it made, the way a
     /// box you dragged wider stays wide.
+    ///
+    /// A text shape does, in both directions, because a text shape has no box
+    /// of its own — it IS its words, and a box left standing around words that
+    /// are no longer there is empty board you cannot click through, cannot draw
+    /// over, and that the alignment guides line the next shape up against.
     fn grown_change(&self, board: &Board, inline: &Inline) -> Option<Change> {
         let grown = inline.grown?;
         let shape = &board.shapes.get(&inline.id)?.shape;
@@ -586,11 +592,27 @@ impl BoardsView {
         if shape.kind.is_path() {
             return None;
         }
-        let needed = grown.ceil().clamp(1., boards::MAX_SIZE as f32) as i32;
-        (needed > shape.height).then(|| Change::Resize {
+        // Clamped to what the board will take: a shape outside the limits is
+        // refused whole, so a card fitted below the floor would not be fitted
+        // at all rather than fitted as far as the floor.
+        let needed = grown
+            .ceil()
+            .clamp(presentation::MIN_CARD[1] as f32, boards::MAX_SIZE as f32)
+            as i32;
+        let hugging = shape.kind == Kind::Text;
+        let height = match hugging {
+            true => needed,
+            false => needed.max(shape.height),
+        };
+        let width = match hugging {
+            true => self.hugged_width(inline, shape),
+            false => shape.width,
+        };
+        let moved = width != shape.width || height != shape.height;
+        moved.then(|| Change::Resize {
             id: inline.id.clone(),
-            width: shape.width,
-            height: needed,
+            width,
+            height,
         })
     }
     fn enqueue_many(&mut self, changes: Vec<Change>) -> Task<Message> {

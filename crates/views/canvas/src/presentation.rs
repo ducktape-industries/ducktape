@@ -148,6 +148,12 @@ const GRID: f32 = 32.;
 /// painter draws it, the editor opens over it, and a press inside it takes the
 /// connector, so the size is stated once here.
 pub(super) const PLATE: [f32; 2] = [200., 56.];
+/// The smallest box the board will take for a card, as `validate_shape` in the
+/// boards module states it. A shape outside the limits is refused whole, so a
+/// card being fitted to its words has to ask for a box inside them: asking for
+/// one pixel less than the floor is not a card fitted to the floor, it is a
+/// card that quietly stopped being fitted at all.
+pub(super) const MIN_CARD: [i32; 2] = [40, 32];
 /// The smallest type the board will draw. Under it letters stop being letters
 /// and start being grey noise, so nothing is drawn at all.
 const SMALLEST: f32 = 8.;
@@ -1122,10 +1128,11 @@ impl BoardsView {
     /// ask, and both get this answer, so a label never changes size or jumps to
     /// a different corner the moment you start typing — which would read as the
     /// editor having its own opinion about the text rather than showing yours.
-    /// Every card writes from the top of its box, because the native editor
-    /// fills the box it is given and cannot be centred in it: words that sat in
-    /// the middle when painted would jump to the top the instant a caret
-    /// appeared. So the painter writes where the editor can.
+    /// The native editor writes from the top-left of the box it is given and
+    /// cannot be aligned inside it, so wherever the painter puts a card's words
+    /// the editor has to be able to put them too: the box the caret lives in
+    /// carries the alignment instead of the words, and it is sized and placed
+    /// off this same answer.
     pub(super) fn lettering(&self, kind: Kind, size: [f32; 2]) -> Lettering {
         let plain = kind == Kind::Text;
         let edge = CARD_INSET * self.zoom;
@@ -1208,7 +1215,12 @@ impl BoardsView {
         // the left edge of whatever box it is given, so a box kept inside the
         // card would spend the margin pushing the words off the middle exactly
         // when the words are wide enough to need it.
-        let width = (wide + 2. * letters.size).max(1.);
+        let width = (wide + margin(&letters)).max(1.);
+        // A text shape IS its words: its corner is where you put it, so they
+        // start there and the box is only the room they need to be written in.
+        if kind == Kind::Text {
+            return (pos, [width, room[1]]);
+        }
         // It is the WORDS that go in the middle, not the box around them.
         let x = (pos[0] + (room[0] - wide) / 2.).max(pos[0]);
         // A connector's plate is centred on the run by the room it is given, so
@@ -1218,6 +1230,25 @@ impl BoardsView {
         };
         let down = ((room[1] - tall * self.zoom) / 2.).max(0.);
         ([x, pos[1] + down], [width, room[1] - down])
+    }
+    /// The box a text shape's words have come to, in board units: the words
+    /// themselves plus the margin the caret needs around them. It follows them
+    /// in both directions because the measurement it reads does not depend on
+    /// the box — a text shape has no column, so nothing about its size can feed
+    /// back into the size of its words.
+    pub(super) fn hugged_width(&self, inline: &Inline, shape: &Shape) -> i32 {
+        let Some(words) = inline.wide else {
+            return shape.width;
+        };
+        let room = [
+            shape.width as f32 * self.zoom,
+            shape.height as f32 * self.zoom,
+        ];
+        let letters = self.lettering(shape.kind, room);
+        let hugged = words + margin(&letters) / self.zoom;
+        hugged
+            .ceil()
+            .clamp(MIN_CARD[0] as f32, boards::MAX_SIZE as f32) as i32
     }
     /// A shape's words, pinned over its body and clipped to it.
     fn label(
@@ -1267,7 +1298,7 @@ impl BoardsView {
                 label,
                 &letters,
                 middling(s.kind),
-                column(s.kind, size[0], &letters),
+                column(s.kind, size[0], &letters, self.zoom),
             ),
         };
         Some(Node::Pin {
@@ -1478,8 +1509,7 @@ impl BoardsView {
                         || interaction::path_points(&shape),
                         |bound| interaction::stroke(board, &bound),
                     );
-                    let screen: Vec<_> =
-                        run.iter().map(|q| self.screen(q[0], q[1])).collect();
+                    let screen: Vec<_> = run.iter().map(|q| self.screen(q[0], q[1])).collect();
                     self.paint_stroke(*kind, &screen, accent, 8, out);
                     return;
                 }
@@ -1722,19 +1752,33 @@ fn float(
 }
 /// A card's words: the top-left of its own box, clipped to it, because a card
 /// is a page and a page fills from its corner.
-/// The column a shape's words are written in. A card's is narrower than the
-/// card by a margin, because the native editor keeps room inside the box it is
-/// given that a plain label does not: with the same words in the same column it
-/// takes one line more than the label does. The margin rides the type size so a
-/// card's height is the same whatever the camera is doing — a box that reflowed
-/// as you zoomed would resize itself for being looked at.
+/// The room a card keeps around its column, because the native editor keeps
+/// room inside the box it is given that a plain label does not: with the same
+/// words in the same column it takes one line more than the label does. It
+/// rides the type size so a card's height is the same whatever the camera is
+/// doing — a box that reflowed as you zoomed would resize itself for being
+/// looked at.
 ///
-/// The label, the gauge that measures it and the caret all wrap here, so what
-/// you type breaks where what is drawn breaks.
-pub(super) fn column(kind: Kind, room: f32, letters: &Lettering) -> f32 {
-    match kind.is_path() {
-        true => room,
-        false => (room - 2. * letters.size).max(40. + 2. * letters.inset),
+/// The label, the gauge that measures it, the caret and the box a text shape
+/// hugs its words with all read this one description of it.
+pub(super) fn margin(letters: &Lettering) -> f32 {
+    2. * letters.size
+}
+/// The column a shape's words are written in, on screen.
+pub(super) fn column(kind: Kind, room: f32, letters: &Lettering, zoom: f32) -> f32 {
+    match kind {
+        // A text shape has no column. It IS its words: as wide as the longest
+        // line, breaking only where you broke it. Wrapping it inside its own
+        // box would make the box the column, and a box that is its own column
+        // walks itself shut — each measurement narrower than the one that sized
+        // the box it was measured in.
+        Kind::Text => boards::MAX_SIZE as f32 * zoom,
+        Kind::Note | Kind::Rectangle | Kind::Ellipse | Kind::Diamond => {
+            (room - margin(letters)).max(40. + 2. * letters.inset)
+        }
+        // A connector's plate is the room, and the room is already the widest
+        // label a line is allowed to carry.
+        Kind::Arrow | Kind::Line | Kind::Draw => room,
     }
 }
 /// Whether a shape's words belong in the middle of it. A card drawn as a box
@@ -1768,12 +1812,10 @@ fn card_words(id: &str, words: Node, letters: &Lettering, middling: bool, room: 
         //
         // Wrapping rides the box's max width rather than the text's own width,
         // because a text told to fill cannot shrink, and a block that cannot
-        // shrink has no middle of its own.
-        *width = Some(match middling {
-            true => Length::Shrink,
-            false => Length::Fill,
-        });
-        *max_width = middling.then(|| room.max(1.));
+        // shrink has no middle of its own — nor any width for a text shape to
+        // take as its own.
+        *width = Some(Length::Shrink);
+        *max_width = Some(room.max(1.));
     }
     let mut clip = kit::container(format!("boards/label-clip/{id}"), held);
     if let Node::Container {
@@ -2218,7 +2260,7 @@ impl BoardsView {
         // only answer the first — it reports the column back whatever is
         // written in it. So the gauge shrinks to its words and wraps at the
         // column instead, which is the same wrap and therefore the same height.
-        let room = column(shape.kind, size[0], &letters);
+        let room = column(shape.kind, size[0], &letters, self.zoom);
         let mut padded = kit::container("boards/gauge-pad", gauge);
         if let Node::Container {
             padding,
