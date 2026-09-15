@@ -206,7 +206,7 @@ async fn gateway_attachment_replays_after_disconnect_and_explicit_close_ends_the
     drop(socket);
     assert!(
         !runtime
-            .replay(session.clone(), owner.clone(), 0)
+            .replay(session.clone(), owner.clone(), 0, 0)
             .await
             .unwrap()
             .ended

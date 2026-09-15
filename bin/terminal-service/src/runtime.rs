@@ -52,6 +52,7 @@ enum Request {
         session: String,
         caller: Caller,
         after: u64,
+        after_command: u64,
         reply: oneshot::Sender<Result<Replay, String>>,
     },
     Stop,
@@ -128,8 +129,9 @@ impl Machine {
                 session,
                 caller,
                 after,
+                after_command,
                 reply,
-            } => self.replay(session, caller, after, reply),
+            } => self.replay(session, caller, after, after_command, reply),
             Request::Stop => Self::stop(),
         }
     }
@@ -154,12 +156,26 @@ impl Machine {
         views: Vec<chat::MessageView>,
         reply: Reply,
     ) -> Vec<Action> {
+        let previous = self
+            .sessions
+            .status(&session, &caller)
+            .map(|status| status.command_cursor);
         match self.sessions.commands(&session, &caller, &owner, &views) {
-            Ok(commands) => vec![Action::Committed {
-                session,
-                commands,
-                reply,
-            }],
+            Ok(commands) => {
+                let current = self
+                    .sessions
+                    .status(&session, &caller)
+                    .map(|status| status.command_cursor);
+                let unchanged = previous == current;
+                if unchanged {
+                    return vec![Action::Reply(reply, Ok(()))];
+                }
+                vec![Action::Committed {
+                    session,
+                    commands,
+                    reply,
+                }]
+            }
             Err(error) => vec![Action::Reply(reply, Err(error))],
         }
     }
@@ -218,11 +234,13 @@ impl Machine {
         session: String,
         caller: Caller,
         after: u64,
+        after_command: u64,
         reply: oneshot::Sender<Result<Replay, String>>,
     ) -> Vec<Action> {
         vec![Action::Replay(
             reply,
-            self.sessions.replay(&session, &caller, after),
+            self.sessions
+                .replay(&session, &caller, after, after_command),
         )]
     }
 
@@ -429,12 +447,14 @@ impl Runtime {
         session: String,
         caller: Caller,
         after: u64,
+        after_command: u64,
     ) -> Result<Replay, String> {
         let (reply, result) = oneshot::channel();
         self.send(Request::Replay {
             session,
             caller,
             after,
+            after_command,
             reply,
         })
         .await?;
@@ -516,6 +536,7 @@ async fn execute(
                 commands,
                 reply,
             } => {
+                changes.send_replace(());
                 let result = committed(engine, &session, commands).await;
                 if result.is_err() {
                     actions.extend(machine.close(session));
@@ -667,6 +688,7 @@ mod tests {
             vec![Action::Committed {
                 session: session.clone(),
                 commands: vec![crate::consensus::Projected {
+                    seq: 1,
                     origin: "acct:7".into(),
                     text: "test".into(),
                 }],

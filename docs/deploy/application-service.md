@@ -163,6 +163,16 @@ executor. It runs the actual terminal executable through inherited-listener
 activation, readiness notification, token replacement, and signal shutdown.
 It does not boot an interactive guest session or install systemd units.
 
+Terminal attachments use `/sessions/{session}?after=<output-seq>&after_command=<chat-seq>`.
+Both cursors default to zero. Replay metadata gives `first`, `head`,
+`command_first`, and `command_head`; following `command` frames carry `seq`,
+`origin`, and `text`, while `output` frames carry `seq` and `data_b64`.
+Resume from frames actually consumed, not a snapshot head announced before those
+frames. Command sequence gaps include refused or deleted Chat posts. Command
+history records accepted execution requests, not proof that the program executed
+them. Output and command history each retain at most 256 KiB and 1024 entries in
+process memory; process restart does not restore terminal sessions.
+
 An application may bind up to 16 explicit read-only directories through
 `readonly_paths`, for example
 `[{"source":"/srv/tenant/forge","destination":"/var/lib/application-storage/git"}]`.

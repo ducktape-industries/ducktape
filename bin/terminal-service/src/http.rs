@@ -86,6 +86,8 @@ fn caller(headers: &HeaderMap, token: &[u8; 64], config: &Route) -> Option<Calle
 struct Cursor {
     #[serde(default)]
     after: u64,
+    #[serde(default)]
+    after_command: u64,
 }
 
 async fn upgrade(
@@ -105,7 +107,12 @@ async fn upgrade(
     let changes = service.runtime.changes();
     let replay = service
         .runtime
-        .replay(session.clone(), owner.clone(), cursor.after)
+        .replay(
+            session.clone(),
+            owner.clone(),
+            cursor.after,
+            cursor.after_command,
+        )
         .await
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(ws
@@ -163,8 +170,13 @@ async fn send(socket: &mut WebSocket, value: Value) -> Result<(), ()> {
     .map_err(|_| ())
 }
 
-async fn replay(socket: &mut WebSocket, snapshot: Replay) -> Result<u64, ()> {
-    send(socket, json!({"event":"replay", "first":snapshot.first, "head":snapshot.head, "ended":snapshot.ended})).await?;
+// Replay heads are snapshot bounds. Clients resume from the last frames they
+// consumed, not from these bounds before consuming the following frames.
+async fn replay(socket: &mut WebSocket, snapshot: Replay) -> Result<Cursor, ()> {
+    send(socket, json!({"event":"replay", "first":snapshot.first, "head":snapshot.head, "ended":snapshot.ended, "command_first":snapshot.command_first, "command_head":snapshot.command_head})).await?;
+    for command in snapshot.commands {
+        send(socket, json!({"event":"command", "seq":command.seq, "origin":command.origin, "text":command.text})).await?;
+    }
     for chunk in snapshot.chunks {
         send(
             socket,
@@ -172,7 +184,10 @@ async fn replay(socket: &mut WebSocket, snapshot: Replay) -> Result<u64, ()> {
         )
         .await?;
     }
-    Ok(snapshot.head)
+    Ok(Cursor {
+        after: snapshot.head,
+        after_command: snapshot.command_head,
+    })
 }
 
 async fn attached(
@@ -188,7 +203,7 @@ async fn attached(
         tokio::select! {
             changed = changes.changed() => {
                 changed.map_err(|_| ())?;
-                let snapshot = runtime.replay(session.clone(), owner.clone(), after).await.map_err(|_| ())?;
+                let snapshot = runtime.replay(session.clone(), owner.clone(), after.after, after.after_command).await.map_err(|_| ())?;
                 after = replay(&mut socket, snapshot).await?;
             }
             message = socket.recv() => {

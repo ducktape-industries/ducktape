@@ -71,6 +71,9 @@ pub struct Replay {
     pub first: u64,
     pub head: u64,
     pub chunks: Vec<Chunk>,
+    pub command_first: u64,
+    pub command_head: u64,
+    pub commands: Vec<crate::consensus::Projected>,
     pub ended: bool,
 }
 
@@ -83,6 +86,8 @@ struct Record {
     head: u64,
     inserted: u64,
     command_cursor: u64,
+    commands: VecDeque<crate::consensus::Projected>,
+    command_bytes: usize,
 }
 
 #[derive(Default)]
@@ -192,6 +197,8 @@ impl Sessions {
                 head: 0,
                 inserted: self.serial,
                 command_cursor: 0,
+                commands: VecDeque::new(),
+                command_bytes: 0,
             },
         );
         Ok(())
@@ -300,6 +307,19 @@ impl Sessions {
         if let Some(last) = previous {
             record.command_cursor = record.command_cursor.max(last);
         }
+        // Record accepted execution requests before dispatch, just as the
+        // native terminal records command stamps before writing to the PTY.
+        for command in &commands {
+            record.command_bytes += command.origin.len() + command.text.len();
+            record.commands.push_back(command.clone());
+        }
+        while record.command_bytes > MAX_REPLAY_BYTES || record.commands.len() > MAX_REPLAY_CHUNKS {
+            let oldest = record
+                .commands
+                .pop_front()
+                .expect("nonempty command history");
+            record.command_bytes -= oldest.origin.len() + oldest.text.len();
+        }
         Ok(commands)
     }
 
@@ -332,13 +352,33 @@ impl Sessions {
         })
     }
 
-    pub fn replay(&self, id: &str, caller: &Caller, after: u64) -> Result<Replay, String> {
+    pub fn replay(
+        &self,
+        id: &str,
+        caller: &Caller,
+        after: u64,
+        after_command: u64,
+    ) -> Result<Replay, String> {
         self.read(id, caller)?;
         let record = &self.records[id];
-        if after > record.head {
+        let ahead = after > record.head || after_command > record.command_cursor;
+        if ahead {
             return Err("resume cursor is ahead of this session".into());
         }
         Ok(Replay {
+            command_first: record
+                .commands
+                .front()
+                .map_or(record.command_cursor.saturating_add(1), |command| {
+                    command.seq
+                }),
+            command_head: record.command_cursor,
+            commands: record
+                .commands
+                .iter()
+                .filter(|command| command.seq > after_command)
+                .cloned()
+                .collect(),
             first: record
                 .chunks
                 .front()
@@ -441,14 +481,14 @@ mod tests {
                 .output(id, vec![b'x'; MAX_REPLAY_BYTES / 4])
                 .unwrap();
         }
-        let replay = sessions.replay(id, &owner, 0).unwrap();
+        let replay = sessions.replay(id, &owner, 0, 0).unwrap();
         assert_eq!(replay.first, 2);
         assert_eq!(replay.chunks.len(), 4);
         assert_eq!(replay.head, 5);
         assert!(!replay.ended);
         assert!(sessions.end(id));
         assert!(!sessions.end(id));
-        assert!(sessions.replay(id, &owner, 5).unwrap().ended);
+        assert!(sessions.replay(id, &owner, 5, 0).unwrap().ended);
         assert!(sessions.output(id, vec![0]).is_err());
     }
 
@@ -461,7 +501,7 @@ mod tests {
             .insert(id.into(), owner.clone(), Mode::Single)
             .unwrap();
         assert!(sessions.output(id, Vec::new()).is_err());
-        let replay = sessions.replay(id, &owner, 0).unwrap();
+        let replay = sessions.replay(id, &owner, 0, 0).unwrap();
         assert_eq!(replay.head, 0);
         assert!(replay.chunks.is_empty());
     }
@@ -487,9 +527,9 @@ mod tests {
         sessions
             .insert(extra.clone(), owner.clone(), Mode::Single)
             .unwrap();
-        assert!(sessions.replay(ended, &owner, 0).is_err());
-        assert!(sessions.replay("0000000000000000", &owner, 0).is_ok());
-        assert!(sessions.replay(&extra, &owner, 1).is_err());
+        assert!(sessions.replay(ended, &owner, 0, 0).is_err());
+        assert!(sessions.replay("0000000000000000", &owner, 0, 0).is_ok());
+        assert!(sessions.replay(&extra, &owner, 1, 0).is_err());
     }
 
     struct PtyProvider;
@@ -575,7 +615,7 @@ mod tests {
             Effect::Changed(session.clone())
         );
         assert_eq!(engine.live(), 0);
-        assert!(sessions.replay(&session, &owner, 0).unwrap().ended);
+        assert!(sessions.replay(&session, &owner, 0, 0).unwrap().ended);
         assert!(!directory.path().join(session).exists());
     }
 
@@ -613,7 +653,7 @@ mod tests {
                     reason: wire::Refusal::UnknownProvider
                 }
             );
-            assert!(sessions.replay(&session, &owner, 0).unwrap().ended);
+            assert!(sessions.replay(&session, &owner, 0, 0).unwrap().ended);
         }
         assert_eq!(engine.live(), 0);
     }
@@ -641,7 +681,13 @@ mod tests {
             Effect::None
         );
         assert!(sessions.write(active, &owner, Write::Input).is_ok());
-        assert!(sessions.replay(ended, &owner, 0).unwrap().chunks.is_empty());
+        assert!(
+            sessions
+                .replay(ended, &owner, 0, 0)
+                .unwrap()
+                .chunks
+                .is_empty()
+        );
     }
 
     #[test]
@@ -686,7 +732,7 @@ mod tests {
                 .unwrap(),
             Effect::None
         );
-        let replay = sessions.replay(&session, &owner, 0).unwrap();
+        let replay = sessions.replay(&session, &owner, 0, 0).unwrap();
         assert!(replay.ended);
         assert_eq!(replay.chunks[0].bytes, b"hi");
     }
@@ -703,7 +749,7 @@ mod tests {
         for _ in 0..2048 {
             sessions.output(id, vec![1]).unwrap();
         }
-        let replay = sessions.replay(id, &owner, 0).unwrap();
+        let replay = sessions.replay(id, &owner, 0, 0).unwrap();
         assert_eq!(replay.chunks.len(), 1024);
         assert_eq!(replay.first, 1025);
         assert_eq!(replay.head, 2048);

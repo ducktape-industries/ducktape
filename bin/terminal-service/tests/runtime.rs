@@ -33,7 +33,7 @@ async fn create_refusal_is_answered_and_stopping_the_runtime_finishes_its_task()
         .await
         .unwrap_err();
     assert!(error.contains("unknown_provider"), "{error}");
-    assert!(runtime.replay(session, caller, 0).await.unwrap().ended);
+    assert!(runtime.replay(session, caller, 0, 0).await.unwrap().ended);
     drop(runtime);
     task.await.unwrap().unwrap();
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
@@ -148,7 +148,7 @@ async fn cancelled_slow_create_does_not_block_existing_input_or_leave_a_pty() {
         .unwrap();
     loop {
         let replay = runtime
-            .replay(first.into(), caller.clone(), 0)
+            .replay(first.into(), caller.clone(), 0, 0)
             .await
             .unwrap();
         let output: Vec<u8> = replay
@@ -162,7 +162,7 @@ async fn cancelled_slow_create_does_not_block_existing_input_or_leave_a_pty() {
         if echoed {
             assert!(
                 runtime
-                    .replay(first.into(), caller.clone(), replay.head)
+                    .replay(first.into(), caller.clone(), replay.head, 0)
                     .await
                     .unwrap()
                     .chunks
@@ -179,7 +179,7 @@ async fn cancelled_slow_create_does_not_block_existing_input_or_leave_a_pty() {
     release.notify_one();
     loop {
         if runtime
-            .replay(second.into(), caller.clone(), 0)
+            .replay(second.into(), caller.clone(), 0, 0)
             .await
             .unwrap()
             .ended
@@ -319,7 +319,7 @@ async fn shared_commands_are_ordered_deduplicated_and_do_not_accept_raw_input() 
         .unwrap();
     loop {
         let replay = runtime
-            .replay(session.clone(), owner.clone(), 0)
+            .replay(session.clone(), owner.clone(), 0, 0)
             .await
             .unwrap();
         let output: Vec<u8> = replay
@@ -340,6 +340,67 @@ async fn shared_commands_are_ordered_deduplicated_and_do_not_accept_raw_input() 
         }
         changes.changed().await.unwrap();
     }
+    // Reconnect with independent output and committed-command cursors.
+    use futures::StreamExt as _;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    let app = ducktape_terminal::http::router(
+        ducktape_terminal::http::Route {
+            account: 7,
+            label: "terminal".into(),
+        },
+        [b'a'; 64],
+        runtime.clone(),
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut request = format!("ws://{address}/sessions/{session}?after=0&after_command=70")
+        .into_client_request()
+        .unwrap();
+    for (name, value) in [
+        ("x-duck-upstream-token", "a".repeat(64)),
+        ("x-duck-route-account", "7".into()),
+        ("x-duck-route-label", "terminal".into()),
+        ("x-duck-route-revision", "1".into()),
+        ("x-duck-caller-account", "7".into()),
+        ("x-duck-caller-node", "01".repeat(32)),
+    ] {
+        request.headers_mut().insert(name, value.parse().unwrap());
+    }
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let metadata = socket.next().await.unwrap().unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(metadata.to_text().unwrap()).unwrap();
+    assert_eq!(metadata["command_head"], 71);
+    let command = socket.next().await.unwrap().unwrap();
+    let command: serde_json::Value = serde_json::from_str(command.to_text().unwrap()).unwrap();
+    assert_eq!(
+        command,
+        serde_json::json!({"event":"command", "seq":71, "origin":"acct:7", "text":"marker"})
+    );
+    runtime
+        .committed(
+            session.clone(),
+            owner.clone(),
+            chat::Party::Account(7),
+            vec![committed_message(72, 7, "live")],
+        )
+        .await
+        .unwrap();
+    loop {
+        let event = socket.next().await.unwrap().unwrap();
+        let event: serde_json::Value = serde_json::from_str(event.to_text().unwrap()).unwrap();
+        if event["event"] == "command" {
+            assert_eq!(event["seq"], 72);
+            assert_eq!(event["text"], "live");
+            break;
+        }
+    }
+    socket.close(None).await.unwrap();
+    server.abort();
+    let _ = server.await;
     runtime.stop().await.unwrap();
     task.await.unwrap().unwrap();
 }
@@ -384,7 +445,7 @@ async fn failed_committed_query_closes_the_shared_session() {
     let mut changes = runtime.changes();
     loop {
         if runtime
-            .replay(session.clone(), owner.clone(), 0)
+            .replay(session.clone(), owner.clone(), 0, 0)
             .await
             .unwrap()
             .ended
@@ -491,7 +552,7 @@ async fn projector_delivers_http_commands_and_session_end_cancels_a_pending_quer
     let mut changes = runtime.changes();
     loop {
         let replay = runtime
-            .replay(session.clone(), owner.clone(), 0)
+            .replay(session.clone(), owner.clone(), 0, 0)
             .await
             .unwrap();
         let bytes: Vec<u8> = replay

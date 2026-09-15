@@ -49,10 +49,10 @@ fn render_author(author: &chat::Party) -> String {
 }
 
 /// one committed command ready for the pty: the verified `origin` and the
-/// decoded `text`. Deliberately does NOT carry the seq — the projector owns the
-/// per-session cursor.
-#[derive(Debug, PartialEq, Eq)]
+/// decoded `text`, retaining the committed sequence for attachment replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Projected {
+    pub seq: u64,
     pub origin: String,
     pub text: String,
 }
@@ -93,6 +93,7 @@ pub fn project_message(
         return Err("command_not_channel_owner");
     }
     Ok(Projected {
+        seq: view.seq,
         origin: render_author(&view.head.author),
         text: command_text(&view.head.blocks),
     })
@@ -416,6 +417,82 @@ mod tests {
         assert_eq!(
             channel_owner(Some(channel(Some(HOST.into())))),
             Ok(Party::Key(HOST.to_vec())),
+        );
+    }
+
+    #[test]
+    fn command_replay_has_an_independent_cursor_and_bounded_history() {
+        let caller = crate::state::Caller {
+            account: 7,
+            node: [1; 32],
+        };
+        let mut sessions = crate::state::Sessions::default();
+        let id = "0000000000000001";
+        sessions
+            .insert(id.into(), caller.clone(), crate::state::Mode::Shared)
+            .unwrap();
+        sessions.created(id);
+        let owner = Party::Account(7);
+        for seq in 1..=1100 {
+            sessions
+                .commands(
+                    id,
+                    &caller,
+                    &owner,
+                    &[view(seq, owner.clone(), command_blocks("pwd"), false)],
+                )
+                .unwrap();
+        }
+        let snapshot = sessions.replay(id, &caller, 0, 0).unwrap();
+        assert_eq!(snapshot.head, 0);
+        assert_eq!(snapshot.command_head, 1100);
+        assert_eq!(snapshot.command_first, 77);
+        assert_eq!(snapshot.commands.len(), 1024);
+        let resumed = sessions.replay(id, &caller, 0, 1099).unwrap();
+        assert_eq!(resumed.commands.len(), 1);
+        assert_eq!(resumed.commands[0].seq, 1100);
+        assert_eq!(resumed.commands[0].origin, "acct:7");
+        sessions
+            .commands(
+                id,
+                &caller,
+                &owner,
+                &[view(
+                    1101,
+                    Party::Account(8),
+                    command_blocks("refused"),
+                    false,
+                )],
+            )
+            .unwrap();
+        let skipped = sessions.replay(id, &caller, 0, 1100).unwrap();
+        assert_eq!(skipped.command_head, 1101);
+        assert!(skipped.commands.is_empty());
+        assert!(sessions.replay(id, &caller, 0, 1102).is_err());
+        for seq in 1102..=1110 {
+            sessions
+                .commands(
+                    id,
+                    &caller,
+                    &owner,
+                    &[view(
+                        seq,
+                        owner.clone(),
+                        command_blocks(&"x".repeat(60 * 1024)),
+                        false,
+                    )],
+                )
+                .unwrap();
+        }
+        let large = sessions.replay(id, &caller, 0, 0).unwrap();
+        assert_eq!(large.commands.len(), 4);
+        assert!(
+            large
+                .commands
+                .iter()
+                .map(|command| command.text.len() + command.origin.len())
+                .sum::<usize>()
+                <= crate::state::MAX_REPLAY_BYTES
         );
     }
 
