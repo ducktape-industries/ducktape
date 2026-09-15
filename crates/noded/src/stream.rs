@@ -1206,7 +1206,7 @@ impl TopicState {
 /// Serve one ws connection.
 ///
 /// `reader_of` is the ONE capability this socket may have been given before it
-/// existed: the dispatch id whose output ring the caller proved it created
+/// existed: the dispatch id whose output ring the caller proved it may read
 /// ([`admit_run_reader`]). It is set at the upgrade and never changes, so a
 /// connection cannot talk its way into another run's output mid-session.
 pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle, reader_of: Option<String>) {
@@ -2139,9 +2139,8 @@ impl TopicRefusal {
                  the workspace and send it as `token` on the subscribe"
             }
             Self::NotThisRunsReader => {
-                "a run's output is for the device that hosts this node or the key \
-                 that created the run — present the service-link token, or open \
-                 the socket as `/v1/ws?run=<dispatch>` signed by that key"
+                "run output requires the workspace token, the requester, or its program \
+                 controller — open `/v1/ws?run=<dispatch>` signed by an authorized key"
             }
         }
     }
@@ -2168,31 +2167,55 @@ fn refuse_topic(topic: &str, refusal: TopicRefusal) -> ServerFrame {
     }
 }
 
-/// Is `requester` the key that signed this upgrade?
-///
-/// A chat run is created by a SIGNED FRAME the app submits, so the committed
-/// run's `requester` is `Origin::External(<that key>)` — the same bytes
-/// [`crate::signed_req::verify_signed_request`] hands back. The two are compared
-/// directly: no account lookup stands between them, and no authority is
-/// invented. The device that asked for the work may watch it.
-///
-/// NARROWER THAN CANCELLING ON PURPOSE. `runs`'s own rule
-/// (`admin.rs::controlled_dispatch_id`) also lets the agent's program controller
-/// stop a run; that arm needs an in-module `control_model` read this node cannot
-/// make, so it is left out. Leaving it out refuses a reader who could have been
-/// admitted; it admits nobody who could not.
-pub(crate) fn created_by(requester: &sdk::Origin, key: &[u8]) -> bool {
-    matches!(requester, sdk::Origin::External(id) if id == key)
+/// An external requester proves its exact key. A program requester has no
+/// key: its current controller's key-held account may read and steer its runs.
+/// Module/system origins grant no interactive authority. Both the live and
+/// settled paths resolve the same committed identity records.
+pub(crate) async fn run_reader(
+    handle: &NodeHandle,
+    requester: &sdk::Origin,
+    key: &[u8],
+) -> Result<bool, String> {
+    match requester {
+        sdk::Origin::External(id) => Ok(!id.is_empty() && id == key),
+        sdk::Origin::Program(number) => program_run_reader(handle, *number, key).await,
+        sdk::Origin::Module(_) | sdk::Origin::System => Ok(false),
+    }
 }
 
-/// Admit a `/v1/ws?run=<dispatch>` upgrade as that run's creator, or answer the
+async fn program_run_reader(handle: &NodeHandle, number: u64, key: &[u8]) -> Result<bool, String> {
+    let (reply, rx) = futures::channel::oneshot::channel();
+    handle
+        .send(crate::NodeCommand::Query {
+            target: "identity".into(),
+            req: identity::encode_query(&identity::IdentityQuery::Get { number }),
+            reply,
+        })
+        .await
+        .map_err(|_| "actor gone".to_string())?;
+    let bytes = rx.await.map_err(|_| "reply dropped".to_string())??;
+    let identity::IdentityReply::Account(account) = identity::decode_reply(&bytes)? else {
+        return Err("unexpected identity reply".into());
+    };
+    let Some(identity::AccountView {
+        control: identity::Control::Program { controller, .. },
+        ..
+    }) = account
+    else {
+        return Ok(false);
+    };
+    let reader = crate::term_consensus::account_of_key(handle, key.to_vec()).await?;
+    Ok(reader == Some(controller))
+}
+
+/// Admit a `/v1/ws?run=<dispatch>` upgrade as a run reader, or answer the
 /// refusal to send instead.
 ///
 /// Two steps, in this order, because the cheap one is the one that must not be
 /// skipped: the signature over `GET` + this exact path+query + an empty body
 /// (the data-plane trio, carried as headers so the proof never enters a query
-/// string or a log), then ONE committed `runs` read asking whether the key that
-/// signed it created this dispatch.
+/// string or a log), then committed run and identity reads resolving the
+/// requester or its current program controller.
 ///
 /// Decided BEFORE the socket exists, which is what keeps
 /// [`subscribe_topics`] synchronous: the committed read happens once per
@@ -2214,11 +2237,18 @@ pub(crate) async fn admit_run_reader(
     let pending = pending_runs(handle).await.map_err(|reason| {
         crate::error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, &reason)
     })?;
-    let created = match pending.iter().find(|run| run.dispatch_id == dispatch) {
-        Some(run) => created_by(&run.requester, &key),
-        None => indexed_run_creator(handle, dispatch, &key).await?,
+    let authorized = match pending.iter().find(|run| run.dispatch_id == dispatch) {
+        Some(run) => run_reader(handle, &run.requester, &key)
+            .await
+            .map_err(|_| {
+                crate::error_response(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Could not verify run access.",
+                )
+            })?,
+        None => indexed_run_reader(handle, dispatch, &key).await?,
     };
-    if !created {
+    if !authorized {
         // the same sentence the topic refusal carries, for the same reason: it
         // names what to present and never what this node holds. A run that has
         // owned by someone else is indistinguishable from an unknown run —
@@ -2240,7 +2270,7 @@ pub(crate) async fn admit_run_reader(
 
 /// Settled runs retain their creator in the materialized journal. Missing or
 /// evicted live output remains an empty trace, never a reason to widen access.
-async fn indexed_run_creator(
+async fn indexed_run_reader(
     handle: &NodeHandle,
     dispatch: &str,
     key: &[u8],
@@ -2287,7 +2317,16 @@ async fn indexed_run_creator(
             )
         })?;
     match reply {
-        runs::index::RunsViewReply::Run(Some(detail)) => Ok(created_by(&detail.run.requester, key)),
+        runs::index::RunsViewReply::Run(Some(detail)) => {
+            run_reader(handle, &detail.run.requester, key)
+                .await
+                .map_err(|_| {
+                    crate::error_response(
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "Could not verify run access.",
+                    )
+                })
+        }
         runs::index::RunsViewReply::Run(None) | runs::index::RunsViewReply::Runs(_) => Ok(false),
     }
 }
@@ -3916,25 +3955,176 @@ mod tests {
         assert!(prepare_topic("metrics", NO_SECRET, NO_RUN, None, None).is_ok());
     }
 
-    /// THE AUTHORITY RULE, stated over every origin a run can have.
-    ///
-    /// Only an external submitter — a device holding a key — can prove itself
-    /// over a signed upgrade at all. A run a program or the system created has no
-    /// key behind it, so no signature admits one, whatever it signs with.
-    #[test]
-    fn only_the_external_key_that_created_a_run_is_its_reader() {
-        let key = [7u8; 32];
-        assert!(created_by(&sdk::Origin::External(key.to_vec()), &key));
-        assert!(!created_by(&sdk::Origin::External(vec![9u8; 32]), &key));
-        assert!(!created_by(&sdk::Origin::External(Vec::new()), &key));
-        // a truncated prefix of the right key is a different key.
-        assert!(!created_by(
-            &sdk::Origin::External(key[..16].to_vec()),
-            &key
-        ));
-        assert!(!created_by(&sdk::Origin::Program(7), &key));
-        assert!(!created_by(&sdk::Origin::Module("runs".into()), &key));
-        assert!(!created_by(&sdk::Origin::System, &key));
+    #[tokio::test]
+    async fn program_runs_admit_only_the_current_controller_through_a_signed_upgrade() {
+        use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+        use futures::SinkExt as _;
+        let reader = PrivateKey::from_seed(91);
+        let key = reader.public_key().as_ref().to_vec();
+        let stranger = PrivateKey::from_seed(92);
+        let node_key = vec![0xab; 32];
+        let dispatch = "d".repeat(64);
+        let (mut handle, mut commands, _) = crate::NodeHandle::channel();
+        handle.admin.node_key = Some(node_key.clone());
+        let program = |controller| identity::Control::Program {
+            controller,
+            executor: "runs".into(),
+            generation: 0,
+            standing: identity::ProgramStanding::Active,
+        };
+        let control = Arc::new(Mutex::new(Some(program(7))));
+        let current = control.clone();
+        let id = dispatch.clone();
+        let actor_key = key.clone();
+        let actor = tokio::spawn(async move {
+            while let Some(command) = commands.next().await {
+                let crate::NodeCommand::Query { target, req, reply } = command else {
+                    continue;
+                };
+                let bytes = match target.as_str() {
+                    "runs" => {
+                        runs::encode_reply(&runs::RunsReply::PendingRuns(vec![runs::PendingRun {
+                            run_id: "attributed/3/chiefduck".into(),
+                            dispatch_id: id.clone(),
+                            agent_id: "chiefduck".into(),
+                            channel_id: "general".into(),
+                            anchor_seq: 4,
+                            thread_root: None,
+                            job_id: None,
+                            job_claim_height: 0,
+                            requester: sdk::Origin::Program(42),
+                            created_at: 0,
+                        }]))
+                    }
+                    "identity" => {
+                        let account = match identity::decode_query(&req).unwrap() {
+                            identity::IdentityQuery::Get { number: 42 } => {
+                                current.lock().unwrap().clone().map(|control| {
+                                    identity::AccountView {
+                                        number: 42,
+                                        name: "ChiefDuck".into(),
+                                        control,
+                                        keys: vec![],
+                                        avatar: None,
+                                        bio: None,
+                                        updated_at: 0,
+                                    }
+                                })
+                            }
+                            identity::IdentityQuery::OfKey { key } if key == actor_key => {
+                                Some(identity::AccountView {
+                                    number: 7,
+                                    name: "Reader".into(),
+                                    control: identity::Control::Keys,
+                                    keys: vec![],
+                                    avatar: None,
+                                    bio: None,
+                                    updated_at: 0,
+                                })
+                            }
+                            identity::IdentityQuery::OfKey { .. } => None,
+                            query => panic!("unexpected query {query:?}"),
+                        };
+                        identity::encode_reply(&identity::IdentityReply::Account(account))
+                    }
+                    target => panic!("unexpected target {target}"),
+                };
+                let _ = reply.send(Ok(bytes));
+            }
+        });
+        let path = format!("/v1/ws?run={dispatch}");
+        let signed = |signer: &PrivateKey| {
+            let mut headers = axum::http::HeaderMap::new();
+            for (name, value) in
+                ::node::signed_req::request_headers(signer, "GET", &path, &node_key, b"")
+            {
+                headers.insert(name, value.parse().unwrap());
+            }
+            headers
+        };
+        assert!(
+            admit_run_reader(&handle, &dispatch, &signed(&reader), &path)
+                .await
+                .is_ok()
+        );
+        assert!(
+            admit_run_reader(&handle, &dispatch, &signed(&stranger), &path)
+                .await
+                .is_err()
+        );
+        // The same proof must deliver actual buffered output over the GUI's
+        // WebSocket path, not merely return true from the admission helper.
+        use tokio_tungstenite::tungstenite::{
+            Message as WsMessage, client::IntoClientRequest as _,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = crate::router(handle.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let output = r#"{"method":"item/completed","params":{"item":{"id":"thought","type":"reasoning","summary":["Visible process details"]}}}"#;
+        handle
+            .stream_hub()
+            .run_output()
+            .append(&dispatch, RunStream::Stdout, output);
+        let mut request = format!("ws://{address}{path}")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().extend(signed(&reader));
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        socket
+            .send(WsMessage::Text(
+                serde_json::json!({"op":"subscribe","topics":[format!("run-output:{dispatch}")]})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            let message = socket
+                .next()
+                .await
+                .expect("run output stream ended")
+                .unwrap();
+            let WsMessage::Text(text) = message else {
+                continue;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_ne!(frame["type"], "error", "{frame}");
+            if frame["type"] == "tail" {
+                assert_eq!(frame["item"]["line"], output);
+                break;
+            }
+        }
+        socket.close(None).await.unwrap();
+        server.abort();
+        for next in [
+            Some(program(8)),
+            Some(identity::Control::Revoked { controller: 7 }),
+            Some(identity::Control::Keys),
+            None,
+        ] {
+            *control.lock().unwrap() = next;
+            assert!(
+                admit_run_reader(&handle, &dispatch, &signed(&reader), &path)
+                    .await
+                    .is_err()
+            );
+        }
+        for origin in [
+            sdk::Origin::External(vec![]),
+            sdk::Origin::External(key[..16].to_vec()),
+            sdk::Origin::Module("runs".into()),
+            sdk::Origin::System,
+        ] {
+            assert!(!run_reader(&handle, &origin, &key).await.unwrap());
+        }
+        assert!(
+            run_reader(&handle, &sdk::Origin::External(key.clone()), &key)
+                .await
+                .unwrap()
+        );
+        actor.abort();
     }
 
     /// THE WHOLE REMOTE ADMISSION, END TO END: a real signature over the real

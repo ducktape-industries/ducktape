@@ -213,13 +213,23 @@ pub async fn control(
                 .into_response();
         }
     };
-    let authorized = pending.iter().any(|run| {
-        run.dispatch_id == body.run && crate::stream::created_by(&run.requester, &signer.0)
-    });
+    let authorized = match pending.iter().find(|run| run.dispatch_id == body.run) {
+        Some(run) => match crate::stream::run_reader(&handle, &run.requester, &signer.0).await {
+            Ok(authorized) => authorized,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error":"Could not verify run access."})),
+                )
+                    .into_response();
+            }
+        },
+        None => false,
+    };
     if !authorized {
         return (
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error":"Only the creator may control an active run."})),
+            Json(serde_json::json!({"error":"Only the requester or its program controller may control an active run."})),
         )
             .into_response();
     }
@@ -390,7 +400,17 @@ mod tests {
         assert_eq!(hub.reading(&run).unwrap()["approvals"], json!([]));
     }
     #[tokio::test]
-    async fn route_requires_the_run_creators_signature_and_rejects_tampered_input() {
+    async fn route_requires_the_run_requesters_signature_and_rejects_tampered_input() {
+        use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+        for requester in [
+            sdk::Origin::External(PrivateKey::from_seed(70).public_key().as_ref().to_vec()),
+            sdk::Origin::Program(42),
+        ] {
+            assert_signed_run_control(requester).await;
+        }
+    }
+
+    async fn assert_signed_run_control(requester: sdk::Origin) {
         use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
         use futures::StreamExt as _;
         use tower::ServiceExt as _;
@@ -409,16 +429,54 @@ mod tests {
             thread_root: None,
             job_id: None,
             job_claim_height: 0,
-            requester: sdk::Origin::External(creator.public_key().as_ref().to_vec()),
+            requester,
             created_at: 0,
         };
+        let creator_key = creator.public_key().as_ref().to_vec();
         let actor = tokio::spawn(async move {
             while let Some(command) = queries.next().await {
-                if let crate::NodeCommand::Query { reply, .. } = command {
-                    let _ =
-                        reply.send(Ok(runs::encode_reply(&runs::RunsReply::PendingRuns(vec![
-                            pending.clone(),
-                        ]))));
+                if let crate::NodeCommand::Query { target, req, reply } = command {
+                    let bytes = match target.as_str() {
+                        "runs" => {
+                            runs::encode_reply(&runs::RunsReply::PendingRuns(vec![pending.clone()]))
+                        }
+                        "identity" => {
+                            let account = match identity::decode_query(&req).unwrap() {
+                                identity::IdentityQuery::Get { number: 42 } => {
+                                    Some(identity::AccountView {
+                                        number: 42,
+                                        name: "Agent".into(),
+                                        control: identity::Control::Program {
+                                            controller: 7,
+                                            executor: "runs".into(),
+                                            generation: 0,
+                                            standing: identity::ProgramStanding::Active,
+                                        },
+                                        keys: vec![],
+                                        avatar: None,
+                                        bio: None,
+                                        updated_at: 0,
+                                    })
+                                }
+                                identity::IdentityQuery::OfKey { key } if key == creator_key => {
+                                    Some(identity::AccountView {
+                                        number: 7,
+                                        name: "Creator".into(),
+                                        control: identity::Control::Keys,
+                                        keys: vec![],
+                                        avatar: None,
+                                        bio: None,
+                                        updated_at: 0,
+                                    })
+                                }
+                                identity::IdentityQuery::OfKey { .. } => None,
+                                query => panic!("unexpected query {query:?}"),
+                            };
+                            identity::encode_reply(&identity::IdentityReply::Account(account))
+                        }
+                        target => panic!("unexpected query to {target}"),
+                    };
+                    let _ = reply.send(Ok(bytes));
                 }
             }
         });
