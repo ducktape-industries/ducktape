@@ -38,7 +38,6 @@ use noded::{
     CreatedSession, NodeCommand, PeerAttach, RemoteSessions, SessionInputWire, SessionJob,
     TermCommandEvent, TermCommandRing, TermError, TermFeedEvent, TermRing, TerminalSessions,
 };
-use provider_host::ResolvedCredential;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -788,47 +787,29 @@ async fn serve_create(
     // could only ever be a second, uncheckable answer to a question the lender
     // has already answered. `peer.0` still binds the session's input frames to
     // its creator; that is a node-key gate, not an identity claim.
-    let record = match credential_record(&control.commands, cred).await {
-        Ok(record) => record,
-        Err(detail) => return refused("unknown_credential", &detail),
-    };
-    let admit = match admit_create(provider, record.as_ref(), cpu, mem_gb, sandbox_present) {
-        Ok(admit) => admit,
+    let resolved = match ducktape_terminal::credential::resolve(
+        provider,
+        cred,
+        cpu,
+        mem_gb,
+        sandbox_present,
+        control.local_gateway_via.clone(),
+        |request| query(&control.commands, "gateway", request),
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
         Err((reason, detail)) => {
             if let Some(occurrences) = CREATE_REFUSED.hit(reason, peer) {
-                tracing::warn!(
-                    target: "ducktape::term",
-                    reason,
-                    occurrences,
-                    "peer session create refused"
-                );
+                tracing::warn!(target: "ducktape::term", reason, occurrences, "peer session create refused");
             }
             return refused(reason, &detail);
         }
     };
-    let authority = match owner_airlock_authority(&control.commands, admit.owner_account).await {
-        Ok(authority) => authority,
-        Err(detail) => return refused("unknown_credential", &detail),
-    };
-    // bin/node owns the record → ResolvedCredential mapping (provider-host must
-    // not depend on the gateway crate): the seal_pk is the on-chain anchor, the
-    // via is the host's own browser-gateway, the authority is the owner's airlock
-    // route.
-    let resolved = ResolvedCredential {
-        name: admit.name,
-        kind: admit.kind,
-        authority,
-        via: control.local_gateway_via.clone(),
-        seal_pk: admit.seal_pk,
-    };
-    // the record travels to the agent daemon, which pins it as its broker's
-    // self-host airlock upstream. Nothing secret crosses, and no identity either:
-    // a name, an authority handle, this node's own gateway `via`, and a PUBLIC
-    // seal key.
     let attach = PeerAttach {
         creator_node: peer.0,
-        credential: agent_service::credential_wire(&resolved),
-        limits: admit.limits,
+        credential: resolved.credential,
+        limits: resolved.limits,
     };
     match sessions.create_for_peer(provider, attach).await {
         Ok(created) => SessionControlReply::Created {
@@ -899,117 +880,6 @@ fn refused_from_term_error(err: TermError) -> SessionControlReply {
         TermError::Spawn(detail) => ("spawn_failed", detail),
     };
     refused(reason, &detail)
-}
-
-/// the host's create decision, given committed state already fetched. Pure so it
-/// is unit-testable without a pty. `Ok` carries the resolved credential pieces +
-/// container limits; `Err` is a `(reason, detail)`.
-#[derive(Debug)]
-struct AdmitOk {
-    name: String,
-    kind: provider_host::CredentialKind,
-    seal_pk: [u8; 32],
-    owner_account: u64,
-    limits: std::collections::BTreeMap<String, u64>,
-}
-
-/// What survives is what this HOST knows about itself and the record: can it
-/// sandbox, does the name exist, does the requested provider contradict the
-/// credential's vendor, what limits apply. The grant check that used to sit here
-/// does not: it decided, against a creator account this node resolved, a question
-/// the lender decides against the account it vouches for — and the two are
-/// different parties the moment the creator is not the host.
-fn admit_create(
-    provider: &str,
-    record: Option<&gateway::CredentialRecord>,
-    cpu: Option<u64>,
-    mem_gb: Option<u64>,
-    sandbox_present: bool,
-) -> Result<AdmitOk, (&'static str, String)> {
-    if !sandbox_present {
-        // `sandbox_present` is `has_sandbox()` = "is an agent service attached",
-        // NOT "is a sandbox image configured" — word it as the fact it tested
-        // (and as `refused_from_term_error` already does). The old "no
-        // configured sandbox image" text sent an operator with a perfectly
-        // good `[sandbox]` table hunting the wrong config.
-        return Err((
-            "no_sandbox",
-            "this node has no agent service attached".into(),
-        ));
-    }
-    let Some(record) = record else {
-        return Err((
-            "unknown_credential",
-            "no credential by that name is registered".into(),
-        ));
-    };
-    let over_ceiling = cpu.is_some_and(|cores| cores > MAX_SESSION_CORES)
-        || mem_gb.is_some_and(|mem| mem > MAX_SESSION_MEM_GB);
-    if over_ceiling {
-        return Err((
-            "limits_exceed_host_ceiling",
-            format!(
-                "this host caps a session at {MAX_SESSION_CORES} cores / \
-                 {MAX_SESSION_MEM_GB} GB"
-            ),
-        ));
-    }
-    let contradicts = provider_contradicts_kind(provider, record.kind);
-    if contradicts {
-        return Err((
-            "provider_kind_mismatch",
-            format!("provider {provider} contradicts the credential kind"),
-        ));
-    }
-    Ok(AdmitOk {
-        name: record.name.clone(),
-        kind: crate::compute::cred::service_kind(record.kind),
-        seal_pk: record.seal_pk,
-        owner_account: record.owner_account,
-        limits: build_limits(cpu, mem_gb),
-    })
-}
-
-/// true when an EXPLICIT vendor provider tag contradicts the credential's kind.
-/// An unknown tag (a test provider) is not a contradiction — the manager's
-/// provider resolution decides it (→ `unknown_provider`).
-fn provider_contradicts_kind(provider: &str, kind: gateway::CredentialKind) -> bool {
-    match provider {
-        "claude" => kind != gateway::CredentialKind::Claude,
-        "codex" => kind != gateway::CredentialKind::Codex,
-        _ => false,
-    }
-}
-
-/// Per-session ceiling on what a REMOTE creator may ask this host to allocate.
-///
-/// `cpu`/`mem_gb` arrive from a mesh peer and go straight to the sandbox
-/// backend. Before the credential gate moved to the lender, a stranger could not
-/// reach [`build_limits`] at all on a node they held no grant on; now any
-/// admitted member naming any registered credential can, so the size of the
-/// container they get is a number they choose. `TermError::AtCapacity` bounds
-/// the session COUNT, not the size of one.
-///
-/// Refused rather than silently clamped: quietly handing back a tenth of what
-/// was asked for is the fail-quiet this repo's refusal doctrine exists to
-/// prevent, and the reason token tells the caller what actually happened.
-///
-/// ponytail: a constant, not the host's real capacity. The compute plane already
-/// models that (`compute_service::ResourceLedger`); wiring one into the term
-/// plane is the upgrade when a host wants to sell its actual size.
-const MAX_SESSION_CORES: u64 = 8;
-const MAX_SESSION_MEM_GB: u64 = 32;
-
-/// `--cpu`/`--mem` → the container limit keys the sandbox backend enforces.
-fn build_limits(cpu: Option<u64>, mem_gb: Option<u64>) -> std::collections::BTreeMap<String, u64> {
-    let mut limits = std::collections::BTreeMap::new();
-    if let Some(cores) = cpu {
-        limits.insert("cores".to_string(), cores);
-    }
-    if let Some(mem) = mem_gb {
-        limits.insert("mem_gb".to_string(), mem);
-    }
-    limits
 }
 
 /// the creator gate: a forwarded input frame is written only when it arrives from
@@ -1421,65 +1291,6 @@ async fn query(
         .map_err(|_| "node actor dropped the query".to_string())?
 }
 
-/// the committed credential record for `name`, or `None` when unregistered.
-async fn credential_record(
-    commands: &fmpsc::Sender<NodeCommand>,
-    name: &str,
-) -> Result<Option<gateway::CredentialRecord>, String> {
-    let reply = query(
-        commands,
-        "gateway",
-        gateway::encode_query(&gateway::GatewayQuery::Credential {
-            name: name.to_string(),
-        }),
-    )
-    .await?;
-    match gateway::decode_reply(&reply)? {
-        gateway::GatewayReply::Credential(record) => Ok(record),
-        _ => Err("unexpected gateway credential reply".into()),
-    }
-}
-
-/// the `airlock.<handle>.duck` authority for the credential owner's co-hosted
-/// gateway, resolved from the owner account's `.duck` handle registration.
-async fn owner_airlock_authority(
-    commands: &fmpsc::Sender<NodeCommand>,
-    owner_account: u64,
-) -> Result<String, String> {
-    // the registrations query is paginated and the module HARD-CAPS a page at
-    // MAX_QUERY_LIMIT (a larger `limit` is rejected outright), so page through in
-    // MAX_QUERY_LIMIT chunks until the owner's handle is found or a short page
-    // marks the end of the listing.
-    let mut from = 0u64;
-    loop {
-        let reply = query(
-            commands,
-            "gateway",
-            gateway::encode_query(&gateway::GatewayQuery::Registrations {
-                from,
-                limit: gateway::MAX_QUERY_LIMIT,
-            }),
-        )
-        .await?;
-        let page = match gateway::decode_reply(&reply)? {
-            gateway::GatewayReply::Registrations(registrations) => registrations,
-            _ => return Err("unexpected gateway registrations reply".into()),
-        };
-        let owned = page
-            .iter()
-            .find(|registration| registration.account_id == owner_account);
-        if let Some(registration) = owned {
-            return Ok(format!("airlock.{}.duck", registration.handle));
-        }
-        let page_len = page.len() as u64;
-        let listing_exhausted = page_len < gateway::MAX_QUERY_LIMIT;
-        if listing_exhausted {
-            return Err("credential owner has no registered duck handle".into());
-        }
-        from += page_len;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1832,118 +1643,6 @@ mod tests {
         write_frame(&mut a, &ev).await.unwrap();
         let got: SessionInputEvent = read_frame(&mut b).await.unwrap().unwrap();
         assert_eq!(got, ev);
-    }
-
-    fn rec(
-        name: &str,
-        owner: u64,
-        grants: &[u64],
-        kind: gateway::CredentialKind,
-    ) -> gateway::CredentialRecord {
-        gateway::CredentialRecord {
-            name: name.into(),
-            owner_account: owner,
-            publisher_node: vec![9u8; 32],
-            kind,
-            seal_pk: [1u8; 32],
-            grants: grants.iter().copied().collect(),
-        }
-    }
-
-    /// What the HOST decides, and the boundary of it. Every case here is a fact
-    /// about this host or about the record; none is a fact about who is asking.
-    ///
-    /// The grant is deliberately absent, including for an account the record does
-    /// NOT name: a record granting somebody else still admits here, because the
-    /// account this host would have checked is not the account the lender checks.
-    /// The lender authorizes the account its own node stamps on the gateway hop —
-    /// this host's — and it refuses at `/session`, before the sandbox spawns.
-    #[test]
-    fn admit_gates_on_sandbox_credential_and_kind_but_never_on_who_is_asking() {
-        let claude = rec("c1", 1, &[2], gateway::CredentialKind::Claude);
-
-        // no sandbox → refused before any credential decision.
-        assert_eq!(
-            admit_create("claude", Some(&claude), None, None, false)
-                .unwrap_err()
-                .0,
-            "no_sandbox"
-        );
-        // unknown credential.
-        assert_eq!(
-            admit_create("claude", None, None, None, true)
-                .unwrap_err()
-                .0,
-            "unknown_credential"
-        );
-        // a record this host is on nobody's grant list for still admits: routing
-        // is not authorization, and the lender has not been asked yet.
-        assert!(admit_create("claude", Some(&claude), None, None, true).is_ok());
-        // an explicit provider contradicting the cred's kind is refused.
-        assert_eq!(
-            admit_create("codex", Some(&claude), None, None, true)
-                .unwrap_err()
-                .0,
-            "provider_kind_mismatch"
-        );
-        // an unknown provider tag is not a contradiction (the manager resolves it).
-        assert!(admit_create("echo", Some(&claude), Some(1), Some(2), true).is_ok());
-    }
-
-    /// The size of the container is a number a REMOTE creator picks, and since
-    /// the credential gate moved to the lender any admitted member can reach it.
-    /// The ceiling is what stops "give me 1024 cores" from being a sentence a
-    /// stranger can say to this host.
-    #[test]
-    fn a_remote_creator_cannot_ask_this_host_for_any_size_it_likes() {
-        let claude = rec("c1", 1, &[], gateway::CredentialKind::Claude);
-
-        // at the ceiling is fine; a step past it is refused, per knob.
-        assert!(
-            admit_create(
-                "claude",
-                Some(&claude),
-                Some(MAX_SESSION_CORES),
-                Some(MAX_SESSION_MEM_GB),
-                true
-            )
-            .is_ok()
-        );
-        assert_eq!(
-            admit_create(
-                "claude",
-                Some(&claude),
-                Some(MAX_SESSION_CORES + 1),
-                None,
-                true
-            )
-            .unwrap_err()
-            .0,
-            "limits_exceed_host_ceiling"
-        );
-        assert_eq!(
-            admit_create(
-                "claude",
-                Some(&claude),
-                None,
-                Some(MAX_SESSION_MEM_GB + 1),
-                true
-            )
-            .unwrap_err()
-            .0,
-            "limits_exceed_host_ceiling"
-        );
-        // and an unset knob is not a request for infinity.
-        assert!(admit_create("claude", Some(&claude), None, None, true).is_ok());
-    }
-
-    #[test]
-    fn admit_maps_limits_and_kind() {
-        let codex = rec("x", 1, &[], gateway::CredentialKind::Codex);
-        let ok = admit_create("codex", Some(&codex), Some(3), Some(8), true).unwrap();
-        assert_eq!(ok.limits.get("cores"), Some(&3));
-        assert_eq!(ok.limits.get("mem_gb"), Some(&8));
-        assert!(matches!(ok.kind, provider_host::CredentialKind::Codex));
     }
 
     #[test]

@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 agent-service.workspace = true
+gateway.workspace = true
 serde.workspace = true
 base64.workspace = true
 axum = { version = "0.8", features = ["ws"] }

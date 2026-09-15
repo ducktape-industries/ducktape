@@ -751,9 +751,9 @@ async fn reaper_fires(lifetime: Duration, cancel: oneshot::Receiver<()>) -> bool
     }
 }
 
-/// put a consensus-resolved credential record on the wire. The node resolves it
-/// (only the node can — that takes committed state and its own actor lane) and
-/// the daemon rebuilds it with [`airlock_config`]. Nothing secret crosses; see
+/// Put a consensus-resolved credential record on the executor wire. The caller
+/// queries committed state and the executor rebuilds it with [`airlock_config`].
+/// Nothing secret crosses; see
 /// [`wire::Credential`].
 pub fn credential_wire(resolved: &ResolvedCredential) -> wire::Credential {
     wire::Credential {

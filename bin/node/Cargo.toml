@@ -57,6 +57,7 @@ provider-host = { workspace = true }
 dispatch = { workspace = true }
 attribution = { workspace = true }
 agent-service = { workspace = true }
+ducktape-terminal = { path = "../terminal-service" }
 compute-service = { workspace = true }
 forge = { workspace = true }
 pages = { workspace = true }

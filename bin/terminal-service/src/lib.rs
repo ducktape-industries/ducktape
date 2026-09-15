@@ -2,3 +2,4 @@
 pub mod state;
 pub mod runtime;
 pub mod http;
+pub mod credential;
