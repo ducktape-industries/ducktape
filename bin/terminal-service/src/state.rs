@@ -24,6 +24,7 @@ pub enum Mode {
 #[derive(Clone, Copy)]
 pub enum Write {
     Input,
+    Committed,
     Resize,
     Close,
 }
@@ -76,6 +77,7 @@ struct Record {
     bytes: usize,
     head: u64,
     inserted: u64,
+    command_cursor: u64,
 }
 
 #[derive(Default)]
@@ -184,6 +186,7 @@ impl Sessions {
                 bytes: 0,
                 head: 0,
                 inserted: self.serial,
+                command_cursor: 0,
             },
         );
         Ok(())
@@ -243,8 +246,56 @@ impl Sessions {
             Write::Input if record.mode == Mode::Shared => {
                 Err("shared input requires a committed channel command".into())
             }
-            Write::Input | Write::Resize | Write::Close => Ok(()),
+            Write::Committed if record.mode != Mode::Shared => {
+                Err("committed commands require a shared session".into())
+            }
+            Write::Input | Write::Committed | Write::Resize | Write::Close => Ok(()),
         }
+    }
+
+    /// Validate the complete committed page before advancing its cursor. The
+    /// runtime owns this cursor, so cancelling a caller cannot replay a write
+    /// whose acknowledgment it missed.
+    pub(crate) fn commands(
+        &mut self,
+        id: &str,
+        caller: &Caller,
+        owner: &chat::Party,
+        views: &[chat::MessageView],
+    ) -> Result<Vec<crate::consensus::Projected>, String> {
+        self.write(id, caller, Write::Committed)?;
+        if views.len() > chat::MAX_QUERY_LIMIT as usize {
+            return Err("terminal command page too large".into());
+        }
+        let record = self.records.get_mut(id).expect("checked session");
+        let channel = crate::consensus::session_channel(id);
+        let mut previous = None;
+        let mut commands = Vec::new();
+        let mut bytes = 0usize;
+        for view in views {
+            let wrong_channel = view.channel_id != channel;
+            let unordered = previous.is_some_and(|seq| view.seq <= seq);
+            if wrong_channel || unordered {
+                return Err("invalid terminal command page".into());
+            }
+            previous = Some(view.seq);
+            if view.seq <= record.command_cursor {
+                continue;
+            }
+            let Ok(projected) = crate::consensus::project_message(view, owner) else {
+                continue;
+            };
+            bytes += projected.text.len() + 1;
+            let over_budget = projected.text.len() >= 64 * 1024 || bytes > MAX_REPLAY_BYTES;
+            if over_budget {
+                return Err("terminal command page too large".into());
+            }
+            commands.push(projected);
+        }
+        if let Some(last) = previous {
+            record.command_cursor = record.command_cursor.max(last);
+        }
+        Ok(commands)
     }
 
     pub fn output(&mut self, id: &str, bytes: Vec<u8>) -> Result<(), String> {

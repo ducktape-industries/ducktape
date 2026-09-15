@@ -2,7 +2,10 @@
 use crate::state::{Caller, Effect, Mode, Replay, Sessions, Write};
 use agent_service::wire;
 use base64::Engine as _;
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    path::PathBuf,
+};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
@@ -20,6 +23,13 @@ pub struct Runtime {
 }
 
 enum Request {
+    Committed {
+        session: String,
+        caller: Caller,
+        owner: chat::Party,
+        views: Vec<chat::MessageView>,
+        reply: Reply,
+    },
     Create {
         caller: Caller,
         mode: Mode,
@@ -43,6 +53,11 @@ enum Request {
 }
 
 enum Action {
+    Committed {
+        session: String,
+        commands: Vec<crate::consensus::Projected>,
+        reply: Reply,
+    },
     Create(wire::Create),
     Drive {
         command: wire::Command,
@@ -75,6 +90,13 @@ struct Machine {
 impl Machine {
     fn request(&mut self, request: Request, workers: usize) -> Vec<Action> {
         match request {
+            Request::Committed {
+                session,
+                caller,
+                owner,
+                views,
+                reply,
+            } => self.committed(session, caller, owner, views, reply),
             Request::Create {
                 caller,
                 mode,
@@ -95,6 +117,24 @@ impl Machine {
                 reply,
             } => self.replay(session, caller, after, reply),
             Request::Stop => Self::stop(),
+        }
+    }
+
+    fn committed(
+        &mut self,
+        session: String,
+        caller: Caller,
+        owner: chat::Party,
+        views: Vec<chat::MessageView>,
+        reply: Reply,
+    ) -> Vec<Action> {
+        match self.sessions.commands(&session, &caller, &owner, &views) {
+            Ok(commands) => vec![Action::Committed {
+                session,
+                commands,
+                reply,
+            }],
+            Err(error) => vec![Action::Reply(reply, Err(error))],
         }
     }
 
@@ -134,7 +174,9 @@ impl Machine {
             return vec![Action::Reply(reply, Err(error))];
         }
         match kind {
-            Write::Input | Write::Resize => vec![Action::Drive { command, reply }],
+            Write::Input | Write::Committed | Write::Resize => {
+                vec![Action::Drive { command, reply }]
+            }
             Write::Close => {
                 self.sessions.closing(&session);
                 vec![Action::Close {
@@ -279,6 +321,27 @@ impl Runtime {
         self.drive(session, caller, Write::Input, command).await
     }
 
+    /// Submit canonical Chat messages after resolving the session channel's
+    /// owner. This is a service-internal lane, never a raw WebSocket command.
+    pub async fn committed(
+        &self,
+        session: String,
+        caller: Caller,
+        owner: chat::Party,
+        views: Vec<chat::MessageView>,
+    ) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.send(Request::Committed {
+            session,
+            caller,
+            owner,
+            views,
+            reply,
+        })
+        .await?;
+        result.await.map_err(|_| "terminal runtime stopped")?
+    }
+
     pub async fn resize(
         &self,
         session: String,
@@ -372,15 +435,53 @@ fn dispatch(
     });
 }
 
+async fn committed(
+    engine: &agent_service::Sessions,
+    session: &str,
+    commands: Vec<crate::consensus::Projected>,
+) -> Result<(), String> {
+    if commands.is_empty() {
+        return Ok(());
+    }
+    // One page occupies one lane item. Byte limits were checked before the
+    // cursor advanced; a valid page cannot overflow the frame-count budget.
+    let mut bytes = Vec::new();
+    for command in commands {
+        bytes.extend_from_slice(command.text.as_bytes());
+        bytes.push(b'\r');
+    }
+    let input = wire::Command::TermInput {
+        session: session.into(),
+        data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    };
+    match engine.dispatch(input).await {
+        Some(refusal) => Err(format!("executor refused committed command: {refusal:?}")),
+        None => Ok(()),
+    }
+}
+
 async fn execute(
     actions: Vec<Action>,
     engine: &agent_service::Sessions,
     creates: &mut JoinSet<Option<String>>,
     closes: &mut JoinSet<Option<String>>,
     changes: &watch::Sender<()>,
+    machine: &mut Machine,
 ) -> bool {
-    for action in actions {
+    let mut actions = VecDeque::from(actions);
+    while let Some(action) = actions.pop_front() {
         match action {
+            Action::Committed {
+                session,
+                commands,
+                reply,
+            } => {
+                let result = committed(engine, &session, commands).await;
+                if result.is_err() {
+                    actions.extend(machine.close(session));
+                }
+                let _ = reply.send(result);
+            }
             Action::Create(spec) => {
                 dispatch(engine, creates, wire::Command::TermCreate(spec), None)
             }
@@ -456,7 +557,16 @@ async fn run(
                 Vec::new()
             }
         };
-        if !execute(actions, &engine, &mut creates, &mut closes, &changes).await {
+        if !execute(
+            actions,
+            &engine,
+            &mut creates,
+            &mut closes,
+            &changes,
+            &mut machine,
+        )
+        .await
+        {
             break Ok(());
         }
     };
@@ -489,6 +599,64 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn refused_committed_input_marks_closing_before_another_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, _receiver) = mpsc::channel(8);
+        let engine = agent_service::Sessions::new(
+            provider_host::ProviderSet::empty(),
+            "test".into(),
+            directory.path().into(),
+            events,
+        );
+        let mut machine = Machine::default();
+        let owner = Caller {
+            account: 7,
+            node: [1; 32],
+        };
+        let session = "0000000000000001".to_string();
+        machine
+            .sessions
+            .insert(session.clone(), owner.clone(), Mode::Shared)
+            .unwrap();
+        machine.sessions.created(&session);
+        let (reply, result) = oneshot::channel();
+        let (changes, _) = watch::channel(());
+        let mut creates = JoinSet::new();
+        let mut closes = JoinSet::new();
+        execute(
+            vec![Action::Committed {
+                session: session.clone(),
+                commands: vec![crate::consensus::Projected {
+                    origin: "acct:7".into(),
+                    text: "test".into(),
+                }],
+                reply,
+            }],
+            &engine,
+            &mut creates,
+            &mut closes,
+            &changes,
+            &mut machine,
+        )
+        .await;
+        assert!(result.await.unwrap().is_err());
+        assert!(
+            machine
+                .sessions
+                .write(&session, &owner, Write::Resize)
+                .is_err()
+        );
+        assert!(
+            machine
+                .sessions
+                .write(&session, &owner, Write::Close)
+                .is_err()
+        );
+        assert_eq!(closes.len(), 1);
+        closes.join_next().await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn successful_reply_send_keeps_ownership_until_the_caller_acknowledges() {
         let directory = tempfile::tempdir().unwrap();
         let (events, _rx) = mpsc::channel(1);
@@ -511,6 +679,7 @@ mod tests {
             &mut creates,
             &mut closes,
             &changes,
+            &mut Machine::default(),
         )
         .await;
         assert!(

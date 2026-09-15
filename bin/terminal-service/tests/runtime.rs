@@ -224,3 +224,122 @@ async fn service_stop_cancels_an_unfinished_spawn_and_closes_running_ptys() {
     assert!(pending.await.unwrap().is_err());
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }
+
+fn committed_message(seq: u64, account: u64, text: &str) -> chat::MessageView {
+    chat::MessageView {
+        channel_id: "term-0000000000000001".into(),
+        seq,
+        head: chat::MessageHead {
+            message_id: format!("m{seq}"),
+            origin: sdk::Origin::Program(account),
+            content_origin: sdk::Origin::Program(account),
+            author: chat::Party::Account(account),
+            revision: 1,
+            blocks: ducktape_terminal::consensus::command_blocks(text),
+            created_at: 0,
+            rev: 0,
+            edited_at: None,
+            base_rev: None,
+            deleted: false,
+            thread: None,
+            reply_count: 0,
+            last_reply_seq: None,
+        },
+    }
+}
+
+#[tokio::test]
+async fn shared_commands_are_ordered_deduplicated_and_do_not_accept_raw_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, task) = Runtime::start(
+        providers(Arc::new(Notify::new()), Arc::new(Notify::new())),
+        "test".into(),
+        directory.path().into(),
+    );
+    let owner = Caller {
+        account: 7,
+        node: [1; 32],
+    };
+    let session = "0000000000000001".to_string();
+    let mut spec = create(&session);
+    spec.restricted = true;
+    runtime
+        .create(owner.clone(), Mode::Shared, spec)
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .input(session.clone(), owner.clone(), b"raw\n".to_vec())
+            .await
+            .is_err()
+    );
+    let messages = vec![
+        committed_message(1, 7, "first"),
+        committed_message(2, 8, "stranger"),
+        committed_message(3, 7, "second"),
+    ];
+    let mut changes = runtime.changes();
+    runtime
+        .committed(
+            session.clone(),
+            owner.clone(),
+            chat::Party::Account(7),
+            messages.clone(),
+        )
+        .await
+        .unwrap();
+    runtime
+        .committed(
+            session.clone(),
+            owner.clone(),
+            chat::Party::Account(7),
+            messages,
+        )
+        .await
+        .unwrap();
+    runtime
+        .committed(
+            session.clone(),
+            owner.clone(),
+            chat::Party::Account(7),
+            (4..=70)
+                .map(|seq| committed_message(seq, 7, "bulk"))
+                .collect(),
+        )
+        .await
+        .unwrap();
+    runtime
+        .committed(
+            session.clone(),
+            owner.clone(),
+            chat::Party::Account(7),
+            vec![committed_message(71, 7, "marker")],
+        )
+        .await
+        .unwrap();
+    loop {
+        let replay = runtime
+            .replay(session.clone(), owner.clone(), 0)
+            .await
+            .unwrap();
+        let output: Vec<u8> = replay
+            .chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.bytes)
+            .collect();
+        let output = String::from_utf8_lossy(&output);
+        if output.contains("marker") {
+            assert!(!output.contains("stranger"));
+            assert!(!output.contains("raw"));
+            assert!(output.find("first").unwrap() < output.find("second").unwrap());
+            // A PTY echoes input and cat writes it once more: at most two copies
+            // per accepted command, even though its committed page was retried.
+            assert!(output.matches("first").count() <= 2, "{output}");
+            assert!(output.matches("second").count() <= 2, "{output}");
+            break;
+        }
+        changes.changed().await.unwrap();
+    }
+    runtime.stop().await.unwrap();
+    task.await.unwrap().unwrap();
+}

@@ -324,6 +324,70 @@ mod tests {
     }
 
     #[test]
+    fn committed_pages_validate_before_advancing_and_never_repeat_consumed_posts() {
+        let caller = crate::state::Caller {
+            account: 7,
+            node: [1; 32],
+        };
+        let mut sessions = crate::state::Sessions::default();
+        let id = "0000000000000001";
+        sessions
+            .insert(id.into(), caller.clone(), crate::state::Mode::Shared)
+            .unwrap();
+        sessions.created(id);
+        let owner = Party::Account(7);
+        let first = view(1, owner.clone(), command_blocks("first"), false);
+        let mut wrong = view(2, owner.clone(), command_blocks("second"), false);
+        wrong.channel_id = "another-channel".into();
+        assert!(
+            sessions
+                .commands(id, &caller, &owner, &[first.clone(), wrong])
+                .is_err()
+        );
+        assert_eq!(
+            sessions
+                .commands(id, &caller, &owner, std::slice::from_ref(&first))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            sessions
+                .commands(id, &caller, &owner, &[first])
+                .unwrap()
+                .is_empty()
+        );
+        let deleted = view(2, owner.clone(), command_blocks("deleted"), true);
+        let stranger = view(3, Party::Account(8), command_blocks("stranger"), false);
+        assert!(
+            sessions
+                .commands(id, &caller, &owner, &[deleted, stranger])
+                .unwrap()
+                .is_empty()
+        );
+        let edited = view(3, owner.clone(), command_blocks("changed author"), false);
+        assert!(
+            sessions
+                .commands(id, &caller, &owner, &[edited])
+                .unwrap()
+                .is_empty()
+        );
+        let fourth = view(4, owner.clone(), command_blocks("fourth"), false);
+        assert!(
+            sessions
+                .commands(id, &caller, &owner, &[fourth.clone(), fourth.clone()])
+                .is_err()
+        );
+        assert_eq!(
+            sessions
+                .commands(id, &caller, &owner, &[fourth])
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn render_author_covers_every_kind() {
         assert_eq!(render_author(&Party::Key(vec![0x01, 0xff])), "01ff");
         assert_eq!(render_author(&Party::Account(7)), "acct:7");
