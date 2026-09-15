@@ -912,6 +912,19 @@ pub fn registered_views() -> Vec<&'static str> {
     registered().lock().expect("registered views").clone()
 }
 
+/// Every id the registry lists, view or module, in registry order: the
+/// planes the live lane subscribes to beyond the built-in ones (a registered
+/// view reads a registered module's plane through `rpc.live`). Set beside
+/// [`registered`], from the same registry read; empty off any node.
+fn registered_modules() -> &'static Mutex<Vec<String>> {
+    static MODULES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    MODULES.get_or_init(Mutex::default)
+}
+
+pub fn registered_module_ids() -> Vec<String> {
+    registered_modules().lock().expect("registered modules").clone()
+}
+
 /// The name a registered view's tab shows: its manifest's, once the view is
 /// seated; its id until then.
 pub fn registered_view_name(module: &'static str) -> String {
@@ -1202,6 +1215,7 @@ pub fn connected(client: &ducktape_rpc::Client) -> Loads {
     for retired in registered().lock().expect("registered views").drain(..) {
         registry.remove(retired);
     }
+    registered_modules().lock().expect("registered modules").clear();
     let mut loads: Vec<std::thread::JoinHandle<()>> = registry
         .iter()
         .filter_map(|(module, mounted)| {
@@ -1316,6 +1330,7 @@ fn seat_registered_views(
         loads.push(spawn_load(module, seat, generation, asked_of.clone()));
     }
     *registered = listed;
+    *registered_modules().lock().expect("registered modules") = entries.keys().cloned().collect();
     loads
 }
 
@@ -5335,6 +5350,7 @@ pub(crate) mod tests {
             registry().lock().expect("module views").remove(module);
         }
         registered().lock().expect("registered views").clear();
+        registered_modules().lock().expect("registered modules").clear();
     }
 
     /// The desktop's own views are all asked for at boot and joined before

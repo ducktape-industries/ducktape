@@ -699,6 +699,7 @@ impl BoardsView {
         let muted = Rgba(p.border_strong);
         let accent = Rgba(p.accent);
         let mut commands = Vec::new();
+        let mut top = Vec::new();
         let mut labels = Vec::new();
         let spacing = (32. * self.zoom).max(28.);
         for col in 0..((self.viewport[0] / spacing).ceil() as usize).min(60) {
@@ -785,25 +786,19 @@ impl BoardsView {
                 Kind::Rectangle => Some(Rgba(alpha(fill(s.color), 0.45))),
                 Kind::Text | Kind::Arrow => None,
             };
-            let border = match (selected, s.kind) {
-                (true, _) => accent,
-                (false, Kind::Note) => Rgba(alpha(tint(s.color), 0.35)),
-                (false, _) => Rgba(tint(s.color)),
+            let border = match s.kind {
+                Kind::Note => Some(Rgba(alpha(tint(s.color), 0.35))),
+                Kind::Rectangle => Some(Rgba(tint(s.color))),
+                Kind::Text | Kind::Arrow => None,
             };
-            if s.kind != Kind::Text || selected {
-                commands.push(rectangle(
-                    pos,
-                    size,
-                    fill,
-                    border,
-                    if selected { 1.5 } else { 1. },
-                ));
+            if selected {
+                top.push(rectangle(pos, size, None, accent, 1.5));
             }
             if selected && self.inline.is_none() && self.selected.len() == 1 {
                 for corner in [[-1, -1], [1, -1], [-1, 1], [1, 1]] {
                     let world = interaction::corner_point(s, corner);
                     let handle = self.screen(world[0], world[1]);
-                    commands.push(Draw::Draw {
+                    top.push(Draw::Draw {
                         shape: Geometry::Rectangle {
                             position: [handle[0] - 3.5, handle[1] - 3.5],
                             size: [7., 7.],
@@ -815,50 +810,61 @@ impl BoardsView {
                     });
                 }
             }
-            if self.inline.as_ref().is_some_and(|inline| &inline.id == id) {
-                continue;
-            }
+            let editing = self.inline.as_ref().is_some_and(|inline| &inline.id == id);
             let text = if s.text.is_empty() {
                 "Write a thought…"
             } else {
                 excerpt(&s.text)
             };
-            let label = kit::colored(
-                kit::text_size(
-                    kit::wrapping(kit::text(format!("boards/label/{id}"), text)),
-                    (if s.kind == Kind::Text { 20. } else { 14. } * self.zoom).clamp(8., 60.),
-                ),
-                if s.text.is_empty() {
-                    p.faint
-                } else {
-                    p.foreground
-                },
-            );
-            let mut clip = kit::container(format!("boards/label-clip/{id}"), label);
+            let label = if editing {
+                kit::space(None, None)
+            } else {
+                kit::colored(
+                    kit::text_size(
+                        kit::wrapping(kit::text(format!("boards/label/{id}"), text)),
+                        (if s.kind == Kind::Text { 20. } else { 14. } * self.zoom).clamp(8., 60.),
+                    ),
+                    if s.text.is_empty() {
+                        p.faint
+                    } else {
+                        p.foreground
+                    },
+                )
+            };
+            // THE BOX IS ITS OWN LAYER, TEXT INCLUDED: a later shape's fill
+            // covers an earlier one's words, which one canvas of fills under
+            // one stack of labels never could.
+            let mut card = kit::container(format!("boards/label-clip/{id}"), label);
             if let Node::Container {
-                clip: clipped,
+                clip,
                 height,
+                padding,
+                background,
+                border: edge,
                 ..
-            } = &mut clip
+            } = &mut card
             {
-                *clipped = true;
+                *clip = true;
                 *height = Some(Length::Fill);
+                *padding = Some(wire::Edges::all(CARD_INSET * self.zoom));
+                *background = fill.map(wire::Background::Color);
+                *edge = border.map(|color| wire::Border {
+                    radius: Some([6.; 4]),
+                    width: Some(1.),
+                    color: Some(color),
+                });
             }
             labels.push(Node::Pin {
                 key: format!("boards/pin/{id}"),
-                x: pos[0] + CARD_INSET * self.zoom,
-                y: pos[1] + CARD_INSET * self.zoom,
-                width: Some(Length::Fixed(
-                    (size[0] - 2. * CARD_INSET * self.zoom).max(1.),
-                )),
-                height: Some(Length::Fixed(
-                    (size[1] - 2. * CARD_INSET * self.zoom).max(1.),
-                )),
-                content: Box::new(clip),
+                x: pos[0],
+                y: pos[1],
+                width: Some(Length::Fixed(size[0].max(1.))),
+                height: Some(Length::Fixed(size[1].max(1.))),
+                content: Box::new(card),
             });
         }
         for guide in &self.guides {
-            commands.push(line(
+            top.push(line(
                 self.screen(guide[0], guide[1]),
                 self.screen(guide[2], guide[3]),
                 accent,
@@ -868,7 +874,7 @@ impl BoardsView {
         if let Gesture::Marquee { start, point, .. } = &self.gesture {
             let b = interaction::points_rect(*start, *point);
             let pos = self.screen(b[0], b[1]);
-            commands.push(rectangle(
+            top.push(rectangle(
                 pos,
                 [(b[2] - b[0]) * self.zoom, (b[3] - b[1]) * self.zoom],
                 Some(Rgba(alpha(p.accent, 0.08))),
@@ -879,7 +885,7 @@ impl BoardsView {
         if let Gesture::Create { kind, start, point } = &self.gesture {
             let shape = self.creation_shape(*kind, *start, *point);
             let pos = self.screen(shape.x as f32, shape.y as f32);
-            commands.push(rectangle(
+            top.push(rectangle(
                 pos,
                 [
                     shape.width as f32 * self.zoom,
@@ -895,7 +901,7 @@ impl BoardsView {
                 (from.shape.x + from.shape.width / 2) as f32,
                 (from.shape.y + from.shape.height / 2) as f32,
             );
-            commands.push(line(start, self.cursor, accent, 1.5));
+            top.push(line(start, self.cursor, accent, 1.5));
         }
         let mut children = vec![Node::Canvas {
             key: "boards/geometry".into(),
@@ -904,6 +910,12 @@ impl BoardsView {
             commands,
         }];
         children.extend(labels);
+        children.push(Node::Canvas {
+            key: "boards/overlay".into(),
+            width: Some(Length::Fill),
+            height: Some(Length::Fill),
+            commands: top,
+        });
         let scene = Node::Stack {
             key: "boards/scene".into(),
             width: Some(Length::Fill),
