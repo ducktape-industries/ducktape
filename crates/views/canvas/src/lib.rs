@@ -212,6 +212,7 @@ pub enum Message {
     EditText,
     FocusText,
     Measured(f32, f32),
+    Mounted(f32, f32),
     FocusResult(String, Result<(), String>),
     MiddleDown,
     FinishText,
@@ -339,6 +340,7 @@ impl BoardsView {
             Message::EditText => self.begin_text(),
             Message::FocusText => self.focus_text(),
             Message::Measured(width, height) => self.on_measured(width, height),
+            Message::Mounted(width, height) => self.on_mounted(width, height),
             Message::FocusResult(id, result) => self.on_focus_result(id, result),
             Message::MiddleDown => self.on_middle_down(),
             Message::FinishText => self.finish_text(),
@@ -676,7 +678,7 @@ impl BoardsView {
         self.undo.clear();
         self.redo.clear();
         self.pending.push_back(Operation::Create { id, title });
-        self.pump()
+        Task::batch([self.pump(), self.take_the_keyboard()])
     }
     fn on_title(&mut self, title: String) -> Task<Message> {
         self.title = title;
@@ -701,7 +703,7 @@ impl BoardsView {
         self.gesture = Gesture::Idle;
         self.undo.clear();
         self.redo.clear();
-        Task::none()
+        self.take_the_keyboard()
     }
 }
 

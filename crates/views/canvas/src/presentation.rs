@@ -142,12 +142,22 @@ const CARD_INSET: f32 = 12.;
 /// grid ever takes is this doubled, so a dot always stands on a coordinate a
 /// reader could name.
 const GRID: f32 = 32.;
+/// The smallest type the board will draw. Under it letters stop being letters
+/// and start being grey noise, so nothing is drawn at all.
+const SMALLEST: f32 = 8.;
 /// One card's words, as both the painter and the editor must lay them out.
 pub(super) struct Lettering {
     /// Screen-space type size, already scaled by the camera.
     pub(super) size: f32,
     /// How far in from the card's box the words start, on every side.
     pub(super) inset: f32,
+    /// Whether the words are being drawn at the size they were asked for.
+    /// Type has a floor and a card does not, so far enough out the letters
+    /// stop shrinking with the box they are in and a card fills up with a
+    /// fragment of its first sentence. A card too small to read carries no
+    /// words: a board zoomed right out is blocks of colour, which is what it
+    /// is for at that distance.
+    pub(super) legible: bool,
 }
 /// The inset every island keeps from the stage's edge.
 const ISLAND: f32 = 12.;
@@ -211,7 +221,7 @@ impl BoardsView {
         // press on an overlay's surface, where a pinned card lets it fall
         // through to the canvas underneath and the gesture it starts
         // re-renders the card out from under the click.
-        let picker_open = self.board_picker || board.is_none();
+        let picker_open = self.picking_a_board();
         let dismiss = (picker_open && board.is_some()).then_some(Message::BoardPicker);
         stage = float(
             "boards/menu-float",
@@ -908,12 +918,15 @@ impl BoardsView {
             on_enter: None,
             content: Box::new(scene),
         };
-        let measure = || Some(slots::handler(Box::new(|(w, h)| Some(Message::Size(w, h)))));
         let sensor = Node::Sensor {
             key: "boards/viewport".into(),
             reset: None,
-            on_show: measure(),
-            on_resize: measure(),
+            // The first sight of the stage is also when the canvas takes the
+            // keyboard; every later one is only a measurement.
+            on_show: Some(slots::handler(Box::new(|(w, h)| {
+                Some(Message::Mounted(w, h))
+            }))),
+            on_resize: Some(slots::handler(Box::new(|(w, h)| Some(Message::Size(w, h))))),
             on_hide: None,
             anticipate: None,
             delay: None,
@@ -1091,9 +1104,11 @@ impl BoardsView {
             Kind::Note | Kind::Rectangle | Kind::Text => 0.,
             Kind::Arrow | Kind::Line | Kind::Draw => 0.,
         };
+        let asked = if plain { 20. } else { 14. } * self.zoom;
         Lettering {
-            size: (if plain { 20. } else { 14. } * self.zoom).clamp(8., 60.),
+            size: asked.clamp(SMALLEST, 60.),
             inset: edge + size[0].min(size[1]) * pinch,
+            legible: asked >= SMALLEST,
         }
     }
     /// A shape's words, pinned over its body and clipped to it.
@@ -1110,21 +1125,32 @@ impl BoardsView {
         if editing {
             return None;
         }
+        let letters = self.lettering(s.kind, [box_[2] - box_[0], box_[3] - box_[1]]);
+        if !letters.legible {
+            return None;
+        }
         // a connector's label rides its middle; it has no box to sit in
         if s.kind.is_path() {
             if s.text.is_empty() {
                 return None;
             }
+            // The plate it is written on rides the camera like everything else
+            // on the board: a label that kept its pixels while the run under it
+            // shrank would swallow the whole drawing at a distance.
+            let plate = [180. * self.zoom, 40. * self.zoom];
             return Some(Node::Pin {
                 key: format!("boards/path-label/{id}"),
-                x: (box_[0] + box_[2]) / 2. - 90.,
-                y: (box_[1] + box_[3]) / 2. - 20.,
-                width: Some(Length::Fixed(180.)),
-                height: Some(Length::Fixed(40.)),
-                content: Box::new(kit::wrapping(kit::text(
-                    format!("boards/path-text/{id}"),
-                    excerpt(&s.text, share),
-                ))),
+                x: (box_[0] + box_[2]) / 2. - plate[0] / 2.,
+                y: (box_[1] + box_[3]) / 2. - plate[1] / 2.,
+                width: Some(Length::Fixed(plate[0])),
+                height: Some(Length::Fixed(plate[1])),
+                content: Box::new(kit::text_size(
+                    kit::wrapping(kit::text(
+                        format!("boards/path-text/{id}"),
+                        excerpt(&s.text, share),
+                    )),
+                    letters.size,
+                )),
             });
         }
         let blank = s.text.is_empty();
@@ -1139,7 +1165,6 @@ impl BoardsView {
             excerpt(&s.text, share)
         };
         let ink = if blank { p.faint } else { p.foreground };
-        let letters = self.lettering(s.kind, [box_[2] - box_[0], box_[3] - box_[1]]);
         let label = kit::colored(
             kit::text_size(
                 kit::wrapping(kit::text(format!("boards/label/{id}"), text)),

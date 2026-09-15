@@ -893,6 +893,13 @@ fn shift_squares_a_drawn_box_and_a_click_centres_the_default_on_the_pointer() {
     let clicked = view.creation_shape(Kind::Rectangle, [500., 300.], [500., 300.]);
     assert_eq!([clicked.width, clicked.height], [240, 140]);
     assert_eq!([clicked.x, clicked.y], [380, 230]);
+    // Words go the other way: you click where the sentence should start, so
+    // the box begins at the pointer rather than straddling it — and it starts
+    // one line tall, because a text shape taller than its words is dead space
+    // that still answers a click.
+    let written = view.creation_shape(Kind::Text, [500., 300.], [500., 300.]);
+    assert_eq!([written.x, written.y], [500, 300]);
+    assert_eq!(written.height, 60);
 }
 
 #[test]
@@ -1306,6 +1313,135 @@ fn a_card_that_already_holds_its_words_is_left_alone_and_a_refused_one_gives_the
     let left = view.visible().unwrap().shapes["a"].shape.clone();
     assert_eq!(left.height, 140, "Escape leaves the card as it was");
     assert_eq!(left.text, "one line");
+}
+
+#[test]
+fn the_box_drawn_round_a_selection_is_the_box_round_what_it_moves() {
+    let mut view = view();
+    view.snap = false;
+    card(&mut view, "a", 0);
+    card(&mut view, "b", 300);
+    // An arrow that holds both cards. Its stored rectangle is wherever it was
+    // drawn — far above the cards here — and it is never restated when a card
+    // it names moves, because the run is recomputed from the cards each frame.
+    view.edit(Change::Create {
+        id: "edge".into(),
+        shape: Shape {
+            x: -400,
+            y: -900,
+            from: Some("a".into()),
+            to: Some("b".into()),
+            ..segment(Kind::Arrow)
+        },
+    });
+    view.selected = ["a".into(), "b".into(), "edge".into()].into();
+    let board = view.visible().unwrap();
+    let (bounds, members) = view.group(&board).expect("three selected have a box");
+    assert_eq!(
+        members.len(),
+        2,
+        "a connector held by its cards is carried, not moved"
+    );
+    let cards = [
+        board.shapes["a"].shape.clone(),
+        board.shapes["b"].shape.clone(),
+    ];
+    let top = cards[0].y.min(cards[1].y) as f32;
+    let left = cards[0].x.min(cards[1].x) as f32;
+    assert_eq!(
+        [bounds[0], bounds[1]],
+        [left, top],
+        "the box stood in a corner none of the cards reach"
+    );
+}
+
+/// The only thing that ever pointed the keyboard at the canvas was leaving a
+/// card, so on a board nobody had written in yet no shortcut worked at all: N
+/// made no note, Delete deleted nothing, and the fix for it was to go and edit
+/// something first. Every way of arriving at a board hands the keyboard over
+/// now. A unit test cannot drive the host's focus, so the seam is pinned here.
+#[test]
+fn every_way_of_arriving_at_a_board_points_the_keyboard_at_it() {
+    let mut view = view();
+    // the stage appearing is also a measurement
+    view.on_mounted(1400., 900.);
+    assert_eq!(view.viewport, [1400., 900.]);
+    let acting = include_str!("interaction.rs");
+    let opening = include_str!("lib.rs");
+    assert_eq!(
+        acting.matches("self.take_the_keyboard()").count(),
+        3,
+        "the stage appearing, the menu closing, and Escape"
+    );
+    assert_eq!(
+        opening.matches("self.take_the_keyboard()").count(),
+        2,
+        "opening a board, and making one"
+    );
+}
+
+#[test]
+fn a_card_too_small_to_read_is_drawn_without_its_words() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            text: "a sentence that would not fit".into(),
+            ..Default::default()
+        },
+    });
+    let close = serde_json::to_string(&view.view()).unwrap();
+    assert!(close.contains("a sentence that would not fit"));
+    // Far enough out the type stops shrinking with the card — it has a floor
+    // and the card does not — so the card fills with a fragment of its first
+    // line. At that distance the board is blocks of colour and nothing else.
+    view.zoom = 0.2;
+    let far = serde_json::to_string(&view.view()).unwrap();
+    assert!(
+        !far.contains("a sentence that would not fit"),
+        "a card two hundred pixels away was still trying to spell"
+    );
+    // and the card itself is still drawn
+    assert!(far.contains("Canvas"));
+}
+
+#[test]
+fn a_board_is_named_with_the_letters_the_tools_answer_to() {
+    let mut view = view();
+    view.on_board_picker();
+    assert!(view.picking_a_board());
+    // "Note" typed into the name field: o is the ellipse, t is the text tool,
+    // e is the eraser. Every one of them used to land on the canvas behind.
+    for letter in ["n", "o", "t", "e"] {
+        key(
+            &mut view,
+            wire::keyboard::Key::Character(letter.into()),
+            Default::default(),
+            false,
+        );
+    }
+    assert_eq!(
+        view.tool,
+        Tool::Select,
+        "the menu is what you are typing at, not the canvas"
+    );
+    // Escape is the one key that reaches past it, and it closes the menu.
+    key(
+        &mut view,
+        wire::keyboard::Key::Named(wire::keyboard::Named::Escape),
+        Default::default(),
+        false,
+    );
+    assert!(!view.picking_a_board());
+    // With the menu gone the canvas answers again.
+    key(
+        &mut view,
+        wire::keyboard::Key::Character("o".into()),
+        Default::default(),
+        false,
+    );
+    assert_eq!(view.tool, Tool::Ellipse);
 }
 
 /// The gauge is the only way a card can know how tall its words are: the
