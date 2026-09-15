@@ -662,7 +662,7 @@ impl DesktopWindow {
                 .gap_1()
                 .child(
                     div()
-                        .text_size(px(24.))
+                        .text_size(px(design::type_scale::TITLE as f32))
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(title),
                 )

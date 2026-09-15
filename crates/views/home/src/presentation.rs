@@ -21,8 +21,9 @@ const LIST_ROW: f32 = 28.;
 /// column.
 const GUTTER: f32 = 16.;
 
-/// The type size a stat tile's number is set at.
-const TILE_VALUE_SIZE: f32 = 22.;
+/// The type size a stat tile's number is set at: the scale's title, the
+/// loudest a view gets.
+const TILE_VALUE_SIZE: f32 = kit::type_scale::TITLE as f32;
 
 // Every cell of a row is ONE LINE. The rows are built at a fixed height
 // (`LIST_ROW`) and a card in a three-column pane is narrow: a height, a
