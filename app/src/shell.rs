@@ -3181,8 +3181,15 @@ pub(crate) fn run() {
         let fonts: Vec<std::borrow::Cow<'static, [u8]>> = vec![
             std::borrow::Cow::Borrowed(include_bytes!("../../crates/views/support/design/assets/fonts/Geist[wght].ttf")),
             std::borrow::Cow::Borrowed(include_bytes!("../../crates/views/support/design/assets/fonts/GeistMono[wght].ttf")),
-            std::borrow::Cow::Borrowed(include_bytes!("../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf")),
         ];
+        // CoreGraphics cannot load Noto's CBDT color font. Including it in
+        // the batch rejects both Latin families too; macOS supplies emoji.
+        #[cfg(not(target_os = "macos"))]
+        let fonts = {
+            let mut fonts = fonts;
+            fonts.push(std::borrow::Cow::Borrowed(include_bytes!("../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf")));
+            fonts
+        };
         if let Err(error) = cx.text_system().add_fonts(fonts) {
             tracing::error!(target: "ducktape::app", reason = "font_registration_failed", %error, "bundled desktop fonts could not be registered");
         }

@@ -36,12 +36,24 @@ fn primary(key: impl Into<String>, label: &str, message: Option<Message>) -> Nod
 }
 
 fn subtle(key: impl Into<String>, label: &str, message: Option<Message>) -> Node {
-    kit::button(
-        key,
-        label,
+    let key = key.into();
+    let mut button = kit::button_child(
+        &key,
+        kit::sized(
+            kit::wrapping(kit::text(format!("{key}/label"), label)),
+            Some(Length::Fill),
+            None,
+        ),
         message.map(slots::message),
         ButtonPreset::Subtle,
-    )
+    );
+    if let Node::Button {
+        label: accessible, ..
+    } = &mut button
+    {
+        *accessible = Some(label.to_owned());
+    }
+    button
 }
 
 fn field(key: &str, hint: &str, value: &str, message: fn(String) -> Message) -> Node {
