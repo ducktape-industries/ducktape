@@ -1161,6 +1161,14 @@ fn the_painter_and_the_editor_read_one_description_of_a_label() {
          any of them reading a second description would lay the words out for \
          a card nobody draws"
     );
+    assert_eq!(
+        painting.matches(".kind, size[0], &letters)").count(),
+        2,
+        "the column a label wraps in is stated once and read twice — by the \
+         label the painter draws and by the gauge that measures it. A second \
+         description of it breaks the same words in two different places, \
+         which is the whole defect this seam exists to close"
+    );
     assert!(
         !painting.contains("size: Some((14."),
         "the inline editor must not carry a type size of its own"
@@ -1887,7 +1895,7 @@ fn an_arrow_can_be_written_on_and_the_words_ride_the_run_rather_than_its_stored_
 }
 
 #[test]
-fn an_arrows_words_ride_a_plate_that_hugs_them_and_a_cards_fill_its_box() {
+fn an_arrows_words_ride_a_plate_and_a_cards_sit_in_the_middle_of_it() {
     let mut view = linked();
     view.on_size(1400., 900.);
     view.selected = Default::default();
@@ -1898,6 +1906,15 @@ fn an_arrows_words_ride_a_plate_that_hugs_them_and_a_cards_fill_its_box() {
     view.edit(Change::Text {
         id: "a".into(),
         text: "a thought".into(),
+    });
+    view.edit(Change::Create {
+        id: "t".into(),
+        shape: Shape {
+            kind: Kind::Text,
+            x: 700,
+            text: "a caption".into(),
+            ..Default::default()
+        },
     });
     let json = serde_json::to_string(&view.view()).unwrap();
     // The room a label is given is the longest one a line could carry. A plate
@@ -1911,15 +1928,26 @@ fn an_arrows_words_ride_a_plate_that_hugs_them_and_a_cards_fill_its_box() {
     let plate = &plate[..plate.len().min(400)];
     assert!(plate.contains("Shrink"), "the plate fills the room: {plate}");
     assert!(plate.contains("Center"), "the plate is not centred: {plate}");
-    // A card is a page: its words start at its own corner and fill it.
+    // A card carries its label in the middle of it — the same middle the caret
+    // writes it at, so the words do not move when you stop typing.
     let card = json
         .split("boards/label-clip/a")
         .nth(1)
         .expect("the card's words are not in its box");
     let card = &card[..card.len().min(400)];
     assert!(
-        !card.contains("Shrink"),
-        "a card's words stopped filling it: {card}"
+        card.contains("Center"),
+        "a card's words are not in the middle of it: {card}"
+    );
+    // A text shape IS its words: its corner is where you put it.
+    let caption = json
+        .split("boards/label-clip/t")
+        .nth(1)
+        .expect("the text shape's words are not in its box");
+    let caption = &caption[..caption.len().min(400)];
+    assert!(
+        !caption.contains("Center"),
+        "a text shape's words walked to the middle of a box nobody drew: {caption}"
     );
 }
 
@@ -1948,7 +1976,7 @@ fn coming_back_to_a_card_puts_the_caret_after_the_words_it_already_holds() {
 }
 
 #[test]
-fn the_caret_hugs_an_arrows_words_and_takes_a_whole_card() {
+fn the_caret_sits_on_the_words_whether_they_ride_a_line_or_a_card() {
     let mut view = linked();
     view.on_size(1400., 900.);
     // Nothing measured yet: the caret takes the room, because a plate hugging
@@ -1969,14 +1997,33 @@ fn the_caret_hugs_an_arrows_words_and_takes_a_whole_card() {
     let inline = view.inline.clone().unwrap();
     let (caret, size) = view.caret_box(&inline, edge.kind, pos, room);
     assert!(size[0] < room[0], "the caret still took the whole room");
+    // The WORDS are centred, not the box: the editor writes from its box's left
+    // edge, so the wrapping margin the box carries is not part of the middle.
     assert!(
-        (caret[0] + size[0] / 2. - (pos[0] + room[0] / 2.)).abs() < 0.5,
-        "the caret is not centred where the plate will be"
+        (caret[0] + 60. / 2. - (pos[0] + room[0] / 2.)).abs() < 0.5,
+        "the words are not centred where the plate will put them"
     );
-    // A card is written across the whole card whatever the gauge says.
+    // A card's words sit in the middle of it, so the caret's box is the words'
+    // own box put in the middle — the same middle the painter centres the saved
+    // label on.
     let card = board.shapes["a"].shape.clone();
     let (pos, room) = view.writing_box(&board, &card, [0., 0., 200., 120.]);
-    assert_eq!(view.caret_box(&inline, Kind::Note, pos, room), (pos, room));
+    let (caret, size) = view.caret_box(&inline, Kind::Note, pos, room);
+    assert!(size[0] < room[0], "the caret took the whole width of the card");
+    assert!(
+        (caret[0] + 60. / 2. - (pos[0] + room[0] / 2.)).abs() < 0.5,
+        "the words are not centred across the card"
+    );
+    assert!(
+        (caret[1] + 24. / 2. - (pos[1] + room[1] / 2.)).abs() < 0.5,
+        "the words do not sit at the middle of the card"
+    );
+    // A text shape IS its words: its corner is where you put it.
+    assert_eq!(
+        view.caret_box(&inline, Kind::Text, pos, room).0[1],
+        pos[1],
+        "a text shape's words walked away from the corner they were put at"
+    );
 }
 
 #[test]
