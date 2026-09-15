@@ -4901,6 +4901,7 @@ impl Ducktape {
         self.onboarding_error = "".to_owned();
         self.password = pw.to_owned();
         self.mutation_phase = MutationPhase::Onboarding;
+        self.wallet_opening_status = "Unlocking wallet…";
         Task::perform(
             crate::backend::unlock_wallet(
                 self.rpc.to_owned(),
@@ -4915,6 +4916,7 @@ impl Ducktape {
     }
     fn on_key_unlocked(&mut self, pubkey: String) -> Task<AppMessage> {
         self.onboarding_error = "".to_owned();
+        self.wallet_opening_status = "Checking network account…";
         self.signer_key = pubkey.to_owned();
         self.live_agents = Vec::new();
         Task::batch([
