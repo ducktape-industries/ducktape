@@ -207,7 +207,11 @@ impl BoardsView {
         // listening — Escape closes it and nothing else reaches past it.
         if self.picking_a_board() {
             let dismiss = key == "Escape";
-            return if dismiss { self.on_cancel() } else { Task::none() };
+            return if dismiss {
+                self.on_cancel()
+            } else {
+                Task::none()
+            };
         }
         let help_key = key == "?" || (key == "/" && shift);
         if help_key && !command && !repeat {
@@ -378,12 +382,9 @@ impl BoardsView {
         self.cursor = [x, y];
         let editing_here = self.inline.as_ref().is_some_and(|inline| {
             self.visible().is_some_and(|board| {
-                board
-                    .shapes
-                    .get(&inline.id)
-                    .is_some_and(|record| {
-                        contains(self.writing_area(&board, &record.shape), self.world([x, y]))
-                    })
+                board.shapes.get(&inline.id).is_some_and(|record| {
+                    contains(self.writing_area(&board, &record.shape), self.world([x, y]))
+                })
             })
         });
         if editing_here {
@@ -1349,11 +1350,23 @@ impl BoardsView {
     /// comes back out of it here.
     pub(super) fn on_measured(&mut self, width: f32, height: f32) -> Task<Message> {
         let zoom = self.zoom;
+        // A card keeps the tallest it has needed while you are in it: the words
+        // that wanted the room may come back with the next key, and a card that
+        // closed up under the caret would be a card that jumped as you deleted.
+        // A text shape IS its words, so it follows them down as well as up.
+        let hugging = self
+            .inline
+            .as_ref()
+            .and_then(|inline| self.kind_of(&inline.id))
+            == Some(Kind::Text);
         let Some(inline) = &mut self.inline else {
             return Task::none();
         };
         let needed = height / zoom;
-        inline.grown = Some(inline.grown.map_or(needed, |seen| seen.max(needed)));
+        inline.grown = Some(match hugging {
+            true => needed,
+            false => inline.grown.map_or(needed, |seen| seen.max(needed)),
+        });
         inline.wide = Some(width / zoom);
         Task::none()
     }

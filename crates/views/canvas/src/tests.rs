@@ -757,16 +757,17 @@ fn an_arrow_bends_by_the_handle_on_its_line_and_straightens_when_you_put_it_back
     view.zoom = 1.;
     let board = view.visible().unwrap();
     let run = super::interaction::stroke(&board, &board.shapes["edge"].shape);
-    let middle = [
-        (run[0][0] + run[1][0]) / 2.,
-        (run[0][1] + run[1][1]) / 2.,
-    ];
+    let middle = [(run[0][0] + run[1][0]) / 2., (run[0][1] + run[1][1]) / 2.];
     // An arrow with no bend still offers one, on its line. Taking it and
     // pulling puts a bend there — a straight arrow becomes a curved one with
     // no separate verb for it.
     drag(
         &mut view,
-        &[middle, [middle[0], middle[1] - 80.], [middle[0], middle[1] - 160.]],
+        &[
+            middle,
+            [middle[0], middle[1] - 80.],
+            [middle[0], middle[1] - 160.],
+        ],
     );
     let board = view.visible().unwrap();
     let bent = &board.shapes["edge"].shape;
@@ -782,10 +783,7 @@ fn an_arrow_bends_by_the_handle_on_its_line_and_straightens_when_you_put_it_back
     assert_eq!(bent.to.as_deref(), Some("b"));
     // And putting it back on the line takes it away again, rather than leaving
     // a sample nobody can see.
-    drag(
-        &mut view,
-        &[[middle[0], middle[1] - 160.], middle, middle],
-    );
+    drag(&mut view, &[[middle[0], middle[1] - 160.], middle, middle]);
     let board = view.visible().unwrap();
     let run = super::interaction::stroke(&board, &board.shapes["edge"].shape);
     assert_eq!(run.len(), 2, "the bend outlived the curve: {run:?}");
@@ -800,10 +798,7 @@ fn a_bend_dragged_across_a_card_binds_nothing() {
     let board = view.visible().unwrap();
     let edge = board.shapes["edge"].shape.clone();
     let run = super::interaction::stroke(&board, &edge);
-    let middle = [
-        (run[0][0] + run[1][0]) / 2.,
-        (run[0][1] + run[1][1]) / 2.,
-    ];
+    let middle = [(run[0][0] + run[1][0]) / 2., (run[0][1] + run[1][1]) / 2.];
     // Card "c" sits at x 600. Drag the bend right over it and let go: the ends
     // are what hold cards, so the arrow must still run a → b.
     let over_c = [650., 60.];
@@ -827,10 +822,7 @@ fn words_on_an_arrow_take_the_middle_and_the_bend_handle_steps_aside() {
     let board = view.visible().unwrap();
     let plain = board.shapes["edge"].shape.clone();
     let run = super::interaction::stroke(&board, &plain);
-    let middle = [
-        (run[0][0] + run[1][0]) / 2.,
-        (run[0][1] + run[1][1]) / 2.,
-    ];
+    let middle = [(run[0][0] + run[1][0]) / 2., (run[0][1] + run[1][1]) / 2.];
     let (_, _, bare) = view.bend(&plain, &run).expect("no handle on a bare arrow");
     assert!(
         (bare[0] - middle[0]).abs() < 0.5,
@@ -967,13 +959,14 @@ fn bending_an_arrow_by_hand_leaves_a_run_the_words_can_ride() {
     // the words sit on — the two answers that used to disagree.
     let board = view.visible().unwrap();
     let run = super::interaction::stroke(&board, &board.shapes["edge"].shape);
-    let middle = [
-        (run[0][0] + run[1][0]) / 2.,
-        (run[0][1] + run[1][1]) / 2.,
-    ];
+    let middle = [(run[0][0] + run[1][0]) / 2., (run[0][1] + run[1][1]) / 2.];
     drag(
         &mut view,
-        &[middle, [middle[0], middle[1] + 90.], [middle[0], middle[1] + 170.]],
+        &[
+            middle,
+            [middle[0], middle[1] + 90.],
+            [middle[0], middle[1] + 170.],
+        ],
     );
     view.edit(Change::Text {
         id: "edge".into(),
@@ -1155,19 +1148,28 @@ fn the_painter_and_the_editor_read_one_description_of_a_label() {
     let painting = include_str!("presentation.rs");
     assert_eq!(
         painting.matches("self.lettering(").count(),
-        4,
+        5,
         "the painter asks once, the inline editor once, the gauge that decides \
-         how tall the card must be once, and the box the caret lives in once — \
-         any of them reading a second description would lay the words out for \
-         a card nobody draws"
+         how tall the card must be once, the box the caret lives in once, and \
+         the box a text shape hugs its words with once — any of them reading a \
+         second description would lay the words out for a card nobody draws"
     );
     assert_eq!(
-        painting.matches(".kind, size[0], &letters)").count(),
+        painting.matches("&letters, self.zoom)").count(),
         2,
         "the column a label wraps in is stated once and read twice — by the \
          label the painter draws and by the gauge that measures it. A second \
          description of it breaks the same words in two different places, \
          which is the whole defect this seam exists to close"
+    );
+    assert_eq!(
+        painting.matches("margin(").count(),
+        4,
+        "the room a card keeps around its column is stated once and read three \
+         times: by the column itself, by the box the caret lives in, and by the \
+         box a text shape hugs its words with. A caret given less of it than \
+         the label was drawn with wraps a word early; a text shape given less \
+         of it than the caret needs is a box that walks itself shut"
     );
     assert!(
         !painting.contains("size: Some((14."),
@@ -1737,7 +1739,11 @@ fn an_arrow_held_at_one_end_still_moves_the_end_it_owns() {
     );
     let board = view.visible().unwrap();
     let edge = &board.shapes["edge"].shape;
-    assert_eq!(edge.from.as_deref(), Some("a"), "the drag broke the binding");
+    assert_eq!(
+        edge.from.as_deref(),
+        Some("a"),
+        "the drag broke the binding"
+    );
     let after = super::interaction::stroke(&board, edge);
     let moved = *after.last().unwrap();
     assert!(
@@ -1926,8 +1932,14 @@ fn an_arrows_words_ride_a_plate_and_a_cards_sit_in_the_middle_of_it() {
         .nth(1)
         .expect("the arrow's words are not on a plate");
     let plate = &plate[..plate.len().min(400)];
-    assert!(plate.contains("Shrink"), "the plate fills the room: {plate}");
-    assert!(plate.contains("Center"), "the plate is not centred: {plate}");
+    assert!(
+        plate.contains("Shrink"),
+        "the plate fills the room: {plate}"
+    );
+    assert!(
+        plate.contains("Center"),
+        "the plate is not centred: {plate}"
+    );
     // A card carries its label in the middle of it — the same middle the caret
     // writes it at, so the words do not move when you stop typing.
     let card = json
@@ -1972,7 +1984,10 @@ fn coming_back_to_a_card_puts_the_caret_after_the_words_it_already_holds() {
         cursor.position.column, 6,
         "the caret is not after the last word"
     );
-    assert_eq!(cursor.selection, None, "the caret arrived holding a selection");
+    assert_eq!(
+        cursor.selection, None,
+        "the caret arrived holding a selection"
+    );
 }
 
 #[test]
@@ -2009,7 +2024,10 @@ fn the_caret_sits_on_the_words_whether_they_ride_a_line_or_a_card() {
     let card = board.shapes["a"].shape.clone();
     let (pos, room) = view.writing_box(&board, &card, [0., 0., 200., 120.]);
     let (caret, size) = view.caret_box(&inline, Kind::Note, pos, room);
-    assert!(size[0] < room[0], "the caret took the whole width of the card");
+    assert!(
+        size[0] < room[0],
+        "the caret took the whole width of the card"
+    );
     assert!(
         (caret[0] + 60. / 2. - (pos[0] + room[0] / 2.)).abs() < 0.5,
         "the words are not centred across the card"
@@ -2018,10 +2036,10 @@ fn the_caret_sits_on_the_words_whether_they_ride_a_line_or_a_card() {
         (caret[1] + 24. / 2. - (pos[1] + room[1] / 2.)).abs() < 0.5,
         "the words do not sit at the middle of the card"
     );
-    // A text shape IS its words: its corner is where you put it.
+    // A text shape IS its words: its corner is where you put it, both ways.
     assert_eq!(
-        view.caret_box(&inline, Kind::Text, pos, room).0[1],
-        pos[1],
+        view.caret_box(&inline, Kind::Text, pos, room).0,
+        pos,
         "a text shape's words walked away from the corner they were put at"
     );
 }
@@ -2246,4 +2264,68 @@ fn an_edge_handle_lines_up_on_the_axis_it_moves_and_stays_quiet_on_the_other() {
         "the edge landed on the line, not four pixels short of it"
     );
     assert_eq!(a.height, 140, "and the axis it never moved on stayed put");
+}
+#[test]
+fn a_text_shape_is_the_size_of_its_words_and_a_card_keeps_the_room_it_was_given() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.zoom = 1.;
+    view.edit(Change::Create {
+        id: "t".into(),
+        shape: Shape {
+            kind: Kind::Text,
+            width: 280,
+            height: 60,
+            text: "a caption".into(),
+            ..Default::default()
+        },
+    });
+    view.selected = ["t".into()].into();
+    view.begin_text();
+    // The host lays the gauge out: the words come to 90 by 24 in a box made at
+    // 280 by 60. The air either side of them is board you cannot click through
+    // and a line the next shape would be snapped against.
+    view.on_measured(90., 40.);
+    let hugged = view.visible().unwrap().shapes["t"].shape.clone();
+    assert!(
+        hugged.width < 280,
+        "a text shape stayed as wide as the box it was made at: {}",
+        hugged.width
+    );
+    assert_eq!(hugged.height, 40, "and as tall as a box nobody drew");
+    // Measuring the same words again says the same thing. A box that shrank
+    // every time it was measured would walk itself shut as you typed.
+    view.on_measured(90., 40.);
+    assert_eq!(
+        view.visible().unwrap().shapes["t"].shape.width,
+        hugged.width,
+        "the box shrank a second time on the same words"
+    );
+    view.finish_text();
+    let saved = view.visible().unwrap().shapes["t"].shape.clone();
+    assert_eq!(
+        (saved.width, saved.height),
+        (hugged.width, hugged.height),
+        "what was drawn under the caret is not what was saved"
+    );
+    // A sticky is a box you drew. Its words ask for more room and never give
+    // any back — the room you made in it stays made.
+    view.edit(Change::Create {
+        id: "n".into(),
+        shape: Shape {
+            width: 200,
+            height: 140,
+            text: "a thought".into(),
+            ..Default::default()
+        },
+    });
+    view.selected = ["n".into()].into();
+    view.begin_text();
+    view.on_measured(90., 40.);
+    let note = view.visible().unwrap().shapes["n"].shape.clone();
+    assert_eq!(
+        (note.width, note.height),
+        (200, 140),
+        "a sticky gave back the room it was drawn with"
+    );
 }
