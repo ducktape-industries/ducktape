@@ -658,6 +658,7 @@ mod tests {
             kind: "peer".into(),
             peer: peer.into(),
             sharing,
+            image: peer.into(),
             ..CallEvent::default()
         };
         // Nobody sharing: no stage, whatever the cameras are doing.

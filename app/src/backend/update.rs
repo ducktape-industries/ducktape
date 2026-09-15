@@ -701,9 +701,13 @@ async fn read_page(
         )
         .await?;
     let reply = &reply["read"];
-    let page = base64_decode(reply["b64"].as_str().unwrap_or_default())
-        .ok_or("The node's read page is not valid base64")?;
-    let eof = reply["eof"].as_bool().unwrap_or(true);
+    let encoded = reply["b64"]
+        .as_str()
+        .ok_or("The node's read page has no bytes")?;
+    let page = base64_decode(encoded).ok_or("The node's read page is not valid base64")?;
+    let eof = reply["eof"]
+        .as_bool()
+        .ok_or("The node's read page has no end marker")?;
     Ok((page, eof))
 }
 

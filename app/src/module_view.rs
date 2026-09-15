@@ -6546,6 +6546,7 @@ pub(crate) mod tests {
     async fn a_new_deployment_swaps_the_view_in_place() {
         let _turn = connection_turn().await;
         use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        can_the_chat_room();
         for module in ["governance", "files", "pages", "chat", "forge"] {
             let Some(staged) = staged(module) else {
                 continue;
