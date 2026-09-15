@@ -3886,6 +3886,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chat",
+ "ducktape-rpc",
  "futures",
  "gateway",
  "libc",

@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 agent-service.workspace = true
 gateway.workspace = true
+ducktape-rpc.workspace = true
 chat.workspace = true
 sdk.workspace = true
 serde.workspace = true

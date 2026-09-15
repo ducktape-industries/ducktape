@@ -62,6 +62,11 @@ pub struct Chunk {
     pub bytes: Vec<u8>,
 }
 
+pub struct Status {
+    pub ended: bool,
+    pub command_cursor: u64,
+}
+
 pub struct Replay {
     pub first: u64,
     pub head: u64,
@@ -316,6 +321,15 @@ impl Sessions {
             record.bytes -= oldest.bytes.len();
         }
         Ok(())
+    }
+
+    pub fn status(&self, id: &str, caller: &Caller) -> Result<Status, String> {
+        self.read(id, caller)?;
+        let record = &self.records[id];
+        Ok(Status {
+            ended: record.phase == Phase::Ended,
+            command_cursor: record.command_cursor,
+        })
     }
 
     pub fn replay(&self, id: &str, caller: &Caller, after: u64) -> Result<Replay, String> {

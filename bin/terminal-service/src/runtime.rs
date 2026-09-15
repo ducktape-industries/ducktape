@@ -1,5 +1,5 @@
 //! Bounded service requests and executor events, with independent spawn jobs.
-use crate::state::{Caller, Effect, Mode, Replay, Sessions, Write};
+use crate::state::{Caller, Effect, Mode, Replay, Sessions, Status, Write};
 use agent_service::wire;
 use base64::Engine as _;
 use std::{
@@ -23,6 +23,11 @@ pub struct Runtime {
 }
 
 enum Request {
+    Status {
+        session: String,
+        caller: Caller,
+        reply: oneshot::Sender<Result<Status, String>>,
+    },
     Committed {
         session: String,
         caller: Caller,
@@ -53,6 +58,10 @@ enum Request {
 }
 
 enum Action {
+    Status(
+        oneshot::Sender<Result<Status, String>>,
+        Result<Status, String>,
+    ),
     Committed {
         session: String,
         commands: Vec<crate::consensus::Projected>,
@@ -90,6 +99,11 @@ struct Machine {
 impl Machine {
     fn request(&mut self, request: Request, workers: usize) -> Vec<Action> {
         match request {
+            Request::Status {
+                session,
+                caller,
+                reply,
+            } => self.status(session, caller, reply),
             Request::Committed {
                 session,
                 caller,
@@ -118,6 +132,18 @@ impl Machine {
             } => self.replay(session, caller, after, reply),
             Request::Stop => Self::stop(),
         }
+    }
+
+    fn status(
+        &self,
+        session: String,
+        caller: Caller,
+        reply: oneshot::Sender<Result<Status, String>>,
+    ) -> Vec<Action> {
+        vec![Action::Status(
+            reply,
+            self.sessions.status(&session, &caller),
+        )]
     }
 
     fn committed(
@@ -387,6 +413,17 @@ impl Runtime {
         result.await.map_err(|_| "terminal runtime stopped")?
     }
 
+    pub async fn status(&self, session: String, caller: Caller) -> Result<Status, String> {
+        let (reply, result) = oneshot::channel();
+        self.send(Request::Status {
+            session,
+            caller,
+            reply,
+        })
+        .await?;
+        result.await.map_err(|_| "terminal runtime stopped")?
+    }
+
     pub async fn replay(
         &self,
         session: String,
@@ -471,6 +508,9 @@ async fn execute(
     let mut actions = VecDeque::from(actions);
     while let Some(action) = actions.pop_front() {
         match action {
+            Action::Status(reply, result) => {
+                let _ = reply.send(result);
+            }
             Action::Committed {
                 session,
                 commands,

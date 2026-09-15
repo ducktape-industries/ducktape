@@ -343,3 +343,180 @@ async fn shared_commands_are_ordered_deduplicated_and_do_not_accept_raw_input() 
     runtime.stop().await.unwrap();
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn failed_committed_query_closes_the_shared_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, task) = Runtime::start(
+        providers(Arc::new(Notify::new()), Arc::new(Notify::new())),
+        "test".into(),
+        directory.path().into(),
+    );
+    let owner = Caller {
+        account: 7,
+        node: [1; 32],
+    };
+    let session = "0000000000000001".to_string();
+    runtime
+        .create(owner.clone(), Mode::Shared, create(&session))
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client =
+        ducktape_rpc::Client::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        let app = axum::Router::new().route(
+            "/v1/query",
+            axum::routing::post(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        axum::serve(listener, app).await.unwrap();
+    });
+    let error = ducktape_terminal::consensus::project(
+        &runtime,
+        &client,
+        &session,
+        &owner,
+        &chat::Party::Account(7),
+    )
+    .await
+    .unwrap_err();
+    assert!(!error.is_empty());
+    let mut changes = runtime.changes();
+    loop {
+        if runtime
+            .replay(session.clone(), owner.clone(), 0)
+            .await
+            .unwrap()
+            .ended
+        {
+            break;
+        }
+        changes.changed().await.unwrap();
+    }
+    runtime.stop().await.unwrap();
+    task.await.unwrap().unwrap();
+    server.abort();
+    let _ = server.await;
+}
+
+async fn committed_query_fixture(
+    axum::extract::State(pending): axum::extract::State<Arc<Notify>>,
+    axum::Json(request): axum::Json<serde_json::Value>,
+) -> axum::Json<chat::ChatReply> {
+    assert_eq!(request["target"], "chat");
+    let query: chat::ChatQuery = serde_json::from_value(request["query"].clone()).unwrap();
+    match query {
+        chat::ChatQuery::Channel { channel_id } => {
+            axum::Json(chat::ChatReply::Channel(Some(chat::Channel {
+                id: channel_id.clone(),
+                name: channel_id,
+                created_at: 0,
+                head_seq: 1,
+                post_policy: chat::PostPolicy::Open,
+                hooks: Vec::new(),
+                pinned: Vec::new(),
+                huddle: Vec::new(),
+                voice: false,
+                owner: chat::Party::Account(7),
+                revision: 1,
+                archived: false,
+            })))
+        }
+        chat::ChatQuery::MessagesRange {
+            channel_id,
+            from_seq,
+            limit,
+        } => {
+            assert_eq!(channel_id, "term-0000000000000001");
+            assert_eq!(limit, chat::MAX_QUERY_LIMIT);
+            match from_seq {
+                1 => axum::Json(chat::ChatReply::Messages(vec![committed_message(
+                    1,
+                    7,
+                    "rpc-command",
+                )])),
+                2 => {
+                    pending.notify_one();
+                    std::future::pending().await
+                }
+                _ => panic!("unexpected committed cursor"),
+            }
+        }
+        _ => panic!("unexpected query"),
+    }
+}
+
+#[tokio::test]
+async fn projector_delivers_http_commands_and_session_end_cancels_a_pending_query() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, task) = Runtime::start(
+        providers(Arc::new(Notify::new()), Arc::new(Notify::new())),
+        "test".into(),
+        directory.path().into(),
+    );
+    let owner = Caller {
+        account: 7,
+        node: [1; 32],
+    };
+    let session = "0000000000000001".to_string();
+    runtime
+        .create(owner.clone(), Mode::Shared, create(&session))
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client =
+        ducktape_rpc::Client::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let pending = Arc::new(Notify::new());
+    let app = axum::Router::new()
+        .route("/v1/query", axum::routing::post(committed_query_fixture))
+        .with_state(pending.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let projector = {
+        let runtime = runtime.clone();
+        let session = session.clone();
+        let owner = owner.clone();
+        tokio::spawn(async move {
+            ducktape_terminal::consensus::project(
+                &runtime,
+                &client,
+                &session,
+                &owner,
+                &chat::Party::Account(7),
+            )
+            .await
+        })
+    };
+    let mut changes = runtime.changes();
+    loop {
+        let replay = runtime
+            .replay(session.clone(), owner.clone(), 0)
+            .await
+            .unwrap();
+        let bytes: Vec<u8> = replay
+            .chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.bytes)
+            .collect();
+        if String::from_utf8_lossy(&bytes).contains("rpc-command") {
+            break;
+        }
+        changes.changed().await.unwrap();
+    }
+    pending.notified().await;
+    assert_eq!(
+        runtime
+            .status(session.clone(), owner.clone())
+            .await
+            .unwrap()
+            .command_cursor,
+        1
+    );
+    runtime.close(session, owner).await.unwrap();
+    projector.await.unwrap().unwrap();
+    runtime.stop().await.unwrap();
+    task.await.unwrap().unwrap();
+    server.abort();
+    let _ = server.await;
+}

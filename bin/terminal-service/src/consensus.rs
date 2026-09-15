@@ -110,6 +110,102 @@ pub fn channel_owner(channel: Option<chat::Channel>) -> Result<chat::Party, &'st
     }
 }
 
+/// Project public, committed Chat messages into one live shared session. The
+/// expected owner comes from successful channel creation/ownership confirmation.
+/// The caller owns this future for the session lifetime; service shutdown must
+/// stop the runtime, which cancels an outstanding node query here.
+pub async fn project(
+    runtime: &crate::runtime::Runtime,
+    client: &ducktape_rpc::Client,
+    session: &str,
+    caller: &crate::state::Caller,
+    owner: &chat::Party,
+) -> Result<(), String> {
+    let changes = runtime.changes();
+    let result = tokio::select! {
+        ended = wait_ended(runtime, session, caller, changes) => return ended,
+        result = feed(runtime, client, session, caller, owner) => result,
+    };
+    // Query/protocol failures have no native input fallback. The runtime closes
+    // asynchronously while continuing to drain executor output.
+    let _ = runtime.close(session.into(), caller.clone()).await;
+    result
+}
+
+async fn wait_ended(
+    runtime: &crate::runtime::Runtime,
+    session: &str,
+    caller: &crate::state::Caller,
+    mut changes: tokio::sync::watch::Receiver<()>,
+) -> Result<(), String> {
+    loop {
+        let status = runtime.status(session.into(), caller.clone()).await?;
+        if status.ended {
+            return Ok(());
+        }
+        if changes.changed().await.is_err() {
+            return Ok(());
+        }
+    }
+}
+
+async fn feed(
+    runtime: &crate::runtime::Runtime,
+    client: &ducktape_rpc::Client,
+    session: &str,
+    caller: &crate::state::Caller,
+    owner: &chat::Party,
+) -> Result<(), String> {
+    let channel = session_channel(session);
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let status = runtime.status(session.into(), caller.clone()).await?;
+        if status.ended {
+            return Ok(());
+        }
+        let reply: chat::ChatReply = client
+            .query(
+                "chat",
+                &chat::ChatQuery::Channel {
+                    channel_id: channel.clone(),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let chat::ChatReply::Channel(Some(record)) = reply else {
+            return Err("terminal channel unreadable".into());
+        };
+        let matching_channel = record.id == channel;
+        let matching_owner = &channel_owner(Some(record))? == owner;
+        if !matching_channel || !matching_owner {
+            return Err("terminal channel owner changed".into());
+        }
+        let from_seq = status
+            .command_cursor
+            .checked_add(1)
+            .ok_or("terminal command cursor exhausted")?;
+        let reply: chat::ChatReply = client
+            .query(
+                "chat",
+                &chat::ChatQuery::MessagesRange {
+                    channel_id: channel.clone(),
+                    from_seq,
+                    limit: chat::MAX_QUERY_LIMIT,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let chat::ChatReply::Messages(views) = reply else {
+            return Err("unexpected terminal messages reply".into());
+        };
+        runtime
+            .committed(session.into(), caller.clone(), owner.clone(), views)
+            .await?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
