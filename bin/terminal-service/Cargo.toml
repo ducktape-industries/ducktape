@@ -8,8 +8,10 @@ agent-service.workspace = true
 serde.workspace = true
 base64.workspace = true
 
-[dev-dependencies]
 provider-host.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync", "process"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["process"] }
 tempfile.workspace = true
 async-trait.workspace = true

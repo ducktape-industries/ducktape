@@ -124,6 +124,9 @@ struct Inner {
     /// sweep cannot see a session that is not in the map yet, and the container
     /// survives, unreachable, until the wall-clock ceiling.
     epoch: AtomicU64,
+    /// Removed sessions can still own a PTY while asynchronous close runs.
+    closing: AtomicUsize,
+    closed: tokio::sync::Notify,
     /// the one way anything here reaches the node. Every writer goes through
     /// [`Inner::emit`], so frame ordering is owned by a single place.
     events: mpsc::Sender<wire::Event>,
@@ -248,6 +251,8 @@ impl Sessions {
             sessions: Mutex::new(HashMap::new()),
             active: AtomicUsize::new(0),
             epoch: AtomicU64::new(0),
+            closing: AtomicUsize::new(0),
+            closed: tokio::sync::Notify::new(),
             events,
         }))
     }
@@ -318,17 +323,26 @@ impl Sessions {
             .keys()
             .cloned()
             .collect();
-        if live.is_empty() {
-            return;
+        let has_live = !live.is_empty();
+        if has_live {
+            tracing::info!(
+                target: "ducktape::term",
+                sessions = live.len(),
+                reason = "link_lost",
+                "ending every session: the node connection dropped"
+            );
         }
-        tracing::info!(
-            target: "ducktape::term",
-            sessions = live.len(),
-            reason = "link_lost",
-            "ending every session: the node connection dropped"
-        );
         for id in live {
             self.finish(&id).await;
+        }
+        loop {
+            let closed = self.0.closed.notified();
+            tokio::pin!(closed);
+            closed.as_mut().enable();
+            if self.0.closing.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            closed.await;
         }
     }
 
@@ -608,20 +622,32 @@ impl Sessions {
     /// Whoever removes the entry owns the teardown, so an explicit close racing
     /// the pump's EOF can never double-terminate. The `TermEnded` frame is
     /// emitted BEFORE `close()` because the terminator is what unblocks an
-    /// attached client and the container teardown can take seconds — the frame
-    /// ordering on the link is what makes this safe, not the timing.
+    /// attached client and the container teardown can take seconds. The event
+    /// retires the session at the receiver, which discards any late pump
+    /// output. close_all separately waits for process and workdir teardown.
     ///
     /// The workdir goes LAST, and by construction rather than by a statement:
     /// `live` — and the [`SessionHome`] inside it — is dropped at the end of
     /// this function, which the awaited `close()` above already precedes. The
     /// directory the container mounts is never removed while it is mounted.
     async fn finish(&self, id: &str) {
-        let removed = self
-            .0
-            .sessions
-            .lock()
-            .expect("agent sessions lock poisoned")
-            .remove(id);
+        let removed = {
+            let mut sessions = self
+                .0
+                .sessions
+                .lock()
+                .expect("agent sessions lock poisoned");
+            let removed = sessions.remove(id);
+            // Increment under the same lock as removal so close_all cannot
+            // observe both an empty map and no outstanding teardown.
+            if removed.is_some() {
+                self.0.closing.fetch_add(1, Ordering::SeqCst);
+            }
+            removed
+        };
+        // Declared before live so even cancellation drops its workdir before
+        // notifying shutdown waiters that teardown has finished.
+        let _teardown = removed.as_ref().map(|_| Teardown(&self.0));
         let Some(live) = removed else {
             return; // already ended: idempotent by construction.
         };
@@ -633,6 +659,15 @@ impl Sessions {
             .await;
         live.session.close().await;
         tracing::info!(target: "ducktape::term", session = %id, "session_ended");
+    }
+}
+
+struct Teardown<'a>(&'a Inner);
+
+impl Drop for Teardown<'_> {
+    fn drop(&mut self) {
+        self.0.closing.fetch_sub(1, Ordering::SeqCst);
+        self.0.closed.notify_waiters();
     }
 }
 
@@ -852,6 +887,47 @@ mod tests {
             dir.display()
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn close_all_waits_for_teardown_already_removed_by_the_pump() {
+        use std::task::Poll;
+        let (plane, root, mut events) = plane("background-close");
+        plane
+            .spawn(&StubProvider { spawns: true }, stub_create())
+            .await
+            .unwrap();
+        for _ in 0..8 {
+            plane
+                .0
+                .events
+                .send(wire::Event::TermOutput {
+                    session: STUB_SESSION.into(),
+                    chunk_b64: "eA==".into(),
+                })
+                .await
+                .unwrap();
+        }
+        let finish = plane.finish(STUB_SESSION);
+        tokio::pin!(finish);
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(finish.as_mut().poll(cx).is_pending())).await
+        );
+        assert!(plane.0.sessions.lock().unwrap().is_empty());
+        let close = plane.close_all();
+        tokio::pin!(close);
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(close.as_mut().poll(cx).is_pending())).await,
+            "a removed record can still own a live PTY and workdir"
+        );
+        let drain = async {
+            for _ in 0..9 {
+                events.recv().await.unwrap();
+            }
+        };
+        tokio::join!(finish, close, drain);
+        assert!(!root.join(STUB_SESSION).exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

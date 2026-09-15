@@ -121,6 +121,16 @@ impl Sessions {
     }
 
     fn engine_output(&mut self, session: String, chunk_b64: String) -> Result<Effect, String> {
+        // The executor pump can have a read in flight when teardown emits
+        // Ended. Its late bytes cannot reopen a record or stop other sessions;
+        // an already-evicted record has the same terminal outcome.
+        let accepts_output = self
+            .records
+            .get(&session)
+            .is_some_and(|record| record.phase != Phase::Ended);
+        if !accepts_output {
+            return Ok(Effect::None);
+        }
         let maximum = MAX_REPLAY_BYTES.div_ceil(3) * 4;
         if chunk_b64.len() > maximum {
             return Err("oversized executor output".into());
@@ -188,6 +198,16 @@ impl Sessions {
             }
             Phase::Running => Created::Ready,
             Phase::Cancelling | Phase::Ended => Created::Close,
+        }
+    }
+
+    /// Refuse further writes as soon as an accepted close is scheduled.
+    pub fn closing(&mut self, id: &str) {
+        let Some(record) = self.records.get_mut(id) else {
+            return;
+        };
+        if record.phase != Phase::Ended {
+            record.phase = Phase::Cancelling;
         }
     }
 
@@ -529,6 +549,32 @@ mod tests {
             assert!(sessions.replay(&session, &owner, 0).unwrap().ended);
         }
         assert_eq!(engine.live(), 0);
+    }
+
+    #[test]
+    fn late_output_from_an_ended_session_does_not_end_its_sibling() {
+        let mut sessions = Sessions::default();
+        let owner = caller(7, 1);
+        let ended = "0000000000000001";
+        let active = "0000000000000002";
+        for session in [ended, active] {
+            sessions
+                .insert(session.into(), owner.clone(), Mode::Single)
+                .unwrap();
+            sessions.created(session);
+        }
+        sessions.end(ended);
+        assert_eq!(
+            sessions
+                .on_engine(wire::Event::TermOutput {
+                    session: ended.into(),
+                    chunk_b64: "bGF0ZQ==".into()
+                })
+                .unwrap(),
+            Effect::None
+        );
+        assert!(sessions.write(active, &owner, Write::Input).is_ok());
+        assert!(sessions.replay(ended, &owner, 0).unwrap().chunks.is_empty());
     }
 
     #[test]
