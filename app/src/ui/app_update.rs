@@ -5360,6 +5360,14 @@ impl Ducktape {
                 self.call_camera = false;
                 self.call_sharing = false;
             }
+            "error" | "refused" => {
+                self.huddle_stage.clear();
+                self.call_video_live = false;
+            }
+            "presentation" => {
+                self.huddle_stage = event.stage.clone();
+                self.call_video_live = event.video_live;
+            }
             "self" => {
                 self.call_muted = event.muted;
                 self.call_camera = event.camera_on;
@@ -5376,13 +5384,6 @@ impl Ducktape {
             self.call_muted,
             self.call_speaking,
         );
-        self.call_video_live = crate::call::call_video_live_after(
-            self.call_peers.clone(),
-            self.call_camera,
-            self.call_sharing,
-        );
-        self.huddle_stage =
-            crate::call::huddle_stage_peer(self.call_peers.clone(), self.call_sharing);
         Task::none()
     }
     fn on_toggle_call_mute(&mut self) -> Task<AppMessage> {
@@ -5402,26 +5403,12 @@ impl Ducktape {
         let source = crate::video::call_use_camera(!self.call_camera);
         self.call_camera = source.camera;
         self.call_sharing = source.sharing;
-        self.call_video_live = crate::call::call_video_live_after(
-            self.call_peers.clone(),
-            self.call_camera,
-            self.call_sharing,
-        );
-        self.huddle_stage =
-            crate::call::huddle_stage_peer(self.call_peers.clone(), self.call_sharing);
         Task::none()
     }
     fn on_toggle_call_screen(&mut self) -> Task<AppMessage> {
         let source = crate::video::call_use_screen(!self.call_sharing);
         self.call_camera = source.camera;
         self.call_sharing = source.sharing;
-        self.call_video_live = crate::call::call_video_live_after(
-            self.call_peers.clone(),
-            self.call_camera,
-            self.call_sharing,
-        );
-        self.huddle_stage =
-            crate::call::huddle_stage_peer(self.call_peers.clone(), self.call_sharing);
         Task::none()
     }
     fn on_show_huddle(&mut self) -> Task<AppMessage> {

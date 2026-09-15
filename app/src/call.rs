@@ -16,6 +16,8 @@ pub struct CallEvent {
     pub message: String,
     pub peer: String,
     pub image: String,
+    pub stage: String,
+    pub video_live: bool,
     pub muted: bool,
     pub camera_on: bool,
     pub sharing: bool,
@@ -458,32 +460,6 @@ pub fn apply_call_peer(peers: Vec<CallEvent>, event: CallEvent) -> Vec<CallEvent
     }
 }
 
-/// Any live video in the call — this device's own source, or any peer
-/// beaconing a camera or a share — gates the tile strip and its repaint tick.
-pub fn call_video_live_after(peers: Vec<CallEvent>, camera: bool, sharing: bool) -> bool {
-    camera || sharing || peers.iter().any(|peer| peer.camera_on || peer.sharing)
-}
-
-/// WHO HOLDS THE STAGE — the one participant whose video is a screen, so the
-/// panel can show it whole instead of cropping a desktop into a 4:3 thumbnail.
-/// Empty means nobody is sharing and there is no stage.
-///
-/// A PEER'S SHARE OUTRANKS OUR OWN. Both can be true — nothing stops two
-/// people sharing at once — and of the two pictures, the one you have not
-/// already got on your screen is the one worth the space. Ours still appears
-/// (as [`crate::video::SELF_STAGE`]) when it is the only one, because a
-/// sharer with no view of what they published is sharing blind.
-pub fn huddle_stage_peer(peers: Vec<CallEvent>, local_sharing: bool) -> String {
-    let remote = peers
-        .into_iter()
-        .find(|peer| peer.sharing && !peer.image.is_empty());
-    match remote {
-        Some(peer) => peer.image,
-        None if local_sharing => crate::video::SELF_STAGE.to_string(),
-        None => String::new(),
-    }
-}
-
 /// One huddle tile with its mute and voice decisions already attached.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct HuddleTileRow {
@@ -650,36 +626,5 @@ mod tests {
         assert!(!rows[0].muted);
         assert!(rows[1].muted);
         assert!(rows[2].muted, "the local tile reads the local mute");
-    }
-
-    #[test]
-    fn the_stage_prefers_the_share_you_cannot_already_see() {
-        let sharing = |peer: &str, sharing: bool| CallEvent {
-            kind: "peer".into(),
-            peer: peer.into(),
-            sharing,
-            image: peer.into(),
-            ..CallEvent::default()
-        };
-        // Nobody sharing: no stage, whatever the cameras are doing.
-        assert!(huddle_stage_peer(vec![sharing("aa", false)], false).is_empty());
-        // A peer's share takes it.
-        assert_eq!(
-            huddle_stage_peer(vec![sharing("aa", false), sharing("bb", true)], false),
-            "bb"
-        );
-        // Ours alone is staged too — a sharer with no view of what they
-        // published is sharing blind.
-        assert_eq!(
-            huddle_stage_peer(vec![sharing("aa", false)], true),
-            crate::video::SELF_STAGE
-        );
-        // Both at once: the picture we do NOT already have on screen wins.
-        assert_eq!(huddle_stage_peer(vec![sharing("bb", true)], true), "bb");
-        // And any live source at all lights the strip.
-        assert!(call_video_live_after(Vec::new(), false, true));
-        let live = |peers: Vec<CallEvent>| call_video_live_after(peers, false, false);
-        assert!(live(vec![sharing("bb", true)]));
-        assert!(!live(vec![sharing("bb", false)]));
     }
 }

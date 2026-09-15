@@ -646,3 +646,47 @@ fn update_facts_reach_settings_and_each_intent_is_one_action() {
     assert!(shell.contains("Message::UpdateAction(crate::UpdateAction::RestartToUpdate)"));
     assert!(shell.contains("Message::UpdateAction(crate::UpdateAction::DismissRollbackNotice)"));
 }
+
+#[test]
+fn call_presentation_comes_from_the_deployed_guest() {
+    let (mut app, _) = Ducktape::boot();
+    let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
+        kind: "presentation".into(),
+        stage: "guest-selected-image".into(),
+        video_live: true,
+        ..Default::default()
+    }));
+    assert_eq!(app.huddle_stage, "guest-selected-image");
+    assert!(app.call_video_live);
+    // Native peer observations cannot choose a different stage or hide the
+    // strip. The next guest presentation owns that decision.
+    let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
+        kind: "peer".into(),
+        peer: "remote".into(),
+        image: "other-image".into(),
+        sharing: true,
+        ..Default::default()
+    }));
+    assert_eq!(app.huddle_stage, "guest-selected-image");
+    // A host runtime trap cannot ask the retired guest to clear its own
+    // presentation. Disposal still belongs to the native lifecycle adapter.
+    let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
+        kind: "error".into(),
+        message: "guest trapped".into(),
+        ..Default::default()
+    }));
+    assert!(app.huddle_stage.is_empty());
+    assert!(!app.call_video_live);
+    let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
+        kind: "presentation".into(),
+        stage: "replacement-image".into(),
+        video_live: true,
+        ..Default::default()
+    }));
+    let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
+        kind: "presentation".into(),
+        ..Default::default()
+    }));
+    assert!(app.huddle_stage.is_empty());
+    assert!(!app.call_video_live);
+}

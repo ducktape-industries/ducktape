@@ -32,6 +32,8 @@ struct Session {
     clock: host::Subscription,
     machine: Machine,
     images: BTreeMap<String, (u64, String)>,
+    preview: String,
+    presentation: Option<(String, bool)>,
 }
 
 fn bytes(value: &Value) -> Vec<u8> {
@@ -85,6 +87,7 @@ pub fn run() -> LocalBoxStream<'static, Message> {
         let next = match next {
             Ok(next) => next,
             Err(error) => {
+                emit(json!({"kind":"presentation", "stage":"", "video_live":false}));
                 status("error", &error);
                 host::notify("host.finish", &[]);
                 Run::End
@@ -132,6 +135,8 @@ impl Session {
             clock: host::subscribe("clock.ticks", &20i64.to_le_bytes()),
             machine: Machine::default(),
             images: BTreeMap::new(),
+            preview: String::new(),
+            presentation: None,
         };
         let initial = session.machine.step(Event::Properties(props));
         session.execute(initial).await?;
@@ -222,6 +227,7 @@ impl Session {
         struct Image {
             timestamp_ms: u32,
             jpeg: Vec<u8>,
+            preview: String,
         }
         let bytes = match answer(item) {
             Ok(bytes) => bytes,
@@ -234,6 +240,7 @@ impl Session {
             }
         };
         let image: Image = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        self.preview = image.preview;
         Ok(vec![Event::LocalImage {
             timestamp_ms: image.timestamp_ms,
             jpeg: image.jpeg,
@@ -273,7 +280,34 @@ impl Session {
                 Effect::DropImage(peer) => self.drop_picture(&peer),
             }
         }
+        self.present();
         Ok(())
+    }
+
+    fn present(&mut self) {
+        let remote = self.machine.peers.iter().find_map(|(peer, beacon)| {
+            if !beacon.sharing {
+                return None;
+            }
+            self.images.get(peer).map(|(_, key)| key.clone())
+        });
+        let stage = remote.unwrap_or_else(|| match self.machine.props.source.as_str() {
+            "screen" => self.preview.clone(),
+            _ => String::new(),
+        });
+        let local_video = matches!(self.machine.props.source.as_str(), "camera" | "screen");
+        let remote_video = self
+            .machine
+            .peers
+            .values()
+            .any(|peer| peer.camera_on || peer.sharing);
+        let current = (stage, local_video || remote_video);
+        let unchanged = self.presentation.as_ref() == Some(&current);
+        if unchanged {
+            return;
+        }
+        emit(json!({"kind":"presentation", "stage":current.0, "video_live":current.1}));
+        self.presentation = Some(current);
     }
 
     fn emit_peer(&self, peer: &str, beacon: &Beacon) {
@@ -290,6 +324,7 @@ impl Session {
 
     fn capture(&mut self, source: &str) {
         self.video.take();
+        self.preview.clear();
         if source != "off" {
             self.video = Some(host::subscribe(
                 "media.video",

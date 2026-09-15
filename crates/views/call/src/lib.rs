@@ -169,7 +169,10 @@ mod tests {
             "call.props",
             json!({"channel": "room", "muted": true, "source": "screen"}),
         );
-        host.item("media.video", json!({"timestamp_ms": 7, "jpeg": [8,9]}));
+        host.item(
+            "media.video",
+            json!({"timestamp_ms": 7, "jpeg": [8,9], "preview":"local-preview"}),
+        );
         assert!(host.effects.iter().any(|(kind, body)| kind == "net.send"
             && body["frame"]["binary"] == json!([2, 1, 0, 0, 0, 7, 8, 9])));
         let before = host.effects.len();
@@ -196,6 +199,77 @@ mod tests {
             host.effects
                 .iter()
                 .any(|(kind, body)| kind == "host.emit" && body["image"] == "opaque-image")
+        );
+    }
+    #[test]
+    fn guest_selects_the_stage_and_emits_only_presentation_changes() {
+        fn shown(host: &Host) -> Value {
+            host.effects
+                .iter()
+                .rev()
+                .find(|(kind, body)| kind == "host.emit" && body["kind"] == "presentation")
+                .expect("guest presentation")
+                .1
+                .clone()
+        }
+        let mut host = Host::new();
+        host.step(Vec::new());
+        host.item("call.props", json!({"channel":"room", "source":"off"}));
+        assert_eq!(
+            shown(&host),
+            json!({"kind":"presentation", "stage":"", "video_live":false})
+        );
+        host.item("call.props", json!({"channel":"room", "source":"screen"}));
+        host.item(
+            "media.video",
+            json!({"timestamp_ms":1, "jpeg":[9], "preview":"local-preview"}),
+        );
+        assert_eq!(shown(&host)["stage"], "local-preview");
+        assert_eq!(shown(&host)["video_live"], true);
+        let peer = "02".repeat(32);
+        host.item(
+            "net.stream",
+            json!({"text":json!({"type":"peer_beacon", "peer":peer, "sharing":true}).to_string()}),
+        );
+        assert_eq!(
+            shown(&host)["stage"],
+            "local-preview",
+            "a beacon alone has no image to show"
+        );
+        let mut video = vec![3, 1, 0, 0, 0, 7];
+        video.extend_from_slice(&[2; 32]);
+        video.push(9);
+        host.item("net.stream", json!({"binary":video}));
+        assert_eq!(
+            shown(&host)["stage"],
+            "opaque-image",
+            "remote share takes priority"
+        );
+        let before = host
+            .effects
+            .iter()
+            .filter(|(_, body)| body["kind"] == "presentation")
+            .count();
+        host.item(
+            "media.video",
+            json!({"timestamp_ms":2, "jpeg":[9], "preview":"local-preview"}),
+        );
+        assert_eq!(
+            host.effects
+                .iter()
+                .filter(|(_, body)| body["kind"] == "presentation")
+                .count(),
+            before
+        );
+        host.item(
+            "net.stream",
+            json!({"text":json!({"type":"peer_left", "peer":peer}).to_string()}),
+        );
+        assert_eq!(shown(&host)["stage"], "local-preview");
+        host.item("call.props", json!({"channel":"room", "source":"off"}));
+        assert_eq!(
+            shown(&host),
+            json!({"kind":"presentation", "stage":"", "video_live":false})
         );
     }
 }

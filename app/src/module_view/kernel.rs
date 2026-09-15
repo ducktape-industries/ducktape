@@ -46,7 +46,8 @@
 //! - `media.audio` subscribes to 960-sample mono 48 kHz PCM capture;
 //!   `media.play` `{audio,samples}` plays one frame, `media.mute`
 //!   `{audio,muted}` controls capture. `media.video` `{source,max_bytes}`
-//!   subscribes to camera/screen JPEG capture. `media.image` allocates an
+//!   subscribes to camera/screen JPEG capture, including an opaque `preview`
+//!   image key for local display. `media.image` allocates an
 //!   opaque image key; `media.put` `{image,jpeg}` updates it and `media.drop`
 //!   `{image}` releases it. All resource IDs belong to one active user-started
 //!   companion; the host interprets no room or peer protocol.

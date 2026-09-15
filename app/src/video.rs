@@ -13,6 +13,7 @@ use gpui_kit::{
 };
 #[derive(serde::Serialize)]
 pub(crate) struct CapturedImage {
+    pub preview: &'static str,
     pub timestamp_ms: u32,
     pub jpeg: Vec<u8>,
 }
@@ -761,6 +762,7 @@ pub(crate) fn capture_thread(
         };
         last_sent = Some(std::time::Instant::now());
         let captured = CapturedImage {
+            preview: SELF_STAGE,
             timestamp_ms: started.elapsed().as_millis() as u32,
             jpeg: encoded,
         };
