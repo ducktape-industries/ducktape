@@ -68,22 +68,6 @@ pub fn message_seq_after_failure(
     }
 }
 
-// --- Client-local unread tracking (no wire read-cursor) ------------------
-//
-// `channel_reads` is the shell's per-channel last-seen `seq` for badges.
-// The Chat guest owns the in-channel "New messages" divider.
-
-fn head_seq_of(channels: &[ChatChannel], channel: &str) -> i64 {
-    channels
-        .iter()
-        .find(|entry| entry.id == channel)
-        .map_or(0, |entry| entry.head_seq)
-}
-
-pub fn channel_head_seq(channels: Vec<ChatChannel>, channel: String) -> i64 {
-    head_seq_of(&channels, &channel)
-}
-
 /// FOLD A LOAD'S ROWS INTO THE LIST ON SCREEN — do not replace it with them.
 ///
 /// The switch loader is handed the list the reader is already looking at and
@@ -212,22 +196,6 @@ pub fn submit_verdict(
     }
 }
 
-pub fn mark_channel_read(
-    mut reads: Vec<ChannelRead>,
-    channel: String,
-    seq: i64,
-) -> Vec<ChannelRead> {
-    if channel.is_empty() {
-        return reads;
-    }
-    if let Some(read) = reads.iter_mut().find(|read| read.channel == channel) {
-        read.seq = read.seq.max(seq);
-        return reads;
-    }
-    reads.push(ChannelRead { channel, seq });
-    reads
-}
-
 /// ONE SEND IN FLIGHT, as the screen must paint it before any block carries
 /// it. The room's timeline is the chat view's own reading of the index, which
 /// cannot know about an operation the node has not committed yet — so the app
@@ -238,25 +206,6 @@ pub struct PendingSend {
     pub id: String,
     pub body: String,
     pub thread_seq: i64,
-}
-
-/// On first connect, seed each not-yet-tracked channel's cursor to its own head
-/// so the session starts fully caught up. Existing entries are preserved.
-pub fn initial_channel_reads(
-    channels: Vec<ChatChannel>,
-    existing: Vec<ChannelRead>,
-) -> Vec<ChannelRead> {
-    let mut reads = existing;
-    for channel in channels {
-        let tracked = reads.iter().any(|read| read.channel == channel.id);
-        if !tracked {
-            reads.push(ChannelRead {
-                channel: channel.id,
-                seq: channel.head_seq,
-            });
-        }
-    }
-    reads
 }
 
 pub(crate) struct Tip {

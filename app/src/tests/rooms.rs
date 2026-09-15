@@ -234,60 +234,6 @@ fn opening_a_network_clears_the_previous_networks_state() {
     assert_eq!(app.connected_rpc, "http://node-b");
 }
 
-#[test]
-fn a_channel_switch_marks_the_native_sidebar_read() {
-    let channel = |id: &str, head: i64| backend::ChatChannel {
-        id: id.into(),
-        name: id.into(),
-        archived: false,
-        members_only: false,
-        huddle_count: 0,
-        voice: false,
-        huddle: Vec::new(),
-        head_seq: head,
-    };
-
-    let (mut app, _) = Ducktape::boot();
-    app.loading = false;
-    app.active_channel = "general".into();
-    app.channels = vec![channel("general", 100), channel("random", 50)];
-    // I last read #random at seq 30; it has since grown to head 50.
-    app.channel_reads = vec![backend::ChannelRead {
-        channel: "random".into(),
-        seq: 30,
-    }];
-
-    // A room click advances its native read cursor after the load completes.
-    let _ = app.update(AppMessage::ChooseChannel("random".into()));
-    assert_eq!(app.active_channel, "random");
-    app.loading = false;
-    let mut switched = chat_data("random");
-    switched.channels = vec![channel("general", 100), channel("random", 50)];
-    switched.generation = app.chat_generation;
-    let _ = app.update(AppMessage::ChatUpdated(switched));
-    assert_eq!(app.active_channel, "random");
-    assert!(
-        backend::channel_head_seq(app.channels.clone(), "random".into())
-            <= read_seq(&app, "random")
-    );
-
-    // Live arrivals retain the active room.
-    let _ = app.update(AppMessage::LiveUpdated(posted_delta(
-        "random",
-        message(60, "d", false),
-    )));
-    assert_eq!(app.active_channel, "random");
-
-    // A caught-up room can also become active.
-    app.channel_reads =
-        backend::mark_channel_read(app.channel_reads.clone(), "general".into(), 100);
-    let mut caught_up = chat_data("general");
-    caught_up.channels = vec![channel("general", 100), channel("random", 60)];
-    caught_up.generation = app.chat_generation;
-    let _ = app.update(AppMessage::ChatUpdated(caught_up));
-    assert_eq!(app.active_channel, "general");
-}
-
 /// THE LAST CLICK WINS. `choose_channel` used to open `return if loading`, and
 /// `loading` covers the whole switch it starts — so the second and third clicks
 /// of a fast A→B→C were discarded on the way out, with nothing on screen
@@ -341,7 +287,6 @@ fn a_switch_reply_keeps_what_the_live_stream_folded_while_it_was_in_flight() {
     app.connected_rpc = "http://node".into();
     app.active_channel = "general".into();
     app.channels = vec![room("general", 10), room("random", 20), room("eng", 40)];
-    app.channel_reads = backend::initial_channel_reads(app.channels.clone(), Vec::new());
 
     let _ = app.update(AppMessage::ChooseChannel("random".into()));
     let switch = app.chat_generation;
@@ -360,9 +305,6 @@ fn a_switch_reply_keeps_what_the_live_stream_folded_while_it_was_in_flight() {
         }],
         ..backend::LiveUpdate::default()
     }));
-    assert!(
-        (backend::channel_head_seq(app.channels.clone(), "eng".into()) > read_seq(&app, "eng"))
-    );
 
     let mut landed = chat_data("random");
     landed.channels = vec![room("random", 20)];
@@ -378,33 +320,25 @@ fn a_switch_reply_keeps_what_the_live_stream_folded_while_it_was_in_flight() {
         "the room created mid-switch is still in the sidebar"
     );
     assert_eq!(
-        backend::channel_head_seq(app.channels.clone(), "eng".into()),
+        app.channels
+            .iter()
+            .find(|row| row.id == "eng")
+            .unwrap()
+            .head_seq,
         41,
         "and the third room's head did not walk back to the pre-click snapshot"
     );
-    assert!(
-        (backend::channel_head_seq(app.channels.clone(), "eng".into()) > read_seq(&app, "eng")),
-        "so its badge survives the switch it had nothing to do with"
-    );
 }
 
-/// AND NEITHER DOES A RESYNC'S REPLY — same rule, same seam, wider blast.
-///
-/// `live_resync_load` is a checkpoint-gated multi-query read whose latency the
-/// repo measures in seconds, so every delta the live stream folds inside its
-/// round trip is the NEWER fact. A flat assignment walked a third room's
-/// `head_seq` back to the snapshot — while `channel_reads` was NOT reverted with
-/// it — so `head_seq > last_read` went false and the badge the reader never saw
-/// blinked out, dark until that room got another message.
+/// A resync preserves channel heads and rooms observed during its request.
 #[test]
-fn a_resync_keeps_the_badge_the_live_stream_lit_while_it_was_in_flight() {
+fn a_resync_keeps_channel_heads_and_rooms_added_while_it_was_in_flight() {
     let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
     app.loading = false;
     app.active_channel = "general".into();
     app.channels = vec![room("general", 10), room("eng", 40)];
-    app.channel_reads = backend::initial_channel_reads(app.channels.clone(), Vec::new());
 
     // mid-RTT: a peer posts into a third room, and another creates a channel
     let _ = app.update(AppMessage::LiveUpdated(posted_delta(
@@ -420,9 +354,6 @@ fn a_resync_keeps_the_badge_the_live_stream_lit_while_it_was_in_flight() {
         }],
         ..backend::LiveUpdate::default()
     }));
-    assert!(
-        (backend::channel_head_seq(app.channels.clone(), "eng".into()) > read_seq(&app, "eng"))
-    );
 
     // the resync answers off a snapshot taken before either of them
     let mut landed = live_refresh(app.hydration_generation, "general");
@@ -430,70 +361,17 @@ fn a_resync_keeps_the_badge_the_live_stream_lit_while_it_was_in_flight() {
     let _ = app.update(AppMessage::LiveResynced(landed));
 
     assert_eq!(
-        backend::channel_head_seq(app.channels.clone(), "eng".into()),
+        app.channels
+            .iter()
+            .find(|row| row.id == "eng")
+            .unwrap()
+            .head_seq,
         41,
         "the third room's head does not walk back to the snapshot"
     );
     assert!(
-        (backend::channel_head_seq(app.channels.clone(), "eng".into()) > read_seq(&app, "eng")),
-        "so the badge it lit survives a resync it had nothing to do with"
-    );
-    assert!(
         app.channels.iter().any(|row| row.id == "brand-new"),
         "and the room created mid-resync is still in the sidebar"
-    );
-}
-
-/// NOBODY READS A PANE THAT IS NOT MOUNTED.
-///
-/// The live feed is subscribed on `connected`, not on the tab, so an arrival in
-/// the open room while the reader was in Settings or Files marked it read on the
-/// spot: she came back to no divider and no way to tell the new rows from the
-/// ones she had already read, and every OTHER room badged normally while that
-/// one stayed dark. The rows still fold in — only the cursor waits for her.
-#[test]
-fn messages_that_arrive_off_tab_wait_for_the_reader_to_come_back() {
-    let (mut app, _) = Ducktape::boot();
-    app.connected = true;
-    app.loading = false;
-    app.active_channel = "general".into();
-    app.channels = vec![room("general", 10), room("eng", 40)];
-    app.channel_reads = backend::initial_channel_reads(app.channels.clone(), Vec::new());
-
-    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Settings));
-    let _ = app.update(AppMessage::LiveUpdated(posted_delta(
-        "general",
-        message(11, "while she was away", false),
-    )));
-
-    assert!(
-        (backend::channel_head_seq(app.channels.clone(), "general".into())
-            > read_seq(&app, "general")),
-        "but the room she left open is unread like any other room"
-    );
-
-    // AND THEN SHE SAVES A FILE. A plane op resyncs the client — files, valset,
-    // identity, agent and governance all land in `live_resynced`, carrying no
-    // chat at all — and the read cursor used to move to the head on the way
-    // past, retiring the badge and the divider for a room she has not looked at
-    // since. It is traffic she generates herself, so the off-tab gate above
-    // survived roughly one keystroke without this.
-    let plane_only = backend::LiveRefresh {
-        chat_loaded: false,
-        ..live_refresh(app.hydration_generation, "general")
-    };
-    let _ = app.update(AppMessage::LiveResynced(plane_only));
-    assert!(
-        (backend::channel_head_seq(app.channels.clone(), "general".into())
-            > read_seq(&app, "general")),
-        "and it does not catch her up on a room she is not on the tab for"
-    );
-
-    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Chat));
-    assert!(
-        backend::channel_head_seq(app.channels.clone(), "general".into())
-            <= read_seq(&app, "general"),
-        "and only then is she caught up"
     );
 }
 
@@ -627,21 +505,6 @@ fn opening_a_search_hit_moves_the_room_on_the_click() {
     assert!(app.history_view, "a hit is a window around one old message");
 }
 
-#[test]
-fn unread_indicators_are_wired_client_local_only() {
-    let connected = handler_body("WorkspaceConnected");
-    assert!(connected.contains("initial_channel_reads("));
-    let updated = handler_body("ChatUpdated");
-    assert!(updated.contains("mark_channel_read("));
-    let resync = handler_body("LiveResynced");
-    assert!(
-        resync.contains("resync_tail_channel") && resync.contains("self.shell_tab==ShellTab::Chat")
-    );
-    let live = rust_tokens(include_str!("../backend/live.rs"));
-    assert!(live.contains("letreads_live_tail=!history_view&&chat_visible"));
-    assert!(live.contains("ifreads_live_tail"));
-}
-
 /// THE LIVE-RUN READING IS REFUSED, NEVER FOLDED. Its rows are the node's whole
 /// pending set, and the reading is stamped with the connection it was taken over
 /// — so a reading that crossed with a reconnect has to be DROPPED. Folding it in
@@ -705,11 +568,4 @@ fn a_stale_live_run_reading_is_dropped_rather_than_folded() {
         leaving.contains("self.signer_key=\"\".to_owned()")
             && leaving.contains("self.live_agents=")
     );
-}
-
-fn read_seq(app: &Ducktape, channel: &str) -> i64 {
-    app.channel_reads
-        .iter()
-        .find(|read| read.channel == channel)
-        .map_or(0, |read| read.seq)
 }

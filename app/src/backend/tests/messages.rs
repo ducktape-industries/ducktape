@@ -328,49 +328,6 @@ fn a_cold_start_lands_on_a_room_with_something_in_it() {
     );
 }
 
-#[test]
-fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
-    let channel = |id: &str, head: i64| ChatChannel {
-        id: id.into(),
-        name: id.into(),
-        archived: false,
-        members_only: false,
-        huddle_count: 0,
-        voice: false,
-        huddle: Vec::new(),
-        head_seq: head,
-    };
-    let read = |channel: &str, seq: i64| ChannelRead {
-        channel: channel.into(),
-        seq,
-    };
-    let reads = vec![read("general", 100), read("random", 30)];
-    let channels = vec![channel("general", 100), channel("random", 50)];
-
-    // channel_last_read / channel_head_seq: lookup, 0 when absent.
-    assert_eq!(channel_last_read(reads.clone(), "random".into()), 30);
-    assert_eq!(channel_last_read(reads.clone(), "missing".into()), 0);
-    assert_eq!(channel_head_seq(channels.clone(), "random".into()), 50);
-    assert_eq!(channel_head_seq(channels.clone(), "missing".into()), 0);
-
-    // mark_channel_read upserts to the max, adds absent, ignores empty id.
-    let marked = mark_channel_read(reads.clone(), "random".into(), 50);
-    assert_eq!(channel_last_read(marked.clone(), "random".into()), 50);
-    let lowered = mark_channel_read(marked, "random".into(), 40);
-    assert_eq!(channel_last_read(lowered, "random".into()), 50);
-    let added = mark_channel_read(reads.clone(), "new".into(), 7);
-    assert_eq!(channel_last_read(added, "new".into()), 7);
-    assert_eq!(
-        mark_channel_read(reads.clone(), String::new(), 9).len(),
-        reads.len()
-    );
-
-    // initial_channel_reads: seed absent channels to head, preserve existing.
-    let seeded = initial_channel_reads(channels.clone(), vec![read("random", 30)]);
-    assert_eq!(channel_last_read(seeded.clone(), "random".into()), 30);
-    assert_eq!(channel_last_read(seeded.clone(), "general".into()), 100);
-}
-
 /// The fairness cap counts websocket work, including chat ops that deliberately
 /// fold to no UI delta (hook registration). Counting only `batch.chat.len()`
 /// lets an always-ready invisible run monopolise one stream poll forever.
@@ -601,10 +558,3 @@ fn every_key_of_an_account_renders_as_that_accounts_name() {
 // is where the feature is actually pinned: which rows a range covers, what
 // comes out of it, and where a press leaves it.
 // ============================================================================
-
-fn channel_last_read(reads: Vec<ChannelRead>, channel: String) -> i64 {
-    reads
-        .iter()
-        .find(|read| read.channel == channel)
-        .map_or(0, |read| read.seq)
-}

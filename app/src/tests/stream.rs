@@ -233,7 +233,11 @@ fn a_resync_across_a_chain_drops_the_previous_networks_rooms() {
         "the room created mid-resync is still in the sidebar"
     );
     assert_eq!(
-        backend::channel_head_seq(app.channels.clone(), "dm-1".into()),
+        app.channels
+            .iter()
+            .find(|row| row.id == "dm-1")
+            .unwrap()
+            .head_seq,
         9,
         "and the head the delta moved does not walk back to the snapshot"
     );

@@ -685,7 +685,6 @@ impl Ducktape {
         self.chat_pending_sends = Vec::new();
         self.chat_edit_seq = 0;
         self.chat_edit_rev = 0;
-        self.channel_reads = Vec::new();
         self.active_channel = "".to_owned();
         self.active_dm_peer = "".to_owned();
         self.chat_dm_peer.clear();
@@ -757,10 +756,6 @@ impl Ducktape {
         self.block_height = next.height;
         self.channels = next.channels.clone();
         self.chat_chain_id = self.network_chain_id.to_owned();
-        self.channel_reads = crate::backend::initial_channel_reads(
-            next.channels.clone(),
-            ::std::mem::take(&mut self.channel_reads),
-        );
         self.history_view = false;
         self.chat_at_tail = true;
         self.chat_land_seq = 0;
@@ -1036,11 +1031,8 @@ impl Ducktape {
                     next.chat.clone(),
                     self.channels.clone(),
                     self.channel_members.clone(),
-                    self.channel_reads.clone(),
                     self.settings_user_key.to_owned(),
                     self.active_channel.to_owned(),
-                    self.history_view,
-                    self.shell_tab == ShellTab::Chat,
                     self.active_channel_name.to_owned(),
                     self.active_channel_archived,
                     self.active_channel_members_only,
@@ -1048,7 +1040,6 @@ impl Ducktape {
                 self.channels = folded_chat.channels.clone();
                 self.channel_members = folded_chat.channel_members.clone();
                 self.follow_voice_room_roster();
-                self.channel_reads = folded_chat.channel_reads.clone();
                 self.active_channel_name = folded_chat.active_channel_name.to_owned();
                 self.active_channel_archived = folded_chat.active_channel_archived;
                 self.active_channel_members_only = folded_chat.active_channel_members_only;
@@ -1299,10 +1290,6 @@ impl Ducktape {
             next.channels.clone(),
             ::std::mem::take(&mut self.channels),
         );
-        self.channel_reads = crate::backend::initial_channel_reads(
-            self.channels.clone(),
-            ::std::mem::take(&mut self.channel_reads),
-        );
         self.chat_chain_id = crate::backend::keep_str(
             next.chat_loaded && (!(self.network_chain_id).is_empty()),
             &self.network_chain_id,
@@ -1372,16 +1359,6 @@ impl Ducktape {
             self.channel_members.clone(),
             self.settings_user_key.to_owned(),
         );
-        let resync_tail_channel = crate::backend::keep_str(
-            (!self.history_view) && (self.shell_tab == ShellTab::Chat),
-            &self.active_channel,
-            "",
-        );
-        self.channel_reads = crate::backend::mark_channel_read(
-            ::std::mem::take(&mut self.channel_reads),
-            resync_tail_channel.to_owned(),
-            crate::backend::channel_head_seq(self.channels.clone(), resync_tail_channel.to_owned()),
-        );
         self.mutation_phase = crate::backend::mutation_phase_after_recovery(self.mutation_phase);
         self.error = "".to_owned();
         crate::shell::close::<AppMessage>(crate::backend::window_target_unless(
@@ -1445,16 +1422,6 @@ impl Ducktape {
         self.account_ceremony_detail = "".to_owned();
         self.account_ceremony_left = "".to_owned();
         self.shell_tab = next;
-        let chat_tab_channel = crate::backend::keep_str(
-            (self.shell_tab == ShellTab::Chat) && (!self.history_view),
-            &self.active_channel,
-            "",
-        );
-        self.channel_reads = crate::backend::mark_channel_read(
-            ::std::mem::take(&mut self.channel_reads),
-            chat_tab_channel.to_owned(),
-            crate::backend::channel_head_seq(self.channels.clone(), chat_tab_channel.to_owned()),
-        );
         self.error = "".to_owned();
         if !self.connected {
             return Task::none();
@@ -3532,11 +3499,6 @@ impl Ducktape {
             ::std::mem::take(&mut self.channels),
             next.channels.clone(),
         );
-        self.channel_reads = crate::backend::mark_channel_read(
-            ::std::mem::take(&mut self.channel_reads),
-            next.active_channel.to_owned(),
-            crate::backend::channel_head_seq(self.channels.clone(), next.active_channel.to_owned()),
-        );
         let landed_elsewhere = self.active_channel != next.active_channel;
         self.history_view = self.history_view && (!landed_elsewhere);
         self.chat_land_seq = crate::backend::keep_i64(landed_elsewhere, 0, self.chat_land_seq);
@@ -4717,7 +4679,6 @@ impl Ducktape {
         self.chat_pending_sends = Vec::new();
         self.chat_edit_seq = 0;
         self.chat_edit_rev = 0;
-        self.channel_reads = Vec::new();
         self.active_channel = "".to_owned();
         self.active_dm_peer = "".to_owned();
         self.chat_dm_peer.clear();

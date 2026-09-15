@@ -37,15 +37,6 @@ const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 /// node is not running and names the command that starts it.
 const PROVISION_PATIENCE: u32 = 8;
 
-/// Client-local read cursor for one channel: the newest `seq` this device has
-/// "seen". There is no wire read-cursor — this list lives only in app state and
-/// is never sent to the node.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ChannelRead {
-    pub channel: String,
-    pub seq: i64,
-}
-
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ChatData {
     /// The switch this window answers for. Every route that moves the reader

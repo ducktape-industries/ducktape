@@ -379,14 +379,13 @@ async fn collect_ready_chat_updates(
 /// the batch can wander through Pages, Bell, or Forge lifecycle reducers.
 /// THE CHAT TAB'S TIMELINE IS NOT IN HERE. The Chat tab is a module-owned
 /// view on the kernel contract: it re-reads its own room on the same block
-/// this fold runs for. The app retains channel facts and read cursors for
-/// navigation and its live state, plus the roster used by native call flows.
+/// this fold runs for. The app retains channel facts for navigation and the roster
+/// used by native call flows.
 /// Sidebar rows and their unread presentation belong to the deployed view.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatLiveFold {
     pub channels: Vec<ChatChannel>,
     pub channel_members: Vec<ChatMember>,
-    pub channel_reads: Vec<ChannelRead>,
     pub active_channel_name: String,
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
@@ -455,11 +454,8 @@ pub fn fold_live_chat(
     deltas: Vec<ChatDelta>,
     channels: Vec<ChatChannel>,
     channel_members: Vec<ChatMember>,
-    mut channel_reads: Vec<ChannelRead>,
     me: String,
     active_channel: String,
-    history_view: bool,
-    chat_visible: bool,
     mut active_channel_name: String,
     mut active_channel_archived: bool,
     mut active_channel_members_only: bool,
@@ -518,7 +514,6 @@ pub fn fold_live_chat(
         refresh_chat,
         ..
     } = state;
-    let reads_live_tail = !history_view && chat_visible;
 
     if let Some(channel) = channels.iter().find(|channel| channel.id == active_channel) {
         active_channel_name.clone_from(&channel.name);
@@ -534,26 +529,9 @@ pub fn fold_live_chat(
         String::new()
     };
 
-    if reads_live_tail {
-        let head = channels
-            .iter()
-            .find(|channel| channel.id == active_channel)
-            .map_or(0, |channel| channel.head_seq);
-        match channel_reads
-            .iter_mut()
-            .find(|read| read.channel == active_channel)
-        {
-            Some(read) => read.seq = read.seq.max(head),
-            None => channel_reads.push(ChannelRead {
-                channel: active_channel.clone(),
-                seq: head,
-            }),
-        }
-    }
     ChatLiveFold {
         channels,
         channel_members,
-        channel_reads,
         active_channel_name,
         active_channel_archived,
         active_channel_members_only,
