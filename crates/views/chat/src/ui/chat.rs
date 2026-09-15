@@ -1746,7 +1746,10 @@ fn menu_item(
 /// which cut the top off every emoji).
 fn emoji_cell(key: String, emoji: &str, message: Message, disabled: bool) -> wire::Node {
     let glyph = native::text_options(
-        native::text_size(native::text(format!("{key}/glyph"), emoji), 18.),
+        native::text_size(
+            native::text(format!("{key}/glyph"), emoji),
+            native::type_scale::TITLE as f32,
+        ),
         wire::TextOptions {
             line_height: Some(wire::LineHeight::Absolute(PICKER_CELL)),
             ..Default::default()
