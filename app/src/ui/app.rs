@@ -130,7 +130,6 @@ pub(crate) enum ForgeIntent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AgentsIntent {
     Badge,
-    Register,
     OpenRun,
     OpenLink,
 }
@@ -525,7 +524,6 @@ pub(crate) enum AppMessage {
     DmPeersLoaded(crate::backend::DmPeersData),
     DmPeersFailed(crate::backend::HydrationError),
     AgentsViewEvent(crate::module_view::ModuleViewEvent),
-    AgentStatusSet(bool),
     NodeViewEvent(crate::module_view::ModuleViewEvent),
     NodeFactsLoaded(crate::backend::NodeFacts),
     NodeFactsFailed(crate::backend::AppError),

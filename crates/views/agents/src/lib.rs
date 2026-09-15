@@ -1302,8 +1302,10 @@ impl AgentsView {
             (true, _) => Some(primary(
                 "agents/register",
                 "Register agent",
-                (complete_record && host::valid_agent_id(&self.draft_id))
-                    .then_some(Message::SubmitRegister),
+                (complete_record
+                    && host::valid_agent_id(&self.draft_id)
+                    && self.registration.is_none())
+                .then_some(Message::SubmitRegister),
             )),
             (false, true) => Some(primary(
                 "agents/save",
@@ -1367,6 +1369,10 @@ pub struct AgentsView {
     pub(crate) account: String,
     pub(crate) committed: i64,
     pub(crate) seeded: i64,
+    #[serde(skip)]
+    registration: Option<ducktape_view_guest::task::Handle>,
+    #[serde(skip)]
+    registration_serial: u64,
     pub(crate) connected: bool,
     pub(crate) connection_serial: i64,
     pub(crate) answered: bool,
@@ -1427,6 +1433,7 @@ pub enum Message {
     SetStatus(String, bool),
     SubmitSave,
     SubmitRegister,
+    RegistrationDone(u64, Result<(), String>),
     BindDraftId(String),
     BindDraftName(String),
     BindSkillName(String),
@@ -1464,6 +1471,8 @@ impl AgentsView {
             account: "".to_owned(),
             committed: 0,
             seeded: 0,
+            registration: None,
+            registration_serial: 0,
             connected: false,
             connection_serial: 0,
             answered: false,
@@ -1554,6 +1563,39 @@ impl AgentsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_completion_preserves_a_different_open_draft() {
+        for creating in [false, true] {
+            let (mut view, _) = AgentsView::boot();
+            view.registration_serial = 4;
+            view.connected = true;
+            view.account = "7".into();
+            view.selected = "other-agent".into();
+            view.draft_id = "other-agent".into();
+            view.draft_name = "Unsaved name".into();
+            view.creating = creating;
+            let _ = view.on_registration_done(4, Ok(()));
+            let mut rows = vec![host::AgentRow {
+                id: "registered-agent".into(),
+                ..Default::default()
+            }];
+            if !creating {
+                rows.push(host::AgentRow {
+                    id: "other-agent".into(),
+                    name: "Stored name".into(),
+                    ..Default::default()
+                });
+            }
+            let _ = view.on_register_arrived(host::RegisterItem {
+                rows,
+                ..Default::default()
+            });
+            assert_eq!(view.draft_name, "Unsaved name");
+            assert_eq!(view.creating, creating);
+        }
+    }
+
     #[test]
     fn long_reply_links_wrap_within_the_journal_width() {
         let label =
@@ -1726,6 +1768,7 @@ impl AgentsView {
             Message::SetStatus(agent_id, paused) => self.on_set_status(agent_id, paused),
             Message::SubmitSave => self.on_submit_save(),
             Message::SubmitRegister => self.on_submit_register(),
+            Message::RegistrationDone(serial, result) => self.on_registration_done(serial, result),
             Message::BindDraftId(value) => self.on_bind_draft_id(value),
             Message::BindDraftName(value) => self.on_bind_draft_name(value),
             Message::BindSkillName(value) => self.on_bind_skill_name(value),
@@ -1916,6 +1959,11 @@ impl AgentsView {
                 return ::ducktape_view_guest::Task::none();
             }
             let next = item.next.clone();
+            let registration_context_changed = !next.connected || self.account != next.account;
+            if registration_context_changed {
+                self.registration.take();
+                self.registration_serial = self.registration_serial.wrapping_add(1);
+            }
             {
                 self.connection_serial = crate::host::connection_serial_after(
                     self.connected,
@@ -2406,22 +2454,48 @@ impl AgentsView {
             ::ducktape_view_guest::Task::none()
         }
     }
-    fn on_submit_register(&mut self) -> ::ducktape_view_guest::Task<Message> {
-        {
-            {
-                self.sent = crate::host::register_agent(
-                    ::std::convert::AsRef::as_ref(&(self.draft_id)),
-                    ::std::convert::AsRef::as_ref(&(self.draft_name)),
-                    ::std::convert::AsRef::as_ref(
-                        &(crate::host::or_empty(::std::borrow::Borrow::borrow(
-                            &(self.draft_capability),
-                        ))),
-                    ),
-                    ::std::convert::AsRef::as_ref(&(self.draft_skills)),
-                );
-            }
-            ::ducktape_view_guest::Task::none()
+    fn on_submit_register(&mut self) -> ducktape_view_guest::Task<Message> {
+        let may_start = self.connected && self.registration.is_none();
+        if !may_start {
+            return ducktape_view_guest::Task::none();
         }
+        let draft = host::Draft {
+            agent_id: self.draft_id.trim().into(),
+            display_name: self.draft_name.trim().into(),
+            capability: self
+                .draft_capability
+                .clone()
+                .unwrap_or_default()
+                .trim()
+                .into(),
+            skills: self.draft_skills.clone(),
+        };
+        self.registration_serial = self.registration_serial.wrapping_add(1);
+        let serial = self.registration_serial;
+        let (task, handle) = ducktape_view_guest::Task::perform(
+            host::register_agent(self.account.clone(), draft),
+            move |result| Message::RegistrationDone(serial, result),
+        )
+        .abortable();
+        self.registration = Some(handle.abort_on_drop());
+        task
+    }
+    fn on_registration_done(
+        &mut self,
+        serial: u64,
+        result: Result<(), String>,
+    ) -> ducktape_view_guest::Task<Message> {
+        if serial != self.registration_serial {
+            return ducktape_view_guest::Task::none();
+        }
+        self.registration.take();
+        // Registration consumes only the creation draft whose id appears in
+        // the registry. A later callback must not consume another open editor.
+        self.host_error = host::fault(
+            "The change was not accepted",
+            &result.err().unwrap_or_default(),
+        );
+        ducktape_view_guest::Task::none()
     }
     fn on_bind_draft_id(&mut self, value: String) -> ::ducktape_view_guest::Task<Message> {
         {

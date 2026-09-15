@@ -2357,7 +2357,7 @@ pub fn open_link(url: &str) -> bool {
     notify("agents.open_link", &OpenLink { url: url.into() })
 }
 
-/// The editor's whole record, as the app's `AgentDraft` decodes it.
+/// The guest-owned registration draft.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Draft {
     pub agent_id: String,
@@ -2366,26 +2366,58 @@ pub struct Draft {
     pub skills: Vec<AgentSkill>,
 }
 
-/// Register a new agent from the draft. THE ONE WRITE THAT IS STILL THE
-/// APP'S: a registration first provisions the agent's program account, and
-/// the program it binds is composed by the runs module's own crate
-/// (`runs::model_program`) — a guest cannot build it without keeping a
-/// second copy of that module's workflow.
-pub fn register_agent(
-    agent_id: &str,
-    display_name: &str,
-    capability: &str,
-    skills: &[AgentSkill],
-) -> bool {
-    notify(
-        "agents.register",
-        &Draft {
-            agent_id: agent_id.trim().to_owned(),
-            display_name: display_name.trim().to_owned(),
-            capability: capability.trim().to_owned(),
-            skills: skills.to_vec(),
-        },
+/// Provision, read the controller-scoped receipt, then configure the model.
+/// Runs supplies its deployed default program; the view owns the write sequence.
+pub async fn register_agent(controller: String, draft: Draft) -> Result<(), String> {
+    let controller: u64 = controller.parse().map_err(
+        |_| "registering an agent needs an account to control it — create one in Settings first",
+    )?;
+    if !valid_agent_id(&draft.agent_id) {
+        return Err("agent_id must be a lowercase DNS label of 1–63 bytes".into());
+    }
+    let name = draft.display_name.trim();
+    if name.is_empty() {
+        return Err("give the agent a display name".into());
+    }
+    let reply = query(
+        "runs",
+        serde_json::json!({"model_program":{"agent_id":draft.agent_id}}),
     )
+    .await?;
+    let program = reply
+        .get("model_program")
+        .filter(|program| program.is_object())
+        .ok_or("the runs module returned no model program")?;
+    ask(
+        "op.submit",
+        &serde_json::json!({"target":"agent", "payload": {
+            "provision": {"request_id":draft.agent_id, "name":name, "program":program}
+        }}),
+    )
+    .await?;
+    let reply = query(
+        "agent",
+        serde_json::json!({"provision":{"controller":controller, "request_id":draft.agent_id}}),
+    )
+    .await?;
+    let receipt = reply
+        .get("provision")
+        .ok_or("the agent module returned the wrong provisioning reply")?;
+    let account = receipt
+        .get("account")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("the agent provisioning receipt was not found after provisioning")?;
+    ask(
+        "op.submit",
+        &serde_json::json!({"target":"runs", "payload":{
+            "configure_model":{"operation":{"register_model":{
+                "account":account, "agent_id":draft.agent_id, "display_name":name,
+                "capability":draft.capability, "skills":skills_wire(&draft.skills)
+            }}}
+        }}),
+    )
+    .await?;
+    Ok(())
 }
 
 fn notify<T: Serialize>(operation: &str, payload: &T) -> bool {

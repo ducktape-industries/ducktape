@@ -145,7 +145,6 @@ impl Ducktape {
             AppMessage::DmPeersLoaded(next) => self.on_dm_peers_loaded(next),
             AppMessage::DmPeersFailed(cause) => self.on_dm_peers_failed(cause),
             AppMessage::AgentsViewEvent(event) => self.on_agents_view_event(event),
-            AppMessage::AgentStatusSet(_result) => self.on_agent_status_set(_result),
             AppMessage::NodeViewEvent(event) => self.on_node_view_event(event),
             AppMessage::NodeFactsLoaded(next) => self.on_node_facts_loaded(next),
             AppMessage::UpdateJobReplied(reply) => self.on_update_job_replied(reply),
@@ -2422,18 +2421,6 @@ impl Ducktape {
                 self.agents_live = crate::module_view::event_int(&(event), "count") > 0;
                 Task::none()
             }
-            AgentsIntent::Register => Task::perform(
-                crate::backend::register_agent(
-                    self.connected_rpc.to_owned(),
-                    self.password.to_owned(),
-                    self.account_number.to_owned(),
-                    event.detail.to_owned(),
-                ),
-                |result| match result {
-                    Ok(value) => AppMessage::AgentStatusSet(value),
-                    Err(error) => AppMessage::MutationFailed(error),
-                },
-            ),
             AgentsIntent::OpenRun => Task::done(AppMessage::OpenRunPanel(
                 crate::module_view::event_text(&(event), "dispatch_id"),
             )),
@@ -2441,10 +2428,6 @@ impl Ducktape {
                 crate::module_view::event_text(&(event), "url"),
             )),
         }
-    }
-    fn on_agent_status_set(&mut self, _result: bool) -> Task<AppMessage> {
-        self.error = "".to_owned();
-        Task::none()
     }
     fn on_node_view_event(
         &mut self,

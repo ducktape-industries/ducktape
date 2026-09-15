@@ -124,8 +124,7 @@ pub fn members_view(dark: bool, connected: bool, admin: bool) -> ViewSpec {
 /// save leaves as `op.submit`, signed here with the seated key.
 ///
 /// What still comes back as an intent: `badge` (how many of its agents are
-/// working — the rail's pulse), `register` (a new agent, whose program
-/// account only the app can provision), `open_run` (`dispatch_id`, "" to
+/// working — the rail's pulse), `open_run` (`dispatch_id`, "" to
 /// close) and `open_link` (`url`, a chip's duck:// address).
 pub fn agents_view(
     dark: bool,
@@ -146,7 +145,6 @@ pub fn agents_view(
 
 pub fn agents_intent(event: &ModuleViewEvent) -> crate::AgentsIntent {
     match event.kind.as_str() {
-        "register" => crate::AgentsIntent::Register,
         "open_run" => crate::AgentsIntent::OpenRun,
         "open_link" => crate::AgentsIntent::OpenLink,
         _ => crate::AgentsIntent::Badge,
@@ -723,11 +721,9 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         "governance" => &["taste", "untaste"],
         // members speaks it too; `copy` is the clipboard door, not a write
         "members" => &["copy"],
-        // the agents view speaks the kernel contract: its pause and its save
-        // are `op.submit`. `register` stays an intent because it provisions a
-        // program account before it registers, and `open_run`/`open_link`
-        // navigate other tabs.
-        "agents" => &["register", "open_run", "open_link"],
+        // the agents view speaks the kernel contract: pause, save,
+        // and registration use `op.submit`; `open_run`/`open_link` navigate other tabs.
+        "agents" => &["open_run", "open_link"],
         // the node view speaks the kernel contract: it reads the node's own
         // status, peers, registry and log ring itself and retunes the live
         // tracing filter through `rpc.admin`. `copy` is the clipboard door.
@@ -3671,7 +3667,7 @@ pub(crate) mod tests {
         assert_eq!(GENERIC_DOORS, ["open_link", "copy"]);
         assert_eq!(intents_of("members"), ["copy"]);
         // the agents view signs its own pause and save through `op.submit`
-        assert_eq!(intents_of("agents"), ["register", "open_run", "open_link"]);
+        assert_eq!(intents_of("agents"), ["open_run", "open_link"]);
         let chat = intents_of("chat");
         assert_eq!(chat.len(), 13);
         // the writes the view signs for itself are nobody's intent
