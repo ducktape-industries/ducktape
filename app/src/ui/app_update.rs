@@ -87,8 +87,7 @@ impl Ducktape {
                 self.on_provision_progress_reply(request_generation, reply_message)
             }
             AppMessage::AppearanceLoaded(mode) => self.on_appearance_loaded(mode),
-            AppMessage::SetAppearanceLight => self.on_set_appearance_light(),
-            AppMessage::SetAppearanceDark => self.on_set_appearance_dark(),
+            AppMessage::SetAppearance(mode) => self.on_set_appearance(mode),
             AppMessage::AppearanceSaved(_written) => self.on_appearance_saved(_written),
             AppMessage::DesktopNotificationsLoaded(enabled) => {
                 self.on_desktop_notifications_loaded(enabled)
@@ -652,27 +651,8 @@ impl Ducktape {
         self.appearance = mode;
         Task::none()
     }
-    fn on_set_appearance_light(&mut self) -> Task<AppMessage> {
-        self.appearance = Appearance::Light;
-        let pending_task = Task::perform(
-            crate::backend::save_appearance(self.appearance),
-            AppMessage::AppearanceSaved,
-        );
-        self.appearance_save_generation = self.appearance_save_generation.wrapping_add(1);
-        let request_generation = self.appearance_save_generation;
-        let (pending_task, request_handle) = pending_task.abortable();
-        if let Some(previous_handle) = self
-            .appearance_save_task
-            .replace(request_handle.abort_on_drop())
-        {
-            previous_handle.abort();
-        }
-        pending_task.map(move |reply_message| {
-            AppMessage::AppearanceSaveReply(request_generation, Box::new(reply_message))
-        })
-    }
-    fn on_set_appearance_dark(&mut self) -> Task<AppMessage> {
-        self.appearance = Appearance::Dark;
+    fn on_set_appearance(&mut self, mode: Appearance) -> Task<AppMessage> {
+        self.appearance = mode;
         let pending_task = Task::perform(
             crate::backend::save_appearance(self.appearance),
             AppMessage::AppearanceSaved,
@@ -3115,8 +3095,9 @@ impl Ducktape {
                     "text",
                 ))
             }
-            SettingsIntent::Light => Task::done(AppMessage::SetAppearanceLight),
-            SettingsIntent::Dark => Task::done(AppMessage::SetAppearanceDark),
+            SettingsIntent::System => Task::done(AppMessage::SetAppearance(Appearance::System)),
+            SettingsIntent::Light => Task::done(AppMessage::SetAppearance(Appearance::Light)),
+            SettingsIntent::Dark => Task::done(AppMessage::SetAppearance(Appearance::Dark)),
             SettingsIntent::Taste => {
                 self.on_taste_event(&event, true);
                 Task::none()

@@ -10,8 +10,8 @@ struct Snapshot {
     icon: usize,
     badge: String,
     tooltip: String,
-    labels: [String; 22],
-    visible: [bool; 22],
+    labels: [String; 23],
+    visible: [bool; 23],
 }
 
 impl Snapshot {
@@ -27,9 +27,9 @@ impl Snapshot {
             (9, "Settings"),
             (13, "Leave huddle"),
             (14, "Appearance"),
-            (18, "Copy node key"),
-            (19, "Reconnect"),
-            (21, "Quit Ducktape"),
+            (19, "Copy node key"),
+            (20, "Reconnect"),
+            (22, "Quit Ducktape"),
         ] {
             labels[row] = label.into();
         }
@@ -45,11 +45,15 @@ impl Snapshot {
             true => "Unmute".into(),
             false => "Mute".into(),
         };
-        labels[15] =
-            backend::tray_choice_row("Light".into(), state.appearance == Appearance::Light);
-        labels[16] = backend::tray_choice_row("Dark".into(), state.appearance == Appearance::Dark);
-        let mut visible = [true; 22];
-        for row in [4, 5, 18, 19] {
+        for (row, label, mode) in [
+            (15, "System", Appearance::System),
+            (16, "Light", Appearance::Light),
+            (17, "Dark", Appearance::Dark),
+        ] {
+            labels[row] = backend::tray_choice_row(label.into(), state.appearance == mode);
+        }
+        let mut visible = [true; 23];
+        for row in [4, 5, 19, 20] {
             visible[row] = state.console_win.is_some();
         }
         visible[11] = state.huddle_joined;
@@ -80,26 +84,27 @@ pub fn message(row: usize) -> Option<Message> {
         9 => Some(Message::TrayGoSettings),
         12 => Some(Message::ToggleCallMute),
         13 => Some(Message::LeaveHuddleHere),
-        15 => Some(Message::SetAppearanceLight),
-        16 => Some(Message::SetAppearanceDark),
-        18 => Some(Message::TrayCopyNodeKey),
-        19 => Some(Message::TrayReconnect),
-        21 => Some(Message::TrayQuit),
+        15 => Some(Message::SetAppearance(Appearance::System)),
+        16 => Some(Message::SetAppearance(Appearance::Light)),
+        17 => Some(Message::SetAppearance(Appearance::Dark)),
+        19 => Some(Message::TrayCopyNodeKey),
+        20 => Some(Message::TrayReconnect),
+        22 => Some(Message::TrayQuit),
         _ => None,
     }
 }
 
 /// Rows that sit directly in the status-item menu, in menu order. The rest
 /// live inside their submenu for the menu's whole life (5 → 6..=9, 11 → 12..=13,
-/// 14 → 15..=16) and never attach or detach on their own.
-const TOP_LEVEL: [usize; 14] = [0, 1, 2, 3, 4, 5, 10, 11, 14, 17, 18, 19, 20, 21];
+/// 14 → 15..=17) and never attach or detach on their own.
+const TOP_LEVEL: [usize; 14] = [0, 1, 2, 3, 4, 5, 10, 11, 14, 18, 19, 20, 21, 22];
 
 /// Rows the layout never shows a label for (separators).
-const SEPARATORS: [usize; 4] = [2, 10, 17, 20];
+const SEPARATORS: [usize; 4] = [2, 10, 18, 21];
 
 /// Each submenu row with the child rows it holds, in menu order.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const SUBMENUS: [(usize, &[usize]); 3] = [(5, &[6, 7, 8, 9]), (11, &[12, 13]), (14, &[15, 16])];
+const SUBMENUS: [(usize, &[usize]); 3] = [(5, &[6, 7, 8, 9]), (11, &[12, 13]), (14, &[15, 16, 17])];
 
 /// Where `row` sits once every top-level row `next` shows is attached: the
 /// count of shown top-level rows before it.
@@ -245,7 +250,7 @@ mod native {
         tray: TrayIcon,
         icons: [Icon; 3],
         menu: Menu,
-        rows: [Row; 22],
+        rows: [Row; 23],
     }
 
     impl StatusItem {
@@ -336,8 +341,8 @@ mod native {
     /// and 1 are facts, not actions, so they stay disabled for good. Children
     /// are attached to their submenu here and stay there; top-level rows are
     /// attached to the menu by `sync` as the snapshot shows them.
-    fn rows() -> Result<[Row; 22], tray_icon::menu::Error> {
-        let mut rows: [Option<Row>; 22] = std::array::from_fn(|_| None);
+    fn rows() -> Result<[Row; 23], tray_icon::menu::Error> {
+        let mut rows: [Option<Row>; 23] = std::array::from_fn(|_| None);
         for row in SEPARATORS {
             rows[row] = Some(Row::Separator(PredefinedMenuItem::separator()));
         }
@@ -357,7 +362,7 @@ mod native {
                 rows[row] = Some(Row::Item(item(row, !is_fact)));
             }
         }
-        Ok(rows.map(|row| row.expect("every row in the 22-row layout is built")))
+        Ok(rows.map(|row| row.expect("every row in the 23-row layout is built")))
     }
 }
 
@@ -371,8 +376,8 @@ mod tests {
         assert_eq!(icon_index(true, 3), 1);
         assert_eq!(icon_index(true, 0), 2);
         assert!(matches!(message(3), Some(Message::TrayOpen)));
-        assert!(matches!(message(21), Some(Message::TrayQuit)));
-        for row in [0, 1, 2, 5, 10, 11, 14, 17, 20, 22] {
+        assert!(matches!(message(22), Some(Message::TrayQuit)));
+        for row in [0, 1, 2, 5, 10, 11, 14, 18, 21, 23] {
             assert!(message(row).is_none());
         }
     }
@@ -400,7 +405,7 @@ mod tests {
             .iter()
             .flat_map(|(_, children)| children.iter().copied())
             .collect();
-        for row in 0..22 {
+        for row in 0..23 {
             let top_level = TOP_LEVEL.contains(&row);
             let child = children.contains(&row);
             assert!(
@@ -444,12 +449,12 @@ mod tests {
         let snapshot = Snapshot::of(&app);
 
         let diff = MenuDiff::between(None, &snapshot);
-        let labelled: Vec<usize> = (0..22).filter(|row| !SEPARATORS.contains(row)).collect();
+        let labelled: Vec<usize> = (0..23).filter(|row| !SEPARATORS.contains(row)).collect();
         assert_eq!(diff.relabelled, labelled);
         assert!(diff.hidden.is_empty());
-        assert_eq!(diff.shown, vec![0, 1, 2, 3, 10, 14, 17, 20, 21]);
+        assert_eq!(diff.shown, vec![0, 1, 2, 3, 10, 14, 18, 21, 22]);
         assert_eq!(attached_position(&snapshot, 0), 0);
-        assert_eq!(attached_position(&snapshot, 21), 8);
+        assert_eq!(attached_position(&snapshot, 22), 8);
     }
 
     #[test]
@@ -464,16 +469,16 @@ mod tests {
         let opened = MenuDiff::between(Some(&closed), &open);
         assert_eq!(opened.relabelled, vec![11]);
         assert!(opened.hidden.is_empty());
-        assert_eq!(opened.shown, vec![4, 5, 11, 18, 19]);
+        assert_eq!(opened.shown, vec![4, 5, 11, 19, 20]);
         assert_eq!(attached_position(&open, 4), 4);
         assert_eq!(attached_position(&open, 5), 5);
         assert_eq!(attached_position(&open, 11), 7);
-        assert_eq!(attached_position(&open, 18), 10);
-        assert_eq!(attached_position(&open, 19), 11);
+        assert_eq!(attached_position(&open, 19), 10);
+        assert_eq!(attached_position(&open, 20), 11);
 
         let shut = MenuDiff::between(Some(&open), &closed);
         assert_eq!(shut.relabelled, vec![11]);
-        assert_eq!(shut.hidden, vec![4, 5, 11, 18, 19]);
+        assert_eq!(shut.hidden, vec![4, 5, 11, 19, 20]);
         assert!(shut.shown.is_empty());
     }
 }

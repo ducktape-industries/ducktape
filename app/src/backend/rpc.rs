@@ -508,14 +508,19 @@ pub async fn load_appearance() -> crate::Appearance {
     }
 }
 
+/// `System` is the absence of an override: it clears the key rather than
+/// storing a third value, so `load_appearance` needs no "system" spelling.
 pub async fn save_appearance(mode: crate::Appearance) -> bool {
-    let mode = match mode {
-        crate::Appearance::System => return false,
-        crate::Appearance::Light => "light",
-        crate::Appearance::Dark => "dark",
-    };
     let mut prefs = read_prefs();
-    prefs["appearance"] = serde_json::json!(mode);
+    match mode {
+        crate::Appearance::System => {
+            if let Some(prefs) = prefs.as_object_mut() {
+                prefs.remove("appearance");
+            }
+        }
+        crate::Appearance::Light => prefs["appearance"] = serde_json::json!("light"),
+        crate::Appearance::Dark => prefs["appearance"] = serde_json::json!("dark"),
+    }
     write_prefs(&prefs)
 }
 
