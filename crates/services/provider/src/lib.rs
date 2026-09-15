@@ -2515,9 +2515,8 @@ enum RunControl {
 /// vsock pump, and where the workspace has to be written back to.
 ///
 /// There is no image to remove and no daemon to tell — the VMM is a child of
-/// this process and dies with it. Teardown is a kill; the only thing that has
-/// to happen on the SUCCESS path and not the failure path is the workspace
-/// read-back, which is why it lives in `wait_success`.
+/// this process and dies with it. After the guest reports its exit, the caller
+/// collects the workspace before releasing a completed invocation.
 struct MicroVmHandle {
     vm: microvm::MicroVm,
     exit: Option<tokio::sync::oneshot::Receiver<i32>>,
@@ -2554,10 +2553,8 @@ impl RunControl {
 
     /// wait for exit; returns `(success, exit_description)`.
     ///
-    /// For a microVM this is also where the workspace comes back. It has to be
-    /// here rather than at teardown: the read-back is only meaningful once the
-    /// guest has synced, unmounted and halted, and `terminate` is the path
-    /// where none of that happened.
+    /// For a microVM this waits for the guest's exit frame. Workspace collection
+    /// then waits for the guest to sync, unmount and halt before reading back.
     async fn wait_success(&mut self, label: &str) -> std::io::Result<(bool, String)> {
         match self {
             RunControl::Local(live) => {
@@ -2819,7 +2816,10 @@ impl CliProvider {
             )
             .await;
             match exited {
-                Ok(Ok((true, _))) => return result,
+                Ok(Ok((true, _))) => {
+                    control.collect_workspace().await?;
+                    return result;
+                }
                 Ok(Ok((false, code))) => {
                     control.terminate().await;
                     return Err(format!("provider session exited unsuccessfully: {code:?}"));
