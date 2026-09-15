@@ -1610,37 +1610,46 @@ impl ChatView {
                 crate::host::BINARY_PLATE,
             );
         }
-        let mut children = vec![Self::plain_line(format!("{key}/text"), &preview.text, true)];
+        // Binary-or-text is the wire's call; markdown-vs-code is the path's.
+        // The same two host surfaces Files previews with: a link pressed in
+        // the markdown leaves through the app's router like any message link.
+        use wire::SurfaceValue::{Bool, Str};
+        let document = match crate::host::markdown_path(path) {
+            true => wire::Node::Surface {
+                key: format!("{key}/markdown"),
+                name: "agent_markdown".into(),
+                args: vec![Str(preview.text.clone()), Bool(self.dark)],
+                on_event: Some(slots::handler::<wire::SurfaceValue, Message>(Box::new(
+                    |value| match value {
+                        Str(link) => Some(Message::OpenMessageLink(link)),
+                        _ => None,
+                    },
+                ))),
+            },
+            false => wire::Node::Surface {
+                key: format!("{key}/code"),
+                name: "forge_code".into(),
+                args: vec![
+                    Str(preview.text.clone()),
+                    Str(path.to_owned()),
+                    Bool(self.dark),
+                ],
+                on_event: None,
+            },
+        };
+        let mut children = vec![native::sized(
+            native::container(format!("{key}/plate"), document),
+            Some(wire::Length::Fill),
+            Some(wire::Length::Fill),
+        )];
         if preview.clipped {
             children.push(native::caption(
                 format!("{key}/clipped"),
                 "Only the beginning is shown here. Open in Files for the whole file.",
             ));
         }
-        let mut plate = native::container(
-            format!("{key}/plate"),
-            native::scroll(
-                format!("{key}/scroll"),
-                native::padded(
-                    native::spaced(native::column(format!("{key}/lines"), children), 8.),
-                    wire::Edges::all(10.),
-                ),
-            ),
-        );
-        if let wire::Node::Container {
-            background, border, ..
-        } = &mut plate
-        {
-            let p = native::palette();
-            *background = Some(wire::Background::Color(native::rgba(p.surface_raised)));
-            *border = Some(wire::Border {
-                color: Some(native::rgba(p.border)),
-                width: Some(1.),
-                radius: Some([native::radius::CONTROL as f32; 4]),
-            });
-        }
         native::sized(
-            plate,
+            native::spaced(native::column(format!("{key}/document"), children), 6.),
             Some(wire::Length::Fixed(plate_width)),
             Some(wire::Length::Fixed(plate_height)),
         )

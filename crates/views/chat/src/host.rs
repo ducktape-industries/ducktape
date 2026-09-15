@@ -129,6 +129,15 @@ pub const PICTURE_SURFACE: &str = "chat";
 /// shape, and never grows past its own size.
 pub const PICTURE_BOX: (f64, f64) = (360., 280.);
 
+/// A file the preview card renders as Markdown rather than code, by its name.
+pub fn markdown_path(name: &str) -> bool {
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(extension.as_str(), "md" | "markdown")
+}
+
 /// A file the host can decode for the timeline, by its name.
 pub fn is_picture(name: &str) -> bool {
     let extension = name

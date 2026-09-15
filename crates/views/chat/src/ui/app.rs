@@ -892,8 +892,46 @@ mod tests {
         });
         assert_eq!(plates, 1, "a binary file shows the no-preview plate");
 
+        // a text file paints through the host's code surface, a Markdown
+        // file through its Markdown surface with a link handler
+        let surfaces = |state: &ChatView| {
+            let mut found = Vec::new();
+            state.view().for_each_mut(&mut |node| {
+                if let wire::Node::Surface {
+                    key,
+                    name,
+                    on_event,
+                    ..
+                } = node
+                    && key.contains("/preview/")
+                {
+                    found.push((name.clone(), on_event.is_some()));
+                }
+            });
+            found
+        };
+        let _ = state.update(Message::PreviewArrived(crate::host::PreviewItem {
+            path: "/shared/attachments/u1/notes.txt".into(),
+            read: true,
+            text: "fn main() {}".into(),
+            ..Default::default()
+        }));
+        assert_eq!(surfaces(&state), vec![("forge_code".to_owned(), false)]);
+        let readme = "duck://files/shared/attachments/u1/README.md".to_owned();
+        let _ = state.update(Message::OpenAttachment(readme));
+        let _ = state.update(Message::PreviewArrived(crate::host::PreviewItem {
+            path: "/shared/attachments/u1/README.md".into(),
+            read: true,
+            text: "# hi".into(),
+            ..Default::default()
+        }));
+        assert_eq!(surfaces(&state), vec![("agent_markdown".to_owned(), true)]);
+
         let _ = state.update(Message::OpenAttachment(shot.clone()));
-        assert!(!state.preview_reads(), "a decoded picture draws from the slot");
+        assert!(
+            !state.preview_reads(),
+            "a decoded picture draws from the slot"
+        );
         let mut pictures = 0;
         state.view().for_each_mut(&mut |node| {
             if let wire::Node::Surface { key, name, .. } = node
@@ -906,7 +944,10 @@ mod tests {
         assert_eq!(pictures, 1);
 
         let _ = state.update(Message::OpenMessageLink(shot));
-        assert!(overlays(&state).is_empty(), "leaving for Files closes the card");
+        assert!(
+            overlays(&state).is_empty(),
+            "leaving for Files closes the card"
+        );
         let _ = state.update(Message::OpenAttachment(doc));
         let _ = state.update(Message::ClosePreview);
         assert!(overlays(&state).is_empty());

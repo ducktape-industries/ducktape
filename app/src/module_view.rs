@@ -768,7 +768,10 @@ fn surface_allowed(module: &str, surface: &str) -> bool {
     matches!(
         (module, surface),
         (_, "artifact_svg" | "artifact_image")
-            | ("chat", "chat_composer" | "picture")
+            | (
+                "chat",
+                "chat_composer" | "picture" | "forge_code" | "agent_markdown"
+            )
             | (
                 "forge",
                 "forge_composer" | "picture" | "forge_markdown" | "forge_code"
@@ -1143,7 +1146,10 @@ fn seat_remembered_tastes(
 /// labels.
 pub(crate) fn intern(id: &str) -> &'static str {
     static INTERNED: OnceLock<Mutex<std::collections::BTreeSet<&'static str>>> = OnceLock::new();
-    let mut interned = INTERNED.get_or_init(Mutex::default).lock().expect("interned ids");
+    let mut interned = INTERNED
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("interned ids");
     if let Some(known) = interned.get(id) {
         return known;
     }
@@ -4522,6 +4528,14 @@ pub(crate) mod tests {
         let _turn = blocking_connection_turn();
         let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
         assert!(surface_allowed(guest.module, "chat_composer"));
+        // the attachment preview card paints a code or Markdown file with
+        // the same host surfaces Files previews with
+        for surface in ["picture", "forge_code", "agent_markdown"] {
+            assert!(
+                surface_allowed(guest.module, surface),
+                "the host paints the {surface} slot the chat preview leaves"
+            );
+        }
         guest.redraw(&None);
         let props = chat_facts();
         guest.redraw(&props);
@@ -4535,10 +4549,9 @@ pub(crate) mod tests {
         }
         assert_eq!(surface_names(&guest), ["chat_composer"]);
 
-        guest.pending.push(wire::Event::Message(button_message(
-            &guest,
-            "ops",
-        )));
+        guest
+            .pending
+            .push(wire::Event::Message(button_message(&guest, "ops")));
         guest.redraw(&props);
         assert_eq!(
             std::mem::take(&mut guest.intents),
@@ -5353,9 +5366,15 @@ pub(crate) mod tests {
         // a block that retires the entry: the seat and the tab go
         *node.status.lock().unwrap() = listing(false);
         deployments_check().await.joined();
-        assert!(registered_views().is_empty(), "a retired view's tab is gone");
         assert!(
-            !registry().lock().expect("module views").contains_key("home"),
+            registered_views().is_empty(),
+            "a retired view's tab is gone"
+        );
+        assert!(
+            !registry()
+                .lock()
+                .expect("module views")
+                .contains_key("home"),
             "a retired view's seat is gone"
         );
         // and one that lists it again seats it again
@@ -6755,8 +6774,7 @@ pub(crate) mod tests {
         );
         // the ballot is open and the bytes were fanned out: the connect's
         // walk lists the pair, and the card offers it — nobody is forced
-        let (node, _client, mounted) =
-            seated_over(&a, &[&b], &[("governance", b.hash())]).await;
+        let (node, _client, mounted) = seated_over(&a, &[&b], &[("governance", b.hash())]).await;
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
         let rows = taste::rows();
         assert_eq!(rows.len(), 1, "{rows:?}");
@@ -6791,7 +6809,10 @@ pub(crate) mod tests {
             assert_eq!(locked.hash, Some(b.hash()));
             assert!(locked.generation > generation);
         }
-        assert_eq!(tab_label("governance", "Governance"), "Governance · proposed");
+        assert_eq!(
+            tab_label("governance", "Governance"),
+            "Governance · proposed"
+        );
         assert_eq!(
             taste::remembered("fake-chain"),
             [("governance".to_owned(), b.hash())].into()
@@ -6823,7 +6844,10 @@ pub(crate) mod tests {
         assert_eq!(tab_label("governance", "Governance"), "Governance");
         taste("governance", b.hash()).joined();
         assert_eq!(slot_assets(&mounted), ["b.svg"]);
-        assert!(taste::take_notices().is_empty(), "a member's own move is no news");
+        assert!(
+            taste::take_notices().is_empty(),
+            "a member's own move is no news"
+        );
 
         // the ballot is withdrawn: the next block returns the seat
         node.propose(&[]);
@@ -6840,7 +6864,10 @@ pub(crate) mod tests {
         );
         assert!(taste::remembered("fake-chain").is_empty());
         assert!(taste::rows().is_empty());
-        registry().lock().expect("module views").remove("governance");
+        registry()
+            .lock()
+            .expect("module views")
+            .remove("governance");
     }
 
     /// A taste that the ballot passes stays a taste while the swap is
@@ -6884,7 +6911,10 @@ pub(crate) mod tests {
             let locked = mounted.lock().expect("module view lock");
             assert_eq!(locked.tasting, None);
             assert_eq!(locked.hash, Some(b.hash()));
-            assert_eq!(locked.generation, generation, "no reload: the seat already draws it");
+            assert_eq!(
+                locked.generation, generation,
+                "no reload: the seat already draws it"
+            );
         }
         assert_eq!(
             taste::take_notices(),
@@ -6893,7 +6923,10 @@ pub(crate) mod tests {
         assert!(taste::remembered("fake-chain").is_empty());
         assert_eq!(tab_label("governance", "Governance"), "Governance");
         drop(client);
-        registry().lock().expect("module views").remove("governance");
+        registry()
+            .lock()
+            .expect("module views")
+            .remove("governance");
     }
 
     /// Every refusal by name: a proposal that changes the core too, one
@@ -6977,14 +7010,20 @@ pub(crate) mod tests {
                 "missing {expected:?} in {shown:?}"
             );
         }
-        assert!(!shown.iter().any(|text| text == "Try this view"), "{shown:?}");
+        assert!(
+            !shown.iter().any(|text| text == "Try this view"),
+            "{shown:?}"
+        );
         // the bytes arrive: the next walk finds them
         node.stage(&not_held);
         deployments_checked().await.joined();
         assert_eq!(reason_of(not_held.hash()), None);
         taste("governance", not_held.hash()).joined();
         assert_eq!(slot_assets(&mounted), ["held.svg"]);
-        registry().lock().expect("module views").remove("governance");
+        registry()
+            .lock()
+            .expect("module views")
+            .remove("governance");
     }
 
     /// A taste is a device preference: at connect, once the chain's
@@ -7019,7 +7058,10 @@ pub(crate) mod tests {
         connected(&client).joined();
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
         assert_eq!(mounted.lock().expect("module view lock").tasting, None);
-        registry().lock().expect("module views").remove("governance");
+        registry()
+            .lock()
+            .expect("module views")
+            .remove("governance");
     }
 
     /// A valid view with an admitted event it has not consumed yet.
