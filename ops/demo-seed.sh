@@ -15,8 +15,9 @@
 # It also publishes two gateway web-app routes (see ops/demo-gateway.mjs): a
 # NETWORK-hosted static site served from DuckFS, and a USER-hosted route that
 # proxies to a node-local server. The frameless /v1/submit lane stamps the
-# node's own validator key as the op origin. Its account controls the model
-# user; the separate demo wallet signs and owns the gateway routes.
+# node's own validator key as the op origin. The demo wallet signs the model
+# provisioning and configuration, so the app's wallet controls its runs as
+# well as its gateway routes.
 #
 # The model user (ChiefDuck) is the network's resident maintainer: a real
 # agent on the `claude` capability, acting as its program account (which may
@@ -123,7 +124,6 @@ if ! CHAIN="$("$NODE_BIN" node init --name "$ID" --dir "$WSDIR" \
 fi
 rm -f "$INIT_ERR"
 [ -n "$CHAIN" ] || die "init produced no chain-id"
-PUB="$("$NODE_BIN" node key --out "$WSDIR/identity.key" 2>/dev/null | tail -1)"
 log "founded '$ID' (chain $CHAIN) at $WSDIR"
 
 # ── 3. user identity ───────────────────────────────────────────
@@ -233,6 +233,22 @@ submit(){ # submit <module> <payload-json>
   [ "$code" = "200" ] || die "op #$N ($1) rejected [$code]: ${resp%$'\n'*}"
 }
 
+# Model ownership must belong to the wallet the desktop unlocks, not the
+# validator identity attached to an operator-token request.
+submit_user(){ # submit_user <module> <payload-json>
+  N=$((N+1))
+  local request frame resp code
+  request=$(bun -e 'const [target,payload]=process.argv.slice(1);const bytes=Buffer.from(JSON.stringify(JSON.parse(payload)));process.stdout.write(`${target} ${BigInt(Date.now())*1000000n} ${bytes.toString("hex")}`)' "$1" "$2") \
+    || die "op #$N ($1): payload is not valid json"
+  frame=$(printf '%s\n%s\n' "$DEMO_PASSWORD" "$request" | "$NODE_BIN" user sign-frame --key "$USERKEY") \
+    || die "op #$N ($1): demo wallet signing failed"
+  resp=$(printf '%s' "$frame" | bun -e 'process.stdout.write(Buffer.from(await Bun.stdin.text(),"hex"))' | \
+    curl -s -w $'\n%{http_code}' "$URL/v1/submit/frame" -H 'content-type: application/octet-stream' --data-binary @-) \
+    || die "op #$N ($1): submit failed"
+  code=${resp##*$'\n'}
+  [ "$code" = "200" ] || die "op #$N ($1) rejected [$code]: ${resp%$'\n'*}"
+}
+
 log "seeding modules…"
 
 # pages — the Pages surface: a welcome page with a few blocks
@@ -263,7 +279,7 @@ submit tasks '{"task":{"create_task":{"task_id":"t3","title":"Fix flaky identity
 submit tasks '{"task":{"update_status":{"task_id":"t2","status":"in_progress"}}}'
 submit tasks '{"task":{"update_status":{"task_id":"t3","status":"done"}}}'
 
-# model user — the operator account controls a keyless programmable account.
+# model user — the demo wallet controls a keyless programmable account.
 # The recipe is emitted by the current binary, never copied into this script.
 # Its capability is `claude`: the run executes on a node whose compute
 # service announces that tag, which `make dev` arranges by installing the
@@ -274,13 +290,17 @@ query(){ # query <module> <query-json>
   body=$(bun -e 'const [target,query]=process.argv.slice(1);process.stdout.write(JSON.stringify({target,query:JSON.parse(query)}))' "$1" "$2") || die "invalid query"
   curl -fsS "$URL/v1/query" -H 'content-type: application/json' -d "$body" || die "query failed"
 }
-NODE_BYTES=$(bun -e 'process.stdout.write(JSON.stringify([...Buffer.from(process.argv[1],"hex")]))' "$PUB")
-CONTROLLER=$(query identity "{\"of_key\":{\"key\":$NODE_BYTES}}" | bun -e 'process.stdout.write(String((await Bun.stdin.json()).account?.number ?? ""))')
+# Operator-authored seed content (including automation rules) needs the
+# node's account. Model control uses the separate desktop wallet below.
+submit identity '{"create":{"name":"Demo operator","scheme":"ed25519"}}'
+USER_PUB=$("$NODE_BIN" user key status --key "$USERKEY" | awk '{print $NF}') || die "cannot read the demo public key"
+USER_BYTES=$(bun -e 'process.stdout.write(JSON.stringify([...Buffer.from(process.argv[1],"hex")]))' "$USER_PUB")
+CONTROLLER=$(query identity "{\"of_key\":{\"key\":$USER_BYTES}}" | bun -e 'process.stdout.write(String((await Bun.stdin.json()).account?.number ?? ""))')
 if [ -z "$CONTROLLER" ]; then
-  submit identity '{"create":{"name":"Demo operator","scheme":"ed25519"}}'
-  CONTROLLER=$(query identity "{\"of_key\":{\"key\":$NODE_BYTES}}" | bun -e 'process.stdout.write(String((await Bun.stdin.json()).account?.number ?? ""))')
+  submit_user identity '{"create":{"name":"demo","scheme":"ed25519"}}'
+  CONTROLLER=$(query identity "{\"of_key\":{\"key\":$USER_BYTES}}" | bun -e 'process.stdout.write(String((await Bun.stdin.json()).account?.number ?? ""))')
 fi
-[ -n "$CONTROLLER" ] || die "the operator has no controller account"
+[ -n "$CONTROLLER" ] || die "the demo wallet has no controller account"
 AGENT_ID="chiefduck"
 AGENT_NAME="ChiefDuck"
 # The persona: an always-loaded skill in the shared library, which the host
@@ -291,7 +311,7 @@ curl -fsS -X PUT "$URL/v1/files/object/shared/skills/$AGENT_ID/SKILL.md" \
   || die "cannot stage the $AGENT_NAME persona skill"
 PROGRAM=$("$NODE_BIN" agent model-program "$AGENT_ID") || die "cannot encode the default model program"
 PROVISION=$(printf '%s' "$PROGRAM" | bun -e 'process.stdout.write(JSON.stringify({provision:{name:process.argv[1],program:await Bun.stdin.json()}}))' "$AGENT_NAME") || die "invalid program"
-submit agent "$PROVISION"
+submit_user agent "$PROVISION"
 MODEL_ACCOUNT=$(query identity "{\"controlled\":{\"by\":$CONTROLLER,\"from\":0,\"limit\":256}}" | bun -e '
   const matches=(await Bun.stdin.json()).accounts.filter(account=>account.name===process.argv[1] && account.control.program?.executor==="agent");
   if(matches.length!==1) throw new Error(`expected exactly one ${process.argv[1]} program account`);
@@ -307,7 +327,7 @@ REGISTER=$(bun -e 'process.stdout.write(JSON.stringify({configure_model:{operati
   account:Number(process.argv[1]),agent_id:process.argv[2],display_name:process.argv[3],capability:"claude",
   skills:[{name:process.argv[2],source_prefix:`/shared/skills/${process.argv[2]}`,load:"always"}]
 }}}}))' "$MODEL_ACCOUNT" "$AGENT_ID" "$AGENT_NAME") || die "invalid registration"
-submit runs "$REGISTER"
+submit_user runs "$REGISTER"
 MENTION=$(bun -e 'process.stdout.write(JSON.stringify({post_message:{channel_id:"general",message_id:"g4",blocks:[{paragraph:[{text:`@${process.argv[2]} introduce yourself: what can you do on this network?`,marks:[{mention:{account:Number(process.argv[1])}}]}]}],thread:null}}))' "$MODEL_ACCOUNT" "$AGENT_ID")
 submit chat "$MENTION"
 

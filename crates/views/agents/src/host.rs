@@ -1539,7 +1539,7 @@ impl LiveRun {
                 "Run output could not be connected. See the error above."
             }
             OutputConnection::Connected if !self.trace.is_empty() => {
-                "This output contains no thinking or tool steps. Raw events are available below."
+                "This output contains no thinking or tool steps. Raw events are available in the Raw tab."
             }
             OutputConnection::Connected if self.control.is_some() => {
                 "Connected to the session. Waiting for its first process details…"
@@ -1633,6 +1633,38 @@ fn readable_json(value: &serde_json::Value) -> String {
     }
 }
 
+/// The provider's final response includes execution instructions as well as
+/// the reply. Only reply blocks belong in the conversation; the exact
+/// provider event remains available in raw events.
+pub fn answer_markdown(answer: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(answer) else {
+        return answer.to_owned();
+    };
+    let Some(blocks) = value["reply_blocks"].as_array() else {
+        return answer.to_owned();
+    };
+    let rendered: Option<Vec<String>> = blocks
+        .iter()
+        .map(|block| {
+            let text = block["text"].as_str()?;
+            match block["kind"].as_str()? {
+                "paragraph" => Some(text.into()),
+                "heading" => Some(format!("## {text}")),
+                "code" => {
+                    let longest = text.split(|c| c != '~').map(str::len).max().unwrap_or(0);
+                    let fence = "~".repeat(longest.max(2) + 1);
+                    let language = block["lang"].as_str().unwrap_or_default();
+                    Some(format!("{fence}{language}\n{text}\n{fence}"))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    rendered
+        .map(|parts| parts.join("\n\n"))
+        .unwrap_or_else(|| answer.into())
+}
+
 fn reasoning_text(value: &serde_json::Value) -> String {
     match value.as_array() {
         Some(parts) => parts
@@ -1700,13 +1732,18 @@ fn fold_process(run: &mut LiveRun, event: &serde_json::Value) {
                     format!("{}/{index}", message["id"].as_str().unwrap_or_default())
                 });
                 match block["type"].as_str() {
-                    Some("thinking") => run.step(
-                        id,
-                        "Thinking".into(),
-                        block["thinking"].as_str().unwrap_or_default().into(),
-                        false,
-                        ProcessState::Completed,
-                    ),
+                    Some("thinking") => {
+                        let text = block["thinking"].as_str().unwrap_or_default();
+                        if !text.is_empty() {
+                            run.step(
+                                id,
+                                "Thinking".into(),
+                                text.into(),
+                                false,
+                                ProcessState::Completed,
+                            );
+                        }
+                    }
                     Some("tool_use") => run.step(
                         id,
                         block["name"].as_str().unwrap_or("Tool").into(),
@@ -2415,7 +2452,7 @@ pub fn run_facts(run: &RunRow) -> Vec<(String, String, bool)> {
     let mut facts = vec![("Run".to_owned(), run.run_id.clone(), true)];
     facts.push(("Dispatch".to_owned(), run.dispatch_id.clone(), true));
     facts.push(("Agent".to_owned(), run.agent_id.clone(), true));
-    facts.push(("Dispatched".to_owned(), run.dispatched.clone(), false));
+    facts.push(("Dispatched at".to_owned(), run.dispatched.clone(), false));
     if !run.settled.is_empty() {
         facts.push(("Settled".to_owned(), run.settled.clone(), false));
     }
@@ -2818,6 +2855,37 @@ mod process_tests {
     }
 
     #[test]
+    fn structured_answers_render_reply_blocks_and_keep_execution_fields_in_raw_events() {
+        let response = json!({
+            "reply_blocks": [
+                {"id":"title","kind":"heading","text":"Result"},
+                {"id":"reply","kind":"paragraph","text":"A **readable** answer.\n한글 답변"},
+                {"id":"code","kind":"code","lang":"sh","text":"echo '~~~'"}
+            ],
+            "actions":[{"operation":"tasks.create","input":{"title":"internal"}}],
+            "commit_message":"internal commit"
+        })
+        .to_string();
+        assert_eq!(
+            answer_markdown(&response),
+            "## Result\n\nA **readable** answer.\n한글 답변\n\n~~~~sh\necho '~~~'\n~~~~"
+        );
+        for answer in [
+            "Plain answer",
+            "{\"reply_blocks\":[",
+            "{\"example\":1}",
+            "{\"reply_blocks\":[{\"kind\":\"unknown\",\"text\":\"keep\"}]}",
+        ] {
+            assert_eq!(answer_markdown(answer), answer);
+        }
+        let mut run = LiveRun::default();
+        output(&mut run, json!({"type":"result","result":response}));
+        assert_eq!(run.answer, response);
+        assert!(run.trace.last().unwrap().contains("internal commit"));
+        assert_eq!(answer_markdown("{\"reply_blocks\":[],\"actions\":[]}"), "");
+    }
+
+    #[test]
     fn elapsed_labels_carry_seconds_minutes_hours_and_days_at_their_boundaries() {
         for (elapsed_ms, expected) in [
             (0, "Worked for 0s"),
@@ -2893,7 +2961,7 @@ mod process_tests {
         let mut run = LiveRun::default();
         output(
             &mut run,
-            json!({"type":"assistant","message":{"content":[{"type":"text","text":"First paragraph."},{"type":"redacted_thinking","data":"opaque"},{"type":"text","text":"Second paragraph."}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"First paragraph."},{"type":"redacted_thinking","data":"opaque"},{"type":"thinking","thinking":""},{"type":"text","text":"Second paragraph."}]}}),
         );
         assert_eq!(run.answer, "First paragraph.\n\nSecond paragraph.");
         assert!(run.process.is_empty());
