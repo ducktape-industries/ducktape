@@ -643,6 +643,52 @@ impl BoardsView {
                 self.guides = guides;
             }
         }
+        // A corner being drawn or dragged lines up with the board the way a
+        // moving card does. tldraw and excalidraw show the same guides while
+        // you create and resize as they do while you move, and without them a
+        // shape had to be drawn roughly and then nudged into place afterwards.
+        let lining_up = self.snap && !self.modifiers.control && !self.modifiers.shift;
+        let nudged = match (&self.gesture, lining_up) {
+            // A stroke, a line and an arrow place their ends by what they
+            // reach for — a card takes the end whole, ringed while you hold it
+            // — so a corner guide has nothing to say about them.
+            (Gesture::Create { kind, .. }, true) => {
+                (!kind.is_path()).then(|| self.corner_nudge(point, [true; 2], &|_| false))
+            }
+            (
+                Gesture::Resize {
+                    id,
+                    corner,
+                    start,
+                    shape,
+                    ..
+                },
+                true,
+            ) => Some(self.corner_nudge(
+                carried(corner_point(shape, *corner), *start, point),
+                travelling(*corner),
+                &|other| other == id,
+            )),
+            (
+                Gesture::Scale {
+                    corner,
+                    start,
+                    bounds,
+                    shapes,
+                    ..
+                },
+                true,
+            ) => Some(self.corner_nudge(
+                carried(handle_point(*bounds, *corner), *start, point),
+                travelling(*corner),
+                &|other| shapes.contains_key(other),
+            )),
+            _ => None,
+        };
+        if let Some((by, guides)) = nudged {
+            point = [point[0] + by[0], point[1] + by[1]];
+            self.guides = guides;
+        }
         let board = self.visible();
         // The eraser is the one gesture that asks what is under the pointer,
         // and the hit test needs the board this borrow is about to lend out.
@@ -1798,6 +1844,32 @@ impl BoardsView {
         let Some(b) = bounds(shapes.values()) else {
             return (delta, Vec::new());
         };
+        self.aligned(b, delta, [true; 2], &|id| shapes.contains_key(id))
+    }
+    /// The nudge that puts a corner in hand onto a line something already on
+    /// the board stands on, and the guides that say which lines those are. A
+    /// corner is a box of no size at all, so it asks exactly the question a
+    /// moving card asks — which is the point: the guides that line a card up
+    /// with its neighbours are the guides that should line up the one you are
+    /// drawing, and drawing with no guides at all meant every new shape had to
+    /// be nudged into place afterwards.
+    fn corner_nudge(
+        &self,
+        at: [f32; 2],
+        axes: [bool; 2],
+        mine: &dyn Fn(&str) -> bool,
+    ) -> ([f32; 2], Vec<[f32; 4]>) {
+        self.aligned([at[0], at[1], at[0], at[1]], [0.; 2], axes, mine)
+    }
+    /// The nudge that lines a box up with something already on the board, once
+    /// the box, the axes it may travel on, and what to ignore are known.
+    fn aligned(
+        &self,
+        b: [f32; 4],
+        delta: [f32; 2],
+        axes: [bool; 2],
+        mine: &dyn Fn(&str) -> bool,
+    ) -> ([f32; 2], Vec<[f32; 4]>) {
         // Snap against the board on screen, not the last one consensus agreed
         // on: a card you drew a second ago is on screen and is exactly what you
         // want to line the next one up with.
@@ -1808,11 +1880,11 @@ impl BoardsView {
         let mut adjustment = [0.; 2];
         let mut lines = [None, None];
         for (id, r) in &board.shapes {
-            if shapes.contains_key(id) || r.shape.kind.is_path() {
+            if mine(id) || r.shape.kind.is_path() {
                 continue;
             }
             let target = rect(&r.shape);
-            for axis in 0..2 {
+            for axis in (0..2).filter(|&axis| axes[axis]) {
                 for moving in [b[axis], (b[axis] + b[axis + 2]) / 2., b[axis + 2]] {
                     for fixed in [
                         target[axis],
@@ -2170,6 +2242,22 @@ fn intersects(a: [f32; 4], b: [f32; 4]) -> bool {
 }
 pub(super) fn corner_point(s: &Shape, c: [i32; 2]) -> [f32; 2] {
     handle_point([s.x as f32, s.y as f32, s.width as f32, s.height as f32], c)
+}
+/// Where a handle taken at `start` has been carried to. A press takes a handle
+/// from a few pixels away, so the handle is not under the pointer — it travels
+/// with it. Lining up the finger instead of the corner would leave the corner
+/// short by exactly the distance the press was off by.
+pub(super) fn carried(handle: [f32; 2], start: [f32; 2], point: [f32; 2]) -> [f32; 2] {
+    [
+        handle[0] + point[0] - start[0],
+        handle[1] + point[1] - start[1],
+    ]
+}
+/// The axes a handle drag can travel on. An edge handle moves on one of them,
+/// and a guide drawn on the other would promise an alignment the drag cannot
+/// reach.
+pub(super) fn travelling(corner: [i32; 2]) -> [bool; 2] {
+    [corner[0] != 0, corner[1] != 0]
 }
 /// Where a handle sits on a box given as origin and size. A sign of zero on an
 /// axis is the middle of it — the edge handle that changes the other axis and
