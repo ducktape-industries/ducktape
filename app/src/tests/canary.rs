@@ -224,9 +224,20 @@ fn canary_follows_a_live_node() {
     let _runtime = runtime.enter();
     let _turn = runtime.block_on(crate::module_view::canary::connection_turn());
     let transitions = tap();
-    let workspace = runtime
-        .block_on(crate::backend::connect(node.clone(), 0, 0))
-        .expect("connect real node");
+    let workspace = runtime.block_on(async {
+        let mut opening = crate::backend::connect(node.clone(), 0, 0).into_stream();
+        while let Some(message) = opening.next().await {
+            match message {
+                crate::AppMessage::ConnectionProgress(..) => continue,
+                crate::AppMessage::WorkspaceConnected(workspace) => return workspace,
+                crate::AppMessage::ConnectFailed(error) => {
+                    panic!("connect real node: {}", error.message)
+                }
+                _ => panic!("unexpected connection publication"),
+            }
+        }
+        panic!("connection ended without a result");
+    });
     let mut height = workspace.height;
     let mut live = crate::backend::live_events(node.clone());
     let mut cx = crate::frame_probe::headless_context();
