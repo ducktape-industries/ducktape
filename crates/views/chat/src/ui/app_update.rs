@@ -16,6 +16,7 @@ impl super::ChatView {
             Message::PreviewArrived(item) => self.on_preview_arrived(item),
             Message::SessionArrived(item) => self.on_session_arrived(*item),
             Message::SidebarArrived(item) => self.on_sidebar_arrived(item),
+            Message::VisibilityChanged(visible) => self.on_visibility_changed(visible),
             Message::SessionSettled(moved_room) => self.on_session_settled(moved_room),
             Message::ParticipationFinished => self.on_participation_finished(),
             Message::SnapStream(moved) => self.on_snap_stream(moved),
@@ -279,6 +280,21 @@ impl super::ChatView {
             (::ducktape_view_guest::Task::done(chord_now)).map(Message::CopyChord),
         ])
     }
+    fn on_visibility_changed(&mut self, visible: bool) -> ducktape_view_guest::Task<Message> {
+        if self.visible == visible {
+            return ducktape_view_guest::Task::none();
+        }
+        self.visible = visible;
+        let reads_current_view = visible && self.connected;
+        if !reads_current_view {
+            return ducktape_view_guest::Task::none();
+        }
+        ducktape_view_guest::Task::perform(
+            crate::host::read_sidebar(self.connection_serial, self.names_serial, self.me.clone()),
+            Message::SidebarArrived,
+        )
+    }
+
     fn on_sidebar_arrived(
         &mut self,
         item: crate::host::SidebarItem,
@@ -298,7 +314,11 @@ impl super::ChatView {
                 .read_cursors
                 .entry(channel.id.clone())
                 .or_insert(channel.head_seq);
-            if channel.id == self.active_channel {
+            let reading_live_room = self.visible
+                && self.land_seq == 0
+                && self.history_pages == 0
+                && channel.id == self.active_channel;
+            if reading_live_room {
                 *cursor = channel.head_seq;
             }
             heads.insert(channel.id.clone(), channel.head_seq > *cursor);

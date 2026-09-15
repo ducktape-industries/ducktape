@@ -75,6 +75,10 @@
 //!   document's own `duck://` address and parked under `doc` for the
 //!   document surface. Both are the app's decoder and its one outbound
 //!   picture gate, which a view has neither of.
+//! - `host.visible` empty bytes subscribes to JSON booleans: whether this view
+//!   is presented in a shell tab. Hiding delivers one bounded update; queued
+//!   responses precede the next visible event. Cancellation and replacement
+//!   retire the subscription with its guest instance.
 //! - `host.badge` `<count>` — the tab badge, handed to the app as the
 //!   `badge` event with `{"count": N}` in its detail.
 //! - `asset.read` `<canonical-relative-path>` — exact bytes of an asset in
@@ -358,6 +362,18 @@ pub(super) fn answer(
         return true;
     }
     match (capability, operation) {
+        ("host", "visible") => {
+            if !payload.is_empty() {
+                guest.refuse(id, "visibility subscription takes no payload".into());
+                return true;
+            }
+            guest.visibility_subscriptions.push(id);
+            guest.pending.push(wire::Event::Response {
+                id,
+                result: Ok(guest.visible.to_string().into_bytes()),
+                done: false,
+            });
+        }
         ("rpc", "query") => spawn(guest, id, payload, query),
         ("net", "request") => spawn(guest, id, payload, application_call),
         ("rpc", "view") => spawn(guest, id, payload, view),

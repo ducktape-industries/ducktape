@@ -554,6 +554,18 @@ pub struct SessionItem {
     pub participation: Option<Participation>,
 }
 
+/// The host reports tab presentation independently of product session facts.
+pub fn visibility() -> ducktape_view_guest::Subscription<bool> {
+    ducktape_view_guest::Subscription::run(|| {
+        host::subscribe("host.visible", &[]).map(|answer| {
+            answer
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or(false)
+        })
+    })
+}
+
 /// The session now, and again on every change the kernel sees.
 pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     ducktape_view_guest::Subscription::run(|| {
@@ -803,7 +815,11 @@ pub fn sidebar(
     })
 }
 
-async fn read_sidebar(connection_serial: i64, names_serial: i64, reader: String) -> SidebarItem {
+pub(crate) async fn read_sidebar(
+    connection_serial: i64,
+    names_serial: i64,
+    reader: String,
+) -> SidebarItem {
     match read_sidebar_now(connection_serial, names_serial, &reader).await {
         Ok(item) => item,
         Err(error) => SidebarItem {

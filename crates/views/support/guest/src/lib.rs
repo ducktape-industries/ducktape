@@ -258,6 +258,9 @@ impl<A: App> Driver<A> {
                 ),
                 wire::Event::Response { id, result, done } => {
                     host::fulfill(id, result, done);
+                    // Response order is semantic: queued hidden data must be
+                    // applied before a later visibility notification.
+                    self.settle();
                     None
                 }
                 // The host dropped the tree the patches build on.

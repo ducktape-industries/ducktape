@@ -496,6 +496,21 @@ impl NativeModuleView {
     }
     pub(super) fn bind_observers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.observers.is_empty() {
+            let window_id = window.window_handle().window_id();
+            let view = cx.entity().downgrade();
+            self.observers.push(cx.on_window_closed(move |cx, closed| {
+                if closed != window_id {
+                    return;
+                }
+                let view = view.clone();
+                cx.defer(move |cx| {
+                    let _ = view.update(cx, |view, cx| {
+                        for intent in view.hide() {
+                            cx.emit(intent);
+                        }
+                    });
+                });
+            }));
             self.observers
                 .push(cx.observe_window_activation(window, |this, window, cx| {
                     this.observe_window(

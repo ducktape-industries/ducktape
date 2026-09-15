@@ -502,7 +502,20 @@ impl DesktopWindow {
     }
 
     fn released(&mut self, cx: &mut gpui_kit::App) {
+        self.hide_module(cx);
         self.observe_module_window(ui_lang_wire::events::Window::Closed, cx);
+    }
+    fn hide_module(&mut self, cx: &mut gpui_kit::App) {
+        let (Some((_, module)), Some(route)) = (&self.module, self.module_route) else {
+            return;
+        };
+        let intents = module.update(cx, |module, _| module.hide());
+        let model = self.model.clone();
+        cx.defer(move |cx| {
+            for intent in intents {
+                model.update(cx, |model, cx| model.dispatch(route(intent), cx));
+            }
+        });
     }
     fn observe_module_window(
         &mut self,
@@ -1630,6 +1643,7 @@ impl DesktopWindow {
             .as_ref()
             .is_none_or(|(module, _)| *module != spec.module);
         if module_changed {
+            self.hide_module(cx);
             let view = cx.new(|_| crate::module_view::NativeModuleView::new(spec.module));
             let model = self.model.clone();
             self.route = Some(cx.subscribe(&view, move |_, _, event, cx| {

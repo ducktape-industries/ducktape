@@ -55,6 +55,7 @@ pub struct ChatView {
     pub(crate) session_loading: bool,
     pub(crate) session_busy: bool,
     #[serde(default)]
+    pub(crate) visible: bool,
     pub(crate) read_cursors: std::collections::BTreeMap<String, i64>,
     pub(crate) rooms: Vec<crate::host::ChatSidebarRow>,
     pub(crate) dm_rows: Vec<crate::host::DmSidebarRow>,
@@ -184,6 +185,7 @@ pub enum Message {
     /// Boxed: the session item dwarfs every other variant.
     SessionArrived(Box<crate::host::SessionItem>),
     SidebarArrived(crate::host::SidebarItem),
+    VisibilityChanged(bool),
     SessionSettled(bool),
     ParticipationFinished,
     SnapStream(bool),
@@ -261,6 +263,7 @@ impl ChatView {
             connected: false,
             session_loading: false,
             session_busy: false,
+            visible: false,
             read_cursors: Default::default(),
             rooms: Vec::new(),
             dm_rows: Vec::new(),
@@ -385,6 +388,7 @@ impl ChatView {
             return Err("invalid Chat snapshot".into());
         };
         let mut state: Self = wire::decode(&state)?;
+        state.visible = false;
         for draft in state.composers.values_mut() {
             draft.retire_device_requests();
         }
@@ -415,6 +419,7 @@ impl ChatView {
     pub(crate) fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
         ::ducktape_view_guest::Subscription::batch([
             self.composer_drops(),
+            crate::host::visibility().map(Message::VisibilityChanged),
             if self.connected {
                 crate::host::sidebar(self.connection_serial, self.names_serial, self.me.clone())
                     .map(Message::SidebarArrived)
@@ -520,8 +525,46 @@ mod tests {
     }
 
     #[test]
+    fn hidden_room_arrivals_do_not_advance_the_guest_read_cursor() {
+        let mut state = ChatView::state();
+        state.active_channel = "a".into();
+        let sidebar = |head| {
+            Message::SidebarArrived(crate::host::SidebarItem {
+                channels: vec![crate::host::ChatChannel {
+                    id: "a".into(),
+                    head_seq: head,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        };
+        let _ = state.update(sidebar(4));
+        let _ = state.update(sidebar(5));
+        assert_eq!(state.read_cursors["a"], 4);
+        assert!(state.rooms[0].unread);
+        let _ = state.update(Message::VisibilityChanged(true));
+        let _ = state.update(sidebar(6));
+        assert_eq!(state.read_cursors["a"], 6);
+        assert!(!state.rooms[0].unread);
+        state.land_seq = 2;
+        let _ = state.update(sidebar(7));
+        assert_eq!(
+            state.read_cursors["a"], 6,
+            "reading history does not read the live tail"
+        );
+        assert!(state.rooms[0].unread);
+        let restored = ChatView::restore(&state.snapshot().unwrap()).unwrap();
+        assert!(
+            !restored.visible,
+            "visibility comes from the current host, not the snapshot"
+        );
+        assert_eq!(restored.read_cursors["a"], 6);
+    }
+
+    #[test]
     fn sidebar_reads_seed_cursors_then_mark_only_inactive_rooms_unread() {
         let mut state = ChatView::state();
+        state.visible = true;
         state.active_channel = "a".into();
         let sidebar = |head| crate::host::SidebarItem {
             channels: ["a", "b"]

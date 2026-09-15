@@ -2023,6 +2023,9 @@ struct Guest {
     /// props it was last given on it.
     props_subscription: Option<u64>,
     props_sent: Option<Vec<u8>>,
+    visible: bool,
+    visibility_change: Option<bool>,
+    visibility_subscriptions: Vec<u64>,
     /// What the guest asked the app to do this redraw.
     intents: Vec<ModuleViewEvent>,
     /// The kernel's answers to this guest's node calls, on their way in.
@@ -2671,6 +2674,9 @@ impl Guest {
             pictures: Pictures::default(),
             props_subscription: None,
             props_sent: None,
+            visible: false,
+            visibility_change: None,
+            visibility_subscriptions: Vec::new(),
             intents: Vec::new(),
             replies: Arc::default(),
             live_subscriptions: Vec::new(),
@@ -2712,6 +2718,27 @@ impl Guest {
         });
     }
 
+    fn set_visible(&mut self, visible: bool) {
+        if self.visible == visible {
+            return;
+        }
+        self.visible = visible;
+        self.visibility_change = Some(visible);
+    }
+
+    fn sync_visibility(&mut self) {
+        let Some(visible) = self.visibility_change.take() else {
+            return;
+        };
+        for id in &self.visibility_subscriptions {
+            self.pending.push(wire::Event::Response {
+                id: *id,
+                result: Ok(visible.to_string().into_bytes()),
+                done: false,
+            });
+        }
+    }
+
     /// One redraw: tick if there is anything to deliver — or never was a
     /// first frame — answer the requests, and say whether the guest is due
     /// again at once. A guest with nothing to deliver is left alone: the
@@ -2732,6 +2759,9 @@ impl Guest {
         }
         self.pending
             .extend(kernel::ticked(&mut self.clocks, std::time::Instant::now()));
+        // Queued results precede becoming visible, so a view can distinguish
+        // arrivals while hidden from data received after it returns to screen.
+        self.sync_visibility();
         if self.staged {
             // a replacement's first tree is already here; only its
             // requests and cancels are still to route
@@ -2766,6 +2796,8 @@ impl Guest {
                 self.props_subscription = None;
             }
             self.live_subscriptions.retain(|(live, _)| *live != id);
+            self.visibility_subscriptions
+                .retain(|subscription| *subscription != id);
             // dropping the stream aborts it: the node socket goes with the
             // subscription the view abandoned
             self.tasks.retain(|(task, _)| *task != id);
@@ -3165,6 +3197,27 @@ impl NativeModuleView {
         }
     }
 
+    /// A hidden tab gets one bounded update before its native presenter leaves.
+    pub(crate) fn hide(&mut self) -> Vec<ModuleViewEvent> {
+        let Some(alive) = &self.alive else {
+            return Vec::new();
+        };
+        let seat = mounted(self.module);
+        let mut mounted = seat.lock().expect("module view lock");
+        let Mounted { slot, props, .. } = &mut *mounted;
+        let Slot::Ready(guest) = slot else {
+            return Vec::new();
+        };
+        let owns_instance =
+            guest.seated_generation() == self.generation && Arc::ptr_eq(alive, &guest.alive);
+        if !owns_instance || !guest.visible {
+            return Vec::new();
+        }
+        guest.set_visible(false);
+        guest.redraw(props);
+        std::mem::take(&mut guest.intents)
+    }
+
     /// Closing has no next paint. Deliver the final semantic observation through
     /// one bounded guest redraw and return its intents to the surviving shell.
     pub(crate) fn observe_final_window_event(
@@ -3223,6 +3276,7 @@ impl NativeModuleView {
         };
         let generation = guest.seated_generation();
         let ticks = guest.ticks;
+        guest.set_visible(true);
         let again = guest.redraw(props);
         filesystem::mount(guest, cx);
         if again {
@@ -3902,6 +3956,47 @@ pub(crate) mod tests {
         guest.staged = true;
         guest.redraw(&None);
         assert!(kernel::next_tick(&guest.clocks).is_none());
+    }
+
+    #[test]
+    fn visibility_subscription_is_generic_and_reports_initial_hidden_state() {
+        let _turn = blocking_connection_turn();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/views/chat_view.wasm");
+        let mut guest = Guest::load_from("unfamiliar-view", &path).expect("staged view");
+        assert!(kernel::answer(&mut guest, "host", "visible", 41, b""));
+        assert!(matches!(guest.pending.last(), Some(wire::Event::Response {
+            id: 41, result: Ok(bytes), done: false,
+        }) if bytes == b"false"));
+        guest.pending.clear();
+        guest.set_visible(true);
+        guest.pending.push(wire::Event::Response {
+            id: 99,
+            result: Ok(b"queued data".to_vec()),
+            done: true,
+        });
+        guest.sync_visibility();
+        assert!(
+            matches!(guest.pending.as_slice(), [wire::Event::Response { id: 99, .. }, wire::Event::Response { id: 41, result: Ok(bytes), done: false }] if bytes == b"true")
+        );
+        guest.pending.clear();
+        guest.set_visible(true);
+        guest.sync_visibility();
+        assert!(guest.pending.is_empty(), "unchanged visibility is silent");
+        guest.set_visible(false);
+        guest.sync_visibility();
+        assert!(
+            matches!(guest.pending.last(), Some(wire::Event::Response { id: 41, result: Ok(bytes), done: false }) if bytes == b"false")
+        );
+        guest.pending.clear();
+        guest.frame.cancels = vec![41];
+        guest.staged = true;
+        guest.redraw(&None);
+        guest.set_visible(true);
+        guest.sync_visibility();
+        assert!(
+            guest.pending.is_empty(),
+            "cancelled subscription stays retired"
+        );
     }
 
     /// `rpc.view` READS THE MODULE'S INDEX TIER FOR ANY VIEW THAT ASKS, off

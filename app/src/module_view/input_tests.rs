@@ -108,6 +108,79 @@ fn click_before_frame(native: &mut VisualTestContext, key: String) {
         );
     });
 }
+#[test]
+fn shell_tab_switches_hide_and_restore_the_retained_guest() {
+    let _turn = tests::blocking_connection_turn();
+    let seat = seated(&[]);
+    let mut cx = crate::frame_probe::headless_context();
+    let mut state = crate::Ducktape::initial_state();
+    state.shell_tab = crate::ShellTab::Chat;
+    let mut presenter = None;
+    let window = cx
+        .open_window(gpui::size(gpui::px(1200.), gpui::px(800.)), |window, cx| {
+            let view =
+                crate::shell::test_window(state, crate::shell::WindowKind::Console, window, cx);
+            presenter = Some(view.clone());
+            cx.new(|cx| gpui_kit::component::Root::new(view, window, cx))
+        })
+        .unwrap();
+    let presenter = presenter.unwrap();
+    let visible = || {
+        let locked = seat.lock().unwrap();
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("live guest");
+        };
+        guest.visible
+    };
+    cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(visible());
+    presenter.update(&mut cx, |view, cx| {
+        view.test_dispatch(
+            crate::AppMessage::SelectShellTab(crate::ShellTab::Files),
+            cx,
+        )
+    });
+    cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(
+        !visible(),
+        "the previous tab remains hidden while another tab is rendered"
+    );
+    presenter.update(&mut cx, |view, cx| {
+        view.test_dispatch(crate::AppMessage::SelectShellTab(crate::ShellTab::Chat), cx)
+    });
+    cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(visible());
+    cx.update_window(window.into(), |_, window, _| window.remove_window())
+        .unwrap();
+    drop(presenter);
+    cx.run_until_parked();
+    assert!(!visible(), "closing retires the tab presentation");
+}
+
+#[gpui_kit::test]
+fn native_presenter_reports_hidden_and_visible_lifecycle(cx: &mut TestAppContext) {
+    let _turn = tests::blocking_connection_turn();
+    let seat = seated(&[]);
+    let (view, mut native) = open(cx);
+    let visible = || {
+        let locked = seat.lock().unwrap();
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("live guest");
+        };
+        guest.visible
+    };
+    assert!(visible());
+    view.update(&mut native, |view, _| {
+        let _ = view.hide();
+        assert!(!visible(), "hidden before the presenter leaves");
+    });
+    native.update(|window, cx| window.render_frame(cx));
+    assert!(visible());
+}
+
 #[gpui_kit::test]
 fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses(cx: &mut TestAppContext) {
     let _turn = tests::blocking_connection_turn();

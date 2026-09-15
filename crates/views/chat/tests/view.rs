@@ -256,7 +256,7 @@ fn live_ids(frame: &Frame) -> Vec<u64> {
         .collect()
 }
 
-/// At boot the view asks for the session alone. Connected, it reads its own
+/// At boot the view asks for session and visibility. Connected, it reads its own
 /// room — the directory, the record, the window and the roster — and the fold
 /// is the whole screen.
 #[test]
@@ -266,8 +266,8 @@ fn a_connected_view_reads_its_own_room() {
         let frame = tick_native(Vec::new());
         assert_eq!(
             kinds(&frame),
-            ["chat.props"],
-            "only the session at boot: {:?}",
+            ["host.visible", "chat.props"],
+            "session and visibility at boot: {:?}",
             frame.requests
         );
 
