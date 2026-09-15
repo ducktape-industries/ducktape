@@ -396,20 +396,35 @@ impl AgentsView {
         }
         for run in &self.runs {
             let key = format!("agents/run/{}", run.run_id);
-            // the run's key is a machine address; the row names the agent
-            // and what it answered, and the key waits behind Run details
             let summary = kit::spaced(
-                kit::centered_row(
+                kit::column(
                     format!("{key}/summary"),
                     [
-                        kit::nowrap(kit::strong(format!("{key}/agent"), &run.agent_name)),
-                        kit::nowrap(kit::secondary(format!("{key}/origin"), &run.origin)),
-                        state_badge(format!("{key}/state"), &run.state),
-                        filler(),
-                        kit::nowrap(kit::caption(format!("{key}/dispatched"), &run.dispatched)),
+                        kit::spaced(
+                            kit::centered_row(
+                                format!("{key}/heading"),
+                                [
+                                    kit::sized(
+                                        kit::nowrap(kit::strong(
+                                            format!("{key}/agent"),
+                                            &run.agent_name,
+                                        )),
+                                        Some(Length::Fill),
+                                        None,
+                                    ),
+                                    state_badge(format!("{key}/state"), &run.state),
+                                ],
+                            ),
+                            6.,
+                        ),
+                        kit::sized(
+                            kit::nowrap(kit::caption(format!("{key}/origin"), &run.origin)),
+                            Some(Length::Fill),
+                            None,
+                        ),
                     ],
                 ),
-                8.,
+                4.,
             );
             let mut button = kit::list_row(
                 &key,
@@ -429,27 +444,46 @@ impl AgentsView {
                 wire::Edges::all(8.),
             ),
         );
-        let rail = (!self.open_run.is_empty()).then(|| {
-            (
-                resize("agents/journal-resize", Message::JournalResized),
-                detail_pane(
-                    "agents/journal",
-                    kit::sized(
-                        kit::column(
-                            "agents/journal-layout",
-                            [
-                                kit::scroll("agents/journal-scroll", self.journal_panel()),
-                                self.run_controls(),
-                            ],
-                        ),
-                        Some(Length::Fill),
-                        Some(Length::Fill),
+        let detail = match self.open_run.is_empty() {
+            true => kit::empty_state(
+                "agents/select-run",
+                "Select a run",
+                "Open a run to see its conversation, work and controls.",
+            ),
+            false => kit::sized(
+                kit::spaced(
+                    kit::column(
+                        "agents/journal-layout",
+                        [
+                            kit::scroll("agents/journal-scroll", self.journal_panel()),
+                            self.run_controls(),
+                        ],
                     ),
-                    self.journal_width,
+                    0.,
                 ),
-            )
-        });
-        self.split("agents/run-panes", list, rail)
+                Some(Length::Fill),
+                Some(Length::Fill),
+            ),
+        };
+        kit::sized(
+            kit::spaced(
+                kit::row(
+                    "agents/run-panes",
+                    [
+                        kit::pane(
+                            "agents/run-list",
+                            list,
+                            Length::Fixed(self.run_list_width as f32),
+                        ),
+                        resize("agents/run-list-resize", Message::RunListResized),
+                        kit::pane("agents/journal", detail, Length::Fill),
+                    ],
+                ),
+                0.,
+            ),
+            Some(Length::Fill),
+            Some(Length::Fill),
+        )
     }
 
     fn run_controls(&self) -> Node {
@@ -570,11 +604,7 @@ impl AgentsView {
                         Some(Length::Fill),
                         None,
                     ),
-                    subtle(
-                        "agents/close-journal",
-                        "Close journal",
-                        Some(Message::CloseRun),
-                    ),
+                    subtle("agents/close-journal", "Close run", Some(Message::CloseRun)),
                 ],
             ),
             kit::spaced(
@@ -613,6 +643,23 @@ impl AgentsView {
                 kit::spaced(kit::column("agents/receipt-body", facts), 6.),
             ));
         }
+        if let host::OutputConnection::Failed(error) = &self.live.connection {
+            items.push(kit::notice(
+                "agents/output-error",
+                kit::column(
+                    "agents/output-error-body",
+                    [
+                        kit::wrapping(kit::text("agents/output-error-text", error)),
+                        action(
+                            "agents/output-retry",
+                            "Reconnect",
+                            Some(Message::RetryTrace),
+                        ),
+                    ],
+                ),
+                Tone::Danger,
+            ));
+        }
         let process_label = self.live.process_label(self.open_row.state == "running");
         items.push(subtle(
             "agents/trace-toggle",
@@ -627,7 +674,7 @@ impl AgentsView {
             if self.live.process.is_empty() {
                 steps.push(kit::wrapping(kit::secondary(
                     "agents/process-empty",
-                    "No process details are available from this node. Older output may have expired.",
+                    self.live.empty_process_message(&self.open_row.state),
                 )));
             }
             for (index, step) in self.live.process.iter().enumerate() {
@@ -1074,7 +1121,7 @@ pub struct AgentsView {
     pub(crate) live: crate::host::LiveRun,
     pub(crate) panel: String,
     pub(crate) open_run: String,
-    pub(crate) journal_width: f64,
+    pub(crate) run_list_width: f64,
     pub(crate) editor_width: f64,
     pub(crate) viewport_width: f64,
     pub(crate) expanded_receipt: String,
@@ -1115,12 +1162,13 @@ impl ::std::fmt::Debug for AgentsView {
 }
 #[derive(Clone)]
 pub enum Message {
-    JournalResized(f64, f64),
+    RunListResized(f64, f64),
     EditorResized(f64, f64),
     ViewportChanged(f64, f64),
     ToggleReceipt(String),
     ToggleTrace,
     ToggleRawTrace,
+    RetryTrace,
     ControlDraft(String),
     ControlSend,
     ControlInterrupt,
@@ -1166,7 +1214,7 @@ impl AgentsView {
             live: crate::host::empty_live(),
             panel: "registry".to_owned(),
             open_run: "".to_owned(),
-            journal_width: 400.0,
+            run_list_width: 260.0,
             editor_width: 400.0,
             viewport_width: 1280.0,
             expanded_receipt: "".to_owned(),
@@ -1206,7 +1254,7 @@ impl AgentsView {
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "9c4a810d48f931b96a2853922b8f0c237adf52031ccab56970b92bdb7afe383c";
+        "5718f398eda6cf183db64765dcd7ae9674416bf9c32676c0e3f60fced7c56db0";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
@@ -1234,7 +1282,7 @@ impl AgentsView {
     }
 
     fn validate_snapshot(&self) -> Result<(), String> {
-        let widths = [self.journal_width, self.editor_width, self.viewport_width];
+        let widths = [self.run_list_width, self.editor_width, self.viewport_width];
         if widths.into_iter().all(f64::is_finite) {
             Ok(())
         } else {
@@ -1332,7 +1380,7 @@ mod tests {
         envelope.schema = AgentsView::SNAPSHOT_SCHEMA.into();
         envelope.state = wire::SnapshotValue::Bytes(vec![255]);
         assert!(AgentsView::restore(&envelope.encode().unwrap()).is_err());
-        state.journal_width = f64::INFINITY;
+        state.run_list_width = f64::INFINITY;
         assert!(state.snapshot().is_err());
         envelope.state = wire::SnapshotValue::Bytes(wire::encode(&state));
         assert!(AgentsView::restore(&envelope.encode().unwrap()).is_err());
@@ -1395,7 +1443,7 @@ mod tests {
         });
         app.open_run = "dispatch".into();
         app.expanded_receipt = "dispatch".into();
-        app.journal_width = 480.;
+        app.run_list_width = 480.;
         app.editor_width = 470.;
         let bytes = app.snapshot().unwrap();
         let restored = AgentsView::restore(&bytes).unwrap();
@@ -1405,12 +1453,13 @@ mod tests {
 impl AgentsView {
     pub(crate) fn update(&mut self, message: Message) -> ::ducktape_view_guest::Task<Message> {
         match message {
-            Message::JournalResized(dx, _dy) => self.on_journal_resized(dx, _dy),
+            Message::RunListResized(dx, _dy) => self.on_run_list_resized(dx, _dy),
             Message::EditorResized(dx, _dy) => self.on_editor_resized(dx, _dy),
             Message::ViewportChanged(width, _height) => self.on_viewport_changed(width, _height),
             Message::ToggleReceipt(value) => self.on_toggle_receipt(value),
             Message::ToggleTrace => self.on_toggle_trace(),
             Message::ToggleRawTrace => self.on_toggle_raw_trace(),
+            Message::RetryTrace => self.on_retry_trace(),
             Message::ControlDraft(text) => self.on_control_draft(text),
             Message::ControlSend => self.on_control_send(),
             Message::ControlInterrupt => self.on_control_interrupt(),
@@ -1445,12 +1494,12 @@ impl AgentsView {
             Message::BindSkillSnapshot(value) => self.on_bind_skill_snapshot(value),
         }
     }
-    fn on_journal_resized(&mut self, dx: f64, _dy: f64) -> ::ducktape_view_guest::Task<Message> {
+    fn on_run_list_resized(&mut self, dx: f64, _dy: f64) -> ::ducktape_view_guest::Task<Message> {
         {
             {
-                self.journal_width = crate::host::journal_width_after_delta(
-                    self.journal_width,
-                    -dx,
+                self.run_list_width = crate::host::run_list_width_after_delta(
+                    self.run_list_width,
+                    dx,
                     self.viewport_width,
                 );
             }
@@ -1479,8 +1528,8 @@ impl AgentsView {
                 self.viewport_width = width;
             }
             {
-                self.journal_width =
-                    crate::host::journal_width_after_delta(self.journal_width, 0.0, width);
+                self.run_list_width =
+                    crate::host::run_list_width_after_delta(self.run_list_width, 0.0, width);
             }
             {
                 self.editor_width =
@@ -1566,6 +1615,12 @@ impl AgentsView {
             }
             Err(error) => host::ControlState::Failed(error),
         };
+        ducktape_view_guest::Task::none()
+    }
+
+    fn on_retry_trace(&mut self) -> ducktape_view_guest::Task<Message> {
+        self.live = host::LiveRun::default();
+        self.connection_serial = self.connection_serial.wrapping_add(1);
         ducktape_view_guest::Task::none()
     }
 
