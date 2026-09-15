@@ -117,6 +117,38 @@ Only a pristine original Chat post or a never-used Page comment admitted with
 cannot borrow an original author's approval. Attribution's actual mutator is
 preserved. Saving a reply and resolving the ask are separate actions.
 
+## Governing the whole body of work
+
+Every task is locally defensible, which is how a small request becomes an
+unrecognizable one: each step is justified alone and nobody rules on the sum.
+Three mechanisms make the aggregate visible, all of them riding on data the
+board already returns — no injected message, no rewritten system prompt.
+
+`chief_task` requires `origin`: the id of the task whose work SURFACED the
+condition for this one (the task that found it, never the one that introduced
+it). The literal `'user'` means the request stands on its own and records no
+origin. Origin is cycle-checked in memory and on reload, follows merges to the
+surviving task, and is correctable late without reopening accepted work or
+stopping a live worker, because no worker brief carries it.
+
+`chief_transition` and `chief_accept` record `footprint`: the repo-relative
+paths a settled run actually changed, read from reviewed evidence rather than a
+worker's claim. It accumulates across a task's runs and never shrinks. Drift is
+the footprint a task's declared `scope` never claimed; `chief_board` reports it
+on task detail. A merge records no footprint — the surviving task does.
+
+A line of work is one origin tree. Mutation acknowledgments carry its size and
+say so once when it crosses a rung of 3/5/8/13/21/34 tasks that CHANGE the
+repository, by comparing the line before and after the change, so each rung
+fires exactly once and a caller with no before-state fires none. `newGround`
+counts how many of those changing tasks reached ground the line had not already
+covered, so delivery does not pull a rung forward while a line is closing.
+Acknowledgments also cross-hash the affected task against all other live and
+already-accepted work standing on its surfaces, and flag work whose origin is
+already done or merged with no threshold at all. `chief_board`'s overview
+carries a census that counts every task and surface and is complete by
+construction; the task list beside it is an explicit preview that drops work.
+
 `chief_rule_put`/`chief_rule_remove` maintain reusable rules. `chief_checkpoint`
 saves current focus and next actions. `chief_limit` gates new admission, not
 already-running workers. `chief_checkin` sets a 1–1440 minute fallback or `null`;

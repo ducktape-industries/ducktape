@@ -157,15 +157,15 @@ test('every tool maps to a typed command and forwards the same signal', async ()
   registerChief(pi.api, bridge.bridge);
   const mutation = { operationId: 'operation', expectedRevision: 1 };
   const ref = { fileId: 'report1', hash: 'a'.repeat(64) };
-  const task = { id: 'task1', key: 'canonical key', title: 'title', brief: 'brief', scope: ['src'], access: 'read', dependencies: [] };
+  const task = { id: 'task1', key: 'canonical key', title: 'title', brief: 'brief', scope: ['src'], access: 'read', dependencies: [], origin: 'task0' };
   const ask = { id: 'ask1', key: 'ask key', title: 'title', question: 'question', whyMember: 'authority', ifUnasked: 'cost', recommendation: 'recommended', options: [], artifacts: [], blocks: [], sources: [], addressedTo: ['member1'] };
   const cases: { name: keyof typeof chiefToolSchemas; input: Record<string, unknown>; expected: unknown }[] = [
     { name: 'chief_board', input: { section: 'tasks', offset: 0, limit: 1, id: 'task1', detailOffset: 2 }, expected: { kind: 'board', section: 'tasks', offset: 0, limit: 1, id: 'task1', detailOffset: 2 } },
     { name: 'chief_report', input: { runId: 'run1' }, expected: { kind: 'report', runId: 'run1' } },
     { name: 'chief_task', input: { ...mutation, task }, expected: { kind: 'change', ...mutation, action: { kind: 'task_put', task } } },
-    { name: 'chief_transition', input: { ...mutation, taskId: 'task1', status: 'blocked', reason: 'reason' }, expected: { kind: 'change', ...mutation, action: { kind: 'task_status', taskId: 'task1', status: 'blocked', reason: 'reason' } } },
+    { name: 'chief_transition', input: { ...mutation, taskId: 'task1', status: 'blocked', reason: 'reason', footprint: ['src/one.ts'] }, expected: { kind: 'change', ...mutation, action: { kind: 'task_status', taskId: 'task1', status: 'blocked', reason: 'reason', footprint: ['src/one.ts'] } } },
     { name: 'chief_merge', input: { ...mutation, sourceId: 'task1', targetId: 'task2' }, expected: { kind: 'change', ...mutation, action: { kind: 'task_merge', sourceId: 'task1', targetId: 'task2' } } },
-    { name: 'chief_accept', input: { ...mutation, taskId: 'task1', outcome: 'verified', evidence: [ref] }, expected: { kind: 'change', ...mutation, action: { kind: 'accept', taskId: 'task1', outcome: 'verified', evidence: [ref] } } },
+    { name: 'chief_accept', input: { ...mutation, taskId: 'task1', outcome: 'verified', evidence: [ref], footprint: ['src/one.ts'] }, expected: { kind: 'change', ...mutation, action: { kind: 'accept', taskId: 'task1', outcome: 'verified', evidence: [ref], footprint: ['src/one.ts'] } } },
     { name: 'chief_ask_open', input: { ...mutation, ask }, expected: { kind: 'change', ...mutation, action: { kind: 'ask_open', ask } } },
     { name: 'chief_decision', input: { ...mutation, askId: 'ask1', messageId: 'message1' }, expected: { kind: 'decision', ...mutation, askId: 'ask1', messageId: 'message1' } },
     { name: 'chief_ask_resolve', input: { ...mutation, askId: 'ask1', status: 'answered', resolution: 'acted' }, expected: { kind: 'change', ...mutation, action: { kind: 'ask_resolve', askId: 'ask1', status: 'answered', resolution: 'acted' } } },
@@ -193,6 +193,21 @@ test('every tool maps to a typed command and forwards the same signal', async ()
   assert(!Value.Check(chiefToolSchemas.chief_control, { ...mutation, runId: 'run1', control: 'cancel', text: '' }));
   assert(!Object.hasOwn(chiefToolSchemas.chief_dispatch.properties, 'runId'));
   assert(!Value.Check(chiefToolSchemas.chief_dispatch, { ...mutation, taskId: 'task1', fresh: true, runId: mutation.operationId }), 'Even a matching caller-supplied runId is not part of dispatch');
+  const { origin: _origin, ...unattributed } = task;
+  assert(!Value.Check(chiefToolSchemas.chief_task, { ...mutation, task: unattributed }), 'A task without recorded provenance is not a task');
+  assert(!Object.hasOwn(chiefToolSchemas.chief_merge.properties, 'footprint'), 'A merge records no footprint; the surviving task does');
+});
+
+test("the 'user' sentinel records no origin and never erases one", async () => {
+  const pi = fakePi();
+  const bridge = fakeBridge();
+  registerChief(pi.api, bridge.bridge);
+  const mutation = { operationId: 'operation', expectedRevision: 1 };
+  const task = { id: 'task1', key: 'canonical key', title: 'title', brief: 'brief', scope: ['src'], access: 'read' as const, dependencies: [] };
+  await pi.call('chief_task', { ...mutation, task: { ...task, origin: 'user' } });
+  assert.deepEqual(bridge.state.calls.at(-1)?.command, { kind: 'change', ...mutation, action: { kind: 'task_put', task } });
+  await pi.call('chief_task', { ...mutation, task: { ...task, origin: 'task0' } });
+  assert.deepEqual(bridge.state.calls.at(-1)?.command, { kind: 'change', ...mutation, action: { kind: 'task_put', task: { ...task, origin: 'task0' } } });
 });
 
 test('the reader forwards the exact artifact and immutable receipt anchor with its cursor', async () => {

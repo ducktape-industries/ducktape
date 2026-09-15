@@ -966,7 +966,7 @@ async fn actual_chief_and_independent_native_worker_share_one_real_host() {
         "second person queues behind the active immutable turn"
     );
     first.tool("chief_task", json!({"operationId":"connected-create","expectedRevision":network.revision(&plan).await,
-        "task":{"id":TASK,"key":"connected-evidence","title":"Review native worker evidence","brief":"Inspect /shared/connected and report evidence; no writes or scope expansion.","scope":["shared/connected"],"access":"read","dependencies":[]}}));
+        "task":{"id":TASK,"key":"connected-evidence","title":"Review native worker evidence","brief":"Inspect /shared/connected and report evidence; no writes or scope expansion.","scope":["shared/connected"],"access":"read","dependencies":[],"origin":"user"}}));
     let dispatch = vendor.next(&mut network, &mut chief, "chief-model").await;
     dispatch.last_result();
     dispatch.tool("chief_dispatch", json!({"operationId":JOB,"expectedRevision":network.revision(&plan).await,"taskId":TASK,"fresh":true}));

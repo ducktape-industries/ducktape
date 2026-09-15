@@ -46,7 +46,10 @@ const identity = (ref: FileRef): FileRef => ({ fileId: ref.fileId, hash: ref.has
 const sameRef = (left: FileRef, right: FileRef): boolean => left.fileId === right.fileId && left.hash === right.hash;
 const runArtifacts = (run: Run | undefined): FileRef[] => run
   ? [run.report, run.progress?.source, ...(run.progress?.artifacts ?? [])].filter((ref): ref is FileRef => ref !== undefined) : [];
-export interface ChangeResult { board: Board; revision: number; operationId: string; replayed: boolean }
+// `previous` is the durable board this change was actually applied to. A replay
+// has none: its transition already happened, and reporting the current board as
+// its before-state would report growth that no caller caused.
+export interface ChangeResult { board: Board; revision: number; operationId: string; replayed: boolean; previous?: Board }
 export interface ChiefStore {
   read(signal?: AbortSignal): Promise<Board>;
   receipt(operationId: string, signal?: AbortSignal): Promise<OperationReceipt | null>;
@@ -174,7 +177,7 @@ export const createStore = (pages: PagesAdapter, conversationId: string, files: 
           .then(({ committed, value }) => {
             if (committed.kind === 'conflict') throw new PolicyError('revision_conflict');
             requirePolicy(committed.requestId === input.operationId && committed.revision === revision, 'invalid_commit_receipt');
-            return { board: value, operationId: input.operationId, revision, replayed: false };
+            return { board: value, operationId: input.operationId, revision, replayed: false, previous: board };
           });
       }),
   };

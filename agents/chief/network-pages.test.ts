@@ -315,6 +315,25 @@ test('checkpoint and stall policy roundtrip in hidden meta without a human meta 
   assert(chunk(state, 'meta'));
 });
 
+test('provenance and footprint ride in the managed task record and its readable body', async () => {
+  const { state, adapter } = createMock();
+  const root = task('task1');
+  const grown = { ...task('task2'), origin: 'task1', footprint: ['crates/wire/frame.rs', 'ops/deploy.sh'] };
+  await adapter.commit(inputFor(emptyBoard('conversation'), 'provenance', { tasks: [root, grown] }));
+  const stored = await readBoard(adapter);
+  assert.deepEqual(stored.tasks.find(item => item.id === 'task2'), grown);
+  // A member reading the Pages document sees what a task grew out of and what
+  // its runs really touched, not only what it declared.
+  const upserts = state.submits.at(-1)!.changes.flatMap(change => 'upsert' in change ? [change.upsert] : []);
+  const body = upserts.find(upsert => upsert.data.value.id === 'task2')!.document.blocks[0].text;
+  assert.match(body, /origin: task1/);
+  assert.match(body, /crates\/wire\/frame\.rs/);
+  // The largest footprint the board accepts still fits one managed record.
+  const widest = { ...task('task3'), footprint: Array.from({ length: 200 }, (_, index) => `crates/services/provider/f${index}.ts`) };
+  await adapter.commit(inputFor(await readBoard(adapter), 'widest', { tasks: [root, grown, widest] }));
+  assert.deepEqual((await readBoard(adapter)).tasks.find(item => item.id === 'task3'), widest);
+});
+
 test('Rust Value digest includes canonical keys, protected state, metadata and artifacts', async () => {
   const { adapter } = createMock();
   const entity = { ...task('task1'), '2': 'two', '10': 'ten', '\u{1f600}': 'supplementary', '\ue000': 'private-use' };

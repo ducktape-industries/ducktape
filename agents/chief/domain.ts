@@ -23,6 +23,23 @@ export const validId = (value: unknown): value is string =>
   typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,199}$/.test(value);
 export const canonicalKey = (value: string): string => value.trim().replace(/\s+/g, ' ').toLowerCase();
 const unique = <T>(values: T[]): T[] => [...new Set(values)];
+// Declared scope and recorded footprint share one path grammar, so measuring
+// one against the other is a prefix comparison rather than a guess: repo-
+// relative, no globs, no traversal, no drive letters, no redundant segments.
+// '.' is the whole repo and the only path that is not a name.
+const GLOB_OR_CONTROL = /[\x00-\x1f\x7f*?[\]{}!\\]|[+@]\(/;
+const normalizedPath = (value: string): string => value.split('/').filter(part => part && part !== '.').join('/') || '.';
+const validPath = (value: unknown): value is string => boundedText(value, 300)
+  && !GLOB_OR_CONTROL.test(value) && !value.startsWith('/') && !/^[a-z]:/i.test(value)
+  && !value.split('/').includes('..') && normalizedPath(value) === value;
+const validPaths = (values: unknown, limit: number): values is string[] => Array.isArray(values)
+  && values.length <= limit && values.every(validPath) && unique(values).length === values.length;
+// A task carries its whole footprint in one durable record, so the record it
+// grows is bounded in characters and not only in entries.
+export const MAX_FOOTPRINT_PATHS = 200;
+const MAX_FOOTPRINT_CHARACTERS = 8000;
+const validFootprint = (values: unknown): values is string[] =>
+  validPaths(values, MAX_FOOTPRINT_PATHS) && values.join('/').length <= MAX_FOOTPRINT_CHARACTERS;
 const uniqueIds = (values: string[]): boolean => values.every(validId) && unique(values).length === values.length;
 export const validRefs = (values: unknown): values is FileRef[] => Array.isArray(values) && values.length <= 16
   && values.every(value => value && validId(value.fileId) && /^[a-f0-9]{64}$/.test(value.hash));
@@ -58,8 +75,9 @@ const dependenciesDone = (board: Board, task: Task): boolean => task.dependencie
 const checkTask = (task: Task): void => {
   requirePolicy(validId(task.id) && boundedText(task.key, 200) && task.key === canonicalKey(task.key), 'invalid_task_key');
   requirePolicy(boundedText(task.title, 300) && boundedText(task.brief, 12000), 'invalid_task_text');
-  requirePolicy(Array.isArray(task.scope) && task.scope.length > 0 && task.scope.length <= 32, 'invalid_scope');
-  requirePolicy(task.scope.every(path => boundedText(path, 300) && !path.startsWith('/') && !path.includes('\\') && !path.split('/').includes('..')), 'invalid_scope');
+  requirePolicy(validPaths(task.scope, 32) && task.scope.length > 0, 'invalid_scope');
+  requirePolicy(task.footprint === undefined || validFootprint(task.footprint) && task.footprint.length > 0, 'invalid_footprint');
+  requirePolicy(task.origin === undefined || validId(task.origin) && task.origin !== task.id, 'invalid_origin');
   requirePolicy(['read', 'write'].includes(task.access) && Array.isArray(task.dependencies) && task.dependencies.length <= 64 && uniqueIds(task.dependencies), 'invalid_dependencies');
   requirePolicy(['queued', 'running', 'review', 'done', 'blocked', 'cancelled', 'merged'].includes(task.status), 'invalid_task_status');
   requirePolicy(validRefs(task.evidence), 'invalid_evidence');
@@ -73,7 +91,26 @@ const checkTask = (task: Task): void => {
   requirePolicy(Number.isSafeInteger(task.acceptance.revision) && task.acceptance.revision > 0 && validId(task.acceptance.runId), 'invalid_acceptance_revision');
   requirePolicy(task.acceptance.evidence.every(ref => task.evidence.some(item => item.fileId === ref.fileId && item.hash === ref.hash)), 'acceptance_not_in_evidence');
 };
+/** A declared path covers itself and everything beneath it; '.' covers the repo. */
+export const coveredByScope = (scope: string[], path: string): boolean =>
+  scope.some(entry => entry === '.' || entry === path || path.startsWith(`${entry}/`));
+/** Paths a task actually touched that its declared scope never claimed. */
+export const scopeDrift = (task: Task): string[] => (task.footprint ?? []).filter(path => !coveredByScope(task.scope, path));
+/** Root of a line of work: follow origin until a task nobody's findings added.
+ * Dependencies are not walked; ordering is not the same relation as causation. */
+export const lineRoot = (board: Board, id: string, seen: string[] = []): Task => {
+  const task = canonicalTask(board, id);
+  requirePolicy(!seen.includes(task.id), 'origin_cycle');
+  return task.origin ? lineRoot(board, task.origin, [...seen, task.id]) : task;
+};
 const checkGraph = (board: Board): void => {
+  board.tasks.forEach(task => {
+    if (task.origin === undefined) return;
+    taskById(board, task.origin);
+    // Rejected on reload as well as in memory: a cycle read back from Pages
+    // would make every projection that walks a line non-terminating.
+    lineRoot(board, task.id);
+  });
   // Shared visitation bounds work on diamond DAGs; local sets are not state.
   const visiting = new Set<string>();
   const visited = new Set<string>();
@@ -164,16 +201,33 @@ const putTask = (board: Board, action: Extract<DomainAction, { kind: 'task_put' 
   const sameKey = board.tasks.find(task => task.key === spec.key);
   requirePolicy(!sameKey || sameKey.id === spec.id, 'canonical_key_exists');
   if (!existing) return { ...board, tasks: [...board.tasks, { ...spec, status: 'queued', evidence: [] }] };
+  // A tombstone is not a task: the surviving task owns the merged work, and
+  // rewriting an absorbed task's record would fork the line it was folded into.
+  requirePolicy(existing.status !== 'merged', 'merged_terminal');
+  const changed = Object.keys(spec).filter(key => JSON.stringify(existing[key as keyof Task]) !== JSON.stringify(spec[key as keyof typeof spec]));
+  // Provenance is a coordination record, not the worker's specification:
+  // correcting it late must not require reopening accepted work or stopping a
+  // live worker, whose brief never carries it.
+  const onlyProvenance = changed.length > 0 && changed.every(key => key === 'origin');
+  if (onlyProvenance) return replaceTask(board, { ...existing, ...spec });
   noLive(board, existing.id);
   requirePolicy(['queued', 'blocked'].includes(existing.status), 'reopen_before_edit');
   return replaceTask(board, { ...existing, ...spec });
+};
+// Footprint accumulates across a task's runs: what the work actually touched is
+// cumulative, and a later run reopening the task never shrinks the record.
+const recordFootprint = (task: Task, recorded: string[] | undefined): { footprint?: string[] } => {
+  requirePolicy(recorded === undefined || validFootprint(recorded), 'invalid_footprint');
+  const footprint = unique([...(task.footprint ?? []), ...(recorded ?? [])]);
+  requirePolicy(validFootprint(footprint), 'invalid_footprint');
+  return footprint.length ? { footprint } : {};
 };
 const setStatus = (board: Board, action: Extract<DomainAction, { kind: 'task_status' }>): Board => {
   const task = taskById(board, action.taskId);
   noLive(board, task.id);
   requirePolicy(task.status !== 'merged', 'merged_terminal');
   const { acceptance: _acceptance, reason: _reason, currentRun: _run, ...rest } = task;
-  return replaceTask(board, { ...rest, status: action.status, reason: action.reason });
+  return replaceTask(board, { ...rest, status: action.status, reason: action.reason, ...recordFootprint(task, action.footprint) });
 };
 const mergeTasks = (board: Board, action: Extract<DomainAction, { kind: 'task_merge' }>): Board => {
   const source = taskById(board, action.sourceId);
@@ -181,10 +235,28 @@ const mergeTasks = (board: Board, action: Extract<DomainAction, { kind: 'task_me
   requirePolicy(source.id !== target.id && source.status !== 'merged' && ['queued', 'blocked'].includes(target.status), 'invalid_merge_target');
   noLive(board, source.id); noLive(board, target.id);
   const rewire = (ids: string[], owner: string): string[] => unique(ids.map(id => canonicalTask(board, id).id === source.id ? target.id : id)).filter(id => canonicalTask(board, id).id !== owner);
-  return { ...board, tasks: board.tasks.map(task => {
+  // A line survives the merge of its own tasks. Where the survivor would end up
+  // originating from itself, it inherits the absorbed task's own origin instead,
+  // so combining two tasks never detaches their line from its root.
+  const survivingOrigin = (origin: string | undefined, owner: string, seen: string[] = []): string | undefined => {
+    if (origin === undefined) return undefined;
+    const resolved = canonicalTask(board, origin).id;
+    if (seen.includes(resolved)) return undefined;
+    const next = resolved === source.id ? target.id : resolved;
+    if (next !== owner) return next;
+    return survivingOrigin(board.tasks.find(task => task.id === resolved)?.origin, owner, [...seen, resolved]);
+  };
+  const survivor = (task: Task, origin: string | undefined): { origin?: string } => {
+    const inherited = survivingOrigin(origin, task.id);
+    return inherited === undefined ? {} : { origin: inherited };
+  };
+  return { ...board, tasks: board.tasks.map((task): Task => {
     if (task.id === source.id) return { ...task, status: 'merged', mergedInto: target.id };
-    if (task.id === target.id) return { ...task, brief: `${target.brief}\n\n${source.title}\n${source.brief}`, evidence: unionRefs(target.evidence, source.evidence), scope: unique([...target.scope, ...source.scope]), access: source.access === 'write' ? 'write' : target.access, dependencies: rewire([...target.dependencies, ...source.dependencies], target.id) };
-    return { ...task, dependencies: rewire(task.dependencies, task.id) };
+    const { origin: _origin, ...kept } = task;
+    // The merged whole keeps both footprints and the surviving provenance; a
+    // line does not lose its added work because two of its tasks combined.
+    if (task.id === target.id) return { ...kept, brief: `${target.brief}\n\n${source.title}\n${source.brief}`, evidence: unionRefs(target.evidence, source.evidence), scope: unique([...target.scope, ...source.scope]), access: source.access === 'write' ? 'write' : target.access, dependencies: rewire([...target.dependencies, ...source.dependencies], target.id), ...recordFootprint(target, source.footprint), ...survivor(target, target.origin ?? source.origin) };
+    return { ...kept, dependencies: rewire(task.dependencies, task.id), ...survivor(task, task.origin) };
   }) };
 };
 const acceptTask = (board: Board, action: Extract<DomainAction, { kind: 'accept' }>): Board => {
@@ -193,7 +265,7 @@ const acceptTask = (board: Board, action: Extract<DomainAction, { kind: 'accept'
   requirePolicy(task.status === 'review' && validRefs(action.evidence) && action.evidence.length > 0 && boundedText(action.outcome, 2000), 'review_evidence_required');
   requirePolicy(task.currentRun, 'review_run_required');
   const { currentRun, ...rest } = task;
-  return replaceTask(board, { ...rest, status: 'done', evidence: unionRefs(task.evidence, action.evidence), acceptance: { revision: board.revision + 1, runId: currentRun!, outcome: action.outcome, evidence: action.evidence } });
+  return replaceTask(board, { ...rest, status: 'done', evidence: unionRefs(task.evidence, action.evidence), ...recordFootprint(task, action.footprint), acceptance: { revision: board.revision + 1, runId: currentRun!, outcome: action.outcome, evidence: action.evidence } });
 };
 const openAsk = (board: Board, action: Extract<DomainAction, { kind: 'ask_open' }>): Board => ({ ...board, asks: [...board.asks, { ...action.ask, key: canonicalKey(action.ask.key), status: 'open' }] });
 const resolveAsk = (board: Board, action: Extract<DomainAction, { kind: 'ask_resolve' }>): Board => {
@@ -227,6 +299,91 @@ export const decide = (board: Board, action: DomainAction): Board => {
     case 'checkin': return setCheckin(board, action);
     default: return assertNever(action);
   }
+};
+
+// -- The whole body of work --------------------------------------------------
+// A task is locally correct and still part of a whole nobody ruled on. The line
+// is that whole: the origin tree rooted at work a member actually asked for.
+// Rungs are crossed once, by comparing the line before and after a mutation, so
+// growth forces exactly one ruling per step instead of a standing nag.
+// Rungs count tasks that CHANGE the repository. Research and verification
+// growth is growth a chief should defend; diff size is worse still, since a
+// deleted lockfile or a test suite dwarfs the code that actually ships.
+export const LINE_LADDER = [3, 5, 8, 13, 21, 34] as const;
+export interface LineOfWork {
+  rootId: string; rootKey: string; rootTitle: string; taskIds: string[];
+  tasks: number; changing: number; newGround: number; open: number; files: number; surfaces: string[];
+}
+// Of the work that changes the repository, how much of it reached ground the
+// line's changing work had not already covered. Delivery — merging, promoting,
+// deploying work already ruled on — reaches none, so this discounts a rung that
+// would otherwise fire hardest while a line is closing rather than growing.
+// It counts paths, so repeated authoring inside a file the line already owns is
+// not counted either: this discounts delivery, it does not prove authorship.
+const groundReached = (tasks: Task[]): number => tasks.filter(task => task.access === 'write')
+  .reduce((result, task) => {
+    const paths = [...task.scope, ...(task.footprint ?? [])];
+    return { count: result.count + Number(paths.some(path => !result.covered.has(path))), covered: new Set([...result.covered, ...paths]) };
+  }, { count: 0, covered: new Set<string>() }).count;
+// A declared path's first segment is the surface it claimed; entering a surface
+// that was never declared is a different animal from touching one more file in it.
+export const surface = (path: string): string => path.split('/')[0] || '.';
+// What a task governs: what it said it would touch and what it actually did.
+// '.' stays its own surface rather than matching everything, so one whole-repo
+// declaration cannot make every task look related to every other task.
+export const taskSurfaces = (task: Task): string[] => unique([...task.scope, ...(task.footprint ?? [])].map(surface));
+export const linesOfWork = (board: Board): LineOfWork[] => {
+  // Merged tasks are tombstones; their work is counted under the surviving task.
+  const groups = board.tasks.filter(task => task.status !== 'merged').reduce((result, task) => {
+    const root = lineRoot(board, task.id).id;
+    return result.set(root, [...(result.get(root) ?? []), task]);
+  }, new Map<string, Task[]>());
+  return [...groups].map(([rootId, tasks]): LineOfWork => {
+    const root = board.tasks.find(task => task.id === rootId);
+    return {
+      rootId, rootKey: root?.key ?? '(unknown)', rootTitle: root?.title ?? '(unknown)',
+      taskIds: tasks.map(task => task.id), tasks: tasks.length,
+      changing: tasks.filter(task => task.access === 'write').length, newGround: groundReached(tasks),
+      open: tasks.filter(task => !['done', 'cancelled'].includes(task.status)).length,
+      files: new Set(tasks.flatMap(task => task.footprint ?? [])).size,
+      surfaces: unique(tasks.flatMap(task => scopeDrift(task).map(surface))).toSorted(),
+    };
+  }).toSorted((a, b) => b.changing - a.changing || b.tasks - a.tasks || b.files - a.files);
+};
+// Governing means knowing what else stands on the ground a task is standing on,
+// including work already accepted: a task cannot be judged alone just because it
+// was dispatched alone. Provenance is one relation; shared surface is the other,
+// and it holds between tasks that have no causal link at all.
+export interface Related { surface: string; live: Task[]; accepted: Task[] }
+export const relatedWork = (board: Board, taskIds: string[]): Related[] => {
+  const selected = board.tasks.filter(task => taskIds.includes(task.id));
+  const others = board.tasks.filter(task => task.status !== 'merged' && task.status !== 'cancelled' && !taskIds.includes(task.id));
+  return unique(selected.flatMap(taskSurfaces)).toSorted().flatMap(name => {
+    const sharing = others.filter(task => taskSurfaces(task).includes(name));
+    return sharing.length ? [{
+      surface: name,
+      live: sharing.filter(task => ['queued', 'running', 'review', 'blocked'].includes(task.status)),
+      accepted: sharing.filter(task => task.status === 'done'),
+    }] : [];
+  });
+};
+export interface SurfaceCount { surface: string; tasks: number; changing: number; accepted: number }
+export interface Census { tasks: number; merged: number; byStatus: Record<string, number>; surfaces: SurfaceCount[] }
+/** A complete count of every task and every surface, by construction. A pulled
+ * task list is prioritized and drops work; these totals never do, so the board
+ * cannot look empty in the region a preview happened not to reach. */
+export const census = (board: Board): Census => {
+  const governed = board.tasks.filter(task => task.status !== 'merged');
+  const byStatus = governed.reduce<Record<string, number>>((result, task) => ({ ...result, [task.status]: (result[task.status] ?? 0) + 1 }), {});
+  const surfaces = governed.reduce((result, task) => {
+    taskSurfaces(task).forEach(name => {
+      const entry = result.get(name) ?? { tasks: 0, changing: 0, accepted: 0 };
+      result.set(name, { tasks: entry.tasks + 1, changing: entry.changing + Number(task.access === 'write'), accepted: entry.accepted + Number(task.status === 'done') });
+    });
+    return result;
+  }, new Map<string, Omit<SurfaceCount, 'surface'>>());
+  return { tasks: governed.length, merged: board.tasks.length - governed.length, byStatus,
+    surfaces: [...surfaces].map(([name, entry]) => ({ surface: name, ...entry })).toSorted((a, b) => b.tasks - a.tasks || a.surface.localeCompare(b.surface)) };
 };
 
 // -- Reserve, acknowledge, and reconcile -------------------------------------

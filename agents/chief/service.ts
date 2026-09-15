@@ -14,7 +14,7 @@ import {
 } from './domain.ts';
 import { createStore, fingerprint } from './store.ts';
 import type { ChangeResult } from './store.ts';
-import { boardView, workerBrief } from './views.ts';
+import { affectedTasks, boardView, mutationView, workerBrief } from './views.ts';
 
 // -- Result metadata never includes transport errors or raw reports -----------
 const ok = (data: Record<string, unknown>): ChiefResult => ({ success: true, data });
@@ -113,7 +113,9 @@ export const createChiefService = (adapters: ChiefAdapters, conversationId: stri
     }));
   const change = (command: Extract<ChiefCommand, { kind: 'change' }>, signal?: AbortSignal): Promise<ChiefResult> => Promise.resolve()
     .then(() => store.change({ operationId: command.operationId, expectedRevision: command.expectedRevision, intent: command, transform: board => decide(board, command.action) }, signal))
-    .then(result => ok(receiptView(result)));
+    // The whole body of work rides on the acknowledgment this change already
+    // returns: no extra model call, no injected message, no rewritten prefix.
+    .then(result => ok({ ...receiptView(result), ...mutationView(result.board, affectedTasks(command.action), result.previous) }));
   const dispatch = (command: Extract<ChiefCommand, { kind: 'dispatch' }>, signal?: AbortSignal): Promise<ChiefResult> => Promise.resolve()
     .then(() => store.change({ operationId: command.operationId, expectedRevision: command.expectedRevision, intent: command, transform: board => {
       const task = taskById(board, command.taskId);
@@ -123,8 +125,10 @@ export const createChiefService = (adapters: ChiefAdapters, conversationId: stri
       const entry: OutboxEntry = { operationId: command.operationId, status: 'reserved', payload: { kind: 'dispatch', runId: command.operationId, taskId: task.id, conversation, prompt: workerBrief(board, task) } };
       return reserveRun(board, task.id, entry);
     } }, signal))
-    .then(result => submitReserved(result, command.operationId, signal))
-    .then(result => result.success ? ok({ ...result.data, runId: command.operationId }) : result);
+    .then(reserved => submitReserved(reserved, command.operationId, signal)
+      // Dispatch changes no task's place in a line, so it reports the standing
+      // size and what else stands on this surface, and crosses no rung.
+      .then(result => result.success ? ok({ ...result.data, runId: command.operationId, ...mutationView(reserved.board, [command.taskId]) }) : result));
   const control = (command: Extract<ChiefCommand, { kind: 'control' }>, signal?: AbortSignal): Promise<ChiefResult> => Promise.resolve()
     .then(() => store.change({ operationId: command.operationId, expectedRevision: command.expectedRevision, intent: command, transform: board => {
       const run = runById(board, command.runId);

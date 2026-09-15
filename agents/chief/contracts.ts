@@ -8,12 +8,21 @@ export interface MemberSource { kind: 'chat' | 'page_comment'; memberId: string;
 export interface TaskSpec {
   id: string; key: string; title: string; brief: string; scope: string[];
   access: 'read' | 'write'; dependencies: string[];
+  // Causal provenance: the task whose work SURFACED the condition for this one.
+  // Dependencies order work; origin records that work was ADDED. A line of work
+  // is the origin tree, and only it makes aggregate growth visible. Work that
+  // stands on its own records none.
+  origin?: string;
 }
 export type TaskStatus = 'queued' | 'running' | 'review' | 'done' | 'blocked' | 'cancelled' | 'merged';
 export interface Acceptance { revision: number; runId: string; outcome: string; evidence: FileRef[] }
 export interface Task extends TaskSpec {
   status: TaskStatus; evidence: FileRef[]; currentRun?: string; conversationId?: string;
   reason?: string; mergedInto?: string; acceptance?: Acceptance;
+  // Paths a settled run actually changed, against which declared scope is
+  // measured. Recorded by Chief from reviewed evidence, never self-asserted,
+  // and accumulated across the task's runs.
+  footprint?: string[];
 }
 export interface Progress { sequence: number; summary: string; next: string; artifacts: FileRef[]; blocker?: string; source?: FileRef }
 export type RunStatus = 'reserved' | 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
@@ -57,9 +66,9 @@ export interface Board {
 export interface Mutation { operationId: string; expectedRevision: number }
 export type DomainAction =
   | { kind: 'task_put'; task: TaskSpec }
-  | { kind: 'task_status'; taskId: string; status: 'queued' | 'blocked' | 'cancelled'; reason: string }
+  | { kind: 'task_status'; taskId: string; status: 'queued' | 'blocked' | 'cancelled'; reason: string; footprint?: string[] }
   | { kind: 'task_merge'; sourceId: string; targetId: string }
-  | { kind: 'accept'; taskId: string; outcome: string; evidence: FileRef[] }
+  | { kind: 'accept'; taskId: string; outcome: string; evidence: FileRef[]; footprint?: string[] }
   | { kind: 'ask_open'; ask: AskSpec }
   | { kind: 'ask_resolve'; askId: string; status: 'answered' | 'superseded' | 'dismissed'; resolution: string }
   | { kind: 'rule_put'; rule: Rule }
