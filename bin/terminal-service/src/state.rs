@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 pub const MAX_REPLAY_BYTES: usize = 256 * 1024;
 const MAX_RECORDS: usize = 16;
+// Bound replay metadata and WebSocket frame count even for one-byte reads.
+const MAX_REPLAY_CHUNKS: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Caller {
@@ -258,7 +260,7 @@ impl Sessions {
             seq: record.head,
             bytes,
         });
-        while record.bytes > MAX_REPLAY_BYTES {
+        while record.bytes > MAX_REPLAY_BYTES || record.chunks.len() > MAX_REPLAY_CHUNKS {
             let oldest = record.chunks.pop_front().expect("nonempty bounded replay");
             record.bytes -= oldest.bytes.len();
         }
@@ -622,6 +624,24 @@ mod tests {
         let replay = sessions.replay(&session, &owner, 0).unwrap();
         assert!(replay.ended);
         assert_eq!(replay.chunks[0].bytes, b"hi");
+    }
+
+    #[test]
+    fn tiny_output_chunks_have_a_bounded_replay_record_count() {
+        let owner = caller(7, 1);
+        let mut sessions = Sessions::default();
+        let id = "0000000000000001";
+        sessions
+            .insert(id.into(), owner.clone(), Mode::Single)
+            .unwrap();
+        sessions.created(id);
+        for _ in 0..2048 {
+            sessions.output(id, vec![1]).unwrap();
+        }
+        let replay = sessions.replay(id, &owner, 0).unwrap();
+        assert_eq!(replay.chunks.len(), 1024);
+        assert_eq!(replay.first, 1025);
+        assert_eq!(replay.head, 2048);
     }
 
     #[test]

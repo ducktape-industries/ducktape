@@ -3883,11 +3883,16 @@ version = "0.1.0"
 dependencies = [
  "agent-service",
  "async-trait",
+ "axum",
  "base64 0.22.1",
+ "futures",
  "provider-host",
  "serde",
+ "serde_json",
+ "subtle",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.24.0",
 ]
 
 [[package]]
