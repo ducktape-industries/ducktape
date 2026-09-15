@@ -60,7 +60,7 @@ pub(super) fn navigation(
         hover: None,
         fit: None,
         rotation: None,
-        opacity: None,
+        opacity: message.is_none().then_some(0.35),
         width: Some(wire::Length::Fixed(20.)),
         height: Some(wire::Length::Fixed(20.)),
     };
@@ -91,7 +91,23 @@ pub(super) fn navigation(
         delay_ms: 400,
         snap: true,
         style: Default::default(),
-        children: vec![button, native::text(format!("{key}/tip"), name)],
+        children: vec![
+            button,
+            native::sized(
+                native::padded(
+                    native::card(
+                        format!("{key}/tip"),
+                        native::colored(
+                            native::text(format!("{key}/tip-label"), name),
+                            native::palette().foreground,
+                        ),
+                    ),
+                    wire::Edges::all(6.),
+                ),
+                Some(wire::Length::Shrink),
+                None,
+            ),
+        ],
     }
 }
 

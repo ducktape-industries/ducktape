@@ -158,35 +158,39 @@ impl FilesView {
                 (self.viewport_width >= app_update::SIDEBAR_MIN).then_some(Message::ToggleSidebar),
                 self.sidebar_open,
             ),
-            native::padded(
-                native::card(
-                    format!("{key}/history-group"),
-                    native::sized(
-                        native::spaced(
-                            native::centered_row(
-                                format!("{key}/history"),
-                                [
-                                    kit::navigation(
-                                        format!("{key}/back"),
-                                        "M15 5l-7 7 7 7",
-                                        "Back",
-                                        self.nav.can_back().then_some(Message::Back),
-                                    ),
-                                    kit::navigation(
-                                        format!("{key}/forward"),
-                                        "M9 5l7 7-7 7",
-                                        "Forward",
-                                        self.nav.can_forward().then_some(Message::Forward),
-                                    ),
-                                ],
+            native::sized(
+                native::padded(
+                    native::card(
+                        format!("{key}/history-group"),
+                        native::sized(
+                            native::spaced(
+                                native::centered_row(
+                                    format!("{key}/history"),
+                                    [
+                                        kit::navigation(
+                                            format!("{key}/back"),
+                                            "M15 5l-7 7 7 7",
+                                            "Back",
+                                            self.nav.can_back().then_some(Message::Back),
+                                        ),
+                                        kit::navigation(
+                                            format!("{key}/forward"),
+                                            "M9 5l7 7-7 7",
+                                            "Forward",
+                                            self.nav.can_forward().then_some(Message::Forward),
+                                        ),
+                                    ],
+                                ),
+                                0.,
                             ),
-                            0.,
+                            Some(wire::Length::Shrink),
+                            None,
                         ),
-                        Some(wire::Length::Shrink),
-                        None,
                     ),
+                    wire::Edges::all(2.),
                 ),
-                wire::Edges::all(2.),
+                Some(wire::Length::Shrink),
+                None,
             ),
             kit::navigation(
                 format!("{key}/up"),
@@ -201,37 +205,41 @@ impl FilesView {
                 Some(Message::Refresh),
             ),
             native::gap(12.),
-            native::padded(
-                native::card(
-                    format!("{key}/view-group"),
-                    native::sized(
-                        native::spaced(
-                            native::centered_row(
-                                format!("{key}/view-modes"),
-                                [
-                                    kit::quiet(
-                                        format!("{key}/list-mode"),
-                                        "List",
-                                        "List view",
-                                        Some(Message::SetViewMode(ViewMode::List)),
-                                        self.view_mode == ViewMode::List,
-                                    ),
-                                    kit::quiet(
-                                        format!("{key}/columns-mode"),
-                                        "Columns",
-                                        "Column view",
-                                        Some(Message::SetViewMode(ViewMode::Columns)),
-                                        self.view_mode == ViewMode::Columns,
-                                    ),
-                                ],
+            native::sized(
+                native::padded(
+                    native::card(
+                        format!("{key}/view-group"),
+                        native::sized(
+                            native::spaced(
+                                native::centered_row(
+                                    format!("{key}/view-modes"),
+                                    [
+                                        kit::quiet(
+                                            format!("{key}/list-mode"),
+                                            "List",
+                                            "List view",
+                                            Some(Message::SetViewMode(ViewMode::List)),
+                                            self.view_mode == ViewMode::List,
+                                        ),
+                                        kit::quiet(
+                                            format!("{key}/columns-mode"),
+                                            "Columns",
+                                            "Column view",
+                                            Some(Message::SetViewMode(ViewMode::Columns)),
+                                            self.view_mode == ViewMode::Columns,
+                                        ),
+                                    ],
+                                ),
+                                2.,
                             ),
-                            2.,
+                            Some(wire::Length::Shrink),
+                            None,
                         ),
-                        Some(wire::Length::Shrink),
-                        None,
                     ),
+                    wire::Edges::all(2.),
                 ),
-                wire::Edges::all(2.),
+                Some(wire::Length::Shrink),
+                None,
             ),
             native::gap(12.),
             kit::action(
