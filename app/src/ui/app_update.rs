@@ -886,7 +886,10 @@ impl Ducktape {
         self.mutation_phase = MutationPhase::Idle;
         self.hydration_retry_attempt = 0;
         self.error = "".to_owned();
-        self.onboarding_error.clear();
+        let entering = self.console_entry == ConsoleEntry::Entering;
+        if entering {
+            self.onboarding_error.clear();
+        }
         self.members_generation += 1;
         self.agents_open_run = "".to_owned();
         self.agents_live = false;

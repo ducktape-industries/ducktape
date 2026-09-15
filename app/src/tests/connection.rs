@@ -344,7 +344,9 @@ fn a_failed_connect_retries_instead_of_giving_up() {
     landed.generation = connect_gen;
     let rpc = landed.rpc.clone();
     wired.hydration_retry_attempt = 3;
+    wired.onboarding_error = "another wallet's error".into();
     let _ = wired.update(AppMessage::WorkspaceConnected(landed));
+    assert_eq!(wired.onboarding_error, "another wallet's error");
     assert_eq!(wired.connected_rpc, rpc);
     assert_eq!(
         wired.active_channel, "general",
