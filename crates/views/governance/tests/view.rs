@@ -4,7 +4,7 @@
 //! hit, and a press leaves as `op.submit` carrying the governance message.
 
 use ducktape_view_guest::testing::{answer, has_text, item, press, refuse, texts};
-use ducktape_view_guest::wire::{Frame, Node, Request};
+use ducktape_view_guest::wire::{Frame, Length, Node, Request, Wrapping};
 use governance_view::host::{Session, TasteRow};
 use governance_view::{boot_native, tick_native};
 
@@ -351,6 +351,130 @@ fn a_met_rule_offers_settle_which_leaves_as_execute() {
     assert_eq!(
         op["payload"],
         serde_json::json!({ "execute": { "proposal_id": "prop-met" } })
+    );
+}
+
+/// Every text the screen may break onto a second line, by key: the view's
+/// own title and its two section headings, a proposal field's value, and a
+/// refused taste. Each sits in a row with no fixed height, so a second line
+/// grows the card instead of landing on the row below. The list is spelled
+/// out so a new wrapping cell fails here rather than in front of a reader.
+const MAY_WRAP: &[&str] = &[
+    "governance/finalized",
+    "governance/pending",
+    "governance/proposal/prop-code/field/0/value",
+    "governance/proposal/prop-code/field/1/value",
+    "governance/proposal/prop-code/field/2/value",
+    "governance/proposal/prop-code/field/3/value",
+    "governance/proposal/prop-code/taste/refused",
+    "governance/proposal/prop-open/field/0/value",
+    "governance/title",
+];
+
+/// Whether `node` is built at one fixed height: the row shape that cannot
+/// afford a cell breaking onto a second line.
+fn is_fixed_height(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::Linear {
+            height: Some(Length::Fixed(_)),
+            ..
+        } | Node::Container {
+            height: Some(Length::Fixed(_)),
+            ..
+        } | Node::Button {
+            height: Some(Length::Fixed(_)),
+            ..
+        } | Node::Scroll {
+            height: Some(Length::Fixed(_)),
+            ..
+        }
+    )
+}
+
+/// The keys of every text under `node` that does not keep one line.
+fn wrapping_texts(node: &Node) -> Vec<String> {
+    let mut tree = node.clone();
+    let mut keys = Vec::new();
+    tree.for_each_mut(&mut |node| {
+        let Node::Text { key, options, .. } = node else {
+            return;
+        };
+        if options.wrapping != Some(Wrapping::None) {
+            keys.push(key.clone());
+        }
+    });
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Every fixed-height row in `node`, itself included.
+fn fixed_height_rows(node: &Node) -> Vec<Node> {
+    let mut tree = node.clone();
+    let mut rows = Vec::new();
+    tree.for_each_mut(&mut |node| {
+        if is_fixed_height(node) {
+            rows.push(node.clone());
+        }
+    });
+    rows
+}
+
+/// The keys of the cells a fixed-height row would let wrap.
+fn wrapping_cells(frame: &Frame) -> Vec<String> {
+    let page = frame.root.clone().expect("a drawn page");
+    let mut keys: Vec<String> = fixed_height_rows(&page)
+        .iter()
+        .flat_map(wrapping_texts)
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// A proposal's head row and a settled row are built at one fixed height:
+/// a cell allowed to wrap breaks onto a second line in a narrow pane and is
+/// drawn under the row below it. Every cell in such a row keeps one line;
+/// the texts that are MEANT to wrap are named in `MAY_WRAP` and none of
+/// them sits in a fixed-height row.
+#[test]
+fn every_row_cell_keeps_one_line() {
+    // the register: an open proposal's head row, and a settled row
+    let (register, _) = connected_with_register();
+
+    // the code ballot draws the taste line the register frame has not got,
+    // and a refused one draws the sentence that says why
+    let ballot = boot();
+    let session_id = request(&ballot, "governance.props").id;
+    let ballot = tick_native(vec![item(session_id, &session_tasting(false, ""))]);
+    let query = request(&ballot, "rpc.query").id;
+    let ballot = tick_native(vec![answer(query, &code_proposals())]);
+    let refused = tick_native(vec![item(
+        session_id,
+        &session_tasting(false, "core_changes_too"),
+    )]);
+
+    let drawn = [&register, &ballot, &refused];
+    for frame in drawn {
+        let cells = wrapping_cells(frame);
+        assert!(
+            cells.is_empty(),
+            "a fixed-height row cannot hold a wrapping cell: {cells:?}"
+        );
+    }
+
+    let mut may_wrap: Vec<String> = drawn
+        .iter()
+        .flat_map(|frame| wrapping_texts(&frame.root.clone().expect("a drawn page")))
+        .collect();
+    may_wrap.sort();
+    may_wrap.dedup();
+    assert_eq!(
+        may_wrap.iter().map(String::as_str).collect::<Vec<_>>(),
+        MAY_WRAP,
+        "the wrappable set moved: {:?}",
+        texts(&refused)
     );
 }
 

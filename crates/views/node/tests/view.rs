@@ -6,7 +6,7 @@
 //! `rpc.admin` POST. The clipboard is the one intent left.
 
 use ducktape_view_guest::testing::{answer, has_text, item, press, refuse, texts, type_into};
-use ducktape_view_guest::wire::{Event, Frame, Node, Request};
+use ducktape_view_guest::wire::{Event, Frame, Length, Node, Request, Wrapping};
 use node_view::host::{Copy, Session};
 use node_view::{boot_native, tick_native};
 use serde_json::{Value, json};
@@ -20,7 +20,12 @@ fn status() -> Value {
         "root_hash": "c0ffee",
         "chain_id": "duck-1#a1b2c3d4",
         "height": 84_912,
-        "modules": [{ "id": "chat", "category": "workspace", "root": "9f3e" }],
+        "modules": [
+            { "id": "chat", "category": "workspace", "root": "9f3e" },
+            // a swap is armed on this one: its pending row is the widest the
+            // registry draws
+            { "id": "governance", "category": "system", "root": "4c1d" },
+        ],
         "operations": {
             "phase": "serving",
             "phase_since": 1_700_000_000,
@@ -41,14 +46,30 @@ fn peers() -> Value {
 /// A whole 32-byte digest, as a module serializes one.
 const ACTIVE_CODE: [u8; 32] = [0x77; 32];
 const ACTIVE_CODE_HEX: &str = "7777777777777777777777777777777777777777777777777777777777777777";
+/// The code a swap is armed on, and the code it would replace.
+const PENDING_CODE: [u8; 32] = [0x5a; 32];
+const SETTLED_CODE: [u8; 32] = [0x31; 32];
 
 fn module_status() -> Value {
-    json!({ "module_status": { "modules": [{
-        "module_id": "chat",
-        "active_code_hash": ACTIVE_CODE,
-        "history": [],
-        "pending": null,
-    }]}})
+    json!({ "module_status": { "modules": [
+        {
+            "module_id": "chat",
+            "active_code_hash": ACTIVE_CODE,
+            "history": [],
+            "pending": null,
+        },
+        {
+            "module_id": "governance",
+            "active_code_hash": SETTLED_CODE,
+            "history": [],
+            "pending": {
+                "code_hash": PENDING_CODE,
+                "activation_height": 85_000,
+                "readiness": [[1], [2]],
+                "ready_at": null,
+            },
+        },
+    ]}})
 }
 
 /// Every read this view makes, answered the way the node serves it. A read
@@ -146,6 +167,29 @@ fn copied(frame: &Frame) -> Copy {
 /// One `logs` tail frame, as the node sends it.
 fn log_frame(cursor: u64, line: &str) -> Value {
     json!({ "type": "tail", "topic": "logs", "cursor": cursor.to_string(), "item": { "line": line } })
+}
+
+/// Every text in a tree: its key, whether a row built at a FIXED height
+/// holds it, and the wrapping it asked for — `None` being the host's own,
+/// which wraps.
+fn cells(node: &Node, in_fixed_row: bool, out: &mut Vec<(String, bool, Option<Wrapping>)>) {
+    let own_height = match node {
+        Node::Linear { height, .. } | Node::Container { height, .. } => *height,
+        _ => None,
+    };
+    let row_is_fixed = in_fixed_row || matches!(own_height, Some(Length::Fixed(_)));
+    if let Node::Text { key, options, .. } = node {
+        out.push((key.clone(), row_is_fixed, options.wrapping));
+    }
+    for child in node.children() {
+        cells(child, row_is_fixed, out);
+    }
+}
+
+fn cells_of(frame: &Frame) -> Vec<(String, bool, Option<Wrapping>)> {
+    let mut out = Vec::new();
+    cells(frame.root.as_ref().expect("a drawn page"), false, &mut out);
+    out
 }
 
 /// Every host surface in the tree, by name. The node view leaves none.
@@ -410,6 +454,88 @@ fn the_activity_tab_streams_the_node_log_ring() {
         has_text(&frame, "No lines match this filter."),
         "{:?}",
         texts(&frame)
+    );
+}
+
+/// Every cell of a fixed-height row keeps ONE LINE, on every tab. A reading
+/// is 24px, a list row 28px and a module row 32px, and the panel is as
+/// narrow as the pane: a height, a count, a digest, a capability name or a
+/// pending-swap caption allowed to wrap breaks onto a second line that
+/// lands under the next row. The texts that DO wrap are exactly the ones
+/// listed below, and every one of them sits in a row with no fixed height.
+#[test]
+fn every_row_cell_keeps_one_line() {
+    let (overview, _) = connected();
+    let (permissions, _) = settle(tick_native(press(&overview, "Node permissions")));
+    let (modules, _) = settle(tick_native(press(&permissions, "Node modules")));
+    let (_, left) = settle(tick_native(press(&modules, "Node activity")));
+    let stream = left
+        .iter()
+        .find(|request| request.kind == "rpc.stream")
+        .unwrap_or_else(|| panic!("no `rpc.stream` request in {left:?}"));
+    let console = tick_native(vec![item(
+        stream.id,
+        log_frame(
+            1,
+            "2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted resident",
+        )
+        .to_string()
+        .as_bytes(),
+    )]);
+    // the seat without administration is the one that reads why the retune
+    // is closed to it
+    let (seated, _) = connected_as(false);
+    let (closed, _) = settle(tick_native(press(&seated, "Node activity")));
+
+    let drawn: Vec<(String, bool, Option<Wrapping>)> =
+        [overview, permissions, modules, console, closed]
+            .iter()
+            .flat_map(cells_of)
+            .collect();
+    assert!(
+        drawn.len() > 40,
+        "the tabs drew {} texts: too few for the rows to be there",
+        drawn.len()
+    );
+
+    let overlapping: Vec<&String> = drawn
+        .iter()
+        .filter(|(_, fixed, wrapping)| *fixed && *wrapping != Some(Wrapping::None))
+        .map(|(key, ..)| key)
+        .collect();
+    assert!(
+        overlapping.is_empty(),
+        "cells in a fixed-height row that wrap under the next row: {overlapping:?}"
+    );
+
+    let mut wrapping: Vec<&str> = drawn
+        .iter()
+        .filter(|(.., wrapping)| *wrapping == Some(Wrapping::WordOrGlyph))
+        .map(|(key, ..)| key.as_str())
+        .collect();
+    wrapping.sort_unstable();
+    wrapping.dedup();
+    // Three families, sorted together: the readings a copy control sits
+    // beside (a workspace path, a node key, a root hash, a module's two
+    // digests — read in full, so the row grows instead of clipping), the
+    // console's message column, and the sentences under the standing and
+    // the retune.
+    assert_eq!(
+        wrapping,
+        [
+            "node/directory/value",
+            "node/key/value",
+            "node/log/1/message",
+            "node/module/chat/code/value",
+            "node/module/chat/root/value",
+            "node/module/governance/code/value",
+            "node/module/governance/root/value",
+            "node/quorum-note",
+            "node/retune/closed",
+            "node/root/value",
+            "node/standing-description",
+        ],
+        "the texts that may wrap, and no others"
     );
 }
 

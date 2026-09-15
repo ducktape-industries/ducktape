@@ -575,3 +575,104 @@ fn a_proposer_that_is_not_a_key_keeps_its_label() {
         }
     );
 }
+
+/// Every text of `frame` that sits under a row built at a stated height and is
+/// allowed to wrap — the cells that break onto a second line and land under the
+/// row below them. Ancestry is what decides, not the key: a row given a fixed
+/// height tomorrow drags its cells into this walk on its own.
+fn wrapping_cells_in_fixed_rows(frame: &Frame) -> Vec<String> {
+    use ducktape_view_guest::wire::{Length, Wrapping};
+
+    fn is_fixed_row(node: &Node) -> bool {
+        matches!(
+            node,
+            Node::Linear {
+                height: Some(Length::Fixed(_)),
+                ..
+            } | Node::Container {
+                height: Some(Length::Fixed(_)),
+                ..
+            } | Node::Button {
+                height: Some(Length::Fixed(_)),
+                ..
+            } | Node::Scroll {
+                height: Some(Length::Fixed(_)),
+                ..
+            }
+        )
+    }
+
+    fn walk(node: &Node, in_a_row: bool, found: &mut Vec<String>) {
+        let in_a_row = in_a_row || is_fixed_row(node);
+        if let Node::Text { key, options, .. } = node {
+            let one_line = options.wrapping == Some(Wrapping::None);
+            if in_a_row && !one_line {
+                found.push(key.clone());
+            }
+        }
+        for child in node.children() {
+            walk(child, in_a_row, found);
+        }
+    }
+
+    let mut found = Vec::new();
+    walk(
+        frame.root.as_ref().expect("a drawn page"),
+        false,
+        &mut found,
+    );
+    found
+}
+
+/// EVERY CELL OF A FIXED-HEIGHT ROW KEEPS ONE LINE. The chrome bars (40 px),
+/// the ledger rows (28 px), an operation's head line (28 px) and a search hit's
+/// line (32 px) are each built at a stated height, and the kit's text
+/// constructors wrap unless told otherwise — so a height, a hash, a verb, a
+/// snippet or a count allowed to break onto a second line in a narrow pane is
+/// drawn UNDER the row below it. The texts this view means to wrap — the host
+/// error and the partial-results notice, a digest beside its copy, a payload
+/// field, a dispatch line — all live in rows with no fixed height, which is
+/// what lets them grow instead of collide. That is why the allow-list here is
+/// empty: NOTHING inside a fixed-height row of this view may wrap, and a new
+/// row cell that does fails this test by its key.
+#[test]
+fn every_row_cell_keeps_one_line() {
+    const SEARCH: &str = "Search messages, pages, issues, files, runs…";
+
+    // the ledger: the toolbar and one block row per height
+    let (ledger, _live) = connected_with_ledger();
+    assert!(has_text(&ledger, "1 op"), "{:?}", texts(&ledger));
+    assert_eq!(wrapping_cells_in_fixed_rows(&ledger), [] as [String; 0]);
+
+    // the details pane: its header bar and the op head line under it
+    let details = tick_native(press(&ledger, "Inspect block"));
+    assert!(has_text(&details, "Applied"), "{:?}", texts(&details));
+    assert_eq!(wrapping_cells_in_fixed_rows(&details), [] as [String; 0]);
+
+    // the search panel: the filter bar and one line per hit
+    let frame = tick_native(type_into(&ledger, SEARCH, "needle"));
+    let frame = tick_native(submit(&frame, SEARCH));
+    let events = frame
+        .requests
+        .iter()
+        .map(|request| {
+            let ask: serde_json::Value =
+                serde_json::from_slice(&request.payload).unwrap_or_default();
+            let reply = match ask["target"].as_str().unwrap_or_default() {
+                "chat" => serde_json::json!({ "hits": [{
+                    "channel_id": "general", "seq": 12, "author": "user:48cedb0d1122",
+                    "text": "the needle is in here, and this snippet is long enough to wrap"
+                }]}),
+                "forge" => serde_json::json!({ "repos": [] }),
+                "files" => serde_json::json!({ "entries": [] }),
+                "tasks" => serde_json::json!({ "tasks": { "tasks": [] } }),
+                "runs" => serde_json::json!({ "runs": [] }),
+                _ => serde_json::json!({ "hits": [] }),
+            };
+            answer(request.id, reply.to_string().as_bytes())
+        })
+        .collect();
+    let results = tick_native(events);
+    assert!(has_text(&results, "message 12"), "{:?}", texts(&results));
+    assert_eq!(wrapping_cells_in_fixed_rows(&results), [] as [String; 0]);
+}

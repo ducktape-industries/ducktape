@@ -9,6 +9,17 @@
 //! governance message the kernel signs with the seated key. Signing secrets
 //! and passwords stay in the host; public proposal data belongs to the guest.
 pub mod host;
+
+/// The height a one-line row is built at.
+///
+/// EVERY cell in a row built at this height keeps one line — `kit::nowrap`,
+/// or a `kit::badge`, which nowraps its own text. The rows are fixed, and a
+/// card in a narrow pane is narrow: a proposal id, a kind or a settle height
+/// allowed to wrap breaks onto a second line and is drawn under the row
+/// below it. Prose that must wrap — a notice, a proposal field's value, a
+/// refused taste — belongs in a row with no fixed height, never here.
+const ROW: f32 = 28.;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct GovernanceView {
     pub(crate) rows: Vec<crate::host::ProposalRow>,
@@ -372,7 +383,7 @@ impl GovernanceView {
                 rows.push(kit::sized(
                     kit::centered_row(key, cells),
                     Some(wire::Length::Fill),
-                    Some(wire::Length::Fixed(28.)),
+                    Some(wire::Length::Fixed(ROW)),
                 ));
             }
             content.push(kit::spaced(kit::column("governance/settled", rows), 0.));
@@ -404,7 +415,7 @@ impl GovernanceView {
                 ],
             ),
             Some(wire::Length::Fill),
-            Some(wire::Length::Fixed(28.)),
+            Some(wire::Length::Fixed(ROW)),
         );
         // what the change does, one labelled field per line.
         let fields = proposal.fields.iter().enumerate().map(|(index, field)| {
@@ -469,7 +480,10 @@ impl GovernanceView {
         use ducktape_view_guest::{kit, slots, wire};
         let refused = !row.reason.is_empty();
         if refused {
-            return kit::nowrap(kit::caption(
+            // a refusal is a sentence, not a cell: it sits on its own in the
+            // card body, where wrapping grows the card instead of running off
+            // the pane.
+            return kit::wrapping(kit::caption(
                 format!("{key}/taste/refused"),
                 host::refusal_words(&row.reason),
             ));
