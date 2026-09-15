@@ -56,7 +56,6 @@ impl Guest {
             .tick
             .call(&mut self.store, (wire::encode(&events),))
             .expect("view tick fits desktop fuel and memory budgets");
-        self.tick.post_return(&mut self.store).unwrap();
         assert!(bytes.len() <= 8 << 20);
         let mut frame: wire::Frame = wire::decode(&bytes).unwrap();
         if let Some(root) = &frame.root {

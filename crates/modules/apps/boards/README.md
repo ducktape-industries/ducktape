@@ -49,4 +49,8 @@ cargo test -p boards
 cargo clippy -p boards --tests --no-deps
 cargo test --manifest-path crates/views/Cargo.toml -p boards-view
 cargo clippy --manifest-path crates/views/Cargo.toml -p boards-view --tests --no-deps
+cargo test -p wasm-host --test boards
+BOARDS_VIEW_WASM="$PWD/target/views/boards_view.wasm" cargo test \
+  --manifest-path crates/views/Cargo.toml -p boards-view \
+  --features host-verification --test wasm
 ```

@@ -227,6 +227,9 @@ impl BoardsView {
         match result {
             Ok(reading) => {
                 self.catalog = reading.catalog;
+                if reading.board.is_none() && self.pending.is_empty() {
+                    self.confirmed = None;
+                }
                 if let Some(board) = reading.board {
                     let newer = self
                         .confirmed
@@ -311,6 +314,8 @@ impl BoardsView {
             return Task::none();
         }
         self.pending.clear();
+        self.confirmed = None;
+        self.error.clear();
         self.delivery = Delivery::Idle;
         self.undo.clear();
         self.redo.clear();

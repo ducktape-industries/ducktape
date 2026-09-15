@@ -326,7 +326,7 @@ impl BoardsView {
             let color = if self.selected.as_ref() == Some(id) {
                 accent
             } else {
-                kit::rgba(p.muted)
+                Rgba(ink(s.color))
             };
             commands.push(line(start, end, color, 2.));
             if !s.text.is_empty() {
@@ -373,10 +373,14 @@ impl BoardsView {
                 self.selected.as_ref() == Some(id) || self.connection.as_ref() == Some(id);
             let fill = match s.kind {
                 Kind::Note => Some(Rgba(COLORS[s.color as usize])),
-                Kind::Rectangle => Some(kit::rgba(p.surface)),
+                Kind::Rectangle => {
+                    let mut color = COLORS[s.color as usize];
+                    color[3] = 0.18;
+                    Some(Rgba(color))
+                }
                 Kind::Text | Kind::Arrow => None,
             };
-            let border = if selected { accent } else { muted };
+            let border = if selected { accent } else { Rgba(ink(s.color)) };
             commands.push(rectangle(
                 pos,
                 size,
@@ -404,6 +408,8 @@ impl BoardsView {
             );
             if s.kind == Kind::Note {
                 label = kit::colored(label, [0.16, 0.15, 0.12, 1.]);
+            } else {
+                label = kit::colored(label, ink(s.color));
             }
             let mut clip = kit::container(format!("boards/label-clip/{id}"), label);
             if let Node::Container {
@@ -497,4 +503,10 @@ fn excerpt(text: &str) -> &str {
         end -= 1;
     }
     &text[..end]
+}
+
+fn ink(index: u8) -> [f32; 4] {
+    let color = COLORS[index as usize];
+    let shade = if kit::is_dark() { 0.9 } else { 0.45 };
+    [color[0] * shade, color[1] * shade, color[2] * shade, 1.]
 }
