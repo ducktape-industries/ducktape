@@ -698,7 +698,6 @@ impl Ducktape {
         self.chat_edit_seq = 0;
         self.chat_edit_rev = 0;
         self.channel_reads = Vec::new();
-        self.unread_boundary = 0;
         self.active_channel = "".to_owned();
         self.active_dm_peer = "".to_owned();
         self.history_view = false;
@@ -784,7 +783,6 @@ impl Ducktape {
             self.dm_peers.clone(),
             self.channel_reads.clone(),
         );
-        self.unread_boundary = 0;
         self.history_view = false;
         self.chat_at_tail = true;
         self.chat_land_seq = 0;
@@ -1404,13 +1402,6 @@ impl Ducktape {
             &self.active_channel,
             "",
         );
-        self.unread_boundary = crate::backend::frozen_unread_boundary(
-            self.channel_reads.clone(),
-            self.channels.clone(),
-            self.active_channel.to_owned(),
-            self.active_channel.to_owned(),
-            self.unread_boundary,
-        );
         self.channel_reads = crate::backend::mark_channel_read(
             ::std::mem::take(&mut self.channel_reads),
             resync_tail_channel.to_owned(),
@@ -1493,20 +1484,6 @@ impl Ducktape {
             (self.shell_tab == ShellTab::Chat) && (!self.history_view),
             &self.active_channel,
             "",
-        );
-        let chat_tab_arrivals =
-            crate::backend::channel_head_seq(self.channels.clone(), chat_tab_channel.to_owned())
-                > crate::backend::channel_last_read(
-                    self.channel_reads.clone(),
-                    chat_tab_channel.to_owned(),
-                );
-        self.unread_boundary = crate::backend::keep_i64(
-            chat_tab_arrivals,
-            crate::backend::channel_last_read(
-                self.channel_reads.clone(),
-                chat_tab_channel.to_owned(),
-            ),
-            self.unread_boundary,
         );
         self.channel_reads = crate::backend::mark_channel_read(
             ::std::mem::take(&mut self.channel_reads),
@@ -3338,14 +3315,10 @@ impl Ducktape {
             return Task::none();
         }
         let next_channel = crate::backend::channel_switch_facts(
-            self.channel_reads.clone(),
             self.channels.clone(),
-            self.active_channel.to_owned(),
             channel_id.to_owned(),
-            self.unread_boundary,
             self.active_channel_name.to_owned(),
         );
-        self.unread_boundary = next_channel.unread_boundary;
         self.active_channel = channel_id.to_owned();
         self.chat_land_seq = target_seq;
         self.active_dm_peer = crate::backend::dm_peer_of_channel(
@@ -3423,14 +3396,10 @@ impl Ducktape {
         self.chat_at_tail = true;
         self.chat_land_seq = 0;
         let next_channel = crate::backend::channel_switch_facts(
-            self.channel_reads.clone(),
             self.channels.clone(),
-            self.active_channel.to_owned(),
             id.to_owned(),
-            self.unread_boundary,
             self.active_channel_name.to_owned(),
         );
-        self.unread_boundary = next_channel.unread_boundary;
         self.active_channel = id.to_owned();
         self.active_channel_name = next_channel.name.to_owned();
         self.active_channel_archived = next_channel.archived;
@@ -3491,14 +3460,10 @@ impl Ducktape {
         self.chat_at_tail = true;
         self.chat_land_seq = 0;
         let next_channel = crate::backend::channel_switch_facts(
-            self.channel_reads.clone(),
             self.channels.clone(),
-            self.active_channel.to_owned(),
             dm_room.to_owned(),
-            self.unread_boundary,
             self.active_channel_name.to_owned(),
         );
-        self.unread_boundary = next_channel.unread_boundary;
         self.active_channel = dm_room.to_owned();
         self.active_channel_name = next_channel.name.to_owned();
         self.active_channel_archived = next_channel.archived;
@@ -3720,13 +3685,6 @@ impl Ducktape {
             ::std::mem::take(&mut self.channels),
             next.channels.clone(),
         );
-        self.unread_boundary = crate::backend::frozen_unread_boundary(
-            self.channel_reads.clone(),
-            self.channels.clone(),
-            self.active_channel.to_owned(),
-            next.active_channel.to_owned(),
-            self.unread_boundary,
-        );
         self.channel_reads = crate::backend::mark_channel_read(
             ::std::mem::take(&mut self.channel_reads),
             next.active_channel.to_owned(),
@@ -3815,13 +3773,6 @@ impl Ducktape {
         self.channels = crate::backend::upsert_channel_rows(
             ::std::mem::take(&mut self.channels),
             next.channels.clone(),
-        );
-        self.unread_boundary = crate::backend::frozen_unread_boundary(
-            self.channel_reads.clone(),
-            self.channels.clone(),
-            self.active_channel.to_owned(),
-            next.active_channel.to_owned(),
-            self.unread_boundary,
         );
         self.channel_reads = crate::backend::mark_channel_read(
             ::std::mem::take(&mut self.channel_reads),
@@ -5025,7 +4976,6 @@ impl Ducktape {
         self.chat_edit_seq = 0;
         self.chat_edit_rev = 0;
         self.channel_reads = Vec::new();
-        self.unread_boundary = 0;
         self.active_channel = "".to_owned();
         self.active_dm_peer = "".to_owned();
         self.history_view = false;

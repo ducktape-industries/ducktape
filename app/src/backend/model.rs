@@ -78,26 +78,14 @@ pub fn message_seq_after_failure(
 
 // --- Client-local unread tracking (no wire read-cursor) ------------------
 //
-// `channel_reads` is a per-channel last-seen `seq`. `unread_boundary` is that
-// value FROZEN at the moment you entered the current channel, used only to
-// place the in-channel "New messages" divider for this visit.
-
-fn last_read_of(reads: &[ChannelRead], channel: &str) -> i64 {
-    reads
-        .iter()
-        .find(|read| read.channel == channel)
-        .map_or(0, |read| read.seq)
-}
+// `channel_reads` is the shell's per-channel last-seen `seq` for badges.
+// The Chat guest owns the in-channel "New messages" divider.
 
 fn head_seq_of(channels: &[ChatChannel], channel: &str) -> i64 {
     channels
         .iter()
         .find(|entry| entry.id == channel)
         .map_or(0, |entry| entry.head_seq)
-}
-
-pub fn channel_last_read(reads: Vec<ChannelRead>, channel: String) -> i64 {
-    last_read_of(&reads, &channel)
 }
 
 pub fn channel_head_seq(channels: Vec<ChatChannel>, channel: String) -> i64 {
@@ -155,30 +143,18 @@ pub fn chain_moved(held: String, live: String) -> bool {
 /// four times before the load task could even start.
 #[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct ChannelSwitchFacts {
-    pub unread_boundary: i64,
     pub name: String,
     pub archived: bool,
     pub members_only: bool,
 }
 
 pub fn channel_switch_facts(
-    reads: Vec<ChannelRead>,
     channels: Vec<ChatChannel>,
-    current_channel: String,
     next_channel: String,
-    current_boundary: i64,
     current_name: String,
 ) -> ChannelSwitchFacts {
     let row = channels.iter().find(|row| row.id == next_channel);
-    let head_seq = row.map_or(0, |row| row.head_seq);
-    let unread_boundary = if current_channel == next_channel {
-        current_boundary
-    } else {
-        let last_read = last_read_of(&reads, &next_channel);
-        if head_seq > last_read { last_read } else { 0 }
-    };
     ChannelSwitchFacts {
-        unread_boundary,
         name: row.map_or(current_name, |row| row.name.clone()),
         archived: row.is_some_and(|row| row.archived),
         members_only: row.is_some_and(|row| row.members_only),
@@ -387,27 +363,6 @@ pub fn initial_channel_reads(
         }
     }
     reads
-}
-
-/// Where to freeze the "New messages" divider when entering a channel. Only
-/// re-freezes on an actual channel change — a same-channel refresh keeps the
-/// divider still. Returns 0 (no divider) when arriving already caught up, so a
-/// caught-up channel never grows a divider above your own later sends or live
-/// arrivals during the visit.
-pub fn frozen_unread_boundary(
-    reads: Vec<ChannelRead>,
-    channels: Vec<ChatChannel>,
-    current_channel: String,
-    next_channel: String,
-    current_boundary: i64,
-) -> i64 {
-    if current_channel == next_channel {
-        return current_boundary;
-    }
-    let last_read = last_read_of(&reads, &next_channel);
-    let head = head_seq_of(&channels, &next_channel);
-    let arrived_with_unread = head > last_read;
-    if arrived_with_unread { last_read } else { 0 }
 }
 
 pub(crate) struct Tip {

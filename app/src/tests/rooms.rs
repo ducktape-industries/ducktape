@@ -239,7 +239,7 @@ fn opening_a_network_clears_the_previous_networks_state() {
 }
 
 #[test]
-fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does_not() {
+fn a_channel_switch_marks_the_native_sidebar_read() {
     let channel = |id: &str, head: i64| backend::ChatChannel {
         id: id.into(),
         name: id.into(),
@@ -261,39 +261,29 @@ fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does
         seq: 30,
     }];
 
-    // Switching INTO #random freezes the divider above the first unread
-    // (>30) and marks #random read up to head so its sidebar badge clears.
-    // The freeze must survive the REAL click path: `choose_channel` takes the
-    // header and highlight optimistically, so by `chat_updated` current ==
-    // next and the load-time freeze self-defers to the click-time one.
+    // A room click clears its native sidebar badge after the load completes.
     let _ = app.update(AppMessage::ChooseChannel("random".into()));
     assert_eq!(app.active_channel, "random");
-    assert_eq!(app.unread_boundary, 30);
     app.loading = false;
     let mut switched = chat_data("random");
     switched.channels = vec![channel("general", 100), channel("random", 50)];
     switched.generation = app.chat_generation;
     let _ = app.update(AppMessage::ChatUpdated(switched));
     assert_eq!(app.active_channel, "random");
-    // the boundary is what the view divides on; where the divider lands is
-    // its own fold over the rows it read
-    assert_eq!(app.unread_boundary, 30);
     assert!(
         !app.rooms
             .iter()
             .any(|row| row.channel.id == "random" && row.unread)
     );
 
-    // A same-channel live delta that brings a NEW message must NOT move
-    // the frozen boundary — the divider would jump as you read.
+    // Live arrivals retain the active room.
     let _ = app.update(AppMessage::LiveUpdated(posted_delta(
         "random",
         message(60, "d", false),
     )));
     assert_eq!(app.active_channel, "random");
-    assert_eq!(app.unread_boundary, 30);
 
-    // Arriving at a caught-up channel shows no divider (boundary 0).
+    // A caught-up room can also become active.
     app.channel_reads =
         backend::mark_channel_read(app.channel_reads.clone(), "general".into(), 100);
     let mut caught_up = chat_data("general");
@@ -301,7 +291,6 @@ fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does
     caught_up.generation = app.chat_generation;
     let _ = app.update(AppMessage::ChatUpdated(caught_up));
     assert_eq!(app.active_channel, "general");
-    assert_eq!(app.unread_boundary, 0);
 }
 
 /// THE LAST CLICK WINS. `choose_channel` used to open `return if loading`, and
@@ -516,22 +505,12 @@ fn messages_that_arrive_off_tab_wait_for_the_reader_to_come_back() {
     );
 
     let _ = app.update(AppMessage::SelectShellTab(ShellTab::Chat));
-    assert_eq!(
-        app.unread_boundary, 10,
-        "coming back freezes the boundary on what she had already read, so the \
-         view divides above what arrived while she was gone"
-    );
     assert!(
         !app.rooms
             .iter()
             .any(|row| row.channel.id == "general" && row.unread),
         "and only then is she caught up"
     );
-
-    // a tab round trip with nothing new must not throw the divider away
-    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Files));
-    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Chat));
-    assert_eq!(app.unread_boundary, 10);
 }
 
 /// A SUPERSEDED SWITCH'S FAILURE STAYS WITH IT. Nothing serializes the room
@@ -692,7 +671,7 @@ fn unread_indicators_are_wired_client_local_only() {
     let connected = handler_body("WorkspaceConnected");
     assert!(connected.contains("initial_channel_reads("));
     let updated = handler_body("ChatUpdated");
-    assert!(updated.contains("frozen_unread_boundary(") && updated.contains("mark_channel_read("));
+    assert!(updated.contains("mark_channel_read("));
     let resync = handler_body("LiveResynced");
     assert!(
         resync.contains("resync_tail_channel") && resync.contains("self.shell_tab==ShellTab::Chat")

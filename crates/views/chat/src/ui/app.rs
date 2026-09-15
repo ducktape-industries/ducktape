@@ -40,6 +40,14 @@ pub(crate) enum LandingThread {
     Absent,
     Seated,
 }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ReadVisit {
+    #[default]
+    Hidden,
+    Entering,
+    Reading,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ChatView {
     #[serde(skip)]
@@ -54,8 +62,8 @@ pub struct ChatView {
     pub(crate) connected: bool,
     pub(crate) session_loading: bool,
     pub(crate) session_busy: bool,
-    #[serde(default)]
-    pub(crate) visible: bool,
+    #[serde(skip)]
+    pub(crate) read_visit: ReadVisit,
     pub(crate) read_cursors: std::collections::BTreeMap<String, i64>,
     pub(crate) rooms: Vec<crate::host::ChatSidebarRow>,
     pub(crate) dm_rows: Vec<crate::host::DmSidebarRow>,
@@ -263,7 +271,7 @@ impl ChatView {
             connected: false,
             session_loading: false,
             session_busy: false,
-            visible: false,
+            read_visit: ReadVisit::Hidden,
             read_cursors: Default::default(),
             rooms: Vec::new(),
             dm_rows: Vec::new(),
@@ -388,7 +396,7 @@ impl ChatView {
             return Err("invalid Chat snapshot".into());
         };
         let mut state: Self = wire::decode(&state)?;
-        state.visible = false;
+        state.read_visit = ReadVisit::Hidden;
         for draft in state.composers.values_mut() {
             draft.retire_device_requests();
         }
@@ -421,8 +429,14 @@ impl ChatView {
             self.composer_drops(),
             crate::host::visibility().map(Message::VisibilityChanged),
             if self.connected {
-                crate::host::sidebar(self.connection_serial, self.names_serial, self.me.clone())
-                    .map(Message::SidebarArrived)
+                crate::host::sidebar(
+                    self.connection_serial,
+                    self.names_serial,
+                    self.me.clone(),
+                    self.active_channel.clone(),
+                    self.land_seq != 0 || self.history_pages != 0,
+                )
+                .map(Message::SidebarArrived)
             } else {
                 ducktape_view_guest::Subscription::none()
             },
@@ -525,6 +539,88 @@ mod tests {
     }
 
     #[test]
+    fn guest_freezes_unread_boundary_on_room_entry_and_hidden_return() {
+        let mut state = ChatView::state();
+        let session = |channel: &str| {
+            Message::SessionArrived(Box::new(crate::host::SessionItem {
+                next: crate::host::Session {
+                    active_channel: channel.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+        };
+        let sidebar = |head| {
+            Message::SidebarArrived(crate::host::SidebarItem {
+                channels: vec![crate::host::ChatChannel {
+                    id: "a".into(),
+                    head_seq: head,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        };
+        let _ = state.update(sidebar(30));
+        let _ = state.update(sidebar(50));
+        let _ = state.update(session("a"));
+        let _ = state.update(Message::VisibilityChanged(true));
+        state.messages = vec![crate::host::ChatMessage {
+            seq: 31,
+            ..Default::default()
+        }];
+        let _ = state.update(sidebar(50));
+        assert_eq!(state.unread_boundary, 30);
+        assert_eq!(
+            state.unread_marker_seq, 31,
+            "sidebar arrival updates already loaded rows"
+        );
+        assert_eq!(state.read_cursors["a"], 50);
+        let _ = state.update(session("a"));
+        let _ = state.update(sidebar(60));
+        assert_eq!(state.unread_boundary, 30, "live refresh keeps the divider");
+        let _ = state.update(Message::VisibilityChanged(false));
+        let _ = state.update(sidebar(70));
+        assert_eq!(state.read_cursors["a"], 60);
+        let _ = state.update(Message::VisibilityChanged(true));
+        let _ = state.update(sidebar(70));
+        assert_eq!(state.unread_boundary, 60);
+        let _ = state.update(Message::VisibilityChanged(false));
+        let _ = state.update(Message::VisibilityChanged(true));
+        let _ = state.update(sidebar(70));
+        assert_eq!(
+            state.unread_boundary, 60,
+            "empty tab roundtrip keeps the divider"
+        );
+        let mut restored = ChatView::restore(&state.snapshot().unwrap()).unwrap();
+        let _ = restored.update(Message::VisibilityChanged(true));
+        let _ = restored.update(sidebar(70));
+        assert_eq!(
+            restored.unread_boundary, 60,
+            "replacement retains the visit boundary"
+        );
+        state.land_seq = 3;
+        let _ = state.update(sidebar(75));
+        assert_eq!(
+            state.read_cursors["a"], 70,
+            "history does not consume new arrivals"
+        );
+        let _ = state.update(session("a"));
+        let _ = state.update(sidebar(75));
+        assert_eq!(state.read_cursors["a"], 75);
+        assert_eq!(
+            state.unread_boundary, 60,
+            "history return retains the same-room divider"
+        );
+        let _ = state.update(session("b"));
+        let _ = state.update(session("a"));
+        let _ = state.update(sidebar(70));
+        assert_eq!(
+            state.unread_boundary, 0,
+            "caught-up room entry has no divider"
+        );
+    }
+
+    #[test]
     fn hidden_room_arrivals_do_not_advance_the_guest_read_cursor() {
         let mut state = ChatView::state();
         state.active_channel = "a".into();
@@ -555,7 +651,7 @@ mod tests {
         assert!(state.rooms[0].unread);
         let restored = ChatView::restore(&state.snapshot().unwrap()).unwrap();
         assert!(
-            !restored.visible,
+            restored.read_visit == ReadVisit::Hidden,
             "visibility comes from the current host, not the snapshot"
         );
         assert_eq!(restored.read_cursors["a"], 6);
@@ -564,7 +660,7 @@ mod tests {
     #[test]
     fn sidebar_reads_seed_cursors_then_mark_only_inactive_rooms_unread() {
         let mut state = ChatView::state();
-        state.visible = true;
+        state.read_visit = ReadVisit::Reading;
         state.active_channel = "a".into();
         let sidebar = |head| crate::host::SidebarItem {
             channels: ["a", "b"]

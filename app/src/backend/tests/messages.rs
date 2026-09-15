@@ -431,38 +431,6 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
     assert_eq!(channel_last_read(seeded.clone(), "random".into()), 30);
     assert_eq!(channel_last_read(seeded.clone(), "general".into()), 100);
     assert!(!chat_sidebar_rooms(vec![channel("general", 100)], Vec::new(), seeded)[0].unread);
-
-    // WHERE THE DIVIDER LANDS is the view's own fold over the rows it read
-    // (`first_unread_seq`, tested there). What stays here is the BOUNDARY the
-    // app hands it, which the bell and the sidebar dots share.
-
-    // frozen_unread_boundary: same channel is left untouched; a change
-    // re-freezes at the arrived channel's last-read, or 0 when caught up.
-    assert_eq!(
-        frozen_unread_boundary(
-            reads.clone(),
-            channels.clone(),
-            "random".into(),
-            "random".into(),
-            30
-        ),
-        30
-    );
-    assert_eq!(
-        frozen_unread_boundary(
-            reads.clone(),
-            channels.clone(),
-            "general".into(),
-            "random".into(),
-            999
-        ),
-        30
-    );
-    let caught_up = vec![read("general", 100), read("random", 50)];
-    assert_eq!(
-        frozen_unread_boundary(caught_up, channels, "general".into(), "random".into(), 999),
-        0
-    );
 }
 
 /// The fairness cap counts websocket work, including chat ops that deliberately
@@ -695,3 +663,10 @@ fn every_key_of_an_account_renders_as_that_accounts_name() {
 // is where the feature is actually pinned: which rows a range covers, what
 // comes out of it, and where a press leaves it.
 // ============================================================================
+
+fn channel_last_read(reads: Vec<ChannelRead>, channel: String) -> i64 {
+    reads
+        .iter()
+        .find(|read| read.channel == channel)
+        .map_or(0, |read| read.seq)
+}

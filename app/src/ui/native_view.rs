@@ -23,7 +23,6 @@ impl Ducktape {
                     self.channel_create_open,
                     &self.active_channel,
                     self.chat_land_seq,
-                    self.unread_boundary,
                     self.mutation_phase,
                     self.loading,
                     self.huddle_joined,

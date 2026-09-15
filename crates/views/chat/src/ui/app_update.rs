@@ -254,10 +254,17 @@ impl super::ChatView {
         );
         self.names_serial = next.names_serial;
         self.channel_create_open = next.channel_create_open;
+        let changed_channel = self.active_channel != next.active_channel;
+        let changed_room_identity = changed_reader || changed_channel;
+        if changed_room_identity {
+            self.unread_boundary = 0;
+            if self.read_visit != ReadVisit::Hidden {
+                self.read_visit = ReadVisit::Entering;
+            }
+        }
         self.active_channel = next.active_channel.to_owned();
         self.refresh_active_dm();
         self.land_seq = next.land_seq;
-        self.unread_boundary = next.unread_boundary;
         self.session_loading = next.loading;
         self.session_busy = next.busy;
         self.busy = self.session_busy;
@@ -281,10 +288,15 @@ impl super::ChatView {
         ])
     }
     fn on_visibility_changed(&mut self, visible: bool) -> ducktape_view_guest::Task<Message> {
-        if self.visible == visible {
+        let was_visible = self.read_visit != ReadVisit::Hidden;
+        if was_visible == visible {
             return ducktape_view_guest::Task::none();
         }
-        self.visible = visible;
+        self.read_visit = if visible {
+            ReadVisit::Entering
+        } else {
+            ReadVisit::Hidden
+        };
         let reads_current_view = visible && self.connected;
         if !reads_current_view {
             return ducktape_view_guest::Task::none();
@@ -314,12 +326,18 @@ impl super::ChatView {
                 .read_cursors
                 .entry(channel.id.clone())
                 .or_insert(channel.head_seq);
-            let reading_live_room = self.visible
+            let reading_live_room = self.read_visit != ReadVisit::Hidden
                 && self.land_seq == 0
                 && self.history_pages == 0
                 && channel.id == self.active_channel;
             if reading_live_room {
-                *cursor = channel.head_seq;
+                let arrived_with_unread =
+                    self.read_visit == ReadVisit::Entering && channel.head_seq > *cursor;
+                if arrived_with_unread {
+                    self.unread_boundary = *cursor;
+                }
+                self.read_visit = ReadVisit::Reading;
+                *cursor = (*cursor).max(channel.head_seq);
             }
             heads.insert(channel.id.clone(), channel.head_seq > *cursor);
         }
@@ -348,6 +366,8 @@ impl super::ChatView {
             })
             .collect();
         self.refresh_active_dm();
+        self.unread_marker_seq =
+            crate::host::first_unread_seq(&self.messages, self.unread_boundary);
         ducktape_view_guest::Task::none()
     }
 

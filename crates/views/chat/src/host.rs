@@ -518,8 +518,6 @@ pub struct Session {
     /// the seq a landing (a search hit, a `duck://channel/…#seq`) asks the
     /// window to open around; 0 opens the live tail
     pub land_seq: i64,
-    /// the read cursor the app keeps per room, for the unread divider
-    pub unread_boundary: i64,
     /// a write the app itself is running (a create, a huddle join)
     pub busy: bool,
     pub loading: bool,
@@ -806,8 +804,10 @@ pub fn sidebar(
     serial: i64,
     names: i64,
     reader: String,
+    channel: String,
+    history: bool,
 ) -> ducktape_view_guest::Subscription<SidebarItem> {
-    ducktape_view_guest::Subscription::run_with((serial, names, reader), |key| {
+    ducktape_view_guest::Subscription::run_with((serial, names, reader, channel, history), |key| {
         let key = key.clone();
         let live = host::subscribe("rpc.live", b"chat");
         stream::once(read_sidebar(key.0, key.1, key.2.clone()))

@@ -1008,3 +1008,29 @@ fn a_landing_short_of_the_rooms_head_offers_the_jump() {
         assert!(has_text(&frame, "Jump to latest"), "{:?}", texts(&frame));
     });
 }
+
+#[test]
+fn visible_room_navigation_requests_a_fresh_sidebar_without_a_live_event() {
+    on_a_deep_stack(|| {
+        boot_native();
+        let boot = chat_view::tick_native(Vec::new());
+        let props_id = request(&boot, "chat.props").id;
+        let visible_id = request(&boot, "host.visible").id;
+        let _ = chat_view::tick_native(vec![
+            item(props_id, &encoded(&session(true))),
+            item(visible_id, b"true"),
+        ]);
+        let mut next = session(true);
+        next.active_channel = "channel-b".into();
+        let frame = chat_view::tick_native(vec![item(props_id, &encoded(&next))]);
+        assert!(
+            frame
+                .requests
+                .iter()
+                .any(|request| request.kind == "rpc.view"
+                    && serde_json::from_slice::<serde_json::Value>(&request.payload)
+                        .is_ok_and(|query| query["query"].get("channels").is_some())),
+            "room entry must request its directory without waiting for network traffic"
+        );
+    });
+}
