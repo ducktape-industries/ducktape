@@ -65,6 +65,7 @@ compute-service = { workspace = true }
 # ptys. Linking the crate is how both sides agree on the protocol — the node
 # never constructs a `Sessions`.
 agent-service = { workspace = true }
+ducktape-terminal = { path = "../../bin/terminal-service" }
 # host-side provider discovery: the dispatch worker runs the operator's locally
 # installed executor CLIs (BYO), never any credential file.
 provider-host = { workspace = true }
