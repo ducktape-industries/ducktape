@@ -1,30 +1,10 @@
 use super::*;
 
-/// A MIRRORED VIEW READING IS ONLY AS GOOD AS ITS WRITERS, SO THE WRITERS ARE
-/// PINNED. These fields exist purely so the view stops paying for them —
-/// sidebar rows, page-comment anchors, huddle tile mute readings,
-/// and `post_refusal` — because a
-/// `sync` extern takes every list BY VALUE and a call in a view expression is
-/// therefore a deep clone per frame (the room projection also ran a SHA-256 per DM
-/// peer, twice a frame). The trade is real: a mirror that a writer forgets is a
-/// sidebar listing DMs under CHANNELS, an unread dot that never lights, a
-/// composer refused in a room she may post in, or a stranger's face over the
-/// header — none of which any type checker can see.
-///
-/// So the rule is mechanical and checked here: a handler that assigns any of a
-/// mirror's SOURCES assigns the mirror too. That is what makes mirroring
-/// cheaper than the per-frame call instead of six chances to drift, and it is
-/// the same shape as the caret-retire and room-mover lints above.
+/// Native call rows and posting hints must follow every change to their inputs.
+/// Sidebar presentation is read and derived by the deployed Chat view.
 #[test]
 fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
-    // (mirror, the sources whose movement invalidates it). THE DM DIRECTORY
-    // decides which channels are DMs — `load_dm_peers` stamps each row's
-    // `channel_id` from the account number it resolved itself, and `account_number`
-    // is Settings' reading alone; THIS DEVICE'S KEY decides whether it is seated
-    // in a members-only room.
-    const MIRRORS: [(&str, &[&str]); 4] = [
-        ("rooms", &["channels", "dm_peers", "channel_reads"]),
-        ("dm_rows", &["channels", "dm_peers", "channel_reads"]),
+    const MIRRORS: [(&str, &[&str]); 2] = [
         (
             "huddle_rows",
             &["huddle_roster", "call_peers", "call_muted"],
@@ -40,9 +20,9 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
         ),
     ];
 
-    let mut checked = 0;
-    for (handler, body) in handler_bodies() {
-        for (mirror, sources) in MIRRORS {
+    for (mirror, sources) in MIRRORS {
+        let mut checked = 0;
+        for (handler, body) in handler_bodies() {
             let moved = sources
                 .iter()
                 .any(|field| body.contains(&format!("self.{field}=")));
@@ -55,8 +35,8 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
                 "{handler} moves a source without refreshing {mirror}"
             );
         }
+        assert!(checked > 0, "the sweep must see assignments for {mirror}");
     }
-    assert!(checked >= 20, "the sweep must see actual assignments");
 }
 
 #[test]

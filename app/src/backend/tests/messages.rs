@@ -10,51 +10,6 @@ fn a_dm_id_is_pair_derived_and_cannot_be_forged() {
         dm_channel_id(b.clone(), a.clone()),
         "both sides derive the same channel"
     );
-    // the sidebar's own filter: the pair's derived channel drops out of
-    // CHANNELS, an ordinary room stays, and an unknown viewer filters
-    // nothing rather than guessing.
-    let channel = |id: &str| ChatChannel {
-        id: id.into(),
-        name: id.into(),
-        archived: false,
-        members_only: false,
-        huddle_count: 0,
-        voice: false,
-        huddle: Vec::new(),
-        head_seq: 0,
-    };
-    let peers = vec![DmPeer {
-        key: b.clone(),
-        name: "b".into(),
-        initials: "B".into(),
-        is_agent: false,
-        channel_id: dm_channel_id(a.clone(), b.clone()),
-    }];
-    let listing = vec![
-        channel(&dm_channel_id(a.clone(), b.clone())),
-        channel("general"),
-    ];
-    let rooms = chat_sidebar_rooms(listing.clone(), peers.clone(), Vec::new());
-    assert_eq!(rooms.len(), 1);
-    assert_eq!(rooms[0].channel.id, "general");
-    // AND AN EMPTY `channel_id` CLAIMS NOTHING. A peer row whose load resolved
-    // no account number of ours carries none, and it must not swallow every
-    // channel whose id happens to be empty — but the DM does NOT fall back
-    // into the room list either: a derived two-party id is never a CHANNELS
-    // row, whoever's it is (`another_members_dm_is_not_a_channel_of_mine`).
-    let unresolved = vec![DmPeer {
-        channel_id: String::new(),
-        ..peers[0].clone()
-    }];
-    let without_the_directory = chat_sidebar_rooms(listing, unresolved, Vec::new());
-    assert_eq!(
-        without_the_directory
-            .iter()
-            .map(|row| row.channel.id.as_str())
-            .collect::<Vec<_>>(),
-        ["general"]
-    );
-
     // the id the app mints is the id chat will accept from a USER author:
     // ':' is reserved for module origins and '/' is refused outright, so a
     // minted id carrying either is a DM that can never be created.
@@ -410,27 +365,10 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
         reads.len()
     );
 
-    // Every prepared row carries its own unread scalar. Both sections resolve
-    // it once when source state moves, never from a list-taking view call.
-    let rooms = chat_sidebar_rooms(channels.clone(), Vec::new(), reads.clone());
-    assert!(!rooms[0].unread);
-    assert!(rooms[1].unread);
-    let dm = DmPeer {
-        key: "peer".into(),
-        name: "Peer".into(),
-        initials: "P".into(),
-        is_agent: false,
-        channel_id: "random".into(),
-    };
-    let dms = chat_sidebar_dms(channels.clone(), vec![dm], reads.clone());
-    assert!(dms[0].unread);
-    assert!(!chat_sidebar_rooms(vec![channel("random", 30)], Vec::new(), reads.clone())[0].unread);
-
     // initial_channel_reads: seed absent channels to head, preserve existing.
     let seeded = initial_channel_reads(channels.clone(), vec![read("random", 30)]);
     assert_eq!(channel_last_read(seeded.clone(), "random".into()), 30);
     assert_eq!(channel_last_read(seeded.clone(), "general".into()), 100);
-    assert!(!chat_sidebar_rooms(vec![channel("general", 100)], Vec::new(), seeded)[0].unread);
 }
 
 /// The fairness cap counts websocket work, including chat ops that deliberately

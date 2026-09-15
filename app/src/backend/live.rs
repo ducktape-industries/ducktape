@@ -379,17 +379,14 @@ async fn collect_ready_chat_updates(
 /// the batch can wander through Pages, Bell, or Forge lifecycle reducers.
 /// THE CHAT TAB'S TIMELINE IS NOT IN HERE. The Chat tab is a module-owned
 /// view on the kernel contract: it re-reads its own room on the same block
-/// this fold runs for. What the app still folds is what OTHER screens read off
-/// the same deltas — the channel list and read cursors the sidebar, the bell
-/// and the tray paint from, the active room's roster the composers complete
-/// mentions against.
+/// this fold runs for. The app retains channel facts and read cursors for
+/// navigation and its live state, plus the roster used by native call flows.
+/// Sidebar rows and their unread presentation belong to the deployed view.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatLiveFold {
     pub channels: Vec<ChatChannel>,
     pub channel_members: Vec<ChatMember>,
     pub channel_reads: Vec<ChannelRead>,
-    pub rooms: Vec<ChatSidebarRow>,
-    pub dm_rows: Vec<DmSidebarRow>,
     pub active_channel_name: String,
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
@@ -459,7 +456,6 @@ pub fn fold_live_chat(
     channels: Vec<ChatChannel>,
     channel_members: Vec<ChatMember>,
     mut channel_reads: Vec<ChannelRead>,
-    dm_peers: Vec<DmPeer>,
     me: String,
     active_channel: String,
     history_view: bool,
@@ -554,14 +550,10 @@ pub fn fold_live_chat(
             }),
         }
     }
-    let rooms = chat_sidebar_rooms(channels.clone(), dm_peers.clone(), channel_reads.clone());
-    let dm_rows = chat_sidebar_dms(channels.clone(), dm_peers, channel_reads.clone());
     ChatLiveFold {
         channels,
         channel_members,
         channel_reads,
-        rooms,
-        dm_rows,
         active_channel_name,
         active_channel_archived,
         active_channel_members_only,

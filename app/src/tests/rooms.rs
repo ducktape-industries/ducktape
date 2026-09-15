@@ -184,8 +184,7 @@ fn a_landing_in_another_room_retires_the_dm_header() {
     app.loading = false;
 
     // A DIRECTORY THAT RESOLVED NO ACCOUNT OF OURS carries no channel id, so it
-    // claims no room — the same answer `chat_sidebar_rooms` gives, from the same
-    // field, which is the point of there being only one derivation.
+    // claims no room: an unresolved directory must not invent a DM identity.
     app.dm_peers[0].channel_id = String::new();
     app.active_dm_peer = peer.into();
     let _ = app.update(AppMessage::ChatUpdated(chat_data(&dm)));
@@ -258,7 +257,7 @@ fn a_channel_switch_marks_the_native_sidebar_read() {
         seq: 30,
     }];
 
-    // A room click clears its native sidebar badge after the load completes.
+    // A room click advances its native read cursor after the load completes.
     let _ = app.update(AppMessage::ChooseChannel("random".into()));
     assert_eq!(app.active_channel, "random");
     app.loading = false;
@@ -268,9 +267,8 @@ fn a_channel_switch_marks_the_native_sidebar_read() {
     let _ = app.update(AppMessage::ChatUpdated(switched));
     assert_eq!(app.active_channel, "random");
     assert!(
-        !app.rooms
-            .iter()
-            .any(|row| row.channel.id == "random" && row.unread)
+        backend::channel_head_seq(app.channels.clone(), "random".into())
+            <= read_seq(&app, "random")
     );
 
     // Live arrivals retain the active room.
@@ -363,9 +361,7 @@ fn a_switch_reply_keeps_what_the_live_stream_folded_while_it_was_in_flight() {
         ..backend::LiveUpdate::default()
     }));
     assert!(
-        app.rooms
-            .iter()
-            .any(|row| row.channel.id == "eng" && row.unread)
+        (backend::channel_head_seq(app.channels.clone(), "eng".into()) > read_seq(&app, "eng"))
     );
 
     let mut landed = chat_data("random");
@@ -387,9 +383,7 @@ fn a_switch_reply_keeps_what_the_live_stream_folded_while_it_was_in_flight() {
         "and the third room's head did not walk back to the pre-click snapshot"
     );
     assert!(
-        app.rooms
-            .iter()
-            .any(|row| row.channel.id == "eng" && row.unread),
+        (backend::channel_head_seq(app.channels.clone(), "eng".into()) > read_seq(&app, "eng")),
         "so its badge survives the switch it had nothing to do with"
     );
 }
@@ -427,9 +421,7 @@ fn a_resync_keeps_the_badge_the_live_stream_lit_while_it_was_in_flight() {
         ..backend::LiveUpdate::default()
     }));
     assert!(
-        app.rooms
-            .iter()
-            .any(|row| row.channel.id == "eng" && row.unread)
+        (backend::channel_head_seq(app.channels.clone(), "eng".into()) > read_seq(&app, "eng"))
     );
 
     // the resync answers off a snapshot taken before either of them
@@ -443,9 +435,7 @@ fn a_resync_keeps_the_badge_the_live_stream_lit_while_it_was_in_flight() {
         "the third room's head does not walk back to the snapshot"
     );
     assert!(
-        app.rooms
-            .iter()
-            .any(|row| row.channel.id == "eng" && row.unread),
+        (backend::channel_head_seq(app.channels.clone(), "eng".into()) > read_seq(&app, "eng")),
         "so the badge it lit survives a resync it had nothing to do with"
     );
     assert!(
@@ -477,9 +467,8 @@ fn messages_that_arrive_off_tab_wait_for_the_reader_to_come_back() {
     )));
 
     assert!(
-        app.rooms
-            .iter()
-            .any(|row| row.channel.id == "general" && row.unread),
+        (backend::channel_head_seq(app.channels.clone(), "general".into())
+            > read_seq(&app, "general")),
         "but the room she left open is unread like any other room"
     );
 
@@ -495,17 +484,15 @@ fn messages_that_arrive_off_tab_wait_for_the_reader_to_come_back() {
     };
     let _ = app.update(AppMessage::LiveResynced(plane_only));
     assert!(
-        app.rooms
-            .iter()
-            .any(|row| row.channel.id == "general" && row.unread),
+        (backend::channel_head_seq(app.channels.clone(), "general".into())
+            > read_seq(&app, "general")),
         "and it does not catch her up on a room she is not on the tab for"
     );
 
     let _ = app.update(AppMessage::SelectShellTab(ShellTab::Chat));
     assert!(
-        !app.rooms
-            .iter()
-            .any(|row| row.channel.id == "general" && row.unread),
+        backend::channel_head_seq(app.channels.clone(), "general".into())
+            <= read_seq(&app, "general"),
         "and only then is she caught up"
     );
 }
@@ -655,69 +642,6 @@ fn unread_indicators_are_wired_client_local_only() {
     assert!(live.contains("ifreads_live_tail"));
 }
 
-/// A DM RECORD IS A NETWORK-VISIBLE CHANNEL ROW, so a DM between two OTHER
-/// people arrives in this device's channel list like any room — and, being in
-/// no peer's `channel_id`, it used to fall through the directory exclusion and
-/// draw under CHANNELS with a `#` glyph and that person's name, right beside
-/// their real DIRECT row. It reads as "clicking a DM created a channel".
-///
-/// Mine belong in DIRECT and theirs belong nowhere on my screen, so no derived
-/// two-party id is ever a CHANNELS row. A channel a person deliberately NAMED
-/// `dm-standup` is not one of those and stays listed — the test pins the shape
-/// rule, not a `dm-` prefix.
-#[test]
-fn another_members_dm_is_not_a_channel_of_mine() {
-    let channel = |id: &str| backend::ChatChannel {
-        id: id.into(),
-        name: id.into(),
-        archived: false,
-        members_only: false,
-        huddle_count: 0,
-        voice: false,
-        huddle: Vec::new(),
-        head_seq: 4,
-    };
-    // the live network's shape: me(1) ↔ orthory(2), me(1) ↔ orthory-ops(3),
-    // and orthory(2) ↔ orthory-ops(3) — the last one none of my business.
-    let mine = backend::dm_channel_id("1".into(), "2".into());
-    let also_mine = backend::dm_channel_id("1".into(), "3".into());
-    let theirs = backend::dm_channel_id("2".into(), "3".into());
-
-    let rooms = backend::chat_sidebar_rooms(
-        vec![
-            channel("general"),
-            channel("dm-standup"),
-            channel(&mine),
-            channel(&also_mine),
-            channel(&theirs),
-        ],
-        vec![
-            backend::DmPeer {
-                key: "2".into(),
-                name: "orthory".into(),
-                initials: "O".into(),
-                is_agent: false,
-                channel_id: mine.clone(),
-            },
-            backend::DmPeer {
-                key: "3".into(),
-                name: "orthory-ops".into(),
-                initials: "O".into(),
-                is_agent: false,
-                channel_id: also_mine.clone(),
-            },
-        ],
-        Vec::new(),
-    );
-
-    let listed: Vec<&str> = rooms.iter().map(|row| row.channel.id.as_str()).collect();
-    assert_eq!(
-        listed,
-        ["general", "dm-standup"],
-        "no derived DM id is a CHANNELS row — not mine, and not theirs"
-    );
-}
-
 /// THE LIVE-RUN READING IS REFUSED, NEVER FOLDED. Its rows are the node's whole
 /// pending set, and the reading is stamped with the connection it was taken over
 /// — so a reading that crossed with a reconnect has to be DROPPED. Folding it in
@@ -781,4 +705,11 @@ fn a_stale_live_run_reading_is_dropped_rather_than_folded() {
         leaving.contains("self.signer_key=\"\".to_owned()")
             && leaving.contains("self.live_agents=")
     );
+}
+
+fn read_seq(app: &Ducktape, channel: &str) -> i64 {
+    app.channel_reads
+        .iter()
+        .find(|read| read.channel == channel)
+        .map_or(0, |read| read.seq)
 }

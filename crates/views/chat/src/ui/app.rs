@@ -735,6 +735,50 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_keeps_dm_rows_separate_and_tracks_their_unread_heads() {
+        let mut state = ChatView::state();
+        state.read_visit = ReadVisit::Reading;
+        state.active_channel = "general".into();
+        let mine = format!("dm-{}", "a".repeat(64));
+        let theirs = format!("dm-{}", "b".repeat(64));
+        let sidebar = |head| crate::host::SidebarItem {
+            channels: ["general", "dm-standup", &mine, &theirs]
+                .into_iter()
+                .map(|id| crate::host::ChatChannel {
+                    id: id.into(),
+                    head_seq: head,
+                    ..Default::default()
+                })
+                .collect(),
+            peers: vec![crate::host::DmPeer {
+                key: "8".into(),
+                channel_id: mine.clone(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let _ = state.update(Message::SidebarArrived(sidebar(4)));
+        assert_eq!(
+            state
+                .rooms
+                .iter()
+                .map(|row| row.channel.id.as_str())
+                .collect::<Vec<_>>(),
+            ["general", "dm-standup"]
+        );
+        assert_eq!(state.dm_rows.len(), 1);
+        assert!(!state.dm_rows[0].unread);
+        let _ = state.update(Message::SidebarArrived(sidebar(5)));
+        assert!(!state.rooms[0].unread);
+        assert!(state.rooms[1].unread);
+        assert!(state.dm_rows[0].unread);
+        state.active_channel = mine.clone();
+        let _ = state.update(Message::SidebarArrived(sidebar(5)));
+        assert!(!state.dm_rows[0].unread);
+        assert_eq!(state.active_dm.channel_id, mine);
+    }
+
+    #[test]
     fn sidebar_reads_seed_cursors_then_mark_only_inactive_rooms_unread() {
         let mut state = ChatView::state();
         state.read_visit = ReadVisit::Reading;

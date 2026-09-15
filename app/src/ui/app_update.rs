@@ -680,8 +680,6 @@ impl Ducktape {
         self.loading = true;
         self.connected = false;
         self.channels = Vec::new();
-        self.rooms = Vec::new();
-        self.dm_rows = Vec::new();
         self.chat_at_tail = true;
         self.chat_land_seq = 0;
         self.chat_pending_sends = Vec::new();
@@ -762,16 +760,6 @@ impl Ducktape {
         self.channel_reads = crate::backend::initial_channel_reads(
             next.channels.clone(),
             ::std::mem::take(&mut self.channel_reads),
-        );
-        self.rooms = crate::backend::chat_sidebar_rooms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
-        self.dm_rows = crate::backend::chat_sidebar_dms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
         );
         self.history_view = false;
         self.chat_at_tail = true;
@@ -1049,7 +1037,6 @@ impl Ducktape {
                     self.channels.clone(),
                     self.channel_members.clone(),
                     self.channel_reads.clone(),
-                    self.dm_peers.clone(),
                     self.settings_user_key.to_owned(),
                     self.active_channel.to_owned(),
                     self.history_view,
@@ -1062,8 +1049,6 @@ impl Ducktape {
                 self.channel_members = folded_chat.channel_members.clone();
                 self.follow_voice_room_roster();
                 self.channel_reads = folded_chat.channel_reads.clone();
-                self.rooms = folded_chat.rooms.clone();
-                self.dm_rows = folded_chat.dm_rows.clone();
                 self.active_channel_name = folded_chat.active_channel_name.to_owned();
                 self.active_channel_archived = folded_chat.active_channel_archived;
                 self.active_channel_members_only = folded_chat.active_channel_members_only;
@@ -1397,16 +1382,6 @@ impl Ducktape {
             resync_tail_channel.to_owned(),
             crate::backend::channel_head_seq(self.channels.clone(), resync_tail_channel.to_owned()),
         );
-        self.rooms = crate::backend::chat_sidebar_rooms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
-        self.dm_rows = crate::backend::chat_sidebar_dms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
         self.mutation_phase = crate::backend::mutation_phase_after_recovery(self.mutation_phase);
         self.error = "".to_owned();
         crate::shell::close::<AppMessage>(crate::backend::window_target_unless(
@@ -1479,16 +1454,6 @@ impl Ducktape {
             ::std::mem::take(&mut self.channel_reads),
             chat_tab_channel.to_owned(),
             crate::backend::channel_head_seq(self.channels.clone(), chat_tab_channel.to_owned()),
-        );
-        self.rooms = crate::backend::chat_sidebar_rooms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
-        self.dm_rows = crate::backend::chat_sidebar_dms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
         );
         self.error = "".to_owned();
         if !self.connected {
@@ -2377,16 +2342,6 @@ impl Ducktape {
             return Task::none();
         }
         self.dm_peers = next.peers.clone();
-        self.rooms = crate::backend::chat_sidebar_rooms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
-        self.dm_rows = crate::backend::chat_sidebar_dms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
         Task::none()
     }
     fn on_dm_peers_failed(&mut self, cause: crate::backend::HydrationError) -> Task<AppMessage> {
@@ -3582,16 +3537,6 @@ impl Ducktape {
             next.active_channel.to_owned(),
             crate::backend::channel_head_seq(self.channels.clone(), next.active_channel.to_owned()),
         );
-        self.rooms = crate::backend::chat_sidebar_rooms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
-        self.dm_rows = crate::backend::chat_sidebar_dms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
         let landed_elsewhere = self.active_channel != next.active_channel;
         self.history_view = self.history_view && (!landed_elsewhere);
         self.chat_land_seq = crate::backend::keep_i64(landed_elsewhere, 0, self.chat_land_seq);
@@ -4767,8 +4712,6 @@ impl Ducktape {
         self.hydration_retry_attempt = 0;
         self.mutation_phase = MutationPhase::Idle;
         self.channels = Vec::new();
-        self.rooms = Vec::new();
-        self.dm_rows = Vec::new();
         self.chat_at_tail = true;
         self.chat_land_seq = 0;
         self.chat_pending_sends = Vec::new();
