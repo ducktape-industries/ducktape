@@ -376,7 +376,7 @@ impl BoardsView {
             checked(
                 "boards/snap",
                 "Snap",
-                "Snap to other cards · hold Alt to bypass",
+                "Snap to other cards · hold Ctrl to bypass",
                 Message::Snap,
                 self.snap,
             ),
@@ -487,7 +487,7 @@ impl BoardsView {
     }
     fn hint(&self) -> &'static str {
         match self.tool {
-            Tool::Select => "Double-click to write · Shift-click to add to selection",
+            Tool::Select => "Double-click to write · Alt-drag to duplicate",
             Tool::Hand => "Drag to explore · Release Space to return to your tool",
             Tool::Note => "Click to place a note and start typing",
             Tool::Rectangle => "Drag to draw a box · Shift-resize to keep proportions",
@@ -584,28 +584,38 @@ impl BoardsView {
                 true,
             )));
         }
-        properties.push(wide(action(
-            "boards/duplicate",
-            "Duplicate",
-            "⌘ / Ctrl D",
-            Message::Duplicate,
-            true,
-        )));
+        // stacking, then arranging: the rows a canvas app keeps in its panel
+        properties.push(kit::spaced(
+            kit::row(
+                "boards/stacking",
+                [
+                    tile(
+                        "front",
+                        "Bring to front",
+                        "⌘ / Ctrl ]",
+                        Message::Stack(true),
+                    ),
+                    tile("back", "Send to back", "⌘ / Ctrl [", Message::Stack(false)),
+                    tile("copy", "Duplicate", "⌘ / Ctrl D", Message::Duplicate),
+                ],
+            ),
+            4.,
+        ));
         if count > 1 {
-            properties.push(wide(action(
-                "boards/align-left",
-                "Align left",
-                "Align selected cards",
-                Message::Align(false),
-                true,
-            )));
-            properties.push(wide(action(
-                "boards/align-top",
-                "Align top",
-                "Align selected cards",
-                Message::Align(true),
-                true,
-            )));
+            properties.push(kit::divider("boards/arrange-rule"));
+            properties.push(kit::caption("boards/arrange-label", "Arrange"));
+            for (key, row) in [("x", ARRANGE_X.as_slice()), ("y", ARRANGE_Y.as_slice())] {
+                properties.push(kit::spaced(
+                    kit::row(
+                        format!("boards/arrange-{key}"),
+                        row.iter().map(|(how, label, name)| {
+                            tile(name, label, "Arrange the selection", Message::Arrange(*how))
+                        }),
+                    ),
+                    4.,
+                ));
+            }
+            properties.push(kit::divider("boards/arrange-rule-b"));
         }
         properties.push(wide(button(
             "boards/delete",
@@ -678,11 +688,14 @@ impl BoardsView {
             ("Shift-click / drag", "Multiple selection"),
             ("Enter / double-click", "Edit text"),
             ("⌘ / Ctrl Enter", "Finish text / next note"),
-            ("⌘ / Ctrl D", "Duplicate selection"),
+            ("⌘ / Ctrl C · X · V", "Copy / cut / paste at pointer"),
+            ("⌘ / Ctrl D · Alt drag", "Duplicate selection"),
+            ("⌘ / Ctrl ] · [", "Bring to front / send to back"),
             ("⌘ / Ctrl Z · Shift Z", "Undo / redo"),
             ("Arrow · Shift Arrow", "Move 1 / 10 units"),
             ("⌘ / Ctrl + scroll", "Zoom at pointer"),
             ("F · Shift F · 0", "Fit board / selection / 100%"),
+            ("Hold Ctrl", "Ignore snapping while dragging"),
             ("Esc", "Cancel the current gesture"),
         ];
         let mut rows = vec![
@@ -1268,6 +1281,20 @@ const TOOLS: [(Tool, &str, &str, &str); 11] = [
     (Tool::Text, "Text", "T", "text"),
     (Tool::Eraser, "Eraser", "E", "eraser"),
 ];
+/// The arrange rows, an axis each: the three edges to line up on, then the
+/// even spread along the same axis.
+const ARRANGE_X: [(Arrange, &str, &str); 4] = [
+    (Arrange::Left, "Align left", "align-left"),
+    (Arrange::CentreX, "Align centres", "align-centre-x"),
+    (Arrange::Right, "Align right", "align-right"),
+    (Arrange::SpreadX, "Spread across", "spread-x"),
+];
+const ARRANGE_Y: [(Arrange, &str, &str); 4] = [
+    (Arrange::Top, "Align top", "align-top"),
+    (Arrange::CentreY, "Align middles", "align-centre-y"),
+    (Arrange::Bottom, "Align bottom", "align-bottom"),
+    (Arrange::SpreadY, "Spread down", "spread-y"),
+];
 fn kind_name(kind: Kind) -> &'static str {
     match kind {
         Kind::Note => "Sticky note",
@@ -1404,6 +1431,30 @@ fn icon(name: &str) -> Node {
         "lock" => {
             "<rect x='5' y='10' width='14' height='11' rx='3'/><path d='M8 10V7a4 4 0 0 1 8 0v3M12 14v3'/>"
         }
+        // the arrange tiles: a rule on the edge the boxes line up against
+        "align-left" => {
+            "<path d='M3 3v18'/><rect x='6' y='5' width='14' height='5'/><rect x='6' y='14' width='9' height='5'/>"
+        }
+        "align-centre-x" => {
+            "<path d='M12 3v18'/><rect x='5' y='5' width='14' height='5'/><rect x='8' y='14' width='8' height='5'/>"
+        }
+        "align-right" => {
+            "<path d='M21 3v18'/><rect x='4' y='5' width='14' height='5'/><rect x='9' y='14' width='9' height='5'/>"
+        }
+        "align-top" => {
+            "<path d='M3 3h18'/><rect x='5' y='6' width='5' height='14'/><rect x='14' y='6' width='5' height='9'/>"
+        }
+        "align-centre-y" => {
+            "<path d='M3 12h18'/><rect x='5' y='5' width='5' height='14'/><rect x='14' y='8' width='5' height='8'/>"
+        }
+        "align-bottom" => {
+            "<path d='M3 21h18'/><rect x='5' y='4' width='5' height='14'/><rect x='14' y='9' width='5' height='9'/>"
+        }
+        "spread-x" => "<path d='M3 3v18M21 3v18'/><rect x='10' y='7' width='4' height='10'/>",
+        "spread-y" => "<path d='M3 3h18M3 21h18'/><rect x='7' y='10' width='10' height='4'/>",
+        "front" => "<rect x='3' y='3' width='12' height='12' rx='2'/><path d='M9 21h12V9'/>",
+        "back" => "<rect x='9' y='9' width='12' height='12' rx='2'/><path d='M15 3H3v12'/>",
+        "copy" => "<rect x='9' y='9' width='12' height='12' rx='2'/><path d='M5 15H3V3h12v2'/>",
         "undo" => "<path d='M9 14 4 9l5-5'/><path d='M4 9h10a5 5 0 0 1 0 10h-3'/>",
         "redo" => "<path d='m15 14 5-5-5-5'/><path d='M20 9H10a5 5 0 0 0 0 10h3'/>",
         "help" => {
@@ -1537,6 +1588,19 @@ fn tool_button_message(
             ),
         ],
     }
+}
+/// An icon-only square in an inspector row: the panel packs its arrangements
+/// the way a canvas app does, six to a strip rather than six stacked labels.
+fn tile(name: &str, label: &str, hint: &str, message: Message) -> Node {
+    icon_button(
+        &format!("boards/tile/{name}"),
+        name,
+        label,
+        hint,
+        message,
+        true,
+        false,
+    )
 }
 /// A 28px icon-only control with a name and a hint, checked when `on`.
 fn icon_button(
