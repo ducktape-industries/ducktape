@@ -627,6 +627,15 @@ fn settings_subtle(
         wire::ButtonPreset::Subtle,
     )
 }
+
+// EVERY READING IS ONE LINE. The kit's text constructors wrap by default,
+// and a settings pane is narrow: a state, a release, a number or a date
+// allowed to wrap breaks onto a second line inside its row's band and lands
+// under the row below it. A one-line cell says so with `kit::nowrap`; the
+// texts that MUST keep wrapping — a sentence, a title that owns its line, an
+// identifier too long to truncate — say so with `kit::wrapping`, and their
+// rows have no fixed height.
+
 /// Every settings field is the same width: the reading stays a column of
 /// labels on the left and controls on the right, whatever the value is.
 const FIELD_WIDTH: f32 = 280.;
@@ -923,27 +932,30 @@ impl SettingsView {
         let current = kit::kv(
             "settings/update-current-row",
             "Installed release",
-            kit::mono("settings/update-current", &self.update_current),
+            kit::nowrap(kit::mono("settings/update-current", &self.update_current)),
         );
         let channel = kit::kv(
             "settings/update-channel-row",
             "Channel",
-            kit::text("settings/update-channel", &self.update_channel),
+            kit::nowrap(kit::text("settings/update-channel", &self.update_channel)),
         );
         let checked = kit::kv(
             "settings/update-checked-row",
             "Last check",
-            kit::text(
+            kit::nowrap(kit::text(
                 "settings/update-checked",
                 update_check_words(&self.update_state, &self.update_checked, self.update_busy),
-            ),
+            )),
         );
         let mut rows = vec![current, channel, checked];
         if staged {
             rows.push(kit::kv(
                 "settings/update-staged-row",
                 "Ready to install",
-                kit::text("settings/update-staged", &self.update_staged_display),
+                kit::nowrap(kit::text(
+                    "settings/update-staged",
+                    &self.update_staged_display,
+                )),
             ));
         }
         let mut actions = vec![settings_action(
@@ -1045,7 +1057,7 @@ impl SettingsView {
                                 kit::kv(
                                     "settings/network-status-row",
                                     "Status",
-                                    kit::text("settings/network-status", &self.status),
+                                    kit::nowrap(kit::text("settings/network-status", &self.status)),
                                 ),
                                 kit::kv(
                                     "settings/network-rpc-row",
@@ -1181,10 +1193,12 @@ impl SettingsView {
             _ => "",
         };
         let standing = self.reading(tier, self.members_answered);
+        // the number sits beside its Copy button: wrapped, it would push the
+        // button off the row
         let number = if self.account_number.is_empty() {
-            kit::secondary("settings/account-number", "None yet")
+            kit::nowrap(kit::secondary("settings/account-number", "None yet"))
         } else {
-            kit::mono("settings/account-number", &self.account_number)
+            kit::nowrap(kit::mono("settings/account-number", &self.account_number))
         };
         let seat = if self.seat_key.is_empty() {
             kit::secondary("settings/seat", "No key on this device")
@@ -1195,14 +1209,14 @@ impl SettingsView {
             kit::kv(
                 "settings/account-name-row",
                 "Name",
-                kit::text(
+                kit::nowrap(kit::text(
                     "settings/account-name",
                     if self.account_name.is_empty() {
                         "Unnamed"
                     } else {
                         &self.account_name
                     },
-                ),
+                )),
             ),
             kit::kv(
                 "settings/standing-row",
@@ -1459,7 +1473,10 @@ impl SettingsView {
                 ));
             }
             add.push(kit::divider("settings/add-rule"));
-            add.push(kit::label("settings/passkey-help", "Or a passkey"));
+            add.push(kit::nowrap(kit::label(
+                "settings/passkey-help",
+                "Or a passkey",
+            )));
             add.push(kit::wrapped_row(
                 "settings/passkey-row",
                 [
@@ -1514,10 +1531,10 @@ impl SettingsView {
                                     "settings/ceremony-detail",
                                     &self.account_ceremony_detail,
                                 )),
-                                kit::caption(
+                                kit::nowrap(kit::caption(
                                     "settings/ceremony-left",
                                     format!("This code expires in {}", self.account_ceremony_left),
-                                ),
+                                )),
                                 settings_subtle(
                                     "settings/ceremony-cancel",
                                     "Cancel",
@@ -1587,7 +1604,10 @@ impl SettingsView {
                             kit::column(
                                 "settings/signing-text",
                                 [
-                                    kit::strong("settings/signing-name", "Signing seat"),
+                                    kit::nowrap(kit::strong(
+                                        "settings/signing-name",
+                                        "Signing seat",
+                                    )),
                                     kit::wrapping(kit::tone_text(
                                         "settings/signing",
                                         "Signing unlocked for this session.",
