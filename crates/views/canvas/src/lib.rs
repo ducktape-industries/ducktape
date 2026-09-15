@@ -539,13 +539,23 @@ impl BoardsView {
         self.epoch += 1;
         Task::none()
     }
-    fn visible(&self) -> Option<Board> {
+    /// The board as this view's own edits leave it, with nothing the pointer
+    /// is in the middle of folded in. Everything a gesture reads to decide
+    /// what it is about to do reads THIS: a gesture asking the board its own
+    /// preview had already changed would be answering itself, and asking
+    /// [`Self::visible`] from inside [`Self::gesture_changes`] does not even
+    /// terminate.
+    fn settled(&self) -> Option<Board> {
         let mut board = self.confirmed.clone()?;
         for operation in &self.pending {
             if let Ok(next) = apply_operation(&board, operation) {
                 board = next;
             }
         }
+        Some(board)
+    }
+    fn visible(&self) -> Option<Board> {
+        let mut board = self.settled()?;
         if let Ok(next) = board.changed_many(&self.gesture_changes()) {
             board = next;
         }

@@ -751,7 +751,7 @@ impl BoardsView {
                 point,
                 shape,
             } => self
-                .routed(id, *end, *point, shape, None)
+                .endpoint_change(id, *end, *point, shape)
                 .into_iter()
                 .collect(),
             Gesture::Scale {
@@ -958,10 +958,10 @@ impl BoardsView {
     /// An arrow drawn onto a card binds to it, so the connection survives the
     /// card moving. Both ends on one card is a free arrow, not a loop.
     fn bind(&self, shape: &mut Shape, start: [f32; 2], end: [f32; 2]) {
-        let Some(board) = self.visible() else {
+        let Some(board) = self.settled() else {
             return;
         };
-        let card = |p| self.topmost(&board, p, |s: &Shape| !s.kind.is_path());
+        let card = |p| self.holding(&board, shape.kind, p);
         shape.from = card(start);
         shape.to = card(end);
         if shape.from.is_some() && shape.from == shape.to {
@@ -969,18 +969,34 @@ impl BoardsView {
             shape.to = None;
         }
     }
+    /// The card an endpoint over this point would take: a card for an arrow,
+    /// nothing for a line or a stroke, which never bind.
+    pub(super) fn holding(&self, board: &Board, kind: Kind, point: [f32; 2]) -> Option<String> {
+        if kind != Kind::Arrow {
+            return None;
+        }
+        self.topmost(board, point, |s: &Shape| !s.kind.is_path())
+    }
+    /// What an endpoint in hand is doing to its connector right now. The drag
+    /// and the release read it the same way, so the arrow snaps to the card's
+    /// edge while you are still holding it rather than jumping there when you
+    /// let go — what you are looking at IS what you are about to commit.
+    pub(super) fn endpoint_change(
+        &self,
+        id: &str,
+        end: usize,
+        point: [f32; 2],
+        shape: &Shape,
+    ) -> Option<Change> {
+        let board = self.settled()?;
+        let held = self.holding(&board, shape.kind, point);
+        self.routed(id, end, point, shape, held)
+    }
     /// Where an endpoint is let go decides what it holds: dropped on a card an
     /// arrow takes it, dropped on the board it stands on its own point. A line
     /// and a stroke never bind, so they only ever move their sample.
     fn on_routed(&mut self, id: &str, end: usize, point: [f32; 2], shape: &Shape) -> Task<Message> {
-        let Some(board) = self.visible() else {
-            return Task::none();
-        };
-        let binds = shape.kind == Kind::Arrow;
-        let held = binds
-            .then(|| self.topmost(&board, point, |s: &Shape| !s.kind.is_path()))
-            .flatten();
-        let Some(change) = self.routed(id, end, point, shape, held) else {
+        let Some(change) = self.endpoint_change(id, end, point, shape) else {
             return Task::none();
         };
         self.edit(change)
@@ -1039,9 +1055,9 @@ impl BoardsView {
         if !drawn {
             return None;
         }
-        if kind == Kind::Arrow {
-            self.bind(&mut shape, start, point);
-        }
+        // `bind` asks the same question the drag was answering all along, and
+        // answers nothing for a line or a stroke.
+        self.bind(&mut shape, start, point);
         Some(shape)
     }
     fn on_created(&mut self, kind: Kind, start: [f32; 2], point: [f32; 2]) -> Task<Message> {
