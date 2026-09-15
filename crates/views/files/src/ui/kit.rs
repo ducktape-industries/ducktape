@@ -39,18 +39,36 @@ pub(super) fn quiet(
     button
 }
 
-/// Navigation stays legible with a 20px face and a 36px pointer target.
+/// Navigation uses a consistent stroke and a generous, quiet pointer target.
 pub(super) fn navigation(
     key: String,
-    face: &str,
+    path: &str,
     name: &str,
     message: Option<Message>,
 ) -> wire::Node {
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="{path}"/></svg>"#
+    );
+    let (hash, bytes) = slots::picture(svg.as_bytes());
+    let icon = wire::Node::Svg {
+        key: format!("{key}/glyph"),
+        inherit_button_ink: true,
+        hash,
+        bytes,
+        label: None,
+        color: None,
+        hover: None,
+        fit: None,
+        rotation: None,
+        opacity: None,
+        width: Some(wire::Length::Fixed(20.)),
+        height: Some(wire::Length::Fixed(20.)),
+    };
     let mut button = native::button_child(
         key.clone(),
-        native::text_size(native::strong(format!("{key}/glyph"), face), 20.),
+        icon,
         message.map(slots::message),
-        wire::ButtonPreset::Secondary,
+        wire::ButtonPreset::Subtle,
     );
     if let wire::Node::Button {
         label,
@@ -65,7 +83,16 @@ pub(super) fn navigation(
         *height = Some(wire::Length::Fixed(36.));
         *padding = Some(wire::Edges::all(4.));
     }
-    button
+    wire::Node::Tooltip {
+        key: format!("{key}/tooltip"),
+        position: wire::TooltipPosition::Bottom,
+        gap: 6.,
+        padding: 6.,
+        delay_ms: 400,
+        snap: true,
+        style: Default::default(),
+        children: vec![button, native::text(format!("{key}/tip"), name)],
+    }
 }
 
 /// A text or any other leaf, inset from its pane's edges.

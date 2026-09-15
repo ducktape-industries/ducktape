@@ -158,46 +158,82 @@ impl FilesView {
                 (self.viewport_width >= app_update::SIDEBAR_MIN).then_some(Message::ToggleSidebar),
                 self.sidebar_open,
             ),
-            kit::navigation(
-                format!("{key}/back"),
-                "←",
-                "Back",
-                self.nav.can_back().then_some(Message::Back),
-            ),
-            kit::navigation(
-                format!("{key}/forward"),
-                "→",
-                "Forward",
-                self.nav.can_forward().then_some(Message::Forward),
+            native::padded(
+                native::card(
+                    format!("{key}/history-group"),
+                    native::sized(
+                        native::spaced(
+                            native::centered_row(
+                                format!("{key}/history"),
+                                [
+                                    kit::navigation(
+                                        format!("{key}/back"),
+                                        "M15 5l-7 7 7 7",
+                                        "Back",
+                                        self.nav.can_back().then_some(Message::Back),
+                                    ),
+                                    kit::navigation(
+                                        format!("{key}/forward"),
+                                        "M9 5l7 7-7 7",
+                                        "Forward",
+                                        self.nav.can_forward().then_some(Message::Forward),
+                                    ),
+                                ],
+                            ),
+                            0.,
+                        ),
+                        Some(wire::Length::Shrink),
+                        None,
+                    ),
+                ),
+                wire::Edges::all(2.),
             ),
             kit::navigation(
                 format!("{key}/up"),
-                "↑",
+                "M5 12l7-7 7 7M12 5v14",
                 "Up",
                 (!self.nav.at_root()).then_some(Message::Parent),
             ),
             kit::navigation(
                 format!("{key}/refresh"),
-                "↻",
+                "M20 7v5h-5M20 12a8 8 0 1 0-2.3 5.7M20 12a8 8 0 0 0-2.3-5.7",
                 "Refresh",
                 Some(Message::Refresh),
             ),
-            native::gap(4.),
-            kit::quiet(
-                format!("{key}/list-mode"),
-                "☰ List",
-                "List view",
-                Some(Message::SetViewMode(ViewMode::List)),
-                self.view_mode == ViewMode::List,
+            native::gap(12.),
+            native::padded(
+                native::card(
+                    format!("{key}/view-group"),
+                    native::sized(
+                        native::spaced(
+                            native::centered_row(
+                                format!("{key}/view-modes"),
+                                [
+                                    kit::quiet(
+                                        format!("{key}/list-mode"),
+                                        "List",
+                                        "List view",
+                                        Some(Message::SetViewMode(ViewMode::List)),
+                                        self.view_mode == ViewMode::List,
+                                    ),
+                                    kit::quiet(
+                                        format!("{key}/columns-mode"),
+                                        "Columns",
+                                        "Column view",
+                                        Some(Message::SetViewMode(ViewMode::Columns)),
+                                        self.view_mode == ViewMode::Columns,
+                                    ),
+                                ],
+                            ),
+                            2.,
+                        ),
+                        Some(wire::Length::Shrink),
+                        None,
+                    ),
+                ),
+                wire::Edges::all(2.),
             ),
-            kit::quiet(
-                format!("{key}/columns-mode"),
-                "▥ Columns",
-                "Column view",
-                Some(Message::SetViewMode(ViewMode::Columns)),
-                self.view_mode == ViewMode::Columns,
-            ),
-            native::gap(4.),
+            native::gap(12.),
             kit::action(
                 format!("{key}/new-folder"),
                 "New folder",
@@ -241,7 +277,10 @@ impl FilesView {
             self.inspector_open,
         ));
         native::padded(
-            native::spaced(native::wrapped_row(key, children), 6.),
+            native::aligned(
+                native::spaced(native::wrapped_row(key, children), 6.),
+                wire::AlignX::Center,
+            ),
             wire::Edges::all(8.),
         )
     }
