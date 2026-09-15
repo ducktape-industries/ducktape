@@ -57,6 +57,26 @@ enum Gesture {
         point: [f32; 2],
         shape: Shape,
     },
+    /// A whole selection in hand, by one handle of the box drawn around it.
+    /// Every shape keeps its place and its share of that box as the box
+    /// changes, which is what makes several shapes scale as one object rather
+    /// than as several that happen to be moving at the same time.
+    Scale {
+        corner: [i32; 2],
+        start: [f32; 2],
+        point: [f32; 2],
+        bounds: [f32; 4],
+        shapes: BTreeMap<String, Shape>,
+    },
+    /// A held arrow key. The selection moves under it as you hold it and the
+    /// board hears about it once, when you let go: a key repeating thirty
+    /// times a second is one intention, not thirty edits to be undone one at
+    /// a time and thirty rounds to consensus for a shape that ended up an
+    /// inch away.
+    Nudge {
+        shapes: BTreeMap<String, Shape>,
+        offset: [i32; 2],
+    },
     Marquee {
         start: [f32; 2],
         point: [f32; 2],
