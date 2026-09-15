@@ -32,6 +32,16 @@ impl super::ChatView {
                 self.on_open_chat_search_hit(channel_id, _root_seq, target_seq)
             }
             Message::ToggleChannelCreate => self.on_toggle_channel_create(),
+            Message::ChannelDraftChanged(value) => self.on_channel_draft_changed(value),
+            Message::ToggleChannelVoice => self.on_toggle_channel_voice(),
+            Message::ToggleChannelMembersOnly => self.on_toggle_channel_members_only(),
+            Message::CreateChannel => self.on_create_channel(),
+            Message::ChannelIdReady(generation, result) => {
+                self.on_channel_id_ready(generation, result)
+            }
+            Message::ChannelCreated(generation, result) => {
+                self.on_channel_created(generation, result)
+            }
             Message::ChooseChannel(id) => self.on_choose_channel(id),
             Message::ChooseDm(peer_key) => self.on_choose_dm(peer_key),
             Message::DmOpened(generation, result) => self.on_dm_opened(generation, result),
@@ -224,6 +234,12 @@ impl super::ChatView {
         let requested_dm =
             next.connected && !next.dm_peer.is_empty() && next.dm_serial != self.dm_request_serial;
         let changed_dm_reader = changed_reader || self.me != next.me;
+        let cancel_creation = changed_dm_reader || !next.connected || moved_room || requested_dm;
+        if cancel_creation {
+            self.retire_channel_creation();
+            self.channel_create_open = false;
+            self.channel_create_id.clear();
+        }
         let cancel_dm = changed_dm_reader || !next.connected || moved_room || requested_dm;
         if cancel_dm {
             self.retire_dm();
@@ -265,7 +281,6 @@ impl super::ChatView {
             ::std::convert::AsRef::as_ref(&(next.me_key)),
         );
         self.names_serial = next.names_serial;
-        self.channel_create_open = next.channel_create_open;
         let changed_channel = self.active_channel != next.active_channel;
         let changed_room_identity = changed_reader || changed_channel;
         if changed_room_identity {
@@ -308,6 +323,8 @@ impl super::ChatView {
     fn on_visibility_changed(&mut self, visible: bool) -> ducktape_view_guest::Task<Message> {
         if !visible {
             self.retire_dm();
+            self.retire_channel_creation();
+            self.channel_create_open = false;
         }
         let was_visible = self.read_visit != ReadVisit::Hidden;
         if was_visible == visible {
@@ -727,6 +744,8 @@ impl super::ChatView {
         target_seq: i64,
     ) -> ducktape_view_guest::Task<Message> {
         self.retire_dm();
+        self.retire_channel_creation();
+        self.channel_create_open = false;
         self.search_phase = SearchPhase::Idle;
         self.search_hits = Vec::new();
         self.search_query = "".to_owned();
@@ -734,12 +753,130 @@ impl super::ChatView {
             crate::host::send_open_hit(::std::convert::AsRef::as_ref(&(channel_id)), target_seq);
         ::ducktape_view_guest::Task::none()
     }
+    fn retire_channel_creation(&mut self) {
+        self.channel_creating.take();
+        self.channel_create_generation = self.channel_create_generation.wrapping_add(1);
+    }
     fn on_toggle_channel_create(&mut self) -> ducktape_view_guest::Task<Message> {
-        self.sent = crate::host::send_toggle_create();
-        ::ducktape_view_guest::Task::none()
+        if self.channel_creating.is_some() {
+            return ducktape_view_guest::Task::none();
+        }
+        self.channel_create_open = !self.channel_create_open;
+        self.channel_create_error.clear();
+        ducktape_view_guest::Task::none()
+    }
+    fn on_channel_draft_changed(&mut self, value: String) -> ducktape_view_guest::Task<Message> {
+        if self.channel_creating.is_none() {
+            let changed = self.channel_draft != value;
+            if changed {
+                self.channel_create_id.clear();
+            }
+            self.channel_draft = value;
+        }
+        ducktape_view_guest::Task::none()
+    }
+    fn on_toggle_channel_voice(&mut self) -> ducktape_view_guest::Task<Message> {
+        if self.channel_creating.is_none() {
+            self.channel_create_id.clear();
+            self.channel_create_voice = !self.channel_create_voice;
+        }
+        ducktape_view_guest::Task::none()
+    }
+    fn on_toggle_channel_members_only(&mut self) -> ducktape_view_guest::Task<Message> {
+        let may_toggle = self.channel_creating.is_none() && !self.channel_create_voice;
+        if may_toggle {
+            self.channel_create_id.clear();
+            self.channel_create_members_only = !self.channel_create_members_only;
+        }
+        ducktape_view_guest::Task::none()
+    }
+    fn on_create_channel(&mut self) -> ducktape_view_guest::Task<Message> {
+        let may_create = self.connected && !self.session_busy && self.channel_creating.is_none();
+        if !may_create {
+            return ducktape_view_guest::Task::none();
+        }
+        let name = self.channel_draft.trim();
+        let invalid_name = name.is_empty() || name.len() > 128 || name.contains('\0');
+        if invalid_name {
+            self.channel_create_error = "Enter a channel name of at most 128 bytes".into();
+            return ducktape_view_guest::Task::none();
+        }
+        self.channel_create_error.clear();
+        self.retire_channel_creation();
+        let generation = self.channel_create_generation;
+        if !self.channel_create_id.is_empty() {
+            return self.on_channel_id_ready(generation, Ok(self.channel_create_id.clone()));
+        }
+        let (task, handle) =
+            ducktape_view_guest::Task::perform(crate::host::mint_channel(), move |result| {
+                Message::ChannelIdReady(generation, result)
+            })
+            .abortable();
+        self.channel_creating = Some(handle.abort_on_drop());
+        task
+    }
+    fn on_channel_id_ready(
+        &mut self,
+        generation: u64,
+        result: Result<String, String>,
+    ) -> ducktape_view_guest::Task<Message> {
+        if generation != self.channel_create_generation {
+            return ducktape_view_guest::Task::none();
+        }
+        self.channel_creating.take();
+        let id = match result {
+            Ok(id) => id,
+            Err(error) => {
+                self.channel_create_error = error;
+                return ducktape_view_guest::Task::none();
+            }
+        };
+        self.channel_create_id = id.clone();
+        let (task, handle) = ducktape_view_guest::Task::perform(
+            crate::host::create_channel(
+                id,
+                self.channel_draft.trim().into(),
+                self.channel_create_voice,
+                self.channel_create_members_only,
+            ),
+            move |result| Message::ChannelCreated(generation, result),
+        )
+        .abortable();
+        self.channel_creating = Some(handle.abort_on_drop());
+        task
+    }
+    fn on_channel_created(
+        &mut self,
+        generation: u64,
+        result: Result<(), String>,
+    ) -> ducktape_view_guest::Task<Message> {
+        if generation != self.channel_create_generation {
+            return ducktape_view_guest::Task::none();
+        }
+        self.channel_creating.take();
+        if let Err(error) = result {
+            self.channel_create_error =
+                crate::host::failure_note("Couldn’t create this channel", &error);
+            return ducktape_view_guest::Task::none();
+        }
+        if !self.channel_create_voice {
+            self.sent =
+                crate::host::send_open_link(&format!("duck://channel/{}", self.channel_create_id));
+        }
+        self.channel_create_open = false;
+        self.channel_draft.clear();
+        self.channel_create_id.clear();
+        self.channel_create_voice = false;
+        self.channel_create_members_only = false;
+        ducktape_view_guest::Task::perform(
+            crate::host::read_sidebar(self.connection_serial, self.names_serial, self.me.clone()),
+            Message::SidebarArrived,
+        )
     }
     fn on_choose_channel(&mut self, id: String) -> ducktape_view_guest::Task<Message> {
         self.retire_dm();
+        self.retire_channel_creation();
+        self.channel_create_open = false;
         self.sent = crate::host::send_choose_channel(::std::convert::AsRef::as_ref(&(id)));
         ::ducktape_view_guest::Task::none()
     }
@@ -753,6 +890,8 @@ impl super::ChatView {
         if !may_open {
             return ducktape_view_guest::Task::none();
         }
+        self.retire_channel_creation();
+        self.channel_create_open = false;
         self.retire_dm();
         let generation = self.dm_generation;
         let (task, handle) = ducktape_view_guest::Task::perform(
@@ -814,6 +953,8 @@ impl super::ChatView {
     /// the tab it lands on.
     fn on_open_message_link(&mut self, url: String) -> ducktape_view_guest::Task<Message> {
         self.retire_dm();
+        self.retire_channel_creation();
+        self.channel_create_open = false;
         self.preview_link = "".to_owned();
         self.sent = crate::host::send_open_link(::std::convert::AsRef::as_ref(&(url)));
         ::ducktape_view_guest::Task::none()

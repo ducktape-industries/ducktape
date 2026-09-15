@@ -263,13 +263,6 @@ async fn a_window_on_an_unseen_room_lands_instead_of_failing() {
     sim.shutdown();
 }
 
-#[test]
-fn post_commit_hydration_errors_are_not_retryable() {
-    let error = committed_error("read failed".into());
-    assert!(error.committed);
-    assert_eq!(error.message, "read failed");
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn chat_round_trips_over_signed_frames() {
     let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());

@@ -116,9 +116,7 @@ fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
     // and a create lands you in a brand-new room, which has no history at all
     let _ = app.update(AppMessage::OpenChatSearchHit("general".into(), 7));
     assert!(app.history_view);
-    let mut created = chat_data("brand-new");
-    created.generation = app.chat_generation;
-    let _ = app.update(AppMessage::ChannelCreated(created));
+    let _ = app.update(AppMessage::ChooseChannel("brand-new".into()));
     assert!(!app.history_view);
 }
 

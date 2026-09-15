@@ -520,7 +520,6 @@ pub struct Session {
     pub me_key: String,
     /// moves when the identity plane does, so the name directory is re-read
     pub names_serial: i64,
-    pub channel_create_open: bool,
     /// the room the app is in — chosen here, but steered by `duck://` links,
     /// notifications and the tray as well
     pub active_channel: String,
@@ -954,6 +953,52 @@ fn dm_channel_id(a: &str, b: &str) -> String {
     let (low, high) = if a < b { (a, b) } else { (b, a) };
     let digest = Sha256::digest(format!("{low}\u{1f}{high}").as_bytes());
     format!("dm-{digest:x}")
+}
+
+pub async fn mint_channel() -> Result<String, String> {
+    let bytes = host::request("host.id", b"channel").await?;
+    let id = String::from_utf8(bytes).map_err(|error| error.to_string())?;
+    if id.is_empty() {
+        return Err("the host returned no channel ID".into());
+    }
+    Ok(id)
+}
+
+pub async fn create_channel(
+    id: String,
+    name: String,
+    voice: bool,
+    members_only: bool,
+) -> Result<(), String> {
+    let reply = ask(
+        "rpc.view",
+        &serde_json::json!({"target":"chat","query":{"channel":{"channel_id":id}}}),
+    )
+    .await?;
+    let existing = reply
+        .get("channel")
+        .ok_or("the chat module returned no channel reply")?;
+    let policy = if members_only { "members_only" } else { "open" };
+    if !existing.is_null() {
+        let same_channel =
+            existing["id"] == id && existing["name"] == name && existing["voice"] == voice;
+        let same_policy = voice || existing["post_policy"] == policy;
+        if same_channel && same_policy {
+            return Ok(());
+        }
+        return Err("This channel ID already has different details".into());
+    }
+    let payload = if voice {
+        serde_json::json!({"create_voice_channel":{"channel_id":id,"name":name}})
+    } else {
+        serde_json::json!({"create_channel":{"channel_id":id,"name":name,"post_policy":policy}})
+    };
+    ask(
+        "op.submit",
+        &serde_json::json!({"target":"chat","payload":payload}),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Resolve an existing DM or atomically create it through the Chat module.
@@ -2202,10 +2247,6 @@ pub fn send_open_hit(channel: &str, target_seq: i64) -> bool {
             target_seq,
         },
     )
-}
-
-pub fn send_toggle_create() -> bool {
-    notify("chat.toggle_create", &())
 }
 
 pub fn send_choose_channel(id: &str) -> bool {

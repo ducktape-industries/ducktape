@@ -278,56 +278,17 @@ fn palette_keys_use_native_platform_shortcuts() {
 
 #[test]
 fn escape_ladder_names_the_topmost_transient_layer_only() {
-    let escape = String::from("escape");
-    let target = |palette: bool, bell: bool, create: bool| {
-        escape_target(escape.clone(), palette, bell, create)
-    };
-
-    // Not Escape -> nothing, whatever is open.
-    assert_eq!(escape_target(String::from("x"), false, true, true), "");
-    // An open palette swallows Escape — palette_key_action owns it.
-    assert_eq!(target(true, true, true), "");
-    // The ladder order is the z-order: bell over the create modal.
-    assert_eq!(target(false, true, true), "bell");
-    assert_eq!(target(false, false, true), "channel_create");
-
-    // Nothing transient open -> Escape is a no-op. THE PER-TAB RUNGS ARE GONE
-    // WITH THEIR SCREENS: the chat menus and details drawer, the pages armed
-    // delete and comments card, are their views' own layers now, dismissed
-    // inside the guest that painted the scrim.
-    assert_eq!(target(false, false, false), "");
+    assert_eq!(escape_target("x".into(), false, true), "");
+    assert_eq!(escape_target("escape".into(), true, true), "");
+    assert_eq!(escape_target("escape".into(), false, true), "bell");
+    assert_eq!(escape_target("escape".into(), false, false), "");
 }
 
-// EVERY RUNG LEFT RIDES EVERY TAB, WHICH IS WHY NEITHER READER TAKES ONE. The
-// per-tab rungs went to the views that mount their surfaces; the palette, the
-// bell and the create modal are mounted outside the native tab content,
-// so they stay on screen across a switch and must keep
-// answering from wherever the reader lands. The two readers enumerate the SAME
-// layers in the same order, and differ on exactly one verdict.
 #[test]
 fn the_two_ladder_readers_enumerate_the_same_layers() {
-    let escape = String::from("escape");
-    let target = |palette: bool, bell: bool, create: bool| {
-        escape_target(escape.clone(), palette, bell, create)
-    };
-
-    for (palette, bell, create, layer) in [
-        (false, true, true, "bell"),
-        (false, false, true, "channel_create"),
-    ] {
-        assert_eq!(topmost_overlay(palette, bell, create), layer);
-        assert_eq!(target(palette, bell, create), layer);
-    }
-
-    // THE ONE VERDICT THEY DIFFER ON. The scroll reader has to know a palette
-    // is over the pane it would otherwise move; Escape must not close what
-    // `palette_key_action` already owns.
-    assert_eq!(topmost_overlay(true, true, true), "palette");
-    assert_eq!(target(true, true, true), String::new());
-
-    // Nothing transient open, nothing named — for both.
-    assert_eq!(topmost_overlay(false, false, false), String::new());
-    assert_eq!(target(false, false, false), String::new());
+    assert_eq!(topmost_overlay(true, true), "palette");
+    assert_eq!(topmost_overlay(false, true), "bell");
+    assert_eq!(topmost_overlay(false, false), "");
 }
 
 #[test]

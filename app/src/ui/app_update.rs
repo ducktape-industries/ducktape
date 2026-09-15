@@ -193,19 +193,12 @@ impl Ducktape {
             }
             AppMessage::ChooseChannel(id) => self.on_choose_channel(id),
             AppMessage::ChooseDm(peer_key) => self.on_choose_dm(peer_key),
-            AppMessage::CreateChannelSubmit => self.on_create_channel_submit(),
-            AppMessage::ToggleChannelCreateMembersOnly => {
-                self.on_toggle_channel_create_members_only()
-            }
-            AppMessage::ToggleChannelCreate => self.on_toggle_channel_create(),
             AppMessage::JoinHuddleSubmit => self.on_join_huddle_submit(),
             AppMessage::HuddleJoinedAck(_result) => self.on_huddle_joined_ack(_result),
             AppMessage::JoinVoice(id) => self.on_join_voice(id),
             AppMessage::VoiceJoined(id) => self.on_voice_joined(id),
-            AppMessage::ToggleChannelCreateVoice => self.on_toggle_channel_create_voice(),
             AppMessage::ChatUpdated(next) => self.on_chat_updated(next),
             AppMessage::ChatLoadFailed(cause) => self.on_chat_load_failed(cause),
-            AppMessage::ChannelCreated(next) => self.on_channel_created(next),
             AppMessage::LiveAgentsEvent(next) => self.on_live_agents_event(next),
             AppMessage::CopyMessageLink(link) => self.on_copy_message_link(link),
             AppMessage::OpenMessageLink(url) => self.on_open_message_link(url),
@@ -289,7 +282,6 @@ impl Ducktape {
             AppMessage::HuddleInviteSent(key) => self.on_huddle_invite_sent(key),
             AppMessage::HuddleInviteFailed(key, error) => self.on_huddle_invite_failed(key, error),
             AppMessage::SecretTyped(slot, text) => self.on_secret_typed(slot, text),
-            AppMessage::ChannelDraftChanged(value) => self.on_channel_draft_changed(value),
         }
     }
     fn on_appearance_save_reply(
@@ -705,7 +697,6 @@ impl Ducktape {
         self.active_channel_members_only = false;
         self.channel_members = Vec::new();
         self.post_refusal = "".to_owned();
-        self.pending_channel = "".to_owned();
         self.page_route = "".to_owned();
         self.palette_search_phase = SearchPhase::Idle;
         self.error = "".to_owned();
@@ -1979,12 +1970,6 @@ impl Ducktape {
             cause.committed,
         );
         self.mutation_phase = crate::backend::mutation_failure_phase(cause.committed);
-        self.channel_draft = crate::backend::restore_draft(
-            self.channel_draft.to_owned(),
-            self.pending_channel.to_owned(),
-            cause.committed,
-        );
-        self.pending_channel = "".to_owned();
         self.error = cause.message.to_owned();
         if !cause.committed {
             return Task::none();
@@ -3207,12 +3192,8 @@ impl Ducktape {
         }
     }
     fn on_global_key_pressed(&mut self, event: crate::shell::KeyPress) -> Task<AppMessage> {
-        let escape_key = crate::backend::escape_target(
-            event.key.clone(),
-            self.palette_open,
-            self.bell_open,
-            self.channel_create_open,
-        );
+        let escape_key =
+            crate::backend::escape_target(event.key.clone(), self.palette_open, self.bell_open);
         let palette_key = crate::backend::palette_key_action(
             event.key.clone(),
             event.modifiers,
@@ -3222,7 +3203,6 @@ impl Ducktape {
             return Task::none();
         }
         self.bell_open = self.bell_open && (escape_key != "bell");
-        self.channel_create_open = self.channel_create_open && (escape_key != "channel_create");
         if palette_key == "none" {
             return Task::none();
         }
@@ -3439,46 +3419,7 @@ impl Ducktape {
         self.chat_dm_serial = self.chat_dm_serial.wrapping_add(1);
         Task::none()
     }
-    fn on_create_channel_submit(&mut self) -> Task<AppMessage> {
-        if (self.loading || (self.mutation_phase != MutationPhase::Idle))
-            || ((self.channel_draft).trim().to_owned()).is_empty()
-        {
-            return Task::none();
-        }
-        self.hydration_generation += 1;
-        self.hydration_retry_attempt = 0;
-        self.mutation_phase = MutationPhase::Channel;
-        self.pending_channel = (self.channel_draft).trim().to_owned();
-        self.channel_draft = "".to_owned();
-        self.error = "".to_owned();
-        self.chat_generation += 1;
-        Task::perform(
-            crate::backend::create_channel(
-                self.connected_rpc.to_owned(),
-                self.password.to_owned(),
-                self.pending_channel.to_owned(),
-                self.channel_create_members_only,
-                self.channel_create_voice,
-                self.chat_generation,
-            ),
-            |result| match result {
-                Ok(value) => AppMessage::ChannelCreated(value),
-                Err(error) => AppMessage::MutationFailed(error),
-            },
-        )
-    }
-    fn on_toggle_channel_create_members_only(&mut self) -> Task<AppMessage> {
-        self.channel_create_members_only = !self.channel_create_members_only;
-        Task::none()
-    }
-    fn on_toggle_channel_create_voice(&mut self) -> Task<AppMessage> {
-        self.channel_create_voice = !self.channel_create_voice;
-        Task::none()
-    }
-    fn on_toggle_channel_create(&mut self) -> Task<AppMessage> {
-        self.channel_create_open = !self.channel_create_open;
-        Task::none()
-    }
+
     fn on_join_huddle_submit(&mut self) -> Task<AppMessage> {
         if ((self.loading || (self.mutation_phase != MutationPhase::Idle))
             || (self.active_channel).is_empty())
@@ -3709,82 +3650,7 @@ impl Ducktape {
         self.error = cause.message.to_owned();
         Task::none()
     }
-    fn on_channel_created(&mut self, next: crate::backend::ChatData) -> Task<AppMessage> {
-        self.pending_channel = "".to_owned();
-        self.channel_create_open = false;
-        self.channel_create_members_only = false;
-        self.channel_create_voice = false;
-        self.mutation_phase = MutationPhase::Idle;
-        if next.generation != self.chat_generation {
-            return Task::none();
-        }
-        self.chat_dm_peer.clear();
-        self.history_view = false;
-        self.chat_at_tail = true;
-        self.chat_land_seq = 0;
-        self.channels = crate::backend::upsert_channel_rows(
-            ::std::mem::take(&mut self.channels),
-            next.channels.clone(),
-        );
-        self.channel_reads = crate::backend::mark_channel_read(
-            ::std::mem::take(&mut self.channel_reads),
-            next.active_channel.to_owned(),
-            crate::backend::channel_head_seq(self.channels.clone(), next.active_channel.to_owned()),
-        );
-        self.rooms = crate::backend::chat_sidebar_rooms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
-        self.dm_rows = crate::backend::chat_sidebar_dms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
-        self.active_channel = next.active_channel.to_owned();
-        self.active_dm_peer = crate::backend::dm_peer_of_channel(
-            self.active_dm_peer.to_owned(),
-            self.dm_peers.clone(),
-            self.active_channel.to_owned(),
-        );
-        self.active_channel_name = next.active_channel_name.to_owned();
-        self.active_channel_archived = next.active_channel_archived;
-        self.active_channel_members_only = next.active_channel_members_only;
-        self.huddle_joined_at =
-            crate::backend::keep_i64(self.huddle_joined, self.huddle_joined_at, self.huddle_now);
-        let huddle = crate::backend::huddle_after_load(
-            true,
-            self.huddle_joined,
-            self.huddle_channel.to_owned(),
-            self.huddle_channel_name.to_owned(),
-            self.huddle_roster.clone(),
-            self.active_channel.to_owned(),
-            self.active_channel_name.to_owned(),
-            next.huddle_roster.clone(),
-        );
-        self.huddle_joined = huddle.joined;
-        self.huddle_roster = huddle.roster.clone();
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
-        self.huddle_channel = huddle.channel.to_owned();
-        self.huddle_channel_name = huddle.channel_name.to_owned();
-        self.channel_members = next.channel_members.clone();
-        self.post_refusal = crate::backend::post_gate(
-            self.active_channel_archived,
-            self.active_channel_members_only,
-            self.channel_members.clone(),
-            self.settings_user_key.to_owned(),
-        );
-        self.error = "".to_owned();
-        crate::shell::close::<AppMessage>(crate::backend::window_target_unless(
-            self.huddle_joined,
-            self.huddle_win,
-        ))
-    }
+
     fn on_live_agents_event(&mut self, next: crate::backend::LiveAgentNotice) -> Task<AppMessage> {
         if crate::backend::live_agents_stale(
             &(next),
@@ -3998,7 +3864,6 @@ impl Ducktape {
                     target_sequence,
                 ))
             }
-            ChatIntent::ToggleCreate => Task::done(AppMessage::ToggleChannelCreate),
             ChatIntent::ChooseChannel => Task::done(AppMessage::ChooseChannel(
                 crate::module_view::event_text(&(event), "id"),
             )),
@@ -4919,8 +4784,6 @@ impl Ducktape {
         self.active_channel_members_only = false;
         self.channel_members = Vec::new();
         self.post_refusal = "".to_owned();
-        self.channel_draft = "".to_owned();
-        self.pending_channel = "".to_owned();
         self.page_route = "".to_owned();
         self.palette_draft = "".to_owned();
         self.palette_chat_hits = Vec::new();
@@ -5511,10 +5374,6 @@ impl Ducktape {
         } {
             self.secrets.set(slot, text);
         }
-        Task::none()
-    }
-    fn on_channel_draft_changed(&mut self, value: String) -> Task<AppMessage> {
-        self.channel_draft = value;
         Task::none()
     }
 }

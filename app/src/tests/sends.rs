@@ -55,7 +55,7 @@ fn a_committed_mutation_failure_unlocks_when_its_recovery_lands() {
     app.connected_rpc = "http://node".into();
     app.loading = false;
     app.active_channel = "general".into();
-    app.mutation_phase = MutationPhase::Channel;
+    app.mutation_phase = MutationPhase::Huddle;
 
     let _ = app.update(AppMessage::MutationFailed(backend::AppError {
         message: "read failed after commit".into(),

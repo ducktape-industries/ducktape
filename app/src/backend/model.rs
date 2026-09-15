@@ -27,13 +27,6 @@ pub fn fresh_operation_id(prefix: String) -> String {
     fresh_id(&prefix)
 }
 
-pub fn restore_draft(current: String, pending: String, keep_pending: bool) -> String {
-    if keep_pending {
-        return current;
-    }
-    if current.is_empty() { pending } else { current }
-}
-
 pub fn mutation_failure_phase(committed: bool) -> crate::MutationPhase {
     if committed {
         crate::MutationPhase::Recovering
@@ -58,7 +51,6 @@ fn committed_message_change(phase: crate::MutationPhase, committed: bool) -> boo
         crate::MutationPhase::MessageEdit => true,
         crate::MutationPhase::Idle
         | crate::MutationPhase::Recovering
-        | crate::MutationPhase::Channel
         | crate::MutationPhase::Huddle
         | crate::MutationPhase::Onboarding => false,
     }

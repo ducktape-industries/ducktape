@@ -480,12 +480,8 @@ impl DesktopWindow {
             true => "none".to_owned(),
             false => palette,
         };
-        let escape = crate::backend::escape_target(
-            key.key.clone(),
-            state.palette_open,
-            state.bell_open,
-            state.channel_create_open,
-        );
+        let escape =
+            crate::backend::escape_target(key.key.clone(), state.palette_open, state.bell_open);
         let global = palette != "none" || !escape.is_empty();
         let message = match chord {
             crate::CommandChord::Quit | crate::CommandChord::CloseWindow => {
@@ -583,20 +579,12 @@ impl DesktopWindow {
                         model.dispatch(Message::SecretTyped(key.into(), text), cx)
                     });
                 }
-                match key {
-                    "palette-input" => {
-                        let text = input.read(cx).value().to_string();
-                        model.update(cx, |model, cx| {
-                            model.dispatch(Message::PaletteChanged(text), cx)
-                        });
-                    }
-                    "channel-draft" => {
-                        let text = input.read(cx).value().to_string();
-                        model.update(cx, |model, cx| {
-                            model.dispatch(Message::ChannelDraftChanged(text), cx)
-                        });
-                    }
-                    _ => {}
+                let palette_input = key == "palette-input";
+                if palette_input {
+                    let text = input.read(cx).value().to_string();
+                    model.update(cx, |model, cx| {
+                        model.dispatch(Message::PaletteChanged(text), cx)
+                    });
                 }
                 cx.notify();
             });
@@ -2205,13 +2193,9 @@ impl DesktopWindow {
     ) -> Option<gpui_kit::AnyElement> {
         use gpui_kit::*;
         let state = &self.model.read(cx).state;
-        let topmost = crate::backend::topmost_overlay(
-            state.palette_open,
-            state.bell_open,
-            state.channel_create_open,
-        );
+        let topmost = crate::backend::topmost_overlay(state.palette_open, state.bell_open);
         use gpui_kit::component::button::ButtonVariants as _;
-        use gpui_kit::component::{ActiveTheme as _, Disableable as _};
+        use gpui_kit::component::ActiveTheme as _;
         let colors = cx.theme().color_tokens();
         let muted = colors.muted_foreground;
         // A modal is one card: a title row with its close, then its body.
@@ -2388,81 +2372,6 @@ impl DesktopWindow {
                     ));
                 }
                 ("Notifications", Message::CloseBell)
-            }
-            "channel_create" => {
-                let busy = state.mutation_phase != crate::MutationPhase::Idle;
-                let members_only = state.channel_create_members_only;
-                let voice = state.channel_create_voice;
-                body = body
-                    .gap_3()
-                    .px_4()
-                    .pb_4()
-                    .child(self.input("channel-draft", "Channel name", false, window, cx))
-                    .child(
-                        gpui_kit::component::checkbox::Checkbox::new("channel-voice")
-                            .label("Voice room")
-                            .checked(voice)
-                            .disabled(busy)
-                            .on_click({
-                                let model = self.model.clone();
-                                move |_, _, cx| {
-                                    model.update(cx, |model, cx| {
-                                        model.dispatch(Message::ToggleChannelCreateVoice, cx)
-                                    })
-                                }
-                            }),
-                    )
-                    .child(
-                        gpui_kit::component::checkbox::Checkbox::new("channel-private")
-                            .label("Members only")
-                            .checked(members_only)
-                            .disabled(busy || voice)
-                            .on_click({
-                                let model = self.model.clone();
-                                move |_, _, cx| {
-                                    model.update(cx, |model, cx| {
-                                        model.dispatch(
-                                            Message::ToggleChannelCreateMembersOnly,
-                                            cx,
-                                        )
-                                    })
-                                }
-                            }),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.5))
-                            .text_color(muted)
-                            .child(match voice {
-                                true => "A voice room is a huddle with a name: pick it in the list to join.",
-                                false => "A members-only channel is read and written by its roster alone.",
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                self.action(
-                                    "channel-cancel",
-                                    "Cancel",
-                                    Message::ToggleChannelCreate,
-                                    busy,
-                                )
-                                .ghost(),
-                            )
-                            .child(
-                                self.action(
-                                    "channel-submit",
-                                    "Create channel",
-                                    Message::CreateChannelSubmit,
-                                    busy,
-                                )
-                                .primary(),
-                            ),
-                    );
-                ("Create a channel", Message::ToggleChannelCreate)
             }
             _ => return None,
         };

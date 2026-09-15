@@ -74,15 +74,12 @@ pub fn command_chord(logical: String, modifiers: gpui_kit::Modifiers) -> crate::
 /// EVERY tab: the native shell renders the palette and bell outside the tab.
 //
 // Inspect every shell layer together to name the topmost.
-pub fn topmost_overlay(palette_open: bool, bell_open: bool, channel_create_open: bool) -> String {
+pub fn topmost_overlay(palette_open: bool, bell_open: bool) -> String {
     if palette_open {
         return "palette".into();
     }
     if bell_open {
         return "bell".into();
-    }
-    if channel_create_open {
-        return "channel_create".into();
     }
     // THE CHAT, PAGES AND FILES LAYERS ARE THEIR VIEWS' OWN. Each holds the
     // keyboard inside its tab and answers Escape itself — the chat menus and
@@ -96,19 +93,14 @@ pub fn topmost_overlay(palette_open: bool, bell_open: bool, channel_create_open:
 
 /// The surface Escape dismisses — the topmost transient layer, minus the one
 /// rung Escape does not own: an open palette swallows the key itself. What is
-/// left after the views took their own layers is the palette, the bell and the
-/// create modal, all three of which ride every tab.
-pub fn escape_target(
-    logical: String,
-    palette_open: bool,
-    bell_open: bool,
-    channel_create_open: bool,
-) -> String {
+/// left after the views took their own layers is the palette and the bell,
+/// both of which ride every tab.
+pub fn escape_target(logical: String, palette_open: bool, bell_open: bool) -> String {
     let not_escape = logical != "escape";
     if not_escape {
         return String::new();
     }
-    let topmost = topmost_overlay(palette_open, bell_open, channel_create_open);
+    let topmost = topmost_overlay(palette_open, bell_open);
     // `palette_key_action` owns the palette's keys — an open palette swallows
     // Escape, so the ladder yields rather than naming a rung.
     let palette_owns_it = topmost == "palette";

@@ -10,7 +10,7 @@ use super::*;
 /// LAUNCHES clear the flag themselves. LANDINGS do not, and must not be added
 /// here without checking that every launch reaching them already cleared it:
 /// `chat_updated` answers the two pickers, `chat_hit_loaded` answers the search
-/// hit, `channel_created` answers the create, `workspace_connected` answers the
+/// hit, `workspace_connected` answers the
 /// reconnect. `live_resynced` is a landing with NO launch behind it, which is
 /// why it is the one that asks.
 #[test]
@@ -26,7 +26,6 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
     assert_eq!(
         movers,
         [
-            "ChannelCreated",
             "ChatUpdated",
             "ChooseChannel",
             "LiveResynced",
@@ -591,12 +590,10 @@ fn an_account_link_delivers_a_new_request_without_mutating_the_current_room() {
         "a later search replaces the account link"
     );
     let _ = app.update(AppMessage::ChooseDm("8".into()));
-    let mut created = chat_data("new-room");
-    created.generation = app.chat_generation;
-    let _ = app.update(AppMessage::ChannelCreated(created));
+    let _ = app.update(AppMessage::ChooseChannel("new-room".into()));
     assert!(
         app.chat_dm_peer.is_empty(),
-        "a created room replaces the account link"
+        "a channel navigation replaces the account link"
     );
 }
 

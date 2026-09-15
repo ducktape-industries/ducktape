@@ -20,7 +20,6 @@ impl Ducktape {
                     &self.account_number,
                     &self.settings_user_key,
                     self.dm_peers_generation,
-                    self.channel_create_open,
                     &self.active_channel,
                     &self.chat_dm_peer,
                     self.chat_dm_serial,

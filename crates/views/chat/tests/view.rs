@@ -1244,3 +1244,146 @@ fn superseded_dm_reads_cannot_create_or_navigate() {
         }
     });
 }
+
+#[test]
+fn creating_a_text_channel_uses_common_requests_and_waits_before_navigation() {
+    on_a_deep_stack(|| {
+        let (frame, _) = connected_room();
+        let frame = tick_native(press(&frame, "New channel"));
+        assert!(has_text(&frame, "Create a channel"));
+        assert!(!kinds(&frame).contains(&"chat.toggle_create"));
+        let frame = tick_native(type_into(&frame, "Channel name", "  Design  "));
+        let frame = tick_native(press(&frame, "Create channel"));
+        let minted = request(&frame, "host.id");
+        assert_eq!(minted.payload, b"channel");
+        let frame = tick_native(vec![answer(minted.id, b"channel-new")]);
+        let frame = tick_native(vec![answer(
+            request(&frame, "rpc.view").id,
+            br#"{"channel":null}"#,
+        )]);
+        let submit = request(&frame, "op.submit");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&submit.payload).unwrap(),
+            serde_json::json!({"target":"chat","payload":{"create_channel":{"channel_id":"channel-new","name":"Design","post_policy":"open"}}})
+        );
+        assert!(!kinds(&frame).contains(&"chat.open_link"));
+        let frame = tick_native(vec![answer(submit.id, b"42")]);
+        let navigate = request(&frame, "chat.open_link");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&navigate.payload).unwrap(),
+            serde_json::json!({"url":"duck://channel/channel-new"})
+        );
+        assert!(!has_text(&frame, "Create a channel"));
+    });
+}
+
+#[test]
+fn voice_creation_preserves_the_text_room_and_ignores_the_members_toggle() {
+    on_a_deep_stack(|| {
+        let (frame, _) = connected_room();
+        let frame = tick_native(press(&frame, "New channel"));
+        let frame = tick_native(type_into(&frame, "Channel name", "Lounge"));
+        let frame = tick_native(press(&frame, "Members only: Off"));
+        let frame = tick_native(press(&frame, "Voice room: Off"));
+        let frame = tick_native(press(&frame, "Create channel"));
+        let frame = tick_native(vec![answer(request(&frame, "host.id").id, b"voice-new")]);
+        let frame = tick_native(vec![answer(
+            request(&frame, "rpc.view").id,
+            br#"{"channel":null}"#,
+        )]);
+        let submit = request(&frame, "op.submit");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&submit.payload).unwrap(),
+            serde_json::json!({"target":"chat","payload":{"create_voice_channel":{"channel_id":"voice-new","name":"Lounge"}}})
+        );
+        let frame = tick_native(vec![answer(submit.id, b"42")]);
+        assert!(!kinds(&frame).contains(&"chat.open_link"));
+        assert!(!has_text(&frame, "Create a channel"));
+    });
+}
+
+#[test]
+fn refused_channel_creation_keeps_the_draft_and_reuses_its_id() {
+    on_a_deep_stack(|| {
+        let (frame, _) = connected_room();
+        let frame = tick_native(press(&frame, "New channel"));
+        let frame = tick_native(type_into(&frame, "Channel name", "Design"));
+        let frame = tick_native(press(&frame, "Members only: Off"));
+        let frame = tick_native(press(&frame, "Create channel"));
+        let frame = tick_native(vec![answer(request(&frame, "host.id").id, b"channel-new")]);
+        let frame = tick_native(vec![answer(
+            request(&frame, "rpc.view").id,
+            br#"{"channel":null}"#,
+        )]);
+        let original = request(&frame, "op.submit").clone();
+        let payload: serde_json::Value = serde_json::from_slice(&original.payload).unwrap();
+        assert_eq!(
+            payload["payload"]["create_channel"]["post_policy"],
+            "members_only"
+        );
+        let frame = tick_native(vec![ducktape_view_guest::wire::Event::Response {
+            id: original.id,
+            result: Err("creation refused".into()),
+            done: true,
+        }]);
+        assert!(
+            texts(&frame)
+                .iter()
+                .any(|text| text.contains("creation refused"))
+        );
+        assert!(!kinds(&frame).contains(&"chat.open_link"));
+        let frame = tick_native(press(&frame, "Create channel"));
+        assert!(!kinds(&frame).contains(&"host.id"));
+        let frame = tick_native(vec![answer(
+            request(&frame, "rpc.view").id,
+            br#"{"channel":null}"#,
+        )]);
+        assert_eq!(request(&frame, "op.submit").payload, original.payload);
+    });
+}
+
+#[test]
+fn an_account_change_cancels_channel_creation_before_it_can_submit() {
+    on_a_deep_stack(|| {
+        let seated = session(true);
+        let (frame, _, props) = connected_room_with(&seated, roots());
+        let frame = tick_native(press(&frame, "New channel"));
+        let frame = tick_native(type_into(&frame, "Channel name", "Design"));
+        let frame = tick_native(press(&frame, "Create channel"));
+        let mint = request(&frame, "host.id").id;
+        let mut next = seated;
+        next.me = "acct:9".into();
+        let frame = tick_native(vec![item(props, &encoded(&next))]);
+        assert!(!has_text(&frame, "Create a channel"));
+        let frame = tick_native(vec![answer(mint, b"channel-old")]);
+        assert!(!kinds(&frame).contains(&"op.submit"));
+        assert!(!kinds(&frame).contains(&"chat.open_link"));
+    });
+}
+
+#[test]
+fn a_lost_creation_reply_is_reconciled_before_retrying_the_write() {
+    on_a_deep_stack(|| {
+        let (frame, _) = connected_room();
+        let frame = tick_native(press(&frame, "New channel"));
+        let frame = tick_native(type_into(&frame, "Channel name", "Design"));
+        let frame = tick_native(press(&frame, "Create channel"));
+        let frame = tick_native(vec![answer(request(&frame, "host.id").id, b"channel-new")]);
+        let frame = tick_native(vec![answer(
+            request(&frame, "rpc.view").id,
+            br#"{"channel":null}"#,
+        )]);
+        let frame = tick_native(vec![ducktape_view_guest::wire::Event::Response {
+            id: request(&frame, "op.submit").id,
+            result: Err("connection closed".into()),
+            done: true,
+        }]);
+        let frame = tick_native(press(&frame, "Create channel"));
+        assert!(!kinds(&frame).contains(&"host.id"));
+        let frame = tick_native(vec![answer(request(&frame, "rpc.view").id,
+            br#"{"channel":{"id":"channel-new","name":"Design","voice":false,"post_policy":"open"}}"#)]);
+        assert!(!kinds(&frame).contains(&"op.submit"));
+        assert!(kinds(&frame).contains(&"chat.open_link"));
+        assert!(!has_text(&frame, "Create a channel"));
+    });
+}

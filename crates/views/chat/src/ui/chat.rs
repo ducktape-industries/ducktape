@@ -1739,3 +1739,73 @@ fn emoji_cell(key: String, emoji: &str, message: Message, disabled: bool) -> wir
     }
     button
 }
+
+impl super::ChatView {
+    pub(crate) fn channel_creation(&self, key: &str) -> Option<wire::Node> {
+        if !self.channel_create_open {
+            return None;
+        }
+        let busy = self.channel_creating.is_some();
+        let voice = if self.channel_create_voice {
+            "Voice room: On"
+        } else {
+            "Voice room: Off"
+        };
+        let members = if self.channel_create_members_only {
+            "Members only: On"
+        } else {
+            "Members only: Off"
+        };
+        let mut children = vec![
+            native::text(format!("{key}/title"), "Create a channel"),
+            field(
+                format!("{key}/name"),
+                "Channel name",
+                &self.channel_draft,
+                Message::ChannelDraftChanged,
+                Some(Message::CreateChannel),
+                busy,
+            ),
+            action(
+                format!("{key}/voice"),
+                voice,
+                Message::ToggleChannelVoice,
+                busy,
+            ),
+            action(
+                format!("{key}/members"),
+                members,
+                Message::ToggleChannelMembersOnly,
+                busy || self.channel_create_voice,
+            ),
+        ];
+        if !self.channel_create_error.is_empty() {
+            children.push(native::text(
+                format!("{key}/error"),
+                &self.channel_create_error,
+            ));
+        }
+        children.push(native::row(
+            format!("{key}/actions"),
+            [
+                subtle(
+                    format!("{key}/cancel"),
+                    "Cancel",
+                    Message::ToggleChannelCreate,
+                    busy,
+                ),
+                primary(
+                    format!("{key}/create"),
+                    "Create channel",
+                    Message::CreateChannel,
+                    busy || !self.connected || self.session_busy,
+                ),
+            ],
+        ));
+        Some(native::sized(
+            native::column(key, children),
+            Some(wire::Length::Fixed(480.)),
+            None,
+        ))
+    }
+}

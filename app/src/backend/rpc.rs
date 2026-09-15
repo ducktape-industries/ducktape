@@ -702,13 +702,6 @@ pub(crate) fn app_error(message: String) -> AppError {
     message.into()
 }
 
-pub(crate) fn committed_error(message: String) -> AppError {
-    AppError {
-        message: user_error(message),
-        committed: true,
-    }
-}
-
 pub(crate) fn retry_delay(attempt: u32) -> Duration {
     let exponent = attempt.saturating_sub(1).min(4);
     Duration::from_secs(1_u64 << exponent)

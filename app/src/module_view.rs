@@ -480,7 +480,6 @@ struct ChatProps<'a> {
     me: String,
     me_key: &'a str,
     names_serial: i64,
-    channel_create_open: bool,
     active_channel: &'a str,
     dm_peer: &'a str,
     dm_serial: i64,
@@ -527,7 +526,6 @@ pub fn chat_view(
     account_number: &str,
     user_key: &str,
     names_serial: i64,
-    channel_create_open: bool,
     active_channel: &str,
     dm_peer: &str,
     dm_serial: i64,
@@ -558,7 +556,6 @@ pub fn chat_view(
         me: reader_handle(account_number, user_key),
         me_key: user_key,
         names_serial,
-        channel_create_open,
         active_channel,
         dm_peer,
         dm_serial,
@@ -642,7 +639,6 @@ pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
     use crate::ChatIntent as Intent;
     match event.kind.as_str() {
         "open_hit" => Intent::OpenHit,
-        "toggle_create" => Intent::ToggleCreate,
         "choose_channel" => Intent::ChooseChannel,
         "show_huddle" => Intent::ShowHuddle,
         "leave_huddle" => Intent::LeaveHuddle,
@@ -740,7 +736,6 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         // left at the door is what another plane of the app steers or owns
         "chat" => &[
             "open_hit",
-            "toggle_create",
             "choose_channel",
             "show_huddle",
             "leave_huddle",
@@ -3673,7 +3668,7 @@ pub(crate) mod tests {
         // the agents view signs its own pause and save through `op.submit`
         assert_eq!(intents_of("agents"), ["open_run", "open_link"]);
         let chat = intents_of("chat");
-        assert_eq!(chat.len(), 12);
+        assert_eq!(chat.len(), 11);
         // the writes the view signs for itself are nobody's intent
         for signed in ["react", "edit", "delete", "rename", "search", "mark_read"] {
             assert!(!chat.contains(&signed), "{signed} is an op.submit now");
@@ -6418,7 +6413,6 @@ pub(crate) mod tests {
             me: "acct:7".into(),
             me_key: "aa",
             names_serial: 0,
-            channel_create_open: false,
             active_channel: room,
             dm_peer: "",
             dm_serial: 0,
