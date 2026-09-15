@@ -133,10 +133,7 @@ impl ForgeView {
                     format!("{key}/line"),
                     [
                         native::sized(
-                            native::text_size(
-                                native::strong(format!("forge/open/{}", repo.name), &repo.name),
-                                14.,
-                            ),
+                            native::strong(format!("forge/open/{}", repo.name), &repo.name),
                             Some(wire::Length::Fill),
                             None,
                         ),

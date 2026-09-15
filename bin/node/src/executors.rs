@@ -65,6 +65,9 @@ pub(crate) struct InstallArgs {
     /// behind the vendor's latest release)
     #[arg(value_name = "NAME")]
     providers: Vec<HarnessArg>,
+    /// install everything the checklist would offer without asking
+    #[arg(short, long, conflicts_with = "providers")]
+    yes: bool,
 }
 
 /// The guest's architecture — the HOST's, because there is no cross-hypervisor:
@@ -498,7 +501,12 @@ pub(crate) fn run(args: InstallArgs, workspace: &Path) -> InstallResult {
             println!("\nnothing to install. `ducktape agent install <name>` reinstalls one.");
             return Ok(());
         }
-        choose(&offered)?
+        // `--yes` is the approval given up front, for the whole checklist.
+        if args.yes {
+            offered
+        } else {
+            choose(&offered)?
+        }
     } else {
         survey
             .iter()

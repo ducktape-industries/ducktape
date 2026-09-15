@@ -223,10 +223,7 @@ impl FilesView {
     /// keeps the same columns; actions live outside the filename's space.
     fn list_row(&self, key: String, entry: &FsEntry) -> wire::Node {
         let chosen = entry.path == self.selected;
-        let name = native::nowrap(native::text_size(
-            native::text(format!("{key}/name"), entry.name.clone()),
-            14.,
-        ));
+        let name = native::nowrap(native::text(format!("{key}/name"), entry.name.clone()));
         let name = match entry.is_dir() {
             true => native::weighted(name, wire::Weight::Medium),
             false => name,

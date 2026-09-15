@@ -59,7 +59,8 @@ all: prereqs
 ## foreground. Ctrl-C quits the app and leaves the node and services up for
 ## `cargo run -p ducktape-app`; the next `make dev` replaces them.
 ## `make dev-clear` stops that background runtime without deleting its state,
-## while `make demo-clear` removes the workspace entirely.
+## while `make demo-clear` removes the workspace entirely. `make dev YES=1`
+## installs every agent CLI the checklist would offer without asking.
 dev: views
 	@bash ops/dev.sh
 
