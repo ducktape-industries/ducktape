@@ -345,8 +345,12 @@ fn disk_substrates(
     blobs: blobstore::BlobHandle,
 ) -> Substrates {
     Substrates {
-        forge_repo: forge_repo.to_path_buf(),
-        duckfs_dir: duckfs_dir.to_path_buf(),
+        directory: duckfs_dir.with_file_name("module-storage"),
+        bindings: [
+            ("forge".into(), forge_repo.to_path_buf()),
+            ("files".into(), duckfs_dir.to_path_buf()),
+        ]
+        .into(),
         blobs,
     }
 }
@@ -500,7 +504,7 @@ pub(super) async fn restore_host(
 fn restore_snapshot(manifest: &Manifest, id: &str, backing: Backing) -> Result<Snapshot, String> {
     match backing {
         Backing::Map => manifest_snapshot(manifest, id).map(Some),
-        Backing::Store | Backing::Odb => Ok(None),
+        Backing::Store | Backing::Odb | Backing::Git => Ok(None),
     }
 }
 

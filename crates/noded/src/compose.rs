@@ -39,20 +39,25 @@ pub type StoreSource<'a> = dyn FnMut(&str) -> BoxFut<'a, Result<Box<dyn MerkleSt
 pub type SnapshotSource<'a> =
     dyn FnMut(&str, Backing) -> BoxFut<'a, Result<Option<(Vec<u8>, StateRoot)>, String>> + 'a;
 
-/// the host-side disk substrates the odb-backed tenants open over.
+/// Storage locations are node configuration, while the guest declares its
+/// engine. An unbound module gets a private directory without a native ID list.
 #[derive(Clone)]
 pub struct Substrates {
-    /// forge's git repo base dir.
-    pub forge_repo: PathBuf,
-    /// files' duckfs data dir (`<dir>/objects` + `<dir>/refs`).
-    pub duckfs_dir: PathBuf,
-    /// the node-local blob plane forge materializes pushed packs from.
+    pub directory: PathBuf,
+    pub bindings: std::collections::BTreeMap<String, PathBuf>,
     pub blobs: blobstore::BlobHandle,
 }
 
-/// the module ids this host provides an odb substrate for — the only ids a
-/// component declaring [`Backing::Odb`] can run under.
-const ODB_SUBSTRATES: &[&str] = &["files", "forge"];
+impl Substrates {
+    pub fn path(&self, id: &str) -> Result<PathBuf, String> {
+        workspace_config::validate_module_id(id)?;
+        Ok(self
+            .bindings
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| self.directory.join(id)))
+    }
+}
 
 /// the per-network values every composition binds into module state: the
 /// invite namespace governance verifies tokens and join proofs against, the
@@ -363,8 +368,8 @@ pub async fn wasm_module(
             }
             compiled.over_store(id, store)
         }
-        Backing::Odb => {
-            let backing = open_odb(id, substrates)?;
+        Backing::Odb | Backing::Git => {
+            let backing = open_odb(id, shape.backing, substrates)?;
             let config = odb_genesis_config(id, &shape, bindings)?;
             compiled.over_odb(id, backing, config)
         }
@@ -479,48 +484,33 @@ fn validate_view(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// can THIS host run a component of `shape` under `id`? an odb declaration
-/// needs a host substrate for the id, and every config key must be one the
+/// Can this host run a component of `shape` under `id`? Every config key must be one the
 /// network binds. the same check a validator applies before it signals a
 /// swap ready, so an admission the boundary could not realize is refused
 /// before it is ever scheduled, never at the boundary of every validator.
 pub fn check_realizable(id: &str, shape: &Shape) -> Result<(), String> {
-    let declares_odb = shape.backing == Backing::Odb;
-    let has_odb_substrate = ODB_SUBSTRATES.contains(&id);
-    if declares_odb && !has_odb_substrate {
-        return Err(no_odb_substrate(id));
-    }
+    workspace_config::validate_module_id(id)?;
     for key in &shape.config {
         require_config_key(id, key)?;
     }
     Ok(())
 }
 
-fn no_odb_substrate(id: &str) -> String {
-    format!(
-        "module {id} declares an odb backing, but this host provides an odb substrate only for {ODB_SUBSTRATES:?}"
-    )
-}
-
-/// the odb-backed tenants' disk substrates, by id — `open` recovers each
-/// substrate's committed position (files' refs envelope, forge's branches).
-fn open_odb(id: &str, substrates: &Substrates) -> Result<Box<dyn wasm_host::OdbBacking>, String> {
-    match id {
-        "files" => {
-            let backing = files::FilesOdbBacking::open(id, substrates.duckfs_dir.clone())
-                .map_err(|e| format!("files open: {e}"))?;
-            Ok(Box::new(backing))
-        }
-        "forge" => {
-            let backing = forge::ForgeOdbBacking::open(
-                id,
-                substrates.forge_repo.clone(),
-                substrates.blobs.clone(),
-            )
-            .map_err(|e| format!("forge open: {e}"))?;
-            Ok(Box::new(backing))
-        }
-        other => Err(no_odb_substrate(other)),
+/// Open the engine named by the component over this tenant's private state.
+fn open_odb(
+    id: &str,
+    engine: Backing,
+    substrates: &Substrates,
+) -> Result<Box<dyn wasm_host::OdbBacking>, String> {
+    let path = substrates.path(id)?;
+    match engine {
+        Backing::Odb => files::FilesOdbBacking::open(id, path)
+            .map(|backing| Box::new(backing) as Box<dyn wasm_host::OdbBacking>)
+            .map_err(|error| format!("object storage open: {error}")),
+        Backing::Git => forge::ForgeOdbBacking::open(id, path, substrates.blobs.clone())
+            .map(|backing| Box::new(backing) as Box<dyn wasm_host::OdbBacking>)
+            .map_err(|error| format!("git storage open: {error}")),
+        Backing::Map | Backing::Store => Err("component does not declare object storage".into()),
     }
 }
 

@@ -2,9 +2,9 @@
 //! [`ForgeState`] core over the host state lane, so the accept/reject logic is
 //! SINGLE-SOURCED with the native module — both call the SAME
 //! [`ForgeState::apply`], arm-for-arm. the host owns everything that touches a
-//! git object database (`root`/`query`/`snapshot`/`install`/materialization)
+//! git object database (`root`/`snapshot`/`install`/materialization)
 //! via the kernel `StateBacking::Odb` backing (`ForgeOdbBacking`, native-only);
-//! the guest owns ONLY `execute`.
+//! the guest owns `execute` and product query policy over bounded Git reads.
 //!
 //! ## per-dispatch re-entry, and why it reproduces the native block
 //!
@@ -134,7 +134,7 @@ impl Guest for Component {
     fn shape() -> host::ModuleShape {
         host::ModuleShape {
             config: vec![sdk::genesis_config::CHAIN_ID.into()],
-            ..ducktape_module_sdk::odb_shape()
+            ..ducktape_module_sdk::git_shape()
         }
     }
 
@@ -150,13 +150,17 @@ impl Guest for Component {
         Err(host::Error::Unsupported)
     }
 
-    /// UNREACHABLE for the odb backing: the kernel serves `query` host-side
-    /// from the committed maps + the git odb and early-returns `backing.query`
-    /// WITHOUT instantiating the guest (`StateBacking::Odb`). fail loud rather
-    /// than fabricate an answer — a deterministic error, identical on every
-    /// validator, if the host ever wires it wrong.
-    fn query(_req: Vec<u8>) -> Result<Vec<u8>, host::Error> {
-        Err(host::Error::Unsupported)
+    fn query(req: Vec<u8>) -> Result<Vec<u8>, host::Error> {
+        let image = match host::state_get_committed(REFS_KEY) {
+            Some(bytes) => decode_image(&bytes).map_err(to_wit_error)?,
+            None => Image::default(),
+        };
+        crate::query::Reader {
+            image: &image,
+            git: crate::query::GuestGit,
+        }
+        .query(&req)
+        .map_err(to_wit_error)
     }
 }
 

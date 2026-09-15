@@ -58,8 +58,8 @@ fn committed_guests_deliver_a_model_reply_to_chat() {
             ).unwrap();
             let mut stores = qmdb_stores(&context);
             let substrates = Substrates {
-                forge_repo: scratch.path().join("forge"),
-                duckfs_dir: scratch.path().join("duckfs"),
+                directory: scratch.path().join("module-storage"),
+                bindings: [("forge".into(), scratch.path().join("forge")), ("files".into(), scratch.path().join("duckfs"))].into(),
                 blobs: blobstore::BlobHandle::default(),
             };
             let bindings = Bindings {

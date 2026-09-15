@@ -235,8 +235,8 @@ fn run_node(
         // stages what clients POST).
         let op_blobs = blobs.clone();
         let substrates = Substrates {
-            forge_repo,
-            duckfs_dir,
+            directory: duckfs_dir.with_file_name("module-storage"),
+            bindings: [("forge".into(), forge_repo), ("files".into(), duckfs_dir)].into(),
             blobs,
         };
         let bindings = Bindings {

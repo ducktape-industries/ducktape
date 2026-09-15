@@ -806,8 +806,8 @@ fn run_sim(
         // wasm, so its code registry is wired and UpdateModule proposals are
         // live in the sim.
         let substrates = Substrates {
-            forge_repo,
-            duckfs_dir,
+            directory: duckfs_dir.with_file_name("module-storage"),
+            bindings: [("forge".into(), forge_repo), ("files".into(), duckfs_dir)].into(),
             blobs: blobs.clone(),
         };
         let bindings = Bindings {

@@ -46,9 +46,6 @@ impl OdbBacking for EmptyOdb {
         Ok(())
     }
     fn discard_block(&mut self) {}
-    fn query(&self, _req: &[u8]) -> Result<Vec<u8>, Error> {
-        Err(Error::QueryUnsupported)
-    }
     fn serve_sync(&self, _req: &[u8]) -> Result<Vec<u8>, Error> {
         Err(Error::SyncUnsupported)
     }

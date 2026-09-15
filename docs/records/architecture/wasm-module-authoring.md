@@ -54,7 +54,8 @@ Implement the five exports:
   the `backing` its committed state lives on (`map`: a host-owned key/value
   map; `store`: a host-constructed authenticated store, every key a 32-byte
   digest; `odb`: a host-side content-addressed substrate the host provides
-  for this module's id — `files`, `forge`), the `config` keys the host seeds
+  in a tenant-scoped directory; `git`: a Git object/refs substrate), the
+  `config` keys the host seeds
   into the reserved `__config` record when the module starts fresh
   (`chain_id`, `invite`; empty when the module is not network-bound), and
   `committed-queries` (the query lane answers from committed state alone,
@@ -62,7 +63,8 @@ Implement the five exports:
   from the bytes on every path a module enters a host — genesis, a registry
   admission, a reopen, a code swap — before wrapping them over a substrate,
   and refuses a backing other than the declared one. `ducktape_module_sdk` names
-  the three plain shapes (`store_shape()`, `map_shape()`, `odb_shape()`);
+  the four plain shapes (`store_shape()`, `map_shape()`, `odb_shape()`,
+  `git_shape()`);
   a network-bound module sets `config` on top.
 - `execute(payload) -> result<_, error>` — apply one op addressed to this
   module. Reject unknown ops with `error::rejected(..)`; a rejection is a clean
@@ -82,6 +84,29 @@ Implement the five exports:
   staged writes. The SDK's store wrapper flushes individual operations without
   publishing the outer block, then invokes `Module::commit_block` here. Valset
   uses this to advance its generation once for a net membership change.
+
+ODB and Git queries execute the deployed guest, including host-routed sibling
+queries. Their SDK shapes declare `committed-queries: true`: the host excludes
+staged refs and staged objects from the read view while a block is open. Files
+runs its pure filesystem query core over `GuestOdb`. Forge selects revisions,
+checks ancestry and paths, reads tracker state, and formats browse/diff replies
+inside its guest. No backing receives a product query request.
+
+The host lends bounded `git-object-read` and `git-diff-read` capabilities to
+query rounds. They address an exact object id within the tenant's named
+repository, never fetch or mutate refs, and return typed commit/tree/blob data
+or diff results. Native libgit2 owns object parsing and patch calculation;
+WASM owns their application meaning. Object reads are capped at 16 MiB, with
+native commit/tree decoding capped at 256 KiB/4 MiB. Diff requests have host
+ceilings of 1 MiB output, 4096 files and 16 MiB materialized blob bytes. All
+resolved data shares the host's aggregate read memo budget. These local Git
+imports are unavailable during execute and lifecycle calls.
+
+The substrate retains root calculation, objects-before-refs publication,
+checkpoint installation, recovery and state sync. `odb` and `git` are distinct
+storage contracts: construction and replacement require the offered engine to
+match the component's declared backing. Replacement changes query policy while
+retaining the existing data layout, backing and initialized configuration.
 
 Lifecycle calls may update own state but cannot emit messages, events, or
 assignments, and cannot read siblings. `state-get-committed` reads before the

@@ -2,8 +2,8 @@
 //! pure [`duckfs_core::Fs`] over the host object plane ([`GuestOdb`]), so the op
 //! semantics are SINGLE-SOURCED with the native module — both delegate to the
 //! SAME `Fs` methods, arm-for-arm. the host owns everything disk- and
-//! read-surface-shaped (`root`/`query`/`snapshot`/`install`/`serve_sync`) via
-//! the kernel `StateBacking::Odb` backing; the guest owns ONLY `execute`.
+//! persistence-shaped (`root`/`snapshot`/`install`/`serve_sync`) via
+//! the kernel `StateBacking::Odb` backing; the guest owns `execute` and `query`.
 //!
 //! ## per-dispatch full-apply, and why it reproduces the native block boundary
 //!
@@ -196,14 +196,11 @@ mod entry {
             Ok(())
         }
 
-        /// UNREACHABLE for the odb backing: the kernel serves `query` host-side
-        /// from committed refs + the disk odb (content bodies cannot be read in a
-        /// sealed round) and early-returns `backing.query` WITHOUT instantiating
-        /// the guest (`StateBacking::Odb`). fail loud rather than fabricate a
-        /// body-less answer — a deterministic error, identical on every
-        /// validator, if the host ever wires it wrong.
-        pub fn query(_req: Vec<u8>) -> Result<Vec<u8>, host::Error> {
-            Err(host::Error::Unsupported)
+        /// Project committed refs and objects through the same pure core as native.
+        pub fn query(req: Vec<u8>) -> Result<Vec<u8>, host::Error> {
+            let query = duckfs_core::decode_query(&req).map_err(host::Error::Rejected)?;
+            let reply = Self::load()?.query(query).map_err(host::Error::Rejected)?;
+            Ok(duckfs_core::encode_reply(&reply))
         }
     }
 

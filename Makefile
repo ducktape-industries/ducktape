@@ -465,6 +465,10 @@ wasm-modules:
 	$(CARGO) run -q $(LOCKED) -p guest-builder -- componentize \
 	  crates/guests/object-wasm/target/wasm32-unknown-unknown/release/object_wasm.wasm \
 	  --out crates/kernel/wasm-host/tests/fixtures/object.component.wasm
+	cd crates/guests/object-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release --features replacement
+	$(CARGO) run -q $(LOCKED) -p guest-builder -- componentize \
+	  crates/guests/object-wasm/target/wasm32-unknown-unknown/release/object_wasm.wasm \
+	  --out crates/kernel/wasm-host/tests/fixtures/object-replacement.component.wasm
 
 ## the drift gate for the committed component artifacts: every copy of the SAME
 ## module must be byte-identical (`node init` hashes the bundle into the

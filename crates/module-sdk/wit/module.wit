@@ -6,6 +6,44 @@ package ducktape:module@0.1.0;
 /// host-routed; writes leave as emitted intents, never reentrant calls.
 /// deliberately NO clock / rng / net / direct blob — determinism by omission.
 interface host {
+  /// Read-only local Git objects. Repository names are confined to this
+  /// module's substrate; no filesystem paths, fetches or reference mutations.
+  /// The host enforces byte ceilings before materializing object bodies.
+  record git-commit {
+    tree: list<u8>,
+    parents: list<list<u8>>,
+  }
+  record git-tree-entry {
+    kind: u8,
+    name: list<u8>,
+    oid: list<u8>,
+  }
+  variant git-object-data {
+    commit(git-commit),
+    tree(list<git-tree-entry>),
+    blob(list<u8>),
+    tag(list<u8>),
+  }
+  record git-object {
+    kind: u8,
+    size: u64,
+    data: option<git-object-data>,
+  }
+  record git-diff {
+    patch: string,
+    truncated: bool,
+    files-changed: u64,
+    additions: u64,
+    deletions: u64,
+  }
+  variant git-diff-error {
+    unavailable(string),
+    limit(string),
+    unsupported,
+  }
+  git-object-read: func(repository: string, oid: list<u8>, max-bytes: u64) -> result<git-object, error>;
+  git-diff-read: func(repository: string, target: list<u8>, source: list<u8>, max-bytes: u64, max-files: u64, max-blob-bytes: u64) -> result<git-diff, git-diff-error>;
+
   /// the deterministic environment for this dispatch (block-constant fields
   /// are identical on every validator; NOT wall clock, NOT per-node).
   record env {
@@ -122,10 +160,10 @@ interface host {
     /// merkle root, sync = the store's resolver lane. every state key is a
     /// 32-byte digest.
     store,
-    /// a host-side content-addressed substrate (duckfs odb, a repo) the host
-    /// provides for this module's id: root = the substrate's fold of its
-    /// refs image, the object plane is live, queries are served host-side.
+    /// Content-addressed objects and a durable refs image. Queries run the guest.
     odb,
+    /// Git object storage and a durable refs image. Queries run the guest.
+    git,
   }
 
   /// what the host must know to run this component. read once from the
