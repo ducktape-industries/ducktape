@@ -1,6 +1,6 @@
 use super::*;
 use ::chat;
-use identity::{AccountView, IdentityQuery, IdentityReply};
+use identity::AccountView;
 
 /// One UI publication may carry at most this many consecutive chat deltas.
 /// The cap bounds one reducer pass; the capacity-one publication gate below
@@ -1152,109 +1152,6 @@ pub fn dm_peer_of_channel(peer: String, peers: Vec<DmPeer>, channel: String) -> 
         true => peer,
         false => String::new(),
     }
-}
-
-/// The room a DIRECT row opens — the id `load_dm_peers` derived for that peer,
-/// empty when the directory does not name him (or names him with no account
-/// number of ours to pair against).
-pub fn dm_room_of_peer(peers: Vec<DmPeer>, peer: String) -> String {
-    peers
-        .into_iter()
-        .find(|row| row.key == peer)
-        .map(|row| row.channel_id)
-        .unwrap_or_default()
-}
-
-/// Open the DM with one peer (an account number): resolve the deterministic
-/// channel when it exists, else create it with the two accounts as members,
-/// then load it. Account membership follows each account's current keys.
-///
-/// NOT confidential. `MembersOnly` gates who may POST; every node replicates
-/// the channel's plaintext, so a DM is a two-person room, not a private one.
-/// Any copy on this surface that promises secrecy is a lie about the wire.
-///
-/// Fails with a generation for the reason [`load_channel_window`] gives: this
-/// is one of the three routes that move the reader between rooms, and a
-/// superseded failure must not land under the room she is in now. The writes it
-/// makes are idempotent by construction: `CreateDmChannel` derives the
-/// deterministic channel id and seats both accounts in the same transaction.
-pub async fn open_dm(
-    rpc: String,
-    password: String,
-    peer_key: String,
-    generation: i64,
-) -> Result<ChatData, HydrationError> {
-    async {
-        let number: u64 = peer_key
-            .trim()
-            .parse()
-            .map_err(|_| "peer must be an account number".to_string())?;
-        let me = local_user_key()
-            .await
-            .ok_or_else(|| "this device has no user key — a DM needs one".to_string())?;
-        let client = rpc_client(&rpc)?;
-        let reply: IdentityReply = client
-            .query("identity", &IdentityQuery::OfKey { key: me })
-            .await?;
-        let mine = match reply {
-            IdentityReply::Account(account) => account,
-            IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
-                return Err("the identity module returned the wrong reply".to_string());
-            }
-        };
-        let mine = mine.ok_or_else(|| "this key is on no account — a DM needs one".to_string())?;
-        let channel_id = dm_channel_id(mine.number.to_string(), number.to_string());
-        let mut existing = load_chat_data(&client, Some(&channel_id)).await?;
-        if existing.active_channel == channel_id {
-            existing.generation = generation;
-            return Ok(existing);
-        }
-        let reply: IdentityReply = client
-            .query("identity", &IdentityQuery::Get { number })
-            .await?;
-        let account = match reply {
-            IdentityReply::Account(account) => account,
-            IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
-                return Err("the identity module returned the wrong reply".to_string());
-            }
-        };
-        let account = account.ok_or_else(|| format!("account {number} does not exist"))?;
-        let peer_name = account.name;
-        // The DM op, not a plain `CreateChannel` naming a `dm-` id: the module
-        // reserves that shape and refuses it from anything but this op, which
-        // resolves the creator's own account and derives the very id computed
-        // above (`dm_channel_id(mine, peer)`), members-only by construction.
-        signed_write(
-            &client,
-            "chat",
-            chat::encode_msg(&ChatMsg::CreateDmChannel {
-                counterpart: number,
-                name: peer_name.clone(),
-            }),
-            password.clone(),
-        )
-        .await?;
-        let names = names();
-        let seated = [mine.number, number]
-            .into_iter()
-            .map(|account| {
-                let handle = format!("acct:{account}");
-                ChatMember {
-                    label: names.member_label(&handle),
-                    key: handle,
-                }
-            })
-            .collect();
-        let data = load_chat_data(&client, Some(&channel_id)).await?;
-        let mut data = landed_on_channel(data, channel_id, peer_name, true, seated);
-        data.generation = generation;
-        Ok(data)
-    }
-    .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
 }
 
 /// Why the viewer may not post here, as a stable reason token — empty when

@@ -524,6 +524,9 @@ pub struct Session {
     /// the room the app is in — chosen here, but steered by `duck://` links,
     /// notifications and the tray as well
     pub active_channel: String,
+    /// An external account link requests a DM; the view owns opening it.
+    pub dm_peer: String,
+    pub dm_serial: i64,
     /// the seq a landing (a search hit, a `duck://channel/…#seq`) asks the
     /// window to open around; 0 opens the live tail
     pub land_seq: i64,
@@ -951,6 +954,51 @@ fn dm_channel_id(a: &str, b: &str) -> String {
     let (low, high) = if a < b { (a, b) } else { (b, a) };
     let digest = Sha256::digest(format!("{low}\u{1f}{high}").as_bytes());
     format!("dm-{digest:x}")
+}
+
+/// Resolve an existing DM or atomically create it through the Chat module.
+/// Navigation waits for the write's commit acknowledgment.
+pub async fn open_dm(reader: String, peer: String) -> Result<String, String> {
+    let mine = reader
+        .strip_prefix("acct:")
+        .and_then(|id| id.parse::<u64>().ok())
+        .ok_or("this key is on no account — a DM needs one")?;
+    let counterpart: u64 = peer
+        .trim()
+        .parse()
+        .map_err(|_| "peer must be an account number")?;
+    let channel = dm_channel_id(&mine.to_string(), &counterpart.to_string());
+    let reply = ask(
+        "rpc.view",
+        &serde_json::json!({"target":"chat","query":{"channel":{"channel_id":channel}}}),
+    )
+    .await?;
+    let existing = reply
+        .get("channel")
+        .ok_or("the chat module returned the wrong channel reply")?;
+    if !existing.is_null() {
+        let matches_channel =
+            existing.get("id").and_then(serde_json::Value::as_str) == Some(channel.as_str());
+        if !matches_channel {
+            return Err("the chat module returned the wrong channel".into());
+        }
+        return Ok(channel);
+    }
+    let reply = ask(
+        "rpc.query",
+        &serde_json::json!({"target":"identity","query":{"get":{"number":counterpart}}}),
+    )
+    .await?;
+    let account = reply
+        .get("account")
+        .filter(|account| account.is_object())
+        .ok_or_else(|| format!("account {counterpart} does not exist"))?;
+    let name = account
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("the identity module returned no account name")?;
+    ask("op.submit", &serde_json::json!({"target":"chat","payload":{"create_dm_channel":{"counterpart":counterpart,"name":name}}})).await?;
+    Ok(channel)
 }
 
 // ---------- the reads ----------
@@ -2089,12 +2137,6 @@ pub struct Channel {
     pub id: String,
 }
 
-/// `chat.choose_dm` — a peer key.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Key {
-    pub key: String,
-}
-
 /// `chat.scrolled` — the stream's offsets, relative to its end anchor.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Scrolled {
@@ -2168,10 +2210,6 @@ pub fn send_toggle_create() -> bool {
 
 pub fn send_choose_channel(id: &str) -> bool {
     notify("chat.choose_channel", &Channel { id: id.into() })
-}
-
-pub fn send_choose_dm(key: &str) -> bool {
-    notify("chat.choose_dm", &Key { key: key.into() })
 }
 
 pub fn send_show_huddle() -> bool {

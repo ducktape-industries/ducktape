@@ -29,7 +29,6 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
             "ChannelCreated",
             "ChatUpdated",
             "ChooseChannel",
-            "ChooseDm",
             "LiveResynced",
             "NetworkEntered",
             "OpenChatSearchHit",
@@ -39,7 +38,6 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
     );
     for launch in [
         "ChooseChannel",
-        "ChooseDm",
         "OpenChatSearchHit",
         "Reconnect",
         "NetworkEntered",
@@ -571,56 +569,35 @@ fn switching_channels_paints_an_empty_loading_state_until_the_root_window_lands(
     assert!(app.post_refusal.is_empty());
 }
 
-/// A DM CLICK LANDS THE WHOLE ROOM, NOT JUST THE FACE.
-///
-/// `choose_dm` used to move `active_dm_peer` and nothing else about the room,
-/// so for the several blocks `open_dm` takes — a channel create plus two
-/// membership seats on a first open — the peer's name sat beside the ARCHIVED
-/// badge, the "· N added" count and the composer refusal of the room she left.
-/// The id is derivable here (`dm_channel_id` is the same deterministic hash
-/// `open_dm` resolves), so the empty loading state can still take the right room
-/// identity on the click.
+/// External account links are navigation requests; the view owns DM creation.
 #[test]
-fn a_dm_click_takes_the_room_with_it_instead_of_wearing_the_last_ones_badges() {
+fn an_account_link_delivers_a_new_request_without_mutating_the_current_room() {
     let (mut app, _) = Ducktape::boot();
-    app.connected = true;
-    app.connected_rpc = "http://node".into();
-    app.account_number = "me".into();
-    app.active_channel = "locked".into();
-    app.active_channel_name = "locked".into();
-    app.active_channel_archived = true;
-    app.active_channel_members_only = true;
-    app.channel_members = vec![backend::ChatMember {
-        key: "someone-else".into(),
-        label: "Someone else".into(),
-    }];
-    app.post_refusal = "channel_archived".into();
-    app.dm_peers = vec![backend::DmPeer {
-        key: "peer".into(),
-        name: "Peer".into(),
-        initials: "P".into(),
-        is_agent: false,
-        channel_id: backend::dm_channel_id("me".into(), "peer".into()),
-    }];
-
-    let _ = app.update(AppMessage::ChooseDm("peer".into()));
-    let dm = backend::dm_channel_id("me".into(), "peer".into());
-    assert_eq!(app.active_channel, dm, "the DM's own room, on the click");
-    assert_eq!(app.active_dm_peer, "peer");
-    assert!(!app.active_channel_archived, "not the left room's badge");
-    assert!(!app.active_channel_members_only);
-    assert!(app.channel_members.is_empty(), "nor its member count");
-    assert!(app.post_refusal.is_empty(), "nor its composer refusal");
-    assert!(!app.history_view, "a DM open is a live tail");
-    assert!(app.loading, "this peer has never been read");
-
-    // A re-open follows the same no-window-cache path as every channel switch.
-    let mut landed = chat_data(&dm);
-    landed.generation = app.chat_generation;
-    let _ = app.update(AppMessage::ChatUpdated(landed));
-    let _ = app.update(AppMessage::ChooseChannel("locked".into()));
-    let _ = app.update(AppMessage::ChooseDm("peer".into()));
-    assert!(app.loading, "the DM's record is fetched again");
+    app.active_channel = "general".into();
+    app.active_channel_name = "General".into();
+    app.loading = false;
+    let before = app.chat_generation;
+    let _ = app.update(AppMessage::ChooseDm("8".into()));
+    assert_eq!(app.chat_dm_peer, "8");
+    assert_eq!(app.chat_dm_serial, 1);
+    assert_eq!(app.active_channel, "general");
+    assert_eq!(app.chat_generation, before);
+    assert!(!app.loading);
+    let _ = app.update(AppMessage::ChooseDm("8".into()));
+    assert_eq!(app.chat_dm_serial, 2, "the same link can be opened again");
+    let _ = app.update(AppMessage::OpenChatSearchHit("design".into(), 7));
+    assert!(
+        app.chat_dm_peer.is_empty(),
+        "a later search replaces the account link"
+    );
+    let _ = app.update(AppMessage::ChooseDm("8".into()));
+    let mut created = chat_data("new-room");
+    created.generation = app.chat_generation;
+    let _ = app.update(AppMessage::ChannelCreated(created));
+    assert!(
+        app.chat_dm_peer.is_empty(),
+        "a created room replaces the account link"
+    );
 }
 
 /// A SEARCH HIT PAINTS THE ROOM IT IS JUMPING TO, NOT THE ROOM IT LEFT.

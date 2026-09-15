@@ -1075,3 +1075,172 @@ fn visible_room_navigation_requests_a_fresh_sidebar_without_a_live_event() {
         );
     });
 }
+
+#[test]
+fn a_dm_click_creates_the_room_through_common_requests_before_navigation() {
+    on_a_deep_stack(|| {
+        let (frame, _) = connected_room();
+        let frame = tick_native(press(&frame, "Ada Lovelace"));
+        let existing = request(&frame, "rpc.view");
+        let ask: serde_json::Value = serde_json::from_slice(&existing.payload).unwrap();
+        let channel = ask["query"]["channel"]["channel_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(channel.starts_with("dm-"));
+        assert!(
+            !frame
+                .requests
+                .iter()
+                .any(|request| request.kind.starts_with("chat."))
+        );
+        let frame = tick_native(vec![answer(existing.id, br#"{"channel":null}"#)]);
+        let peer = request(&frame, "rpc.query");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&peer.payload).unwrap(),
+            serde_json::json!({"target":"identity","query":{"get":{"number":8}}})
+        );
+        let frame = tick_native(vec![answer(
+            peer.id,
+            br#"{"account":{"number":8,"name":"Ada Lovelace"}}"#,
+        )]);
+        let create = request(&frame, "op.submit");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&create.payload).unwrap(),
+            serde_json::json!({"target":"chat","payload":{"create_dm_channel":{"counterpart":8,"name":"Ada Lovelace"}}})
+        );
+        assert!(
+            !frame
+                .requests
+                .iter()
+                .any(|request| request.kind.starts_with("chat."))
+        );
+        let frame = tick_native(vec![answer(create.id, b"{}")]);
+        let navigate = request(&frame, "chat.open_link");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&navigate.payload).unwrap(),
+            serde_json::json!({"url":format!("duck://channel/{channel}")})
+        );
+    });
+}
+
+#[test]
+fn existing_dm_and_external_account_links_use_the_same_guest_opening_flow() {
+    on_a_deep_stack(|| {
+        let seated = session(true);
+        let (frame, _, props) = connected_room_with(&seated, roots());
+        let frame = tick_native(press(&frame, "Ada Lovelace"));
+        let existing = request(&frame, "rpc.view");
+        let query: serde_json::Value = serde_json::from_slice(&existing.payload).unwrap();
+        let channel = query["query"]["channel"]["channel_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let frame = tick_native(vec![answer(
+            existing.id,
+            &serde_json::to_vec(&serde_json::json!({"channel":{"id":channel}})).unwrap(),
+        )]);
+        assert_eq!(request(&frame, "chat.open_link").kind, "chat.open_link");
+        assert!(
+            !frame
+                .requests
+                .iter()
+                .any(|request| matches!(request.kind.as_str(), "op.submit" | "rpc.query"))
+        );
+        let mut linked = seated;
+        linked.dm_peer = "8".into();
+        linked.dm_serial = 1;
+        let frame = tick_native(vec![item(props, &encoded(&linked))]);
+        let existing = request(&frame, "rpc.view").id;
+        let repeated = tick_native(vec![item(props, &encoded(&linked))]);
+        assert!(
+            !repeated
+                .requests
+                .iter()
+                .any(|request| request.kind == "rpc.view")
+        );
+        let frame = tick_native(vec![answer(
+            existing,
+            &serde_json::to_vec(&serde_json::json!({"channel":{"id":channel}})).unwrap(),
+        )]);
+        assert!(
+            frame
+                .requests
+                .iter()
+                .any(|request| request.kind == "chat.open_link")
+        );
+    });
+}
+
+#[test]
+fn dm_creation_refusal_does_not_navigate_and_can_be_retried() {
+    on_a_deep_stack(|| {
+        let (frame, _) = connected_room();
+        let frame = tick_native(press(&frame, "Ada Lovelace"));
+        let frame = tick_native(vec![answer(
+            request(&frame, "rpc.view").id,
+            br#"{"channel":null}"#,
+        )]);
+        let frame = tick_native(vec![answer(
+            request(&frame, "rpc.query").id,
+            br#"{"account":{"number":8,"name":"Ada Lovelace"}}"#,
+        )]);
+        let frame = tick_native(vec![ducktape_view_guest::wire::Event::Response {
+            id: request(&frame, "op.submit").id,
+            result: Err("create refused".into()),
+            done: true,
+        }]);
+        assert!(
+            !frame
+                .requests
+                .iter()
+                .any(|request| request.kind.starts_with("chat."))
+        );
+        assert!(
+            texts(&frame)
+                .iter()
+                .any(|text| text.contains("create refused"))
+        );
+        let frame = tick_native(press(&frame, "Ada Lovelace"));
+        assert!(
+            frame
+                .requests
+                .iter()
+                .any(|request| request.kind == "rpc.view")
+        );
+    });
+}
+
+#[test]
+fn superseded_dm_reads_cannot_create_or_navigate() {
+    on_a_deep_stack(|| {
+        for reason in ["room", "account", "disconnect"] {
+            let mut seated = session(true);
+            let (frame, _, props) = connected_room_with(&seated, roots());
+            let frame = tick_native(press(&frame, "Ada Lovelace"));
+            let pending = request(&frame, "rpc.view").id;
+            match reason {
+                "room" => {
+                    let _ = tick_native(press(&frame, "ops"));
+                }
+                "account" => {
+                    seated.me = "acct:9".into();
+                    let _ = tick_native(vec![item(props, &encoded(&seated))]);
+                }
+                "disconnect" => {
+                    seated.connected = false;
+                    let _ = tick_native(vec![item(props, &encoded(&seated))]);
+                }
+                _ => unreachable!(),
+            }
+            let frame = tick_native(vec![answer(pending, br#"{"channel":null}"#)]);
+            assert!(
+                !frame.requests.iter().any(|request| matches!(
+                    request.kind.as_str(),
+                    "op.submit" | "rpc.query" | "chat.open_link"
+                )),
+                "{reason}"
+            );
+        }
+    });
+}

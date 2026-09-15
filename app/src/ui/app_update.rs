@@ -698,6 +698,7 @@ impl Ducktape {
         self.channel_reads = Vec::new();
         self.active_channel = "".to_owned();
         self.active_dm_peer = "".to_owned();
+        self.chat_dm_peer.clear();
         self.history_view = false;
         self.active_channel_name = "".to_owned();
         self.active_channel_archived = false;
@@ -3296,6 +3297,7 @@ impl Ducktape {
         if self.mutation_phase != MutationPhase::Idle {
             return Task::none();
         }
+        self.chat_dm_peer.clear();
         let next_channel = crate::backend::channel_switch_facts(
             self.channels.clone(),
             channel_id.to_owned(),
@@ -3374,6 +3376,7 @@ impl Ducktape {
             return Task::none();
         }
         self.active_dm_peer = "".to_owned();
+        self.chat_dm_peer.clear();
         self.history_view = false;
         self.chat_at_tail = true;
         self.chat_land_seq = 0;
@@ -3427,48 +3430,14 @@ impl Ducktape {
             AppMessage::ChannelWindowLoadReply(request_generation, Box::new(reply_message))
         })
     }
-    fn on_choose_dm(&mut self, peer_key: String) -> Task<AppMessage> {
-        if (self.mutation_phase != MutationPhase::Idle) || (peer_key).is_empty() {
+    fn on_choose_dm(&mut self, peer: String) -> Task<AppMessage> {
+        let may_navigate = self.mutation_phase == MutationPhase::Idle && !peer.is_empty();
+        if !may_navigate {
             return Task::none();
         }
-        self.channel_window_load_generation = self.channel_window_load_generation.wrapping_add(1);
-        if let Some(previous_handle) = self.channel_window_load_task.take() {
-            previous_handle.abort();
-        }
-        self.active_dm_peer = peer_key.to_owned();
-        let dm_room =
-            crate::backend::dm_room_of_peer(self.dm_peers.clone(), self.active_dm_peer.to_owned());
-        self.history_view = false;
-        self.chat_at_tail = true;
-        self.chat_land_seq = 0;
-        let next_channel = crate::backend::channel_switch_facts(
-            self.channels.clone(),
-            dm_room.to_owned(),
-            self.active_channel_name.to_owned(),
-        );
-        self.active_channel = dm_room.to_owned();
-        self.active_channel_name = next_channel.name.to_owned();
-        self.active_channel_archived = next_channel.archived;
-        self.active_channel_members_only = next_channel.members_only;
-        self.channel_members = Vec::new();
-        self.post_refusal = "".to_owned();
-        self.hydration_generation += 1;
-        self.hydration_retry_attempt = 0;
-        self.loading = true;
-        self.error = "".to_owned();
-        self.chat_generation += 1;
-        Task::perform(
-            crate::backend::open_dm(
-                self.connected_rpc.to_owned(),
-                self.password.to_owned(),
-                self.active_dm_peer.to_owned(),
-                self.chat_generation,
-            ),
-            |result| match result {
-                Ok(value) => AppMessage::ChatUpdated(value),
-                Err(error) => AppMessage::ChatLoadFailed(error),
-            },
-        )
+        self.chat_dm_peer = peer;
+        self.chat_dm_serial = self.chat_dm_serial.wrapping_add(1);
+        Task::none()
     }
     fn on_create_channel_submit(&mut self) -> Task<AppMessage> {
         if (self.loading || (self.mutation_phase != MutationPhase::Idle))
@@ -3749,6 +3718,7 @@ impl Ducktape {
         if next.generation != self.chat_generation {
             return Task::none();
         }
+        self.chat_dm_peer.clear();
         self.history_view = false;
         self.chat_at_tail = true;
         self.chat_land_seq = 0;
@@ -4031,9 +4001,6 @@ impl Ducktape {
             ChatIntent::ToggleCreate => Task::done(AppMessage::ToggleChannelCreate),
             ChatIntent::ChooseChannel => Task::done(AppMessage::ChooseChannel(
                 crate::module_view::event_text(&(event), "id"),
-            )),
-            ChatIntent::ChooseDm => Task::done(AppMessage::ChooseDm(
-                crate::module_view::event_text(&(event), "key"),
             )),
             ChatIntent::ShowHuddle => Task::done(AppMessage::ShowHuddle),
             ChatIntent::LeaveHuddle => Task::done(AppMessage::LeaveHuddleHere),
@@ -4945,6 +4912,7 @@ impl Ducktape {
         self.channel_reads = Vec::new();
         self.active_channel = "".to_owned();
         self.active_dm_peer = "".to_owned();
+        self.chat_dm_peer.clear();
         self.history_view = false;
         self.active_channel_name = "".to_owned();
         self.active_channel_archived = false;

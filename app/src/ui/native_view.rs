@@ -22,6 +22,8 @@ impl Ducktape {
                     self.dm_peers_generation,
                     self.channel_create_open,
                     &self.active_channel,
+                    &self.chat_dm_peer,
+                    self.chat_dm_serial,
                     self.chat_land_seq,
                     self.mutation_phase,
                     self.loading,

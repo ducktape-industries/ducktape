@@ -34,6 +34,7 @@ impl super::ChatView {
             Message::ToggleChannelCreate => self.on_toggle_channel_create(),
             Message::ChooseChannel(id) => self.on_choose_channel(id),
             Message::ChooseDm(peer_key) => self.on_choose_dm(peer_key),
+            Message::DmOpened(generation, result) => self.on_dm_opened(generation, result),
             Message::ToggleChannelSettings => self.on_toggle_channel_settings(),
             Message::ShowHuddle => self.on_show_huddle(),
             Message::LeaveHuddleHere => self.on_leave_huddle_here(),
@@ -220,6 +221,16 @@ impl super::ChatView {
         let changed_reader = self.endpoint != next.endpoint
             || self.network_chain_id != next.network_chain_id
             || self.me_key != next.me_key;
+        let requested_dm =
+            next.connected && !next.dm_peer.is_empty() && next.dm_serial != self.dm_request_serial;
+        let changed_dm_reader = changed_reader || self.me != next.me;
+        let cancel_dm = changed_dm_reader || !next.connected || moved_room || requested_dm;
+        if cancel_dm {
+            self.retire_dm();
+        }
+        if next.connected || next.dm_peer.is_empty() {
+            self.dm_request_serial = next.dm_serial;
+        }
         let rebound = changed_reader || (!self.connected && next.connected);
         if rebound {
             self.upload_handles.clear();
@@ -281,14 +292,23 @@ impl super::ChatView {
         self.refresh_pending();
         self.live_agents = next.live_agents.clone();
         self.loading = self.session_loading
+            || self.dm_opening.is_some()
             || ((!(self.active_channel).is_empty()) && (self.room_channel != self.active_channel));
         ::ducktape_view_guest::Task::batch([
+            if requested_dm {
+                ducktape_view_guest::Task::done(Message::ChooseDm(next.dm_peer))
+            } else {
+                ducktape_view_guest::Task::none()
+            },
             (::ducktape_view_guest::Task::done(moved_room)).map(Message::SessionSettled),
             (::ducktape_view_guest::Task::done(sent_now)).map(Message::SnapStream),
             (::ducktape_view_guest::Task::done(chord_now)).map(Message::CopyChord),
         ])
     }
     fn on_visibility_changed(&mut self, visible: bool) -> ducktape_view_guest::Task<Message> {
+        if !visible {
+            self.retire_dm();
+        }
         let was_visible = self.read_visit != ReadVisit::Hidden;
         if was_visible == visible {
             return ducktape_view_guest::Task::none();
@@ -514,7 +534,7 @@ impl super::ChatView {
             return ::ducktape_view_guest::Task::none();
         }
         self.room_channel = item.channel.to_owned();
-        self.loading = self.session_loading;
+        self.loading = self.session_loading || self.dm_opening.is_some();
         if !(item.error).is_empty() {
             return ::ducktape_view_guest::Task::none();
         }
@@ -706,6 +726,7 @@ impl super::ChatView {
         _root_seq: i64,
         target_seq: i64,
     ) -> ducktape_view_guest::Task<Message> {
+        self.retire_dm();
         self.search_phase = SearchPhase::Idle;
         self.search_hits = Vec::new();
         self.search_query = "".to_owned();
@@ -718,12 +739,52 @@ impl super::ChatView {
         ::ducktape_view_guest::Task::none()
     }
     fn on_choose_channel(&mut self, id: String) -> ducktape_view_guest::Task<Message> {
+        self.retire_dm();
         self.sent = crate::host::send_choose_channel(::std::convert::AsRef::as_ref(&(id)));
         ::ducktape_view_guest::Task::none()
     }
-    fn on_choose_dm(&mut self, peer_key: String) -> ducktape_view_guest::Task<Message> {
-        self.sent = crate::host::send_choose_dm(::std::convert::AsRef::as_ref(&(peer_key)));
-        ::ducktape_view_guest::Task::none()
+    fn retire_dm(&mut self) {
+        self.dm_opening.take();
+        self.dm_generation = self.dm_generation.wrapping_add(1);
+        self.loading = self.session_loading || self.room_channel != self.active_channel;
+    }
+    fn on_choose_dm(&mut self, peer: String) -> ducktape_view_guest::Task<Message> {
+        let may_open = self.connected && !self.session_busy && !peer.is_empty();
+        if !may_open {
+            return ducktape_view_guest::Task::none();
+        }
+        self.retire_dm();
+        let generation = self.dm_generation;
+        let (task, handle) = ducktape_view_guest::Task::perform(
+            crate::host::open_dm(self.me.clone(), peer),
+            move |result| Message::DmOpened(generation, result),
+        )
+        .abortable();
+        self.dm_opening = Some(handle.abort_on_drop());
+        self.loading = true;
+        self.host_error.clear();
+        task
+    }
+    fn on_dm_opened(
+        &mut self,
+        generation: u64,
+        result: Result<String, String>,
+    ) -> ducktape_view_guest::Task<Message> {
+        if generation != self.dm_generation {
+            return ducktape_view_guest::Task::none();
+        }
+        self.dm_opening.take();
+        self.loading = self.session_loading || self.room_channel != self.active_channel;
+        match result {
+            Ok(channel) => {
+                self.sent = crate::host::send_open_link(&format!("duck://channel/{channel}"));
+            }
+            Err(error) => {
+                self.host_error =
+                    crate::host::failure_note("Couldn’t open this conversation", &error);
+            }
+        }
+        ducktape_view_guest::Task::none()
     }
     fn on_toggle_channel_settings(&mut self) -> ducktape_view_guest::Task<Message> {
         if (self.active_channel).is_empty() {
@@ -752,6 +813,7 @@ impl super::ChatView {
     /// A link leaves for the app's own router; a preview card gives way to
     /// the tab it lands on.
     fn on_open_message_link(&mut self, url: String) -> ducktape_view_guest::Task<Message> {
+        self.retire_dm();
         self.preview_link = "".to_owned();
         self.sent = crate::host::send_open_link(::std::convert::AsRef::as_ref(&(url)));
         ::ducktape_view_guest::Task::none()

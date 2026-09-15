@@ -51,6 +51,11 @@ pub(crate) enum ReadVisit {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ChatView {
     #[serde(skip)]
+    pub(crate) dm_opening: Option<ducktape_view_guest::task::Handle>,
+    #[serde(skip)]
+    pub(crate) dm_generation: u64,
+    pub(crate) dm_request_serial: i64,
+    #[serde(skip)]
     pub(crate) upload_handles: std::collections::HashMap<String, ducktape_view_guest::task::Handle>,
     pub(crate) sending: std::collections::BTreeMap<String, (String, crate::host::PendingSend)>,
     pub(crate) composers: std::collections::BTreeMap<String, ducktape_view_composer::Draft>,
@@ -209,6 +214,7 @@ pub enum Message {
     ToggleChannelCreate,
     ChooseChannel(String),
     ChooseDm(String),
+    DmOpened(u64, Result<String, String>),
     ToggleChannelSettings,
     ShowHuddle,
     LeaveHuddleHere,
@@ -261,6 +267,9 @@ impl ::std::fmt::Debug for Message {
 impl ChatView {
     fn state() -> Self {
         Self {
+            dm_opening: None,
+            dm_generation: 0,
+            dm_request_serial: 0,
             composers: Default::default(),
             sending: Default::default(),
             upload_handles: Default::default(),
@@ -482,6 +491,22 @@ impl ChatView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hiding_a_pending_dm_retires_navigation_and_restores_the_loaded_room() {
+        let mut state = ChatView::state();
+        state.connected = true;
+        state.active_channel = "general".into();
+        state.room_channel = "general".into();
+        state.loading = true;
+        state.dm_generation = 4;
+        state.message_edit_draft = "unsaved edit".into();
+        let _ = state.update(Message::VisibilityChanged(false));
+        let _ = state.update(Message::DmOpened(4, Ok("dm-stale".into())));
+        assert!(!state.loading);
+        assert_eq!(state.active_channel, "general");
+        assert_eq!(state.message_edit_draft, "unsaved edit");
+    }
+
     #[test]
     fn run_cancel_replies_preserve_edits_and_belong_to_their_connection() {
         let mut state = ChatView::state();

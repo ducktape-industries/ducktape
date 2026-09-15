@@ -482,6 +482,8 @@ struct ChatProps<'a> {
     names_serial: i64,
     channel_create_open: bool,
     active_channel: &'a str,
+    dm_peer: &'a str,
+    dm_serial: i64,
     land_seq: i64,
     busy: bool,
     loading: bool,
@@ -527,6 +529,8 @@ pub fn chat_view(
     names_serial: i64,
     channel_create_open: bool,
     active_channel: &str,
+    dm_peer: &str,
+    dm_serial: i64,
     land_seq: i64,
     mutation_phase: crate::MutationPhase,
     loading: bool,
@@ -556,6 +560,8 @@ pub fn chat_view(
         names_serial,
         channel_create_open,
         active_channel,
+        dm_peer,
+        dm_serial,
         land_seq,
         busy: mutation_phase != crate::MutationPhase::Idle,
         loading,
@@ -638,7 +644,6 @@ pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
         "open_hit" => Intent::OpenHit,
         "toggle_create" => Intent::ToggleCreate,
         "choose_channel" => Intent::ChooseChannel,
-        "choose_dm" => Intent::ChooseDm,
         "show_huddle" => Intent::ShowHuddle,
         "leave_huddle" => Intent::LeaveHuddle,
         "join_huddle" => Intent::JoinHuddle,
@@ -737,7 +742,6 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "open_hit",
             "toggle_create",
             "choose_channel",
-            "choose_dm",
             "show_huddle",
             "leave_huddle",
             "join_huddle",
@@ -3669,7 +3673,7 @@ pub(crate) mod tests {
         // the agents view signs its own pause and save through `op.submit`
         assert_eq!(intents_of("agents"), ["open_run", "open_link"]);
         let chat = intents_of("chat");
-        assert_eq!(chat.len(), 13);
+        assert_eq!(chat.len(), 12);
         // the writes the view signs for itself are nobody's intent
         for signed in ["react", "edit", "delete", "rename", "search", "mark_read"] {
             assert!(!chat.contains(&signed), "{signed} is an op.submit now");
@@ -6416,6 +6420,8 @@ pub(crate) mod tests {
             names_serial: 0,
             channel_create_open: false,
             active_channel: room,
+            dm_peer: "",
+            dm_serial: 0,
             land_seq,
             busy: false,
             loading: false,
