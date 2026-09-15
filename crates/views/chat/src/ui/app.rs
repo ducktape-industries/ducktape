@@ -127,6 +127,14 @@ pub struct ChatView {
     /// The pictures asked for and not yet answered.
     #[serde(skip)]
     pub(crate) pictures_pending: ::std::collections::BTreeSet<String>,
+    /// The attachment open in the preview card over the screen, by its duck
+    /// link; "" is no card. The serial moves on every open so the read
+    /// subscription re-runs even for the same file.
+    pub(crate) preview_link: String,
+    pub(crate) preview_serial: i64,
+    /// What that read answered. Not a snapshot's to keep: the card re-reads.
+    #[serde(skip)]
+    pub(crate) preview: crate::host::PreviewItem,
     /// Where the pointer last pressed, in chat-screen pixels: a message menu
     /// opens there.
     pub(crate) press_x: f64,
@@ -160,6 +168,10 @@ pub enum Message {
     PressedAt(f64, f64),
     /// The host decoded (or refused) the picture behind a duck link.
     PictureLoaded(String, Result<(i64, i64), String>),
+    /// A press on a message's file: the preview card opens over the screen.
+    OpenAttachment(String),
+    ClosePreview,
+    PreviewArrived(crate::host::PreviewItem),
     /// Boxed: the session item dwarfs every other variant.
     SessionArrived(Box<crate::host::SessionItem>),
     SessionSettled(bool),
@@ -313,6 +325,9 @@ impl ChatView {
             chat_viewport_height: 800.0,
             pictures: ::std::collections::BTreeMap::new(),
             pictures_pending: ::std::collections::BTreeSet::new(),
+            preview_link: "".to_owned(),
+            preview_serial: 0,
+            preview: crate::host::PreviewItem::default(),
             press_x: 0.0,
             press_y: 0.0,
             menu_x: 0.0,
@@ -402,6 +417,15 @@ impl ChatView {
                     self.search_key.clone(),
                 )
                 .map(Message::SearchArrived)])
+            } else {
+                ::ducktape_view_guest::Subscription::none()
+            },
+            if self.preview_reads() {
+                ::ducktape_view_guest::Subscription::batch([crate::host::preview(
+                    self.preview_serial,
+                    crate::host::attachment_file_path(&self.preview_link),
+                )
+                .map(Message::PreviewArrived)])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
@@ -782,6 +806,110 @@ mod tests {
             (state.chat_viewport_width, state.chat_viewport_height),
         );
         assert_eq!((x, y), (980.0, 304.0));
+    }
+
+    /// A pressed attachment previews in a modal card over the screen — a
+    /// picture from the host's slot, a file from a read the card keys —
+    /// and Files is a button inside it, never where the press lands.
+    #[test]
+    fn attachment_press_previews_in_place_and_files_is_one_press_away() {
+        let doc = "duck://files/shared/attachments/u1/notes.txt".to_owned();
+        let shot = "duck://files/shared/attachments/u1/shot.png".to_owned();
+        let mut state = ChatView::state();
+        state.connected = true;
+        state.active_channel = "room".into();
+        state.messages = vec![crate::host::ChatMessage {
+            seq: 1,
+            view_key: 11,
+            blocks: vec![
+                crate::host::ChatBlock {
+                    kind: "attachment".into(),
+                    text: "notes.txt".into(),
+                    link: doc.clone(),
+                    ..Default::default()
+                },
+                crate::host::ChatBlock {
+                    kind: "attachment".into(),
+                    text: "shot.png".into(),
+                    link: shot.clone(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }];
+        state.pictures.insert(shot.clone(), (800, 600));
+        let overlays = |state: &ChatView| {
+            let mut found = Vec::new();
+            state.view().for_each_mut(&mut |node| {
+                if let wire::Node::Overlay {
+                    key, on_dismiss, ..
+                } = node
+                {
+                    assert!(on_dismiss.is_some(), "a press outside the card closes it");
+                    found.push(key.clone());
+                }
+            });
+            found
+        };
+        let buttons = |state: &ChatView| {
+            let mut labels = Vec::new();
+            state.view().for_each_mut(&mut |node| {
+                if let wire::Node::Button {
+                    label: Some(label),
+                    on_press: Some(_),
+                    ..
+                } = node
+                {
+                    labels.push(label.clone());
+                }
+            });
+            labels
+        };
+        assert!(overlays(&state).is_empty());
+        assert!(buttons(&state).contains(&"Open notes.txt".to_owned()));
+
+        let _ = state.update(Message::OpenAttachment(doc.clone()));
+        assert!(state.preview_reads(), "a text file is read for its card");
+        assert_eq!(overlays(&state).len(), 1);
+        let labels = buttons(&state);
+        assert!(labels.contains(&"Open in Files".to_owned()));
+        assert!(labels.contains(&"Close preview".to_owned()));
+
+        let _ = state.update(Message::PreviewArrived(crate::host::PreviewItem {
+            path: "/shared/attachments/u1/notes.txt".into(),
+            read: true,
+            binary: true,
+            text: crate::host::BINARY_PLATE.into(),
+            ..Default::default()
+        }));
+        let mut plates = 0;
+        state.view().for_each_mut(&mut |node| {
+            if let wire::Node::Linear { key, .. } = node
+                && key.ends_with("/preview/binary")
+            {
+                plates += 1;
+            }
+        });
+        assert_eq!(plates, 1, "a binary file shows the no-preview plate");
+
+        let _ = state.update(Message::OpenAttachment(shot.clone()));
+        assert!(!state.preview_reads(), "a decoded picture draws from the slot");
+        let mut pictures = 0;
+        state.view().for_each_mut(&mut |node| {
+            if let wire::Node::Surface { key, name, .. } = node
+                && name == "picture"
+                && key.ends_with("/preview/picture")
+            {
+                pictures += 1;
+            }
+        });
+        assert_eq!(pictures, 1);
+
+        let _ = state.update(Message::OpenMessageLink(shot));
+        assert!(overlays(&state).is_empty(), "leaving for Files closes the card");
+        let _ = state.update(Message::OpenAttachment(doc));
+        let _ = state.update(Message::ClosePreview);
+        assert!(overlays(&state).is_empty());
     }
 
     #[test]
