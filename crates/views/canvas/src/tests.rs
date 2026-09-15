@@ -783,8 +783,10 @@ fn the_painter_and_the_editor_read_one_description_of_a_label() {
     let painting = include_str!("presentation.rs");
     assert_eq!(
         painting.matches("self.lettering(").count(),
-        2,
-        "the painter asks once and the inline editor asks once"
+        3,
+        "the painter asks once, the inline editor once, and the gauge that \
+         decides how tall the card must be once — a gauge reading a second \
+         description would size the card for words nobody draws"
     );
     assert!(
         !painting.contains("size: Some((14."),
@@ -1230,5 +1232,117 @@ fn the_two_keys_that_leave_a_card_are_not_the_same_answer() {
         source.matches("Some(Message::Cancel)").count(),
         1,
         "Escape leaves through the cancel path, once"
+    );
+}
+
+#[test]
+fn a_card_grows_to_hold_what_you_type_and_keeps_the_height_when_it_is_saved() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            text: "one line".into(),
+            ..Default::default()
+        },
+    });
+    view.selected = ["a".into()].into();
+    view.begin_text();
+    let short = view.visible().unwrap().shapes["a"].shape.height;
+    // The host lays the gauge out and says the words come to 420 px. At this
+    // zoom that is 420 board units, well past the 140 the card was made at.
+    view.inline.as_mut().unwrap().document = Editor::new("a lot more words");
+    view.on_measured(200., 420.);
+    assert_eq!(
+        view.visible().unwrap().shapes["a"].shape.height,
+        420,
+        "the card under the caret is drawn as tall as its words"
+    );
+    // A shorter measurement does not take the room back while you are still
+    // in the card — the words that need it may come back with the next key.
+    view.on_measured(200., 300.);
+    assert_eq!(view.visible().unwrap().shapes["a"].shape.height, 420);
+    view.finish_text();
+    let saved = view.visible().unwrap().shapes["a"].shape.clone();
+    assert_eq!(saved.text, "a lot more words");
+    assert_eq!(
+        saved.height, 420,
+        "a card that snapped back on save was clipping the whole time"
+    );
+    assert!(saved.height > short);
+}
+
+#[test]
+fn a_card_that_already_holds_its_words_is_left_alone_and_a_refused_one_gives_the_room_back() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            text: "one line".into(),
+            ..Default::default()
+        },
+    });
+    view.selected = ["a".into()].into();
+    view.begin_text();
+    // Words that fit ask for nothing: the card keeps the size it was drawn at
+    // and leaving it saves nothing.
+    view.on_measured(200., 60.);
+    assert_eq!(view.visible().unwrap().shapes["a"].shape.height, 140);
+    let before = view.pending.len();
+    view.finish_text();
+    assert_eq!(view.pending.len(), before, "nothing changed, nothing saved");
+    // A card the board will not take gives the room back when you leave it.
+    // The height rode the words, so it goes out with them: a card left holding
+    // its old sentence in a box sized for one it never kept is a card that
+    // remembers a draft nobody saved.
+    view.begin_text();
+    view.inline.as_mut().unwrap().document = Editor::new("x".repeat(boards::MAX_TEXT + 10));
+    view.on_measured(200., 500.);
+    assert_eq!(view.visible().unwrap().shapes["a"].shape.height, 500);
+    view.finish_text();
+    assert!(view.inline.is_some(), "the board refuses text this long");
+    view.on_cancel();
+    let left = view.visible().unwrap().shapes["a"].shape.clone();
+    assert_eq!(left.height, 140, "Escape leaves the card as it was");
+    assert_eq!(left.text, "one line");
+}
+
+/// The gauge is the only way a card can know how tall its words are: the
+/// native editor shows one line when asked to size itself, and the wire has no
+/// verb for measuring a document. It must carry what the editor holds — not
+/// what the board holds — or the card is sized for the text you started with.
+#[test]
+fn the_gauge_carries_the_words_being_typed_and_not_the_ones_already_saved() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            text: "saved words".into(),
+            ..Default::default()
+        },
+    });
+    view.selected = ["a".into()].into();
+    view.begin_text();
+    view.inline.as_mut().unwrap().document = Editor::new("typed words");
+    let json = serde_json::to_string(&view.view()).unwrap();
+    let gauge = json.split("boards/gauge-pin").nth(1).unwrap();
+    let gauge = gauge.split("boards/editor-pin").next().unwrap();
+    assert!(
+        gauge.contains("typed words"),
+        "the gauge measures the document, not the board"
+    );
+    // And it is invisible: a second copy of the words over the card would
+    // double every glyph you typed.
+    assert!(
+        gauge.contains("\"color\":["),
+        "the gauge names a colour of its own"
+    );
+    let ink = gauge.split("\"color\":[").nth(1).unwrap();
+    let ink = ink.split(']').next().unwrap();
+    assert!(
+        ink.ends_with("0.0"),
+        "the gauge is drawn in nothing, it read {ink}"
     );
 }
