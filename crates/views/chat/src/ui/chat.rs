@@ -580,7 +580,7 @@ impl ChatView {
                 native::column(
                     key.clone(),
                     [
-                        native::text_size(native::title(format!("{key}/name"), name), 20.),
+                        native::title(format!("{key}/name"), name),
                         native::wrapping(native::secondary(format!("{key}/detail"), detail)),
                         native::gap(4.),
                         native::divider(format!("{key}/rule")),
