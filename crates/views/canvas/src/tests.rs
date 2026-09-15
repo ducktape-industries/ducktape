@@ -247,6 +247,30 @@ fn key(
     );
 }
 
+/// Press a key, hold it for `repeats` more, then let it go.
+fn hold(view: &mut BoardsView, named: wire::keyboard::Named, repeats: usize) {
+    let state = || wire::keyboard::KeyState {
+        key: wire::keyboard::Key::Named(named),
+        modified_key: wire::keyboard::Key::Named(named),
+        physical_key: wire::keyboard::Physical::Unidentified(
+            wire::keyboard::NativeCode::Unidentified,
+        ),
+        location: wire::keyboard::Location::Standard,
+        modifiers: Default::default(),
+    };
+    for index in 0..=repeats {
+        view.on_key(
+            wire::keyboard::Event::Press {
+                state: state(),
+                text: None,
+                repeat: index > 0,
+            },
+            false,
+        );
+    }
+    view.on_key(wire::keyboard::Event::Release(state()), false);
+}
+
 #[test]
 fn selection_moves_and_undoes_as_one_gesture_before_receipts() {
     let mut view = view();
@@ -984,5 +1008,122 @@ fn a_handle_on_a_flat_line_stays_where_the_pointer_put_it() {
         rule.width >= 400,
         "the far end did not travel: {}",
         rule.width
+    );
+}
+
+#[test]
+fn an_edge_handle_changes_one_side_and_leaves_the_other_where_it_was() {
+    let mut view = view();
+    view.snap = false;
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            width: 200,
+            height: 120,
+            ..Default::default()
+        },
+    });
+    view.selected = ["a".into()].into();
+    // the middle of the right edge is world (200,60) = screen (280,140)
+    drag(&mut view, &[[280., 140.], [340., 200.], [400., 220.]]);
+    let a = view.visible().unwrap().shapes["a"].shape.clone();
+    assert_eq!(a.height, 120, "an edge handle moved the other side too");
+    assert_eq!([a.x, a.y], [0, 0], "an edge handle moved the far corner");
+    assert!(a.width >= 300, "the edge did not travel: {}", a.width);
+}
+
+#[test]
+fn a_selection_of_several_is_taken_by_the_one_box_drawn_around_it() {
+    let mut view = view();
+    view.snap = false;
+    for (id, x) in [("a", 0), ("b", 300)] {
+        view.edit(Change::Create {
+            id: id.into(),
+            shape: Shape {
+                x,
+                width: 200,
+                height: 100,
+                ..Default::default()
+            },
+        });
+    }
+    view.selected = ["a".into(), "b".into()].into();
+    let board = view.visible().unwrap();
+    let (bounds, members) = view.group(&board).expect("a selection of two has a box");
+    assert_eq!(
+        bounds,
+        [0., 0., 500., 100.],
+        "the box is the span of the two"
+    );
+    assert_eq!(members.len(), 2);
+    // the middle of that box's right edge is world (500,50) = screen (580,130)
+    drag(&mut view, &[[580., 130.], [700., 130.], [830., 130.]]);
+    let board = view.visible().unwrap();
+    let (a, b) = (
+        board.shapes["a"].shape.clone(),
+        board.shapes["b"].shape.clone(),
+    );
+    // the box went from 500 wide to 750, and each member took its share of it
+    assert_eq!(a.width, 300);
+    assert_eq!([b.x, b.width], [450, 300]);
+    assert_eq!(
+        [a.height, b.height],
+        [100, 100],
+        "the other axis was pinned"
+    );
+    // one shape alone wears its own handles, so no second box is drawn round it
+    view.selected = ["a".into()].into();
+    let board = view.visible().unwrap();
+    assert!(view.group(&board).is_none());
+}
+
+#[test]
+fn a_held_arrow_key_is_one_edit_however_long_it_is_held() {
+    let mut view = view();
+    view.snap = false;
+    card(&mut view, "a", 0);
+    let settled = view.pending.len();
+    let undos = view.undo.len();
+    view.selected = ["a".into()].into();
+    hold(&mut view, wire::keyboard::Named::ArrowRight, 29);
+    let board = view.visible().unwrap();
+    assert_eq!(
+        board.shapes["a"].shape.x, 30,
+        "every repeat moved the card by one"
+    );
+    assert_eq!(
+        view.pending.len() - settled,
+        1,
+        "thirty repeats went to consensus as one edit"
+    );
+    assert_eq!(
+        view.undo.len() - undos,
+        1,
+        "and come back in one press of undo"
+    );
+}
+
+#[test]
+fn a_nudge_shows_on_the_board_before_it_is_let_go_of() {
+    let mut view = view();
+    view.snap = false;
+    card(&mut view, "a", 0);
+    let settled = view.pending.len();
+    view.selected = ["a".into()].into();
+    key(
+        &mut view,
+        wire::keyboard::Key::Named(wire::keyboard::Named::ArrowRight),
+        Default::default(),
+        false,
+    );
+    assert_eq!(
+        view.visible().unwrap().shapes["a"].shape.x,
+        1,
+        "a held key moves the board the way a held button does"
+    );
+    assert_eq!(
+        view.pending.len(),
+        settled,
+        "and nothing was sent for it yet"
     );
 }

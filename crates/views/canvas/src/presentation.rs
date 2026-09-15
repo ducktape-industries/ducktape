@@ -1198,8 +1198,37 @@ impl BoardsView {
             if !interaction::free(s) {
                 continue;
             }
-            for corner in [[-1, -1], [1, -1], [-1, 1], [1, 1]] {
+            for corner in interaction::HANDLES {
                 let world = interaction::corner_point(s, corner);
+                out.push(grip(self.screen(world[0], world[1])));
+            }
+        }
+        // Several shapes are one thing to hold, so they get one box to hold it
+        // by. Without it a multiple selection is a scatter of rings that says
+        // what is in it and nothing about what taking hold of it would do.
+        if let Some((bounds, _)) = self.group(board) {
+            let origin = self.screen(bounds[0], bounds[1]);
+            let size = [bounds[2] * self.zoom, bounds[3] * self.zoom];
+            out.push(rectangle(
+                [origin[0] - 6., origin[1] - 6.],
+                [size[0] + 12., size[1] + 12.],
+                None,
+                Rgba(alpha(p.accent, 0.7)),
+                1.,
+                2.,
+            ));
+            let grip = |at: [f32; 2]| Draw::Draw {
+                shape: Geometry::Rectangle {
+                    position: [at[0] - 3.5, at[1] - 3.5],
+                    size: [7., 7.],
+                    radius: [1.5; 4],
+                },
+                fill: Some(Rgba(p.background)),
+                even_odd: false,
+                stroke: Some(pen(accent, 1.5)),
+            };
+            for corner in interaction::HANDLES {
+                let world = interaction::handle_point(bounds, corner);
                 out.push(grip(self.screen(world[0], world[1])));
             }
         }
@@ -1291,6 +1320,8 @@ impl BoardsView {
             Gesture::Idle
             | Gesture::Pan { .. }
             | Gesture::Move { .. }
+            | Gesture::Scale { .. }
+            | Gesture::Nudge { .. }
             | Gesture::Resize { .. }
             | Gesture::Erase { .. } => {
                 let _ = board;

@@ -7,6 +7,144 @@ impl BoardsView {
             .then(|| self.selected.first())
             .flatten()
     }
+    /// The box around a selection of more than one, and the shapes inside it
+    /// that a scale may move — a connector holding a card is not one of them,
+    /// because its box is dictated by the cards it names and it will follow
+    /// them without being told.
+    ///
+    /// `None` for a selection of one: that shape wears its own handles, and a
+    /// second box around a single outline would read as two selections.
+    pub(super) fn group(&self, board: &Board) -> Option<([f32; 4], BTreeMap<String, Shape>)> {
+        if self.selected.len() < 2 || self.inline.is_some() {
+            return None;
+        }
+        let mut shapes = BTreeMap::new();
+        let mut bounds = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+        for id in &self.selected {
+            let Some(record) = board.shapes.get(id) else {
+                continue;
+            };
+            let s = &record.shape;
+            bounds = [
+                bounds[0].min(s.x as f32),
+                bounds[1].min(s.y as f32),
+                bounds[2].max((s.x + s.width) as f32),
+                bounds[3].max((s.y + s.height) as f32),
+            ];
+            if free(s) {
+                shapes.insert(id.clone(), s.clone());
+            }
+        }
+        if shapes.is_empty() {
+            return None;
+        }
+        Some((
+            [
+                bounds[0],
+                bounds[1],
+                bounds[2] - bounds[0],
+                bounds[3] - bounds[1],
+            ],
+            shapes,
+        ))
+    }
+    /// The box a handle drag leaves behind, given the box it started from.
+    /// The same arithmetic a single shape's resize uses, over a group's box:
+    /// the handle moves, the opposite side stays, and a sign of zero on an
+    /// axis pins that axis entirely.
+    fn dragged_box(
+        &self,
+        bounds: [f32; 4],
+        corner: [i32; 2],
+        delta: [f32; 2],
+        least: [f32; 2],
+    ) -> [f32; 4] {
+        let mut size = [
+            (bounds[2] + delta[0] * corner[0] as f32).clamp(least[0], boards::MAX_SIZE as f32),
+            (bounds[3] + delta[1] * corner[1] as f32).clamp(least[1], boards::MAX_SIZE as f32),
+        ];
+        if self.modifiers.shift && bounds[2] > 0. && bounds[3] > 0. {
+            let ratio = bounds[2] / bounds[3];
+            size[0] = size[0].max(size[1] * ratio).min(boards::MAX_SIZE as f32);
+            size[1] = (size[0] / ratio).clamp(least[1], boards::MAX_SIZE as f32);
+        }
+        [
+            bounds[0]
+                + if corner[0] < 0 {
+                    bounds[2] - size[0]
+                } else {
+                    0.
+                },
+            bounds[1]
+                + if corner[1] < 0 {
+                    bounds[3] - size[1]
+                } else {
+                    0.
+                },
+            size[0],
+            size[1],
+        ]
+    }
+    /// Every member re-placed into the box the handle drew, keeping the share
+    /// of it that it had. Two changes per shape and not a third: a card's
+    /// samples are already stored against its own box, so a run scales with
+    /// the box it is given and needs no re-routing.
+    fn scaled(
+        &self,
+        corner: [i32; 2],
+        start: [f32; 2],
+        point: [f32; 2],
+        bounds: [f32; 4],
+        shapes: &BTreeMap<String, Shape>,
+    ) -> Vec<Change> {
+        let delta = [point[0] - start[0], point[1] - start[1]];
+        if delta[0].hypot(delta[1]) * self.zoom < 3. {
+            return Vec::new();
+        }
+        // The group may not shrink past the point where its smallest card
+        // would stop being a card — the module refuses that shape, and a
+        // refused change would drop the whole gesture rather than this member.
+        let floor = shapes.values().fold([0_f32; 2], |a, s| {
+            let least = least(s);
+            let share = |axis: usize, span: f32, size: f32| {
+                if size <= 0. {
+                    0.
+                } else {
+                    least[axis] * span / size
+                }
+            };
+            [
+                a[0].max(share(0, bounds[2], s.width as f32)),
+                a[1].max(share(1, bounds[3], s.height as f32)),
+            ]
+        });
+        let drawn = self.dragged_box(bounds, corner, delta, floor);
+        let scale = |axis: usize| {
+            if bounds[2 + axis] > 0. {
+                drawn[2 + axis] / bounds[2 + axis]
+            } else {
+                1.
+            }
+        };
+        let (sx, sy) = (scale(0), scale(1));
+        let mut changes = Vec::new();
+        for (id, s) in shapes {
+            let x = drawn[0] + (s.x as f32 - bounds[0]) * sx;
+            let y = drawn[1] + (s.y as f32 - bounds[1]) * sy;
+            let least = least(s);
+            changes.push(Change::Move {
+                id: id.clone(),
+                x: coordinate(x),
+                y: coordinate(y),
+            });
+            changes.push(Change::Resize {
+                id: id.clone(),
+                width: (s.width as f32 * sx).round().max(least[0]) as i32,
+                height: (s.height as f32 * sy).round().max(least[1]) as i32,
+            });
+        }
+        changes
+    }
     pub(super) fn on_key(&mut self, event: Event, captured: bool) -> Task<Message> {
         match event {
             Event::Modifiers(modifiers) => self.on_modifiers(modifiers),
@@ -23,7 +161,14 @@ impl BoardsView {
         if state.key == Key::Named(Named::Space) {
             self.space_pan = false;
         }
-        Task::none()
+        let arrow = matches!(
+            state.key,
+            Key::Named(Named::ArrowLeft | Named::ArrowRight | Named::ArrowUp | Named::ArrowDown)
+        );
+        if !arrow {
+            return Task::none();
+        }
+        self.settle()
     }
     fn on_key_press(
         &mut self,
@@ -57,7 +202,11 @@ impl BoardsView {
                 Task::none()
             };
         }
-        match (command, key.as_str()) {
+        // Any key that is not the one being held ends the hold, so a nudge
+        // reaches the board before whatever comes next reads it.
+        let arrow = key.starts_with("Arrow");
+        let settled = if arrow { Task::none() } else { self.settle() };
+        let acted = match (command, key.as_str()) {
             (true, "a") => self.on_select_all(),
             (true, "c") if !repeat => self.on_copy(),
             (true, "x") if !repeat => self.on_cut(),
@@ -99,7 +248,8 @@ impl BoardsView {
             (_, "+" | "=") => self.on_zoom(1.25),
             (_, "-" | "_") => self.on_zoom(0.8),
             _ => Task::none(),
-        }
+        };
+        Task::batch([settled, acted])
     }
     pub(super) fn on_tool(&mut self, tool: Tool) -> Task<Message> {
         let save = self.finish_text();
@@ -188,7 +338,7 @@ impl BoardsView {
         if editing_here {
             return Task::none();
         }
-        let save = self.finish_text();
+        let save = Task::batch([self.settle(), self.finish_text()]);
         if self.inline.is_some() {
             return save;
         }
@@ -246,7 +396,7 @@ impl BoardsView {
                 }
             }
             if free(shape) {
-                for corner in [[-1, -1], [1, -1], [-1, 1], [1, 1]] {
+                for corner in HANDLES {
                     let target = corner_point(shape, corner);
                     if (point[0] - target[0]).hypot(point[1] - target[1]) <= 9. / self.zoom {
                         self.gesture = Gesture::Resize {
@@ -258,6 +408,23 @@ impl BoardsView {
                         };
                         return Task::none();
                     }
+                }
+            }
+        }
+        // Several shapes are taken by the box drawn around them, not by any
+        // one of their own outlines: the handles belong to the group.
+        if let Some((bounds, shapes)) = self.group(&board) {
+            for corner in HANDLES {
+                let target = handle_point(bounds, corner);
+                if (point[0] - target[0]).hypot(point[1] - target[1]) <= 9. / self.zoom {
+                    self.gesture = Gesture::Scale {
+                        corner,
+                        start: point,
+                        point,
+                        bounds,
+                        shapes,
+                    };
+                    return Task::none();
                 }
             }
         }
@@ -445,12 +612,14 @@ impl BoardsView {
             _ => None,
         };
         match &mut self.gesture {
-            Gesture::Idle => {}
+            // The pointer moving says nothing about a key being held down.
+            Gesture::Idle | Gesture::Nudge { .. } => {}
             Gesture::Pan { start, camera } => {
                 self.camera = [camera[0] + x - start[0], camera[1] + y - start[1]]
             }
             Gesture::Move { point: p, .. }
             | Gesture::Resize { point: p, .. }
+            | Gesture::Scale { point: p, .. }
             | Gesture::Create { point: p, .. }
             | Gesture::Endpoint { point: p, .. } => *p = point,
             Gesture::Sketch { points } => {
@@ -537,6 +706,21 @@ impl BoardsView {
             } => self
                 .routed(id, *end, *point, shape, None)
                 .into_iter()
+                .collect(),
+            Gesture::Scale {
+                corner,
+                start,
+                point,
+                bounds,
+                shapes,
+            } => self.scaled(*corner, *start, *point, *bounds, shapes),
+            Gesture::Nudge { shapes, offset } => shapes
+                .iter()
+                .map(|(id, s)| Change::Move {
+                    id: id.clone(),
+                    x: coordinate((s.x + offset[0]) as f32),
+                    y: coordinate((s.y + offset[1]) as f32),
+                })
                 .collect(),
             Gesture::Move {
                 start,
@@ -779,6 +963,8 @@ impl BoardsView {
             | Gesture::Pan { .. }
             | Gesture::Marquee { .. }
             | Gesture::Move { .. }
+            | Gesture::Scale { .. }
+            | Gesture::Nudge { .. }
             | Gesture::Resize { .. } => self.edit_many(changes),
         }
     }
@@ -1063,25 +1249,45 @@ impl BoardsView {
         Task::none()
     }
     fn nudge(&mut self, x: i32, y: i32) -> Task<Message> {
+        if let Gesture::Nudge { offset, .. } = &mut self.gesture {
+            offset[0] += x;
+            offset[1] += y;
+            return Task::none();
+        }
         let Some(board) = self.visible() else {
             return Task::none();
         };
-        self.edit_many(
-            self.selected
-                .iter()
-                .filter_map(|id| {
-                    board
-                        .shapes
-                        .get(id)
-                        .filter(|r| free(&r.shape))
-                        .map(|r| Change::Move {
-                            id: id.clone(),
-                            x: coordinate((r.shape.x + x) as f32),
-                            y: coordinate((r.shape.y + y) as f32),
-                        })
-                })
-                .collect(),
-        )
+        let shapes: BTreeMap<String, Shape> = self
+            .selected
+            .iter()
+            .filter_map(|id| {
+                board
+                    .shapes
+                    .get(id)
+                    .filter(|r| free(&r.shape))
+                    .map(|r| (id.clone(), r.shape.clone()))
+            })
+            .collect();
+        if shapes.is_empty() {
+            return Task::none();
+        }
+        self.gesture = Gesture::Nudge {
+            shapes,
+            offset: [x, y],
+        };
+        Task::none()
+    }
+    /// What the keyboard has in hand, handed to the board. A gesture the
+    /// keyboard drives has no button coming up to end it, so it is ended by
+    /// whatever starts the next one — the key going up, another key, or the
+    /// pointer.
+    pub(super) fn settle(&mut self) -> Task<Message> {
+        if !matches!(self.gesture, Gesture::Nudge { .. }) {
+            return Task::none();
+        }
+        let changes = self.gesture_changes();
+        self.gesture = Gesture::Idle;
+        self.edit_many(changes)
     }
     pub(super) fn on_undo(&mut self) -> Task<Message> {
         if self.pending.len() >= 64 {
@@ -1417,6 +1623,15 @@ const MAX_SAMPLES: usize = 4096;
 pub(super) fn free(s: &Shape) -> bool {
     s.from.is_none() && s.to.is_none()
 }
+/// A card's smallest size, which the module enforces, and a run's, which it
+/// does not — a straight horizontal line is legitimately zero high.
+pub(super) fn least(s: &Shape) -> [f32; 2] {
+    if s.kind.is_path() {
+        [0., 0.]
+    } else {
+        [40., 32.]
+    }
+}
 fn axis_start(s: &Shape, axis: usize) -> f32 {
     if axis == 0 { s.x as f32 } else { s.y as f32 }
 }
@@ -1659,11 +1874,33 @@ fn intersects(a: [f32; 4], b: [f32; 4]) -> bool {
     a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1]
 }
 pub(super) fn corner_point(s: &Shape, c: [i32; 2]) -> [f32; 2] {
-    [
-        s.x as f32 + if c[0] > 0 { s.width as f32 } else { 0. },
-        s.y as f32 + if c[1] > 0 { s.height as f32 } else { 0. },
-    ]
+    handle_point([s.x as f32, s.y as f32, s.width as f32, s.height as f32], c)
 }
+/// Where a handle sits on a box given as origin and size. A sign of zero on an
+/// axis is the middle of it — the edge handle that changes the other axis and
+/// leaves this one exactly where it was.
+pub(super) fn handle_point(box_: [f32; 4], c: [i32; 2]) -> [f32; 2] {
+    let along = |start: f32, size: f32, sign: i32| match sign {
+        s if s > 0 => start + size,
+        0 => start + size / 2.,
+        _ => start,
+    };
+    [along(box_[0], box_[2], c[0]), along(box_[1], box_[3], c[1])]
+}
+/// The eight places a box can be taken by: its four corners, which change both
+/// axes at once, and the middle of its four edges, which change one. A canvas
+/// app offers both, because "make this wider" and "make this bigger" are
+/// different edits and a corner can only express the second.
+pub(super) const HANDLES: [[i32; 2]; 8] = [
+    [-1, -1],
+    [0, -1],
+    [1, -1],
+    [1, 0],
+    [1, 1],
+    [0, 1],
+    [-1, 1],
+    [-1, 0],
+];
 fn line_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
     let d = [b[0] - a[0], b[1] - a[1]];
     let t = (((p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1])
