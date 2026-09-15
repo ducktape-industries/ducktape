@@ -145,21 +145,11 @@ fn the_shell_yields_the_palette_chord_inside_a_guest_editor() {
 fn the_row_gutter_shows_on_hover_only() {
     let editor = rust_tokens(include_str!("../editor/blocks.rs"));
     assert!(editor.contains(".group(format!(\"row-{index}\"))"));
-    assert!(editor.contains(".opacity(0.).group_hover(format!(\"row-{index}\"),|style|style.opacity(1.))"));
-}
-/// A block's furniture is the host's widget, read off the line's prefix — a
-/// real checkbox that toggles, a bullet dot, a quote bar — and a code block
-/// is one plate: only the fences round corners, and no line draws an edge
-/// between two lines of the same plate.
-#[test]
-fn block_furniture_is_drawn_by_the_host_not_spelled_in_glyphs() {
-    let editor = rust_tokens(include_str!("../editor/blocks.rs"));
-    assert!(editor.contains("Shape::Todo{done}=>"));
-    assert!(editor.contains("EditorInteraction::LinePress{tag:1,"));
-    assert!(editor.contains("Shape::Bullet=>column.w(px(MARKER_COLUMN)).child(div().size(px(6.)).rounded_full()"));
-    assert!(editor.contains(".w(px(QUOTE_BAR))"));
-    assert!(editor.contains("Shape::Code=>body.border_l(width).border_r(width),"));
-    assert!(editor.contains("Shape::CodeOpen=>body.border_t(width).border_l(width).border_r(width).rounded_tl(radius).rounded_tr(radius),"));
+    assert!(
+        editor.contains(
+            ".opacity(0.).group_hover(format!(\"row-{index}\"),|style|style.opacity(1.))"
+        )
+    );
 }
 /// The comment badge sits on its row's LAST line, above the reserve the row
 /// carries for an inline card: the guest hangs the card half a line under the
