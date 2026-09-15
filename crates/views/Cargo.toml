@@ -2,7 +2,7 @@
 # A separate workspace keeps the WASM build profile independent of the desktop.
 [workspace]
 resolver = "2"
-members = ["boards", "governance", "home", "members", "agents", "node", "explorer", "settings", "chat", "files", "pages", "forge", "support/design", "support/guest", "pages/tests/editor-binding-app"]
+members = ["canvas", "governance", "home", "members", "agents", "node", "explorer", "settings", "chat", "files", "pages", "forge", "support/design", "support/guest", "pages/tests/editor-binding-app"]
 
 [workspace.dependencies]
 futures = "0.3"
