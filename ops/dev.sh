@@ -58,8 +58,9 @@ bash "$SCRIPT_DIR/demo-seed.sh" || die "seeding the '$ID' localnet failed"
 # What this network's guest lends to runs: the agent CLIs, installed into the
 # fresh workspace's executors dir. A checklist, because it is the operator's
 # call: each entry is the vendor's latest release, shown with its url and
-# expected hash, and checking none is a complete answer.
-"$NODE_BIN" agent install -n "$ID" || log "agent CLI setup skipped — runs will refuse the providers that are missing"
+# expected hash, and checking none is a complete answer. `make dev YES=1`
+# takes the whole checklist without asking.
+"$NODE_BIN" agent install -n "$ID" ${YES:+--yes} || log "agent CLI setup skipped — runs will refuse the providers that are missing"
 
 # The compute plane's readiness, said now and where the operator is looking:
 # `node sandbox` measures the [sandbox] table `node init` just wrote against
