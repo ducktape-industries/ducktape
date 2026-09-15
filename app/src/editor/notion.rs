@@ -11,15 +11,20 @@
 //! flattened on the way out; the guest never learns a shape it cannot store.
 use super::{EditorStore, position};
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, IntoElement,
-    ParentElement as _, Render, Styled as _, Subscription, Window, div, px,
+    AnyElement, App, AppContext as _, Bounds, Context, Entity, EventEmitter, Focusable as _,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, canvas, div, px,
 };
 use gpui_notion::NotionEditor;
 use gpui_notion::editor::block::{BlockAttrs, BlockContent, types};
+use gpui_notion::editor::comments::ThreadId;
 use gpui_notion::editor::mark::{Mark, MarkKind, MarkList};
+use gpui_notion::editor::theme::ActiveEditorTheme as _;
 use gpui_notion::editor::view::{Caret, DocumentChanged};
+use std::collections::HashSet;
 use std::sync::Arc;
 use ui_lang_wire as wire;
+use wire::editor_presentation::{EditorInteraction, EditorMargin};
 
 /// Two spaces per depth: `document_sync::INDENT`.
 const INDENT: &str = "  ";
@@ -30,16 +35,22 @@ const FENCE: &str = "```";
 pub const NOTION_DOCUMENT_KEY: &str = "/pages/document";
 
 /// Register gpui-notion after `gpui_kit::init`. The guest already sizes and
-/// pads the document column, so the editor's own page column is flush: no
-/// side padding, no width cap, a short tail under the last block.
+/// pads the document column, so the editor's own page column is flush with
+/// it: no width cap, a short tail under the last block, and exactly the
+/// gutter's width of side padding — the mount pulls the editor out by that
+/// much on both sides (see `Render`), so the text lands on the guest column
+/// and the hover "+ ⠿" controls hang in the guest's left padding.
 pub fn init(cx: &mut App) {
     gpui_notion::editor::init(cx);
     gpui_notion::editor::EditorTheme::customize(cx, |theme, _| {
         theme.page_width = px(f32::MAX);
-        theme.page_padding = px(0.);
+        theme.page_padding = theme.gutter_controls_width;
         theme.page_bottom = theme.rem * 4.;
     });
 }
+
+/// The badge's height: one marker slot.
+const BADGE_HEIGHT: f32 = 22.;
 
 pub struct NotionWireEditor {
     key: String,
@@ -51,6 +62,15 @@ pub struct NotionWireEditor {
     cursor: wire::EditorCursor,
     reset: Option<u64>,
     fault: Option<String>,
+    /// Where the mount painted last frame, so block bounds (window space)
+    /// can be turned into overlay offsets.
+    bounds: Option<Bounds<Pixels>>,
+    /// The guest's comment badges: one per commented line, with its count.
+    margins: Vec<EditorMargin>,
+    /// gpui-notion threads already handed to the guest. The editor's own
+    /// thread model is a stepping stone: a thread it opens is taken straight
+    /// to the guest's card, which owns comments on the module.
+    threads: HashSet<ThreadId>,
     _changes: Subscription,
 }
 
@@ -77,6 +97,9 @@ impl NotionWireEditor {
             cursor: Default::default(),
             reset: None,
             fault: None,
+            bounds: None,
+            margins: Vec::new(),
+            threads: HashSet::new(),
             _changes: changes,
         };
         this.sync(window, cx);
@@ -90,6 +113,16 @@ impl NotionWireEditor {
             return;
         };
         self.note_fault(projection.fault.as_deref());
+        let margins = projection
+            .options
+            .presentation
+            .as_ref()
+            .map(|paint| paint.affordances.margins.clone())
+            .unwrap_or_default();
+        if margins != self.margins {
+            self.margins = margins;
+            cx.notify();
+        }
         // No text yet (a page just opened, its transfer in flight): nothing to
         // install — a blank rebuild here would blink the page and drop focus.
         let Some(canonical) = projection.text.clone() else {
@@ -133,6 +166,9 @@ impl NotionWireEditor {
     }
 
     fn changed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.hand_over_new_thread(cx) {
+            return;
+        }
         let text = markdown_of(&self.editor.read(cx).content());
         if text.as_str() == &*self.installed {
             return;
@@ -153,6 +189,120 @@ impl NotionWireEditor {
         self.cursor = next;
         cx.emit(());
         cx.notify();
+    }
+
+    /// The toolbar's "Comment" opened a gpui-notion thread on the selection.
+    /// The guest's card owns comments, so the thread is dropped here and the
+    /// guest gets the same ask: the selection as the document cursor, then a
+    /// margin press on its line, which opens the card anchored on the words.
+    fn hand_over_new_thread(&mut self, cx: &mut Context<Self>) -> bool {
+        let editor = self.editor.read(cx);
+        let Some(thread) = editor
+            .comment_threads()
+            .iter()
+            .find(|thread| !self.threads.contains(&thread.id()))
+        else {
+            return false;
+        };
+        let id = thread.id();
+        let block = thread.block();
+        self.threads.insert(id);
+        let ix = editor.index_of(block);
+        let range = editor.block(block).and_then(|block| {
+            block
+                .marks()
+                .iter()
+                .find(|mark| mark.kind == MarkKind::Comment(id))
+                .map(|mark| mark.range.clone())
+        });
+        let content = editor.content();
+        self.editor
+            .update(cx, |editor, cx| editor.remove_comment_thread(id, cx));
+        let (Some(ix), Some(range)) = (ix, range) else {
+            return true;
+        };
+        let line = block_starts(&self.installed).get(ix).copied().unwrap_or(0);
+        let Some(block) = content.get(ix) else {
+            return true;
+        };
+        let prefix = line_of(block, 1).len() - inline_of(block).len();
+        let at = |plain: usize| (prefix + fenced_column(block, plain)) as u32;
+        let cursor = wire::EditorCursor {
+            position: wire::EditorPosition {
+                line: line as u32,
+                column: at(range.end),
+            },
+            selection: Some(wire::EditorPosition {
+                line: line as u32,
+                column: at(range.start),
+            }),
+        };
+        self.store.native(
+            &self.key,
+            &self.installed,
+            self.cursor,
+            &self.installed,
+            cursor,
+            wire::EditorEditKind::Cursor,
+        );
+        self.cursor = cursor;
+        self.interaction(EditorInteraction::Margin { line: line as u32 }, cx);
+        true
+    }
+
+    fn interaction(&mut self, action: EditorInteraction, cx: &mut Context<Self>) {
+        self.store
+            .request(&self.key, wire::EditorRequestInput::Interaction { action });
+        cx.emit(());
+        cx.notify();
+    }
+
+    /// One badge per commented block, on the block's last line at the text
+    /// column's right edge; pressing it opens the guest's card for the block.
+    fn badges(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(origin) = self.bounds.map(|bounds| bounds.origin) else {
+            return Vec::new();
+        };
+        let starts = block_starts(&self.installed);
+        let editor = self.editor.read(cx);
+        let theme = cx.editor_theme().clone();
+        self.margins
+            .iter()
+            .filter_map(|margin| {
+                let line = margin.line as usize;
+                let ix = starts.iter().rposition(|start| *start <= line)?;
+                let bounds = editor.block_bounds(editor.block_id_at(ix)?)?;
+                let top = bounds.bottom() - px(BADGE_HEIGHT) - origin.y;
+                let line = margin.line;
+                Some(
+                    div()
+                        .id(("comments", line as usize))
+                        .absolute()
+                        .right(px(0.))
+                        .top(top)
+                        .h(px(BADGE_HEIGHT))
+                        .px(theme.rems(0.375))
+                        .flex()
+                        .items_center()
+                        .gap(theme.rems(0.25))
+                        .rounded(theme.radius_sm)
+                        .bg(theme.comment_fill)
+                        .text_color(theme.comment_accent)
+                        .text_size(theme.ui_small_text_size)
+                        .cursor_pointer()
+                        .child(gpui_notion::editor::ui::icon(
+                            "message-square",
+                            theme.ui_small_text_size,
+                            theme.comment_accent,
+                        ))
+                        .child(margin.count.to_string())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.interaction(EditorInteraction::Margin { line }, cx)
+                        }))
+                        .into_any_element(),
+                )
+            })
+            .collect()
     }
 
     pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
@@ -191,9 +341,98 @@ impl NotionWireEditor {
 }
 
 impl Render for NotionWireEditor {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.editor.clone())
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The editor is pulled out of the mount by its gutter width on both
+        // sides and pads itself back in by the same amount (`init`): its text
+        // column is the mount's box, and the gutter controls hang to the left
+        // of it, in the guest's own padding.
+        let gutter = cx.editor_theme().gutter_controls_width;
+        let weak = cx.entity().downgrade();
+        let probe = canvas(
+            move |bounds, _, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    if this.bounds != Some(bounds) {
+                        this.bounds = Some(bounds);
+                        cx.notify();
+                    }
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0();
+        let badges = self.badges(cx);
+        div()
+            .size_full()
+            .relative()
+            .flex()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .ml(-gutter)
+                    .mr(-gutter)
+                    .child(self.editor.clone()),
+            )
+            .child(probe)
+            .children(badges)
     }
+}
+
+/// The document line each block starts on: the title is block 0 on line 0,
+/// and a code block spans its two fences and its body.
+fn block_starts(text: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    let Some((_, body)) = text.split_once('\n') else {
+        return starts;
+    };
+    let mut line = 1;
+    let mut source = body.split('\n');
+    while let Some(raw) = source.next() {
+        starts.push(line);
+        line += 1;
+        let (_, rest) = split_indent(raw);
+        if !rest.starts_with(FENCE) {
+            continue;
+        }
+        for inside in source.by_ref() {
+            line += 1;
+            if inside.trim_start_matches([' ', '\t']).starts_with(FENCE) {
+                break;
+            }
+        }
+    }
+    starts
+}
+
+/// A byte offset in a block's plain text as the byte column of the same
+/// character in the block's fenced line, marker excluded.
+fn fenced_column(block: &BlockContent, plain: usize) -> usize {
+    let text = block.text.as_str();
+    let mut out = 0;
+    let mut at = 0;
+    for (range, kinds) in block.marks.runs() {
+        let range = range.start.max(at)..range.end.min(text.len());
+        if range.start >= range.end {
+            continue;
+        }
+        // A selection starting on the run's first character starts INSIDE
+        // its fence, so the anchor covers the words and not the markers.
+        if plain < range.start {
+            return out + (plain - at);
+        }
+        out += range.start - at;
+        let body = &text[range.clone()];
+        let fenced = fence_of(body, &kinds);
+        let open = fenced.find(body).unwrap_or(0);
+        if plain <= range.end {
+            return out + open + (plain - range.start);
+        }
+        out += fenced.len();
+        at = range.end;
+    }
+    out + plain.saturating_sub(at)
 }
 
 /// The byte in `after` just past the edit that turned `before` into it.
@@ -657,6 +896,26 @@ mod tests {
         assert_eq!(blocks[1].ty, types::PARAGRAPH);
         assert_eq!(markdown_of(&blocks), "Untitled\n");
         assert_eq!(markdown_of(&blocks_of("")), "");
+    }
+
+    #[test]
+    fn blocks_start_on_their_document_lines() {
+        assert_eq!(block_starts("T\na\n```\nx\ny\n```\nb"), [0, 1, 2, 6]);
+        assert_eq!(block_starts("T"), [0]);
+        assert_eq!(block_starts("T\n"), [0, 1]);
+    }
+
+    #[test]
+    fn plain_offsets_map_onto_the_fenced_line() {
+        let block = blocks_of("T\nSee **bold** and [docs](https://x.y) now").remove(1);
+        assert_eq!(block.text, "See bold and docs now");
+        // "See " is plain; "bold" opens after `**`; "docs" after `[`.
+        assert_eq!(fenced_column(&block, 0), 0);
+        assert_eq!(fenced_column(&block, 4), 6);
+        assert_eq!(fenced_column(&block, 8), 10);
+        assert_eq!(fenced_column(&block, 13), 18);
+        assert_eq!(fenced_column(&block, 17), 22);
+        assert_eq!(fenced_column(&block, 21), 40);
     }
 
     #[test]

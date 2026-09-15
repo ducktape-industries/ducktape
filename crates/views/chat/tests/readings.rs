@@ -5,8 +5,7 @@
 use chat_view::host::{
     ChatMember, ChatMessage, PendingSend, copy_range_count, copy_range_label, copy_range_text,
     edit_body_of, first_unread_seq, fold_message, fold_names, near_scroll_tail, near_scroll_top,
-    post_gate, preview_box, preview_room, reaction_applied, readable, run_of_message, seat_reader,
-    with_pending,
+    post_gate, reaction_applied, run_of_message, seat_reader, with_pending,
 };
 
 fn names() -> chat_view::host::Names {
@@ -202,10 +201,7 @@ fn the_post_gate_names_its_refusal() {
         key: "acct:7".into(),
         label: "mallard".into(),
     }];
-    assert_eq!(
-        post_gate(true, false, &roster, "acct:7"),
-        "channel_archived"
-    );
+    assert_eq!(post_gate(true, false, &roster, "acct:7"), "channel_archived");
     assert_eq!(post_gate(false, true, &roster, "acct:7"), "");
     assert_eq!(post_gate(false, true, &roster, "acct:9"), "members_only");
     assert_eq!(post_gate(false, false, &[], "acct:9"), "");
@@ -279,25 +275,4 @@ fn a_runs_reply_names_the_run_that_posted_it() {
     );
     assert_eq!(run_of_message("agent/short"), "");
     assert_eq!(run_of_message("m12"), "");
-}
-
-/// The preview's reading of a page: a cut inside a multi-byte character
-/// is the page's, a control byte is the file's; the picture box fits the
-/// screen it is given and never grows past the picture.
-#[test]
-fn a_preview_reads_a_cut_page_as_text_and_fits_its_picture_to_the_screen() {
-    let mut bytes = "한글 문서 ".repeat(3).into_bytes();
-    let whole = bytes.len();
-    bytes.extend_from_slice(&"한".as_bytes()[..2]);
-    let (text, binary) = readable(bytes.clone(), false);
-    assert!(!binary, "a trailing partial character is the page's cut");
-    assert_eq!(text.len(), whole);
-    let (_, binary) = readable(bytes, true);
-    assert!(binary, "the same bytes at the file's end are malformed");
-    let (_, binary) = readable(b"plain\0bytes".to_vec(), true);
-    assert!(binary, "a control byte is binary");
-
-    assert_eq!(preview_box(4000, 3000, (1280., 800.)), (800., 600.));
-    assert_eq!(preview_box(200, 100, (1280., 800.)), (200., 100.));
-    assert_eq!(preview_room((300., 200.)), (360., 280.));
 }

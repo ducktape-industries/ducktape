@@ -469,7 +469,7 @@ impl ChatView {
                 radius: Some([native::radius::CARD as f32; 4]),
             });
         }
-        let action = Some(slots::message(Message::OpenAttachment(block.link.clone())));
+        let action = Some(slots::message(Message::OpenMessageLink(block.link.clone())));
         let mut open = native::button_child(
             format!("{key}/open"),
             frame,
@@ -516,7 +516,7 @@ impl ChatView {
             ),
             10.,
         );
-        let action = Some(slots::message(Message::OpenAttachment(block.link.clone())));
+        let action = Some(slots::message(Message::OpenMessageLink(block.link.clone())));
         let mut card = native::button_child(
             format!("{key}/card"),
             content,

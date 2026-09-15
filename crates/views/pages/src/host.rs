@@ -1984,12 +1984,12 @@ pub fn toggled(ids: Vec<String>, id: &str) -> Vec<String> {
 
 /// The pane geometry the card is placed against, in logical pixels. `max-w`
 /// bounds a box INCLUDING its padding, so `DOCUMENT_SURFACE` is the `max-w` the
-/// document arm carries and `DOCUMENT_PADDING` (pl 22 + pr 40) comes off it
+/// document arm carries and `DOCUMENT_PADDING` (pl 56 + pr 40) comes off it
 /// before the editor gets its column.
 const DOCUMENT_SURFACE: f64 = 766.0;
 const DOCUMENT_MINIMUM: f64 = 500.0;
-const DOCUMENT_PADDING: f64 = 62.0;
-const DOCUMENT_LEFT_PADDING: f64 = 22.0;
+const DOCUMENT_PADDING: f64 = 96.0;
+const DOCUMENT_LEFT_PADDING: f64 = 56.0;
 const DOCUMENT_TOP_PADDING: f64 = 26.0;
 const COMMENTS_CARD: f64 = 320.0;
 const COMMENTS_GAP: f64 = 12.0;
@@ -2226,8 +2226,8 @@ mod tests {
         // Inline hands the document its full width back and takes the text
         // column — the surface's own, or the pane's when the pane is narrower.
         assert_eq!(document_width(843.0, true), 766.0);
-        assert_eq!(comments_card_width(843.0), 766.0 - 62.0);
-        assert_eq!(comments_card_width(600.0), 600.0 - 62.0);
+        assert_eq!(comments_card_width(843.0), 766.0 - 96.0);
+        assert_eq!(comments_card_width(600.0), 600.0 - 96.0);
         assert_eq!(comments_card_width(2000.0), 320.0);
         assert_eq!(comments_card_width(844.0), 320.0);
     }
@@ -2240,7 +2240,7 @@ mod tests {
             assert_eq!(comments_card_x(pane) + 320.0, pane - 12.0);
         }
         // Inline: the card lands on the text column, 22 into the surface.
-        assert_eq!(comments_card_x(800.0), 22.0);
+        assert_eq!(comments_card_x(800.0), 56.0);
     }
 
     #[test]
