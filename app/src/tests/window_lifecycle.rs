@@ -2,6 +2,50 @@
 use super::*;
 
 #[test]
+fn wallet_opening_progress_follows_replies_and_restarts_after_failure() {
+    let (mut app, _) = Ducktape::boot();
+    app.hub_step = HubStep::Wallets;
+    app.hub_wallet_selected = "test-wallet".into();
+    app.rpc = "http://127.0.0.1:8844".into();
+
+    let _ = app.update(AppMessage::UnlockSubmit("password".into()));
+    assert_eq!(app.wallet_opening_status, "Unlocking wallet…");
+    assert_eq!(app.mutation_phase, MutationPhase::Onboarding);
+    let _ = app.update(AppMessage::KeyUnlocked("public-key".into()));
+    assert_eq!(app.wallet_opening_status, "Checking network account…");
+    assert_eq!(app.mutation_phase, MutationPhase::Onboarding);
+
+    let _ = app.update(AppMessage::AccountProbeFailed(backend::HydrationError {
+        generation: app.account_generation,
+        message: "Account lookup failed".into(),
+    }));
+    assert_eq!(app.mutation_phase, MutationPhase::Idle);
+    assert_eq!(app.onboarding_error, "Account lookup failed");
+    let _ = app.update(AppMessage::UnlockSubmit("password".into()));
+    assert_eq!(app.wallet_opening_status, "Unlocking wallet…");
+    assert!(app.onboarding_error.is_empty());
+    let _ = app.update(AppMessage::LoginFailed(backend::AppError {
+        message: "Wrong password".into(),
+        committed: false,
+    }));
+    assert_eq!(app.mutation_phase, MutationPhase::Idle);
+
+    let _ = app.update(AppMessage::UnlockSubmit("password".into()));
+    let _ = app.update(AppMessage::KeyUnlocked("public-key".into()));
+    let _ = app.update(AppMessage::AccountProbed(backend::AccountData {
+        generation: app.account_generation,
+        exists: true,
+        number: "1".into(),
+        name: "test".into(),
+        bio: String::new(),
+    }));
+    let _ = app.update(AppMessage::NetworkEntered);
+    assert_eq!(app.console_entry, ConsoleEntry::Entering);
+    let _ = app.update(AppMessage::ConsoleEntryAnswered);
+    assert_eq!(app.console_entry, ConsoleEntry::Idle);
+}
+
+#[test]
 fn os_duck_urls_are_received_before_launch_and_wait_for_network_identity() {
     let shell = rust_tokens(include_str!("../shell.rs"));
     let registered = shell
