@@ -8,6 +8,9 @@ impl Ducktape {
             AppMessage::ConnectionReply(request_generation, reply_message) => {
                 self.on_connection_reply(request_generation, reply_message)
             }
+            AppMessage::ConnectionProgress(generation, status) => {
+                self.on_connection_progress(generation, status)
+            }
             AppMessage::DmPeersLoadReply(request_generation, reply_message) => {
                 self.on_dm_peers_load_reply(request_generation, reply_message)
             }
@@ -334,11 +337,31 @@ impl Ducktape {
     fn on_connection_reply(
         &mut self,
         request_generation: u64,
-        reply_message: Box<AppMessage>,
+        reply_message: Option<Box<AppMessage>>,
     ) -> Task<AppMessage> {
-        if self.connection_generation == request_generation {
-            self.connection_task = None;
-            return self.update(*reply_message);
+        if self.connection_generation != request_generation {
+            return Task::none();
+        }
+        match reply_message {
+            Some(message) => self.update(*message),
+            None => {
+                self.connection_task = None;
+                Task::none()
+            }
+        }
+    }
+    fn on_connection_progress(
+        &mut self,
+        generation: i64,
+        status: &'static str,
+    ) -> Task<AppMessage> {
+        if self.connect_generation != generation {
+            return Task::none();
+        }
+        self.connection_progress = status.to_owned();
+        let entering = self.console_entry == ConsoleEntry::Entering;
+        if entering {
+            self.onboarding_error.clear();
         }
         Task::none()
     }
@@ -762,27 +785,27 @@ impl Ducktape {
         self.bell_read_through = 0;
         self.bell_clear_through = 0;
         self.connect_generation += 1;
-        let pending_task = Task::perform(
-            crate::backend::connect(
-                self.connected_rpc.to_owned(),
-                self.hydration_retry_attempt,
-                self.connect_generation,
-            ),
-            |result| match result {
-                Ok(value) => AppMessage::WorkspaceConnected(value),
-                Err(error) => AppMessage::ConnectFailed(error),
-            },
+        let pending_task = crate::backend::connect(
+            self.connected_rpc.to_owned(),
+            self.hydration_retry_attempt,
+            self.connect_generation,
         );
         self.connection_generation = self.connection_generation.wrapping_add(1);
         let request_generation = self.connection_generation;
+        let pending_task = pending_task
+            .map(move |reply_message| {
+                AppMessage::ConnectionReply(request_generation, Some(Box::new(reply_message)))
+            })
+            .chain(Task::done(AppMessage::ConnectionReply(
+                request_generation,
+                None,
+            )));
         let (pending_task, request_handle) = pending_task.abortable();
         if let Some(previous_handle) = self.connection_task.replace(request_handle.abort_on_drop())
         {
             previous_handle.abort();
         }
-        pending_task.map(move |reply_message| {
-            AppMessage::ConnectionReply(request_generation, Box::new(reply_message))
-        })
+        pending_task
     }
     fn on_workspace_connected(&mut self, next: crate::backend::WorkspaceData) -> Task<AppMessage> {
         if next.generation != self.connect_generation {
@@ -863,6 +886,7 @@ impl Ducktape {
         self.mutation_phase = MutationPhase::Idle;
         self.hydration_retry_attempt = 0;
         self.error = "".to_owned();
+        self.onboarding_error.clear();
         self.members_generation += 1;
         self.agents_open_run = "".to_owned();
         self.agents_live = false;
@@ -2110,6 +2134,14 @@ impl Ducktape {
         self.bell_clear_through = 0;
         self.connect_generation += 1;
         self.hydration_retry_attempt += 1;
+        let retry_seconds = crate::backend::retry_delay(
+            u32::try_from(self.hydration_retry_attempt).unwrap_or(u32::MAX),
+        )
+        .as_secs();
+        self.connection_progress = format!(
+            "Retrying automatically in {retry_seconds}s · retry {}",
+            self.hydration_retry_attempt,
+        );
         self.loading = false;
         self.status = "Offline".to_owned();
         self.error = cause.message.to_owned();
@@ -2118,27 +2150,27 @@ impl Ducktape {
             &(cause.message),
             &self.onboarding_error,
         );
-        let pending_task = Task::perform(
-            crate::backend::connect(
-                self.connected_rpc.to_owned(),
-                self.hydration_retry_attempt,
-                self.connect_generation,
-            ),
-            |result| match result {
-                Ok(value) => AppMessage::WorkspaceConnected(value),
-                Err(error) => AppMessage::ConnectFailed(error),
-            },
+        let pending_task = crate::backend::connect(
+            self.connected_rpc.to_owned(),
+            self.hydration_retry_attempt,
+            self.connect_generation,
         );
         self.connection_generation = self.connection_generation.wrapping_add(1);
         let request_generation = self.connection_generation;
+        let pending_task = pending_task
+            .map(move |reply_message| {
+                AppMessage::ConnectionReply(request_generation, Some(Box::new(reply_message)))
+            })
+            .chain(Task::done(AppMessage::ConnectionReply(
+                request_generation,
+                None,
+            )));
         let (pending_task, request_handle) = pending_task.abortable();
         if let Some(previous_handle) = self.connection_task.replace(request_handle.abort_on_drop())
         {
             previous_handle.abort();
         }
-        pending_task.map(move |reply_message| {
-            AppMessage::ConnectionReply(request_generation, Box::new(reply_message))
-        })
+        pending_task
     }
     fn on_forge_view_event(
         &mut self,
@@ -5622,6 +5654,7 @@ impl Ducktape {
             return Task::none();
         }
         self.console_entry = ConsoleEntry::Entering;
+        self.connection_progress = "Loading chat and workspace…".to_owned();
         Task::batch([
             (Task::perform(
                 crate::backend::remember_network(self.connected_rpc.to_owned()),
@@ -5629,28 +5662,31 @@ impl Ducktape {
             ))
             .discard::<AppMessage>(),
             {
-                let pending_task = Task::perform(
-                    crate::backend::connect(
-                        self.connected_rpc.to_owned(),
-                        0,
-                        self.connect_generation,
-                    ),
-                    |result| match result {
-                        Ok(value) => AppMessage::WorkspaceConnected(value),
-                        Err(error) => AppMessage::ConnectFailed(error),
-                    },
+                let pending_task = crate::backend::connect(
+                    self.connected_rpc.to_owned(),
+                    0,
+                    self.connect_generation,
                 );
                 self.connection_generation = self.connection_generation.wrapping_add(1);
                 let request_generation = self.connection_generation;
+                let pending_task = pending_task
+                    .map(move |reply_message| {
+                        AppMessage::ConnectionReply(
+                            request_generation,
+                            Some(Box::new(reply_message)),
+                        )
+                    })
+                    .chain(Task::done(AppMessage::ConnectionReply(
+                        request_generation,
+                        None,
+                    )));
                 let (pending_task, request_handle) = pending_task.abortable();
                 if let Some(previous_handle) =
                     self.connection_task.replace(request_handle.abort_on_drop())
                 {
                     previous_handle.abort();
                 }
-                pending_task.map(move |reply_message| {
-                    AppMessage::ConnectionReply(request_generation, Box::new(reply_message))
-                })
+                pending_task
             },
         ])
     }
@@ -5694,6 +5730,16 @@ impl Ducktape {
             (self.mutation_phase != MutationPhase::Idle) && (self.hub_step != HubStep::Account);
         if unrelated_mutation {
             return Task::none();
+        }
+        let entering = self.console_entry == ConsoleEntry::Entering;
+        if entering {
+            self.console_entry = ConsoleEntry::Idle;
+            self.connect_generation += 1;
+            self.connection_generation = self.connection_generation.wrapping_add(1);
+            if let Some(previous_handle) = self.connection_task.take() {
+                previous_handle.abort();
+            }
+            self.connection_progress.clear();
         }
         self.welcome_qr_auth_generation = self.welcome_qr_auth_generation.wrapping_add(1);
         if let Some(previous_handle) = self.welcome_qr_auth_task.take() {
