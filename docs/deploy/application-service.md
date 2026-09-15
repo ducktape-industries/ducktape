@@ -149,6 +149,20 @@ units on the test host. The Gateway tests exercise real loopback HTTP and
 WebSocket forwarding, caller proofs, route audience checks, and private
 credential files.
 
+The terminal executable's production startup check uses real sandbox prerequisites:
+
+```sh
+DUCK_TERMINAL_GUEST_DIR=/srv/terminal/guest \
+DUCK_TERMINAL_EXECUTORS=/srv/terminal/executors \
+cargo test -p ducktape-terminal --test activation production_process -- --ignored
+```
+
+It requires Firecracker and its host tools on the executable search path, access
+to `/dev/kvm`, `vmlinux` and `rootfs.ext4` in the guest directory, and an installed
+executor. It runs the actual terminal executable through inherited-listener
+activation, readiness notification, token replacement, and signal shutdown.
+It does not boot an interactive guest session or install systemd units.
+
 An application may bind up to 16 explicit read-only directories through
 `readonly_paths`, for example
 `[{"source":"/srv/tenant/forge","destination":"/var/lib/application-storage/git"}]`.
