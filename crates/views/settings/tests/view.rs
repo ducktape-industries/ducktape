@@ -873,3 +873,31 @@ fn the_updates_group_reads_the_facts_and_each_control_is_one_intent() {
     assert!(has_text(&frame, "Checking…"), "{:?}", texts(&frame));
     assert!(button_disabled(&frame, "Check now"));
 }
+
+#[test]
+fn the_appearance_choice_offers_system_and_checks_the_current_mode() {
+    let (frame, _, _) = connected(&facts(), 2);
+    let mut choices = Vec::new();
+    let mut root = frame.root.clone().expect("Settings tree");
+    root.for_each_mut(&mut |node| {
+        if let Node::Button {
+            key,
+            checked,
+            on_press,
+            ..
+        } = node
+            && let Some(mode) = key.strip_prefix("settings/appearance/")
+        {
+            assert!(on_press.is_some());
+            choices.push((mode.to_owned(), *checked));
+        }
+    });
+    assert_eq!(
+        choices,
+        vec![
+            ("system".to_owned(), Some(true)),
+            ("light".to_owned(), Some(false)),
+            ("dark".to_owned(), Some(false)),
+        ]
+    );
+}

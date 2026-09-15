@@ -91,6 +91,7 @@ pub enum Message {
     AccountWalletSubmit,
     AccountLoginSubmit,
     CopyToClipboard(String, String),
+    SetAppearanceSystem,
     SetAppearanceLight,
     SetAppearanceDark,
     SetDesktopNotifications(bool),
@@ -313,6 +314,7 @@ impl SettingsView {
             Message::AccountWalletSubmit => self.on_account_wallet_submit(),
             Message::AccountLoginSubmit => self.on_account_login_submit(),
             Message::CopyToClipboard(text, label) => self.on_copy_to_clipboard(text, label),
+            Message::SetAppearanceSystem => self.on_set_appearance_system(),
             Message::SetAppearanceLight => self.on_set_appearance_light(),
             Message::SetAppearanceDark => self.on_set_appearance_dark(),
             Message::SetDesktopNotifications(enabled) => self.on_set_desktop_notifications(enabled),
@@ -522,6 +524,10 @@ impl SettingsView {
     }
     fn on_copy_to_clipboard(&mut self, text: String, label: String) -> Task<Message> {
         crate::host::copy(&(text), &(label));
+        Task::none()
+    }
+    fn on_set_appearance_system(&mut self) -> Task<Message> {
+        crate::host::set_system();
         Task::none()
     }
     fn on_set_appearance_light(&mut self) -> Task<Message> {
@@ -837,6 +843,12 @@ impl SettingsView {
         let appearance = settings_choice(
             "settings/appearance",
             [
+                (
+                    "system".to_owned(),
+                    "System",
+                    self.appearance == "system",
+                    Message::SetAppearanceSystem,
+                ),
                 (
                     "light".to_owned(),
                     "Light",

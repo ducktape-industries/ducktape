@@ -607,6 +607,10 @@ pub fn copy(text: &str, label: &str) -> bool {
     )
 }
 
+pub fn set_system() -> bool {
+    notify("settings.system", &())
+}
+
 pub fn set_light() -> bool {
     notify("settings.light", &())
 }
