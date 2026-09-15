@@ -205,7 +205,7 @@ impl BoardsView {
                 origin[1] + s.height as f32 * self.zoom,
             ];
             let box_ = self.on_screen(live, s).unwrap_or(stored);
-            let (pos, size) = self.writing_box(box_, s.kind);
+            let (pos, size) = self.writing_box(live, s, box_);
             layers.push(self.text_gauge(inline, s, pos, size));
             let (caret, room) = self.caret_box(inline, s.kind, pos, size);
             layers.push(self.inline_editor(s, caret, room));
@@ -883,7 +883,7 @@ impl BoardsView {
                     commands: body,
                 });
             }
-            if let Some(label) = self.label(id, s, box_, opacity, share) {
+            if let Some(label) = self.label(board, id, s, box_, opacity, share) {
                 layers.push(label);
             }
         }
@@ -962,7 +962,7 @@ impl BoardsView {
     }
     /// The screen box a shape occupies, or nothing when it is off stage. A
     /// connector's box is the stroke it draws, which a bound end moves.
-    fn on_screen(&self, board: &Board, s: &Shape) -> Option<[f32; 4]> {
+    pub(super) fn on_screen(&self, board: &Board, s: &Shape) -> Option<[f32; 4]> {
         let world = if s.kind.is_path() {
             let path = interaction::stroke(board, s);
             span(&path)?
@@ -1074,12 +1074,23 @@ impl BoardsView {
         if limit < 2 {
             return;
         }
-        let path = decimate(&interaction::thin(screen, 0.75), limit);
+        // A connector bent by hand has exactly one interior sample and it is a
+        // handle somebody put where they wanted the line. Thinning could drop
+        // it and the smoothing would ride past it either way, so a bent
+        // connector is drawn through its samples instead.
+        let bent = kind != Kind::Draw && screen.len() == 3;
+        let path = match bent {
+            true => screen.to_vec(),
+            false => decimate(&interaction::thin(screen, 0.75), limit),
+        };
         let end = path[path.len() - 1];
         let weight = if kind == Kind::Draw { 2.5 } else { 1.8 };
         let width = (weight * self.zoom).clamp(1.2, 14.);
         out.push(Draw::Draw {
-            shape: Geometry::Path(polyline(&path)),
+            shape: Geometry::Path(match bent {
+                true => through(&path),
+                false => polyline(&path),
+            }),
             fill: None,
             even_odd: false,
             stroke: Some(pen(color, width)),
@@ -1087,7 +1098,12 @@ impl BoardsView {
         if kind != Kind::Arrow {
             return;
         }
-        let before = path[path.len() - 2];
+        // The head points the way the line arrives, which on a curve is the way
+        // its last control point leaves — not the way the sample before it lies.
+        let before = match bent {
+            true => bend_control(&path),
+            false => path[path.len() - 2],
+        };
         let angle = (end[1] - before[1]).atan2(end[0] - before[0]);
         let head = (12. * self.zoom).clamp(7., 30.);
         for turn in [-0.5_f32, 0.5] {
@@ -1133,8 +1149,13 @@ impl BoardsView {
     /// its own outline. A connector has none to write in, so its words ride a
     /// plate at the middle of the run — the middle of where the run is drawn
     /// now, which a bound end moves every time the card it holds does.
-    pub(super) fn writing_box(&self, box_: [f32; 4], kind: Kind) -> ([f32; 2], [f32; 2]) {
-        if !kind.is_path() {
+    pub(super) fn writing_box(
+        &self,
+        board: &Board,
+        s: &Shape,
+        box_: [f32; 4],
+    ) -> ([f32; 2], [f32; 2]) {
+        if !s.kind.is_path() {
             return (
                 [box_[0], box_[1]],
                 [(box_[2] - box_[0]).max(1.), (box_[3] - box_[1]).max(1.)],
@@ -1142,9 +1163,12 @@ impl BoardsView {
         }
         // The plate rides the camera like everything else on the board: one
         // that kept its pixels while the run under it shrank would swallow the
-        // whole drawing at a distance.
+        // whole drawing at a distance. Where it sits is the hit test's answer
+        // and not a second opinion — that is the difference between a
+        // double-click that opens a label and one that opens the board.
         let plate = [PLATE[0] * self.zoom, PLATE[1] * self.zoom];
-        let middle = [(box_[0] + box_[2]) / 2., (box_[1] + box_[3]) / 2.];
+        let at = interaction::plate(&interaction::stroke(board, s));
+        let middle = self.screen((at[0] + at[2]) / 2., (at[1] + at[3]) / 2.);
         (
             [middle[0] - plate[0] / 2., middle[1] - plate[1] / 2.],
             plate,
@@ -1178,6 +1202,7 @@ impl BoardsView {
     /// A shape's words, pinned over its body and clipped to it.
     fn label(
         &self,
+        board: &Board,
         id: &str,
         s: &Shape,
         box_: [f32; 4],
@@ -1213,7 +1238,7 @@ impl BoardsView {
             ),
             alpha(ink, opacity),
         );
-        let (pos, size) = self.writing_box(box_, s.kind);
+        let (pos, size) = self.writing_box(board, s, box_);
         let riding_a_line = s.kind.is_path();
         let body = match riding_a_line {
             true => plate(id, label, &letters, alpha(p.surface, opacity), size),
@@ -1302,6 +1327,22 @@ impl BoardsView {
                 let run = interaction::stroke(board, s);
                 for end in [run.first(), run.last()].into_iter().flatten() {
                     out.push(grip(self.screen(end[0], end[1])));
+                }
+                // The bend is offered the same way whether it has been used or
+                // not, so it is drawn hollow: it is a place the line will go,
+                // not a place the line is.
+                if let Some((_, _, at)) = self.bend(s, &run) {
+                    let at = self.screen(at[0], at[1]);
+                    out.push(Draw::Draw {
+                        shape: Geometry::Rectangle {
+                            position: [at[0] - 3., at[1] - 3.],
+                            size: [6., 6.],
+                            radius: [3.; 4],
+                        },
+                        fill: Some(Rgba(p.background)),
+                        even_odd: false,
+                        stroke: Some(pen(Rgba(alpha(p.accent, 0.6)), 1.5)),
+                    });
                 }
                 continue;
             }
@@ -1438,9 +1479,14 @@ impl BoardsView {
                     out,
                 );
             }
-            Gesture::Endpoint { point, shape, .. } => {
+            // Only an end reaches for a card; a bend crossing one binds nothing
+            // and must not say that it would.
+            Gesture::Endpoint {
+                point, shape, end, ..
+            } if interaction::reaches_for_a_card(shape, *end) => {
                 self.ring_the_card(board, shape.kind, *point, out)
             }
+            Gesture::Endpoint { .. } => {}
             Gesture::Idle
             | Gesture::Pan { .. }
             | Gesture::Move { .. }
@@ -1508,6 +1554,36 @@ fn span(points: &[[f32; 2]]) -> Option<[f32; 4]> {
 }
 /// A run of points as one path: a straight segment between two, and a round
 /// one through the midpoints of a longer run, so a pen stroke reads as drawn.
+/// The control point that makes one quadratic pass exactly through the sample
+/// between its ends: a quadratic sits halfway between its control and the chord
+/// at t=½, so the control is twice the sample less the chord's middle.
+fn bend_control(points: &[[f32; 2]]) -> [f32; 2] {
+    let [first, middle, last] = points[..] else {
+        return points[points.len().saturating_sub(2)];
+    };
+    [
+        2. * middle[0] - (first[0] + last[0]) / 2.,
+        2. * middle[1] - (first[1] + last[1]) / 2.,
+    ]
+}
+/// A curve THROUGH the sample it was bent by rather than near it. `polyline`'s
+/// smoothing treats every sample as a control and rides past it, which is right
+/// for ink — a pen's jitter should not be honoured — and wrong for a connector,
+/// where the one interior sample is a handle somebody placed. A line that does
+/// not go where the handle went is a handle that does not work.
+fn through(points: &[[f32; 2]]) -> Vec<wire::CanvasSegment> {
+    use wire::CanvasSegment as Segment;
+    let [first, _, last] = points[..] else {
+        return polyline(points);
+    };
+    vec![
+        Segment::Move(first),
+        Segment::Quadratic {
+            control: bend_control(points),
+            end: last,
+        },
+    ]
+}
 fn polyline(points: &[[f32; 2]]) -> Vec<wire::CanvasSegment> {
     use wire::CanvasSegment as Segment;
     let mut path = vec![Segment::Move(points[0])];
