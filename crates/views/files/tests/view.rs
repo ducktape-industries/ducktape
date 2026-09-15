@@ -269,6 +269,34 @@ fn every_browser_split_drags_with_the_cursor_its_axis_uses() {
     assert!(!keys(&frame).iter().any(|key| key.ends_with("/inspector")));
     let frame = tick_native(press(&frame, "Toggle sidebar"));
     assert_eq!(fixed(&frame, "/sidebar"), Some(Length::Fixed(240.0)));
+
+    let frame = tick_native(press(&frame, "Column view"));
+    let frame = tick_native(press(&frame, "Folder docs"));
+    let frame = drag(&frame, "/column//shared/resize", 80.);
+    assert_eq!(fixed(&frame, "/column//shared"), Some(Length::Fixed(310.)));
+    assert_eq!(
+        fixed(&frame, "/column//shared/docs"),
+        Some(Length::Fixed(230.))
+    );
+    let frame = drag(&frame, "/column//shared/docs/resize", -1000.);
+    assert_eq!(
+        fixed(&frame, "/column//shared/docs"),
+        Some(Length::Fixed(160.))
+    );
+    let frame = drag(&frame, "/column//shared/resize", 1000.);
+    assert_eq!(fixed(&frame, "/column//shared"), Some(Length::Fixed(640.)));
+    let frame = tick_native(press(&frame, "File README.md"));
+    let frame = drag(&frame, "/columns/last/resize", 100.);
+    assert_eq!(fixed(&frame, "/columns/last"), Some(Length::Fixed(390.)));
+    assert_eq!(
+        fixed(&frame, "/columns/row"),
+        Some(Length::Fixed(1050.)),
+        "the strip retains every pane and grip so horizontal overflow is measurable"
+    );
+    let frame = tick_native(press(&frame, "List view"));
+    let frame = tick_native(press(&frame, "Column view"));
+    assert_eq!(fixed(&frame, "/column//shared"), Some(Length::Fixed(640.)));
+    assert_eq!(fixed(&frame, "/columns/last"), Some(Length::Fixed(390.)));
 }
 
 /// At boot the view asks for the session only; connected, it lists the

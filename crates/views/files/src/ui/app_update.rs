@@ -47,6 +47,8 @@ impl FilesView {
             Message::OpenLinkAt(url) => self.on_open_link_at(url),
             Message::SidebarResized(dx, _dy) => self.on_sidebar_resized(dx),
             Message::InspectorResized(dx, _dy) => self.on_inspector_resized(dx),
+            Message::ColumnResized(index, dx, _dy) => self.on_column_resized(index, dx),
+            Message::ChosenResized(dx, _dy) => self.on_chosen_resized(dx),
             Message::ViewportChanged(width, height) => self.on_viewport_changed(width, height),
         }
     }
@@ -788,6 +790,26 @@ impl FilesView {
                 0.
             },
         );
+        Task::none()
+    }
+
+    fn on_column_resized(&mut self, index: usize, dx: f64) -> Task<Message> {
+        if !dx.is_finite() {
+            return Task::none();
+        }
+        self.column_widths.resize(
+            self.column_widths.len().max(index + 1),
+            columns::COLUMN_WIDTH,
+        );
+        self.column_widths[index] = (self.column_widths[index] + dx).clamp(160., 640.);
+        Task::none()
+    }
+
+    fn on_chosen_resized(&mut self, dx: f64) -> Task<Message> {
+        if !dx.is_finite() {
+            return Task::none();
+        }
+        self.chosen_width = (self.chosen_width + dx).clamp(160., 640.);
         Task::none()
     }
 

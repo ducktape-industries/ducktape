@@ -158,33 +158,29 @@ impl FilesView {
                 (self.viewport_width >= app_update::SIDEBAR_MIN).then_some(Message::ToggleSidebar),
                 self.sidebar_open,
             ),
-            kit::quiet(
+            kit::navigation(
                 format!("{key}/back"),
-                "‹",
+                "←",
                 "Back",
                 self.nav.can_back().then_some(Message::Back),
-                false,
             ),
-            kit::quiet(
+            kit::navigation(
                 format!("{key}/forward"),
-                "›",
+                "→",
                 "Forward",
                 self.nav.can_forward().then_some(Message::Forward),
-                false,
             ),
-            kit::quiet(
+            kit::navigation(
                 format!("{key}/up"),
                 "↑",
                 "Up",
                 (!self.nav.at_root()).then_some(Message::Parent),
-                false,
             ),
-            kit::quiet(
+            kit::navigation(
                 format!("{key}/refresh"),
                 "↻",
                 "Refresh",
                 Some(Message::Refresh),
-                false,
             ),
             native::gap(4.),
             kit::quiet(
