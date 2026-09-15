@@ -25,15 +25,21 @@ impl BoardsView {
                 continue;
             };
             let s = &record.shape;
+            // Only what the box will move is inside the box. A connector that
+            // holds a card is carried by the cards it names, so it is not a
+            // member — and its stored rectangle is left where it was drawn,
+            // which the run itself long since left. Counting it stretched the
+            // box up to a corner nothing stood in.
+            if !free(s) {
+                continue;
+            }
             bounds = [
                 bounds[0].min(s.x as f32),
                 bounds[1].min(s.y as f32),
                 bounds[2].max((s.x + s.width) as f32),
                 bounds[3].max((s.y + s.height) as f32),
             ];
-            if free(s) {
-                shapes.insert(id.clone(), s.clone());
-            }
+            shapes.insert(id.clone(), s.clone());
         }
         if shapes.is_empty() {
             return None;
@@ -190,6 +196,15 @@ impl BoardsView {
             Key::Named(named) => format!("{named:?}"),
             _ => return Task::none(),
         };
+        // The board menu has a name field in it, and a board is named with the
+        // same letters the tools answer to: every character of "Grid" picked a
+        // tool up as it went past, and the board you made landed on a canvas
+        // holding the ellipse. While the menu is up the canvas is not
+        // listening — Escape closes it and nothing else reaches past it.
+        if self.picking_a_board() {
+            let dismiss = key == "Escape";
+            return if dismiss { self.on_cancel() } else { Task::none() };
+        }
         let help_key = key == "?" || (key == "/" && shift);
         if help_key && !command && !repeat {
             return self.on_help();
@@ -270,9 +285,19 @@ impl BoardsView {
         self.help = !self.help;
         Task::none()
     }
+    /// Whether the board menu is the thing on screen: either you opened it, or
+    /// there is no board to draw on and it is all there is. The painter asks so
+    /// it knows to draw the menu open; the keyboard asks so it knows the canvas
+    /// is not the one being typed at.
+    pub(super) fn picking_a_board(&self) -> bool {
+        self.board_picker || self.confirmed.is_none()
+    }
     pub(super) fn on_board_picker(&mut self) -> Task<Message> {
         self.board_picker = !self.board_picker;
-        Task::none()
+        if self.board_picker {
+            return Task::none();
+        }
+        self.take_the_keyboard()
     }
     pub(super) fn on_snap(&mut self) -> Task<Message> {
         self.snap = !self.snap;
@@ -830,12 +855,13 @@ impl BoardsView {
             Kind::Rectangle => (240., 140.),
             Kind::Ellipse => (200., 200.),
             Kind::Diamond => (200., 160.),
-            Kind::Text => (280., 96.),
+            // One line and the room it is written in. Words are the whole of a
+            // text shape, so a box made taller than its words is dead space
+            // that still answers a click; it grows under the caret as you type
+            // and stops where you stop.
+            Kind::Text => (280., 60.),
             Kind::Arrow | Kind::Line | Kind::Draw => (200., 140.),
         };
-        // A click has no box to take, so the default one lands centred on the
-        // pointer: a shape that appeared below and right of where you clicked
-        // would read as having missed.
         let size = if dragged {
             [
                 (b[2] - b[0]).round().clamp(40., 4000.),
@@ -844,10 +870,17 @@ impl BoardsView {
         } else {
             [w, h]
         };
-        let corner = if dragged {
-            [b[0], b[1]]
-        } else {
-            [start[0] - size[0] / 2., start[1] - size[1] / 2.]
+        // Where a click with no box to take leaves the shape. A card lands
+        // centred on the pointer: one that appeared below and right of where
+        // you clicked would read as having missed. Words are the other way
+        // round — you click where the sentence should START, the way a text
+        // cursor works everywhere else — so a text shape's corner is the
+        // pointer and it runs away from it.
+        let writing = kind == Kind::Text;
+        let corner = match (dragged, writing) {
+            (true, _) => [b[0], b[1]],
+            (false, true) => start,
+            (false, false) => [start[0] - size[0] / 2., start[1] - size[1] / 2.],
         };
         Shape {
             kind,
@@ -1037,7 +1070,7 @@ impl BoardsView {
         self.guides.clear();
         self.help = false;
         self.board_picker = false;
-        Task::none()
+        self.take_the_keyboard()
     }
     pub(super) fn on_wheel(&mut self, x: f32, y: f32, pixels: bool) -> Task<Message> {
         let scale = if pixels { 1. } else { 32. };
@@ -1254,6 +1287,23 @@ impl BoardsView {
         ducktape_view_guest::widget::perform(wire::WidgetCommand::Focus {
             target: "boards/canvas-layout".into(),
         })
+    }
+    /// The keyboard belongs to the canvas whenever nothing else on the stage
+    /// is being typed at. A board you have just opened, or just made, answers
+    /// to the tool keys straight away: until now the only thing that ever
+    /// pointed the keyboard at the canvas was leaving a card, so on a board
+    /// you had not yet written in, N and R and Delete went nowhere.
+    pub(super) fn take_the_keyboard(&self) -> Task<Message> {
+        if self.inline.is_some() {
+            return Task::none();
+        }
+        self.hand_back_focus()
+    }
+    /// The stage has appeared. Take its measure, and take the keyboard with
+    /// it — a canvas nobody has clicked in yet is still the thing on screen.
+    pub(super) fn on_mounted(&mut self, width: f32, height: f32) -> Task<Message> {
+        let sized = self.on_size(width, height);
+        Task::batch([sized, self.take_the_keyboard()])
     }
     fn kind_of(&self, id: &str) -> Option<Kind> {
         Some(self.visible()?.shapes.get(id)?.shape.kind)
