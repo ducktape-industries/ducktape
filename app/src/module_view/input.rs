@@ -263,13 +263,23 @@ impl Element for Observe {
         listen_key(window, self.route.clone(), |event: &gpui::KeyUpEvent| {
             wire::keyboard::Event::Release(key_state(&event.keystroke))
         });
-        listen_key(
-            window,
-            self.route.clone(),
-            |event: &gpui::ModifiersChangedEvent| {
-                wire::keyboard::Event::Modifiers(modifiers(event.modifiers))
-            },
-        );
+        // A modifier changing is NOT a keystroke: GPUI keeps its own listener
+        // list for it, and a key listener registered for the event is never
+        // called. Registered as a key listener, the guest learned a modifier
+        // only from a key pressed while it was held — so ⌘-wheel never zoomed,
+        // Alt-drag never duplicated, and Shift never held a run straight.
+        // Nothing captures a modifier, so it is never captured.
+        let route = self.route.clone();
+        window.on_modifiers_changed(move |event: &gpui::ModifiersChangedEvent, _, cx| {
+            route.deferred(
+                wire::Event::Keyboard {
+                    event: wire::keyboard::Event::Modifiers(modifiers(event.modifiers)),
+                    captured: false,
+                },
+                Rc::new(Cell::new(false)),
+                cx,
+            );
+        });
         let route = self.route.clone();
         let files = self.files.clone();
         let dispatch = RefCell::new(None);
