@@ -424,6 +424,7 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
         (
             "agent",
             json!({ "provision": {
+                "request_id": "sweep",
                 "name": "quackbot",
                 "program": runs::model_program("quackbot"),
             }}),
