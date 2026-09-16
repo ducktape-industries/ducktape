@@ -1,4 +1,4 @@
-//! The wire between a host and an Ice app running in wasm.
+//! The wire between a host and a view running in wasm.
 //!
 //! The guest ships a WIDGET TREE, not a picture: every tick it returns the
 //! [`Node`] its view built, with every value inlined — text, colours, sizes —
@@ -21,14 +21,11 @@
 //! drop silently. A host that reads a frame from an untrusted module runs
 //! [`sanitize`] first.
 
-#[cfg(feature = "authored-tests")]
-pub mod authored;
 /// Exact bincode protocol implemented by this build. Bump on serialized shape changes.
 /// This is independent of WIT signatures and the manifest text format.
 pub const WIRE_EPOCH: u32 = 7;
 
 pub mod manifest;
-pub mod native;
 #[cfg(feature = "schema")]
 pub mod schema;
 mod wit;
@@ -97,8 +94,6 @@ pub use list::ListKey;
 mod query;
 pub use query::{ContainerQuery, MAX_QUERY_OPS, QueryOp};
 
-mod markdown;
-pub use markdown::MarkdownDocument;
 mod window;
 pub use window::WindowCommand;
 
@@ -109,23 +104,13 @@ mod surface;
 pub use surface::{MAX_SURFACE_DEPTH, MAX_SURFACE_VALUES, SurfaceValue, sanitize_surface_event};
 
 mod node;
-pub use node::{ButtonContent, Erase, Node};
+pub use node::{ButtonContent, Node};
 mod patch;
 pub use patch::{MAX_PATCHES, Patch, apply, diff};
-
-/// Clipboard addressed by `clipboard.read` (this value as payload) and
-/// `clipboard.write` (`(ClipboardTarget, String)` as payload). Reads return
-/// an encoded `Option<String>`; writes return an empty successful response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ClipboardTarget {
-    Standard,
-    Primary,
-}
 
 pub mod events;
 pub mod keyboard;
 pub mod mouse;
-pub mod system;
 
 /// Something the host tells the guest.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

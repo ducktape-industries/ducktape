@@ -497,27 +497,14 @@ pub enum Node {
     /// hands it; `on_event` routes a returned value to its handler. The guest
     /// never sees what is drawn there, and the host repaints it on its own clock — a live video tile, a sweeping hand —
     /// without a guest tick. A name the host has not registered renders as
-    /// a visible placeholder. It takes the size its parent gives it: an Ice
-    /// `box w= h=` around the `extern` call sets it.
+    /// a visible placeholder. It takes the size its parent gives it: wrap it
+    /// in a sized [`Node::Container`] to set one.
     Surface {
         key: String,
         name: String,
         args: Vec<SurfaceValue>,
         on_event: Option<u32>,
     },
-}
-
-/// Spends generic parameters on nothing: `<(&'a (), M, T) as Erase>::Node`
-/// is [`Node`] for every `'a`, `M` and `T`. Generated code names its element
-/// type `__IceElement<'a, Message, Theme>` for both targets, and a type
-/// alias may not drop a parameter, so the tree target's alias projects
-/// through this instead.
-pub trait Erase {
-    type Node;
-}
-
-impl<T: ?Sized> Erase for T {
-    type Node = Node;
 }
 
 impl Node {

@@ -146,7 +146,7 @@ mod tests {
     }
 }
 
-/// Copied native viewer settings; absent values retain Iced defaults.
+/// Copied native viewer settings; absent values retain the host's defaults.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ViewerOptions {
     pub padding: Option<f32>,

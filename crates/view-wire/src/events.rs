@@ -10,13 +10,6 @@ pub struct Interest {
 }
 
 impl Interest {
-    pub const ALL: Self = Self {
-        focus: true,
-        close: true,
-        files: true,
-        input_method: true,
-    };
-
     pub fn include(&mut self, other: Self) {
         self.focus |= other.focus;
         self.close |= other.close;

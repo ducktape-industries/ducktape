@@ -16,7 +16,6 @@ manifest = ["dep:wasmparser"]
 # Derives a view's snapshot layout from its own serde impls. A dev-dependency
 # feature: the tracer never enters wasm, so a guest builds without either crate.
 schema = ["dep:serde-reflection", "dep:sha2"]
-authored-tests = []
 
 [dependencies]
 wasmparser = { version = "0.251", optional = true }

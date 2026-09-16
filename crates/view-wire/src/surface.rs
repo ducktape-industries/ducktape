@@ -5,7 +5,7 @@ use std::cell::Cell;
 pub const MAX_SURFACE_DEPTH: usize = 32;
 pub const MAX_SURFACE_VALUES: usize = 4096;
 
-/// An owned, tagged value. Records carry the Ice declaration name and named
+/// An owned, tagged value. Records carry the guest's declaration name and named
 /// fields; native resources and pointers are not wire values.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum SurfaceValue {
