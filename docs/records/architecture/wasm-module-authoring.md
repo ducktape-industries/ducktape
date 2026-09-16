@@ -305,7 +305,12 @@ share the same preparation checks. A `<id>.view.pending` marker blocks both,
 even when an older view file is still present.
 
 `make views` bundles the packages declared under `crates/views/`, with fixed
-source-path prefixes and explicit unoptimized output independent of PATH.
+source-path prefixes and explicit unoptimized output independent of PATH. It
+compiles through `/var/tmp/ducktape-view-root`, a symlink to the checkout: a
+view reaches module crates outside the `crates/views` workspace, and cargo
+hashes such a dependency's absolute location into its `-C metadata` and so into
+every symbol it emits, which would tie a view's bytes to where the checkout
+lives. One build owns that name at a time.
 `make views-repro-check` builds the committed HEAD snapshot in two isolated
 roots, compares all view bytes, and rejects embedded builder-home paths.
 The consensus guest `wasm-rebuild-check` does not cover these views. The noded
