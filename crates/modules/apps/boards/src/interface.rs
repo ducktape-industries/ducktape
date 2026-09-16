@@ -32,6 +32,31 @@ impl Kind {
     }
 }
 
+/// Where a shape's words sit across the room they are written in. A card is a
+/// column of text and a column can be read from either edge or from the
+/// middle; nothing else about the shape changes with it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Align {
+    Start,
+    #[default]
+    Middle,
+    End,
+}
+/// How big a shape's words are. Four steps and not a number: the size decides
+/// the box a text shape hugs and the column a card wraps in, so a free number
+/// would let a board hold writing that no zoom level can read and no box can
+/// be fitted to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextSize {
+    Small,
+    #[default]
+    Medium,
+    Large,
+    Huge,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Shape {
@@ -42,6 +67,8 @@ pub struct Shape {
     pub height: i32,
     pub text: String,
     pub color: u8,
+    pub align: Align,
+    pub text_size: TextSize,
     /// A path's samples, relative to `x`/`y` and spanning `width`/`height`,
     /// so a move carries the stroke and a resize scales it. Cards hold none.
     pub points: Vec<[i32; 2]>,
@@ -60,6 +87,8 @@ impl Default for Shape {
             height: 140,
             text: String::new(),
             color: 0,
+            align: Align::Middle,
+            text_size: TextSize::Medium,
             points: Vec::new(),
             from: None,
             to: None,
@@ -113,6 +142,14 @@ pub enum Change {
     Color {
         id: String,
         color: u8,
+    },
+    Align {
+        id: String,
+        align: Align,
+    },
+    TextSize {
+        id: String,
+        text_size: TextSize,
     },
     /// A connector's run, restated: the samples, the box they span, and which
     /// cards its ends hold. Dragging one end moves all of them together — a
@@ -200,6 +237,8 @@ impl Board {
             Change::Resize { id, width, height } => self.resize(id, *width, *height),
             Change::Text { id, text } => self.text(id, text),
             Change::Color { id, color } => self.color(id, *color),
+            Change::Align { id, align } => self.align(id, *align),
+            Change::TextSize { id, text_size } => self.text_size(id, *text_size),
             Change::Route {
                 id,
                 x,
@@ -291,6 +330,22 @@ impl Board {
         };
         let mut shape = record.shape.clone();
         shape.color = color;
+        self.replace(id, Some(shape))
+    }
+    fn align(&mut self, id: &str, align: Align) -> Result<(), String> {
+        let Some(record) = self.shapes.get(id) else {
+            return Ok(());
+        };
+        let mut shape = record.shape.clone();
+        shape.align = align;
+        self.replace(id, Some(shape))
+    }
+    fn text_size(&mut self, id: &str, text_size: TextSize) -> Result<(), String> {
+        let Some(record) = self.shapes.get(id) else {
+            return Ok(());
+        };
+        let mut shape = record.shape.clone();
+        shape.text_size = text_size;
         self.replace(id, Some(shape))
     }
     /// A card has no run to re-route, so naming one here is a mistake worth

@@ -2004,13 +2004,13 @@ fn the_caret_sits_on_the_words_whether_they_ride_a_line_or_a_card() {
     let box_ = super::interaction::plate(&run);
     let (pos, room) = view.writing_box(&board, &edge, box_);
     let inline = view.inline.clone().unwrap();
-    assert_eq!(view.caret_box(&inline, edge.kind, pos, room), (pos, room));
+    assert_eq!(view.caret_box(&inline, &edge, pos, room), (pos, room));
     // Once the gauge has answered, the caret is as wide as the words and sits
     // at the middle of the room — the same middle the painter centres the
     // saved plate on, so the words do not jump when you stop typing.
     view.on_measured(60., 24.);
     let inline = view.inline.clone().unwrap();
-    let (caret, size) = view.caret_box(&inline, edge.kind, pos, room);
+    let (caret, size) = view.caret_box(&inline, &edge, pos, room);
     assert!(size[0] < room[0], "the caret still took the whole room");
     // The WORDS are centred, not the box: the editor writes from its box's left
     // edge, so the wrapping margin the box carries is not part of the middle.
@@ -2023,7 +2023,7 @@ fn the_caret_sits_on_the_words_whether_they_ride_a_line_or_a_card() {
     // label on.
     let card = board.shapes["a"].shape.clone();
     let (pos, room) = view.writing_box(&board, &card, [0., 0., 200., 120.]);
-    let (caret, size) = view.caret_box(&inline, Kind::Note, pos, room);
+    let (caret, size) = view.caret_box(&inline, &card, pos, room);
     assert!(
         size[0] < room[0],
         "the caret took the whole width of the card"
@@ -2037,8 +2037,12 @@ fn the_caret_sits_on_the_words_whether_they_ride_a_line_or_a_card() {
         "the words do not sit at the middle of the card"
     );
     // A text shape IS its words: its corner is where you put it, both ways.
+    let plain = Shape {
+        kind: Kind::Text,
+        ..card.clone()
+    };
     assert_eq!(
-        view.caret_box(&inline, Kind::Text, pos, room).0,
+        view.caret_box(&inline, &plain, pos, room).0,
         pos,
         "a text shape's words walked away from the corner they were put at"
     );
@@ -2464,4 +2468,184 @@ fn a_line_once_taken_is_kept_until_the_hand_is_clearly_past_it() {
     );
     view.on_release();
     assert!(view.guides.is_empty(), "the guides go with the gesture");
+}
+/// The layout the painter gives one shape's words, out of a whole frame.
+fn written(json: &str, id: &str) -> String {
+    let tail = json
+        .split(&format!("boards/label-clip/{id}"))
+        .nth(1)
+        .unwrap_or_else(|| panic!("{id} has no words in its box"));
+    tail[..tail.len().min(400)].to_string()
+}
+#[test]
+fn the_type_ladder_moves_the_words_and_the_room_they_ask_for() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.zoom = 1.;
+    let laid_out = |view: &BoardsView, text_size| {
+        view.lettering(
+            &Shape {
+                text_size,
+                ..Default::default()
+            },
+            [200., 140.],
+        )
+    };
+    let small = laid_out(&view, TextSize::Small);
+    let medium = laid_out(&view, TextSize::Medium);
+    let huge = laid_out(&view, TextSize::Huge);
+    assert!(
+        small.size < medium.size && medium.size < huge.size,
+        "the ladder does not climb: {} {} {}",
+        small.size,
+        medium.size,
+        huge.size
+    );
+    assert_eq!(
+        medium.size, 14.,
+        "the middle step moved what a card was already written at"
+    );
+    // Everything the size decides moves with it: the margin a box keeps
+    // around the words, and so the room a text shape hugs them with.
+    assert!(
+        super::presentation::margin(&huge) > super::presentation::margin(&small),
+        "the room the words ask for does not follow the size they are at"
+    );
+    // And the step reaches the board: a card set to Huge is painted at the
+    // huge size, not at the one it was created with.
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            text: "loud".into(),
+            ..Default::default()
+        },
+    });
+    view.selected = ["a".into()].into();
+    view.on_lettering(TextSize::Huge);
+    let shape = view.visible().unwrap().shapes["a"].shape.clone();
+    assert_eq!(shape.text_size, TextSize::Huge);
+    assert_eq!(
+        view.lettering(&shape, [200., 140.]).size,
+        huge.size,
+        "the card is not painted at the size it was set to"
+    );
+    // Undo puts the step back the way it puts any other field back.
+    view.on_undo();
+    assert_eq!(
+        view.visible().unwrap().shapes["a"].shape.text_size,
+        TextSize::Medium,
+        "the size it was is not what undo restored"
+    );
+    // A text shape IS its words, so the box steps with them — a box left at
+    // the old size holds the new words clipped, with nothing to re-measure it
+    // until somebody types in it again. A card keeps the room it was given.
+    view.edit(Change::Create {
+        id: "t".into(),
+        shape: Shape {
+            kind: Kind::Text,
+            x: 700,
+            width: 120,
+            height: 40,
+            text: "a caption".into(),
+            ..Default::default()
+        },
+    });
+    let card = view.visible().unwrap().shapes["a"].shape.clone();
+    view.selected = ["t".into(), "a".into()].into();
+    view.on_lettering(TextSize::Huge);
+    let board = view.visible().unwrap();
+    let grown = &board.shapes["t"].shape;
+    let ratio =
+        super::presentation::step(TextSize::Huge) / super::presentation::step(TextSize::Medium);
+    assert_eq!(
+        (grown.width, grown.height),
+        ((120. * ratio).ceil() as i32, (40. * ratio).ceil() as i32),
+        "a text shape's box did not step with its words"
+    );
+    let kept = &board.shapes["a"].shape;
+    assert_eq!(
+        (kept.width, kept.height),
+        (card.width, card.height),
+        "a card did not keep the room it was given"
+    );
+}
+#[test]
+fn a_cards_words_sit_where_the_alignment_says_and_the_caret_goes_with_them() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.zoom = 1.;
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            text: "a thought".into(),
+            ..Default::default()
+        },
+    });
+    view.selected = ["a".into()].into();
+    view.begin_text();
+    // The gauge has answered: the words are 60 wide in a card 200 wide, so
+    // there are 140 units of slack for the alignment to spend.
+    view.on_measured(60., 24.);
+    let inline = view.inline.clone().unwrap();
+    let pos = [0., 0.];
+    let room = [200., 140.];
+    let placed = |view: &BoardsView, align| {
+        let shape = Shape {
+            align,
+            text: "a thought".into(),
+            ..Default::default()
+        };
+        view.caret_box(&inline, &shape, pos, room).0[0]
+    };
+    assert_eq!(
+        placed(&view, Align::Start),
+        0.,
+        "words set to the left did not start at the left"
+    );
+    assert_eq!(
+        placed(&view, Align::Middle),
+        70.,
+        "words set to the middle are not in the middle"
+    );
+    assert_eq!(
+        placed(&view, Align::End),
+        140.,
+        "words set to the right did not end at the right"
+    );
+    // And the painter is set the same way, because a card whose words are
+    // drawn to the left and typed in the middle is the same defect as one
+    // whose words move when you save it.
+    view.on_cancel();
+    view.selected = ["a".into()].into();
+    for (align, expected) in [
+        (Align::Start, "Left"),
+        (Align::Middle, "Center"),
+        (Align::End, "Right"),
+    ] {
+        view.on_align(align);
+        let json = serde_json::to_string(&view.view()).unwrap();
+        let card = written(&json, "a");
+        assert!(
+            card.contains(expected),
+            "a card set to {align:?} is painted as {card}"
+        );
+    }
+    // A text shape IS its words, so nothing about it moves: its corner is
+    // where you put it however the alignment is set.
+    view.edit(Change::Create {
+        id: "t".into(),
+        shape: Shape {
+            kind: Kind::Text,
+            x: 700,
+            align: Align::End,
+            text: "a caption".into(),
+            ..Default::default()
+        },
+    });
+    let json = serde_json::to_string(&view.view()).unwrap();
+    let caption = written(&json, "t");
+    assert!(
+        !caption.contains("Right"),
+        "a text shape's words walked away from the corner they were put at: {caption}"
+    );
 }
