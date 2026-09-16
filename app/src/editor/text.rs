@@ -13,8 +13,8 @@ use gpui_kit::base::input::{InputEditorStyle, Textarea, TextareaState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, Edges, Entity, EntityInputHandler as _, EventEmitter,
-    Focusable as _, Hsla, InteractiveElement as _, IntoElement, Keystroke, ParentElement as _,
-    Render, SharedString, Styled as _, Subscription, Window, div, px,
+    Focusable as _, Hsla, InteractiveElement as _, IntoElement, Keystroke, MouseButton,
+    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, div, px,
 };
 use std::ops::Range;
 use std::sync::Arc;
@@ -315,6 +315,31 @@ impl TextEditor {
         cx.stop_propagation();
         cx.emit(());
     }
+
+    /// A press in the box that the field itself did not take — the empty room
+    /// under the last line — is still a press on the writing. It puts the
+    /// caret at the end of the text, the way clicking under the words in any
+    /// text box does, instead of landing nowhere.
+    fn pressed(
+        &mut self,
+        event: &gpui_kit::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let on_the_words = self.input.read(cx).input_bounds().contains(&event.position);
+        if on_the_words {
+            return;
+        }
+        let end = wire::EditorCursor {
+            position: position(&self.preview, self.preview.len()),
+            selection: None,
+        };
+        if end != self.cursor {
+            self.move_cursor(end, cx);
+            self.install(window, cx);
+        }
+        self.input.read(cx).focus_handle(cx).focus(window, cx);
+    }
 }
 
 impl Render for TextEditor {
@@ -342,6 +367,10 @@ impl Render for TextEditor {
             .key_context(GUEST_EDITOR_CONTEXT)
             .relative()
             .w_full()
+            // The box the guest gave, not the room the words take: a press in
+            // the empty part of a card is a press on the card's writing.
+            .h_full()
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::pressed))
             .p(px(options.padding.unwrap_or(8.)))
             .text_size(px(size))
             .line_height(px(line_height))
