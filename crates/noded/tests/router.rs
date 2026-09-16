@@ -2165,6 +2165,93 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
 }
 
 #[tokio::test]
+async fn gateway_operator_forwards_existing_authentication_without_requiring_an_account() {
+    let (handle, cmds, _events) = local_node();
+    let owner = caller();
+    let handle = handle.with_admin(AdminConfig {
+        operator_token: Some(OPERATOR.into()),
+        node_key: Some(NODE_KEY.to_vec()),
+        owner_key: Some(owner.public_key().as_ref().to_vec()),
+        ..Default::default()
+    });
+    let body = serde_json::json!({
+        "head": {
+            "account_id": 1, "name": {"label": "app"}, "revision": 7,
+            "method": "post", "path_and_query": "/sessions", "headers": [],
+            "body_len": 2, "upgrade": false, "user_pop": null,
+        },
+        "body_b64": "e30=",
+    });
+    let (lane, mut jobs) = tokio::sync::mpsc::channel(1);
+    let app = noded::router(handle.with_gateway(lane));
+    let path = "/v1/gateway/operator";
+    let stranger = commonware_cryptography::ed25519::PrivateKey::from_seed(78);
+    let requests = [
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        signed_by(&stranger, "POST", path, body.clone()),
+        with_peer(post(path, body.clone()), "192.0.2.1:40000"),
+    ];
+    for (request, status) in requests.into_iter().zip([
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::UNAUTHORIZED,
+    ]) {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), status);
+    }
+    let mut forged = body.clone();
+    forged["head"]["operator"] = true.into();
+    let response = app
+        .clone()
+        .oneshot(post("/v1/gateway/proxy", forged))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(jobs.try_recv().is_err());
+
+    spawn_gateway_actor(cmds, 2);
+    let serving = tokio::spawn(async move {
+        for _ in 0..2 {
+            let noded::GatewayJob::Http {
+                head, body, reply, ..
+            } = jobs.recv().await.unwrap()
+            else {
+                panic!("HTTP exchange expected");
+            };
+            assert!(head.operator);
+            assert!(head.user_pop.is_none());
+            assert!(head.headers.is_empty());
+            assert_eq!(body, b"{}");
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            drop(tx);
+            reply
+                .send(Ok(noded::GatewayResponse {
+                    head: gateway::ProxyResponseHead {
+                        status: 204,
+                        headers: vec![],
+                    },
+                    body: rx,
+                }))
+                .unwrap();
+        }
+    });
+    for request in [
+        post(path, body.clone()),
+        signed_by(&owner, "POST", path, body),
+    ] {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["head"]["status"], 204);
+    }
+    serving.await.unwrap();
+}
+
+#[tokio::test]
 async fn gateway_api_rejects_untrusted_browser_origins_before_network_work() {
     let (handle, _cmds, _events) = local_node();
     for origin in ["https://evil.example", "http://app.demo.duck"] {

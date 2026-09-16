@@ -757,6 +757,12 @@ pub fn router(handle: NodeHandle) -> Router {
                 gateway_http::JSON_LANE_REQUEST_BYTES * 2 + gateway::MAX_PROXY_HEAD_BYTES,
             )),
         )
+        .route(
+            "/v1/gateway/operator",
+            post(gateway_http::gateway_operator_proxy).layer(DefaultBodyLimit::max(
+                gateway_http::JSON_LANE_REQUEST_BYTES * 2 + gateway::MAX_PROXY_HEAD_BYTES,
+            )),
+        )
         .route("/v1/gateway/browser", get(gateway_browser_base))
         .route(
             "/v1/gateway/stream",

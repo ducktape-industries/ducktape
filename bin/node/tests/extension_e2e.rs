@@ -328,6 +328,7 @@ fn route(user: &ed25519::PrivateKey, chain: &str, publisher: Vec<u8>) -> gateway
 fn proxy(cluster: &Cluster, user: &ed25519::PrivateKey, text: &str) -> (u16, serde_json::Value) {
     let body = serde_json::to_vec(&serde_json::json!({"text":text})).unwrap();
     let mut head = gateway::ProxyRequestHead {
+        operator: false,
         account_id: 1,
         name: gateway::RouteName::named(LABEL),
         revision: 1,

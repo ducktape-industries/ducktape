@@ -958,6 +958,9 @@ async fn proxy_loopback(
     if let Some(account) = caller_account {
         upstream = upstream.header("x-duck-caller-account", account.to_string());
     }
+    if head.operator {
+        upstream = upstream.header("x-duck-caller-operator", "true");
+    }
     for header in &head.headers {
         // Strip hop-by-hop / forwarding / identity headers and never let a
         // caller header shadow a proxy-minted x-duck-* (decode already rejects
@@ -2242,6 +2245,7 @@ mod tests {
             credential: Some(reqwest::header::HeaderValue::from_str(&"a".repeat(64)).unwrap()),
         };
         let head = gateway::ProxyRequestHead {
+            operator: false,
             account_id: 1,
             name: gateway::RouteName::named("api"),
             revision: 1,
@@ -2302,6 +2306,7 @@ mod tests {
     #[test]
     fn a_multibyte_header_name_yields_a_failure_frame_and_no_non_ascii() {
         let head = gateway::ProxyRequestHead {
+            operator: false,
             account_id: 1,
             name: gateway::RouteName::named("app"),
             revision: 1,
@@ -2709,6 +2714,7 @@ mod tests {
     async fn live_reauthorization_fails_closed_when_the_actor_holds_its_reply() {
         let (commands, mut requests) = mpsc::channel(1);
         let head = gateway::ProxyRequestHead {
+            operator: false,
             account_id: 1,
             name: gateway::RouteName::named("api"),
             revision: 4,
@@ -2753,6 +2759,7 @@ mod tests {
         let member = ed25519::PrivateKey::from_seed(44);
         let route = signed_route(&member, publisher, gateway::RouteAudience::Owner, true);
         let head = gateway::ProxyRequestHead {
+            operator: false,
             account_id: 1,
             name: gateway::RouteName::named("api"),
             revision: 4,
@@ -3077,6 +3084,7 @@ mod tests {
 
         let (mut client, server) = tokio::io::duplex(4096);
         let head = gateway::ProxyRequestHead {
+            operator: false,
             account_id: 1,
             name: gateway::RouteName::named("api"),
             revision: 4,
@@ -3236,6 +3244,7 @@ mod tests {
         // caller_ws_pump over a local duplex.
         let (server_end, caller_end) = tokio::io::duplex(64 * 1024);
         let head = gateway::ProxyRequestHead {
+            operator: false,
             account_id: 1,
             name: gateway::RouteName::named("api"),
             revision: 4,
@@ -3355,6 +3364,7 @@ mod tests {
             .unwrap()
             .as_secs();
         let head = gateway::ProxyRequestHead {
+            operator: false,
             account_id: statement.account_id,
             name: statement.name.clone(),
             revision: statement.revision,
@@ -3375,6 +3385,11 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_proxy_forwards_cookie_and_verified_caller() {
+        assert_loopback_caller(false).await;
+        assert_loopback_caller(true).await;
+    }
+
+    async fn assert_loopback_caller(operator: bool) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -3391,6 +3406,8 @@ mod tests {
             // is rejected at decode and stripped at forward).
             assert!(lower.contains("x-duck-caller-node: 0303"));
             assert!(!lower.contains("x-duck-caller-account"));
+            assert_eq!(lower.contains("x-duck-caller-operator: true\r\n"), operator);
+            assert!(!lower.contains("x-ducktape-admin-token"));
             assert!(lower.contains("x-duck-route-account: 1\r\n"));
             assert!(lower.contains(&format!("x-duck-upstream-token: {}\r\n", "a".repeat(64))));
             assert!(lower.contains("content-type: application/json"));
@@ -3458,6 +3475,7 @@ mod tests {
             },
             &caller,
             &gateway::ProxyRequestHead {
+                operator,
                 account_id: 1,
                 name: gateway::RouteName::named("api"),
                 revision: 4,
@@ -3586,6 +3604,7 @@ mod tests {
             },
             &caller_node,
             &gateway::ProxyRequestHead {
+                operator: false,
                 account_id: 1,
                 name: gateway::RouteName::named("api"),
                 revision: 4,
@@ -3651,6 +3670,7 @@ mod tests {
             },
             &[3u8; 32],
             &gateway::ProxyRequestHead {
+                operator: false,
                 account_id: 1,
                 name: gateway::RouteName::named("api"),
                 revision: 4,
@@ -3772,6 +3792,7 @@ mod tests {
             )));
         });
         let head = gateway::ProxyRequestHead {
+            operator: false,
             account_id: 1,
             name: gateway::RouteName::named("api"),
             revision: 4,
@@ -3816,6 +3837,7 @@ mod tests {
             },
             &caller,
             &gateway::ProxyRequestHead {
+                operator: false,
                 account_id: 1,
                 name: gateway::RouteName::named("api"),
                 revision: 4,
@@ -3872,6 +3894,7 @@ mod tests {
             own_node: &publisher,
         };
         let owned_head = gateway::ProxyRequestHead {
+            operator: false,
             account_id: 1,
             name: gateway::RouteName::named("api"),
             revision: 4,
@@ -3883,6 +3906,7 @@ mod tests {
             user_pop: Some(pop),
         };
         let anonymous_head = gateway::ProxyRequestHead {
+            operator: false,
             user_pop: None,
             ..owned_head.clone()
         };
@@ -4005,6 +4029,7 @@ mod tests {
             },
             &[3u8; 32],
             &gateway::ProxyRequestHead {
+                operator: false,
                 account_id: 2,
                 name: gateway::RouteName::named("api"),
                 revision: 4,
@@ -4210,6 +4235,7 @@ mod tests {
             },
             &case.publisher,
             &gateway::ProxyRequestHead {
+                operator: false,
                 account_id: 1,
                 name: gateway::RouteName::apex(),
                 revision: 1,

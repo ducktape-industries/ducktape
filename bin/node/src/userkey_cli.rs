@@ -1093,6 +1093,7 @@ mod userkey_verb_tests {
         let head_path = dir.path().join("head.json");
         let body_path = dir.path().join("body.bin");
         let head = gateway::ProxyRequestHead {
+            operator: false,
             account_id: 7,
             name: gateway::RouteName::named("api"),
             revision: 3,

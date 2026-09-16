@@ -104,6 +104,12 @@ pub struct UserPop {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyRequestHead {
+    /// The authenticated calling node attests that its operator authorized this
+    /// exchange. This is not authority on the publisher: services still apply
+    /// their existing local/peer admission. Public ingress never trusts this
+    /// client-supplied field; only the operator-authenticated node door sets it.
+    #[serde(default)]
+    pub operator: bool,
     pub account_id: u64,
     pub name: RouteName,
     pub revision: u64,
@@ -408,6 +414,7 @@ mod tests {
     #[test]
     fn invocation_is_record_method_revision_and_header_scoped() {
         let head = ProxyRequestHead {
+            operator: false,
             account_id: 1,
             name: RouteName::named("api"),
             revision: 7,
@@ -446,6 +453,7 @@ mod tests {
     #[test]
     fn request_head_requires_the_upgrade_verdict() {
         let mut value = serde_json::to_value(ProxyRequestHead {
+            operator: false,
             account_id: 1,
             name: RouteName::named("api"),
             revision: 7,
@@ -464,6 +472,7 @@ mod tests {
     #[test]
     fn a_head_without_a_user_pop_decodes_as_an_account_less_caller() {
         let mut value = serde_json::to_value(ProxyRequestHead {
+            operator: false,
             account_id: 1,
             name: RouteName::named("api"),
             revision: 7,
@@ -582,6 +591,7 @@ mod tests {
     #[test]
     fn caller_cannot_forge_a_huge_body_len_or_the_zero_account() {
         let head = ProxyRequestHead {
+            operator: false,
             account_id: 1,
             name: RouteName::apex(),
             revision: 1,

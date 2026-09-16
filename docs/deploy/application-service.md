@@ -85,6 +85,13 @@ socket. The Gateway strips caller-supplied `x-duck-*` headers and injects its ow
 - `x-duck-caller-account`: the account established by the request's user proof;
   absent when the route permits an anonymous peer.
 - `x-duck-caller-node`: the authenticated source peer's public key in hexadecimal.
+- `x-duck-caller-operator: true`: the calling node verified its existing operator
+  token or configured operator-key signature through `POST /v1/gateway/operator`.
+  This asserts authority on the calling node, not on the service's host. The
+  service still applies its existing local/peer admission. The node never
+  forwards the operator credential itself. Ordinary proxy and view-stream
+  requests cannot supply this assertion.
+
 - `x-duck-route-account`, `x-duck-route-label`, `x-duck-route-revision`: the route
   whose current signed policy admitted the request.
 

@@ -305,6 +305,19 @@ async fn proxy_current(
     head: gateway::ProxyRequestHead,
     body: Vec<u8>,
 ) -> Result<GatewayResponse, GatewayFailure> {
+    if head.operator {
+        return Err(GatewayFailure::Forbidden(
+            "operator assertion requires the operator door".into(),
+        ));
+    }
+    proxy_authorized(handle, head, body).await
+}
+
+async fn proxy_authorized(
+    handle: &NodeHandle,
+    head: gateway::ProxyRequestHead,
+    body: Vec<u8>,
+) -> Result<GatewayResponse, GatewayFailure> {
     gateway::validate_proxy_request_head(&head).map_err(GatewayFailure::Invalid)?;
     if body.len() as u64 != head.body_len {
         return Err(GatewayFailure::Invalid(
@@ -375,8 +388,31 @@ pub(crate) async fn gateway_proxy(
             return error_response(StatusCode::BAD_REQUEST, &format!("body_b64: {error}"));
         }
     };
-    match proxy_current(&handle, request.head, body).await {
-        // The JSON lane is buffered BY CONTRACT (body_b64); collect the stream.
+    buffered_proxy_reply(proxy_current(&handle, request.head, body).await).await
+}
+
+/// The signed-write guard admits exactly the existing node operator credentials.
+/// Never copy those credentials into the upstream request.
+pub(crate) async fn gateway_operator_proxy(
+    State(handle): State<NodeHandle>,
+    headers: HeaderMap,
+    Json(mut request): Json<GatewayProxyRequest>,
+) -> Response {
+    use base64::Engine as _;
+    if let Some(response) = gateway_api_origin_guard(&headers) {
+        return response;
+    }
+    let body = match base64::engine::general_purpose::STANDARD.decode(request.body_b64) {
+        Ok(body) => body,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid body_b64"),
+    };
+    request.head.operator = true;
+    buffered_proxy_reply(proxy_authorized(&handle, request.head, body).await).await
+}
+
+async fn buffered_proxy_reply(result: Result<GatewayResponse, GatewayFailure>) -> Response {
+    use base64::Engine as _;
+    match result {
         Ok(mut response) => match collect_body(&mut response.body).await {
             Ok(body) => Json(GatewayProxyReply {
                 head: response.head,
@@ -477,7 +513,7 @@ pub async fn gateway_caller_account(
 /// The publisher verifies that proof and finalized route before upstream I/O.
 fn native_stream_head(bytes: &[u8]) -> Result<gateway::ProxyRequestHead, String> {
     let head = gateway::decode_proxy_request_head(bytes)?;
-    let authenticated_upgrade = head.upgrade && head.user_pop.is_some();
+    let authenticated_upgrade = head.upgrade && head.user_pop.is_some() && !head.operator;
     if !authenticated_upgrade {
         return Err("application stream requires a signed upgrade".into());
     }
@@ -864,6 +900,7 @@ async fn gateway_browser_proxy(
         Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
     };
     let head = gateway::ProxyRequestHead {
+        operator: false,
         account_id,
         name,
         revision: record.statement.revision,
@@ -1116,6 +1153,7 @@ async fn gateway_ws_door(
         return error_response(StatusCode::BAD_GATEWAY, "route has an invalid publisher");
     };
     let head = gateway::ProxyRequestHead {
+        operator: false,
         account_id: grant.account_id,
         name: grant.name,
         revision: record.statement.revision,
@@ -1261,6 +1299,7 @@ mod tests {
         };
         let ts = ::node::signed_req::now_secs();
         let mut head = gateway::ProxyRequestHead {
+            operator: false,
             account_id: 7,
             name: statement.name.clone(),
             revision: 1,
@@ -1330,6 +1369,7 @@ mod tests {
     #[test]
     fn native_stream_requires_a_bounded_signed_upgrade_head() {
         let mut head = gateway::ProxyRequestHead {
+            operator: false,
             account_id: 7,
             name: gateway::RouteName::named("canvas"),
             revision: 1,
@@ -1345,6 +1385,9 @@ mod tests {
             }),
         };
         assert!(native_stream_head(&serde_json::to_vec(&head).unwrap()).is_ok());
+        head.operator = true;
+        assert!(native_stream_head(&serde_json::to_vec(&head).unwrap()).is_err());
+        head.operator = false;
         head.user_pop = None;
         assert!(native_stream_head(&serde_json::to_vec(&head).unwrap()).is_err());
         head.upgrade = false;

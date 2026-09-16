@@ -243,7 +243,7 @@ enum Authority {
 /// to join this mesh for up to a year — neither is a module write any acting
 /// key should be able to ask for. neither handler reads [`SignedBy`], which is
 /// exactly why neither may be admitted on possession alone.
-const NODE_LEVEL_POSTS: &[&str] = &["/v1/log-filter", "/v1/invite"];
+const NODE_LEVEL_POSTS: &[&str] = &["/v1/log-filter", "/v1/invite", "/v1/gateway/operator"];
 
 /// the huddle node-proof mint ([`Lane::HuddleProof`]). an exact path: the
 /// handler binds the verified signer, and the account check is its own.
@@ -820,6 +820,7 @@ mod tests {
             // self-chosen key must not be enough.
             (Method::POST, "/v1/log-filter", Authority::Operator),
             (Method::POST, "/v1/invite", Authority::Operator),
+            (Method::POST, "/v1/gateway/operator", Authority::Operator),
             // the huddle proof binds the SIGNER, and a remote device has no
             // operator credential to offer: possession, then the handler's
             // own account check.

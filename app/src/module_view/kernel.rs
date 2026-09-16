@@ -1261,6 +1261,7 @@ fn application_request(value: serde_json::Value) -> Result<ApplicationRequest, S
     let request: ApplicationRequest =
         serde_json::from_value(value).map_err(|error| error.to_string())?;
     gateway::validate_proxy_request_head(&gateway::ProxyRequestHead {
+        operator: false,
         account_id: request.account,
         name: gateway::RouteName {
             label: request.route.clone(),
@@ -1303,6 +1304,7 @@ async fn application_head(
         return Err("application route is not published".into());
     }
     let mut head = gateway::ProxyRequestHead {
+        operator: false,
         account_id: request.account,
         name,
         revision: record.statement.revision,
