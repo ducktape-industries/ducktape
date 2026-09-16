@@ -701,7 +701,7 @@ async fn execute(
         });
     };
     let ws: Arc<dyn crate::provision::ProvisionedWorkspace> = ws?.into();
-    bind_workspace(ws.as_ref(), &mut ctx); // set workdir_override/env/path_entries
+    bind_workspace(ws.as_ref(), &mut ctx); // set workdir_override/env/context doc
     let native_artifacts_missing = spec
         .agent
         .as_ref()
@@ -2468,9 +2468,6 @@ format = "text"
         fn env(&self) -> BTreeMap<String, String> {
             self.env.clone()
         }
-        fn path_entries(&self) -> Vec<PathBuf> {
-            Vec::new()
-        }
         fn context_doc(&self) -> Option<String> {
             self.context_doc.clone()
         }
@@ -2553,10 +2550,6 @@ format = "text"
 
         fn env(&self) -> BTreeMap<String, String> {
             BTreeMap::new()
-        }
-
-        fn path_entries(&self) -> Vec<PathBuf> {
-            Vec::new()
         }
 
         async fn commit(
@@ -3018,9 +3011,6 @@ format = "text"
         fn env(&self) -> BTreeMap<String, String> {
             BTreeMap::new()
         }
-        fn path_entries(&self) -> Vec<PathBuf> {
-            Vec::new()
-        }
         async fn commit(
             &self,
             _audit_message: &str,
@@ -3105,9 +3095,6 @@ format = "text"
         }
         fn env(&self) -> BTreeMap<String, String> {
             BTreeMap::new()
-        }
-        fn path_entries(&self) -> Vec<PathBuf> {
-            Vec::new()
         }
         async fn commit(
             &self,
@@ -3428,9 +3415,6 @@ format = "text"
         }
         fn env(&self) -> BTreeMap<String, String> {
             BTreeMap::new()
-        }
-        fn path_entries(&self) -> Vec<PathBuf> {
-            Vec::new()
         }
         async fn commit(
             &self,

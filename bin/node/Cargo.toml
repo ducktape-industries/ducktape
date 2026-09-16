@@ -53,6 +53,9 @@ saga = { workspace = true }
 # provider discovery announces this node's installed executor CLIs into it.
 capability = { workspace = true }
 provider-host = { workspace = true }
+# the agent tool plane's catalog. `ducktape mcp` is its stdio transport; the
+# compute daemon serves the SAME `handle` over each run's node lane.
+mcp-host = { workspace = true }
 # the task plane: recipe manifests + capability dispatch + its host worker.
 dispatch = { workspace = true }
 attribution = { workspace = true }

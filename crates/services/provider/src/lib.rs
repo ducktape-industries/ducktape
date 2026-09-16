@@ -56,7 +56,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rand::RngCore as _;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 /// how long a cancelled child process group gets to handle SIGTERM before the
@@ -127,14 +127,17 @@ pub fn managed_label(owner: &str) -> String {
 pub const RUN_RUNTIME_DIR: &str = ".ducktape-run";
 
 /// the env var the provisioner exports to point a run at its read-only W6 skills
-/// tree (`crates/noded/src/agent_provision.rs`, consumed by `bin/node`'s MCP server). the sandbox
+/// tree (`crates/noded/src/agent_provision.rs`, read by the tool plane). the sandbox
 /// backends read it to know what to MOUNT — see [`CliProvider::sandbox_ro_paths`].
 const SKILLS_ROOT_ENV: &str = "DUCKTAPE_RUN_SKILLS";
 const RUN_ACTION_URL_ENV: &str = "DUCKTAPE_RUN_ACTION_URL";
-/// the node this run's tool plane dials — the READ half of it, since every
-/// `ducktape mcp` read tool queries this base while writes ride
-/// [`RUN_ACTION_URL_ENV`] and the broker. A sandbox backend must tunnel its
-/// port, or unset it: see [`wire_guest_tunnels`].
+/// the bearer that endpoint takes. Host-only, like the url: see
+/// [`host_only_env`].
+const RUN_ACTION_TOKEN_ENV: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
+/// the node this run dials. It is BOTH the run's read surface and, at
+/// [`MCP_PATH`], its whole tool plane — the lane serves that one route itself
+/// (see [`read_lane`]). A sandbox backend must tunnel its port, or unset it:
+/// see [`wire_guest_tunnels`].
 const NODE_URL_ENV: &str = "DUCKTAPE_NODE";
 
 /// the opaque per-run bearer the broker hands the child. NOT a credential: it
@@ -185,6 +188,77 @@ fn broker_provider_overrides(broker: &broker::BrokerEndpoint, workdir: &Path) ->
     ]
 }
 
+/// run env the HOST reads and the guest must never see.
+///
+/// The scoped action endpoint signs Runs messages as this run's program
+/// account, and its token is the whole proof. The only thing that ever used it
+/// was the tool plane, which now runs on the host — so the guest holding a copy
+/// would be a write capability lent to the model's own sandbox for no reason at
+/// all. It is dropped from the manifest env rather than never built, because
+/// [`read_lane::ReadLane`] reads it out of this same env to BE the tool plane.
+fn host_only_env(key: &str) -> bool {
+    matches!(key, RUN_ACTION_URL_ENV | RUN_ACTION_TOKEN_ENV)
+}
+
+/// the argv that points ONE run's CLI at ITS tool plane: the MCP endpoint the
+/// run's node lane serves, as this CLI spells an MCP server.
+///
+/// Per RUN, not per spec, and that is the whole reason this is code rather than
+/// `[tools].args` in the file: the endpoint is a loopback port drawn when the
+/// lane binds, so it does not exist until the run does. The credential broker's
+/// `-c` overrides are written the same way and for the same reason.
+///
+/// `guest_node_url` is the run's node base AS THE GUEST SEES IT — already
+/// rewritten to the guest end of the tunnel — so the CLI dials the tool plane
+/// over the one socket it has.
+///
+/// Nothing else crosses: no server command, no environment, no token. A guest
+/// that can reach this url is the run the lane belongs to, which is the only
+/// identity the tool plane needs.
+fn mcp_argv(dialect: McpDialect, guest_node_url: &str) -> Vec<String> {
+    let url = format!("{}{}", guest_node_url.trim_end_matches('/'), MCP_PATH);
+    match dialect {
+        // --allowedTools is NOT optional: in `-p` print mode an unapproved MCP
+        // tool call is a DENIAL (there is no human to approve it), so a server
+        // that is merely configured would be dead weight.
+        McpDialect::Claude => vec![
+            "--mcp-config".into(),
+            json!({"mcpServers": {"ducktape": {"type": "http", "url": url}}}).to_string(),
+            "--allowedTools".into(),
+            "mcp__ducktape".into(),
+        ],
+        // the approval mode is the same requirement in codex's words: without
+        // it `exec` cancels every ducktape call rather than asking a human who
+        // is not there.
+        McpDialect::Codex => vec![
+            "-c".into(),
+            format!("mcp_servers.ducktape.url={}", toml::Value::String(url)),
+            "-c".into(),
+            "mcp_servers.ducktape.default_tools_approval_mode=\"approve\"".into(),
+        ],
+    }
+}
+
+/// `argv` with the run's MCP wiring in it, at the one position legal for every
+/// executor: after a leading SUBCOMMAND if there is one, otherwise at the
+/// front.
+///
+/// Never the end — codex's headless argv keeps its trailing bare `-` (the stdin
+/// marker) LAST. And never blindly after `argv[0]` either: a restricted claude
+/// TUI argv opens `--permission-mode plan`, and splitting a flag from its value
+/// is an argv the CLI rejects.
+fn with_mcp_argv(argv: &[String], dialect: Option<McpDialect>, guest_node_url: &str) -> Vec<String> {
+    let Some(dialect) = dialect else {
+        return argv.to_vec();
+    };
+    let leads_with_subcommand = argv.first().is_some_and(|arg| !arg.starts_with('-'));
+    let at = usize::from(leads_with_subcommand);
+    let mut out = argv[..at].to_vec();
+    out.extend(mcp_argv(dialect, guest_node_url));
+    out.extend_from_slice(&argv[at..]);
+    out
+}
+
 // the broker lives in its own crate (crates/services/broker); the alias keeps
 // the run loop's `broker::…` call sites reading as the module they were carved
 // from.
@@ -210,6 +284,7 @@ pub(crate) use sandbox_host::{firecracker_api, guest_manifest, microvm};
 mod egress_proxy;
 mod pi;
 mod read_lane;
+pub use read_lane::MCP_PATH;
 pub mod run_session;
 mod spec;
 mod variants;
@@ -222,8 +297,8 @@ pub use interactive::InteractiveSession;
 pub use sandbox_host::executor_image;
 pub use sandbox_host::{SandboxBackend, Vmm};
 pub use spec::{
-    BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, ReleaseSource,
-    SpecSet,
+    BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, McpDialect, OutputFormat,
+    ReleaseSource, SpecSet,
 };
 
 /// canonical label-safe identity for the node executing a provider run.
@@ -388,7 +463,14 @@ pub struct RunContext {
     /// these are additive to the process environment and apply only to the
     /// spawned provider child.
     pub env: BTreeMap<String, String>,
-    /// path entries prepended to `PATH` for run-scoped tool bindings.
+    /// host directories whose top-level COMMANDS the run may exec, prepended to
+    /// its `PATH`. A sandbox backend copies each one's executables into the
+    /// run's read-only asset image, so an entry costs the run its bytes.
+    ///
+    /// Empty for every run this node provisions: the tool plane is an endpoint
+    /// on the run's node lane, not a binary, and nothing else the node ships is
+    /// the run's to exec. It stays for an embedder that really does hand a run
+    /// a host command.
     pub path_entries: Vec<PathBuf>,
     /// the run's numeric resource demands (`ExecJob.demands`), keyed by
     /// dimension (`cores`, `mem_gb`, ...). the pool fills this before
@@ -891,6 +973,7 @@ impl CliProvider {
         // substring-translated so an embedded host path cannot survive.
         let translated_env: Vec<(String, String)> = envs
             .iter()
+            .filter(|(key, _)| !host_only_env(key))
             .map(|(key, value)| {
                 let value = if key == "HOME" {
                     sandbox_host::guest_paths::GUEST_HOME.to_string()
@@ -900,7 +983,23 @@ impl CliProvider {
                 (key.clone(), value)
             })
             .collect();
-        let manifest_argv = guest_argv(&self.bin, args, &layout);
+        // HERE and nowhere earlier: the tool plane's address is the guest end
+        // of this run's node tunnel, which `wire_guest_tunnels` above only just
+        // decided. Both argvs — the headless `[invoke]` one and the interactive
+        // TUI one — reach the guest through this function, so wiring it here is
+        // what makes a SESSION carry the ducktape tools too.
+        let guest_node_url = envs
+            .iter()
+            .find(|(key, _)| key == NODE_URL_ENV)
+            .map(|(_, url)| url.clone());
+        let args = match &guest_node_url {
+            Some(url) => with_mcp_argv(args, self.spec.tools, url),
+            // a run with no node url has no lane and therefore no tool plane;
+            // configuring a server it could not reach would make the CLI spend
+            // its startup failing to connect instead of running.
+            None => args.to_vec(),
+        };
+        let manifest_argv = guest_argv(&self.bin, &args, &layout);
 
         // THE paid-execution guard, at the last moment before anything is
         // spent. There is no pull or create step here to race — booting the VM
@@ -1525,31 +1624,44 @@ impl CliProvider {
         argv
     }
 
-    /// the run-scoped PATH: `ctx.path_entries` prepended to the inherited PATH,
-    /// or `None` when the run adds no entries. The microVM carries it in the
-    /// guest manifest's env, translated to the guest's own asset mountpoints;
-    /// the test-only bare harness sets it as the child's PATH env.
+    /// the run's PATH: `ctx.path_entries` prepended to the GUEST's own
+    /// ([`guest_paths::GUEST_PATH`]), which the microVM carries in its manifest
+    /// env with each entry translated to its asset mountpoint.
+    ///
+    /// The host's PATH is not in it. A guest is a fixed filesystem that shares
+    /// none of the operator's, so inheriting their `PATH` string only carried
+    /// directories that do not exist there — and naming the operator's home
+    /// layout while it was at it.
+    ///
+    /// The test-only bare harness is the other way round, because it IS a host
+    /// child: declared entries, then the host's own PATH, and `None` when it
+    /// declares none so the child simply inherits.
     fn run_path(&self, ctx: &RunContext) -> Result<Option<OsString>, String> {
-        if ctx.path_entries.is_empty() {
-            return Ok(None);
-        }
-        let mut path = if self.backend.is_bare_test() {
-            ctx.path_entries.clone()
-        } else {
-            ctx.path_entries
-                .iter()
-                .map(|path| canonical_mount_path(path, "sandbox PATH mount"))
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        if let Some(existing) = std::env::var_os("PATH") {
-            path.extend(std::env::split_paths(&existing));
-        }
-        std::env::join_paths(path).map(Some).map_err(|e| {
+        let invalid = |e| {
             format!(
                 "run-local PATH for {} contains an invalid path entry: {e}",
                 self.spec.tag
             )
-        })
+        };
+        if self.backend.is_bare_test() {
+            if ctx.path_entries.is_empty() {
+                return Ok(None);
+            }
+            let mut path = ctx.path_entries.clone();
+            if let Some(existing) = std::env::var_os("PATH") {
+                path.extend(std::env::split_paths(&existing));
+            }
+            return std::env::join_paths(path).map(Some).map_err(invalid);
+        }
+        let mut path = ctx
+            .path_entries
+            .iter()
+            .map(|path| canonical_mount_path(path, "sandbox PATH mount"))
+            .collect::<Result<Vec<_>, _>>()?;
+        path.extend(std::env::split_paths(OsStr::new(
+            sandbox_host::guest_paths::GUEST_PATH,
+        )));
+        std::env::join_paths(path).map(Some).map_err(invalid)
     }
 
     /// resolve the run's cwd to a WRITABLE directory, creating it.
@@ -1829,9 +1941,9 @@ impl Drop for ContextGuard {
 /// carry it. Both halves are one decision, so they are one call.
 ///
 /// The loopback services the guest may reach, tunnelled over vsock: this run's
-/// credential broker, the node's run-action RPC when the run has one, and the
-/// node's own http surface — the READ plane every `ducktape mcp` tool dials
-/// through `DUCKTAPE_NODE`. The guest serves the SAME port numbers on its own
+/// credential broker, its egress proxy, and the node lane it dials through
+/// `DUCKTAPE_NODE` — which is both its read plane and, at [`MCP_PATH`], its
+/// whole tool plane. The guest serves the SAME port numbers on its own
 /// loopback, so `http://127.0.0.1:<port>` needs no rewriting on either side —
 /// which is why the container backend's `host.containers.internal`
 /// substitution is gone rather than ported.
@@ -1886,11 +1998,13 @@ impl Drop for ContextGuard {
 /// The gateway egress above is what remains: a run's own credential-less reach
 /// off this host, gated only by a header check.
 fn wire_guest_tunnels(envs: &mut Vec<(String, String)>, broker_base: Option<&str>) -> Vec<u16> {
+    // NOT the scoped action endpoint: the tool plane that used it runs on the
+    // host now ([`read_lane`]), so tunnelling it would put this run's own
+    // signer on a port inside the guest for nobody to call. See
+    // [`host_only_env`], which drops its address and token from the manifest
+    // env for the same reason.
     let mut ports = Vec::new();
     ports.extend(broker_base.and_then(url_port));
-    if let Some((_, run_action)) = envs.iter().find(|(key, _)| key == RUN_ACTION_URL_ENV) {
-        ports.extend(url_port(run_action));
-    }
     if let Some((_, proxy)) = envs
         .iter()
         .find(|(key, _)| key == egress_proxy::HTTPS_PROXY_ENV)
@@ -6326,11 +6440,86 @@ format = "text"
             .map(|(_, v)| v.to_string())
     }
 
-    /// the READ plane. Writes ride the broker and the run-action lane, both
-    /// already tunnelled; without the read lane's port every `ducktape mcp`
-    /// read tool dies on the guest's own loopback.
+    /// each CLI's own MCP syntax, aimed at the run's own lane — and NOTHING
+    /// that names a command, because a command is what used to require a
+    /// ducktape binary inside the guest.
     #[test]
-    fn the_guest_allowlist_carries_the_node_read_plane() {
+    fn each_dialect_points_its_cli_at_this_runs_endpoint_and_nothing_else() {
+        let claude = mcp_argv(McpDialect::Claude, "http://127.0.0.1:41999/");
+        assert_eq!(claude[0], "--mcp-config");
+        let configured: Value = serde_json::from_str(&claude[1]).expect("literal json");
+        assert_eq!(configured["mcpServers"]["ducktape"]["type"], "http");
+        assert_eq!(
+            configured["mcpServers"]["ducktape"]["url"],
+            "http://127.0.0.1:41999/mcp",
+            "one slash, whatever the base carried"
+        );
+        assert!(
+            configured["mcpServers"]["ducktape"]["command"].is_null(),
+            "an http server has no command to exec: {configured}"
+        );
+        assert_eq!(
+            claude[2..],
+            ["--allowedTools", "mcp__ducktape"],
+            "print mode cannot prompt, so the server must be pre-allowed"
+        );
+
+        let codex = mcp_argv(McpDialect::Codex, "http://127.0.0.1:41999");
+        assert_eq!(
+            codex,
+            [
+                "-c",
+                "mcp_servers.ducktape.url=\"http://127.0.0.1:41999/mcp\"",
+                "-c",
+                "mcp_servers.ducktape.default_tools_approval_mode=\"approve\"",
+            ],
+            "the url is TOML, because codex parses a -c override as TOML"
+        );
+    }
+
+    /// WHERE the wiring lands: after a leading subcommand when there is one,
+    /// at the front when there is not. Never blindly after argv[0] — a
+    /// restricted claude session opens `--permission-mode plan`, and splitting
+    /// a flag from its value is an argv the CLI rejects.
+    #[test]
+    fn the_mcp_wiring_lands_where_every_executor_accepts_it() {
+        let arg = |argv: &[&str]| {
+            with_mcp_argv(
+                &argv.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                Some(McpDialect::Codex),
+                "http://127.0.0.1:1",
+            )
+        };
+        // codex headless: the subcommand stays first, the trailing stdin
+        // marker stays last.
+        let headless = arg(&["app-server", "-c", "sandbox_mode=\"x\"", "-"]);
+        assert_eq!(headless[0], "app-server");
+        assert_eq!(headless[1], "-c");
+        assert_eq!(headless.last().unwrap(), "-");
+
+        // a flag-led argv (an interactive TUI one) takes it at the front, so a
+        // flag is never separated from its value.
+        let restricted = arg(&["--permission-mode", "plan"]);
+        assert_eq!(restricted[restricted.len() - 2..], ["--permission-mode", "plan"]);
+        assert_eq!(restricted[0], "-c");
+
+        // an empty argv is the bare TUI launch, and gets the wiring alone.
+        assert_eq!(arg(&[]).len(), 4);
+
+        // a spec that declares no dialect is untouched, byte for byte.
+        let untouched = with_mcp_argv(&["run".to_string()], None, "http://127.0.0.1:1");
+        assert_eq!(untouched, ["run"]);
+    }
+
+    /// the node lane, which is the run's whole surface: its reads AND, at
+    /// [`MCP_PATH`], its tool plane. Without this port the guest has neither.
+    ///
+    /// The run-action endpoint is deliberately NOT tunnelled: the only thing
+    /// that ever called it was the tool plane, which runs on the host now, so
+    /// a port into the guest would expose this run's own signer to the model's
+    /// sandbox for nobody to use.
+    #[test]
+    fn the_guest_allowlist_carries_the_node_lane_and_not_the_run_signer() {
         let mut envs = vec![
             (NODE_URL_ENV.into(), "http://127.0.0.1:8844".into()),
             (
@@ -6339,12 +6528,26 @@ format = "text"
             ),
         ];
         let ports = wire_guest_tunnels(&mut envs, Some("http://127.0.0.1:54321/v1"));
-        assert_eq!(ports, vec![54321, 41111, 8844]);
+        assert_eq!(ports, vec![54321, 8844]);
         assert_eq!(
             env_of(&envs, NODE_URL_ENV).as_deref(),
             Some("http://127.0.0.1:8844"),
             "the guest dials the tunnel's own end"
         );
+    }
+
+    /// the run's signer is the HOST's: its address and its bearer are read by
+    /// the lane to BE the tool plane, and then dropped before the manifest env
+    /// is written. A guest holding them would hold a write capability for its
+    /// own program account.
+    #[test]
+    fn the_run_signers_address_and_token_never_reach_the_guest() {
+        for key in [RUN_ACTION_URL_ENV, RUN_ACTION_TOKEN_ENV] {
+            assert!(host_only_env(key), "{key} must not cross");
+        }
+        for key in [NODE_URL_ENV, SKILLS_ROOT_ENV, "DUCKTAPE_RUN_AGENT", "HOME"] {
+            assert!(!host_only_env(key), "{key} is the run's to read");
+        }
     }
 
     /// a wildcard bind reaches here as loopback already ([`node_http_base`] in

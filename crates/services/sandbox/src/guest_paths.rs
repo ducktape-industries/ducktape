@@ -57,6 +57,17 @@ pub const GUEST_RUN_GID: u32 = 0;
 /// announces and what a run can exec are the same bytes by construction.
 pub const GUEST_BIN_DIR: &str = "/opt/duck/bin";
 
+/// the guest's `PATH`: the CLI image's mountpoint, then the rootfs's own
+/// directories.
+///
+/// FIXED, and never the host's. A run used to inherit the operator's `PATH`
+/// string, which named directories that do not exist inside the VM — the only
+/// entry that ever resolved was the one the host copied in. The guest is a
+/// known filesystem, so its `PATH` is a known list, and a run that declares its
+/// own entries gets them prepended to this.
+pub const GUEST_PATH: &str =
+    "/opt/duck/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 /// the guest's `HOME`. The rootfs ships it; no host home is ever visible.
 pub const GUEST_HOME: &str = "/root";
 

@@ -125,29 +125,26 @@ broker = "codex-responses"
 path = "config-home:AGENTS.md"
 
 [tools]
-# Wires the Ducktape MCP server into every argv this file produces — the base
-# tag and every [[variants]] tag — spliced in at load time
-# immediately after args[0] (the App Server subcommand).
+# WHICH MCP SYNTAX this CLI is handed the run's tool plane in — not an argv.
+# The endpoint is a loopback address on the run's OWN node tunnel, drawn when
+# its lane binds, so it cannot be written down in a file: the host composes
+# `-c mcp_servers.ducktape.url=…` per run (provider_host::mcp_argv), the same
+# way the credential broker's `-c` overrides are composed, and the pre-approval
+# rides with it — without it `exec` cancels every ducktape call rather than
+# asking a human who is not there.
 #
-# `ducktape` is resolved from the RUN's PATH — the provisioner puts its
-# directory there — so this spec names no absolute path and stays portable
-# across hosts. The values carry embedded double quotes because codex parses
-# a -c override as TOML; argv goes straight to exec, no shell ever sees it.
-# env_vars is a names-only allowlist: codex reads the values from the run env,
-# so the session key and other per-run values never enter argv.
+# This reaches EVERY argv this file produces: the base tag, every [[variants]]
+# tag, and the [interactive] TUI argv above, because the host wires it where
+# the run boots rather than where the file is parsed.
+#
+# Nothing about the tool plane enters the guest — no server command, no
+# `ducktape` binary on its PATH, no run-scoped token in its environment. The
+# run reaches the catalog over the one tunnel it already has, and the node
+# knows which run is calling because the lane IS that run.
 #
 # Ducktape MCP tools remain preapproved under the committed run grant.
 # Shell and file approval requests go to the run creator in Agents.
-args = [
-    "-c",
-    'mcp_servers.ducktape.command="ducktape"',
-    "-c",
-    'mcp_servers.ducktape.args=["mcp"]',
-    "-c",
-    'mcp_servers.ducktape.env_vars=["DUCKTAPE_NODE","DUCKTAPE_RUN_AGENT","DUCKTAPE_RUN_WORKSPACE","DUCKTAPE_RUN_SKILLS","DUCKTAPE_RUN_ACTION_URL","DUCKTAPE_RUN_ACTION_TOKEN","DUCKTAPE_RUN_ID","DUCKTAPE_PROVIDER_CONTROL_URL","DUCKTAPE_PROVIDER_CONTROL_TOKEN"]',
-    "-c",
-    'mcp_servers.ducktape.default_tools_approval_mode="approve"',
-]
+mcp = "codex"
 
 # ---- curated model/effort matrix -------------------------------------------
 # The models the codex CLI itself lists (0.144.1): the gpt-5.6 family plus

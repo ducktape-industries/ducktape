@@ -88,6 +88,9 @@ pub(crate) fn expand(
             timeout_secs: base.timeout_secs,
             hard_timeout_factor: base.hard_timeout_factor,
             output: base.output,
+            // WHICH MCP syntax the CLI takes its tool plane in is a property of
+            // the CLI, so every variant is wired the same way the base is.
+            tools: base.tools,
             // HOW the executor authenticates — its broker and its config home —
             // is a property of the CLI, not of the model or the effort a variant
             // pins. so the auth section inherits whole.
@@ -325,32 +328,17 @@ args = ["run", "--model", "m1"]
         };
 
         // base tags keep their no-model argv — tools-enabled sandbox posture
-        // (workspace-write / acceptEdits), no model, no effort flag — plus the
-        // [tools] MCP args every embedded spec injects after args[0].
+        // (workspace-write / acceptEdits), no model, no effort flag. The MCP
+        // server is NOT here: its address is the run's own, so `crate::mcp_argv`
+        // composes it per run.
         assert_eq!(
             get("codex").args,
-            vec![
-                "app-server",
-                "-c",
-                "mcp_servers.ducktape.command=\"ducktape\"",
-                "-c",
-                "mcp_servers.ducktape.args=[\"mcp\"]",
-                "-c",
-                "mcp_servers.ducktape.env_vars=[\"DUCKTAPE_NODE\",\"DUCKTAPE_RUN_AGENT\",\"DUCKTAPE_RUN_WORKSPACE\",\"DUCKTAPE_RUN_SKILLS\",\"DUCKTAPE_RUN_ACTION_URL\",\"DUCKTAPE_RUN_ACTION_TOKEN\",\"DUCKTAPE_RUN_ID\",\"DUCKTAPE_PROVIDER_CONTROL_URL\",\"DUCKTAPE_PROVIDER_CONTROL_TOKEN\"]",
-                "-c",
-                "mcp_servers.ducktape.default_tools_approval_mode=\"approve\"",
-                "-c",
-                "sandbox_mode=\"workspace-write\""
-            ],
+            vec!["app-server", "-c", "sandbox_mode=\"workspace-write\""],
         );
         assert_eq!(
             get("claude").args,
             vec![
                 "-p",
-                "--mcp-config",
-                "{\"mcpServers\":{\"ducktape\":{\"command\":\"ducktape\",\"args\":[\"mcp\"]}}}",
-                "--allowedTools",
-                "mcp__ducktape",
                 "--input-format",
                 "stream-json",
                 "--replay-user-messages",
@@ -379,14 +367,6 @@ args = ["run", "--model", "m1"]
             vec![
                 "app-server",
                 "-c",
-                "mcp_servers.ducktape.command=\"ducktape\"",
-                "-c",
-                "mcp_servers.ducktape.args=[\"mcp\"]",
-                "-c",
-                "mcp_servers.ducktape.env_vars=[\"DUCKTAPE_NODE\",\"DUCKTAPE_RUN_AGENT\",\"DUCKTAPE_RUN_WORKSPACE\",\"DUCKTAPE_RUN_SKILLS\",\"DUCKTAPE_RUN_ACTION_URL\",\"DUCKTAPE_RUN_ACTION_TOKEN\",\"DUCKTAPE_RUN_ID\",\"DUCKTAPE_PROVIDER_CONTROL_URL\",\"DUCKTAPE_PROVIDER_CONTROL_TOKEN\"]",
-                "-c",
-                "mcp_servers.ducktape.default_tools_approval_mode=\"approve\"",
-                "-c",
                 "sandbox_mode=\"workspace-write\"",
                 "-c",
                 "model=\"gpt-5.5\"",
@@ -398,10 +378,6 @@ args = ["run", "--model", "m1"]
             get("claude_opus_max").args,
             vec![
                 "-p",
-                "--mcp-config",
-                "{\"mcpServers\":{\"ducktape\":{\"command\":\"ducktape\",\"args\":[\"mcp\"]}}}",
-                "--allowedTools",
-                "mcp__ducktape",
                 "--input-format",
                 "stream-json",
                 "--replay-user-messages",

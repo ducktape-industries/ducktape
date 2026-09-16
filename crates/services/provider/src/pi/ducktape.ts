@@ -1,32 +1,32 @@
 // Ducktape's Pi tool plane: discover the same tools and guide as the other
-// runners from `ducktape mcp`, rather than maintaining another tool catalog.
-// Stage this file outside Pi's auto-discovery directories and pass it with -e
-// only for tools-enabled headless runs. Pi supplies the TypeScript loader;
-// runtime imports are Node built-ins, including in the standalone Pi binary.
-// The child inherits run-scoped capabilities, never model-provider credentials.
+// runners from the run's own MCP endpoint, rather than maintaining another tool
+// catalog. Stage this file outside Pi's auto-discovery directories and pass it
+// with -e only for tools-enabled headless runs. Pi supplies the TypeScript
+// loader; runtime imports are Node built-ins, including in the standalone Pi
+// binary.
+//
+// The endpoint is the node lane this run already dials (DUCKTAPE_NODE) plus
+// MCP_PATH, and it is the ONLY thing this extension needs: the tools run on the
+// host, under the identity that lane belongs to, so nothing here holds a
+// credential, spawns a process, or knows which agent it is acting for.
 
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createInterface } from "node:readline";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
-// --- Process environment ---------------------------------------------------
+// --- The run's tool plane ---------------------------------------------------
 
-const CHILD_ENV = [
-  "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR",
-  "DUCKTAPE_NODE", "DUCKTAPE_RUN_AGENT", "DUCKTAPE_RUN_WORKSPACE",
-  "DUCKTAPE_RUN_SKILLS", "DUCKTAPE_RUN_ACTION_URL", "DUCKTAPE_RUN_ACTION_TOKEN",
-  "DUCKTAPE_RUN_ID", "DUCKTAPE_PROVIDER_CONTROL_URL", "DUCKTAPE_PROVIDER_CONTROL_TOKEN",
-] as const;
+// Must match `provider_host::MCP_PATH` — the one route the run's node lane
+// serves itself instead of forwarding.
+const MCP_PATH = "/mcp";
 
-const childEnvironment = (env: NodeJS.ProcessEnv): NodeJS.ProcessEnv =>
-  Object.fromEntries(CHILD_ENV.flatMap((name) => {
-    const value = env[name];
-    return value === undefined ? [] : [[name, value]];
-  }));
+const endpointFrom = (env: NodeJS.ProcessEnv): string | undefined => {
+  const node = env.DUCKTAPE_NODE;
+  if (typeof node !== "string" || node === "") return undefined;
+  return `${node.replace(/\/+$/, "")}${MCP_PATH}`;
+};
 
 // --- Wire validation -------------------------------------------------------
 
@@ -35,11 +35,6 @@ interface McpTool {
   title: string;
   description: string;
   inputSchema: ToolDefinition["parameters"];
-}
-
-interface Pending {
-  resolve: (value: unknown) => void;
-  reject: (error: Error) => void;
 }
 
 const object = (value: unknown): Record<string, unknown> => {
@@ -74,100 +69,56 @@ const toolList = (value: unknown): McpTool[] => {
   });
 };
 
-// --- Session-scoped stdio transport ----------------------------------------
+// --- Streamable-HTTP transport ---------------------------------------------
 
-const connect = (cwd: string, env: NodeJS.ProcessEnv) => {
-  const child = spawn("ducktape", ["mcp"], {
-    cwd, env, stdio: ["pipe", "pipe", "ignore"], shell: false,
-  });
-  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
-  const pending = new Map<string, Pending>();
-  // Mutable resource state is confined to callbacks that own the child lifetime.
-  const state: { failure?: Error; closing?: Promise<void> } = {};
-  const exited = new Promise<void>((resolve) => child.once("close", () => resolve()));
-  const fail = (error: Error) => {
-    if (state.failure) return;
-    state.failure = error;
-    pending.forEach((request) => request.reject(error));
-    pending.clear();
-  };
-  const close = (): Promise<void> => {
-    if (state.closing) return state.closing;
-    fail(new Error("Ducktape MCP session closed"));
-    // EOF is the server's normal shutdown. Bound a blocked HTTP call without
-    // detaching the process; the sandbox still owns Pi and its child together.
-    child.stdin.end();
-    const kill = setTimeout(() => child.kill("SIGKILL"), 1000);
-    state.closing = exited.finally(() => {
-      clearTimeout(kill);
-      lines.close();
-      process.off("exit", onExit);
+// One message per POST, one JSON response back — or 202 and no body for a
+// notification, which is the transport's rule and why `send` never reads one.
+// No SSE stream: the server never initiates a message.
+const connect = (endpoint: string) => {
+  // Mutable state is confined to this closure and only ever moves to "closed".
+  const state: { failure?: Error } = {};
+  const post = (frame: Record<string, unknown>, signal?: AbortSignal): Promise<Response> =>
+    fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", ...frame }),
+      signal,
     });
-    return state.closing;
-  };
-  const onExit = () => child.kill("SIGKILL");
-  process.once("exit", onExit);
-  child.once("error", () => fail(new Error("Could not start ducktape mcp; check the run PATH")));
-  child.once("close", (code, signal) => {
-    fail(new Error(`Ducktape MCP exited (code ${code}, signal ${signal})`));
-    process.off("exit", onExit);
-  });
-  child.stdin.on("error", () => fail(new Error("Ducktape MCP stdin failed")));
-  child.stdout.on("error", () => fail(new Error("Ducktape MCP stdout failed")));
-  lines.once("close", () => fail(new Error("Ducktape MCP stdout closed")));
-
-  const receive = (line: string) => {
-    if (line.trim() === "") return;
-    const frame = object(JSON.parse(line));
-    if (frame.jsonrpc !== "2.0") throw new Error("Ducktape MCP returned an invalid JSON-RPC frame");
-    if (typeof frame.id !== "string") throw new Error("Ducktape MCP returned an invalid response id");
-    const request = pending.get(frame.id);
-    // A cancelled request can still finish on the synchronous Rust server.
-    if (!request) return;
-    if (frame.error !== undefined) {
-      const error = object(frame.error);
-      pending.delete(frame.id);
-      request.reject(new Error(`Ducktape MCP protocol error ${error.code}: ${error.message}`));
-      return;
-    }
-    pending.delete(frame.id);
-    if (!("result" in frame)) {
-      request.reject(new Error("Ducktape MCP response has no result"));
-      return;
-    }
-    request.resolve(frame.result);
-  };
-  lines.on("line", (line) => {
-    Promise.resolve().then(() => receive(line)).catch(() => {
-      // Never include a malformed raw frame or child stderr in diagnostics:
-      // those can contain run capabilities or arbitrarily large tool payloads.
-      fail(new Error("Ducktape MCP returned malformed protocol output"));
-      return close();
-    });
-  });
-
-  const send = (frame: Record<string, unknown>) => {
+  const send = (frame: Record<string, unknown>): void => {
     if (state.failure) throw state.failure;
-    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", ...frame })}\n`);
+    // A notification has no answer to wait for; a failed POST cannot be
+    // reported to anyone, so it must not become an unhandled rejection.
+    void post(frame).catch(() => {});
   };
   const request = (method: string, params: unknown, signal?: AbortSignal): Promise<unknown> =>
     Promise.resolve().then(() => {
       if (state.failure) throw state.failure;
       signal?.throwIfAborted();
       const id = randomUUID();
-      const abort = () => {
-        pending.get(id)?.reject(new Error("Ducktape MCP call cancelled; a submitted action may still complete"));
-        pending.delete(id);
-      };
-      return new Promise<unknown>((resolve, reject) => {
-        pending.set(id, { resolve, reject });
-        signal?.addEventListener("abort", abort, { once: true });
-        send({ id, method, params });
-      }).finally(() => {
-        signal?.removeEventListener("abort", abort);
-        pending.delete(id);
-      });
+      return post({ id, method, params }, signal)
+        .catch(() => {
+          throw new Error("Ducktape MCP call cancelled or unreachable; a submitted action may still complete");
+        })
+        .then((response) => {
+          if (!response.ok) throw new Error(`Ducktape MCP answered http ${response.status}`);
+          return response.json();
+        })
+        .then((value: unknown) => {
+          const frame = object(value);
+          if (frame.jsonrpc !== "2.0") throw new Error("Ducktape MCP returned an invalid JSON-RPC frame");
+          if (frame.id !== id) throw new Error("Ducktape MCP returned an invalid response id");
+          if (frame.error !== undefined) {
+            const error = object(frame.error);
+            throw new Error(`Ducktape MCP protocol error ${error.code}: ${error.message}`);
+          }
+          if (!("result" in frame)) throw new Error("Ducktape MCP response has no result");
+          return frame.result;
+        });
     });
+  const close = (): Promise<void> => {
+    state.failure ??= new Error("Ducktape MCP session closed");
+    return Promise.resolve();
+  };
   return { request, send, close };
 };
 
@@ -224,22 +175,15 @@ const awaitStartup = (ready: Promise<void>, signal?: AbortSignal): Promise<void>
   return Promise.race([ready, cancelled.promise]).finally(() => signal.removeEventListener("abort", abort));
 };
 
-const redactValue = (value: unknown, redact: (text: string) => string): unknown => {
-  if (typeof value === "string") return redact(value);
-  if (Array.isArray(value)) return value.map((entry) => redactValue(entry, redact));
-  if (value === null || typeof value !== "object") return value;
-  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, redactValue(entry, redact)]));
-};
-
 // --- Pi lifecycle ----------------------------------------------------------
 
 const ducktapeExtension = (pi: ExtensionAPI): void => {
   // Snapshot once per extension instance, after the provider has provisioned
   // this run. No host credential/config discovery and no re-reading hot env.
-  const env = childEnvironment(process.env);
-  const tokens = [env.DUCKTAPE_RUN_ACTION_TOKEN, env.DUCKTAPE_PROVIDER_CONTROL_TOKEN]
-    .filter((token): token is string => typeof token === "string" && token.length > 0);
-  const redact = (text: string) => tokens.reduce((value, token) => value.replaceAll(token, "[redacted]"), text);
+  // The run's write authority lives on the HOST, behind this endpoint. Nothing
+  // this process holds is a secret any more, which is why no result or
+  // diagnostic is redacted on the way out — there is nothing to redact.
+  const endpoint = endpointFrom(process.env);
   const state: { client?: ReturnType<typeof connect>; guidance?: string; unavailable?: Error } = {};
   const names = new Set<string>();
   const ready = Promise.withResolvers<void>();
@@ -260,10 +204,7 @@ const ducktapeExtension = (pi: ExtensionAPI): void => {
         // Validate the server's exact text-only envelope without flattening or
         // clipping it. Trusted packages need complete structured operation JSON.
         toolResult(value);
-        return redactValue(value, redact) as MCPToolsCallResult;
-      })
-      .catch((error: unknown) => {
-        throw new Error(redact(error instanceof Error ? error.message : String(error)));
+        return value as MCPToolsCallResult;
       }),
   };
   const unbind = pi.events.on("ducktape:network:bind", (value) => {
@@ -279,7 +220,12 @@ const ducktapeExtension = (pi: ExtensionAPI): void => {
       ready.reject(state.unavailable);
       return;
     }
-    const client = connect(ctx.cwd, env);
+    if (!endpoint) {
+      state.unavailable = new Error("This run has no Ducktape node lane, so it has no tool plane");
+      ready.reject(state.unavailable);
+      return;
+    }
+    const client = connect(endpoint);
     state.client = client;
     const startup = AbortSignal.timeout(10_000);
     return Promise.resolve()
@@ -293,7 +239,7 @@ const ducktapeExtension = (pi: ExtensionAPI): void => {
           && object(initialized.serverInfo).name === "ducktape"
           && typeof initialized.instructions === "string";
         if (!validServer) throw new Error("Ducktape MCP initialization did not match the server contract");
-        state.guidance = redact(initialized.instructions as string);
+        state.guidance = initialized.instructions as string;
         client.send({ method: "notifications/initialized" });
         return client.request("tools/list", {}, startup);
       })
@@ -307,20 +253,17 @@ const ducktapeExtension = (pi: ExtensionAPI): void => {
           execute: (_id, args, signal) => Promise.resolve()
             .then(() => client.request("tools/call", { name: tool.name, arguments: args }, signal))
             .then(toolResult)
-            .then(({ text, isError }) => boundedText(redact(text)).then((text) => {
+            .then(({ text, isError }) => boundedText(text).then((text) => {
               // Returning isError from execute does NOT mark a Pi tool failed.
               if (isError) throw new Error(text);
               return { content: [{ type: "text" as const, text }], details: {} };
-            }))
-            .catch((error: unknown) => {
-              throw new Error(redact(error instanceof Error ? error.message : String(error)));
-            }),
+            })),
         }));
         pi.setActiveTools([...new Set([...pi.getActiveTools(), ...tools.map((tool) => tool.name)])]);
         ready.resolve();
       })
       .catch((error: unknown) => {
-        const reason = redact(error instanceof Error ? error.message : String(error));
+        const reason = error instanceof Error ? error.message : String(error);
         state.guidance = `Ducktape tools are unavailable: ${reason}. Do not claim to have read or changed the network.`;
         state.unavailable = new Error(reason);
         ready.reject(state.unavailable);

@@ -21,12 +21,12 @@
 //! all.
 //!
 //! whichever lane materializes it, every run is handed the same TOOL PLANE
-//! ([`run_env`] + [`tool_path_entries`]): the bin dir of the running binary on
-//! `PATH` (where `ducktape mcp` ships), the node's http base as `DUCKTAPE_NODE`,
-//! and its agent id as `DUCKTAPE_RUN_AGENT`. that is enough for the MCP server
-//! — which the runner CLI spawns OUTSIDE the agent's sandbox — to find the node
-//! and know who it acts for; the record itself is never in the env (see
-//! [`run_env`]).
+//! ([`run_env`]): the node's http base as `DUCKTAPE_NODE`, its agent id as
+//! `DUCKTAPE_RUN_AGENT`, and the run-scoped action endpoint. Those are read by
+//! the HOST — the run's node lane serves the MCP catalog itself
+//! (`provider_host::MCP_PATH`) under the identity that lane belongs to — so no
+//! ducktape binary and no write token ever cross into the run. the agent's
+//! record itself is never in the env either (see [`run_env`]).
 //!
 //! D7 (isolation floor): the per-run dir is minted under [`agent_runs_root`],
 //! a root VALIDATED at boot to be OUTSIDE `<storage>` — so a `..` from a
@@ -225,22 +225,6 @@ pub fn node_http_base(http_listen: Option<&str>) -> Option<String> {
         Err(_) => listen.to_string(),
     };
     Some(format!("http://{base}"))
-}
-
-/// the tool plane's PATH entry: the directory holding the CURRENTLY-RUNNING
-/// binary. `ducktape mcp` ships beside `noded`/`node`, and the runner CLI
-/// (codex/claude) spawns the MCP server by bare command name. The sandbox
-/// stages its commands as a read-only guest asset and translates this PATH entry.
-///
-/// a failing `current_exe` (an exotic platform, a deleted/replaced binary)
-/// degrades to NO entry rather than failing the run: the agent still runs,
-/// just without the tool plane. never the other way round.
-fn tool_path_entries() -> Vec<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-        .into_iter()
-        .collect()
 }
 
 /// the run child's environment, shared by both lanes: where its writable tree

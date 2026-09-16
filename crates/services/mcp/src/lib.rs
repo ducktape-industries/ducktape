@@ -1,26 +1,33 @@
-//! `ducktape mcp` — the agent tool plane.
+//! the agent tool plane: the MCP server a Ducktape run's CLI talks to.
 //!
-//! a stdio MCP server that gives a Ducktape agent run access to the network
-//! it is running inside: read any module, and write to any module as the
-//! run's own program account.
+//! it gives a run access to the network it is running inside: read any module,
+//! and write to any module as the run's own program account.
 //!
-//! ## why this is a separate process and not a library
+//! ## one catalog, two hosts
 //!
-//! the RUNNER spawns it — codex or claude, from the argv their capability specs
-//! carry — not the node, and not the agent. that placement is the whole design:
-//! codex runs the agent under `--sandbox workspace-write`, which disables
-//! network access, so a tool the AGENT invoked could never reach the node. an
-//! MCP server the RUNNER invokes lives outside that sandbox and can. under
-//! claude, which sandboxes nothing, it is instead the tidy, gated, auditable
-//! route to a surface the run could already have reached by hand.
+//! [`handle`] is the whole server — one JSON-RPC frame in, at most one out, no
+//! transport of its own. Two hosts carry it:
+//!
+//! * the compute daemon's per-run node lane serves it as a streamable-HTTP MCP
+//!   endpoint on the ONE tunnel the guest already has
+//!   (`provider_host::read_lane`). The tools then run on the HOST, so nothing
+//!   about them enters the guest — no binary, no credential, and no way for
+//!   the two to be different builds.
+//! * `ducktape mcp` serves it over stdin/stdout for a local operator and for
+//!   the node's own e2e suites.
+//!
+//! Both call this one function, because a second implementation of the tool
+//! catalog is a tool plane that drifts.
 //!
 //! ## how it knows who it is
 //!
-//! two environment variables, set by the node's provisioner and inherited down
-//! the runner into this process: `DUCKTAPE_NODE` (which node) and
-//! `DUCKTAPE_RUN_AGENT` (which agent). the agent's record itself never travels
-//! in the environment — it is read back from the committed registry, so what
-//! the model sees is what consensus actually holds. see `identity`.
+//! [`Run`] carries which node and which agent, plus the run-scoped write
+//! endpoint. The HTTP host reads those out of the run's own host-side
+//! environment, which is why the guest never supplies them — a header naming
+//! the agent would be the guest choosing whose account it writes as. The stdio
+//! host reads them out of the process environment. The agent's record itself
+//! never travels either way: it is read back from the committed registry, so
+//! what the model sees is what consensus actually holds. see [`identity`].
 //!
 //! ## failure posture
 //!
@@ -39,15 +46,20 @@ mod node;
 mod rpc;
 mod tools;
 
-use self::rpc::{PROTOCOL_VERSION, Request, Response, SERVER_NAME, tool_failure, tool_result};
+pub use self::identity::Run;
+pub use self::rpc::Response;
+
+use self::rpc::{PROTOCOL_VERSION, Request, SERVER_NAME, tool_failure, tool_result};
 
 /// JSON-RPC's "method not found".
 const METHOD_NOT_FOUND: i32 = -32601;
 /// JSON-RPC's "parse error".
 const PARSE_ERROR: i32 = -32700;
 
-pub(crate) fn serve() {
-    let run = identity::Run::from_env();
+/// serve the tool plane over stdin/stdout, one JSON object per line, until
+/// the runner closes stdin.
+pub fn serve_stdio() {
+    let run = Run::from_env();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
 
@@ -74,7 +86,7 @@ pub(crate) fn serve() {
 }
 
 /// one frame in, at most one frame out. `None` == the frame was a notification.
-fn handle(run: &identity::Run, line: &str) -> Option<Response> {
+pub fn handle(run: &Run, line: &str) -> Option<Response> {
     let request: Request = match serde_json::from_str(line) {
         Ok(r) => r,
         // a frame we cannot even parse has no id to answer against; JSON-RPC
