@@ -12,7 +12,10 @@
 use std::path::{Path, PathBuf};
 
 /// A body that is a raw `serde_json::Value` is a pass-through (the module's own
-/// wire decodes it); there are no fields to deny on the way in.
+/// wire decodes it); there are no fields to deny on the way in. Matched by its
+/// bare name, like every other lookup in this file, so a file that imports
+/// `Value` directly (`use serde_json::Value`) reads the same as one that
+/// spells out the full path.
 const RAW_VALUE: &str = "serde_json::Value";
 
 /// Every `.rs` file under `crates/noded/src`, as `(relative path, source)`.
@@ -60,7 +63,7 @@ fn extractor_types(files: &[(String, String)]) -> Vec<(String, usize, String)> {
                 let Some(end) = after.find('>') else { break };
                 let is_parameter = rest[..at].contains("): ") || rest[..at].ends_with("Option<");
                 let ty = after[..end].to_string();
-                if is_parameter && ty != RAW_VALUE {
+                if is_parameter && bare_name(&ty) != bare_name(RAW_VALUE) {
                     found.push((file.clone(), index + 1, ty));
                 }
                 rest = &after[end..];
@@ -70,10 +73,28 @@ fn extractor_types(files: &[(String, String)]) -> Vec<(String, usize, String)> {
     found
 }
 
+/// Strips a leading Rust visibility modifier (`pub`, `pub(crate)`,
+/// `pub(super)`, `pub(in a::b)`) from a definition line so the scan matches
+/// on the `struct`/`enum` keyword regardless of visibility.
+fn strip_visibility(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    let Some(after_pub) = trimmed.strip_prefix("pub") else {
+        return trimmed;
+    };
+    match after_pub.strip_prefix('(') {
+        Some(rest) => match rest.find(')') {
+            Some(close) => rest[close + 1..].trim_start(),
+            None => trimmed,
+        },
+        None => after_pub.trim_start(),
+    }
+}
+
 /// Whether the attribute block directly above `T`'s definition carries
-/// `deny_unknown_fields`. Panics if the type is not defined in this crate: an
-/// extractor type from elsewhere is a policy the lint cannot see.
-fn definition_denies_unknown(files: &[(String, String)], ty: &str) -> bool {
+/// `deny_unknown_fields`. `None` if the type is not defined in this crate: an
+/// extractor type from elsewhere is a policy the lint cannot see, and the
+/// caller names the extractor's own file and line rather than panicking here.
+fn definition_denies_unknown(files: &[(String, String)], ty: &str) -> Option<bool> {
     let name = bare_name(ty);
     let heads = [
         format!("struct {name} "),
@@ -84,10 +105,7 @@ fn definition_denies_unknown(files: &[(String, String)], ty: &str) -> bool {
     for (_, text) in files {
         let lines: Vec<&str> = text.lines().collect();
         for (index, line) in lines.iter().enumerate() {
-            let trimmed = line
-                .trim_start()
-                .trim_start_matches("pub(crate) ")
-                .trim_start_matches("pub ");
+            let trimmed = strip_visibility(line);
             let is_definition = heads.iter().any(|head| trimmed.starts_with(head));
             if !is_definition {
                 continue;
@@ -97,10 +115,12 @@ fn definition_denies_unknown(files: &[(String, String)], ty: &str) -> bool {
                 .rev()
                 .map(|l| l.trim())
                 .take_while(|l| l.starts_with("#[") || l.starts_with("///") || l.starts_with("//"));
-            return attributes.any(|l| l.starts_with("#[") && l.contains("deny_unknown_fields"));
+            return Some(
+                attributes.any(|l| l.starts_with("#[") && l.contains("deny_unknown_fields")),
+            );
         }
     }
-    panic!("`{ty}` is a Json extractor but is not defined under crates/noded/src");
+    None
 }
 
 #[test]
@@ -114,8 +134,13 @@ fn every_json_extractor_type_denies_unknown_fields() {
     );
     let missing: Vec<String> = extractors
         .iter()
-        .filter(|(_, _, ty)| !definition_denies_unknown(&files, ty))
-        .map(|(file, line, ty)| format!("{file}:{line} Json<{ty}>"))
+        .filter_map(|(file, line, ty)| match definition_denies_unknown(&files, ty) {
+            Some(true) => None,
+            Some(false) => Some(format!("{file}:{line} Json<{ty}>")),
+            None => Some(format!(
+                "{file}:{line} Json<{ty}> — not defined under crates/noded/src"
+            )),
+        })
         .collect();
     assert!(
         missing.is_empty(),

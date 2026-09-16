@@ -46,13 +46,18 @@ impl HttpFixture {
                                         let query = query["query"].as_object().unwrap();
                                         assert_eq!(query.len(), 1);
                                         let (kind, params) = query.iter().next().unwrap();
-                                        let (status, value) = handler(
+                                        let (status, value) = call_handler(
+                                            handler.as_ref(),
                                             &format!("files:{kind}"),
                                             &serde_json::to_vec(params).unwrap(),
                                         );
-                                        (status, json!({kind:value}))
+                                        if status == 200 {
+                                            (status, json!({kind:value}))
+                                        } else {
+                                            (status, value)
+                                        }
                                     }
-                                    None => handler(&path, &body),
+                                    None => call_handler(handler.as_ref(), &path, &body),
                                 };
                                 (
                                     axum::http::StatusCode::from_u16(status).unwrap(),
@@ -79,6 +84,30 @@ impl Drop for HttpFixture {
     fn drop(&mut self) {
         let _ = self.stop.take().unwrap().send(());
         self.thread.take().unwrap().join().unwrap();
+    }
+}
+/// Calls the fixture's handler, catching a panic so an unmet expectation
+/// fails the request with the path and message that tripped it instead of
+/// unwinding the serving thread and leaving the CLI's client to report a
+/// dead connection.
+fn call_handler<H: Fn(&str, &[u8]) -> (u16, Value) + ?Sized>(
+    handler: &H,
+    path: &str,
+    body: &[u8],
+) -> (u16, Value) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(path, body))) {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "fixture handler panicked".to_string());
+            (
+                500,
+                json!({"error": format!("fixture handler panicked for {path}: {message}")}),
+            )
+        }
     }
 }
 fn signer(seed: u8) -> PrivateKey {
@@ -335,17 +364,22 @@ fn existing_stable_package_pin_wins_retries_and_mismatched_source_is_refused() {
     let name = format!("{}-package", plan.namespace);
     let pinned = "b".repeat(64);
     let expected = pinned.clone();
-    let http = HttpFixture::new(move |path, _| {
+    let http = HttpFixture::new(move |path, body| {
         if path == "files:refs" {
             return (
                 200,
                 json!({"head":"c".repeat(64),"pins":{name.clone():pinned},"window_len":1}),
             );
         }
-        let url = reqwest::Url::parse(&format!("http://test{path}")).unwrap();
-        assert!(
-            url.query_pairs()
-                .any(|(k, v)| k == "snapshot" && v == pinned)
+        // Files queries carry `snapshot` as a field of the JSON `query` body
+        // (see `duckfs_core::FilesQuery`), never a URL query string: this
+        // fixture routes `/v1/query` by its JSON `target`/`query`, so `path`
+        // here is the synthetic `files:<kind>` tag, not a real URL.
+        let params: Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(
+            params["snapshot"],
+            json!(pinned),
+            "path={path} params={params}"
         );
         if path.starts_with("files:find") {
             return (
