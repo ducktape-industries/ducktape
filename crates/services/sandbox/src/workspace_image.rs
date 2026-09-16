@@ -166,6 +166,14 @@ pub fn build(workdir: &Path, image: &Path, bytes: u64) -> Result<(), String> {
 /// Rootless and mount-free like the rest of this module: `debugfs -w` edits
 /// the inode table directly, so re-owning a workspace does not make this a
 /// node that needs root.
+///
+/// Measured against this checkout's `crates/` — 75 MB, 1,616 inodes, 3,232
+/// commands — at 0.32s, beside 0.64s for the `mke2fs` that precedes it. The
+/// cost is per INODE, not per byte (~10k commands/s), so a tree with many
+/// small files pays more than its size suggests: a 50k-file checkout is
+/// around ten seconds. If that ever binds, the next rung is a `fuse2fs -o
+/// fakeroot` mount and a plain `chown -R`, which trades this module's
+/// mount-free property for a syscall per file instead of a parsed command.
 fn own_as_the_run(workdir: &Path, image: &Path) -> Result<(), String> {
     let tool = crate::host_tools::find_system_tool("debugfs")
         .ok_or_else(|| "debugfs is not on PATH; install e2fsprogs".to_string())?;
