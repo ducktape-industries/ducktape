@@ -21,6 +21,8 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::guest_paths;
+
 /// the floor: ext4 metadata plus a journal does not fit in a few hundred KiB,
 /// and `mke2fs` silently drops the journal below ~16 MiB ("Filesystem too small
 /// for a journal"). A journal-less workspace image is a torn tree after a hard
@@ -140,6 +142,7 @@ pub fn build(workdir: &Path, image: &Path, bytes: u64) -> Result<(), String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
+    own_as_the_run(workdir, image)?;
     // the other half of a run's fixed cost, beside the copy back.
     tracing::debug!(
         target: "ducktape::sandbox",
@@ -148,6 +151,102 @@ pub fn build(workdir: &Path, image: &Path, bytes: u64) -> Result<(), String> {
         "workspace image built"
     );
     Ok(())
+}
+
+/// give every inode the image just took from `workdir` to the identity the
+/// guest runs as ([`GUEST_RUN_UID`]).
+///
+/// `mke2fs -d` stamps the HOST operator's uid into each inode it copies, and
+/// its `-E root_owner` reaches the root directory alone — verified: files
+/// under a `root_owner=0:0` image still come out owned by the operator. So the
+/// tree is re-owned afterwards, in ONE `debugfs` process fed the whole script
+/// on stdin, because a process per file would cost more than building the
+/// image did.
+///
+/// Rootless and mount-free like the rest of this module: `debugfs -w` edits
+/// the inode table directly, so re-owning a workspace does not make this a
+/// node that needs root.
+fn own_as_the_run(workdir: &Path, image: &Path) -> Result<(), String> {
+    let tool = crate::host_tools::find_system_tool("debugfs")
+        .ok_or_else(|| "debugfs is not on PATH; install e2fsprogs".to_string())?;
+    let mut script = String::new();
+    own_one(&mut script, "/");
+    for path in image_paths(workdir)? {
+        own_one(&mut script, &path);
+    }
+    let mut child = Command::new(&tool)
+        .arg("-w")
+        .arg(image)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("run debugfs: {e}"))?;
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .ok_or("debugfs took no stdin")?
+        .write_all(script.as_bytes())
+        .map_err(|e| format!("write the ownership script: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("wait for debugfs: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "debugfs exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+fn own_one(script: &mut String, path: &str) {
+    use std::fmt::Write as _;
+    let _ = writeln!(script, "sif \"{path}\" uid {}", guest_paths::GUEST_RUN_UID);
+    let _ = writeln!(script, "sif \"{path}\" gid {}", guest_paths::GUEST_RUN_GID);
+}
+
+/// every path in `workdir`, as the guest image spells it: rooted at `/`, one
+/// per line of the ownership script.
+///
+/// A name holding a `"` or a newline is REFUSED rather than skipped.
+/// `debugfs`'s command parser has no escape for either — a quote inside a
+/// quoted filespec is "Unbalanced quotes in command line" — so such a file
+/// cannot be addressed at all, and leaving one owned by the host while
+/// reporting success is the silent half-fix this contract exists to end.
+fn image_paths(workdir: &Path) -> Result<Vec<String>, String> {
+    let mut paths = Vec::new();
+    let mut stack = vec![workdir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        let entries = std::fs::read_dir(&next)
+            .map_err(|e| format!("walk workspace {}: {e}", next.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("walk workspace: {e}"))?;
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(workdir)
+                .map_err(|_| format!("{} is not under the workspace", path.display()))?;
+            let spelled = relative
+                .to_str()
+                .ok_or_else(|| format!("{} is not UTF-8", path.display()))?;
+            if spelled.contains('"') || spelled.contains('\n') {
+                return Err(format!(
+                    "{} cannot be given to the run: a workspace path may not hold a quote or a newline",
+                    path.display()
+                ));
+            }
+            paths.push(format!("/{spelled}"));
+            let meta = entry
+                .metadata()
+                .map_err(|e| format!("walk {}: {e}", path.display()))?;
+            if meta.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(paths)
 }
 
 /// walk `image` back out, REPLACING `dest` with the result.
@@ -577,6 +676,94 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o755, "the executable bit must survive");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// the uid `debugfs` reports for one path inside `image`.
+    fn owner_in_image(image: &Path, path: &str) -> u32 {
+        let tool = crate::host_tools::find_system_tool("debugfs").expect("debugfs");
+        let out = Command::new(tool)
+            .arg("-R")
+            .arg(format!("stat \"{path}\""))
+            .arg(image)
+            .output()
+            .expect("stat the inode");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let field = text
+            .split_whitespace()
+            .skip_while(|word| *word != "User:")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no User: field for {path} in {text}"));
+        field.parse().expect("a uid")
+    }
+
+    /// EVERY inode belongs to the identity the run executes as, not to the
+    /// operator who built the image. `mke2fs -d` copies the host's uid onto
+    /// each file it takes, and the run then meets a checkout owned by a user
+    /// that does not exist inside the VM — git calls that "dubious ownership"
+    /// and refuses to read the history (#2107). The root directory is checked
+    /// too: it is the one inode `-E root_owner` would have covered, and the
+    /// one a partial fix would leave looking right.
+    #[test]
+    fn the_image_belongs_to_the_identity_the_run_executes_as() {
+        if !have_e2fsprogs() {
+            return;
+        }
+        let root = scratch("run-owner");
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("nested/deeper")).expect("nested");
+        std::fs::write(src.join("plain.txt"), b"x").expect("plain");
+        std::fs::write(src.join("nested/deeper/leaf.bin"), b"y").expect("leaf");
+        std::fs::write(src.join("two words.txt"), b"z").expect("spaced");
+
+        let image = root.join("ws.img");
+        build(&src, &image, sized_for(&src).expect("size")).expect("build");
+
+        let host_owner = std::fs::metadata(src.join("plain.txt")).expect("stat").uid();
+        assert_ne!(
+            host_owner,
+            guest_paths::GUEST_RUN_UID,
+            "run this as a normal user, or the test proves nothing",
+        );
+        for path in [
+            "/",
+            "/plain.txt",
+            "/nested",
+            "/nested/deeper",
+            "/nested/deeper/leaf.bin",
+            "/two words.txt",
+        ] {
+            assert_eq!(
+                owner_in_image(&image, path),
+                guest_paths::GUEST_RUN_UID,
+                "{path} is still owned by the host operator",
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A name `debugfs` cannot address is REFUSED, not skipped. Its parser has
+    /// no escape for a quote inside a quoted filespec, so such a file could
+    /// only be left owned by the host — and an image that is correct except
+    /// for one file is the silent half-fix this contract exists to end.
+    #[test]
+    fn a_path_the_ownership_pass_cannot_address_is_refused() {
+        if !have_e2fsprogs() {
+            return;
+        }
+        let root = scratch("odd-name");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::write(src.join("od\"d.txt"), b"x").expect("odd");
+
+        let refusal = build(&src, &root.join("ws.img"), MIN_WORKSPACE_BYTES)
+            .expect_err("a quote in a workspace path must be refused");
+        assert!(
+            refusal.contains("quote or a newline"),
+            "the refusal must name the reason: {refusal}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

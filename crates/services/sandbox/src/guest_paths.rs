@@ -31,6 +31,22 @@ pub const GUEST_WORKSPACE: &str = "/duck/workspace";
 /// skills tree, and any host PATH directories the run declared.
 pub const GUEST_ASSETS: &str = "/duck";
 
+/// THE IDENTITY A RUN EXECUTES AS, and therefore the identity that must own
+/// every file it works on. `duck-guest-init` is PID 1 and `execve`s the run
+/// without changing credentials, so every tool in the guest runs as root.
+///
+/// The host must stamp it into the workspace image, because nothing else
+/// will: `mke2fs -d` copies the OPERATOR's uid off the host tree, and a run
+/// then meets a checkout owned by a user that does not exist inside the VM.
+/// Git is only the first tool to say so — "detected dubious ownership in
+/// repository at '/duck/workspace'", the whole of #2107 — and every later
+/// tool with an ownership check would need its own exception. One number both
+/// sides agree on is enough here: this is a VM boundary, not a container, so
+/// there is no idmap to arrange.
+pub const GUEST_RUN_UID: u32 = 0;
+/// the group half of [`GUEST_RUN_UID`].
+pub const GUEST_RUN_GID: u32 = 0;
+
 /// where the agent CLI a run executes appears inside the guest.
 ///
 /// A MOUNTPOINT the rootfs ships empty, not a directory it fills. The CLIs used
