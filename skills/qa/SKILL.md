@@ -25,6 +25,54 @@ make test                                    # full local gate: wasm drift + wor
 `cargo test -p ducktape-app` is part of every QA pass; the node lanes above do
 not cover it.
 
+### Reading an e2e failure on a loaded box
+
+The node e2e suites spawn real processes and wait on real markers, so on a box
+where other sessions are compiling they fail for reasons that have nothing to
+do with the code. Three rules, in the order they bite:
+
+**Run the test binary at NORMAL priority.** `nice -n 19` belongs on cargo
+BUILDS. These suites race fixed deadlines — `wait_marker(…, Duration::from_secs(30))` —
+so a deprioritised node misses them by construction and every case goes red at
+once. Build niced, then exec the test binary un-niced.
+
+**A `timed out without printing "<marker>"` panic is LOAD, not a bug.** Quote
+the marker before believing anything: it names the phase that ran out of clock.
+`genesis root_hash=` is first boot, where the node installs every founding
+module's wasm and which is by far the heaviest phase; `recovered root_hash=` is
+restart recovery. Confirm by reading the node's own log tail in the panic — a
+node that is still emitting lines at the deadline (`module installed`,
+`Merkle structure lags behind journal`, `recovering orphaned leaf`) was SLOW,
+not wedged. Never widen a deadline to make one pass: the deadline is what makes
+stopped progress visible at all.
+
+**Pin what the run reads, and guard it.** `workspace_config::modules_dir()`
+honours `$DUCKTAPE_MODULES_DIR` before anything else and `founding_set()`
+resolves through it, so a private snapshot takes the run off the shared
+founding set that any peer's `noded` build restages:
+
+```bash
+make views                                             # once, in this worktree
+touch crates/noded/build.rs && cargo check -p noded    # restage; expect 0 *.pending
+cp -a "$CARGO_TARGET_DIR/debug/modules/." target/pin-modules/
+export DUCKTAPE_MODULES_DIR=$PWD/target/pin-modules
+```
+
+That variable ALSO redirects `sim_modules_dir()`, and the production set has no
+`kv`, so snapshot both directories or neither — otherwise the app suites fail
+with `kv.component.wasm: no such founding entry`. The node binary cannot be
+pinned at all (`CARGO_BIN_EXE_ducktape` is baked in at compile time), so digest
+it around each iteration and DISCARD any iteration it changed under — a pass on
+shifted artifacts is worth no more than a failure. Digest a directory by hashing
+the hashes (`find . -type f | sort | xargs md5sum | awk '{print $1}' | md5sum`);
+comparing raw `md5sum` output across two directories always differs, because it
+embeds the path.
+
+**Keep the evidence.** `DUCKTAPE_E2E_KEEP=1` disarms the cluster tempdir's Drop
+so a failed run's storage, journal and logs survive the unwind. Kept roots are
+named `ducktape-e2e-keep-…`, which the harness's own sweep skips, so they
+outlive every later run and are yours to delete.
+
 ### The huddle: three lanes, and only the last one is the whole thing
 
 A huddle is the one feature whose failure mode is BETWEEN two people, so its

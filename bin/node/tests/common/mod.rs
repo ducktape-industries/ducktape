@@ -87,10 +87,34 @@ pub const TEST_BLOCK_TIME_MS: u64 = 100;
 /// process is gone. A LIVE pid is never touched (sibling test binaries run
 /// concurrently), and pid reuse only makes the sweep skip a directory — it can
 /// never make it delete a live one.
+/// `DUCKTAPE_E2E_KEEP` disarms the Drop above so a FAILED run's storage, qmdb
+/// and consensus journal survive the unwind that would otherwise delete them.
+/// A restart bug is only diagnosable from the journal tail it left behind, and
+/// the harness destroyed exactly that evidence every time one reproduced.
+///
+/// The name carries the retention, not a flag file: `ducktape-e2e-keep-<pid>-…`
+/// makes [`sweep_abandoned_e2e_dirs`] skip it forever, because the segment it
+/// parses as a pid is `keep` and the parse fails. So a kept root outlives both
+/// its own process and every later run on the box.
+///
+/// OFF by default and swept BY HAND, because that permanence is the whole point
+/// and these roots are multi-GB — which, where `TMPDIR` is tmpfs, is RAM.
+fn keep_e2e_dirs() -> bool {
+    std::env::var_os("DUCKTAPE_E2E_KEEP").is_some()
+}
+
 pub fn e2e_tempdir(tag: &str) -> tempfile::TempDir {
     sweep_abandoned_e2e_dirs();
+    let keep = keep_e2e_dirs();
+    let pid = std::process::id();
+    let prefix = if keep {
+        format!("ducktape-e2e-keep-{pid}-{tag}-")
+    } else {
+        format!("ducktape-e2e-{pid}-{tag}-")
+    };
     tempfile::Builder::new()
-        .prefix(&format!("ducktape-e2e-{}-{tag}-", std::process::id()))
+        .prefix(&prefix)
+        .disable_cleanup(keep)
         .tempdir()
         .expect("e2e tempdir")
 }
