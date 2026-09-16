@@ -121,6 +121,35 @@ const MAX_IN_FLIGHT: usize = 256;
 const MAX_SUBSCRIPTIONS: usize = 256;
 const MAX_REPLY_EVENTS: usize = 1024;
 const MAX_REPLY_BYTES: usize = 32 << 20;
+/// The share of the reply budget SUBSCRIPTIONS may fill before they stop
+/// reading their sources. A request answers once, so the budget bounds it
+/// on its own; a subscription answers forever, against a queue only a
+/// redraw empties — the node's `logs` topic replays its whole ring (4,096
+/// frames) the moment a view subscribes, and a view the user has switched
+/// away from is not redrawing at all. Without a park that producer walks
+/// straight into the fault above and stops the view for good. Half, so the
+/// answers a redraw is actually waiting on keep the other half.
+const MAX_STREAM_BACKLOG_EVENTS: usize = MAX_REPLY_EVENTS / 2;
+const MAX_STREAM_BACKLOG_BYTES: usize = MAX_REPLY_BYTES / 2;
+
+/// What one answer holds against the reply budget.
+fn result_bytes(result: &Result<Vec<u8>, String>) -> usize {
+    match result {
+        Ok(bytes) => bytes.len(),
+        Err(error) => error.len(),
+    }
+}
+
+/// What the queue holds against it.
+fn queued_bytes(events: &[wire::Event]) -> usize {
+    events
+        .iter()
+        .map(|event| match event {
+            wire::Event::Response { result, .. } => result_bytes(result),
+            _ => 0,
+        })
+        .sum()
+}
 
 /// The kernel's answers to a view's requests, written off-thread and
 /// drained into the guest's pending events at its next redraw.
@@ -131,6 +160,9 @@ pub(super) struct Replies {
     /// calls in flight, never on a clock.
     landed: std::sync::Condvar,
     changed: tokio::sync::watch::Sender<()>,
+    /// Told on every redraw that takes the queue: a subscription parked on
+    /// [`Replies::backlogged`] wakes here and reads its socket again.
+    drained: tokio::sync::watch::Sender<()>,
     fault: Mutex<Option<String>>,
 }
 
@@ -141,6 +173,7 @@ impl Default for Replies {
             in_flight: AtomicUsize::new(0),
             landed: std::sync::Condvar::new(),
             changed: tokio::sync::watch::channel(()).0,
+            drained: tokio::sync::watch::channel(()).0,
             fault: Mutex::default(),
         }
     }
@@ -157,7 +190,43 @@ impl Replies {
         let mut events = self.events.lock().expect("kernel replies");
         if let Some(fault) = self.fault() { return Err(fault); }
         pending.append(&mut events);
+        self.drained.send_replace(());
         Ok(())
+    }
+
+    /// Told on every drain: what a parked subscription waits on.
+    fn drains(&self) -> tokio::sync::watch::Receiver<()> {
+        self.drained.subscribe()
+    }
+
+    /// Whether ONE subscription's share of the queue is spoken for, in
+    /// either budget — a frame past this waits for a redraw rather than
+    /// growing the queue toward the fault in [`Replies::item`].
+    fn backlogged(&self) -> bool {
+        let events = self.events.lock().expect("kernel replies");
+        events.len() >= MAX_STREAM_BACKLOG_EVENTS
+            || queued_bytes(&events) >= MAX_STREAM_BACKLOG_BYTES
+    }
+
+    /// One item from a SUBSCRIPTION, which is the only producer that can
+    /// outrun the redraw: it answers for as long as the view holds it,
+    /// against a queue only a redraw empties. It PARKS here while its share
+    /// is spoken for, so its own source — a node socket, a companion
+    /// session — holds the backlog instead of the queue growing into the
+    /// fault. `false` when the view is gone and the subscription should end.
+    async fn subscription_item(
+        &self,
+        drained: &mut tokio::sync::watch::Receiver<()>,
+        id: u64,
+        result: Result<Vec<u8>, String>,
+    ) -> bool {
+        while self.backlogged() {
+            if drained.changed().await.is_err() {
+                return false;
+            }
+        }
+        self.item(id, result, false);
+        self.fault().is_none()
     }
 
     pub(super) fn fault(&self) -> Option<String> {
@@ -209,15 +278,9 @@ impl Replies {
     fn item(&self, id: u64, result: Result<Vec<u8>, String>, done: bool) {
         let mut events = self.events.lock().expect("kernel replies");
         if self.fault().is_some() { return; }
-        let bytes = |result: &Result<Vec<u8>, String>| match result {
-            Ok(bytes) => bytes.len(), Err(error) => error.len(),
-        };
-        let queued: usize = events.iter().map(|event| match event {
-            wire::Event::Response { result, .. } => bytes(result),
-            _ => 0,
-        }).sum();
+        let queued = queued_bytes(&events);
         let exceeds_budget = events.len() >= MAX_REPLY_EVENTS
-            || bytes(&result) > MAX_REPLY_BYTES.saturating_sub(queued);
+            || result_bytes(&result) > MAX_REPLY_BYTES.saturating_sub(queued);
         if exceeds_budget {
             *self.fault.lock().expect("kernel reply fault") = Some("view reply backlog limit exceeded; view stopped".into());
             self.landed.notify_all();
@@ -563,9 +626,12 @@ fn session_answer(guest: &mut Guest, operation: &str, id: u64, payload: &[u8]) {
             let replies = guest.replies.clone();
             let task = runtime().spawn(async move {
                 use futures::StreamExt as _;
+                let mut drained = replies.drains();
                 let mut events = session.events;
                 while let Some(event) = events.next().await {
-                    replies.item(id, event, false);
+                    if !replies.subscription_item(&mut drained, id, event).await {
+                        return;
+                    }
                 }
                 replies.item(id, Ok(Vec::new()), true);
             });
@@ -1105,6 +1171,7 @@ where
 {
     use futures::StreamExt as _;
     use tokio_tungstenite::tungstenite::Message;
+    let mut drained = replies.drains();
     while let Some(message) = socket.next().await {
         let frame = match message {
             Ok(frame @ (Message::Text(_) | Message::Binary(_))) => frame,
@@ -1136,8 +1203,12 @@ where
             }
             _ => unreachable!("only data frames reach the encoder"),
         };
-        replies.item(id, Ok(bytes), false);
-        if replies.fault().is_some() {
+        // The socket is where a topic that outruns the redraw waits: reading
+        // on regardless would grow the queue into the fault that stops the
+        // view, and the node's `logs` topic replays 4,096 frames the moment
+        // a view subscribes — four times the whole budget, so that fault was
+        // a certainty, not a corner.
+        if !replies.subscription_item(&mut drained, id, Ok(bytes)).await {
             return;
         }
     }
@@ -1798,6 +1869,52 @@ mod tests {
             ]
         );
         assert!(!replies.any_in_flight());
+    }
+
+    /// A subscription that outruns the redraw PARKS instead of stopping the
+    /// view, and every frame still arrives. The node's `logs` topic replays
+    /// its whole ring the moment a view subscribes — four times the reply
+    /// budget — so a forwarder that reads on regardless walks the view into
+    /// the backlog fault before the first redraw ever runs.
+    #[test]
+    fn a_stream_longer_than_the_reply_budget_parks_instead_of_stopping_the_view() {
+        const FRAMES: usize = MAX_REPLY_EVENTS * 4;
+        let replies = Replies::default();
+        type Frame = Result<Message, tokio_tungstenite::tungstenite::Error>;
+        let frames = futures::stream::iter(
+            (0..FRAMES)
+                .map(|nth| Message::Text(format!("line-{nth}")))
+                .map(Frame::Ok),
+        );
+        let mut landed = Vec::new();
+        let mut forwarding = std::pin::pin!(forward(&replies, 7, frames, StreamEncoding::Bytes));
+        // The redraw, and nothing else, is what lets the forwarder read on:
+        // every park here is answered with one drain, so the run is the
+        // whole handshake with no thread and no clock in it.
+        futures::executor::block_on(std::future::poll_fn(|cx| {
+            if std::future::Future::poll(forwarding.as_mut(), cx).is_ready() {
+                return std::task::Poll::Ready(());
+            }
+            let before = landed.len();
+            replies
+                .drain_into(&mut landed)
+                .expect("the budget holds against a stream four times its size");
+            assert!(
+                landed.len() > before,
+                "the forwarder parked on a queue the redraw had already emptied"
+            );
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }));
+        replies
+            .drain_into(&mut landed)
+            .expect("the budget holds against a stream four times its size");
+        assert!(replies.fault().is_none(), "{:?}", replies.fault());
+        assert_eq!(landed.len(), FRAMES + 1, "every frame, then the close");
+        assert!(matches!(
+            landed.last(),
+            Some(wire::Event::Response { done: true, .. })
+        ));
     }
 
     #[test]
