@@ -9,7 +9,7 @@
 //! `forge`, `tasks`, `runs`, `attribution`). Everything re-reads on an
 //! `rpc.live` hit for the inbox plane. Marking read leaves as `op.submit`
 //! carrying the module message the kernel signs; a row's door out is
-//! `inbox.open_link` carrying the `duck://` address the shell's link plane
+//! `host.open_link` carrying the `duck://` address the shell's link plane
 //! routes.
 //!
 //! The same fold answers the app's BADGE. A background session
@@ -880,13 +880,10 @@ fn net_query(chain: &str) -> String {
     }
 }
 
-/// `inbox.open_link` — a row's address, handed to the shell's ONE open plane,
-/// which routes a `duck://` link to the tab that owns it.
+/// A row's address, handed to the kernel's ONE open door, which routes a
+/// `duck://` link to whatever owns it.
 pub fn open_link(link: &str) {
-    host::notify(
-        "inbox.open_link",
-        &serde_json::to_vec(&serde_json::json!({ "link": link })).expect("encodes"),
-    );
+    ducktape_view_guest::host::open_link(link);
 }
 
 // ---------- words ----------

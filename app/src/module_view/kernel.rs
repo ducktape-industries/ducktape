@@ -467,6 +467,27 @@ pub(super) fn answer(
         ("rpc", "admin") => spawn(guest, id, payload, admin),
         ("picture", "put") => spawn_host(guest, id, payload, picture_put),
         ("picture", "inline") => spawn(guest, id, payload, picture_inline),
+        // THE ONE DOOR OUT OF A VIEW. Every view used to declare an
+        // `open_link` intent of its own and spell the address field its own
+        // way; there is one door now, module-free, and the app resolves the
+        // address through the single `duck://` table. A view never names a
+        // tab, a route or a window — the address does.
+        ("host", "open_link") => {
+            let link = serde_json::from_slice::<serde_json::Value>(payload)
+                .ok()
+                .and_then(|ask| ask["link"].as_str().map(str::to_owned))
+                .filter(|link| !link.is_empty());
+            match link {
+                Some(link) => {
+                    guest.intents.push(ModuleViewEvent {
+                        kind: "open_link".into(),
+                        detail: serde_json::json!({ "link": link }).to_string(),
+                    });
+                    guest.reply(id, Ok(Vec::new()));
+                }
+                None => guest.refuse(id, "`host.open_link` names no link".into()),
+            }
+        }
         ("host", "badge") => {
             let count = std::str::from_utf8(payload)
                 .ok()
@@ -480,6 +501,35 @@ pub(super) fn answer(
                     guest.reply(id, Ok(Vec::new()));
                 }
                 None => guest.refuse(id, "`host.badge` carries no count".into()),
+            }
+        }
+        // A CHORD IS CLAIMED, NOT WIRED. The app has no table of which key
+        // opens what: a seated view asks for a chord and is told when it is
+        // pressed, so what a chord does is the view's and a swap changes it.
+        // First claim holds it — a second view asking is refused by name, so
+        // a swap that wanted a taken chord says so instead of going quiet.
+        ("host", "chord") => {
+            let chord = std::str::from_utf8(payload).unwrap_or_default().trim();
+            if !is_chord(chord) {
+                guest.refuse(id, format!("`{chord}` is not a claimable chord"));
+                return true;
+            }
+            if guest.chords.len() >= MAX_SUBSCRIPTIONS {
+                guest.refuse(id, "too many chord claims".into());
+                return true;
+            }
+            match super::claim_chord(chord, guest.module) {
+                Ok(()) => guest.chords.push((id, chord.to_owned())),
+                Err(holder) => {
+                    tracing::debug!(
+                        target: "ducktape::app",
+                        chord,
+                        module = guest.module,
+                        holder = %holder,
+                        "chord already claimed"
+                    );
+                    guest.refuse(id, format!("`{chord}` is already {holder}'s"));
+                }
             }
         }
         ("clock", "ticks") => {
@@ -794,6 +844,55 @@ pub(super) struct Clock {
     pub(super) id: u64,
     period: std::time::Duration,
     due: std::time::Instant,
+}
+
+/// WHICH CHORDS A VIEW MAY CLAIM, and why it is only these: a claim must
+/// hold the platform command modifier (⌘ on a Mac, Ctrl elsewhere). A view
+/// that could claim a bare letter would eat ordinary typing in every other
+/// seat, and one that could claim ⇧+letter would eat capitals.
+///
+/// The spelling is `cmd[-shift][-alt]-<key>`, lowercase, in that order — one
+/// spelling, so a claim and a press cannot disagree about how to say the
+/// same chord.
+pub(crate) fn chord_of(key: &str, modifiers: gpui_kit::Modifiers) -> Option<String> {
+    if !crate::backend::command_held(modifiers) {
+        return None;
+    }
+    let key = key.trim().to_ascii_lowercase();
+    let claimable = !key.is_empty()
+        && key.len() <= MAX_CHORD_KEY
+        && key.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    if !claimable {
+        return None;
+    }
+    let mut chord = String::from("cmd");
+    if modifiers.shift {
+        chord.push_str("-shift");
+    }
+    if modifiers.alt {
+        chord.push_str("-alt");
+    }
+    chord.push('-');
+    chord.push_str(&key);
+    Some(chord)
+}
+
+/// The longest key name a chord may end in (`escape` is six).
+const MAX_CHORD_KEY: usize = 12;
+
+/// Is this the spelling [`chord_of`] would produce? A claim is refused
+/// otherwise — a chord nothing can press is a view waiting forever.
+fn is_chord(chord: &str) -> bool {
+    let Some(rest) = chord.strip_prefix("cmd-") else {
+        return false;
+    };
+    let rest = rest.strip_prefix("shift-").unwrap_or(rest);
+    let rest = rest.strip_prefix("alt-").unwrap_or(rest);
+    !rest.is_empty()
+        && rest.len() <= MAX_CHORD_KEY
+        && rest
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
 }
 
 /// The shortest and longest period a view may ask the clock for. Below the

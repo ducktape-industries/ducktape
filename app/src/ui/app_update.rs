@@ -38,9 +38,6 @@ impl Ducktape {
             AppMessage::NotificationsSaveReply(request_generation, reply_message) => {
                 self.on_notifications_save_reply(request_generation, reply_message)
             }
-            AppMessage::PaletteSearchReply(request_generation, reply_message) => {
-                self.on_palette_search_reply(request_generation, reply_message)
-            }
             AppMessage::ChannelWindowLoadReply(request_generation, reply_message) => {
                 self.on_channel_window_load_reply(request_generation, reply_message)
             }
@@ -146,16 +143,12 @@ impl Ducktape {
             AppMessage::ToastTick => self.on_toast_tick(),
             AppMessage::ViewNotice(sentence) => self.on_view_notice(sentence),
             AppMessage::ExplorerViewEvent(event) => self.on_explorer_view_event(event),
-            AppMessage::ClosePalette => self.on_close_palette(),
             AppMessage::ToggleBell => self.on_toggle_bell(),
             AppMessage::CloseBell => self.on_close_bell(),
             AppMessage::BellUnreadLoaded(generation, account, unread) => {
                 self.on_bell_unread_loaded(generation, account, unread)
             }
             AppMessage::GlobalKeyPressed(event) => self.on_global_key_pressed(event),
-            AppMessage::PaletteChanged(next) => self.on_palette_changed(next),
-            AppMessage::PaletteResults(next) => self.on_palette_results(next),
-            AppMessage::PaletteSearchFailed(cause) => self.on_palette_search_failed(cause),
             AppMessage::OpenChatSearchHit(channel_id, target_seq) => {
                 self.on_open_chat_search_hit(channel_id, target_seq)
             }
@@ -388,17 +381,6 @@ impl Ducktape {
         }
         Task::none()
     }
-    fn on_palette_search_reply(
-        &mut self,
-        request_generation: u64,
-        reply_message: Box<AppMessage>,
-    ) -> Task<AppMessage> {
-        if self.palette_search_generation == request_generation {
-            self.palette_search_task = None;
-            return self.update(*reply_message);
-        }
-        Task::none()
-    }
     fn on_channel_window_load_reply(
         &mut self,
         request_generation: u64,
@@ -579,10 +561,6 @@ impl Ducktape {
         self.account_ceremony_qr = "".to_owned();
         self.account_ceremony_detail = "".to_owned();
         self.account_ceremony_left = "".to_owned();
-        self.palette_search_generation = self.palette_search_generation.wrapping_add(1);
-        if let Some(previous_handle) = self.palette_search_task.take() {
-            previous_handle.abort();
-        }
         self.channel_window_load_generation = self.channel_window_load_generation.wrapping_add(1);
         if let Some(previous_handle) = self.channel_window_load_task.take() {
             previous_handle.abort();
@@ -604,7 +582,6 @@ impl Ducktape {
         self.active_channel_archived = false;
 
         self.page_route = "".to_owned();
-        self.palette_search_phase = SearchPhase::Idle;
         self.error = "".to_owned();
         self.status = "Connecting…".to_owned();
         self.bell_load_generation = self.bell_load_generation.wrapping_add(1);
@@ -1631,31 +1608,18 @@ impl Ducktape {
         &mut self,
         event: crate::module_view::ModuleViewEvent,
     ) -> Task<AppMessage> {
-        match crate::module_view::forge_intent(&(event)) {
-            ForgeIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
-                crate::module_view::event_text(&(event), "url"),
-            )),
-            ForgeIntent::Copy => {
-                self.toast = crate::module_view::event_text(&(event), "label");
-                self.toast_age = 0;
-                crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(
-                    &(event),
-                    "text",
-                ))
-            }
-        }
+        self.toast = crate::module_view::event_text(&(event), "label");
+        self.toast_age = 0;
+        crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(&(event), "text"))
     }
+    /// The files seat has no door of its own: its reads and writes are the
+    /// kernel contract, and a link the Markdown reader activated is
+    /// `host.open_link`, answered before any seat's route.
     fn on_files_view_event(
         &mut self,
-        event: crate::module_view::ModuleViewEvent,
+        _event: crate::module_view::ModuleViewEvent,
     ) -> Task<AppMessage> {
-        if event.kind != "open_link" {
-            return Task::none();
-        }
-        Task::done(AppMessage::OpenMessageLink(crate::module_view::event_text(
-            &(event),
-            "url",
-        )))
+        Task::none()
     }
     fn on_account_loaded(&mut self, next: crate::backend::AccountData) -> Task<AppMessage> {
         if next.generation != self.account_generation {
@@ -1861,15 +1825,8 @@ impl Ducktape {
         if !self.connected {
             return Task::none();
         }
-        match crate::module_view::agents_intent(&(event)) {
-            AgentsIntent::Badge => {
-                self.agents_live = crate::module_view::event_int(&(event), "count") > 0;
-                Task::none()
-            }
-            AgentsIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
-                crate::module_view::event_text(&(event), "url"),
-            )),
-        }
+        self.agents_live = crate::module_view::event_int(&(event), "count") > 0;
+        Task::none()
     }
     fn on_node_view_event(
         &mut self,
@@ -2376,15 +2333,6 @@ impl Ducktape {
         self.toast_age = 0;
         crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(&(event), "text"))
     }
-    fn on_close_palette(&mut self) -> Task<AppMessage> {
-        self.palette_search_generation = self.palette_search_generation.wrapping_add(1);
-        if let Some(previous_handle) = self.palette_search_task.take() {
-            previous_handle.abort();
-        }
-        self.palette_search_phase = SearchPhase::Idle;
-        self.palette_open = false;
-        Task::none()
-    }
     /// The bell opens the seated `inbox` view and asks it for a fresh count;
     /// the view re-reads its own queue on the same block the rail does.
     fn on_toggle_bell(&mut self) -> Task<AppMessage> {
@@ -2445,86 +2393,15 @@ impl Ducktape {
         }
         Task::none()
     }
+    /// Escape closes the one overlay the shell still owns. Every other
+    /// global key belongs to the view that claimed it — the kernel carries
+    /// the press, and this never sees it.
     fn on_global_key_pressed(&mut self, event: crate::shell::KeyPress) -> Task<AppMessage> {
-        let escape_key =
-            crate::backend::escape_target(event.key.clone(), self.palette_open, self.bell_open);
-        let palette_key = crate::backend::palette_key_action(
-            event.key.clone(),
-            event.modifiers,
-            self.palette_open,
-        );
-        if (escape_key).is_empty() && (palette_key == "none") {
+        let escape_key = crate::backend::escape_target(event.key.clone(), self.bell_open);
+        if (escape_key).is_empty() {
             return Task::none();
         }
         self.bell_open = self.bell_open && (escape_key != "bell");
-        if palette_key == "none" {
-            return Task::none();
-        }
-        if (palette_key == "open") && (!self.connected) {
-            return Task::none();
-        }
-        self.palette_search_generation = self.palette_search_generation.wrapping_add(1);
-        if let Some(previous_handle) = self.palette_search_task.take() {
-            previous_handle.abort();
-        }
-        self.palette_open = palette_key == "open";
-        self.palette_draft = "".to_owned();
-        self.palette_chat_hits = Vec::new();
-        self.palette_page_hits = Vec::new();
-        self.palette_search_phase = SearchPhase::Idle;
-        if !self.palette_open {
-            return Task::none();
-        }
-        crate::shell::focus::<AppMessage>(
-            "Ducktape/workspace-tabs/overlays/palette-input".to_owned(),
-        )
-    }
-    fn on_palette_changed(&mut self, next: String) -> Task<AppMessage> {
-        self.palette_search_generation = self.palette_search_generation.wrapping_add(1);
-        if let Some(previous_handle) = self.palette_search_task.take() {
-            previous_handle.abort();
-        }
-        self.palette_draft = next.to_owned();
-        self.palette_search_phase = SearchPhase::Idle;
-        self.palette_chat_hits = Vec::new();
-        self.palette_page_hits = Vec::new();
-        if ((self.palette_draft).trim().to_owned()).is_empty() {
-            return Task::none();
-        }
-        self.palette_search_phase = SearchPhase::Searching;
-        let pending_task = Task::perform(
-            crate::backend::palette_search(
-                self.connected_rpc.to_owned(),
-                (self.palette_draft).trim().to_owned(),
-            ),
-            |result| match result {
-                Ok(value) => AppMessage::PaletteResults(value),
-                Err(error) => AppMessage::PaletteSearchFailed(error),
-            },
-        );
-        self.palette_search_generation = self.palette_search_generation.wrapping_add(1);
-        let request_generation = self.palette_search_generation;
-        let (pending_task, request_handle) = pending_task.abortable();
-        if let Some(previous_handle) = self
-            .palette_search_task
-            .replace(request_handle.abort_on_drop())
-        {
-            previous_handle.abort();
-        }
-        pending_task.map(move |reply_message| {
-            AppMessage::PaletteSearchReply(request_generation, Box::new(reply_message))
-        })
-    }
-    fn on_palette_results(&mut self, next: crate::backend::PaletteSearchData) -> Task<AppMessage> {
-        self.palette_chat_hits = next.chat_hits.clone();
-        self.palette_page_hits = next.page_hits.clone();
-        self.palette_search_phase = SearchPhase::Done;
-        Task::none()
-    }
-    fn on_palette_search_failed(&mut self, _cause: crate::backend::AppError) -> Task<AppMessage> {
-        self.palette_search_phase = SearchPhase::Idle;
-        self.palette_chat_hits = Vec::new();
-        self.palette_page_hits = Vec::new();
         Task::none()
     }
     fn on_open_chat_search_hit(&mut self, channel_id: String, target_seq: i64) -> Task<AppMessage> {
@@ -2542,7 +2419,6 @@ impl Ducktape {
         self.active_channel_name = next_channel.name.to_owned();
         self.active_channel_archived = next_channel.archived;
 
-        self.palette_open = false;
         self.account_qr_auth_generation = self.account_qr_auth_generation.wrapping_add(1);
         if let Some(previous_handle) = self.account_qr_auth_task.take() {
             previous_handle.abort();
@@ -3000,9 +2876,6 @@ impl Ducktape {
             ChatIntent::JoinVoice => Task::done(AppMessage::JoinVoice(
                 crate::module_view::event_text(&(event), "id"),
             )),
-            ChatIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
-                crate::module_view::event_text(&(event), "url"),
-            )),
             ChatIntent::Copy => {
                 let label = crate::module_view::event_text(&(event), "label");
                 let clipboard_label = label.to_owned();
@@ -3017,44 +2890,25 @@ impl Ducktape {
         &mut self,
         event: crate::module_view::ModuleViewEvent,
     ) -> Task<AppMessage> {
-        match crate::module_view::pages_intent(&(event)) {
-            PagesIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
-                crate::module_view::event_text(&(event), "link"),
-            )),
-            PagesIntent::Copy => {
-                self.toast = crate::module_view::event_text(&(event), "label");
-                self.toast_age = 0;
-                crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(
-                    &(event),
-                    "text",
-                ))
-            }
-        }
+        self.toast = crate::module_view::event_text(&(event), "label");
+        self.toast_age = 0;
+        crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(&(event), "text"))
     }
-    /// A registry-listed view's two doors: a `duck://` link through the
-    /// one open plane, and the clipboard with its toast.
+    /// A registry-listed view's one door: the clipboard, with its toast.
+    /// Opening a `duck://` address is the kernel's door, answered before
+    /// this route.
     fn on_registered_view_event(
         &mut self,
         event: crate::module_view::ModuleViewEvent,
     ) -> Task<AppMessage> {
-        match crate::module_view::registered_intent(&event) {
-            RegisteredIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
-                crate::module_view::event_text(&event, "link"),
-            )),
-            RegisteredIntent::Copy => {
-                self.toast = crate::module_view::event_text(&event, "label");
-                self.toast_age = 0;
-                crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(
-                    &event, "text",
-                ))
-            }
-        }
+        self.toast = crate::module_view::event_text(&event, "label");
+        self.toast_age = 0;
+        crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(&event, "text"))
     }
     fn on_open_page_search_hit(&mut self, page_id: String, _block_id: String) -> Task<AppMessage> {
         if (page_id).is_empty() {
             return Task::none();
         }
-        self.palette_open = false;
         self.shell_tab = ShellTab::Pages;
         self.page_route = page_id.to_owned();
         self.page_route_serial += 1;
@@ -3844,10 +3698,6 @@ impl Ducktape {
         self.account_ceremony_qr = "".to_owned();
         self.account_ceremony_detail = "".to_owned();
         self.account_ceremony_left = "".to_owned();
-        self.palette_search_generation = self.palette_search_generation.wrapping_add(1);
-        if let Some(previous_handle) = self.palette_search_task.take() {
-            previous_handle.abort();
-        }
         self.channel_window_load_generation = self.channel_window_load_generation.wrapping_add(1);
         if let Some(previous_handle) = self.channel_window_load_task.take() {
             previous_handle.abort();
@@ -3878,10 +3728,6 @@ impl Ducktape {
         self.active_channel_archived = false;
 
         self.page_route = "".to_owned();
-        self.palette_draft = "".to_owned();
-        self.palette_chat_hits = Vec::new();
-        self.palette_page_hits = Vec::new();
-        self.palette_search_phase = SearchPhase::Idle;
         self.forge_note_pending = "".to_owned();
         self.forge_link = "".to_owned();
         self.huddle_joined = false;

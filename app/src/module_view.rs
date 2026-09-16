@@ -20,6 +20,7 @@ mod filesystem;
 mod taste;
 
 pub use kernel::{block_hit as view_block_hit, live_hit as view_live_hit};
+pub(crate) use kernel::chord_of;
 
 /// Shared HTTP connections need a continuously driven I/O runtime. Loader
 /// threads can compile or join child loads between requests; their own parked
@@ -114,6 +115,22 @@ pub fn inbox_view(dark: bool, connected: bool, chain: &str, account: &str) -> Vi
     module_view("inbox", serde_json::to_vec(&props).expect("props encode"))
 }
 
+/// The command palette, drawn by the `palette` view over the KERNEL
+/// CONTRACT. THE APP HAS NO PALETTE: which chord opens it, what a query
+/// searches, how a hit reads and where pressing one goes are the view's own
+/// — the chord is claimed through `host.chord`, the messages and pages are
+/// its own reads, and a hit leaves through `host.open_link`. The app owns
+/// the seat and nothing in it: a palette that is closed draws an empty tree,
+/// and an empty tree is no overlay at all.
+pub fn palette_view(dark: bool, connected: bool, chain: &str) -> ViewSpec {
+    let props = serde_json::json!({
+        "connected": connected,
+        "dark": dark,
+        "chain": chain,
+    });
+    module_view("palette", serde_json::to_vec(&props).expect("props encode"))
+}
+
 // ---------- the roster seats ----------
 
 /// The Members tab, on the KERNEL CONTRACT: session facts go in, the view
@@ -138,7 +155,8 @@ pub fn members_view(dark: bool, connected: bool) -> ViewSpec {
 /// save leaves as `op.submit`, signed here with the seated key.
 ///
 /// What still comes back as an intent: `badge` (how many of its agents are
-/// working — the rail's pulse) and `open_link` (`url`, a chip's duck:// address).
+/// working — the rail's pulse). A chip's `duck://` address leaves through
+/// the kernel's one door, not through this seat.
 pub fn agents_view(
     dark: bool,
     connected: bool,
@@ -154,13 +172,6 @@ pub fn agents_view(
         "dark": dark,
     });
     module_view("agents", serde_json::to_vec(&props).expect("props encode"))
-}
-
-pub fn agents_intent(event: &ModuleViewEvent) -> crate::AgentsIntent {
-    match event.kind.as_str() {
-        "open_link" => crate::AgentsIntent::OpenLink,
-        _ => crate::AgentsIntent::Badge,
-    }
 }
 
 /// The string under `field` in an intent's JSON detail; empty when absent.
@@ -418,15 +429,6 @@ pub fn forge_view(
     module_view("forge", serde_json::to_vec(&props).expect("props encode"))
 }
 
-/// OS navigation and clipboard doors requested by the Forge guest.
-pub fn forge_intent(event: &ModuleViewEvent) -> crate::ForgeIntent {
-    use crate::ForgeIntent as Intent;
-    match event.kind.as_str() {
-        "open_link" => Intent::OpenLink,
-        _ => Intent::Copy,
-    }
-}
-
 // ---------- the pages seat ----------
 
 /// Pages speaks the KERNEL CONTRACT: session facts go in — the chain the
@@ -450,17 +452,6 @@ pub fn pages_view(
         "route_serial": route_serial,
     });
     module_view("pages", serde_json::to_vec(&props).expect("props encode"))
-}
-
-/// The two OS doors the pages view still asks the app for: a `duck://`
-/// address pressed in a document goes through the ONE open plane, and a
-/// clipboard copy is the clipboard.
-pub fn pages_intent(event: &ModuleViewEvent) -> crate::PagesIntent {
-    use crate::PagesIntent as Intent;
-    match event.kind.as_str() {
-        "open_link" => Intent::OpenLink,
-        _ => Intent::Copy,
-    }
 }
 
 // ---------- the chat seat ----------
@@ -592,9 +583,7 @@ pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
         "leave_huddle" => Intent::LeaveHuddle,
         "join_huddle" => Intent::JoinHuddle,
         "join_voice" => Intent::JoinVoice,
-        "open_link" => Intent::OpenLink,
-        "copy" => Intent::Copy,
-        _ => Intent::OpenLink,
+        _ => Intent::Copy,
     }
 }
 
@@ -664,9 +653,11 @@ pub(crate) fn intents_of(module: &str) -> &'static [&'static str] {
         "governance" => &["taste", "untaste"],
         // members speaks it too; `copy` is the clipboard door, not a write
         "members" => &["copy"],
-        // the agents view speaks the kernel contract: pause, save,
-        // and registration use `op.submit`; links navigate other tabs.
-        "agents" => &["open_link"],
+        // the agents view speaks the kernel contract end to end: pause,
+        // save and registration are `op.submit`, the rail's pulse is
+        // `host.badge` and a chip's address is `host.open_link`. Nothing is
+        // left at this seat's door.
+        "agents" => &[],
         // the node view speaks the kernel contract: it reads the node's own
         // status, peers, registry and log ring itself and retunes the live
         // tracing filter through `rpc.admin`. `copy` is the clipboard door.
@@ -692,15 +683,16 @@ pub(crate) fn intents_of(module: &str) -> &'static [&'static str] {
             "leave_huddle",
             "join_huddle",
             "join_voice",
-            "open_link",
             "copy",
         ],
         // the forge view reads, folds and writes through the kernel: what is
         // left at the door is the two OS doors.
-        "forge" => &["open_link", "copy"],
+        "forge" => &["copy"],
         // the files view speaks the kernel contract: its reads and writes go
         // through the kernel, and the two events left are the app's own doors
-        "files" => &["open_link"],
+        // the files view speaks the kernel contract too; a link the Markdown
+        // reader activated leaves through the kernel's door.
+        "files" => &[],
         "settings" => &[
             "tab",
             "reconnect",
@@ -732,17 +724,34 @@ pub(crate) fn intents_of(module: &str) -> &'static [&'static str] {
         // every write `op.submit`. What is left are the two OS doors — the
         // clipboard, and the open plane a `duck://` link in a document goes
         // through.
-        "pages" => &["copy", "open_link"],
+        "pages" => &["copy"],
         // a registry-listed view (no arm above) speaks the kernel contract
         // and the two OS doors every view is allowed: nothing of its own
         _ => GENERIC_DOORS,
     }
 }
 
-/// The two OS doors the app owns for every view: the open plane a `duck://`
-/// address goes through, and the clipboard. A view seated off the registry
-/// alone gets exactly these.
-const GENERIC_DOORS: &[&str] = &["open_link", "copy"];
+/// The one OS door the app owns for every registry-listed view: the
+/// clipboard. Opening a `duck://` address is not here — it is the kernel's
+/// `host.open_link`, which every view reaches whether or not the app has
+/// heard of it ([`host_door`]).
+const GENERIC_DOORS: &[&str] = &["copy"];
+
+/// The address a kernel door asked the app to open, or `None` for an intent
+/// the view itself owns.
+///
+/// ONE DOOR OUT, FOR EVERY VIEW. A view cannot name a tab or a route: it
+/// hands over a `duck://` address and the app resolves it through the single
+/// module table. The check sits here, in front of every per-view route, so a
+/// view's own intent enum never grows an opening act again — and
+/// `no_view_declares_its_own_open_link` fails the build if one does.
+pub fn host_door(event: &ModuleViewEvent) -> Option<String> {
+    if event.kind != "open_link" {
+        return None;
+    }
+    let link = event_text(event, "link");
+    (!link.is_empty()).then_some(link)
+}
 
 // ---------- the registry-listed seats ----------
 
@@ -767,15 +776,35 @@ pub fn registered_view(
     module_view(module, serde_json::to_vec(&props).expect("props encode"))
 }
 
-/// The generic decoder: `open_link` (`link`) goes to the open plane, and
-/// anything else a registered view may say is the clipboard (`text`,
-/// `label`) — the door list admits nothing else.
-pub fn registered_intent(event: &ModuleViewEvent) -> crate::RegisteredIntent {
-    use crate::RegisteredIntent as Intent;
-    match event.kind.as_str() {
-        "open_link" => Intent::OpenLink,
-        _ => Intent::Copy,
+/// Which module holds each claimed chord. Global, because the claim is:
+/// two seats answering to one chord would make the key mean whichever guest
+/// the shell reached first that frame.
+fn chord_claims() -> &'static Mutex<std::collections::BTreeMap<String, &'static str>> {
+    static CLAIMS: OnceLock<Mutex<std::collections::BTreeMap<String, &'static str>>> =
+        OnceLock::new();
+    CLAIMS.get_or_init(Mutex::default)
+}
+
+/// Claim `chord` for `module`, or name the module that already holds it.
+///
+/// FIRST COME HOLDS IT, and a module re-claiming its own is the same claim:
+/// a swap installs a new instance of the same id, and a view must not lose
+/// its chord by being replaced with itself.
+pub(crate) fn claim_chord(chord: &str, module: &'static str) -> Result<(), &'static str> {
+    let mut claims = chord_claims().lock().expect("chord claims");
+    match claims.get(chord) {
+        Some(holder) if *holder != module => Err(holder),
+        _ => {
+            claims.insert(chord.to_owned(), module);
+            Ok(())
+        }
     }
+}
+
+/// The module that holds `chord`, if any — what the shell asks before it
+/// carries a press to a seat.
+pub(crate) fn chord_holder(chord: &str) -> Option<&'static str> {
+    chord_claims().lock().expect("chord claims").get(chord).copied()
 }
 
 /// The ids the connected node's registry lists as `Kind::View` entries, in
@@ -2015,6 +2044,10 @@ struct Guest {
     /// so periodic guest subscriptions use this list — driven from the window
     /// thread's own redraw, never from a thread that would have to wake it.
     clocks: Vec<kernel::Clock>,
+    /// The chords this guest claimed, each with the subscription its presses
+    /// arrive on. The claim itself is global ([`claim_chord`]): two seats
+    /// cannot answer to one chord.
+    chords: Vec<(u64, String)>,
     /// The trap that ended the view, if one did. A faulted guest never ticks again.
     fault: Option<String>,
     /// The assets the deployment shipped beside this view, for the host
@@ -2679,6 +2712,7 @@ impl Guest {
             tasks: Vec::new(),
             filesystem: Default::default(),
             clocks: Vec::new(),
+            chords: Vec::new(),
             fault: None,
             assets: Arc::default(),
             hash: None,
@@ -2719,6 +2753,26 @@ impl Guest {
         }
         self.visible = visible;
         self.visibility_change = Some(visible);
+    }
+
+    /// A chord this guest claimed was pressed: every subscription that named
+    /// it gets one item. Says whether any did, which is how the shell knows
+    /// the press was spent and must not also be a native key.
+    fn chord_pressed(&mut self, chord: &str) -> bool {
+        let claimed: Vec<u64> = self
+            .chords
+            .iter()
+            .filter(|(_, named)| named == chord)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &claimed {
+            self.pending.push(wire::Event::Response {
+                id: *id,
+                result: Ok(Vec::new()),
+                done: false,
+            });
+        }
+        !claimed.is_empty()
     }
 
     fn sync_visibility(&mut self) {
@@ -2796,6 +2850,7 @@ impl Guest {
             // subscription the view abandoned
             self.tasks.retain(|(task, _)| *task != id);
             self.clocks.retain(|clock| clock.id != id);
+            self.chords.retain(|(chord, _)| *chord != id);
             self.sessions.remove(&id);
             if let Some(session) = self.session.as_mut() {
                 session.media.cancel(id);
@@ -3202,6 +3257,46 @@ impl NativeModuleView {
             seat.props = Some(props);
             cx.notify();
         }
+    }
+
+    /// Does this seat's view draw anything at all?
+    ///
+    /// An overlay seat is always mounted and mostly silent: a palette that is
+    /// closed returns an empty tree, and an empty tree must not be stacked
+    /// over the window — a layer that draws nothing still eats the presses
+    /// underneath it. This is that question, asked of the tree the guest
+    /// actually sent.
+    pub(crate) fn draws(&self) -> bool {
+        let seat = mounted(self.module);
+        let mounted = seat.lock().expect("module view lock");
+        let Slot::Ready(guest) = &mounted.slot else {
+            return false;
+        };
+        guest
+            .frame
+            .root
+            .as_ref()
+            .is_some_and(|root| !root.children().is_empty())
+    }
+
+    /// A chord was pressed: if this seat's module claimed it, its guest is
+    /// told and redrawn, and the press is spent. Says whether it landed, so
+    /// the shell stops at the seat that took it.
+    pub(crate) fn chord(&mut self, chord: &str, cx: &mut gpui_kit::Context<Self>) -> bool {
+        if chord_holder(chord) != Some(self.module) {
+            return false;
+        }
+        let seat = mounted(self.module);
+        let mut mounted = seat.lock().expect("module view lock");
+        let Slot::Ready(guest) = &mut mounted.slot else {
+            return false;
+        };
+        let taken = guest.chord_pressed(chord);
+        drop(mounted);
+        if taken {
+            cx.notify();
+        }
+        taken
     }
 
     /// A hidden tab gets one bounded update before its native presenter leaves.
@@ -3681,15 +3776,17 @@ pub(crate) mod tests {
     #[test]
     fn only_declared_intents_are_routed() {
         assert_eq!(intents_of("governance"), ["taste", "untaste"]);
-        // a registry-listed view declares nothing of its own: the two
-        // generic OS doors, and only those
+        // a registry-listed view declares nothing of its own: the one
+        // generic OS door, and only that
         assert_eq!(intents_of("home"), GENERIC_DOORS);
-        assert_eq!(GENERIC_DOORS, ["open_link", "copy"]);
+        assert_eq!(GENERIC_DOORS, ["copy"]);
         assert_eq!(intents_of("members"), ["copy"]);
-        // the agents view signs its own pause and save through `op.submit`
-        assert_eq!(intents_of("agents"), ["open_link"]);
+        // the agents view signs its own pause and save through `op.submit`,
+        // pulses the rail through `host.badge` and opens an address through
+        // `host.open_link`: nothing is left at its door
+        assert_eq!(intents_of("agents"), [] as [&str; 0]);
         let chat = intents_of("chat");
-        assert_eq!(chat.len(), 6);
+        assert_eq!(chat.len(), 5);
         assert!(!chat.contains(&"scrolled"), "scrolling belongs to the view");
         // the writes the view signs for itself are nobody's intent
         for signed in ["react", "edit", "delete", "rename", "search", "mark_read"] {
@@ -3707,6 +3804,65 @@ pub(crate) mod tests {
         );
     }
 
+    /// NO VIEW HAS AN OPENING ACT OF ITS OWN. Opening a `duck://` address is
+    /// the kernel's one door, `host.open_link`, and every seat's route reads
+    /// it before the view's own intents ([`host_door`]). A view that grew a
+    /// `<module>.open_link` back would be a second grammar for the same act:
+    /// two spellings of the address field, two places to scope a link to its
+    /// network, and whichever the app decoded last on screen.
+    ///
+    /// Parsed, not agreed: the view tree is read for the string a notify
+    /// would carry, and the door tables for the kind they would admit.
+    #[test]
+    fn no_view_declares_its_own_open_link() {
+        for module in [
+            "governance", "members", "agents", "node", "explorer", "call", "chat", "forge",
+            "files", "settings", "pages", "home", "inbox",
+        ] {
+            assert!(
+                !intents_of(module).contains(&"open_link"),
+                "{module}'s door still admits an open_link of its own"
+            );
+        }
+        let views = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/views");
+        let mut sources = Vec::new();
+        collect_view_sources(&views, &mut sources);
+        assert!(!sources.is_empty(), "the walk found no view source at all");
+        for (path, source) in sources {
+            // `host.open_link` is the door; anything else before the dot is a
+            // module claiming one of its own.
+            let own_door = source
+                .match_indices(".open_link\"")
+                .any(|(at, _)| !source[..at].ends_with("host"));
+            assert!(
+                !own_door,
+                "{} names an `<module>.open_link` — the door is `host.open_link`",
+                path.display()
+            );
+        }
+    }
+
+    /// Every `.rs` under `dir`, with its text — source only, never a build
+    /// output.
+    fn collect_view_sources(
+        dir: &std::path::Path,
+        out: &mut Vec<(std::path::PathBuf, String)>,
+    ) {
+        for entry in std::fs::read_dir(dir).expect("read a view source dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                if path.file_name().and_then(|name| name.to_str()) != Some("target") {
+                    collect_view_sources(&path, out);
+                }
+                continue;
+            }
+            if path.extension().and_then(|end| end.to_str()) == Some("rs") {
+                let source = std::fs::read_to_string(&path).expect("read a view source");
+                out.push((path, source));
+            }
+        }
+    }
+
     /// Every kind a module's decoder names is admitted at that module's
     /// door, so a view never emits an intent the app knows how to decode
     /// but refuses to hear. The kinds a decoder names off its door are
@@ -3719,11 +3875,9 @@ pub(crate) mod tests {
         let (source, _tests) = include_str!("module_view.rs")
             .split_once("\npub(crate) mod tests {")
             .expect("the tests module");
-        let other_route_only: [(&str, &str, &[&str]); 4] = [
-            ("agents", "agents_intent", &[]),
+        let other_route_only: [(&str, &str, &[&str]); 2] = [
             ("settings", "settings_intent", &[]),
-            ("forge", "forge_intent", &[]),
-            ("pages", "pages_intent", &[]),
+            ("chat", "chat_intent", &[]),
         ];
         let snake = |variant: &str| -> String {
             let mut word = String::new();

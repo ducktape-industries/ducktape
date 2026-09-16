@@ -118,35 +118,21 @@ fn the_backend_builds_no_roster_of_its_own() {
     );
 }
 
-#[test]
-fn palette_keys_use_native_platform_shortcuts() {
-    let plain = gpui_kit::Modifiers::default();
-    let command = gpui_kit::Modifiers {
-        platform: cfg!(target_os = "macos"),
-        control: !cfg!(target_os = "macos"),
-        ..Default::default()
-    };
-    assert_eq!(palette_key_action("escape".into(), plain, true), "close");
-    assert_eq!(palette_key_action("escape".into(), plain, false), "none");
-    assert_eq!(palette_key_action("k".into(), command, false), "open");
-    assert_eq!(palette_key_action("K".into(), command, true), "close");
-    assert_eq!(palette_key_action("x".into(), command, false), "none");
-    assert_eq!(palette_key_action("k".into(), plain, false), "none");
-}
-
+/// The shell owns ONE transient layer now — the bell — and Escape names it
+/// only when it is up. Every other layer is a view's own: the palette claims
+/// its chord and answers its own Escape, like the chat menus and the pages
+/// cards before it.
 #[test]
 fn escape_ladder_names_the_topmost_transient_layer_only() {
-    assert_eq!(escape_target("x".into(), false, true), "");
-    assert_eq!(escape_target("escape".into(), true, true), "");
-    assert_eq!(escape_target("escape".into(), false, true), "bell");
-    assert_eq!(escape_target("escape".into(), false, false), "");
+    assert_eq!(escape_target("x".into(), true), "");
+    assert_eq!(escape_target("escape".into(), true), "bell");
+    assert_eq!(escape_target("escape".into(), false), "");
 }
 
 #[test]
 fn the_two_ladder_readers_enumerate_the_same_layers() {
-    assert_eq!(topmost_overlay(true, true), "palette");
-    assert_eq!(topmost_overlay(false, true), "bell");
-    assert_eq!(topmost_overlay(false, false), "");
+    assert_eq!(topmost_overlay(true), "bell");
+    assert_eq!(topmost_overlay(false), "");
 }
 
 #[test]

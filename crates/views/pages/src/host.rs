@@ -1666,15 +1666,15 @@ pub fn copy(text: &str, label: &str) -> bool {
     true
 }
 
-/// `pages.open_link` — a link pressed in the document. It goes through the
-/// app's ONE open plane, not straight to the OS: a page cites `duck://`
-/// addresses as readily as a chat message does, and only that plane knows
-/// the module table and the network scope.
+/// A link pressed in the document, handed to the kernel's ONE open door,
+/// not straight to the OS: a page cites `duck://` addresses as readily as a
+/// chat message does, and only the app's table knows the module and the
+/// network scope.
 pub fn open_link(link: &str) -> bool {
     if link.is_empty() {
         return false;
     }
-    host::notify("pages.open_link", &encode(&json!({ "link": link })));
+    ducktape_view_guest::host::open_link(link);
     true
 }
 

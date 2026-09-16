@@ -2331,14 +2331,11 @@ impl Stream for ActStream {
 
 // ---------- the intents ----------
 
-/// A chip pressed: the duck:// address the app's open plane warps to.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenLink {
-    pub url: String,
-}
-
+/// A chip pressed: the `duck://` address, handed to the kernel's ONE open
+/// door, which warps to whatever owns it.
 pub fn open_link(url: &str) -> bool {
-    notify("agents.open_link", &OpenLink { url: url.into() })
+    ducktape_view_guest::host::open_link(url);
+    true
 }
 
 /// The guest-owned registration draft.
@@ -2402,12 +2399,6 @@ pub async fn register_agent(controller: String, draft: Draft) -> Result<(), Stri
     )
     .await?;
     Ok(())
-}
-
-fn notify<T: Serialize>(operation: &str, payload: &T) -> bool {
-    let bytes = serde_json::to_vec(payload).expect("an intent encodes");
-    host::notify(operation, &bytes);
-    true
 }
 
 // ---------- the readings ----------

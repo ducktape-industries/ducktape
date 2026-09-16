@@ -106,6 +106,22 @@ pub fn log(message: impl AsRef<str>) {
     notify("host.log", message.as_ref().as_bytes());
 }
 
+/// Opens a `duck://` address — the ONE door out of a view to whatever owns
+/// that address, and the only way a view moves the app off itself.
+///
+/// The address is the whole request: it names its module, its object and the
+/// network it belongs to (`?net=`), so nothing here says which tab, which
+/// route or which window. The host resolves it against the same table a
+/// pressed link in a document resolves against, and a view that cannot be
+/// opened is the host's answer, not this view's business.
+pub fn open_link(link: &str) {
+    let ask = serde_json::json!({ "link": link });
+    notify(
+        "host.open_link",
+        ask.to_string().as_bytes(),
+    );
+}
+
 /// The host's colour mode, now and whenever it changes: every item is
 /// `light` or `dark`. Needs no capability — an app that cannot follow the
 /// host's dark mode is the one thing every app should be allowed to fix.

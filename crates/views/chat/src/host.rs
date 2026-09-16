@@ -2432,12 +2432,6 @@ pub struct Channel {
     pub id: String,
 }
 
-/// `chat.open_link` — a pressed link.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Url {
-    pub url: String,
-}
-
 /// `chat.copy` — the host puts `text` on the clipboard and toasts `label`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Copy {
@@ -2486,8 +2480,10 @@ pub fn send_join_voice(id: &str) -> bool {
     notify("chat.join_voice", &Channel { id: id.into() })
 }
 
+/// A pressed link, handed to the kernel's ONE open door.
 pub fn send_open_link(url: &str) -> bool {
-    notify("chat.open_link", &Url { url: url.into() })
+    ducktape_view_guest::host::open_link(url);
+    true
 }
 
 pub fn send_copy(text: &str, label: &str) -> bool {

@@ -4,7 +4,7 @@
 //! `rpc.live` hit, and a pause or a save leaves as `op.submit`. Only the
 //! navigation intents still leave as notifications.
 
-use agents_view::host::{OpenLink, Session};
+use agents_view::host::Session;
 use agents_view::{boot_native, tick_native};
 use ducktape_view_guest::testing::{answer, has_text, item, pick, press, texts, toggle, type_into};
 use ducktape_view_guest::wire::{Event, Frame, Node, Request};
@@ -157,6 +157,15 @@ fn request<'a>(frame: &'a Frame, kind: &str) -> &'a Request {
         .iter()
         .find(|request| request.kind == kind)
         .unwrap_or_else(|| panic!("no `{kind}` request in {:?}", frame.requests))
+}
+
+/// The address the one intent on this frame asked the host to open.
+fn opened_link(frame: &Frame) -> String {
+    serde_json::from_slice::<serde_json::Value>(&one_intent(frame).payload)
+        .expect("the door's payload decodes")["link"]
+        .as_str()
+        .expect("the door carries a link")
+        .to_owned()
 }
 
 fn one_intent(frame: &Frame) -> &Request {
@@ -643,9 +652,7 @@ fn the_open_run_draws_its_places_as_chips() {
     );
     let opened = tick_native(press(&frame, "Open in chat"));
     assert_eq!(
-        serde_json::from_slice::<OpenLink>(&one_intent(&opened).payload)
-            .unwrap()
-            .url,
+        opened_link(&opened),
         "duck://channel/general?net=a1b2c3d4#9"
     );
     let frame = tick_native(press(&opened, "Hide message"));
@@ -663,13 +670,11 @@ fn the_open_run_draws_its_places_as_chips() {
 
     let frame = tick_native(press(&frame, "Release notes"));
     let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "agents.open_link");
+    assert_eq!(intent.kind, "host.open_link");
+    // the chain's digest, never its whole id
     assert_eq!(
-        serde_json::from_slice::<OpenLink>(&intent.payload).expect("decodes"),
-        OpenLink {
-            // the chain's digest, never its whole id
-            url: "duck://page/p-9?net=a1b2c3d4".into()
-        }
+        serde_json::from_slice::<serde_json::Value>(&intent.payload).expect("decodes")["link"],
+        "duck://page/p-9?net=a1b2c3d4"
     );
 }
 

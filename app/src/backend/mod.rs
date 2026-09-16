@@ -52,38 +52,6 @@ pub struct ChatData {
     pub huddle_roster: Vec<HuddleParticipant>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ChatSearchHit {
-    pub channel_id: String,
-    pub seq: i64,
-    pub root_seq: i64,
-    pub author: String,
-    pub text: String,
-    pub meta: String,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ChatSearchData {
-    pub hits: Vec<ChatSearchHit>,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct PageSearchHit {
-    pub page_id: String,
-    /// The title of the page the block lives in. The index's hit row carries
-    /// only `page_id`, so without this join no surface could name the page a
-    /// match came from; the Pages guest joins the title to each result.
-    pub page_title: String,
-    pub block_id: String,
-    pub kind: String,
-    pub text: String,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct PageSearchData {
-    pub hits: Vec<PageSearchHit>,
-}
-
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct WorkspaceData {
     pub generation: i64,
@@ -207,7 +175,6 @@ mod notify;
 mod picture;
 mod roster;
 mod rpc;
-mod search;
 mod shell;
 mod storage;
 mod style;
@@ -232,7 +199,6 @@ pub use notify::*;
 pub use picture::*;
 use roster::*;
 pub use rpc::*;
-pub use search::*;
 pub use shell::*;
 pub(crate) use storage::*;
 pub(crate) use style::*;

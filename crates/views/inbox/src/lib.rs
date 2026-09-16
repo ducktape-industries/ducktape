@@ -7,7 +7,7 @@
 //! SAYS are this view's own fold — read through the kernel's doors off the
 //! inbox queue, the identity directory and each source module's read lane,
 //! re-read on every `rpc.live` hit for the inbox plane. A row's door out is
-//! `inbox.open_link` carrying a `duck://` address the shell's link plane
+//! `host.open_link` carrying a `duck://` address the shell's link plane
 //! routes; "Mark all read" leaves as `op.submit`.
 //!
 //! The app keeps no second fold: the number beside its bell is this view's

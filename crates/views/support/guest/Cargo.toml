@@ -10,4 +10,5 @@ description = "Renderer-independent WASM view execution and host protocol"
 futures.workspace = true
 view-wire.workspace = true
 design.workspace = true
+serde_json.workspace = true
 wit-bindgen = "0.61"
