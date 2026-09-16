@@ -115,6 +115,19 @@ impl Phase {
         }
     }
 
+    /// The phase's name without its body — what a log line says a machine
+    /// settled on.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Phase::Idle(_) => "idle",
+            Phase::Downloading(_) => "downloading",
+            Phase::Staged(_) => "staged",
+            Phase::Swapping(_) => "swapping",
+            Phase::PendingHealthy(_) => "pending_healthy",
+            Phase::RolledBack(_) => "rolled_back",
+        }
+    }
+
     pub fn pinned_sequence(&self) -> u64 {
         match self {
             Phase::Idle(Idle {
@@ -176,9 +189,13 @@ pub enum Event {
     Verified(Sha),
     /// App: any of those checks failed; `reason` is a stable token.
     VerifyRefused { sha: Sha, reason: String },
-    /// Either: `<staged>/ducktape-launcher --qualify` exited 0.
+    /// The staged release answered its own self-check: the app's staged
+    /// launcher `--qualify`, the node's staged binary reopening the
+    /// workspace checkpoint.
     QualifyPassed(Sha),
-    /// Either: it did not; `reason` is a stable token.
+    /// It did not; `reason` is a stable token. A node whose network has not
+    /// designated the staged release at the committed height refuses here
+    /// too: the staged bytes are not yet the ones to run.
     QualifyFailed { sha: Sha, reason: String },
     /// App: the banner button or the Settings row.
     RestartToUpdate,
@@ -186,7 +203,9 @@ pub enum Event {
     UserRollback,
     /// App: the `RolledBack` notice was dismissed.
     DismissRollbackNotice,
-    /// App: the first window opened — the healthy signal.
+    /// The release that was flipped to came up — the healthy signal, and the
+    /// only thing that clears `PendingHealthy`. The app's first window; the
+    /// node's published mesh identity.
     Rendered,
     /// App: the check cadence; the only time-driven input.
     Tick,
@@ -236,8 +255,9 @@ pub enum Command {
     Flip { from: Sha, to: Sha },
     /// Run `sha`: the install path now points at it (a `Flip` earlier in
     /// this list, or one that landed before a crash). A boot with no `Exec`
-    /// in its command list execs [`Phase::current`]; the app treats it as
-    /// "quit and relaunch through the launcher".
+    /// in its command list runs [`Phase::current`]; the app treats it as
+    /// "quit and relaunch through the launcher", and a supervising launcher
+    /// as "stop the child and start this one".
     Exec(Sha),
     /// Show (or clear) the update strip; app only.
     Banner(UpdateBanner),

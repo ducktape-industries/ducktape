@@ -1,18 +1,25 @@
-//! The desktop app's self-update, as a pure library.
+//! Ducktape's self-update, as a pure library — the desktop app's and the
+//! node's, one machine.
 //!
-//! Two processes drive one state machine and share one file:
+//! Processes drive one state machine and share one file per install:
 //! - the launcher, at boot: reads `state.json`, runs [`step`] on
-//!   [`Event::Boot`], performs the flip/rollback it is told, execs the app;
+//!   [`Event::Boot`], performs the flip/rollback it is told, runs the release;
 //! - the app, while running: checks, downloads, verifies, stages, marks
-//!   healthy and shows the banner, through the same [`step`].
+//!   healthy and shows the banner, through the same [`step`];
+//! - the node's launcher, supervising: the same checks and staging, with the
+//!   flip held until the network's [`Designation`] is armed at the committed
+//!   height.
 //!
 //! This crate holds the vocabulary ([`Phase`], [`Event`], [`Command`]), the
 //! decision ([`step`]), the signed release manifest ([`Manifest`],
-//! [`verify_manifest`]), its signature ([`release`]), the duckfs layout it
-//! is published under ([`layout`]) and the `state.json` codec ([`state`]).
-//! It performs no I/O, reads no clock and opens no socket: every effect is a
-//! [`Command`] for the calling process's executor.
+//! [`verify_manifest`]), its signature ([`release`]), the duckfs layout each
+//! [`layout::Kind`] is published under ([`layout`]), the governance
+//! designation that says when a node cuts over ([`designation`]) and the
+//! `state.json` codec ([`state`]). It performs no I/O, reads no clock and
+//! opens no socket: every effect is a [`Command`] for the calling process's
+//! executor.
 
+pub mod designation;
 pub mod layout;
 pub mod manifest;
 pub mod phase;
@@ -22,6 +29,8 @@ pub mod state;
 pub mod step;
 pub mod verify;
 
+pub use designation::Designation;
+pub use layout::Kind;
 pub use manifest::{Artifact, Manifest, Platform, Release, SCHEMA, SuccessorKey};
 pub use phase::{
     Command, Downloading, Event, Idle, PendingHealthy, Phase, RollbackReason, RolledBack, Staged,
@@ -41,6 +50,7 @@ mod lint {
     fn no_minisign_symbol_anywhere_in_the_crate() {
         let sources = [
             ("lib.rs", include_str!("lib.rs")),
+            ("designation.rs", include_str!("designation.rs")),
             ("layout.rs", include_str!("layout.rs")),
             ("manifest.rs", include_str!("manifest.rs")),
             ("phase.rs", include_str!("phase.rs")),

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Publish a desktop-app release to a network's duckfs.
+# Publish a release to a network's duckfs — the desktop app's (--kind app,
+# the default) or the node's (--kind node).
 #
 # Given built archives (one per platform), this composes the sealed manifest,
 # signs it with the release wallet and lands the archives, the manifest and
@@ -12,6 +13,14 @@
 #       --sequence 18 --display "2026.09.2+9d71b254a" \
 #       --archive macos-aarch64=target/Ducktape-macos-aarch64.tar.zst \
 #       --archive linux-x86_64=target/Ducktape-linux-x86_64.tar.zst
+#
+# A node release is the same three steps under its own channel, and WHEN the
+# network runs it is a separate governance decision:
+#
+#   ops/release/publish.sh --kind node --node http://127.0.0.1:8844 \
+#       --key ... --sequence 3 --display "2026.09.3+e6352411a" \
+#       --archive linux-x86_64=target/ducktape-linux-x86_64.tar.zst
+#   ducktape release schedule --sha <archive sha256> --at <height>
 #
 # The release wallet is an ordinary ducktape wallet minted into a workspace
 # of its own (`ducktape wallet new release --workspace ~/.ducktape/release`);
@@ -34,8 +43,10 @@ OUT_DIR="${PUBLISH_OUT_DIR:-target/release-publish}"
 ARCHIVES=()
 EXTRA=()
 
+KIND="app"
+
 usage() {
-  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 }
 
@@ -48,9 +59,10 @@ while [ $# -gt 0 ]; do
     --notes-url) NOTES_URL="$2"; shift 2 ;;
     --archive) ARCHIVES+=("$2"); shift 2 ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
-    # forwarded to `release manifest` verbatim (--node-contract, --channel,
+    --kind) KIND="$2"; shift 2 ;;
+    # forwarded to `release manifest` verbatim (--node-contract,
     # --successor-key, --successor-from)
-    --node-contract|--channel|--successor-key|--successor-from) EXTRA+=("$1" "$2"); shift 2 ;;
+    --node-contract|--successor-key|--successor-from) EXTRA+=("$1" "$2"); shift 2 ;;
     -h|--help) usage ;;
     *) echo "publish.sh: unknown argument $1" >&2; usage ;;
   esac
@@ -63,9 +75,17 @@ done
 [ "${#ARCHIVES[@]}" -gt 0 ] || { echo "publish.sh: at least one --archive <os>-<arch>=<path> is required" >&2; exit 2; }
 [ -f "$KEY" ] || { echo "publish.sh: no key file at $KEY" >&2; exit 1; }
 
+case "$KIND" in
+  app)  CHANNEL="stable" ;;
+  node) CHANNEL="node" ;;
+  *) echo "publish.sh: --kind takes app or node, not $KIND" >&2; exit 2 ;;
+esac
+
 mkdir -p "$OUT_DIR"
-MANIFEST="$OUT_DIR/stable.json"
+# The manifest's duckfs name IS its channel — `app_update::layout::Kind`.
+MANIFEST="$OUT_DIR/$CHANNEL.json"
 SIGNATURE="$MANIFEST.sig"
+DUCKFS_MANIFEST="/shared/releases/$CHANNEL.json"
 
 if [ -n "${RELEASE_WALLET_PASSWORD:-}" ]; then
   PASSWORD="$RELEASE_WALLET_PASSWORD"
@@ -79,11 +99,11 @@ password() { printf '%s\n' "$PASSWORD"; }
 ARCHIVE_ARGS=()
 for archive in "${ARCHIVES[@]}"; do ARCHIVE_ARGS+=(--archive "$archive"); done
 PLAN="$OUT_DIR/plan.tsv"
-"$DUCKTAPE_BIN" release manifest --out "$MANIFEST" --sequence "$SEQUENCE" \
+"$DUCKTAPE_BIN" release manifest --out "$MANIFEST" --sequence "$SEQUENCE" --kind "$KIND" \
   --display "$DISPLAY_TEXT" --notes-url "$NOTES_URL" "${ARCHIVE_ARGS[@]}" "${EXTRA[@]}" > "$PLAN"
 
 # 2. sign it with the release wallet; the printed pubkey is the pin.
-PUBKEY="$(password | "$DUCKTAPE_BIN" release sign "$MANIFEST" --key "$KEY")"
+PUBKEY="$(password | "$DUCKTAPE_BIN" release sign "$MANIFEST" --key "$KEY" --kind "$KIND")"
 echo "release key: $PUBKEY" >&2
 
 # 3. land the archives, then the manifest, then its signature.
@@ -92,11 +112,11 @@ while IFS=$'\t' read -r local duckfs; do
   password | "$DUCKTAPE_BIN" fs put "$local" "$duckfs" --node "$NODE" --key "$KEY" \
     --message "release $SEQUENCE: $(basename "$duckfs")"
 done < "$PLAN"
-echo "put $MANIFEST -> /shared/releases/stable.json" >&2
-password | "$DUCKTAPE_BIN" fs put "$MANIFEST" /shared/releases/stable.json --node "$NODE" --key "$KEY" \
+echo "put $MANIFEST -> $DUCKFS_MANIFEST" >&2
+password | "$DUCKTAPE_BIN" fs put "$MANIFEST" "$DUCKFS_MANIFEST" --node "$NODE" --key "$KEY" \
   --message "release $SEQUENCE: manifest"
-echo "put $SIGNATURE -> /shared/releases/stable.json.sig" >&2
-password | "$DUCKTAPE_BIN" fs put "$SIGNATURE" /shared/releases/stable.json.sig --node "$NODE" --key "$KEY" \
+echo "put $SIGNATURE -> $DUCKFS_MANIFEST.sig" >&2
+password | "$DUCKTAPE_BIN" fs put "$SIGNATURE" "$DUCKFS_MANIFEST.sig" --node "$NODE" --key "$KEY" \
   --message "release $SEQUENCE: signature"
 
-echo "published release $SEQUENCE ($DISPLAY_TEXT) to $NODE" >&2
+echo "published $KIND release $SEQUENCE ($DISPLAY_TEXT) to $NODE" >&2

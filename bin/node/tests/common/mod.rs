@@ -198,6 +198,35 @@ impl NodeProc {
         )
     }
 
+    /// block until the `nth` (1-based) line carrying every needle lands.
+    ///
+    /// [`Self::expect_line`] rescans the whole run each call, so it answers
+    /// with the FIRST match every time — right for a marker that happens once,
+    /// useless for one a supervised process prints per restart. The count
+    /// lives in the probe, which is offered every line exactly once.
+    pub fn expect_line_nth(&self, needles: &[&str], nth: usize, timeout: Duration) -> String {
+        let mut seen = 0usize;
+        self.feed
+            .wait(Instant::now() + timeout, |unseen| {
+                strip_ansi(unseen).lines().find_map(|line| {
+                    let matches = needles.iter().all(|needle| line.contains(needle));
+                    if !matches {
+                        return None;
+                    }
+                    seen += 1;
+                    (seen == nth).then(|| line.to_string())
+                })
+            })
+            .unwrap_or_else(|why| {
+                panic!(
+                    "{} {} without printing {needles:?} {nth} time(s) (saw {seen});\n{}",
+                    self.what,
+                    why.verb(),
+                    self.tail(60)
+                )
+            })
+    }
+
     /// block until an ANSI-stripped line satisfies `accept`, and answer with
     /// that line; `wanted` names it in the panic when the process never does.
     pub fn expect_line_where(
@@ -274,6 +303,31 @@ impl NodeProc {
     /// the last `lines` lines the process wrote.
     fn tail(&self, lines: usize) -> String {
         log_tail(&self.text(), lines)
+    }
+}
+
+impl NodeProc {
+    /// SIGTERM this process and wait for it to go, SIGKILLing only if it
+    /// outlives `budget`.
+    ///
+    /// `Drop` SIGKILLs, which is right for a node (a crash is a case under
+    /// test) and wrong for a SUPERVISOR: a killed supervisor leaves the node
+    /// it started running, orphaned, over a tempdir the test is about to
+    /// remove. A stop signal is also what `systemctl stop` sends, so this is
+    /// the shutdown the supervisor is built for.
+    pub fn terminate(&mut self, budget: Duration) {
+        // SAFETY: our own child, not yet reaped — `Drop` is the only other
+        // reaper and it runs after this.
+        unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM) };
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_)) | Err(_)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

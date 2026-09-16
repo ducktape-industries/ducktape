@@ -1,5 +1,19 @@
-//! `ducktape release` — compose, sign and verify the desktop app's release
-//! manifest with a ducktape wallet key.
+//! `ducktape release` — compose, sign and verify a release manifest with a
+//! ducktape wallet key, and tell a network which node release to run.
+//!
+//! TWO ARTIFACT KINDS ride the same plane and the same key
+//! (`--kind app|node`, [`app_update::Kind`]): the desktop app's
+//! `stable.json` + `Ducktape-<sha7>-<os>-<arch>.tar.zst`, and the node's
+//! `node.json` + `ducktape-<sha7>-<os>-<arch>.tar.zst`. The channel is inside
+//! the signed body, so a signature can never be replayed from one onto the
+//! other, and each has its own monotonic `sequence`.
+//!
+//! WHAT a release is, the release key says. WHEN a network runs a node
+//! release is a network decision: `release schedule` drives a governance
+//! proposal carrying an `app_update::Designation` (artifact sha + activation
+//! height) and `release status` reads back what a running node's committed
+//! state designates — which is the whole interface `ducktape-node-launcher`
+//! has to the chain.
 //!
 //! The manifest (`app_update::Manifest`, one JSON file per channel) names
 //! each platform's archive by sha256 and size and seals itself with
@@ -32,7 +46,7 @@ use airlock::client::Gateway;
 use airlock::wire::WorkRef;
 use airlock::{bodyseal, sign};
 use app_update::{
-    Artifact, Manifest, PublicKey, Release, SCHEMA, Sha, Signature, SuccessorKey, layout,
+    Artifact, Designation, Kind, Manifest, PublicKey, Release, SCHEMA, Sha, Signature, SuccessorKey,
 };
 
 use crate::cli_args::NodeAddr;
@@ -50,10 +64,36 @@ pub(crate) enum ReleaseCmd {
     Sign(SignArgs),
     /// verify a manifest against its `.sig` under a release public key
     Verify(VerifyArgs),
+    /// propose, vote and execute the governance decision that runs a node
+    /// release from a height (every member passes the same --sha and --at)
+    Schedule(ScheduleArgs),
+    /// what a RUNNING node's network designates, and where that node is —
+    /// the node launcher's whole view of the chain
+    Status(StatusArgs),
     /// sign, notarize and staple an UNSIGNED `Ducktape.app` through the
     /// airlock gateway holding an `apple-codesign` credential; writes the
     /// signed `.tar.zst` the enclave returned
     SignBundle(SignBundleArgs),
+}
+
+/// Which artifact a manifest publishes, on argv. A clap mirror of
+/// [`app_update::Kind`], which stays free of a CLI dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum ArtifactKind {
+    /// the desktop app (`stable.json`, `Ducktape-…tar.zst`)
+    App,
+    /// the `ducktape` binary the node and its service daemons run
+    /// (`node.json`, `ducktape-…tar.zst`)
+    Node,
+}
+
+impl From<ArtifactKind> for Kind {
+    fn from(kind: ArtifactKind) -> Kind {
+        match kind {
+            ArtifactKind::App => Kind::App,
+            ArtifactKind::Node => Kind::Node,
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -74,9 +114,10 @@ pub(crate) struct ManifestArgs {
     /// release notes link (banner text only)
     #[arg(long, default_value = "")]
     pub notes_url: String,
-    /// the channel the manifest names (default: `stable`)
-    #[arg(long, default_value = layout::CHANNEL)]
-    pub channel: String,
+    /// which artifact this manifest publishes — it picks the channel, the
+    /// manifest's duckfs name and the archive naming
+    #[arg(long, value_enum, default_value_t = ArtifactKind::App)]
+    pub kind: ArtifactKind,
     /// a built archive, as `<os>-<arch>=<path>` (repeatable), e.g.
     /// `macos-aarch64=target/Ducktape.tar.zst`
     #[arg(long = "archive", value_name = "OS-ARCH=PATH", required = true)]
@@ -92,11 +133,15 @@ pub(crate) struct ManifestArgs {
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct SignArgs {
-    /// the manifest JSON file (`stable.json`)
+    /// the manifest JSON file (`stable.json`, `node.json`)
     pub manifest: PathBuf,
     /// the release wallet's key file (default: `$DUCKTAPE_USER_KEY`)
     #[arg(long, value_name = "PATH")]
     pub key: Option<PathBuf>,
+    /// the artifact kind this manifest must be — refuses to sign a document
+    /// whose channel says otherwise
+    #[arg(long, value_enum, default_value_t = ArtifactKind::App)]
+    pub kind: ArtifactKind,
 }
 
 #[derive(Debug, clap::Args)]
@@ -109,6 +154,36 @@ pub(crate) struct VerifyArgs {
     /// the release public key, 64 hex characters (what `sign` printed)
     #[arg(long, value_name = "HEX")]
     pub pubkey: PublicKey,
+    /// the artifact kind the manifest must name — the channel is inside the
+    /// signed body, so this is the replay check, not a formality
+    #[arg(long, value_enum, default_value_t = ArtifactKind::App)]
+    pub kind: ArtifactKind,
+}
+
+/// `release schedule --sha <hex> --at <height>`: the governance half.
+#[derive(Debug, clap::Args)]
+pub(crate) struct ScheduleArgs {
+    /// the node archive's sha256, as the signed node manifest names it for
+    /// the platform this network runs
+    #[arg(long, value_name = "HEX")]
+    pub sha: Sha,
+    /// the block from which every validator runs it. ABSOLUTE, and the same
+    /// number for every member co-signing this proposal — it is inside the
+    /// text they join each other by
+    #[arg(long, value_name = "HEIGHT")]
+    pub at: u64,
+    #[command(flatten)]
+    pub selector: crate::cli_args::Selector,
+}
+
+/// `release status`: what the launcher asks a running node.
+#[derive(Debug, clap::Args)]
+pub(crate) struct StatusArgs {
+    #[command(flatten)]
+    pub selector: crate::cli_args::Selector,
+    /// emit one machine-readable JSON object instead of prose
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -137,6 +212,8 @@ pub(crate) fn run(cmd: ReleaseCmd) -> CommandResult {
         ReleaseCmd::Manifest(args) => manifest(args),
         ReleaseCmd::Sign(args) => sign(args, &mut stdin),
         ReleaseCmd::Verify(args) => verify(args),
+        ReleaseCmd::Schedule(args) => schedule(args),
+        ReleaseCmd::Status(args) => status(args),
         ReleaseCmd::SignBundle(args) => sign_bundle(args),
     }
 }
@@ -150,8 +227,11 @@ fn sig_path(manifest: &Path) -> PathBuf {
 
 /// The manifest bytes exactly as they will be published — the signature is
 /// over the FILE, so the file is checked to be a well-formed, sealed,
-/// current-schema manifest before a key is ever opened.
-fn read_manifest(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+/// current-schema manifest for the KIND asked before a key is ever opened.
+/// The channel is what separates the two artifacts, and it is inside the
+/// signed body: signing an app manifest as a node release, or verifying one
+/// as the other, is refused here rather than discovered on a node.
+fn read_manifest(path: &Path, kind: Kind) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let manifest: Manifest = serde_json::from_slice(&bytes)
         .map_err(|e| format!("{} is not a release manifest: {e}", path.display()))?;
@@ -161,6 +241,16 @@ fn read_manifest(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
             "{} carries schema {}, expected {SCHEMA}",
             path.display(),
             manifest.schema
+        )
+        .into());
+    }
+    let names_this_kind = manifest.channel == kind.channel();
+    if !names_this_kind {
+        return Err(format!(
+            "{} is a {:?} manifest, not a {:?} one (channel_mismatch)",
+            path.display(),
+            manifest.channel,
+            kind.channel()
         )
         .into());
     }
@@ -191,6 +281,7 @@ fn parse_archive_arg(arg: &str) -> Result<(String, PathBuf), String> {
 }
 
 fn manifest(args: ManifestArgs) -> CommandResult {
+    let kind = Kind::from(args.kind);
     let mut artifacts = BTreeMap::new();
     let mut lines = Vec::new();
     for arg in &args.archives {
@@ -212,7 +303,7 @@ fn manifest(args: ManifestArgs) -> CommandResult {
         lines.push(format!(
             "{}\t{}",
             path.display(),
-            layout::archive_path(&sha256, &platform)
+            kind.archive_path(&sha256, &platform)
         ));
     }
     let successor_key = match (args.successor_key, args.successor_from) {
@@ -226,7 +317,7 @@ fn manifest(args: ManifestArgs) -> CommandResult {
     };
     let manifest = Manifest {
         schema: SCHEMA,
-        channel: args.channel,
+        channel: kind.channel().to_string(),
         sequence: args.sequence,
         published_at: published_at_now(),
         release: Release {
@@ -271,7 +362,7 @@ fn published_at_now() -> String {
 }
 
 fn sign(args: SignArgs, stdin: &mut impl std::io::BufRead) -> CommandResult {
-    let bytes = read_manifest(&args.manifest)?;
+    let bytes = read_manifest(&args.manifest, args.kind.into())?;
     let key_path = match (args.key, keystore::wallet::env_user_key()) {
         (Some(explicit), _) => explicit,
         (None, Some(env)) => env,
@@ -289,7 +380,7 @@ fn sign(args: SignArgs, stdin: &mut impl std::io::BufRead) -> CommandResult {
 }
 
 fn verify(args: VerifyArgs) -> CommandResult {
-    let bytes = read_manifest(&args.manifest)?;
+    let bytes = read_manifest(&args.manifest, args.kind.into())?;
     let sig_path = args.sig.unwrap_or_else(|| sig_path(&args.manifest));
     let sig_text = std::fs::read_to_string(&sig_path)
         .map_err(|e| format!("read {}: {e}", sig_path.display()))?;
@@ -307,6 +398,182 @@ fn verify(args: VerifyArgs) -> CommandResult {
     }
     println!("ok");
     Ok(())
+}
+
+// ============================================================================
+// the node channel's governance half: schedule and status
+// ============================================================================
+
+/// The proposal-id space a node-release designation is minted in. It carries
+/// NO proposer key on purpose: a settled proposal leaves the open roster, so
+/// the only way a launcher can read a passed designation back is to walk ids
+/// it can predict. `release status` walks `node-release:0`, `node-release:1`,
+/// … to the first id no record exists under.
+const DESIGNATION_PREFIX: &str = "node-release";
+
+/// How far that walk goes. A network that has designated this many node
+/// releases has outgrown a linear probe, not this plane.
+const MAX_DESIGNATIONS: u64 = 1024;
+
+fn designation_id(nth: u64) -> String {
+    format!("{DESIGNATION_PREFIX}:{nth}")
+}
+
+/// `release schedule --sha <hex> --at <height>` — the network decides WHICH
+/// node release it runs and FROM WHEN.
+///
+/// The carrier is governance's `Signal`, whose text is the designation. That
+/// is deliberate: a `Signal` has no on-chain effect beyond its recorded
+/// outcome, which is exactly what a binary cutover is — nothing in any root
+/// changes, and every validator's launcher reads the recorded outcome and
+/// flips its own files. No module id, no registry entry, no new action: a
+/// designation can neither halt a block nor wedge a boundary.
+///
+/// `--at` is ABSOLUTE and the same number for every member: it is inside the
+/// text they join each other's proposal by.
+fn schedule(args: ScheduleArgs) -> CommandResult {
+    let designation = Designation {
+        sha256: args.sha,
+        activation_height: args.at,
+    };
+    let cfg_path = args.selector.config_path()?;
+    let resolved = crate::config::resolve(&cfg_path)?;
+    let node = crate::cli::DrivenNode::of(&resolved, "release schedule")?;
+    let signer = crate::cli::gov_signer(node.rpc(), &cfg_path, &resolved)?;
+    let pubkey_hex = crate::module_cli::signer_pubkey_hex(&signer);
+    let wanted = governance::GovAction::Signal {
+        text: designation.signal_text(),
+    };
+    let same_action = {
+        let wanted = wanted.clone();
+        move |action: &governance::GovAction| *action == wanted
+    };
+    let outcome = crate::cli::drive_proposal_ceremony(
+        &node,
+        &signer,
+        &pubkey_hex,
+        // EMPTY seed: this proposal must be findable by id from any node.
+        "",
+        "release schedule",
+        DESIGNATION_PREFIX,
+        wanted,
+        &same_action,
+    )?;
+    match outcome {
+        crate::cli::CeremonyOutcome::Passed => {
+            println!(
+                "designated {} from height {}; track with: ducktape release status",
+                args.sha, args.at
+            );
+            Ok(())
+        }
+        crate::cli::CeremonyOutcome::AwaitingBallots => Ok(()),
+    }
+}
+
+/// `release status [--json]` — what a RUNNING node's network designates, and
+/// where that node is. This is the whole interface `ducktape-node-launcher`
+/// has to the chain: the http base it reads duckfs through, the mesh identity
+/// whose absence kills a service daemon, the committed height an activation
+/// is measured against, and the designation itself.
+fn status(args: StatusArgs) -> CommandResult {
+    let cfg_path = args.selector.config_path()?;
+    // The KEYLESS read: a launcher asks this once a poll, and it has no
+    // business opening the node's identity or rehashing the founding set to
+    // find out where the node serves.
+    let service = crate::config::resolve_service(&cfg_path)?;
+    let http_listen = service.http_listen.as_deref().ok_or(
+        "release status reads the node's app surface — set `http_listen` in node.toml",
+    )?;
+    let base = crate::config::http_base_of(http_listen);
+    let live = crate::node_http::get_json(&base, "/v1/status")
+        .map_err(|error| format!("read this node's status: {error}"))?;
+    let public_key = live["public_key"].as_str().unwrap_or_default().to_string();
+    let height = live["height"].as_u64().unwrap_or_default();
+    let root_hash = live["root_hash"].as_str().unwrap_or_default().to_string();
+    // A node that is up but whose governance module cannot answer yet is
+    // still a node the launcher must hear about: the identity seam is the
+    // half that matters first, so a designation read that fails reports as
+    // "none" rather than failing the whole verb.
+    let designation = designated(&base).unwrap_or(None);
+    if args.json {
+        let reading = serde_json::json!({
+            "base": base,
+            "public_key": public_key,
+            "height": height,
+            "root_hash": root_hash,
+            "designation": designation,
+        });
+        println!("{reading}");
+        return Ok(());
+    }
+    println!("base\t{base}");
+    println!(
+        "node\t{}",
+        match public_key.is_empty() {
+            true => "(no mesh identity published yet)",
+            false => &public_key,
+        }
+    );
+    println!("height\t{height}");
+    println!("root_hash\t{root_hash}");
+    match designation {
+        Some(designation) => println!(
+            "designated\t{} from height {} ({})",
+            designation.sha256,
+            designation.activation_height,
+            match designation.armed_at(height) {
+                true => "armed",
+                false => "pending",
+            }
+        ),
+        None => println!("designated\t(none — this network runs whatever each node was installed with)"),
+    }
+    Ok(())
+}
+
+/// The designation this network's committed governance carries: the LAST
+/// passed `node-release:<n>` whose signal text decodes. The walk stops at the
+/// first id with no record, which is exactly where the ceremony's own mint
+/// stops.
+fn designated(base: &str) -> Result<Option<Designation>, Box<dyn std::error::Error>> {
+    let mut latest = None;
+    for nth in 0..MAX_DESIGNATIONS {
+        let Some(view) = read_proposal(base, &designation_id(nth))? else {
+            break;
+        };
+        if let Some(designation) = passed_designation(&view) {
+            latest = Some(designation);
+        }
+    }
+    Ok(latest)
+}
+
+fn read_proposal(
+    base: &str,
+    proposal_id: &str,
+) -> Result<Option<governance::ProposalView>, Box<dyn std::error::Error>> {
+    let query = serde_json::to_value(governance::GovQuery::Proposal {
+        proposal_id: proposal_id.to_string(),
+    })?;
+    let reply = crate::node_http::query(base, "governance", query)?;
+    match serde_json::from_value::<governance::GovReply>(reply)? {
+        governance::GovReply::Proposal(view) => Ok(view),
+        other => Err(format!("unexpected governance reply: {other:?}").into()),
+    }
+}
+
+/// A settled proposal's designation — `None` for everything that is not a
+/// PASSED node-release signal, including one still being voted on.
+fn passed_designation(view: &governance::ProposalView) -> Option<Designation> {
+    let decided = view.status == governance::ProposalStatus::Passed;
+    if !decided {
+        return None;
+    }
+    let governance::GovAction::Signal { text } = &view.action else {
+        return None;
+    };
+    Designation::from_signal_text(text)
 }
 
 // ============================================================================

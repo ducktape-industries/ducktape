@@ -7990,6 +7990,23 @@ dependencies = [
  "workspace-config",
  "x25519-dalek 2.0.1",
  "zeroize",
+ "zstd",
+]
+
+[[package]]
+name = "node-launcher"
+version = "0.1.0"
+dependencies = [
+ "app-update",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]

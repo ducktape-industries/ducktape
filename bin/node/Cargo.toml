@@ -223,6 +223,9 @@ verify = ["airlock/verify", "airlock/testkit", "provider-host/verify"]
 [dev-dependencies]
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 ducktape-forge-service = { path = "../forge-service" }
+# the node release e2e packs its own `.tar.zst` releases (tar is already a
+# runtime dep above); the launcher under test unpacks them.
+zstd = { workspace = true }
 # the shared raw-http/port/poll harness helpers (was: a per-suite copy each).
 nettest = { path = "../../crates/testing/nettest" }
 # a scripted fixture lifts its guest shell out of the rootfs with the same

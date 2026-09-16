@@ -29,6 +29,7 @@ pub(super) fn run(op: OpCmd) -> CommandResult {
         OpCmd::Join(cmd) => dispatch_join(cmd),
         OpCmd::List => cmd_list(),
         OpCmd::Status(args) => cmd_node_status(args),
+        OpCmd::Qualify(args) => crate::qualify::run(args),
         OpCmd::Peers(args) => cmd_node_peers(args),
         OpCmd::Resident(cmd) => dispatch_resident(cmd),
         OpCmd::Member(cmd) => dispatch_member(cmd),
@@ -1434,17 +1435,27 @@ pub(super) fn open_proposal_matching<'a>(
 
 /// drive a governance proposal ceremony for `wanted` through this eligible
 /// account's running node: adopt an existing OPEN proposal `matches` accepts
-/// (else mint an unused `<id_prefix><key>:<n>` id and propose), cast a yes
+/// (else mint an unused `<id_prefix><id_seed>:<n>` id and propose), cast a yes
 /// ballot, and execute once decidable. idempotent across
 /// members — each runs the same verb; the run landing the deciding ballot
 /// executes. shared by the membership verbs — `resident accept`
 /// (AddResident), `member promote` (AddValidator), `resident remove`
-/// (RemoveResident) — and the module verbs `module update`/`module register`
-/// (UpdateModule/RegisterModule).
+/// (RemoveResident) — the module verbs `module update`/`module register`
+/// (UpdateModule/RegisterModule), and `release schedule` (Signal).
+///
+/// `id_seed` is what keeps two members minting at the same instant off each
+/// other's id: the proposer's own key for a per-member verb. A ceremony whose
+/// settled proposal must be FOUND AGAIN by id from any node — the node
+/// release designation, which every launcher reads back — passes an EMPTY
+/// seed instead, so the id space is `<id_prefix>:<n>` and a reader can walk
+/// it. A concurrent second proposer then simply mints `:<n+1>` for the same
+/// decision rather than colliding.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn drive_proposal_ceremony(
     node: &DrivenNode,
     signer: &GovSigner,
     pubkey_hex: &str,
+    id_seed: &str,
     verb: &str,
     id_prefix: &str,
     wanted: governance::GovAction,
@@ -1473,7 +1484,7 @@ pub(super) fn drive_proposal_ceremony(
             p.proposal_id.clone()
         }
         None => {
-            let prefix: String = pubkey_hex.chars().take(16).collect();
+            let prefix: String = id_seed.chars().take(16).collect();
             // MINT AGAINST THE RECORD, not the roster. `GovQuery::Proposals`
             // walks the OPEN roster, but a settled proposal's record is kept
             // forever under its id — so an id missing from that list can still
@@ -1589,6 +1600,7 @@ fn cmd_invite_accept(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
         &node,
         &signer,
         pubkey_hex,
+        pubkey_hex,
         "node resident accept",
         "resident:",
         wanted,
@@ -1637,6 +1649,7 @@ fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     match drive_proposal_ceremony(
         &node,
         &signer,
+        pubkey_hex,
         pubkey_hex,
         "node member promote",
         "admit:",
@@ -1699,6 +1712,7 @@ fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error
     match drive_proposal_ceremony(
         &node,
         &signer,
+        pubkey_hex,
         pubkey_hex,
         "node resident remove",
         "revoke:",

@@ -11,7 +11,7 @@ _ducktape() {
 
     local families="node user account wallet gateway fs service agent module collab mcp release help --help -h --version -V"
 
-    local node_verbs="run key init invite admit join list status peers resident member work sandbox log-filter netstack help"
+    local node_verbs="run key init invite admit join list status qualify peers resident member work sandbox log-filter netstack help"
     local node_resident="accept remove"
     local node_member="promote remove leave status"
     local node_work="list admit revoke"
@@ -40,8 +40,8 @@ _ducktape() {
     local agent_flags="-n --network --node --key --host-node --account --route --cred --cpu --mem --attempt --package --worker --channel --retry-initialization --installed-by --yes -y"
     local module_verbs="pack update register status help"
     local module_flags="--index --view --assets --out --after --config -n --network --json"
-    local release_verbs="sign-bundle manifest sign verify help"
-    local release_flags="-n --unpack-into --node --network --credential --out --sequence --display --node-contract --notes-url --channel --archive --successor-key --successor-from --key --sig --pubkey"
+    local release_verbs="sign-bundle manifest sign verify schedule status help"
+    local release_flags="-n --unpack-into --node --network --config --credential --out --sequence --display --node-contract --notes-url --kind --archive --successor-key --successor-from --key --sig --pubkey --sha --at --json"
     local collab_verbs="query key attach send ack help"
     local collab_flags="--target --node -n --network --key --trust-node --channel --participant --existing-only --device --expect --to --kind --message-id --credential --seq --ttl-secs --state --reason"
 

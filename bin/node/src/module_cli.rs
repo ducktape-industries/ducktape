@@ -282,6 +282,7 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         &node,
         &signer,
         &pubkey_hex,
+        &pubkey_hex,
         verb.name(),
         "module:",
         verb.action(&args.id, kind, args.after, code_hash),
@@ -516,7 +517,7 @@ fn read_live_modules(rpc_addr: &str) -> Result<Vec<String>, String> {
 
 /// the signer's public key as hex: the proposal-id seed the ceremony mints
 /// from (and nothing else — the receipt gate is keyed by the NODE's key).
-fn signer_pubkey_hex(signer: &GovSigner) -> String {
+pub(crate) fn signer_pubkey_hex(signer: &GovSigner) -> String {
     match signer {
         GovSigner::Node { key } => hex_bytes(key),
         GovSigner::User { key, .. } => hex_bytes(key.public_key().as_ref()),

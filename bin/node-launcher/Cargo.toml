@@ -1,0 +1,35 @@
+[package]
+name = "node-launcher"
+edition.workspace = true
+version.workspace = true
+
+# The node's supervisor: what a systemd unit's `Exec=` names instead of the
+# `ducktape` binary. It reads `state.json`, drives `app_update::step`, and runs
+# `<workspace>/current/ducktape` as a child — staging the release the network's
+# signed node manifest names, and holding the flip until a governance
+# `Designation` is armed at the committed height. Kept small on purpose: no
+# async, no http client, no consensus. Everything it needs to know about the
+# chain it asks the `ducktape` binary for (`release status`), and every file it
+# reads off the network it reads with `ducktape fs cat` — the node serves the
+# duckfs it downloads its successor from, and that is a file read like any
+# other.
+[dependencies]
+app-update = { workspace = true }
+# SIGTERM to the node (a checkpointing shutdown), never SIGKILL first.
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# the archive's identity, re-checked on what landed.
+sha2 = { workspace = true }
+# the release archive is one `ducktape` executable in a `.tar.zst`.
+tar = "0.4"
+zstd = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "ducktape-node-launcher"
+path = "src/main.rs"
