@@ -24,46 +24,51 @@ use crate::util::{Presence, fatal, hex, participant_bytes, resident_bytes, unix_
 /// never accepts the rewrite.
 const MARK_LOST_WARN_EVERY: u64 = 600;
 
-/// how many consecutive checkpoints may defer `prune_oplog` for a warm sync
-/// lease before the checkpoint prunes anyway. an active syncer that never
-/// stops asking (or a peer that renews the lease every 10s forever) would
-/// otherwise pin the retained journal open indefinitely — the lease exists to
-/// protect one in-flight sync's boundary, not to suspend retention (#1814).
-/// a joiner still below the new floor gets `Error::RangePruned`, which the
-/// sync path already handles.
-const MAX_PRUNE_DEFERRALS: u32 = 3;
-
 /// the checkpoint's prune outcome — one discriminant covering floor
-/// readiness, sync-lease warmth, and the deferral cap together (see
-/// `MAX_PRUNE_DEFERRALS`).
+/// readiness and the sync retention contract together.
 #[derive(Debug, PartialEq, Eq)]
 enum PruneAction {
     /// the finalization floor hasn't passed this checkpoint yet: nothing to
     /// prune.
     NotDue,
-    /// the sync lease is warm and hasn't deferred past the cap: hold off.
-    Deferred,
-    /// the sync lease is warm but has deferred `MAX_PRUNE_DEFERRALS`
-    /// checkpoints running: prune anyway.
-    Forced,
-    /// the sync lease is not warm: prune normally.
-    Clear,
+    /// this prune would drop frames a syncer we are serving still needs: hold
+    /// it (see `prune_cuts_served_sync`).
+    HeldForSync,
+    /// nothing in flight needs what this prune drops.
+    Prune,
 }
 
-/// decide a checkpoint's prune action from the three governing facts. pure —
-/// the drain loop performs the actual prune/defer effects and counter update
-/// for whichever action this returns, so the decision itself is testable
-/// without a journal or a lease.
-fn decide_prune_action(
-    floor_passed: bool,
-    lease_active: bool,
-    deferral_cap_reached: bool,
-) -> PruneAction {
-    match (floor_passed, lease_active, deferral_cap_reached) {
-        (false, _, _) => PruneAction::NotDue,
-        (true, true, false) => PruneAction::Deferred,
-        (true, true, true) => PruneAction::Forced,
-        (true, false, _) => PruneAction::Clear,
+/// decide a checkpoint's prune action from the two governing facts. pure —
+/// the drain loop performs the prune for whichever action this returns, so
+/// the decision itself is testable without a journal or a lease.
+fn decide_prune_action(floor_passed: bool, cuts_served_sync: bool) -> PruneAction {
+    match (floor_passed, cuts_served_sync) {
+        (false, _) => PruneAction::NotDue,
+        (true, true) => PruneAction::HeldForSync,
+        (true, false) => PruneAction::Prune,
+    }
+}
+
+/// whether pruning the journal below the previous checkpoint at height
+/// `anchor` would drop frames a syncer this node is serving still needs
+/// (`needed_from`, from `sync::serve::SyncRetention::floor`).
+///
+/// THE ANTI-TREADMILL CONTRACT. A prune retains from `anchor + 1`; a syncer
+/// working from `needed_from` asks for the frames after it. Pruning past that
+/// height answers its catch-up with `RangePruned`, it re-bootstraps at a newer
+/// boundary, and a chain that prunes faster than one bootstrap takes never
+/// lets it converge (observed on a 100 ms chain with a 4-block checkpoint
+/// cadence: boundary 1752 → 2117 → 2360 → … forever).
+///
+/// The hold is bounded by the syncer's OWN PROGRESS, never by a count of
+/// checkpoints: every chunk it pulls and every frame batch it folds restates
+/// the height it works from, so retention advances with it and lapses when it
+/// stops asking. A count would be denominated in blocks, and a busy chain
+/// burns any count of checkpoints in seconds.
+fn prune_cuts_served_sync(anchor: Option<u64>, needed_from: Option<u64>) -> bool {
+    match (anchor, needed_from) {
+        (Some(anchor), Some(needed_from)) => anchor > needed_from,
+        _ => false,
     }
 }
 
@@ -178,7 +183,7 @@ impl ValidatorRuntime<'_> {
             signer,
             label,
             checkpoint_blocks,
-            sync_lease,
+            sync_retention,
             stream_hub,
             index,
             blobs,
@@ -193,7 +198,6 @@ impl ValidatorRuntime<'_> {
             blocks_since_checkpoint,
             checkpoint_not_before,
             last_written_root,
-            prune_deferrals,
             last_reach_view,
             pending_retarget,
             next_drain,
@@ -1044,52 +1048,22 @@ impl ValidatorRuntime<'_> {
                             Ok(Some(fc))
                                 if prev_ckpt.0.is_none_or(|h| fc.height >= h)
                         );
-                        let lease_active = crate::sync::serve::sync_lease_active(sync_lease);
-                        let deferral_cap_reached = *prune_deferrals >= MAX_PRUNE_DEFERRALS;
-                        let action =
-                            decide_prune_action(floor_passed, lease_active, deferral_cap_reached);
+                        let needed_from = sync_retention.floor();
+                        let cuts_served_sync = prune_cuts_served_sync(prev_ckpt.0, needed_from);
+                        let action = decide_prune_action(floor_passed, cuts_served_sync);
                         match action {
                             PruneAction::NotDue => {}
-                            PruneAction::Deferred => {
-                                // a syncer is actively pulling from this node:
-                                // pruning now would yank its boundary away and
-                                // put it on the rebootstrap treadmill. defer —
-                                // the next checkpoint prunes once the lease
-                                // lapses, up to the deferral cap.
-                                *prune_deferrals += 1;
+                            PruneAction::HeldForSync => {
                                 tracing::debug!(
                                     target: "ducktape::statesync",
                                     node = %label,
-                                    reason = "sync_lease_active",
-                                    deferrals = *prune_deferrals,
-                                    "oplog prune deferred"
+                                    reason = "sync_retention_floor",
+                                    anchor = prev_ckpt.0.unwrap_or_default(),
+                                    needed_from = needed_from.unwrap_or_default(),
+                                    "oplog prune held for a served sync"
                                 );
                             }
-                            PruneAction::Forced => {
-                                // the lease is still warm, but it has stalled
-                                // pruning for MAX_PRUNE_DEFERRALS checkpoints
-                                // running: prune anyway. an in-flight sync
-                                // below the new floor gets `RangePruned`,
-                                // which it already handles.
-                                *prune_deferrals = 0;
-                                tracing::warn!(
-                                    target: "ducktape::statesync",
-                                    node = %label,
-                                    reason = "sync_lease_deferral_cap",
-                                    cap = MAX_PRUNE_DEFERRALS,
-                                    "oplog prune forced past warm sync lease"
-                                );
-                                if let Err(e) = node.sink_mut().prune_oplog(prev_ckpt.1).await {
-                                    tracing::warn!(
-                                        target: "ducktape::recovery",
-                                        node = %label,
-                                        error = %e,
-                                        "oplog prune failed"
-                                    );
-                                }
-                            }
-                            PruneAction::Clear => {
-                                *prune_deferrals = 0;
+                            PruneAction::Prune => {
                                 if let Err(e) = node.sink_mut().prune_oplog(prev_ckpt.1).await {
                                     tracing::warn!(
                                         target: "ducktape::recovery",
@@ -1914,55 +1888,47 @@ mod conversation_crank_tests {
 }
 
 #[cfg(test)]
-mod prune_cadence_tests {
-    use super::{MAX_PRUNE_DEFERRALS, PruneAction, decide_prune_action};
+mod prune_retention_tests {
+    use super::{PruneAction, decide_prune_action, prune_cuts_served_sync};
 
-    /// no floor, no lease warmth, no cap ever overrides "nothing to prune yet".
+    /// a floor that has not passed overrides everything: there is nothing to
+    /// prune yet, served sync or not.
     #[test]
     fn floor_not_passed_never_prunes() {
-        assert_eq!(decide_prune_action(false, true, true), PruneAction::NotDue);
-        assert_eq!(
-            decide_prune_action(false, false, false),
-            PruneAction::NotDue
-        );
+        assert_eq!(decide_prune_action(false, true), PruneAction::NotDue);
+        assert_eq!(decide_prune_action(false, false), PruneAction::NotDue);
     }
 
-    /// a cold lease prunes normally once the floor has passed, regardless of
-    /// a stale deferral count.
+    /// no syncer, no hold: the checkpoint prunes the moment the floor passes.
     #[test]
-    fn cold_lease_prunes_once_the_floor_passes() {
-        assert_eq!(decide_prune_action(true, false, false), PruneAction::Clear);
-        assert_eq!(decide_prune_action(true, false, true), PruneAction::Clear);
+    fn nothing_in_flight_prunes_once_the_floor_passes() {
+        assert!(!prune_cuts_served_sync(Some(3598), None));
+        assert_eq!(decide_prune_action(true, false), PruneAction::Prune);
     }
 
-    /// #1814: a warm lease defers for up to `MAX_PRUNE_DEFERRALS` consecutive
-    /// checkpoints, then the 4th checkpoint prunes anyway — the counter never
-    /// suspends retention forever.
+    /// the reported shape: the syncer is still installing boundary 3404 while
+    /// the busy chain's next checkpoint anchor is already 3598. pruning there
+    /// answers its catch-up with `RangePruned` and restarts its whole
+    /// bootstrap, so the checkpoint holds instead.
     #[test]
-    fn a_warm_lease_defers_up_to_the_cap_then_prunes_on_the_next_checkpoint() {
-        let mut prune_deferrals: u32 = 0;
-        let mut actions = Vec::new();
-        // four consecutive checkpoints, all under a floor that has passed and
-        // a lease that never lapses.
-        for _ in 0..4 {
-            let deferral_cap_reached = prune_deferrals >= MAX_PRUNE_DEFERRALS;
-            let action = decide_prune_action(true, true, deferral_cap_reached);
-            match action {
-                PruneAction::Deferred => prune_deferrals += 1,
-                PruneAction::Forced | PruneAction::Clear => prune_deferrals = 0,
-                PruneAction::NotDue => {}
-            }
-            actions.push(action);
-        }
-        assert_eq!(
-            actions,
-            vec![
-                PruneAction::Deferred,
-                PruneAction::Deferred,
-                PruneAction::Deferred,
-                PruneAction::Forced,
-            ]
-        );
+    fn a_served_boundary_below_the_anchor_holds_the_prune() {
+        assert!(prune_cuts_served_sync(Some(3598), Some(3404)));
+        assert_eq!(decide_prune_action(true, true), PruneAction::HeldForSync);
+    }
+
+    /// and the hold releases on the syncer's OWN progress — a newer boundary
+    /// or a later frame batch — never on a checkpoint count.
+    #[test]
+    fn the_hold_releases_when_the_syncer_passes_the_anchor() {
+        assert!(!prune_cuts_served_sync(Some(3598), Some(3598)));
+        assert!(!prune_cuts_served_sync(Some(3598), Some(3660)));
+    }
+
+    /// a boot with no previous checkpoint height has no anchor to hold
+    /// against, and prunes nothing either way.
+    #[test]
+    fn no_anchor_holds_nothing() {
+        assert!(!prune_cuts_served_sync(None, Some(3404)));
     }
 }
 
