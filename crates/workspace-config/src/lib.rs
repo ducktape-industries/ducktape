@@ -37,6 +37,7 @@ use tracing::warn;
 // back in bin/node reaches several of them by path (`node_toml::RawNodeToml`),
 // and it is the one caller that wants the raw, pre-resolution shapes.
 pub mod genesis;
+pub mod staged_key;
 mod view_files;
 pub use view_files::{ensure_view_ready, read_deployment_files};
 pub mod identity;
@@ -106,8 +107,9 @@ pub fn modules_dir() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current executable: {e}"))?;
     staged_modules_dir(&exe).ok_or_else(|| {
         format!(
-            "no founding set beside {} — `cargo build` stages one (target/<profile>/modules), \
-             `make install-node` installs one beside the binary, or set $DUCKTAPE_MODULES_DIR",
+            "no founding set beside {} — `cargo build` stages this checkout's own \
+             (target/<profile>/{STAGED_MODULES}), `make install-node` installs one beside the \
+             binary as `modules`, or set $DUCKTAPE_MODULES_DIR",
             exe.display()
         )
     })
@@ -120,7 +122,19 @@ pub fn sim_modules_dir() -> Result<PathBuf, String> {
     if let Some(dir) = configured {
         return Ok(PathBuf::from(dir));
     }
-    Ok(modules_dir()?.with_file_name("sim-modules"))
+    Ok(sim_twin(&modules_dir()?))
+}
+
+/// the simulation set beside a resolved founding set: this checkout's keyed
+/// pair (`modules-<checkout>` -> `sim-modules-<checkout>`), or the installed
+/// pair (`modules` -> `sim-modules`).
+fn sim_twin(modules: &Path) -> PathBuf {
+    let resolved = modules.file_name().and_then(|name| name.to_str());
+    let sim = match resolved {
+        Some(name) if name == STAGED_MODULES => STAGED_SIM_MODULES,
+        _ => "sim-modules",
+    };
+    modules.with_file_name(sim)
 }
 
 /// the founding set the build staged beside `exe`: `<exe dir>/modules` (a
@@ -128,14 +142,33 @@ pub fn sim_modules_dir() -> Result<PathBuf, String> {
 /// `<exe dir>/../modules` (a test executable cargo runs from
 /// `target/<profile>/deps/`). `None` when neither directory exists.
 pub fn staged_modules_dir(exe: &Path) -> Option<PathBuf> {
+    // THIS CHECKOUT'S set first, then the unkeyed one. A profile directory is
+    // shared by every checkout that shares the target, so `modules` alone is
+    // whichever build ran last — `STAGED_MODULES` is the one this binary's own
+    // build staged (`staged_key.rs`). Unkeyed is the INSTALLED layout, which
+    // `make install-node` and the pinned dognet binaries use, and where
+    // nothing else writes.
     let exe_dir = exe.parent()?;
-    let beside = exe_dir.join("modules");
-    if beside.is_dir() {
-        return Some(beside);
-    }
-    let beside_parent = exe_dir.parent()?.join("modules");
-    beside_parent.is_dir().then_some(beside_parent)
+    let deps_parent = exe_dir.parent();
+    let candidates = [
+        Some(exe_dir.join(STAGED_MODULES)),
+        deps_parent.map(|dir| dir.join(STAGED_MODULES)),
+        Some(exe_dir.join("modules")),
+        deps_parent.map(|dir| dir.join("modules")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|candidate| candidate.is_dir())
 }
+
+/// the name of the founding set this build's own `cargo build` staged, and of
+/// its simulation twin: `modules-<checkout>` / `sim-modules-<checkout>`
+/// ([`staged_key`]). Stamped by this crate's build script from its own
+/// manifest directory, so it names the same directory `crates/noded/build.rs`
+/// wrote from that checkout.
+pub const STAGED_MODULES: &str = env!("DUCKTAPE_STAGED_MODULES");
+pub const STAGED_SIM_MODULES: &str = env!("DUCKTAPE_STAGED_SIM_MODULES");
 
 /// default recovery checkpoint cadence: small enough that boot replay stays
 /// cheap, large enough that snapshotting the in-memory cohort is amortized.
@@ -1343,6 +1376,54 @@ pub fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A binary resolves THIS CHECKOUT's staged set before the unkeyed one,
+    /// from the profile directory and from `deps/` where cargo runs tests —
+    /// and an installed layout (a plain `modules` beside the binary, which is
+    /// what `make install-node` and the pinned dognet binaries have) resolves
+    /// exactly as it did before the keying.
+    #[test]
+    fn a_binary_resolves_its_own_staged_set_before_the_installed_one() {
+        let scratch = tempfile::tempdir().unwrap();
+        let profile = scratch.path().join("debug");
+        let exe = profile.join("ducktape");
+        std::fs::create_dir_all(profile.join("deps")).unwrap();
+
+        std::fs::create_dir(profile.join("modules")).unwrap();
+        assert_eq!(staged_modules_dir(&exe).unwrap(), profile.join("modules"));
+        std::fs::create_dir(profile.join(STAGED_MODULES)).unwrap();
+        assert_eq!(
+            staged_modules_dir(&exe).unwrap(),
+            profile.join(STAGED_MODULES),
+            "another checkout's `modules` must not outrank our own set"
+        );
+        let test_exe = profile.join("deps/noded-1234");
+        assert_eq!(
+            staged_modules_dir(&test_exe).unwrap(),
+            profile.join(STAGED_MODULES),
+            "a test binary runs from deps/"
+        );
+
+        // the installed layout: one unkeyed set beside the binary, nothing else
+        let installed = scratch.path().join("bin");
+        std::fs::create_dir_all(installed.join("modules")).unwrap();
+        assert_eq!(
+            staged_modules_dir(&installed.join("ducktape")).unwrap(),
+            installed.join("modules")
+        );
+        assert_eq!(
+            sim_twin(&installed.join("modules")),
+            installed.join("sim-modules")
+        );
+        assert_eq!(
+            sim_twin(&profile.join(STAGED_MODULES)),
+            profile.join(STAGED_SIM_MODULES)
+        );
+        assert!(
+            STAGED_MODULES.starts_with("modules") && STAGED_SIM_MODULES.starts_with("sim-modules"),
+            "{STAGED_MODULES} / {STAGED_SIM_MODULES}"
+        );
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

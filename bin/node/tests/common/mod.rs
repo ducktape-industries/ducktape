@@ -41,8 +41,10 @@ pub const FIXTURES: &str = concat!(
     "/../../crates/kernel/host/tests/fixtures"
 );
 
-/// the founding set `cargo build` staged beside this test executable
-/// (`target/<profile>/modules`): every `<id>.component.wasm`, every
+/// the founding set `cargo build` staged beside this test executable, under
+/// the name this checkout owns (`target/<profile>/modules%<checkout path>`, so
+/// a sibling checkout sharing the target dir stages its own and never this
+/// one): every `<id>.component.wasm`, every
 /// `<id>.index.wasm`, and the netstack guest. A network has no embedded
 /// wasm, so `node init` composes its genesis out of THIS directory and the
 /// dev shape derives its genesis code set from it — the same resolution the

@@ -297,16 +297,22 @@ CARGO_BIN = $${CARGO_HOME:-$$HOME/.cargo}/bin
 
 ## the binary embeds no wasm: `node init` composes a network's genesis out of
 ## the founding set (`<id>.component.wasm`, `<id>.index.wasm`, the netstack
-## guest) that noded's build script stages beside every build's binary
-## (target/<profile>/modules), so installing the node installs that set
-## beside the installed binary. `--target-dir target` keeps the install build
-## in the checkout's target dir, which is where the staged set lands.
+## guest) that noded's build script stages beside every build's binary, in the
+## directory named for THIS checkout (target/<profile>/modules%<path>, see
+## crates/workspace-config/src/staged_key.rs — the name is the checkout's path
+## with `/` written `%`, which is why make can spell it with one `subst` and
+## needs no second implementation). Installing the node copies that set beside
+## the installed binary under the plain, unkeyed name an installed layout
+## reads. `--target-dir target` keeps the install build in the checkout's
+## target dir, which is where the staged set lands.
+STAGED_MODULES = modules$(subst /,%,$(CURDIR))
+STAGED_SIM_MODULES = sim-modules$(subst /,%,$(CURDIR))
 install-node: prereqs
 	$(CARGO) install --path bin/node --locked --target-dir target
 	rm -rf "$(CARGO_BIN)/modules"
-	cp -r target/release/modules "$(CARGO_BIN)/modules"
+	cp -r "target/release/$(STAGED_MODULES)" "$(CARGO_BIN)/modules"
 	rm -rf "$(CARGO_BIN)/sim-modules"
-	cp -r target/release/sim-modules "$(CARGO_BIN)/sim-modules"
+	cp -r "target/release/$(STAGED_SIM_MODULES)" "$(CARGO_BIN)/sim-modules"
 	@echo "installed the founding set into $(CARGO_BIN)/modules"
 
 ## coordinator -> ~/.cargo/bin/ducktape-coordinator

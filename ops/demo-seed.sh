@@ -32,7 +32,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # no wasm is embedded in the binary: founding composes the workspace genesis
 # out of the founding set the build staged beside the binary (`<target>/
-# <profile>/modules`), which `node init` finds by itself — nothing to point at.
+# <profile>/modules%<checkout>`, named for the checkout that staged it), which
+# `node init` finds by itself — nothing to point at.
 ID="${DEMO_WORKSPACE_ID:-demo}"
 # The SAME home the CLI and the app resolve: `$DUCKTAPE_HOME` when set, else
 # `~/.ducktape`. The home holds workspaces and nothing else; everything the
@@ -91,7 +92,21 @@ mkdir -p "$WSDIR"
 # founding set as `<exe dir>/modules`, which is now the copy too.
 # $DUCKTAPE_NODE_BIN set explicitly keeps pointing wherever the operator aimed it.
 if [ -z "${DUCKTAPE_NODE_BIN:-}" ]; then
-  STAGED_MODULES="${DUCKTAPE_MODULES_DIR:-$(dirname "$NODE_BIN")/modules}"
+  # the two candidates the binary itself resolves (`staged_modules_dir`): the
+  # set named for THIS checkout — a build stages there so a sibling worktree
+  # sharing the target dir cannot stage over it — then the plain name an
+  # installed layout carries. The copy below is plain, which is why the
+  # workspace's own binary keeps resolving beside itself.
+  STAGED_MODULES="${DUCKTAPE_MODULES_DIR:-}"
+  if [ -z "$STAGED_MODULES" ]; then
+    BIN_DIR="$(dirname "$NODE_BIN")"
+    KEYED="$BIN_DIR/modules$(printf '%s' "$REPO_ROOT" | tr / %)"
+    if [ -d "$KEYED" ]; then
+      STAGED_MODULES="$KEYED"
+    else
+      STAGED_MODULES="$BIN_DIR/modules"
+    fi
+  fi
   [ -d "$STAGED_MODULES" ] || die "no founding set at $STAGED_MODULES — run cargo build -p node-bin"
   mkdir -p "$WSDIR/bin" || die "cannot create $WSDIR/bin"
   cp "$NODE_BIN" "$WSDIR/bin/ducktape" || die "cannot copy the node binary into $WSDIR/bin"

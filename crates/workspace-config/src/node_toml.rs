@@ -154,7 +154,13 @@ pub struct DevSeedToml {
     /// the directory holding `<id>.component.wasm` for every wasm tenant — the
     /// dev shape has no descriptor, so its genesis code set is DERIVED from
     /// these files (every node of a dev cluster must point at identical bytes).
-    pub modules: String,
+    ///
+    /// ABSENT means the set the running binary's own build staged beside it
+    /// ([`crate::modules_dir`]), which is what every node of a dev cluster run
+    /// from one checkout resolves — and the only thing a CHECKED-IN example
+    /// can say, since that directory carries the checkout's path in its name
+    /// ([`crate::staged_key`]).
+    pub modules: Option<String>,
     /// one dial address per `peer_seeds` entry, same order. optional only
     /// for a SOLO node (nobody to dial); a multi-node cluster without it
     /// is refused at resolve.

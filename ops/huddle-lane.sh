@@ -96,7 +96,8 @@ listen = "127.0.0.1:$p2p"
 namespace = "$NAMESPACE"
 peer_seeds = [0, 1]
 validator_seeds = [0, 1]
-modules = "$ROOT/target/debug/modules"
+# no modules key: every node of this lane runs the binary whose own build
+# staged the set, and that directory is named for the checkout
 peer_addrs = ["127.0.0.1:$P2P_A", "127.0.0.1:$P2P_B"]
 storage_dir = "$LANE/storage-$idx"
 rpc_listen = "127.0.0.1:$rpc"

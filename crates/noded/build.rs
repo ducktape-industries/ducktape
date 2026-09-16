@@ -21,9 +21,11 @@
 //! network's wasm is its genesis, and the one place bare wasm files are read
 //! is the founding set `node init` composes a genesis from (and the daemons
 //! that run no network compose directly from). `cargo build` is what puts
-//! that set where a freshly built binary looks — `target/<profile>/modules`,
-//! beside the binary (`workspace_config::modules_dir`) — so a built node is
-//! complete without an install step. The set is the checkout's committed
+//! that set where a freshly built binary looks — beside the binary, under the
+//! name THIS checkout owns (`target/<profile>/modules%<checkout path>`, see
+//! `staged_key.rs`; `workspace_config::modules_dir` resolves it) — so a built
+//! node is complete without an install step, and a second checkout sharing
+//! the target speaks only for its own set. The set is the checkout's committed
 //! artifacts (`make wasm-modules` refreshes them): one component per wasm
 //! module the topology names, plus one index guest per module whose crate
 //! declares one by carrying `src/index_guest.rs`. A declared artifact the
@@ -36,6 +38,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub(crate) mod view_staging;
+
+// the name of the set THIS checkout stages, shared verbatim with the code that
+// reads it back (`workspace_config::staged_modules_dir`): one file, included
+// here and compiled into that library, because a build script and its reader
+// disagreeing about the directory is the whole bug this keying fixes.
+#[path = "../workspace-config/src/staged_key.rs"]
+pub(crate) mod staged_key;
 
 fn main() {
     // re-run when HEAD moves. `--git-path` resolves correctly inside a git
@@ -67,11 +76,11 @@ fn stage_founding_set() {
         .ancestors()
         .nth(3)
         .expect("OUT_DIR sits three levels under the profile dir");
-    let checkout =
-        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir")).join("../..");
+    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
+    let checkout = staged_key::checkout_of_crate(&manifest);
     stage_preset(
         &checkout,
-        &profile_dir.join("modules"),
+        &staged_dir(profile_dir, "modules", &checkout),
         topology::PRODUCTION,
         topology::VIEWS,
     );
@@ -80,7 +89,24 @@ fn stage_founding_set() {
         .iter()
         .map(|module| module.id)
         .collect();
-    stage_preset(&checkout, &profile_dir.join("sim-modules"), &simulation, &[]);
+    stage_preset(
+        &checkout,
+        &staged_dir(profile_dir, "sim-modules", &checkout),
+        &simulation,
+        &[],
+    );
+}
+
+/// the directory THIS checkout stages `base` (`"modules"` / `"sim-modules"`)
+/// into: the profile directory, plus the checkout's own name for that set.
+///
+/// EVERY staging destination comes from here. A bare `profile_dir.join(base)`
+/// is the poisoning path this keying removed — one checkout writing a set
+/// every other checkout reads — and
+/// `a_staging_destination_is_always_keyed_to_the_checkout` (in
+/// `tests/view_staging.rs`) reads this file and fails if one comes back.
+pub(crate) fn staged_dir(profile_dir: &Path, base: &str, checkout: &Path) -> PathBuf {
+    profile_dir.join(staged_key::staged_set_name(base, checkout))
 }
 
 /// stage the module set `ids` and the view-only entries `views` into `dest`:
