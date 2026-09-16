@@ -442,6 +442,9 @@ fn huddle_props(state: &Ducktape) -> Vec<u8> {
         // Only the host can enumerate displays and windows, so the view gets
         // the labels and answers with a row index — see `Action::Share`.
         "share_targets": state.share_picker.iter().map(|choice| &choice.label).collect::<Vec<_>>(),
+        // GATED ON `call_sharing` HERE, which is why `sharing_label` needs
+        // clearing on none of the paths that end a share.
+        "sharing_label": if state.call_sharing { state.sharing_label.as_str() } else { "" },
         "speaking": state.call_speaking, "stage": state.huddle_stage,
         "tiles": state.huddle_tiles, "video_live": state.call_video_live,
         "peers": state.call_peers,
