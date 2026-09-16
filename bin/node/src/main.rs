@@ -358,7 +358,19 @@ fn run_node_verb(args: cli_args::RunArgs) -> Result<(), Box<dyn std::error::Erro
     noded::log::init(Some(log_ring.clone()), Some(workspace.join("daemon.log")));
     report_open_file_limit();
 
-    run_node(config::resolve(&cfg_path)?, cfg_path, sync_only, log_ring)
+    let resolved = config::resolve(&cfg_path)?;
+    // BEFORE any of the boot: a binary whose module world is not the one this
+    // workspace was founded with cannot instantiate the network's components.
+    // Without this guard the failure is a "type-checking export func `shape`"
+    // deep inside the restore compose — hours of reading the wrong plane.
+    // Refused by name, with no tolerance window: rebuild or re-found.
+    config::guard_founding_binary(
+        &resolved.service.workspace,
+        &resolved.service.chain_id,
+        noded::services::build_identity_or_unknown(),
+        wasm_host::module_world_digest(),
+    )?;
+    run_node(resolved, cfg_path, sync_only, log_ring)
 }
 
 /// Put the startup open-file raise ([`main`]) in `daemon.log`, ONCE, now that

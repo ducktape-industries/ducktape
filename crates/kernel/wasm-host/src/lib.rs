@@ -101,6 +101,33 @@ use bindings::ducktape::module::host::{
     ModuleShape as WitShape, Origin as WitOrigin, PendingItem as WitPendingItem, Root as WitRoot,
 };
 
+/// the `ducktape:module` world THIS binary speaks: sha256 (hex) of the WIT
+/// text the [`bindings`] `bindgen!` above is generated from.
+///
+/// A component is compiled against one world, and a host that binds a
+/// different one cannot instantiate it — the refusal surfaces deep inside
+/// component instantiation ("type-checking export func `shape`"), which
+/// reads like a compose bug rather than the binary skew it is. A workspace
+/// records this at founding (`workspace_config::FoundingBinary`), so a later
+/// boot against a binary carrying another world is refused up front, by name.
+///
+/// The TEXT is the digest, so a comment-only edit to the file reads as a
+/// different world: a false refusal costs a re-found, a missed one costs a
+/// network that boots into that instantiation failure.
+pub fn module_world_digest() -> &'static str {
+    static DIGEST: OnceLock<String> = OnceLock::new();
+    DIGEST.get_or_init(|| {
+        // the same file the `bindgen!` above reads (`path: "../../module-sdk/wit"`).
+        // the world is ONE file — `the_module_world_is_one_wit_file` fails the
+        // build's test run if a second one appears beside it.
+        let world = include_str!("../../../module-sdk/wit/module.wit");
+        Sha256::digest(world.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    })
+}
+
 /// where a wasm module's COMMITTED state lives: the kind a component declares
 /// ([`Shape::backing`]) and the host must wrap it over. the public twin of
 /// the private [`StateBacking`], which carries the substrate itself.
@@ -2648,6 +2675,19 @@ mod bounds {
         assert!(error.to_string().contains("read-memo budget exceeded"));
         assert!(memo.queries.is_empty());
         assert_eq!(memo.bytes, 0);
+    }
+
+    /// [`module_world_digest`] digests one file. A second `.wit` beside it
+    /// would be part of the world `bindgen!` binds and no part of the digest,
+    /// which is a skew this binary could not see.
+    #[test]
+    fn the_module_world_is_one_wit_file() {
+        let wit = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../module-sdk/wit");
+        let files: Vec<_> = std::fs::read_dir(&wit)
+            .expect("read the module wit directory")
+            .map(|entry| entry.expect("wit entry").file_name())
+            .collect();
+        assert_eq!(files, ["module.wit"], "wit files in {}", wit.display());
     }
 
     #[test]

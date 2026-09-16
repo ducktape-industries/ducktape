@@ -55,6 +55,15 @@ fi
 # inherits whichever values are already in the caller's environment.
 bash "$SCRIPT_DIR/demo-seed.sh" || die "seeding the '$ID' localnet failed"
 
+# The seed copied the binary and the founding set into the workspace and
+# founded from that copy; the rest of this lap runs from it too, so a sibling
+# worktree's `cargo build` cannot swap the binary under this live node.
+if [ -z "${DUCKTAPE_NODE_BIN:-}" ] && [ -x "$WSDIR/bin/ducktape" ]; then
+  NODE_BIN="$WSDIR/bin/ducktape"
+  export DUCKTAPE_MODULES_DIR="$WSDIR/bin/modules"
+  log "running this network's own copy of the binary: $NODE_BIN"
+fi
+
 # What this network's guest lends to runs: the agent CLIs, installed into the
 # fresh workspace's executors dir. A checklist, because it is the operator's
 # call: each entry is the vendor's latest release, shown with its url and
