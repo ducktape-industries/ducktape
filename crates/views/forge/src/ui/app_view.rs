@@ -19,7 +19,7 @@ impl ForgeView {
             // no inset here: the namespace and the item screens are readings
             // that pad themselves, and the code split runs to the edges
             child: Box::new(native::sized(
-                native::spaced(native::column("ForgeView/page", [content]), 0.),
+                native::spaced(native::column(crate::PAGE_KEY, [content]), 0.),
                 Some(wire::Length::Fill),
                 Some(wire::Length::Fill),
             )),

@@ -184,6 +184,31 @@ impl ForgeView {
         }
     }
 
+    /// The open file's path as crumbs: every directory above it presses to
+    /// show that directory in the tree, and the file's own name does not
+    /// press, because it is already what the reader holds.
+    fn crumb_trail(&self, path: &str) -> wire::Node {
+        let mut trail = Vec::new();
+        for (index, (dir, name)) in host::crumbs_of(path).into_iter().enumerate() {
+            if index > 0 {
+                trail.push(native::colored(
+                    native::caption(format!("forge/crumb-edge/{index}"), "/"),
+                    native::palette().faint,
+                ));
+            }
+            let key = format!("forge/crumb/{index}");
+            let leaf = dir.is_empty();
+            trail.push(match leaf {
+                true => native::nowrap(native::weighted(
+                    native::mono(key, &name),
+                    wire::Weight::Medium,
+                )),
+                false => subtle(key, &name, Some(Message::ForgeRevealDir(dir))),
+            });
+        }
+        native::spaced(native::wrapped_row("forge/file-crumbs", trail), 2.)
+    }
+
     /// The reader: its header, then the body — a code file fills the pane
     /// and scrolls inside its editor, anything else scrolls as a page.
     fn file_screen(&self) -> wire::Node {
@@ -207,10 +232,14 @@ impl ForgeView {
         let head = native::centered_row(
             "forge/file-head",
             [
-                native::sized(
-                    native::wrapping(native::mono("forge/file-header", &path)),
-                    Some(wire::Length::Fill),
-                    None,
+                native::sized(self.crumb_trail(&path), Some(wire::Length::Fill), None),
+                subtle(
+                    "forge/copy-path",
+                    "Copy path",
+                    Some(Message::CopyToClipboard(
+                        self.file_path.clone(),
+                        "Path copied".into(),
+                    )),
                 ),
                 native::nowrap(native::caption("forge/code-context", "Read only")),
             ],
@@ -302,6 +331,61 @@ impl ForgeView {
         )
     }
 
+    /// One changed file's header: the whole strip presses to fold the hunks
+    /// under it, the way a forge lets you put a reviewed file away.
+    fn file_header(&self, key: &str, text: &str) -> wire::Node {
+        let p = native::palette();
+        let folded = self.diff_folded.iter().any(|name| name == text);
+        let caret = match folded {
+            true => "▸",
+            false => "▾",
+        };
+        let line = native::sized(
+            native::spaced(
+                native::centered_row(
+                    format!("{key}/line"),
+                    [
+                        native::colored(native::caption(format!("{key}/caret"), caret), p.muted),
+                        native::nowrap(native::weighted(
+                            native::mono(format!("{key}/text"), text),
+                            wire::Weight::Medium,
+                        )),
+                    ],
+                ),
+                6.,
+            ),
+            Some(wire::Length::Fill),
+            None,
+        );
+        let mut head = native::button_child(
+            key,
+            line,
+            Some(slots::message(Message::ForgeFoldFile(text.to_owned()))),
+            wire::ButtonPreset::Subtle,
+        );
+        if let wire::Node::Button {
+            label,
+            width,
+            padding,
+            ..
+        } = &mut head
+        {
+            *label = Some(text.to_owned());
+            *width = Some(wire::Length::Fill);
+            *padding = Some(wire::Edges {
+                top: 4.,
+                right: 8.,
+                bottom: 4.,
+                left: 8.,
+            });
+        }
+        let mut framed = native::row(format!("{key}/frame"), [head]);
+        if let wire::Node::Linear { background, .. } = &mut framed {
+            *background = Some(native::rgba(p.surface_raised));
+        }
+        framed
+    }
+
     pub(super) fn diff_screen(&self) -> wire::Node {
         let p = native::palette();
         let title = native::centered_row(
@@ -347,27 +431,7 @@ impl ForgeView {
                         left: 8.,
                     },
                 ),
-                "file" => {
-                    let mut head = native::padded(
-                        native::row(
-                            &key,
-                            [native::nowrap(native::weighted(
-                                native::mono(format!("{key}/text"), &line.text),
-                                wire::Weight::Medium,
-                            ))],
-                        ),
-                        wire::Edges {
-                            top: 4.,
-                            right: 8.,
-                            bottom: 4.,
-                            left: 8.,
-                        },
-                    );
-                    if let wire::Node::Linear { background, .. } = &mut head {
-                        *background = Some(native::rgba(p.surface_raised));
-                    }
-                    head
-                }
+                "file" => self.file_header(&key, &line.text),
                 "hunk" => native::padded(
                     native::row(
                         &key,
@@ -415,16 +479,7 @@ impl ForgeView {
                         ),
                     ];
                     if !line.path.is_empty() {
-                        cells.push(native::button(
-                            format!("{key}/comment"),
-                            "Comment on this line",
-                            Some(slots::message(Message::ForgeCommentOpen(
-                                line.path.clone(),
-                                line_number.clone(),
-                                line.side.clone(),
-                            ))),
-                            wire::ButtonPreset::Text,
-                        ));
+                        cells.push(comment_mark(&key, line, line_number));
                     }
                     let mut row = native::padded(
                         native::sized(
@@ -458,15 +513,23 @@ impl ForgeView {
         }
         let mut content: Vec<wire::Node> = blocks
             .into_iter()
-            .map(|block| wire::Node::KeyedColumn {
-                key: format!("forge/diff-lines/{}", block[0].key),
+            .map(|block| {
+                // a folded file keeps its header and puts its hunks away
+                let named = block.first().filter(|line| line.kind == "file");
+                let folded = named.is_some_and(|line| self.diff_folded.contains(&line.text));
+                let shown: Vec<&host::DiffLine> = match folded {
+                    true => block[..1].to_vec(),
+                    false => block,
+                };
+                wire::Node::KeyedColumn {
+                key: format!("forge/diff-lines/{}", shown[0].key),
                 keys: Some(
-                    block
+                    shown
                         .iter()
                         .map(|line| wire::ListKey::from(line.key))
                         .collect(),
                 ),
-                children: block.into_iter().map(&render).collect(),
+                children: shown.into_iter().map(&render).collect(),
                 background: Some(native::rgba(p.surface)),
                 border: Some(wire::Border {
                     color: Some(native::rgba(p.border)),
@@ -480,6 +543,7 @@ impl ForgeView {
                 max_width: None,
                 align: None,
                 virtual_row: Some(24.),
+            }
             })
             .collect();
         if self.forge_item_diff_truncated {
@@ -859,4 +923,25 @@ impl ForgeView {
         }
         input
     }
+}
+
+/// The mark that opens a line comment: a `+` in its own column, with the
+/// line it belongs to as its accessible name. It used to be the sentence
+/// "Comment on this line" on EVERY row, which took a third of the diff's
+/// width and repeated itself once per line.
+fn comment_mark(key: &str, line: &host::DiffLine, line_number: &str) -> wire::Node {
+    let mut mark = native::button(
+        format!("{key}/comment"),
+        "+",
+        Some(slots::message(Message::ForgeCommentOpen(
+            line.path.clone(),
+            line_number.to_owned(),
+            line.side.clone(),
+        ))),
+        wire::ButtonPreset::Text,
+    );
+    if let wire::Node::Button { label, .. } = &mut mark {
+        *label = Some(host::forge_comment_target(&line.path, line_number, &line.side));
+    }
+    native::sized(mark, Some(wire::Length::Fixed(22.)), None)
 }
