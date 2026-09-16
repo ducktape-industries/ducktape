@@ -25,6 +25,11 @@ const ALLOWED: &[&str] = &[
     // the view tree wire: the one encoding a guest writes and the renderer
     // decodes, so it belongs to neither workspace and is shared by both.
     "workspace.dependencies view-wire -> crates/view-wire",
+    // the palette, the type scale and the bundled faces — beside view-wire for
+    // the same reason. What a view draws with and what the shell framing it
+    // draws with have to be one answer, or the two halves of a window disagree
+    // about what the product looks like.
+    "workspace.dependencies design -> crates/design",
     // module wire surfaces — types and codecs only, no module logic and no host
     // sdk. `boards` is the one of the three with a native default feature, and
     // `canvas` names `default-features = false` on it so the sdk graph stays out

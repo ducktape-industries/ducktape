@@ -2,14 +2,14 @@
 # A separate workspace keeps the WASM build profile independent of the desktop.
 [workspace]
 resolver = "2"
-members = ["canvas", "governance", "home", "inbox", "members", "agents", "node", "explorer", "palette", "settings", "chat", "call", "files", "pages", "forge", "support/design", "support/guest", "support/composer", "support/files", "pages/tests/editor-binding-app"]
+members = ["canvas", "governance", "home", "inbox", "members", "agents", "node", "explorer", "palette", "settings", "chat", "call", "files", "pages", "forge", "support/guest", "support/composer", "support/files", "pages/tests/editor-binding-app"]
 
 [workspace.dependencies]
 futures = "0.3"
 ducktape-view-guest = { path = "support/guest" }
 ducktape-view-composer = { path = "support/composer" }
 ducktape-view-files = { path = "support/files" }
-design = { path = "support/design" }
+design = { path = "../design" }
 view-wire = { path = "../view-wire" }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }

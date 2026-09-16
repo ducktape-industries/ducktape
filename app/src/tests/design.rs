@@ -162,7 +162,7 @@ fn persistent_split_panes_have_native_resize_handles_and_cursor_feedback() {
 }
 #[test]
 fn compact_controls_share_a_single_geometry_and_type_scale() {
-    let design = include_str!("../../../crates/views/support/design/src/lib.rs");
+    let design = include_str!("../../../crates/design/src/lib.rs");
     assert!(design.contains("Inter"));
     assert!(design.contains("13.5"));
     let shell = rust_tokens(include_str!("../shell.rs"));

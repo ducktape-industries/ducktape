@@ -42,10 +42,10 @@ The tree groups by function into three layers — module / kernel / networking:
 | `crates/guests/` | The kernel-fixture test guests only (hello, hello-replacement, noop, sibling, object). Every module carries its own port (`src/guest.rs` behind the `guest` feature) and `bin/guest-builder` builds it out of the repository at a revision — no per-module crate lives here |
 | `crates/examples/` | Reference modules: `directory` (the first wasm port; a test tenant, in no genesis set), `greeter` (types-only composition example) |
 | `crates/testing/` | `nettest` — the raw-HTTP-over-TCP test client, collision-safe port allocation and coarse event poll every node/daemon/sim integration harness shares |
-| `crates/views/support/design/` | The desktop app's font identity and type scale (shared tokens come from `ducktape-ui`) |
+| `crates/design/` | The desktop app's font identity and type scale (shared tokens come from `ducktape-ui`) |
 | `crates/labs/` | Quarantined experimental modules (`evm`, `multisig`): in-tree and tested but registered by NO genesis set, kept as a standalone crate EXCLUDED from the workspace so its heavy deps (revm, alloy) never tax the shipping build — gated via `make labs-gate` |
 | `bin/` | Runnable binaries: `node` (the unified `ducktape` CLI: `node run` plus every operator family — `node`, `user`, `account`, `wallet`, `gateway`, `fs`, `service`, `agent`, `module`, `mcp`), `noded` (`noded-bin`: the throwaway dev daemon with temp storage), `simnode` (deterministic /v1 twin), `coordinator` (STUN rendezvous + the TCP first-contact relay), `airlock-gateway` (the TEE enclave lender; the non-TEE lender is `ducktape service run airlock`), `guest-builder` (module → wasm component packaging tool), `duck-guest-init` (PID 1 inside a run's microVM), `duck-vz-shim` (the macOS Virtualization.framework VMM shim, Swift) |
-| `app/` | `ducktape-app`, the native GPUI desktop host; Rust-authored WASM views live in `crates/views`, with product assets in `crates/views/support/design` |
+| `app/` | `ducktape-app`, the native GPUI desktop host; Rust-authored WASM views live in `crates/views`, with product assets in `crates/design` |
 | `ops/` | Operator scripts, the node and coordinator systemd units, the sandbox guest image builder, the hosted auth page — see `ops/README.md` |
 | `docs/` | Operator runbooks (`deploy/`, `dogfood.md`, `sandbox-macos.md`) and the few records code cites by path (`records/`); `docs/README.md` indexes every document in the repo by the question it answers |
 

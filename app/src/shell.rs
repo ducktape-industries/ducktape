@@ -2883,7 +2883,7 @@ fn nav_icon(tab: ShellTab) -> gpui_kit::component::Icon {
 }
 
 /// The faces the app registers: ONE FILE PER FACE, each the vendor's own
-/// released static (`crates/views/support/design/assets/fonts/SOURCES`), never
+/// released static (`crates/design/assets/fonts/SOURCES`), never
 /// a variable font. The text system keeps the requested weight only long
 /// enough to match a face — `gpui-pre-wgpu`'s `cosmic_text_system.rs` then
 /// shapes with the matched face's own `usWeightClass` and rasterizes from a
@@ -2909,24 +2909,24 @@ fn nav_icon(tab: ShellTab) -> gpui_kit::component::Icon {
 /// Both are upright only — no open Hangul font has an italic — so an italic
 /// run slants its Latin and leaves its Korean standing.
 pub(crate) const BUNDLED_FACES: [&[u8]; 12] = [
-    include_bytes!("../../crates/views/support/design/assets/fonts/Inter-Regular.ttf"),
-    include_bytes!("../../crates/views/support/design/assets/fonts/Inter-Bold.ttf"),
-    include_bytes!("../../crates/views/support/design/assets/fonts/Inter-Italic.ttf"),
-    include_bytes!("../../crates/views/support/design/assets/fonts/Inter-BoldItalic.ttf"),
-    include_bytes!("../../crates/views/support/design/assets/fonts/JetBrainsMono-Regular.ttf"),
-    include_bytes!("../../crates/views/support/design/assets/fonts/JetBrainsMono-Bold.ttf"),
-    include_bytes!("../../crates/views/support/design/assets/fonts/JetBrainsMono-Italic.ttf"),
-    include_bytes!("../../crates/views/support/design/assets/fonts/JetBrainsMono-BoldItalic.ttf"),
-    include_bytes!("../../crates/views/support/design/assets/fonts/Pretendard-Regular.otf"),
-    include_bytes!("../../crates/views/support/design/assets/fonts/Pretendard-Bold.otf"),
-    include_bytes!("../../crates/views/support/design/assets/fonts/D2Coding-Regular.ttf"),
-    include_bytes!("../../crates/views/support/design/assets/fonts/D2Coding-Bold.ttf"),
+    include_bytes!("../../crates/design/assets/fonts/Inter-Regular.ttf"),
+    include_bytes!("../../crates/design/assets/fonts/Inter-Bold.ttf"),
+    include_bytes!("../../crates/design/assets/fonts/Inter-Italic.ttf"),
+    include_bytes!("../../crates/design/assets/fonts/Inter-BoldItalic.ttf"),
+    include_bytes!("../../crates/design/assets/fonts/JetBrainsMono-Regular.ttf"),
+    include_bytes!("../../crates/design/assets/fonts/JetBrainsMono-Bold.ttf"),
+    include_bytes!("../../crates/design/assets/fonts/JetBrainsMono-Italic.ttf"),
+    include_bytes!("../../crates/design/assets/fonts/JetBrainsMono-BoldItalic.ttf"),
+    include_bytes!("../../crates/design/assets/fonts/Pretendard-Regular.otf"),
+    include_bytes!("../../crates/design/assets/fonts/Pretendard-Bold.otf"),
+    include_bytes!("../../crates/design/assets/fonts/D2Coding-Regular.ttf"),
+    include_bytes!("../../crates/design/assets/fonts/D2Coding-Bold.ttf"),
 ];
 
 /// The emoji face, kept apart from [`BUNDLED_FACES`] because the two
 /// platforms differ on it (see the registration below).
 pub(crate) const EMOJI_FACE: &[u8] =
-    include_bytes!("../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf");
+    include_bytes!("../../crates/design/assets/fonts/NotoColorEmoji.ttf");
 
 /// The families a run falls back to when the primary face has no glyph, after
 /// the bundled Hangul face each chain leads with. WITHOUT this list a Korean
