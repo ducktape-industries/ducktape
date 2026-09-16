@@ -47,6 +47,7 @@
 //!     machinery as sibling reads (bounded by [`MAX_STORE_READS`]); the staged
 //!     overlay and the commit/abort boundary are identical in both backings.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -1292,6 +1293,10 @@ pub struct WasmModule {
     /// module records atomically with the refs). `None` between blocks / when no
     /// dispatch has run this block.
     block_env: Option<WitEnv>,
+    /// how many times the pure guest has been instantiated and driven since
+    /// this module was loaded — see [`WasmModule::guest_runs`]. `Cell` because
+    /// the read paths run the guest through `&self`.
+    guest_runs: Cell<u64>,
 }
 
 impl WasmModule {
@@ -1323,7 +1328,35 @@ impl WasmModule {
             fuel: DEFAULT_FUEL,
             committed_queries: compiled.shape.committed_queries,
             block_env: None,
+            guest_runs: Cell::new(0),
         })
+    }
+
+    /// How many times this module has instantiated and driven its pure guest,
+    /// counted since load and never reset — a caller measuring one dispatch
+    /// takes the difference across it.
+    ///
+    /// A store-backed tenant's every unresolved record read pauses the run and
+    /// replays it with the answer memoized, and nothing outside this crate can
+    /// see those boundaries: an injected [`sdk::MerkleStore`] observes `get`
+    /// calls, which is a different number. This is the seam that makes a
+    /// replay budget assertable — a tenant that loses its prefetch and starts
+    /// replaying per record moves this count and nothing else.
+    ///
+    /// Loading is not a run: the `shape` probe runs before the module exists.
+    pub fn guest_runs(&self) -> u64 {
+        self.guest_runs.get()
+    }
+
+    /// Instantiate the pure guest for ONE run. THE seam every round goes
+    /// through — the mutation driver's replay loop and [`Self::read_round`]
+    /// both — so [`Self::guest_runs`] counts runs and not call sites.
+    fn instantiate_round(
+        &self,
+        store: &mut Store<HostData>,
+    ) -> Result<ModuleWorld, wasmtime::Error> {
+        self.guest_runs.set(self.guest_runs.get() + 1);
+        ModuleWorld::instantiate(store, &self.component, &self.linker)
     }
 
     fn require_declared_backing(id: &str, shape: &Shape, offered: Backing) -> Result<(), SdkError> {
@@ -1589,8 +1622,7 @@ impl WasmModule {
 
             let outcome: Result<Result<(), WitError>, SdkError> = match store.set_fuel(fuel_left) {
                 Err(e) => Err(module_err(e)),
-                Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker)
-                {
+                Ok(()) => match self.instantiate_round(&mut store) {
                     Err(e) => Err(module_err(e)),
                     Ok(inst) => call.invoke(&inst, &mut store).map_err(module_err),
                 },
@@ -1873,7 +1905,7 @@ impl WasmModule {
         store.limiter(|d| &mut d.limits.0);
         let outcome: Result<Result<R, WitError>, SdkError> = match store.set_fuel(fuel) {
             Err(e) => Err(module_err(e)),
-            Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker) {
+            Ok(()) => match self.instantiate_round(&mut store) {
                 Err(e) => Err(module_err(e)),
                 Ok(inst) => call(&inst, &mut store).map_err(module_err),
             },

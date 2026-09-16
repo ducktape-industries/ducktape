@@ -59,6 +59,34 @@ async fn dispatch_commit_query_roundtrip() {
     assert_eq!(ctx.events()[2].source, "hello");
 }
 
+/// The control for every replay budget a store tenant pins: a map-backed
+/// tenant carries its committed state INTO the round, so no read can pause it
+/// and every entry point is exactly one run of the pure guest. A number above
+/// one here would mean a map tenant had started replaying, and a number below
+/// one would mean the counter had stopped seeing a run site.
+#[tokio::test]
+async fn a_map_tenant_never_pauses_so_every_entry_point_is_one_guest_run() {
+    let mut m = WasmModule::from_bytes("hello", HELLO).expect("load");
+    let mut ctx = mock("hello");
+
+    let mark = m.guest_runs();
+    inc(&mut m, &mut ctx).await;
+    assert_eq!(m.guest_runs() - mark, 1, "execute");
+
+    let mark = m.guest_runs();
+    m.commit_block().await.expect("commit");
+    assert_eq!(m.guest_runs() - mark, 1, "finalize");
+
+    let mark = m.guest_runs();
+    m.query(b"").await.expect("query");
+    assert_eq!(m.guest_runs() - mark, 1, "query");
+
+    // hashing the committed map is the host's own work; the guest is not run.
+    let mark = m.guest_runs();
+    let _ = m.root();
+    assert_eq!(m.guest_runs() - mark, 0, "root");
+}
+
 #[tokio::test]
 async fn abort_discards_staged() {
     let mut m = WasmModule::from_bytes("hello", HELLO).expect("load");

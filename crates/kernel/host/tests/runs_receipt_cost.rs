@@ -40,10 +40,11 @@ impl Counters {
         self.read_bytes.set(0);
     }
 
-    fn cost(&self) -> BlockCost {
+    fn cost(&self, runs: u64) -> BlockCost {
         BlockCost {
             reads: self.reads.get(),
             read_bytes: self.read_bytes.get(),
+            runs,
         }
     }
 }
@@ -85,11 +86,16 @@ impl MerkleStore for Counting {
     }
 }
 
-/// what one block's read path touched, in records and in bytes.
+/// what one block's read path touched, in records, in bytes, and in guest
+/// runs. The records are what the injected store saw; the runs are how many
+/// times the pure guest was driven to see them, which no store can observe —
+/// a tenant that lost its prefetch would read the same records one pause at a
+/// time and move only this number.
 #[derive(Debug, PartialEq, Eq)]
 struct BlockCost {
     reads: usize,
     read_bytes: usize,
+    runs: u64,
 }
 
 /// the store a composer hands a fresh runs tenant, plus `history` completed
@@ -132,21 +138,26 @@ fn block_cost(history: usize) -> [BlockCost; 3] {
     });
     let module = WasmModule::with_store("runs", RUNS_WASM, store).expect("load the runs component");
 
-    // loading is not part of a block: start counting at the block path.
+    // loading is not part of a block: start counting at the block path. both
+    // meters zero together — the store's counters here, the module's run count
+    // by taking a mark to subtract.
     counters.zero();
+    let mark = module.guest_runs();
     futures::executor::block_on(module.pending_items()).expect("the pending sweep");
-    let sweep = counters.cost();
+    let sweep = counters.cost(module.guest_runs() - mark);
 
     counters.zero();
+    let mark = module.guest_runs();
     let query = runs::encode_query(&runs::RunsQuery::Conversation {
         conversation_id: "absent".into(),
     });
     let _ = futures::executor::block_on(module.query(&query));
-    let point_query = counters.cost();
+    let point_query = counters.cost(module.guest_runs() - mark);
 
     counters.zero();
+    let mark = module.guest_runs();
     let _ = module.root();
-    let root = counters.cost();
+    let root = counters.cost(module.guest_runs() - mark);
 
     [sweep, point_query, root]
 }
@@ -188,8 +199,25 @@ fn a_blocks_cost_is_its_own_receipts_not_the_history() {
         small[2],
         BlockCost {
             reads: 0,
-            read_bytes: 0
+            read_bytes: 0,
+            runs: 0,
         },
         "a store tenant's root is the store's own — the host reads nothing to fold it"
+    );
+    // The replay budget, which no count of records can see: a run is driven
+    // from the top, pauses on the first read the memo cannot answer, and is
+    // replayed with that answer added — so the runs are the pauses plus the
+    // one that finishes. The sweep pauses three times (the four-record
+    // prefetch, then the action queue, then the conversation queue, its two
+    // awaited steps) and the point query twice (the prefetch, then the record
+    // it names). A tenant that lost its prefetch would resolve the SAME
+    // records one pause at a time: identical reads above, more runs here.
+    assert_eq!(
+        small[0].runs, 4,
+        "the pending sweep: prefetch + two queues, then the run that returns"
+    );
+    assert_eq!(
+        small[1].runs, 3,
+        "the point query: prefetch + its record, then the run that answers"
     );
 }
