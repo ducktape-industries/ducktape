@@ -257,7 +257,7 @@ impl PagesView {
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     /// This state's layout, digested — `snapshot_schema` holds it here.
     const SNAPSHOT_SCHEMA: &'static str =
-        "2ab020a6340d03d1bee4c1be13e9d7a86cc797eeed91fdaabce209f1899c04f1";
+        "99f970a5f55760e6d0bf1493c68789be0cf0feceb46861a00c2c76e69e50c24e";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
