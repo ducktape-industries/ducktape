@@ -3706,3 +3706,65 @@ fn a_connectors_plate_is_the_paper_it_rubs_the_line_out_with() {
          printed a chip over the run instead of rubbing it out"
     );
 }
+
+/// How a shape's own body is drawn, out of the layer the painter gives it —
+/// not the rings and guides the board draws around it, which live elsewhere.
+fn body_of(view: &BoardsView, id: &str) -> (Option<wire::Rgba>, Option<wire::CanvasStroke>) {
+    let tree = view.view();
+    let layer = node_at(&tree, &format!("boards/body/{id}")).expect("a shape is drawn in a layer");
+    let wire::Node::Canvas { commands, .. } = layer else {
+        panic!("a body layer is a canvas");
+    };
+    let Some(wire::CanvasCommand::Draw { fill, stroke, .. }) = commands.first() else {
+        panic!("a shape's layer draws nothing: {commands:?}");
+    };
+    (*fill, stroke.clone())
+}
+
+/// A shape says how it is painted, not only what colour it is: whether the body
+/// behind its outline is there, and whether that outline is unbroken. Both ride
+/// the shape, so everyone looking at the board sees the same drawing.
+#[test]
+fn a_shape_is_drawn_with_the_fill_and_the_dash_it_carries() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            kind: Kind::Rectangle,
+            x: 100,
+            y: 100,
+            width: 200,
+            height: 140,
+            ..Default::default()
+        },
+    });
+    let (fill, stroke) = body_of(&view, "a");
+    assert!(fill.is_some(), "a shape filled by default was drawn hollow");
+    assert!(
+        stroke.as_ref().is_some_and(|pen| pen.dash.is_empty()),
+        "a shape with an unbroken outline was drawn dashed"
+    );
+
+    // Emptied and broken, one property at a time, each landing on its own.
+    view.selected = ["a".into()].into();
+    view.on_fill(Fill::None);
+    view.on_dash(Dash::Dashed);
+    let (fill, stroke) = body_of(&view, "a");
+    assert!(
+        fill.is_none(),
+        "an emptied shape was still painted behind its outline, so whatever it \
+         was drawn around is still hidden"
+    );
+    assert!(
+        stroke.as_ref().is_some_and(|pen| !pen.dash.is_empty()),
+        "a dashed shape was drawn with an unbroken outline"
+    );
+
+    // And the pen is remembered, the way the colour is: you choose how you are
+    // drawing and then draw several, rather than correcting each one after.
+    let next = view.creation_shape(Kind::Ellipse, [0., 0.], [100., 80.]);
+    assert_eq!((next.fill, next.dash), (Fill::None, Dash::Dashed));
+}

@@ -4,7 +4,7 @@ mod host;
 mod interaction;
 mod markdown;
 mod presentation;
-use boards::{Align, Board, Change, Kind, Operation, Shape, TextSize};
+use boards::{Align, Board, Change, Dash, Fill, Kind, Operation, Shape, TextSize};
 use ducktape_view_guest::{Editor, wire};
 use ducktape_view_guest::{Subscription, Task};
 use serde::{Deserialize, Serialize};
@@ -182,7 +182,13 @@ pub struct BoardsView {
     modifiers: wire::keyboard::Modifiers,
     space_pan: bool,
     tool_locked: bool,
+    /// The pen the next shape will be drawn with. A board keeps one of these
+    /// per property, the way a drawing app keeps a current colour: you pick
+    /// how a thing is going to look and then draw several of them, rather
+    /// than drawing each one wrong and correcting it.
     palette: u8,
+    fill: Fill,
+    dash: Dash,
     help: bool,
     board_picker: bool,
     snap: bool,
@@ -273,6 +279,8 @@ pub enum Message {
     Fit,
     Size(f32, f32),
     Color(u8),
+    Painting(Fill),
+    Outline(Dash),
     Align(Align),
     Lettering(TextSize),
     Delete,
@@ -301,6 +309,8 @@ impl BoardsView {
                 space_pan: false,
                 tool_locked: false,
                 palette: 0,
+                fill: Fill::Solid,
+                dash: Dash::Solid,
                 help: false,
                 board_picker: false,
                 snap: true,
@@ -399,6 +409,8 @@ impl BoardsView {
             Message::Fit => self.on_fit(),
             Message::Size(w, h) => self.on_size(w, h),
             Message::Color(color) => self.on_color(color),
+            Message::Painting(fill) => self.on_fill(fill),
+            Message::Outline(dash) => self.on_dash(dash),
             Message::Align(align) => self.on_align(align),
             Message::Lettering(text_size) => self.on_lettering(text_size),
             Message::Delete => self.on_delete(),
@@ -871,6 +883,26 @@ fn inverse(board: &Board, change: &Change) -> Vec<Change> {
                 vec![Change::Color {
                     id: id.clone(),
                     color: r.shape.color,
+                }]
+            })
+            .unwrap_or_default(),
+        Change::Fill { id, .. } => board
+            .shapes
+            .get(id)
+            .map(|r| {
+                vec![Change::Fill {
+                    id: id.clone(),
+                    fill: r.shape.fill,
+                }]
+            })
+            .unwrap_or_default(),
+        Change::Dash { id, .. } => board
+            .shapes
+            .get(id)
+            .map(|r| {
+                vec![Change::Dash {
+                    id: id.clone(),
+                    dash: r.shape.dash,
                 }]
             })
             .unwrap_or_default(),

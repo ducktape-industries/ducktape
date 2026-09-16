@@ -7,22 +7,32 @@ use ducktape_view_guest::{
     },
 };
 
-fn pen(color: Rgba, width: f32) -> wire::CanvasStroke {
+fn pen(color: Rgba, width: f32, dash: Dash) -> wire::CanvasStroke {
     wire::CanvasStroke {
         color,
         width,
         cap: wire::CanvasLineCap::Round,
         join: wire::CanvasLineJoin::Round,
-        dash: Vec::new(),
+        // The rhythm is measured in pen widths, not pixels, so a dash reads the
+        // same on a hairline at 30% zoom as on a fat stroke at 300%. A list in
+        // absolute units would be a solid line at one end of the range and a
+        // row of dots at the other.
+        dash: match dash {
+            Dash::Solid => Vec::new(),
+            Dash::Dashed => vec![width * 3., width * 2.5],
+        },
         dash_offset: 0,
     }
 }
+/// The board's own chrome — rings, guides, previews — is never dashed and never
+/// hollow: a broken selection ring would read as a shape somebody drew.
+const CHROME: Dash = Dash::Solid;
 fn line(from: [f32; 2], to: [f32; 2], color: Rgba, width: f32) -> Draw {
     Draw::Draw {
         shape: Geometry::Line { from, to },
         fill: None,
         even_odd: false,
-        stroke: Some(pen(color, width)),
+        stroke: Some(pen(color, width, CHROME)),
     }
 }
 fn rectangle(
@@ -32,6 +42,7 @@ fn rectangle(
     border: Rgba,
     width: f32,
     radius: f32,
+    dash: Dash,
 ) -> Draw {
     Draw::Draw {
         shape: Geometry::Rectangle {
@@ -41,7 +52,7 @@ fn rectangle(
         },
         fill,
         even_odd: false,
-        stroke: Some(pen(border, width)),
+        stroke: Some(pen(border, width, dash)),
     }
 }
 fn ellipse(
@@ -50,6 +61,7 @@ fn ellipse(
     fill: Option<Rgba>,
     border: Rgba,
     width: f32,
+    dash: Dash,
 ) -> Draw {
     Draw::Draw {
         shape: Geometry::Path(vec![wire::CanvasSegment::Ellipse {
@@ -61,7 +73,7 @@ fn ellipse(
         }]),
         fill,
         even_odd: false,
-        stroke: Some(pen(border, width)),
+        stroke: Some(pen(border, width, dash)),
     }
 }
 fn diamond(
@@ -70,6 +82,7 @@ fn diamond(
     fill: Option<Rgba>,
     border: Rgba,
     width: f32,
+    dash: Dash,
 ) -> Draw {
     use wire::CanvasSegment as Segment;
     let middle = [position[0] + size[0] / 2., position[1] + size[1] / 2.];
@@ -83,7 +96,7 @@ fn diamond(
         ]),
         fill,
         even_odd: false,
-        stroke: Some(pen(border, width)),
+        stroke: Some(pen(border, width, dash)),
     }
 }
 /// The five card hues, softened onto the app's cool greys: a fill per
@@ -511,8 +524,18 @@ impl BoardsView {
         // has no room for is an alignment, and `inspector` withholds that row
         // on its own.
         let writable = only.map(|record| &record.shape);
+        // A control that cannot do anything is worse than a missing one: it
+        // says the shape has a property it does not have. A run has no body to
+        // empty and a text shape has neither a body nor an outline, so each row
+        // appears only when something in the selection can answer it. The
+        // answer SHOWN is the pen — what a new shape would be drawn with —
+        // because a mixed selection has no single one and the pen is what
+        // pressing the button would set them all to.
+        let picked = || self.selected.iter().filter_map(|id| board.shapes.get(id));
+        let any_body = picked().any(|record| has_body(record.shape.kind));
+        let any_outline = picked().any(|record| has_outline(record.shape.kind));
         Some(kit::sized(
-            self.inspector(name, count, writable),
+            self.inspector(name, count, writable, any_body, any_outline),
             Some(Length::Fixed(204.)),
             None,
         ))
@@ -680,6 +703,12 @@ impl BoardsView {
                     [
                         kit::caption("boards/next-color-label", "New shape"),
                         self.swatches(),
+                        // The whole pen, not just its colour: choosing to draw
+                        // outlines is a decision you make before drawing, and
+                        // having to draw one filled and empty it afterwards is
+                        // the same complaint the colour row was added for.
+                        fill_row(self.fill),
+                        dash_row(self.dash),
                     ],
                 ),
                 6.,
@@ -695,12 +724,25 @@ impl BoardsView {
             4.,
         )
     }
-    fn inspector(&self, name: String, count: usize, writable: Option<&Shape>) -> Node {
+    fn inspector(
+        &self,
+        name: String,
+        count: usize,
+        writable: Option<&Shape>,
+        any_body: bool,
+        any_outline: bool,
+    ) -> Node {
         let mut properties = vec![
             kit::heading("boards/selection-title", name),
             self.swatches(),
-            kit::divider("boards/properties-rule"),
         ];
+        if any_body {
+            properties.push(fill_row(self.fill));
+        }
+        if any_outline {
+            properties.push(dash_row(self.dash));
+        }
+        properties.push(kit::divider("boards/properties-rule"));
         if let Some(shape) = writable {
             properties.push(wide(action(
                 "boards/edit-text",
@@ -1088,28 +1130,43 @@ impl BoardsView {
     fn paint(&self, board: &Board, s: &Shape, opacity: f32, budget: usize, out: &mut Vec<Draw>) {
         let pos = self.screen(s.x as f32, s.y as f32);
         let size = [s.width as f32 * self.zoom, s.height as f32 * self.zoom];
-        let body = |strength: f32| Rgba(alpha(fill(s.color), strength * opacity));
+        // An emptied shape is its outline and nothing else: what is behind it
+        // shows through, which is the whole point of drawing a box around a
+        // cluster of notes rather than over them.
+        let body = |strength: f32| match s.fill {
+            Fill::Solid => Some(Rgba(alpha(fill(s.color), strength * opacity))),
+            Fill::None => None,
+        };
         let edge = |strength: f32| Rgba(alpha(tint(s.color), strength * opacity));
         let line_width = (1.5 * self.zoom).clamp(1., 8.);
         let radius = (6. * self.zoom).clamp(2., 20.);
         match s.kind {
-            Kind::Note => out.push(rectangle(pos, size, Some(body(1.)), edge(0.35), 1., radius)),
+            Kind::Note => out.push(rectangle(
+                pos,
+                size,
+                body(1.),
+                edge(0.35),
+                1.,
+                radius,
+                s.dash,
+            )),
             Kind::Rectangle => out.push(rectangle(
                 pos,
                 size,
-                Some(body(0.45)),
+                body(0.45),
                 edge(1.),
                 line_width,
                 radius,
+                s.dash,
             )),
-            Kind::Ellipse => out.push(ellipse(pos, size, Some(body(0.45)), edge(1.), line_width)),
-            Kind::Diamond => out.push(diamond(pos, size, Some(body(0.45)), edge(1.), line_width)),
+            Kind::Ellipse => out.push(ellipse(pos, size, body(0.45), edge(1.), line_width, s.dash)),
+            Kind::Diamond => out.push(diamond(pos, size, body(0.45), edge(1.), line_width, s.dash)),
             // text carries no body: the words are the shape
             Kind::Text => {}
             Kind::Arrow | Kind::Line | Kind::Draw => {
                 let world = interaction::stroke(board, s);
                 let screen: Vec<_> = world.iter().map(|p| self.screen(p[0], p[1])).collect();
-                self.paint_stroke(s.kind, &screen, edge(1.), budget, out);
+                self.paint_stroke(s.kind, &screen, edge(1.), s.dash, budget, out);
             }
         }
     }
@@ -1118,6 +1175,7 @@ impl BoardsView {
         kind: Kind,
         screen: &[[f32; 2]],
         color: Rgba,
+        dash: Dash,
         budget: usize,
         out: &mut Vec<Draw>,
     ) {
@@ -1151,9 +1209,12 @@ impl BoardsView {
             }),
             fill: None,
             even_odd: false,
-            stroke: Some(pen(color, width)),
+            stroke: Some(pen(color, width, dash)),
         });
         if kind != Kind::Arrow {
+            // The head is the one part of a run that is never broken: a dashed
+            // arrowhead is two short ticks that read as noise beside the line
+            // rather than as the thing the line is pointing at.
             return;
         }
         // The head points the way the line arrives, which on a curve is the way
@@ -1495,6 +1556,7 @@ impl BoardsView {
                 Rgba(alpha(p.accent, 0.45)),
                 1.,
                 ring,
+                CHROME,
             ));
         }
         // leave the gesture and the guides their own room out of the budget
@@ -1521,6 +1583,7 @@ impl BoardsView {
                 accent,
                 1.5,
                 ring,
+                CHROME,
             ));
             let alone = self.selected.len() == 1 && self.inline.is_none();
             if !alone {
@@ -1534,7 +1597,7 @@ impl BoardsView {
                 },
                 fill: Some(Rgba(p.background)),
                 even_odd: false,
-                stroke: Some(pen(accent, 1.5)),
+                stroke: Some(pen(accent, 1.5, CHROME)),
             };
             // A connector is taken by its ends, a card by its corners: the grip
             // a shape offers is the edit it can be given, and they differ.
@@ -1556,7 +1619,7 @@ impl BoardsView {
                         },
                         fill: Some(Rgba(p.background)),
                         even_odd: false,
-                        stroke: Some(pen(Rgba(alpha(p.accent, 0.6)), 1.5)),
+                        stroke: Some(pen(Rgba(alpha(p.accent, 0.6)), 1.5, CHROME)),
                     });
                 }
                 continue;
@@ -1582,6 +1645,7 @@ impl BoardsView {
                 Rgba(alpha(p.accent, 0.7)),
                 1.,
                 2.,
+                CHROME,
             ));
             let grip = |at: [f32; 2]| Draw::Draw {
                 shape: Geometry::Rectangle {
@@ -1591,7 +1655,7 @@ impl BoardsView {
                 },
                 fill: Some(Rgba(p.background)),
                 even_odd: false,
-                stroke: Some(pen(accent, 1.5)),
+                stroke: Some(pen(accent, 1.5, CHROME)),
             };
             for corner in interaction::HANDLES {
                 let world = interaction::handle_point(bounds, corner);
@@ -1630,6 +1694,7 @@ impl BoardsView {
             Rgba(p.accent),
             2.,
             (6. * self.zoom).clamp(2., 20.),
+            CHROME,
         ));
     }
     fn paint_gesture(&self, board: &Board, out: &mut Vec<Draw>) {
@@ -1646,6 +1711,7 @@ impl BoardsView {
                     accent,
                     1.,
                     2.,
+                    CHROME,
                 ));
             }
             Gesture::Create { kind, start, point } => {
@@ -1668,7 +1734,7 @@ impl BoardsView {
                         |bound| interaction::stroke(board, &bound),
                     );
                     let screen: Vec<_> = run.iter().map(|q| self.screen(q[0], q[1])).collect();
-                    self.paint_stroke(*kind, &screen, accent, 8, out);
+                    self.paint_stroke(*kind, &screen, accent, shape.dash, 8, out);
                     return;
                 }
                 // A card is drawn AS the card it will be, in the ink it will
@@ -1700,14 +1766,18 @@ impl BoardsView {
                     accent,
                     1.,
                     (6. * self.zoom).clamp(2., 20.),
+                    CHROME,
                 ));
             }
             Gesture::Sketch { points } => {
                 let screen: Vec<_> = points.iter().map(|q| self.screen(q[0], q[1])).collect();
+                // A stroke is drawn in the pen it will be kept in, and the pen
+                // a new shape gets is the board's current one.
                 self.paint_stroke(
                     Kind::Draw,
                     &screen,
                     Rgba(tint(self.palette)),
+                    self.dash,
                     boards::MAX_POINTS,
                     out,
                 );
@@ -1983,6 +2053,17 @@ pub(super) fn column(kind: Kind, room: f32, letters: &Lettering, zoom: f32) -> f
 /// as one that moves when you save it.
 pub(super) fn middling(kind: Kind) -> bool {
     !kind.is_path() && kind != Kind::Text
+}
+/// Whether this kind is painted behind its outline at all. A run is a stroke
+/// with nothing inside it and a text shape is its words, so emptying either
+/// changes nothing anyone can see.
+pub(super) fn has_body(kind: Kind) -> bool {
+    middling(kind)
+}
+/// Whether this kind draws a line that could be broken — a card's border and a
+/// run's stroke both do; a text shape draws neither.
+pub(super) fn has_outline(kind: Kind) -> bool {
+    kind != Kind::Text
 }
 /// Set the line spacing on a run of words. Absolute and not a ratio: the
 /// editor multiplies a ratio by the size it was told, the painter by the size
@@ -2381,6 +2462,17 @@ fn icon(name: &str) -> Node {
         "help" => {
             "<circle cx='12' cy='12' r='9'/><path d='M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.7.4-1 1-1 1.7M12 17h.01'/>"
         }
+        // whether the body behind the outline is painted: a hatched box and an
+        // empty one. Hatching rather than a solid square because every icon
+        // here is drawn in strokes and a filled one would read as a different
+        // family of control.
+        "fill-solid" => {
+            "<rect x='4' y='4' width='16' height='16' rx='3'/><path d='M5 11 11 5M5 17 17 5M8 19 19 8M14 20 20 14'/>"
+        }
+        "fill-none" => "<rect x='4' y='4' width='16' height='16' rx='3'/>",
+        // whether the outline is unbroken
+        "dash-solid" => "<path d='M3 12h18'/>",
+        "dash-dashed" => "<path d='M3 12h4M10 12h4M17 12h4'/>",
         _ => "",
     };
     let bytes=format!("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='#222222' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'>{path}</svg>").into_bytes();
@@ -2576,6 +2668,54 @@ fn text_size_row(current: TextSize) -> Node {
                     size,
                     Message::Lettering(step),
                     step == current,
+                )
+            }),
+        ),
+        4.,
+    )
+}
+/// Whether the shape's body is painted, the one it is set to checked.
+fn fill_row(current: Fill) -> Node {
+    kit::spaced(
+        kit::row(
+            "boards/fill",
+            [
+                (Fill::Solid, "fill-solid", "Filled"),
+                (Fill::None, "fill-none", "Outline only"),
+            ]
+            .map(|(fill, name, label)| {
+                icon_button(
+                    &format!("boards/fill/{name}"),
+                    name,
+                    label,
+                    "Whether the shape is painted behind its outline",
+                    Message::Painting(fill),
+                    true,
+                    fill == current,
+                )
+            }),
+        ),
+        4.,
+    )
+}
+/// Whether the shape's outline is unbroken, the one it is set to checked.
+fn dash_row(current: Dash) -> Node {
+    kit::spaced(
+        kit::row(
+            "boards/dash",
+            [
+                (Dash::Solid, "dash-solid", "Solid line"),
+                (Dash::Dashed, "dash-dashed", "Dashed line"),
+            ]
+            .map(|(dash, name, label)| {
+                icon_button(
+                    &format!("boards/dash/{name}"),
+                    name,
+                    label,
+                    "Whether the outline is drawn unbroken",
+                    Message::Outline(dash),
+                    true,
+                    dash == current,
                 )
             }),
         ),
