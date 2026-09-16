@@ -116,16 +116,31 @@ fn provider_contradicts_kind(provider: &str, kind: gateway::CredentialKind) -> b
     }
 }
 
-/// `--cpu`/`--mem` → the container limit keys the sandbox backend enforces.
-pub(crate) fn build_limits(cpu: Option<u64>, mem_gb: Option<u64>) -> std::collections::BTreeMap<String, u64> {
-    let mut limits = std::collections::BTreeMap::new();
-    if let Some(cores) = cpu {
-        limits.insert("cores".to_string(), cores);
-    }
-    if let Some(mem) = mem_gb {
-        limits.insert("mem_gb".to_string(), mem);
-    }
-    limits
+/// the size a session's sandbox is built at when the caller named none.
+///
+/// Matches the delegated-child profile the runs module uses: enough for one
+/// interactive CLI, small enough that a host running several is not surprised.
+const DEFAULT_SESSION_CORES: u64 = 2;
+const DEFAULT_SESSION_MEM_GB: u64 = 4;
+
+/// `--cpu`/`--mem` → the limit keys the sandbox backend enforces, with this
+/// service's default size filled in for whatever the caller left out.
+///
+/// A microVM is BUILT at a size and has no "unlimited" state: the provider
+/// refuses a run with no `cores` outright. So the one place a create is
+/// performed names the size, for the local path and the credential path alike —
+/// a create carrying neither `--cpu` nor `--mem` is the ordinary case.
+pub(crate) fn build_limits(
+    cpu: Option<u64>,
+    mem_gb: Option<u64>,
+) -> std::collections::BTreeMap<String, u64> {
+    std::collections::BTreeMap::from([
+        ("cores".to_string(), cpu.unwrap_or(DEFAULT_SESSION_CORES)),
+        (
+            "mem_gb".to_string(),
+            mem_gb.unwrap_or(DEFAULT_SESSION_MEM_GB),
+        ),
+    ])
 }
 
 /// the committed credential record for `name`, or `None` when unregistered.
@@ -350,5 +365,23 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(("unknown_credential", _))));
+    }
+
+    /// A create that names no size still names one: a microVM has no unlimited
+    /// state, so an empty limit map is a session that cannot boot.
+    #[test]
+    fn a_session_is_always_built_at_a_size() {
+        let named = build_limits(Some(8), Some(16));
+        assert_eq!(named["cores"], 8);
+        assert_eq!(named["mem_gb"], 16);
+
+        let bare = build_limits(None, None);
+        assert_eq!(bare["cores"], DEFAULT_SESSION_CORES);
+        assert_eq!(bare["mem_gb"], DEFAULT_SESSION_MEM_GB);
+
+        // one named dimension does not leave the other unset.
+        let half = build_limits(Some(6), None);
+        assert_eq!(half["cores"], 6);
+        assert_eq!(half["mem_gb"], DEFAULT_SESSION_MEM_GB);
     }
 }
