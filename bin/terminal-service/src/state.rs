@@ -1,6 +1,5 @@
 use agent_service::wire;
 use base64::Engine as _;
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -9,17 +8,9 @@ pub enum Caller {
     Operator { node: [u8; 32] },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Mode {
-    Single,
-    Shared,
-}
-
 #[derive(Clone, Copy)]
 pub enum Write {
     Input,
-    Committed,
     Resize,
     Close,
 }
@@ -57,29 +48,18 @@ pub struct Chunk {
     pub bytes: Vec<u8>,
 }
 
-pub struct Status {
-    pub ended: bool,
-    pub command_cursor: u64,
-}
-
 pub struct Replay {
     pub first: u64,
     pub head: u64,
     pub chunks: Vec<Chunk>,
-    pub command_first: u64,
-    pub command_head: u64,
-    pub commands: Vec<crate::consensus::Projected>,
     pub ended: bool,
 }
 
 struct Record {
     owner: Caller,
-    mode: Mode,
     phase: Phase,
     chunks: VecDeque<Chunk>,
     head: u64,
-    command_cursor: u64,
-    commands: VecDeque<crate::consensus::Projected>,
 }
 
 #[derive(Default)]
@@ -94,6 +74,9 @@ impl Sessions {
     pub fn on_engine(&mut self, event: wire::Event) -> Result<Effect, String> {
         match event {
             wire::Event::TermCreated { session } => self.engine_created(session),
+            // `detail` is this host's own diagnosis of the failed spawn, not the
+            // client's answer: the session engine logs it at the point it
+            // decides the refusal, and the stable token is what crosses back.
             wire::Event::TermRefused {
                 session,
                 reason,
@@ -155,7 +138,7 @@ impl Sessions {
         Err("messaging event on terminal executor stream".into())
     }
 
-    pub fn insert(&mut self, id: String, owner: Caller, mode: Mode) -> Result<(), String> {
+    pub fn insert(&mut self, id: String, owner: Caller) -> Result<(), String> {
         let invalid = !agent_service::wire::valid_session(&id) || self.records.contains_key(&id);
         if invalid {
             return Err("invalid or occupied session".into());
@@ -164,12 +147,9 @@ impl Sessions {
             id,
             Record {
                 owner,
-                mode,
                 phase: Phase::Starting,
                 chunks: VecDeque::new(),
                 head: 0,
-                command_cursor: 0,
-                commands: VecDeque::new(),
             },
         );
         Ok(())
@@ -208,16 +188,16 @@ impl Sessions {
         }
     }
 
+    /// A session answers exactly one caller: the operator that created it.
     pub fn read(&self, id: &str, caller: &Caller) -> Result<(), String> {
         let record = self.records.get(id).ok_or("unknown session")?;
-        let authorized = record.owner == *caller || record.mode == Mode::Shared;
-        if !authorized {
+        if record.owner != *caller {
             return Err("session is not readable by this caller".into());
         }
         Ok(())
     }
 
-    pub fn write(&self, id: &str, caller: &Caller, action: Write) -> Result<(), String> {
+    pub fn write(&self, id: &str, caller: &Caller) -> Result<(), String> {
         let record = self.records.get(id).ok_or("unknown session")?;
         if record.owner != *caller {
             return Err("session belongs to another caller".into());
@@ -225,56 +205,7 @@ impl Sessions {
         if record.phase != Phase::Running {
             return Err("session is not running".into());
         }
-        match action {
-            Write::Input if record.mode == Mode::Shared => {
-                Err("shared input requires a committed channel command".into())
-            }
-            Write::Committed if record.mode != Mode::Shared => {
-                Err("committed commands require a shared session".into())
-            }
-            Write::Input | Write::Committed | Write::Resize | Write::Close => Ok(()),
-        }
-    }
-
-    /// Validate the complete committed page before advancing its cursor. The
-    /// runtime owns this cursor, so cancelling a caller cannot replay a write
-    /// whose acknowledgment it missed.
-    pub(crate) fn commands(
-        &mut self,
-        id: &str,
-        caller: &Caller,
-        owner: &chat::Party,
-        views: &[chat::MessageView],
-    ) -> Result<Vec<crate::consensus::Projected>, String> {
-        self.write(id, caller, Write::Committed)?;
-        let record = self.records.get_mut(id).expect("checked session");
-        let channel = crate::consensus::session_channel(id);
-        let mut previous = None;
-        let mut commands = Vec::new();
-        for view in views {
-            let wrong_channel = view.channel_id != channel;
-            let unordered = previous.is_some_and(|seq| view.seq <= seq);
-            if wrong_channel || unordered {
-                return Err("invalid terminal command page".into());
-            }
-            previous = Some(view.seq);
-            if view.seq <= record.command_cursor {
-                continue;
-            }
-            let Ok(projected) = crate::consensus::project_message(view, owner) else {
-                continue;
-            };
-            commands.push(projected);
-        }
-        if let Some(last) = previous {
-            record.command_cursor = record.command_cursor.max(last);
-        }
-        // Record accepted execution requests before dispatch, just as the
-        // native terminal records command stamps before writing to the PTY.
-        for command in &commands {
-            record.commands.push_back(command.clone());
-        }
-        Ok(commands)
+        Ok(())
     }
 
     pub fn output(&mut self, id: &str, bytes: Vec<u8>) -> Result<(), String> {
@@ -292,45 +223,18 @@ impl Sessions {
         Ok(())
     }
 
-    pub fn status(&self, id: &str, caller: &Caller) -> Result<Status, String> {
+    pub fn replay(&self, id: &str, caller: &Caller, after: u64) -> Result<Replay, String> {
         self.read(id, caller)?;
         let record = &self.records[id];
-        Ok(Status {
-            ended: record.phase == Phase::Ended,
-            command_cursor: record.command_cursor,
-        })
-    }
-
-    pub fn replay(
-        &self,
-        id: &str,
-        caller: &Caller,
-        after: u64,
-        after_command: u64,
-    ) -> Result<Replay, String> {
-        self.read(id, caller)?;
-        let record = &self.records[id];
-        let ahead = after > record.head || after_command > record.command_cursor;
-        if ahead {
+        if after > record.head {
             return Err("resume cursor is ahead of this session".into());
         }
-        // Both queues are append-only with strictly increasing sequence
-        // numbers, so a resume point is a binary search. Scanning for it
-        // instead costs the whole retained stream on every reader wake-up,
-        // which is quadratic over the life of a streaming session.
+        // The queue is append-only with strictly increasing sequence numbers,
+        // so a resume point is a binary search. Scanning for it instead costs
+        // the whole retained stream on every reader wake-up, which is quadratic
+        // over the life of a streaming session.
         let resume_chunk = record.chunks.partition_point(|chunk| chunk.seq <= after);
-        let resume_command = record
-            .commands
-            .partition_point(|command| command.seq <= after_command);
         Ok(Replay {
-            command_first: record
-                .commands
-                .front()
-                .map_or(record.command_cursor.saturating_add(1), |command| {
-                    command.seq
-                }),
-            command_head: record.command_cursor,
-            commands: record.commands.range(resume_command..).cloned().collect(),
             first: record
                 .chunks
                 .front()
@@ -369,67 +273,30 @@ mod tests {
         let mut sessions = Sessions::default();
         let owner = Caller::Operator { node: [1; 32] };
         let id = "0000000000000001";
-        sessions
-            .insert(id.into(), owner.clone(), Mode::Single)
-            .unwrap();
+        sessions.insert(id.into(), owner.clone()).unwrap();
         sessions.created(id);
-        assert!(sessions.write(id, &owner, Write::Input).is_ok());
+        assert!(sessions.write(id, &owner).is_ok());
         for stranger in [Caller::Operator { node: [2; 32] }, caller(7, 1)] {
-            assert!(sessions.write(id, &stranger, Write::Input).is_err());
-            assert!(sessions.write(id, &stranger, Write::Close).is_err());
-            assert!(sessions.replay(id, &stranger, 0, 0).is_err());
+            assert!(sessions.write(id, &stranger).is_err());
+            assert!(sessions.replay(id, &stranger, 0).is_err());
         }
     }
 
+    /// A session is one operator's: the exact account AND the exact node that
+    /// created it drive and read it, and nobody else does either.
     #[test]
-    fn single_input_is_scoped_to_exact_creator_and_shared_input_requires_committed_command() {
+    fn a_session_answers_only_its_exact_creator() {
         let owner = caller(7, 1);
         let mut sessions = Sessions::default();
-        sessions
-            .insert("0000000000000001".into(), owner.clone(), Mode::Single)
-            .unwrap();
-        sessions
-            .insert("0000000000000002".into(), owner.clone(), Mode::Shared)
-            .unwrap();
-        sessions.created("0000000000000001");
-        sessions.created("0000000000000002");
-        assert!(
-            sessions
-                .write("0000000000000001", &owner, Write::Input)
-                .is_ok()
-        );
-        assert!(
-            sessions
-                .write("0000000000000001", &caller(7, 2), Write::Input)
-                .is_err()
-        );
-        assert!(
-            sessions
-                .write("0000000000000001", &caller(8, 1), Write::Input)
-                .is_err()
-        );
-        assert!(
-            sessions
-                .write("0000000000000002", &owner, Write::Input)
-                .is_err()
-        );
-        assert!(
-            sessions
-                .write("0000000000000002", &owner, Write::Resize)
-                .is_ok()
-        );
-        assert!(
-            sessions
-                .write("0000000000000002", &owner, Write::Close)
-                .is_ok()
-        );
-        assert!(
-            sessions
-                .write("0000000000000002", &caller(7, 2), Write::Close)
-                .is_err()
-        );
-        assert!(sessions.read("0000000000000002", &caller(8, 2)).is_ok());
-        assert!(sessions.read("0000000000000001", &caller(8, 2)).is_err());
+        let id = "0000000000000001";
+        sessions.insert(id.into(), owner.clone()).unwrap();
+        sessions.created(id);
+        assert!(sessions.write(id, &owner).is_ok());
+        assert!(sessions.read(id, &owner).is_ok());
+        for stranger in [caller(7, 2), caller(8, 1), caller(8, 2)] {
+            assert!(sessions.write(id, &stranger).is_err());
+            assert!(sessions.read(id, &stranger).is_err());
+        }
     }
 
     #[test]
@@ -437,20 +304,18 @@ mod tests {
         let owner = caller(7, 1);
         let mut sessions = Sessions::default();
         let id = "0000000000000001";
-        sessions
-            .insert(id.into(), owner.clone(), Mode::Single)
-            .unwrap();
+        sessions.insert(id.into(), owner.clone()).unwrap();
         for _ in 0..5 {
             sessions.output(id, vec![b'x'; 128 * 1024]).unwrap();
         }
-        let replay = sessions.replay(id, &owner, 0, 0).unwrap();
+        let replay = sessions.replay(id, &owner, 0).unwrap();
         assert_eq!(replay.first, 1);
         assert_eq!(replay.chunks.len(), 5);
         assert_eq!(replay.head, 5);
         assert!(!replay.ended);
         assert!(sessions.end(id));
         assert!(!sessions.end(id));
-        assert!(sessions.replay(id, &owner, 5, 0).unwrap().ended);
+        assert!(sessions.replay(id, &owner, 5).unwrap().ended);
         assert!(sessions.output(id, vec![0]).is_err());
     }
 
@@ -459,11 +324,9 @@ mod tests {
         let owner = caller(7, 1);
         let mut sessions = Sessions::default();
         let id = "0000000000000001";
-        sessions
-            .insert(id.into(), owner.clone(), Mode::Single)
-            .unwrap();
+        sessions.insert(id.into(), owner.clone()).unwrap();
         assert!(sessions.output(id, Vec::new()).is_err());
-        let replay = sessions.replay(id, &owner, 0, 0).unwrap();
+        let replay = sessions.replay(id, &owner, 0).unwrap();
         assert_eq!(replay.head, 0);
         assert!(replay.chunks.is_empty());
     }
@@ -474,18 +337,18 @@ mod tests {
         let mut sessions = Sessions::default();
         for number in 0..128 {
             sessions
-                .insert(format!("{number:016x}"), owner.clone(), Mode::Single)
+                .insert(format!("{number:016x}"), owner.clone())
                 .unwrap();
         }
         let ended = "0000000000000001";
         sessions.created(ended);
         assert!(sessions.end(ended));
         sessions
-            .insert("0000000000000080".into(), owner.clone(), Mode::Single)
+            .insert("0000000000000080".into(), owner.clone())
             .unwrap();
-        assert!(sessions.replay(ended, &owner, 0, 0).unwrap().ended);
-        assert!(sessions.replay("0000000000000000", &owner, 0, 0).is_ok());
-        assert!(sessions.replay("0000000000000080", &owner, 1, 0).is_err());
+        assert!(sessions.replay(ended, &owner, 0).unwrap().ended);
+        assert!(sessions.replay("0000000000000000", &owner, 0).is_ok());
+        assert!(sessions.replay("0000000000000080", &owner, 1).is_err());
     }
 
     struct PtyProvider;
@@ -543,9 +406,7 @@ mod tests {
         let mut sessions = Sessions::default();
         let owner = caller(7, 1);
         let session = "0000000000000001".to_string();
-        sessions
-            .insert(session.clone(), owner.clone(), Mode::Single)
-            .unwrap();
+        sessions.insert(session.clone(), owner.clone()).unwrap();
         sessions.cancel_create(&session);
         engine
             .dispatch(wire::Command::TermCreate(wire::Create {
@@ -571,7 +432,7 @@ mod tests {
             Effect::Changed(session.clone())
         );
         assert_eq!(engine.live(), 0);
-        assert!(sessions.replay(&session, &owner, 0, 0).unwrap().ended);
+        assert!(sessions.replay(&session, &owner, 0).unwrap().ended);
         assert!(!directory.path().join(session).exists());
     }
 
@@ -589,9 +450,7 @@ mod tests {
         let mut sessions = Sessions::default();
         for number in 0..32 {
             let session = format!("{number:016x}");
-            sessions
-                .insert(session.clone(), owner.clone(), Mode::Single)
-                .unwrap();
+            sessions.insert(session.clone(), owner.clone()).unwrap();
             engine
                 .dispatch(wire::Command::TermCreate(wire::Create {
                     session: session.clone(),
@@ -609,7 +468,7 @@ mod tests {
                     reason: wire::Refusal::UnknownProvider
                 }
             );
-            assert!(sessions.replay(&session, &owner, 0, 0).unwrap().ended);
+            assert!(sessions.replay(&session, &owner, 0).unwrap().ended);
         }
         assert_eq!(engine.live(), 0);
     }
@@ -621,9 +480,7 @@ mod tests {
         let ended = "0000000000000001";
         let active = "0000000000000002";
         for session in [ended, active] {
-            sessions
-                .insert(session.into(), owner.clone(), Mode::Single)
-                .unwrap();
+            sessions.insert(session.into(), owner.clone()).unwrap();
             sessions.created(session);
         }
         sessions.end(ended);
@@ -636,14 +493,8 @@ mod tests {
                 .unwrap(),
             Effect::None
         );
-        assert!(sessions.write(active, &owner, Write::Input).is_ok());
-        assert!(
-            sessions
-                .replay(ended, &owner, 0, 0)
-                .unwrap()
-                .chunks
-                .is_empty()
-        );
+        assert!(sessions.write(active, &owner).is_ok());
+        assert!(sessions.replay(ended, &owner, 0).unwrap().chunks.is_empty());
     }
 
     #[test]
@@ -651,9 +502,7 @@ mod tests {
         let mut sessions = Sessions::default();
         let owner = caller(7, 1);
         let session = "0000000000000001".to_string();
-        sessions
-            .insert(session.clone(), owner.clone(), Mode::Single)
-            .unwrap();
+        sessions.insert(session.clone(), owner.clone()).unwrap();
         sessions.cancel_create(&session);
         let output = wire::Event::TermOutput {
             session: session.clone(),
@@ -671,7 +520,7 @@ mod tests {
                 .unwrap(),
             Effect::Close(session.clone())
         );
-        assert!(sessions.write(&session, &owner, Write::Input).is_err());
+        assert!(sessions.write(&session, &owner).is_err());
         assert_eq!(
             sessions
                 .on_engine(wire::Event::TermEnded {
@@ -688,77 +537,34 @@ mod tests {
                 .unwrap(),
             Effect::None
         );
-        let replay = sessions.replay(&session, &owner, 0, 0).unwrap();
+        let replay = sessions.replay(&session, &owner, 0).unwrap();
         assert!(replay.ended);
         assert_eq!(replay.chunks[0].bytes, b"hi");
     }
 
     /// The resume point is found by binary search, which is only correct while
-    /// both queues stay sorted by a strictly increasing sequence. Resuming from
+    /// the queue stays sorted by a strictly increasing sequence. Resuming from
     /// every cursor a reader can hold must return exactly the tail after it.
     #[test]
     fn every_resume_cursor_returns_exactly_the_tail_after_it() {
         let owner = caller(7, 1);
-        let author = chat::Party::Account(7);
         let mut sessions = Sessions::default();
         let id = "0000000000000001";
-        sessions
-            .insert(id.into(), owner.clone(), Mode::Shared)
-            .unwrap();
+        sessions.insert(id.into(), owner.clone()).unwrap();
         sessions.created(id);
         for _ in 0..512 {
             sessions.output(id, vec![7]).unwrap();
         }
-        // Committed pages advance the command cursor in three batches, so the
-        // command queue is built the way a live shared session builds it.
-        for page in 0..3u64 {
-            let views: Vec<_> = (1..=4)
-                .map(|offset| command_view(page * 4 + offset, &author))
-                .collect();
-            sessions.commands(id, &owner, &author, &views).unwrap();
-        }
-        let full = sessions.replay(id, &owner, 0, 0).unwrap();
+        let full = sessions.replay(id, &owner, 0).unwrap();
         assert_eq!(full.chunks.len(), 512);
         assert_eq!(full.head, 512);
-        assert_eq!(full.commands.len(), 12);
-        assert_eq!(full.command_head, 12);
         for after in 0..=512u64 {
-            let page = sessions.replay(id, &owner, after, 0).unwrap();
+            let page = sessions.replay(id, &owner, after).unwrap();
             let expected: Vec<u64> = (after + 1..=512).collect();
             let seqs: Vec<u64> = page.chunks.iter().map(|chunk| chunk.seq).collect();
             assert_eq!(seqs, expected, "output resume from {after}");
         }
-        for after_command in 0..=12u64 {
-            let page = sessions.replay(id, &owner, 0, after_command).unwrap();
-            let expected: Vec<u64> = (after_command + 1..=12).collect();
-            let seqs: Vec<u64> = page.commands.iter().map(|command| command.seq).collect();
-            assert_eq!(seqs, expected, "command resume from {after_command}");
-        }
-        assert!(sessions.replay(id, &owner, 513, 0).is_err());
-        assert!(sessions.replay(id, &owner, 0, 13).is_err());
-    }
-
-    fn command_view(seq: u64, author: &chat::Party) -> chat::MessageView {
-        chat::MessageView {
-            channel_id: crate::consensus::session_channel("0000000000000001"),
-            seq,
-            head: chat::MessageHead {
-                message_id: format!("m{seq}"),
-                origin: sdk::Origin::Program(7),
-                content_origin: sdk::Origin::Program(7),
-                author: author.clone(),
-                revision: 1,
-                blocks: vec![chat::Block::Paragraph(vec![chat::Span::plain("echo hi")])],
-                created_at: 0,
-                rev: 0,
-                edited_at: None,
-                base_rev: None,
-                deleted: false,
-                thread: None,
-                reply_count: 0,
-                last_reply_seq: None,
-            },
-        }
+        assert!(sessions.replay(id, &owner, 513).is_err());
     }
 
     #[test]
@@ -766,14 +572,12 @@ mod tests {
         let owner = caller(7, 1);
         let mut sessions = Sessions::default();
         let id = "0000000000000001";
-        sessions
-            .insert(id.into(), owner.clone(), Mode::Single)
-            .unwrap();
+        sessions.insert(id.into(), owner.clone()).unwrap();
         sessions.created(id);
         for _ in 0..2048 {
             sessions.output(id, vec![1]).unwrap();
         }
-        let replay = sessions.replay(id, &owner, 0, 0).unwrap();
+        let replay = sessions.replay(id, &owner, 0).unwrap();
         assert_eq!(replay.chunks.len(), 2048);
         assert_eq!(replay.first, 1);
         assert_eq!(replay.head, 2048);
@@ -784,7 +588,7 @@ mod tests {
         let owner = caller(7, 1);
         let mut sessions = Sessions::default();
         let id = "0000000000000001";
-        sessions.insert(id.into(), owner, Mode::Single).unwrap();
+        sessions.insert(id.into(), owner).unwrap();
         sessions.cancel_create(id);
         assert_eq!(sessions.created(id), Created::Close);
         assert_eq!(sessions.created("0000000000000002"), Created::Close);

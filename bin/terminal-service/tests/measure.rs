@@ -10,7 +10,7 @@
 use agent_service::wire;
 use ducktape_terminal::{
     runtime::Runtime,
-    state::{Caller, Mode, Sessions},
+    state::{Caller, Sessions},
 };
 use std::{collections::BTreeMap, time::Instant};
 
@@ -63,7 +63,7 @@ fn distribution(mut samples: Vec<u64>) -> (u64, u64, u64) {
 
 fn filled(chunks: u64, size: usize) -> Sessions {
     let mut sessions = Sessions::default();
-    sessions.insert(ID.into(), owner(), Mode::Single).expect("insert");
+    sessions.insert(ID.into(), owner()).expect("insert");
     sessions.created(ID);
     for _ in 0..chunks {
         sessions.output(ID, vec![b'x'; size]).expect("output");
@@ -85,12 +85,15 @@ fn caught_up_reader_poll_cost_by_history_depth() {
         let mut samples = Vec::with_capacity(PROBES);
         for _ in 0..PROBES {
             let start = Instant::now();
-            let replay = sessions.replay(ID, &owner(), depth, 0).expect("replay");
+            let replay = sessions.replay(ID, &owner(), depth).expect("replay");
             samples.push(start.elapsed().as_nanos() as u64);
             assert!(replay.chunks.is_empty(), "a caught-up reader ships nothing");
         }
         let (p50, p95, p99) = distribution(samples);
-        println!("{depth}\t{p50}\t{p95}\t{p99}\t{:.3}", p50 as f64 / depth as f64);
+        println!(
+            "{depth}\t{p50}\t{p95}\t{p99}\t{:.3}",
+            p50 as f64 / depth as f64
+        );
     }
 }
 
@@ -104,12 +107,12 @@ fn streaming_reader_total_cost_by_stream_length() {
     println!("chunks\ttotal_ms\tus_per_chunk\tretained_kib\trss_kib\tpeak_kib");
     for chunks in [1_000u64, 4_000, 16_000, 64_000] {
         let mut sessions = Sessions::default();
-        sessions.insert(ID.into(), owner(), Mode::Single).expect("insert");
+        sessions.insert(ID.into(), owner()).expect("insert");
         sessions.created(ID);
         let start = Instant::now();
         for sequence in 0..chunks {
             sessions.output(ID, vec![b'x'; 64]).expect("output");
-            let page = sessions.replay(ID, &owner(), sequence, 0).expect("replay");
+            let page = sessions.replay(ID, &owner(), sequence).expect("replay");
             assert_eq!(page.chunks.len(), 1, "one chunk per wake-up");
         }
         let elapsed = start.elapsed();
@@ -130,7 +133,9 @@ fn streaming_reader_total_cost_by_stream_length() {
 #[ignore = "measurement harness"]
 fn retained_bytes_and_end_of_session_release() {
     println!("== retention ==");
-    println!("chunks\tchunk_bytes\tstream_mib\trss_after_kib\trss_after_end_kib\trss_after_drop_kib");
+    println!(
+        "chunks\tchunk_bytes\tstream_mib\trss_after_kib\trss_after_end_kib\trss_after_drop_kib"
+    );
     for (chunks, size) in [(16_000u64, 1_024usize), (16_000, 8_192), (4_000, 65_536)] {
         let base = memory().0;
         let mut sessions = filled(chunks, size);
@@ -221,7 +226,6 @@ fn session_churn_cleanup_and_residue() {
             service
                 .create(
                     owner(),
-                    Mode::Single,
                     wire::Create {
                         session: session.clone(),
                         provider: "echo".into(),
@@ -240,7 +244,7 @@ fn session_churn_cleanup_and_residue() {
             // Wait on the session's own end, never on a timer.
             let mut changes = service.changes();
             while !service
-                .replay(session.clone(), owner(), 0, 0)
+                .replay(session.clone(), owner(), 0)
                 .await
                 .expect("replay")
                 .ended
@@ -254,7 +258,9 @@ fn session_churn_cleanup_and_residue() {
             rss.saturating_sub(base_rss),
             threads() as i64 - base_threads as i64,
             open_descriptors() as i64 - base_fds as i64,
-            std::fs::read_dir(directory.path()).expect("workdir listing").count()
+            std::fs::read_dir(directory.path())
+                .expect("workdir listing")
+                .count()
         );
         let (p50, p95, p99) = distribution(samples);
         println!("create+close round-trip us: p50={p50} p95={p95} p99={p99}");

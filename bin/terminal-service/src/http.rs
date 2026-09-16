@@ -1,7 +1,7 @@
 //! Gateway-attested attachment to service-owned terminal sessions.
 use crate::{
     runtime::Runtime,
-    state::{Caller, Mode, Replay},
+    state::{Caller, Replay},
 };
 use axum::{
     Json, Router,
@@ -14,10 +14,10 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use futures::{SinkExt as _, StreamExt as _};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use futures::{SinkExt as _, StreamExt as _};
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, watch};
 
@@ -162,7 +162,6 @@ async fn create(
         .runtime
         .create(
             owner,
-            Mode::Single,
             agent_service::wire::Create {
                 session: session.clone(),
                 provider: request.agent,
@@ -181,8 +180,6 @@ async fn create(
 struct Cursor {
     #[serde(default)]
     after: u64,
-    #[serde(default)]
-    after_command: u64,
 }
 
 async fn upgrade(
@@ -197,12 +194,7 @@ async fn upgrade(
     let changes = service.runtime.changes();
     let replay = service
         .runtime
-        .replay(
-            session.clone(),
-            owner.clone(),
-            cursor.after,
-            cursor.after_command,
-        )
+        .replay(session.clone(), owner.clone(), cursor.after)
         .await
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(ws
@@ -255,19 +247,13 @@ fn send(output: &mpsc::UnboundedSender<Message>, value: Value) -> Result<(), ()>
         .map_err(|_| ())
 }
 
-// Replay heads are snapshot bounds. Clients resume from the last frames they
-// consumed, not from these bounds before consuming the following frames.
+// A replay head is a snapshot bound. Clients resume from the last frame they
+// consumed, not from that bound before consuming the following frames.
 fn replay(output: &mpsc::UnboundedSender<Message>, snapshot: Replay) -> Result<Cursor, ()> {
     send(
         output,
-        json!({"event":"replay", "first":snapshot.first, "head":snapshot.head, "ended":snapshot.ended, "command_first":snapshot.command_first, "command_head":snapshot.command_head}),
+        json!({"event":"replay", "first":snapshot.first, "head":snapshot.head, "ended":snapshot.ended}),
     )?;
-    for command in snapshot.commands {
-        send(
-            output,
-            json!({"event":"command", "seq":command.seq, "origin":command.origin, "text":command.text}),
-        )?;
-    }
     for chunk in snapshot.chunks {
         send(
             output,
@@ -276,7 +262,6 @@ fn replay(output: &mpsc::UnboundedSender<Message>, snapshot: Replay) -> Result<C
     }
     Ok(Cursor {
         after: snapshot.head,
-        after_command: snapshot.command_head,
     })
 }
 
@@ -303,7 +288,7 @@ async fn attached(
             result = &mut writer => return result,
             changed = changes.changed() => {
                 changed.map_err(|_| ())?;
-                let snapshot = runtime.replay(session.clone(), owner.clone(), after.after, after.after_command).await.map_err(|_| ())?;
+                let snapshot = runtime.replay(session.clone(), owner.clone(), after.after).await.map_err(|_| ())?;
                 after = replay(&output, snapshot)?;
             }
             message = input.next() => {

@@ -44,7 +44,7 @@ async fn session_upgrade_requires_the_installed_gateway_route_and_caller() {
 
 use agent_service::wire;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use ducktape_terminal::state::{Caller, Mode};
+use ducktape_terminal::state::Caller;
 use futures::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
 use tokio_tungstenite::{
@@ -131,7 +131,6 @@ async fn gateway_attachment_replays_after_disconnect_and_explicit_close_ends_the
     runtime
         .create(
             owner.clone(),
-            Mode::Single,
             wire::Create {
                 session: session.clone(),
                 provider: "echo".into(),
@@ -216,7 +215,7 @@ async fn gateway_attachment_replays_after_disconnect_and_explicit_close_ends_the
     drop(socket);
     assert!(
         !runtime
-            .replay(session.clone(), owner.clone(), 0, 0)
+            .replay(session.clone(), owner.clone(), 0)
             .await
             .unwrap()
             .ended
@@ -320,6 +319,22 @@ async fn local_operator_creates_and_drives_a_service_owned_session() {
             .status(),
         403
     );
+    // A refused create answers the stable token and NOTHING else. The sentence
+    // that says why ("no provider serves …", a missing limit, a spawn error) is
+    // this host's own diagnosis: it reaches the unit's journal, never the
+    // caller.
+    let refused = client
+        .post(&url)
+        .headers(headers.clone())
+        .json(&json!({"agent":"absent"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 503);
+    assert_eq!(
+        refused.json::<Value>().await.unwrap(),
+        json!({"error": "unknown_provider"})
+    );
     let response = client
         .post(&url)
         .headers(headers.clone())
@@ -378,7 +393,7 @@ async fn local_operator_creates_and_drives_a_service_owned_session() {
     }
     assert!(
         runtime
-            .replay(session.into(), Caller::Operator { node: [1; 32] }, 0, 0)
+            .replay(session.into(), Caller::Operator { node: [1; 32] }, 0)
             .await
             .unwrap()
             .ended
@@ -392,11 +407,11 @@ async fn local_operator_creates_and_drives_a_service_owned_session() {
 
 #[tokio::test]
 async fn remote_create_rereads_work_policy_before_resolving_credentials() {
+    use provider_host::work_admission::{self, WorkAdmission};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use provider_host::work_admission::{self, WorkAdmission};
     let reads = Arc::new(AtomicUsize::new(0));
     let observed = reads.clone();
     let api = axum::Router::new().route(
@@ -482,7 +497,7 @@ async fn remote_create_rereads_work_policy_before_resolving_credentials() {
     let session = reply["session_id"].as_str().unwrap();
     assert!(
         !runtime
-            .replay(session.into(), Caller::Operator { node: [2; 32] }, 0, 0)
+            .replay(session.into(), Caller::Operator { node: [2; 32] }, 0)
             .await
             .unwrap()
             .ended

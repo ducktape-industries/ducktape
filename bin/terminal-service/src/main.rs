@@ -117,8 +117,54 @@ struct Config {
 
 type Error = Box<dyn std::error::Error>;
 
+/// Install the process log sink: `tracing` events to stderr, which the unit
+/// captures into the journal. Without it the whole session engine — every
+/// refusal, every teardown, every `ducktape::term` line — goes nowhere, and an
+/// operator reading `journalctl -u ducktape-application-terminal` sees an empty
+/// unit while the service answers a create with a bare token.
+///
+/// RUST_LOG *adds to* the `info` floor rather than replacing it: with
+/// `EnvFilter`'s own default, a bare `RUST_LOG=ducktape::term=debug` would turn
+/// every other event OFF while appearing to turn one plane UP.
+///
+/// The directives are parsed STRICTLY. `EnvFilter::new` SKIPS a malformed
+/// directive and carries on, so a typo'd `ducktape:term=debug` would look like
+/// it worked: no plane, no error, no clue. A bad RUST_LOG falls back to the
+/// default filter and says so, once there is a subscriber to say it through.
+fn install_tracing() {
+    let env = std::env::var("RUST_LOG").unwrap_or_default();
+    let directives = match env.is_empty() {
+        true => "info".to_string(),
+        false => format!("info,{env}"),
+    };
+    let (filter, bad_env) = match tracing_subscriber::EnvFilter::builder().parse(&directives) {
+        Ok(filter) => (filter, None),
+        Err(error) => (
+            tracing_subscriber::EnvFilter::new("info"),
+            Some(error.to_string()),
+        ),
+    };
+    // colour only for a human at a terminal: the deployed sink is the journal,
+    // where escape codes are noise in every grep.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(interactive)
+        .with_env_filter(filter)
+        .init();
+    if let Some(error) = bad_env {
+        tracing::warn!(
+            target: "ducktape::term",
+            reason = "malformed_rust_log",
+            error,
+            "RUST_LOG is malformed — ignored, running at the default filter"
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    install_tracing();
     let directory = PathBuf::from(
         std::env::var_os("CREDENTIALS_DIRECTORY").ok_or("missing credentials directory")?,
     );
