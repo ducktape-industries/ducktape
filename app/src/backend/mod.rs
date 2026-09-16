@@ -28,7 +28,7 @@ pub use ::chat::client::{
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.
 #[cfg(test)]
-pub use ::chat::client::{BoundAccount, ChatMessage, author_name, paragraph_blocks};
+pub use ::chat::client::{ChatMessage, author_name, paragraph_blocks};
 pub use inbox::client::{BellDelta, BellItem};
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 /// How many one-second polls the provisioning screen waits before it says the

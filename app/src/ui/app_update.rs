@@ -679,7 +679,7 @@ impl Ducktape {
         self.active_channel_archived = false;
         self.active_channel_members_only = false;
         self.channel_members = Vec::new();
-        self.post_refusal = "".to_owned();
+
         self.page_route = "".to_owned();
         self.palette_search_phase = SearchPhase::Idle;
         self.error = "".to_owned();
@@ -764,12 +764,7 @@ impl Ducktape {
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
         self.channel_members = next.channel_members.clone();
-        self.post_refusal = crate::backend::post_gate(
-            self.active_channel_archived,
-            self.active_channel_members_only,
-            self.channel_members.clone(),
-            self.settings_user_key.to_owned(),
-        );
+
         self.connected = true;
         self.loading = false;
         self.mutation_phase = MutationPhase::Idle;
@@ -1004,7 +999,6 @@ impl Ducktape {
                     next.chat.clone(),
                     self.channels.clone(),
                     self.channel_members.clone(),
-                    self.settings_user_key.to_owned(),
                     self.active_channel.to_owned(),
                     self.active_channel_name.to_owned(),
                     self.active_channel_archived,
@@ -1016,7 +1010,7 @@ impl Ducktape {
                 self.active_channel_name = folded_chat.active_channel_name.to_owned();
                 self.active_channel_archived = folded_chat.active_channel_archived;
                 self.active_channel_members_only = folded_chat.active_channel_members_only;
-                self.post_refusal = folded_chat.post_refusal.to_owned();
+
                 if !folded_chat.refresh_chat {
                     return Task::none();
                 }
@@ -1310,12 +1304,7 @@ impl Ducktape {
             next.channel_members.clone(),
             ::std::mem::take(&mut self.channel_members),
         );
-        self.post_refusal = crate::backend::post_gate(
-            self.active_channel_archived,
-            self.active_channel_members_only,
-            self.channel_members.clone(),
-            self.settings_user_key.to_owned(),
-        );
+
         self.mutation_phase = crate::backend::mutation_phase_after_recovery(self.mutation_phase);
         self.error = "".to_owned();
         crate::shell::close::<AppMessage>(crate::backend::window_target_unless(
@@ -2348,12 +2337,7 @@ impl Ducktape {
         self.settings_key_path = next.key_path.to_owned();
         self.settings_key_state = next.key_state.to_owned();
         self.settings_user_key = next.user_key.to_owned();
-        self.post_refusal = crate::backend::post_gate(
-            self.active_channel_archived,
-            self.active_channel_members_only,
-            self.channel_members.clone(),
-            self.settings_user_key.to_owned(),
-        );
+
         Task::none()
     }
     fn on_settings_failed(&mut self, cause: crate::backend::HydrationError) -> Task<AppMessage> {
@@ -3151,17 +3135,7 @@ impl Ducktape {
         self.active_channel_archived = next_channel.archived;
         self.active_channel_members_only = next_channel.members_only;
         self.channel_members = Vec::new();
-        let post_gate_known = !self.active_channel_members_only;
-        self.post_refusal = crate::backend::keep_str(
-            post_gate_known,
-            &(crate::backend::post_gate(
-                self.active_channel_archived,
-                self.active_channel_members_only,
-                self.channel_members.clone(),
-                self.settings_user_key.to_owned(),
-            )),
-            "",
-        );
+
         self.palette_open = false;
         self.account_qr_auth_generation = self.account_qr_auth_generation.wrapping_add(1);
         if let Some(previous_handle) = self.account_qr_auth_task.take() {
@@ -3222,17 +3196,7 @@ impl Ducktape {
         self.active_channel_archived = next_channel.archived;
         self.active_channel_members_only = next_channel.members_only;
         self.channel_members = Vec::new();
-        let post_gate_known = !self.active_channel_members_only;
-        self.post_refusal = crate::backend::keep_str(
-            post_gate_known,
-            &(crate::backend::post_gate(
-                self.active_channel_archived,
-                self.active_channel_members_only,
-                self.channel_members.clone(),
-                self.settings_user_key.to_owned(),
-            )),
-            "",
-        );
+
         self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         self.loading = true;
@@ -3435,12 +3399,7 @@ impl Ducktape {
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
         self.channel_members = next.channel_members.clone();
-        self.post_refusal = crate::backend::post_gate(
-            self.active_channel_archived,
-            self.active_channel_members_only,
-            self.channel_members.clone(),
-            self.settings_user_key.to_owned(),
-        );
+
         self.loading = false;
         self.error = "".to_owned();
         crate::shell::close::<AppMessage>(crate::backend::window_target_unless(
@@ -4530,7 +4489,7 @@ impl Ducktape {
         self.active_channel_archived = false;
         self.active_channel_members_only = false;
         self.channel_members = Vec::new();
-        self.post_refusal = "".to_owned();
+
         self.page_route = "".to_owned();
         self.palette_draft = "".to_owned();
         self.palette_chat_hits = Vec::new();

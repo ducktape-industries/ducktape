@@ -308,7 +308,6 @@ fn switching_channels_paints_an_empty_loading_state_until_the_root_window_lands(
     // would otherwise wear the last room's badges.
     assert!(app.channel_members.is_empty(), "its member roll leaves");
     assert!(app.loading, "the selected room is fetching its record");
-    assert!(app.post_refusal.is_empty());
 }
 
 /// External account links are navigation requests; the view owns DM creation.
@@ -371,7 +370,6 @@ fn opening_a_search_hit_moves_the_room_on_the_click() {
     assert_eq!(app.active_channel_name, "design", "and so does the header");
     assert!(!app.active_channel_archived, "not general's badge");
     assert!(app.channel_members.is_empty(), "nor general's roll");
-    assert!(app.post_refusal.is_empty());
     assert_eq!(
         app.chat_land_seq, 7,
         "and the seq the hit named is what the view opens its window around"

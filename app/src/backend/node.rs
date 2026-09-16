@@ -55,12 +55,8 @@ pub struct SettingsFacts {
     pub key_state: String,
     /// This workspace's directory on this device — the Node overview's data dir.
     pub data_dir: String,
-    /// THE VIEWER'S OWN KEY, full hex — the `me` every membership test needs.
-    /// `ChatMember.key` carries the full key id, and the account card
-    /// carries an account NUMBER, not a key, so neither the account card nor
-    /// the node key can answer "is this row me". Empty on a device with no user
-    /// key, which `post_gate` reads as "not seated" — the honest answer when
-    /// there is no identity to seat.
+    /// The viewer's full public-key hex, or empty without a local user key.
+    /// Views resolve account membership from this key and the identity module.
     pub user_key: String,
 }
 

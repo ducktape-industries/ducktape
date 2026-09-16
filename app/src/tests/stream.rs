@@ -1,38 +1,5 @@
 use super::*;
 
-/// Native posting hints must follow every change to their inputs.
-/// Sidebar presentation is read and derived by the deployed Chat view.
-#[test]
-fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
-    const MIRRORS: [(&str, &[&str]); 1] = [(
-        "post_refusal",
-        &[
-            "channel_members",
-            "active_channel_archived",
-            "active_channel_members_only",
-            "settings_user_key",
-        ],
-    )];
-
-    for (mirror, sources) in MIRRORS {
-        let mut checked = 0;
-        for (handler, body) in handler_bodies() {
-            let moved = sources
-                .iter()
-                .any(|field| body.contains(&format!("self.{field}=")));
-            if !moved {
-                continue;
-            }
-            checked += 1;
-            assert!(
-                body.contains(&format!("self.{mirror}=")),
-                "{handler} moves a source without refreshing {mirror}"
-            );
-        }
-        assert!(checked > 0, "the sweep must see assignments for {mirror}");
-    }
-}
-
 #[test]
 fn history_windows_offer_a_jump_back_to_latest() {
     let (mut app, _) = Ducktape::boot();

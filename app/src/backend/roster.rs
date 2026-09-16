@@ -138,21 +138,6 @@ impl Drop for SeededNames {
     }
 }
 
-/// Whether the account or exact key represented by `me` holds a seat.
-pub(crate) fn seated_in(members: &[ChatMember], me: &str) -> bool {
-    let Ok(key) = hex_decode(me) else {
-        return false;
-    };
-    let names = names();
-    members.iter().any(|member| {
-        let handle = match member.key.starts_with("acct:") || member.key.starts_with("user:") {
-            true => member.key.clone(),
-            false => format!("user:{}", member.key),
-        };
-        names.owns_handle(&handle, &key)
-    })
-}
-
 /// Refresh the directory and nothing else — what a chat load does before it
 /// renders a row.
 pub(crate) async fn refresh_names(client: &RpcClient) -> Result<(), String> {

@@ -388,7 +388,6 @@ pub struct ChatLiveFold {
     pub active_channel_name: String,
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
-    pub post_refusal: String,
     /// A huddle roster change in the active channel needs the canonical roster
     /// read that a delta cannot derive.
     pub refresh_chat: bool,
@@ -453,7 +452,6 @@ pub fn fold_live_chat(
     deltas: Vec<ChatDelta>,
     channels: Vec<ChatChannel>,
     channel_members: Vec<ChatMember>,
-    me: String,
     active_channel: String,
     mut active_channel_name: String,
     mut active_channel_archived: bool,
@@ -519,22 +517,12 @@ pub fn fold_live_chat(
         active_channel_archived = channel.archived;
         active_channel_members_only = channel.members_only;
     }
-    let seated = seated_in(&channel_members, &me);
-    let post_refusal = if active_channel_archived {
-        "channel_archived".into()
-    } else if active_channel_members_only && !seated {
-        "members_only".into()
-    } else {
-        String::new()
-    };
-
     ChatLiveFold {
         channels,
         channel_members,
         active_channel_name,
         active_channel_archived,
         active_channel_members_only,
-        post_refusal,
         refresh_chat,
     }
 }
@@ -944,23 +932,4 @@ pub async fn refresh_name_directory(rpc: String, generation: i64) -> Result<i64,
         generation,
         message: user_error(message),
     })
-}
-
-/// Why the viewer may not post here, as a stable reason token — empty when
-/// she may. A members-only channel she is not seated in refuses her post; a
-/// seat is hers under any key of her account ([`seated_in`]).
-pub fn post_gate(
-    archived: bool,
-    members_only: bool,
-    members: Vec<ChatMember>,
-    me: String,
-) -> String {
-    if archived {
-        return "channel_archived".into();
-    }
-    let seated = seated_in(&members, &me);
-    if members_only && !seated {
-        return "members_only".into();
-    }
-    String::new()
 }
