@@ -345,3 +345,40 @@ fn request(
     };
     Ok(Some(bytes))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lease is what makes "one microphone, one call" true: it is the only
+    /// thing standing between a second panel, a replaced view or a switched
+    /// network and a second capture opened behind the first. Nothing here
+    /// opens a device — `acquire` is the gate, and the image resource is the
+    /// cheapest operation that takes it.
+    ///
+    /// `DEVICE_OWNER` is process-global on purpose (a device is), so this is
+    /// the one test in the crate that takes it.
+    #[test]
+    fn one_session_holds_the_devices_and_dropping_it_releases_them() {
+        let mut first = Devices::new();
+        first
+            .image()
+            .expect("the first session takes the device lease");
+        let mut second = Devices::new();
+        let refused = second
+            .image()
+            .expect_err("a second session cannot open the same devices");
+        assert!(
+            refused.contains("another active session"),
+            "refusal names the holder: {refused}"
+        );
+        first
+            .image()
+            .expect("the holder may open further resources on its own lease");
+
+        drop(first);
+        second
+            .image()
+            .expect("ending a session releases the devices for the next one");
+    }
+}

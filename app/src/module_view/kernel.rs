@@ -1080,8 +1080,14 @@ fn application_stream(guest: &mut Guest, id: u64, payload: &[u8]) {
                 max_frame_size: Some(MAX_STREAM_FRAME_BYTES),
                 ..Default::default()
             };
+            // A guest sends one whole application message per `net.send`, so
+            // Nagle has nothing to coalesce on this socket — it only holds a
+            // frame back until the previous one is acknowledged, adding a
+            // round trip to every frame on a long link. A view cannot reach a
+            // socket option and should not be able to; the bounded transport
+            // the host offers is where the property belongs.
             let (socket, _) =
-                tokio_tungstenite::connect_async_with_config(request, Some(config), false)
+                tokio_tungstenite::connect_async_with_config(request, Some(config), true)
                     .await
                     .map_err(|_| "application stream transport failed")?;
             Ok::<_, String>(socket)
