@@ -16,9 +16,10 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use futures::{SinkExt as _, StreamExt as _};
 use subtle::ConstantTimeEq;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{mpsc, watch};
 
 pub struct Route {
     pub account: u64,
@@ -28,7 +29,6 @@ struct Service {
     route: Route,
     token: [u8; 64],
     runtime: Runtime,
-    streams: Arc<Semaphore>,
 }
 
 pub fn router(route: Route, token: [u8; 64], runtime: Runtime) -> Result<Router, String> {
@@ -39,7 +39,6 @@ pub fn router(route: Route, token: [u8; 64], runtime: Runtime) -> Result<Router,
         route,
         token,
         runtime,
-        streams: Arc::new(Semaphore::new(64)),
     });
     Ok(Router::new()
         .route("/sessions/{session}", get(upgrade))
@@ -98,11 +97,6 @@ async fn upgrade(
     ws: WebSocketUpgrade,
 ) -> Result<Response, StatusCode> {
     let owner = caller(&headers, &service.token, &service.route).ok_or(StatusCode::UNAUTHORIZED)?;
-    let permit = service
-        .streams
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     // Subscribe before the snapshot so output arriving during replay is observed.
     let changes = service.runtime.changes();
     let replay = service
@@ -116,10 +110,9 @@ async fn upgrade(
         .await
         .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(ws
-        .max_message_size(128 * 1024)
-        .max_frame_size(128 * 1024)
+        .max_message_size(usize::MAX)
+        .max_frame_size(usize::MAX)
         .on_upgrade(move |socket| async move {
-            let _permit = permit;
             let _ = attached(socket, &service.runtime, session, owner, replay, changes).await;
         }))
 }
@@ -160,29 +153,30 @@ async fn command(
     }
 }
 
-async fn send(socket: &mut WebSocket, value: Value) -> Result<(), ()> {
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        socket.send(Message::Text(value.to_string().into())),
-    )
-    .await
-    .map_err(|_| ())?
-    .map_err(|_| ())
+fn send(output: &mpsc::UnboundedSender<Message>, value: Value) -> Result<(), ()> {
+    output
+        .send(Message::Text(value.to_string().into()))
+        .map_err(|_| ())
 }
 
 // Replay heads are snapshot bounds. Clients resume from the last frames they
 // consumed, not from these bounds before consuming the following frames.
-async fn replay(socket: &mut WebSocket, snapshot: Replay) -> Result<Cursor, ()> {
-    send(socket, json!({"event":"replay", "first":snapshot.first, "head":snapshot.head, "ended":snapshot.ended, "command_first":snapshot.command_first, "command_head":snapshot.command_head})).await?;
+fn replay(output: &mpsc::UnboundedSender<Message>, snapshot: Replay) -> Result<Cursor, ()> {
+    send(
+        output,
+        json!({"event":"replay", "first":snapshot.first, "head":snapshot.head, "ended":snapshot.ended, "command_first":snapshot.command_first, "command_head":snapshot.command_head}),
+    )?;
     for command in snapshot.commands {
-        send(socket, json!({"event":"command", "seq":command.seq, "origin":command.origin, "text":command.text})).await?;
+        send(
+            output,
+            json!({"event":"command", "seq":command.seq, "origin":command.origin, "text":command.text}),
+        )?;
     }
     for chunk in snapshot.chunks {
         send(
-            socket,
+            output,
             json!({"event":"output", "seq":chunk.seq, "data_b64":STANDARD.encode(chunk.bytes)}),
-        )
-        .await?;
+        )?;
     }
     Ok(Cursor {
         after: snapshot.head,
@@ -191,27 +185,37 @@ async fn replay(socket: &mut WebSocket, snapshot: Replay) -> Result<Cursor, ()> 
 }
 
 async fn attached(
-    mut socket: WebSocket,
+    socket: WebSocket,
     runtime: &Runtime,
     session: String,
     owner: Caller,
     initial: Replay,
     mut changes: watch::Receiver<()>,
 ) -> Result<(), ()> {
-    let mut after = replay(&mut socket, initial).await?;
+    let (mut sink, mut input) = socket.split();
+    let (output, mut pending) = mpsc::unbounded_channel();
+    let writer = async move {
+        while let Some(message) = pending.recv().await {
+            sink.send(message).await.map_err(|_| ())?;
+        }
+        Ok(())
+    };
+    tokio::pin!(writer);
+    let mut after = replay(&output, initial)?;
     loop {
         tokio::select! {
+            result = &mut writer => return result,
             changed = changes.changed() => {
                 changed.map_err(|_| ())?;
                 let snapshot = runtime.replay(session.clone(), owner.clone(), after.after, after.after_command).await.map_err(|_| ())?;
-                after = replay(&mut socket, snapshot).await?;
+                after = replay(&output, snapshot)?;
             }
-            message = socket.recv() => {
+            message = input.next() => {
                 let Some(Ok(message)) = message else { return Ok(()); };
                 match message {
                     Message::Text(text) => {
                         let result = command(runtime, &session, &owner, text.as_bytes()).await;
-                        send(&mut socket, json!({"event":"result", "result":result})).await?;
+                        send(&output, json!({"event":"result", "result":result}))?;
                     }
                     Message::Close(_) => return Ok(()),
                     Message::Ping(_) | Message::Pong(_) => {},

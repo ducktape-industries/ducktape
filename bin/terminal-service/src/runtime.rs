@@ -12,7 +12,6 @@ use tokio::{
 };
 
 const LANE: usize = 64;
-const MAX_INPUT_BYTES: usize = 64 * 1024;
 type Reply = oneshot::Sender<Result<(), String>>;
 type CreateReply = oneshot::Sender<Result<oneshot::Sender<()>, String>>;
 
@@ -98,7 +97,7 @@ struct Machine {
 }
 
 impl Machine {
-    fn request(&mut self, request: Request, workers: usize) -> Vec<Action> {
+    fn request(&mut self, request: Request) -> Vec<Action> {
         match request {
             Request::Status {
                 session,
@@ -117,7 +116,7 @@ impl Machine {
                 mode,
                 spec,
                 reply,
-            } => self.create(caller, mode, spec, reply, workers),
+            } => self.create(caller, mode, spec, reply),
             Request::Drive {
                 session,
                 caller,
@@ -186,16 +185,9 @@ impl Machine {
         mode: Mode,
         spec: wire::Create,
         reply: CreateReply,
-        workers: usize,
     ) -> Vec<Action> {
         if reply.is_closed() {
             return Vec::new();
-        }
-        if workers >= LANE {
-            return vec![Action::CreateFailed(
-                reply,
-                "terminal worker capacity exhausted".into(),
-            )];
         }
         if let Err(error) = self.sessions.insert(spec.session.clone(), caller, mode) {
             return vec![Action::CreateFailed(reply, error)];
@@ -354,9 +346,6 @@ impl Runtime {
         caller: Caller,
         bytes: Vec<u8>,
     ) -> Result<(), String> {
-        if bytes.len() > MAX_INPUT_BYTES {
-            return Err("terminal input too large".into());
-        }
         let data_b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
         let command = wire::Command::TermInput {
             session: session.clone(),
@@ -591,12 +580,11 @@ async fn run(
     let mut creates = JoinSet::new();
     let mut closes = JoinSet::new();
     let result = loop {
-        let workers = creates.len() + closes.len();
         let creating = !creates.is_empty();
         let closing = !closes.is_empty();
         let actions = tokio::select! {
             request = requests.recv() => match request {
-                Some(request) => machine.request(request, workers),
+                Some(request) => machine.request(request),
                 None => break Ok(()),
             },
             event = events.recv() => match event {

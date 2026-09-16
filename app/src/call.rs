@@ -3,7 +3,7 @@
 
 use futures::{StreamExt as _, stream::BoxStream};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -14,6 +14,7 @@ pub(crate) const FRAME_SAMPLES: usize = 960;
 pub struct CallEvent {
     pub kind: String,
     pub message: String,
+    pub status: Option<String>,
     pub peers: Vec<CallPeer>,
     pub stage: String,
     pub tiles: Vec<String>,
@@ -36,17 +37,12 @@ pub struct CallPeer {
 }
 
 impl CallEvent {
-    #[cfg(test)]
-    fn of(kind: &str) -> Self {
-        Self {
-            kind: kind.into(),
-            ..Self::default()
-        }
-    }
     fn failed(kind: &str, message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
             kind: kind.into(),
-            message: message.into(),
+            status: Some(message.clone()),
+            message,
             ..Self::default()
         }
     }
@@ -429,59 +425,6 @@ fn audio_thread(
 // state folds — the flat handlers' arms live here
 // ============================================================================
 
-/// The status line after `event`: connecting → live (with the audio note
-/// folded in) → refused/error prose → closed.
-pub fn call_status_after(current: String, event: CallEvent) -> String {
-    match event.kind.as_str() {
-        "connecting" => "connecting".into(),
-        "live" if event.message.is_empty() => "live".into(),
-        "live" => format!("live · {}", event.message),
-        "refused" | "error" => event.message,
-        "closed" => "closed".into(),
-        _ => current,
-    }
-}
-
-/// One huddle tile with its mute and voice decisions already attached.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct HuddleTileRow {
-    pub person: crate::backend::HuddleParticipant,
-    pub muted: bool,
-    pub speaking: bool,
-}
-
-/// Tile rows prepared whenever the roster, call beacons, or local mute or
-/// voice gate moves.
-pub fn huddle_tile_rows(
-    roster: Vec<crate::backend::HuddleParticipant>,
-    peers: Vec<CallPeer>,
-    local_muted: bool,
-    local_speaking: bool,
-) -> Vec<HuddleTileRow> {
-    let muted_peers: BTreeSet<String> = peers
-        .iter()
-        .filter(|peer| peer.muted)
-        .map(|peer| peer.peer.clone())
-        .collect();
-    let speaking_peers = speaking_peers(&peers);
-    roster
-        .into_iter()
-        .map(|person| HuddleTileRow {
-            muted: if person.is_you {
-                local_muted
-            } else {
-                muted_peers.contains(&person.node)
-            },
-            speaking: if person.is_you {
-                local_speaking
-            } else {
-                speaking_peers.contains(&person.node)
-            },
-            person,
-        })
-        .collect()
-}
-
 /// This side's voice gate after a session event: a `self` event carries the
 /// flip, a session start or end clears it, and every other event keeps it.
 pub fn call_speaking_after(current: bool, event: &CallEvent) -> bool {
@@ -490,16 +433,6 @@ pub fn call_speaking_after(current: bool, event: &CallEvent) -> bool {
         "connecting" | "closed" | "refused" | "error" => false,
         _ => current,
     }
-}
-
-/// The node keys of every peer whose beacon says they are talking — the
-/// shape the chat view lights its seats from.
-pub fn speaking_peers(peers: &[CallPeer]) -> Vec<String> {
-    peers
-        .iter()
-        .filter(|peer| peer.speaking && !peer.muted)
-        .map(|peer| peer.peer.clone())
-        .collect()
 }
 
 #[cfg(test)]
@@ -551,56 +484,5 @@ mod tests {
         let mut empty = PlayoutRing::default();
         empty.drain_into(&mut out);
         assert_eq!(out, [0i16; 4]);
-    }
-
-    #[test]
-    fn status_and_peer_folds() {
-        assert_eq!(
-            call_status_after("".into(), CallEvent::of("connecting")),
-            "connecting"
-        );
-        assert_eq!(call_status_after("x".into(), CallEvent::of("live")), "live");
-        let mut live = CallEvent::of("live");
-        live.message = "no microphone".into();
-        assert_eq!(call_status_after("x".into(), live), "live · no microphone");
-        assert_eq!(
-            call_status_after("live".into(), CallEvent::failed("refused", "nope")),
-            "nope"
-        );
-
-        let peers = vec![
-            CallPeer {
-                peer: "aa".into(),
-                muted: false,
-                ..Default::default()
-            },
-            CallPeer {
-                peer: "bb".into(),
-                muted: true,
-                ..Default::default()
-            },
-        ];
-        let participant = |node: &str, is_you: bool| crate::backend::HuddleParticipant {
-            key: node.into(),
-            label: node.into(),
-            initials: node.into(),
-            is_agent: false,
-            is_you,
-            joined_at: 0,
-            node: node.into(),
-        };
-        let rows = huddle_tile_rows(
-            vec![
-                participant("aa", false),
-                participant("bb", false),
-                participant("cc", true),
-            ],
-            peers,
-            true,
-            false,
-        );
-        assert!(!rows[0].muted);
-        assert!(rows[1].muted);
-        assert!(rows[2].muted, "the local tile reads the local mute");
     }
 }

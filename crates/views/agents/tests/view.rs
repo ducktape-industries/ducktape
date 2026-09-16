@@ -4,7 +4,7 @@
 //! `rpc.live` hit, and a pause or a save leaves as `op.submit`. Only the
 //! navigation intents still leave as notifications.
 
-use agents_view::host::{OpenLink, OpenRun, Session};
+use agents_view::host::{OpenLink, Session};
 use agents_view::{boot_native, tick_native};
 use ducktape_view_guest::testing::{answer, has_text, item, pick, press, texts, toggle, type_into};
 use ducktape_view_guest::wire::{Event, Frame, Node, Request};
@@ -545,14 +545,7 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
     assert!(frame.requests.is_empty(), "{:?}", frame.requests);
 
     let frame = tick_native(press(&frame, "run-gone"));
-    let intent = request(&frame, "agents.open_run");
-    assert_eq!(
-        serde_json::from_slice::<OpenRun>(&intent.payload).expect("decodes"),
-        OpenRun {
-            dispatch_id: "dispatch-gone".into()
-        },
-        "the other tabs follow the reader's press"
-    );
+    assert!(!frame.requests.iter().any(|r| r.kind == "agents.open_run"));
     // Answer the subscription requests before a tab-only redraw.
     let (frame, _) = settle(frame);
     assert!(!has_text(&frame, "Dispatched"));
@@ -596,16 +589,15 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
         texts(&frame)
     );
 
-    // closing tells the app to stop reading it
+    // Closing is local to the view and retires its run subscriptions.
     let frame = tick_native(press(&frame, "Close run"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "agents.open_run");
-    assert_eq!(
-        serde_json::from_slice::<OpenRun>(&intent.payload).expect("decodes"),
-        OpenRun {
-            dispatch_id: String::new()
-        }
+    assert!(
+        !frame
+            .requests
+            .iter()
+            .any(|request| request.kind == "agents.open_run")
     );
+    assert!(!has_text(&frame, "Close run"));
 }
 
 /// The journal's places draw as chips: one with an address opens through

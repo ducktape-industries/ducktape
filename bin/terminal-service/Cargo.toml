@@ -9,6 +9,7 @@ gateway.workspace = true
 ducktape-rpc.workspace = true
 chat.workspace = true
 sdk.workspace = true
+futures.workspace = true
 serde.workspace = true
 base64.workspace = true
 axum = { version = "0.8", features = ["ws"] }
@@ -24,4 +25,3 @@ tokio = { workspace = true, features = ["process"] }
 tempfile.workspace = true
 async-trait.workspace = true
 tokio-tungstenite = "0.24"
-futures.workspace = true

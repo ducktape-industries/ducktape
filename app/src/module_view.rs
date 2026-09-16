@@ -51,12 +51,8 @@ pub struct ModuleViewEvent {
     pub detail: String,
 }
 
-/// What one call into a view may spend: about a 60 Hz frame of
-/// instructions, and a wall-clock deadline for the time an import takes
-/// that fuel cannot see.
+/// Instruction budget for one call into a view.
 const FUEL_PER_TICK: u64 = 100_000_000;
-const TICK_DEADLINE: Duration = Duration::from_millis(100);
-const EPOCH_TICK: Duration = Duration::from_millis(10);
 const MEMORY_LIMIT: usize = 64 << 20;
 const MAX_MODULE_BYTES: u64 = 64 << 20;
 /// A frame the view sends past this ends it: nothing a screen needs is
@@ -124,8 +120,7 @@ pub fn members_view(dark: bool, connected: bool, admin: bool) -> ViewSpec {
 /// save leaves as `op.submit`, signed here with the seated key.
 ///
 /// What still comes back as an intent: `badge` (how many of its agents are
-/// working — the rail's pulse), `open_run` (`dispatch_id`, "" to
-/// close) and `open_link` (`url`, a chip's duck:// address).
+/// working — the rail's pulse) and `open_link` (`url`, a chip's duck:// address).
 pub fn agents_view(
     dark: bool,
     connected: bool,
@@ -145,7 +140,6 @@ pub fn agents_view(
 
 pub fn agents_intent(event: &ModuleViewEvent) -> crate::AgentsIntent {
     match event.kind.as_str() {
-        "open_run" => crate::AgentsIntent::OpenRun,
         "open_link" => crate::AgentsIntent::OpenLink,
         _ => crate::AgentsIntent::Badge,
     }
@@ -491,9 +485,8 @@ struct ChatProps<'a> {
     call_peers: &'a [crate::call::CallPeer],
     shift_held: bool,
     copy_chord_serial: i64,
-    /// THIS ROOM'S runs only, as hints: the reading is taken for the whole
-    /// node and cut to `active_channel` on the way out.
-    live_agents: Vec<crate::backend::LiveRunHint>,
+    /// Run observations; the guest selects the room and presentation.
+    live_agents: &'a [crate::backend::LiveAgentRow],
 }
 
 /// The Chat tab, drawn by the `chat` view over the KERNEL CONTRACT: the app
@@ -506,7 +499,6 @@ struct ChatProps<'a> {
 /// or owns: the room to open (`duck://` links, notifications, the tray), the
 /// huddle, a link or a copy, a run to stop or open, and the seed for the edit
 /// The guest owns its editor documents and product actions.
-
 pub fn chat_view(
     dark: bool,
     connected: bool,
@@ -563,10 +555,7 @@ pub fn chat_view(
         call_peers,
         shift_held,
         copy_chord_serial,
-        // THIS IS THE ONLY PLACE A RUN IS MATCHED TO A ROOM: the reading
-        // covers the whole node, so a row from a room the reader left cannot
-        // reach the screen no matter which handler moved `active_channel`.
-        live_agents: live_agents_within(live_agents, active_channel, LIVE_AGENT_TEXT_BUDGET),
+        live_agents,
     };
     module_view("chat", serde_json::to_vec(&props).expect("props encode"))
 }
@@ -581,64 +570,19 @@ fn reader_handle(account_number: &str, user_key: &str) -> String {
     }
 }
 
-/// Bytes the live agent cards may take on one frame. The wire spends 64 KiB
-/// of text per frame and EMPTIES whatever comes after; the cards draw inside
-/// the stream, so this ceiling is what keeps a room with a great many runs in
-/// flight from blanking the messages they sit under.
-const LIVE_AGENT_TEXT_BUDGET: usize = 6 << 10;
-
-/// The bytes a live run hint puts on the wire as text.
-fn live_text_bytes(hint: &crate::backend::LiveRunHint) -> usize {
-    let activity: usize = hint.activity.iter().map(|act| act.label.len()).sum();
-    hint.agent.len() + hint.status.len() + activity + hint.answer_preview.len()
-}
-
-/// The runs anchored in `channel_id` whose hints fit `budget`, newest anchor
-/// kept first — those are the ones at the tail the reader is looking at — and
-/// handed back in anchor order so the list does not churn the guest's timeline
-/// memo when two runs start in the same poll.
-fn live_agents_within(
-    rows: &[crate::backend::LiveAgentRow],
-    channel_id: &str,
-    budget: usize,
-) -> Vec<crate::backend::LiveRunHint> {
-    let mut here: Vec<crate::backend::LiveRunHint> = rows
-        .iter()
-        .filter(|row| row.channel_id == channel_id)
-        .map(crate::backend::LiveRunHint::from)
-        .collect();
-    here.sort_by_key(|hint| std::cmp::Reverse(hint.anchor_seq));
-    let mut spent = 0;
-    let mut kept = Vec::new();
-    for hint in here {
-        let cost = live_text_bytes(&hint);
-        if spent + cost > budget {
-            break;
-        }
-        spent += cost;
-        kept.push(hint);
-    }
-    kept.sort_by_key(|hint| hint.anchor_seq);
-    kept
-}
-
 /// The act a chat intent names. The door ([`intents_of`]) refuses every kind
 /// this does not list, so the wildcard is unreachable in practice; it verdicts
-/// the link copy, whose handler refuses an empty link.
+/// the link handler, which refuses an empty address.
 pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
     use crate::ChatIntent as Intent;
     match event.kind.as_str() {
-        "open_hit" => Intent::OpenHit,
-        "choose_channel" => Intent::ChooseChannel,
         "show_huddle" => Intent::ShowHuddle,
         "leave_huddle" => Intent::LeaveHuddle,
         "join_huddle" => Intent::JoinHuddle,
         "join_voice" => Intent::JoinVoice,
         "open_link" => Intent::OpenLink,
         "copy" => Intent::Copy,
-        "copy_link" => Intent::CopyLink,
-        "open_run" => Intent::OpenRun,
-        _ => Intent::CopyLink,
+        _ => Intent::OpenLink,
     }
 }
 
@@ -712,8 +656,8 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         // members speaks it too; `copy` is the clipboard door, not a write
         "members" => &["copy"],
         // the agents view speaks the kernel contract: pause, save,
-        // and registration use `op.submit`; `open_run`/`open_link` navigate other tabs.
-        "agents" => &["open_run", "open_link"],
+        // and registration use `op.submit`; links navigate other tabs.
+        "agents" => &["open_link"],
         // the node view speaks the kernel contract: it reads the node's own
         // status, peers, registry and log ring itself and retunes the live
         // tracing filter through `rpc.admin`. `copy` is the clipboard door.
@@ -723,17 +667,14 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         "explorer" => &["copy"],
         // the chat view reads its own room and signs its own writes; what is
         // left at the door is what another plane of the app steers or owns
+        "call" => &["mute", "camera", "screen", "channel", "leave"],
         "chat" => &[
-            "open_hit",
-            "choose_channel",
             "show_huddle",
             "leave_huddle",
             "join_huddle",
             "join_voice",
             "open_link",
             "copy",
-            "copy_link",
-            "open_run",
         ],
         // the forge view reads, folds and writes through the kernel: what is
         // left at the door is the two OS doors.
@@ -2132,7 +2073,6 @@ fn engine() -> &'static Engine {
         let mut config = Config::new();
         config.cranelift_opt_level(OptLevel::Speed);
         config.consume_fuel(true);
-        config.epoch_interruption(true);
         match crate::backend::cache_dir() {
             Ok(directory) => {
                 let mut cache = CacheConfig::new();
@@ -2146,25 +2086,13 @@ fn engine() -> &'static Engine {
             }
             Err(error) => tracing::warn!(reason = "view_cache_directory_unavailable", %error),
         }
-        let engine = Engine::new(&config).expect("wasmtime engine");
-        // The clock every tick's deadline is measured against: one thread
-        // for the process, never stopped.
-        let ticking = engine.clone();
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(EPOCH_TICK);
-                ticking.increment_epoch();
-            }
-        });
-        engine
+        Engine::new(&config).expect("wasmtime engine")
     })
 }
 
-/// What one call into the view may spend: instructions, and time.
+/// Reset the instruction allowance before entering the guest.
 fn arm(store: &mut Store<HostState>) {
     let _ = store.set_fuel(FUEL_PER_TICK);
-    let epochs = TICK_DEADLINE.as_nanos().div_ceil(EPOCH_TICK.as_nanos()) as u64;
-    store.set_epoch_deadline(epochs);
 }
 
 impl Guest {
@@ -2592,7 +2520,6 @@ impl Guest {
             },
         );
         store.limiter(|state| &mut state.limits);
-        store.epoch_deadline_trap();
         // The `ice:view` world's one import is the panic hook's; anything
         // else the component asks for traps if it is ever called.
         let mut linker = Linker::<HostState>::new(engine);
@@ -3095,9 +3022,6 @@ fn panic_message(store: &mut Store<HostState>) -> Option<String> {
 /// Why a call failed: the trap itself, not the wrapper and backtrace
 /// wasmtime prints around it.
 fn first_line(error: &wasmtime::Error) -> String {
-    if let Some(wasmtime::Trap::Interrupt) = error.root_cause().downcast_ref::<wasmtime::Trap>() {
-        return format!("tick exceeded {} ms", TICK_DEADLINE.as_millis());
-    }
     error
         .root_cause()
         .to_string()
@@ -3557,7 +3481,6 @@ pub(crate) mod tests {
         let mut config = Config::new();
         config.cranelift_opt_level(OptLevel::Speed);
         config.consume_fuel(true);
-        config.epoch_interruption(true);
         let uncached = Engine::new(&config).unwrap();
         let before = Instant::now();
         let baseline = Component::new(&uncached, &bytes).expect("uncached compilation");
@@ -3654,15 +3577,16 @@ pub(crate) mod tests {
         assert_eq!(GENERIC_DOORS, ["open_link", "copy"]);
         assert_eq!(intents_of("members"), ["copy"]);
         // the agents view signs its own pause and save through `op.submit`
-        assert_eq!(intents_of("agents"), ["open_run", "open_link"]);
+        assert_eq!(intents_of("agents"), ["open_link"]);
         let chat = intents_of("chat");
-        assert_eq!(chat.len(), 10);
+        assert_eq!(chat.len(), 6);
         assert!(!chat.contains(&"scrolled"), "scrolling belongs to the view");
         // the writes the view signs for itself are nobody's intent
         for signed in ["react", "edit", "delete", "rename", "search", "mark_read"] {
             assert!(!chat.contains(&signed), "{signed} is an op.submit now");
         }
-        assert!(chat.contains(&"choose_channel"));
+        assert!(!chat.contains(&"choose_channel"));
+        assert!(!chat.contains(&"open_hit"));
         assert!(
             !chat.contains(&"cancel_run"),
             "run cancellation is guest-authored op.submit"
@@ -6418,7 +6342,7 @@ pub(crate) mod tests {
             call_peers: &[],
             shift_held: false,
             copy_chord_serial: 0,
-            live_agents: live_agents_within(live, room, LIVE_AGENT_TEXT_BUDGET),
+            live_agents: live,
         };
         Some(serde_json::to_vec(&props).expect("props encode"))
     }
@@ -6435,70 +6359,17 @@ pub(crate) mod tests {
         }
     }
 
-    /// ROOM ISOLATION, DECIDED BY THE HOST. A run lives in this process, not on
-    /// the chain, so it reaches the view as a session fact — and the reading
-    /// covers the WHOLE node. The room on screen is what picks rows out of it,
-    /// and it is picked at encode time, which is why no handler that moves
-    /// `active_channel` has to remember this lane exists. What the view then
-    /// DRAWS of a run — the door under its anchor, the card in its thread, and
-    /// Stop leaving as a cancel — is the view's own test.
     #[test]
-    fn the_room_on_screen_decides_which_of_the_nodes_runs_are_drawn() {
+    fn chat_facts_preserve_all_run_observations() {
         let reading = [
-            live_run("channel-a", "Chief Duck", "Reading the repo"),
-            live_run("channel-b", "Ops Duck", "Draining the queue"),
+            live_run("channel-a", "Chief Duck", &"x".repeat(20_000)),
+            live_run("channel-b", "Ops Duck", "Working"),
         ];
-
-        let here =
-            String::from_utf8(chat_facts_in("channel-a", 0, &reading).expect("props encode"))
-                .unwrap();
-        assert!(here.contains("Chief Duck"), "this room's run is missing");
-        assert!(
-            !here.contains("Ops Duck"),
-            "another room's run crossed to the view: {here}"
-        );
-
-        let there =
-            String::from_utf8(chat_facts_in("channel-b", 0, &reading).expect("props encode"))
-                .unwrap();
-        assert!(there.contains("Ops Duck"), "that room's run is missing");
-        assert!(
-            !there.contains("Chief Duck"),
-            "the room she left kept its run on the frame: {there}"
-        );
-    }
-
-    /// A room full of runs cannot blank the messages they sit under: the cards
-    /// spend [`LIVE_AGENT_TEXT_BUDGET`] and the newest anchors are the ones
-    /// kept, because those are the ones at the tail she is looking at.
-    #[test]
-    fn the_live_cards_are_held_to_their_slice_of_the_frame_budget() {
-        let crowd: Vec<_> = (1..=60)
-            .map(|seq| crate::backend::LiveAgentRow {
-                channel_id: "channel-a".into(),
-                anchor_seq: seq,
-                run_id: format!("run-{seq}"),
-                agent: format!("agent-{seq}"),
-                status: "x".repeat(400),
-                ..Default::default()
-            })
-            .collect();
-        let kept = live_agents_within(&crowd, "channel-a", LIVE_AGENT_TEXT_BUDGET);
-        let spent: usize = kept.iter().map(live_text_bytes).sum();
-        assert!(
-            spent <= LIVE_AGENT_TEXT_BUDGET,
-            "{spent} bytes past the {LIVE_AGENT_TEXT_BUDGET} byte ceiling"
-        );
-        assert!(kept.len() < crowd.len(), "nothing was held back");
+        let bytes = chat_facts_in("channel-a", 0, &reading).unwrap();
+        let props: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
-            kept.last().map(|row| row.anchor_seq),
-            Some(60),
-            "the newest anchor is the one that must survive"
-        );
-        assert!(
-            kept.windows(2)
-                .all(|pair| pair[0].anchor_seq < pair[1].anchor_seq),
-            "the kept rows are handed back in anchor order"
+            props["live_agents"],
+            serde_json::to_value(&reading).unwrap()
         );
     }
 

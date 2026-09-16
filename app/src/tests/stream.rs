@@ -1,24 +1,18 @@
 use super::*;
 
-/// Native call rows and posting hints must follow every change to their inputs.
+/// Native posting hints must follow every change to their inputs.
 /// Sidebar presentation is read and derived by the deployed Chat view.
 #[test]
 fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
-    const MIRRORS: [(&str, &[&str]); 2] = [
-        (
-            "huddle_rows",
-            &["huddle_roster", "call_peers", "call_muted"],
-        ),
-        (
-            "post_refusal",
-            &[
-                "channel_members",
-                "active_channel_archived",
-                "active_channel_members_only",
-                "settings_user_key",
-            ],
-        ),
-    ];
+    const MIRRORS: [(&str, &[&str]); 1] = [(
+        "post_refusal",
+        &[
+            "channel_members",
+            "active_channel_archived",
+            "active_channel_members_only",
+            "settings_user_key",
+        ],
+    )];
 
     for (mirror, sources) in MIRRORS {
         let mut checked = 0;

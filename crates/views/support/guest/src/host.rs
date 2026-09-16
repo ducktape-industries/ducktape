@@ -207,6 +207,12 @@ pub(crate) fn fulfill(id: u64, answer: Answer, done: bool) {
     }
 }
 
+/// Return a background response and finish the session.
+pub fn finish_response(bytes: &[u8]) {
+    notify("host.emit", bytes);
+    notify("host.finish", &[]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

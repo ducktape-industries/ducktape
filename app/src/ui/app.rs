@@ -130,7 +130,6 @@ pub(crate) enum ForgeIntent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AgentsIntent {
     Badge,
-    OpenRun,
     OpenLink,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -176,16 +175,12 @@ pub(crate) enum PagesIntent {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ChatIntent {
-    OpenHit,
-    ChooseChannel,
     ShowHuddle,
     LeaveHuddle,
     JoinHuddle,
     JoinVoice,
     OpenLink,
     Copy,
-    CopyLink,
-    OpenRun,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MutationPhase {
@@ -397,6 +392,7 @@ pub struct Ducktape {
     pub(crate) huddle_channel: String,
     pub(crate) huddle_channel_name: String,
     pub(crate) huddle_joined_at: i64,
+    pub(crate) huddle_instance: u64,
     pub(crate) huddle_now: i64,
     pub(crate) call_status: String,
     pub(crate) call_muted: bool,
@@ -409,10 +405,6 @@ pub struct Ducktape {
     pub(crate) huddle_stage: String,
     pub(crate) huddle_tiles: Vec<String>,
     pub(crate) huddle_roster: Vec<crate::backend::HuddleParticipant>,
-    pub(crate) huddle_rows: Vec<crate::call::HuddleTileRow>,
-    /// The huddle room's member roll, loaded on seating; the window offers
-    /// the ones not seated as invite chips. A sent invite leaves the roll.
-    pub(crate) huddle_invitees: Vec<crate::backend::ChatMember>,
     pub(crate) secrets: crate::secret::SecretStore,
 }
 impl ::std::fmt::Debug for Ducktape {
@@ -552,7 +544,6 @@ pub(crate) enum AppMessage {
     ChatUpdated(crate::backend::ChatData),
     ChatLoadFailed(crate::backend::HydrationError),
     LiveAgentsEvent(crate::backend::LiveAgentNotice),
-    CopyMessageLink(String),
     OpenMessageLink(String),
     CopyChordPressed(crate::shell::KeyPress),
     ChatViewEvent(crate::module_view::ModuleViewEvent),
@@ -624,12 +615,6 @@ pub(crate) enum AppMessage {
     HuddleGoChannel,
     LeaveHuddleHere,
     HuddleLeft(bool),
-    HuddleInviteesLoaded(Vec<crate::backend::ChatMember>),
-    /// Invite a member (by their member-row key) into the huddle the reader
-    /// is seated in.
-    InviteToHuddle(String),
-    HuddleInviteSent(String),
-    HuddleInviteFailed(String, crate::backend::OptimisticMutationError),
     SecretTyped(String, String),
 }
 impl ::std::fmt::Debug for AppMessage {
@@ -842,6 +827,7 @@ impl Ducktape {
             huddle_channel: "".to_owned(),
             huddle_channel_name: "".to_owned(),
             huddle_joined_at: 0,
+            huddle_instance: 0,
             huddle_now: 0,
             call_status: "".to_owned(),
             call_muted: false,
@@ -853,8 +839,6 @@ impl Ducktape {
             huddle_stage: "".to_owned(),
             huddle_tiles: Vec::new(),
             huddle_roster: Vec::new(),
-            huddle_rows: Vec::new(),
-            huddle_invitees: Vec::new(),
             secrets: Default::default(),
         }
     }

@@ -15,7 +15,7 @@
 
 use sha2::{Digest, Sha256};
 pub use chat_message::parse_message;
-use chat_message::{inline_spans, mention_at};
+use chat_message::inline_spans;
 
 use crate::index::{self, MsgRow};
 use crate::{Block, ChatAssigned, ChatMsg, Mark, Party, PostPolicy, Span, decode_msg};
@@ -1556,52 +1556,7 @@ pub fn draft_mentions(
     text: &str,
     names: &NameDirectory,
 ) -> (String, Vec<(std::ops::Range<usize>, Party)>) {
-    let chars: Vec<char> = text.chars().collect();
-    let mut display = String::new();
-    let mut mentions = Vec::new();
-    let mut index = 0;
-    while index < chars.len() {
-        if let Some(consumed) = code_fence_len(&chars, index) {
-            display.extend(&chars[index..index + consumed]);
-            index += consumed;
-            continue;
-        }
-        if let Some((party, consumed)) = mention_at(&chars, index) {
-            let start = display.len();
-            display.push_str(&mention_label(&party, names));
-            mentions.push((start..display.len(), party));
-            index += consumed;
-        } else {
-            display.push(chars[index]);
-            index += 1;
-        }
-    }
-    (display, mentions)
-}
-
-/// Fenced code is literal, including token-shaped text inside it.
-fn code_fence_len(chars: &[char], at: usize) -> Option<usize> {
-    let line_start = at == 0 || chars[at - 1] == '\n';
-    if !line_start {
-        return None;
-    }
-    let mut lines = chars[at..].split_inclusive(|ch| *ch == '\n');
-    let opener = lines.next()?;
-    let opener_text: String = opener.iter().collect();
-    let opens_fence = opener_text.trim().starts_with("```");
-    if !opens_fence {
-        return None;
-    }
-    let mut consumed = opener.len();
-    for line in lines {
-        consumed += line.len();
-        let line_text: String = line.iter().collect();
-        let closes_fence = line_text.trim() == "```";
-        if closes_fence {
-            break;
-        }
-    }
-    Some(consumed)
+    chat_message::draft_mentions(text, |party| mention_label(party, names))
 }
 
 /// The optimistic row's render blocks: the SAME grammar the send commits

@@ -20,6 +20,7 @@ enum Input {
 }
 enum Run {
     Start,
+    Panel(host::Subscription),
     Live(Box<Session>),
     End,
 }
@@ -62,7 +63,21 @@ fn emit(value: Value) {
     notify("host.emit", value);
 }
 fn status(kind: &str, message: &str) {
-    emit(json!({"kind": kind, "message": message}));
+    emit(json!({"kind": kind, "message": message, "status": status_text(kind, message)}));
+}
+
+fn status_text(kind: &str, message: &str) -> String {
+    match kind {
+        "connecting" | "closed" => kind.into(),
+        "live" => {
+            if message.is_empty() {
+                "live".into()
+            } else {
+                format!("live · {message}")
+            }
+        }
+        _ => message.into(),
+    }
 }
 fn answer(answer: Answer) -> Result<Vec<u8>, String> {
     answer.ok_or_else(|| "session stream closed".to_owned())?
@@ -94,10 +109,12 @@ fn escaped(value: &str) -> String {
 pub fn run() -> LocalBoxStream<'static, Message> {
     futures::stream::unfold(Run::Start, |state| async move {
         let next = match state {
-            Run::Start => Session::connect()
-                .await
-                .map(|session| Run::Live(Box::new(session))),
-            Run::Live(mut session) => session.advance().await.map(|()| Run::Live(session)),
+            Run::Start => begin().await,
+            Run::Panel(mut properties) => {
+                let item = answer(properties.next().await).and_then(|bytes| panel_properties(&bytes));
+                item.map(|panel| (Message::Panel(Box::new(panel)), Run::Panel(properties)))
+            }
+            Run::Live(mut session) => session.advance().await.map(|()| (Message::Progress, Run::Live(session))),
             Run::End => return None,
         };
         let next = match next {
@@ -106,18 +123,40 @@ pub fn run() -> LocalBoxStream<'static, Message> {
                 emit(json!({"kind":"presentation", "stage":"", "video_live":false, "peers":[], "tiles":[]}));
                 status("error", &error);
                 host::notify("host.finish", &[]);
-                Run::End
+                (Message::Progress, Run::End)
             }
         };
-        Some((Message::Progress, next))
+        Some(next)
     })
     .boxed_local()
 }
 
+fn panel_properties(bytes: &[u8]) -> Result<crate::panel::Panel, String> {
+    #[derive(Deserialize)]
+    struct Envelope {
+        panel: crate::panel::Panel,
+    }
+    serde_json::from_slice::<Envelope>(bytes)
+        .map(|value| value.panel)
+        .map_err(|error| error.to_string())
+}
+
+async fn begin() -> Result<(Message, Run), String> {
+    let mut stream = host::subscribe("call.props", &[]);
+    let bytes = answer(stream.next().await)?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if value.get("panel").is_some() {
+        return Ok((
+            Message::Panel(Box::new(panel_properties(&bytes)?)),
+            Run::Panel(stream),
+        ));
+    }
+    let session = Session::connect(stream, properties(&bytes)?).await?;
+    Ok((Message::Progress, Run::Live(Box::new(session))))
+}
+
 impl Session {
-    async fn connect() -> Result<Self, String> {
-        let mut properties_stream = host::subscribe("call.props", &[]);
-        let props = properties(&answer(properties_stream.next().await)?)?;
+    async fn connect(properties_stream: host::Subscription, props: Props) -> Result<Self, String> {
         status("connecting", "");
         let channel = host::request(
             "rpc.query",
@@ -455,5 +494,18 @@ fn control(value: Value) -> Result<Vec<Event>, String> {
         }]),
         Some("peer_left") => Ok(vec![Event::Left(peer(&value)?)]),
         _ => Err("unknown call control".into()),
+    }
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+    #[test]
+    fn status_labels_belong_to_the_deployed_session() {
+        assert_eq!(status_text("connecting", ""), "connecting");
+        assert_eq!(status_text("live", ""), "live");
+        assert_eq!(status_text("live", "no microphone"), "live · no microphone");
+        assert_eq!(status_text("refused", "not seated"), "not seated");
+        assert_eq!(status_text("closed", ""), "closed");
     }
 }

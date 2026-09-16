@@ -417,15 +417,9 @@ fn a_failed_huddle_leave_keeps_the_retained_roster_visible() {
     assert!(handler_body("JoinVoice").contains("drop_call_state("));
     let dropped = fn_body("drop_call_state");
     assert!(dropped.contains("self.call_peers="));
-    assert!(dropped.contains("huddle_tile_rows("));
-    assert!(!dropped.contains("self.huddle_rows=::std::vec::Vec::new()"));
+    assert!(!dropped.contains("self.huddle_roster="));
     let ack = handler_body("HuddleLeft");
-    for field in [
-        "huddle_joined",
-        "huddle_roster",
-        "huddle_rows",
-        "huddle_channel",
-    ] {
+    for field in ["huddle_joined", "huddle_roster", "huddle_channel"] {
         assert!(ack.contains(&format!("self.{field}=")));
     }
 }
@@ -707,4 +701,20 @@ fn call_presentation_comes_from_the_deployed_guest() {
     }));
     assert!(app.huddle_stage.is_empty());
     assert!(!app.call_video_live);
+}
+
+#[test]
+fn call_status_is_the_deployed_views_text() {
+    let (mut app, _) = Ducktape::boot();
+    let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
+        kind: "live".into(),
+        status: Some("Custom session status".into()),
+        ..Default::default()
+    }));
+    assert_eq!(app.call_status, "Custom session status");
+    let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
+        kind: "presentation".into(),
+        ..Default::default()
+    }));
+    assert_eq!(app.call_status, "Custom session status");
 }

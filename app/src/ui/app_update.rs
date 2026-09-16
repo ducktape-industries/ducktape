@@ -200,7 +200,6 @@ impl Ducktape {
             AppMessage::ChatUpdated(next) => self.on_chat_updated(next),
             AppMessage::ChatLoadFailed(cause) => self.on_chat_load_failed(cause),
             AppMessage::LiveAgentsEvent(next) => self.on_live_agents_event(next),
-            AppMessage::CopyMessageLink(link) => self.on_copy_message_link(link),
             AppMessage::OpenMessageLink(url) => self.on_open_message_link(url),
             AppMessage::CopyChordPressed(event) => self.on_copy_chord_pressed(event),
             AppMessage::ChatViewEvent(event) => self.on_chat_view_event(event),
@@ -274,10 +273,6 @@ impl Ducktape {
             AppMessage::HuddleGoChannel => self.on_huddle_go_channel(),
             AppMessage::LeaveHuddleHere => self.on_leave_huddle_here(),
             AppMessage::HuddleLeft(_result) => self.on_huddle_left(_result),
-            AppMessage::HuddleInviteesLoaded(members) => self.on_huddle_invitees_loaded(members),
-            AppMessage::InviteToHuddle(key) => self.on_invite_to_huddle(key),
-            AppMessage::HuddleInviteSent(key) => self.on_huddle_invite_sent(key),
-            AppMessage::HuddleInviteFailed(key, error) => self.on_huddle_invite_failed(key, error),
             AppMessage::SecretTyped(slot, text) => self.on_secret_typed(slot, text),
         }
     }
@@ -766,12 +761,6 @@ impl Ducktape {
         );
         self.huddle_joined = huddle.joined;
         self.huddle_roster = huddle.roster.clone();
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
         self.channel_members = next.channel_members.clone();
@@ -1314,12 +1303,6 @@ impl Ducktape {
         );
         self.huddle_joined = huddle.joined;
         self.huddle_roster = huddle.roster.clone();
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
         self.channel_members = crate::backend::keep_members(
@@ -2289,9 +2272,6 @@ impl Ducktape {
                 self.agents_live = crate::module_view::event_int(&(event), "count") > 0;
                 Task::none()
             }
-            AgentsIntent::OpenRun => Task::done(AppMessage::OpenRunPanel(
-                crate::module_view::event_text(&(event), "dispatch_id"),
-            )),
             AgentsIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
                 crate::module_view::event_text(&(event), "url"),
             )),
@@ -3384,12 +3364,6 @@ impl Ducktape {
             return;
         };
         self.huddle_roster = crate::backend::roster_of_seats(&room.huddle);
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
     }
     /// The reader is seated in `channel`'s huddle: open the huddle window and
     /// re-read the room on screen so its seats catch up.
@@ -3397,24 +3371,13 @@ impl Ducktape {
         self.mutation_phase = MutationPhase::Idle;
         self.error = "".to_owned();
         self.huddle_joined = true;
+        self.huddle_instance = self.huddle_instance.wrapping_add(1);
         self.huddle_channel = channel;
         self.huddle_channel_name = name;
         self.huddle_joined_at = self.huddle_now;
-        self.huddle_invitees = Vec::new();
         self.follow_voice_room_roster();
         self.chat_generation += 1;
-        let invitees = Task::perform(
-            crate::backend::load_huddle_invitees(
-                self.connected_rpc.to_owned(),
-                self.huddle_channel.to_owned(),
-            ),
-            |result| match result {
-                Ok(members) => AppMessage::HuddleInviteesLoaded(members),
-                // no roll, no chips: the invite is a convenience, not the call
-                Err(_) => AppMessage::HuddleInviteesLoaded(Vec::new()),
-            },
-        );
-        Task::batch([Task::done(AppMessage::ShowHuddle), invitees, {
+        Task::batch([Task::done(AppMessage::ShowHuddle), {
             let pending_task = Task::perform(
                 crate::backend::load_channel_window(
                     self.connected_rpc.to_owned(),
@@ -3469,12 +3432,6 @@ impl Ducktape {
         );
         self.huddle_joined = huddle.joined;
         self.huddle_roster = huddle.roster.clone();
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
         self.channel_members = next.channel_members.clone();
@@ -3514,16 +3471,6 @@ impl Ducktape {
         }
         self.live_agents = next.rows.clone();
         Task::none()
-    }
-    fn on_copy_message_link(&mut self, link: String) -> Task<AppMessage> {
-        if (link).is_empty() {
-            return Task::none();
-        }
-        let confirmation = "Message link copied".to_owned();
-        Task::done(AppMessage::CopyToClipboard(
-            link.to_owned(),
-            confirmation.clone(),
-        ))
     }
     fn on_open_message_link(&mut self, url: String) -> Task<AppMessage> {
         if (url).is_empty() {
@@ -3696,17 +3643,6 @@ impl Ducktape {
         event: crate::module_view::ModuleViewEvent,
     ) -> Task<AppMessage> {
         match crate::module_view::chat_intent(&(event)) {
-            ChatIntent::OpenHit => {
-                let target_seq = crate::module_view::event_int(&(event), "target_seq");
-                let target_sequence = target_seq;
-                Task::done(AppMessage::OpenChatSearchHit(
-                    crate::module_view::event_text(&(event), "channel"),
-                    target_sequence,
-                ))
-            }
-            ChatIntent::ChooseChannel => Task::done(AppMessage::ChooseChannel(
-                crate::module_view::event_text(&(event), "id"),
-            )),
             ChatIntent::ShowHuddle => Task::done(AppMessage::ShowHuddle),
             ChatIntent::LeaveHuddle => Task::done(AppMessage::LeaveHuddleHere),
             ChatIntent::JoinHuddle => Task::done(AppMessage::JoinHuddleSubmit),
@@ -3724,12 +3660,6 @@ impl Ducktape {
                     clipboard_label.clone(),
                 ))
             }
-            ChatIntent::CopyLink => Task::done(AppMessage::CopyMessageLink(
-                crate::module_view::event_text(&(event), "link"),
-            )),
-            ChatIntent::OpenRun => Task::done(AppMessage::OpenRunPanel(
-                crate::module_view::event_text(&(event), "dispatch_id"),
-            )),
         }
     }
     fn on_pages_view_event(
@@ -4613,7 +4543,6 @@ impl Ducktape {
         self.huddle_channel_name = "".to_owned();
         self.huddle_joined_at = 0;
         self.huddle_roster = Vec::new();
-        self.huddle_rows = Vec::new();
         self.call_status = "".to_owned();
         self.call_muted = false;
         self.call_speaking = false;
@@ -4968,8 +4897,9 @@ impl Ducktape {
         ])
     }
     fn on_call_event(&mut self, event: crate::call::CallEvent) -> Task<AppMessage> {
-        self.call_status =
-            crate::call::call_status_after(self.call_status.to_owned(), event.clone());
+        if let Some(status) = &event.status {
+            self.call_status.clone_from(status);
+        }
         match event.kind.as_str() {
             "connecting" => {
                 self.call_muted = false;
@@ -4996,12 +4926,6 @@ impl Ducktape {
             _ => {}
         }
         self.call_speaking = crate::call::call_speaking_after(self.call_speaking, &event);
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
         Task::none()
     }
     fn on_toggle_call_mute(&mut self) -> Task<AppMessage> {
@@ -5009,12 +4933,6 @@ impl Ducktape {
             return Task::none();
         }
         self.call_muted = crate::call::call_set_muted(!self.call_muted);
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
         Task::none()
     }
     fn on_toggle_call_camera(&mut self) -> Task<AppMessage> {
@@ -5105,77 +5023,10 @@ impl Ducktape {
         self.huddle_stage = "".to_owned();
         self.huddle_tiles.clear();
         self.call_peers = Vec::new();
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
-    }
-    fn on_huddle_invitees_loaded(
-        &mut self,
-        members: Vec<crate::backend::ChatMember>,
-    ) -> Task<AppMessage> {
-        if !self.huddle_joined {
-            return Task::none();
-        }
-        self.huddle_invitees = members;
-        Task::none()
-    }
-    /// An invite is a post in the huddle's room that mentions the person; the
-    /// chip leaves the window the moment it is pressed and comes back only if
-    /// the post fails.
-    fn on_invite_to_huddle(&mut self, key: String) -> Task<AppMessage> {
-        let seated = self.huddle_joined && !self.huddle_channel.is_empty();
-        if !seated || self.loading {
-            return Task::none();
-        }
-        let Some(index) = self
-            .huddle_invitees
-            .iter()
-            .position(|member| member.key == key)
-        else {
-            return Task::none();
-        };
-        self.huddle_invitees.remove(index);
-        let body = crate::backend::huddle_invite_text(&key, &self.huddle_channel_name);
-        let sent_key = key.clone();
-        Task::perform(
-            crate::backend::send_message(
-                self.connected_rpc.to_owned(),
-                self.password.to_owned(),
-                self.huddle_channel.to_owned(),
-                crate::backend::fresh_operation_id("huddle-invite".to_owned()),
-                body,
-            ),
-            move |result| match result {
-                Ok(_) => AppMessage::HuddleInviteSent(sent_key.clone()),
-                Err(error) => AppMessage::HuddleInviteFailed(key.clone(), error),
-            },
-        )
-    }
-    fn on_huddle_invite_sent(&mut self, _key: String) -> Task<AppMessage> {
-        Task::none()
-    }
-    fn on_huddle_invite_failed(
-        &mut self,
-        key: String,
-        error: crate::backend::OptimisticMutationError,
-    ) -> Task<AppMessage> {
-        self.error = error.message;
-        let names = crate::backend::names();
-        let member = crate::backend::ChatMember {
-            label: names.member_label(&key),
-            key,
-        };
-        self.huddle_invitees.push(member);
-        Task::none()
     }
     fn on_huddle_left(&mut self, _result: bool) -> Task<AppMessage> {
         self.huddle_joined = false;
         self.huddle_roster = Vec::new();
-        self.huddle_rows = Vec::new();
-        self.huddle_invitees = Vec::new();
         self.huddle_channel = "".to_owned();
         self.huddle_channel_name = "".to_owned();
         self.huddle_joined_at = 0;

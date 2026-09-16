@@ -1562,6 +1562,38 @@ impl AgentsView {
 }
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn local_run_navigation_survives_session_refresh_until_another_external_request() {
+        let mut view = super::AgentsView::state();
+        let session = |opened, run: &str| {
+            super::Message::SessionArrived(crate::host::SessionItem {
+                next: crate::host::Session {
+                    connected: true,
+                    open_run: run.into(),
+                    opened,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        };
+        let _ = view.update(session(1, "external"));
+        assert_eq!(view.open_run, "external");
+        let _ = view.update(super::Message::CloseRun);
+        let _ = view.update(session(1, "external"));
+        assert!(
+            view.open_run.is_empty(),
+            "ordinary props cannot reopen a closed run"
+        );
+        view.open_run = "local".into();
+        let _ = view.update(session(1, "external"));
+        assert_eq!(view.open_run, "local");
+        let _ = view.update(session(2, "external"));
+        assert_eq!(
+            view.open_run, "external",
+            "a fresh external request is navigation"
+        );
+    }
     use super::*;
 
     #[test]
@@ -1959,6 +1991,8 @@ impl AgentsView {
                 return ::ducktape_view_guest::Task::none();
             }
             let next = item.next.clone();
+            let navigation_changed = next.opened != self.opened;
+            let connection_changed = next.connected != self.connected;
             let registration_context_changed = !next.connected || self.account != next.account;
             if registration_context_changed {
                 self.registration.take();
@@ -1981,7 +2015,8 @@ impl AgentsView {
                 self.account = next.account.to_owned();
             }
             {
-                if self.open_run != next.open_run {
+                let accept_navigation = navigation_changed || connection_changed;
+                if accept_navigation {
                     self.control_state = host::ControlState::Idle;
                     self.control_serial = self.control_serial.wrapping_add(1);
                     self.control_draft.clear();
@@ -1990,8 +2025,11 @@ impl AgentsView {
                     self.raw_event_open = None;
                     self.message_preview_open = None;
                     self.run_tab = RunTab::Conversation;
+                    self.open_run = match next.connected {
+                        true => next.open_run.clone(),
+                        false => String::new(),
+                    };
                 }
-                self.open_run = next.open_run.to_owned();
             }
             {
                 self.open_row = crate::host::run_at(
@@ -2300,11 +2338,6 @@ impl AgentsView {
                 }
                 self.open_run = self.open_row.dispatch_id.to_owned();
             }
-            {
-                self.sent = crate::host::open_run(::std::convert::AsRef::as_ref(
-                    &(self.open_row.dispatch_id),
-                ));
-            }
             ::ducktape_view_guest::Task::none()
         }
     }
@@ -2331,9 +2364,6 @@ impl AgentsView {
             }
             {
                 self.live = crate::host::empty_live();
-            }
-            {
-                self.sent = crate::host::open_run(::std::convert::AsRef::as_ref(&("")));
             }
             ::ducktape_view_guest::Task::none()
         }

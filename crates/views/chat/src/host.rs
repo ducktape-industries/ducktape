@@ -395,11 +395,17 @@ pub struct ChatSearchHit {
     pub meta: String,
 }
 
-/// An agent run in flight under its anchor message: whose it is, where it
-/// stands, and which run to open for its progress. A run lives in THIS
-/// process, off the node, so it reaches the view as a session fact.
+/// Authorized run observations and the presentation derived by this view.
+/// The host forwards output; provider formats and display choices live here.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct LiveRunHint {
+    #[serde(default)]
+    pub public_progress: Option<serde_json::Value>,
+    #[serde(default)]
+    pub output: Vec<String>,
+    #[serde(default)]
+    pub output_error: String,
+    pub channel_id: String,
     pub anchor_seq: i64,
     pub thread_root: i64,
     pub run_id: String,
@@ -410,7 +416,7 @@ pub struct LiveRunHint {
     /// what the run has done so far, oldest first
     #[serde(default)]
     pub activity: Vec<LiveActivity>,
-    /// the answer as it is being written, clipped by the app
+    /// the answer as it is being written
     #[serde(default)]
     pub answer_preview: String,
 }
@@ -558,7 +564,7 @@ pub struct Session {
 pub struct SessionItem {
     pub next: Session,
     pub error: String,
-    pub participation: Option<Participation>,
+    pub background: Option<BackgroundRequest>,
 }
 
 /// The host reports tab presentation independently of product session facts.
@@ -582,10 +588,10 @@ pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
                     .map_err(|error| error.to_string())
             });
             match read {
-                Ok(value) => match value.get("participation") {
+                Ok(value) => match value.get("background") {
                     Some(intent) => match serde_json::from_value(intent.clone()) {
                         Ok(participation) => SessionItem {
-                            participation: Some(participation),
+                            background: Some(participation),
                             ..SessionItem::default()
                         },
                         Err(error) => SessionItem {
@@ -857,15 +863,12 @@ async fn read_sidebar_now(
         let rows = page["channels"].as_array().ok_or("missing channels page")?;
         for row in rows {
             seats.insert(
-                row["channel"]["id"].as_str().unwrap_or_default().to_owned(),
-                row["channel"]["huddle"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default(),
+                row["id"].as_str().unwrap_or_default().to_owned(),
+                row["huddle"].as_array().cloned().unwrap_or_default(),
             );
         }
         channels.extend(rows.iter().map(|row| {
-            let channel = &row["channel"];
+            let channel = row;
             ChatChannel {
                 id: channel["id"].as_str().unwrap_or_default().into(),
                 name: channel["name"].as_str().unwrap_or_default().into(),
@@ -1441,21 +1444,25 @@ pub fn search(key: SearchKey) -> ducktape_view_guest::Subscription<SearchItem> {
     ducktape_view_guest::Subscription::run_with(key, |key| stream::once(read_search(key.clone())))
 }
 
+fn search_query(text: &str, channel: Option<&str>) -> serde_json::Value {
+    // A `#tag` query filters by the exact hashtag (the index's tag postings);
+    // anything else is full-text search.
+    match text.strip_prefix('#').filter(|tag| !tag.is_empty()) {
+        Some(tag) => serde_json::json!({
+            "tag_search": { "tag": tag.to_lowercase(), "channel_id": channel, "limit": 50 },
+        }),
+        None => serde_json::json!({
+            "search": { "text": text, "channel_id": channel, "limit": 50 },
+        }),
+    }
+}
+
 async fn read_search(key: SearchKey) -> SearchItem {
     if key.query.is_empty() {
         return SearchItem::default();
     }
     let names = names_at(key.names).await;
-    // A `#tag` query filters by the exact hashtag (the index's tag postings);
-    // anything else is full-text search.
-    let query = match key.query.strip_prefix('#').filter(|tag| !tag.is_empty()) {
-        Some(tag) => serde_json::json!({
-            "tag_search": { "tag": tag.to_lowercase(), "channel_id": null, "limit": 50 },
-        }),
-        None => serde_json::json!({
-            "search": { "text": key.query, "channel_id": null, "limit": 50 },
-        }),
-    };
+    let query = search_query(&key.query, None);
     match view("hits", query).await {
         Ok(reply) => SearchItem {
             hits: fold_hits(&reply, &names),
@@ -2167,14 +2174,7 @@ fn notify<T: Serialize>(operation: &str, payload: &T) -> bool {
     true
 }
 
-/// `chat.open_hit` — land on a search hit: its channel and the target message.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Hit {
-    pub channel: String,
-    pub target_seq: i64,
-}
-
-/// `chat.choose_channel` — the room to open.
+/// The room selected for a voice call.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Channel {
     pub id: String,
@@ -2191,18 +2191,6 @@ pub struct Url {
 pub struct Copy {
     pub text: String,
     pub label: String,
-}
-
-/// `chat.copy_link` — a built message link for the clipboard.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Link {
-    pub link: String,
-}
-
-/// The run a "View run" or a message's run chip opens.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct DispatchId {
-    pub dispatch_id: String,
 }
 
 /// `chat.begin_edit` — seed the app's edit composer for one message. The
@@ -2226,20 +2214,6 @@ pub fn edit_body_of(messages: &[ChatMessage], seq: i64, rev: i64) -> String {
         .filter(|message| !message.deleted && !message.pending && message.rev == rev)
         .map(|message| message.edit_body.clone())
         .unwrap_or_default()
-}
-
-pub fn send_open_hit(channel: &str, target_seq: i64) -> bool {
-    notify(
-        "chat.open_hit",
-        &Hit {
-            channel: channel.into(),
-            target_seq,
-        },
-    )
-}
-
-pub fn send_choose_channel(id: &str) -> bool {
-    notify("chat.choose_channel", &Channel { id: id.into() })
 }
 
 pub fn send_show_huddle() -> bool {
@@ -2274,10 +2248,6 @@ pub fn send_copy(text: &str, label: &str) -> bool {
     )
 }
 
-pub fn send_copy_link(link: &str) -> bool {
-    notify("chat.copy_link", &Link { link: link.into() })
-}
-
 /// The runs module decides whether the seated signer may cancel this run.
 pub async fn cancel_run(run_id: String) -> ActItem {
     let request = serde_json::json!({"target":"runs", "payload":{"cancel_run":{"run_id":run_id}}});
@@ -2286,17 +2256,6 @@ pub async fn cancel_run(run_id: String) -> ActItem {
     ActItem {
         error: response.err().unwrap_or_default(),
     }
-}
-
-/// Take the reader to a run's panel: the live hint's "View run", or the run
-/// chip on a message a run posted.
-pub fn send_open_run(dispatch_id: &str) -> bool {
-    notify(
-        "chat.open_run",
-        &DispatchId {
-            dispatch_id: dispatch_id.into(),
-        },
-    )
 }
 
 // ---------- the readings ----------
@@ -2672,6 +2631,10 @@ fn net_query(chain_id: &str) -> String {
     }
 }
 
+pub fn duck_run_link(dispatch_id: String, chain_id: String) -> String {
+    format!("duck://run/{dispatch_id}{}", net_query(&chain_id))
+}
+
 pub fn duck_channel_link(channel: String, chain_id: String) -> String {
     format!("duck://channel/{channel}{}", net_query(&chain_id))
 }
@@ -2911,18 +2874,19 @@ mod tests {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Participation {
+pub enum BackgroundRequest {
+    Search { channel: String, text: String },
     Join { channel: String },
     Move { from: String, channel: String },
     Leave { channel: String },
 }
 
 #[derive(Debug, Serialize)]
-struct ParticipationError {
+struct BackgroundError {
     message: String,
     committed: bool,
 }
-impl From<String> for ParticipationError {
+impl From<String> for BackgroundError {
     fn from(message: String) -> Self {
         Self {
             message,
@@ -2949,7 +2913,7 @@ async fn participation_submit(operation: serde_json::Value) -> Result<(), String
     Ok(())
 }
 
-async fn participation_join(channel: String) -> Result<String, ParticipationError> {
+async fn participation_join(channel: String) -> Result<String, BackgroundError> {
     let channel = participation_channel(&channel)?;
     let proof = ask(
         "rpc.admin",
@@ -2971,13 +2935,13 @@ async fn participation_join(channel: String) -> Result<String, ParticipationErro
     Ok(channel.to_owned())
 }
 
-async fn participation_leave(channel: String) -> Result<String, ParticipationError> {
+async fn participation_leave(channel: String) -> Result<String, BackgroundError> {
     let channel = participation_channel(&channel)?;
     participation_submit(serde_json::json!({"leave_huddle":{"channel_id":channel}})).await?;
     Ok(channel.to_owned())
 }
 
-async fn participation_move(from: String, channel: String) -> Result<String, ParticipationError> {
+async fn participation_move(from: String, channel: String) -> Result<String, BackgroundError> {
     let channel = participation_channel(&channel)?.to_owned();
     if from == channel {
         return Ok(channel);
@@ -2988,28 +2952,56 @@ async fn participation_move(from: String, channel: String) -> Result<String, Par
     participation_leave(from).await?;
     participation_join(channel)
         .await
-        .map_err(|error| ParticipationError {
+        .map_err(|error| BackgroundError {
             committed: true,
             ..error
         })
 }
 
-async fn participate(intent: Participation) -> Result<String, ParticipationError> {
+async fn background_search(
+    channel: String,
+    text: String,
+) -> Result<serde_json::Value, BackgroundError> {
+    let text = text.trim();
+    let invalid = text.is_empty() || text.contains('\0');
+    if invalid {
+        return Err("search must be nonempty and contain no NUL"
+            .to_owned()
+            .into());
+    }
+    let names = read_names(0).await;
+    let channel = (!channel.is_empty()).then_some(channel.as_str());
+    let reply = view("hits", search_query(text, channel)).await?;
+    let mut hits = fold_hits(&reply, &names);
+    for hit in &mut hits {
+        hit.meta = format!("{} · #{}", hit.channel_id, hit.seq);
+        hit.text = chat_message::draft_mentions(&hit.text, |party| {
+            mention_label(&serde_json::to_value(party).expect("party encodes"), &names)
+        })
+        .0;
+    }
+    Ok(serde_json::json!({"hits":hits}))
+}
+
+async fn participate(intent: BackgroundRequest) -> Result<serde_json::Value, BackgroundError> {
     match intent {
-        Participation::Join { channel } => participation_join(channel).await,
-        Participation::Move { from, channel } => participation_move(from, channel).await,
-        Participation::Leave { channel } => participation_leave(channel).await,
+        BackgroundRequest::Search { channel, text } => background_search(channel, text).await,
+        BackgroundRequest::Join { channel } => participation_join(channel)
+            .await
+            .map(|channel| serde_json::json!({"channel":channel})),
+        BackgroundRequest::Move { from, channel } => participation_move(from, channel)
+            .await
+            .map(|channel| serde_json::json!({"channel":channel})),
+        BackgroundRequest::Leave { channel } => participation_leave(channel)
+            .await
+            .map(|channel| serde_json::json!({"channel":channel})),
     }
 }
 
-pub async fn run_participation(intent: Participation) {
+pub async fn run_background(intent: BackgroundRequest) {
     let output = match participate(intent).await {
-        Ok(channel) => serde_json::json!({"channel":channel}),
+        Ok(output) => output,
         Err(error) => serde_json::json!({"error":error}),
     };
-    host::notify(
-        "host.emit",
-        &serde_json::to_vec(&output).expect("participation result encodes"),
-    );
-    host::notify("host.finish", &[]);
+    host::finish_response(&serde_json::to_vec(&output).expect("background result encodes"));
 }

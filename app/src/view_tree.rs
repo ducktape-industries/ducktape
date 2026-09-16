@@ -1443,22 +1443,7 @@ impl ViewTree {
             Node::Hover { .. } => self.hover(node, window, cx),
             Node::Tooltip { .. } => self.tooltip(node, window, cx),
             Node::Float { .. } => self.float(node, window, cx),
-            Node::Image {
-                hash,
-                data,
-                width,
-                height,
-                fit,
-                opacity,
-                ..
-            } => self.picture(
-                *hash,
-                data.as_ref(),
-                *width,
-                *height,
-                *fit,
-                opacity.unwrap_or(1.0),
-            ),
+            Node::Image { .. } => self.picture(node, window),
             Node::ImageViewer { .. } => self.image_viewer(node, window, cx),
             Node::Svg { .. } => self.vector(node, window),
             Node::Canvas { .. } => self.drawing(node, cx),
@@ -3359,32 +3344,36 @@ impl ViewTree {
         outer.child(element).into_any_element()
     }
 
+    fn refresh_resource(&self, data: Option<&wire::ImageData>, window: &mut Window) {
+        if let Some(wire::ImageData::Resource(_)) = data {
+            window.request_animation_frame();
+        }
+    }
+
     fn remember_image(&mut self, hash: u64, data: &wire::ImageData) {
-        if self.images.contains_key(&hash) || self.images.len() >= 4096 {
+        if matches!(data, wire::ImageData::Resource(_)) {
             return;
         }
-        let bytes: usize = self
-            .images
-            .values()
-            .filter_map(|image| image.as_bytes(0))
-            .map(<[u8]>::len)
-            .sum();
+        if self.images.contains_key(&hash) {
+            return;
+        }
         let Some(image) = decode_image(data) else {
             return;
         };
-        let next = image.as_bytes(0).map_or(0, <[u8]>::len);
-        if bytes.saturating_add(next) > 64 << 20 {
-            return;
-        }
         self.images.insert(hash, Arc::new(image));
     }
 
-    fn remember_vector(&mut self, hash: u64, bytes: &[u8]) {
-        if self.vectors.contains_key(&hash) || self.vectors.len() >= 4096 {
-            return;
+    fn image_frame(&self, hash: u64, data: Option<&wire::ImageData>) -> Option<Arc<RenderImage>> {
+        match data {
+            Some(wire::ImageData::Resource(key)) => {
+                crate::video::stage_frame(key).map(|(_, _, image)| image)
+            }
+            _ => self.images.get(&hash).cloned(),
         }
-        let total: usize = self.vectors.values().map(|bytes| bytes.len()).sum();
-        if total.saturating_add(bytes.len()) > 16 << 20 {
+    }
+
+    fn remember_vector(&mut self, hash: u64, bytes: &[u8]) {
+        if self.vectors.contains_key(&hash) {
             return;
         }
         self.vectors.insert(hash, Arc::from(bytes));
@@ -3408,16 +3397,18 @@ impl ViewTree {
         else {
             unreachable!()
         };
+        self.refresh_resource(data.as_ref(), window);
         if let Some(data) = data {
             self.remember_image(*hash, data);
         }
+        let frame = self.image_frame(*hash, data.as_ref());
         let viewer = self.viewers.entry(key.clone()).or_default();
         if viewer.scale == 0.0 {
             viewer.scale = 1.0;
         }
         let mut element =
             dimensions(div().relative().overflow_hidden(), *width, *height).id(key.clone());
-        if let Some(image) = self.images.get(hash) {
+        if let Some(image) = frame {
             let original = image.size(0);
             let viewport = self
                 .bounds
@@ -3495,21 +3486,26 @@ impl ViewTree {
         element.child(self.measure(key, cx)).into_any_element()
     }
 
-    fn picture(
-        &mut self,
-        hash: u64,
-        data: Option<&wire::ImageData>,
-        width: Option<wire::Length>,
-        height: Option<wire::Length>,
-        fit: Option<wire::ContentFit>,
-        opacity: f32,
-    ) -> AnyElement {
+    fn picture(&mut self, node: &wire::Node, window: &mut Window) -> AnyElement {
+        let wire::Node::Image {
+            hash,
+            data,
+            width,
+            height,
+            fit,
+            opacity,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        self.refresh_resource(data.as_ref(), window);
         if let Some(data) = data {
-            self.remember_image(hash, data);
+            self.remember_image(*hash, data);
         }
-        let mut element = dimensions(div(), width, height).opacity(opacity);
-        if let Some(image) = self.images.get(&hash) {
-            element = element.child(img(image.clone()).size_full().object_fit(object_fit(fit)));
+        let mut element = dimensions(div(), *width, *height).opacity(opacity.unwrap_or(1.0));
+        if let Some(image) = self.image_frame(*hash, data.as_ref()) {
+            element = element.child(img(image.clone()).size_full().object_fit(object_fit(*fit)));
         }
         element.into_any_element()
     }
@@ -3687,6 +3683,9 @@ impl ViewTree {
 
 impl Render for ViewTree {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for image in crate::video::take_retired() {
+            let _ = window.drop_image(image);
+        }
         self.mounted.clear();
         let node = self.node(&self.root.clone(), window, cx);
         // Only controls mounted by this replacement frame may recover focus.
@@ -4127,6 +4126,7 @@ fn object_fit(fit: Option<wire::ContentFit>) -> ObjectFit {
 
 fn decode_image(data: &wire::ImageData) -> Option<RenderImage> {
     let mut pixels = match data {
+        wire::ImageData::Resource(_) => return None,
         wire::ImageData::Rgba {
             width,
             height,
@@ -4606,6 +4606,23 @@ fn append_arc_to(
         enter[0], enter[1], exit[0], exit[1]
     );
     exit
+}
+
+#[cfg(test)]
+pub(crate) fn assert_released_image_is_not_cached(key: &str) {
+    let mut tree = ViewTree::new(wire::Node::empty());
+    let resource = wire::ImageData::Resource(key.into());
+    tree.remember_image(7, &resource);
+    let image = tree.image_frame(7, Some(&resource)).expect("live resource");
+    let released = Arc::downgrade(&image);
+    drop(image);
+    crate::video::forget_peer(key);
+    drop(crate::video::take_retired());
+    assert!(tree.image_frame(7, Some(&resource)).is_none());
+    assert!(
+        released.upgrade().is_none(),
+        "the renderer must not retain a released resource"
+    );
 }
 
 #[cfg(test)]

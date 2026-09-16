@@ -177,7 +177,7 @@ pub struct Session {
     pub dark: bool,
     /// the signing account's number, decimal; "" when the app has none
     pub account: String,
-    /// the run the app has open for the reader, by dispatch id; "" is none
+    /// the latest external run navigation request; consumed when `opened` changes
     pub open_run: String,
     /// one per door a run was opened through, counted
     pub opened: i64,
@@ -2330,22 +2330,6 @@ impl Stream for ActStream {
 }
 
 // ---------- the intents ----------
-
-/// The run the reader opened, whose panel the app is asked to follow; an
-/// empty id closes it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenRun {
-    pub dispatch_id: String,
-}
-
-pub fn open_run(dispatch_id: &str) -> bool {
-    notify(
-        "agents.open_run",
-        &OpenRun {
-            dispatch_id: dispatch_id.into(),
-        },
-    )
-}
 
 /// A chip pressed: the duck:// address the app's open plane warps to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

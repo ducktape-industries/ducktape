@@ -89,17 +89,6 @@ fn admit_create(
             "no credential by that name is registered".into(),
         ));
     };
-    let over_ceiling = cpu.is_some_and(|cores| cores > MAX_SESSION_CORES)
-        || mem_gb.is_some_and(|mem| mem > MAX_SESSION_MEM_GB);
-    if over_ceiling {
-        return Err((
-            "limits_exceed_host_ceiling",
-            format!(
-                "this host caps a session at {MAX_SESSION_CORES} cores / \
-                 {MAX_SESSION_MEM_GB} GB"
-            ),
-        ));
-    }
     let contradicts = provider_contradicts_kind(provider, record.kind);
     if contradicts {
         return Err((
@@ -126,25 +115,6 @@ fn provider_contradicts_kind(provider: &str, kind: gateway::CredentialKind) -> b
         _ => false,
     }
 }
-
-/// Per-session ceiling on what a REMOTE creator may ask this host to allocate.
-///
-/// `cpu`/`mem_gb` arrive from a mesh peer and go straight to the sandbox
-/// backend. Before the credential gate moved to the lender, a stranger could not
-/// reach [`build_limits`] at all on a node they held no grant on; now any
-/// admitted member naming any registered credential can, so the size of the
-/// container they get is a number they choose. `TermError::AtCapacity` bounds
-/// the session COUNT, not the size of one.
-///
-/// Refused rather than silently clamped: quietly handing back a tenth of what
-/// was asked for is the fail-quiet this repo's refusal doctrine exists to
-/// prevent, and the reason token tells the caller what actually happened.
-///
-/// ponytail: a constant, not the host's real capacity. The compute plane already
-/// models that (`compute_service::ResourceLedger`); wiring one into the term
-/// plane is the upgrade when a host wants to sell its actual size.
-const MAX_SESSION_CORES: u64 = 8;
-const MAX_SESSION_MEM_GB: u64 = 32;
 
 /// `--cpu`/`--mem` → the container limit keys the sandbox backend enforces.
 fn build_limits(cpu: Option<u64>, mem_gb: Option<u64>) -> std::collections::BTreeMap<String, u64> {
@@ -270,59 +240,12 @@ mod tests {
         assert!(admit_create("echo", Some(&claude), Some(1), Some(2), true).is_ok());
     }
 
-    /// The size of the container is a number a REMOTE creator picks, and since
-    /// the credential gate moved to the lender any admitted member can reach it.
-    /// The ceiling is what stops "give me 1024 cores" from being a sentence a
-    /// stranger can say to this host.
-    #[test]
-    fn a_remote_creator_cannot_ask_this_host_for_any_size_it_likes() {
-        let claude = rec("c1", 1, &[], gateway::CredentialKind::Claude);
-
-        // at the ceiling is fine; a step past it is refused, per knob.
-        assert!(
-            admit_create(
-                "claude",
-                Some(&claude),
-                Some(MAX_SESSION_CORES),
-                Some(MAX_SESSION_MEM_GB),
-                true
-            )
-            .is_ok()
-        );
-        assert_eq!(
-            admit_create(
-                "claude",
-                Some(&claude),
-                Some(MAX_SESSION_CORES + 1),
-                None,
-                true
-            )
-            .unwrap_err()
-            .0,
-            "limits_exceed_host_ceiling"
-        );
-        assert_eq!(
-            admit_create(
-                "claude",
-                Some(&claude),
-                None,
-                Some(MAX_SESSION_MEM_GB + 1),
-                true
-            )
-            .unwrap_err()
-            .0,
-            "limits_exceed_host_ceiling"
-        );
-        // and an unset knob is not a request for infinity.
-        assert!(admit_create("claude", Some(&claude), None, None, true).is_ok());
-    }
-
     #[test]
     fn admit_maps_limits_and_kind() {
         let codex = rec("x", 1, &[], gateway::CredentialKind::Codex);
-        let ok = admit_create("codex", Some(&codex), Some(3), Some(8), true).unwrap();
-        assert_eq!(ok.limits.get("cores"), Some(&3));
-        assert_eq!(ok.limits.get("mem_gb"), Some(&8));
+        let ok = admit_create("codex", Some(&codex), Some(64), Some(256), true).unwrap();
+        assert_eq!(ok.limits.get("cores"), Some(&64));
+        assert_eq!(ok.limits.get("mem_gb"), Some(&256));
         assert!(matches!(ok.kind, provider_host::CredentialKind::Codex));
     }
 

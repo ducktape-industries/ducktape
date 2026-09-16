@@ -18,3 +18,4 @@ serde_json.workspace = true
 ducktape-view-guest.workspace = true
 ducktape-view-composer.workspace = true
 sha2 = "0.10"
+chat-message = { path = "../../modules/apps/chat/message" }

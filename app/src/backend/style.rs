@@ -39,24 +39,6 @@ pub(crate) fn live_resync(module: &str, height: i64) -> LiveUpdate {
     update
 }
 
-pub(crate) const fn block_kind_name(kind: BlockKind) -> &'static str {
-    match kind {
-        BlockKind::Page => "Page",
-        BlockKind::Paragraph => "Text",
-        BlockKind::Heading1 => "Heading 1",
-        BlockKind::Heading2 => "Heading 2",
-        BlockKind::Heading3 => "Heading 3",
-        BlockKind::Bulleted => "Bullet",
-        BlockKind::Numbered => "Number",
-        BlockKind::Todo => "Todo",
-        BlockKind::Toggle => "Toggle",
-        BlockKind::Quote => "Quote",
-        BlockKind::Code => "Code",
-        BlockKind::Callout => "Callout",
-        BlockKind::Divider => "Divider",
-    }
-}
-
 pub(crate) fn next_sequence() -> u64 {
     static SEQUENCE: OnceLock<AtomicU64> = OnceLock::new();
     SEQUENCE

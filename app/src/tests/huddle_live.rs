@@ -45,8 +45,6 @@ use futures::StreamExt as _;
 /// join, and start publishing. Generous on purpose — a person is slower than
 /// a test.
 const MEETING: Duration = Duration::from_secs(120);
-/// One roster read per second, the same cadence the session's own poll runs.
-const ROSTER_READ: Duration = Duration::from_secs(1);
 /// How long this side keeps publishing after it is satisfied, so the other
 /// side — a second behind at worst — still has somebody to see.
 const COURTESY: Duration = Duration::from_secs(15);
@@ -70,24 +68,6 @@ async fn this_side_hears_and_sees_the_other_through_the_apps_own_leg() {
         .await
         .expect("this side joins the huddle");
 
-    // Wait for the other side, by the only fact that says they are here: the
-    // fan-out this device would steer to names exactly them. (A chain read is
-    // the event; there is no push for "somebody joined a room you are in".)
-    let deadline = std::time::Instant::now() + MEETING;
-    let peer = loop {
-        let fanout = crate::backend::huddle_fanout_nodes(&node, &channel)
-            .await
-            .expect("the node serves the huddle roster");
-        if let [peer] = &fanout[..] {
-            break peer.clone();
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no second side joined {channel} within {MEETING:?}; the roster reads {fanout:?}"
-        );
-        tokio::time::sleep(ROSTER_READ).await;
-    };
-
     let client = crate::backend::rpc_client(&node).expect("live node client");
     crate::module_view::connected(&client).settled().await;
     let joined_at = std::time::Instant::now();
@@ -110,6 +90,7 @@ async fn this_side_hears_and_sees_the_other_through_the_apps_own_leg() {
     }
 
     let mut seen_peer = false;
+    let mut peer = String::new();
     let mut note = String::new();
     let mut peer_image = String::new();
     let watch = async {
@@ -123,9 +104,10 @@ async fn this_side_hears_and_sees_the_other_through_the_apps_own_leg() {
             if !event.message.is_empty() {
                 note = format!("{}: {}", event.kind, event.message);
             }
-            if let Some(other) = event.peers.iter().find(|other| other.peer == peer) {
+            if let [other] = event.peers.as_slice() {
                 seen_peer = true;
-                peer_image = other.image.clone();
+                peer.clone_from(&other.peer);
+                peer_image.clone_from(&other.image);
             }
             if !seen_peer {
                 continue;

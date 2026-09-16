@@ -1123,3 +1123,44 @@ fn rich_annotation_route(
         serde_json::json!({"start": 4, "end": 9})
     );
 }
+
+#[test]
+fn background_search_preserves_full_hits_and_survives_a_failed_title_lookup() {
+    for titles_available in [true, false] {
+        let frame = boot();
+        let frame = tick_native(vec![item(
+            request(&frame, "pages.props").id,
+            br#"{"background":{"text":"needle","page":""}}"#,
+        )]);
+        let content = "needle ".repeat(6000);
+        let hits = serde_json::json!({"hits":[
+            {"page_id":"named","block_id":"block","kind":"paragraph","text":content},
+            {"page_id":"untitled","block_id":"second","kind":"paragraph","text":"needle"},
+            {"page_id":"missing","block_id":"third","kind":"paragraph","text":"needle"}
+        ]});
+        let frame = tick_native(vec![answer(
+            request(&frame, "rpc.view").id,
+            hits.to_string().as_bytes(),
+        )]);
+        let titles = request(&frame, "rpc.view").id;
+        let reply = match titles_available {
+            true => answer(titles, br#"{"pages":{"pages":[{"id":"named","title":"Design"},{"id":"untitled","title":""}],"has_more":false,"next_after":null}}"#),
+            false => ducktape_view_guest::testing::refuse(titles, "page index unavailable"),
+        };
+        let frame = tick_native(vec![reply]);
+        let result: serde_json::Value =
+            serde_json::from_slice(&request(&frame, "host.emit").payload).unwrap();
+        assert_eq!(result["hits"][0]["text"], content);
+        assert_eq!(
+            result["hits"][0]["page_title"],
+            if titles_available {
+                "Design"
+            } else {
+                "Untitled"
+            }
+        );
+        assert_eq!(result["hits"][1]["page_title"], "Untitled");
+        assert_eq!(result["hits"][2]["page_title"], "Untitled");
+        assert!(request(&frame, "host.finish").payload.is_empty());
+    }
+}

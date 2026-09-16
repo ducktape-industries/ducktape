@@ -3,11 +3,6 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 
-pub const MAX_REPLAY_BYTES: usize = 256 * 1024;
-const MAX_RECORDS: usize = 16;
-// Bound replay metadata and WebSocket frame count even for one-byte reads.
-const MAX_REPLAY_CHUNKS: usize = 1024;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Caller {
     pub account: u64,
@@ -82,18 +77,14 @@ struct Record {
     mode: Mode,
     phase: Phase,
     chunks: VecDeque<Chunk>,
-    bytes: usize,
     head: u64,
-    inserted: u64,
     command_cursor: u64,
     commands: VecDeque<crate::consensus::Projected>,
-    command_bytes: usize,
 }
 
 #[derive(Default)]
 pub struct Sessions {
     records: BTreeMap<String, Record>,
-    serial: u64,
 }
 
 impl Sessions {
@@ -137,17 +128,13 @@ impl Sessions {
     fn engine_output(&mut self, session: String, chunk_b64: String) -> Result<Effect, String> {
         // The executor pump can have a read in flight when teardown emits
         // Ended. Its late bytes cannot reopen a record or stop other sessions;
-        // an already-evicted record has the same terminal outcome.
+        // an unknown session has the same terminal outcome.
         let accepts_output = self
             .records
             .get(&session)
             .is_some_and(|record| record.phase != Phase::Ended);
         if !accepts_output {
             return Ok(Effect::None);
-        }
-        let maximum = MAX_REPLAY_BYTES.div_ceil(3) * 4;
-        if chunk_b64.len() > maximum {
-            return Err("oversized executor output".into());
         }
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(chunk_b64)
@@ -173,19 +160,6 @@ impl Sessions {
         if invalid {
             return Err("invalid or occupied session".into());
         }
-        if self.records.len() >= MAX_RECORDS {
-            let oldest = self
-                .records
-                .iter()
-                .filter(|(_, record)| record.phase == Phase::Ended)
-                .min_by_key(|(_, record)| record.inserted)
-                .map(|(id, _)| id.clone());
-            let Some(oldest) = oldest else {
-                return Err("terminal record capacity reached".into());
-            };
-            self.records.remove(&oldest);
-        }
-        self.serial += 1;
         self.records.insert(
             id,
             Record {
@@ -193,12 +167,9 @@ impl Sessions {
                 mode,
                 phase: Phase::Starting,
                 chunks: VecDeque::new(),
-                bytes: 0,
                 head: 0,
-                inserted: self.serial,
                 command_cursor: 0,
                 commands: VecDeque::new(),
-                command_bytes: 0,
             },
         );
         Ok(())
@@ -276,14 +247,10 @@ impl Sessions {
         views: &[chat::MessageView],
     ) -> Result<Vec<crate::consensus::Projected>, String> {
         self.write(id, caller, Write::Committed)?;
-        if views.len() > chat::MAX_QUERY_LIMIT as usize {
-            return Err("terminal command page too large".into());
-        }
         let record = self.records.get_mut(id).expect("checked session");
         let channel = crate::consensus::session_channel(id);
         let mut previous = None;
         let mut commands = Vec::new();
-        let mut bytes = 0usize;
         for view in views {
             let wrong_channel = view.channel_id != channel;
             let unordered = previous.is_some_and(|seq| view.seq <= seq);
@@ -297,11 +264,6 @@ impl Sessions {
             let Ok(projected) = crate::consensus::project_message(view, owner) else {
                 continue;
             };
-            bytes += projected.text.len() + 1;
-            let over_budget = projected.text.len() >= 64 * 1024 || bytes > MAX_REPLAY_BYTES;
-            if over_budget {
-                return Err("terminal command page too large".into());
-            }
             commands.push(projected);
         }
         if let Some(last) = previous {
@@ -310,36 +272,23 @@ impl Sessions {
         // Record accepted execution requests before dispatch, just as the
         // native terminal records command stamps before writing to the PTY.
         for command in &commands {
-            record.command_bytes += command.origin.len() + command.text.len();
             record.commands.push_back(command.clone());
-        }
-        while record.command_bytes > MAX_REPLAY_BYTES || record.commands.len() > MAX_REPLAY_CHUNKS {
-            let oldest = record
-                .commands
-                .pop_front()
-                .expect("nonempty command history");
-            record.command_bytes -= oldest.origin.len() + oldest.text.len();
         }
         Ok(commands)
     }
 
     pub fn output(&mut self, id: &str, bytes: Vec<u8>) -> Result<(), String> {
         let record = self.records.get_mut(id).ok_or("unknown session")?;
-        let invalid_size = bytes.is_empty() || bytes.len() > MAX_REPLAY_BYTES;
+        let invalid_size = bytes.is_empty();
         let rejected = record.phase == Phase::Ended || invalid_size;
         if rejected {
             return Err("closed session or invalid output size".into());
         }
         record.head += 1;
-        record.bytes += bytes.len();
         record.chunks.push_back(Chunk {
             seq: record.head,
             bytes,
         });
-        while record.bytes > MAX_REPLAY_BYTES || record.chunks.len() > MAX_REPLAY_CHUNKS {
-            let oldest = record.chunks.pop_front().expect("nonempty bounded replay");
-            record.bytes -= oldest.bytes.len();
-        }
         Ok(())
     }
 
@@ -469,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_is_bounded_and_marks_gap_and_end_once() {
+    fn replay_retains_output_and_marks_end_once() {
         let owner = caller(7, 1);
         let mut sessions = Sessions::default();
         let id = "0000000000000001";
@@ -477,13 +426,11 @@ mod tests {
             .insert(id.into(), owner.clone(), Mode::Single)
             .unwrap();
         for _ in 0..5 {
-            sessions
-                .output(id, vec![b'x'; MAX_REPLAY_BYTES / 4])
-                .unwrap();
+            sessions.output(id, vec![b'x'; 128 * 1024]).unwrap();
         }
         let replay = sessions.replay(id, &owner, 0, 0).unwrap();
-        assert_eq!(replay.first, 2);
-        assert_eq!(replay.chunks.len(), 4);
+        assert_eq!(replay.first, 1);
+        assert_eq!(replay.chunks.len(), 5);
         assert_eq!(replay.head, 5);
         assert!(!replay.ended);
         assert!(sessions.end(id));
@@ -493,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_output_cannot_grow_replay_without_spending_its_byte_budget() {
+    fn empty_output_does_not_advance_replay() {
         let owner = caller(7, 1);
         let mut sessions = Sessions::default();
         let id = "0000000000000001";
@@ -507,29 +454,23 @@ mod tests {
     }
 
     #[test]
-    fn capacity_reclaims_ended_sessions_but_never_live_or_starting_sessions() {
+    fn new_sessions_preserve_live_and_ended_records() {
         let owner = caller(7, 1);
         let mut sessions = Sessions::default();
-        for number in 0..MAX_RECORDS {
+        for number in 0..128 {
             sessions
                 .insert(format!("{number:016x}"), owner.clone(), Mode::Single)
                 .unwrap();
         }
-        let extra = format!("{MAX_RECORDS:016x}");
-        assert!(
-            sessions
-                .insert(extra.clone(), owner.clone(), Mode::Single)
-                .is_err()
-        );
         let ended = "0000000000000001";
         sessions.created(ended);
         assert!(sessions.end(ended));
         sessions
-            .insert(extra.clone(), owner.clone(), Mode::Single)
+            .insert("0000000000000080".into(), owner.clone(), Mode::Single)
             .unwrap();
-        assert!(sessions.replay(ended, &owner, 0, 0).is_err());
+        assert!(sessions.replay(ended, &owner, 0, 0).unwrap().ended);
         assert!(sessions.replay("0000000000000000", &owner, 0, 0).is_ok());
-        assert!(sessions.replay(&extra, &owner, 1, 0).is_err());
+        assert!(sessions.replay("0000000000000080", &owner, 1, 0).is_err());
     }
 
     struct PtyProvider;
@@ -620,7 +561,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executor_refusal_finishes_the_record_and_releases_capacity() {
+    async fn executor_refusal_finishes_each_record() {
         let directory = tempfile::tempdir().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let engine = agent_service::Sessions::new(
@@ -631,7 +572,7 @@ mod tests {
         );
         let owner = caller(7, 1);
         let mut sessions = Sessions::default();
-        for number in 0..MAX_RECORDS + 1 {
+        for number in 0..32 {
             let session = format!("{number:016x}");
             sessions
                 .insert(session.clone(), owner.clone(), Mode::Single)
@@ -738,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn tiny_output_chunks_have_a_bounded_replay_record_count() {
+    fn tiny_output_chunks_remain_available_for_replay() {
         let owner = caller(7, 1);
         let mut sessions = Sessions::default();
         let id = "0000000000000001";
@@ -750,8 +691,8 @@ mod tests {
             sessions.output(id, vec![1]).unwrap();
         }
         let replay = sessions.replay(id, &owner, 0, 0).unwrap();
-        assert_eq!(replay.chunks.len(), 1024);
-        assert_eq!(replay.first, 1025);
+        assert_eq!(replay.chunks.len(), 2048);
+        assert_eq!(replay.first, 1);
         assert_eq!(replay.head, 2048);
     }
 

@@ -394,3 +394,56 @@ fn hex_bytes(hex: &str) -> Option<Vec<u8>> {
 }
 
 const LINK_SCHEMES: [&str; 3] = ["http://", "https://", "duck://"];
+
+/// Resolve display labels for mention tokens while preserving fenced code and byte ranges.
+pub fn draft_mentions(
+    text: &str,
+    label: impl Fn(&Party) -> String,
+) -> (String, Vec<(std::ops::Range<usize>, Party)>) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut display = String::new();
+    let mut mentions = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if let Some(consumed) = code_fence_len(&chars, index) {
+            display.extend(&chars[index..index + consumed]);
+            index += consumed;
+            continue;
+        }
+        if let Some((party, consumed)) = mention_at(&chars, index) {
+            let start = display.len();
+            display.push_str(&label(&party));
+            mentions.push((start..display.len(), party));
+            index += consumed;
+        } else {
+            display.push(chars[index]);
+            index += 1;
+        }
+    }
+    (display, mentions)
+}
+
+/// Fenced code is literal, including token-shaped text inside it.
+fn code_fence_len(chars: &[char], at: usize) -> Option<usize> {
+    let line_start = at == 0 || chars[at - 1] == '\n';
+    if !line_start {
+        return None;
+    }
+    let mut lines = chars[at..].split_inclusive(|ch| *ch == '\n');
+    let opener = lines.next()?;
+    let opener_text: String = opener.iter().collect();
+    let opens_fence = opener_text.trim().starts_with("```");
+    if !opens_fence {
+        return None;
+    }
+    let mut consumed = opener.len();
+    for line in lines {
+        consumed += line.len();
+        let line_text: String = line.iter().collect();
+        let closes_fence = line_text.trim() == "```";
+        if closes_fence {
+            break;
+        }
+    }
+    Some(consumed)
+}

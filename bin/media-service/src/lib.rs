@@ -8,16 +8,10 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse as _, Response};
-use futures::{StreamExt as _, future::BoxFuture, stream::BoxStream};
+use futures::{SinkExt as _, StreamExt as _, future::BoxFuture, stream::BoxStream};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
 use tokio::sync::mpsc;
-
-const MAX_FRAME: usize = 64 * 1024;
-const MAX_SESSIONS: usize = 256;
-const MAX_ROOM: usize = 32;
-const QUEUE: usize = 4;
-const SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -193,7 +187,7 @@ enum Control {
 struct Participant {
     id: u64,
     caller: Caller,
-    output: mpsc::Sender<Message>,
+    output: mpsc::UnboundedSender<Message>,
     beacon: Beacon,
 }
 
@@ -223,21 +217,16 @@ impl Hub {
         room: &str,
         caller: Caller,
         roster: &Roster,
-    ) -> Result<(u64, mpsc::Receiver<Message>), String> {
-        let sessions: usize = self.rooms.values().map(BTreeMap::len).sum();
-        if sessions >= MAX_SESSIONS {
-            return Err("service capacity reached".into());
-        }
+    ) -> Result<(u64, mpsc::UnboundedReceiver<Message>), String> {
         let participants = self.rooms.entry(room.into()).or_default();
         let occupied = participants.contains_key(&caller.account)
             || participants
                 .values()
-                .any(|participant| participant.caller.node == caller.node)
-            || participants.len() >= MAX_ROOM;
+                .any(|participant| participant.caller.node == caller.node);
         if occupied {
             return Err("room seat unavailable".into());
         }
-        // Admission sends one bounded roster frame, even when all seats exist.
+        // Admission sends the current roster before subsequent media.
         let peers: Vec<_> = participants
             .values()
             .filter(|participant| roster.contains(&participant.caller))
@@ -246,8 +235,8 @@ impl Hub {
                 "peer": peer(&participant.caller.node), "state": participant.beacon})
             })
             .collect();
-        let (output, input) = mpsc::channel(QUEUE);
-        let _ = output.try_send(Message::Text(
+        let (output, input) = mpsc::unbounded_channel();
+        let _ = output.send(Message::Text(
             serde_json::json!({"type": "ready", "peers": peers})
                 .to_string()
                 .into(),
@@ -283,7 +272,7 @@ impl Hub {
             .to_string()
             .into(),
         );
-        participants.retain(|_, participant| participant.output.try_send(left.clone()).is_ok());
+        participants.retain(|_, participant| participant.output.send(left.clone()).is_ok());
         if participants.is_empty() {
             self.rooms.remove(room);
         }
@@ -329,9 +318,6 @@ impl Hub {
                 beacon_message(caller, &source.beacon)
             }
             Message::Binary(bytes) => {
-                if bytes.len() > MAX_FRAME {
-                    return Err("media frame too large".into());
-                }
                 match bytes.first().copied() {
                     Some(1) => {
                         let pcm = media_service::call_wire::decode_audio(&bytes)
@@ -375,7 +361,7 @@ impl Hub {
         };
         participants.retain(|account, participant| {
             let recipient = *account != caller.account && roster.contains(&participant.caller);
-            !recipient || participant.output.try_send(message.clone()).is_ok()
+            !recipient || participant.output.send(message.clone()).is_ok()
         });
         Ok(())
     }
@@ -449,8 +435,8 @@ async fn upgrade(
         caller,
     };
     socket
-        .max_frame_size(MAX_FRAME)
-        .max_message_size(MAX_FRAME)
+        .max_frame_size(usize::MAX)
+        .max_message_size(usize::MAX)
         .on_upgrade(move |socket| serve(socket, seat, membership, incoming))
 }
 
@@ -472,11 +458,20 @@ impl Drop for Seat {
 }
 
 async fn serve(
-    mut socket: WebSocket,
+    socket: WebSocket,
     seat: Seat,
     mut membership: Membership,
-    mut output: mpsc::Receiver<Message>,
+    mut output: mpsc::UnboundedReceiver<Message>,
 ) {
+    let (mut sink, mut incoming) = socket.split();
+    let writer = async {
+        while let Some(outgoing) = output.recv().await {
+            if sink.send(outgoing).await.is_err() {
+                break;
+            }
+        }
+    };
+    tokio::pin!(writer);
     loop {
         tokio::select! {
             biased;
@@ -489,12 +484,8 @@ async fn serve(
                 if !roster.contains(&seat.caller) { break; }
                 membership.roster = roster;
             }
-            outgoing = output.recv() => {
-                let Some(outgoing) = outgoing else { break; };
-                let sent = tokio::time::timeout(SEND_DEADLINE, socket.send(outgoing)).await;
-                if !matches!(sent, Ok(Ok(()))) { break; }
-            }
-            incoming = socket.recv() => {
+            _ = &mut writer => break,
+            incoming = incoming.next() => {
                 let Some(Ok(incoming)) = incoming else { break; };
                 let relayed = seat.service.hub.lock().expect("media hub").relay(&seat.room, &seat.caller, seat.id, &membership.roster, incoming);
                 if relayed.is_err() { break; }
@@ -506,7 +497,6 @@ async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::SinkExt as _;
     use tokio_tungstenite::tungstenite::{
         Message as ClientMessage, client::IntoClientRequest as _,
     };
@@ -750,7 +740,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_readers_are_retired_and_old_teardown_cannot_remove_a_new_seat() {
+    async fn queued_output_is_preserved_and_old_teardown_cannot_remove_a_new_seat() {
         let first = Caller {
             account: 1,
             node: [1; 32],
@@ -767,11 +757,17 @@ mod tests {
             media_service::call_wire::encode_audio(&vec![1; media_service::voice::FRAME_SAMPLES])
                 .into(),
         );
-        for _ in 0..QUEUE {
+        for _ in 0..64 {
             hub.relay("room", &second, second_id, &roster, audio.clone())
                 .unwrap();
         }
-        while output.recv().await.is_some() {}
+        assert!(matches!(output.recv().await, Some(Message::Text(_))));
+        for _ in 0..64 {
+            assert!(matches!(output.recv().await, Some(Message::Binary(_))));
+        }
+        drop(output);
+        hub.relay("room", &second, second_id, &roster, audio)
+            .unwrap();
         let (replacement, _output) = hub.join("room", first.clone(), &roster).unwrap();
         hub.leave("room", &first, first_id);
         assert_eq!(hub.rooms["room"][&first.account].id, replacement);

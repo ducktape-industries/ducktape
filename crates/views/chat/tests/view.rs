@@ -33,7 +33,23 @@ fn tick_native(input: Vec<ducktape_view_guest::wire::Event>) -> Frame {
         })
         .cloned();
     if let Some(request) = sidebar {
-        let rows: Vec<_> = [("channel-a", "general", false), ("channel-b", "ops", false), ("channel-v", "lounge", true)].into_iter().map(|(id,name,voice)| serde_json::json!({"channel":{"id":id,"name":name,"voice":voice,"post_policy":"open","archived":false,"huddle":if id == "channel-b" { serde_json::json!([{ "party":"acct:8", "node":"ada lovelace", "joined_at":1 },{ "party":"acct:7", "node":"me", "joined_at":2 }]) } else {serde_json::json!([])}},"head_seq":0})).collect();
+        let rows: Vec<_> = [
+            ("channel-a", "general", false),
+            ("channel-b", "ops", false),
+            ("channel-v", "lounge", true),
+        ]
+        .into_iter()
+        .map(|(id, name, voice)| {
+            serde_json::json!({
+                "id": id, "name": name, "voice": voice, "post_policy": "open",
+                "archived": false, "head_seq": 0,
+                "huddle": if id == "channel-b" { serde_json::json!([
+                    {"party":"acct:8", "node":"ada lovelace", "joined_at":1},
+                    {"party":"acct:7", "node":"me", "joined_at":2}
+                ]) } else { serde_json::json!([]) }
+            })
+        })
+        .collect();
         let bytes = serde_json::to_vec(
             &serde_json::json!({"channels":{"channels":rows,"has_more":false,"next_after":null}}),
         )
@@ -202,6 +218,10 @@ const CHIEF_RUN: &str = "chat\u{1f}channel-a\u{1f}2\u{1f}chiefduck";
 /// One run in flight, anchored at seq 2 of the room on screen.
 fn live_run(agent: &str, status: &str) -> chat_view::host::LiveRunHint {
     chat_view::host::LiveRunHint {
+        public_progress: None,
+        output: Vec::new(),
+        output_error: String::new(),
+        channel_id: "channel-a".into(),
         anchor_seq: 2,
         thread_root: 0,
         run_id: CHIEF_RUN.into(),
@@ -392,19 +412,18 @@ fn a_voice_room_lists_under_voice_and_joins_on_press() {
     });
 }
 
-/// The room the app is in stays the app's to move: several planes steer it.
+/// Room navigation uses the same link contract as external navigation.
 #[test]
-fn choosing_a_room_still_leaves_as_an_intent() {
+fn choosing_a_room_uses_the_common_link_intent() {
     on_a_deep_stack(|| {
         let (frame, _) = connected_room();
         let frame = tick_native(press(&frame, "ops"));
         let intent = one_intent(&frame);
-        assert_eq!(intent.kind, "chat.choose_channel");
+        assert_eq!(intent.kind, "chat.open_link");
+        let link: serde_json::Value = serde_json::from_slice(&intent.payload).unwrap();
         assert_eq!(
-            serde_json::from_slice::<Channel>(&intent.payload).expect("decodes"),
-            Channel {
-                id: "channel-b".into()
-            }
+            link["url"],
+            chat_view::host::duck_channel_link("channel-b".into(), session(true).network_chain_id,)
         );
     });
 }
@@ -767,8 +786,10 @@ fn the_channel_list_and_details_drawer_drag_with_horizontal_cursors() {
 #[test]
 fn a_live_run_opens_its_thread_and_stop_leaves_as_a_cancel() {
     on_a_deep_stack(|| {
+        let mut other_room = live_run("otherduck", "Working elsewhere");
+        other_room.channel_id = "channel-b".into();
         let seated = Session {
-            live_agents: vec![live_run("chiefduck", "Reading the repo")],
+            live_agents: vec![live_run("chiefduck", "Reading the repo"), other_room],
             ..session(true)
         };
         let (frame, _, props) = connected_room_with(&seated, roots());

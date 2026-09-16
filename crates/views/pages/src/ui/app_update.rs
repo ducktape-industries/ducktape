@@ -13,6 +13,7 @@ impl PagesView {
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::SessionArrived(item) => self.on_session_arrived(item),
+            Message::BackgroundFinished => self.on_background_finished(),
             Message::CommentPointerMoved(_x, y) => self.on_comment_pointer_moved(_x, y),
             Message::ChoosePage(id) => self.on_choose_page(id),
             Message::TogglePageFold(id) => self.on_toggle_page_fold(id),
@@ -78,7 +79,15 @@ impl PagesView {
             Message::DocumentUpdated(document) => self.on_document_updated(document),
         }
     }
+    fn on_background_finished(&mut self) -> Task<Message> {
+        Task::none()
+    }
     fn on_session_arrived(&mut self, item: crate::host::SessionItem) -> Task<Message> {
+        if let Some(request) = item.background {
+            return Task::perform(crate::host::background_search(request), |_| {
+                Message::BackgroundFinished
+            });
+        }
         self.host_error = item.error.to_owned();
         if !(item.error).is_empty() {
             return Task::none();

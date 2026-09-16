@@ -317,7 +317,6 @@ impl Desktop {
                     inputs: HashMap::new(),
                     input_step: None,
                     qr: None,
-                    video: None,
                     focus,
                     _activation: activation,
                     _observer: observer,
@@ -408,14 +407,35 @@ fn release_window_input(window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
     window.draw(cx).clear(cx);
 }
 
-struct VideoSurfaces {
-    selection: (String, Vec<String>),
-    tiles: Entity<crate::video::VideoView>,
-    picture: Entity<crate::video::VideoView>,
+fn huddle_props(state: &Ducktape) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({"panel": {
+        "instance": state.huddle_instance, "channel": state.huddle_channel,
+        "joined": state.huddle_joined, "loading": state.loading,
+        "dark": state.is_dark(), "network": state.network_chain_id,
+        "endpoint": state.connected_rpc, "account": state.account_number,
+        "user_key": state.settings_user_key,
+        "status": state.call_status, "joined_at": state.huddle_joined_at,
+        "now": state.huddle_now, "muted": state.call_muted,
+        "camera": state.call_camera, "sharing": state.call_sharing,
+        "speaking": state.call_speaking, "stage": state.huddle_stage,
+        "tiles": state.huddle_tiles, "video_live": state.call_video_live,
+        "peers": state.call_peers,
+    }}))
+    .expect("call panel facts")
+}
+
+fn huddle_route(event: crate::module_view::ModuleViewEvent) -> Message {
+    match event.kind.as_str() {
+        "mute" => Message::ToggleCallMute,
+        "camera" => Message::ToggleCallCamera,
+        "screen" => Message::ToggleCallScreen,
+        "channel" => Message::HuddleGoChannel,
+        "leave" => Message::LeaveHuddleHere,
+        _ => Message::ExternalUrlFailed("unrecognized call control".to_owned().into()),
+    }
 }
 
 pub(crate) struct DesktopWindow {
-    video: Option<VideoSurfaces>,
     model: Entity<Desktop>,
     kind: WindowKind,
     module: Option<(&'static str, Entity<crate::module_view::NativeModuleView>)>,
@@ -1356,280 +1376,22 @@ impl DesktopWindow {
     }
 
     fn huddle(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        use gpui_kit::component::button::ButtonVariants as _;
-        use gpui_kit::*;
-        let colors = gpui_kit::component::Theme::global(cx).color_tokens();
-        let state = &self.model.read(cx).state;
-        let live_dot = hsla_of(design::palette(state.is_dark()).accent);
-        // The ring a plate wears while its person talks.
-        let speaking_ring = hsla_of(design::palette(state.is_dark()).success);
-        let mute = if state.call_muted { "Unmute" } else { "Mute" };
-        let camera = if state.call_camera {
-            "Stop camera"
-        } else {
-            "Camera"
-        };
-        let screen = if state.call_sharing {
-            "Stop sharing"
-        } else {
-            "Share screen"
-        };
-        let stage = state.huddle_stage.clone();
-        let images = state.huddle_tiles.clone();
-        let selection = (stage.clone(), images.clone());
-        let video_live = state.call_video_live;
-        let invitees =
-            crate::backend::huddle_invitees(&state.huddle_invitees, &state.huddle_roster);
-        let (muted, camera_on, sharing) = (state.call_muted, state.call_camera, state.call_sharing);
-        let rows = state.huddle_rows.clone();
-        let row_count = rows.len();
-        let title = state.huddle_channel_name.clone();
-        let status = state.call_status.clone();
-        let elapsed = if state.huddle_joined_at > 0 {
-            crate::backend::mmss(state.huddle_now - state.huddle_joined_at)
-        } else {
-            String::new()
-        };
-        match &mut self.video {
-            Some(VideoSurfaces {
-                selection: previous,
-                tiles,
-                picture,
-            }) => {
-                if previous != &selection {
-                    tiles.update(cx, |view, cx| {
-                        view.replace_tiles(images.clone(), stage.clone(), cx)
-                    });
-                    picture.update(cx, |view, cx| view.replace_stage(stage.clone(), cx));
-                    *previous = selection.clone();
-                }
-            }
-            None => {
-                self.video = Some(VideoSurfaces {
-                    selection,
-                    tiles: cx.new(|_| crate::video::call_video_tiles(images, &stage)),
-                    picture: cx.new(|_| crate::video::call_video_stage(&stage)),
-                })
-            }
+        use gpui_kit::IntoElement as _;
+        let props = huddle_props(&self.model.read(cx).state);
+        if self.module.is_none() {
+            let view = cx.new(|_| crate::module_view::NativeModuleView::new("call"));
+            let model = self.model.clone();
+            self.route = Some(cx.subscribe(&view, move |_, _, event, cx| {
+                model.update(cx, |model, cx| {
+                    model.dispatch(huddle_route(event.clone()), cx)
+                });
+            }));
+            self.module = Some(("call", view));
+            self.module_route = Some(huddle_route);
         }
-        let VideoSurfaces { tiles, picture, .. } =
-            self.video.as_ref().expect("retained video surfaces");
-        let mut body = div()
-            .id("huddle-stage")
-            .flex_1()
-            .min_h_0()
-            .overflow_hidden()
-            .p_3()
-            .flex()
-            .flex_col()
-            .gap_3();
-        // The video takes the room the roster leaves: the stage whole in the
-        // largest box left, the tiles a strip under it or, with no stage, the
-        // grid in that box instead. The surfaces fill whatever box they get.
-        if !stage.is_empty() {
-            body = body.child(div().flex_1().min_h_0().w_full().child(picture.clone()));
-        }
-        if video_live {
-            let tiles_box = if stage.is_empty() {
-                div().flex_1().min_h_0()
-            } else {
-                div().flex_shrink_0()
-            };
-            body = body.child(tiles_box.w_full().child(tiles.clone()));
-        }
-        // The people, one a row, the way a voice channel lists them: the
-        // plate, the name, and "you" / "muted" beside it. The list stays
-        // virtual: only the rows on screen are built.
-        body = body.child(
-            div()
-                .px_1()
-                .text_size(px(11.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(colors.muted_foreground)
-                .child(format!("In the huddle · {row_count}")),
-        );
-        body = body.child(
-            uniform_list("huddle-roster", row_count, move |range, _, _| {
-                rows[range]
-                    .iter()
-                    .map(|row| {
-                        let caption = match (row.person.is_you, row.muted) {
-                            (true, true) => "you · muted",
-                            (true, false) => "you",
-                            (false, true) => "muted",
-                            (false, false) => "",
-                        };
-                        let mut plate = div()
-                            .flex_shrink_0()
-                            .size(px(26.))
-                            .rounded_full()
-                            .bg(colors.secondary)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(row.person.initials.clone());
-                        if row.speaking {
-                            plate = plate.border_2().border_color(speaking_ring);
-                        }
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .h(px(36.))
-                            .px_2()
-                            .rounded(px(design::radius::CONTROL as f32))
-                            .child(plate)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(13.))
-                                    .child(row.person.label.clone()),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(px(11.5))
-                                    .text_color(colors.muted_foreground)
-                                    .child(caption),
-                            )
-                    })
-                    .collect()
-            })
-            // with video on screen the list yields to it and scrolls instead
-            .when(video_live, |list| list.flex_shrink_0().max_h(px(150.)))
-            .when(!video_live, |list| list.flex_1().min_h_0()),
-        );
-        // The room's members not seated yet, one chip each: a press posts a
-        // mention into the room that says come join, and the chip is gone —
-        // an invite is sent once.
-        if !invitees.is_empty() {
-            use gpui_kit::component::Sizable as _;
-            let mut chips = div().flex().flex_wrap().gap_1();
-            for member in invitees {
-                chips = chips.child(
-                    self.action(
-                        format!("huddle-invite-{}", member.key),
-                        member.label.clone(),
-                        Message::InviteToHuddle(member.key.clone()),
-                        false,
-                    )
-                    .outline()
-                    .xsmall(),
-                );
-            }
-            body = body.child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .flex_shrink_0()
-                    .border_t_1()
-                    .border_color(colors.border)
-                    .child(
-                        div()
-                            .pb_1()
-                            .text_size(px(11.5))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(colors.muted_foreground)
-                            .child("Invite"),
-                    )
-                    .child(chips),
-            );
-        }
-        // The control bar reads left to right as media, then the room, then
-        // the exit: a toggle that is ON is filled so its state is visible
-        // without reading the label (a muted mic is the red one).
-        let mute_button = self.action("huddle-mute", mute, Message::ToggleCallMute, false);
-        let mute_button = match muted {
-            true => mute_button.danger(),
-            false => mute_button.outline(),
-        };
-        let camera_button = self.action("huddle-camera", camera, Message::ToggleCallCamera, false);
-        let camera_button = match camera_on {
-            true => camera_button.primary(),
-            false => camera_button.outline(),
-        };
-        let screen_button = self.action("huddle-screen", screen, Message::ToggleCallScreen, false);
-        let screen_button = match sharing {
-            true => screen_button.primary(),
-            false => screen_button.outline(),
-        };
-        let controls = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .p_3()
-            .flex_shrink_0()
-            .border_t_1()
-            .border_color(colors.border)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(mute_button)
-                    .child(camera_button)
-                    .child(screen_button),
-            )
-            .child(div().flex_1())
-            .child(
-                self.action(
-                    "huddle-channel",
-                    "Go to channel",
-                    Message::HuddleGoChannel,
-                    false,
-                )
-                .ghost(),
-            )
-            .child(
-                self.action(
-                    "huddle-leave",
-                    "Leave huddle",
-                    Message::LeaveHuddleHere,
-                    false,
-                )
-                .danger(),
-            );
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(colors.background)
-            .text_color(colors.foreground)
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .flex_shrink_0()
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().size(px(8.)).rounded_full().bg(live_dot))
-                    .child(div().font_weight(FontWeight::MEDIUM).child(title))
-                    .child(
-                        div()
-                            .font_family(design::fonts::FAMILY_MONO)
-                            .text_size(px(12.))
-                            .text_color(colors.muted_foreground)
-                            .child(elapsed),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_size(px(11.5))
-                            .text_color(colors.muted_foreground)
-                            .child(status),
-                    ),
-            )
-            .child(body)
-            .child(controls)
-            .into_any_element()
+        let view = self.module.as_ref().expect("call view seated").1.clone();
+        view.update(cx, |view, cx| view.set_props(props, cx));
+        view.into_any_element()
     }
 
     fn console(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
@@ -1682,7 +1444,7 @@ impl DesktopWindow {
         navigation.extend(
             registered
                 .into_iter()
-                .filter(|module| *module != HOME_VIEW)
+                .filter(|module| *module != HOME_VIEW && *module != "call")
                 .map(|module| (ShellTab::Registered(module), label(module))),
         );
         navigation.extend([
@@ -1710,7 +1472,7 @@ impl DesktopWindow {
         let voice = state.huddle_joined.then(|| VoiceDock {
             room: state.huddle_channel_name.clone(),
             elapsed: crate::backend::mmss(state.huddle_now - state.huddle_joined_at),
-            others: state.huddle_rows.len().saturating_sub(1),
+            others: state.huddle_roster.len().saturating_sub(1),
             muted: state.call_muted,
         });
         let success = hsla_of(palette.success);
@@ -2495,7 +2257,6 @@ pub(crate) fn test_window(
             inputs: HashMap::new(),
             input_step: None,
             qr: None,
-            video: None,
             focus: cx.focus_handle(),
             _activation: activation,
             _observer: observer,
@@ -2747,45 +2508,16 @@ mod close_tests {
         });
     }
 
-    #[gpui_kit::test]
-    fn huddle_replaces_tile_selection_without_a_stage_change(cx: &mut gpui_kit::TestAppContext) {
-        use gpui_kit::test::TestWindowExt as _;
-        cx.update(gpui_kit::init);
-        let mut presenter = None;
-        let handle = cx.open_window(
-            gpui_kit::size(gpui_kit::px(560.), gpui_kit::px(600.)),
-            |window, cx| {
-                let (mut state, _) = Ducktape::boot();
-                state.call_video_live = true;
-                state.huddle_tiles = vec!["first-image".into()];
-                let view = test_window(state, WindowKind::Huddle, window, cx);
-                presenter = Some(view.clone());
-                gpui_kit::component::Root::new(view, window, cx)
-            },
-        );
-        let presenter = presenter.unwrap();
-        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
-            .unwrap();
-        presenter.read_with(cx, |view, _| {
-            assert_eq!(
-                view.video.as_ref().unwrap().selection,
-                (String::new(), vec!["first-image".into()])
-            );
-        });
-        presenter.update(cx, |view, cx| {
-            view.model.update(cx, |model, cx| {
-                model.state.huddle_tiles = vec!["second-image".into()];
-                cx.notify();
-            });
-        });
-        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
-            .unwrap();
-        presenter.read_with(cx, |view, _| {
-            assert_eq!(
-                view.video.as_ref().unwrap().selection,
-                (String::new(), vec!["second-image".into()])
-            );
-        });
+    #[test]
+    fn huddle_forwards_tile_changes_without_selecting_a_stage() {
+        let (mut state, _) = Ducktape::boot();
+        state.call_video_live = true;
+        for key in ["first-image", "second-image"] {
+            state.huddle_tiles = vec![key.into()];
+            let props: serde_json::Value = serde_json::from_slice(&huddle_props(&state)).unwrap();
+            assert_eq!(props["panel"]["tiles"], serde_json::json!([key]));
+            assert_eq!(props["panel"]["stage"], "");
+        }
     }
 
     fn frozen_route(event: crate::module_view::ModuleViewEvent) -> Message {
@@ -2809,7 +2541,8 @@ mod close_tests {
             gpui_kit::size(gpui_kit::px(320.), gpui_kit::px(460.)),
             |window, cx| {
                 let (state, _) = Ducktape::boot();
-                let view = test_window(state, WindowKind::Huddle, window, cx);
+                // Onboarding has no deployed module of its own to replace this fixture.
+                let view = test_window(state, WindowKind::Onboarding, window, cx);
                 presenter = Some(view.clone());
                 gpui_kit::component::Root::new(view, window, cx)
             },

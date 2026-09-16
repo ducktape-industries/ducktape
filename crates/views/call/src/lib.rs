@@ -1,38 +1,155 @@
 //! Deployed call protocol over generic media devices and Gateway streams.
+mod panel;
 mod protocol;
 mod session;
 
 use ducktape_view_guest::{Subscription, Task, wire};
 
-pub struct CallView;
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub struct CallView {
+    panel: Option<panel::Panel>,
+    invited: std::collections::BTreeSet<String>,
+    room: panel::Room,
+    error: String,
+    #[serde(skip)]
+    invitations: std::collections::BTreeMap<String, ducktape_view_guest::task::Handle>,
+}
 #[derive(Clone)]
 pub enum Message {
     Progress,
+    Panel(Box<panel::Panel>),
+    Action(panel::Action),
+    InviteFinished(panel::RoomKey, String, Result<(), String>),
+    RoomLoaded(panel::RoomKey, Result<panel::Room, String>),
 }
 
 impl CallView {
     const PREFERRED_WINDOW_SIZE: &'static str = "none";
     fn boot() -> (Self, Task<Message>) {
-        (Self, Task::none())
+        (Self::default(), Task::none())
     }
     fn view(&self) -> wire::Node {
-        wire::Node::empty()
+        self.panel.as_ref().map_or_else(wire::Node::empty, |panel| {
+            panel.view(&self.room, &self.invited, &self.error)
+        })
     }
-    fn update(&mut self, _: Message) -> Task<Message> {
+    fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Progress => self.on_progress(),
+            Message::Panel(panel) => self.on_panel(*panel),
+            Message::Action(action) => self.on_action(action),
+            Message::RoomLoaded(key, result) => self.on_room_loaded(key, result),
+            Message::InviteFinished(instance, key, result) => {
+                self.on_invite_finished(instance, key, result)
+            }
+        }
+    }
+    fn on_progress(&mut self) -> Task<Message> {
+        Task::none()
+    }
+    fn on_panel(&mut self, panel: panel::Panel) -> Task<Message> {
+        let changed = self.panel.as_ref().is_none_or(|previous| {
+            previous.room_key() != panel.room_key() || previous.joined != panel.joined
+        });
+        if changed {
+            self.invitations.clear();
+            self.invited.clear();
+            self.room = panel::Room::default();
+            self.error.clear();
+        }
+        self.panel = Some(panel);
+        Task::none()
+    }
+    fn on_room_loaded(
+        &mut self,
+        key: panel::RoomKey,
+        result: Result<panel::Room, String>,
+    ) -> Task<Message> {
+        let current = self
+            .panel
+            .as_ref()
+            .is_some_and(|panel| panel.joined && panel.room_key() == key);
+        if !current {
+            return Task::none();
+        }
+        match result {
+            Ok(room) => self.room = room,
+            Err(error) => self.error = error,
+        }
+        Task::none()
+    }
+    fn on_action(&mut self, action: panel::Action) -> Task<Message> {
+        match action {
+            panel::Action::Mute => self.control("call.mute"),
+            panel::Action::Camera => self.control("call.camera"),
+            panel::Action::Screen => self.control("call.screen"),
+            panel::Action::Channel => self.control("call.channel"),
+            panel::Action::Leave => self.control("call.leave"),
+            panel::Action::Invite(key) => self.invite(key),
+        }
+    }
+    fn control(&self, kind: &str) -> Task<Message> {
+        panel::notify(kind);
+        Task::none()
+    }
+    fn invite(&mut self, key: String) -> Task<Message> {
+        let Some(panel) = &self.panel else {
+            return Task::none();
+        };
+        let available = panel.joined
+            && !panel.loading
+            && !panel.channel.is_empty()
+            && self.room.members.iter().any(|member| member.key == key);
+        if !available || !self.invited.insert(key.clone()) {
+            return Task::none();
+        }
+        self.error.clear();
+        let room = panel.room_key();
+        let member = key.clone();
+        let (task, handle) = Task::perform(
+            panel::invite(panel.channel.clone(), self.room.title.clone(), key.clone()),
+            move |result| Message::InviteFinished(room.clone(), key.clone(), result),
+        )
+        .abortable();
+        self.invitations.insert(member, handle.abort_on_drop());
+        task
+    }
+    fn on_invite_finished(
+        &mut self,
+        room: panel::RoomKey,
+        key: String,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        let current = self
+            .panel
+            .as_ref()
+            .is_some_and(|panel| panel.joined && panel.room_key() == room);
+        if !current {
+            return Task::none();
+        }
+        self.invitations.remove(&key);
+        if let Err(error) = result {
+            self.invited.remove(&key);
+            self.error = error;
+        }
         Task::none()
     }
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::run(session::run)
+        let protocol = Subscription::run(session::run);
+        let Some(panel) = &self.panel else {
+            return protocol;
+        };
+        if !panel.joined || panel.channel.is_empty() {
+            return protocol;
+        }
+        Subscription::batch([protocol, panel::rooms(panel.room_key())])
     }
-    // Replacement restarts protocol resources against current properties.
+    // Protocol resources restart; panel interaction state survives replacement.
     fn snapshot(&self) -> Result<Vec<u8>, String> {
-        Ok(Vec::new())
+        serde_json::to_vec(self).map_err(|error| error.to_string())
     }
     fn restore(bytes: &[u8]) -> Result<Self, String> {
-        if !bytes.is_empty() {
-            return Err("call snapshot must be empty".into());
-        }
-        Ok(Self)
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())
     }
 }
 
@@ -48,6 +165,149 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn panel_replacement_preserves_invites_and_rejects_an_old_rooms_reply() {
+        let mut view = CallView::default();
+        let _ = view.on_panel(panel::Panel {
+            instance: 7,
+            joined: true,
+            channel: "room".into(),
+            ..Default::default()
+        });
+        view.invited.insert("acct:8".into());
+        let mut restored = CallView::restore(&view.snapshot().unwrap()).unwrap();
+        let _ = restored.on_panel(panel::Panel {
+            instance: 7,
+            joined: true,
+            channel: "room".into(),
+            muted: true,
+            ..Default::default()
+        });
+        assert!(restored.invited.contains("acct:8"));
+        let _ = restored.on_panel(panel::Panel {
+            instance: 8,
+            joined: true,
+            channel: "other".into(),
+            ..Default::default()
+        });
+        restored.invited.insert("acct:8".into());
+        let old = view.panel.as_ref().unwrap().room_key();
+        let current = restored.panel.as_ref().unwrap().room_key();
+        let _ = restored.on_invite_finished(old, "acct:8".into(), Err("old failure".into()));
+        assert!(restored.error.is_empty());
+        assert!(restored.invited.contains("acct:8"));
+        let _ =
+            restored.on_invite_finished(current, "acct:8".into(), Err("current failure".into()));
+        assert_eq!(restored.error, "current failure");
+        assert!(restored.invited.is_empty());
+    }
+
+    #[test]
+    fn identity_changes_cancel_pending_invites_and_discard_the_old_rooms_state() {
+        use futures::{FutureExt as _, StreamExt as _};
+        let base = panel::Panel {
+            instance: 7,
+            channel: "room".into(),
+            joined: true,
+            network: "chain-a".into(),
+            endpoint: "node-a".into(),
+            account: "7".into(),
+            user_key: "key-a".into(),
+            ..Default::default()
+        };
+        let alternatives = [
+            panel::Panel {
+                network: "chain-b".into(),
+                ..base.clone()
+            },
+            panel::Panel {
+                endpoint: "node-b".into(),
+                ..base.clone()
+            },
+            panel::Panel {
+                account: "8".into(),
+                ..base.clone()
+            },
+            panel::Panel {
+                user_key: "key-b".into(),
+                ..base.clone()
+            },
+            panel::Panel {
+                joined: false,
+                ..base.clone()
+            },
+        ];
+        for changed in alternatives {
+            let mut view = CallView::default();
+            let _ = view.on_panel(base.clone());
+            view.room.title = "old room".into();
+            view.invited.insert("acct:9".into());
+            let (task, handle) = Task::future(std::future::pending::<Message>()).abortable();
+            view.invitations
+                .insert("acct:9".into(), handle.abort_on_drop());
+            let _ = view.on_panel(changed);
+            assert!(view.invited.is_empty());
+            assert!(view.room.title.is_empty());
+            assert!(view.invitations.is_empty());
+            assert!(matches!(
+                task.into_stream().next().now_or_never(),
+                Some(None)
+            ));
+            let _ = view.on_invite_finished(
+                base.room_key(),
+                "acct:9".into(),
+                Err("old failure".into()),
+            );
+            let _ = view.on_room_loaded(base.room_key(), Err("old lookup".into()));
+            assert!(view.error.is_empty());
+        }
+    }
+
+    #[test]
+    fn room_queries_belong_to_the_current_panel_instance() {
+        let mut view = CallView::default();
+        let old = panel::Panel {
+            instance: 1,
+            ..Default::default()
+        }
+        .room_key();
+        let current = panel::Panel {
+            instance: 2,
+            joined: true,
+            ..Default::default()
+        };
+        let key = current.room_key();
+        let _ = view.on_panel(current);
+        let _ = view.on_room_loaded(old, Err("old room".into()));
+        assert!(view.error.is_empty());
+        let _ = view.on_room_loaded(
+            key,
+            Ok(panel::Room {
+                title: "current".into(),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(view.room.title, "current");
+    }
+
+    #[test]
+    fn panel_properties_do_not_start_devices_or_transport() {
+        let mut host = Host::new();
+        host.step(Vec::new());
+        host.item("call.props", json!({"panel": {"title": "Engineering"}}));
+        assert_eq!(
+            host.streams.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["call.props"]
+        );
+        assert!(host.effects.is_empty());
+        host.item(
+            "call.props",
+            json!({"panel": {"title": "Other room", "muted": true}}),
+        );
+        assert_eq!(host.streams.len(), 1);
+        assert!(host.effects.is_empty());
+    }
 
     struct Host {
         guest: ducktape_view_guest::Driver<CallView>,

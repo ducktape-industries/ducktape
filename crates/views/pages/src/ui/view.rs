@@ -103,6 +103,7 @@ impl ::std::fmt::Debug for PagesView {
 #[derive(Clone)]
 pub enum Message {
     SessionArrived(crate::host::SessionItem),
+    BackgroundFinished,
     CommentPointerMoved(f64, f64),
     ChoosePage(String),
     TogglePageFold(String),

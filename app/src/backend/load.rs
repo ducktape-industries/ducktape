@@ -266,17 +266,6 @@ pub(crate) async fn load_channel_window_data(
     })
 }
 
-/// The huddle room's member roll, for the invite chips: the room the reader
-/// is seated in is not necessarily the one on screen (a voice room), so the
-/// active channel's roll cannot stand in for it.
-pub async fn load_huddle_invitees(
-    rpc: String,
-    channel_id: String,
-) -> Result<Vec<ChatMember>, String> {
-    let client = rpc_client(&rpc)?;
-    load_channel_members(&client, &channel_id, &names()).await
-}
-
 pub(crate) async fn load_channel_members(
     rpc: &RpcClient,
     channel_id: &str,
@@ -328,39 +317,4 @@ pub(crate) async fn load_channel_members(
 /// or the whole handle when it carries no such prefix.
 pub(crate) fn member_id(user: &str) -> &str {
     user.strip_prefix("user:").unwrap_or(user)
-}
-
-pub(crate) async fn load_page_index(rpc: &RpcClient) -> Result<Vec<PageRow>, String> {
-    let mut pages = Vec::new();
-    let mut after: Option<String> = None;
-    loop {
-        let reply: PagesViewReply = rpc
-            .view(
-                "pages",
-                &PagesViewQuery::ListPages {
-                    after: after.clone(),
-                    limit: None,
-                },
-            )
-            .await?;
-        let PagesViewReply::Pages {
-            pages: page,
-            has_more,
-            next_after,
-        } = reply
-        else {
-            return Err("node returned an invalid page list".into());
-        };
-        pages.extend(page);
-        if !has_more {
-            return Ok(pages);
-        }
-        let Some(next) = next_after else {
-            return Ok(pages);
-        };
-        if after.as_ref() == Some(&next) {
-            return Err("node repeated the page-list cursor".into());
-        }
-        after = Some(next);
-    }
 }

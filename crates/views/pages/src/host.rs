@@ -127,9 +127,17 @@ pub struct Session {
     pub route_serial: i64,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchRequest {
+    pub text: String,
+    pub page: String,
+}
+
 /// One item of the session subscription: the facts, or why not.
 #[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct SessionItem {
+    pub background: Option<SearchRequest>,
     pub next: Session,
     pub error: String,
 }
@@ -139,16 +147,27 @@ pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     ducktape_view_guest::Subscription::run(|| {
         host::subscribe("pages.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
-                serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+                let value: Value =
+                    serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+                match value.get("background") {
+                    Some(request) => {
+                        serde_json::from_value(request.clone()).map(|background| SessionItem {
+                            background: Some(background),
+                            ..Default::default()
+                        })
+                    }
+                    None => serde_json::from_value(value).map(|next| SessionItem {
+                        next,
+                        ..Default::default()
+                    }),
+                }
+                .map_err(|error| error.to_string())
             });
             match read {
-                Ok(next) => SessionItem {
-                    next,
-                    error: String::new(),
-                },
+                Ok(item) => item,
                 Err(error) => SessionItem {
-                    next: Session::default(),
                     error,
+                    ..Default::default()
                 },
             }
         })
@@ -741,12 +760,17 @@ pub fn search(query: String, serial: i64) -> ducktape_view_guest::Subscription<S
 }
 
 async fn run_search(query: String) -> SearchItem {
-    match read_search(&query).await {
-        Ok(hits) => SearchItem {
-            query,
-            hits,
-            error: String::new(),
-        },
+    match read_search(&query, None).await {
+        Ok(mut hits) => {
+            for hit in &mut hits {
+                hit.text = excerpt(&hit.text, &query);
+            }
+            SearchItem {
+                query,
+                hits,
+                error: String::new(),
+            }
+        }
         Err(error) => SearchItem {
             query,
             hits: Vec::new(),
@@ -755,8 +779,8 @@ async fn run_search(query: String) -> SearchItem {
     }
 }
 
-async fn read_search(query: &str) -> Result<Vec<PageSearchHit>, String> {
-    let ask = json!({ "search": { "text": query, "page_id": null, "limit": SEARCH_HITS } });
+async fn read_search(query: &str, page: Option<&str>) -> Result<Vec<PageSearchHit>, String> {
+    let ask = json!({ "search": { "text": query, "page_id": page, "limit": SEARCH_HITS } });
     let reply = view(ask).await?;
     let found = rows(&reply["hits"]);
     if found.is_empty() {
@@ -784,11 +808,30 @@ async fn read_search(query: &str) -> Result<Vec<PageSearchHit>, String> {
                     .unwrap_or_else(|| "Untitled".into()),
                 block_id: text_of(&hit["block_id"]),
                 kind: block_kind_name(&text_of(&hit["kind"])).into(),
-                text: excerpt(&text_of(&hit["text"]), query),
+                text: text_of(&hit["text"]),
                 page_id,
             }
         })
         .collect())
+}
+
+pub async fn background_search(request: SearchRequest) {
+    let query = request.text.trim();
+    let invalid = query.is_empty() || query.contains('\0');
+    let result = if invalid {
+        Err("search must be nonempty and contain no NUL".to_owned())
+    } else {
+        read_search(
+            query,
+            (!request.page.is_empty()).then_some(request.page.as_str()),
+        )
+        .await
+    };
+    let output = match result {
+        Ok(hits) => json!({"hits":hits}),
+        Err(error) => json!({"error":error}),
+    };
+    host::finish_response(&serde_json::to_vec(&output).expect("search response encodes"));
 }
 
 /// The most characters a search row shows of the block it hit.

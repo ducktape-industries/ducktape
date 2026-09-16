@@ -1,6 +1,7 @@
 //! Guest-owned conversations, composers, and module operations.
 
 pub mod host;
+mod live;
 
 #[path = "ui/app.rs"]
 mod app;

@@ -170,8 +170,11 @@ Both cursors default to zero. Replay metadata gives `first`, `head`,
 Resume from frames actually consumed, not a snapshot head announced before those
 frames. Command sequence gaps include refused or deleted Chat posts. Command
 history records accepted execution requests, not proof that the program executed
-them. Output and command history each retain at most 256 KiB and 1024 entries in
-process memory; process restart does not restore terminal sessions.
+them. Output and command history remain in process memory without a configured
+retention ceiling; process restart does not restore terminal sessions. Each
+attachment queues output independently, so a slow reader does not block its
+input or close commands. There is no configured attachment count, WebSocket
+frame size, output queue, or send deadline ceiling.
 
 An application may bind up to 16 explicit read-only directories through
 `readonly_paths`, for example
@@ -256,8 +259,12 @@ Build the process with `cargo build --release -p ducktape-media` and the
 companion view with `bash ops/build-views.sh -p call-view`. Deploy
 `target/views/call_view.wasm` as the registry's `call` view. The desktop loads
 that artifact at runtime; its session owns call framing, mute/source controls,
-speaking state, and bounded audio playout. Native code owns the microphone,
-speaker, camera/screen capture, and JPEG rendering resources.
+speaking state, and bounded audio playout. A separate instance of the same view
+renders the call window from panel properties without opening devices or another
+transport session. It owns the video grid, participant captions, invite chips,
+and control labels. Native code owns the microphone, speaker, camera/screen
+capture, JPEG rendering resources, and window/device control effects. Live image
+references resolve the latest host frame at paint time.
 
 Use an installation manifest with `label: "media"`, `readonly_paths: []`,
 `devices: []`, and:
@@ -276,13 +283,13 @@ The service additionally requires an authenticated caller account and verifies
 that the channel's committed huddle roster names that account at the attested
 source node. It subscribes before reading the roster, pauses forwarding while
 refreshing it, and ends a session if the account is removed or canonical state
-becomes unavailable. A process admits at most 256 sessions, at most 32 per room,
-and one session per account and source node in a room.
+becomes unavailable. Each room admits one session per account and source node.
+The service has no configured session-count, room-size, or output-queue ceiling.
 
 Media uses reliable WebSockets. Packet loss can delay later audio/video behind
 an earlier frame; it does not retain the independent datagram queues of an
-unreliable media transport. Per-client output queues and image sizes are bounded;
-a slow client disconnects instead of delaying the room. Service replacement
+unreliable media transport. Per-client output queues retain pending frames;
+slow readers can accumulate queued media. Service replacement
 closes existing calls, and a view replacement or network switch releases its
 native device resources. Opening another tab keeps a user-started session alive.
 
@@ -292,7 +299,7 @@ cargo test --manifest-path crates/views/Cargo.toml -p call-view
 ```
 
 These checks cover authenticated fanout, membership withdrawal, source metadata,
-bounded queues, actual executable socket activation and replacement, and the
+queued delivery, actual executable socket activation and replacement, and the
 guest's host requests for audio, mute, video, images, and playout. Physical device
 permission and microphone/camera quality require a desktop with those devices.
 These automated checks do not establish equivalent media quality, end-to-end

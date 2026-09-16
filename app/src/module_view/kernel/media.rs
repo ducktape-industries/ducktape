@@ -10,8 +10,6 @@ use serde::Deserialize;
 use super::{Guest, Replies, runtime};
 
 static DEVICE_OWNER: AtomicBool = AtomicBool::new(false);
-const MAX_IMAGES: usize = 32;
-const MAX_JPEG: usize = 1024 * 1024;
 
 struct Lease;
 
@@ -159,8 +157,8 @@ impl Devices {
             "screen" => crate::video::Source::Screen,
             _ => return Err("unknown capture source".into()),
         };
-        if !(4096..=MAX_JPEG).contains(&max_bytes) {
-            return Err("image byte budget must be 4096..1048576".into());
+        if max_bytes == 0 {
+            return Err("image byte budget must be positive".into());
         }
         self.acquire()?;
         self.video.take();
@@ -198,9 +196,6 @@ impl Devices {
 
     fn image(&mut self) -> Result<Vec<u8>, String> {
         self.acquire()?;
-        if self.images.len() >= MAX_IMAGES {
-            return Err("image resource limit reached".into());
-        }
         static NEXT_IMAGE: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_IMAGE.fetch_add(1, Ordering::Relaxed);
         let key = format!("image:{id}");
@@ -219,9 +214,6 @@ impl Devices {
     }
 
     fn put(&mut self, id: u64, jpeg: Vec<u8>) -> Result<Vec<u8>, String> {
-        if jpeg.len() > MAX_JPEG {
-            return Err("encoded image exceeds one MiB".into());
-        }
         let image = self.images.get(&id).ok_or("unknown image resource")?;
         let busy = image.decoding.swap(true, Ordering::AcqRel);
         if busy {

@@ -18,7 +18,7 @@ fn start(intent: Value) -> Frame {
     let frame = tick_native(Vec::new());
     tick_native(vec![item(
         request(&frame, "chat.props").id,
-        &serde_json::to_vec(&json!({"participation":intent})).unwrap(),
+        &serde_json::to_vec(&json!({"background":intent})).unwrap(),
     )])
 }
 fn proof(frame: &Frame, channel: &str) -> Frame {
@@ -109,5 +109,31 @@ fn a_refused_leave_cannot_continue_to_join() {
             payload(request(&frame, "host.emit")),
             json!({"error":{"message":"leave refused","committed":false}})
         );
+    });
+}
+
+#[test]
+fn background_search_names_the_room_once_without_requesting_a_signature() {
+    on_stack(|| {
+        let frame = start(json!({"kind":"search", "channel":"room", "text":"needle"}));
+        let directory = request(&frame, "rpc.query");
+        assert_eq!(payload(directory)["target"], "identity");
+        let frame = tick_native(vec![answer(directory.id, br#"{"accounts":[]}"#)]);
+        let search = request(&frame, "rpc.view");
+        assert_eq!(payload(search)["query"]["search"]["channel_id"], "room");
+        let frame = tick_native(vec![answer(
+            search.id,
+            br#"{"hits":[{"channel_id":"room","seq":12,"author":"system","text":"needle"}]}"#,
+        )]);
+        let response = payload(request(&frame, "host.emit"));
+        assert_eq!(response["hits"][0]["meta"], "room · #12");
+        assert_eq!(response["hits"][0]["text"], "needle");
+        assert!(
+            !frame
+                .requests
+                .iter()
+                .any(|request| request.kind == "op.submit")
+        );
+        assert!(request(&frame, "host.finish").payload.is_empty());
     });
 }

@@ -6,11 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use gpui_kit::StyledImage;
-use gpui_kit::{
-    Context, IntoElement, ObjectFit, ParentElement, Render, RenderImage, Styled, Window, div, img,
-    px,
-};
+use gpui_kit::RenderImage;
 #[derive(serde::Serialize)]
 pub(crate) struct CapturedImage {
     pub preview: &'static str,
@@ -773,123 +769,6 @@ pub(crate) fn capture_thread(
     }
 }
 
-/// Native video surfaces read the latest decoded frame at the window's vsync.
-/// Empty stores park redraws; the call roster update mounts/re-arms the surface.
-pub struct VideoView {
-    source: VideoDisplay,
-}
-enum VideoDisplay {
-    Tiles { images: Vec<String>, staged: String },
-    Stage(String),
-}
-
-pub fn call_video_tiles(images: Vec<String>, staged: &str) -> VideoView {
-    VideoView {
-        source: VideoDisplay::Tiles {
-            images,
-            staged: staged.to_owned(),
-        },
-    }
-}
-pub fn call_video_stage(peer: &str) -> VideoView {
-    VideoView {
-        source: VideoDisplay::Stage(peer.to_owned()),
-    }
-}
-impl VideoView {
-    pub fn replace_tiles(&mut self, images: Vec<String>, staged: String, cx: &mut Context<Self>) {
-        self.source = VideoDisplay::Tiles { images, staged };
-        cx.notify();
-    }
-    pub fn replace_stage(&mut self, peer: String, cx: &mut Context<Self>) {
-        self.source = VideoDisplay::Stage(peer);
-        cx.notify();
-    }
-}
-impl Render for VideoView {
-    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        // the frames a newer one replaced since the last paint give their
-        // atlas tiles back here, the one place a Window is in hand
-        for handle in take_retired() {
-            let _ = window.drop_image(handle);
-        }
-        // EVERY SURFACE FILLS THE BOX IT IS GIVEN; the window decides the box.
-        // The stage is the picture, whole, in whatever room is left; the
-        // tiles are a strip under a stage, or an even grid of the room when
-        // there is none — so a bigger window is a bigger picture, never the
-        // same 128-pixel plate with more air around it.
-        match &self.source {
-            VideoDisplay::Stage(peer) => {
-                let Some((_, _, handle)) = stage_frame(peer) else {
-                    return div().into_any_element();
-                };
-                window.request_animation_frame();
-                img(handle)
-                    .size_full()
-                    .object_fit(ObjectFit::Contain)
-                    .rounded(px(8.))
-                    .into_any_element()
-            }
-            VideoDisplay::Tiles { images, staged } => {
-                let tiles = tiles_snapshot(images);
-                if !tiles.is_empty() {
-                    window.request_animation_frame();
-                }
-                let under_a_stage = !staged.is_empty();
-                if under_a_stage {
-                    return div()
-                        .w_full()
-                        .h(px(TILE_HEIGHT))
-                        .flex_shrink_0()
-                        .flex()
-                        .gap(px(TILE_GAP))
-                        .overflow_hidden()
-                        .children(tiles.into_iter().map(|(_, _, handle)| {
-                            img(handle)
-                                .w(px(TILE_HEIGHT * 4. / 3.))
-                                .h_full()
-                                .object_fit(ObjectFit::Cover)
-                                .rounded(px(6.))
-                        }))
-                        .into_any_element();
-                }
-                let (rows, cols) = grid_shape(tiles.len());
-                let mut grid = div().size_full().flex().flex_col().gap(px(TILE_GAP));
-                let mut tiles = tiles.into_iter();
-                for _ in 0..rows {
-                    let mut row = div().flex_1().min_h_0().flex().gap(px(TILE_GAP));
-                    for _ in 0..cols {
-                        let Some((_, _, handle)) = tiles.next() else {
-                            break;
-                        };
-                        row = row.child(
-                            img(handle)
-                                .flex_1()
-                                .min_w_0()
-                                .h_full()
-                                .object_fit(ObjectFit::Cover)
-                                .rounded(px(6.)),
-                        );
-                    }
-                    grid = grid.child(row);
-                }
-                grid.into_any_element()
-            }
-        }
-    }
-}
-
-/// The grid a stage-less huddle lays its tiles in: as square as the count
-/// allows (1, 2 side by side, 2×2, 2×3, 3×3 …), rows filled left to right.
-fn grid_shape(tiles: usize) -> (usize, usize) {
-    if tiles == 0 {
-        return (0, 0);
-    }
-    let rows = (tiles as f32).sqrt().floor() as usize;
-    let cols = tiles.div_ceil(rows);
-    (rows, cols)
-}
-
 /// The stage's stand-in for "the screen this device is sharing" — a sentinel
 /// no node key can collide with (they are 64 hex characters).
 pub const SELF_STAGE: &str = "you";
@@ -905,16 +784,6 @@ pub(crate) fn stage_frame(peer: &str) -> Option<(u32, u32, Arc<RenderImage>)> {
         key => store.peers.get(key),
     }?;
     Some((frame.width, frame.height, frame.handle.clone()))
-}
-
-/// The strip under a stage: 4:3 plates of this height, the frame
-/// Cover-cropped onto them. The stage-less grid ignores it and fills the room.
-const TILE_HEIGHT: f32 = 96.0;
-const TILE_GAP: f32 = 8.0;
-/// Resolve only the images named by the guest, preserving its display order.
-/// Missing decoded frames stay absent until a later paint.
-fn tiles_snapshot(images: &[String]) -> Vec<(u32, u32, Arc<RenderImage>)> {
-    images.iter().filter_map(|key| stage_frame(key)).collect()
 }
 
 #[cfg(test)]
@@ -979,18 +848,6 @@ mod tests {
         assert_eq!(budget_format(&[], CAPTURE_PIXEL_BUDGET), None);
     }
 
-    #[test]
-    fn the_grid_is_as_square_as_the_count_allows() {
-        assert_eq!(grid_shape(0), (0, 0));
-        assert_eq!(grid_shape(1), (1, 1));
-        assert_eq!(grid_shape(2), (1, 2));
-        assert_eq!(grid_shape(3), (1, 3));
-        assert_eq!(grid_shape(4), (2, 2));
-        assert_eq!(grid_shape(5), (2, 3));
-        assert_eq!(grid_shape(9), (3, 3));
-        assert_eq!(grid_shape(10), (3, 4));
-    }
-
     /// One global store AND one global source, so this stays ONE test, in
     /// sequence — and it carries the blink's property: a stored frame owns ONE
     /// renderer handle, so every view rebuild between two captures reads the
@@ -1007,9 +864,9 @@ mod tests {
         };
         // A guest may select an image before its first decoded frame arrives.
         reset();
-        assert!(tiles_snapshot(&[SELF_STAGE.to_owned()]).is_empty());
+        assert!(stage_frame(SELF_STAGE).is_none());
         store_preview(vec![10, 20, 30, 0xff], 1, 1);
-        assert_eq!(tiles_snapshot(&[SELF_STAGE.to_owned()]).len(), 1);
+        assert!(stage_frame(SELF_STAGE).is_some());
         let first = preview_id().expect("preview");
         assert_eq!(first, preview_id().expect("preview"));
         store_preview(vec![40, 50, 60, 0xff], 1, 1);
@@ -1031,9 +888,7 @@ mod tests {
         let (width, height, _) = stage_frame(SELF_STAGE).unwrap();
         assert_eq!((width, height), (2, 1));
         assert!(stage_frame("a-peer-nobody-sent").is_none());
-        // An empty guest selection draws nothing, even with a stored preview.
-        assert!(tiles_snapshot(&[]).is_empty());
-        assert_eq!(tiles_snapshot(&[SELF_STAGE.to_owned()]).len(), 1);
+        assert!(stage_frame(SELF_STAGE).is_some());
 
         let remote = render_bgra(vec![0xff; 4], 1, 1).unwrap();
         let remote_id = remote.id;
@@ -1045,17 +900,9 @@ mod tests {
                 handle: remote,
             },
         );
-        let selected =
-            tiles_snapshot(&["missing".into(), "remote-image".into(), SELF_STAGE.into()]);
-        assert_eq!(
-            selected
-                .iter()
-                .map(|(_, _, frame)| frame.id)
-                .collect::<Vec<_>>(),
-            vec![remote_id, preview_id().unwrap()]
-        );
-        assert!(tiles_snapshot(&[]).is_empty());
-        forget_peer("remote-image");
+        assert_eq!(stage_frame("remote-image").unwrap().2.id, remote_id);
+        assert!(stage_frame("missing").is_none());
+        crate::view_tree::assert_released_image_is_not_cached("remote-image");
 
         // ONE SOURCE: starting either one ends the other, and either one off
         // is off — there is no state where both are live.

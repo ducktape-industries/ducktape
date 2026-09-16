@@ -208,7 +208,7 @@ pub enum Message {
     SidebarArrived(crate::host::SidebarItem),
     VisibilityChanged(bool),
     SessionSettled(bool),
-    ParticipationFinished,
+    BackgroundFinished,
     RevealStream(i64),
     RevealThread(i64),
     RoomArrived(crate::host::RoomItem),

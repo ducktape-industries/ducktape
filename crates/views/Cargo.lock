@@ -286,6 +286,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 name = "call-view"
 version = "0.1.0"
 dependencies = [
+ "ducktape-view-composer",
  "ducktape-view-guest",
  "futures",
  "serde",
@@ -394,6 +395,7 @@ name = "chat-view"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "chat-message",
  "ducktape-view-composer",
  "ducktape-view-guest",
  "futures",
@@ -3057,7 +3059,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 [[package]]
 name = "ui-lang-wire"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=3a7e02378a135839d32019dd835b2a5b2473252f#3a7e02378a135839d32019dd835b2a5b2473252f"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=3d8ba98833c48e030e1b955ac2799bc27755b2bf#3d8ba98833c48e030e1b955ac2799bc27755b2bf"
 dependencies = [
  "bincode",
  "memchr",

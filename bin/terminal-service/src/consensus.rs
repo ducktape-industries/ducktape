@@ -421,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn command_replay_has_an_independent_cursor_and_bounded_history() {
+    fn command_replay_has_an_independent_cursor_and_retains_history() {
         let caller = crate::state::Caller {
             account: 7,
             node: [1; 32],
@@ -446,8 +446,8 @@ mod tests {
         let snapshot = sessions.replay(id, &caller, 0, 0).unwrap();
         assert_eq!(snapshot.head, 0);
         assert_eq!(snapshot.command_head, 1100);
-        assert_eq!(snapshot.command_first, 77);
-        assert_eq!(snapshot.commands.len(), 1024);
+        assert_eq!(snapshot.command_first, 1);
+        assert_eq!(snapshot.commands.len(), 1100);
         let resumed = sessions.replay(id, &caller, 0, 1099).unwrap();
         assert_eq!(resumed.commands.len(), 1);
         assert_eq!(resumed.commands[0].seq, 1100);
@@ -485,14 +485,14 @@ mod tests {
                 .unwrap();
         }
         let large = sessions.replay(id, &caller, 0, 0).unwrap();
-        assert_eq!(large.commands.len(), 4);
+        assert_eq!(large.commands.len(), 1109);
         assert!(
             large
                 .commands
                 .iter()
                 .map(|command| command.text.len() + command.origin.len())
                 .sum::<usize>()
-                <= crate::state::MAX_REPLAY_BYTES
+                > 256 * 1024
         );
     }
 

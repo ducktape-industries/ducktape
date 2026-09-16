@@ -11,7 +11,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 TARGET = ROOT / "target"
 ENV = dict(os.environ, CARGO_TARGET_DIR=str(TARGET), CARGO_INCREMENTAL="0",
-           RUSTC_WRAPPER="", RUST_MIN_STACK="67108864")
+           RUSTC_WRAPPER="", RUST_MIN_STACK="134217728")
 
 
 def cargo(*arguments):

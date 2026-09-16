@@ -23,10 +23,6 @@ pub fn load_request(
     })
 }
 
-pub fn fresh_operation_id(prefix: String) -> String {
-    fresh_id(&prefix)
-}
-
 pub fn mutation_failure_phase(committed: bool) -> crate::MutationPhase {
     if committed {
         crate::MutationPhase::Recovering

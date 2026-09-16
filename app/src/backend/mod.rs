@@ -15,8 +15,6 @@ use ::chat::{ChatMsg, PostPolicy};
 use commonware_cryptography::{Signer as _, ed25519};
 use ducktape_rpc::{Client as RpcClient, ModuleEvent, Status as NodeStatus};
 use futures::{FutureExt as _, StreamExt as _};
-use pages::BlockKind;
-use pages::index::{PageRow, PagesViewQuery, PagesViewReply};
 use tokio::sync::OwnedSemaphorePermit;
 use zeroize::Zeroizing;
 
@@ -54,16 +52,7 @@ pub struct ChatData {
     pub channel_members: Vec<ChatMember>,
 }
 
-/// The submit receipt of an optimistic send: the client-minted operation id
-/// and its channel. The committed row arrives on the delta stream and settles
-/// the pending row by id — there is no snapshot to merge.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct SendReceipt {
-    pub operation_id: String,
-    pub channel_id: String,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChatSearchHit {
     pub channel_id: String,
     pub seq: i64,
@@ -78,12 +67,12 @@ pub struct ChatSearchData {
     pub hits: Vec<ChatSearchHit>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PageSearchHit {
     pub page_id: String,
     /// The title of the page the block lives in. The index's hit row carries
     /// only `page_id`, so without this join no surface could name the page a
-    /// match came from — see [`titled_page_hits`].
+    /// match came from; the Pages guest joins the title to each result.
     pub page_title: String,
     pub block_id: String,
     pub kind: String,
@@ -114,19 +103,6 @@ pub struct WorkspaceData {
 pub struct AppError {
     pub message: String,
     pub committed: bool,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct OptimisticMutationError {
-    pub message: String,
-    pub committed: bool,
-    pub operation_id: String,
-    pub scope_id: String,
-    /// The thread a REPLY was for, `0` for a message. The composer that let
-    /// the body go is keyed by its room and its thread, so a failure can only
-    /// be handed back to the box it came from if it says which one that was.
-    pub thread_seq: i64,
-    pub body: String,
 }
 
 impl From<String> for AppError {

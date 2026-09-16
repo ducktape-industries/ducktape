@@ -82,32 +82,6 @@ fn the_post_gate_names_why_a_viewer_cannot_post() {
     );
 }
 
-/// A SEARCH HIT SAYS WHICH ROOM IT IS IN, ONCE. The hit's `meta` was
-/// `#{seq}` — the message's sequence number, rendered exactly like a channel,
-/// because every channel in this app is written `# General`. So a palette row
-/// read `#1` and the reader could not tell whether that was a room, a position,
-/// or which of four channels the message actually lived in.
-///
-/// Three surfaces render `hit.meta` — the palette, the chat sidebar and the
-/// Explorer — and only the Explorer composed the channel in, at its own call
-/// site. The room now lives in `meta` itself, so all three agree and the
-/// Explorer stops composing (which would have printed it twice).
-#[test]
-fn a_search_hit_names_its_room_exactly_once() {
-    const CHAT: &str = include_str!("../chat.rs");
-    let hit = CHAT
-        .split("ChatSearchHit {")
-        .nth(1)
-        .expect("the search hit mapping")
-        .split("})")
-        .next()
-        .expect("mapping body");
-    assert!(
-        hit.contains(r#"meta: format!("{} · #{}", hit.channel_id, hit.seq)"#),
-        "the room comes first, then the sequence"
-    );
-}
-
 /// AN UNREAD HEIGHT SAYS SO. The Node overview must not print `h 0` before a
 /// status document lands — a measured zero for a chain sitting at ~398,000.
 ///

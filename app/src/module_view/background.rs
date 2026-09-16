@@ -8,9 +8,6 @@ use tokio::sync::{mpsc, watch};
 
 use super::{Guest, Mounted, Slot, connection, intern, kernel, mounted, runtime, spawn_load};
 
-const OUTPUT_LIMIT: usize = 16 * 1024;
-const OUTPUT_QUEUE: usize = 16;
-
 pub(crate) struct Session {
     pub input: watch::Sender<Vec<u8>>,
     pub events: BoxStream<'static, Result<Vec<u8>, String>>,
@@ -18,7 +15,7 @@ pub(crate) struct Session {
 
 pub(super) struct Attachment {
     id: u64,
-    output: Option<mpsc::Sender<Result<Vec<u8>, String>>>,
+    output: Option<mpsc::UnboundedSender<Result<Vec<u8>, String>>>,
     pub media: kernel::media::Devices,
 }
 
@@ -35,11 +32,10 @@ pub(super) fn emit(guest: &mut Guest, id: u64, payload: Vec<u8>) {
         .and_then(|session| session.output.as_ref())
     {
         None => Err("host.emit requires an active user-started session".into()),
-        Some(_) if payload.len() > OUTPUT_LIMIT => Err("session output exceeds 16 KiB".into()),
         Some(output) => output
-            .try_send(Ok(payload))
+            .send(Ok(payload))
             .map(|()| Vec::new())
-            .map_err(|_| "session output is full or closed".into()),
+            .map_err(|_| "session output is closed".into()),
     };
     guest.reply(id, result);
 }
@@ -83,13 +79,24 @@ pub(crate) fn start(module: &str, props: Vec<u8>, origin: &str) -> Result<Sessio
     start_at(module, props, revision)
 }
 
+/// Collect one background response; dropping the caller retires its session.
+pub(crate) async fn request(module: &str, props: Vec<u8>, origin: &str) -> Result<Vec<u8>, String> {
+    let mut session = start(module, props, origin)?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = session.events.next().await {
+        let chunk = chunk?;
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 pub(super) fn start_at(module: &str, props: Vec<u8>, revision: u64) -> Result<Session, String> {
     let valid_name = !module.is_empty()
         && module.len() <= 64
         && module
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
-    if !valid_name || props.len() > OUTPUT_LIMIT {
+    if !valid_name {
         return Err("invalid session view or properties".into());
     }
     let connection = connection().lock().expect("views rpc").clone();
@@ -102,7 +109,7 @@ pub(super) fn start_at(module: &str, props: Vec<u8>, revision: u64) -> Result<Se
     let module = module.to_owned();
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (output, receiver) = mpsc::channel(OUTPUT_QUEUE);
+    let (output, receiver) = mpsc::unbounded_channel();
     let (input, properties) = watch::channel(props);
     // Resolve after returning to the parent: it may hold the same view's
     // mounted lock while invoking session.start from its native button.
@@ -110,7 +117,7 @@ pub(super) fn start_at(module: &str, props: Vec<u8>, revision: u64) -> Result<Se
         let (source, changes) = match session_source(&module, revision) {
             Ok(source) => source,
             Err(error) => {
-                let _ = output.try_send(Err(error));
+                let _ = output.send(Err(error));
                 return;
             }
         };
@@ -190,7 +197,7 @@ async fn run(
     revision: u64,
     mut changes: watch::Receiver<()>,
     mut properties: watch::Receiver<Vec<u8>>,
-    output: mpsc::Sender<Result<Vec<u8>, String>>,
+    output: mpsc::UnboundedSender<Result<Vec<u8>, String>>,
 ) {
     let mut live = kernel::isolated_live_events();
     let code = loop {
@@ -214,7 +221,7 @@ async fn run(
                 result = changes.changed() => if result.is_err() { return; },
             },
             Err(error) => {
-                let _ = output.try_send(Err(error));
+                let _ = output.send(Err(error));
                 return;
             }
         }
@@ -222,7 +229,7 @@ async fn run(
     let (mut guest, source_identity) = match code.instantiate() {
         Ok(instance) => instance,
         Err(error) => {
-            let _ = output.try_send(Err(error));
+            let _ = output.send(Err(error));
             return;
         }
     };
@@ -242,7 +249,7 @@ async fn run(
             match turn(&mut guest, id, &output, &properties.borrow_and_update()) {
                 Ok(step) => step,
                 Err(error) => {
-                    let _ = output.try_send(Err(error));
+                    let _ = output.send(Err(error));
                     break;
                 }
             };
@@ -284,7 +291,7 @@ async fn run(
 fn turn(
     guest: &mut Guest,
     id: u64,
-    output: &mpsc::Sender<Result<Vec<u8>, String>>,
+    output: &mpsc::UnboundedSender<Result<Vec<u8>, String>>,
     props: &[u8],
 ) -> Result<(watch::Receiver<()>, Option<std::time::Instant>, bool), String> {
     if guest.session.is_none() {
@@ -385,25 +392,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_output_is_bounded_and_finish_drains_before_terminal() {
+    async fn session_output_drains_before_terminal() {
         let _turn = super::super::tests::connection_turn().await;
         let mut guest = call_guest();
-        let (output, mut receiver) = mpsc::channel(OUTPUT_QUEUE);
+        let (output, mut receiver) = mpsc::unbounded_channel();
         guest.session = Some(Attachment {
             id: 1,
             output: Some(output),
             media: kernel::media::Devices::new(),
         });
-        emit(&mut guest, 1, vec![0; OUTPUT_LIMIT + 1]);
-        assert!(receiver.try_recv().is_err());
-        for id in 0..OUTPUT_QUEUE {
+        let large = vec![0; 128 * 1024];
+        emit(&mut guest, 1, large.clone());
+        for id in 0..64 {
             emit(&mut guest, id as u64 + 2, vec![id as u8]);
         }
-        emit(&mut guest, 100, b"overfull".to_vec());
         finish(&mut guest, 101, &[]);
         assert!(!guest.session.as_ref().unwrap().active());
         emit(&mut guest, 102, b"after finish".to_vec());
-        for id in 0..OUTPUT_QUEUE {
+        assert_eq!(receiver.recv().await.unwrap().unwrap(), large);
+        for id in 0..64 {
             assert_eq!(receiver.recv().await.unwrap().unwrap(), vec![id as u8]);
         }
         assert!(receiver.recv().await.is_none());
@@ -421,7 +428,7 @@ mod tests {
             state.changes.subscribe()
         };
         let (_input, properties) = watch::channel(b"[]".to_vec());
-        let (output, mut events) = mpsc::channel(OUTPUT_QUEUE);
+        let (output, mut events) = mpsc::unbounded_channel();
         let runner = tokio::spawn(run(
             mounted.clone(),
             1,
@@ -473,7 +480,7 @@ mod tests {
         };
         let (_input, properties) =
             watch::channel(br#"{"channel":"room","muted":false,"source":"off"}"#.to_vec());
-        let (output, mut events) = mpsc::channel(OUTPUT_QUEUE);
+        let (output, mut events) = mpsc::unbounded_channel();
         let runner = tokio::spawn(run(
             mounted.clone(),
             1,

@@ -68,17 +68,7 @@ async fn one_unlock_signs_every_request_of_the_session() {
     assert!(locked.contains("locked"), "{locked}");
 }
 
-/// THE FAN-OUT SET, READ THROUGH A REAL NODE — the poll a live call session
-/// runs once a second, and the read the whole huddle rides on. Everything
-/// downstream of it is exact: the hub parses each entry with `from_hex_32` and
-/// admits that peer's media by the key it gets, so a roster row that is not 64
-/// lowercase hex characters of NODE key is a call that stays silent with
-/// nothing to see anywhere.
-///
-/// It also pins the vocabulary that made the LIVE pill unreachable once
-/// already: `HuddleEntry.user` is the kernel's BARE user id, and a comparison
-/// against any other spelling of it marks nobody as you — which here would
-/// mean fanning this device's own media at itself and never at the peer.
+/// Channel hydration preserves each participant's identity and node key.
 #[tokio::test(flavor = "current_thread")]
 async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
     let storage = tempfile::tempdir().unwrap();
@@ -168,20 +158,12 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
         "exactly one row is this device's — the id vocabulary has to match"
     );
 
-    let nodes = huddle_recipient_nodes(roster, None);
+    let nodes: std::collections::BTreeSet<_> = roster.iter().map(|row| row.node.clone()).collect();
     assert_eq!(
         nodes,
-        vec![hex_encode(&peer_node_pub)],
-        "the fan-out is the OTHER node's key: ours in it would aim this \
-         device's media at itself, and the peer's missing from it is the \
-         silence this whole poll exists to end"
-    );
-    let admissible = nodes[0].len() == 64 && nodes[0].chars().all(|c| c.is_ascii_hexdigit());
-    assert!(
-        admissible,
-        "the hub parses a recipient with `from_hex_32`; anything else is \
-         dropped and the peer is never admitted: {}",
-        nodes[0]
+        [hex_encode(&my_node_pub), hex_encode(&peer_node_pub)]
+            .into_iter()
+            .collect()
     );
     // `shutdown`, not a drop: the handle's last executor reference cannot be
     // dropped on this async thread (see `SimHandle::shutdown`).
