@@ -15,11 +15,6 @@ pub(crate) enum Appearance {
     Dark,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum SubmitVerdict {
-    Admitted,
-    Refused,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum HubStep {
     Loading,
     Password,
