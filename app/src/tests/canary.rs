@@ -74,7 +74,7 @@ fn capture(module: &'static str, path: &Path) -> Vec<u8> {
     })
     .unwrap();
     cx.run_until_parked();
-    let bytes = ui_lang_wire::encode(&frame(module));
+    let bytes = view_wire::encode(&frame(module));
     std::fs::write(path.with_extension("wire"), &bytes).unwrap();
     std::fs::write(path.with_extension("txt"), texts(module).join("\n")).unwrap();
     if std::env::var_os("DUCKTAPE_CANARY_PIXELS").is_some() {
@@ -285,7 +285,7 @@ fn canary_follows_a_live_node() {
         let mut root = frame("chat").expect("live Chat frame");
         let mut found = None;
         root.for_each_mut(&mut |node| {
-            if let ui_lang_wire::Node::Input {
+            if let view_wire::Node::Input {
                 key,
                 options,
                 value,
@@ -472,7 +472,7 @@ fn canary_follows_a_live_node() {
             log.push_str(&format!("phase={variant} height={height} native_entity={identity:?} seated_hash={hash:?} draft_preserved=true focus_preserved=true selection={:?} fresh_handler_verified=true\n", expected_presentation.2));
             std::fs::write(
                 out.join(format!("{variant}.wire")),
-                ui_lang_wire::encode(&frame("chat")),
+                view_wire::encode(&frame("chat")),
             )
             .unwrap();
             std::fs::write(out.join(format!("{variant}.txt")), texts("chat").join("\n")).unwrap();

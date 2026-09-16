@@ -3,7 +3,7 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant},
 };
-use ui_lang_wire as wire;
+use view_wire as wire;
 use wasmtime::{
     Engine, Store,
     component::{Component, Linker, TypedFunc},

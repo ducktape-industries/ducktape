@@ -1,0 +1,23 @@
+# The wire between the gpui host and a ducktape view running in wasm: a widget
+# tree out, meaning-level events in, requests and responses beside. Both ends
+# live in this repo — the guests under `crates/views/*` build against it, and
+# `app` + `crates/noded` decode what they emit — so the format is ours and the
+# two halves are only ever built from one copy of it. `WIRE_EPOCH` is what a
+# host checks a `.component.wasm` against before running it.
+[package]
+name = "view-wire"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# Reads the manifest custom section out of a built component: host-only, so the
+# guests skip `wasmparser` entirely.
+manifest = ["dep:wasmparser"]
+authored-tests = []
+
+[dependencies]
+wasmparser = { version = "0.251", optional = true }
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+memchr = "2"
+unicode-segmentation = "1"

@@ -10,7 +10,7 @@ ducktape-view-guest = { path = "support/guest" }
 ducktape-view-composer = { path = "support/composer" }
 ducktape-view-files = { path = "support/files" }
 design = { path = "support/design" }
-ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "3d8ba98833c48e030e1b955ac2799bc27755b2bf" }
+view-wire = { path = "../view-wire" }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

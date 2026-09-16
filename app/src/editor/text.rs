@@ -18,7 +18,7 @@ use gpui_kit::{
 };
 use std::ops::Range;
 use std::sync::Arc;
-use ui_lang_wire as wire;
+use view_wire as wire;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// The key context a guest editor sits in. The shell's keystroke interceptor

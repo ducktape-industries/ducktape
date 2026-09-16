@@ -29,7 +29,7 @@ use gpui_kit::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use ui_lang_wire as wire;
+use view_wire as wire;
 use unicode_segmentation::UnicodeSegmentation;
 
 struct RichSelection {

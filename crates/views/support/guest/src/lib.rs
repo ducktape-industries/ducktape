@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-pub use ui_lang_wire as wire;
+pub use view_wire as wire;
 pub use wit_bindgen;
 
 use futures::StreamExt;

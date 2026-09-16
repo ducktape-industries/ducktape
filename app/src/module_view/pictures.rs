@@ -2,7 +2,7 @@
 //! only hashes; mounting that tree in a new window still needs the first bytes.
 
 use std::collections::HashMap;
-use ui_lang_wire as wire;
+use view_wire as wire;
 
 #[derive(Default)]
 pub(super) struct Pictures {

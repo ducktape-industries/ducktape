@@ -907,7 +907,7 @@ fn deployment_readiness_rejects_invalid_view_manifest() {
     for offset in offsets {
         view[offset] = b'x';
     }
-    assert!(ui_lang_wire::manifest::read_manifest(&view).is_none());
+    assert!(view_wire::manifest::read_manifest(&view).is_none());
     let error =
         noded::compose::validate_deployment("pages", modules::Kind::Module, &encode(&view_deployment(view)), &index)
             .expect_err("invalid view manifest must refuse readiness");
@@ -940,7 +940,7 @@ fn append_manifest(view: &mut Vec<u8>) {
     let name = b"ice.manifest";
     let text = format!(
         "ice.manifest.v2\nTest\n\n\nnone\n{}",
-        ui_lang_wire::WIRE_EPOCH
+        view_wire::WIRE_EPOCH
     );
     let text = text.as_bytes();
     view.extend_from_slice(&[0, (1 + name.len() + text.len()) as u8, name.len() as u8]);

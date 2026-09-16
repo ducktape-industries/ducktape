@@ -82,7 +82,7 @@ impl MarkdownSurface {
         cx.notify();
     }
 }
-impl EventEmitter<ui_lang_wire::SurfaceValue> for MarkdownSurface {}
+impl EventEmitter<view_wire::SurfaceValue> for MarkdownSurface {}
 impl Render for MarkdownSurface {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
@@ -100,7 +100,7 @@ impl Render for MarkdownSurface {
                     };
                     if opens {
                         let _ = view.update(cx, |_, cx| {
-                            cx.emit(ui_lang_wire::SurfaceValue::Str(url.to_string()))
+                            cx.emit(view_wire::SurfaceValue::Str(url.to_string()))
                         });
                     }
                 }),
