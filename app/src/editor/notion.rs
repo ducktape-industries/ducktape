@@ -15,7 +15,7 @@ use gpui_notion::editor::mark::{HighlightColor, Mark, MarkKind, MarkList, TextCo
 use gpui_notion::editor::theme::ActiveEditorTheme as _;
 use gpui_notion::editor::toolbar::{ToolbarAction, ToolbarItem};
 use gpui_notion::editor::slash::{ApplicationMenu, ApplicationMenuAnchor, MenuAction};
-use gpui_notion::editor::view::{Caret, DocumentChanged, SelectionChanged};
+use gpui_notion::editor::view::{Caret, DocumentChanged, LinkPressed, SelectionChanged};
 use view_wire as wire;
 use wire::editor_presentation::EditorMargin;
 
@@ -55,6 +55,7 @@ pub struct RichWireEditor {
     _selection: Subscription,
     _actions: Subscription,
     _annotations: Subscription,
+    _links: Subscription,
 }
 
 impl EventEmitter<()> for RichWireEditor {}
@@ -99,6 +100,12 @@ impl RichWireEditor {
             cx.subscribe_in(&editor, window, |this, _, action: &MenuAction, _, cx| {
                 this.menu_action(action, cx);
             });
+        // A link in a page is as often `duck://page/…` as it is the web, and
+        // the app already knows what every `duck://` address names — so a
+        // press goes to the one place that routes them all.
+        let links = cx.subscribe(&editor, |_, _, pressed: &LinkPressed, _| {
+            crate::shell::open_link(pressed.0.to_string())
+        });
         let mut this = Self {
             key,
             store,
@@ -114,6 +121,7 @@ impl RichWireEditor {
             _selection: selection,
             _actions: actions,
             _annotations: annotations,
+            _links: links,
         };
         this.sync(window, cx);
         this
@@ -341,6 +349,7 @@ impl RichWireEditor {
         cx.emit(());
         cx.notify();
     }
+
 
     fn annotation(&mut self, event: &AnnotationRequested, cx: &mut Context<Self>) {
         let Some(line) = self.editor.read(cx).index_of(event.block) else {

@@ -3738,6 +3738,7 @@ fn content_dimensions(node: &wire::Node) -> (Option<wire::Length>, Option<wire::
         | wire::Node::KeyedColumn { width, height, .. }
         | wire::Node::Grid { width, height, .. }
         | wire::Node::Container { width, height, .. }
+        | wire::Node::Hover { width, height, .. }
         | wire::Node::Scroll { width, height, .. }
         | wire::Node::Stack { width, height, .. }
         | wire::Node::Responsive { width, height, .. } => (*width, *height),

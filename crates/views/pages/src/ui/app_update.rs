@@ -22,12 +22,13 @@ impl PagesView {
             Message::ActDone(item) => self.on_act_done(item),
             Message::SaveDone(item) => self.on_save_done(item),
             Message::PageAutosaveTick => self.on_page_autosave_tick(),
-            Message::TogglePageCreate => self.on_toggle_page_create(),
             Message::CreatePageSubmit => self.on_create_page_submit(),
             Message::ArmPageDelete(id) => self.on_arm_page_delete(id),
             Message::DisarmPageDelete => self.on_disarm_page_delete(),
             Message::AddSubpage(id) => self.on_add_subpage(id),
             Message::OpenPageRowMenu(id) => self.on_open_page_row_menu(id),
+            Message::OfferPageMove => self.on_offer_page_move(),
+            Message::MovePage(parent) => self.on_move_page(parent),
             Message::PressedAt(x, y) => self.on_pressed_at(x, y),
             Message::DeletePageSubmit => self.on_delete_page_submit(),
             Message::SearchPagesSubmit => self.on_search_pages_submit(),
@@ -65,10 +66,8 @@ impl PagesView {
             Message::CommentsCardMeasured(_width, height) => {
                 self.on_comments_card_measured(_width, height)
             }
-            Message::TogglePageMenu => self.on_toggle_page_menu(),
             Message::ClosePageMenu => self.on_close_page_menu(),
             Message::DocumentCommitted(next) => self.on_document_committed(next),
-            Message::PageDraftChanged(value) => self.on_page_draft_changed(value),
             Message::SearchDraftChanged(value) => self.on_search_draft_changed(value),
             Message::ReplyDraftChanged(value) => self.on_reply_draft_changed(value),
             Message::ReplyDraftChangedIn(thread, value) => {
@@ -207,7 +206,16 @@ impl PagesView {
         self.document_menu = crate::editor_binding::initial_menu();
         self.document_error = "".to_owned();
         self.refresh_document_presentation();
-        Task::none()
+        let naming = !(self.page_to_name).is_empty() && (self.page_to_name == item.active_page);
+        if !naming {
+            return Task::none();
+        }
+        self.page_to_name = "".to_owned();
+        ::ducktape_view_guest::widget::perform::<Message>(
+            ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                target: format!("{PAGE_KEY}/document"),
+            },
+        )
     }
     fn on_search_arrived(&mut self, item: crate::host::SearchItem) -> Task<Message> {
         self.host_error = item.error.to_owned();
@@ -224,7 +232,6 @@ impl PagesView {
         self.host_error = item.error.to_owned();
         self.register_serial += 1;
         let refused = !(item.error).is_empty();
-        self.page_draft = crate::host::keep_str(refused, &(self.pending_page), &(self.page_draft));
         self.reply_draft = crate::host::keep_str(
             refused && (!(self.reply_thread).is_empty()),
             &(self.pending_comment),
@@ -235,16 +242,17 @@ impl PagesView {
             &(self.pending_comment),
             &(self.block_comment_draft),
         );
-        self.pending_page = "".to_owned();
         self.pending_comment = "".to_owned();
         if refused {
             return Task::none();
         }
-        self.page_create_open = false;
         self.page_delete_armed = false;
         self.page_delete_page = "".to_owned();
         self.active_page =
             crate::host::keep_str(!(item.page).is_empty(), &(item.page), &(self.active_page));
+        // A page arrives called Untitled: the caret owes its title line a
+        // visit as soon as that page's document lands.
+        self.page_to_name = item.page.to_owned();
         Task::none()
     }
     fn on_save_done(&mut self, item: crate::host::SaveItem) -> Task<Message> {
@@ -331,26 +339,15 @@ impl PagesView {
         crate::host::save(&(self.active_page), &(text), &(self.page_saved_text));
         Task::none()
     }
-    fn on_toggle_page_create(&mut self) -> Task<Message> {
-        if !(self.host_error).is_empty() {
-            return Task::none();
-        }
-        self.page_create_open = !self.page_create_open;
-        Task::none()
-    }
     fn on_create_page_submit(&mut self) -> Task<Message> {
         if !(self.host_error).is_empty() {
             return Task::none();
         }
-        if ((self.loading || self.busy) || (!self.connected))
-            || ((self.page_draft).trim().to_owned()).is_empty()
-        {
+        if (self.loading || self.busy) || (!self.connected) {
             return Task::none();
         }
         self.busy = true;
-        self.pending_page = (self.page_draft).trim().to_owned();
-        self.page_draft = "".to_owned();
-        crate::host::create(&(self.pending_page));
+        crate::host::create(crate::host::NEW_PAGE_TITLE);
         Task::none()
     }
     fn on_arm_page_delete(&mut self, id: String) -> Task<Message> {
@@ -360,8 +357,8 @@ impl PagesView {
         if (self.loading || self.busy) || id.is_empty() {
             return Task::none();
         }
-        self.page_menu_open = false;
         self.page_menu_page = "".to_owned();
+        self.page_menu_moving = false;
         self.page_delete_page = id;
         self.page_delete_armed = true;
         Task::none()
@@ -423,10 +420,27 @@ impl PagesView {
         if !(self.host_error).is_empty() {
             return Task::none();
         }
-        self.page_menu_open = false;
         self.page_menu_page = id;
+        self.page_menu_moving = false;
         self.page_menu_x = self.press_x;
         self.page_menu_y = self.press_y;
+        Task::none()
+    }
+    fn on_offer_page_move(&mut self) -> Task<Message> {
+        self.page_menu_moving = true;
+        Task::none()
+    }
+    fn on_move_page(&mut self, parent: String) -> Task<Message> {
+        if !(self.host_error).is_empty() {
+            return Task::none();
+        }
+        if (self.loading || self.busy) || (self.page_menu_page).is_empty() {
+            return Task::none();
+        }
+        self.busy = true;
+        crate::host::move_page(&(self.page_menu_page), &(parent));
+        self.page_menu_page = "".to_owned();
+        self.page_menu_moving = false;
         Task::none()
     }
     fn on_pressed_at(&mut self, x: f64, y: f64) -> Task<Message> {
@@ -812,14 +826,9 @@ impl PagesView {
         self.refresh_document_presentation();
         Task::none()
     }
-    fn on_toggle_page_menu(&mut self) -> Task<Message> {
-        self.page_menu_open = !self.page_menu_open;
-        self.page_menu_page = "".to_owned();
-        Task::none()
-    }
     fn on_close_page_menu(&mut self) -> Task<Message> {
-        self.page_menu_open = false;
         self.page_menu_page = "".to_owned();
+        self.page_menu_moving = false;
         Task::none()
     }
     fn on_document_committed(
@@ -877,10 +886,6 @@ impl PagesView {
         self.document_reserve = opened;
         self.refresh_document_presentation();
         focus_composer
-    }
-    fn on_page_draft_changed(&mut self, value: String) -> Task<Message> {
-        self.page_draft = value;
-        Task::none()
     }
     fn on_search_draft_changed(&mut self, value: String) -> Task<Message> {
         self.page_search_draft = value;

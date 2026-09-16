@@ -158,58 +158,20 @@ impl PagesView {
                         Tone::Neutral,
                     ),
                     kit::spacer(),
-                    action(
-                        "pages/sidebar/new",
-                        if self.page_create_open {
-                            "Cancel"
-                        } else {
-                            "New page"
-                        },
-                        Message::TogglePageCreate,
-                        !self.unavailable(),
-                        ButtonPreset::Subtle,
+                    // Notion's plus: a page is born the moment it is asked
+                    // for, named in its own title line. A form here would be
+                    // a field to find, focus and fill before anything exists.
+                    glyph(
+                        "pages/sidebar/new".into(),
+                        "+",
+                        "New page",
+                        Message::CreatePageSubmit,
+                        self.unavailable(),
                     ),
                 ],
             ),
             kit::divider("pages/sidebar/rule"),
         ];
-        if self.page_create_open {
-            rows.push(kit::padded(
-                kit::spaced(
-                    kit::column(
-                        "pages/sidebar/create-form",
-                        [
-                            input(
-                                format!("{PAGE_KEY}/new-page"),
-                                "New page",
-                                &self.page_draft,
-                                Message::PageDraftChanged,
-                                Some(Message::CreatePageSubmit),
-                                self.unavailable(),
-                            ),
-                            kit::sized(
-                                action(
-                                    "pages/sidebar/create",
-                                    "Create page",
-                                    Message::CreatePageSubmit,
-                                    !self.unavailable() && !self.page_draft.trim().is_empty(),
-                                    ButtonPreset::Primary,
-                                ),
-                                Some(Length::Fill),
-                                None,
-                            ),
-                        ],
-                    ),
-                    6.,
-                ),
-                wire::Edges {
-                    top: 8.,
-                    right: 12.,
-                    bottom: 12.,
-                    left: 12.,
-                },
-            ));
-        }
         let mut list = self.page_tree_rows();
         if list.is_empty() && !self.loading {
             list.push(kit::padded(
@@ -239,11 +201,7 @@ impl PagesView {
     }
 
     fn document_toolbar(&self) -> Node {
-        let title = if self.active_page_title.is_empty() {
-            "Untitled"
-        } else {
-            &self.active_page_title
-        };
+        let title = crate::host::titled(&self.active_page_title);
         // Notion's crumb: the parent by TITLE, a way back up the tree, and
         // an ellipsis standing for everything above it — the row does not
         // clip, so a deep tree must not spell its whole path into the
@@ -312,13 +270,6 @@ impl PagesView {
                 "Copy page link",
                 Message::CopyToClipboard(self.page_link.clone(), "Page link".into()),
                 !self.page_link.is_empty(),
-                ButtonPreset::Subtle,
-            ),
-            action(
-                "pages/toolbar/menu",
-                "Page actions",
-                Message::TogglePageMenu,
-                !self.unavailable(),
                 ButtonPreset::Subtle,
             ),
         ];
@@ -405,34 +356,6 @@ impl PagesView {
         if self.connected && !self.active_page.is_empty() && self.block_comments_open {
             children.push(self.comments_layer());
         }
-        if self.connected && self.page_menu_open {
-            let menu = modal(
-                "pages/menu/card",
-                kit::sized(
-                    action(
-                        "pages/menu/delete",
-                        "Delete page",
-                        Message::ArmPageDelete(self.active_page.clone()),
-                        !self.unavailable(),
-                        ButtonPreset::Danger,
-                    ),
-                    Some(Length::Fill),
-                    None,
-                ),
-                200.,
-            );
-            let mut menu = menu;
-            if let Node::Container { padding, .. } = &mut menu {
-                *padding = Some(wire::Edges::all(6.));
-            }
-            children.push(overlay(
-                "pages/menu",
-                menu,
-                Message::ClosePageMenu,
-                wire::AlignX::Right,
-                wire::AlignY::Top,
-            ));
-        }
         Node::Stack {
             padding: None,
             background: None,
@@ -512,12 +435,17 @@ impl PagesView {
         if !self.subpages.is_empty() {
             let mut links = vec![kit::heading("pages/subpages/title", "Subpages")];
             links.extend(self.subpages.iter().map(|page| {
-                action(
-                    format!("pages/subpage/{}", page.id),
-                    &page.title,
-                    Message::ChoosePage(page.id.clone()),
-                    !self.unavailable(),
-                    ButtonPreset::Text,
+                // Held left: a page inside this one reads as a line of a
+                // list, not a banner centred under the document.
+                leading(
+                    format!("pages/subpage/{}/lead", page.id),
+                    action(
+                        format!("pages/subpage/{}", page.id),
+                        &page.title,
+                        Message::ChoosePage(page.id.clone()),
+                        !self.unavailable(),
+                        ButtonPreset::Text,
+                    ),
                 )
             }));
             content.push(kit::divider("pages/subpages/rule"));

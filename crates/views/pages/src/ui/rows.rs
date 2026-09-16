@@ -9,6 +9,8 @@ const PAGE_ROW_ACTIONS_WIDTH: f32 = 52.;
 const PAGE_MENU_WIDTH: f64 = 200.;
 const PAGE_MENU_INSET: f32 = 6.;
 const PAGE_MENU_ITEM_HEIGHT: f32 = 28.;
+/// The tallest a row menu grows before its list scrolls inside it.
+const PAGE_MENU_MAX_ROWS: usize = 12;
 /// A reply sits one avatar in from its opener.
 const COMMENT_REPLY_INSET: f32 = 32.;
 /// How far the hover bar rises above a comment's top edge.
@@ -46,11 +48,8 @@ impl PagesView {
     /// leaf's empty slot), then the page itself, inset one step per depth.
     fn page_row(&self, page: &crate::host::PageItem) -> Node {
         let selected = page.id == self.active_page;
-        let title = if page.title.is_empty() {
-            "Untitled"
-        } else {
-            &page.title
-        };
+        let title = crate::host::titled(&page.title);
+        let title = title.as_str();
         let key = format!("{PAGE_KEY}/page/{}", page.id);
         let available = !self.unavailable();
         let slot = match page.child_count > 0 {
@@ -103,9 +102,9 @@ impl PagesView {
         if let Node::Button { label, padding, .. } = &mut row {
             *label = Some(title.to_owned());
             *padding = Some(wire::Edges {
-                top: 8.,
+                top: 5.,
                 right: PAGE_ROW_ACTIONS_WIDTH,
-                bottom: 8.,
+                bottom: 5.,
                 left: 4.,
             });
         }
@@ -183,6 +182,58 @@ impl PagesView {
         )
     }
 
+    /// Where the menu's page can go: the workspace root, then every page that
+    /// is neither the page itself nor inside it — the two destinations the
+    /// module rejects as a cycle. Its current parent is left out: moving a
+    /// page where it already is says nothing.
+    fn page_move_items(
+        &self,
+        page: &crate::host::PageItem,
+        key: &str,
+        available: bool,
+    ) -> Vec<Node> {
+        let depth = page_depth(page);
+        let inside: Vec<&str> = self
+            .pages
+            .iter()
+            .skip_while(|row| row.id != page.id)
+            .skip(1)
+            .take_while(|row| page_depth(row) > depth)
+            .map(|row| row.id.as_str())
+            .collect();
+        let mut items = vec![named(
+            menu_item(
+                format!("{key}/move/root"),
+                "⌂",
+                "Workspace",
+                Message::MovePage(String::new()),
+                !available || page.parent.is_empty(),
+            ),
+            "Move to the workspace",
+        )];
+        items.extend(
+            self.pages
+                .iter()
+                .filter(|row| row.id != page.id && !inside.contains(&row.id.as_str()))
+                .map(|row| {
+                    // The row reads as the destination's title; the name says
+                    // what pressing it does, which is what a reader hears and
+                    // what a test presses.
+                    named(
+                        menu_item(
+                            format!("{key}/move/{}", row.id),
+                            "›",
+                            &row.title,
+                            Message::MovePage(row.id.clone()),
+                            !available || row.id == page.parent,
+                        ),
+                        &format!("Move into {}", row.title),
+                    )
+                }),
+        );
+        items
+    }
+
     /// The dropdown a row's "…" opens, floated at the press that opened it.
     fn page_row_menu(&self) -> Option<Node> {
         let page = self
@@ -191,48 +242,67 @@ impl PagesView {
             .find(|page| page.id == self.page_menu_page)?;
         let key = format!("{PAGE_KEY}/page/{}/menu", page.id);
         let available = !self.unavailable();
-        let items = [
-            menu_item(
-                format!("{key}/add"),
-                "+",
-                "Add a page inside",
-                Message::AddSubpage(page.id.clone()),
-                !available,
-            ),
-            menu_item(
-                format!("{key}/link"),
-                "🔗",
-                "Copy link",
-                Message::CopyToClipboard(
-                    crate::host::page_address(&page.id, &self.chain),
-                    "Page link".into(),
+        let items = match self.page_menu_moving {
+            true => self.page_move_items(page, &key, available),
+            false => vec![
+                menu_item(
+                    format!("{key}/add"),
+                    "+",
+                    "Add a page inside",
+                    Message::AddSubpage(page.id.clone()),
+                    !available,
                 ),
-                false,
-            ),
-            menu_item(
-                format!("{key}/delete"),
-                "🗑",
-                "Delete",
-                Message::ArmPageDelete(page.id.clone()),
-                !available,
-            ),
-        ];
+                menu_item(
+                    format!("{key}/move"),
+                    "↳",
+                    "Move to…",
+                    Message::OfferPageMove,
+                    !available,
+                ),
+                menu_item(
+                    format!("{key}/link"),
+                    "🔗",
+                    "Copy link",
+                    Message::CopyToClipboard(
+                        crate::host::page_address(&page.id, &self.chain),
+                        "Page link".into(),
+                    ),
+                    false,
+                ),
+                menu_item(
+                    format!("{key}/delete"),
+                    "🗑",
+                    "Delete",
+                    Message::ArmPageDelete(page.id.clone()),
+                    !available,
+                ),
+            ],
+        };
+        // A workspace of a hundred pages must not draw a menu taller than the
+        // screen: past the cap the list scrolls inside a card of that height.
+        let rows = items.len().min(PAGE_MENU_MAX_ROWS) as f32;
         let size = (
             PAGE_MENU_WIDTH,
-            f64::from(PAGE_MENU_INSET * 2. + items.len() as f32 * PAGE_MENU_ITEM_HEIGHT),
+            f64::from(PAGE_MENU_INSET * 2. + rows * PAGE_MENU_ITEM_HEIGHT),
         );
         let (x, y) = crate::host::menu_origin(
             (self.page_menu_x, self.page_menu_y),
             size,
             (self.pages_viewport_width, self.pages_viewport_height),
         );
-        let mut card = kit::card(
-            format!("{key}/card"),
-            kit::spaced(kit::column(format!("{key}/items"), items), 0.),
-        );
-        if let Node::Container { padding, width, .. } = &mut card {
+        let list = kit::spaced(kit::column(format!("{key}/items"), items), 0.);
+        let mut card = kit::card(format!("{key}/card"), kit::scroll(format!("{key}/rows"), list));
+        if let Node::Container {
+            padding,
+            width,
+            max_height,
+            ..
+        } = &mut card
+        {
             *padding = Some(wire::Edges::all(PAGE_MENU_INSET));
             *width = Some(Length::Fixed(PAGE_MENU_WIDTH as f32));
+            // A ceiling, not a height: four actions draw a four-row card.
+            *max_height = Some(size.1 as f32);
         }
         let shade = if kit::is_dark() { 0.5 } else { 0.16 };
         Some(Node::Float {

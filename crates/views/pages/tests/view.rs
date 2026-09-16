@@ -246,9 +246,9 @@ fn a_live_hit_reads_the_workspace_again() {
 #[test]
 fn a_create_mints_its_id_and_leaves_as_a_signed_op() {
     let (frame, _) = connected_with_register();
+    // The page is born on the press, UNNAMED: its title is typed into the
+    // document's title line, where every other page title is edited.
     let frame = tick_native(press(&frame, "New page"));
-    let frame = tick_native(type_into(&frame, "New page", "Runbook"));
-    let frame = tick_native(press(&frame, "Create page"));
 
     let mint = request(&frame, "host.id");
     assert_eq!(mint.payload, b"page", "the prefix names the kind of record");
@@ -261,7 +261,36 @@ fn a_create_mints_its_id_and_leaves_as_a_signed_op() {
         serde_json::json!({
             "target": "pages",
             "payload": { "create_page": {
-                "page_id": "page-1757000000-1", "title": "Runbook", "blocks": []
+                "page_id": "page-1757000000-1", "title": "", "blocks": []
+            }}
+        })
+    );
+}
+
+/// Re-parenting is how a tree is built out of pages that already exist: the
+/// row menu's destination list leaves as the module's own `move_block`.
+#[test]
+fn moving_a_page_into_another_leaves_as_a_move_block_op() {
+    let (frame, _) = connected_with_register();
+    let frame = tick_native(press(&frame, "Actions for Alpha"));
+    let frame = tick_native(press(&frame, "Move to…"));
+    let frame = tick_native(press(&frame, "Move into Beta"));
+
+    // The destination's children are read first: the page lands after the
+    // last of them, where a subpage created there would have landed.
+    let read = request(&frame, "rpc.view");
+    let ask: serde_json::Value = serde_json::from_slice(&read.payload).expect("a view ask decodes");
+    assert_eq!(ask["query"]["get_page"]["page_id"], "beta");
+
+    let frame = tick_native(vec![answer(read.id, &page_blocks())]);
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(
+        op,
+        serde_json::json!({
+            "target": "pages",
+            "payload": { "move_block": {
+                "block_id": "alpha", "parent": "beta", "after": null
             }}
         })
     );
