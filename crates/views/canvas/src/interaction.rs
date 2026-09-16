@@ -281,7 +281,7 @@ impl BoardsView {
         }
         self.tool = tool;
         self.gesture = Gesture::Idle;
-        self.guides.clear();
+        self.stop_guiding();
         self.help = false;
         save
     }
@@ -309,7 +309,7 @@ impl BoardsView {
     }
     pub(super) fn on_snap(&mut self) -> Task<Message> {
         self.snap = !self.snap;
-        self.guides.clear();
+        self.stop_guiding();
         Task::none()
     }
     pub(super) fn world(&self, point: [f32; 2]) -> [f32; 2] {
@@ -627,7 +627,9 @@ impl BoardsView {
     pub(super) fn on_move(&mut self, x: f32, y: f32) -> Task<Message> {
         self.cursor = [x, y];
         let mut point = self.world([x, y]);
-        self.guides.clear();
+        // The lines this move is held to are decided once, at the end, so the
+        // guides drawn and the lines held can never say different things.
+        let mut lined_up: Option<Snapped> = None;
         if let Gesture::Move { start, shapes, .. } = &self.gesture {
             let delta = [point[0] - start[0], point[1] - start[1]];
             if self.modifiers.shift {
@@ -638,10 +640,9 @@ impl BoardsView {
                 }
             }
             if self.snap && !self.modifiers.control && !self.modifiers.shift {
-                let (offset, guides) =
-                    self.snap_delta(shapes, [point[0] - start[0], point[1] - start[1]]);
-                point = [start[0] + offset[0], start[1] + offset[1]];
-                self.guides = guides;
+                let snapped = self.snap_delta(shapes, [point[0] - start[0], point[1] - start[1]]);
+                point = [start[0] + snapped.delta[0], start[1] + snapped.delta[1]];
+                lined_up = Some(snapped);
             }
         }
         // A corner being drawn or dragged lines up with the board the way a
@@ -686,10 +687,16 @@ impl BoardsView {
             )),
             _ => None,
         };
-        if let Some((by, guides)) = nudged {
-            point = [point[0] + by[0], point[1] + by[1]];
-            self.guides = guides;
+        if let Some(snapped) = nudged {
+            point = [point[0] + snapped.delta[0], point[1] + snapped.delta[1]];
+            lined_up = Some(snapped);
         }
+        let (guides, held) = match lined_up {
+            Some(snapped) => (snapped.guides, snapped.held),
+            None => (Vec::new(), [None, None]),
+        };
+        self.guides = guides;
+        self.held = held;
         let board = self.visible();
         // The eraser is the one gesture that asks what is under the pointer,
         // and the hit test needs the board this borrow is about to lend out.
@@ -1142,7 +1149,7 @@ impl BoardsView {
     pub(super) fn on_release(&mut self) -> Task<Message> {
         let changes = self.gesture_changes();
         let gesture = std::mem::take(&mut self.gesture);
-        self.guides.clear();
+        self.stop_guiding();
         match gesture {
             // Alt on a drag duplicates: the shapes it carried are planted
             // where the pointer let them go and the originals never moved,
@@ -1243,15 +1250,24 @@ impl BoardsView {
         }
         self.gesture = Gesture::Idle;
         self.space_pan = false;
-        self.guides.clear();
+        self.stop_guiding();
         self.help = false;
         self.board_picker = false;
         self.take_the_keyboard()
     }
     pub(super) fn on_wheel(&mut self, x: f32, y: f32, pixels: bool) -> Task<Message> {
         let scale = if pixels { 1. } else { 32. };
+        // A wheel turned away from you moves the board down and zooms IN, the
+        // way it does in a browser and in every canvas app. The delta is how
+        // far the CONTENT moves, so the two agree on one sign.
+        //
+        // One notch of a mouse wheel is three lines — 96 of these units — and
+        // the step is chosen against THAT: about a seventh of a turn each, so
+        // a handful of notches walks the range rather than crossing it. A
+        // trackpad sends the same units by the pixel and lands, by the same
+        // rate, on a smooth glide instead of a jump.
         if self.modifiers.control || self.modifiers.logo {
-            return self.zoom_at((-y * scale * 0.004).exp(), self.cursor);
+            return self.zoom_at((y * scale * 0.0015).exp(), self.cursor);
         }
         self.camera[0] += x * scale;
         self.camera[1] += y * scale;
@@ -1849,13 +1865,16 @@ impl BoardsView {
         };
         self.edit_many(changes)
     }
-    fn snap_delta(
-        &self,
-        shapes: &BTreeMap<String, Shape>,
-        delta: [f32; 2],
-    ) -> ([f32; 2], Vec<[f32; 4]>) {
+    /// Nothing is being lined up any more: the guides go and so do the lines
+    /// they stood for. They are one fact and are dropped as one — a held line
+    /// outliving its guide would silently pull the NEXT drag onto it.
+    pub(super) fn stop_guiding(&mut self) {
+        self.guides.clear();
+        self.held = [None, None];
+    }
+    fn snap_delta(&self, shapes: &BTreeMap<String, Shape>, delta: [f32; 2]) -> Snapped {
         let Some(b) = bounds(shapes.values()) else {
-            return (delta, Vec::new());
+            return Snapped::adrift(delta);
         };
         self.aligned(b, delta, [true; 2], &|id| shapes.contains_key(id))
     }
@@ -1866,12 +1885,7 @@ impl BoardsView {
     /// with its neighbours are the guides that should line up the one you are
     /// drawing, and drawing with no guides at all meant every new shape had to
     /// be nudged into place afterwards.
-    fn corner_nudge(
-        &self,
-        at: [f32; 2],
-        axes: [bool; 2],
-        mine: &dyn Fn(&str) -> bool,
-    ) -> ([f32; 2], Vec<[f32; 4]>) {
+    fn corner_nudge(&self, at: [f32; 2], axes: [bool; 2], mine: &dyn Fn(&str) -> bool) -> Snapped {
         self.aligned([at[0], at[1], at[0], at[1]], [0.; 2], axes, mine)
     }
     /// The nudge that lines a box up with something already on the board, once
@@ -1882,22 +1896,45 @@ impl BoardsView {
         delta: [f32; 2],
         axes: [bool; 2],
         mine: &dyn Fn(&str) -> bool,
-    ) -> ([f32; 2], Vec<[f32; 4]>) {
+    ) -> Snapped {
         // Snap against the board on screen, not the last one consensus agreed
         // on: a card you drew a second ago is on screen and is exactly what you
         // want to line the next one up with.
         let Some(board) = self.visible() else {
-            return (delta, Vec::new());
+            return Snapped::adrift(delta);
         };
-        let mut best = [6. / self.zoom; 2];
+        let capture = 6. / self.zoom;
+        // A line already taken is KEPT until the hand is clearly past it. An
+        // alignment tested afresh every frame engages and releases at whatever
+        // speed the hand happens to be moving — a hand crossing six units in
+        // one frame is aligned on half the frames and free on the rest — and a
+        // guide that comes and goes every few pixels is a line flickering
+        // across the whole board rather than an answer to what you are doing.
+        let release = 3. * capture;
+        let mut best = [capture; 2];
         let mut adjustment = [0.; 2];
-        let mut lines = [None, None];
+        let mut held: [Option<Hold>; 2] = [None, None];
+        for axis in (0..2).filter(|&axis| axes[axis]) {
+            let Some(hold) = self.held[axis] else {
+                continue;
+            };
+            let diff = nearest(b, axis, delta[axis], hold.fixed);
+            let still_on_it = diff.abs() < release;
+            if still_on_it {
+                adjustment[axis] = diff;
+                held[axis] = Some(hold);
+            }
+        }
         for (id, r) in &board.shapes {
             if mine(id) || r.shape.kind.is_path() {
                 continue;
             }
             let target = rect(&r.shape);
-            for axis in (0..2).filter(|&axis| axes[axis]) {
+            for axis in 0..2 {
+                let free = axes[axis] && held[axis].is_none();
+                if !free {
+                    continue;
+                }
                 for moving in [b[axis], (b[axis] + b[axis + 2]) / 2., b[axis + 2]] {
                     for fixed in [
                         target[axis],
@@ -1908,31 +1945,75 @@ impl BoardsView {
                         if diff.abs() < best[axis] {
                             best[axis] = diff.abs();
                             adjustment[axis] = diff;
-                            lines[axis] = Some(if axis == 0 {
-                                [
-                                    fixed,
-                                    b[1].min(target[1]) - 20.,
-                                    fixed,
-                                    b[3].max(target[3]) + 20.,
-                                ]
-                            } else {
-                                [
-                                    b[0].min(target[0]) - 20.,
-                                    fixed,
-                                    b[2].max(target[2]) + 20.,
-                                    fixed,
-                                ]
+                            held[axis] = Some(Hold {
+                                fixed,
+                                span: [target[1 - axis], target[3 - axis]],
                             });
                         }
                     }
                 }
             }
         }
-        (
-            [delta[0] + adjustment[0], delta[1] + adjustment[1]],
-            lines.into_iter().flatten().collect(),
-        )
+        let guides = (0..2)
+            .filter_map(|axis| held[axis].map(|hold| hold.guide(axis, b)))
+            .collect();
+        Snapped {
+            delta: [delta[0] + adjustment[0], delta[1] + adjustment[1]],
+            guides,
+            held,
+        }
     }
+}
+
+/// A line a drag is currently held to: the coordinate it stands on, and how
+/// far the shape that offered it reaches along that line, so the guide can be
+/// redrawn as the held shape travels.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(super) struct Hold {
+    fixed: f32,
+    span: [f32; 2],
+}
+
+impl Hold {
+    /// The guide, stretched to cover both the shape that offered the line and
+    /// the box being lined up against it.
+    fn guide(self, axis: usize, b: [f32; 4]) -> [f32; 4] {
+        let low = b[1 - axis].min(self.span[0]) - 20.;
+        let high = b[3 - axis].max(self.span[1]) + 20.;
+        match axis {
+            0 => [self.fixed, low, self.fixed, high],
+            _ => [low, self.fixed, high, self.fixed],
+        }
+    }
+}
+
+/// What lining a box up came to: where it goes, the guides that say why, and
+/// the lines it is now held to.
+pub(super) struct Snapped {
+    pub(super) delta: [f32; 2],
+    pub(super) guides: Vec<[f32; 4]>,
+    pub(super) held: [Option<Hold>; 2],
+}
+
+impl Snapped {
+    /// Nothing to line up against: the box goes where it was going.
+    fn adrift(delta: [f32; 2]) -> Self {
+        Self {
+            delta,
+            guides: Vec::new(),
+            held: [None, None],
+        }
+    }
+}
+
+/// The smallest move on `axis` that puts one of the box's three lines — its
+/// two edges and its middle — onto `fixed`.
+fn nearest(b: [f32; 4], axis: usize, delta: f32, fixed: f32) -> f32 {
+    [b[axis], (b[axis] + b[axis + 2]) / 2., b[axis + 2]]
+        .into_iter()
+        .map(|moving| fixed - (moving + delta))
+        .min_by(|left, right| left.abs().total_cmp(&right.abs()))
+        .expect("a box has three lines on each axis")
 }
 /// The pen samples no more than this in one stroke; the release thins the run
 /// down to the board's point budget before anything leaves the view.
