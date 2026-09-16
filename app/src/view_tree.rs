@@ -4005,7 +4005,7 @@ fn text_options(
 ) -> Div {
     element = element.font_weight(font_weight(font.weight));
     if font.monospace {
-        element = element.font_family(design::fonts::FAMILY_MONO);
+        element = crate::shell::mono_family(element);
     }
     if let Some(font) = &options.font {
         // The generic families name no face this app registered, and a family
@@ -4021,9 +4021,7 @@ fn text_options(
             | wire::FontFamily::Cursive
             | wire::FontFamily::Fantasy => design::fonts::FAMILY_UI.into(),
         };
-        element = element
-            .font_family(family)
-            .font_weight(font_weight(font.weight));
+        element = crate::shell::with_family(element, family).font_weight(font_weight(font.weight));
         if font.style != wire::FontStyle::Normal {
             element = element.italic();
         }

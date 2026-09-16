@@ -14,7 +14,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, Edges, Entity, EntityInputHandler as _, EventEmitter,
     Focusable as _, Hsla, InteractiveElement as _, IntoElement, Keystroke, MouseButton,
-    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window, div, px,
+    ParentElement as _, Render, Styled as _, Subscription, Window, div, px,
 };
 use std::ops::Range;
 use std::sync::Arc;
@@ -419,7 +419,7 @@ impl Render for TextEditor {
             .text_size(px(size))
             .line_height(px(line_height))
             .when_some(family, |element, family| {
-                element.font_family(SharedString::from(family))
+                crate::shell::with_family(element, family)
             })
             .child(Textarea::new(&self.input))
     }

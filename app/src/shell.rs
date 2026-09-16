@@ -870,15 +870,11 @@ impl DesktopWindow {
                                 div()
                                     .w(px(24.))
                                     .text_size(px(12.))
-                                    .font_family(design::fonts::FAMILY_MONO)
+                                    .map(mono_family)
                                     .text_color(colors.muted_foreground)
                                     .child(number),
                             )
-                            .child(
-                                div()
-                                    .font_family(design::fonts::FAMILY_MONO)
-                                    .child(text),
-                            )
+                            .child(div().map(mono_family).child(text))
                     };
                     words = words.child(
                         div()
@@ -985,7 +981,7 @@ impl DesktopWindow {
                         .child(
                             div()
                                 .text_size(px(12.))
-                                .font_family(design::fonts::FAMILY_MONO)
+                                .map(mono_family)
                                 .text_color(colors.muted_foreground)
                                 .child(networks.len().to_string()),
                         ),
@@ -2907,43 +2903,62 @@ fn nav_icon(tab: ShellTab) -> gpui_kit::component::Icon {
     }
 }
 
-/// The Latin faces the app registers: ONE FILE PER WEIGHT, not the variable
-/// source they are cut from. The text system keeps the requested weight only
-/// long enough to match a face — `gpui-pre-wgpu`'s `cosmic_text_system.rs`
-/// then shapes with the matched face's own `usWeightClass` and rasterizes
-/// from a font built at `Weight::NORMAL` with no variation settings — so a
-/// family holding one variable face draws every weight at 400 and no slant
-/// at all. A static face has no axes and is immune to both.
-/// `ops/build-font-instances.sh` cuts these from `Geist[wght]`.
+/// The faces the app registers: ONE FILE PER FACE, each the vendor's own
+/// released static (`crates/views/support/design/assets/fonts/SOURCES`), never
+/// a variable font. The text system keeps the requested weight only long
+/// enough to match a face — `gpui-pre-wgpu`'s `cosmic_text_system.rs` then
+/// shapes with the matched face's own `usWeightClass` and rasterizes from a
+/// font built at `Weight::NORMAL` with no variation settings — so a family
+/// holding one variable face draws every weight at 400. A static face has no
+/// axes and is immune to both.
 ///
-/// The set is the two RIBBI weights `ops/build-font-instances.sh` cuts, so a
-/// `MEDIUM` request lands on the Regular face and a `SEMIBOLD` on the Bold
-/// one. That same substitution read the other way — the matched face's weight
-/// is also the weight every FALLBACK lookup runs at — is why
-/// [`FALLBACK_FAMILIES`] exists: a registered face at a weight no system font
-/// declares leaves the shaper with nothing to match and it walks the font
-/// database instead.
-pub(crate) const LATIN_FACES: [&[u8]; 4] = [
-    include_bytes!("../../crates/views/support/design/assets/fonts/Geist-Regular.ttf"),
-    include_bytes!("../../crates/views/support/design/assets/fonts/Geist-Bold.ttf"),
-    include_bytes!("../../crates/views/support/design/assets/fonts/GeistMono-Regular.ttf"),
-    include_bytes!("../../crates/views/support/design/assets/fonts/GeistMono-Bold.ttf"),
+/// SLANT IS A FACE, NOT AN EFFECT. `find_best_match` scores style with a flat
+/// penalty and then picks the best-scoring face anyway, and neither gpui nor
+/// cosmic-text shears a glyph, so an italic request in a family with no
+/// italic face is drawn upright. `element.italic()` and a `*run*` in a chat
+/// message need the Italic and Bold Italic files to have anything to select.
+///
+/// The set is the four RIBBI faces, so a `MEDIUM` request lands on the
+/// Regular face and a `SEMIBOLD` on the Bold one. That same substitution read
+/// the other way — the matched face's weight is also the weight every
+/// FALLBACK lookup runs at — is why [`FALLBACK_FAMILIES`] exists: a
+/// registered face at a weight no system font declares leaves the shaper with
+/// nothing to match and it walks the font database instead.
+///
+/// The two Hangul faces are bundled rather than named and hoped for: a chain
+/// entry no box can resolve is dropped, and neither Latin family draws 한글.
+/// Both are upright only — no open Hangul font has an italic — so an italic
+/// run slants its Latin and leaves its Korean standing.
+pub(crate) const BUNDLED_FACES: [&[u8]; 12] = [
+    include_bytes!("../../crates/views/support/design/assets/fonts/Inter-Regular.ttf"),
+    include_bytes!("../../crates/views/support/design/assets/fonts/Inter-Bold.ttf"),
+    include_bytes!("../../crates/views/support/design/assets/fonts/Inter-Italic.ttf"),
+    include_bytes!("../../crates/views/support/design/assets/fonts/Inter-BoldItalic.ttf"),
+    include_bytes!("../../crates/views/support/design/assets/fonts/JetBrainsMono-Regular.ttf"),
+    include_bytes!("../../crates/views/support/design/assets/fonts/JetBrainsMono-Bold.ttf"),
+    include_bytes!("../../crates/views/support/design/assets/fonts/JetBrainsMono-Italic.ttf"),
+    include_bytes!("../../crates/views/support/design/assets/fonts/JetBrainsMono-BoldItalic.ttf"),
+    include_bytes!("../../crates/views/support/design/assets/fonts/Pretendard-Regular.otf"),
+    include_bytes!("../../crates/views/support/design/assets/fonts/Pretendard-Bold.otf"),
+    include_bytes!("../../crates/views/support/design/assets/fonts/D2Coding-Regular.ttf"),
+    include_bytes!("../../crates/views/support/design/assets/fonts/D2Coding-Bold.ttf"),
 ];
 
-/// The emoji face, kept apart from the Latin set because the two platforms
-/// differ on it (see the registration below).
+/// The emoji face, kept apart from [`BUNDLED_FACES`] because the two
+/// platforms differ on it (see the registration below).
 pub(crate) const EMOJI_FACE: &[u8] =
     include_bytes!("../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf");
 
-/// The families a run falls back to when the Latin face has no glyph, in
-/// order. WITHOUT this list a Korean run reaches cosmic-text tagged only
-/// `Geist`: no glyph is found, and `FontFallbackIter` walks the font
-/// database, SHAPING the word with one face after another until one covers
-/// it. WITH it, `gpui-pre-wgpu`'s `compute_run_spans` cuts the run at the
-/// first uncovered codepoint and tags that span with the family that covers
-/// it, so the fallback is a lookup — and the requested weight stops steering
-/// the search, which is what made a face at a weight no system font declares
-/// expensive for every non-Latin run at that weight.
+/// The families a run falls back to when the primary face has no glyph, after
+/// the bundled Hangul face each chain leads with. WITHOUT this list a Korean
+/// run reaches cosmic-text tagged only `Inter`: no glyph is found, and
+/// `FontFallbackIter` walks the font database, SHAPING the word with one face
+/// after another until one covers it. WITH it, `gpui-pre-wgpu`'s
+/// `compute_run_spans` cuts the run at the first uncovered codepoint and tags
+/// that span with the family that covers it, so the fallback is a lookup —
+/// and the requested weight stops steering the search, which is what made a
+/// face at a weight no system font declares expensive for every non-Latin run
+/// at that weight.
 ///
 /// One list for both platforms: `load_family` drops a family it cannot
 /// resolve, so the macOS names vanish on Linux and the Linux names on macOS.
@@ -2968,15 +2983,58 @@ const FALLBACK_FAMILIES: [&str; 9] = [
     "Apple Symbols",
 ];
 
-/// [`FALLBACK_FAMILIES`] as the text system wants it. Built once: the root
-/// element asks for it on every frame and `FontFallbacks` is an `Arc`.
+/// The chain for body text: Pretendard, then [`FALLBACK_FAMILIES`]. Built
+/// once — the root element asks for it on every frame and `FontFallbacks` is
+/// an `Arc`.
 pub(crate) fn fallback_chain() -> gpui_kit::FontFallbacks {
-    static CHAIN: std::sync::LazyLock<gpui_kit::FontFallbacks> = std::sync::LazyLock::new(|| {
-        gpui_kit::FontFallbacks::from_fonts(
-            FALLBACK_FAMILIES.iter().map(|name| name.to_string()).collect(),
-        )
-    });
+    static CHAIN: std::sync::LazyLock<gpui_kit::FontFallbacks> =
+        std::sync::LazyLock::new(|| chain_led_by(design::fonts::FAMILY_UI_HANGUL));
     CHAIN.clone()
+}
+
+/// The chain for the code face: D2Coding, then [`FALLBACK_FAMILIES`]. A
+/// SEPARATE chain because Pretendard is proportional — reached from a
+/// terminal, a diff or a hash it would shape 한글 off the column grid the
+/// mono face exists for. [`with_family`] is what puts the right one on an
+/// element; `font_family` alone leaves the body chain the root installed.
+pub(crate) fn mono_fallback_chain() -> gpui_kit::FontFallbacks {
+    static CHAIN: std::sync::LazyLock<gpui_kit::FontFallbacks> =
+        std::sync::LazyLock::new(|| chain_led_by(design::fonts::FAMILY_MONO_HANGUL));
+    CHAIN.clone()
+}
+
+fn chain_led_by(hangul: &str) -> gpui_kit::FontFallbacks {
+    gpui_kit::FontFallbacks::from_fonts(
+        std::iter::once(hangul.to_string())
+            .chain(FALLBACK_FAMILIES.iter().map(|name| name.to_string()))
+            .collect(),
+    )
+}
+
+/// Sets a family AND the fallback chain that belongs to it. Every family the
+/// app names goes through here: a run that switches to the code face has to
+/// switch its Hangul face with it, and the two are set in one place so they
+/// cannot drift apart.
+pub(crate) fn with_family<E: gpui_kit::Styled>(
+    mut element: E,
+    family: impl Into<gpui_kit::SharedString>,
+) -> E {
+    let family = family.into();
+    let is_code_face = family == design::fonts::FAMILY_MONO;
+    let style = element.text_style();
+    style.font_fallbacks = Some(if is_code_face {
+        mono_fallback_chain()
+    } else {
+        fallback_chain()
+    });
+    style.font_family = Some(family);
+    element
+}
+
+/// [`with_family`] with the code face, in the shape a fluent chain takes it:
+/// `.map(shell::mono_family)`.
+pub(crate) fn mono_family<E: gpui_kit::Styled>(element: E) -> E {
+    with_family(element, design::fonts::FAMILY_MONO)
 }
 
 pub(crate) fn run() {
@@ -2998,9 +3056,9 @@ pub(crate) fn run() {
         // launch event and its answer is in the log before the first mention.
         crate::backend::boot_desktop_notifications();
         let fonts: Vec<std::borrow::Cow<'static, [u8]>> =
-            LATIN_FACES.iter().copied().map(std::borrow::Cow::Borrowed).collect();
+            BUNDLED_FACES.iter().copied().map(std::borrow::Cow::Borrowed).collect();
         // CoreGraphics cannot load Noto's CBDT color font. Including it in
-        // the batch rejects both Latin families too; macOS supplies emoji.
+        // the batch rejects every other family too; macOS supplies emoji.
         #[cfg(not(target_os = "macos"))]
         let fonts = {
             let mut fonts = fonts;

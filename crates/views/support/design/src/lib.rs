@@ -7,28 +7,43 @@
 /// constant together when changing the product face.
 pub mod fonts {
     /// the UI face — every sans role (default, medium, display).
-    pub const FAMILY_UI: &str = "Geist";
+    pub const FAMILY_UI: &str = "Inter";
     /// the data face — hashes, seqs, diffs, code, the log ring.
-    pub const FAMILY_MONO: &str = "Geist Mono";
-    /// Bundled files relative to this crate. The emoji face supplies fallback
-    /// glyphs; it is not a separate product type role. ONE FILE PER WEIGHT:
-    /// the shell's text system draws a whole family at the weight of the face
-    /// it matched, so a family holding one variable face has one weight. Two
-    /// weights, not four — a heavier request lands on the nearer of these
-    /// (see `app/src/shell.rs`'s `LATIN_FACES`).
-    pub const ASSETS: [&str; 5] = [
-        "assets/fonts/Geist-Regular.ttf",
-        "assets/fonts/Geist-Bold.ttf",
-        "assets/fonts/GeistMono-Regular.ttf",
-        "assets/fonts/GeistMono-Bold.ttf",
+    pub const FAMILY_MONO: &str = "JetBrains Mono";
+    /// The Hangul face behind [`FAMILY_UI`]: neither Latin family draws
+    /// 한글, so every Korean run falls back, and the fallback is named
+    /// rather than searched (`app/src/shell.rs`'s chains).
+    pub const FAMILY_UI_HANGUL: &str = "Pretendard";
+    /// The Hangul face behind [`FAMILY_MONO`]. A code face exists for its
+    /// column grid, and [`FAMILY_UI_HANGUL`] is proportional — Korean in a
+    /// terminal or a diff has to land on a monospaced Hangul face.
+    pub const FAMILY_MONO_HANGUL: &str = "D2Coding";
+    /// Bundled files relative to this crate, each the vendor's own released
+    /// static face (see `assets/fonts/SOURCES`). The emoji face supplies
+    /// fallback glyphs; it is not a separate product type role.
+    ///
+    /// ONE FILE PER FACE, and no variable font: the shell's text system
+    /// shapes with the matched face's own weight and rasterizes with no
+    /// variation settings, so a family holding one variable face draws every
+    /// weight at 400 and slants for nothing. The set is the four RIBBI faces
+    /// — Regular, Bold, Italic, Bold Italic — and a heavier request lands on
+    /// the nearer of the two weights (see `app/src/shell.rs`'s
+    /// `BUNDLED_FACES`). Hangul has no italic in any open font: an italic run
+    /// slants its Latin and stays upright in 한글.
+    pub const ASSETS: [&str; 13] = [
+        "assets/fonts/Inter-Regular.ttf",
+        "assets/fonts/Inter-Bold.ttf",
+        "assets/fonts/Inter-Italic.ttf",
+        "assets/fonts/Inter-BoldItalic.ttf",
+        "assets/fonts/JetBrainsMono-Regular.ttf",
+        "assets/fonts/JetBrainsMono-Bold.ttf",
+        "assets/fonts/JetBrainsMono-Italic.ttf",
+        "assets/fonts/JetBrainsMono-BoldItalic.ttf",
+        "assets/fonts/Pretendard-Regular.otf",
+        "assets/fonts/Pretendard-Bold.otf",
+        "assets/fonts/D2Coding-Regular.ttf",
+        "assets/fonts/D2Coding-Bold.ttf",
         "assets/fonts/NotoColorEmoji.ttf",
-    ];
-    /// The variable faces [`ASSETS`]' Latin instances are cut from, by
-    /// `ops/build-font-instances.sh`. Kept so a regeneration needs nothing
-    /// off the network; nothing registers them.
-    pub const SOURCES: [&str; 2] = [
-        "assets/fonts/Geist[wght].ttf",
-        "assets/fonts/GeistMono[wght].ttf",
     ];
 }
 
@@ -347,7 +362,7 @@ mod tests {
     use super::*;
     #[test]
     fn every_embedded_font_file_exists_and_is_truetype() {
-        for asset in fonts::ASSETS.iter().chain(&fonts::SOURCES) {
+        for asset in fonts::ASSETS {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(asset);
             let bytes = std::fs::read(&path)
                 .unwrap_or_else(|error| panic!("font asset {asset} unreadable: {error}"));
@@ -373,7 +388,7 @@ mod tests {
         let json = kit_theme_json();
         assert!(json.contains("\"Ducktape Light\""));
         assert!(json.contains("\"Ducktape Dark\""));
-        assert!(json.contains("\"font.family\": \"Geist\""));
+        assert!(json.contains("\"font.family\": \"Inter\""));
         assert!(json.contains("\"mode\": \"dark\""));
         let braces = json.matches('{').count();
         assert_eq!(braces, json.matches('}').count());

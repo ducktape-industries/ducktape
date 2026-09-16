@@ -317,9 +317,15 @@ presets onto gpui-kit variants (primary, outline, ghost, link, danger).
 
 ## Design system
 
-- Faces: **Geist** (UI), **Geist Mono** (identifiers, hashes, paths, code).
-  The files are embedded from `crates/views/support/design/assets/fonts/` at
-  build time; the kit's component icons come from `gpui_kit::assets::Assets`.
+- Faces: **Inter** (UI), **JetBrains Mono** (identifiers, hashes, paths, code),
+  each in Regular, Bold, Italic and Bold Italic — a slant is a face here, not
+  an effect, and nothing in this stack shears a glyph. Hangul falls back to
+  **Pretendard** behind the UI face and **D2Coding** behind the code face, both
+  upright: no open Hangul font has an italic, so an italic run slants its Latin
+  and leaves its Korean standing. The files are embedded from
+  `crates/views/support/design/assets/fonts/` at build time (that directory's
+  `SOURCES` names each release they come from); the kit's component icons come
+  from `gpui_kit::assets::Assets`.
 - Type scale (`design::type_scale`): title 16, section 13.5, body 13,
   secondary 12, caption 11, mono 12.
 - Radii (`design::radius`): 4px controls and badges, 6px cards, round avatars.
