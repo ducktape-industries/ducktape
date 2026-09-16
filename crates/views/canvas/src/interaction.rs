@@ -1277,17 +1277,33 @@ impl BoardsView {
         self.edit_many(swept.into_iter().map(|id| Change::Delete { id }).collect())
     }
     pub(super) fn on_cancel(&mut self) -> Task<Message> {
-        // Escape is the way out that keeps NOTHING. ⌘Enter keeps what you
-        // wrote and so does clicking away; one key has to be the other answer
-        // or a card you opened by accident is a card you have already
-        // changed. It used to save as well, which left the board with three
-        // ways to say yes and none to say no — and the message printed over
-        // an overlong card promising Escape would leave it as it was.
-        if let Some(inline) = self.inline.take() {
+        // Escape stops the writing. It does not throw it away: EVERY door out
+        // of a card keeps what you wrote, which is the answer tldraw and
+        // excalidraw both give and the only safe one here. What you type lives
+        // in the editor until a door commits it, so a door that discarded
+        // would destroy a paragraph with no undo standing behind it — and
+        // Escape is the key you press to mean "stop", not "undo everything".
+        //
+        // Nothing is lost by opening a card you did not mean to, either: a
+        // card whose words came back unchanged is a card nothing is written
+        // for, so there was never a change to escape from.
+        //
+        // The one exception is a card the board will not take at all. Every
+        // door ends in the same save and that save refuses, so without a way
+        // past it the writer is shut inside an editor that answers nothing —
+        // and the banner has been saying so, by how much, for as long as it
+        // has been true. A save that fails because earlier edits are still in
+        // flight is NOT that: it clears on its own, so it keeps the words and
+        // asks for a retry.
+        if let Some(inline) = self.inline.as_ref() {
+            let refused_outright = inline.document.text().len() > boards::MAX_TEXT;
+            if !refused_outright {
+                return self.finish_text();
+            }
+            let inline = self.inline.take().expect("the editor is open");
             self.error.clear();
-            // Words are the whole of a text shape. One that never had any is
-            // going back to not existing, the same rule that governs leaving
-            // one empty.
+            // Words are the whole of a text shape, and these are not being
+            // kept, so one that had none before goes back to not existing.
             let never_written =
                 self.kind_of(&inline.id) == Some(Kind::Text) && inline.original.trim().is_empty();
             if !never_written {
@@ -1507,13 +1523,13 @@ impl BoardsView {
         };
         let text = inline.document.text();
         if text.len() > boards::MAX_TEXT {
-            // Say by how much, and say the way out. Refusing to save without
-            // either is a card you cannot leave: every way out of the editor
-            // ends here, so a reader who does not know Escape discards is
-            // stuck deleting characters against a limit nobody named.
+            // Say by how much, and say the way out. Every door out of the
+            // editor ends here and this one refuses, so a reader who is not
+            // told that Escape leaves anyway is shut in against a number
+            // nobody named.
             self.error = format!(
                 "This card holds {} bytes and there are {}. Shorten it, or press Escape to \
-                 leave the card as it was.",
+                 leave it behind.",
                 boards::MAX_TEXT,
                 text.len()
             );
