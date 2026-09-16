@@ -16,11 +16,9 @@ ducktape-view-guest = { path = "../crates/views/support/guest" }
 qrcode = { version = "0.14", default-features = false }
 futures.workspace = true
 pulldown-cmark = "0.12.2"
-# the program-account module: the Agents editor provisions a new agent's
-# keyless account through it before the runs module registers the record.
-agent.workspace = true
-# the network's node -> announced-provider registry, behind the Shell's host
-# picker: which peers can actually run an agent.
+# chat's CLIENT view model: the block parse a composer's text goes through
+# and the account link a mention spells. One implementation, whether the
+# reader of it is this app or the chat view.
 chat.workspace = true
 # the huddle media planes: the call-socket framing and voice/video wire.
 media-service.workspace = true
@@ -31,9 +29,11 @@ app-update.workspace = true
 tar.workspace = true
 zstd.workspace = true
 module-artifact.workspace = true
-# the files read lane's wire (`b64` pages), the one codec duckfs-core writes
+# the `b64` pages the node's read lane answers with
 base64.workspace = true
 sha2.workspace = true
+# the blob read lane's own bounds and reply shape: a page size spelled here
+# as a literal would be a second copy the module cannot see move.
 forge.workspace = true
 gateway.workspace = true
 # the client-computed merge lane: a bare mirror fetched over the node's
@@ -45,7 +45,6 @@ git2 = { version = "0.19", default-features = false, features = ["vendored-libgi
 # zero-dependency leaf so every reader of that root agrees about it.
 ducktape-home.workspace = true
 identity.workspace = true
-inbox.workspace = true
 # THE device keystore, linked rather than spawned. Opening your own key is the
 # app's own business: it used to reach argon2id by starting `ducktape` and
 # piping to it, which made "can this process find a binary on disk?" a
@@ -56,26 +55,15 @@ keystore.workspace = true
 # of holding the key in-process; `node::encode_frame` is the ONE encoder, and a
 # second implementation of a machine wire format is not a thing to write.
 node.workspace = true
-# the duckfs wire bounds an upload must agree with (inline cap, chunk size):
-# a threshold spelled here as a literal is a second copy the module cannot
-# see move.
-duckfs-core.workspace = true
 authpage.workspace = true
 # the ed25519 signer `keystore` hands back and `node::encode_frame` signs with.
 commonware-cryptography.workspace = true
-# scheduling a durable agent run in-process: the work spec the saga carries and
-# the run envelope's headless composer. `run-envelope` is the SCHEMA only —
-# reaching the composer through `compute-service` would link provider-host and
-# the microVM sandbox into a GUI.
-dispatch.workspace = true
+# the run envelope a durable agent run is scheduled with — the SCHEMA only.
+# Reaching the composer through `compute-service` would link provider-host
+# and the microVM sandbox into a GUI.
 run-envelope.workspace = true
-runs.workspace = true
-tasks.workspace = true
-attribution.workspace = true
 # the 32 random bytes of a fresh dispatch id.
 rand.workspace = true
-pages.workspace = true
-saga.workspace = true
 # Consensus payloads and authenticated origin types used by signed writes.
 sdk.workspace = true
 # The join ceremony, linked rather than spawned. Joining is the one node
@@ -158,6 +146,9 @@ x11rb = { version = "0.13", features = ["composite", "randr", "xfixes"] }
 gpui-kit = { version = "=0.6.1", features = ["test-support"] }
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
+# the dependency line this app is held to is read off the manifests, not
+# asserted about from memory: `the_app_links_only_what_it_still_speaks_for`
+toml = "0.8"
 commonware-cryptography.workspace = true
 simnode = { path = "../bin/simnode" }
 tempfile.workspace = true
