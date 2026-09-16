@@ -4003,16 +4003,21 @@ fn text_options(
 ) -> Div {
     element = element.font_weight(font_weight(font.weight));
     if font.monospace {
-        element = element.font_family("monospace");
+        element = element.font_family(design::fonts::FAMILY_MONO);
     }
     if let Some(font) = &options.font {
+        // The generic families name no face this app registered, and a family
+        // that does not resolve takes the weight and the slant down with it:
+        // a run asking for bold sans-serif came back as plain body text.
+        // Every generic but the monospace one is the app's own text face,
+        // which is the one with the weights.
         let family = match &font.family {
             wire::FontFamily::Named(name) => name.clone(),
-            wire::FontFamily::Serif => "serif".into(),
-            wire::FontFamily::SansSerif => "sans-serif".into(),
-            wire::FontFamily::Monospace => "monospace".into(),
-            wire::FontFamily::Cursive => "cursive".into(),
-            wire::FontFamily::Fantasy => "fantasy".into(),
+            wire::FontFamily::Monospace => design::fonts::FAMILY_MONO.into(),
+            wire::FontFamily::Serif
+            | wire::FontFamily::SansSerif
+            | wire::FontFamily::Cursive
+            | wire::FontFamily::Fantasy => design::fonts::FAMILY_UI.into(),
         };
         element = element
             .font_family(family)

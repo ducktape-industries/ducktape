@@ -669,6 +669,39 @@ fn alt_drag_leaves_the_original_and_plants_the_copy_where_the_pointer_let_go() {
     assert_eq!(board.shapes["a"].shape.x, 0);
 }
 #[test]
+fn the_other_duplicate_chord_drags_rather_than_changing_what_is_selected() {
+    // Shift is half of ⌘⇧, and Shift on its own takes a shape out of the
+    // selection — so the press that should have started the drag used to
+    // deselect the card under it and sit there doing nothing, while the board
+    // went on printing the chord along its bottom edge.
+    let mut view = view();
+    view.camera = [0., 0.];
+    card(&mut view, "a", 0);
+    card(&mut view, "b", 300);
+    view.selected = ["a".into()].into();
+    view.modifiers.shift = true;
+    view.modifiers.control = true;
+    view.modifiers.logo = true;
+    view.on_press(100., 70.);
+    assert!(
+        matches!(view.gesture, super::Gesture::Move { .. }),
+        "the press took hold of nothing: {:?}",
+        view.gesture
+    );
+    assert_eq!(
+        view.selected,
+        ["a".into()].into(),
+        "the press changed the selection instead of dragging it"
+    );
+    // and Shift by itself still does what it always did
+    view.on_release();
+    view.modifiers.control = false;
+    view.modifiers.logo = false;
+    view.on_press(400., 70.);
+    assert_eq!(view.selected, ["a".into(), "b".into()].into());
+    assert!(matches!(view.gesture, super::Gesture::Idle));
+}
+#[test]
 fn stacking_moves_a_shape_and_undo_puts_the_whole_stack_back() {
     let mut view = view();
     card(&mut view, "a", 0);
@@ -749,6 +782,123 @@ fn dragging_an_arrows_end_onto_another_card_rebinds_that_end_and_leaves_the_far_
     assert_eq!(edge.to.as_deref(), Some("c"));
 }
 
+/// A free arrow lying along `run`, and one card to drop an end on.
+fn loose_arrow(run: [[i32; 2]; 2]) -> BoardsView {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    card(&mut view, "c", 600);
+    let low = [run[0][0].min(run[1][0]), run[0][1].min(run[1][1])];
+    view.edit(Change::Create {
+        id: "e".into(),
+        shape: Shape {
+            kind: Kind::Arrow,
+            x: low[0],
+            y: low[1],
+            width: (run[1][0] - run[0][0]).abs(),
+            height: (run[1][1] - run[0][1]).abs(),
+            points: run
+                .iter()
+                .map(|p| [p[0] - low[0], p[1] - low[1]])
+                .collect(),
+            ..Default::default()
+        },
+    });
+    view.selected = ["e".into()].into();
+    view
+}
+#[test]
+fn an_arrows_start_takes_a_card_exactly_where_its_end_would() {
+    // Card "c" is 600..800 by 0..140, so its centre is (700, 70). Which end of
+    // a run you are holding says nothing about where the card lets you attach
+    // it: the same run dropped on the same point, once by each end, comes to
+    // rest in the same place. What the landing DOES depend on is where the
+    // other end of the run is standing, because that is the direction the
+    // arrow arrives from — so each case holds that end still and only swaps
+    // which of the two is the one in hand.
+    let approaches = [
+        // straight at the middle of the card's left edge
+        ([250, 70], [550, 70], [600., 70.]),
+        // and up at it from below and to the left, which leaves through the
+        // bottom edge rather than the corner
+        ([600, 350], [660, 210], [675., 140.]),
+    ];
+    for (standing, held, expected) in approaches {
+        let mut lands = Vec::new();
+        for end in [1_usize, 0] {
+            // The end in hand is the run's last sample or its first, and the
+            // end left standing is the same point either way.
+            let run = match end {
+                0 => [held, standing],
+                _ => [standing, held],
+            };
+            let mut view = loose_arrow(run);
+            drag(
+                &mut view,
+                &[[held[0] as f32, held[1] as f32], [690., 70.], [700., 70.]],
+            );
+            let board = view.visible().unwrap();
+            let arrow = &board.shapes["e"].shape;
+            let bound = match end {
+                0 => arrow.from.as_deref(),
+                _ => arrow.to.as_deref(),
+            };
+            assert_eq!(bound, Some("c"), "end {end} did not take the card");
+            let drawn = super::interaction::stroke(&board, arrow);
+            lands.push(drawn[end * (drawn.len() - 1)]);
+        }
+        let [by_the_end, by_the_start] = lands[..] else {
+            unreachable!()
+        };
+        assert!(
+            (by_the_start[0] - by_the_end[0]).abs() < 1.
+                && (by_the_start[1] - by_the_end[1]).abs() < 1.,
+            "an arrow standing at {standing:?} and dropped on the card lands \
+             at {by_the_end:?} by its end and {by_the_start:?} by its start"
+        );
+        assert!(
+            (by_the_end[0] - expected[0]).abs() < 1.
+                && (by_the_end[1] - expected[1]).abs() < 1.,
+            "an arrow standing at {standing:?} should reach the card at \
+             {expected:?}, not {by_the_end:?}"
+        );
+    }
+}
+#[test]
+fn a_bent_arrow_leaves_its_card_toward_the_bend_and_not_past_it() {
+    // Card "c" is 600..800 by 0..140, centre (700, 70). An arrow bound to it
+    // and bent hard below it: the bend sits straight under the card and the
+    // far end doubles back up to the left. Aimed at the far end the run would
+    // leave through the card's LEFT side and then kink back across the card to
+    // reach a bend that is underneath it — the line crossing the shape it is
+    // attached to. It has to leave through the bottom.
+    let mut view = loose_arrow([[700, 340], [420, 60]]);
+    view.edit(Change::Route {
+        id: "e".into(),
+        x: 420,
+        y: 60,
+        width: 280,
+        height: 280,
+        points: vec![[280, 10], [280, 280], [0, 0]],
+        from: Some("c".into()),
+        to: None,
+    });
+    let board = view.visible().unwrap();
+    let run = super::interaction::stroke(&board, &board.shapes["e"].shape);
+    assert_eq!(
+        run.len(),
+        3,
+        "the bend was not kept: the run came out as {run:?}"
+    );
+    assert!(
+        (run[0][1] - 140.).abs() < 1. && (run[0][0] - 700.).abs() < 1.,
+        "the arrow left the card at {:?} instead of the bottom, straight \
+         above its bend at {:?}",
+        run[0],
+        run[1]
+    );
+}
 #[test]
 fn an_arrow_bends_by_the_handle_on_its_line_and_straightens_when_you_put_it_back() {
     let mut view = linked();
@@ -1156,11 +1306,13 @@ fn the_painter_and_the_editor_read_one_description_of_a_label() {
     );
     assert_eq!(
         painting.matches("&letters, self.zoom)").count(),
-        2,
-        "the column a label wraps in is stated once and read twice — by the \
-         label the painter draws and by the gauge that measures it. A second \
-         description of it breaks the same words in two different places, \
-         which is the whole defect this seam exists to close"
+        3,
+        "the column a label wraps in is stated once and read three times — by \
+         the label the painter draws, by the gauge that measures it, and by \
+         the box the caret writes in. That third reader is the point: a box \
+         that took its width from the measurement instead wrapped at where the \
+         words LANDED rather than where they were ALLOWED to, which is always \
+         a little short and broke a line the label kept whole"
     );
     assert_eq!(
         painting.matches("margin(").count(),
@@ -1258,6 +1410,103 @@ fn a_card_paints_every_word_its_editor_holds_and_the_marks_keep_their_own_room()
         overlay.matches("Rectangle").count() >= 12,
         "a ring for every selected card survives a board full of text"
     );
+}
+
+/// A card draws the markers it was written with rather than printing them:
+/// `**bold**` arrives bold and the asterisks are spent. A card wearing none is
+/// drawn by the path that has always drawn one — the geometry of an ordinary
+/// card must not change because the board learned to read a marker.
+#[test]
+fn a_card_spends_the_markers_it_was_written_with() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "plain".into(),
+        shape: Shape {
+            text: "just words".into(),
+            ..Default::default()
+        },
+    });
+    let json = serde_json::to_string(&view.view()).unwrap();
+    assert!(
+        json.contains("boards/label/plain") && !json.contains("RichText"),
+        "an unmarked card left the one text node the board has always drawn it with"
+    );
+
+    view.edit(Change::Create {
+        id: "marked".into(),
+        shape: Shape {
+            x: 400,
+            text: "# Title\na **bold** word and `code`".into(),
+            ..Default::default()
+        },
+    });
+    let json = serde_json::to_string(&view.view()).unwrap();
+    assert!(
+        json.contains("RichText"),
+        "a marked card drew no styled runs"
+    );
+    for spent in ["# Title", "**bold**", "`code`"] {
+        assert!(
+            !json.contains(spent),
+            "the card printed {spent} instead of drawing it"
+        );
+    }
+    for drawn in ["Title", "bold", "code"] {
+        assert!(json.contains(drawn), "the card lost the word {drawn}");
+    }
+    assert!(
+        json.contains("Bold") && json.contains("Monospace"),
+        "the markers were read off and then thrown away"
+    );
+
+    // And the card is drawn while it is being WRITTEN on, which is a second
+    // tree — the gauge's — over the same text. Building the label alone once
+    // passed while the gauge next to it refused the whole view.
+    view.selected = ["marked".into()].into();
+    view.begin_text();
+    let json = serde_json::to_string(&view.view()).unwrap();
+    assert!(
+        json.contains("boards/gauge") && json.contains("boards/editor/marked"),
+        "the editor and the gauge it is sized by did not both survive a marked card"
+    );
+}
+
+/// A marked card that is only ever measured, never drawn: every kind of line
+/// the reader understands, through the gauge as well as the label, at a size
+/// where the card is legible and one where it is not.
+#[test]
+fn every_kind_of_marked_line_survives_being_drawn_and_measured() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    let text = "# One\n## Two\n### Three\n\n- bullet\n1. numbered\n> quoted\n\
+                plain **bold** *slant* `code` ~~struck~~ 2 * 3 * 4 **unclosed";
+    for (index, kind) in [Kind::Note, Kind::Rectangle, Kind::Ellipse, Kind::Text]
+        .into_iter()
+        .enumerate()
+    {
+        view.edit(Change::Create {
+            id: format!("m{index}"),
+            shape: Shape {
+                kind,
+                x: index as i32 * 300,
+                width: 260,
+                height: 200,
+                text: text.into(),
+                ..Default::default()
+            },
+        });
+    }
+    for zoom in [0.2, 1., 3.] {
+        view.zoom = zoom;
+        serde_json::to_string(&view.view()).unwrap();
+        for index in 0..4 {
+            view.inline = None;
+            view.selected = [format!("m{index}")].into();
+            view.begin_text();
+            serde_json::to_string(&view.view()).unwrap();
+        }
+    }
 }
 
 #[test]
@@ -1626,6 +1875,187 @@ fn the_two_keys_that_leave_a_card_are_not_the_same_answer() {
 }
 
 #[test]
+fn escape_keeps_nothing_and_every_other_way_out_keeps_everything() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            text: "kept".into(),
+            ..Default::default()
+        },
+    });
+    view.selected = ["a".into()].into();
+    view.begin_text();
+    view.inline.as_mut().unwrap().document = Editor::new("thrown away");
+    view.on_cancel();
+    assert!(view.inline.is_none(), "Escape left the editor open");
+    assert_eq!(
+        view.visible().unwrap().shapes["a"].shape.text,
+        "kept",
+        "Escape saved the card it was supposed to leave alone"
+    );
+
+    // Clicking away is the other answer, and it keeps what was typed.
+    view.begin_text();
+    view.inline.as_mut().unwrap().document = Editor::new("written");
+    view.finish_text();
+    assert_eq!(view.visible().unwrap().shapes["a"].shape.text, "written");
+
+    // A text shape that was never written on goes back to not existing, the
+    // same rule that governs leaving one empty.
+    view.edit(Change::Create {
+        id: "t".into(),
+        shape: Shape {
+            kind: Kind::Text,
+            ..Default::default()
+        },
+    });
+    view.selected = ["t".into()].into();
+    view.begin_text();
+    view.inline.as_mut().unwrap().document = Editor::new("second thoughts");
+    view.on_cancel();
+    assert!(
+        !view.visible().unwrap().shapes.contains_key("t"),
+        "an abandoned text shape was left behind as an invisible hit box"
+    );
+}
+
+#[test]
+fn a_press_anywhere_on_the_card_being_written_on_goes_back_to_the_writing() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            x: 0,
+            y: 0,
+            width: 300,
+            height: 200,
+            text: "hi".into(),
+            ..Default::default()
+        },
+    });
+    view.selected = ["a".into()].into();
+    view.begin_text();
+    // The field wraps in the card's column and sits on the words' own line, so
+    // the dead room on a big card is the band above and below them.
+    view.on_measured(view.zoom, 40., 20.);
+    let board = view.visible().unwrap();
+    let shape = &board.shapes["a"].shape.clone();
+    let (pos, room) = view.typing_box(&board, shape);
+    assert!(
+        room[1] < 200. * view.zoom,
+        "the field covers the whole card, so there is no dead room to test"
+    );
+    // A press in that dead room used to do nothing at all. It must not close
+    // the card, and it must not leave the board keyboard-dead either.
+    let corner = view.screen(290., 10.);
+    assert!(
+        !interaction::contains([pos[0], pos[1], pos[0] + room[0], pos[1] + room[1]], corner),
+        "the corner is inside the field after all"
+    );
+    view.on_press(corner[0], corner[1]);
+    assert!(
+        view.inline.is_some(),
+        "a press on the card being written on closed it"
+    );
+
+    // A press OUTSIDE the card still leaves, saving as it goes.
+    let away = view.screen(900., 700.);
+    view.on_press(away[0], away[1]);
+    assert!(
+        view.inline.is_none(),
+        "a press off the card did not leave it"
+    );
+}
+
+#[test]
+fn a_card_deleted_under_the_caret_stops_being_the_card_under_the_caret() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            text: "here".into(),
+            ..Default::default()
+        },
+    });
+    view.selected = ["a".into()].into();
+    view.begin_text();
+    // Undo is live while you write, and the shape can go out from under the
+    // caret. Believing it was still open dropped every key on the board.
+    view.edit(Change::Delete { id: "a".into() });
+    assert!(
+        view.inline.is_none(),
+        "the view still believes it is writing on a card that is gone"
+    );
+}
+
+#[test]
+fn a_measurement_is_divided_by_the_zoom_it_was_laid_out_at() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            text: "one line".into(),
+            ..Default::default()
+        },
+    });
+    view.selected = ["a".into()].into();
+    view.begin_text();
+    let laid_out_at = view.zoom;
+    // The camera moves between the frame that laid the gauge out and the
+    // frame that answers for it. Dividing by the zoom that arrived after the
+    // measurement is a card that grew for stepping back from it.
+    view.on_zoom(0.5);
+    view.on_measured(laid_out_at, 200., 300.);
+    assert_eq!(
+        view.visible().unwrap().shapes["a"].shape.height,
+        300,
+        "the card took the new zoom's word for the old zoom's pixels"
+    );
+}
+
+#[test]
+fn the_box_you_type_in_wraps_where_the_card_wraps_whatever_the_words_measured() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "a".into(),
+        shape: Shape {
+            text: "one two three four five six seven eight nine".into(),
+            ..Default::default()
+        },
+    });
+    view.selected = ["a".into()].into();
+    view.begin_text();
+    let board = view.visible().unwrap();
+    let shape = board.shapes["a"].shape.clone();
+    let room = [shape.width as f32 * view.zoom, shape.height as f32 * view.zoom];
+    let pos = view.screen(shape.x as f32, shape.y as f32);
+    let letters = view.lettering(&shape, room);
+    let column = super::presentation::column(shape.kind, room[0], &letters, view.zoom);
+    // The words land short of the column they were allowed — the room after
+    // the last word on a line is room the next word needed and could not have.
+    // Whatever that leftover comes to, the box keeps the column, plus the
+    // strip the field will not wrap into so that what is left IS the column.
+    let wraps_at = column + super::presentation::WRAP_RESERVE;
+    for measured in [40., 120., room[0] - 30., room[0] * 4.] {
+        view.on_measured(view.zoom, measured, 60.);
+        let inline = view.inline.as_ref().unwrap();
+        let (_, box_) = view.caret_box(inline, &shape, pos, room);
+        assert!(
+            (box_[0] - wraps_at).abs() < 0.5,
+            "a gauge answering {measured} gave the caret a {}-wide box to \
+             write in when the card wraps at {column}",
+            box_[0]
+        );
+    }
+}
+
+#[test]
 fn a_card_grows_to_hold_what_you_type_and_keeps_the_height_when_it_is_saved() {
     let mut view = view();
     view.on_size(1400., 900.);
@@ -1642,7 +2072,7 @@ fn a_card_grows_to_hold_what_you_type_and_keeps_the_height_when_it_is_saved() {
     // The host lays the gauge out and says the words come to 420 px. At this
     // zoom that is 420 board units, well past the 140 the card was made at.
     view.inline.as_mut().unwrap().document = Editor::new("a lot more words");
-    view.on_measured(200., 420.);
+    view.on_measured(view.zoom, 200., 420.);
     assert_eq!(
         view.visible().unwrap().shapes["a"].shape.height,
         420,
@@ -1650,7 +2080,7 @@ fn a_card_grows_to_hold_what_you_type_and_keeps_the_height_when_it_is_saved() {
     );
     // A shorter measurement does not take the room back while you are still
     // in the card — the words that need it may come back with the next key.
-    view.on_measured(200., 300.);
+    view.on_measured(view.zoom, 200., 300.);
     assert_eq!(view.visible().unwrap().shapes["a"].shape.height, 420);
     view.finish_text();
     let saved = view.visible().unwrap().shapes["a"].shape.clone();
@@ -1677,7 +2107,7 @@ fn a_card_that_already_holds_its_words_is_left_alone_and_a_refused_one_gives_the
     view.begin_text();
     // Words that fit ask for nothing: the card keeps the size it was drawn at
     // and leaving it saves nothing.
-    view.on_measured(200., 60.);
+    view.on_measured(view.zoom, 200., 60.);
     assert_eq!(view.visible().unwrap().shapes["a"].shape.height, 140);
     let before = view.pending.len();
     view.finish_text();
@@ -1688,7 +2118,7 @@ fn a_card_that_already_holds_its_words_is_left_alone_and_a_refused_one_gives_the
     // remembers a draft nobody saved.
     view.begin_text();
     view.inline.as_mut().unwrap().document = Editor::new("x".repeat(boards::MAX_TEXT + 10));
-    view.on_measured(200., 500.);
+    view.on_measured(view.zoom, 200., 500.);
     assert_eq!(view.visible().unwrap().shapes["a"].shape.height, 500);
     view.finish_text();
     assert!(view.inline.is_some(), "the board refuses text this long");
@@ -1964,7 +2394,7 @@ fn an_arrows_words_ride_a_plate_and_a_cards_sit_in_the_middle_of_it() {
 }
 
 #[test]
-fn coming_back_to_a_card_puts_the_caret_after_the_words_it_already_holds() {
+fn coming_back_to_a_card_holds_what_it_says_with_the_caret_at_the_end() {
     let mut view = view();
     view.on_size(1400., 900.);
     view.edit(Change::Create {
@@ -1977,16 +2407,33 @@ fn coming_back_to_a_card_puts_the_caret_after_the_words_it_already_holds() {
     view.selected = ["a".into()].into();
     view.begin_text();
     let cursor = view.inline.as_ref().unwrap().document.cursor();
-    // Typing on a card you have written on adds to it. A caret left in front
-    // of the first letter put every new word ahead of every kept one.
+    // Opening a written card selects what it says, the way a canvas app does:
+    // the first letter typed is the new label. The caret is at the FAR end of
+    // that selection, so one press of Right collapses it to the end and adding
+    // a word is the next keystroke.
     assert_eq!(cursor.position.line, 1, "the caret is not on the last line");
     assert_eq!(
         cursor.position.column, 6,
         "the caret is not after the last word"
     );
     assert_eq!(
-        cursor.selection, None,
-        "the caret arrived holding a selection"
+        cursor.selection,
+        Some(wire::EditorPosition::default()),
+        "the card's words did not arrive selected"
+    );
+
+    // A card with nothing on it has nothing to select.
+    view.inline = None;
+    view.edit(Change::Create {
+        id: "b".into(),
+        shape: Shape::default(),
+    });
+    view.selected = ["b".into()].into();
+    view.begin_text();
+    assert_eq!(
+        view.inline.as_ref().unwrap().document.cursor().selection,
+        None,
+        "an empty card arrived holding a selection"
     );
 }
 
@@ -2008,7 +2455,7 @@ fn the_caret_sits_on_the_words_whether_they_ride_a_line_or_a_card() {
     // Once the gauge has answered, the caret is as wide as the words and sits
     // at the middle of the room — the same middle the painter centres the
     // saved plate on, so the words do not jump when you stop typing.
-    view.on_measured(60., 24.);
+    view.on_measured(view.zoom, 60., 24.);
     let inline = view.inline.clone().unwrap();
     let (caret, size) = view.caret_box(&inline, &edge, pos, room);
     assert!(size[0] < room[0], "the caret still took the whole room");
@@ -2289,7 +2736,7 @@ fn a_text_shape_is_the_size_of_its_words_and_a_card_keeps_the_room_it_was_given(
     // The host lays the gauge out: the words come to 90 by 24 in a box made at
     // 280 by 60. The air either side of them is board you cannot click through
     // and a line the next shape would be snapped against.
-    view.on_measured(90., 40.);
+    view.on_measured(view.zoom, 90., 40.);
     let hugged = view.visible().unwrap().shapes["t"].shape.clone();
     assert!(
         hugged.width < 280,
@@ -2299,7 +2746,7 @@ fn a_text_shape_is_the_size_of_its_words_and_a_card_keeps_the_room_it_was_given(
     assert_eq!(hugged.height, 40, "and as tall as a box nobody drew");
     // Measuring the same words again says the same thing. A box that shrank
     // every time it was measured would walk itself shut as you typed.
-    view.on_measured(90., 40.);
+    view.on_measured(view.zoom, 90., 40.);
     assert_eq!(
         view.visible().unwrap().shapes["t"].shape.width,
         hugged.width,
@@ -2325,7 +2772,7 @@ fn a_text_shape_is_the_size_of_its_words_and_a_card_keeps_the_room_it_was_given(
     });
     view.selected = ["n".into()].into();
     view.begin_text();
-    view.on_measured(90., 40.);
+    view.on_measured(view.zoom, 90., 40.);
     let note = view.visible().unwrap().shapes["n"].shape.clone();
     assert_eq!(
         (note.width, note.height),
@@ -2637,7 +3084,7 @@ fn a_cards_words_sit_where_the_alignment_says_and_the_caret_goes_with_them() {
     view.begin_text();
     // The gauge has answered: the words are 60 wide in a card 200 wide, so
     // there are 140 units of slack for the alignment to spend.
-    view.on_measured(60., 24.);
+    view.on_measured(view.zoom, 60., 24.);
     let inline = view.inline.clone().unwrap();
     let pos = [0., 0.];
     let room = [200., 140.];

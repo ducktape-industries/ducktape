@@ -305,15 +305,56 @@ impl TextEditor {
                     .iter()
                     .any(|claim| claim.matches(&key, cfg!(target_os = "macos")))
             });
-        if !claimed {
+        if claimed {
+            self.store.request(
+                &self.key,
+                wire::EditorRequestInput::Key { key, repeat: false },
+            );
+            cx.stop_propagation();
+            cx.emit(());
             return;
         }
-        self.store.request(
-            &self.key,
-            wire::EditorRequestInput::Key { key, repeat: false },
-        );
+        self.tab(keystroke, window, cx);
+    }
+
+    /// Tab, which the writer means as an indent and the field would otherwise
+    /// spend on leaving. The editing engine has an indent of its own and will
+    /// not run it here — it is switched off for a field that grows with its
+    /// text, which is every guest editor — so the keystroke walks on to the
+    /// window's focus ring and the caret never sees it. Type the indent
+    /// instead, exactly as if the two spaces had been pressed.
+    fn tab(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
+        let tab = keystroke.key == "tab";
+        let plain = !keystroke.modifiers.control
+            && !keystroke.modifiers.alt
+            && !keystroke.modifiers.platform
+            && !keystroke.modifiers.function;
+        if !tab || !plain {
+            return;
+        }
+        let outward = keystroke.modifiers.shift;
+        let input = self.input.clone();
+        let (text, selected, writable) = input.update(cx, |input, _| {
+            (
+                input.value().to_string(),
+                input.selected_range(),
+                input.is_editable(),
+            )
+        });
+        if !writable {
+            return;
+        }
+        // Shift+Tab against a line with no indent left to give has nothing to
+        // do, and a key with nothing to do is the key that walks the focus
+        // ring. Only an indent that actually moved is one this field keeps.
+        let Some((next, moved)) = indent(&text, selected, outward) else {
+            return;
+        };
+        input.update(cx, |input, cx| {
+            input.set_value(next, window, cx);
+            input.set_selected_range(moved, cx);
+        });
         cx.stop_propagation();
-        cx.emit(());
     }
 
     /// A press in the box that the field itself did not take — the empty room
@@ -356,10 +397,13 @@ impl Render for TextEditor {
             Some(wire::LineHeight::Relative(ratio)) => ratio * size,
             None => size * 1.4,
         };
+        // The generic families name no face this app registered; every one but
+        // the monospace is the app's own text face, which is the one with the
+        // weights on it.
         let family = options.font.as_ref().map(|font| match &font.family {
             wire::FontFamily::Named(name) => name.clone(),
-            wire::FontFamily::Monospace => "monospace".to_owned(),
-            _ => "Geist".to_owned(),
+            wire::FontFamily::Monospace => design::fonts::FAMILY_MONO.to_owned(),
+            _ => design::fonts::FAMILY_UI.to_owned(),
         });
         // The shell reads this context off a keystroke to yield the chords a
         // guest editor claims — Ctrl+K is a link here, not the search palette.
@@ -379,6 +423,87 @@ impl Render for TextEditor {
             })
             .child(Textarea::new(&self.input))
     }
+}
+
+/// One indent. Two spaces, the editing engine's own tab size: what an indent
+/// has to do in prose is line the next line up under this one, and a hard tab
+/// lines it up against a stop no painter here draws.
+const INDENT: &str = "  ";
+
+/// The document after Tab, and where the selection lands in it. `None` when
+/// the key had nothing to do.
+///
+/// A caret types an indent where it stands. A SELECTION moves whole lines
+/// instead — that is what makes Tab worth having in a list, and replacing the
+/// selected words with two spaces is a deletion nobody asked for.
+fn indent(text: &str, selected: Range<usize>, outward: bool) -> Option<(String, Range<usize>)> {
+    let lo = selected.start.min(selected.end);
+    let hi = selected.start.max(selected.end);
+    let typing = lo == hi && !outward;
+    if typing {
+        let mut next = text.to_owned();
+        next.insert_str(lo, INDENT);
+        let at = lo + INDENT.len();
+        return Some((next, at..at));
+    }
+    // The first line is the one the selection starts ON, wherever in it that
+    // is; the last is the last one it starts BEFORE, so a selection carried to
+    // the head of a line leaves that line alone, as it does everywhere else.
+    let head = text[..lo].rfind('\n').map_or(0, |at| at + 1);
+    let mut next = text[..head].to_owned();
+    let mut edits: Vec<(usize, usize, usize)> = Vec::new();
+    let mut at = head;
+    for line in text[head..].split_inclusive('\n') {
+        let touched = at == head || at < hi;
+        if !touched {
+            next.push_str(line);
+            at += line.len();
+            continue;
+        }
+        match outward {
+            true => {
+                let shed = outdent(line);
+                edits.push((at, 0, shed));
+                next.push_str(&line[shed..]);
+            }
+            false => {
+                edits.push((at, INDENT.len(), 0));
+                next.push_str(INDENT);
+                next.push_str(line);
+            }
+        }
+        at += line.len();
+    }
+    let nothing_to_shed = edits
+        .iter()
+        .all(|(_, added, removed)| *added + *removed == 0);
+    if nothing_to_shed {
+        return None;
+    }
+    let shifted = |offset: usize| {
+        let mut moved = offset;
+        for &(start, added, removed) in &edits {
+            if start > offset {
+                break;
+            }
+            moved += added;
+            moved -= removed.min(offset - start);
+        }
+        moved
+    };
+    Some((next, shifted(selected.start)..shifted(selected.end)))
+}
+
+/// How much of a line's leading whitespace one Shift+Tab takes back: a hard
+/// tab whole, or up to an indent's worth of spaces.
+fn outdent(line: &str) -> usize {
+    if line.starts_with('\t') {
+        return 1;
+    }
+    line.bytes()
+        .take(INDENT.len())
+        .take_while(|byte| *byte == b' ')
+        .count()
 }
 
 /// The field's selection for a guest cursor, ANCHOR first: the range runs
@@ -714,4 +839,76 @@ fn a_readonly_field_reports_no_edit(cx: &mut gpui_kit::TestAppContext) {
         store.lock().documents["readonly"].text.as_deref(),
         Some("Read only 한글")
     );
+}
+
+/// A drag-selection is one caret move per pointer sample, against a queue that
+/// drains one item per guest frame and faults the whole view when it fills.
+/// Two caret moves in a row compose, so the queue keeps the one in flight and
+/// one destination however far the pointer travels.
+#[cfg(test)]
+#[test]
+fn a_drag_through_a_paragraph_does_not_fill_the_queue() {
+    let text = "one two three four five six seven eight nine ten";
+    let store = store_with("drag", text, Vec::new(), "");
+    let reaching = |byte: usize| wire::EditorCursor {
+        position: position(text, byte),
+        selection: Some(position(text, 0)),
+    };
+    let mut held = wire::EditorCursor {
+        position: position(text, 0),
+        selection: None,
+    };
+    for byte in 1..text.len() {
+        let next = reaching(byte);
+        store.native(
+            "document",
+            text,
+            held,
+            text,
+            next,
+            wire::EditorEditKind::Cursor,
+        );
+        held = next;
+    }
+    let locked = store.lock();
+    assert!(locked.fault.is_none(), "{:?}", locked.fault);
+    let queue = &locked.documents["drag"].queue;
+    assert!(
+        queue.len() <= 2,
+        "a drag of {} samples left {} in the queue",
+        text.len() - 1,
+        queue.len()
+    );
+}
+
+/// Tab is an indent: typed where the caret stands, and carried across whole
+/// lines when a selection covers them. Shift+Tab takes one back, and takes
+/// nothing when there is nothing left to take — which is what leaves the key
+/// to the focus ring.
+#[cfg(test)]
+#[test]
+fn tab_indents_a_caret_a_block_and_gives_it_back() {
+    let typed = indent("ab", 1..1, false).expect("an indent at the caret");
+    assert_eq!(typed, ("a  b".to_owned(), 3..3));
+
+    // Two lines selected from the middle of the first to the middle of the
+    // second: both move, and both ends of the selection move with them.
+    let block = indent("one\ntwo\nthree", 1..5, false).expect("a block indent");
+    assert_eq!(block, ("  one\n  two\nthree".to_owned(), 3..9));
+
+    // A selection carried to the head of the next line leaves that line where
+    // it is — the writer stopped before it.
+    let up_to = indent("one\ntwo", 0..4, false).expect("a block indent");
+    assert_eq!(up_to.0, "  one\ntwo");
+
+    let back = indent("  one\n  two", 3..9, true).expect("an outdent");
+    assert_eq!(back, ("one\ntwo".to_owned(), 1..5));
+
+    // A caret inside the indentation being taken back lands at the line's
+    // head rather than running off it.
+    let inside = indent("  one", 1..1, true).expect("an outdent");
+    assert_eq!(inside, ("one".to_owned(), 0..0));
+
+    assert_eq!(indent("one\ntwo", 0..7, true), None);
+    assert_eq!(indent("\tone", 0..0, true), Some(("one".to_owned(), 0..0)));
 }

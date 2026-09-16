@@ -157,10 +157,51 @@ pub(super) const MIN_CARD: [i32; 2] = [40, 32];
 /// The smallest type the board will draw. Under it letters stop being letters
 /// and start being grey noise, so nothing is drawn at all.
 const SMALLEST: f32 = 8.;
+/// What an empty card says when it is waiting for a word.
+const PROMPT: &str = "Write a thought…";
+/// Whether a blank shape of this kind is a card waiting for a word or a
+/// drawing that was never going to carry one. A blank sticky invites a word; a
+/// blank outline is a drawing, and a connector with nothing written on it is
+/// just a line. The painter and the editor ask this together, so a shape the
+/// board would never prompt does not start prompting the moment you click into
+/// it.
+fn invites_a_word(kind: Kind) -> bool {
+    matches!(kind, Kind::Note | Kind::Text)
+}
+/// How far apart a card's lines sit, as a multiple of the type size. The
+/// painter and the editor each have a default and they are NOT the same
+/// number, so a card whose lines were set by neither drew them tight while
+/// you typed and loose once you stopped. Both read this one instead.
+const LEADING: f32 = 1.4;
+/// The strip at the right of a field that the host's soft-wrapping input will
+/// not wrap into — room it keeps for the caret to stand past the last glyph of
+/// a line. A painted label keeps none, so a field handed the label's column
+/// exactly wraps ten pixels early: every line loses whatever word straddles
+/// that strip, and the words rewrap the moment you stop typing.
+///
+/// Pixels and not a multiple of the type size, because that is what it is on
+/// the other side: a fixed reserve the field takes whatever the camera or the
+/// writing is doing. Scaling it would make a card rewrap for being zoomed.
+///
+/// Ten of those pixels are the reserve itself. The eleventh is the pixel the
+/// two layouts can round apart, and it is spent in this direction on purpose:
+/// a field that breaks a line the label keeps shows more lines than the card
+/// was measured to hold and clips the last of them, where a field that keeps a
+/// line the label breaks only leaves the card a line taller than it needed.
+///
+/// This closes the column, not the last few pixels of it. The field and the
+/// label are two different text engines on the host side and they do not
+/// measure the same sentence to quite the same width, so a word whose end
+/// falls within a pixel or three of the column can still land on either side
+/// of the break. What it does close is the whole-word disagreement that used
+/// to show on every card that wrapped at all.
+pub(super) const WRAP_RESERVE: f32 = 11.;
 /// One card's words, as both the painter and the editor must lay them out.
 pub(super) struct Lettering {
     /// Screen-space type size, already scaled by the camera.
     pub(super) size: f32,
+    /// The distance from one line of those words to the next, in pixels.
+    pub(super) leading: f32,
     /// How far in from the card's box the words start, on every side.
     pub(super) inset: f32,
     /// Whether the words are being drawn at the size they were asked for.
@@ -203,15 +244,7 @@ impl BoardsView {
             // editor opens exactly over the label it replaces — for a
             // connector that is the plate at the middle of the run, which is
             // nowhere near the rectangle its samples were stored with.
-            let origin = self.screen(s.x as f32, s.y as f32);
-            let stored = [
-                origin[0],
-                origin[1],
-                origin[0] + s.width as f32 * self.zoom,
-                origin[1] + s.height as f32 * self.zoom,
-            ];
-            let box_ = self.on_screen(live, s).unwrap_or(stored);
-            let (pos, size) = self.writing_box(live, s, box_);
+            let (pos, size) = self.writing_box(live, s, self.card_box(live, s));
             layers.push(self.text_gauge(inline, s, pos, size));
             let (caret, room) = self.caret_box(inline, s, pos, size);
             layers.push(self.inline_editor(s, caret, room));
@@ -552,7 +585,7 @@ impl BoardsView {
     }
     fn hint(&self) -> &'static str {
         match self.tool {
-            Tool::Select => "Double-click to write · Alt-drag to duplicate",
+            Tool::Select => "Double-click to write · Alt or ⌘⇧ drag to duplicate",
             Tool::Hand => "Drag to explore · Release Space to return to your tool",
             Tool::Note => "Click to place a note and start typing",
             Tool::Rectangle => "Drag to draw a box · Shift-resize to keep proportions",
@@ -782,7 +815,7 @@ impl BoardsView {
             ("Enter / double-click", "Edit text"),
             ("⌘ / Ctrl Enter", "Finish text / next note"),
             ("⌘ / Ctrl C · X · V", "Copy / cut / paste at pointer"),
-            ("⌘ / Ctrl D · Alt drag", "Duplicate selection"),
+            ("⌘ / Ctrl D · Alt or ⌘⇧ drag", "Duplicate selection"),
             ("⌘ / Ctrl ] · [", "Bring to front / send to back"),
             ("⌘ / Ctrl Z · Shift Z", "Undo / redo"),
             ("Arrow · Shift Arrow", "Move 1 / 10 units"),
@@ -1159,8 +1192,10 @@ impl BoardsView {
         // the writing IS the thing — and the step multiplies whichever it is,
         // so choosing a size says the same thing on both.
         let asked = if plain { 20. } else { 14. } * step(s.text_size) * self.zoom;
+        let drawn = asked.clamp(SMALLEST, 60.);
         Lettering {
-            size: asked.clamp(SMALLEST, 60.),
+            size: drawn,
+            leading: drawn * LEADING,
             inset: edge + size[0].min(size[1]) * pinch,
             legible: asked >= SMALLEST,
         }
@@ -1170,6 +1205,29 @@ impl BoardsView {
     /// its own outline. A connector has none to write in, so its words ride a
     /// plate at the middle of the run — the middle of where the run is drawn
     /// now, which a bound end moves every time the card it holds does.
+    /// A shape's box on screen: where it is being drawn now if the board can
+    /// say, and where it was stored otherwise.
+    pub(super) fn card_box(&self, board: &Board, s: &Shape) -> [f32; 4] {
+        let origin = self.screen(s.x as f32, s.y as f32);
+        let stored = [
+            origin[0],
+            origin[1],
+            origin[0] + s.width as f32 * self.zoom,
+            origin[1] + s.height as f32 * self.zoom,
+        ];
+        self.on_screen(board, s).unwrap_or(stored)
+    }
+    /// Where the caret lives on screen right now, for the shape being written
+    /// on. The painter opens the editor here and the pointer asks the same
+    /// question of the same function, so a press either lands in the field or
+    /// is known not to have.
+    pub(super) fn typing_box(&self, board: &Board, s: &Shape) -> ([f32; 2], [f32; 2]) {
+        let Some(inline) = &self.inline else {
+            return ([0.; 2], [0.; 2]);
+        };
+        let (pos, size) = self.writing_box(board, s, self.card_box(board, s));
+        self.caret_box(inline, s, pos, size)
+    }
     pub(super) fn writing_box(
         &self,
         board: &Board,
@@ -1201,10 +1259,17 @@ impl BoardsView {
     /// connector's words are centred on its line once saved, and an editor
     /// given the whole room would write them from the room's left edge and
     /// throw them a hundred units across the board the moment you were done.
-    /// The host does not centre text inside an editor, so the box is centred
-    /// instead — with a margin, because the editor wraps a shade tighter than
-    /// the label the gauge measures and a box trimmed to the last glyph would
-    /// break a line the painter keeps whole.
+    /// The host does not centre text inside an editor, so the box is placed
+    /// where the words are instead and writing starts at its left edge. That
+    /// is the one thing the box has to do twice: say where the words START and
+    /// say where they BREAK. A box set against a card that is not left-aligned
+    /// therefore reaches past the column by the slack the alignment spent, and
+    /// a line whose last word falls in that slack is a line the editor keeps
+    /// and the label breaks. It is a fraction of a word on one card in a
+    /// handful, where reading the wrap off the measurement was a whole word on
+    /// every card that wrapped at all — and it closes for good the day the wire
+    /// can align an editor's text, which is the only way one box stops having
+    /// to answer both questions.
     pub(super) fn caret_box(
         &self,
         inline: &Inline,
@@ -1224,19 +1289,37 @@ impl BoardsView {
         };
         let letters = self.lettering(s, room);
         let wide = words * self.zoom;
-        // The box is wider than the words by a margin, so the editor does not
-        // wrap a word earlier than the label it is standing in for did. The
-        // margin hangs off the right, where it is empty: the editor writes from
-        // the left edge of whatever box it is given, so a box kept inside the
-        // card would spend the margin pushing the words off the middle exactly
-        // when the words are wide enough to need it.
-        let width = (wide + margin(&letters)).max(1.);
         // A text shape IS its words: its corner is where you put it, so they
         // start there and the box is only the room they need to be written in.
-        // It has no slack for an alignment to move them into.
+        // It has no column to wrap against, so the margin past the last glyph
+        // is room for the caret and nothing else wraps because of it.
         if kind == Kind::Text {
-            return (pos, [width, room[1]]);
+            return (pos, [(wide + margin(&letters)).max(1.), room[1]]);
         }
+        // The box is as wide as the COLUMN the card wraps in — not as wide as
+        // the words came out in it. `wide` is where the words happened to land,
+        // which is always a little short of where they were allowed to: a line
+        // ends at the last word that fitted, and the room left after it is room
+        // the next word needed and could not have. Wrapping the editor at that
+        // measurement hands it a column narrower than the label's by exactly
+        // that leftover, so the editor breaks a line the label keeps whole and
+        // the words rewrap the moment you stop typing. It also feeds the
+        // measurement back into the thing being measured, which is a box that
+        // can only ever walk shut.
+        //
+        // The column does not depend on the words, so both sides wrap in the
+        // same place by construction and neither can drift.
+        //
+        // A connector has no column to share: its plate IS the room it was
+        // given, and the box is the only thing centring the words on the line.
+        // Handed the whole room it would write them from the room's left edge
+        // and throw them a hundred units across the board.
+        // …plus the strip the field keeps for its caret, so that what is left
+        // to wrap in is the column itself and not the column less the reserve.
+        let width = match middling(kind) {
+            true => column(kind, room[0], &letters, self.zoom) + WRAP_RESERVE,
+            false => wide.max(1.),
+        };
         // It is the WORDS that are set against the card, not the box around
         // them: the box carries a margin the painter's block does not, and
         // aligning the box would spend that margin pushing the words off the
@@ -1295,25 +1378,16 @@ impl BoardsView {
             return None;
         }
         let blank = s.text.is_empty();
-        // a blank sticky invites a word; a blank outline is a drawing, not a
-        // card, and a connector with nothing written on it is just a line
-        let prompt = matches!(s.kind, Kind::Note | Kind::Text);
-        if blank && !prompt {
+        if blank && !invites_a_word(s.kind) {
             return None;
         }
         let text = if blank {
-            "Write a thought…"
+            PROMPT
         } else {
             excerpt(&s.text, share)
         };
-        let ink = if blank { p.faint } else { p.foreground };
-        let label = kit::colored(
-            kit::text_size(
-                kit::wrapping(kit::text(format!("boards/label/{id}"), text)),
-                letters.size,
-            ),
-            alpha(ink, opacity),
-        );
+        let ink = alpha(if blank { p.faint } else { p.foreground }, opacity);
+        let label = written(id, text, &letters, ink);
         let (pos, size) = self.writing_box(board, s, box_);
         let riding_a_line = s.kind.is_path();
         let body = match riding_a_line {
@@ -1851,6 +1925,169 @@ pub(super) fn column(kind: Kind, room: f32, letters: &Lettering, zoom: f32) -> f
 /// as one that moves when you save it.
 pub(super) fn middling(kind: Kind) -> bool {
     !kind.is_path() && kind != Kind::Text
+}
+/// Set the line spacing on a run of words. Absolute and not a ratio: the
+/// editor multiplies a ratio by the size it was told, the painter by the size
+/// the window carries, and the two only agree on a number of pixels.
+fn led(mut node: Node, letters: &Lettering) -> Node {
+    let height = Some(wire::LineHeight::Absolute(letters.leading));
+    match &mut node {
+        Node::Text { options, .. } | Node::RichText { options, .. } => options.line_height = height,
+        _ => panic!("led requires text"),
+    }
+    node
+}
+/// A card's words as the board draws them: what was typed, with its markers
+/// spent. See [`crate::markdown`] for the vocabulary.
+///
+/// A card wearing no marker is drawn the way the board has always drawn one —
+/// ONE text node, one paragraph, one wrap. Only a card that actually wears a
+/// marker becomes a column of styled lines, because a column is several
+/// paragraphs and several paragraphs do not wrap quite like one.
+fn written(id: &str, text: &str, letters: &Lettering, ink: [f32; 4]) -> Node {
+    let lines = markdown::read(text);
+    if !markdown::marked(&lines) {
+        let plain = kit::text_size(
+            kit::wrapping(kit::text(format!("boards/label/{id}"), text)),
+            letters.size,
+        );
+        return kit::colored(led(plain, letters), ink);
+    }
+    let drawn = lines
+        .iter()
+        .enumerate()
+        .map(|(row, line)| written_line(format!("boards/label/{id}/{row}"), line, letters, ink));
+    let mut block = kit::column(format!("boards/label/{id}"), drawn);
+    if let Node::Linear { spacing, .. } = &mut block {
+        // The line height already holds the lines apart. A gap on top of it
+        // would be a second one, and the card's lines would drift out of step
+        // with the same lines under the caret.
+        *spacing = Some(0.);
+    }
+    block
+}
+/// One line of a marked-up card.
+fn written_line(key: String, line: &markdown::Line, letters: &Lettering, ink: [f32; 4]) -> Node {
+    let size = letters.size * line.scale;
+    let mut spans: Vec<wire::RichSpan> = Vec::new();
+    if !line.lead.is_empty() {
+        spans.push(inked(
+            &line.lead,
+            markdown::Face::default(),
+            line.heavy,
+            size,
+            ink,
+        ));
+    }
+    for run in &line.runs {
+        spans.push(inked(&run.text, run.face, line.heavy, size, ink));
+    }
+    // A blank line is a blank line and not a line that vanished: a paragraph
+    // with nothing in it is nothing tall, so it is given a space to be tall
+    // with.
+    if spans.is_empty() {
+        spans.push(inked(" ", markdown::Face::default(), false, size, ink));
+    }
+    let words = Node::RichText {
+        key,
+        spans,
+        size: Some(size),
+        color: Some(wire::Rgba(ink)),
+        font: Default::default(),
+        width: Some(Length::Fill),
+        align_x: None,
+        options: wire::TextOptions {
+            wrapping: Some(wire::Wrapping::WordOrGlyph),
+            ..Default::default()
+        },
+        on_link: None,
+    };
+    // A heading is taller than the body it heads, and its lines have to be
+    // held that much further apart or a wrapped one writes over itself.
+    let stepped = Lettering {
+        size,
+        leading: letters.leading * line.scale,
+        inset: letters.inset,
+        legible: letters.legible,
+    };
+    led(words, &stepped)
+}
+/// The text exactly as typed — markers and all — but laid out line by line at
+/// the sizes the card will draw those lines at. Nothing styles it beyond that:
+/// this is what the gauge measures, and a measurement only wants the geometry.
+fn headed(key: &str, text: &str, letters: &Lettering, ink: [f32; 4]) -> Node {
+    let lines = markdown::read(text);
+    let sized = lines.iter().any(|line| line.scale != 1.);
+    if !sized {
+        let plain = kit::text_size(
+            kit::wrapping(kit::text(format!("{key}-text"), text)),
+            letters.size,
+        );
+        return kit::colored(led(plain, letters), ink);
+    }
+    let drawn = text
+        .split('\n')
+        .zip(&lines)
+        .enumerate()
+        .map(|(row, (source, line))| {
+            let stepped = Lettering {
+                size: letters.size * line.scale,
+                leading: letters.leading * line.scale,
+                inset: letters.inset,
+                legible: letters.legible,
+            };
+            // A blank line is still a line tall, here as on the card.
+            let held = if source.is_empty() { " " } else { source };
+            let words = kit::text_size(
+                kit::wrapping(kit::text(format!("{key}-text/{row}"), held)),
+                stepped.size,
+            );
+            kit::colored(led(words, &stepped), ink)
+        });
+    let mut block = kit::column(format!("{key}-block"), drawn);
+    if let Node::Linear { spacing, .. } = &mut block {
+        *spacing = Some(0.);
+    }
+    block
+}
+/// One run of a line, in the face its markers asked for.
+fn inked(
+    text: &str,
+    face: markdown::Face,
+    heavy: bool,
+    size: f32,
+    ink: [f32; 4],
+) -> wire::RichSpan {
+    let p = kit::palette();
+    let bold = face.bold || heavy;
+    wire::RichSpan {
+        content: text.to_owned(),
+        size: Some(size),
+        font: Some(wire::NamedFont {
+            family: match face.code {
+                true => wire::FontFamily::Monospace,
+                false => wire::FontFamily::SansSerif,
+            },
+            weight: match bold {
+                true => wire::Weight::Bold,
+                false => wire::Weight::Normal,
+            },
+            stretch: wire::FontStretch::Normal,
+            style: match face.italic {
+                true => wire::FontStyle::Italic,
+                false => wire::FontStyle::Normal,
+            },
+        }),
+        color: Some(wire::Rgba(ink)),
+        // Code wears a plate so it reads as code and not as a font someone
+        // chose. No padding: a plate that pushed its neighbours apart would
+        // move the words either side of it off the line they share.
+        background: face
+            .code
+            .then(|| wire::Rgba(alpha(p.surface_raised, ink[3] * 0.9))),
+        strikethrough: face.struck,
+        ..Default::default()
+    }
 }
 fn card_words(
     id: &str,
@@ -2413,16 +2650,26 @@ impl BoardsView {
     fn text_gauge(&self, inline: &Inline, shape: &Shape, pos: [f32; 2], size: [f32; 2]) -> Node {
         let letters = self.lettering(shape, size);
         let words = inline.document.text();
+        // The answer comes back a frame later, against the layout THIS frame
+        // set up. The zoom it was laid out at travels with it, because the
+        // camera can move in between and a measurement divided by the zoom
+        // that arrived after it is a card that grew for stepping back from it.
+        let laid_out_at = self.zoom;
         let measure = || {
-            Some(slots::handler(Box::new(|(w, h)| {
-                Some(Message::Measured(w, h))
+            Some(slots::handler(Box::new(move |(w, h)| {
+                Some(Message::Measured(laid_out_at, w, h))
             })))
         };
-        let gauge = kit::colored(
-            kit::text_size(
-                kit::wrapping(kit::text("boards/gauge-text", excerpt(&words, LETTERS))),
-                letters.size,
-            ),
+        // The SOURCE, at the sizes the card will draw it: the editor holds
+        // the markers and the card spends them, so the source is the wider of
+        // the two and a heading is the taller. Measuring the one against the
+        // other's sizes is the box that fits both, and a card whose first
+        // line is a heading neither clips the words under the caret nor the
+        // bigger ones it gets back.
+        let gauge = headed(
+            "boards/gauge",
+            excerpt(&words, LETTERS),
+            &letters,
             alpha(kit::palette().foreground, 0.),
         );
         // Both halves of the answer, from one measurement: how TALL the words
@@ -2535,18 +2782,22 @@ impl BoardsView {
             document,
             on_document,
             editable: true,
-            placeholder: "Write a thought…".into(),
+            placeholder: match invites_a_word(shape.kind) {
+                true => PROMPT.into(),
+                false => String::new(),
+            },
             width: Some((size[0] - 2. * letters.inset).max(40.)),
             // The editor fills the card. It cannot be asked to lay out to its
             // own content instead — a shrunk editor collapses to its first
             // line on the native side, which is how a card would learn to
             // hide five of the six lines it is holding.
             height: Some(Length::Fill),
-            min_height: Some(letters.size * 1.6),
+            min_height: Some(letters.leading),
             max_height: None,
             options: Box::new(wire::EditorOptions {
                 binding: Some(Box::new(binding)),
                 size: Some(letters.size),
+                line_height: Some(wire::LineHeight::Absolute(letters.leading)),
                 padding: Some(0.),
                 style,
                 ..Default::default()
