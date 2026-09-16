@@ -266,9 +266,9 @@ pub struct RegisterItem {
     /// resolved thread is filed away, so it is not what the page carries.
     pub thread_total: i64,
     pub commented_hits: Vec<String>,
-    /// Every named member of the network — what an `@` in the document
-    /// completes to.
-    pub names: Vec<String>,
+    /// Every named member of the network, with its account number — what an
+    /// `@` completes to, in the document and in a comment.
+    pub names: Vec<(String, u64)>,
     /// The active agents "Ask AI" can address: each one's display name and
     /// program account.
     pub agents: Vec<(String, u64)>,
@@ -641,16 +641,17 @@ impl Names {
         }
     }
 
-    /// Every account's name, sorted and deduplicated, for the mention picker.
-    fn members(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
+    /// Every account's name and number, sorted and deduplicated by name, for
+    /// the mention picker. The number is what a posted mention carries.
+    fn members(&self) -> Vec<(String, u64)> {
+        let mut names: Vec<(String, u64)> = self
             .by_account
-            .values()
-            .filter(|name| !name.is_empty())
-            .cloned()
+            .iter()
+            .filter(|(_, name)| !name.is_empty())
+            .map(|(number, name)| (name.clone(), *number as u64))
             .collect();
         names.sort();
-        names.dedup();
+        names.dedup_by(|a, b| a.0 == b.0);
         names
     }
 }
@@ -1073,6 +1074,62 @@ pub const NEW_PAGE_TITLE: &str = "";
 
 /// What a page with no title of its own is called on screen.
 pub const UNTITLED: &str = "Untitled";
+
+/// The handle being typed at the END of a comment draft: an `@` at a word
+/// start with nothing but handle characters after it. A plain input carries
+/// no caret, so the tail is the only thing a picker can complete.
+pub fn mention_query(draft: &str) -> Option<&str> {
+    let at = draft.rfind('@')?;
+    let mid_word = draft[..at]
+        .chars()
+        .next_back()
+        .is_some_and(crate::inline::handle_char);
+    if mid_word {
+        return None;
+    }
+    let partial = &draft[at + 1..];
+    partial
+        .chars()
+        .all(crate::inline::handle_char)
+        .then_some(partial)
+}
+
+/// Who a typed `@` offers: every named account and every active agent, the
+/// ones whose name contains the query, name-sorted and capped.
+pub fn mention_choices(
+    names: &[(String, u64)],
+    agents: &[(String, u64)],
+    query: &str,
+) -> Vec<(String, u64)> {
+    let query = query.to_lowercase();
+    let mut choices: Vec<(String, u64)> = names
+        .iter()
+        .chain(agents)
+        .filter(|(name, _)| name.to_lowercase().contains(&query))
+        .cloned()
+        .collect();
+    choices.sort();
+    choices.dedup_by(|a, b| a.0 == b.0);
+    choices.truncate(MENTION_CHOICES);
+    choices
+}
+
+/// How many names the `@` picker offers at once.
+const MENTION_CHOICES: usize = 8;
+
+/// Every comment on the page, threads and replies together. An agent answers
+/// with one more of them, which is how a wait ends.
+pub fn comment_total(rows: &[PageCommentThreadRow]) -> i64 {
+    rows.iter().map(|row| row.thread.comment_count).sum()
+}
+
+/// The draft with its trailing `@query` completed to `name`.
+pub fn mention_completed(draft: &str, name: &str) -> String {
+    let Some(at) = draft.rfind('@') else {
+        return draft.to_owned();
+    };
+    format!("{}@{name} ", &draft[..at])
+}
 
 /// A page's title, or what an unnamed one is called.
 pub fn titled(title: &str) -> String {

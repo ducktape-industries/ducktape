@@ -450,15 +450,10 @@ impl PagesView {
             ));
         }
         if !thread.resolved {
-            rows.push(kit::padded(
-                self.reply_box(&key, &thread.id, disabled),
-                wire::Edges {
-                    top: 2.,
-                    right: 0.,
-                    bottom: 0.,
-                    left: COMMENT_REPLY_INSET,
-                },
-            ));
+            // The box is where the reader WRITES, not a reply that has been
+            // written: it takes the card's full width, so the inset the
+            // written replies sit at would only make it harder to type in.
+            rows.push(self.reply_box(&key, &thread.id, disabled));
         }
         kit::card(
             key.clone(),

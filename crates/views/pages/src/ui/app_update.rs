@@ -76,6 +76,9 @@ impl PagesView {
                 self.on_reply_draft_changed_in(thread, value)
             }
             Message::CommentDraftChanged(value) => self.on_comment_draft_changed(value),
+            Message::PickCommentMention(name, account) => {
+                self.on_pick_comment_mention(name, account)
+            }
             Message::DocumentTransaction(transaction) => self.on_document_transaction(transaction),
             Message::DocumentUpdated(document) => self.on_document_updated(document),
         }
@@ -177,6 +180,10 @@ impl PagesView {
         self.active_page_parent = item.active_page_parent.to_owned();
         self.thread_total = item.thread_total;
         self.comment_rows = item.comment_rows.clone();
+        let answered = crate::host::comment_total(&(item.comment_rows)) > self.awaiting_comments;
+        if answered {
+            self.awaiting_agent = String::new();
+        }
         self.commented_hits = item.commented_hits.clone();
         self.member_names = item.names.clone();
         self.member_agents = item.agents.clone();
@@ -561,6 +568,9 @@ impl PagesView {
         }
         self.block_comment_draft = draft.to_owned();
         self.block_comments_open = true;
+        // A draft picked back up is a comment, not an ask: whoever the last
+        // "Ask AI" addressed is not who this one goes to.
+        self.comment_mention = 0;
         self.scope_target = "".to_owned();
         self.scope_pinned = false;
         self.orphaned_comment_drafts =
@@ -770,6 +780,14 @@ impl PagesView {
         // composer post is on the whole scope again.
         let anchor = self.comment_anchor_range.take();
         let mention = std::mem::take(&mut self.comment_mention);
+        // An ask to an agent is answered by a run, which takes as long as it
+        // takes. Say who is working on it until the answer lands.
+        self.awaiting_agent = (self.member_agents)
+            .iter()
+            .find(|(_, account)| *account as i64 == mention)
+            .map(|(name, _)| name.to_owned())
+            .unwrap_or_default();
+        self.awaiting_comments = crate::host::comment_total(&(self.comment_rows));
         crate::host::post(
             &(self.pending_comment),
             &(fresh_target),
@@ -987,6 +1005,14 @@ impl PagesView {
     }
     fn on_comment_draft_changed(&mut self, value: String) -> Task<Message> {
         self.block_comment_draft = value;
+        Task::none()
+    }
+    /// The picked name is spelled into the draft and addressed: a comment
+    /// carries ONE mention, so the last name picked is the one it goes to.
+    fn on_pick_comment_mention(&mut self, name: String, account: u64) -> Task<Message> {
+        self.block_comment_draft =
+            crate::host::mention_completed(&(self.block_comment_draft), &name);
+        self.comment_mention = account as i64;
         Task::none()
     }
     fn on_document_transaction(

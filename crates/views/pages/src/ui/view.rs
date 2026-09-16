@@ -18,7 +18,7 @@ pub struct PagesView {
     pub(crate) comment_mention: i64,
     pub(crate) comments_card_height: f64,
     /// The network's named members: what an `@` in the document completes to.
-    pub(crate) member_names: Vec<String>,
+    pub(crate) member_names: Vec<(String, u64)>,
     /// The active agents "Ask AI" can address: display name and account.
     pub(crate) member_agents: Vec<(String, u64)>,
     /// The one comment being rewritten in place, and its words.
@@ -83,6 +83,11 @@ pub struct PagesView {
     pub(crate) scope_pinned: bool,
     pub(crate) thread_total: i64,
     pub(crate) comment_rows: Vec<crate::host::PageCommentThreadRow>,
+    /// The agent an "Ask AI" was just posted to, and how many comments the
+    /// page carried when it went out. The answer arrives as another comment,
+    /// so a page that has grown one has been answered.
+    pub(crate) awaiting_agent: String,
+    pub(crate) awaiting_comments: i64,
     pub(crate) threads_loading: bool,
     pub(crate) commented_hits: Vec<String>,
     pub(crate) reply_thread: String,
@@ -166,6 +171,8 @@ pub enum Message {
     /// Typing in one thread's reply box: the draft belongs to that thread.
     ReplyDraftChangedIn(String, String),
     CommentDraftChanged(String),
+    /// A name picked out of the `@` list under the comment composer.
+    PickCommentMention(String, u64),
     DocumentUpdated(::ducktape_view_guest::EditorDocumentUpdate),
     DocumentTransaction(::ducktape_view_guest::EditorTransaction<Message>),
 }
@@ -236,6 +243,8 @@ impl PagesView {
             scope_pinned: false,
             thread_total: 0,
             comment_rows: Vec::new(),
+            awaiting_agent: String::new(),
+            awaiting_comments: 0,
             threads_loading: false,
             commented_hits: Vec::new(),
             reply_thread: "".to_owned(),
@@ -257,7 +266,7 @@ impl PagesView {
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     /// This state's layout, digested — `snapshot_schema` holds it here.
     const SNAPSHOT_SCHEMA: &'static str =
-        "99f970a5f55760e6d0bf1493c68789be0cf0feceb46861a00c2c76e69e50c24e";
+        "37094f89e5c6a00384a2f4c7ca7c349ef30b1b99216bc3bb86c6caaa9fed58e0";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
