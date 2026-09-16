@@ -125,11 +125,15 @@ in `skills/` (`qa`, `sim-lane`, `module-dev`).
 - **Merged means gone.** Remove the worktree and delete the branch as soon as
   the PR merges. Then `git grep` your symbol on `origin/dev`: a sibling's
   merge commit can revert it.
-- **A module's wire moves with its guest.** A change under a module crate's
-  `src/`, the module SDK, or any shape a guest decodes (`Seed`, a module's
-  message or query enum, a `deny_unknown_fields` record) ships the rebuilt
-  `component.wasm`, `index.wasm` and kernel fixture in the SAME PR, for EVERY
-  guest whose source it reached — `make wasm-rebuild-check` names them. The
+- **A module's bytes move with everything it compiles in.** A change to ANY
+  crate a guest compiles (a module crate's `src/`, the module SDK, a library a
+  module wraps such as `duckfs-core` or `files`) or to any shape a guest
+  decodes (`Seed`, a module's message or query enum, a `deny_unknown_fields`
+  record) ships the rebuilt `component.wasm`, `index.wasm` and kernel fixture
+  in the SAME PR, for EVERY guest it reached. Even a deletion moves bytes:
+  panic paths carry line numbers. `make wasm-rebuild-check` names the guests;
+  `grep -l 'name = "<crate>"' crates/modules/*/*/guest.lock` says which
+  guests compile a crate in. The
   committed guest is what every composed genesis runs; a host that speaks a
   field the guest never learned fails closed on every network founded from
   that `dev`, and the failure surfaces as a stranger's red hours later.
