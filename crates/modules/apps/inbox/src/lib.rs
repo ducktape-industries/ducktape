@@ -76,9 +76,11 @@ pub use interface::*;
 // `index_guest` below.
 pub mod index;
 
-// the CLIENT view model: the rendered bell item + the account-scoped delta
-// fold a feed-following UI splices with. pure, ui.wasm-portable.
-pub mod client;
+// NO CLIENT VIEW MODEL LIVES HERE. What a notification says, which ones are
+// noise and what the unread count is are the `inbox` VIEW's own fold
+// (`crates/views/inbox`), read off this module's index tier as the JSON the
+// wire already is. A rendered-row type here would be a second copy of those
+// rules that no view swap could reach.
 
 // the wasm index-mapper shell: wires the pure core into the fluent31 engine.
 // compiled only by `guest-builder --index`'s synthesized wasm32 workspace
