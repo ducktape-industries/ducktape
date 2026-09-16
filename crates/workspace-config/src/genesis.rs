@@ -55,6 +55,13 @@ pub fn index_guest_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.index.wasm"))
 }
 
+/// `<dir>/<id>.lanes` — a module's data-plane lane declaration, as JSON. The
+/// FILE IS THE DECLARATION: a module with no lanes ships none, and no catalog
+/// anywhere lists which modules have them.
+pub fn lanes_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.lanes"))
+}
+
 /// Package one founding entry's files from a directory: `<id>.component.wasm`
 /// with its optional mapper, view and assets as a module frame, or
 /// `<id>.view.wasm` (+ `<id>.assets`) alone as a view-only frame.
@@ -64,6 +71,7 @@ pub fn read_module_artifact(dir: &Path, id: &str) -> Result<module_artifact::Art
     let index = optional_path(index_guest_path(dir, id))?;
     let view = optional_path(dir.join(format!("{id}.view.wasm")))?;
     let assets = optional_path(dir.join(format!("{id}.assets")))?;
+    let lanes = optional_path(lanes_path(dir, id))?;
     let no_files_at_all = component.is_none() && view.is_none();
     if no_files_at_all {
         return Err(format!(
@@ -76,6 +84,7 @@ pub fn read_module_artifact(dir: &Path, id: &str) -> Result<module_artifact::Art
         index.as_deref(),
         view.as_deref(),
         assets.as_deref(),
+        lanes.as_deref(),
     )
 }
 
@@ -533,10 +542,7 @@ mod tests {
         genesis.materialize(&modules).unwrap();
         assert!(!component_path(&modules, "home").exists());
         assert!(!index_guest_path(&modules, "home").exists());
-        assert_eq!(
-            std::fs::read(modules.join("home.view.wasm")).unwrap(),
-            b"H"
-        );
+        assert_eq!(std::fs::read(modules.join("home.view.wasm")).unwrap(), b"H");
         assert_eq!(
             std::fs::read(modules.join("home.assets/icons/tab.svg")).unwrap(),
             b"<svg/>"
@@ -598,12 +604,58 @@ mod tests {
                 bytes: module_artifact::Artifact::Module(module_artifact::ModuleArtifact {
                     view: None,
                     component: b"W".to_vec(),
-                    index: Some(b"mapper".to_vec())
+                    index: Some(b"mapper".to_vec()),
+                    lanes: Vec::new()
                 })
                 .encode()
             }]
         );
         assert_eq!(genesis.index_guest("weather"), Some(&b"mapper"[..]));
+    }
+
+    /// a founding module declares its data-plane lanes beside its component,
+    /// as `<id>.lanes`, and composing folds the declaration into the frame the
+    /// code hash covers. Nothing else in the tree says which module owns which
+    /// lane, and a declaration the artifact would refuse refuses here, by file.
+    #[test]
+    fn a_founding_frame_carries_the_lane_declaration_beside_its_component() {
+        let dir = tempfile::tempdir().unwrap();
+        founding_set(dir.path(), &[("chat", b"C")], &[]);
+        let lanes = lanes_path(dir.path(), "chat");
+        std::fs::write(&lanes, br#"[{"id": 2, "name": "voice", "stream": null}]"#).unwrap();
+        let genesis = Genesis::compose(dir.path()).unwrap();
+        let module_artifact::Artifact::Module(frame) =
+            module_artifact::Artifact::decode(&genesis.modules[0].bytes).unwrap()
+        else {
+            panic!("a component founds a module frame");
+        };
+        assert_eq!(
+            frame.lanes,
+            vec![module_artifact::LaneDecl {
+                id: 2,
+                name: "voice".into(),
+                stream: None,
+            }]
+        );
+
+        std::fs::write(&lanes, br#"[{"id": 2, "name": "VOICE", "stream": null}]"#).unwrap();
+        let err = Genesis::compose(dir.path()).unwrap_err();
+        assert!(
+            err.contains("chat.lanes") && err.contains("malformed"),
+            "{err}"
+        );
+
+        std::fs::remove_file(&lanes).unwrap();
+        let module_artifact::Artifact::Module(frame) = module_artifact::Artifact::decode(
+            &Genesis::compose(dir.path()).unwrap().modules[0].bytes,
+        )
+        .unwrap() else {
+            panic!("a component founds a module frame");
+        };
+        assert!(
+            frame.lanes.is_empty(),
+            "no file, no lanes — the file IS the declaration"
+        );
     }
 
     #[test]
@@ -699,6 +751,7 @@ mod tests {
                     view: None,
                     component: vec![1, 2, 3],
                     index: Some(vec![9]),
+                    lanes: Vec::new(),
                 })
                 .encode(),
             }],

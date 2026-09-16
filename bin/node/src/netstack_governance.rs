@@ -428,6 +428,7 @@ mod tests {
             component: component.clone(),
             index: None,
             view: None,
+            lanes: Vec::new(),
         });
         let hash = blobs.put_chunk(artifact.encode());
         let backend = backend_from_roster(&[entry(None, &hash)], 0, &blobs).unwrap();
@@ -438,6 +439,7 @@ mod tests {
             component: b"replacement".to_vec(),
             index: None,
             view: None,
+            lanes: Vec::new(),
         });
         let next_hash = blobs.put_chunk(replacement.encode());
         let scheduled = vec![entry(Some(next_hash), &hash)];

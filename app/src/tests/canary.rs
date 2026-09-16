@@ -100,6 +100,7 @@ fn artifact(component: &[u8], code: Vec<u8>, seal: Vec<u8>) -> module_artifact::
             component: component.to_vec(),
             assets: [("icons/seal.svg".to_owned(), seal)].into(),
         }),
+        lanes: Vec::new(),
     })
 }
 
@@ -351,6 +352,7 @@ fn canary_follows_a_live_node() {
                 component: std::fs::read(&view).unwrap(),
                 assets: Default::default(),
             }),
+            lanes: Vec::new(),
         });
         let expected_hash = artifact.hash();
         let deployed = std::process::Command::new(&cli)

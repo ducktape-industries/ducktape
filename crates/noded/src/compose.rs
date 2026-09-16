@@ -121,6 +121,9 @@ pub struct Founding {
     pub id: String,
     pub hash: [u8; 32],
     pub kind: modules::Kind,
+    /// what the frame declares it needs on the data plane. Read off the same
+    /// bytes the hash covers, so genesis is not a second declarer.
+    pub lanes: Vec<modules::LaneDecl>,
 }
 
 /// what a deployment frame IS, by its tag: the kind the registry seeds a
@@ -129,6 +132,17 @@ pub fn artifact_kind(bytes: &[u8]) -> Result<modules::Kind, String> {
     Ok(match module_artifact::ArtifactRef::decode(bytes)? {
         module_artifact::ArtifactRef::Module(_) => modules::Kind::Module,
         module_artifact::ArtifactRef::View(_) => modules::Kind::View,
+    })
+}
+
+/// the data-plane lanes a deployment frame declares — what the registry
+/// admits for it, whether the frame arrives at genesis or through a
+/// governance admission. A view frame declares none: it has no consensus code
+/// and no sockets, so it has nothing to speak on a lane with.
+pub fn artifact_lanes(bytes: &[u8]) -> Result<Vec<modules::LaneDecl>, String> {
+    Ok(match module_artifact::ArtifactRef::decode(bytes)? {
+        module_artifact::ArtifactRef::Module(module) => module.lanes,
+        module_artifact::ArtifactRef::View(_) => Vec::new(),
     })
 }
 
@@ -142,52 +156,11 @@ pub fn genesis_seeds(founding: &[Founding]) -> BTreeMap<String, modules::Seed> {
             let seed = modules::Seed {
                 kind: entry.kind,
                 code_hash: entry.hash.to_vec(),
-                lanes: founding_lanes(&entry.id),
+                lanes: entry.lanes.clone(),
             };
             (entry.id.clone(), seed)
         })
         .collect()
-}
-
-/// The data-plane lanes a founding module brings, by name.
-///
-/// This table is native for the same reason `topology::TOPOLOGY` is: it IS the
-/// founding set's content, and a network has no registry to read until genesis
-/// has seeded one. It is not the coupling #2202 removes — POST-genesis, a
-/// module declares its lanes through governance and the host learns them from
-/// the registry, with no native entry anywhere.
-///
-/// The ids and values are what the node binds today, carried over unchanged so
-/// founding a network changes no wire behaviour. Kernel lanes
-/// ([`modules::RESERVED_LANE_IDS`]) are absent on purpose: state sync and the
-/// code plane are bound before any registry can be read, so they are fixed in
-/// the binary and the registry refuses to hand their ids out.
-fn founding_lanes(module_id: &str) -> Vec<modules::LaneDecl> {
-    // a lane with no stream half binds its sockets and speaks datagrams only.
-    let datagram_only = |id, name: &str| modules::LaneDecl {
-        id,
-        name: name.to_string(),
-        stream: None,
-    };
-    let shared_stream = |id, name: &str, accept_backlog| modules::LaneDecl {
-        id,
-        name: name.to_string(),
-        stream: Some(modules::LaneStream {
-            pacing: modules::LanePacing::Shared,
-            accept_backlog,
-        }),
-    };
-    match module_id {
-        // media rides the overlay datagrams, and neither binds a stream plane
-        // today. The host binds these by name, never by id or position.
-        "chat" => vec![datagram_only(2, "voice"), datagram_only(3, "video")],
-        // the reverse-proxy door every installed service is reached through —
-        // one lane for all of them, which is why a service declares none.
-        "gateway" => vec![shared_stream(4, "gateway", 16)],
-        // live agent run output between member nodes; observability only.
-        "agent" => vec![shared_stream(5, "telemetry", 64)],
-        _ => Vec::new(),
-    }
 }
 
 /// Compose the boot mode's deployment set into a [`Host`];
@@ -220,6 +193,7 @@ pub async fn compose(
             id: id.clone(),
             hash: *hash,
             kind: artifact_kind(&bytes)?,
+            lanes: artifact_lanes(&bytes)?,
         });
         fetched.push((id, bytes));
     }

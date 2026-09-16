@@ -5339,6 +5339,7 @@ pub(crate) mod tests {
                     component: component.clone(),
                     assets: [(asset.to_owned(), b"<svg/>".to_vec())].into(),
                 }),
+                lanes: Vec::new(),
             })
         };
         let status = |artifact: &Artifact| {
@@ -5460,6 +5461,7 @@ pub(crate) mod tests {
                 component: component.to_vec(),
                 assets: [(asset.to_owned(), b"<svg/>".to_vec())].into(),
             }),
+            lanes: Vec::new(),
         })
     }
 
@@ -7289,11 +7291,13 @@ pub(crate) mod tests {
                 component: component.clone(),
                 assets: [("core.svg".to_owned(), b"<svg/>".to_vec())].into(),
             }),
+            lanes: Vec::new(),
         });
         let no_view = module_artifact::Artifact::Module(module_artifact::ModuleArtifact {
             component: vec![1, 2, 3],
             index: None,
             view: None,
+            lanes: Vec::new(),
         });
         let view_only = module_artifact::Artifact::View(module_artifact::ViewArtifact {
             component: component.clone(),

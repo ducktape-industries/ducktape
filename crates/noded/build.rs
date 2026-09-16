@@ -126,7 +126,8 @@ pub(crate) fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str], views: &[
             .or_else(|| name.strip_suffix(".index.wasm"))
             .or_else(|| name.strip_suffix(".view.wasm"))
             .or_else(|| name.strip_suffix(".view.pending"))
-            .or_else(|| name.strip_suffix(".assets"));
+            .or_else(|| name.strip_suffix(".assets"))
+            .or_else(|| name.strip_suffix(".lanes"));
         let obsolete = artifact_id
             .is_some_and(|id| id != "netstack" && !ids.contains(&id) && !views.contains(&id));
         if obsolete {
@@ -150,6 +151,7 @@ pub(crate) fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str], views: &[
             &dest.join(format!("{}.component.wasm", spec.id)),
         );
         view_staging::stage_view(checkout, dest, id).expect("stage module view");
+        stage_lane_declaration(&module_dir, dest, spec.id);
         let ships_guest = declares_index_guest(&module_dir);
         // The catalog and source declaration must agree for build presets.
         assert_eq!(
@@ -181,6 +183,30 @@ pub(crate) fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str], views: &[
         &checkout.join("crates/networking/netstack-machine/component.wasm"),
         &dest.join("netstack.component.wasm"),
     );
+}
+
+/// a module declares its data-plane lanes by carrying `lanes.json`: the FILE
+/// IS THE DECLARATION, exactly like the index guest's shell below, so no
+/// catalog anywhere lists which modules have lanes. Absent means none, and
+/// removing the file removes the staged declaration too — the founding set
+/// must never keep a lane the module stopped asking for. The path is a rerun
+/// trigger, so editing the declaration re-stages it.
+fn stage_lane_declaration(module_dir: &Path, dest: &Path, id: &str) {
+    let source = module_dir.join("lanes.json");
+    println!("cargo:rerun-if-changed={}", source.display());
+    let staged = dest.join(format!("{id}.lanes"));
+    if source.is_file() {
+        stage(&source, &staged);
+        return;
+    }
+    match std::fs::remove_file(&staged) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "remove obsolete lane declaration {}: {error}",
+            staged.display()
+        ),
+    }
 }
 
 /// a module declares its index guest by carrying the guest's engine shell:

@@ -185,6 +185,83 @@ fn genesis_module_membership_comes_from_the_bundle() {
     });
 }
 
+/// genesis declares no lane of its own. The lane table a founding module
+/// lands in is the one its FRAME carries — read off the same bytes the code
+/// hash covers — so there is no native table beside the deployment to
+/// disagree with it, and a frame that declares nothing founds no lane.
+#[test]
+fn founding_lanes_come_from_the_frame_and_nowhere_else() {
+    use module_artifact::{Artifact, ModuleArtifact};
+    run(|context, dir| {
+        Box::pin(async move {
+            let telemetry = modules::LaneDecl {
+                id: 7,
+                name: "telemetry".into(),
+                stream: Some(modules::LaneStream {
+                    pacing: modules::LanePacing::Shared,
+                    accept_backlog: 16,
+                }),
+            };
+            let read = |id: &str| std::fs::read(fixtures().join(format!("{id}.component.wasm")));
+            let mut source = ArtifactSource(Default::default());
+            let codes = std::collections::BTreeMap::from([
+                // the registry's own frame declares nothing…
+                (
+                    "modules".to_string(),
+                    source.add(Artifact::module(read("modules").unwrap())),
+                ),
+                // …and this one declares one lane, in its artifact.
+                (
+                    "valset".to_string(),
+                    source.add(Artifact::Module(ModuleArtifact {
+                        component: read("valset").unwrap(),
+                        index: None,
+                        view: None,
+                        lanes: vec![telemetry.clone()],
+                    })),
+                ),
+            ]);
+
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
+            let host = compose(
+                &source,
+                &mut stores,
+                &substrates,
+                &BINDINGS,
+                Boot::Genesis {
+                    validators: &[],
+                    bundle: &codes,
+                },
+            )
+            .await
+            .unwrap();
+
+            let reply = host
+                .query(
+                    host::MODULES_ID,
+                    &modules::encode_query(&modules::ModulesQuery::Lanes),
+                )
+                .await
+                .unwrap();
+            let modules::ModulesReply::Lanes { lanes } = modules::decode_reply(&reply).unwrap()
+            else {
+                panic!("the lane query answers with lanes");
+            };
+            assert_eq!(
+                lanes,
+                vec![modules::LaneRecord {
+                    id: telemetry.id,
+                    module_id: "valset".into(),
+                    name: telemetry.name.clone(),
+                    stream: telemetry.stream.clone(),
+                }],
+                "the committed table is the frame's declaration, and only it"
+            );
+        })
+    });
+}
+
 #[test]
 fn genesis_refuses_unsafe_ids() {
     run(|context, dir| {
@@ -531,6 +608,7 @@ fn a_view_entry_composes_no_module_and_the_boundary_leaves_it_alone() {
                     id: "home".into(),
                     hash: home,
                     kind: modules::Kind::View,
+                    lanes: Vec::new(),
                 }])["home"],
                 modules::Seed {
                     kind: modules::Kind::View,
@@ -568,7 +646,13 @@ fn a_view_entry_composes_no_module_and_the_boundary_leaves_it_alone() {
             let root = host.root_hash();
             for height in 1..=3 {
                 host.realize_module_swaps(height, &source).await.unwrap();
-                registry_op(&mut host, height, Origin::System, modules::ModulesMsg::Advance).await;
+                registry_op(
+                    &mut host,
+                    height,
+                    Origin::System,
+                    modules::ModulesMsg::Advance,
+                )
+                .await;
             }
             assert!(host.module_root("home").is_none());
             assert_eq!(host.root_hash(), root);
@@ -675,6 +759,7 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
                 view: None,
                 component: pages.clone(),
                 index: Some(mapper),
+                lanes: Vec::new(),
             });
             let bare = source.add(Artifact::module(pages));
             assert_ne!(indexed, bare, "mapper removal is a different deployment");
@@ -722,8 +807,13 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
             let index =
                 indexer::IndexStore::open_bare(dir.join("index"), &["modules", "valset"]).unwrap();
             noded::converge_host_modules(&index, &host).unwrap();
-            noded::compose::validate_deployment("pages", modules::Kind::Module, &source.0[&indexed.to_vec()], &index)
-                .unwrap();
+            noded::compose::validate_deployment(
+                "pages",
+                modules::Kind::Module,
+                &source.0[&indexed.to_vec()],
+                &index,
+            )
+            .unwrap();
             let Artifact::Module(mut invalid_mapper) =
                 Artifact::decode(&source.0[&indexed.to_vec()]).unwrap()
             else {
@@ -923,9 +1013,13 @@ fn deployment_readiness_rejects_invalid_view_manifest() {
         view[offset] = b'x';
     }
     assert!(view_wire::manifest::read_manifest(&view).is_none());
-    let error =
-        noded::compose::validate_deployment("pages", modules::Kind::Module, &encode(&view_deployment(view)), &index)
-            .expect_err("invalid view manifest must refuse readiness");
+    let error = noded::compose::validate_deployment(
+        "pages",
+        modules::Kind::Module,
+        &encode(&view_deployment(view)),
+        &index,
+    )
+    .expect_err("invalid view manifest must refuse readiness");
     assert!(error.contains("view manifest"), "{error}");
 }
 
@@ -942,9 +1036,13 @@ fn deployment_readiness_rejects_invalid_view_abi() {
     )
     .unwrap();
     append_manifest(&mut view);
-    let error =
-        noded::compose::validate_deployment("pages", modules::Kind::Module, &encode(&view_deployment(view)), &index)
-            .expect_err("wrong view export type must refuse readiness");
+    let error = noded::compose::validate_deployment(
+        "pages",
+        modules::Kind::Module,
+        &encode(&view_deployment(view)),
+        &index,
+    )
+    .expect_err("wrong view export type must refuse readiness");
     assert!(
         error.contains("view ABI") && error.contains("init"),
         "{error}"
@@ -967,8 +1065,13 @@ fn append_manifest(view: &mut Vec<u8>) {
 fn deployment_readiness_accepts_actual_view() {
     let dir = tempfile::tempdir().unwrap();
     let index = indexer::IndexStore::open_bare(dir.path(), &["pages"]).unwrap();
-    noded::compose::validate_deployment("pages", modules::Kind::Module, &encode(&view_deployment(view_component())), &index)
-        .unwrap();
+    noded::compose::validate_deployment(
+        "pages",
+        modules::Kind::Module,
+        &encode(&view_deployment(view_component())),
+        &index,
+    )
+    .unwrap();
 }
 
 /// a `Kind::View` entry is ready on the view ABI alone: no core to compile,
@@ -1007,9 +1110,8 @@ fn a_view_entry_is_ready_on_the_view_alone_and_the_tag_must_match_the_kind() {
         assets: Default::default(),
     })
     .encode();
-    let error =
-        noded::compose::validate_deployment("home", modules::Kind::View, &broken, &index)
-            .unwrap_err();
+    let error = noded::compose::validate_deployment("home", modules::Kind::View, &broken, &index)
+        .unwrap_err();
     assert!(error.contains("view manifest"), "{error}");
 }
 
@@ -1040,8 +1142,13 @@ fn deployment_readiness_does_not_instantiate_view() {
             (result (result (error string)))
             (canon lift (core func $i "restore") (memory $i "memory") (realloc (func $i "realloc")))))"#).unwrap();
     append_manifest(&mut view);
-    noded::compose::validate_deployment("pages", modules::Kind::Module, &encode(&view_deployment(view.clone())), &index)
-        .expect("static view readiness must not execute the trapping start");
+    noded::compose::validate_deployment(
+        "pages",
+        modules::Kind::Module,
+        &encode(&view_deployment(view.clone())),
+        &index,
+    )
+    .expect("static view readiness must not execute the trapping start");
     // Prove the fixture's trap is reached on real instantiation; a passing
     // readiness assertion alone would not establish this counterexample.
     let engine = wasmtime::Engine::default();
@@ -1143,7 +1250,13 @@ fn wasm_registry_activates_view_assets_and_reopens_after_view_removal() {
             let index =
                 indexer::IndexStore::open_bare(dir.join("index"), &["modules", "valset"]).unwrap();
             for deployment in &deployments {
-                noded::compose::validate_deployment("pages", modules::Kind::Module, &encode(deployment), &index).unwrap();
+                noded::compose::validate_deployment(
+                    "pages",
+                    modules::Kind::Module,
+                    &encode(deployment),
+                    &index,
+                )
+                .unwrap();
                 assert_eq!(deployment.component, deployments[0].component);
                 assert_eq!(deployment.index, deployments[0].index);
             }

@@ -184,71 +184,13 @@ pub const RESERVED_LANE_IDS: &[u8] = &[1, 6];
 /// compile-time variants could never reach it; a declared id can.
 pub const MAX_LANE_ID: u8 = 99;
 
-/// Whether a lane owns its stream budget or shares the process-wide link
-/// budget. Mirrors the host's `StreamPacing` minus the live pacer handle,
-/// which is the host's to supply.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum LanePacing {
-    /// participate in the process-wide bulk budget
-    Shared,
-    /// own a budget: the bulk ceiling and the largest instantaneous burst
-    Local {
-        bulk_bytes_per_sec: u64,
-        bulk_burst_bytes: u64,
-    },
-}
-
-/// A lane's STREAM half, when it has one.
-///
-/// Both overlay sockets are bound for every lane — datagram-vs-stream is a
-/// per-SEND choice, not a property of the lane. What differs is whether a
-/// stream PLANE (queues, pacing, an accept backlog) is bound over them. The
-/// media lanes carry none: they bind sockets and speak datagrams only, which
-/// is why they have no budget to declare.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct LaneStream {
-    pub pacing: LanePacing,
-    /// max accepted-but-unclaimed inbound streams before further opens are
-    /// refused — the host's `StreamPolicy::accept_backlog`.
-    pub accept_backlog: u32,
-}
-
-/// What a module declares it needs. The id is CHOSEN, not allocated: the
-/// registry refuses a collision rather than renumbering, because a renumber
-/// would make the same lane mean different ports on nodes that read the
-/// registry at different heights.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct LaneDecl {
-    pub id: u8,
-    /// What this lane IS to the module that declares it — `voice`, `video`,
-    /// `telemetry`. The host binds by `(module_id, name)`, because a module
-    /// with two lanes is otherwise indistinguishable from itself: only the id
-    /// differs, and the id is a port, not a purpose. NEVER positional — a
-    /// binding that depended on declaration order would break silently the
-    /// first time a module declared a third lane.
-    pub name: String,
-    /// `None` is datagram-only — sockets, no stream plane.
-    pub stream: Option<LaneStream>,
-}
-
-/// The longest a lane name may be. The table is one consensus record that
-/// every node decodes, so an unbounded name is a poison vector rather than a
-/// style question.
-pub const MAX_LANE_NAME_BYTES: usize = 32;
-
-/// A lane name is a stable token, not prose: lowercase, digits, underscore.
-/// It is matched exactly by a host looking for the lane it serves, so a name
-/// that varies by case or spacing is a binding that silently does not happen.
-pub fn lane_name_is_well_formed(name: &str) -> bool {
-    let within_bound = !name.is_empty() && name.len() <= MAX_LANE_NAME_BYTES;
-    within_bound
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-}
+// THE lane declaration shapes live in `module-artifact`, because the ARTIFACT
+// FRAME is where a module declares them — the frame is what a deployment
+// ships and what its hash covers. The registry commits what the frame said;
+// it does not get a second, independent definition of the same thing.
+pub use module_artifact::{
+    LaneDecl, LanePacing, LaneStream, MAX_LANE_NAME_BYTES, lane_name_is_well_formed,
+};
 
 /// The lane table's readable entry: a declaration plus who owns it. The table
 /// is the ONE place a lane's fields live; a module's record does not repeat
