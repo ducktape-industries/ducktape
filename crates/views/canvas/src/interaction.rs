@@ -559,7 +559,11 @@ impl BoardsView {
         if !self.selected.contains(&id) {
             self.selected = with_group_mates(&board, [id.clone()]);
         }
-        self.palette = board.shapes[&id].shape.color;
+        // Picking a shape takes up the pen it was drawn with — all of it. An
+        // eyedropper that took the colour and left the rest made "match that
+        // one" work for one third of how a shape looks and quietly not for the
+        // other two, and made the panel describe a shape nobody had selected.
+        self.pen = Pen::of(&board.shapes[&id].shape);
         let shapes = self
             .selected
             .iter()
@@ -1023,15 +1027,11 @@ impl BoardsView {
             (false, false) => [start[0] - size[0] / 2., start[1] - size[1] / 2.],
         };
         Shape {
-            kind,
-            color: self.palette,
-            fill: self.fill,
-            dash: self.dash,
             x: coordinate(corner[0]),
             y: coordinate(corner[1]),
             width: size[0] as i32,
             height: size[1] as i32,
-            ..Default::default()
+            ..self.pen.shape(kind)
         }
     }
     fn segment_shape(&self, kind: Kind, start: [f32; 2], point: [f32; 2]) -> Shape {
@@ -1062,10 +1062,6 @@ impl BoardsView {
         let fit = (limit / (b[2] - b[0]).max(limit)).min(limit / (b[3] - b[1]).max(limit));
         let size = |span: f32| (span * fit).round().clamp(0., limit);
         Shape {
-            kind,
-            color: self.palette,
-            fill: self.fill,
-            dash: self.dash,
             x: coordinate(b[0]),
             y: coordinate(b[1]),
             width: size(b[2] - b[0]) as i32,
@@ -1074,7 +1070,7 @@ impl BoardsView {
                 .iter()
                 .map(|p| [size(p[0] - b[0]) as i32, size(p[1] - b[1]) as i32])
                 .collect(),
-            ..Default::default()
+            ..self.pen.shape(kind)
         }
     }
     /// An arrow drawn onto a card binds to it, so the connection survives the
@@ -1629,7 +1625,7 @@ impl BoardsView {
         Some(self.visible()?.shapes.get(id)?.shape.kind)
     }
     pub(super) fn on_color(&mut self, color: u8) -> Task<Message> {
-        self.palette = color;
+        self.pen.color = color;
         self.edit_many(
             self.selected
                 .iter()
@@ -1645,7 +1641,7 @@ impl BoardsView {
     /// choice about how you are drawing, not about the box in hand — you
     /// reach for it to outline a region and then outline three more.
     pub(super) fn on_fill(&mut self, fill: Fill) -> Task<Message> {
-        self.fill = fill;
+        self.pen.fill = fill;
         self.edit_many(
             self.selected
                 .iter()
@@ -1658,7 +1654,7 @@ impl BoardsView {
     }
     /// Whether the selection's outlines are unbroken, and the next shape's.
     pub(super) fn on_dash(&mut self, dash: Dash) -> Task<Message> {
-        self.dash = dash;
+        self.pen.dash = dash;
         self.edit_many(
             self.selected
                 .iter()
@@ -2027,15 +2023,11 @@ impl BoardsView {
                 })
             })
             .unwrap_or(Shape {
-                kind: Kind::Note,
                 x: coordinate(p[0]),
                 y: coordinate(p[1]),
                 width: 220,
                 height: 180,
-                color: self.palette,
-                fill: self.fill,
-                dash: self.dash,
-                ..Default::default()
+                ..self.pen.shape(Kind::Note)
             });
         self.mint_shape(Shape {
             text: String::new(),

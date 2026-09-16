@@ -166,6 +166,42 @@ struct History {
     undo: Vec<Change>,
     redo: Vec<Change>,
 }
+/// How the board is currently drawing: the whole appearance the next shape
+/// gets, the way a drawing app keeps a current pen. You decide how a thing is
+/// going to look and then draw several of them, rather than drawing each one
+/// wrong and correcting it.
+///
+/// One value and not three fields on the view, because every use of it is over
+/// the WHOLE pen — picking a shape takes all of it up, minting a shape lays all
+/// of it down — and three properties written in three places is exactly how two
+/// of them came to be forgotten at the pick-up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Pen {
+    color: u8,
+    fill: Fill,
+    dash: Dash,
+}
+impl Pen {
+    /// The pen this shape was drawn with.
+    fn of(shape: &Shape) -> Self {
+        Self {
+            color: shape.color,
+            fill: shape.fill,
+            dash: shape.dash,
+        }
+    }
+    /// A shape in this pen with nothing else decided. Every gesture that mints
+    /// one starts here, so a property added to the pen reaches all of them.
+    fn shape(self, kind: Kind) -> Shape {
+        Shape {
+            kind,
+            color: self.color,
+            fill: self.fill,
+            dash: self.dash,
+            ..Shape::default()
+        }
+    }
+}
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BoardsView {
     session: host::Session,
@@ -182,13 +218,7 @@ pub struct BoardsView {
     modifiers: wire::keyboard::Modifiers,
     space_pan: bool,
     tool_locked: bool,
-    /// The pen the next shape will be drawn with. A board keeps one of these
-    /// per property, the way a drawing app keeps a current colour: you pick
-    /// how a thing is going to look and then draw several of them, rather
-    /// than drawing each one wrong and correcting it.
-    palette: u8,
-    fill: Fill,
-    dash: Dash,
+    pen: Pen,
     help: bool,
     board_picker: bool,
     snap: bool,
@@ -308,9 +338,7 @@ impl BoardsView {
                 modifiers: Default::default(),
                 space_pan: false,
                 tool_locked: false,
-                palette: 0,
-                fill: Fill::Solid,
-                dash: Dash::Solid,
+                pen: Pen::default(),
                 help: false,
                 board_picker: false,
                 snap: true,
