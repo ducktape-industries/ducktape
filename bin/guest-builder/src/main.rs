@@ -930,6 +930,125 @@ mod tests {
         }
     }
 
+    /// where a round of the redirection test sends cargo's output when the
+    /// explicit selection is dropped.
+    #[derive(Clone, Copy)]
+    enum Redirect {
+        Environment,
+        Configuration,
+    }
+
+    /// An inherited `CARGO_TARGET_DIR` or a `build.target-dir` in
+    /// configuration must not move the compiler's output away from the path
+    /// the artifact lookup reads: a redirected build either cannot be found at
+    /// all, or leaves an EARLIER build's bytes there to be packaged under this
+    /// build's lock. Each round compiles a real cdylib through the production
+    /// seam and reads back what would be packaged.
+    #[test]
+    fn a_redirected_cargo_output_cannot_package_an_earlier_build() {
+        let work = scratch();
+        let shell = work.path().join("shell");
+        fixture_file(
+            &shell,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"component\", \"index\"]\nresolver = \"2\"\n",
+        );
+        for kind in GuestKind::ALL {
+            fixture_file(
+                &shell,
+                &format!("{}/Cargo.toml", kind.member()),
+                &format!(
+                    "[package]\nname = \"probe-{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[lib]\ncrate-type = [\"cdylib\"]\n",
+                    kind.member()
+                ),
+            );
+            fixture_file(&shell, &format!("{}/src/lib.rs", kind.member()), "");
+        }
+        run_command(
+            Command::new(cargo())
+                .current_dir(&shell)
+                .arg("generate-lockfile"),
+        );
+
+        let decoy = |redirect: Redirect| match redirect {
+            Redirect::Environment => work.path().join("decoy-environment"),
+            Redirect::Configuration => work.path().join("decoy-configuration"),
+        };
+        let redirect_output = |redirect: Redirect, command: &mut Command| match redirect {
+            Redirect::Environment => {
+                command.env("CARGO_TARGET_DIR", decoy(redirect));
+            }
+            Redirect::Configuration => {
+                fixture_file(
+                    &shell,
+                    ".cargo/config.toml",
+                    &format!(
+                        "[build]\ntarget-dir = {:?}\n",
+                        decoy(redirect).display().to_string()
+                    ),
+                );
+            }
+        };
+        // the same build minus the explicit selection: what the redirection
+        // does when nothing overrides it, so a round that redirects nothing
+        // cannot pass for one that does.
+        let unselected = |kind: GuestKind| {
+            let reference = build_command(&shell, "probe", kind, "");
+            let mut args: Vec<std::ffi::OsString> =
+                reference.get_args().map(ToOwned::to_owned).collect();
+            let selection = args
+                .iter()
+                .position(|arg| arg == "--target-dir")
+                .expect("the build must select its target directory explicitly");
+            args.drain(selection..selection + 2);
+            let mut command = Command::new(cargo());
+            command
+                .args(args)
+                .env("CARGO_ENCODED_RUSTFLAGS", "")
+                .env_remove("RUSTFLAGS")
+                .current_dir(&shell);
+            command
+        };
+
+        let mut packaged: std::collections::HashMap<&str, Vec<u8>> = Default::default();
+        // round 1 builds a clean scratch; round 2 finds round 1's bytes
+        // sitting at the lookup path.
+        for (value, redirect) in [(1u32, Redirect::Environment), (2, Redirect::Configuration)] {
+            for kind in GuestKind::ALL {
+                fixture_file(
+                    &shell,
+                    &format!("{}/src/lib.rs", kind.member()),
+                    &format!("#[no_mangle]\npub extern \"C\" fn value() -> u32 {{ {value} }}\n"),
+                );
+            }
+            let mut without_selection = unselected(GuestKind::Component);
+            redirect_output(redirect, &mut without_selection);
+            run_command(&mut without_selection);
+            assert!(
+                decoy(redirect)
+                    .join("wasm32-unknown-unknown/release/probe_component.wasm")
+                    .is_file(),
+                "the redirection under test moved nothing"
+            );
+
+            for kind in GuestKind::ALL {
+                let mut command = build_command(&shell, "probe", kind, "");
+                redirect_output(redirect, &mut command);
+                run_command(&mut command);
+                let artifact = cdylib_path(&shell, "probe", kind);
+                let bytes =
+                    fs::read(&artifact).unwrap_or_else(|e| panic!("{}: {e}", artifact.display()));
+                assert_ne!(
+                    packaged.get(kind.member()),
+                    Some(&bytes),
+                    "{}: the lookup still holds the earlier build's bytes",
+                    kind.member()
+                );
+                packaged.insert(kind.member(), bytes);
+            }
+        }
+    }
+
     fn scratch() -> tempfile::TempDir {
         let root = default_platform_root()
             .unwrap()
