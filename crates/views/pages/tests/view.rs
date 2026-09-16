@@ -267,6 +267,83 @@ fn a_create_mints_its_id_and_leaves_as_a_signed_op() {
     );
 }
 
+/// A picture in a page is a file on the network. Nothing can draw a
+/// `duck://` address by itself, so the view asks the host to page each one in
+/// under its own surface — once per address, whatever the document repeats.
+#[test]
+fn a_page_asks_the_host_to_page_in_every_picture_it_names() {
+    let frame = boot();
+    let session_id = request(&frame, "pages.props").id;
+    let mut frame = tick_native(vec![item(session_id, &session(true))]);
+    // A picture is asked for on the frame its page's read lands on, and the
+    // register settles over several more.
+    let mut asks: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..16 {
+        asks.extend(
+            frame
+                .requests
+                .iter()
+                .filter(|one| one.kind == "picture.load")
+                .map(|one| serde_json::from_slice(&one.payload).expect("a picture ask decodes")),
+        );
+        let read = frame
+            .requests
+            .iter()
+            .find(|one| one.kind == "rpc.view" || one.kind == "rpc.query");
+        let Some(read) = read else { break };
+        let ask: serde_json::Value = serde_json::from_slice(&read.payload).expect("a view ask");
+        let reply = match ask["query"]["get_page"].is_null() {
+            true => answered(read),
+            false => illustrated_page(),
+        };
+        frame = tick_native(vec![answer(read.id, &reply)]);
+    }
+    assert_eq!(
+        asks,
+        [serde_json::json!({
+            "surface": "pages",
+            "path": "/shared/pages/alpha/p1/duck.png"
+        })],
+        "the address off the web is the image loader's own, and the repeat is \
+         the same picture"
+    );
+}
+
+/// `page_blocks`, with a picture named twice and one off the web.
+fn illustrated_page() -> Vec<u8> {
+    serde_json::json!({ "page": {
+        "blocks": [
+            {
+                "id": "alpha", "parent": null, "page": "alpha", "kind": "page",
+                "text": "Alpha", "checked": false,
+                "children": ["alpha-1", "alpha-2", "alpha-3", "alpha-4"]
+            },
+            {
+                "id": "alpha-1", "parent": "alpha", "page": "alpha", "kind": "paragraph",
+                "text": "the first paragraph", "checked": false, "children": []
+            },
+            {
+                "id": "alpha-2", "parent": "alpha", "page": "alpha", "kind": "paragraph",
+                "text": "![duck](duck://files/shared/pages/alpha/p1/duck.png)",
+                "checked": false, "children": []
+            },
+            {
+                "id": "alpha-3", "parent": "alpha", "page": "alpha", "kind": "paragraph",
+                "text": "![duck again](duck://files/shared/pages/alpha/p1/duck.png)",
+                "checked": false, "children": []
+            },
+            {
+                "id": "alpha-4", "parent": "alpha", "page": "alpha", "kind": "paragraph",
+                "text": "![off the web](https://example.test/duck.png)",
+                "checked": false, "children": []
+            }
+        ],
+        "next_after": null
+    }})
+    .to_string()
+    .into_bytes()
+}
+
 /// Re-parenting is how a tree is built out of pages that already exist: the
 /// row menu's destination list leaves as the module's own `move_block`.
 #[test]

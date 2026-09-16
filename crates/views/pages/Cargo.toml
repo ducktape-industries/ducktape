@@ -18,3 +18,6 @@ design = { path = "../support/design" }
 serde.workspace = true
 serde_json.workspace = true
 ducktape-view-guest.workspace = true
+# A picture in a page is a file on the network: the same commit policy the
+# Files view and the chat composer put one there with.
+ducktape-view-files.workspace = true

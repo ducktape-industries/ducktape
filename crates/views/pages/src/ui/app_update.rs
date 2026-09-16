@@ -29,6 +29,8 @@ impl PagesView {
             Message::OpenPageRowMenu(id) => self.on_open_page_row_menu(id),
             Message::OfferPageMove => self.on_offer_page_move(),
             Message::MovePage(parent) => self.on_move_page(parent),
+            Message::PictureReady(line, item) => self.on_picture_ready(line, item),
+            Message::PictureLoaded(path) => self.on_picture_loaded(path),
             Message::PressedAt(x, y) => self.on_pressed_at(x, y),
             Message::DeletePageSubmit => self.on_delete_page_submit(),
             Message::SearchPagesSubmit => self.on_search_pages_submit(),
@@ -190,11 +192,19 @@ impl PagesView {
             &(self.page_saved_text),
             &(item.document),
         );
+        // Another page's pictures are another page's: the list of what has
+        // been asked for goes with the page it was read for.
+        if self.active_page != item.active_page {
+            self.pictures_asked.clear();
+        }
         self.active_page = item.active_page.to_owned();
         self.buffer_page = item.active_page.to_owned();
         self.refresh_document_presentation();
+        // A page's pictures are read off the page, not off the buffer: they
+        // are asked for whether or not this read installs new text.
+        let pictures = self.ask_for_pictures(&(item.document));
         if !install {
-            return Task::none();
+            return pictures;
         }
         self.page_saved_text = item.document.to_owned();
         self.page_refusal = "".to_owned();
@@ -208,14 +218,68 @@ impl PagesView {
         self.refresh_document_presentation();
         let naming = !(self.page_to_name).is_empty() && (self.page_to_name == item.active_page);
         if !naming {
-            return Task::none();
+            return pictures;
         }
         self.page_to_name = "".to_owned();
-        ::ducktape_view_guest::widget::perform::<Message>(
-            ::ducktape_view_guest::wire::WidgetCommand::Focus {
-                target: format!("{PAGE_KEY}/document"),
-            },
+        Task::batch([
+            pictures,
+            ::ducktape_view_guest::widget::perform::<Message>(
+                ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                    target: format!("{PAGE_KEY}/document"),
+                },
+            ),
+        ])
+    }
+
+    /// Ask the host to page in every picture `text` names that this view has
+    /// not asked for yet. The app draws them out of its own store, so the
+    /// answer is only that one landed.
+    fn ask_for_pictures(&mut self, text: &str) -> Task<Message> {
+        let fresh: Vec<String> = crate::host::document_pictures(text)
+            .into_iter()
+            .filter(|path| !self.pictures_asked.contains(path))
+            .collect();
+        self.pictures_asked.extend(fresh.iter().cloned());
+        Task::batch(
+            fresh
+                .into_iter()
+                .map(|path| Task::perform(crate::host::load_picture(path), Message::PictureLoaded)),
         )
+    }
+
+    /// A picked picture is on the network: its address goes on the line the
+    /// writer asked for it on, and the host is asked to draw it.
+    fn on_picture_ready(&mut self, line: i64, item: crate::host::PictureItem) -> Task<Message> {
+        if !(item.error).is_empty() {
+            self.page_refusal = item.error.to_owned();
+            return Task::none();
+        }
+        // No file chosen: the picker was dismissed, and the empty line the
+        // pick left behind is the writer's to type in.
+        if (item.uri).is_empty() {
+            return Task::none();
+        }
+        let text = crate::host::document_text(&(self.document));
+        let placed = crate::host::picture_placed(&(text), line, &(item.uri), &(item.alt));
+        if placed == text {
+            return Task::none();
+        }
+        {
+            let reset = self.document.reset_revision();
+            let next = crate::host::document_editor(&(placed));
+            self.document.replace(next, reset);
+        };
+        self.document
+            .move_to(crate::host::picture_caret(&(placed), &(item.uri)));
+        self.refresh_document_presentation();
+        self.ask_for_pictures(&(placed))
+    }
+
+    /// One picture landed in the host's slot. The frame this answer draws is
+    /// the redraw that shows it; an empty path is a read that failed, and the
+    /// block keeps saying it is waiting.
+    fn on_picture_loaded(&mut self, _path: String) -> Task<Message> {
+        Task::none()
     }
     fn on_search_arrived(&mut self, item: crate::host::SearchItem) -> Task<Message> {
         self.host_error = item.error.to_owned();
@@ -845,6 +909,15 @@ impl PagesView {
             &crate::host::navigation_copy(next.interaction.clone()),
             "Copied",
         );
+        let picture_line = crate::host::navigation_picture_line(next.interaction.clone());
+        if picture_line >= 0 {
+            // The picker is the host's, and the upload after it is a round
+            // trip to the node: the line waits empty until both are done.
+            let page = self.active_page.clone();
+            return Task::perform(crate::host::pick_picture(page), move |item| {
+                Message::PictureReady(picture_line, item)
+            });
+        }
         if (((comment_line < 0) || self.loading) || self.busy) || (self.active_page).is_empty() {
             return Task::none();
         }

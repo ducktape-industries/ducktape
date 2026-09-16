@@ -1639,6 +1639,149 @@ pub fn search_answer_stands(query: &str, draft: &str, searching: bool) -> bool {
     !searching && !query.is_empty() && draft.trim() == query
 }
 
+/// The host picture slot this view's pages draw from. A page carries as many
+/// pictures as it was written with, so the slot keeps a list.
+pub const PICTURE_SURFACE: &str = "pages";
+
+/// What a picked picture leaves behind: the address the document will carry
+/// and the words that stand in for it, or why nothing was added.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct PictureItem {
+    pub uri: String,
+    pub alt: String,
+    pub error: String,
+}
+
+/// Choose a picture on this device and put it ON THE NETWORK: the bytes are
+/// this machine's alone, so a path would name nothing to anybody else. The
+/// answer is the `duck://files/…` address every member can fetch, under the
+/// page that names it.
+pub async fn pick_picture(page_id: String) -> PictureItem {
+    match picked_picture(page_id).await {
+        Ok(item) => item,
+        Err(error) => PictureItem {
+            error,
+            ..Default::default()
+        },
+    }
+}
+
+async fn picked_picture(page_id: String) -> Result<PictureItem, String> {
+    if page_id.is_empty() {
+        return Err("open a page before adding a picture".into());
+    }
+    let chosen = host::request("fs.pick", b"{}").await?;
+    let files: Vec<ducktape_view_files::SelectedFile> =
+        serde_json::from_slice(&chosen).map_err(|error| error.to_string())?;
+    // The picker offers several; a document line holds one.
+    let Some(file) = files.into_iter().next() else {
+        return Ok(PictureItem::default());
+    };
+    let alt = file.name.clone();
+    // Under the page, under a minted id: two pictures of the same name, in
+    // one page or in two, are two files.
+    let id = mint("picture").await?;
+    let path = format!("/shared/pages/{page_id}/{id}/{}", file_name(&file.name));
+    let uri = ducktape_view_files::upload(file, path).await?;
+    Ok(PictureItem {
+        uri,
+        alt,
+        error: String::new(),
+    })
+}
+
+/// A file's name with the characters a Markdown address cannot carry folded
+/// away, mirroring the composer's own safe name.
+fn file_name(name: &str) -> String {
+    name.chars()
+        .map(|c| match c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '/') {
+            true => '_',
+            false => c,
+        })
+        .collect()
+}
+
+/// The document with the picture on `line`: over that line when the pick
+/// left it empty, on a line of its own under it otherwise — a picture never
+/// eats a line of prose. A line past the end appends.
+pub fn picture_placed(text: &str, line: i64, uri: &str, alt: &str) -> String {
+    if uri.is_empty() {
+        return text.to_owned();
+    }
+    let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+    let picture = format!("![{}]({uri})", alt.replace(['[', ']'], ""));
+    let asked = usize::try_from(line).unwrap_or(usize::MAX);
+    let in_document = asked < lines.len();
+    // The pick empties the line it was typed on, and that line takes the
+    // picture. The title line is never a picture's, and neither is a line the
+    // document does not have: those put it after the words, or at the end.
+    let cleared = in_document && asked > 0 && lines[asked].trim().is_empty();
+    let at = match (in_document, cleared) {
+        (_, true) => asked,
+        (true, false) => asked + 1,
+        (false, false) => lines.len(),
+    };
+    match cleared {
+        true => lines[at] = picture,
+        false => lines.insert(at, picture),
+    }
+    // A picture is an atom: a caret left on one selects it instead of writing
+    // under it, so the writer always gets an empty line to go on with.
+    let room_to_write = lines.get(at + 1).is_some_and(|next| next.trim().is_empty());
+    if !room_to_write {
+        lines.insert(at + 1, String::new());
+    }
+    lines.join("\n")
+}
+
+/// The caret under the picture at `uri`: the empty line [`picture_placed`]
+/// leaves for the writer, at its start.
+pub fn picture_caret(text: &str, uri: &str) -> ducktape_view_guest::wire::EditorCursor {
+    let placed = text.split('\n').position(|line| {
+        crate::rich_document::picture_line(line).is_some_and(|(_, src)| src == uri)
+    });
+    ducktape_view_guest::wire::EditorCursor {
+        position: ducktape_view_guest::wire::EditorPosition {
+            line: placed.map_or(0, |at| at + 1) as u32,
+            column: 0,
+        },
+        selection: None,
+    }
+}
+
+/// Every picture the document names, once each, in reading order: the duckfs
+/// path behind each `![alt](duck://files/…)` line.
+pub fn document_pictures(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let Some(path) = picture_line_path(line) else {
+            continue;
+        };
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// The duckfs path of a line that is one picture and nothing else.
+fn picture_line_path(line: &str) -> Option<String> {
+    let (_alt, src) = crate::rich_document::picture_line(line)?;
+    let path = src.strip_prefix("duck://files")?;
+    let plain = !path.is_empty() && !path.contains(['?', '#']);
+    plain.then(|| path.to_owned())
+}
+
+/// Ask the host to page in one duckfs picture and decode it into this view's
+/// slot. The answer is only whether it landed: the app draws it from the slot.
+pub async fn load_picture(path: String) -> String {
+    let ask = json!({ "surface": PICTURE_SURFACE, "path": path.clone() });
+    match host::request("picture.load", &encode(&ask)).await {
+        Ok(_) => path,
+        Err(_) => String::new(),
+    }
+}
+
 /// `duck://page/<id>?net=<digest>` — the handle that brings a reader back to
 /// this page, from another page, another view, or outside the app.
 ///
@@ -1934,6 +2077,14 @@ pub fn navigation_mention(interaction: Vec<u8>) -> i64 {
     i64::try_from(decode_navigation(&interaction).mention).unwrap_or_default()
 }
 
+/// The line a picture was asked for on, or `-1` when the interaction asked
+/// for no picture.
+pub fn navigation_picture_line(interaction: Vec<u8>) -> i64 {
+    decode_navigation(&interaction)
+        .picture_line
+        .map_or(-1, i64::from)
+}
+
 /// The line a margin badge was pressed on, or `-1` when the interaction was
 /// not a badge press.
 pub fn navigation_comment_line(interaction: Vec<u8>) -> i64 {
@@ -2226,6 +2377,64 @@ pub fn measured_card_height(current: f64, measured: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::CommentsMode;
+
+    /// The document names its pictures once each, by the duckfs path behind
+    /// the address — what `picture.load` reads and the block draws under.
+    #[test]
+    fn a_document_names_each_of_its_pictures_once() {
+        const DOCUMENT: &str = "# Handbook\n\
+            Everything a new member needs.\n\
+            ![duck](duck://files/shared/pages/p1/a/duck.png)\n\
+            ![again](duck://files/shared/pages/p1/a/duck.png)\n\
+            ![goose](duck://files/shared/pages/p1/b/goose.gif)\n\
+            ![web](https://example.test/off.png)\n\
+            A line with ![one](duck://files/shared/pages/p1/c/inline.png) inside it.";
+        assert_eq!(
+            document_pictures(DOCUMENT),
+            [
+                "/shared/pages/p1/a/duck.png",
+                "/shared/pages/p1/b/goose.gif"
+            ],
+            "a picture off the web is the loader's, and one inside a sentence \
+             is prose — neither is a line this view pages in"
+        );
+    }
+
+    /// The pick leaves an empty line to put the picture on; anything else on
+    /// that line is prose the picture goes under, never over. An empty line
+    /// always follows it, and that is where the caret goes.
+    #[test]
+    fn a_picture_lands_on_its_own_line() {
+        const DOCUMENT: &str = "# Handbook\nWritten already\n\nUnder it";
+        let uri = "duck://files/shared/pages/p1/a/duck.png";
+        let placed = format!("# Handbook\nWritten already\n![duck.png]({uri})\n\nUnder it");
+        assert_eq!(picture_placed(DOCUMENT, 2, uri, "duck.png"), placed);
+        assert_eq!(
+            picture_placed(DOCUMENT, 1, uri, "duck.png"),
+            placed,
+            "a line with words on it keeps them"
+        );
+        assert_eq!(
+            picture_caret(&placed, uri).position,
+            ducktape_view_guest::wire::EditorPosition { line: 3, column: 0 },
+            "the caret goes under the picture, never on it"
+        );
+        assert_eq!(
+            picture_placed(DOCUMENT, 0, uri, "duck.png"),
+            format!("# Handbook\n![duck.png]({uri})\n\nWritten already\n\nUnder it"),
+            "the title line is never overwritten; the picture opens the body"
+        );
+        assert_eq!(
+            picture_placed(DOCUMENT, 9, uri, "duck.png"),
+            format!("# Handbook\nWritten already\n\nUnder it\n![duck.png]({uri})\n"),
+            "past the end appends"
+        );
+        assert_eq!(
+            picture_placed(DOCUMENT, 2, "", "duck.png"),
+            DOCUMENT,
+            "nothing picked, nothing written"
+        );
+    }
 
     /// A page link carries the chain id's hash half and nothing else — the
     /// app reads `?net=` as that digest, so the name in front of it would be
