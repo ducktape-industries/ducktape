@@ -657,10 +657,6 @@ pub(crate) fn bounded_text(value: String, field: &str, limit: usize) -> Result<S
     Ok(value.to_string())
 }
 
-pub(crate) fn required_id(value: String, subject: &str) -> Result<String, String> {
-    bounded_text(value, &format!("{subject} id"), 512)
-}
-
 /// One voice at the surface. The global banner prints whatever reaches an
 /// `AppError`/`HydrationError`, so the known developer diagnostics — CLI spawn
 /// chatter, key paths, argv timeouts, serde parse positions — translate to a

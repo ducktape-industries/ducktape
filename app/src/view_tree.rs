@@ -291,9 +291,11 @@ impl SearchableListItem for Choice {
     }
 }
 
+type SearchQueryFn = Box<dyn Fn(&str, &mut App)>;
+
 struct PickerChoices {
     items: SearchableVec<Choice>,
-    query: Box<dyn Fn(&str, &mut App)>,
+    query: SearchQueryFn,
 }
 
 impl SearchableListDelegate for PickerChoices {

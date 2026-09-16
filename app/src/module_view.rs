@@ -499,6 +499,10 @@ struct ChatProps<'a> {
 /// or owns: the room to open (`duck://` links, notifications, the tray), the
 /// huddle, a link or a copy, a run to stop or open, and the seed for the edit
 /// The guest owns its editor documents and product actions.
+// Each parameter is a distinct piece of chat state the caller already tracks
+// separately; bundling them into a struct is a structural change, not this
+// clippy sweep's job.
+#[allow(clippy::too_many_arguments)]
 pub fn chat_view(
     dark: bool,
     connected: bool,
@@ -639,10 +643,7 @@ fn surface_bool(args: &[wire::SurfaceValue], index: usize) -> bool {
 }
 
 fn surface_allowed(surface: &str) -> bool {
-    match surface {
-        "artifact_svg" | "artifact_image" | "picture" | "code" | "markdown" => true,
-        _ => false,
-    }
+    matches!(surface, "artifact_svg" | "artifact_image" | "picture" | "code" | "markdown")
 }
 
 /// The operations a view may ask of the app, by module. An intent outside
@@ -1852,10 +1853,10 @@ pub(crate) mod canary {
         };
         let mut root = guest.frame.root.clone()?;
         root.for_each_mut(&mut |node| {
-            if let super::wire::Node::Surface { name, args, .. } = node {
-                if matches!(name.as_str(), "artifact_svg" | "artifact_image") {
-                    *node = super::surfaces::asset_node(name, args, guest);
-                }
+            if let super::wire::Node::Surface { name, args, .. } = node
+                && matches!(name.as_str(), "artifact_svg" | "artifact_image")
+            {
+                *node = super::surfaces::asset_node(name, args, guest);
             }
         });
         guest.pictures.hydrate(&mut root);
@@ -2652,7 +2653,6 @@ impl Guest {
     fn surface_event(&mut self, handler: Option<u32>, value: wire::SurfaceValue) {
         if let Some(handler) = handler {
             self.pending.push(wire::Event::Surface { handler, value });
-            return;
         }
     }
 
@@ -6301,10 +6301,10 @@ pub(crate) mod tests {
             if width == 1300. {
                 let mut published_width = None;
                 guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
-                    if let wire::Node::Container { key, max_width, .. } = node {
-                        if key == "pages/document/surface" {
-                            published_width = *max_width;
-                        }
+                    if let wire::Node::Container { key, max_width, .. } = node
+                        && key == "pages/document/surface"
+                    {
+                        published_width = *max_width;
                     }
                 });
                 assert_eq!(

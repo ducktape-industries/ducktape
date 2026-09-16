@@ -44,6 +44,9 @@ struct Document {
     phase: Phase,
 }
 
+// Boxing `Decision` would allocate on every structural edit inside the
+// per-frame pump/drain loop below; the size difference is accepted instead.
+#[allow(clippy::large_enum_variant)]
 enum Phase {
     Ready,
     Decision { request: wire::EditorRequest, since: Instant },

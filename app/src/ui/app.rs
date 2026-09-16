@@ -1031,12 +1031,12 @@ mod state_tests {
         let (mut state, _) = Ducktape::fixture_live_agent_session();
         let reply_message = AppMessage::SelectShellTab(ShellTab::Agents);
         dispatch(&mut state, reply_message);
-        let actual = state.shell_tab.clone();
+        let actual = state.shell_tab;
         let expected = ShellTab::Agents;
         assert_eq!(actual, expected);
         let reply_message = AppMessage::OpenMessageLink("duck://channel/general".to_owned());
         dispatch(&mut state, reply_message);
-        let actual = state.shell_tab.clone();
+        let actual = state.shell_tab;
         let expected = ShellTab::Chat;
         assert_eq!(actual, expected);
     }
@@ -1047,7 +1047,7 @@ mod state_tests {
         assert!(actual);
         let reply_message = AppMessage::OpenRunPanel("dispatch-1".to_owned());
         dispatch(&mut state, reply_message);
-        let actual = state.shell_tab.clone();
+        let actual = state.shell_tab;
         let expected = ShellTab::Agents;
         assert_eq!(actual, expected);
         let actual = state.agents_open_run.to_owned();
