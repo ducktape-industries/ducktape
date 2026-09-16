@@ -787,7 +787,9 @@ impl PagesView {
             .find(|(_, account)| *account as i64 == mention)
             .map(|(name, _)| name.to_owned())
             .unwrap_or_default();
-        self.awaiting_comments = crate::host::comment_total(&(self.comment_rows));
+        // The ask itself is the next comment the page gets, so the wait ends
+        // on the one after it — the answer.
+        self.awaiting_comments = crate::host::comment_total(&(self.comment_rows)) + 1;
         crate::host::post(
             &(self.pending_comment),
             &(fresh_target),

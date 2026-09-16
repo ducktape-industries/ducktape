@@ -718,6 +718,38 @@ mod tests {
                 .any(|key| key == "PagesView/root/pages/page/alpha-child")
         );
     }
+    /// The ask is itself the next comment the page gets. The wait ends on the
+    /// one after it — the answer — not on the reader's own words landing.
+    #[test]
+    fn the_ask_waits_for_the_answer_not_for_itself() {
+        let thread = |comments: i64| crate::host::PageCommentThreadRow {
+            thread: crate::host::PageCommentThread {
+                id: "thread-a".into(),
+                comment_count: comments,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (mut app, _) = PagesView::boot();
+        app.awaiting_agent = "Builder".into();
+        app.awaiting_comments = 2;
+        app.update(Message::RegisterArrived(crate::host::RegisterItem {
+            comment_rows: vec![thread(1)],
+            ..Default::default()
+        }));
+        assert_eq!(app.awaiting_agent, "Builder", "the ask has not landed yet");
+        app.update(Message::RegisterArrived(crate::host::RegisterItem {
+            comment_rows: vec![thread(2)],
+            ..Default::default()
+        }));
+        assert_eq!(app.awaiting_agent, "Builder", "that one is the ask itself");
+        app.update(Message::RegisterArrived(crate::host::RegisterItem {
+            comment_rows: vec![thread(3)],
+            ..Default::default()
+        }));
+        assert!(app.awaiting_agent.is_empty(), "the answer ends the wait");
+    }
+
     #[test]
     fn kit_composition_retains_editor_and_comment_routes_without_custom_control_faces() {
         let (mut app, _) = PagesView::boot();
