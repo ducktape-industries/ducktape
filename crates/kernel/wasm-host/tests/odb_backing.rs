@@ -73,6 +73,10 @@ struct MockInner {
     /// the last durably-committed height, `None` until the first adopt — the
     /// recovery cursor `durable_commit_height` surfaces.
     durable_height: Option<u64>,
+    /// how many times the committed refs image has been read. every guest RUN
+    /// re-seeds its committed view from it exactly once, so this counts runs —
+    /// which is what makes a replay visible to a test.
+    refs_reads: usize,
     log: Vec<Call>,
 }
 
@@ -100,6 +104,9 @@ impl Mock {
     }
     fn committed_has(&self, id: &[u8]) -> bool {
         self.0.borrow().committed_objects.contains_key(id)
+    }
+    fn refs_reads(&self) -> usize {
+        self.0.borrow().refs_reads
     }
 }
 
@@ -140,7 +147,9 @@ impl OdbBacking for Mock {
         self.0.borrow().engine.unwrap_or(wasm_host::Backing::Odb)
     }
     fn refs_bytes(&self) -> Vec<u8> {
-        self.0.borrow().committed_refs.clone()
+        let mut inner = self.0.borrow_mut();
+        inner.refs_reads += 1;
+        inner.committed_refs.clone()
     }
     fn adopt_refs(&mut self, bytes: &[u8]) -> Result<(), Error> {
         let mut inner = self.0.borrow_mut();
@@ -290,7 +299,7 @@ async fn queries_run_guest_policy_over_committed_refs_and_objects() {
 }
 
 #[tokio::test]
-async fn query_replays_typed_git_reads_through_the_guest_import() {
+async fn typed_git_reads_answer_through_the_guest_import() {
     let mock = Mock::with_refs(b"REFS");
     let module = module(&mock);
     let req = [b"g".as_slice(), &[0; 20]].concat();
@@ -529,6 +538,43 @@ async fn staged_object_is_cross_dispatch_visible_but_hidden_from_the_backing_unt
     exec(&mut m, &mut ctx, present_op(&id))
         .await
         .expect("post-publish backing hit");
+}
+
+/// An object read costs no guest RUN. The odb backing is synchronous, so the
+/// import answers in place instead of pausing for a resolver: a dispatch that
+/// reads a committed object runs the guest exactly as many times as one that
+/// reads none. Counting `refs_bytes` counts runs — every round re-seeds its
+/// committed view from the image exactly once — so under a pause-and-replay
+/// object plane the reading dispatch costs one run per distinct read and this
+/// fails. That is the whole of the quadratic the object plane used to carry.
+#[tokio::test]
+async fn an_object_read_costs_no_extra_guest_run() {
+    let mock = Mock::with_refs(b"REFS-V0");
+    let id = object_id(0, b"chunk-bytes");
+    mock.0
+        .borrow_mut()
+        .committed_objects
+        .insert(id.to_vec(), [&[0u8][..], b"chunk-bytes"].concat());
+    let mut m = module(&mock);
+    let mut ctx = MockCtx::new();
+
+    let before = mock.refs_reads();
+    exec(&mut m, &mut ctx, refs_set_op(b"REFS-V1"))
+        .await
+        .expect("a dispatch that reads no object");
+    let without_read = mock.refs_reads() - before;
+
+    let before = mock.refs_reads();
+    exec(&mut m, &mut ctx, present_op(&id))
+        .await
+        .expect("a dispatch that reads one committed object");
+    let with_read = mock.refs_reads() - before;
+
+    assert_eq!(without_read, 1, "a dispatch is one guest run");
+    assert_eq!(
+        with_read, without_read,
+        "the object read replayed the guest instead of answering in place"
+    );
 }
 
 #[tokio::test]
