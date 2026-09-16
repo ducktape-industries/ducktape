@@ -638,7 +638,10 @@ fn a_send_in_flight_paints_its_row_before_the_block() {
             done: true,
         }]);
         assert!(!has_text(&frame, "third rail"));
-        assert!(has_text(&frame, "Restore unsent message"));
+        // the refusal is a notice that says what happened, with the way back
+        // beside it — not a bare button carrying the whole sentence
+        assert!(has_text(&frame, "An earlier message wasn’t sent"));
+        assert!(has_text(&frame, "Restore"));
         let Node::Editor { document, .. } = node_ending(&frame, "/composer/editor") else {
             panic!("composer")
         };
