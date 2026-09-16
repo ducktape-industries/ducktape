@@ -1957,8 +1957,9 @@ struct Guest {
     tick: TypedFunc<(Vec<u8>,), (Vec<u8>,)>,
     /// The guest's events for its next tick.
     pending: Vec<wire::Event>,
-    /// Requests wait for their frame's native layout, inside this instance only.
-    widget_commands: Vec<(u64, u64, wire::WidgetCommand)>,
+    /// Requests wait for the native layout of a frame that still mounts
+    /// their target, inside this instance only.
+    widget_commands: Vec<(u64, wire::WidgetCommand)>,
     /// The last frame, its `root` kept across `unchanged` ticks and patched
     /// in place by a frame that carries patches instead of a tree.
     frame: wire::Frame,
@@ -2768,8 +2769,7 @@ impl Guest {
         self.user_activation = None;
         for id in std::mem::take(&mut self.frame.cancels) {
             self.filesystem.cancel(id);
-            self.widget_commands
-                .retain(|(request, _, _)| *request != id);
+            self.widget_commands.retain(|(request, _)| *request != id);
             if self.props_subscription == Some(id) {
                 self.props_subscription = None;
             }
@@ -2859,6 +2859,49 @@ impl Guest {
         self.reply(id, Err(message));
     }
 
+    /// The key a command acts on, or `None` for the two that act on focus
+    /// order rather than a node. Exhaustive by design: adding a command
+    /// requires reviewing its scope.
+    fn command_target(command: &wire::WidgetCommand) -> Option<&str> {
+        use wire::WidgetCommand as C;
+        match command {
+            C::FocusPrevious | C::FocusNext => None,
+            C::EditorAction { target, .. }
+            | C::Focus { target }
+            | C::Focused { target }
+            | C::CursorFront { target }
+            | C::CursorEnd { target }
+            | C::Cursor { target, .. }
+            | C::SelectAll { target }
+            | C::Select { target, .. }
+            | C::Snap { target, .. }
+            | C::SnapEnd { target }
+            | C::ScrollTo { target, .. }
+            | C::ScrollToKey { target, .. }
+            | C::ScrollBy { target, .. } => Some(target),
+        }
+    }
+
+    /// Whether the key this command names is in the tree the guest is
+    /// showing RIGHT NOW. A press is answered a frame or more after it was
+    /// made, and a live view replaces its frame between the two — so the
+    /// question a queued command has to pass is whether its target is still
+    /// there, never whether the frame it was made against is still the
+    /// current one.
+    fn target_is_mounted(&self, command: &wire::WidgetCommand) -> bool {
+        fn contains(node: &wire::Node, target: &str) -> bool {
+            node.key() == Some(target)
+                || node.children().iter().any(|child| contains(child, target))
+        }
+        let Some(target) = Self::command_target(command) else {
+            return true;
+        };
+        self.frame
+            .root
+            .as_ref()
+            .is_some_and(|root| contains(root, target))
+    }
+
     fn widget_request(&mut self, id: u64, payload: &[u8]) {
         let admitted = (|| {
             let mut command: wire::WidgetCommand = wire::decode(payload)?;
@@ -2871,56 +2914,29 @@ impl Guest {
             if queue_full {
                 return Err("too many pending widget requests".into());
             }
-            // Exhaustive by design: adding a command requires reviewing its scope.
-            use wire::WidgetCommand as C;
-            let target = match &command {
-                C::FocusPrevious | C::FocusNext => None,
-                C::EditorAction { target, .. }
-                | C::Focus { target }
-                | C::Focused { target }
-                | C::CursorFront { target }
-                | C::CursorEnd { target }
-                | C::Cursor { target, .. }
-                | C::SelectAll { target }
-                | C::Select { target, .. }
-                | C::Snap { target, .. }
-                | C::SnapEnd { target }
-                | C::ScrollTo { target, .. }
-                | C::ScrollToKey { target, .. }
-                | C::ScrollBy { target, .. } => Some(target),
-            };
-            fn contains(node: &wire::Node, target: &str) -> bool {
-                node.key() == Some(target)
-                    || node.children().iter().any(|child| contains(child, target))
-            }
-            if let Some(target) = target {
-                let in_scope = self
-                    .frame
-                    .root
-                    .as_ref()
-                    .is_some_and(|root| contains(root, target));
-                if !in_scope {
-                    return Err("widget target is outside this guest tree".into());
-                }
+            if !self.target_is_mounted(&command) {
+                return Err("widget target is outside this guest tree".into());
             }
             Ok(command)
         })();
         match admitted {
-            Ok(command) => self.widget_commands.push((id, self.frame_rev, command)),
+            Ok(command) => self.widget_commands.push((id, command)),
             Err(error) => self.refuse(id, error),
         }
     }
 
-    /// Called only on the matching mounted tree after native editor work drains.
+    /// Called on this guest's mounted tree once native editor work drains.
+    /// A command whose target left the tree in the meantime is answered with
+    /// that, never performed.
     fn execute_widget_commands(
         &mut self,
         mut execute: impl FnMut(wire::WidgetCommand) -> Result<Vec<u8>, String>,
     ) {
-        for (id, revision, command) in std::mem::take(&mut self.widget_commands) {
-            let result = if revision == self.frame_rev {
+        for (id, command) in std::mem::take(&mut self.widget_commands) {
+            let result = if self.target_is_mounted(&command) {
                 execute(command)
             } else {
-                Err("widget request belongs to a replaced frame".into())
+                Err("widget target left the tree".into())
             };
             self.reply(id, result);
         }
@@ -3347,7 +3363,6 @@ impl NativeModuleView {
                 let view = cx.entity().downgrade();
                 let seat = mounted.clone();
                 let alive = guest.alive.clone();
-                let revision = self.revision;
                 // The child tree mounts during this frame. A newly opened
                 // menu or input cannot receive focus before that render.
                 window.defer(cx, move |window, cx| {
@@ -3356,11 +3371,17 @@ impl NativeModuleView {
                         let Slot::Ready(guest) = &mut locked.slot else {
                             return;
                         };
-                        let current_frame = guest.seated_generation() == generation
-                            && Arc::ptr_eq(&alive, &guest.alive)
-                            && guest.frame_rev == revision
-                            && this.revision == revision;
-                        if !current_frame || guest.inputs.pending() {
+                        // The GUEST has to be the one that asked — a
+                        // replacement or a reseat takes its queue with it.
+                        // The FRAME does not: a live view replaces its frame
+                        // between the press and this deferred run, and each
+                        // command is judged against the tree standing now.
+                        let same_guest = guest.seated_generation() == generation
+                            && Arc::ptr_eq(&alive, &guest.alive);
+                        if !same_guest {
+                            return;
+                        }
+                        if guest.inputs.pending() {
                             cx.notify();
                             return;
                         }
@@ -5862,6 +5883,16 @@ pub(crate) mod tests {
             .expect("native projections");
         guest.pending.clear();
         let root = guest.frame.root.clone().unwrap();
+        // The frame the guest raises while the press is in flight: its own
+        // tick answers the request and redraws the room under it.
+        let later = {
+            let mut later = root.clone();
+            let wire::Node::Linear { children, .. } = &mut later else {
+                unreachable!()
+            };
+            children.push(input("arrived"));
+            later
+        };
         let (view, mut native) =
             native_tree(root.clone(), gpui::size(gpui::px(300.), gpui::px(220.)), cx);
         let (sibling, mut sibling_window) =
@@ -5876,6 +5907,11 @@ pub(crate) mod tests {
                     },
                     &None,
                 );
+                // Every command here is queued against one frame and
+                // performed after the next one landed — the sequence every
+                // press takes, and the one that used to refuse them all.
+                guest.frame.root = Some(later.clone());
+                guest.frame_rev += 1;
                 guest
                     .execute_widget_commands(|command| native_command(&view, &mut native, command));
                 let Some(wire::Event::Response {
@@ -6146,7 +6182,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn widget_requests_validate_scope_payload_budget_and_frame() {
+    fn widget_requests_validate_scope_payload_budget_and_target() {
         let path = staged("pages").expect("actual Pages Wasm is required");
         let mut guest = Guest::load_from("pages", &path).unwrap();
         guest.redraw(&None);
@@ -6199,16 +6235,32 @@ pub(crate) mod tests {
         guest.staged = true;
         guest.frame.cancels = vec![0];
         guest.redraw(&None);
-        assert!(!guest.widget_commands.iter().any(|(id, _, _)| *id == 0));
+        assert!(!guest.widget_commands.iter().any(|(id, _)| *id == 0));
+        // A frame the guest raised under the queued presses keeps their
+        // target mounted, so every one of them still runs.
         guest.frame_rev += 1;
-        guest.execute_widget_commands(|_| panic!("old-frame commands must not touch native state"));
+        let mut performed = 0;
+        guest.execute_widget_commands(|_| {
+            performed += 1;
+            Ok(Vec::new())
+        });
+        assert_eq!(performed, MAX_REQUESTS_PER_TICK - 1, "one id was cancelled");
         assert!(guest.widget_commands.is_empty());
         assert!(
             guest
                 .pending
-                .iter()
-                .all(|event| matches!(event, wire::Event::Response { result: Err(_), .. }))
+                .drain(..)
+                .all(|event| matches!(event, wire::Event::Response { result: Ok(_), .. }))
         );
+        // The target itself leaving is the only thing that drops one.
+        guest.answer(request(1, wire::encode(&command)), &None);
+        guest.frame.root = Some(wire::Node::empty());
+        guest.frame_rev += 1;
+        guest.execute_widget_commands(|_| panic!("a vanished target must not touch native state"));
+        assert!(matches!(
+            guest.pending.pop(),
+            Some(wire::Event::Response { result: Err(error), .. }) if error == "widget target left the tree"
+        ));
     }
 
     /// The workspace the pages view reads for itself, one entry per query

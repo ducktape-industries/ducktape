@@ -831,12 +831,21 @@ impl ViewTree {
                 return Ok(wire::encode(&()));
             }
         }
+        // A toolbar press names a tag, not an edit: it goes to the guest's
+        // binding as an interaction on that field's document, whichever
+        // editor draws it. Neither native editor may decide what a view's
+        // tag means.
+        if let C::EditorAction { tag, .. } = command {
+            let editor_mounted = self.editors.contains_key(target);
+            let Some(store) = editor_mounted.then_some(self.editor_store.as_ref()).flatten() else {
+                return Err("editor action target is not a mounted editor".into());
+            };
+            store.act(target, tag.clone());
+            return Ok(wire::encode(&()));
+        }
         if let Some(editor) = self.editors.get(target) {
             editor.view.widget_command(command, window, cx);
             return Ok(wire::encode(&()));
-        }
-        if matches!(command, C::EditorAction { .. }) {
-            return Err("editor action target is not a mounted editor".into());
         }
         if let Some(picker) = self.pickers.get(target) {
             if matches!(command, C::Focus { .. }) {

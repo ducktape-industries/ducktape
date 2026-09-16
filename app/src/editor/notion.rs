@@ -689,10 +689,6 @@ impl RichWireEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if let wire::WidgetCommand::EditorAction { tag, .. } = command {
-            self.changed(tag.clone(), window, cx);
-            return true;
-        }
         if !matches!(command, wire::WidgetCommand::Focus { .. }) {
             return false;
         }
