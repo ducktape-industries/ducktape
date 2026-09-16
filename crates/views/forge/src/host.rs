@@ -1268,15 +1268,24 @@ async fn merge_pr(
         });
     }
     let merge_oid = built["merge_oid"].as_str().unwrap_or_default().to_owned();
+    let pack = base64::engine::general_purpose::STANDARD
+        .decode(
+            built["pack_b64"]
+                .as_str()
+                .ok_or("merge service returned no pack")?,
+        )
+        .map_err(|error| error.to_string())?;
+    let digest = host::request("blob.put", &pack).await?;
+    let digest = String::from_utf8(digest).map_err(|error| error.to_string())?;
     let message = serde_json::json!({ "merge_pr": {
         "repo": repo,
         "number": number,
         "prev_target_oid": prev_target_oid,
         "expected_source_oid": expected_source_oid,
         "merge_oid": &merge_oid,
-        "pack_digest": built["pack_digest"].as_str().unwrap_or_default(),
+        "pack_digest": &digest,
     }});
-    submit_with_blob(message, built["pack_digest"].as_str()).await?;
+    submit_with_blob(message, Some(&digest)).await?;
     Ok(ActItem {
         kind: "merge".to_owned(),
         merge_oid,

@@ -57,15 +57,11 @@ async fn calculate(
     match build {
         MergeBuild::Conflicts(paths) => Ok(serde_json::json!({"conflicts":paths})),
         MergeBuild::Clean { merge_oid, pack } => {
-            if pack.len() > blobstore::MAX_TRANSFER_BYTES {
-                return Err("merge pack exceeds transfer limit".into());
-            }
-            let pack_digest = state
-                .client
-                .put_blob(pack)
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(serde_json::json!({"merge_oid":merge_oid,"pack_digest":pack_digest}))
+            use base64::Engine as _;
+            // The caller stages these bytes on its submission node. The service's
+            // node need not be the node that accepts the signed operation.
+            Ok(serde_json::json!({"merge_oid":merge_oid,
+                "pack_b64":base64::engine::general_purpose::STANDARD.encode(pack)}))
         }
     }
 }
@@ -232,10 +228,7 @@ mod tests {
 
     #[tokio::test]
     async fn deployed_guest_merge_calls_the_service_and_submits_its_actual_commit() {
-        use axum::{
-            body::{Body, Bytes},
-            http::Request,
-        };
+        use axum::{body::Body, http::Request};
         use base64::Engine as _;
         use ducktape_view_guest::testing::answer;
         use http_body_util::BodyExt as _;
@@ -245,25 +238,9 @@ mod tests {
         let base = mirror_commit(&mirror, None, &[("a", "base"), ("b", "base")]);
         let ours = mirror_commit(&mirror, Some(base), &[("a", "ours"), ("b", "base")]);
         let theirs = mirror_commit(&mirror, Some(base), &[("a", "base"), ("b", "theirs")]);
-        let (packs, mut received) = tokio::sync::mpsc::channel(1);
-        let cas = axum::Router::new().route(
-            "/v1/files/blob",
-            axum::routing::post(move |bytes: Bytes| {
-                let packs = packs.clone();
-                async move {
-                    packs.send(bytes.to_vec()).await.unwrap();
-                    Json(serde_json::json!({"digest":"aa".repeat(32)}))
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            axum::serve(listener, cas).await.unwrap();
-        });
         let app = crate::router(
             crate::Config {
-                node_url: origin,
+                node_url: "http://127.0.0.1:1".into(),
                 node_key: "01".repeat(32),
                 signing_seed: "09".repeat(32),
                 chain_id: "test".into(),
@@ -320,6 +297,13 @@ mod tests {
             request.id,
             &serde_json::to_vec(&reply).unwrap(),
         )]);
+        let upload = frame
+            .requests
+            .iter()
+            .find(|request| request.kind == "blob.put")
+            .unwrap();
+        let pack = upload.payload.clone();
+        let frame = forge_view::tick_native(vec![answer(upload.id, "aa".repeat(32).as_bytes())]);
         let submit = frame
             .requests
             .iter()
@@ -350,11 +334,10 @@ mod tests {
         );
         let odb = mirror.odb().unwrap();
         let mut writer = odb.packwriter().unwrap();
-        std::io::Write::write_all(&mut writer, &received.recv().await.unwrap()).unwrap();
+        std::io::Write::write_all(&mut writer, &pack).unwrap();
         writer.commit().unwrap();
         let commit = mirror.find_commit(merged).unwrap();
         assert_eq!(commit.parent_id(0).unwrap(), ours);
         assert_eq!(commit.parent_id(1).unwrap(), theirs);
-        server.abort();
     }
 }

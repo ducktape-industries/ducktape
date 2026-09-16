@@ -405,8 +405,11 @@ fn a_merge_uses_its_deployed_service_then_submits_the_commit() {
     assert_eq!(ask["ours"], "1111222233334444", "the target tip");
     assert_eq!(ask["theirs"], "aaaabbbbccccdddd", "the source tip");
 
-    let built = serde_json::json!({ "merge_oid": "99998888", "pack_digest": "de".repeat(32) });
+    let built = serde_json::json!({ "merge_oid": "99998888", "pack_b64": "UEFDSw==" });
     drive.tick(vec![answer(build.id, &service_reply(built))]);
+    let upload = request(&drive.frame, "blob.put");
+    assert_eq!(upload.payload, b"PACK");
+    drive.tick(vec![answer(upload.id, "de".repeat(32).as_bytes())]);
     let submit = request(&drive.frame, "op.submit");
     let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
     assert_eq!(op["required_blob"], "de".repeat(32));

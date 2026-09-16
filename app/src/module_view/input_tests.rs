@@ -770,3 +770,175 @@ fn call_panel_renders_staged_wasm_and_routes_native_control_clicks(cx: &mut Test
         assert_eq!(events.borrow_mut().drain(..).collect::<Vec<_>>(), [intent]);
     }
 }
+
+/// Driven by node-bin's real Gateway/Git fixture. Resolve the deployed view;
+/// only service.json is supplied here. Queries, merge and writes use the host.
+#[gpui::test]
+#[ignore = "run with node-bin's compiled_wasm_merge_updates_the_real_forge_branch fixture"]
+fn forge_wasm_merges_through_the_real_service(cx: &mut TestAppContext) {
+    // Real socket replies wake the presenter from the kernel runtime thread.
+    cx.executor().allow_parking();
+    fn has_key(node: &wire::Node, wanted: &str) -> bool {
+        node.key().is_some_and(|key| key.ends_with(wanted))
+            || node.children().iter().any(|child| has_key(child, wanted))
+    }
+    fn until(
+        seat: &Arc<Mutex<Mounted>>,
+        live: &tokio::sync::watch::Sender<()>,
+        ready: impl Fn(&Guest) -> bool,
+    ) {
+        loop {
+            let mut live = live.subscribe();
+            let mut locked = seat.lock().unwrap();
+            let props = locked.props.clone();
+            let Slot::Ready(guest) = &mut locked.slot else {
+                panic!("live Forge guest")
+            };
+            let mut replies = guest.replies.changes();
+            let again = guest.redraw(&props);
+            assert!(guest.fault.is_none(), "{:?}", guest.fault);
+            if guest
+                .frame
+                .root
+                .as_ref()
+                .is_some_and(|root| has_key(root, "forge/error"))
+            {
+                panic!("Forge view refused the request: {:?}", guest.frame.root);
+            }
+            if ready(guest) {
+                return;
+            }
+            drop(locked);
+            if !again {
+                runtime().block_on(async {
+                    tokio::select! {
+                        result = replies.changed() => result.expect("Forge reply event"),
+                        result = live.changed() => result.expect("Forge module event"),
+                    }
+                });
+            }
+        }
+    }
+    let _turn = tests::blocking_connection_turn();
+    let rpc = std::env::var("DUCK_FORGE_RPC").expect("node fixture RPC");
+    let key = std::env::var("DUCK_FORGE_KEY").expect("fixture user key");
+    let account: u64 = std::env::var("DUCK_FORGE_ACCOUNT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    runtime()
+        .block_on(crate::backend::seat_signer(
+            key.into(),
+            zeroize::Zeroizing::new("forge-test-password".into()),
+        ))
+        .unwrap();
+    let client = crate::backend::rpc_client(&rpc).unwrap();
+    connection().lock().unwrap().client = Some(client.clone());
+    let source = runtime()
+        .block_on(crate::backend::view_source::resolve(
+            &client,
+            "forge",
+            None,
+            &mut crate::backend::view_source::Asked::default(),
+        ))
+        .expect("resolve deployed Forge view");
+    let crate::backend::view_source::ViewSource::Ready {
+        hash, component, ..
+    } = source
+    else {
+        panic!("Forge fixture must deploy its view");
+    };
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/views/forge_view.wasm");
+    assert_eq!(
+        component,
+        std::fs::read(path).unwrap(),
+        "fixture deploys current Forge WASM"
+    );
+    let mut guest = Guest::from_bytes("forge", &component, "deployed Forge").unwrap();
+    guest.assets = Arc::new(
+        [(
+            "service.json".into(),
+            serde_json::to_vec(&serde_json::json!({"account":account,"route":"git"})).unwrap(),
+        )]
+        .into(),
+    );
+    let props = Some(
+        forge_view(
+            false,
+            true,
+            "",
+            "",
+            "",
+            "",
+            &rpc,
+            "duck://forge/wasm-merge/1",
+            1,
+        )
+        .props,
+    );
+    let seat = Arc::new(Mutex::new(Mounted {
+        changes: tokio::sync::watch::channel(()).0,
+        slot: Slot::Ready(Box::new(guest)),
+        props,
+        generation: 1,
+        hash: Some(hash),
+        in_flight: false,
+        wanted: None,
+        tasting: None,
+        waiting_since: None,
+        replacement: Replacement::Preserve,
+        retry: None,
+    }));
+    registry().lock().unwrap().insert("forge", seat.clone());
+    struct LivePump(tokio::task::JoinHandle<()>);
+    impl Drop for LivePump {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let (ready, listening) = tokio::sync::oneshot::channel();
+    let origin = rpc.clone();
+    let live = tokio::sync::watch::channel(()).0;
+    let signal = live.clone();
+    let _live = LivePump(runtime().spawn(async move {
+        use futures::StreamExt as _;
+        let mut events = crate::backend::live_events(origin);
+        let mut ready = Some(ready);
+        let mut serial = 0;
+        while let Some(event) = events.next().await {
+            serial = view_live_hit(&event.module, serial);
+            signal.send_replace(());
+            let became_ready = event.kind == crate::LiveKind::Ready;
+            if became_ready && let Some(ready) = ready.take() {
+                let _ = ready.send(());
+            }
+        }
+    }));
+    runtime()
+        .block_on(listening)
+        .expect("real module subscription ready");
+    until(&seat, &live, |guest| {
+        guest
+            .frame
+            .root
+            .as_ref()
+            .is_some_and(|root| has_key(root, "forge/merge"))
+    });
+    cx.update(gpui_kit::init);
+    let window = cx.open_window(gpui::size(gpui::px(1200.), gpui::px(900.)), |_, _| {
+        NativeModuleView::new("forge")
+    });
+    let mut native = VisualTestContext::from_window(window.into(), cx);
+    native.update(|window, cx| window.render_frame(cx));
+    click_before_frame(&mut native, button(&seat, "Merge pull request"));
+    native.update(|window, cx| window.render_frame(cx));
+    native.run_until_parked();
+    until(&seat, &live, |guest| {
+        guest
+            .frame
+            .root
+            .as_ref()
+            .is_some_and(|root| has_key(root, "forge/merged"))
+    });
+    native.update(|window, cx| window.render_frame(cx));
+}

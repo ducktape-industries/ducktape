@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+base64 = "0.22"
 axum = "0.8"
 blobstore.workspace = true
 commonware-codec.workspace = true
@@ -30,4 +31,3 @@ http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 forge-view = { path = "../../crates/views/forge" }
 ducktape-view-guest = { path = "../../crates/views/support/guest" }
-base64 = "0.22"

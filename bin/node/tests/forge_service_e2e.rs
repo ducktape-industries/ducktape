@@ -15,6 +15,7 @@ struct GatewayGit {
     cluster: Cluster,
     browser: String,
     signing_key: PathBuf,
+    account: u64,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     service: Option<std::thread::JoinHandle<()>>,
 }
@@ -177,6 +178,7 @@ impl GatewayGit {
             browser: browser["base"].as_str().unwrap().into(),
             cluster,
             signing_key,
+            account,
             shutdown: Some(shutdown),
             service: Some(service),
         }
@@ -626,5 +628,99 @@ fn git_push_larger_than_post_buffer_uses_the_probe_path(daemon: &GatewayGit) {
         forge_head(daemon, "probed"),
         Some(rev_parse_head(wd)),
         "forge HEAD must equal the pushed commit after a probed push"
+    );
+}
+
+/// Uses the app test binary's native window and compiled Forge WASM against
+/// this fixture's real Gateway, service, blob store and consensus modules.
+#[test]
+#[ignore = "requires DUCK_FORGE_APP_TEST and the staged Forge WASM"]
+fn compiled_wasm_merge_updates_the_real_forge_branch() {
+    use commonware_codec::Encode as _;
+    let app = std::env::var("DUCK_FORGE_APP_TEST").expect("compiled app test executable");
+    let daemon = GatewayGit::start();
+    let work = tempfile::tempdir().unwrap();
+    let wd = work.path();
+    git_ok(wd, &["init"]);
+    commit_file(wd, "base.txt", "base\n", "base");
+    git_ok(
+        wd,
+        &["remote", "add", "ducktape", &daemon.forge_url("wasm-merge")],
+    );
+    git_push_ok(&daemon, wd, &["push", "ducktape", "main"]);
+    git_ok(wd, &["checkout", "-b", "feature"]);
+    commit_file(wd, "feature.txt", "feature\n", "feature");
+    let source = rev_parse_head(wd);
+    git_push_ok(&daemon, wd, &["push", "ducktape", "feature"]);
+    git_ok(wd, &["checkout", "main"]);
+    commit_file(wd, "main.txt", "main\n", "main");
+    let target = rev_parse_head(wd);
+    git_push_ok(&daemon, wd, &["push", "ducktape", "main"]);
+    let owner = ed25519::PrivateKey::from_seed(42);
+    submit_frame(
+        &daemon.cluster,
+        0,
+        &owner,
+        "forge",
+        &forge::encode_msg(&forge::ForgeMsg::OpenPr {
+            repo: "wasm-merge".into(),
+            title: "Merge through the actual view".into(),
+            body: String::new(),
+            source_branch: "feature".into(),
+            target_branch: "main".into(),
+        }),
+    );
+    let query =
+        serde_json::to_vec(&serde_json::json!({"get_item":{"repo":"wasm-merge","number":1}}))
+            .unwrap();
+    daemon
+        .cluster
+        .await_committed(1, "open merge fixture PR", FINALIZE, || {
+            let reply = daemon.cluster.query(1, "forge", &query)?;
+            let item: serde_json::Value = serde_json::from_slice(&reply).ok()?;
+            (item["item"]["state"] == "open").then_some(())
+        });
+    let key_path = work.path().join("view-user.key");
+    let seed: [u8; 32] = owner.encode().as_ref().try_into().unwrap();
+    let sealed = keystore::userkey::seal_user_key(&seed, "forge-test-password").unwrap();
+    keystore::userkey::write_user_key_new(&key_path, &sealed).unwrap();
+    let output = Command::new("timeout")
+        .args([
+            "--kill-after=5s",
+            "120s",
+            &app,
+            "module_view::input_tests::forge_wasm_merges_through_the_real_service",
+            "--ignored",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("DUCK_FORGE_RPC", daemon.cluster.http_base(1))
+        .env("DUCK_FORGE_KEY", &key_path)
+        .env("DUCK_FORGE_ACCOUNT", daemon.account.to_string())
+        .output()
+        .expect("launch native Forge test window");
+    assert!(
+        output.status.success(),
+        "native Forge merge failed: {}",
+        render(&output)
+    );
+    for node in 0..2 {
+        daemon
+            .cluster
+            .await_committed(node, "WASM merge committed", FINALIZE, || {
+                let reply = daemon.cluster.query(node, "forge", &query)?;
+                let item: serde_json::Value = serde_json::from_slice(&reply).ok()?;
+                (item["item"]["state"] == "merged").then_some(())
+            });
+    }
+    let merged = forge_head(&daemon, "wasm-merge").unwrap();
+    assert_ne!(merged, target);
+    assert_ne!(merged, source);
+    git_ok(wd, &["fetch", "ducktape", "main"]);
+    let parents = git_capture(wd, &["show", "-s", "--format=%P", "FETCH_HEAD"]);
+    assert!(parents.status.success(), "{}", render(&parents));
+    assert_eq!(
+        String::from_utf8(parents.stdout).unwrap().trim(),
+        format!("{target} {source}")
     );
 }

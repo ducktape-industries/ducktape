@@ -318,7 +318,8 @@ COMPONENT --view VIEW --assets ROOT --after HEIGHT --config NODE_CONFIG`.
 The account and route must match the installed service and signed Gateway route.
 Missing configuration refuses merge. The view sends `POST /merge` with the repo,
 exact source and target commit IDs, and commit message. The service computes the
-merge against its read-only tenant store, uploads its bounded pack through the
-generic blob store, and returns the merge ID and pack digest (or conflict paths).
-The view then submits `MergePr` under the seated user's authority; the module
+merge against its read-only tenant store and returns the merge ID and base64
+pack bytes (or conflict paths). The view uploads the pack through `blob.put` to
+its submission node, then submits `MergePr` with that digest under the seated
+user's authority; the module
 checks both expected branch heads before committing it.
