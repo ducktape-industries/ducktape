@@ -64,8 +64,8 @@ pub(crate) async fn seated_data_plane_signer(
         signer.key.clone()
     };
     Ok(std::sync::Arc::new(
-        move |method: &str, path: &str, body: &[u8]| {
-            ::node::signed_req::request_headers(&key, method, path, &node_key, body)
+        move |method: &str, path: &str, digest: &[u8; 32]| {
+            ::node::signed_req::request_headers_digest(&key, method, path, &node_key, digest)
                 .into_iter()
                 .map(|(name, value)| (name.to_string(), value))
                 .collect()

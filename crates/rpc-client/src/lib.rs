@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_tungstenite::tungstenite::Message;
 
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
+/// one frame of a streamed blob upload: what this process holds of a file
+/// while it crosses to the node, whatever the file's size.
+const BLOB_UPLOAD_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 4 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(7_500);
@@ -246,12 +249,16 @@ pub struct Client {
     write_auth: Option<WriteAuth>,
 }
 
-/// Signs one mutating request: `(method, path_and_query, body)` in, the
-/// headers that prove possession out. The signing itself lives with the
-/// kernel's frame codec (`node::signed_req::request_headers`); this crate
-/// carries the hook only, and stays free of node internals.
+/// Signs one mutating request: `(method, path_and_query, sha256 of the body)`
+/// in, the headers that prove possession out. The signing itself lives with
+/// the kernel's frame codec (`node::signed_req::request_headers_digest`); this
+/// crate carries the hook only, and stays free of node internals.
+///
+/// The DIGEST rather than the body, because one caller here uploads a file it
+/// never holds: a git push's packfile streams from disk, and the only thing a
+/// signature can bind is what the bytes hash to.
 pub type WriteAuth =
-    std::sync::Arc<dyn Fn(&str, &str, &[u8]) -> Vec<(String, String)> + Send + Sync>;
+    std::sync::Arc<dyn Fn(&str, &str, &[u8; 32]) -> Vec<(String, String)> + Send + Sync>;
 
 /// The header the operator credential travels in — the same one `/v1/admin/*`
 /// takes, because it is the same secret and the same bar ("can read the node's
@@ -368,10 +375,23 @@ impl Client {
         path: &str,
         body: &[u8],
     ) -> reqwest::RequestBuilder {
+        use sha2::Digest as _;
+        self.proven_digest(request, method, path, &sha2::Sha256::digest(body).into())
+    }
+
+    /// the same proof for a body this process never holds — a streamed upload
+    /// hashes as it sends and signs that.
+    fn proven_digest(
+        &self,
+        request: reqwest::RequestBuilder,
+        method: &str,
+        path: &str,
+        digest: &[u8; 32],
+    ) -> reqwest::RequestBuilder {
         let Some(sign) = self.write_auth.as_ref() else {
             return self.credentialed(request);
         };
-        sign(method, path, body)
+        sign(method, path, digest)
             .into_iter()
             .fold(request, |request, (name, value)| {
                 request.header(name, value)
@@ -457,7 +477,11 @@ impl Client {
             .post(self.url(QUERY_READER_PATH.trim_start_matches('/'))?)
             .header("content-type", "application/json")
             .body(body.clone());
-        let response = sign("POST", QUERY_READER_PATH, &body)
+        let digest: [u8; 32] = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(&body).into()
+        };
+        let response = sign("POST", QUERY_READER_PATH, &digest)
             .into_iter()
             .fold(request, |request, (name, value)| request.header(name, value))
             .send()
@@ -554,6 +578,91 @@ impl Client {
             digest: String,
         }
         let reply: Stored = decode_json(response).await?;
+        Ok(reply.digest)
+    }
+
+    /// Land a FILE's bytes — from `offset` to its end — in the node-local blob
+    /// store, streaming.
+    ///
+    /// This is the door a git push takes, so it has no size: the packfile was
+    /// spooled to disk by whoever received it, one frame of it at a time
+    /// crosses to the node, and the node writes it straight back to disk. The
+    /// file is hashed first because the signature binds the digest — two
+    /// sequential reads of a file, and never the file in memory.
+    pub async fn put_blob_file(&self, path: &std::path::Path, offset: u64) -> Result<String> {
+        use sha2::Digest as _;
+        use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+        let open = |offset: u64| async move {
+            let mut file = tokio::fs::File::open(path)
+                .await
+                .map_err(|error| Error::new(format!("RPC blob put failed: {error}")))?;
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(|error| Error::new(format!("RPC blob put failed: {error}")))?;
+            Ok::<tokio::fs::File, Error>(file)
+        };
+
+        let mut hashing = open(offset).await?;
+        let mut hasher = sha2::Sha256::new();
+        let mut total = 0u64;
+        let mut buf = vec![0u8; BLOB_UPLOAD_FRAME_BYTES];
+        loop {
+            let read = hashing
+                .read(&mut buf)
+                .await
+                .map_err(|error| Error::new(format!("RPC blob put failed: {error}")))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buf[..read]);
+            total += read as u64;
+        }
+        let digest: [u8; 32] = hasher.finalize().into();
+
+        let sending = open(offset).await?;
+        let body = futures::stream::unfold(sending, |mut file| async move {
+            let mut buf = vec![0u8; BLOB_UPLOAD_FRAME_BYTES];
+            match file.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(read) => {
+                    buf.truncate(read);
+                    Some((Ok::<Vec<u8>, std::io::Error>(buf), file))
+                }
+                Err(error) => Some((Err(error), file)),
+            }
+        });
+
+        // this client's flat [`TIMEOUT`] is an RPC's budget, and a push is not
+        // an RPC: its duration scales with the history it carries. The budget
+        // here is a floor on THROUGHPUT — 64 KiB/s over the bytes, on top of a
+        // five-minute base — so a big push is allowed to take long and a dead
+        // link still fails.
+        const UPLOAD_FLOOR_BYTES_PER_SEC: u64 = 64 * 1024;
+        let budget = Duration::from_secs(300 + total.div_ceil(UPLOAD_FLOOR_BYTES_PER_SEC));
+        let response = self
+            .proven_digest(
+                self.http.post(self.url("v1/files/blob")?),
+                "POST",
+                "/v1/files/blob",
+                &digest,
+            )
+            .header("content-type", "application/octet-stream")
+            .header("content-length", total)
+            .timeout(budget)
+            .body(reqwest::Body::wrap_stream(body))
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("RPC blob put failed: {error}")))?;
+        #[derive(Deserialize)]
+        struct Stored {
+            digest: String,
+        }
+        let reply: Stored = decode_json(response).await?;
+        let expected: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        if reply.digest != expected {
+            return Err(Error::new("blob receipt digest mismatch"));
+        }
         Ok(reply.digest)
     }
 

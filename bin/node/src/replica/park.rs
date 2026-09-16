@@ -880,10 +880,8 @@ pub(super) async fn park(
     // The relay runtime owns caller holds, Forge pack fanout, and the
     // persisted resident sequence. This loop only supplies current
     // validator targets and consumes unclaimed pump replies.
-    let mut resident_relay = relay_runtime::ResidentRelay::new(
-        storage_for_sync.join("relay-submit-seq"),
-        std::sync::Arc::new(blobs.clone()),
-    );
+    let mut resident_relay =
+        relay_runtime::ResidentRelay::new(storage_for_sync.join("relay-submit-seq"), blobs.clone());
     // bridge the relay lane ONCE, before the park loop: the serve
     // window's select is torn down every 2s tick, and dropping the p2p
     // receiver's actor-backed `recv()` mid-flight could eat a delivered
@@ -2058,7 +2056,9 @@ pub(super) async fn park(
                 pending_cutover_view: None,
             };
         }
-        resident_relay.expire(std::time::Instant::now());
+        // drives the open pack transfers too: a window whose chunks the mesh
+        // dropped only heals when this tick rewinds it.
+        resident_relay.expire(std::time::Instant::now(), &mut relay_tx);
         // a FOLDING replica's window closes per certificate; this
         // poll is only the fallback DETECTION lane now (standing
         // detection pre-ascension; promotion, cutover, and revocation

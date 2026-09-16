@@ -41,7 +41,26 @@ pub fn request_message(
     ts: u64,
     body: &[u8],
 ) -> Vec<u8> {
-    let digest = Sha256::digest(body);
+    request_message_digest(
+        method,
+        path_and_query,
+        node_key,
+        ts,
+        &Sha256::digest(body).into(),
+    )
+}
+
+/// the same canonical bytes when the body's digest is already known and the
+/// body itself is not — a blob upload STREAMS, so the only thing either end
+/// ever holds of it is this hash. Identical bytes to [`request_message`] over
+/// the same body: the signature does not know which way the digest arrived.
+pub fn request_message_digest(
+    method: &str,
+    path_and_query: &str,
+    node_key: &[u8],
+    ts: u64,
+    digest: &[u8; 32],
+) -> Vec<u8> {
     let digest = digest.as_slice();
     let mut m = Vec::with_capacity(method.len() + path_and_query.len() + node_key.len() + 45);
     m.extend_from_slice(method.as_bytes());
@@ -65,9 +84,28 @@ pub fn sign_request(
     ts: u64,
     body: &[u8],
 ) -> ed25519::Signature {
+    sign_request_digest(
+        signer,
+        method,
+        path_and_query,
+        node_key,
+        ts,
+        &Sha256::digest(body).into(),
+    )
+}
+
+/// sign one data-plane request whose body is known only by its digest.
+pub fn sign_request_digest(
+    signer: &ed25519::PrivateKey,
+    method: &str,
+    path_and_query: &str,
+    node_key: &[u8],
+    ts: u64,
+    digest: &[u8; 32],
+) -> ed25519::Signature {
     signer.sign(
         DATA_REQ_NS,
-        &request_message(method, path_and_query, node_key, ts, body),
+        &request_message_digest(method, path_and_query, node_key, ts, digest),
     )
 }
 
@@ -81,8 +119,26 @@ pub fn request_headers(
     node_key: &[u8],
     body: &[u8],
 ) -> [(&'static str, String); 3] {
+    request_headers_digest(
+        signer,
+        method,
+        path_and_query,
+        node_key,
+        &Sha256::digest(body).into(),
+    )
+}
+
+/// the same three headers for a body known only by its digest — what a
+/// streamed upload signs, since it never holds the body to hash twice.
+pub fn request_headers_digest(
+    signer: &ed25519::PrivateKey,
+    method: &str,
+    path_and_query: &str,
+    node_key: &[u8],
+    digest: &[u8; 32],
+) -> [(&'static str, String); 3] {
     let ts = now_secs();
-    let sig = sign_request(signer, method, path_and_query, node_key, ts, body);
+    let sig = sign_request_digest(signer, method, path_and_query, node_key, ts, digest);
     [
         (KEY_HEADER, hex(signer.public_key().as_ref())),
         (TS_HEADER, ts.to_string()),

@@ -116,6 +116,18 @@ pub const FRESHNESS_SECS: u64 = 30;
 /// layers and so cannot read the limit they install.
 const DEFAULT_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
 
+/// how much of a USER-SIGNED blob upload this gate will hold in memory to
+/// verify the signature over it.
+///
+/// This is not a limit on what may be uploaded — the blob route itself takes
+/// an unbounded stream onto disk, and a git push (any size, up to a whole
+/// repository's history) arrives on the operator credential, which returns
+/// before this gate buffers anything. It is the memory an UNAUTHENTICATED
+/// caller can make this node hold while it finds out whether the signature is
+/// any good, and a signature is over bytes, so there is no streaming answer to
+/// that question.
+const SIGNED_BLOB_HASH_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PopError {
     /// a required header is missing or malformed.
@@ -183,6 +195,44 @@ pub(crate) fn from_hex(s: &str) -> Option<Vec<u8>> {
 /// on an ungated route.
 #[derive(Clone, Debug)]
 pub struct SignedBy(pub Vec<u8>);
+
+/// a proof the gate could not check for itself, handed to the handler that
+/// can. ONE lane travels this way — the blob upload, whose body is unbounded
+/// and streams to disk, so the digest the signature binds only exists once the
+/// handler has written every byte. The handler MUST call
+/// [`DeferredProof::verify`] before it publishes anything: a request carrying
+/// this extension has been admitted by nobody yet.
+#[derive(Clone, Debug)]
+pub struct DeferredProof {
+    method: Method,
+    path_and_query: String,
+    headers: HeaderMap,
+}
+
+impl DeferredProof {
+    /// the acting key that signed for a body with this digest, or the refusal
+    /// to answer the caller with.
+    pub fn verify(&self, handle: &NodeHandle, digest: &[u8; 32]) -> Result<Vec<u8>, WriteRefusal> {
+        let Some(node_key) = handle.admin.node_key.clone().filter(|k| !k.is_empty()) else {
+            return Err(WriteRefusal::NodeUnidentified);
+        };
+        let verified = verify_pop(&self.headers, DATA_HEADERS, DATA_REQ_NS, now_secs(), |ts| {
+            node::signed_req::request_message_digest(
+                self.method.as_str(),
+                &self.path_and_query,
+                &node_key,
+                ts,
+                digest,
+            )
+        });
+        verified.map_err(|error| match error {
+            PopError::MissingAuth => WriteRefusal::SignatureMissing,
+            PopError::Stale => WriteRefusal::SignatureStale,
+            PopError::BadKey => WriteRefusal::SignatureMalformed,
+            PopError::BadSig => WriteRefusal::SignatureInvalid,
+        })
+    }
+}
 
 /// which mutating lane a request path belongs to — the ONE discriminant
 /// [`Lane::mutates`] branches on. `Open` is everything else: reads, the
@@ -334,10 +384,14 @@ impl Lane {
     /// the largest body this gate will read in order to hash it.
     ///
     /// Buffering precedes signature verification, so each lane spends only
-    /// the body budget of its underlying endpoint.
+    /// the body budget of its underlying endpoint. A body this gate would
+    /// have to hold is therefore never the same question as how much the
+    /// ROUTE accepts: the blob route takes an unbounded stream, and the
+    /// operator credential — the one a push arrives with — skips this gate
+    /// entirely and streams to the handler.
     fn max_body(self) -> usize {
         match self {
-            Lane::Blob => crate::MAX_BLOB_BODY_BYTES,
+            Lane::Blob => SIGNED_BLOB_HASH_BYTES,
             Lane::RawSubmit => node::MAX_PAYLOAD_BYTES,
             Lane::GatewayOperator => {
                 crate::gateway_http::JSON_LANE_REQUEST_BYTES * 2 + gateway::MAX_PROXY_HEAD_BYTES
@@ -513,9 +567,27 @@ pub(crate) async fn signed_write_guard(
         return next.run(req).await;
     };
     // admitted without touching the body: nothing is signed over it on this
-    // path, so a bounded blob still streams to its handler
-    // instead of buffering in middleware.
+    // path, so a blob still streams to its handler instead of buffering in
+    // middleware.
     if is_operator {
+        return next.run(req).await;
+    }
+    // the blob lane's body is UNBOUNDED and streams to disk, so this gate
+    // cannot hold it to hash it. The proof travels to the handler instead,
+    // which hashes the bytes as they land and admits them only once the
+    // signature binds that digest — nothing is addressable before it does.
+    if matches!(lane, Lane::Blob) {
+        let proof = DeferredProof {
+            method,
+            path_and_query: req
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or(path),
+            headers: req.headers().clone(),
+        };
+        let mut req = req;
+        req.extensions_mut().insert(proof);
         return next.run(req).await;
     }
     let path_and_query = req
@@ -891,7 +963,7 @@ mod tests {
     #[test]
     fn no_lane_buffers_more_than_its_own_route_accepts() {
         let cap = |path: &str| lane_of(path).max_body();
-        assert_eq!(cap("/v1/files/blob"), crate::MAX_BLOB_BODY_BYTES);
+        assert_eq!(cap("/v1/files/blob"), SIGNED_BLOB_HASH_BYTES);
         assert_eq!(cap("/v1/submit"), DEFAULT_JSON_BODY_BYTES);
         assert_eq!(cap("/v1/submit/raw/new-product"), node::MAX_PAYLOAD_BYTES);
         assert_eq!(cap("/v1/fs/workspaces"), DEFAULT_JSON_BODY_BYTES);

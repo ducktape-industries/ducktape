@@ -757,9 +757,11 @@ pub fn router(handle: NodeHandle) -> Router {
         )
         .route(
             "/v1/files/blob",
-            // one receipt per request; the json routes keep axum's (smaller)
-            // default limit.
-            post(put_blob).layer(DefaultBodyLimit::max(MAX_BLOB_BODY_BYTES)),
+            // NO body limit, and the one route that has none: `put_blob`
+            // streams to disk, and the bytes arriving here are a git push's
+            // packfile — capping them caps what anyone may push. The json
+            // routes keep axum's (smaller) default limit.
+            post(put_blob).layer(DefaultBodyLimit::disable()),
         )
         .route("/v1/files/blob/{digest}", get(get_blob))
         // ---- duckfs workspace RPC (the jobs/sandbox seam) ----
@@ -1332,26 +1334,56 @@ async fn limit_blob_uploads(
     next.run(request).await
 }
 
-const MAX_BLOB_BODY_BYTES: usize = blobstore::MAX_TRANSFER_BYTES;
-
 /// POST /v1/files/blob — raw receipt bytes in, `{"digest":"<64-hex>"}` out.
 ///
 /// bytes go straight into the node-local blob store; NOTHING reaches the node
-/// actor and no op is submitted. the route's body limit is
-/// `MAX_BLOB_BODY_BYTES`, and an oversized body is a 413 in the daemon's json
-/// error envelope.
+/// actor and no op is submitted.
+///
+/// THE BODY HAS NO SIZE LIMIT, and streams: it is written to the store's
+/// staging directory frame by frame and named by its own hash once it ends, so
+/// what a caller uploads costs this process one frame of memory and the disk
+/// the bytes occupy. A git push of a whole repository's history arrives here,
+/// and a limit on it would be a limit on what anyone may push.
 async fn put_blob(
     State(handle): State<NodeHandle>,
-    body: Result<Bytes, BytesRejection>,
+    proof: Option<axum::Extension<signed_req::DeferredProof>>,
+    body: axum::body::Body,
 ) -> Response {
-    let bytes = match body {
-        Ok(bytes) => bytes,
-        // the DefaultBodyLimit layer stops reading past the cap and the
-        // extractor rejects with 413 — re-wrap it in the json envelope.
-        Err(rejection) => return error_response(rejection.status(), &rejection.body_text()),
+    use futures::StreamExt as _;
+    let mut ingest = match handle.blobs.ingest() {
+        Ok(ingest) => ingest,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    let digest = handle.blobs.put_chunk(bytes.to_vec());
-    Json(serde_json::json!({ "digest": hex_bytes(&digest) })).into_response()
+    let mut frames = body.into_data_stream();
+    while let Some(frame) = frames.next().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            // the upload died in flight; the ingest's Drop takes its file
+            // with it.
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("body: {e}")),
+        };
+        if let Err(e) = ingest.append(&frame) {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+        }
+    }
+    // name the bytes, THEN admit them: an unsealed ingest is nameless and an
+    // unadmitted one is never published, so a signature that does not bind
+    // these exact bytes leaves nothing behind.
+    let digest = match ingest.seal() {
+        Ok(digest) => digest,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    // no proof extension means the gate admitted the request itself (this
+    // node's operator credential); one means the gate deferred to here.
+    if let Some(axum::Extension(proof)) = proof
+        && let Err(refusal) = proof.verify(&handle, &digest)
+    {
+        return error_response(refusal.status(), refusal.message());
+    }
+    match ingest.publish() {
+        Ok(digest) => Json(serde_json::json!({ "digest": hex_bytes(&digest) })).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
 
 /// GET /v1/files/blob/{digest} — chunk bytes back out of the node-local store.

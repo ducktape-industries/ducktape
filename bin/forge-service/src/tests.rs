@@ -106,6 +106,44 @@ async fn an_unproven_push_is_refused() {
     );
 }
 
+/// THE PUSH DOOR HAS NO CEILING. This body is larger than the whole transfer
+/// limit that used to bound it (95.25 MiB — `127 * 768 KiB`, the relay's old
+/// mailbox-sized cap), and the door does not answer 413: it spools the body to
+/// disk and the push reaches the same proof gate every other push reaches.
+///
+/// A ceiling here is a ceiling on what anyone may push, and a repository's
+/// first push carries its whole history. The refusal below is about the PROOF,
+/// which is the only thing a push is ever refused for.
+#[tokio::test]
+async fn a_push_far_past_the_old_transfer_limit_is_not_refused_for_its_size() {
+    const OLD_TRANSFER_LIMIT: usize = 127 * 768 * 1024;
+    let (_directory, router) = application();
+    let mut body = unsigned_push_body().into_bytes();
+    body.extend(std::iter::repeat_n(0x42, OLD_TRANSFER_LIMIT + 1024 * 1024));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/lab/git-receive-pack")
+        .header(
+            header::CONTENT_TYPE,
+            "application/x-git-receive-pack-request",
+        )
+        .body(Body::from(body))
+        .unwrap();
+    let response = router.oneshot(authenticated(request)).await.unwrap();
+    assert_ne!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a push is never refused for its size"
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let report = String::from_utf8_lossy(&bytes);
+    assert!(
+        report.contains("git push --signed"),
+        "the oversized push reached the proof gate: {report}"
+    );
+}
+
 /// An operator token cannot replace a user certificate at the service boundary.
 #[tokio::test]
 async fn an_operator_token_does_not_authorize_unsigned_pushes() {

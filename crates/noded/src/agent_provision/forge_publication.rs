@@ -117,16 +117,13 @@ fn pack<'a>(
             writeln!(input, "^{previous}").map_err(|error| error.to_string())?;
         }
         drop(input);
-        let output = child.stdout.take().ok_or("pack stdout unavailable")?;
+        // no ceiling on the pack: an agent's branch may be its first, carrying
+        // a whole history, and the blob lane it rides streams.
+        let mut output = child.stdout.take().ok_or("pack stdout unavailable")?;
         let mut bytes = Vec::new();
         output
-            .take(blobstore::MAX_TRANSFER_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|error| error.to_string())?;
-        let oversized = bytes.len() > blobstore::MAX_TRANSFER_BYTES;
-        if oversized {
-            return Err("Git pack exceeds blob transfer limit".into());
-        }
         Ok(bytes)
     })();
     if result.is_err() {

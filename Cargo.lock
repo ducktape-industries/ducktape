@@ -3815,6 +3815,7 @@ dependencies = [
  "flate2",
  "forge",
  "forge-view",
+ "futures",
  "git2",
  "hex",
  "http-body-util",
@@ -3873,6 +3874,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tokio-tungstenite 0.24.0",
 ]

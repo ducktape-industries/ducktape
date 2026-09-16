@@ -122,13 +122,18 @@ pub fn router(config: Config, token: [u8; 64]) -> Result<axum::Router, Box<dyn s
     let auth_signer = signer.clone();
     let node_key = hex::decode(&config.node_key)?;
     let client = ducktape_rpc::Client::new(&config.node_url)?.with_write_auth(Arc::new(
-        move |method, path, body| {
-            node::signed_req::request_headers(&auth_signer, method, path, &node_key, body)
+        move |method, path, digest| {
+            node::signed_req::request_headers_digest(&auth_signer, method, path, &node_key, digest)
                 .into_iter()
                 .map(|(name, value)| (name.to_owned(), value))
                 .collect()
         },
     ));
+    // a push spools to `<git_store>/.incoming/` and its guard deletes the file
+    // on every exit — but a process that was killed mid-push never ran one, so
+    // the directory is cleared at startup. Nothing resumes a spool: a client
+    // whose push died re-sends it.
+    let _ = std::fs::remove_dir_all(config.git_store.join(".incoming"));
     let sequence = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos() as u64;
@@ -155,13 +160,18 @@ pub fn router(config: Config, token: [u8; 64]) -> Result<axum::Router, Box<dyn s
         )
         .route(
             "/{repo}/git-receive-pack",
-            axum::routing::post(git_http::git_receive_pack),
+            // NO body limit: a push is as big as the history it carries, and
+            // `git_receive_pack` spools it to disk rather than sizing itself
+            // to it. A limit here is a limit on what anyone may push.
+            axum::routing::post(git_http::git_receive_pack).layer(DefaultBodyLimit::disable()),
         )
         .route(
             "/{repo}/git-upload-pack",
             axum::routing::post(git_http::git_upload_pack),
         )
-        .layer(DefaultBodyLimit::max(blobstore::MAX_TRANSFER_BYTES))
+        // the default bounds the SMALL bodies — a merge request, a fetch's
+        // want/have negotiation. The push route above opts out.
+        .layer(DefaultBodyLimit::max(git_http::GIT_NEGOTIATION_BODY_LIMIT))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             authenticate,

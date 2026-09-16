@@ -19,12 +19,10 @@
 //! module, the prompt-blob mesh lane) were both deleted after converging on
 //! duckfs. don't start a third.
 
-/// Maximum complete blob admitted to the bounded relay transport. One offer
-/// and at most 127 chunks of 768 KiB fit its 128-message receive backlog.
-pub const MAX_TRANSFER_BYTES: usize = 127 * 768 * 1024;
-
 mod staging;
-pub use staging::{LARGE_BLOB_CACHE_BYTES, STAGING_RESUME_WINDOW, StageError, StagedBlob};
+pub use staging::{
+    IngestBlob, LARGE_BLOB_CACHE_BYTES, STAGING_RESUME_WINDOW, StageError, StagedBlob,
+};
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};

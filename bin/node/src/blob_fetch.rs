@@ -560,17 +560,18 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> SyncClient for ServeLaneBlobC
 /// it costs one `stat` per tick when nothing is outstanding.
 const PACK_SWEEP_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// the largest forge pack this lane will pull — the smart-HTTP push lane's own
-/// body limit (`GIT_PACK_BODY_LIMIT`), because that is the ceiling on a pack
-/// that could legitimately have reached consensus in the first place.
+/// what this lane will pull for a forge pack: WHATEVER THE PUSH CARRIED.
 ///
-/// The bound is load-bearing, not tidiness. A digest here was chosen by whoever
-/// submitted the push; naming an enormous blob some colluding node will serve
-/// would otherwise have every node in the network stage it, every tick, before
-/// the hash check could reject it. Sizing the cap to what a real push can be
-/// — the smart-HTTP door's own ceiling, `blobstore::MAX_TRANSFER_BYTES` — keeps
-/// that to one legitimate pack's worth of disk.
-pub const MAX_FORGE_PACK_BYTES: u64 = blobstore::MAX_TRANSFER_BYTES as u64;
+/// There is no ceiling on a push — a repository's whole history is one push,
+/// and a node that refused to replicate it would leave its own git mirror
+/// permanently behind a head consensus already committed. So this lane's bound
+/// is the same non-bound, and what stands between a node's disk and an
+/// enormous pack is who may push at all (the module's push-cert and ref
+/// gates), not a number here.
+///
+/// The digest is only ever read out of forge's committed catch-up map, so the
+/// bytes being pulled are bytes the validators already accepted at the door.
+const NO_FORGE_PACK_CEILING: u64 = u64::MAX;
 
 /// keep this node's forge substrate healthy, forever: pull the packs forge is
 /// waiting on, then collapse the packs it has piled up.
@@ -666,7 +667,7 @@ async fn sweep_packs_once<C: SyncClient + SourceRotate>(
             client,
             blobs,
             &pending.digest,
-            MAX_FORGE_PACK_BYTES,
+            NO_FORGE_PACK_CEILING,
             crate::constants::BLOB_FETCH_ATTEMPTS,
         )
         .await;
@@ -767,7 +768,7 @@ async fn objects_once<C: SyncClient>(
         SyncResponse::Error(e) => return Err(SyncError::Server(e).into()),
         other => return Err(SyncError::UnexpectedResponse(other.kind_name()).into()),
     };
-    fetch_once(client, blobs, &digest, MAX_FORGE_PACK_BYTES).await?;
+    fetch_once(client, blobs, &digest, NO_FORGE_PACK_CEILING).await?;
     let Some(pack) = blobs.get_chunk(&digest) else {
         return Err(BlobFetchError::Miss);
     };
