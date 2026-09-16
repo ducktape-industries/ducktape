@@ -108,51 +108,6 @@ pub fn channel_switch_facts(
     }
 }
 
-/// THE COMPOSER'S INSTANCE KEY (ducktape-ui#697). One retained
-/// `ChatComposer` per room, so a draft never rides a room switch — and the
-/// ENDPOINT is in the key because a channel id is a user-chosen string:
-/// network A's `#general` and network B's `#general` are two rooms, and the
-/// park store this replaced had to be emptied by hand on every network switch
-/// to keep one from handing its words to the other.
-pub fn composer_scope(endpoint: &str, channel_id: &str) -> String {
-    format!("{endpoint}\u{1f}{channel_id}")
-}
-
-/// Whether a submitted body may be posted, decided ONCE at delivery from
-/// state that may have moved since the composer's frame drew its gate.
-///
-/// It is a verdict and not a bool because the two answers do different work:
-/// an admitted body starts a send, a refused one goes back to the composer
-/// it came from. One discriminant, one `match`, each arm ending in its own
-/// task — a boolean would have to be read twice, and the second read is
-/// where a `return if` swallows the words.
-///
-/// `scope` is the box the body was written in and `current` the box the
-/// screen would post from now: a submit queued before the reader moved —
-/// another room, another item, another network — is refused, and the arm
-/// hands it back to the box it came from rather than posting it here.
-pub fn submit_verdict(
-    busy: bool,
-    connected: bool,
-    channel: String,
-    refusal: String,
-    seated: bool,
-    scope: String,
-    current: String,
-) -> crate::SubmitVerdict {
-    let refused = busy
-        || !connected
-        || channel.is_empty()
-        || !refusal.is_empty()
-        || !seated
-        || scope != current;
-    if refused {
-        crate::SubmitVerdict::Refused
-    } else {
-        crate::SubmitVerdict::Admitted
-    }
-}
-
 pub(crate) struct Tip {
     pub(crate) height: i64,
     pub(crate) status: String,

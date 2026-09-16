@@ -11,32 +11,6 @@ use crate::ShellTab;
 
 mod docs;
 
-/// The delivery verdict refuses a body written in another box — the same
-/// room on another network, or another room — beside its live gates.
-#[test]
-fn a_submit_from_another_box_is_refused_at_delivery() {
-    let here = composer_scope("http://node", "general");
-    let verdict = |scope: &str| {
-        submit_verdict(
-            false,
-            true,
-            "general".into(),
-            String::new(),
-            true,
-            scope.into(),
-            here.clone(),
-        )
-    };
-    assert!(matches!(verdict(&here), crate::SubmitVerdict::Admitted));
-    assert!(matches!(
-        verdict(&composer_scope("http://other", "general")),
-        crate::SubmitVerdict::Refused
-    ));
-    assert!(matches!(
-        verdict(&composer_scope("http://node", "ops")),
-        crate::SubmitVerdict::Refused
-    ));
-}
 mod messages;
 mod repos;
 mod shell;
