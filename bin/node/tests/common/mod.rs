@@ -540,8 +540,8 @@ impl Drop for Cluster {
     /// ~45 MB rooted in a tempdir about to vanish, and reaped only when a
     /// SUCCESSOR booted on the same root, which a torn-down cluster never gets
     /// (102 of them, ~4.5 GB, were once swept by hand). A run's VMM is a child
-    /// of its daemon spawned `kill_on_drop`, so the SIGKILL that ends the
-    /// daemon ends its guests too.
+    /// of its daemon, armed with a parent-death signal, so the SIGKILL that
+    /// ends the daemon ends its guests too.
     fn drop(&mut self) {
         for daemon in &mut self.daemons {
             *daemon = None; // NodeProc::drop kills + waits
