@@ -9,8 +9,10 @@
 
 CARGO ?= cargo
 # every build/test recipe resolves against the COMMITTED lock: a guest's wasm
-# bytes are pinned by GENESIS_ROOT_HASH, so a silent re-resolution between two
-# operators moves the genesis hash with no source change.
+# bytes reach the descriptor's module table, so a silent re-resolution between
+# two operators founds a DIFFERENT network from the same source — the genesis
+# fingerprint covers every `id=code_hash` line, and a member built against the
+# other resolution cannot handshake.
 LOCKED ?= --locked
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)

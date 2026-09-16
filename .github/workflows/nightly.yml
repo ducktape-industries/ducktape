@@ -32,8 +32,8 @@ jobs:
   #   - `views-repro-check`: the bundle rebuilds byte-identical from an
   #     isolated archive, with no builder-local path inside it
   #   - `simnode`: every scenario, booting the 15-module `topology::SIM_BASE`
-  #     genesis. `topology_set.rs`'s `DEFAULT_GENESIS_ROOT_HASH` pins the
-  #     sim's genesis composition and this is the only place it runs.
+  #     genesis. `topology_set.rs` pins the sim's composed module set against
+  #     the topology selection and this is the only place it runs.
   #     DUCKTAPE_WASM_CACHE_DIR turns on wasmtime's compilation cache
   #     (`simnode::boot` calls `wasm_host::enable_compilation_cache`) so the
   #     test binaries compile the shared genesis once instead of once each;
@@ -41,7 +41,8 @@ jobs:
   #     under `target/` so rust-cache persists it.
   #   - `ducktape-app`: its unit tests mount the staged views in
   #     `module_view`; and the rpc client's blob round-trip
-  #   - `host_state`: the network genesis root-hash pin
+  #   - `host_state`: the production genesis composes `topology::PRODUCTION`
+  #     and every module in it runs as wasm
   views-and-node:
     runs-on: ubuntu-latest
     timeout-minutes: 180
