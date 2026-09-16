@@ -313,7 +313,13 @@ pub fn checkout_with(
                 if !link_stays_inside(dir, &disk, Path::new(&target)) {
                     return Err(CheckoutError::EscapingLink(entry.path.clone()));
                 }
-                // resumable: remove an existing entry before re-linking.
+                // a destination of the WRONG kind goes first, by the same rule
+                // the File and Dir arms use — upstream replacing a directory
+                // with a link is an ordinary tree put, and `remove_file` on a
+                // directory is "Is a directory", not a transition.
+                clear_wrong_kind(&disk, EntryKind::Symlink)?;
+                // resumable: a link already there is replaced, since
+                // `symlink(2)` refuses to overwrite.
                 if disk.symlink_metadata().is_ok() {
                     std::fs::remove_file(&disk).map_err(io)?;
                 }
