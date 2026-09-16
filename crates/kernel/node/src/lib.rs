@@ -2348,14 +2348,6 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         &mut self.orderer
     }
 
-    /// borrow the sink mutably AND the host immutably in one call — the
-    /// replica's self-checkpoint at promotion captures the live host through
-    /// the very journal the node owns as its sink, and two separate
-    /// accessors cannot borrow both at once.
-    pub fn sink_and_host(&mut self) -> (&mut S, &Host) {
-        (&mut self.sink, &self.host)
-    }
-
     /// Readiness preflight against the running module's retained state shape.
     pub fn check_module_replacement(&mut self, id: &str, bytes: &[u8]) -> Result<(), sdk::Error> {
         self.host.check_module_replacement(id, bytes)
