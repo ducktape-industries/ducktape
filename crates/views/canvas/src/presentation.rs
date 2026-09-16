@@ -1312,16 +1312,17 @@ impl BoardsView {
         // The column does not depend on the words, so both sides wrap in the
         // same place by construction and neither can drift.
         //
-        // A connector has no column to share: its plate IS the room it was
-        // given, and the box is the only thing centring the words on the line.
-        // Handed the whole room it would write them from the room's left edge
-        // and throw them a hundred units across the board.
+        // A connector shares it too. Its plate IS the room it was given, which
+        // is what `column` answers for a path, and the box took the MEASUREMENT
+        // instead for as long as the two questions this box answers were read
+        // as one: the words are centred on the line by where the box STARTS,
+        // never by how wide it is. A box sized to the words was a field forty
+        // pixels wide against a plate that wrapped at a hundred and seventy-six
+        // — the padding subtracted once by the plate and again by the pin — so
+        // a single word re-wrapped the moment you clicked into it.
         // …plus the strip the field keeps for its caret, so that what is left
         // to wrap in is the column itself and not the column less the reserve.
-        let width = match middling(kind) {
-            true => column(kind, room[0], &letters, self.zoom) + WRAP_RESERVE,
-            false => wide.max(1.),
-        };
+        let width = column(kind, room[0], &letters, self.zoom) + WRAP_RESERVE;
         // It is the WORDS that are set against the card, not the box around
         // them: the box carries a margin the painter's block does not, and
         // aligning the box would spend that margin pushing the words off the
@@ -1333,12 +1334,26 @@ impl BoardsView {
                 Align::Middle => (slack / 2.).max(0.),
                 Align::End => slack.max(0.),
             };
-        // A connector's plate is centred on the run by the room it is given, so
-        // its top is already the top of the plate.
-        let Some(tall) = inline.grown.filter(|_| middling(kind)) else {
+        // A connector's plate is centred in the room the same way, so it takes
+        // the same drop: the plate hugs the words and the room is the widest
+        // label a line may carry, so its top is the top of the ROOM only while
+        // the words fill it. Left out of this, a label sat a few pixels above
+        // the plate that replaced it.
+        let Some(tall) = inline.grown else {
             return ([x, pos[1]], [width, room[1]]);
         };
-        let down = ((room[1] - tall * self.zoom) / 2.).max(0.);
+        // A card's box is DRAWN, so its words never start above it however many
+        // of them there are — the card grows to hold them instead. A plate is
+        // not drawn until it is saved and it only floats over the run, so a
+        // label too tall for the room it was allowed still centres on the line
+        // and hangs off both ends. Clamping it to the room's top is what left a
+        // two-line label three pixels above the plate it became.
+        let floats = !middling(kind);
+        let room_to_spare = (room[1] - tall * self.zoom) / 2.;
+        let down = match floats {
+            true => room_to_spare,
+            false => room_to_spare.max(0.),
+        };
         ([x, pos[1] + down], [width, room[1] - down])
     }
     /// The box a text shape's words have come to, in board units: the words
