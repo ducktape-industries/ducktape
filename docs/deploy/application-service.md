@@ -172,12 +172,25 @@ executor. It runs the actual terminal executable through inherited-listener
 activation, readiness notification, token replacement, and signal shutdown.
 It does not boot an interactive guest session or install systemd units.
 
-The terminal service accepts `POST /sessions` with `agent` and optional `cpu`
-and `mem_gb` fields. The request must carry a Gateway-attested operator whose
-calling node equals the service's configured `identity`. It creates a local
-single-user terminal and returns `session_id` after the executor starts. The
-same node operator owns attachment input, resize, and close commands. Provider
-startup failures return an error instead of a session receipt.
+The terminal service accepts `POST /sessions` with `agent` and optional `cpu`,
+`mem_gb`, and `cred` fields. Requests must carry a Gateway-attested node operator.
+Without `cred`, the calling node must equal the service's configured `identity`.
+With `cred`, the service reads `work-admit.toml` from its configured `workspace`
+on each request: the local node is admitted, and a remote node requires `anyone`.
+Account lists do not admit peer nodes. An unreadable policy refuses the request.
+The service needs read access to that workspace through an installer read-only
+mount. Mount the directory, not only the policy file: the node replaces that
+file atomically, and a file bind mount would retain the old inode.
+The configured `node_api` supplies committed Gateway credential metadata; the
+credential lender retains its existing grant checks. The service receives no
+client-supplied credential secret.
+
+Creation returns `session_id` after the single-user executor starts. The calling
+node operator owns attachment input, resize, and close commands. Provider startup
+failures return an error instead of a session receipt. The terminal executable's
+`application.json` includes absolute `workspace`, the `node_api` HTTP origin,
+public `identity`, route `account` and `label`, and absolute `capabilities`,
+`kernel`, `rootfs`, and `executors` paths.
 
 Terminal attachments use `/sessions/{session}?after=<output-seq>&after_command=<chat-seq>`.
 Both cursors default to zero. Replay metadata gives `first`, `head`,

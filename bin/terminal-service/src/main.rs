@@ -103,6 +103,8 @@ fn notify_ready() -> std::io::Result<()> {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
+    workspace: PathBuf,
+    node_api: String,
     account: u64,
     label: String,
     // Public execution identity, used for provider labels; never a private key.
@@ -135,6 +137,7 @@ async fn main() -> Result<(), Error> {
         PathBuf::from(std::env::var_os("STATE_DIRECTORY").ok_or("missing state directory")?);
     let paths_absolute = [
         &state,
+        &config.workspace,
         &config.capabilities,
         &config.kernel,
         &config.rootfs,
@@ -170,9 +173,13 @@ async fn main() -> Result<(), Error> {
         driver,
         serve(
             listener,
-            config.identity,
-            config.account,
-            config.label,
+            ducktape_terminal::http::Route {
+                node: config.identity,
+                account: config.account,
+                label: config.label,
+                workspace: config.workspace,
+                node_api: config.node_api,
+            },
             token,
             runtime,
         ),
@@ -206,9 +213,7 @@ async fn supervise(
 #[cfg(unix)]
 async fn serve(
     listener: tokio::net::TcpListener,
-    node: [u8; 32],
-    account: u64,
-    label: String,
+    route: ducktape_terminal::http::Route,
     token: [u8; 64],
     runtime: ducktape_terminal::runtime::Runtime,
 ) -> Result<(), Error> {
@@ -218,15 +223,7 @@ async fn serve(
     // as it observes readiness without bypassing PTY cleanup.
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
-    let router = ducktape_terminal::http::router(
-        ducktape_terminal::http::Route {
-            node,
-            account,
-            label,
-        },
-        token,
-        runtime,
-    )?;
+    let router = ducktape_terminal::http::router(route, token, runtime)?;
     let server = axum::serve(listener, router).into_future();
     tokio::pin!(server);
     notify_ready()?;
@@ -241,9 +238,7 @@ async fn serve(
 #[cfg(not(unix))]
 async fn serve(
     _: tokio::net::TcpListener,
-    _: [u8; 32],
-    _: u64,
-    _: String,
+    _: ducktape_terminal::http::Route,
     _: [u8; 64],
     _: ducktape_terminal::runtime::Runtime,
 ) -> Result<(), Error> {

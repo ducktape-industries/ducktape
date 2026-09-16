@@ -345,6 +345,8 @@ async fn shared_commands_are_ordered_deduplicated_and_do_not_accept_raw_input() 
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
     let app = ducktape_terminal::http::router(
         ducktape_terminal::http::Route {
+            workspace: directory.path().into(),
+            node_api: "http://127.0.0.1:1".into(),
             node: [1; 32],
             account: 7,
             label: "terminal".into(),

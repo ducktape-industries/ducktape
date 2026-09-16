@@ -19,6 +19,7 @@ fn unusable_sandbox_exits_without_announcing_readiness() {
     let absent = directory.path().join("absent");
     let config = serde_json::json!({
         "account":7, "label":"terminal", "identity":vec![1;32],
+        "workspace":directory.path(), "node_api":"http://127.0.0.1:1",
         "capabilities":absent, "kernel":absent, "rootfs":absent,
         "executors":absent
     });
@@ -90,6 +91,7 @@ async fn production_process_readiness_signal_shutdown_and_replacement() {
     let notify = tokio::net::UnixDatagram::bind(&notify_path).unwrap();
     let config = serde_json::json!({
         "account":7, "label":"terminal", "identity":vec![1;32],
+        "workspace":directory.path(), "node_api":"http://127.0.0.1:1",
         "capabilities":directory.path().join("capabilities"),
         "kernel":guest.join("vmlinux"), "rootfs":guest.join("rootfs.ext4"),
         "executors":executors

@@ -14,6 +14,8 @@ async fn session_upgrade_requires_the_installed_gateway_route_and_caller() {
     );
     let app = router(
         Route {
+            workspace: directory.path().into(),
+            node_api: "http://127.0.0.1:1".into(),
             node: [1; 32],
             account: 7,
             label: "terminal".into(),
@@ -142,6 +144,8 @@ async fn gateway_attachment_replays_after_disconnect_and_explicit_close_ends_the
         .unwrap();
     let app = router(
         Route {
+            workspace: directory.path().into(),
+            node_api: "http://127.0.0.1:1".into(),
             node: [1; 32],
             account: 7,
             label: "terminal".into(),
@@ -266,6 +270,8 @@ async fn local_operator_creates_and_drives_a_service_owned_session() {
     let (runtime, driver) = Runtime::start(providers(), "test".into(), directory.path().into());
     let app = router(
         Route {
+            workspace: directory.path().into(),
+            node_api: "http://127.0.0.1:1".into(),
             node: [1; 32],
             account: 7,
             label: "terminal".into(),
@@ -286,7 +292,7 @@ async fn local_operator_creates_and_drives_a_service_owned_session() {
     let url = format!("http://{address}/sessions");
     for (name, value, status) in [
         ("x-duck-upstream-token", "b".repeat(64), 401),
-        ("x-duck-caller-node", "02".repeat(32), 403),
+        ("x-duck-caller-node", "02".repeat(32), 400),
         ("x-duck-caller-operator", "false".into(), 401),
     ] {
         let mut denied = headers.clone();
@@ -382,4 +388,115 @@ async fn local_operator_creates_and_drives_a_service_owned_session() {
     driver.await.unwrap().unwrap();
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn remote_create_rereads_work_policy_before_resolving_credentials() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use provider_host::work_admission::{self, WorkAdmission};
+    let reads = Arc::new(AtomicUsize::new(0));
+    let observed = reads.clone();
+    let api = axum::Router::new().route(
+        "/v1/query",
+        axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+            let observed = observed.clone();
+            async move {
+                assert_eq!(body["target"], "gateway");
+                observed.fetch_add(1, Ordering::SeqCst);
+                let query =
+                    gateway::decode_query(&serde_json::to_vec(&body["query"]).unwrap()).unwrap();
+                let reply = match query {
+                    gateway::GatewayQuery::Credential { name } => {
+                        assert_eq!(name, "remote");
+                        gateway::GatewayReply::Credential(Some(gateway::CredentialRecord {
+                            name,
+                            owner_account: 9,
+                            publisher_node: vec![1; 32],
+                            kind: gateway::CredentialKind::Codex,
+                            seal_pk: [3; 32],
+                            grants: Default::default(),
+                        }))
+                    }
+                    gateway::GatewayQuery::Registrations { from: 0, .. } => {
+                        gateway::GatewayReply::Registrations(vec![gateway::HandleRegistration {
+                            account_id: 9,
+                            handle: "lender".into(),
+                        }])
+                    }
+                    _ => panic!("unexpected credential query"),
+                };
+                axum::Json(serde_json::from_slice::<Value>(&gateway::encode_reply(&reply)).unwrap())
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_api = format!("http://{}", listener.local_addr().unwrap());
+    let api_server = tokio::spawn(async move {
+        axum::serve(listener, api).await.unwrap();
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, driver) = Runtime::start(providers(), "test".into(), directory.path().into());
+    let app = router(
+        Route {
+            workspace: directory.path().into(),
+            node_api,
+            node: [1; 32],
+            account: 7,
+            label: "terminal".into(),
+        },
+        [b'a'; 64],
+        runtime.clone(),
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut headers = request(address, 0).headers().clone();
+    headers.remove("x-duck-caller-account");
+    headers.insert("x-duck-caller-operator", "true".parse().unwrap());
+    headers.insert("x-duck-caller-node", "02".repeat(32).parse().unwrap());
+    let client = reqwest::Client::new();
+    let create = || {
+        client
+            .post(format!("http://{address}/sessions"))
+            .headers(headers.clone())
+            .json(&json!({"agent":"echo", "cred":"remote"}))
+    };
+    assert_eq!(create().send().await.unwrap().status(), 403);
+    work_admission::save(
+        directory.path(),
+        &WorkAdmission::Accounts([7].into_iter().collect()),
+    )
+    .unwrap();
+    assert_eq!(create().send().await.unwrap().status(), 403);
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    work_admission::save(directory.path(), &WorkAdmission::Anyone).unwrap();
+    let response = create().send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let reply: Value = response.json().await.unwrap();
+    let session = reply["session_id"].as_str().unwrap();
+    assert!(
+        !runtime
+            .replay(session.into(), Caller::Operator { node: [2; 32] }, 0, 0)
+            .await
+            .unwrap()
+            .ended
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    work_admission::save(directory.path(), &WorkAdmission::default()).unwrap();
+    assert_eq!(create().send().await.unwrap().status(), 403);
+    std::fs::write(work_admission::policy_path(directory.path()), "admit = 3").unwrap();
+    assert_eq!(create().send().await.unwrap().status(), 503);
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    runtime.stop().await.unwrap();
+    driver.await.unwrap().unwrap();
+    server.abort();
+    api_server.abort();
+    let _ = server.await;
+    let _ = api_server.await;
 }

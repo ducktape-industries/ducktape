@@ -505,8 +505,9 @@ fn the_submit_lane_still_resigns_with_the_node_key() {
         code.contains("origin: _,"),
         "the validator submit lane must IGNORE the caller's claimed origin"
     );
+    let compact: String = code.chars().filter(|character| !character.is_whitespace()).collect();
     assert!(
-        code.contains("node::encode_frame(&self.signer,"),
+        compact.contains("node::encode_frame_with_blob(&self.signer,"),
         "the validator submit lane must re-sign with this node's own signer"
     );
 }

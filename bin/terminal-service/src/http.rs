@@ -22,6 +22,8 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, watch};
 
 pub struct Route {
+    pub workspace: std::path::PathBuf,
+    pub node_api: String,
     pub node: [u8; 32],
     pub account: u64,
     pub label: String,
@@ -92,6 +94,7 @@ fn caller(headers: &HeaderMap, token: &[u8; 64], config: &Route) -> Option<Calle
 #[serde(deny_unknown_fields)]
 struct Create {
     agent: String,
+    cred: Option<String>,
     cpu: Option<u64>,
     mem_gb: Option<u64>,
 }
@@ -104,15 +107,57 @@ async fn create(
     let refuse = |status, error: &str| (status, Json(json!({"error":error})));
     let owner = caller(&headers, &service.token, &service.route)
         .ok_or_else(|| refuse(StatusCode::UNAUTHORIZED, "invalid_gateway_caller"))?;
-    let local_operator = owner
-        == Caller::Operator {
-            node: service.route.node,
-        };
-    if !local_operator {
-        return Err(refuse(StatusCode::FORBIDDEN, "not_local_operator"));
-    }
+    let Caller::Operator { node } = owner else {
+        return Err(refuse(StatusCode::FORBIDDEN, "not_operator"));
+    };
+    let local = node == service.route.node;
+    let (credential, limits) = match request.cred.as_deref() {
+        None if local => (
+            None,
+            crate::credential::build_limits(request.cpu, request.mem_gb),
+        ),
+        None => {
+            return Err(refuse(
+                StatusCode::BAD_REQUEST,
+                "remote_credential_required",
+            ));
+        }
+        Some(name) => {
+            let policy = provider_host::work_admission::load(&service.route.workspace)
+                .map_err(|_| refuse(StatusCode::SERVICE_UNAVAILABLE, "work_policy_unreadable"))?;
+            let admitted =
+                local || matches!(policy, provider_host::work_admission::WorkAdmission::Anyone);
+            if !admitted {
+                return Err(refuse(StatusCode::FORBIDDEN, "work_not_admitted"));
+            }
+            let client = ducktape_rpc::Client::new(&service.route.node_api)
+                .map_err(|_| refuse(StatusCode::SERVICE_UNAVAILABLE, "invalid_node_api"))?;
+            let resolved = crate::credential::resolve(
+                &request.agent,
+                name,
+                request.cpu,
+                request.mem_gb,
+                true,
+                service.route.node_api.clone(),
+                |bytes| {
+                    let client = &client;
+                    async move {
+                        let query: Value =
+                            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+                        let reply: Value = client
+                            .query("gateway", &query)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        serde_json::to_vec(&reply).map_err(|error| error.to_string())
+                    }
+                },
+            )
+            .await
+            .map_err(|(reason, _)| refuse(StatusCode::SERVICE_UNAVAILABLE, reason))?;
+            (Some(resolved.credential), resolved.limits)
+        }
+    };
     let session = format!("{:016x}", rand::random::<u64>());
-    let limits = crate::credential::build_limits(request.cpu, request.mem_gb);
     service
         .runtime
         .create(
@@ -123,7 +168,7 @@ async fn create(
                 provider: request.agent,
                 restricted: false,
                 limits,
-                credential: None,
+                credential,
             },
         )
         .await
@@ -284,6 +329,8 @@ mod tests {
     #[test]
     fn operator_identity_requires_the_installed_gateway_attestation() {
         let route = Route {
+            workspace: "/unused".into(),
+            node_api: "http://127.0.0.1:1".into(),
             node: [1; 32],
             account: 7,
             label: "terminal".into(),

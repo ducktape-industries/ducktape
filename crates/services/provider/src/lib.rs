@@ -46,6 +46,8 @@
 //! a run's whole continuity is its prompt envelope, which is what lets any
 //! assignee execute it.
 
+pub mod work_admission;
+
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
