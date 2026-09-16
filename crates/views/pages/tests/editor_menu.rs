@@ -103,7 +103,7 @@ fn menu_lifecycle_filters_at_byte_columns_and_closes_on_caret_movement() {
     let slash = doc("Title\n한글 /", 1, 8);
     let mut state = menu::Menu::default();
     state.after_edit(&slash, Some('/'));
-    assert_eq!(state.current(&slash).unwrap().items.len(), 14);
+    assert_eq!(state.current(&slash).unwrap().items.len(), 15);
     let filter = doc("Title\n한글 /h", 1, 9);
     state.after_edit(&filter, None);
     let view = state.current(&filter).unwrap();
@@ -115,6 +115,30 @@ fn menu_lifecycle_filters_at_byte_columns_and_closes_on_caret_movement() {
     state.after_edit(&slash, Some('/'));
     state.after_edit(&doc("Title\n한글 /hz", 1, 10), None);
     assert!(state.current(&filter).is_none());
+}
+
+/// A picture is picked from the palette like a block turn, but it is neither
+/// a turn nor a trigger: the words that asked for it go, the line is left
+/// empty for the picture, and the pick tells the view which line waits for
+/// the file the host is about to offer.
+#[test]
+fn a_picture_pick_clears_its_line_and_asks_the_view_for_a_file() {
+    let slash = doc("Title\nnotes /image", 1, 12);
+    let mut state = menu::Menu::default();
+    state.after_edit(&doc("Title\nnotes /", 1, 7), Some('/'));
+    state.after_edit(&slash, None);
+    assert_eq!(tags(&state.current(&slash).unwrap()), vec![menu::PICTURE]);
+    assert_eq!(
+        state.intent(&slash, menu::PICTURE).picture_line,
+        Some(1),
+        "the view opens the picker for this line"
+    );
+    let (decision, closed) = state.pick(&slash, menu::PICTURE);
+    assert_eq!(apply(&slash, decision), doc("Title\nnotes ", 1, 6));
+    assert!(
+        closed.current(&slash).is_none(),
+        "the palette closes behind the pick"
+    );
 }
 
 fn tags(view: &menu::MenuView) -> Vec<&str> {
@@ -339,7 +363,7 @@ fn menu_lifecycle_plans_do_not_change_the_current_menu_before_commit() {
     let (decision, opened) = state.plus(&before, 2);
     assert!(state.current(&before).is_none());
     let after = apply(&before, decision);
-    assert_eq!(opened.current(&after).unwrap().items.len(), 14);
+    assert_eq!(opened.current(&after).unwrap().items.len(), 15);
     let (decision, closed) = opened.pick(&after, "h1");
     assert!(
         opened.current(&after).is_some(),

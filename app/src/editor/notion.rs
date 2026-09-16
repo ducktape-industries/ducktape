@@ -2,17 +2,21 @@
 //! Block snapshots and toolbar tags cross the wire without interpreting the
 //! application's canonical document format.
 use super::EditorStore;
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, EventEmitter, Focusable as _,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, canvas, div, px,
+    InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Pixels, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription,
+    Window, canvas, div, img, px,
 };
 use gpui_notion::NotionEditor;
 use gpui_notion::editor::input_rules::InputRuleMode;
 use gpui_notion::editor::comments::{AnnotationMode, AnnotationRequested};
-use gpui_notion::editor::block::{BlockAttrs, BlockContent};
+use gpui_notion::editor::block::{
+    BlockAttrs, BlockCaps, BlockContent, BlockContext, BlockLayout, BlockRegistry, BlockSpec, types,
+};
 use gpui_notion::editor::mark::{HighlightColor, Mark, MarkKind, MarkList, TextColor};
-use gpui_notion::editor::theme::ActiveEditorTheme as _;
+use gpui_notion::editor::theme::{ActiveEditorTheme as _, EditorTheme};
 use gpui_notion::editor::toolbar::{ToolbarAction, ToolbarItem};
 use gpui_notion::editor::slash::{ApplicationMenu, ApplicationMenuAnchor, MenuAction};
 use gpui_notion::editor::view::{Caret, DocumentChanged, LinkPressed, SelectionChanged};
@@ -32,6 +36,117 @@ pub fn init(cx: &mut App) {
         theme.page_padding = theme.gutter_controls_width;
         theme.page_bottom = theme.rem * 4.;
     });
+    // Over the library's own image block, which draws its `src` with `img` —
+    // and no image loader can fetch a `duck://` address.
+    BlockRegistry::register(cx, DocumentImage);
+}
+
+/// How tall a picture may draw. A page is read top to bottom, so a portrait
+/// photo that filled the window would push the next paragraph off the screen.
+const PICTURE_HEIGHT: Pixels = px(480.);
+
+/// The document's image block: gpui-notion's, with the one change that a
+/// `duck://files/…` address draws from the host picture store. A picture in a
+/// page is a file on the network, not on the writer's disk — the guest puts
+/// it there and then asks `picture.load` for every address its page names, so
+/// what this draws is already decoded.
+struct DocumentImage;
+
+impl BlockSpec for DocumentImage {
+    fn type_name(&self) -> &'static str {
+        types::IMAGE
+    }
+
+    fn label(&self, _: &BlockAttrs) -> SharedString {
+        "Image".into()
+    }
+
+    fn caps(&self) -> BlockCaps {
+        BlockCaps::atom()
+    }
+
+    fn layout(&self, _: &BlockAttrs, theme: &EditorTheme) -> BlockLayout {
+        BlockLayout {
+            margin_top: theme.section_gap,
+            margin_bottom: theme.section_gap,
+            ..BlockLayout::new(theme)
+        }
+    }
+
+    fn render_body(&self, ctx: &BlockContext, _: &mut Window, cx: &mut App) -> Option<AnyElement> {
+        let framed = |picture: AnyElement| {
+            let frame = div().w_full();
+            let frame = match ctx.selected {
+                true => frame.border_2().border_color(cx.theme().primary),
+                false => frame,
+            };
+            frame.child(picture).into_any_element()
+        };
+        let Some(src) = ctx.attrs.src.clone() else {
+            return Some(plate(ctx, cx, "Add a picture with /image").into_any_element());
+        };
+        let Some(path) = duckfs_path(&src) else {
+            // A picture off the web: the loader fetches it and it is the one
+            // that knows the dimensions, so the two bounds are all this can
+            // say about the size.
+            return Some(framed(
+                img(src.to_string())
+                    .max_w_full()
+                    .max_h(PICTURE_HEIGHT)
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element(),
+            ));
+        };
+        // Until the guest's `picture.load` lands, the block holds its place
+        // rather than collapsing the text around it.
+        let Some(picture) = crate::backend::stored_picture(crate::backend::PAGES_SURFACE, path)
+        else {
+            return Some(plate(ctx, cx, "Loading the picture…").into_any_element());
+        };
+        Some(framed(drawn(&picture)))
+    }
+}
+
+/// The picture at its own size, so a small one is not blown up to the column:
+/// BOTH dimensions are stated, because an image given only one takes its size
+/// from the aspect ratio gpui hands it and overflows whatever box it is in.
+/// The bounds then keep it inside the column and off the next paragraph, and
+/// `Contain` keeps a bounded one in proportion.
+fn drawn(picture: &crate::backend::Picture) -> AnyElement {
+    img(picture.source())
+        .w(px(picture.width as f32))
+        .h(px(picture.height as f32))
+        .max_w_full()
+        .max_h(PICTURE_HEIGHT)
+        .object_fit(ObjectFit::Contain)
+        .into_any_element()
+}
+
+/// The dashed box an image block draws while it has no picture to draw.
+fn plate(ctx: &BlockContext, cx: &App, say: &'static str) -> impl IntoElement {
+    div()
+        .w_full()
+        .h(ctx.theme.rems(7.5))
+        .rounded(ctx.theme.radius)
+        .border_1()
+        .border_dashed()
+        .border_color(match ctx.selected {
+            true => cx.theme().primary,
+            false => cx.theme().border,
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(cx.theme().muted_foreground)
+        .child(say)
+}
+
+/// The duckfs path behind a picture's address, or `None` when the address is
+/// not one of ours — a picture off the web, or a path on somebody's disk.
+fn duckfs_path(src: &str) -> Option<&str> {
+    let path = src.strip_prefix("duck://files")?;
+    let plain = !path.is_empty() && !path.contains(['?', '#']);
+    plain.then_some(path)
 }
 
 /// The badge's height: one marker slot.

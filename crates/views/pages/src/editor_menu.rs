@@ -323,6 +323,14 @@ pub fn clear_block(document: &Doc, line: usize) -> EditorDecision {
 /// open instead of a block.
 const SLASH_EXTRAS: &[(&str, &str, &str)] = &[("mention", "Mention", "@"), ("emoji", "Emoji", ":")];
 
+/// The palette's one upload. A picture is neither a block turn nor a trigger
+/// that reopens the menu: picking it asks the host for a file, and the line
+/// it was typed on holds the picture once that file is on the network.
+const SLASH_UPLOADS: &[(&str, &str)] = &[(PICTURE, "Picture")];
+
+/// The tag of the picture pick, and the field of [`Intent`] it fills.
+pub const PICTURE: &str = "image";
+
 /// The floating format menu over a selection — Tiptap's floating toolbar
 /// as a list the keyboard can walk. Third column is the ASCII glyph the
 /// bubble toolbar button shows instead of the word (#1143: no non-ASCII
@@ -873,6 +881,14 @@ impl Menu {
         slashed: bool,
         tag: &str,
     ) -> (EditorDecision, Self) {
+        // The picture's own line is cleared of what was typed to ask for it;
+        // the file picker the intent opens fills it.
+        if tag == PICTURE {
+            return (
+                replace_slash(document, line, strip, slashed, ""),
+                self.closed(),
+            );
+        }
         let Some((_, _, trigger)) = SLASH_EXTRAS.iter().find(|(name, ..)| *name == tag) else {
             return (
                 turn_from_slash(document, line, strip, slashed, tag),
@@ -957,6 +973,7 @@ impl Menu {
             return intent;
         };
         match (open.kind, tag) {
+            (Kind::Slash { line, .. }, PICTURE) => intent.picture_line = Some(line as u32),
             (Kind::Block { line }, "comment") => intent.comment_line = Some(line as u32),
             (Kind::Block { line }, "copy") => intent.copy = block_text(document, line),
             (Kind::Format { line }, "comment") => {
@@ -1156,6 +1173,12 @@ fn slash_items(filter: &str) -> Vec<(String, String)> {
             .iter()
             .filter(|(tag, label, _)| matches_filter(tag, label, &lowered))
             .map(|(tag, label, _)| ((*tag).to_owned(), (*label).to_owned())),
+    );
+    items.extend(
+        SLASH_UPLOADS
+            .iter()
+            .filter(|(tag, label)| matches_filter(tag, label, &lowered))
+            .map(|(tag, label)| ((*tag).to_owned(), (*label).to_owned())),
     );
     items
 }

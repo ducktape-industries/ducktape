@@ -15,6 +15,7 @@ mod types {
     pub const HORIZONTAL_RULE: &str = "horizontalRule";
     pub const CALLOUT: &str = "callout";
     pub const TOGGLE: &str = "details";
+    pub const IMAGE: &str = "image";
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MarkKind {
@@ -74,6 +75,9 @@ struct BlockAttrs {
     level: u8,
     checked: bool,
     language: Option<String>,
+    /// A picture's address and the words that stand in for it.
+    src: Option<String>,
+    alt: Option<String>,
 }
 impl BlockAttrs {
     fn level(level: u8) -> Self {
@@ -239,6 +243,15 @@ fn block_of(rest: &str, indent: usize) -> BlockContent {
     if rest.trim_end() == "---" {
         return BlockContent::new(types::HORIZONTAL_RULE, "").with_indent(indent);
     }
+    if let Some((alt, src)) = picture_line(rest) {
+        return BlockContent::new(types::IMAGE, "")
+            .with_attrs(BlockAttrs {
+                src: Some(src.into()),
+                alt: Some(alt.into()),
+                ..Default::default()
+            })
+            .with_indent(indent);
+    }
     // Longest first: `### ` must not be read as `# ` plus prose.
     let markers: [(&str, &str, BlockAttrs); 11] = [
         ("### ", types::HEADING, BlockAttrs::level(3)),
@@ -263,6 +276,16 @@ fn block_of(rest: &str, indent: usize) -> BlockContent {
         return inline_block(types::ORDERED_LIST, BlockAttrs::default(), content, indent);
     }
     inline_block(types::PARAGRAPH, BlockAttrs::default(), rest, indent)
+}
+
+/// `![alt](src)` and nothing else on the line: the words and the address of a
+/// picture. A line with anything around it is prose that happens to carry an
+/// image, and stays a paragraph.
+pub(crate) fn picture_line(rest: &str) -> Option<(&str, &str)> {
+    let body = rest.trim().strip_prefix("![")?.strip_suffix(')')?;
+    let (alt, src) = body.split_once("](")?;
+    let one_picture = !alt.contains(['[', ']']) && !src.contains(['(', ')']);
+    one_picture.then_some((alt, src))
 }
 
 fn checked() -> BlockAttrs {
@@ -446,6 +469,15 @@ fn line_of(block: &BlockContent, ordinal: usize) -> String {
         types::BLOCKQUOTE => "> ".into(),
         types::CALLOUT => "!> ".into(),
         types::HORIZONTAL_RULE => return format!("{indent}---"),
+        // A picture is its address and the words that stand in for it, in
+        // Markdown's own shape: `![alt](src)`. Without a line of its own an
+        // image block wrote an empty marker over empty text and the picture
+        // was gone the moment the document went back through the dialect.
+        types::IMAGE => {
+            let src = block.attrs.src.as_deref().unwrap_or_default();
+            let alt = block.attrs.alt.as_deref().unwrap_or_default();
+            return format!("{indent}![{alt}]({src})");
+        }
         types::CODE_BLOCK => {
             let language = block.attrs.language.as_deref().unwrap_or("");
             let body: Vec<String> = block
@@ -548,6 +580,14 @@ fn native_mark(mark: &RichMark) -> Option<Mark> {
     Some(Mark::new(kind, mark.start as usize..mark.end as usize))
 }
 fn wire_block(block: &BlockContent) -> RichBlock {
+    // A picture's address and alt text are attributes on the wire, the two
+    // the editor draws an image block from.
+    let named = |name: &str, value: &Option<String>| {
+        value.clone().map(|value| wire::editor_rich::RichAttribute {
+            name: name.to_owned(),
+            value,
+        })
+    };
     RichBlock {
         kind: block.ty.clone(),
         text: block.text.clone(),
@@ -556,10 +596,20 @@ fn wire_block(block: &BlockContent) -> RichBlock {
         checked: block.attrs.checked,
         language: block.attrs.language.clone().unwrap_or_default(),
         marks: block.marks.iter().map(wire_mark).collect(),
-        attributes: Vec::new(),
+        attributes: [named("src", &block.attrs.src), named("alt", &block.attrs.alt)]
+            .into_iter()
+            .flatten()
+            .collect(),
     }
 }
 fn native_block(block: &RichBlock) -> BlockContent {
+    let attribute = |name: &str| {
+        block
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == name)
+            .map(|attribute| attribute.value.clone())
+    };
     BlockContent {
         ty: block.kind.clone(),
         text: block.text.clone(),
@@ -568,6 +618,8 @@ fn native_block(block: &RichBlock) -> BlockContent {
             level: block.level,
             checked: block.checked,
             language: (!block.language.is_empty()).then(|| block.language.clone()),
+            src: attribute("src"),
+            alt: attribute("alt"),
         },
         marks: MarkList(block.marks.iter().filter_map(native_mark).collect()),
     }

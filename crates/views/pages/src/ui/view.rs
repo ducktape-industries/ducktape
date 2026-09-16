@@ -95,6 +95,10 @@ pub struct PagesView {
     pub(crate) page_saved_text: String,
     pub(crate) buffer_page: String,
     pub(crate) page_inflight_text: String,
+    /// The pictures this view has already asked the host to page in. The
+    /// document names its pictures on every redraw; the host decodes each
+    /// once.
+    pub(crate) pictures_asked: Vec<String>,
 }
 impl ::std::fmt::Debug for PagesView {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -122,6 +126,12 @@ pub enum Message {
     OfferPageMove,
     /// Re-parent the menu's page; an empty destination is the workspace root.
     MovePage(String),
+    /// A picture picked on this device and put on the network, for the line
+    /// the writer asked for it on.
+    PictureReady(i64, crate::host::PictureItem),
+    /// One of the document's pictures is decoded and drawable; an empty path
+    /// is one that could not be read.
+    PictureLoaded(String),
     PressedAt(f64, f64),
     DeletePageSubmit,
     SearchPagesSubmit,
@@ -238,6 +248,7 @@ impl PagesView {
             page_saved_text: "".to_owned(),
             buffer_page: "".to_owned(),
             page_inflight_text: "".to_owned(),
+            pictures_asked: Vec::new(),
         }
     }
     pub(crate) fn boot() -> (Self, Task<Message>) {
@@ -412,6 +423,55 @@ mod tests {
         let restored = PagesView::restore(&snapshot).unwrap();
         assert_eq!(restored.snapshot().unwrap(), snapshot);
     }
+    /// A picked picture is on the network before the document hears about it:
+    /// what lands in the page is the address every member can read, on the
+    /// line that asked for it, and the caret carries on under the picture.
+    #[test]
+    fn a_picked_picture_lands_as_the_address_the_network_shares() {
+        let (mut app, _) = PagesView::boot();
+        app.connected = true;
+        app.active_page = "alpha".into();
+        app.buffer_page = "alpha".into();
+        app.document = ducktape_view_guest::Editor::new("Handbook\n\nUnder it");
+        app.update(Message::PictureReady(
+            1,
+            crate::host::PictureItem {
+                uri: "duck://files/shared/pages/alpha/p1/duck.png".into(),
+                alt: "duck.png".into(),
+                error: String::new(),
+            },
+        ));
+        assert_eq!(
+            crate::host::document_text(&app.document),
+            "Handbook\n![duck.png](duck://files/shared/pages/alpha/p1/duck.png)\n\nUnder it"
+        );
+        assert_eq!(
+            app.document.cursor().position,
+            ducktape_view_guest::wire::EditorPosition { line: 2, column: 0 },
+            "the writer carries on under the picture, not on it"
+        );
+        assert_eq!(
+            app.pictures_asked,
+            ["/shared/pages/alpha/p1/duck.png"],
+            "and the host is asked to draw it, once"
+        );
+
+        // A picker dismissed leaves the page exactly as it was.
+        let standing = crate::host::document_text(&app.document);
+        app.update(Message::PictureReady(1, Default::default()));
+        assert_eq!(crate::host::document_text(&app.document), standing);
+
+        // A refusal is the page's to show, not a silent nothing.
+        app.update(Message::PictureReady(
+            1,
+            crate::host::PictureItem {
+                error: "the upload did not land".into(),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(app.page_refusal, "the upload did not land");
+    }
+
     /// A tree is built by moving pages, not only by creating them in place:
     /// the menu offers the workspace and every page the module would accept,
     /// which is every page outside the moving page's own subtree.

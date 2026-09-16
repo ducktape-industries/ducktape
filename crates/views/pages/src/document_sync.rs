@@ -52,6 +52,9 @@ pub struct Navigation {
     pub link: String,
     pub comment_line: Option<u32>,
     pub copy: String,
+    /// The line a picture was asked for on: the file picker opens, and what
+    /// it puts on the network lands here.
+    pub picture_line: Option<u32>,
     pub anchor: Option<(u32, u32)>,
     /// The agent account an "Ask AI" comment is addressed to; `0` is nobody.
     pub mention: u64,

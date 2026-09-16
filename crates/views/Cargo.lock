@@ -2048,6 +2048,7 @@ name = "pages-view"
 version = "0.1.0"
 dependencies = [
  "design",
+ "ducktape-view-files",
  "ducktape-view-guest",
  "futures",
  "pulldown-cmark",

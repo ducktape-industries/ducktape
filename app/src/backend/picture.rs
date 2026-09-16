@@ -23,10 +23,19 @@ pub const FILES_SURFACE: &str = "files";
 pub const FORGE_SURFACE: &str = "forge";
 /// The chat timeline's slot — many pictures at once, the ones on screen.
 pub const CHAT_SURFACE: &str = "chat";
-/// How many timeline pictures stay decoded; the oldest goes when one more
-/// lands. ponytail: enough for a screen of attachments; make it byte-bounded
-/// if a room of photos ever matters.
-pub const MAX_CHAT_PICTURES: usize = 24;
+/// The open pages document's slot — a page carries as many pictures as it
+/// was written with, so it keeps a list like the timeline does.
+pub const PAGES_SURFACE: &str = "pages";
+/// How many of a list surface's pictures stay decoded; the oldest goes when
+/// one more lands. ponytail: enough for a screen of attachments or a page of
+/// them; make it byte-bounded if a room of photos ever matters.
+pub const MAX_LIST_PICTURES: usize = 24;
+
+/// Whether a surface holds a LIST of pictures (a timeline, a document) or the
+/// single one it is previewing.
+fn keeps_many(surface: &str) -> bool {
+    matches!(surface, CHAT_SURFACE | PAGES_SURFACE)
+}
 /// How many of a Markdown document's in-repo pictures the loader fetches, in
 /// document order. ponytail: the rest keep their alt text; page them lazily
 /// if a README ever carries more.
@@ -51,12 +60,18 @@ pub struct Picture {
 }
 
 impl Picture {
-    pub fn element(&self) -> AnyElement {
-        let source: ImageSource = match &self.handle {
+    /// What an `img` is built from. gpui hands an image its natural aspect
+    /// ratio when a dimension is left open, so a caller that does not give it
+    /// BOTH gets an element sized from that ratio rather than from its box.
+    pub fn source(&self) -> ImageSource {
+        match &self.handle {
             PictureHandle::Raster(image) => image.clone().into(),
             PictureHandle::Vector(image) => image.clone().into(),
-        };
-        img(source)
+        }
+    }
+
+    pub fn element(&self) -> AnyElement {
+        img(self.source())
             .size_full()
             .object_fit(ObjectFit::Contain)
             .into_any_element()
@@ -166,14 +181,15 @@ pub async fn store_picture(
 }
 
 /// Park one decoded picture under `surface` as `path`'s, replacing whatever
-/// the surface held. The one writer to the store. The chat slot is the
-/// exception: it keeps the last [`MAX_CHAT_PICTURES`], by path.
+/// the surface held. The one writer to the store. A list surface is the
+/// exception: it keeps the last [`MAX_LIST_PICTURES`], by path.
 pub(crate) fn park_picture(surface: &'static str, path: String, picture: Picture) {
-    if surface == CHAT_SURFACE {
-        let mut recent = chat_store().lock().expect("chat picture store");
+    if keeps_many(surface) {
+        let mut lists = list_store().lock().expect("picture list store");
+        let recent = lists.entry(surface.to_owned()).or_default();
         recent.retain(|(stored, _)| *stored != path);
         recent.push((path, picture));
-        let over = recent.len().saturating_sub(MAX_CHAT_PICTURES);
+        let over = recent.len().saturating_sub(MAX_LIST_PICTURES);
         recent.drain(..over);
         return;
     }
@@ -186,10 +202,11 @@ pub(crate) fn park_picture(surface: &'static str, path: String, picture: Picture
 /// The picture parked under `surface`, only if it is still `path`'s — a slot
 /// holding the previous file never draws under the next file's name.
 pub fn stored_picture(surface: &str, path: &str) -> Option<Picture> {
-    if surface == CHAT_SURFACE {
-        return chat_store()
+    if keeps_many(surface) {
+        return list_store()
             .lock()
-            .expect("chat picture store")
+            .expect("picture list store")
+            .get(surface)?
             .iter()
             .find(|(stored, _)| stored == path)
             .map(|(_, picture)| picture.clone());
@@ -202,10 +219,15 @@ pub fn stored_picture(surface: &str, path: &str) -> Option<Picture> {
         .map(|(_, picture)| picture.clone())
 }
 
-/// The timeline's pictures, oldest first.
-fn chat_store() -> &'static Mutex<Vec<(String, Picture)>> {
-    static STORE: OnceLock<Mutex<Vec<(String, Picture)>>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(Vec::new()))
+/// One list surface's pictures, oldest first, each under the path it was
+/// parked as.
+type PictureList = Vec<(String, Picture)>;
+
+/// surface → its pictures: what a timeline or a document holds at once, as
+/// against the one-slot [`store`] a preview keeps.
+fn list_store() -> &'static Mutex<HashMap<String, PictureList>> {
+    static STORE: OnceLock<Mutex<HashMap<String, PictureList>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Resolve a Markdown image URL against the document's place in the repo:
@@ -457,11 +479,11 @@ mod tests {
         assert_eq!((picture.width, picture.height), (2, 3));
     }
 
-    /// The chat slot keeps the last [`MAX_CHAT_PICTURES`] by path: a re-park
+    /// The chat slot keeps the last [`MAX_LIST_PICTURES`] by path: a re-park
     /// of a known path refreshes it, and the oldest goes once over the cap.
     #[test]
     fn the_chat_slot_keeps_the_most_recent_pictures_by_path() {
-        for index in 0..=MAX_CHAT_PICTURES {
+        for index in 0..=MAX_LIST_PICTURES {
             let picture = decode_picture(&png(1, 1)).expect("decodes");
             park_picture(CHAT_SURFACE, format!("/chat-test/{index}.png"), picture);
         }
@@ -471,7 +493,19 @@ mod tests {
         park_picture(CHAT_SURFACE, "/chat-test/1.png".into(), again);
         let refreshed = stored_picture(CHAT_SURFACE, "/chat-test/1.png").expect("kept");
         assert_eq!(refreshed.width, 2);
-        assert_eq!(chat_store().lock().expect("store").len(), MAX_CHAT_PICTURES);
+        let lists = list_store().lock().expect("store");
+        assert_eq!(lists[CHAT_SURFACE].len(), MAX_LIST_PICTURES);
+    }
+
+    /// Two list surfaces are two lists: a document's pictures neither evict
+    /// the timeline's nor answer under its name.
+    #[test]
+    fn a_document_keeps_its_own_pictures_beside_the_timelines() {
+        let picture = decode_picture(&png(3, 1)).expect("decodes");
+        park_picture(PAGES_SURFACE, "/shared/pages/p1/duck.png".into(), picture);
+        let kept = stored_picture(PAGES_SURFACE, "/shared/pages/p1/duck.png").expect("kept");
+        assert_eq!(kept.width, 3);
+        assert!(stored_picture(CHAT_SURFACE, "/shared/pages/p1/duck.png").is_none());
     }
 
     #[test]
