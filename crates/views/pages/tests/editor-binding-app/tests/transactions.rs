@@ -521,10 +521,20 @@ fn actual_menu_edit_commits_after_accept_and_undo_survives_restore() {
     assert_eq!(guest.text, "- 한글\n");
     let menu = guest.menu().expect("accepted plus opens the caret menu");
     assert_eq!(menu.anchor, EditorMenuAnchor::Caret);
+    // The palette named, not counted. A bare length says a menu grew without
+    // saying into what, so a deliberate row and an accidental duplicate read
+    // the same; the tags tell them apart on sight.
+    let tags: Vec<&str> = menu.items.iter().map(|item| item.tag.as_str()).collect();
     assert_eq!(
-        menu.items.len(),
-        15,
-        "the twelve turns, the two pickers and the picture"
+        tags,
+        [
+            "page", //
+            "text", "h1", "h2", "h3", "todo", "bullet", "number", "toggle", "quote", "callout",
+            "code", "divider", //
+            "mention", "emoji", //
+            "image",
+        ],
+        "the page row, the twelve turns, the two pickers and the picture"
     );
     let pick = || EditorInteraction::MenuPick { tag: "h1".into() };
     let cancelled = guest.interaction(pick());

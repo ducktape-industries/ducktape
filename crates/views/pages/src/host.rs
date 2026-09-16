@@ -1072,8 +1072,9 @@ async fn create_page(title: String) -> Result<ActItem, String> {
 /// shows a page by name falls back to [`UNTITLED`].
 pub const NEW_PAGE_TITLE: &str = "";
 
-/// What a page with no title of its own is called on screen.
-pub const UNTITLED: &str = "Untitled";
+/// What a page with no title of its own is called on screen. Defined by
+/// [`crate::rich_document`], which draws it as the title line's hint.
+pub use crate::rich_document::UNTITLED;
 
 /// The handle being typed at the END of a comment draft: an `@` at a word
 /// start with nothing but handle characters after it. A plain input carries
