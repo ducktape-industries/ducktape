@@ -95,6 +95,7 @@ mod netstack_governance;
 mod node_http;
 mod overlay_book;
 mod plane_metrics;
+mod qualify;
 mod reachability_plane;
 #[cfg(test)]
 mod reachability_plane_tests;

@@ -36,6 +36,10 @@ pub enum OpCmd {
     List,
     /// the running node's tip: height + root hash (reads the local rpc)
     Status(StatusArgs),
+    /// can THIS binary run this workspace? reopens the checkpoint offline and
+    /// recomposes its committed root hash — what a release launcher asks a
+    /// staged binary before it flips. the node must be STOPPED
+    Qualify(SelectorArgs),
     /// the running node's direct peers: connection, traffic, sync heights
     Peers(StatusArgs),
     /// resident standing: the staged-admission tier

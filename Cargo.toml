@@ -206,6 +206,9 @@ members = [
     "bin/duck-guest-init",
     # the desktop app's boot-time executor (flip / rollback / exec)
     "bin/app-launcher",
+    # the node's supervisor: the same machine, holding the flip for the
+    # network's governance-designated activation height
+    "bin/node-launcher",
     # native desktop client — intentionally only Chat + Pages
     "app",
 ]

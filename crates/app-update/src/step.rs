@@ -1031,6 +1031,80 @@ mod tests {
         assert!(matches!(commands[2], Command::Persist(Phase::Staged(_))));
     }
 
+    /// THE NODE'S FLIP, end to end through the same machine the app drives —
+    /// the supervising launcher's whole cutover, with no event, phase or
+    /// command of its own.
+    ///
+    /// The height gate is the QUALIFY answer, not a new state: a launcher
+    /// restarted while `Staged` before the network's activation height
+    /// refuses its own staged release by name and keeps running the current
+    /// one, which is the same arm a failed checkpoint reopen takes.
+    #[test]
+    fn a_node_stages_early_refuses_to_flip_unarmed_and_flips_when_armed() {
+        let idle = idle("a", None, 17);
+
+        // 1. the designated release is fetched, downloaded and staged the
+        //    moment it is published — before the activation height, so the
+        //    bytes are on every validator's disk when the block arrives.
+        let (phase, commands) = step(idle, fetched(18, &host(), "b"));
+        assert!(matches!(commands[1], Command::Download { .. }));
+        let (phase, commands) = step(phase, Event::DownloadFinished { sha: sha("b") });
+        assert_eq!(commands, vec![Command::Verify(sha("b"))]);
+        let (staged, _) = step(phase, Event::Verified(sha("b")));
+        assert!(matches!(staged, Phase::Staged(_)));
+
+        // 2. a launcher restart before the height asks the staged release to
+        //    qualify, and the unarmed refusal leaves the phase untouched: no
+        //    flip, and the reason is carried, not swallowed.
+        let (after_boot, commands) = step(staged.clone(), Event::Boot);
+        assert_eq!(commands, vec![Command::Qualify(sha("b"))]);
+        let (after_refusal, commands) = step(
+            after_boot,
+            Event::QualifyFailed {
+                sha: sha("b"),
+                reason: "not_armed".into(),
+            },
+        );
+        assert_eq!(after_refusal, staged, "an unarmed node stays on its release");
+        assert_eq!(
+            commands,
+            vec![Command::Banner(UpdateBanner::QualifyFailed {
+                staged: sha("b"),
+                reason: "not_armed".into(),
+            })]
+        );
+
+        // 3. at the activation height the same staged phase flips, crash-safely.
+        let (_, commands) = step(after_refusal.clone(), Event::RestartToUpdate);
+        assert_eq!(commands, vec![Command::Qualify(sha("b"))]);
+        let flipped = step(after_refusal, Event::QualifyPassed(sha("b")));
+        assert_eq!(flipped, flip_commands("a", "b", 18));
+    }
+
+    /// The node's rollback: the flipped binary never publishes an identity, so
+    /// the supervisor's next `Boot` counts it and the one after flips back —
+    /// the app's crash-rollback, with the node's healthy signal.
+    #[test]
+    fn a_node_that_never_publishes_an_identity_is_rolled_back() {
+        let flipped = pending("b", "a", 0);
+        let (counted, _) = step(flipped, Event::Boot);
+        assert_eq!(counted, pending("b", "a", 1));
+        let (rolled, commands) = step(counted, Event::Boot);
+        assert_eq!(rolled, rolled_back("a", "b"));
+        assert_eq!(commands.last(), Some(&Command::Exec(sha("a"))));
+
+        // and the healthy path: an identity published before that second boot
+        // keeps the new release and collects the rest.
+        let (healthy, commands) = step(pending("b", "a", 1), Event::Rendered);
+        assert_eq!(healthy, idle("b", Some("a"), 18));
+        assert_eq!(
+            commands.last(),
+            Some(&Command::Gc {
+                keep: vec![sha("b"), sha("a")]
+            })
+        );
+    }
+
     /// Every (Phase, Event) pair is routed: exhaustiveness is the compiler's,
     /// but a stale pair must also be a no-op, never a panic.
     #[test]
