@@ -7,7 +7,8 @@
 
 use std::cell::Cell;
 
-use crate::wire::{self, Axis, ButtonContent, ButtonPreset, Length, Node};
+use crate as wire;
+use crate::{Axis, ButtonContent, ButtonPreset, Length, Node};
 
 pub use design::Palette;
 pub use design::{radius, type_scale};

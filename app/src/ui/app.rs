@@ -1,4 +1,4 @@
-use ducktape_view_guest::Task;
+use view_wire::Task;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum LiveKind {
     Retry,
@@ -164,49 +164,49 @@ pub(crate) enum CeremonyRetirement {
 }
 pub struct Ducktape {
     pub(crate) appearance_save_generation: u64,
-    pub(crate) appearance_save_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) appearance_save_task: Option<::view_wire::task::Handle>,
     pub(crate) connection_generation: u64,
-    pub(crate) connection_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) connection_task: Option<::view_wire::task::Handle>,
     pub(crate) dm_peers_load_generation: u64,
-    pub(crate) dm_peers_load_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) dm_peers_load_task: Option<::view_wire::task::Handle>,
     pub(crate) node_facts_load_generation: u64,
-    pub(crate) node_facts_load_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) node_facts_load_task: Option<::view_wire::task::Handle>,
     pub(crate) bell_load_generation: u64,
-    pub(crate) bell_load_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) bell_load_task: Option<::view_wire::task::Handle>,
     pub(crate) settings_load_generation: u64,
-    pub(crate) settings_load_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) settings_load_task: Option<::view_wire::task::Handle>,
     pub(crate) account_load_generation: u64,
-    pub(crate) account_load_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) account_load_task: Option<::view_wire::task::Handle>,
     pub(crate) live_resync_generation: u64,
-    pub(crate) live_resync_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) live_resync_task: Option<::view_wire::task::Handle>,
     pub(crate) account_qr_auth_generation: u64,
-    pub(crate) account_qr_auth_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) account_qr_auth_task: Option<::view_wire::task::Handle>,
     pub(crate) account_desktop_auth_generation: u64,
-    pub(crate) account_desktop_auth_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) account_desktop_auth_task: Option<::view_wire::task::Handle>,
     pub(crate) notifications_save_generation: u64,
-    pub(crate) notifications_save_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) notifications_save_task: Option<::view_wire::task::Handle>,
     pub(crate) channel_window_load_generation: u64,
-    pub(crate) channel_window_load_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) channel_window_load_task: Option<::view_wire::task::Handle>,
     pub(crate) appearance_load_generation: u64,
-    pub(crate) appearance_load_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) appearance_load_task: Option<::view_wire::task::Handle>,
     pub(crate) notifications_load_generation: u64,
-    pub(crate) notifications_load_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) notifications_load_task: Option<::view_wire::task::Handle>,
     pub(crate) hub_load_generation: u64,
-    pub(crate) hub_load_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) hub_load_task: Option<::view_wire::task::Handle>,
     pub(crate) network_probe_generation: u64,
-    pub(crate) network_probe_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) network_probe_task: Option<::view_wire::task::Handle>,
     pub(crate) welcome_account_load_generation: u64,
-    pub(crate) welcome_account_load_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) welcome_account_load_task: Option<::view_wire::task::Handle>,
     pub(crate) chain_identity_load_generation: u64,
-    pub(crate) chain_identity_load_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) chain_identity_load_task: Option<::view_wire::task::Handle>,
     pub(crate) wallets_load_generation: u64,
-    pub(crate) wallets_load_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) wallets_load_task: Option<::view_wire::task::Handle>,
     pub(crate) welcome_qr_auth_generation: u64,
-    pub(crate) welcome_qr_auth_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) welcome_qr_auth_task: Option<::view_wire::task::Handle>,
     pub(crate) welcome_desktop_auth_generation: u64,
-    pub(crate) welcome_desktop_auth_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) welcome_desktop_auth_task: Option<::view_wire::task::Handle>,
     pub(crate) provision_progress_generation: u64,
-    pub(crate) provision_progress_task: Option<::ducktape_view_guest::task::Handle>,
+    pub(crate) provision_progress_task: Option<::view_wire::task::Handle>,
     pub(crate) appearance: Appearance,
     /// What `Appearance::System` resolved to at the last sync: the OS
     /// appearance the kit theme picked up. `is_dark` answers from it.
@@ -749,8 +749,8 @@ impl Ducktape {
         let (_, task) = crate::shell::open(crate::shell::WindowKind::Onboarding);
         task.map(AppMessage::OnboardingOpened)
     }
-    pub(crate) fn subscriptions(&self) -> ducktape_view_guest::Subscription<AppMessage> {
-        use ducktape_view_guest::Subscription;
+    pub(crate) fn subscriptions(&self) -> view_wire::Subscription<AppMessage> {
+        use view_wire::Subscription;
         let mut subscriptions = Vec::new();
         if self.connected {
             subscriptions.push(

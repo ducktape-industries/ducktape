@@ -529,20 +529,22 @@ fn the_app_links_only_what_it_still_speaks_for() {
     // registry and the account records the shell reads off the node.
     let guests: Vec<&str> = linked.intersection(&modules).map(String::as_str).collect();
     assert_eq!(guests, ["chat", "forge", "gateway", "identity"]);
-    // Nothing the workspace declares inside `crates/views` is the app's to
-    // link: `design` left for the SDK set in 7c, and what is shared is
-    // shared from there.
+    // AND NOTHING FROM THE VIEW TREE AT ALL. `design` left for the SDK set
+    // (7c) and the guest SDK's `Task`, `Subscription` and `kit` moved beside
+    // the wire they build (7b), so what the two halves share they share from
+    // `crates/`, and the desktop links no crate a view's build produces.
     let into_views: Vec<&str> = linked.intersection(&views).map(String::as_str).collect();
     assert_eq!(into_views, [] as [&str; 0]);
-    // `ducktape-view-guest` is the last one, reached by path rather than
-    // through the workspace, and linked for its `Task`, `Subscription` and
-    // `kit` alone. #2303 7b moves those three beside the wire they build and
-    // deletes this line.
-    assert!(
-        app["dependencies"]
-            .get("ducktape-view-guest")
-            .and_then(|spec| spec.get("path"))
-            .is_some(),
-        "the guest SDK left the app; delete this and the note above it"
-    );
+    let reaching: Vec<&str> = app["dependencies"]
+        .as_table()
+        .expect("the app declares its dependencies")
+        .iter()
+        .filter(|(_, spec)| {
+            spec.get("path")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|path| path.contains("crates/views"))
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(reaching, [] as [&str; 0], "the app reaches into the view tree by path");
 }

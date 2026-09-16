@@ -14,10 +14,12 @@ use futures::StreamExt;
 use std::collections::HashSet;
 use task::BoxStream;
 pub mod rev;
-mod subscription;
-pub mod task;
-pub use subscription::{Recipe, Subscription};
-pub use task::Task;
+// What a view is written in lives beside the wire it writes (`view_wire::{kit,
+// task, subscription}`), so the desktop that renders for a view takes the same
+// implementation without linking this SDK. Re-exported here because a view
+// names them through this crate.
+pub use view_wire::{kit, task};
+pub use view_wire::{Recipe, Subscription, Task};
 
 mod editor;
 mod editor_binding;
@@ -30,7 +32,6 @@ pub use editor_binding::{
 pub use editor_documents::EditorDocumentUpdate;
 pub mod events;
 pub mod keyboard;
-pub mod kit;
 mod memo;
 pub mod mouse;
 pub use memo::{invalidate_component, memo_lazy};
@@ -85,7 +86,7 @@ pub struct Driver<A: App> {
     app: A,
     tasks: Vec<Running<A::Message>>,
     subscriptions: HashSet<u64>,
-    observers: Vec<subscription::Observer<A::Message>>,
+    observers: Vec<wire::Observer<A::Message>>,
     last_root: Option<wire::Node>,
     /// The last tick ran out of budget with work still ready: the frame
     /// asks the host for the next tick at once instead of waiting for an
@@ -360,17 +361,13 @@ impl<A: App> Driver<A> {
     fn subscribe(&mut self) {
         slots::set_mouse_interest(false);
         slots::clear_event_interest();
-        let subscription = self.app.subscription();
-        let next: HashSet<_> = subscription
-            .recipes
-            .iter()
-            .map(|recipe| recipe.key)
-            .collect();
+        let (recipes, observers) = self.app.subscription().into_parts();
+        let next: HashSet<_> = recipes.iter().map(|recipe| recipe.key).collect();
         self.tasks
             .retain(|task| task.subscription.is_none_or(|key| next.contains(&key)));
         self.subscriptions.retain(|key| next.contains(key));
-        self.observers = subscription.observers;
-        for recipe in subscription.recipes {
+        self.observers = observers;
+        for recipe in recipes {
             if self.subscriptions.insert(recipe.key) {
                 self.tasks.push(Running {
                     subscription: Some(recipe.key),
@@ -383,7 +380,7 @@ impl<A: App> Driver<A> {
 }
 
 fn spawn<M: 'static>(tasks: &mut Vec<Running<M>>, task: Task<M>) {
-    if let Some(stream) = task.0 {
+    if let Some(stream) = task.into_option() {
         tasks.push(Running {
             subscription: None,
             woken: Arc::new(Woken(AtomicBool::new(true))),

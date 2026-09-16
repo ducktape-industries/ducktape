@@ -3744,7 +3744,6 @@ dependencies = [
  "design",
  "ducktape-home",
  "ducktape-rpc",
- "ducktape-view-guest",
  "forge",
  "futures",
  "gateway",
@@ -13739,6 +13738,8 @@ name = "view-wire"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "design",
+ "futures",
  "memchr",
  "serde",
  "serde-reflection",
