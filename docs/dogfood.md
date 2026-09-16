@@ -121,7 +121,7 @@ submit files "$(jq -nc --argjson head "$FILES_HEAD" --arg b64 "$PERSONA_B64" '{c
 # Serialize the current default script; do not maintain a separate recipe copy.
 PROGRAM="$(ducktape agent model-program dogfood)"
 submit agent "$(jq -nc --argjson program "$PROGRAM" \
-  '{provision:{name:"Dogfood Duck",program:$program}}')"
+  '{provision:{request_id:"dogfood",name:"Dogfood Duck",program:$program}}')"
 MODEL_ACCOUNT="$(query identity "{\"controlled\":{\"by\":$CONTROLLER,\"from\":0,\"limit\":256}}" |
   jq -er '.accounts | map(select(.name == "Dogfood Duck" and .control.program.executor == "agent")) |
     if length == 1 then .[0].number else error("choose a unique dogfood program account") end')"
@@ -284,10 +284,14 @@ ducktape module register hello crates/kernel/host/tests/fixtures/hello.component
 ```
 
 Commit an artifact containing the replacement component to the run's repository.
-The guest builds it with the compiler its image carries and fetches dependencies
-through the run's egress proxy (`HTTP_PROXY`/`HTTPS_PROXY`, which dials off the
-host and refuses the host itself). The executor consumes committed artifacts;
-source compilation belongs to the run's build tools. The existing replacement
+The guest builds it with the compiler its image carries, against the vendored
+registry the image also carries: `/.cargo/config.toml` replaces crates.io with
+`/opt/duck/vendor`, so the build resolves offline and a crate outside the
+vendored closure does not resolve at all. The run's egress proxy
+(`HTTP_PROXY`/`HTTPS_PROXY`, which dials off the host and refuses the host
+itself) still carries git and everything that is not cargo's registry. The
+executor consumes committed artifacts; source compilation belongs to the run's
+build tools. The existing replacement
 fixture is `crates/kernel/host/tests/fixtures/hello-replacement.component.wasm`.
 
 The model's final JSON response can include:
@@ -350,19 +354,33 @@ workflow checkpoint. Clock values in its query are hints from local committed
 status. Every target still validates messages against its execution context.
 
 The standard Linux guest includes the Rust toolchain from `rust-toolchain.toml`,
-the wasm32 target, native build utilities and the `wasm-tools` CLI of the
+the wasm32 target, native build utilities, the `wasm-tools` CLI of the
 componentizer's release (the `wit-component` pin in
-`bin/guest-builder/Cargo.toml`). Build it at the default location with:
+`bin/guest-builder/Cargo.toml`), and the vendored registry at `/opt/duck/vendor`
+that `guest-builder vendor` derives from every module's dependency closure.
+Build it at the default location with:
 
 ```sh
 ops/build-guest-rootfs.sh
 ```
 
-Linux setup requires Bubblewrap with user namespaces, in addition to the base
-image builder's tools. Ubuntu 24.04 denies an unconfined `bwrap` its user
-namespace (`bwrap: setting up uid map: Permission denied`) while
-`kernel.apparmor_restrict_unprivileged_userns` is 1; set it to 0 for the build
-and back afterwards. It runs inside the extracted guest root with private,
+Linux setup requires Bubblewrap, in addition to the base image builder's tools,
+and it needs to be root inside the extracted guest root. Rootless, it asks for
+a user namespace to get there, which Ubuntu 23.10+ refuses while
+`kernel.apparmor_restrict_unprivileged_userns` is 1 (`bwrap: setting up uid map:
+Permission denied`). Lend privilege to that ONE step instead of loosening a
+host-wide kernel setting:
+
+```sh
+GUEST_SETUP_SUDO=sudo ops/build-guest-rootfs.sh
+```
+
+The download, extraction, init build and `mke2fs` all stay rootless, and the
+setup hands `$TREE` and its scratch back to the invoking user afterwards. Under
+sudo the namespace is dropped rather than requested — asking for one buys
+nothing when already root, and the same hosts attach an `unprivileged_userns`
+AppArmor profile to whatever creates one, root included, which then refuses the
+bind itself. The setup runs inside the extracted guest root with private,
 disk-backed scratch and receives no host home, credentials or caches.
 `ROOTFS_SETUP=/path/to/setup.sh` replaces the setup and receives command-line
 arguments; `ROOTFS_SETUP=` builds only the base image. macOS builds the base
