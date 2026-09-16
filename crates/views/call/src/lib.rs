@@ -83,6 +83,8 @@ impl CallView {
             panel::Action::Mute => self.control("call.mute"),
             panel::Action::Camera => self.control("call.camera"),
             panel::Action::Screen => self.control("call.screen"),
+            panel::Action::Share(index) => self.share(index),
+            panel::Action::ShareCancel => self.control("call.share_cancel"),
             panel::Action::Channel => self.control("call.channel"),
             panel::Action::Leave => self.control("call.leave"),
             panel::Action::Invite(key) => self.invite(key),
@@ -90,6 +92,11 @@ impl CallView {
     }
     fn control(&self, kind: &str) -> Task<Message> {
         panel::notify(kind);
+        Task::none()
+    }
+    /// The picked row, which the host resolves against the targets it offered.
+    fn share(&self, index: usize) -> Task<Message> {
+        panel::notify_with("call.share", &index.to_string());
         Task::none()
     }
     fn invite(&mut self, key: String) -> Task<Message> {

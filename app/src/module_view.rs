@@ -647,7 +647,7 @@ fn surface_allowed(surface: &str) -> bool {
 
 /// The operations a view may ask of the app, by module. An intent outside
 /// the list is refused at the door, never handed to a handler.
-fn intents_of(module: &str) -> &'static [&'static str] {
+pub(crate) fn intents_of(module: &str) -> &'static [&'static str] {
     match module {
         // the governance view speaks the kernel contract: its writes are
         // `op.submit`. What is left at the door is a member's own taste of
@@ -667,7 +667,17 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         "explorer" => &["copy"],
         // the chat view reads its own room and signs its own writes; what is
         // left at the door is what another plane of the app steers or owns
-        "call" => &["mute", "camera", "screen", "channel", "leave"],
+        // `share` carries the row index of the share target the picker was
+        // pressed on: only the host can enumerate a display or a window.
+        "call" => &[
+            "mute",
+            "camera",
+            "screen",
+            "share",
+            "share_cancel",
+            "channel",
+            "leave",
+        ],
         "chat" => &[
             "show_huddle",
             "leave_huddle",
@@ -4350,6 +4360,79 @@ pub(crate) mod tests {
         }
         eprintln!("skipped: no {} — run `make views`", staged.display());
         None
+    }
+
+    /// The staged Call view through the host, on the share picker: the rows the
+    /// HOST offered come back as the only buttons on screen, and pressing one
+    /// leaves the `share` intent carrying THAT ROW'S INDEX — which is the whole
+    /// of what the view knows about a share target, since only the host can
+    /// enumerate a display or a window.
+    ///
+    /// This is the seam the Rust-side panel test cannot reach: props in through
+    /// the real guest, a press through the real wire, an intent out.
+    #[test]
+    fn the_staged_call_view_offers_the_hosts_share_rows_and_answers_with_one() {
+        let Some(view) = staged("call") else {
+            return;
+        };
+        let _turn = blocking_connection_turn();
+        let mut guest = Guest::load_from("call", &view).expect("the view loads");
+        let picking = Some(
+            serde_json::to_vec(&serde_json::json!({"panel": {
+                "joined": true, "dark": false, "status": "in the huddle",
+                // a stage and a tile the picker has to displace
+                "video_live": true, "stage": "image:stage", "tiles": ["image:tile"],
+                "share_targets": [
+                    "Entire desktop — all 2 screens",
+                    "DP-1 (primary) — 2560×1440",
+                    "src/video.rs — Neovim",
+                ],
+            }}))
+            .expect("props encode"),
+        );
+        while guest.redraw(&picking) {}
+        let shown = texts(&guest);
+        assert!(
+            shown.iter().any(|text| text == "Share a screen or a window"),
+            "{shown:?}"
+        );
+        assert!(
+            shown.iter().any(|text| text == "src/video.rs — Neovim"),
+            "a row wears the host's own label: {shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|text| text == "Mute"),
+            "the media toggles yield to the picker: {shown:?}"
+        );
+        assert!(guest.intents.is_empty(), "{:?}", guest.intents);
+
+        // The middle row: its index is what the host resolves against the list
+        // it offered, so an off-by-one here shares the wrong screen.
+        guest.pending.push(wire::Event::Message(button_message(
+            &guest,
+            "DP-1 (primary) — 2560×1440",
+        )));
+        guest.redraw(&picking);
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "share".to_owned(),
+                detail: "1".to_owned(),
+            }]
+        );
+
+        // And the way out asks the host to close the picker, never to share.
+        guest
+            .pending
+            .push(wire::Event::Message(button_message(&guest, "Cancel")));
+        guest.redraw(&picking);
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "share_cancel".to_owned(),
+                detail: "null".to_owned(),
+            }]
+        );
     }
 
     /// The bundled Members view through the host, on the kernel contract:

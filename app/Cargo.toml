@@ -147,7 +147,12 @@ zbus = "5"
 # put a build-time system library on every machine that builds this app. A
 # Wayland session's X root holds X clients only, so the share refuses there
 # rather than grab a black desktop (`ScreenSource::open`).
-x11rb = "0.13"
+# `composite` for the window shares: an unredirected window cannot be named as
+# a pixmap, and reading the window drawable itself returns undefined bytes
+# wherever something overlaps it. `randr` (the heads) and `xfixes` (the pointer)
+# are already on through gpui; naming them here keeps the picker from silently
+# losing them if gpui ever stops asking.
+x11rb = { version = "0.13", features = ["composite", "randr", "xfixes"] }
 
 [dev-dependencies]
 gpui-kit = { version = "=0.6.1", features = ["test-support"] }

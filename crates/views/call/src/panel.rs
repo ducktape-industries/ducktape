@@ -20,6 +20,10 @@ pub struct Panel {
     pub muted: bool,
     pub camera: bool,
     pub sharing: bool,
+    /// The share targets the host is offering, as labels. Non-empty IS the
+    /// picker being open; the view answers with a row index, because only the
+    /// host can enumerate a display or a window.
+    pub share_targets: Vec<String>,
     pub speaking: bool,
     pub stage: String,
     pub tiles: Vec<String>,
@@ -89,6 +93,9 @@ pub enum Action {
     Mute,
     Camera,
     Screen,
+    /// Share the target on this row of `share_targets`.
+    Share(usize),
+    ShareCancel,
     Channel,
     Leave,
     Invite(String),
@@ -96,6 +103,12 @@ pub enum Action {
 
 pub fn notify(kind: &str) {
     ducktape_view_guest::host::notify(kind, b"null");
+}
+
+/// A control that carries something — the payload reaches the host as the
+/// intent's `detail`.
+pub fn notify_with(kind: &str, payload: &str) {
+    ducktape_view_guest::host::notify(kind, payload.as_bytes());
 }
 
 async fn request(kind: &str, payload: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -340,6 +353,12 @@ impl Panel {
                 kit::secondary("huddle/status", &self.status),
             ],
         );
+        // THE PICKER OWNS THE WINDOW WHILE IT IS OPEN: choosing what to share
+        // is the one thing being asked, and this window is too small to ask it
+        // beside a video stage and a roster.
+        if !self.share_targets.is_empty() {
+            return self.share_picker(header);
+        }
         let mut body = Vec::new();
         if !self.stage.is_empty() {
             body.push(kit::image_resource("huddle/stage", &self.stage));
@@ -486,6 +505,53 @@ impl Panel {
     }
 }
 
+impl Panel {
+    /// What to share, one row each, in the order the host offered them: the
+    /// whole desktop first where there is more than one head, then each head,
+    /// then each window. A row's INDEX is the whole answer — the host holds the
+    /// targets and resolves it.
+    fn share_picker(&self, header: wire::Node) -> wire::Node {
+        use wire::{ButtonPreset as Style, Length};
+
+        let mut body = vec![kit::caption(
+            "huddle/share-title",
+            "Share a screen or a window",
+        )];
+        body.extend(self.share_targets.iter().enumerate().map(|(index, label)| {
+            button(
+                &format!("huddle/share/{index}"),
+                label,
+                Action::Share(index),
+                Style::Secondary,
+            )
+        }));
+        kit::sized(
+            kit::column(
+                "huddle",
+                [
+                    header,
+                    kit::sized(
+                        kit::scroll("huddle/share-scroll", kit::column("huddle/share", body)),
+                        Some(Length::Fill),
+                        Some(Length::Fill),
+                    ),
+                    kit::wrapped_row(
+                        "huddle/share-controls",
+                        [button(
+                            "huddle/share-cancel",
+                            "Cancel",
+                            Action::ShareCancel,
+                            Style::Text,
+                        )],
+                    ),
+                ],
+            ),
+            Some(Length::Fill),
+            Some(Length::Fill),
+        )
+    }
+}
+
 /// The grid a stage-less huddle lays its tiles in: as square as the count
 /// allows (1, 2 side by side, 2×2, 2×3, 3×3 …), rows filled left to right.
 fn grid_shape(tiles: usize) -> (usize, usize) {
@@ -560,5 +626,78 @@ mod tests {
         assert!(text.iter().any(|text| text == "you · muted"));
         assert_eq!(resources, ["image:stage", "image:tile"]);
         assert_eq!(invites, ["huddle/invite/bb"]);
+    }
+
+    /// Offered targets take over the window: what gets shared is the one thing
+    /// being asked, and the stage, the roster and the media toggles have no
+    /// business competing with it. One row per target, in the host's order.
+    #[test]
+    fn offered_share_targets_replace_the_huddle_with_the_picker() {
+        let panel: Panel = serde_json::from_value(serde_json::json!({
+            "video_live": true, "stage": "image:stage", "tiles": ["image:tile"],
+            "share_targets": ["Entire desktop — all 2 screens", "DP-1 — 2560×1440", "Neovim"],
+        }))
+        .unwrap();
+        let room = Room {
+            title: "Engineering".into(),
+            members: Vec::new(),
+            roster: vec![Person {
+                key: "aa".into(),
+                node: "node-a".into(),
+                label: "Alice".into(),
+                is_you: true,
+                ..Default::default()
+            }],
+        };
+        let mut tree = panel.view(&room, &Default::default(), "");
+        let mut buttons = Vec::new();
+        let mut labels = Vec::new();
+        let mut resources = Vec::new();
+        tree.for_each_mut(&mut |node| match node {
+            wire::Node::Button { key, label, .. } => {
+                buttons.push(key.clone());
+                labels.push(label.clone());
+            }
+            wire::Node::Image {
+                data: Some(wire::ImageData::Resource(key)),
+                ..
+            } => resources.push(key.clone()),
+            _ => {}
+        });
+        assert_eq!(
+            buttons,
+            [
+                "huddle/share/0",
+                "huddle/share/1",
+                "huddle/share/2",
+                "huddle/share-cancel"
+            ],
+            "only the picker's own rows, and the way out"
+        );
+        assert_eq!(
+            labels[2].as_deref(),
+            Some("Neovim"),
+            "a row wears the host's label"
+        );
+        assert!(
+            resources.is_empty(),
+            "the stage and the tiles yield to the picker"
+        );
+
+        // And with nothing offered the huddle is itself again — the picker is
+        // the list, not a flag beside it.
+        let closed = Panel {
+            share_targets: Vec::new(),
+            ..panel
+        };
+        let mut tree = closed.view(&room, &Default::default(), "");
+        let mut rows = Vec::new();
+        tree.for_each_mut(&mut |node| {
+            if let wire::Node::Button { key, .. } = node {
+                rows.push(key.clone());
+            }
+        });
+        assert!(rows.iter().any(|key| key == "huddle/screen"));
+        assert!(!rows.iter().any(|key| key.starts_with("huddle/share/")));
     }
 }

@@ -97,6 +97,41 @@ fn render_bgra(pixels: Vec<u8>, width: u32, height: u32) -> Option<Arc<RenderIma
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])))
 }
 
+/// What a share captures. A SHARE IS A CHOICE, NOT "THE DESKTOP": a two-head
+/// desktop glued into one strip and shrunk onto [`SCREEN_PIXEL_BUDGET`] is
+/// illegible, and the thing someone means to present is usually one window —
+/// where the same budget buys several times the legibility.
+///
+/// A HEAD AND A WINDOW ARE NAMED, NEVER A CACHED RECTANGLE. The index and the
+/// window id are re-resolved on EVERY grab, so a head that changes resolution
+/// and a window that moves or resizes mid-share both keep working.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShareTarget {
+    /// Every head at once — the root window whole.
+    #[default]
+    Desktop,
+    /// One head, by its place in the platform's monitor list.
+    Monitor(usize),
+    /// One top-level window, by the platform's window id.
+    Window(u32),
+}
+
+/// A share target and the label the picker shows for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShareChoice {
+    pub target: ShareTarget,
+    pub label: String,
+}
+
+/// The target the next [`Source::Screen`] opens, beside [`SOURCE`] and for the
+/// same reason: the capture thread reads both, and the app writes both before
+/// the capture the deployed call guest asks for ever starts. One process shares
+/// one thing.
+fn share_target() -> &'static Mutex<ShareTarget> {
+    static TARGET: OnceLock<Mutex<ShareTarget>> = OnceLock::new();
+    TARGET.get_or_init(|| Mutex::new(ShareTarget::default()))
+}
+
 /// What the video leg is sending, if anything.
 ///
 /// ONE DISCRIMINANT, because the camera and the screen are two SOURCES for one
@@ -168,10 +203,18 @@ pub fn call_use_camera(on: bool) -> VideoSource {
     VideoSource { camera: on, sharing: false }
 }
 
-/// Start or stop sharing the screen. Starting one turns the camera off.
-pub fn call_use_screen(on: bool) -> VideoSource {
-    crate::call::set_video_source(if on { "screen" } else { "off" });
-    VideoSource { camera: false, sharing: on }
+/// Start sharing `target`, or stop with `None`. Starting one turns the camera
+/// off. THE TARGET IS STORED BEFORE THE SOURCE MOVES, so the capture thread —
+/// which the call guest starts a round trip later — can never see
+/// [`Source::Screen`] without the target it belongs to.
+pub fn call_use_screen(target: Option<ShareTarget>) -> VideoSource {
+    let Some(target) = target else {
+        crate::call::set_video_source("off");
+        return VideoSource { camera: false, sharing: false };
+    };
+    *share_target().lock().expect("share target") = target;
+    crate::call::set_video_source("screen");
+    VideoSource { camera: false, sharing: true }
 }
 
 /// Clear everything at session end — the next session must not open on the
@@ -433,8 +476,45 @@ fn refuse_source(
     SOURCE.store(Source::Off.code(), Ordering::Relaxed);
 }
 
-/// The screen source on macOS: the main display, one `CGDisplayCreateImage`
-/// per frame. `core-graphics` is already in this binary under gpui, so the
+/// The displays a share may pick on macOS, in the order
+/// [`ShareTarget::Monitor`] indexes them. Windows are not offered: capturing
+/// one wants `CGWindowListCopyWindowInfo` to enumerate and
+/// `CGWindowListCreateImage` to read, and neither can be exercised from the
+/// Linux hosts this is developed on.
+// ponytail: displays only on macOS. Add windows when a Mac is in the loop to
+// verify them — the picker and the target enum already carry them.
+#[cfg(target_os = "macos")]
+pub fn call_share_targets() -> Result<Vec<ShareChoice>, String> {
+    use core_graphics::display::CGDisplay;
+
+    let displays =
+        CGDisplay::active_displays().map_err(|error| format!("no display to share ({error})"))?;
+    if displays.is_empty() {
+        return Err("this Mac reports no active display".into());
+    }
+    let main = CGDisplay::main().id;
+    let choices = displays
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let bounds = CGDisplay::new(*id).bounds();
+            let primary = if *id == main { " (main)" } else { "" };
+            ShareChoice {
+                target: ShareTarget::Monitor(index),
+                label: format!(
+                    "Display {}{primary} — {}×{}",
+                    index + 1,
+                    bounds.size.width as i64,
+                    bounds.size.height as i64
+                ),
+            }
+        })
+        .collect();
+    Ok(choices)
+}
+
+/// The screen source on macOS: one display, one `CGDisplayCreateImage` per
+/// frame. `core-graphics` is already in this binary under gpui, so the
 /// desktop costs no new dependency. The image comes back in device pixels
 /// (a Retina desktop is 4× the points) as 32-bit BGRX rows that may carry
 /// padding; the grab strips the padding and halves onto the screen budget.
@@ -442,8 +522,9 @@ fn refuse_source(
 /// SCREEN RECORDING PERMISSION IS THE SYSTEM'S: without it macOS hands back
 /// the wallpaper with no windows on it and no error. The first share prompts
 /// once (the app must be launched from a bundle for the prompt to name it).
-// ponytail: the main display only — a per-display or per-window picker is
-// the obvious next step and wants a picker UI, not a different capture.
+// ponytail: no pointer drawn in, unlike the X11 source — `CGDisplayCreateImage`
+// leaves the cursor out too, but reading it back wants AppKit's `NSCursor`
+// image, which no Linux host here can exercise.
 #[cfg(target_os = "macos")]
 struct ScreenSource {
     display: core_graphics::display::CGDisplay,
@@ -451,8 +532,25 @@ struct ScreenSource {
 
 #[cfg(target_os = "macos")]
 impl ScreenSource {
-    fn open() -> Result<Self, String> {
-        let display = core_graphics::display::CGDisplay::main();
+    fn open(target: ShareTarget) -> Result<Self, String> {
+        use core_graphics::display::CGDisplay;
+
+        let display = match target {
+            // Every head at once is one `CGDisplayCreateImage` per head glued
+            // into one picture; nothing offers it, so nothing implements it.
+            ShareTarget::Desktop => CGDisplay::main(),
+            ShareTarget::Monitor(head) => {
+                let displays = CGDisplay::active_displays()
+                    .map_err(|error| format!("no display to share ({error})"))?;
+                let id = displays
+                    .get(head)
+                    .ok_or_else(|| "that display is no longer attached".to_string())?;
+                CGDisplay::new(*id)
+            }
+            ShareTarget::Window(_) => {
+                return Err("sharing a single window is not available on macOS yet".into());
+            }
+        };
         // one probe grab: a display that cannot be imaged (a headless run, a
         // locked session) is refused at open, not on every frame
         display
@@ -499,100 +597,433 @@ impl ScreenSource {
     }
 }
 
-/// The screen source: one X11 connection, and a full-desktop grab per frame.
+/// One X11 display this app may capture from: the connection and its root.
 ///
-/// X11 AND PURE RUST ON PURPOSE. `x11rb` is already in this binary (winit
-/// draws through it), so the desktop costs no new dependency, no C toolchain
-/// and no build-time system library — which the portal/pipewire route would
-/// cost on every machine that builds this app. The app itself runs natively
-/// on either display server; a share is an X11-session feature, and a
-/// Wayland session is refused below rather than grabbed.
-// ponytail: the WHOLE root window, so a multi-head desktop shares every head
-// at once — a per-monitor or per-window picker is the obvious next step and
-// wants a picker UI, not a different capture.
+/// X11 AND PURE RUST ON PURPOSE. `x11rb` is already in this binary (gpui draws
+/// through it), so the desktop costs no new dependency, no C toolchain and no
+/// build-time system library — which the portal/pipewire route would cost on
+/// every machine that builds this app. The app itself runs natively on either
+/// display server; a share is an X11-session feature, and a Wayland session is
+/// refused here rather than grabbed.
+///
+/// BOTH the picker and the capture come through this, so a target can never be
+/// offered on a display that would then refuse it.
+#[cfg(not(target_os = "macos"))]
+fn x11_display() -> Result<(x11rb::rust_connection::RustConnection, u32), String> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::ImageOrder;
+
+    // A WAYLAND SESSION'S X SERVER IS XWAYLAND, and its root window holds
+    // X clients only — a grab there is a black rectangle with this app's
+    // own windows in it, never the desktop. Refusing says that; sharing it
+    // would be a lie the sharer cannot see (they see their own screen).
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return Err("screen sharing needs an X11 session, and this one is Wayland".into());
+    }
+    let (connection, screen) =
+        x11rb::connect(None).map_err(|error| format!("no X display ({error})"))?;
+    let setup = connection.setup();
+    let screen = setup
+        .roots
+        .get(screen)
+        .ok_or_else(|| "the X display named no screen".to_string())?;
+    let (root, depth) = (screen.root, screen.root_depth);
+    // The one pixel layout `grab` reads: 32 bits per pixel, little-endian,
+    // which is every TrueColor desktop this app runs on. Anything else is
+    // refused rather than shipped as swapped colour.
+    let bits = setup
+        .pixmap_formats
+        .iter()
+        .find(|format| format.depth == depth)
+        .map(|format| format.bits_per_pixel);
+    let packed_bgrx = bits == Some(32) && setup.image_byte_order == ImageOrder::LSB_FIRST;
+    if !packed_bgrx {
+        return Err(format!(
+            "this display's {depth}-bit pixel layout is not one screen sharing can read"
+        ));
+    }
+    Ok((connection, root))
+}
+
+/// The heads RandR reports, in the order the picker numbers them — the same
+/// order [`ShareTarget::Monitor`] indexes, so the list is the contract between
+/// the picker and the grab and nothing needs to carry a rectangle around.
+///
+/// A server too old for RandR 1.5, or one with no monitor objects, reports
+/// none: the root IS its one screen, and [`ShareTarget::Desktop`] shares it.
+#[cfg(not(target_os = "macos"))]
+fn x11_monitors(
+    connection: &x11rb::rust_connection::RustConnection,
+    root: u32,
+) -> Vec<x11rb::protocol::randr::MonitorInfo> {
+    use x11rb::protocol::randr::ConnectionExt as _;
+
+    // RandR is version-negotiated before use, and `get_monitors` is 1.5.
+    let Ok(version) = connection.randr_query_version(1, 5) else {
+        return Vec::new();
+    };
+    let Ok(version) = version.reply() else {
+        return Vec::new();
+    };
+    let has_monitors = (version.major_version, version.minor_version) >= (1, 5);
+    if !has_monitors {
+        return Vec::new();
+    }
+    connection
+        .randr_get_monitors(root, true)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .map(|reply| reply.monitors)
+        .unwrap_or_default()
+}
+
+/// The top-level windows a share may pick, newest-mapped first as the window
+/// manager lists them. Only `_NET_CLIENT_LIST` windows are offered: that is the
+/// WM's own list of the things a person thinks of as windows, so no menu,
+/// tooltip or override-redirect surface can end up in the picker.
+#[cfg(not(target_os = "macos"))]
+fn x11_windows(
+    connection: &x11rb::rust_connection::RustConnection,
+    root: u32,
+) -> Vec<ShareChoice> {
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+
+    let atom = |name: &str| -> Option<u32> {
+        connection
+            .intern_atom(true, name.as_bytes())
+            .ok()?
+            .reply()
+            .ok()
+            .map(|reply| reply.atom)
+            .filter(|atom| *atom != 0)
+    };
+    // No `_NET_CLIENT_LIST` is a window manager that does not publish one (or
+    // none running at all): there is nothing to enumerate, and the heads above
+    // are the whole picker.
+    let Some(client_list) = atom("_NET_CLIENT_LIST") else {
+        return Vec::new();
+    };
+    let listed = connection
+        .get_property(false, root, client_list, AtomEnum::WINDOW, 0, MAX_LISTED_WINDOWS)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .and_then(|reply| reply.value32().map(|windows| windows.collect::<Vec<u32>>()))
+        .unwrap_or_default();
+    let net_wm_name = atom("_NET_WM_NAME");
+    let utf8 = atom("UTF8_STRING");
+    let mut choices = Vec::with_capacity(listed.len());
+    for window in listed {
+        // A window too small to read is a tray icon or a stray 1×1 helper; a
+        // share of one is never what was meant.
+        let big_enough = connection
+            .get_geometry(window)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .is_some_and(|geometry| {
+                geometry.width >= MIN_SHAREABLE_EDGE && geometry.height >= MIN_SHAREABLE_EDGE
+            });
+        if !big_enough {
+            continue;
+        }
+        let utf8_title = net_wm_name
+            .zip(utf8)
+            .and_then(|(name, utf8)| x11_text(connection, window, name, utf8));
+        let title = utf8_title
+            .or_else(|| x11_text(connection, window, AtomEnum::WM_NAME.into(), AtomEnum::STRING.into()))
+            .unwrap_or_else(|| "Untitled window".to_string());
+        choices.push(ShareChoice {
+            target: ShareTarget::Window(window),
+            label: title,
+        });
+    }
+    choices
+}
+
+/// One text property as a `String`, or `None` when it is absent or empty —
+/// which is how a window with no title falls through to the next property.
+#[cfg(not(target_os = "macos"))]
+fn x11_text(
+    connection: &x11rb::rust_connection::RustConnection,
+    window: u32,
+    property: u32,
+    kind: u32,
+) -> Option<String> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+
+    let reply = connection
+        .get_property(false, window, property, kind, 0, MAX_TITLE_WORDS)
+        .ok()?
+        .reply()
+        .ok()?;
+    let text = String::from_utf8_lossy(&reply.value).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// `_NET_CLIENT_LIST` is read in 32-bit words: a desktop with more open windows
+/// than this has a picker nobody would scroll anyway.
+#[cfg(not(target_os = "macos"))]
+const MAX_LISTED_WINDOWS: u32 = 256;
+/// A window title is read in 32-bit words — 1 KiB of name is already far more
+/// than a row can show.
+#[cfg(not(target_os = "macos"))]
+const MAX_TITLE_WORDS: u32 = 256;
+/// The smallest window edge worth offering, in pixels.
+#[cfg(not(target_os = "macos"))]
+const MIN_SHAREABLE_EDGE: u16 = 64;
+
+/// The share targets this host can capture, in the order the picker shows them:
+/// the whole desktop (only where there is more than one head to glue), then
+/// each head, then each window.
+#[cfg(not(target_os = "macos"))]
+pub fn call_share_targets() -> Result<Vec<ShareChoice>, String> {
+    let (connection, root) = x11_display()?;
+    let heads = x11_monitors(&connection, root);
+    let mut choices = Vec::new();
+    let one_head = heads.len() < 2;
+    if !one_head {
+        choices.push(ShareChoice {
+            target: ShareTarget::Desktop,
+            label: format!("Entire desktop — all {} screens", heads.len()),
+        });
+    }
+    for (index, head) in heads.iter().enumerate() {
+        let name = x11_text_of_atom(&connection, head.name).unwrap_or_else(|| format!("Screen {}", index + 1));
+        let primary = if head.primary { " (primary)" } else { "" };
+        choices.push(ShareChoice {
+            target: ShareTarget::Monitor(index),
+            label: format!("{name}{primary} — {}×{}", head.width, head.height),
+        });
+    }
+    if choices.is_empty() {
+        choices.push(ShareChoice {
+            target: ShareTarget::Desktop,
+            label: "Entire screen".to_string(),
+        });
+    }
+    choices.extend(x11_windows(&connection, root));
+    Ok(choices)
+}
+
+/// A RandR monitor's name, which is an atom (`DP-1`, `eDP-1`, `XWAYLAND0`).
+#[cfg(not(target_os = "macos"))]
+fn x11_text_of_atom(
+    connection: &x11rb::rust_connection::RustConnection,
+    atom: u32,
+) -> Option<String> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+
+    let reply = connection.get_atom_name(atom).ok()?.reply().ok()?;
+    let name = String::from_utf8_lossy(&reply.name).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The screen source: one X11 connection, and one grab of [`ShareTarget`] per
+/// frame.
 #[cfg(not(target_os = "macos"))]
 struct ScreenSource {
     connection: x11rb::rust_connection::RustConnection,
     root: x11rb::protocol::xproto::Window,
+    target: ShareTarget,
+}
+
+/// One frame's read: the drawable, the rectangle inside it, and where that
+/// rectangle sits on the root — which is the frame of reference the pointer's
+/// position comes in, and the only reason the origin is carried.
+#[cfg(not(target_os = "macos"))]
+struct Plan {
+    drawable: x11rb::protocol::xproto::Drawable,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    root_x: i16,
+    root_y: i16,
+    /// A pixmap this plan named, which the grab frees after reading it.
+    pixmap: Option<x11rb::protocol::xproto::Pixmap>,
 }
 
 #[cfg(not(target_os = "macos"))]
 impl ScreenSource {
-    fn open() -> Result<Self, String> {
-        use x11rb::connection::Connection as _;
-        use x11rb::protocol::xproto::ImageOrder;
-
-        // A WAYLAND SESSION'S X SERVER IS XWAYLAND, and its root window holds
-        // X clients only — a grab there is a black rectangle with this app's
-        // own windows in it, never the desktop. Refusing says that; sharing it
-        // would be a lie the sharer cannot see (they see their own screen).
-        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            return Err("screen sharing needs an X11 session, and this one is Wayland".into());
-        }
-        let (connection, screen) =
-            x11rb::connect(None).map_err(|error| format!("no X display ({error})"))?;
-        let setup = connection.setup();
-        let root = setup
-            .roots
-            .get(screen)
-            .ok_or_else(|| "the X display named no screen".to_string())?
-            .root;
-        // The one pixel layout `grab` reads: 32 bits per pixel, little-endian,
-        // which is every TrueColor desktop this app runs on. Anything else is
-        // refused rather than shipped as swapped colour.
-        let depth = setup
-            .roots
-            .get(screen)
-            .map(|screen| screen.root_depth)
-            .unwrap_or_default();
-        let bits = setup
-            .pixmap_formats
-            .iter()
-            .find(|format| format.depth == depth)
-            .map(|format| format.bits_per_pixel);
-        let packed_bgrx = bits == Some(32) && setup.image_byte_order == ImageOrder::LSB_FIRST;
-        if !packed_bgrx {
-            return Err(format!(
-                "this display's {depth}-bit pixel layout is not one screen sharing can read"
-            ));
-        }
-        Ok(ScreenSource { connection, root })
+    fn open(target: ShareTarget) -> Result<Self, String> {
+        let (connection, root) = x11_display()?;
+        let source = ScreenSource {
+            connection,
+            root,
+            target,
+        };
+        source.prepare()?;
+        // One probe grab: a target that cannot be read — a window that closed
+        // between the picker and the press, a head RandR no longer reports —
+        // is refused at open, where the toggle can go back, not every frame.
+        source.plan()?;
+        Ok(source)
     }
 
-    /// One grab, RGBA, already inside the wire budget.
-    fn grab(&self) -> Result<(Vec<u8>, u32, u32), String> {
-        use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
+    /// What a target needs before its first grab. A WINDOW MUST BE REDIRECTED
+    /// TO BE NAMED: `NameWindowPixmap` answers `BadMatch` for a window nobody
+    /// redirected, and reading the window drawable itself instead would hand
+    /// back undefined bytes wherever another window overlaps it — the sharer's
+    /// own huddle window, most of the time. `AUTOMATIC` keeps the server
+    /// painting it to the screen as well, so redirecting changes nothing the
+    /// sharer can see, and a compositing WM that already holds a `MANUAL`
+    /// redirect on the same window is unaffected by ours.
+    fn prepare(&self) -> Result<(), String> {
+        use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
+        use x11rb::protocol::xfixes::ConnectionExt as _;
 
-        // The geometry is re-read per frame: a resolution change mid-share
-        // would otherwise grab a rectangle the root no longer has.
-        let geometry = self
+        // XFIXES IS NEGOTIATED PER CONNECTION before any of its requests, and
+        // this source owns its own. A server without it is a share with no
+        // pointer drawn into it, never a refused share — so the result is
+        // dropped rather than raised.
+        let _ = self
             .connection
-            .get_geometry(self.root)
+            .xfixes_query_version(5, 0)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok());
+        let ShareTarget::Window(window) = self.target else {
+            return Ok(());
+        };
+        self.connection
+            .composite_query_version(0, 4)
+            .map_err(|error| error.to_string())?
+            .reply()
+            .map_err(|_| "this X server has no Composite extension, so a single window cannot be shared".to_string())?;
+        self.connection
+            .composite_redirect_window(window, Redirect::AUTOMATIC)
+            .map_err(|error| error.to_string())?
+            .check()
+            .map_err(|error| format!("that window cannot be captured ({error})"))?;
+        Ok(())
+    }
+
+    /// ONE DISPATCH over the target, each arm one delegation — a new kind of
+    /// share must fail the build here until it is routed.
+    fn plan(&self) -> Result<Plan, String> {
+        match self.target {
+            ShareTarget::Desktop => self.plan_desktop(),
+            ShareTarget::Monitor(head) => self.plan_monitor(head),
+            ShareTarget::Window(window) => self.plan_window(window),
+        }
+    }
+
+    /// The root whole. Its geometry is re-read per frame: a resolution change
+    /// mid-share would otherwise grab a rectangle the root no longer has.
+    fn plan_desktop(&self) -> Result<Plan, String> {
+        let geometry = self.geometry(self.root)?;
+        Ok(Plan {
+            drawable: self.root,
+            x: 0,
+            y: 0,
+            width: geometry.width,
+            height: geometry.height,
+            root_x: 0,
+            root_y: 0,
+            pixmap: None,
+        })
+    }
+
+    /// One head, as a rectangle of the root — never a drawable of its own, so
+    /// nothing can overlap it and no compositing is involved.
+    fn plan_monitor(&self, head: usize) -> Result<Plan, String> {
+        let heads = x11_monitors(&self.connection, self.root);
+        let head = heads
+            .get(head)
+            .ok_or_else(|| "that screen is no longer attached".to_string())?;
+        Ok(Plan {
+            drawable: self.root,
+            x: head.x,
+            y: head.y,
+            width: head.width,
+            height: head.height,
+            root_x: head.x,
+            root_y: head.y,
+            pixmap: None,
+        })
+    }
+
+    /// One window, through its redirected offscreen pixmap. THE PIXMAP IS
+    /// NAMED PER FRAME: the server frees the old backing store when the window
+    /// resizes, and a name held across that grabs a stale size forever.
+    fn plan_window(&self, window: u32) -> Result<Plan, String> {
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::composite::ConnectionExt as _;
+        use x11rb::protocol::xproto::ConnectionExt as _;
+
+        let geometry = self.geometry(window)?;
+        let root_at = self
+            .connection
+            .translate_coordinates(window, self.root, 0, 0)
             .map_err(|error| error.to_string())?
             .reply()
             .map_err(|error| error.to_string())?;
+        let pixmap = self
+            .connection
+            .generate_id()
+            .map_err(|error| error.to_string())?;
+        self.connection
+            .composite_name_window_pixmap(window, pixmap)
+            .map_err(|error| error.to_string())?
+            .check()
+            .map_err(|error| format!("that window stopped answering ({error})"))?;
+        Ok(Plan {
+            drawable: pixmap,
+            x: 0,
+            y: 0,
+            width: geometry.width,
+            height: geometry.height,
+            root_x: root_at.dst_x,
+            root_y: root_at.dst_y,
+            pixmap: Some(pixmap),
+        })
+    }
+
+    fn geometry(
+        &self,
+        drawable: x11rb::protocol::xproto::Drawable,
+    ) -> Result<x11rb::protocol::xproto::GetGeometryReply, String> {
+        use x11rb::protocol::xproto::ConnectionExt as _;
+
+        self.connection
+            .get_geometry(drawable)
+            .map_err(|error| error.to_string())?
+            .reply()
+            .map_err(|error| format!("that share target is gone ({error})"))
+    }
+
+    /// One grab, BGRA, already inside the wire budget.
+    fn grab(&self) -> Result<(Vec<u8>, u32, u32), String> {
+        use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
+
+        let plan = self.plan()?;
         let image = self
             .connection
             .get_image(
                 ImageFormat::Z_PIXMAP,
-                self.root,
-                0,
-                0,
-                geometry.width,
-                geometry.height,
+                plan.drawable,
+                plan.x,
+                plan.y,
+                plan.width,
+                plan.height,
                 u32::MAX,
             )
-            .map_err(|error| error.to_string())?
-            .reply()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())
+            .and_then(|cookie| cookie.reply().map_err(|error| error.to_string()));
+        // The pixmap goes back BEFORE the reply is unwrapped: a failed read
+        // must not leak one per frame for as long as the share runs.
+        if let Some(pixmap) = plan.pixmap {
+            let _ = self.connection.free_pixmap(pixmap);
+        }
+        let mut pixels = image?.data;
+        // The pointer goes in at full size, so it shrinks with the picture.
+        self.draw_pointer(&mut pixels, &plan);
         let codec::Picture {
             mut pixels,
             width,
             height,
         } = codec::shrink_to_budget(
-            image.data,
-            u32::from(geometry.width),
-            u32::from(geometry.height),
+            pixels,
+            u32::from(plan.width),
+            u32::from(plan.height),
             SCREEN_PIXEL_BUDGET,
         );
         // X hands back BGRX, which IS the renderer's and the encoder's order;
@@ -601,6 +1032,99 @@ impl ScreenSource {
             pixel[3] = 0xff;
         }
         Ok((pixels, width, height))
+    }
+
+    /// Draw the pointer into the grab, BECAUSE X DOES NOT PUT IT THERE.
+    /// `GetImage` reads the framebuffer and the cursor is an overlay the server
+    /// composites on the way out, so a share without this step is one where
+    /// "click here" points at nothing — the single most common thing a shared
+    /// screen is for.
+    ///
+    /// A pointer that cannot be read is not a reason to drop the frame, and it
+    /// is not loggable either (this runs ten times a second), so every failure
+    /// here is simply a frame without a cursor in it.
+    fn draw_pointer(&self, pixels: &mut [u8], plan: &Plan) {
+        use x11rb::protocol::xfixes::ConnectionExt as _;
+
+        let Some(cursor) = self
+            .connection
+            .xfixes_get_cursor_image()
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+        else {
+            return;
+        };
+        // The pointer's position is in ROOT coordinates and names its hotspot,
+        // not its corner; the grab's own origin on the root turns one into the
+        // other.
+        blend_pointer(
+            pixels,
+            i32::from(plan.width),
+            i32::from(plan.height),
+            Pointer {
+                argb: &cursor.cursor_image,
+                width: i32::from(cursor.width).max(1),
+                left: i32::from(cursor.x) - i32::from(cursor.xhot) - i32::from(plan.root_x),
+                top: i32::from(cursor.y) - i32::from(cursor.yhot) - i32::from(plan.root_y),
+            },
+        );
+    }
+}
+
+/// The pointer as XFIXES hands it over, placed: premultiplied ARGB words, the
+/// row length that shapes them, and where its top-left corner falls INSIDE the
+/// grabbed rectangle — which is the only coordinate space [`blend_pointer`]
+/// knows about.
+#[cfg(not(target_os = "macos"))]
+struct Pointer<'a> {
+    argb: &'a [u32],
+    width: i32,
+    left: i32,
+    top: i32,
+}
+
+/// Composite the pointer onto a BGRA grab, clipped to it: the pointer sits
+/// where it sits, and a rectangle that only catches a corner of it gets that
+/// corner and nothing outside the buffer.
+#[cfg(not(target_os = "macos"))]
+fn blend_pointer(pixels: &mut [u8], width: i32, height: i32, pointer: Pointer<'_>) {
+    for (index, argb) in pointer.argb.iter().enumerate() {
+        let index = index as i32;
+        let x = pointer.left + index % pointer.width;
+        let y = pointer.top + index / pointer.width;
+        let inside = x >= 0 && y >= 0 && x < width && y < height;
+        let alpha = (argb >> 24) & 0xff;
+        if !inside || alpha == 0 {
+            continue;
+        }
+        let at = ((y * width + x) * 4) as usize;
+        let Some(pixel) = pixels.get_mut(at..at + 4) else {
+            continue;
+        };
+        // XFIXES hands back PREMULTIPLIED ARGB, so source-over onto an opaque
+        // destination is an add — no divide by alpha anywhere.
+        let keep = 255 - alpha;
+        let over = |source: u32, under: u8| (source + u32::from(under) * keep / 255).min(255) as u8;
+        pixel[0] = over(argb & 0xff, pixel[0]);
+        pixel[1] = over((argb >> 8) & 0xff, pixel[1]);
+        pixel[2] = over((argb >> 16) & 0xff, pixel[2]);
+    }
+}
+
+/// A redirect this source asked for is released with it — the server drops a
+/// dead client's redirect anyway, but the share ending is not the app exiting.
+#[cfg(not(target_os = "macos"))]
+impl Drop for ScreenSource {
+    fn drop(&mut self) {
+        use x11rb::protocol::composite::ConnectionExt as _;
+
+        let ShareTarget::Window(window) = self.target else {
+            return;
+        };
+        let _ = self.connection.composite_unredirect_window(
+            window,
+            x11rb::protocol::composite::Redirect::AUTOMATIC,
+        );
     }
 }
 
@@ -634,7 +1158,7 @@ fn open_source(
     match source {
         Source::Off => Open::None,
         Source::Camera => open_camera(events).map_or(Open::None, Open::Camera),
-        Source::Screen => match ScreenSource::open() {
+        Source::Screen => match ScreenSource::open(*share_target().lock().expect("share target")) {
             Ok(screen) => Open::Screen(screen),
             Err(reason) => {
                 refuse_source(events, format!("share: {reason}"));
@@ -789,6 +1313,255 @@ pub(crate) fn stage_frame(peer: &str) -> Option<(u32, u32, Arc<RenderImage>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// EVERY TARGET THE PICKER OFFERS MUST ACTUALLY GRAB — a row that refuses
+    /// on press is worse than no row — and a window share must come back with
+    /// THAT WINDOW's pixels in it, which is the whole question the composite
+    /// redirect answers.
+    ///
+    /// The test brings its own window and publishes it the way a window manager
+    /// does, because one `_NET_CLIENT_LIST` property is the entire contribution
+    /// a WM makes to the picker's list. So a bare `DISPLAY=:95` against an Xvfb
+    /// is enough to run it:
+    /// `DISPLAY=:95 cargo test -p ducktape-app --bin ducktape-app
+    /// every_offered_share_target -- --ignored --nocapture`
+    #[cfg(not(target_os = "macos"))]
+    #[ignore = "needs a real X display"]
+    #[test]
+    fn every_offered_share_target_grabs_and_a_window_share_is_that_window() {
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xproto::{
+            AtomEnum, ConnectionExt as _, CreateGCAux, CreateWindowAux, PropMode, Rectangle,
+            WindowClass,
+        };
+        use x11rb::wrapper::ConnectionExt as _;
+
+        const EDGE: u16 = 320;
+        /// Where the pointer's hotspot is put inside the window — far from the
+        /// centre, so the fill and the pointer are checked in their own corners.
+        const POINTER_AT: u16 = 40;
+        let (connection, root) = x11_display().expect("an X display to share");
+        let screen = connection
+            .setup()
+            .roots
+            .iter()
+            .find(|screen| screen.root == root)
+            .expect("the screen this root belongs to")
+            .clone();
+        let window = connection.generate_id().expect("a window id");
+        connection
+            .create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                window,
+                root,
+                0,
+                0,
+                EDGE,
+                EDGE,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                screen.root_visual,
+                &CreateWindowAux::new().background_pixel(screen.black_pixel),
+            )
+            .expect("create a window")
+            .check()
+            .expect("the window is created");
+        connection
+            .map_window(window)
+            .expect("map it")
+            .check()
+            .expect("it is mapped");
+        let client_list = connection
+            .intern_atom(false, b"_NET_CLIENT_LIST")
+            .expect("intern")
+            .reply()
+            .expect("the atom")
+            .atom;
+        connection
+            .change_property32(PropMode::REPLACE, root, client_list, AtomEnum::WINDOW, &[
+                window,
+            ])
+            .expect("publish the client list")
+            .check()
+            .expect("it is published");
+
+        let offered = call_share_targets().expect("this display offers a share target");
+        assert!(!offered.is_empty(), "a display with no target is a bug");
+        let ours = offered
+            .iter()
+            .find(|choice| choice.target == ShareTarget::Window(window))
+            .expect("the published window must be offered");
+        println!("offered window: {}", ours.label);
+
+        for choice in &offered {
+            let source = ScreenSource::open(choice.target)
+                .unwrap_or_else(|reason| panic!("{} must open: {reason}", choice.label));
+            // The window is painted AFTER the source opened, because opening it
+            // is what redirects the window: a fill from before the redirect is
+            // not in the pixmap the grab names.
+            let is_ours = choice.target == ShareTarget::Window(window);
+            if is_ours {
+                let gc = connection.generate_id().expect("a gc id");
+                connection
+                    .create_gc(gc, window, &CreateGCAux::new().foreground(0x00_ff_00))
+                    .expect("create a gc")
+                    .check()
+                    .expect("the gc is created");
+                connection
+                    .poly_fill_rectangle(window, gc, &[Rectangle {
+                        x: 0,
+                        y: 0,
+                        width: EDGE,
+                        height: EDGE,
+                    }])
+                    .expect("fill the window")
+                    .check()
+                    .expect("it is filled");
+                // The pointer is put INSIDE the window, so the grab below has
+                // to draw it in — see `draw_pointer`. Its hotspot lands in the
+                // top-left quadrant, away from the centre the fill is checked
+                // at.
+                connection
+                    .warp_pointer(
+                        x11rb::NONE,
+                        window,
+                        0,
+                        0,
+                        0,
+                        0,
+                        (POINTER_AT) as i16,
+                        (POINTER_AT) as i16,
+                    )
+                    .expect("warp the pointer")
+                    .check()
+                    .expect("the pointer moved");
+                // A round trip on this connection is the wait: the server has
+                // processed the fill and the warp before it can answer. No
+                // sleep, no retry.
+                connection
+                    .get_input_focus()
+                    .expect("sync")
+                    .reply()
+                    .expect("the server is caught up");
+            }
+            let (pixels, width, height) = source
+                .grab()
+                .unwrap_or_else(|reason| panic!("{} must grab: {reason}", choice.label));
+            assert_eq!(
+                pixels.len(),
+                (width * height * 4) as usize,
+                "{} handed back a picture that is not its own size",
+                choice.label
+            );
+            assert!(
+                width * height <= SCREEN_PIXEL_BUDGET,
+                "{} came back over the share budget at {width}×{height}",
+                choice.label
+            );
+            println!("{} grabbed at {width}×{height}", choice.label);
+            if !is_ours {
+                continue;
+            }
+            assert_eq!(
+                (width, height),
+                (u32::from(EDGE), u32::from(EDGE)),
+                "a window share must be the window's own size, not the desktop's"
+            );
+            // The middle of the window, where nothing else can be: BGRA, so the
+            // green we filled with reads back in the middle channel.
+            let middle = ((height / 2 * width + width / 2) * 4) as usize;
+            assert_eq!(
+                &pixels[middle..middle + 3],
+                &[0x00, 0xff, 0x00],
+                "a window share must carry that window's pixels"
+            );
+            // And the pointer must be IN the picture: X leaves it out of
+            // `GetImage`, so the only thing that can have broken the green fill
+            // around its hotspot is `draw_pointer` having run.
+            let near_pointer = |x: u32, y: u32| {
+                let at = ((y * width + x) * 4) as usize;
+                pixels[at..at + 3] != [0x00, 0xff, 0x00]
+            };
+            let drawn = (0..u32::from(POINTER_AT) * 2)
+                .flat_map(|y| (0..u32::from(POINTER_AT) * 2).map(move |x| (x, y)))
+                .any(|(x, y)| near_pointer(x, y));
+            assert!(
+                drawn,
+                "the pointer is inside this window and nothing drew it into the share"
+            );
+        }
+    }
+
+    /// The pointer is drawn in BY HAND because X leaves it out of `GetImage`,
+    /// so this arithmetic is the only thing standing between a share and a
+    /// "click here" that points at nothing: premultiplied source-over, and
+    /// clipped to the grab so a pointer half off the shared rectangle writes
+    /// only the half that is on it.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_pointer_is_blended_in_and_clipped_to_the_share() {
+        // a 2×2 black grab, and a 2×2 pointer — words are A, R, G, B from the
+        // top byte down: opaque blue, transparent, half-alpha white
+        // (premultiplied, so 0x80 in every channel), opaque red
+        let opaque_blue = 0xff_00_00_ffu32;
+        let clear = 0x00_00_00_00u32;
+        let half_white = 0x80_80_80_80u32;
+        let opaque_red = 0xff_ff_00_00u32;
+        let cursor = [opaque_blue, clear, half_white, opaque_red];
+        let mut pixels = vec![0u8; 2 * 2 * 4];
+        blend_pointer(
+            &mut pixels,
+            2,
+            2,
+            Pointer {
+                argb: &cursor,
+                width: 2,
+                left: 0,
+                top: 0,
+            },
+        );
+        // BGRA out: blue is (255, 0, 0), the clear word left its pixel alone,
+        // half-alpha over black is the premultiplied value itself, red is
+        // (0, 0, 255).
+        assert_eq!(&pixels[0..3], &[0xff, 0x00, 0x00]);
+        assert_eq!(&pixels[4..7], &[0x00, 0x00, 0x00]);
+        assert_eq!(&pixels[8..11], &[0x80, 0x80, 0x80]);
+        assert_eq!(&pixels[12..15], &[0x00, 0x00, 0xff]);
+
+        // Half-alpha over an opaque WHITE ground keeps the rest of the ground:
+        // 0x80 + 0xff * (255 - 0x80) / 255 = 0xff.
+        let mut white = vec![0xffu8; 4];
+        blend_pointer(
+            &mut white,
+            1,
+            1,
+            Pointer {
+                argb: &[half_white],
+                width: 1,
+                left: 0,
+                top: 0,
+            },
+        );
+        assert_eq!(&white[0..3], &[0xff, 0xff, 0xff]);
+
+        // A pointer whose hotspot sits one pixel off the top-left of the
+        // shared rectangle: only its bottom-right quarter lands, and nothing
+        // is written outside the buffer.
+        let mut corner = vec![0u8; 2 * 2 * 4];
+        blend_pointer(
+            &mut corner,
+            2,
+            2,
+            Pointer {
+                argb: &cursor,
+                width: 2,
+                left: -1,
+                top: -1,
+            },
+        );
+        assert_eq!(&corner[0..3], &[0x00, 0x00, 0xff], "the red corner lands");
+        assert_eq!(&corner[4..], &[0u8; 12], "and nothing else does");
+    }
 
     /// The codec's own tests own the round trip and the crafted-SOF refusal;
     /// this end is the budgets: a within-budget frame decodes AT its size

@@ -417,6 +417,9 @@ fn huddle_props(state: &Ducktape) -> Vec<u8> {
         "status": state.call_status, "joined_at": state.huddle_joined_at,
         "now": state.huddle_now, "muted": state.call_muted,
         "camera": state.call_camera, "sharing": state.call_sharing,
+        // Only the host can enumerate displays and windows, so the view gets
+        // the labels and answers with a row index — see `Action::Share`.
+        "share_targets": state.share_picker.iter().map(|choice| &choice.label).collect::<Vec<_>>(),
         "speaking": state.call_speaking, "stage": state.huddle_stage,
         "tiles": state.huddle_tiles, "video_live": state.call_video_live,
         "peers": state.call_peers,
@@ -429,6 +432,11 @@ fn huddle_route(event: crate::module_view::ModuleViewEvent) -> Message {
         "mute" => Message::ToggleCallMute,
         "camera" => Message::ToggleCallCamera,
         "screen" => Message::ToggleCallScreen,
+        "share" => match event.detail.trim().parse::<usize>() {
+            Ok(index) => Message::PickShareTarget(index),
+            Err(_) => Message::CloseSharePicker,
+        },
+        "share_cancel" => Message::CloseSharePicker,
         "channel" => Message::HuddleGoChannel,
         "leave" => Message::LeaveHuddleHere,
         _ => Message::ExternalUrlFailed("unrecognized call control".to_owned().into()),
@@ -2263,6 +2271,66 @@ pub(crate) fn test_window(
             _keystrokes: keystrokes,
         }
     })
+}
+
+#[cfg(test)]
+mod call_control_tests {
+    use super::*;
+
+    /// A CONTROL THE VIEW PRESSES AND THE HOST NEVER DECLARED IS SWALLOWED
+    /// SILENTLY: an intent absent from `intents_of("call")` never becomes a
+    /// `ModuleViewEvent` at all, so the button simply does nothing, with no
+    /// error anywhere. `huddle_route`'s arms and that list are one seam kept in
+    /// two files, so the arms are READ OUT OF THIS SOURCE rather than copied
+    /// into a third list that could drift from both.
+    #[test]
+    fn every_call_control_the_host_routes_is_one_the_view_may_send() {
+        let source = include_str!("shell.rs");
+        let body = source
+            .split_once("fn huddle_route(")
+            .expect("huddle_route lives in this file")
+            .1
+            .split_once("\n}\n")
+            .expect("and its body ends")
+            .0;
+        let routed: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix('"'))
+            .filter_map(|line| line.split_once('"'))
+            .map(|(kind, _)| kind)
+            .collect();
+        assert!(
+            routed.contains(&"share") && routed.contains(&"mute"),
+            "the arms did not parse out of the source: {routed:?}"
+        );
+        let declared = crate::module_view::intents_of("call");
+        for kind in &routed {
+            assert!(
+                declared.contains(kind),
+                "the host routes `{kind}` and the view is not allowed to send it"
+            );
+        }
+        for kind in declared {
+            assert!(
+                routed.contains(kind),
+                "the view may send `{kind}` and the host routes it nowhere"
+            );
+        }
+        // And the picker's row index survives the trip as an index, not as the
+        // "unrecognized control" a bad parse would fall through to.
+        let picked = huddle_route(crate::module_view::view_event(
+            "share".to_owned(),
+            "2".to_owned(),
+        ));
+        assert!(matches!(picked, Message::PickShareTarget(2)));
+        // A row index that is not one closes the picker rather than sharing
+        // something nobody asked for.
+        let nonsense = huddle_route(crate::module_view::view_event(
+            "share".to_owned(),
+            "not a row".to_owned(),
+        ));
+        assert!(matches!(nonsense, Message::CloseSharePicker));
+    }
 }
 
 #[cfg(test)]
