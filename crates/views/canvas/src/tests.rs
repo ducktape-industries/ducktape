@@ -1502,14 +1502,14 @@ fn the_painter_and_the_editor_read_one_description_of_a_label() {
         !painting.contains("size: Some((14."),
         "the inline editor must not carry a type size of its own"
     );
-    // The editor fills the card it is opened over. Asking it to lay out to
-    // its own content instead collapses it to its first line on the native
-    // side, so five of a note's six lines go missing the moment a caret
-    // appears — the exact difference between editing and reading a card that
-    // this description exists to close.
+    // The editor fills the card it is opened over. A card is already sized by
+    // the gauge that measures its PAINTED label, so a caret box that laid out
+    // to its own words instead would answer to a second measurement — and the
+    // two disagreeing by a pixel is the difference between editing a card and
+    // reading one.
     assert!(
         !painting.contains("height: Some(Length::Shrink)"),
-        "the inline editor fills its card; a shrunk one shows one line of many"
+        "the inline editor fills the card the gauge already sized"
     );
 }
 

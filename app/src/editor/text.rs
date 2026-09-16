@@ -40,6 +40,7 @@ pub struct TextEditor {
     reset: Option<u64>,
     projection: Option<Projection>,
     painted: Option<wire::EditorOptions>,
+    fills: bool,
     ime: Option<crate::module_view::input::ImeState>,
     _observation: Subscription,
     _keystrokes: Subscription,
@@ -81,6 +82,7 @@ impl TextEditor {
             reset: None,
             projection: None,
             painted: None,
+            fills: true,
             ime: None,
             _observation: observation,
             _keystrokes: keystrokes,
@@ -91,6 +93,17 @@ impl TextEditor {
 
     pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
         self.input.read(cx).focus_handle(cx).is_focused(window)
+    }
+
+    /// Whether the field takes the box it was given or the room its own words
+    /// need. Set from the node's height, because a field that always asked for
+    /// all of its parent's height gave a shrinking box nothing to shrink to.
+    pub fn set_fills(&mut self, fills: bool, cx: &mut Context<Self>) {
+        if self.fills == fills {
+            return;
+        }
+        self.fills = fills;
+        cx.notify();
     }
 
     pub fn widget_command(
@@ -412,8 +425,11 @@ impl Render for TextEditor {
             .relative()
             .w_full()
             // The box the guest gave, not the room the words take: a press in
-            // the empty part of a card is a press on the card's writing.
-            .h_full()
+            // the empty part of a card is a press on the card's writing. A
+            // field asked to shrink has no empty part to press — its box IS
+            // its words — and taking the parent's height there would be taking
+            // the height the parent is waiting on this field to report.
+            .when(self.fills, |element| element.h_full())
             .on_mouse_down(MouseButton::Left, cx.listener(Self::pressed))
             .p(px(options.padding.unwrap_or(8.)))
             .text_size(px(size))
