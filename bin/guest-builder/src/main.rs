@@ -1272,6 +1272,13 @@ mod tests {
                 .args(args)
                 .env("CARGO_ENCODED_RUSTFLAGS", "")
                 .env_remove("RUSTFLAGS")
+                // "nothing overrides it" has to mean nothing THE OPERATOR
+                // brought either. The configuration round redirects with a
+                // config file, and cargo ranks the environment above one — so
+                // a `CARGO_TARGET_DIR` in the shell running the test wins,
+                // the reference build lands in the operator's directory, and
+                // the round fails claiming the redirection moved nothing.
+                .env_remove("CARGO_TARGET_DIR")
                 .current_dir(&shell);
             command
         };
