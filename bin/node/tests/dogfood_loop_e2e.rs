@@ -114,6 +114,7 @@ impl DogfoodProvider {
         // prints, so a run that replies at all is a run whose MCP calls landed.
         let requests = [
             serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
             serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
                 "name":"ducktape_action","arguments":{
                     "operation":"reply",
@@ -152,9 +153,31 @@ impl DogfoodProvider {
 /// clone of the branch — committed evidence, from a node that executed nothing.
 fn run_evidence(checkout: &Path, commit: &str) -> (String, String) {
     let responses = git_stdout(checkout, &["show", &format!("{commit}:{MCP_FILE}")]);
-    let reply = responses
+    let frames: Vec<serde_json::Value> = responses
         .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("MCP response"))
+        .map(|line| serde_json::from_str(line).expect("MCP response"))
+        .collect();
+    let listed = frames
+        .iter()
+        .find(|response| response["id"] == 2)
+        .expect("the VM listed the tools");
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tools/list carries a tool array, got {listed}"))
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("a tool name"))
+        .collect();
+    // the run's own view of the plane: the names it can call, as the lane
+    // served them into the VM. every one is ducktape's, and the door the next
+    // frame goes through is among them.
+    assert!(
+        names.iter().all(|name| name.starts_with("ducktape_")),
+        "{names:?}"
+    );
+    assert!(names.contains(&"ducktape_action"), "{names:?}");
+    assert!(names.contains(&"ducktape_actions"), "{names:?}");
+    let reply = frames
+        .iter()
         .find(|response| response["id"] == 1)
         .expect("the VM called ducktape_action");
     assert_ne!(reply["result"]["isError"], true, "{reply}");
@@ -701,18 +724,31 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
         (branch_tip(&cluster, 2, &pr_work_branch)? == run3_oid).then_some(())
     });
     cluster.clone_forge(2, REPO, &dest);
-    assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD"]), run3_oid);
+    // Walk the WORK BRANCH, not `HEAD`. A clone's HEAD is whatever branch the
+    // server advertised as its default, which is never a feature branch — and
+    // a clone of an empty repository succeeds, so reading HEAD would report
+    // git's confusion instead of the state that caused it. Say what node 2
+    // served, then walk the ref this test is actually about.
+    let served = git_stdout(&dest, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+    assert!(
+        !served.is_empty(),
+        "node 2 served an EMPTY repository for {REPO}: it holds {pr_work_branch} at \
+         {run3_oid} in consensus, but its materialized git store had no refs to clone"
+    );
+    let work = format!("refs/remotes/origin/{pr_work_branch}");
+    let walk = |rev: &str| git_stdout(&dest, &["rev-parse", rev]);
+    assert_eq!(walk(&work), run3_oid, "node 2 served:\n{served}");
     assert_eq!(
-        git_stdout(&dest, &["rev-parse", "HEAD^"]),
+        walk(&format!("{work}^")),
         run2_oid,
         "run 3 continues the PR session from run 2's commit"
     );
     assert_eq!(
-        git_stdout(&dest, &["rev-parse", "HEAD~2"]),
+        walk(&format!("{work}~2")),
         run1_oid,
         "run 2's parent is run 1's commit"
     );
-    assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD~3"]), dev_tip);
+    assert_eq!(walk(&format!("{work}~3")), dev_tip);
 
     // What each run SAW, read out of the commit it produced: the sandboxed
     // neutral cwd, and a detached `.git/HEAD` naming the commit it forked. Run 1
