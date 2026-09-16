@@ -116,18 +116,6 @@ pub const FRESHNESS_SECS: u64 = 30;
 /// layers and so cannot read the limit they install.
 const DEFAULT_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
 
-/// how much of a USER-SIGNED blob upload this gate will hold in memory to
-/// verify the signature over it.
-///
-/// This is not a limit on what may be uploaded — the blob route itself takes
-/// an unbounded stream onto disk, and a git push (any size, up to a whole
-/// repository's history) arrives on the operator credential, which returns
-/// before this gate buffers anything. It is the memory an UNAUTHENTICATED
-/// caller can make this node hold while it finds out whether the signature is
-/// any good, and a signature is over bytes, so there is no streaming answer to
-/// that question.
-const SIGNED_BLOB_HASH_BYTES: usize = 64 * 1024 * 1024;
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PopError {
     /// a required header is missing or malformed.
@@ -154,6 +142,32 @@ pub(crate) fn verify_pop(
     now: u64,
     message: impl FnOnce(u64) -> Vec<u8>,
 ) -> Result<Vec<u8>, PopError> {
+    let claim = read_pop(headers, names, now)?;
+    let message = message(claim.ts);
+    claim.against(ns, &message)
+}
+
+/// a well-formed, fresh proof-of-possession whose signature has not been
+/// checked against a message yet — everything about a request that can be
+/// judged WITHOUT its body.
+pub(crate) struct PopClaim {
+    key_bytes: Vec<u8>,
+    pubkey: ed25519::PublicKey,
+    sig: ed25519::Signature,
+    /// the timestamp the signed message must be built from.
+    pub(crate) ts: u64,
+}
+
+/// read the proof out of the headers: present, fresh, and decodable. A caller
+/// that cannot have the message yet — the blob lane hashes its body as it
+/// streams to disk — runs this FIRST, so a request with no headers, a stale
+/// timestamp or an undecodable key is refused at byte zero instead of after a
+/// whole upload.
+pub(crate) fn read_pop(
+    headers: &HeaderMap,
+    names: PopHeaders,
+    now: u64,
+) -> Result<PopClaim, PopError> {
     let key_hex = header_str(headers, names.key).ok_or(PopError::MissingAuth)?;
     let ts_str = header_str(headers, names.ts).ok_or(PopError::MissingAuth)?;
     let sig_hex = header_str(headers, names.sig).ok_or(PopError::MissingAuth)?;
@@ -168,9 +182,22 @@ pub(crate) fn verify_pop(
     let pubkey = ed25519::PublicKey::decode(key_bytes.as_slice()).map_err(|_| PopError::BadKey)?;
     let sig = ed25519::Signature::decode(sig_bytes.as_slice()).map_err(|_| PopError::BadKey)?;
 
-    match pubkey.verify(ns, &message(ts), &sig) {
-        true => Ok(key_bytes),
-        false => Err(PopError::BadSig),
+    Ok(PopClaim {
+        key_bytes,
+        pubkey,
+        sig,
+        ts,
+    })
+}
+
+impl PopClaim {
+    /// the last question, and the only one that needs the message: does this
+    /// signature actually cover these bytes?
+    pub(crate) fn against(self, ns: &[u8], message: &[u8]) -> Result<Vec<u8>, PopError> {
+        match self.pubkey.verify(ns, message, &self.sig) {
+            true => Ok(self.key_bytes),
+            false => Err(PopError::BadSig),
+        }
     }
 }
 
@@ -210,27 +237,46 @@ pub struct DeferredProof {
 }
 
 impl DeferredProof {
-    /// the acting key that signed for a body with this digest, or the refusal
-    /// to answer the caller with.
-    pub fn verify(&self, handle: &NodeHandle, digest: &[u8; 32]) -> Result<Vec<u8>, WriteRefusal> {
+    /// everything about this request that can be refused BEFORE its body:
+    /// this node has a key to bind against, the headers are there, the
+    /// timestamp is fresh, and the key and signature decode. Only the digest
+    /// binding has to wait, so a caller with no proof at all never gets to
+    /// stream a byte onto this node's disk.
+    pub fn precheck(&self, handle: &NodeHandle) -> Result<(), WriteRefusal> {
+        self.claim(handle).map(|_| ())
+    }
+
+    fn claim(&self, handle: &NodeHandle) -> Result<(PopClaim, Vec<u8>), WriteRefusal> {
         let Some(node_key) = handle.admin.node_key.clone().filter(|k| !k.is_empty()) else {
             return Err(WriteRefusal::NodeUnidentified);
         };
-        let verified = verify_pop(&self.headers, DATA_HEADERS, DATA_REQ_NS, now_secs(), |ts| {
-            node::signed_req::request_message_digest(
-                self.method.as_str(),
-                &self.path_and_query,
-                &node_key,
-                ts,
-                digest,
-            )
-        });
-        verified.map_err(|error| match error {
+        let claim = read_pop(&self.headers, DATA_HEADERS, now_secs())?;
+        Ok((claim, node_key))
+    }
+
+    /// the acting key that signed for a body with this digest, or the refusal
+    /// to answer the caller with.
+    pub fn verify(&self, handle: &NodeHandle, digest: &[u8; 32]) -> Result<Vec<u8>, WriteRefusal> {
+        let (claim, node_key) = self.claim(handle)?;
+        let message = node::signed_req::request_message_digest(
+            self.method.as_str(),
+            &self.path_and_query,
+            &node_key,
+            claim.ts,
+            digest,
+        );
+        Ok(claim.against(DATA_REQ_NS, &message)?)
+    }
+}
+
+impl From<PopError> for WriteRefusal {
+    fn from(error: PopError) -> Self {
+        match error {
             PopError::MissingAuth => WriteRefusal::SignatureMissing,
             PopError::Stale => WriteRefusal::SignatureStale,
             PopError::BadKey => WriteRefusal::SignatureMalformed,
             PopError::BadSig => WriteRefusal::SignatureInvalid,
-        })
+        }
     }
 }
 
@@ -391,7 +437,13 @@ impl Lane {
     /// entirely and streams to the handler.
     fn max_body(self) -> usize {
         match self {
-            Lane::Blob => SIGNED_BLOB_HASH_BYTES,
+            // the blob lane never asks: [`signed_write_guard`] hands its proof
+            // to the handler and returns before any buffering, because the
+            // body is an unbounded stream the handler hashes to disk. A number
+            // here would be a cap nothing applies.
+            Lane::Blob => {
+                unreachable!("the blob lane defers its proof instead of buffering a body")
+            }
             Lane::RawSubmit => node::MAX_PAYLOAD_BYTES,
             Lane::GatewayOperator => {
                 crate::gateway_http::JSON_LANE_REQUEST_BYTES * 2 + gateway::MAX_PROXY_HEAD_BYTES
@@ -399,11 +451,9 @@ impl Lane {
             // json bodies and the log-filter string. `Open` never reaches here
             // (the guard returns before asking), and takes the small cap so a
             // table that ever disagreed fails closed rather than wide.
-            Lane::Workspace
-            | Lane::Submit
-            | Lane::NodeLevel
-            | Lane::HuddleProof
-            | Lane::Open => DEFAULT_JSON_BODY_BYTES,
+            Lane::Workspace | Lane::Submit | Lane::NodeLevel | Lane::HuddleProof | Lane::Open => {
+                DEFAULT_JSON_BODY_BYTES
+            }
             Lane::RunControl => 64 * 1024,
         }
     }
@@ -583,9 +633,16 @@ pub(crate) async fn signed_write_guard(
                 .uri()
                 .path_and_query()
                 .map(|pq| pq.as_str().to_string())
-                .unwrap_or(path),
+                .unwrap_or(path.clone()),
             headers: req.headers().clone(),
         };
+        // only the digest binding waits for the body. Everything else about
+        // the proof is answerable now, and answering it now is what keeps an
+        // unsigned caller from streaming a whole upload onto this node's disk
+        // before being told no.
+        if let Err(refusal) = proof.precheck(&handle) {
+            return refuse(&path, refusal);
+        }
         let mut req = req;
         req.extensions_mut().insert(proof);
         return next.run(req).await;
@@ -905,7 +962,11 @@ mod tests {
             // the frameless op lane: the framed op is re-signed as the NODE,
             // never the caller (#1808), so it takes the same operator-only bar.
             (Method::POST, "/v1/submit", Authority::Operator),
-            (Method::POST, "/v1/submit/raw/new-product", Authority::Operator),
+            (
+                Method::POST,
+                "/v1/submit/raw/new-product",
+                Authority::Operator,
+            ),
             (Method::DELETE, "/v1/fs/workspaces/abc", Authority::Operator),
         ];
         for (method, path, wanted) in gated {
@@ -958,16 +1019,65 @@ mod tests {
     }
 
     /// the hashing cap is reached by an UNAUTHENTICATED caller, so no lane may
-    /// inherit a wider one than its own route accepts — a shared 64 MiB ceiling
-    /// would let anyone make the node hold 64 MiB for a 1 MiB chunk route.
+    /// inherit a wider one than its own route accepts — a shared ceiling would
+    /// let anyone make the node hold that much for a small-bodied route.
+    ///
+    /// The blob lane is absent on purpose: it never buffers, so it has no cap
+    /// to compare (asking for one panics, which is the point).
     #[test]
     fn no_lane_buffers_more_than_its_own_route_accepts() {
         let cap = |path: &str| lane_of(path).max_body();
-        assert_eq!(cap("/v1/files/blob"), SIGNED_BLOB_HASH_BYTES);
         assert_eq!(cap("/v1/submit"), DEFAULT_JSON_BODY_BYTES);
         assert_eq!(cap("/v1/submit/raw/new-product"), node::MAX_PAYLOAD_BYTES);
         assert_eq!(cap("/v1/fs/workspaces"), DEFAULT_JSON_BODY_BYTES);
-        assert!(cap("/v1/submit") < cap("/v1/files/blob"));
+        // the gateway-operator lane is the widest that still buffers, and it
+        // is wide because its own route is: two json bodies plus a proxy head.
+        // Nothing may quietly climb past it.
+        let widest = cap("/v1/gateway/operator");
+        for path in [
+            "/v1/submit",
+            "/v1/submit/raw/new-product",
+            "/v1/fs/workspaces",
+        ] {
+            assert!(
+                cap(path) <= widest,
+                "{path} buffers more than the gateway lane"
+            );
+        }
+    }
+
+    /// the blob lane costs nothing to refuse: an upload with no proof on it is
+    /// turned away by the gate, so the handler never opens an ingest and no
+    /// unauthenticated byte reaches this node's disk.
+    #[tokio::test]
+    async fn an_unsigned_blob_upload_is_refused_before_its_body_is_read() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::post;
+        use tower::ServiceExt as _;
+
+        async fn never_reached() -> StatusCode {
+            panic!("the handler must never see an unsigned upload")
+        }
+
+        let (mut handle, _cmds, _hub) = crate::NodeHandle::channel();
+        handle.admin.node_key = Some(vec![7u8; 32]);
+        let app = axum::Router::new()
+            .route("/v1/files/blob", post(never_reached))
+            .route_layer(axum::middleware::from_fn_with_state(
+                handle,
+                signed_write_guard,
+            ));
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/files/blob")
+                    .body(Body::from(vec![0u8; 1024]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), WriteRefusal::SignatureMissing.status());
     }
 
     /// the embedded-daemon shape this refusal exists for: no consensus key
