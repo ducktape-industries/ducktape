@@ -592,13 +592,17 @@ fn choose<'a>(offered: &[&'a Surveyed]) -> Result<Vec<&'a Surveyed>, String> {
 fn install_all(vendors: &Vendors, chosen: &[&Surveyed], dir: &Path) -> InstallResult {
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let cache = download_cache()?;
+    let artifacts = fetch_all(vendors, chosen, &cache)?;
+
+    // Phase 2: unpack/install + receipt, sequential and unchanged, now
+    // reading from the cache phase 1 just filled.
     let mut receipts = Receipts::load(dir)?;
-    for row in chosen {
-        let receipt = install_one(vendors, row.provider, &row.latest, dir, &cache)?;
+    for (row, artifact) in chosen.iter().zip(artifacts) {
+        let receipt = install_one(row.provider, &row.latest, dir, &artifact)?;
         receipts
             .providers
             .insert(row.provider.token().to_string(), receipt);
-        // saved per install, so a second download failing does not lose the
+        // saved per install, so a second install failing does not lose the
         // first one's receipt.
         receipts.save(dir)?;
     }
@@ -608,25 +612,81 @@ fn install_all(vendors: &Vendors, chosen: &[&Surveyed], dir: &Path) -> InstallRe
     Ok(())
 }
 
-fn install_one(
+/// Phase 1 of an install: every chosen artifact fetched concurrently, one
+/// thread per row — no pool, since the row count is the checklist's own,
+/// never unbounded. `fetch`/`download_to` keep their existing fail-closed
+/// checksum semantics and `.part`-then-rename discipline unchanged per
+/// thread, so a half-written download still never reads back as a cache hit.
+/// Any fetch failing fails the whole install, same as the sequential version
+/// did.
+fn fetch_all(
+    vendors: &Vendors,
+    chosen: &[&Surveyed],
+    cache: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let single_download = chosen.len() == 1;
+    let fetched: Vec<Result<PathBuf, String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = chosen
+            .iter()
+            .map(|row| {
+                // printed before spawning, on the main thread, so the header
+                // lines themselves never interleave with each other.
+                println!(
+                    "\n{} {} <- {}",
+                    row.provider.token(),
+                    row.latest.version,
+                    row.latest.url
+                );
+                let provider = row.provider;
+                let latest = &row.latest;
+                scope.spawn(move || fetch_one(vendors, provider, latest, cache, single_download))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("fetch thread panicked"))
+            .collect()
+    });
+    // fail-closed: any fetch failing refuses the whole install, same as the
+    // sequential version did.
+    fetched.into_iter().collect()
+}
+
+/// One row of phase 1: land `latest`'s artifact on its cache shelf, verified
+/// against the vendor's checksum.
+fn fetch_one(
     vendors: &Vendors,
     provider: HarnessArg,
     latest: &Release,
-    dir: &Path,
     cache: &Path,
-) -> Result<Receipt, Box<dyn std::error::Error>> {
-    println!("\n{} {} <- {}", provider.token(), latest.version, latest.url);
-
+    single_download: bool,
+) -> Result<PathBuf, String> {
     let shelf = cache.join(provider.token()).join(&latest.version);
     std::fs::create_dir_all(&shelf).map_err(|e| format!("create {}: {e}", shelf.display()))?;
     let artifact = shelf.join(base_name(&latest.url));
-    fetch(vendors, &latest.url, &artifact, &latest.sha256)?;
-    println!("  sha256 ok");
+    fetch(
+        vendors,
+        &latest.url,
+        &artifact,
+        &latest.sha256,
+        single_download,
+    )?;
+    println!("  {} sha256 ok", provider.token());
+    Ok(artifact)
+}
 
+/// Phase 2 of an install: `artifact` is already on the cache shelf and
+/// verified: unpack it into `dir` and write the receipt for it.
+fn install_one(
+    provider: HarnessArg,
+    latest: &Release,
+    dir: &Path,
+    artifact: &Path,
+) -> Result<Receipt, Box<dyn std::error::Error>> {
     match &latest.payload {
-        Payload::Binary(name) => install_file(&artifact, &dir.join(name))?,
-        Payload::TarGz(members) => unpack_into(&artifact, members, dir)?,
-        Payload::Bundle { root, bin } => unpack_bundle(&artifact, root, bin, dir)?,
+        Payload::Binary(name) => install_file(artifact, &dir.join(name))?,
+        Payload::TarGz(members) => unpack_into(artifact, members, dir)?,
+        Payload::Bundle { root, bin } => unpack_bundle(artifact, root, bin, dir)?,
     }
     for file in latest.files() {
         println!("  installed {}", dir.join(file).display());
@@ -642,9 +702,19 @@ fn install_one(
 /// entry cannot survive into an image. A mismatch deletes the file and stops:
 /// there is no "carry on without it" for an executable that runs beside a
 /// credential.
-fn fetch(vendors: &Vendors, url: &str, dest: &Path, want: &str) -> Result<(), String> {
+///
+/// `single_download` is only about the progress meter: it is the caller
+/// saying no other fetch is in flight beside this one, so a redrawing `\r`
+/// bar is safe to draw without a second thread's bar splicing into it.
+fn fetch(
+    vendors: &Vendors,
+    url: &str,
+    dest: &Path,
+    want: &str,
+    single_download: bool,
+) -> Result<(), String> {
     if !dest.exists() {
-        download_to(vendors, url, dest)?;
+        download_to(vendors, url, dest, single_download)?;
     }
     let got = sha256_file(dest)?;
     if got != want {
@@ -659,13 +729,19 @@ fn fetch(vendors: &Vendors, url: &str, dest: &Path, want: &str) -> Result<(), St
 
 /// Stream to `<dest>.part` and rename on success: an interrupted download must
 /// never be picked up as a cache hit on the next run.
-fn download_to(vendors: &Vendors, url: &str, dest: &Path) -> Result<(), String> {
+fn download_to(
+    vendors: &Vendors,
+    url: &str,
+    dest: &Path,
+    single_download: bool,
+) -> Result<(), String> {
     let part = dest.with_extension("part");
     let mut response = vendors.get(url)?;
     let response_length = response.content_length();
     // The meter draws nothing off a terminal, so say the size once instead: it
     // is the part that tells a long download from a wedged one, and it is the
-    // only part a log wants.
+    // only part a log wants. One line per download is safe to interleave;
+    // only the redrawing bar below needs `single_download`.
     if !std::io::stdout().is_terminal() {
         match response_length {
             Some(total) => println!("  downloading {} MiB", mib(total)),
@@ -674,7 +750,7 @@ fn download_to(vendors: &Vendors, url: &str, dest: &Path) -> Result<(), String> 
     }
     let mut file =
         std::fs::File::create(&part).map_err(|e| format!("create {}: {e}", part.display()))?;
-    let mut metered = Metered::new(&mut response, response_length);
+    let mut metered = Metered::new(&mut response, response_length, single_download);
     let copied = std::io::copy(&mut metered, &mut file);
     metered.finish();
     if let Err(e) = copied {
@@ -704,13 +780,16 @@ struct Metered<R> {
 }
 
 impl<R: std::io::Read> Metered<R> {
-    fn new(inner: R, total: Option<u64>) -> Self {
+    /// `allow_live` is false when a sibling fetch may be drawing its own bar
+    /// at the same time — a redrawing `\r` line only reads correctly when it
+    /// is the only one writing to the terminal.
+    fn new(inner: R, total: Option<u64>, allow_live: bool) -> Self {
         Self {
             inner,
             total,
             done: 0,
             drawn: std::time::Instant::now(),
-            live: std::io::stdout().is_terminal(),
+            live: allow_live && std::io::stdout().is_terminal(),
         }
     }
 
@@ -1226,7 +1305,7 @@ mod tests {
     #[test]
     fn the_meter_fills_end_to_end_and_degrades_without_a_length() {
         let meter = |done: u64, total: Option<u64>| {
-            let mut meter = Metered::new(std::io::empty(), total);
+            let mut meter = Metered::new(std::io::empty(), total, true);
             meter.done = done;
             meter.line()
         };
@@ -1422,7 +1501,14 @@ mod tests {
         std::fs::write(&dest, b"not what the vendor published").unwrap();
         let vendors = Vendors::new().unwrap();
 
-        let err = fetch(&vendors, "https://example.invalid/x", &dest, &"0".repeat(64)).unwrap_err();
+        let err = fetch(
+            &vendors,
+            "https://example.invalid/x",
+            &dest,
+            &"0".repeat(64),
+            true,
+        )
+        .unwrap_err();
         assert!(
             err.contains("refusing to install an unverified executable"),
             "{err}"
@@ -1436,11 +1522,130 @@ mod tests {
             "https://example.invalid/x",
             &dest,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            true,
         )
         .unwrap();
         assert!(dest.exists());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn sha256_bytes(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hex::encode(hasher.finalize())
+    }
+
+    struct RendezvousVendor {
+        port: u16,
+        handle: std::thread::JoinHandle<()>,
+    }
+
+    /// A vendor stand-in for the concurrency test below: accepts one HTTP
+    /// request, then blocks on `barrier` before answering — so its response
+    /// only goes out once its rendezvous partner also has a request in hand.
+    /// A fetcher that requests its rows one after another (send request,
+    /// read the full response, only then send the next request) can never
+    /// land both halves of the barrier, so it hangs forever; one that fires
+    /// every row's request up front satisfies it immediately.
+    fn rendezvous_vendor(
+        barrier: std::sync::Arc<std::sync::Barrier>,
+        body: &'static [u8],
+    ) -> RendezvousVendor {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            barrier.wait();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            stream.flush().unwrap();
+        });
+        RendezvousVendor { port, handle }
+    }
+
+    /// The bug this proves absent: `install_all` used to fetch its chosen
+    /// providers one after another, so a second provider's download only
+    /// began once the first one's response had been read in full. The two
+    /// vendor stand-ins here only answer once BOTH have a request in hand,
+    /// which a sequential fetcher can never arrange — this test would hang
+    /// under the old behaviour, and completes under `fetch_all`'s
+    /// one-thread-per-row fetch.
+    #[test]
+    fn fetch_all_downloads_every_row_concurrently() {
+        let body_a: &[u8] = b"claude release bytes";
+        let body_b: &[u8] = b"codex release bytes";
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let server_a = rendezvous_vendor(std::sync::Arc::clone(&barrier), body_a);
+        let server_b = rendezvous_vendor(std::sync::Arc::clone(&barrier), body_b);
+
+        let rows = [
+            Surveyed {
+                provider: HarnessArg::Claude,
+                latest: Release {
+                    version: "1".into(),
+                    url: format!("http://127.0.0.1:{}/claude", server_a.port),
+                    sha256: sha256_bytes(body_a),
+                    payload: Payload::Binary("claude".into()),
+                },
+                state: Installed::Missing,
+            },
+            Surveyed {
+                provider: HarnessArg::Codex,
+                latest: Release {
+                    version: "1".into(),
+                    url: format!("http://127.0.0.1:{}/codex", server_b.port),
+                    sha256: sha256_bytes(body_b),
+                    payload: Payload::Binary("codex".into()),
+                },
+                state: Installed::Missing,
+            },
+        ];
+        let cache = scratch("fetch-all-cache");
+        let cache_cleanup = cache.clone();
+        let vendors = Vendors::new().unwrap();
+
+        // `fetch_all` blocks the calling thread until every row lands, so the
+        // call itself runs on a throwaway thread and the test waits on it
+        // with a bound: a regression to sequential fetching hangs that thread
+        // forever (the barrier's other half never arrives), and this test
+        // must fail rather than hang the suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let refs: Vec<&Surveyed> = rows.iter().collect();
+            let _ = tx.send(fetch_all(&vendors, &refs, &cache));
+        });
+        let artifacts = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect(
+                "fetch_all did not return within 10s — it fetched its rows one \
+                 after another instead of concurrently",
+            )
+            .unwrap();
+
+        assert_eq!(std::fs::read(&artifacts[0]).unwrap(), body_a);
+        assert_eq!(std::fs::read(&artifacts[1]).unwrap(), body_b);
+
+        server_a.handle.join().unwrap();
+        server_b.handle.join().unwrap();
+        std::fs::remove_dir_all(&cache_cleanup).unwrap();
     }
 
     /// Both built-in channels answer, live: the feed names a version and a
