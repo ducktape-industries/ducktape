@@ -73,7 +73,7 @@ impl Phase {
         sorted[sorted.len() / 2]
     }
 
-    fn median_us(&self) -> u128 {
+    pub(crate) fn median_us(&self) -> u128 {
         let mut sorted = self.elapsed_us.clone();
         sorted.sort_unstable();
         sorted[sorted.len() / 2]
