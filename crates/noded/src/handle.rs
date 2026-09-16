@@ -558,16 +558,6 @@ impl NodeHandle {
     /// a clone of the command lane's sender, for embedder-side producers
     /// that inject commands exactly as the http layer does — the oracle
     /// pool's completed provider runs re-enter as `Submit` commands here.
-    /// the loopback base URL of this node's browser gateway (`http://<addr>`),
-    /// or `None` when none is wired. It is the `via` a per-run airlock config
-    /// routes credential traffic through onto the overlay gateway plane; a node
-    /// without it cannot host a lent-credential run.
-    pub fn browser_gateway_url(&self) -> Option<String> {
-        self.browser_gateway
-            .as_ref()
-            .map(|gw| format!("http://{}", gw.listen))
-    }
-
     pub fn command_sender(&self) -> mpsc::Sender<NodeCommand> {
         self.cmds.clone()
     }
