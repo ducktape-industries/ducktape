@@ -358,7 +358,7 @@ async fn read_register(requested: &str) -> Result<RegisterItem, String> {
         .into_iter()
         .map(|block| Subpage {
             id: block.id.clone(),
-            title: block.text.clone(),
+            title: titled(&block.text),
         })
         .collect();
     let document = page_document_text(&active_page_title, &blocks);
@@ -557,10 +557,7 @@ fn page_items(wire: &[Value]) -> Vec<PageItem> {
         let title = text_of(&page["title"]);
         let below = children.get(&id);
         items.push(PageItem {
-            title: match title.is_empty() {
-                true => "Untitled".into(),
-                false => title,
-            },
+            title: titled(&title),
             parent: text_of(&page["parent"]),
             prefix: "  ".repeat(depth),
             child_count: below.map_or(0, |below| count_i64(below.len())),
@@ -805,7 +802,7 @@ async fn read_search(query: &str, page: Option<&str>) -> Result<Vec<PageSearchHi
                     .get(&page_id)
                     .filter(|title| !title.is_empty())
                     .cloned()
-                    .unwrap_or_else(|| "Untitled".into()),
+                    .unwrap_or_else(|| UNTITLED.into()),
                 block_id: text_of(&hit["block_id"]),
                 kind: block_kind_name(&text_of(&hit["kind"])).into(),
                 text: text_of(&hit["text"]),
@@ -1058,9 +1055,6 @@ pub fn create(title: &str) -> bool {
 }
 
 async fn create_page(title: String) -> Result<ActItem, String> {
-    if title.is_empty() {
-        return Err("a page needs a title".into());
-    }
     let title = bounded(&title, "page title", MAX_PAGE_TITLE_BYTES)?;
     let page_id = mint("page").await?;
     submit(json!({ "create_page": { "page_id": page_id, "title": title, "blocks": [] } })).await?;
@@ -1070,9 +1064,21 @@ async fn create_page(title: String) -> Result<ActItem, String> {
     })
 }
 
-/// The title a subpage is born with; the writer replaces it in the title
-/// line.
-pub const NEW_SUBPAGE_TITLE: &str = "Untitled";
+/// A page is born UNNAMED: its title line is empty, so the caret that lands
+/// there types the title instead of deleting a word first. Every place that
+/// shows a page by name falls back to [`UNTITLED`].
+pub const NEW_PAGE_TITLE: &str = "";
+
+/// What a page with no title of its own is called on screen.
+pub const UNTITLED: &str = "Untitled";
+
+/// A page's title, or what an unnamed one is called.
+pub fn titled(title: &str) -> String {
+    match title.is_empty() {
+        true => UNTITLED.to_owned(),
+        false => title.to_owned(),
+    }
+}
 
 /// `AddSubpage` — a page inside `parent`, after its last block, landed on
 /// as soon as it exists: the "+" on a sidebar row.
@@ -1100,11 +1106,53 @@ async fn create_subpage_in(parent: String) -> Result<ActItem, String> {
     submit(json!({ "insert_block": {
         "parent": parent,
         "after": last,
-        "block": { "id": page_id, "kind": "page", "text": NEW_SUBPAGE_TITLE },
+        "block": { "id": page_id, "kind": "page", "text": NEW_PAGE_TITLE },
     } }))
     .await?;
     Ok(ActItem {
         page: page_id,
+        error: String::new(),
+    })
+}
+
+/// `MoveBlock` on a page: re-parent it, subtree and all. An empty `parent`
+/// promotes it to the top level, which the module accepts only with no
+/// anchor; into a page it lands after that page's last child, where a
+/// subpage created there would have landed.
+pub fn move_page(page_id: &str, parent: &str) -> bool {
+    let (page_id, parent) = (page_id.to_owned(), parent.to_owned());
+    push_act(Box::pin(async move {
+        acted(move_page_under(page_id, parent).await)
+    }))
+}
+
+async fn move_page_under(page_id: String, parent: String) -> Result<ActItem, String> {
+    if page_id.is_empty() {
+        return Err("choose a page first".into());
+    }
+    let anchor = match parent.is_empty() {
+        true => None,
+        false => {
+            let blocks = read_page_blocks(&parent).await?;
+            blocks
+                .iter()
+                .skip(1)
+                .rev()
+                .find(|block| {
+                    let under_the_parent = block.parent.as_deref() == Some(parent.as_str());
+                    under_the_parent && block.id != page_id
+                })
+                .map(|block| block.id.clone())
+        }
+    };
+    submit(json!({ "move_block": {
+        "block_id": page_id,
+        "parent": (!parent.is_empty()).then_some(parent),
+        "after": anchor,
+    } }))
+    .await?;
+    Ok(ActItem {
+        page: String::new(),
         error: String::new(),
     })
 }
@@ -1591,14 +1639,23 @@ pub fn search_answer_stands(query: &str, draft: &str, searching: bool) -> bool {
     !searching && !query.is_empty() && draft.trim() == query
 }
 
-/// `duck://page/<id>?net=<chain>` — the open page's own address.
+/// `duck://page/<id>?net=<digest>` — the handle that brings a reader back to
+/// this page, from another page, another view, or outside the app.
+///
+/// Only the chain id's HASH HALF rides a URI, and it splits from the right:
+/// `node init --name` validates nothing, so a network named `my#net` mints
+/// the chain id `my#net#a1b2c3d4` and only the last `#` is the separator.
+/// Mirror of `chat::client::duck_net_query`, a crate a view cannot reach —
+/// spell the query any other way and the app reads the whole chain id as the
+/// digest and refuses its own link as a foreign network's.
 pub fn page_address(page_id: &str, chain: &str) -> String {
     if page_id.is_empty() {
         return String::new();
     }
-    match chain.is_empty() {
+    let digest = chain.rsplit_once('#').map_or("", |(_, hex)| hex);
+    match digest.is_empty() {
         true => format!("duck://page/{page_id}"),
-        false => format!("duck://page/{page_id}?net={chain}"),
+        false => format!("duck://page/{page_id}?net={digest}"),
     }
 }
 
@@ -2169,6 +2226,27 @@ pub fn measured_card_height(current: f64, measured: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::CommentsMode;
+
+    /// A page link carries the chain id's hash half and nothing else — the
+    /// app reads `?net=` as that digest, so the name in front of it would be
+    /// read as a different network's and the link refused.
+    #[test]
+    fn a_page_link_carries_only_the_chain_digest() {
+        assert_eq!(
+            page_address("pg-notes", "pages#b71c73d1"),
+            "duck://page/pg-notes?net=b71c73d1"
+        );
+        // `node init --name` validates nothing: only the last `#` is minted.
+        assert_eq!(
+            page_address("pg-notes", "my#net#a1b2c3d4"),
+            "duck://page/pg-notes?net=a1b2c3d4"
+        );
+        // No chain yet, or an unnamed one: a link without the query still
+        // names the page for the network the reader already stands on.
+        assert_eq!(page_address("pg-notes", ""), "duck://page/pg-notes");
+        assert_eq!(page_address("pg-notes", "pages"), "duck://page/pg-notes");
+        assert_eq!(page_address("", "pages#b71c73d1"), "");
+    }
 
     /// The crumb walks the parents by title, root first; a parent the index
     /// does not hold ends the walk, and a cycle cannot run away.

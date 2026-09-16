@@ -50,11 +50,15 @@ pub struct PagesView {
     pub(crate) pages_viewport_height: f64,
     pub(crate) pages_pane_width: f64,
     pub(crate) sidebar_width: f64,
-    pub(crate) page_menu_open: bool,
     /// The sidebar row whose "…" menu is open; empty when none is.
     pub(crate) page_menu_page: String,
+    /// The open row menu is showing its destinations, not its actions.
+    pub(crate) page_menu_moving: bool,
     /// The page the delete dialog asks about; empty when it is closed.
     pub(crate) page_delete_page: String,
+    /// A page just created and not yet named: when its document lands the
+    /// caret goes to its title line, where the writer is already typing.
+    pub(crate) page_to_name: String,
     /// Where the last press landed on the view, so a menu opens there.
     pub(crate) press_x: f64,
     pub(crate) press_y: f64,
@@ -62,7 +66,6 @@ pub struct PagesView {
     /// so the presses on the menu itself do not move it.
     pub(crate) page_menu_x: f64,
     pub(crate) page_menu_y: f64,
-    pub(crate) page_create_open: bool,
     pub(crate) active_page: String,
     pub(crate) active_page_title: String,
     pub(crate) active_page_parent: String,
@@ -85,11 +88,9 @@ pub struct PagesView {
     pub(crate) reply_thread: String,
     pub(crate) expanded_threads: Vec<String>,
     pub(crate) resolved_open: bool,
-    pub(crate) page_draft: String,
     pub(crate) page_search_draft: String,
     pub(crate) block_comment_draft: String,
     pub(crate) reply_draft: String,
-    pub(crate) pending_page: String,
     pub(crate) pending_comment: String,
     pub(crate) page_saved_text: String,
     pub(crate) buffer_page: String,
@@ -112,12 +113,15 @@ pub enum Message {
     ActDone(crate::host::ActItem),
     SaveDone(crate::host::SaveItem),
     PageAutosaveTick,
-    TogglePageCreate,
     CreatePageSubmit,
     ArmPageDelete(String),
     DisarmPageDelete,
     AddSubpage(String),
     OpenPageRowMenu(String),
+    /// The open row menu turns into its destination list.
+    OfferPageMove,
+    /// Re-parent the menu's page; an empty destination is the workspace root.
+    MovePage(String),
     PressedAt(f64, f64),
     DeletePageSubmit,
     SearchPagesSubmit,
@@ -145,10 +149,8 @@ pub enum Message {
     PagesViewportChanged(f64, f64),
     PagesPaneResized(f64, f64),
     CommentsCardMeasured(f64, f64),
-    TogglePageMenu,
     ClosePageMenu,
     DocumentCommitted(crate::editor_binding::EditorUpdate),
-    PageDraftChanged(String),
     SearchDraftChanged(String),
     ReplyDraftChanged(String),
     /// Typing in one thread's reply box: the draft belongs to that thread.
@@ -199,14 +201,14 @@ impl PagesView {
             pages_viewport_height: 700.0,
             pages_pane_width: 1280.0,
             sidebar_width: 230.0,
-            page_menu_open: false,
             page_menu_page: "".to_owned(),
+            page_menu_moving: false,
             page_delete_page: "".to_owned(),
+            page_to_name: "".to_owned(),
             press_x: 0.,
             press_y: 0.,
             page_menu_x: 0.,
             page_menu_y: 0.,
-            page_create_open: false,
             active_page: "".to_owned(),
             active_page_title: "".to_owned(),
             active_page_parent: "".to_owned(),
@@ -229,11 +231,9 @@ impl PagesView {
             reply_thread: "".to_owned(),
             expanded_threads: Vec::new(),
             resolved_open: false,
-            page_draft: "".to_owned(),
             page_search_draft: "".to_owned(),
             block_comment_draft: "".to_owned(),
             reply_draft: "".to_owned(),
-            pending_page: "".to_owned(),
             pending_comment: "".to_owned(),
             page_saved_text: "".to_owned(),
             buffer_page: "".to_owned(),
@@ -394,7 +394,6 @@ mod tests {
     fn ordinary_state_preserves_document_and_drafts_through_snapshot() {
         let (mut app, _) = PagesView::boot();
         app.document = ducktape_view_guest::Editor::new("# 제목\n\nDocument 🙂");
-        app.page_draft = "새 페이지".into();
         app.block_comment_draft = "Unsent comment".into();
         app.reply_draft = "Unsent reply".into();
         app.expanded_threads = vec!["thread-a".into()];
@@ -402,7 +401,6 @@ mod tests {
         app.document_menu.snapshot = vec![4, 5];
         app.page_search_draft = "Unsubmitted search".into();
         app.orphaned_comment_drafts = vec!["Recovered draft".into()];
-        app.pending_page = "Submitted title".into();
         app.pending_comment = "Submitted comment".into();
         app.page_inflight_text = "Submitted document".into();
         app.page_saved_text = "Acknowledged document".into();
@@ -414,6 +412,54 @@ mod tests {
         let restored = PagesView::restore(&snapshot).unwrap();
         assert_eq!(restored.snapshot().unwrap(), snapshot);
     }
+    /// A tree is built by moving pages, not only by creating them in place:
+    /// the menu offers the workspace and every page the module would accept,
+    /// which is every page outside the moving page's own subtree.
+    #[test]
+    fn move_to_offers_the_workspace_and_every_page_outside_the_moving_subtree() {
+        use ducktape_view_guest::testing::keys;
+        let page = |id: &str, parent: &str, depth: usize, children: i64| crate::host::PageItem {
+            id: id.into(),
+            title: id.to_uppercase(),
+            parent: parent.into(),
+            prefix: "  ".repeat(depth),
+            child_count: children,
+        };
+        let (mut app, _) = PagesView::boot();
+        app.connected = true;
+        app.pages = vec![
+            page("alpha", "", 0, 1),
+            page("alpha-child", "alpha", 1, 1),
+            page("alpha-grandchild", "alpha-child", 2, 0),
+            page("beta", "", 0, 0),
+        ];
+        app.update(Message::OpenPageRowMenu("alpha-child".into()));
+        app.update(Message::OfferPageMove);
+        let frame = wire::Frame {
+            root: Some(app.view()),
+            ..Default::default()
+        };
+        let present = keys(&frame);
+        let has = |key: &str| present.iter().any(|k| k == key);
+        const MENU: &str = "PagesView/root/pages/page/alpha-child/menu/move";
+        assert!(has(&format!("{MENU}/root")), "the workspace is a home");
+        assert!(has(&format!("{MENU}/alpha")), "its own parent is listed");
+        assert!(has(&format!("{MENU}/beta")));
+        assert!(
+            !has(&format!("{MENU}/alpha-child")),
+            "a page cannot move into itself"
+        );
+        assert!(
+            !has(&format!("{MENU}/alpha-grandchild")),
+            "nor into what is already inside it"
+        );
+
+        app.update(Message::MovePage("beta".into()));
+        assert!(app.busy, "the host is asked for the move");
+        assert_eq!(app.page_menu_page, "", "the menu closes behind the move");
+        assert!(!app.page_menu_moving);
+    }
+
     /// A sidebar row carries "…" and "+": the "+" asks the host for a page
     /// inside and unfolds the parent so the newcomer shows; the "…" (or a
     /// right press) opens the row's own menu at the last press, whose
@@ -579,7 +625,6 @@ mod tests {
         app.connected = true;
         app.active_page = "page-a".into();
         app.buffer_page = app.active_page.clone();
-        app.page_create_open = true;
         app.block_comments_open = true;
         app.comment_rows = vec![crate::host::PageCommentThreadRow {
             thread: crate::host::PageCommentThread {
@@ -628,7 +673,6 @@ mod tests {
             _ => {}
         });
         assert!(editor);
-        assert!(inputs.contains(&format!("{PAGE_KEY}/new-page")));
         assert!(inputs.contains(&format!("{PAGE_KEY}/page-search")));
         assert!(inputs.contains(&format!("{PAGE_KEY}/page-comment(page-a)")));
         assert!(inputs.contains(&format!("{PAGE_KEY}/thread-reply(thread-a)")));

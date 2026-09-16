@@ -203,11 +203,7 @@ impl PagesView {
             &self.page_delete_page,
             &self.active_page_title,
         );
-        let title = if target.is_empty() {
-            "Untitled"
-        } else {
-            target.as_str()
-        };
+        let title = crate::host::titled(&target);
         let contents = kit::spaced(
             kit::column(
                 "pages/delete/content",

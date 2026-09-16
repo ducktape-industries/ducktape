@@ -46,6 +46,7 @@ pub(crate) enum Command {
     Raise(WindowKey),
     Clipboard(String),
     Focus(String),
+    OpenLink(String),
     Quit,
 }
 
@@ -120,6 +121,26 @@ pub(crate) fn focus<Message: 'static>(key: String) -> Task<Message> {
 
 pub(crate) fn quit<Message: 'static>() -> Task<Message> {
     effect(Command::Quit)
+}
+
+/// A link a native widget wants opened — the same door a `duck://` URL handed
+/// to the app from outside comes through. Nothing waits on it, so unlike the
+/// commands above it needs no task to drive: a widget is not in the message
+/// loop and has nothing to hand one to.
+pub(crate) fn open_link(url: String) {
+    let (completed, _dropped) = oneshot::channel();
+    let pending = PendingCommand {
+        command: Command::OpenLink(url),
+        completed,
+    };
+    let sent = sender()
+        .lock()
+        .expect("native shell commands")
+        .as_ref()
+        .is_some_and(|sender| sender.unbounded_send(pending).is_ok());
+    if !sent {
+        tracing::error!(target: "ducktape::app", reason = "native_shell_closed", "a pressed link could not be delivered");
+    }
 }
 
 use crate::{AppMessage as Message, Ducktape, ShellTab};
@@ -229,6 +250,7 @@ impl Desktop {
             Command::Raise(key) => self.raise_window(key, cx),
             Command::Clipboard(text) => self.write_clipboard(text, cx),
             Command::Focus(key) => self.focus_control(key, cx),
+            Command::OpenLink(url) => self.dispatch(Message::OpenMessageLink(url), cx),
             Command::Quit => self.quit(cx),
         }
     }
