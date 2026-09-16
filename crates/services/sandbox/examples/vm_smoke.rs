@@ -6,7 +6,8 @@
 //!   cargo run -p sandbox-host --example vm_smoke -- \
 //!       --kernel <workspace>/guest/vmlinux \
 //!       --rootfs <workspace>/guest/rootfs.ext4 \
-//!       [--vmm firecracker|vz] [--exec '<shell command>']
+//!       [--vmm firecracker|vz] [--exec '<shell command>'] [--workspace <dir>]
+//!       [--vcpus N] [--mem-mib N]
 //!
 //! `--vmm` defaults to this OS's flavor (vz on macOS, Firecracker elsewhere).
 //! `--exec` runs a command of your own inside the guest FIRST — what an image
@@ -26,11 +27,31 @@ use sandbox_host::{MicroVm, Vmm};
 /// one file the host put in the workspace.
 const DEFAULT_EXEC: &str = "cat input.txt";
 
-fn parse_args() -> Result<(PathBuf, PathBuf, Vmm, String), String> {
+/// enough to boot, dial back and run `/bin/sh` — which is all the default
+/// probe does. Anything that compiles in there says so with `--vcpus` and
+/// `--mem-mib`; a smoke test does not reserve a build machine's worth of host.
+const SMOKE_VCPUS: u32 = 1;
+const SMOKE_MEM_MIB: u64 = 512;
+
+/// one run of the probe, as the flags describe it.
+struct Probe {
+    kernel: PathBuf,
+    rootfs: PathBuf,
+    vmm: Vmm,
+    exec: String,
+    workspace: Option<PathBuf>,
+    vcpus: u32,
+    mem_mib: u64,
+}
+
+fn parse_args() -> Result<Probe, String> {
     let mut kernel = None;
     let mut rootfs = None;
     let mut vmm = Vmm::platform_default();
     let mut exec = DEFAULT_EXEC.to_string();
+    let mut workspace = None;
+    let mut vcpus = SMOKE_VCPUS;
+    let mut mem_mib = SMOKE_MEM_MIB;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
@@ -38,6 +59,9 @@ fn parse_args() -> Result<(PathBuf, PathBuf, Vmm, String), String> {
             "--kernel" => kernel = Some(PathBuf::from(value)),
             "--rootfs" => rootfs = Some(PathBuf::from(value)),
             "--exec" => exec = value,
+            "--workspace" => workspace = Some(PathBuf::from(value)),
+            "--vcpus" => vcpus = value.parse().map_err(|e| format!("--vcpus: {e}"))?,
+            "--mem-mib" => mem_mib = value.parse().map_err(|e| format!("--mem-mib: {e}"))?,
             "--vmm" => {
                 vmm = match value.as_str() {
                     "firecracker" => Vmm::Firecracker,
@@ -50,7 +74,15 @@ fn parse_args() -> Result<(PathBuf, PathBuf, Vmm, String), String> {
     }
     let kernel = kernel.ok_or("--kernel is required")?;
     let rootfs = rootfs.ok_or("--rootfs is required")?;
-    Ok((kernel, rootfs, vmm, exec))
+    Ok(Probe {
+        kernel,
+        rootfs,
+        vmm,
+        exec,
+        workspace,
+        vcpus,
+        mem_mib,
+    })
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -63,12 +95,25 @@ async fn main() {
 }
 
 async fn smoke() -> Result<(), String> {
-    let (kernel, rootfs, vmm, exec) = parse_args()?;
+    let Probe {
+        kernel,
+        rootfs,
+        vmm,
+        exec,
+        workspace,
+        vcpus,
+        mem_mib,
+    } = parse_args()?;
 
     // scratch: a workspace with one input file, a run dir, and a SHORT socket
     // dir (`SUN_LEN` caps a unix socket path near 104 bytes on macOS).
     let slot = format!("smoke-{}", std::process::id());
-    let workdir = std::env::temp_dir().join(format!("dt-smoke-ws-{}", std::process::id()));
+    // a workspace the host supplied carries whatever that run needs to work on
+    // — a repository to clone, a fixture tree. Otherwise the probe brings its
+    // own, which is the whole workspace the default `--exec` reads.
+    let workdir = workspace.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("dt-smoke-ws-{}", std::process::id()))
+    });
     std::fs::create_dir_all(&workdir).map_err(|e| e.to_string())?;
     std::fs::write(workdir.join("input.txt"), b"from the host\n").map_err(|e| e.to_string())?;
     // owned by guards until the VM exists: a smoke run that fails to boot
@@ -91,8 +136,8 @@ async fn smoke() -> Result<(), String> {
         // this run execs `/bin/sh` from the rootfs — there is no agent CLI to lend.
         executors: None,
         workspace: run_dir.join("workspace.ext4"),
-        vcpus: 1,
-        mem_mib: 512,
+        vcpus,
+        mem_mib,
         vsock_uds: socket_dir.join("v.sock"),
         tap: None,
     };
@@ -166,6 +211,10 @@ async fn smoke() -> Result<(), String> {
         return Err(format!("read back {echoed:?}, expected \"smoke\""));
     }
 
-    let _ = std::fs::remove_dir_all(&workdir);
+    // a supplied workspace is the caller's to keep: it holds what they put
+    // there, and the run's output is usually why they ran this at all.
+    if workspace.is_none() {
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
     Ok(())
 }
