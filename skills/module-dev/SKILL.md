@@ -1,6 +1,6 @@
 ---
 name: module-dev
-description: Use when creating a new ducktape consensus module, porting a native module to a wasm guest, or wiring a module into the genesis set — topology::PRODUCTION, host_state, crates/guests, Makefile wasm-modules. Also when a module change breaks the root-hash pin, the registry parity test, a missing component in the fixtures/modules dir, or wasm-modules-check.
+description: Use when creating a new ducktape consensus module, porting a native module to a wasm guest, or wiring a module into the genesis set — topology::PRODUCTION, host_state, crates/guests, Makefile wasm-modules. Also when a module change breaks the registry parity test, a missing component in the fixtures/modules dir, or wasm-modules-check.
 ---
 
 # Module development — the end-to-end wiring runbook
@@ -16,9 +16,10 @@ A module written outside this tree needs none of it: see "Decide first".
 ## Decide first: genesis registration is a root-hash break
 
 A module in `topology::PRODUCTION` (the selection `bin/node` composes,
-opens its index over, and reports) joins the genesis set: every existing
-workspace fails closed, dev networks re-genesis, and `GENESIS_ROOT_HASH`
-moves. A genesis module ⇒ a new genesis — get that agreed before wiring.
+opens its index over, and reports) joins the genesis set: the descriptor's
+module table gains a row, its `genesis_namespace()` fingerprint moves, so
+every existing workspace fails closed and dev networks re-genesis. A genesis
+module ⇒ a new genesis — get that agreed before wiring.
 
 A post-genesis module leaves the genesis unchanged, changes the live root at
 activation, and needs no genesis edit, no
@@ -179,8 +180,7 @@ and state-sync manifests authenticate the code needed to reopen the registries.
 
 `SIM_BASE` contains 15 modules; `--with-valset` adds `acl`, `governance`,
 `modules`, `valset`, and `kv`, all Wasm. When changing a shipped default set,
-update its membership tests and `host_state.rs`'s `GENESIS_ROOT_HASH` after
-rebuilding the artifacts; the failing pin prints the expected root.
+update its membership tests after rebuilding the artifacts.
 
 ## 4. Gates — ordering is load-bearing
 
@@ -201,7 +201,7 @@ make wasm-rebuild-check                                   # 7. every guest match
 | Mistake | Reality |
 |---|---|
 | Adding the id to `PRODUCTION` only | noded/simnode compose `SIM_BASE`/`SIM_VALSET`; the module is invisible in daemon/sim lanes until it joins one of those too |
-| Topology pins or `GENESIS_ROOT_HASH` left stale after adding/removing a module | `cargo test -p topology` and the root-hash pin fail; update both in the same commit |
+| Topology pins left stale after adding/removing a module | `cargo test -p topology` and the genesis registry parity test fail; update both in the same commit |
 | Guest added to root workspace members | guests are standalone BY DESIGN; membership poisons native feature unification |
 | Node pins run before `make wasm-modules` | the fixtures dir lacks the component; `hash_bundle` refuses by name |
 | Building a guest before pushing | guest-builder reads the module out of the repository at HEAD: an unpushed HEAD fails to fetch, an uncommitted edit is refused. Commit, push, then build |
