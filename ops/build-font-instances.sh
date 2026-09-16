@@ -12,10 +12,10 @@
 # One variable face therefore draws every weight at 400. A static face has no
 # axes and is immune to both.
 #
-# THE TWO RIBBI WEIGHTS ONLY. A face's usWeightClass becomes the weight every
-# FALLBACK lookup runs at, and no system face declares 500 or 600: registering
-# those cost one uncached line of Korean 5.0ms (500) and 6.0ms (600) against
-# 0.2ms at 400/700. See app/src/tests/font_fallback.rs.
+# THE TWO RIBBI WEIGHTS. `--update-name-table` keeps family "Geist" for 400
+# and 700 and moves any other weight into the family name ("Geist Medium"),
+# which the app would then have to ask for by that name; a request at 500 or
+# 600 lands on the nearer of these two instead.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 dir=crates/views/support/design/assets/fonts

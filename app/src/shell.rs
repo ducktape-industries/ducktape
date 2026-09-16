@@ -2226,8 +2226,13 @@ impl Render for DesktopWindow {
                 self.model.update(cx, |model, _| model.pending_focus = None);
             }
         }
-        gpui_kit::div()
-            .id("desktop-root")
+        // Every text style in every app window descends from this one, and
+        // `font_family` — which is all the tree below ever overrides — leaves
+        // the chain in place. Set it here and a run in any pane falls back by
+        // lookup.
+        let mut root = gpui_kit::div();
+        root.text_style().font_fallbacks = Some(fallback_chain());
+        root.id("desktop-root")
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
@@ -2908,14 +2913,13 @@ fn nav_icon(tab: ShellTab) -> gpui_kit::component::Icon {
 /// at all. A static face has no axes and is immune to both.
 /// `ops/build-font-instances.sh` cuts these from `Geist[wght]`.
 ///
-/// TWO WEIGHTS, NOT FOUR, and the reason is that same substitution read the
-/// other way: the matched face's weight is also the weight every FALLBACK
-/// lookup runs at. No system face declares 500 or 600, so registering a
-/// Medium or a SemiBold sent every non-Latin run off to walk the font
-/// database — one uncached line of Korean measured 5.0ms at 500 and 6.0ms at
-/// 600, against 0.2ms at 400 and 700. A `SEMIBOLD` request lands on Bold and
-/// a `MEDIUM` on Regular instead; `app/src/tests/font_fallback.rs` holds
-/// that line.
+/// The set is the two RIBBI weights `ops/build-font-instances.sh` cuts, so a
+/// `MEDIUM` request lands on the Regular face and a `SEMIBOLD` on the Bold
+/// one. That same substitution read the other way — the matched face's weight
+/// is also the weight every FALLBACK lookup runs at — is why
+/// [`FALLBACK_FAMILIES`] exists: a registered face at a weight no system font
+/// declares leaves the shaper with nothing to match and it walks the font
+/// database instead.
 pub(crate) const LATIN_FACES: [&[u8]; 4] = [
     include_bytes!("../../crates/views/support/design/assets/fonts/Geist-Regular.ttf"),
     include_bytes!("../../crates/views/support/design/assets/fonts/Geist-Bold.ttf"),
@@ -2927,6 +2931,50 @@ pub(crate) const LATIN_FACES: [&[u8]; 4] = [
 /// differ on it (see the registration below).
 pub(crate) const EMOJI_FACE: &[u8] =
     include_bytes!("../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf");
+
+/// The families a run falls back to when the Latin face has no glyph, in
+/// order. WITHOUT this list a Korean run reaches cosmic-text tagged only
+/// `Geist`: no glyph is found, and `FontFallbackIter` walks the font
+/// database, SHAPING the word with one face after another until one covers
+/// it. WITH it, `gpui-pre-wgpu`'s `compute_run_spans` cuts the run at the
+/// first uncovered codepoint and tags that span with the family that covers
+/// it, so the fallback is a lookup — and the requested weight stops steering
+/// the search, which is what made a face at a weight no system font declares
+/// expensive for every non-Latin run at that weight.
+///
+/// One list for both platforms: `load_family` drops a family it cannot
+/// resolve, so the macOS names vanish on Linux and the Linux names on macOS.
+/// The list stays short because every non-ASCII grapheme the primary face
+/// misses is tested against it in order.
+///
+/// NO EMOJI FAMILY BELONGS HERE. Resolving a name runs `load_family`, which
+/// REMOVES from the font database any face whose charmap has no 'm' — which
+/// is every color emoji face. Naming one deletes it, and emoji then have no
+/// face at all: one uncached line of 🎉 went from 200us to 11ms and drew
+/// from whatever the walk landed on. The platform's own fallback reaches the
+/// emoji face without being named.
+const FALLBACK_FAMILIES: [&str; 9] = [
+    "Noto Sans CJK KR",
+    "Noto Sans CJK JP",
+    "Noto Sans CJK SC",
+    "Apple SD Gothic Neo",
+    "Hiragino Sans",
+    "PingFang SC",
+    "Noto Sans",
+    "DejaVu Sans",
+    "Apple Symbols",
+];
+
+/// [`FALLBACK_FAMILIES`] as the text system wants it. Built once: the root
+/// element asks for it on every frame and `FontFallbacks` is an `Arc`.
+pub(crate) fn fallback_chain() -> gpui_kit::FontFallbacks {
+    static CHAIN: std::sync::LazyLock<gpui_kit::FontFallbacks> = std::sync::LazyLock::new(|| {
+        gpui_kit::FontFallbacks::from_fonts(
+            FALLBACK_FAMILIES.iter().map(|name| name.to_string()).collect(),
+        )
+    });
+    CHAIN.clone()
+}
 
 pub(crate) fn run() {
     // The kit's component icons (search, bell, folder, …) are SVGs the app
