@@ -3609,3 +3609,58 @@ fn an_arrow_label_wraps_where_it_is_painted_whether_or_not_you_are_typing() {
         caret[1]
     );
 }
+
+/// The panel is the only place that says a shape can be labelled at all, so
+/// every shape that CAN be labelled has to appear in it — and a connector can.
+/// What a connector has no room for is an alignment, which is a different
+/// question and gets a different answer.
+#[test]
+fn the_panel_offers_a_label_to_everything_that_can_carry_one() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "card".into(),
+        shape: Shape {
+            kind: Kind::Rectangle,
+            ..Default::default()
+        },
+    });
+    view.edit(Change::Create {
+        id: "line".into(),
+        shape: Shape {
+            kind: Kind::Arrow,
+            points: vec![[0, 0], [120, 80]],
+            ..Default::default()
+        },
+    });
+
+    view.selected = ["card".into()].into();
+    let json = serde_json::to_string(&view.view()).unwrap();
+    for offered in ["boards/edit-text", "boards/text-size", "boards/align/"] {
+        assert!(json.contains(offered), "a card was not offered {offered}");
+    }
+
+    view.selected = ["line".into()].into();
+    let json = serde_json::to_string(&view.view()).unwrap();
+    for offered in ["boards/edit-text", "boards/text-size"] {
+        assert!(
+            json.contains(offered),
+            "a connector carries a label the painter draws, but the panel did \
+             not offer {offered}"
+        );
+    }
+    assert!(
+        !json.contains("boards/align/"),
+        "a connector's words float over the run with no box to be moved \
+         around inside, so there is nothing for an alignment to do"
+    );
+
+    // And the button the panel offers is the gesture the keyboard offers: one
+    // way in, so the panel cannot promise something `Enter` does not do.
+    view.begin_text();
+    assert_eq!(
+        view.inline.as_ref().map(|inline| inline.id.as_str()),
+        Some("line"),
+        "the panel's own button did not open the connector's label"
+    );
+}
