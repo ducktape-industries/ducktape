@@ -8,7 +8,7 @@ use super::*;
 fn no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer() {
     let shell = rust_tokens(include_str!("../shell.rs"));
     assert_eq!(shell.matches("Message::GlobalKeyPressed(key)").count(), 1);
-    assert!(shell.contains("if!global{return;}Message::GlobalKeyPressed(key)"));
+    assert!(shell.contains("ifescape.is_empty(){return;}Message::GlobalKeyPressed(key)"));
     assert!(shell.contains("ifwindow.window_handle().window_id()!=window_id{return;}"));
     assert_eq!(
         shell.matches("Message::ModifierStateChanged(").count(),

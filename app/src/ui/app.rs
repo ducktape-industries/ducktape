@@ -9,12 +9,6 @@ pub(crate) enum LiveKind {
     Resync,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum SearchPhase {
-    Idle,
-    Searching,
-    Done,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Appearance {
     System,
     Light,
@@ -117,21 +111,6 @@ pub(crate) enum ShellTab {
     Registered(&'static str),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum RegisteredIntent {
-    OpenLink,
-    Copy,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum ForgeIntent {
-    OpenLink,
-    Copy,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum AgentsIntent {
-    Badge,
-    OpenLink,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SettingsIntent {
     Tab,
     Reconnect,
@@ -168,17 +147,11 @@ pub(crate) enum UpdateAction {
     DismissRollbackNotice,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum PagesIntent {
-    OpenLink,
-    Copy,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ChatIntent {
     ShowHuddle,
     LeaveHuddle,
     JoinHuddle,
     JoinVoice,
-    OpenLink,
     Copy,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -217,8 +190,6 @@ pub struct Ducktape {
     pub(crate) account_desktop_auth_task: Option<::ducktape_view_guest::task::Handle>,
     pub(crate) notifications_save_generation: u64,
     pub(crate) notifications_save_task: Option<::ducktape_view_guest::task::Handle>,
-    pub(crate) palette_search_generation: u64,
-    pub(crate) palette_search_task: Option<::ducktape_view_guest::task::Handle>,
     pub(crate) channel_window_load_generation: u64,
     pub(crate) channel_window_load_task: Option<::ducktape_view_guest::task::Handle>,
     pub(crate) appearance_load_generation: u64,
@@ -323,16 +294,11 @@ pub struct Ducktape {
     pub(crate) node_reachable_label: String,
     pub(crate) fs_route: String,
     pub(crate) fs_route_serial: i64,
-    pub(crate) palette_open: bool,
     pub(crate) bell_open: bool,
     /// What the rail paints beside the bell: the seated `inbox` view's own
     /// count, read through a headless session. The app folds no inbox of its
     /// own — the number, the wording and the unread rule are all the view's.
     pub(crate) bell_unread: i64,
-    pub(crate) palette_draft: String,
-    pub(crate) palette_search_phase: SearchPhase,
-    pub(crate) palette_chat_hits: Vec<crate::backend::ChatSearchHit>,
-    pub(crate) palette_page_hits: Vec<crate::backend::PageSearchHit>,
     pub(crate) toast: String,
     pub(crate) toast_age: i64,
     pub(crate) page_route: String,
@@ -406,7 +372,6 @@ pub(crate) enum AppMessage {
     AccountQrAuthReply(u64, Option<Box<AppMessage>>),
     AccountDesktopAuthReply(u64, Box<AppMessage>),
     NotificationsSaveReply(u64, Box<AppMessage>),
-    PaletteSearchReply(u64, Box<AppMessage>),
     ChannelWindowLoadReply(u64, Box<AppMessage>),
     AppearanceLoadReply(u64, Box<AppMessage>),
     NotificationsLoadReply(u64, Box<AppMessage>),
@@ -492,16 +457,12 @@ pub(crate) enum AppMessage {
     /// were trying was withdrawn, or became the current one.
     ViewNotice(String),
     ExplorerViewEvent(crate::module_view::ModuleViewEvent),
-    ClosePalette,
     ToggleBell,
     CloseBell,
     /// The count the `inbox` view answered for this connection's account, or
     /// `None` when the read failed and the rail keeps the number it has.
     BellUnreadLoaded(i64, String, Option<i64>),
     GlobalKeyPressed(crate::shell::KeyPress),
-    PaletteChanged(String),
-    PaletteResults(crate::backend::PaletteSearchData),
-    PaletteSearchFailed(crate::backend::AppError),
     OpenChatSearchHit(String, i64),
     ChooseChannel(String),
     ChooseDm(String),
@@ -639,8 +600,6 @@ impl Ducktape {
             account_desktop_auth_task: None,
             notifications_save_generation: 0,
             notifications_save_task: None,
-            palette_search_generation: 0,
-            palette_search_task: None,
             channel_window_load_generation: 0,
             channel_window_load_task: None,
             appearance_load_generation: 0,
@@ -741,13 +700,8 @@ impl Ducktape {
             node_reachable_label: "—".to_owned(),
             fs_route: "".to_owned(),
             fs_route_serial: 0,
-            palette_open: false,
             bell_open: false,
             bell_unread: 0,
-            palette_draft: "".to_owned(),
-            palette_search_phase: SearchPhase::Idle,
-            palette_chat_hits: Vec::new(),
-            palette_page_hits: Vec::new(),
             toast: "".to_owned(),
             toast_age: 0,
             page_route: "".to_owned(),

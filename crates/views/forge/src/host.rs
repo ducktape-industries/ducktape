@@ -1406,12 +1406,6 @@ async fn merge_pr(
 
 // ---------- the OS doors ----------
 
-/// `forge.open_link` — a link a body or the reader's document carried.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Link {
-    pub url: String,
-}
-
 /// `forge.copy` — the host puts `text` on the clipboard and toasts `label`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Copy {
@@ -1419,8 +1413,11 @@ pub struct Copy {
     pub label: String,
 }
 
+/// A link a body or the reader's document carried, handed to the kernel's
+/// ONE open door.
 pub fn open_link(url: &str) -> bool {
-    notify("forge.open_link", &Link { url: url.into() })
+    ducktape_view_guest::host::open_link(url);
+    true
 }
 
 pub fn copy(text: &str, label: &str) -> bool {

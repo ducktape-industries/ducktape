@@ -1,7 +1,7 @@
 //! The view driven natively through the wire: the kernel pushes session
 //! facts, the view reads every card itself through the kernel doors,
 //! re-reads a card on its plane's `rpc.live` hit, and a pressed row leaves
-//! as `home.open_link` carrying a `duck://` address.
+//! as `host.open_link` carrying a `duck://` address.
 
 use ducktape_view_guest::testing::{answer, find, has_text, item, measure, press, refuse, texts};
 use ducktape_view_guest::wire::{Frame, Node, Request};
@@ -377,7 +377,7 @@ fn every_row_cell_keeps_one_line() {
     assert!(wrapping.is_empty(), "cells that may wrap: {wrapping:?}");
 }
 
-/// A pressed room leaves as `home.open_link` with the room's `duck://`
+/// A pressed room leaves as `host.open_link` with the room's `duck://`
 /// address on this chain; so does a run.
 #[test]
 fn a_room_and_a_run_open_through_the_link_plane() {
@@ -386,7 +386,7 @@ fn a_room_and_a_run_open_through_the_link_plane() {
     let [intent] = frame.requests.as_slice() else {
         panic!("one intent after a press, got {:?}", frame.requests);
     };
-    assert_eq!(intent.kind, "home.open_link");
+    assert_eq!(intent.kind, "host.open_link");
     assert_eq!(
         payload(intent),
         serde_json::json!({ "link": "duck://channel/general?net=a1b2c3d4" })
@@ -396,7 +396,7 @@ fn a_room_and_a_run_open_through_the_link_plane() {
     let [intent] = frame.requests.as_slice() else {
         panic!("one intent after a press, got {:?}", frame.requests);
     };
-    assert_eq!(intent.kind, "home.open_link");
+    assert_eq!(intent.kind, "host.open_link");
     assert_eq!(
         payload(intent),
         serde_json::json!({ "link": format!("duck://run/{}?net=a1b2c3d4", "ab".repeat(32)) })

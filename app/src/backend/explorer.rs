@@ -1,22 +1,5 @@
 use super::*;
 
-/// The global-key router for the command palette: platform-Command+K
-/// toggles, Escape closes an open palette; anything else is `none`.
-pub fn palette_key_action(logical: String, modifiers: gpui_kit::Modifiers, open: bool) -> String {
-    let is_toggle = command_held(modifiers) && logical.eq_ignore_ascii_case("k");
-    if is_toggle {
-        return match open {
-            true => "close".into(),
-            false => "open".into(),
-        };
-    }
-    let closes_palette = open && logical == "escape";
-    if closes_palette {
-        return "close".into();
-    }
-    "none".into()
-}
-
 /// Is the command modifier down? The cheap half of the quit chord: it is read
 /// off the native modifier stream. Command on a Mac, Control elsewhere:
 /// arming and routing a chord must use the same platform modifier.
@@ -71,13 +54,12 @@ pub fn command_chord(logical: String, modifiers: gpui_kit::Modifiers) -> crate::
 /// (`crates/views/pages`); the forge's switchers are the host's own pick lists.
 /// Each guest paints its own scrim and dismisses its own layers — a key the
 /// kernel contract carries no door for. What is enumerated here is what rides
-/// EVERY tab: the native shell renders the palette and bell outside the tab.
+/// EVERY tab and is still the shell's: the bell. The palette is a view of its
+/// own now — it claims its chord, paints its scrim and answers its own
+/// Escape, like every other guest layer above.
 //
 // Inspect every shell layer together to name the topmost.
-pub fn topmost_overlay(palette_open: bool, bell_open: bool) -> String {
-    if palette_open {
-        return "palette".into();
-    }
+pub fn topmost_overlay(bell_open: bool) -> String {
     if bell_open {
         return "bell".into();
     }
@@ -91,23 +73,15 @@ pub fn topmost_overlay(palette_open: bool, bell_open: bool) -> String {
     String::new()
 }
 
-/// The surface Escape dismisses — the topmost transient layer, minus the one
-/// rung Escape does not own: an open palette swallows the key itself. What is
-/// left after the views took their own layers is the palette and the bell,
-/// both of which ride every tab.
-pub fn escape_target(logical: String, palette_open: bool, bell_open: bool) -> String {
+/// The surface Escape dismisses — the topmost transient layer the SHELL
+/// still owns. What is left after the views took their own layers is the
+/// bell, which rides every tab.
+pub fn escape_target(logical: String, bell_open: bool) -> String {
     let not_escape = logical != "escape";
     if not_escape {
         return String::new();
     }
-    let topmost = topmost_overlay(palette_open, bell_open);
-    // `palette_key_action` owns the palette's keys — an open palette swallows
-    // Escape, so the ladder yields rather than naming a rung.
-    let palette_owns_it = topmost == "palette";
-    if palette_owns_it {
-        return String::new();
-    }
-    topmost
+    topmost_overlay(bell_open)
 }
 
 pub fn canonical_endpoint(input: String) -> String {

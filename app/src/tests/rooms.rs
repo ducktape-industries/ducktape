@@ -396,6 +396,42 @@ fn the_host_folds_no_live_run_of_its_own() {
     assert!(!backend.exists(), "the host lane's file is back");
 }
 
+/// THE HOST FOLDS NO PALETTE. The shell SEATS one — a view has to be mounted
+/// to hear a chord — and that seat is all it knows: no palette state, no
+/// query, no hits, and no search of its own. What a query searches, how a hit
+/// reads and where pressing one goes are the view's, so a swap moves all of
+/// it. Both halves are parsed for here, because either one growing back is
+/// the app quietly deciding again what it no longer owns.
+#[test]
+fn the_host_folds_no_palette_of_its_own() {
+    for (which, source) in [
+        ("state", include_str!("../ui/app.rs")),
+        ("update", include_str!("../ui/app_update.rs")),
+    ] {
+        let tokens = rust_tokens(source).to_lowercase();
+        assert!(
+            !tokens.contains("palette"),
+            "the app's {which} carries a palette again"
+        );
+    }
+    let backend = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backend");
+    assert!(
+        !backend.join("search.rs").exists(),
+        "the host's search lane is back"
+    );
+    let mut files = Vec::new();
+    collect_rust_files(&backend, &mut files);
+    assert!(!files.is_empty(), "the walk found no backend source at all");
+    for file in files {
+        let source = std::fs::read_to_string(&file).expect("read a backend source");
+        assert!(
+            !rust_tokens(&source).contains("fnsearch_"),
+            "{} searches the workspace on the host's side again",
+            file.display()
+        );
+    }
+}
+
 /// A CREDENTIAL NEVER CROSSES INTO A VIEW. The kernel reads the node's 0600
 /// link token and attaches it to the socket it opens; what reaches a guest is
 /// a topic and the frames on it. A view naming the token, or the file it

@@ -102,7 +102,7 @@ fn one_intent(frame: &Frame) -> &Request {
     let intents: Vec<_> = frame
         .requests
         .iter()
-        .filter(|request| request.kind.starts_with("chat."))
+        .filter(|request| request.kind.starts_with("chat.") || request.kind == "host.open_link")
         .collect();
     let [intent] = intents.as_slice() else {
         panic!("one intent, got {:?}", frame.requests);
@@ -513,10 +513,10 @@ fn choosing_a_room_uses_the_common_link_intent() {
         let (frame, _) = connected_room();
         let frame = tick_native(press(&frame, "ops"));
         let intent = one_intent(&frame);
-        assert_eq!(intent.kind, "chat.open_link");
+        assert_eq!(intent.kind, "host.open_link");
         let link: serde_json::Value = serde_json::from_slice(&intent.payload).unwrap();
         assert_eq!(
-            link["url"],
+            link["link"],
             chat_view::host::duck_channel_link("channel-b".into(), session(true).network_chain_id,)
         );
     });
@@ -1389,10 +1389,10 @@ fn a_dm_click_creates_the_room_through_common_requests_before_navigation() {
                 .any(|request| request.kind.starts_with("chat."))
         );
         let frame = tick_native(vec![answer(create.id, b"{}")]);
-        let navigate = request(&frame, "chat.open_link");
+        let navigate = request(&frame, "host.open_link");
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&navigate.payload).unwrap(),
-            serde_json::json!({"url":format!("duck://channel/{channel}")})
+            serde_json::json!({"link":format!("duck://channel/{channel}")})
         );
     });
 }
@@ -1413,7 +1413,7 @@ fn existing_dm_and_external_account_links_use_the_same_guest_opening_flow() {
             existing.id,
             &serde_json::to_vec(&serde_json::json!({"channel":{"id":channel}})).unwrap(),
         )]);
-        assert_eq!(request(&frame, "chat.open_link").kind, "chat.open_link");
+        assert_eq!(request(&frame, "host.open_link").kind, "host.open_link");
         assert!(
             !frame
                 .requests
@@ -1440,7 +1440,7 @@ fn existing_dm_and_external_account_links_use_the_same_guest_opening_flow() {
             frame
                 .requests
                 .iter()
-                .any(|request| request.kind == "chat.open_link")
+                .any(|request| request.kind == "host.open_link")
         );
     });
 }
@@ -1510,7 +1510,7 @@ fn superseded_dm_reads_cannot_create_or_navigate() {
             assert!(
                 !frame.requests.iter().any(|request| matches!(
                     request.kind.as_str(),
-                    "op.submit" | "rpc.query" | "chat.open_link"
+                    "op.submit" | "rpc.query" | "host.open_link"
                 )),
                 "{reason}"
             );
@@ -1539,12 +1539,12 @@ fn creating_a_text_channel_uses_common_requests_and_waits_before_navigation() {
             serde_json::from_slice::<serde_json::Value>(&submit.payload).unwrap(),
             serde_json::json!({"target":"chat","payload":{"create_channel":{"channel_id":"channel-new","name":"Design","post_policy":"open"}}})
         );
-        assert!(!kinds(&frame).contains(&"chat.open_link"));
+        assert!(!kinds(&frame).contains(&"host.open_link"));
         let frame = tick_native(vec![answer(submit.id, b"42")]);
-        let navigate = request(&frame, "chat.open_link");
+        let navigate = request(&frame, "host.open_link");
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&navigate.payload).unwrap(),
-            serde_json::json!({"url":"duck://channel/channel-new"})
+            serde_json::json!({"link":"duck://channel/channel-new"})
         );
         assert!(!has_text(&frame, "Create a channel"));
     });
@@ -1570,7 +1570,7 @@ fn voice_creation_preserves_the_text_room_and_ignores_the_members_toggle() {
             serde_json::json!({"target":"chat","payload":{"create_voice_channel":{"channel_id":"voice-new","name":"Lounge"}}})
         );
         let frame = tick_native(vec![answer(submit.id, b"42")]);
-        assert!(!kinds(&frame).contains(&"chat.open_link"));
+        assert!(!kinds(&frame).contains(&"host.open_link"));
         assert!(!has_text(&frame, "Create a channel"));
     });
 }
@@ -1604,7 +1604,7 @@ fn refused_channel_creation_keeps_the_draft_and_reuses_its_id() {
                 .iter()
                 .any(|text| text.contains("creation refused"))
         );
-        assert!(!kinds(&frame).contains(&"chat.open_link"));
+        assert!(!kinds(&frame).contains(&"host.open_link"));
         let frame = tick_native(press(&frame, "Create channel"));
         assert!(!kinds(&frame).contains(&"host.id"));
         let frame = tick_native(vec![answer(
@@ -1630,7 +1630,7 @@ fn an_account_change_cancels_channel_creation_before_it_can_submit() {
         assert!(!has_text(&frame, "Create a channel"));
         let frame = tick_native(vec![answer(mint, b"channel-old")]);
         assert!(!kinds(&frame).contains(&"op.submit"));
-        assert!(!kinds(&frame).contains(&"chat.open_link"));
+        assert!(!kinds(&frame).contains(&"host.open_link"));
     });
 }
 
@@ -1656,7 +1656,7 @@ fn a_lost_creation_reply_is_reconciled_before_retrying_the_write() {
         let frame = tick_native(vec![answer(request(&frame, "rpc.view").id,
             br#"{"channel":{"id":"channel-new","name":"Design","voice":false,"post_policy":"open"}}"#)]);
         assert!(!kinds(&frame).contains(&"op.submit"));
-        assert!(kinds(&frame).contains(&"chat.open_link"));
+        assert!(kinds(&frame).contains(&"host.open_link"));
         assert!(!has_text(&frame, "Create a channel"));
     });
 }

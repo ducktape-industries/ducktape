@@ -74,26 +74,6 @@ fn chat_data(active_channel: &str) -> backend::ChatData {
     }
 }
 
-fn stale_chat_hit() -> backend::ChatSearchHit {
-    backend::ChatSearchHit {
-        channel_id: "old".into(),
-        seq: 1,
-        root_seq: 1,
-        author: "user".into(),
-        text: "stale".into(),
-        meta: "#1".into(),
-    }
-}
-
-fn stale_page_hit() -> backend::PageSearchHit {
-    backend::PageSearchHit {
-        page_id: "old".into(),
-        page_title: "Old".into(),
-        block_id: "old-block".into(),
-        kind: "Text".into(),
-        text: "stale".into(),
-    }
-}
 
 fn workspace(active_channel: &str) -> backend::WorkspaceData {
     backend::WorkspaceData {

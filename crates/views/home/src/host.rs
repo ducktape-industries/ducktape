@@ -816,13 +816,11 @@ pub fn fold_proposals(reply: &serde_json::Value) -> Vec<ProposalRow> {
 
 // ---------- the doors out ----------
 
-/// `home.open_link` — a card's address, handed to the shell's ONE open
-/// plane, which routes a `duck://` link to the tab that owns it.
+/// A card's address, handed to the kernel's ONE open door, which routes a
+/// `duck://` link to whatever owns it. Not this view's intent: every view
+/// leaves through the same door.
 pub fn open_link(link: &str) -> bool {
-    host::notify(
-        "home.open_link",
-        &serde_json::to_vec(&serde_json::json!({ "link": link })).expect("encodes"),
-    );
+    ducktape_view_guest::host::open_link(link);
     true
 }
 

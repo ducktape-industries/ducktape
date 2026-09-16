@@ -80,21 +80,6 @@ pub(crate) async fn chat_background(
     Ok(result)
 }
 
-/// The deployed Chat view owns workspace message search and its display rows.
-pub async fn search_chat(
-    rpc: String,
-    channel_id: String,
-    text: String,
-) -> Result<ChatSearchData, AppError> {
-    let result = chat_background(
-        &rpc,
-        serde_json::json!({"kind":"search", "channel":channel_id, "text":text}),
-    )
-    .await?;
-    let hits = serde_json::from_value(result["hits"].clone()).map_err(|error| error.to_string())?;
-    Ok(ChatSearchData { hits })
-}
-
 /// Hand a WEB link to the OS opener — the `DuckKind::Web` arm of the open
 /// plane, and its only caller. Only http(s) leaves the app this way
 /// (this passes a string to a shell command, and the scheme gate is the trust
@@ -123,22 +108,4 @@ pub async fn open_external_url(url: String) -> Result<bool, AppError> {
     }
     .await
     .map_err(app_error)
-}
-
-/// The Pages guest resolves search hits and titles for the workspace palette.
-pub async fn search_pages(
-    rpc: String,
-    page_id: String,
-    text: String,
-) -> Result<PageSearchData, AppError> {
-    let props = serde_json::to_vec(&serde_json::json!({"background":{"page":page_id,"text":text}}))
-        .map_err(|error| error.to_string())?;
-    let bytes = crate::module_view::background::request("pages", props, &rpc).await?;
-    let reply: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    if let Some(error) = reply.get("error").and_then(serde_json::Value::as_str) {
-        return Err(error.to_owned().into());
-    }
-    let hits = serde_json::from_value(reply["hits"].clone()).map_err(|error| error.to_string())?;
-    Ok(PageSearchData { hits })
 }

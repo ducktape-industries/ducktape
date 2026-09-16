@@ -777,13 +777,10 @@ impl Stream for ActStream {
 
 // ---------- the doors that stay the app's ----------
 
-/// A link the Markdown reader offered, handed to the shell's link plane.
+/// A link the Markdown reader offered, handed to the kernel's ONE open
+/// door.
 pub fn open_link(url: &str) -> bool {
-    let payload = serde_json::json!({ "url": url });
-    host::notify(
-        "files.open_link",
-        &serde_json::to_vec(&payload).expect("an intent encodes"),
-    );
+    ducktape_view_guest::host::open_link(url);
     true
 }
 

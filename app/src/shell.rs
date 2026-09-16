@@ -45,7 +45,6 @@ pub(crate) enum Command {
     Close(WindowKey),
     Raise(WindowKey),
     Clipboard(String),
-    Focus(String),
     OpenLink(String),
     Quit,
 }
@@ -115,10 +114,6 @@ pub(crate) fn clipboard<Message: 'static>(text: String) -> Task<Message> {
     effect(Command::Clipboard(text))
 }
 
-pub(crate) fn focus<Message: 'static>(key: String) -> Task<Message> {
-    effect(Command::Focus(key))
-}
-
 pub(crate) fn quit<Message: 'static>() -> Task<Message> {
     effect(Command::Quit)
 }
@@ -156,7 +151,6 @@ struct Desktop {
     windows: BTreeMap<WindowKey, gpui_kit::AnyWindowHandle>,
     views: BTreeMap<WindowKey, gpui_kit::WeakEntity<DesktopWindow>>,
     streams: HashMap<u64, gpui_kit::Task<()>>,
-    pending_focus: Option<String>,
     pending_urls: Vec<String>,
 }
 
@@ -249,7 +243,6 @@ impl Desktop {
             Command::Close(key) => self.close_window(key, cx),
             Command::Raise(key) => self.raise_window(key, cx),
             Command::Clipboard(text) => self.write_clipboard(text, cx),
-            Command::Focus(key) => self.focus_control(key, cx),
             Command::OpenLink(url) => self.dispatch(Message::OpenMessageLink(url), cx),
             Command::Quit => self.quit(cx),
         }
@@ -337,7 +330,9 @@ impl Desktop {
                     module_route: None,
                     route: None,
                     overlay_module: None,
+                    palette_module: None,
                     overlay_route: None,
+                    palette_route: None,
                     inputs: HashMap::new(),
                     input_step: None,
                     qr: None,
@@ -407,11 +402,6 @@ impl Desktop {
         cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
     }
 
-    fn focus_control(&mut self, key: String, cx: &mut Context<Self>) {
-        self.pending_focus = Some(key);
-        cx.notify();
-    }
-
     fn quit(&mut self, cx: &mut Context<Self>) {
         let windows = self.windows.values().copied().collect::<Vec<_>>();
         cx.defer(move |cx| {
@@ -470,6 +460,22 @@ fn huddle_route(event: crate::module_view::ModuleViewEvent) -> Message {
     }
 }
 
+/// One intent from a seated view, as the message the app acts on.
+///
+/// THE HOST DOORS ARE READ BEFORE THE VIEW'S OWN ROUTE, and they are read in
+/// one place however many seats there are: every view reaches
+/// `host.open_link` through the kernel, so no view's route has an opening
+/// act of its own to drift.
+fn routed(
+    route: fn(crate::module_view::ModuleViewEvent) -> Message,
+    intent: crate::module_view::ModuleViewEvent,
+) -> Message {
+    match crate::module_view::host_door(&intent) {
+        Some(link) => Message::OpenMessageLink(link),
+        None => route(intent),
+    }
+}
+
 pub(crate) struct DesktopWindow {
     model: Entity<Desktop>,
     kind: WindowKind,
@@ -481,6 +487,11 @@ pub(crate) struct DesktopWindow {
     /// hold both.
     overlay_module: Option<Entity<crate::module_view::NativeModuleView>>,
     overlay_route: Option<gpui_kit::Subscription>,
+    /// The palette's seat, which is never given back: the view answers to a
+    /// chord, so it has to be there to hear one. It draws an empty tree
+    /// until it is opened, and an empty tree is not stacked over the window.
+    palette_module: Option<Entity<crate::module_view::NativeModuleView>>,
+    palette_route: Option<gpui_kit::Subscription>,
     inputs: HashMap<&'static str, NativeInput>,
     input_step: Option<crate::HubStep>,
     qr: Option<(String, Entity<crate::view_tree::ViewTree>)>,
@@ -530,25 +541,25 @@ impl DesktopWindow {
     fn global_key(&mut self, key: KeyPress, in_guest_editor: bool, cx: &mut Context<Self>) {
         let state = &self.model.read(cx).state;
         let chord = crate::backend::command_chord(key.key.clone(), key.modifiers);
-        let palette =
-            crate::backend::palette_key_action(key.key.clone(), key.modifiers, state.palette_open);
-        // A guest editor claims Ctrl+K for a link: the palette does not open
-        // over it. Closing an open palette is unaffected — its focus is not in
-        // the editor.
-        let editor_claims_the_chord = in_guest_editor && palette == "open";
-        let palette = match editor_claims_the_chord {
-            true => "none".to_owned(),
-            false => palette,
-        };
-        let escape =
-            crate::backend::escape_target(key.key.clone(), state.palette_open, state.bell_open);
-        let global = palette != "none" || !escape.is_empty();
+        let escape = crate::backend::escape_target(key.key.clone(), state.bell_open);
+        // THE APP OWNS THE TWO CHORDS THAT CLOSE IT and nothing else: ⌘Q and
+        // ⌘W are the OS's, and a view cannot claim them. Every other
+        // command chord belongs to whichever seated view claimed it, which
+        // is how a swap changes what a key does.
+        let app_owned = !matches!(chord, crate::CommandChord::Ignored);
+        // A guest editor claims Ctrl+K for a link, so a claimed chord does
+        // not fire over one.
+        let claimable = !app_owned && !in_guest_editor;
+        if claimable && self.deliver_chord(&key, cx) {
+            cx.stop_propagation();
+            return;
+        }
         let message = match chord {
             crate::CommandChord::Quit | crate::CommandChord::CloseWindow => {
                 Message::CommandChordPressed(key)
             }
             crate::CommandChord::Ignored => {
-                if !global {
+                if escape.is_empty() {
                     return;
                 }
                 Message::GlobalKeyPressed(key)
@@ -557,6 +568,22 @@ impl DesktopWindow {
         self.model
             .update(cx, |model, cx| model.dispatch(message, cx));
         cx.stop_propagation();
+    }
+
+    /// Carry a press to the view that claimed it, if any seat in this window
+    /// holds the chord. Says whether it landed — a claimed chord is spent
+    /// where it lands and never also a native key.
+    fn deliver_chord(&mut self, key: &KeyPress, cx: &mut Context<Self>) -> bool {
+        let Some(chord) = crate::module_view::chord_of(&key.key, key.modifiers) else {
+            return false;
+        };
+        let palette = self.palette_module.clone();
+        let seated = self.module.as_ref().map(|(_, view)| view.clone());
+        let overlay = self.overlay_module.clone();
+        [palette, seated, overlay]
+            .into_iter()
+            .flatten()
+            .any(|view| view.update(cx, |view, cx| view.chord(&chord, cx)))
     }
 
     fn released(&mut self, cx: &mut gpui_kit::App) {
@@ -585,7 +612,10 @@ impl DesktopWindow {
             let model = self.model.clone();
             self.overlay_route = Some(cx.subscribe(&view, move |_, _, event, cx| {
                 model.update(cx, |model, cx| {
-                    model.dispatch(Message::RegisteredViewEvent(event.clone()), cx)
+                    model.dispatch(
+                        routed(Message::RegisteredViewEvent, event.clone()),
+                        cx,
+                    )
                 });
             }));
             self.overlay_module = Some(view);
@@ -598,6 +628,48 @@ impl DesktopWindow {
         view.update(cx, |view, cx| view.set_props(spec.props, cx));
         view.into_any_element()
     }
+    /// The palette's seat: mounted the first time the console draws and kept
+    /// for the window's life, because a view that answers to a chord has to
+    /// be seated to hear one. The element comes back only while the view is
+    /// drawing something — a closed palette is an empty tree, and stacking
+    /// an empty layer over the window would eat every press under it.
+    fn seat_palette(&mut self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        use gpui_kit::IntoElement as _;
+        let spec = {
+            let state = &self.model.read(cx).state;
+            crate::module_view::palette_view(
+                state.is_dark(),
+                state.connected,
+                &state.network_chain_id,
+            )
+        };
+        if self.palette_module.is_none() {
+            let view = cx.new(|_| crate::module_view::NativeModuleView::new(spec.module));
+            let model = self.model.clone();
+            self.palette_route = Some(cx.subscribe(&view, move |_, _, event, cx| {
+                model.update(cx, |model, cx| {
+                    model.dispatch(routed(Message::RegisteredViewEvent, event.clone()), cx)
+                });
+            }));
+            self.palette_module = Some(view);
+        }
+        let view = self
+            .palette_module
+            .as_ref()
+            .expect("palette view seated")
+            .clone();
+        view.update(cx, |view, cx| view.set_props(spec.props, cx));
+        let drawing = view.read(cx).draws();
+        drawing.then(|| {
+            use gpui_kit::{ParentElement as _, Styled as _};
+            gpui_kit::div()
+                .absolute()
+                .inset_0()
+                .child(view.into_any_element())
+                .into_any_element()
+        })
+    }
+
     /// A closed bell returns its seat: nothing is drawn, so nothing keeps
     /// re-reading the queue. The headless errand behind the rail's number is
     /// the only inbox read a closed bell pays for.
@@ -624,7 +696,7 @@ impl DesktopWindow {
         let model = self.model.clone();
         cx.defer(move |cx| {
             for intent in intents {
-                model.update(cx, |model, cx| model.dispatch(route(intent), cx));
+                model.update(cx, |model, cx| model.dispatch(routed(route, intent), cx));
             }
         });
     }
@@ -644,7 +716,7 @@ impl DesktopWindow {
         let model = self.model.clone();
         cx.defer(move |cx| {
             for intent in intents {
-                model.update(cx, |model, cx| model.dispatch(route(intent), cx));
+                model.update(cx, |model, cx| model.dispatch(routed(route, intent), cx));
             }
         });
     }
@@ -699,13 +771,6 @@ impl DesktopWindow {
                     let text = input.read(cx).value().to_string();
                     model.update(cx, |model, cx| {
                         model.dispatch(Message::SecretTyped(key.into(), text), cx)
-                    });
-                }
-                let palette_input = key == "palette-input";
-                if palette_input {
-                    let text = input.read(cx).value().to_string();
-                    model.update(cx, |model, cx| {
-                        model.dispatch(Message::PaletteChanged(text), cx)
                     });
                 }
                 cx.notify();
@@ -1481,7 +1546,7 @@ impl DesktopWindow {
             let model = self.model.clone();
             self.route = Some(cx.subscribe(&view, move |_, _, event, cx| {
                 model.update(cx, |model, cx| {
-                    model.dispatch(huddle_route(event.clone()), cx)
+                    model.dispatch(routed(huddle_route, event.clone()), cx)
                 });
             }));
             self.module = Some(("call", view));
@@ -1506,7 +1571,9 @@ impl DesktopWindow {
             let view = cx.new(|_| crate::module_view::NativeModuleView::new(spec.module));
             let model = self.model.clone();
             self.route = Some(cx.subscribe(&view, move |_, _, event, cx| {
-                model.update(cx, |model, cx| model.dispatch(route(event.clone()), cx));
+                model.update(cx, |model, cx| {
+                    model.dispatch(routed(route, event.clone()), cx)
+                });
             }));
             self.module = Some((spec.module, view));
             self.module_route = Some(route);
@@ -1675,17 +1742,18 @@ impl DesktopWindow {
                 .text_color(ink_muted)
                 .child(shortcut),
         )
+        // The rail row IS the chord: whoever claimed ⌘K gets the same press
+        // a keyboard would have sent, so the app still knows nothing about
+        // what opens.
         .on_click(cx.listener(move |this, _, _, cx| {
             cx.stop_propagation();
-            this.model.update(cx, |model, cx| {
-                model.dispatch(
-                    Message::GlobalKeyPressed(KeyPress {
-                        key: "k".into(),
-                        modifiers,
-                    }),
-                    cx,
-                )
-            });
+            this.deliver_chord(
+                &KeyPress {
+                    key: "k".into(),
+                    modifiers,
+                },
+                cx,
+            );
         }));
         let bell_label = match bell_unread {
             0 => "Notifications".to_owned(),
@@ -1711,7 +1779,7 @@ impl DesktopWindow {
             .id("workspace-rail")
             .flex()
             .flex_col()
-            .w(px(200.))
+            .w(px(RAIL_WIDTH))
             .h_full()
             .flex_shrink_0()
             .px_2()
@@ -1986,8 +2054,13 @@ impl DesktopWindow {
             .overflow_hidden()
             .child(tabs)
             .child(content);
-        if let Some(overlay) = self.overlay(window, cx) {
+        if let Some(overlay) = self.overlay(cx) {
             root = root.child(overlay);
+        }
+        // The palette is the topmost layer and its own overlay: it draws its
+        // scrim and its card, or nothing at all.
+        if let Some(palette) = self.seat_palette(cx) {
+            root = root.child(palette);
         }
         root.into_any_element()
     }
@@ -2046,170 +2119,57 @@ impl DesktopWindow {
             .into_any_element()
     }
 
-    fn overlay(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui_kit::AnyElement> {
+    /// The bell's popover: a card beside the rail, at the bell row it hangs
+    /// off. It is 380px wide because the seat inside it is the deployed
+    /// `inbox` view and a view lays itself out for the width it is handed —
+    /// a popover column, not the page the tab underneath draws. The height
+    /// is this chrome's to cap; the guest scrolls inside it.
+    fn overlay(&mut self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        use gpui_kit::component::ActiveTheme as _;
+        use gpui_kit::component::button::ButtonVariants as _;
         use gpui_kit::*;
         let topmost = {
             let state = &self.model.read(cx).state;
-            crate::backend::topmost_overlay(state.palette_open, state.bell_open)
+            crate::backend::topmost_overlay(state.bell_open)
         };
-        // The seat is taken before the card is drawn — it needs the window,
-        // and everything below borrows the model. A bell that is not the
-        // topmost overlay gives its seat back.
-        let inbox = match topmost.as_str() {
-            "bell" => Some(self.seat_inbox(cx)),
-            _ => {
-                self.unseat_inbox(cx);
-                None
-            }
-        };
-        let state = &self.model.read(cx).state;
-        use gpui_kit::component::button::ButtonVariants as _;
-        use gpui_kit::component::ActiveTheme as _;
+        // A bell that is not the topmost overlay gives its seat back.
+        if topmost != "bell" {
+            self.unseat_inbox(cx);
+            return None;
+        }
+        // The seat is taken before the card is drawn: everything below
+        // borrows the model, and seating writes to it.
+        let inbox = self.seat_inbox(cx);
         let colors = cx.theme().color_tokens();
-        let muted = colors.muted_foreground;
-        // A modal is one card: a title row with its close, then its body.
-        let heading = |this: &Self, title: &'static str, close: Message| {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_4()
-                .pt_3()
-                .pb_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .text_size(px(15.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(title),
-                )
-                .child(
-                    this.action("modal-close", "", close, false)
-                        .ghost()
-                        .icon(gpui_kit::component::IconName::Close)
-                        .accessibility_label("Close")
-                        .h_7()
-                        .w_7()
-                        .px_0(),
-                )
-        };
-        // A result or a notification is one full-width row: a name, then
-        // what it says, in the muted tone.
-        let row = |this: &Self, key: String, name: String, detail: String, message, disabled| {
-            this.action(key, "", message, disabled)
-                .accessibility_label(format!("{name} {detail}"))
-                .ghost()
-                .w_full()
-                .h_auto()
-                .px_2()
-                .py_1p5()
-                .justify_start()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_start()
-                        .gap_0p5()
-                        .min_w_0()
-                        .w_full()
-                        .child(
-                            div()
-                                .w_full()
-                                .truncate()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(name),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .truncate()
-                                .text_size(px(12.5))
-                                .font_weight(FontWeight::NORMAL)
-                                .text_color(muted)
-                                .child(detail),
-                        ),
-                )
-        };
-        let mut body = div().flex().flex_col().gap_1().px_3().pb_3();
-        let (title, dismiss) = match topmost.as_str() {
-            "palette" => {
-                let chats = state.palette_chat_hits.clone();
-                let pages = state.palette_page_hits.clone();
-                let phase = state.palette_search_phase;
-                let query = state.palette_draft.clone();
-                let empty = chats.is_empty() && pages.is_empty();
-                body = body.child(div().px_1().pb_1().child(self.input(
-                    "palette-input",
-                    "Search messages and pages",
-                    false,
-                    window,
-                    cx,
-                )));
-                let note = match phase {
-                    crate::SearchPhase::Searching => Some("Searching…"),
-                    crate::SearchPhase::Done if empty => Some("No messages or pages matched."),
-                    crate::SearchPhase::Idle if !query.trim().is_empty() => Some("Search failed."),
-                    _ => None,
-                };
-                if let Some(note) = note {
-                    body = body.child(
-                        div()
-                            .px_2()
-                            .py_2()
-                            .text_size(px(12.5))
-                            .text_color(muted)
-                            .child(note),
-                    );
-                }
-                for hit in chats {
-                    body = body.child(row(
-                        self,
-                        format!("search-chat/{}/{}", hit.channel_id, hit.seq),
-                        hit.author,
-                        hit.text,
-                        Message::OpenChatSearchHit(hit.channel_id, hit.seq),
-                        false,
-                    ));
-                }
-                for hit in pages {
-                    body = body.child(row(
-                        self,
-                        format!("search-page/{}/{}", hit.page_id, hit.block_id),
-                        hit.page_title,
-                        hit.text,
-                        Message::OpenPageSearchHit(hit.page_id, hit.block_id),
-                        false,
-                    ));
-                }
-                ("Search this workspace", Message::ClosePalette)
-            }
-            // The body is the guest's frame and nothing else: no rows, no
-            // empty state, no mark-read button and no retry drawn here. All
-            // of those are inbox content, and the view words them. The
-            // height is the chrome's cap on the guest, which draws no
-            // popover of its own.
-            "bell" => {
-                body = body.child(
-                    div()
-                        .h(px(420.))
-                        .w_full()
-                        .child(inbox.expect("the bell overlay seats the inbox view")),
-                );
-                ("Notifications", Message::CloseBell)
-            }
-            _ => return None,
-        };
-        let model = self.model.clone();
+        let dismiss = Message::CloseBell;
+        let heading = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .pt_2p5()
+            .pb_1p5()
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Notifications"),
+            )
+            .child(
+                self.action("modal-close", "", dismiss.clone(), false)
+                    .ghost()
+                    .icon(gpui_kit::component::IconName::Close)
+                    .accessibility_label("Close")
+                    .h_6()
+                    .w_6()
+                    .px_0(),
+            );
         let panel = div()
             .id("shell-modal")
             .flex()
             .flex_col()
-            .w(px(560.0))
-            .max_h(relative(0.8))
+            .w(px(BELL_POPOVER_WIDTH))
             .bg(cx.theme().popover)
             .text_color(cx.theme().popover_foreground)
             .rounded(px(design::radius::CARD as f32 + 2.))
@@ -2217,25 +2177,28 @@ impl DesktopWindow {
             .border_color(colors.border)
             .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(heading(self, title, dismiss.clone()))
+            .child(heading)
             .child(
                 div()
-                    .id("shell-modal-body")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(body),
+                    .h(px(BELL_POPOVER_HEIGHT))
+                    .w_full()
+                    .px_2()
+                    .pb_2()
+                    .child(inbox),
             );
+        let model = self.model.clone();
         Some(
+            // A popover dims nothing: the catcher is transparent and exists
+            // only so a press anywhere else closes the bell.
             div()
                 .id("shell-scrim")
                 .absolute()
                 .inset_0()
                 .flex()
                 .items_start()
-                .justify_center()
-                .pt(px(96.))
-                .bg(rgba(0x00000055))
+                .justify_start()
+                .pl(px(RAIL_WIDTH + 6.))
+                .pt(px(BELL_POPOVER_TOP))
                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                     model.update(cx, |model, cx| model.dispatch(dismiss.clone(), cx))
                 })
@@ -2254,14 +2217,6 @@ impl Render for DesktopWindow {
             WindowKind::Onboarding => self.onboarding(window, cx),
             WindowKind::Huddle => self.huddle(window, cx),
         };
-        let pending_focus = self.model.read(cx).pending_focus.clone();
-        if let Some(key) = pending_focus {
-            let local_key = key.rsplit('/').next().unwrap_or(&key);
-            if let Some(input) = self.inputs.get(local_key) {
-                input.state.update(cx, |state, cx| state.focus(window, cx));
-                self.model.update(cx, |model, _| model.pending_focus = None);
-            }
-        }
         // Every text style in every app window descends from this one, and
         // `font_family` — which is all the tree below ever overrides — leaves
         // the chain in place. Set it here and a run in any pane falls back by
@@ -2311,7 +2266,6 @@ pub(crate) fn test_window(
         windows: BTreeMap::new(),
         views: BTreeMap::new(),
         streams: HashMap::new(),
-        pending_focus: None,
         pending_urls: Vec::new(),
     });
     cx.new(|cx| {
@@ -2326,7 +2280,9 @@ pub(crate) fn test_window(
             module_route: None,
             route: None,
             overlay_module: None,
+            palette_module: None,
             overlay_route: None,
+            palette_route: None,
             inputs: HashMap::new(),
             input_step: None,
             qr: None,
@@ -2473,18 +2429,10 @@ mod close_tests {
                 } else {
                     "ctrl"
                 };
-                window.press(&format!("{command}-k"), cx);
-                assert!(view.read(cx).model.read(cx).state.palette_open);
                 view.read(cx)
                     .model
                     .clone()
                     .update(cx, |model, _| model.state.bell_open = true);
-                window.press("escape", cx);
-                assert!(!view.read(cx).model.read(cx).state.palette_open);
-                assert!(
-                    view.read(cx).model.read(cx).state.bell_open,
-                    "only the top shell overlay closes"
-                );
                 window.press("escape", cx);
                 assert!(!view.read(cx).model.read(cx).state.bell_open);
                 window.press(&format!("{command}-w"), cx);
@@ -2754,6 +2702,18 @@ fn hsla_of(color: design::Color) -> gpui_kit::Hsla {
 /// The registry id of the dashboard view: the one registered view that
 /// leads the rail instead of following the built-in tabs.
 const HOME_VIEW: &str = "home";
+
+/// The ink rail's width. The bell's popover hangs off it, so the two share
+/// one number rather than agreeing by coincidence.
+const RAIL_WIDTH: f32 = 200.;
+
+/// The bell popover's box. The WIDTH is the load-bearing one: the deployed
+/// `inbox` view reads the width it is given and lays itself out for it, so
+/// a popover column is what 380 buys. The height is a cap — the guest
+/// scrolls inside it — and the top is the rail's own bell row.
+const BELL_POPOVER_WIDTH: f32 = 380.;
+const BELL_POPOVER_HEIGHT: f32 = 420.;
+const BELL_POPOVER_TOP: f32 = 88.;
 
 const MESSAGE_SQUARE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>"#;
 const GIT_BRANCH: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>"#;
@@ -3098,8 +3058,7 @@ pub(crate) fn run() {
             windows: BTreeMap::new(),
             views: BTreeMap::new(),
             streams: HashMap::new(),
-            pending_focus: None,
-            pending_urls: Vec::new(),
+                pending_urls: Vec::new(),
         });
         desktop.update(cx, |desktop, cx| desktop.sync_appearance(cx));
         let url_desktop = desktop.downgrade();

@@ -1110,6 +1110,7 @@ version = "0.1.0"
 dependencies = [
  "design",
  "futures",
+ "serde_json",
  "view-wire",
  "wit-bindgen 0.61.1",
 ]
@@ -2082,6 +2083,17 @@ dependencies = [
  "ducktape-view-guest",
  "futures",
  "pulldown-cmark",
+ "serde",
+ "serde_json",
+ "view-wire",
+]
+
+[[package]]
+name = "palette-view"
+version = "0.1.0"
+dependencies = [
+ "ducktape-view-guest",
+ "futures",
  "serde",
  "serde_json",
  "view-wire",

@@ -56,19 +56,18 @@ fn a_pushed_status_moves_every_fact_it_carries() {
 /// snapshot and a refresh button.
 
 #[test]
-fn shell_tab_is_app_state_and_palette_hits_switch_panes() {
+fn shell_tab_is_app_state_and_an_opened_message_switches_panes() {
     let (mut app, _) = Ducktape::boot();
     assert_eq!(app.shell_tab, ShellTab::Chat);
     let _ = app.update(AppMessage::SelectShellTab(ShellTab::Pages));
     assert_eq!(app.shell_tab, ShellTab::Pages);
 
-    // a palette chat hit closes the palette and lands on the chat pane
+    // a `duck://` message address lands on the chat pane, whichever view
+    // handed it to the open plane
     app.loading = false;
     app.mutation_phase = MutationPhase::Idle;
     app.connected_rpc = "http://node".into();
-    app.palette_open = true;
     let _ = app.update(AppMessage::OpenChatSearchHit("general".into(), 7));
-    assert!(!app.palette_open);
     assert_eq!(app.shell_tab, ShellTab::Chat);
 }
 

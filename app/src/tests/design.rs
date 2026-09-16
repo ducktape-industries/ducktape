@@ -139,14 +139,14 @@ fn a_held_modifier_reaches_the_guest_without_a_keystroke() {
 /// The shell's keystroke interceptor runs before the guest editor's and cannot
 /// be stopped by it, so the field sits in a key context the shell reads off
 /// the stack to yield the chords a guest claims: Ctrl+K is a link in the
-/// editor, and the search palette must not open over it.
+/// editor, and no chord a seated view claimed may fire over one.
 #[test]
-fn the_shell_yields_the_palette_chord_inside_a_guest_editor() {
+fn the_shell_yields_a_claimed_chord_inside_a_guest_editor() {
     let editor = rust_tokens(include_str!("../editor/text.rs"));
     assert!(editor.contains(".key_context(GUEST_EDITOR_CONTEXT)"));
     let shell = rust_tokens(include_str!("../shell.rs"));
     assert!(shell.contains("context.contains(crate::editor::wire::GUEST_EDITOR_CONTEXT)"));
-    assert!(shell.contains("leteditor_claims_the_chord=in_guest_editor&&palette==\"open\";"));
+    assert!(shell.contains("letclaimable=!app_owned&&!in_guest_editor;"));
 }
 #[test]
 fn persistent_split_panes_have_native_resize_handles_and_cursor_feedback() {
