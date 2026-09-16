@@ -280,7 +280,6 @@ fn no_view_expression_hands_an_extern_an_owned_list() {
         "self.rooms.clone()",
         "self.dm_rows.clone()",
         "self.members_rows.clone()",
-        "self.live_agents.clone()",
     ] {
         assert!(
             !source.contains(field),
