@@ -733,7 +733,7 @@ fn x11_windows(
             .unwrap_or_else(|| "Untitled window".to_string());
         choices.push(ShareChoice {
             target: ShareTarget::Window(window),
-            label: title,
+            label: row_label(&title),
         });
     }
     choices
@@ -770,6 +770,42 @@ const MAX_TITLE_WORDS: u32 = 256;
 /// The smallest window edge worth offering, in pixels.
 #[cfg(not(target_os = "macos"))]
 const MIN_SHAREABLE_EDGE: u16 = 64;
+/// The longest a picker row's label may be, in characters. Past this it stops
+/// being a name anyone picks by, and it is the row that pays.
+#[cfg(not(target_os = "macos"))]
+const MAX_LABEL_CHARS: usize = 72;
+
+/// A window title as a picker row's label.
+///
+/// A TITLE IS WHATEVER THE PROGRAM THAT OWNS THE WINDOW WROTE. `_NET_WM_NAME`
+/// has no length rule and no character rule: a browser tab puts a page title
+/// there, so it arrives with the page's newlines, tabs and control bytes in it
+/// and at whatever length the page felt like. A newline in a button label
+/// breaks the row it is drawn in, and a kilobyte of title breaks the picker, so
+/// the collapse and the bound both happen here — at the one place an outside
+/// string becomes something this app draws.
+#[cfg(not(target_os = "macos"))]
+fn row_label(title: &str) -> String {
+    let printable = title
+        .chars()
+        .map(|character| if character.is_control() { ' ' } else { character });
+    let collapsed = printable.collect::<String>();
+    let mut label: String = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
+    let over = label.chars().count() > MAX_LABEL_CHARS;
+    if !over {
+        return label;
+    }
+    // Cut on a character boundary, never a byte one: a title is UTF-8 and a
+    // split through a multi-byte character would panic.
+    let cut = label
+        .char_indices()
+        .nth(MAX_LABEL_CHARS)
+        .map(|(at, _)| at)
+        .unwrap_or(label.len());
+    label.truncate(cut);
+    label.push('…');
+    label
+}
 
 /// The share targets this host can capture, in the order the picker shows them:
 /// the whole desktop (only where there is more than one head to glue), then
@@ -1384,6 +1420,33 @@ mod tests {
             .expect("publish the client list")
             .check()
             .expect("it is published");
+        // The title a hostile (or merely careless) program would set: newlines,
+        // a control byte and far more of it than a row can hold. The picker
+        // must offer a bounded single line, not this.
+        let net_wm_name = connection
+            .intern_atom(false, b"_NET_WM_NAME")
+            .expect("intern")
+            .reply()
+            .expect("the atom")
+            .atom;
+        let utf8 = connection
+            .intern_atom(false, b"UTF8_STRING")
+            .expect("intern")
+            .reply()
+            .expect("the atom")
+            .atom;
+        let shouting = format!("a\nvery\u{1}\tlong {}", "가".repeat(400));
+        connection
+            .change_property8(
+                PropMode::REPLACE,
+                window,
+                net_wm_name,
+                utf8,
+                shouting.as_bytes(),
+            )
+            .expect("set a hostile title")
+            .check()
+            .expect("it is set");
 
         let offered = call_share_targets().expect("this display offers a share target");
         assert!(!offered.is_empty(), "a display with no target is a bug");
@@ -1392,6 +1455,17 @@ mod tests {
             .find(|choice| choice.target == ShareTarget::Window(window))
             .expect("the published window must be offered");
         println!("offered window: {}", ours.label);
+        assert!(
+            ours.label.chars().count() <= MAX_LABEL_CHARS + 1,
+            "a title a program shouted must arrive bounded: {} chars",
+            ours.label.chars().count()
+        );
+        assert!(
+            !ours.label.chars().any(|character| character.is_control()),
+            "and on one line: {:?}",
+            ours.label
+        );
+        assert!(ours.label.starts_with("a very long 가"), "{:?}", ours.label);
 
         for choice in &offered {
             let source = ScreenSource::open(choice.target)
@@ -1490,6 +1564,35 @@ mod tests {
                 "the pointer is inside this window and nothing drew it into the share"
             );
         }
+    }
+
+    /// A WINDOW TITLE IS UNTRUSTED INPUT — `_NET_WM_NAME` is whatever the
+    /// owning program wrote, so a browser hands over its page title complete
+    /// with the page's newlines and at the page's length. The row it becomes is
+    /// drawn in a button, where a newline breaks the row and a kilobyte breaks
+    /// the picker.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_row_label_collapses_and_bounds_whatever_a_window_calls_itself() {
+        assert_eq!(row_label("src/video.rs — Neovim"), "src/video.rs — Neovim");
+        // whitespace of every kind collapses, including the control bytes that
+        // are not whitespace at all
+        assert_eq!(
+            row_label(" a\ttitle\nover \u{1} lines  "),
+            "a title over lines"
+        );
+        // the bound counts CHARACTERS, and says it was cut
+        let long = "가".repeat(MAX_LABEL_CHARS * 3);
+        let bounded = row_label(&long);
+        assert_eq!(bounded.chars().count(), MAX_LABEL_CHARS + 1);
+        assert!(bounded.ends_with('…'));
+        // exactly at the bound is not cut
+        let exact = "x".repeat(MAX_LABEL_CHARS);
+        assert_eq!(row_label(&exact), exact);
+        // and a title of nothing but whitespace does not become a blank row
+        // that looks pressable but reads as empty — the caller's fallback is
+        // what a window with no title gets, so this one is simply empty
+        assert_eq!(row_label("   \n\t "), "");
     }
 
     /// The pointer is drawn in BY HAND because X leaves it out of `GetImage`,
