@@ -472,7 +472,7 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
         // guest, where the whole intake runs — r-ghost downgrades (channel
         // probe), r-inbox delivers, r-post passes both chat probes and posts
         // (its module-authored reply is seq 2, whose OWN hook event must be
-        // loop-prevented), r-task creates job-general-1. everything commits
+        // loop-prevented), r-task creates job-r-task-general-1. everything commits
         // in the posting block, identically.
         roundtrip(
             &mut native,
@@ -483,7 +483,7 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
             true,
         )
         .await;
-        assert_eq!(task_ids(&wasm).await, vec!["job-general-1".to_string()]);
+        assert_eq!(task_ids(&wasm).await, vec!["job-r-task-general-1".to_string()]);
         // Reports are source-owned attribution changes in this block; inbox
         // ingestion is a later unit. Its queue may already contain channel and
         // rule ownership changes, so compare the report itself here.
@@ -553,7 +553,10 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
         .await;
         assert_eq!(
             task_ids(&wasm).await,
-            vec!["job-general-1".to_string(), "job-general-3".to_string()],
+            vec![
+                "job-r-task-general-1".to_string(),
+                "job-r-task-general-3".to_string()
+            ],
             "the disabled window skipped exactly the middle post"
         );
 
@@ -567,7 +570,7 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
                 Msg {
                     target: "tasks".into(),
                     payload: tasks_encode_msg(&TaskMsg::CreateTask {
-                        task_id: "job-general-6".into(),
+                        task_id: "job-r-task-general-6".into(),
                         title: "squatted".into(),
                         owner: None,
                     }),
@@ -597,7 +600,7 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
             true,
         )
         .await;
-        // no NEW task landed (the squat is the only "job-general-6").
+        // no NEW task landed (the squat is the only "job-r-task-general-6").
         assert_eq!(
             task_ids(&wasm).await.len(),
             3,

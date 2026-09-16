@@ -789,7 +789,7 @@ fn creating_a_rule_is_gated_but_firing_one_is_not() {
     assert_eq!(
         chat_ctx.task_msgs(),
         vec![TaskMsg::CreateTask {
-            task_id: "auto-general-1".into(),
+            task_id: "auto-r-general-1".into(),
             title: "T".into(),
             owner: Some(account_of(OWNER)),
         }],
@@ -860,7 +860,10 @@ fn create_task_action_emits_deterministic_task_id() {
     let TaskMsg::CreateTask { task_id, title, .. } = &tasks[0] else {
         panic!("expected CreateTask");
     };
-    assert_eq!(task_id, "todo-general-5", "deterministic task id");
+    assert_eq!(
+        task_id, "todo-r-general-5",
+        "deterministic task id, the firing rule named in it"
+    );
     assert_eq!(title, "from general #5", "substituted title");
 
     block_on(m.commit_block()).expect("commit");
@@ -1667,7 +1670,7 @@ fn task_id_collision_is_caught_by_probe() {
 
     let mut chat_ctx = CaptureCtx::new()
         .with_chat_origin()
-        .with_task("auto-general-5");
+        .with_task("auto-r-general-5");
     exec(
         &mut m,
         &mut chat_ctx,
@@ -1808,7 +1811,7 @@ fn an_amplifying_template_truncates_instead_of_failing_the_triggering_post() {
     let [TaskMsg::CreateTask { task_id, title, .. }] = &tasks[..] else {
         panic!("expected one CreateTask, got {tasks:?}");
     };
-    assert_eq!(task_id, "todo-general-1");
+    assert_eq!(task_id, "todo-task-general-1");
     assert_eq!(
         title.len(),
         MAX_SUBSTITUTED_BYTES - 1,
