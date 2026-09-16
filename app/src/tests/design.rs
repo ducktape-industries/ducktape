@@ -120,6 +120,22 @@ fn shell_keeps_opaque_window_and_alpha_authored_content() {
     assert!(renderer.contains("wire::Background::Color"));
     assert!(renderer.contains("let[r,g,b,a]=color.0"));
 }
+/// GPUI dispatches a modifier change to its OWN listener list, never to key
+/// listeners, so the guest's modifier state has to be registered with
+/// `on_modifiers_changed`. Registered as a key listener it is never called at
+/// all, and every held-modifier gesture on a board quietly does the unmodified
+/// thing: ⌘-wheel pans instead of zooming, Alt-drag moves instead of
+/// duplicating, Shift does not hold a run straight.
+#[test]
+fn a_held_modifier_reaches_the_guest_without_a_keystroke() {
+    let input = rust_tokens(include_str!("../module_view/input.rs"));
+    assert!(input.contains("window.on_modifiers_changed("));
+    assert_eq!(
+        input.matches("ModifiersChangedEvent").count(),
+        1,
+        "the modifier event is read in exactly one place, and it is that listener"
+    );
+}
 /// The shell's keystroke interceptor runs before the guest editor's and cannot
 /// be stopped by it, so the field sits in a key context the shell reads off
 /// the stack to yield the chords a guest claims: Ctrl+K is a link in the
