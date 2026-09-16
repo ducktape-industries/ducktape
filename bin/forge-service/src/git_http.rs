@@ -543,19 +543,43 @@ pub(crate) async fn git_info_refs(
     git_advertise_refs(&handle, &repo, service).await
 }
 
+/// the branch a clone checks out: the repo's integration branch, else `main`.
+///
+/// Same order the forge module itself resolves a repo's head in
+/// (`forge::query`'s `revision`, and what `RepoHead::head` documents), because
+/// it is the same question. A repo seeded on `dev` has no `main` at all, and a
+/// client told nothing falls back to a `refs/heads/main` that does not exist —
+/// it clones every ref and lands on an UNBORN HEAD.
+fn default_branch(refs: &[forge::RefHead]) -> Option<&forge::RefHead> {
+    let named = |branch: &'static str| refs.iter().find(move |r| r.name == branch);
+    named(forge::refs::INTEGRATION_BRANCH).or_else(|| named(forge::refs::MAIN_BRANCH))
+}
+
 /// build the smart-HTTP ref advertisement for `service`: the service banner, a
 /// flush, the ref line(s), then a flush. an unborn repo advertises the null oid
 /// against the magic `capabilities^{}` ref (so caps ride along with no real ref)
 /// — a clone then reports an empty repository. a born repo advertises EVERY
-/// committed branch; a fetch advertisement leads with a `HEAD` line at main's
-/// oid so `git clone` resolves the default branch to check out. capabilities
-/// ride the first emitted line after a NUL, per the v0 protocol.
+/// committed branch; a fetch advertisement leads with a `HEAD` line at the
+/// [`default_branch`]'s oid so `git clone` resolves the branch to check out.
+/// capabilities ride the first emitted line after a NUL, per the v0 protocol.
 async fn git_advertise_refs(handle: &ServiceState, repo: &str, service: GitService) -> Response {
     let refs = match advertised_refs(handle, repo, service).await {
         Ok(refs) => refs,
         Err(resp) => return resp,
     };
+    let default = match service {
+        GitService::Upload => default_branch(&refs),
+        GitService::Receive => None,
+    };
     let caps = advertised_caps(handle, repo, service);
+    // `symref` NAMES the branch. Without it a client has to guess HEAD by
+    // matching its oid against the advertised refs, and a feature branch cut
+    // from the default sits on that same oid until its first commit — so the
+    // guess is wrong exactly when a run has just branched.
+    let caps = match default {
+        Some(r) => format!("{caps} symref=HEAD:{GIT_HEADS_PREFIX}{}", r.name),
+        None => caps,
+    };
 
     let mut body = Vec::new();
     body.extend_from_slice(&pkt_line(
@@ -568,10 +592,8 @@ async fn git_advertise_refs(handle: &ServiceState, repo: &str, service: GitServi
         ));
     } else {
         let mut lines: Vec<String> = Vec::new();
-        if matches!(service, GitService::Upload)
-            && let Some(main) = refs.iter().find(|r| r.name == "main")
-        {
-            lines.push(format!("{} HEAD", main.head));
+        if let Some(r) = default {
+            lines.push(format!("{} HEAD", r.head));
         }
         for r in &refs {
             lines.push(format!("{} {GIT_HEADS_PREFIX}{}", r.head, r.name));
