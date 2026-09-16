@@ -49,6 +49,30 @@ pub fn router(route: Route, token: [u8; 64], runtime: Runtime) -> Result<Router,
         .with_state(service))
 }
 
+/// Every socket this service accepts carries a live terminal, and a terminal
+/// is made of small writes: a keystroke out, its echo back, a line of output.
+/// Nagle's algorithm holds a small write until the previous one is
+/// acknowledged, so on a link with a real round trip every echo waits one and
+/// output arrives in clumps. There is nothing here to coalesce — each frame
+/// is already a whole application message — and `axum::serve` does not turn
+/// it off, so the listener does: it is a property of the transport, not of
+/// the session protocol riding it.
+pub fn keystroke_listener(
+    listener: tokio::net::TcpListener,
+) -> impl axum::serve::Listener<Addr = std::net::SocketAddr, Io = tokio::net::TcpStream> {
+    use axum::serve::ListenerExt as _;
+    listener.tap_io(|socket| {
+        if let Err(error) = socket.set_nodelay(true) {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "nodelay_refused",
+                %error,
+                "accepted socket kept Nagle batching"
+            );
+        }
+    })
+}
+
 fn caller(headers: &HeaderMap, token: &[u8; 64], config: &Route) -> Option<Caller> {
     let field = |name| {
         let mut values = headers.get_all(name).iter();
@@ -310,6 +334,30 @@ async fn attached(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The socket option `keystroke_listener` exists to set, read back off a
+    /// real accepted socket. `tap_io` swallows a failing option quietly
+    /// enough that only the accepted socket can say whether it took.
+    #[tokio::test]
+    async fn an_accepted_terminal_socket_has_nagle_disabled() {
+        use axum::serve::Listener as _;
+
+        let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = bound.local_addr().unwrap();
+        let mut listener = keystroke_listener(bound);
+        let dial = tokio::spawn(async move { tokio::net::TcpStream::connect(address).await });
+
+        let (accepted, _) = listener.accept().await;
+        let client = dial.await.unwrap().expect("client connects");
+
+        assert!(
+            accepted
+                .nodelay()
+                .expect("read the accepted socket's option"),
+            "an accepted terminal socket must not batch keystrokes behind Nagle"
+        );
+        drop(client);
+    }
 
     #[test]
     fn operator_identity_requires_the_installed_gateway_attestation() {

@@ -270,7 +270,11 @@ async fn serve(
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
     let router = ducktape_terminal::http::router(route, token, runtime)?;
-    let server = axum::serve(listener, router).into_future();
+    let server = axum::serve(
+        ducktape_terminal::http::keystroke_listener(listener),
+        router,
+    )
+    .into_future();
     tokio::pin!(server);
     notify_ready()?;
     tokio::select! {

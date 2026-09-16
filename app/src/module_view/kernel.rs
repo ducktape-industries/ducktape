@@ -1144,10 +1144,13 @@ async fn open_topic(
         max_frame_size: Some(MAX_STREAM_FRAME_BYTES),
         ..Default::default()
     };
-    let (mut socket, _) =
-        tokio_tungstenite::connect_async_with_config(request, Some(config), false)
-            .await
-            .map_err(|error| format!("could not open the node stream: {error}"))?;
+    // The node pushes one committed event per frame down this socket and
+    // nothing on it is ever coalesced into a bigger write, so Nagle can only
+    // hold a frame back until the previous one is acknowledged — a round trip
+    // per event on an app pointed at a node that is not this machine's.
+    let (mut socket, _) = tokio_tungstenite::connect_async_with_config(request, Some(config), true)
+        .await
+        .map_err(|error| format!("could not open the node stream: {error}"))?;
     let subscribe = serde_json::json!({"op": "subscribe", "topics": [topic]});
     socket
         .send(Message::Text(subscribe.to_string()))

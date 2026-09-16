@@ -11,7 +11,7 @@ use axum::response::{IntoResponse as _, Response};
 use futures::{SinkExt as _, StreamExt as _, future::BoxFuture, stream::BoxStream};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -117,6 +117,72 @@ fn channel_roster(channel: chat::Channel, account: u64) -> Result<Roster, String
         .collect()
 }
 
+const FEED_LOST: &str = "room event feed lost";
+
+/// The channel one committed chat write acts on, or `None` when the write
+/// names none this service could be seated in.
+///
+/// Exhaustive on purpose: a new chat write must fail this build until someone
+/// states which room it touches, because a write nobody routed is a write
+/// this service would stop re-reading its roster for.
+fn acted_channel(message: &chat::ChatMsg) -> Option<&str> {
+    match message {
+        chat::ChatMsg::CreateChannel { channel_id, .. }
+        | chat::ChatMsg::CreateVoiceChannel { channel_id, .. }
+        | chat::ChatMsg::RenameChannel { channel_id, .. }
+        | chat::ChatMsg::SetChannelArchived { channel_id, .. }
+        | chat::ChatMsg::PostMessage { channel_id, .. }
+        | chat::ChatMsg::EditMessage { channel_id, .. }
+        | chat::ChatMsg::DeleteMessage { channel_id, .. }
+        | chat::ChatMsg::AddReaction { channel_id, .. }
+        | chat::ChatMsg::RemoveReaction { channel_id, .. }
+        | chat::ChatMsg::RegisterHook { channel_id, .. }
+        | chat::ChatMsg::UnregisterHook { channel_id, .. }
+        | chat::ChatMsg::SetMembership { channel_id, .. }
+        | chat::ChatMsg::JoinHuddle { channel_id, .. }
+        | chat::ChatMsg::LeaveHuddle { channel_id }
+        | chat::ChatMsg::SweepHuddle { channel_id, .. } => Some(channel_id),
+        // The module derives a DM's id from the pair that opens it, so the
+        // payload carries no channel to compare against.
+        chat::ChatMsg::CreateDmChannel { .. } => None,
+    }
+}
+
+/// Whether one committed chat op can have changed who is in `room`.
+///
+/// A channel's huddle is written only by an op naming that channel, so an op
+/// naming another one cannot have moved this roster. An op this service
+/// cannot attribute to a channel — a payload that is not JSON, one that does
+/// not decode — is treated as this room's: an unattributed change may be the
+/// one that revoked this seat.
+fn changes_room(op: &ducktape_rpc::StreamOp, room: &str) -> bool {
+    let Some(payload) = op.payload.as_ref() else {
+        return true;
+    };
+    let Ok(message) = chat::ChatMsg::deserialize(payload) else {
+        return true;
+    };
+    acted_channel(&message).is_none_or(|channel| channel == room)
+}
+
+/// What one chat-module event means to a seat in `room`: `None` to ignore it,
+/// `Some(Ok(()))` to read the canonical roster again before anything more is
+/// forwarded, `Some(Err(..))` for a feed that will not deliver.
+///
+/// Chat is ONE module and a seat follows all of it, so every committed
+/// message in every channel of the workspace arrives here. This narrows WHICH
+/// events reach the roster gate and never what the gate does when one does: a
+/// replay gap loses the ops themselves, so it re-reads like a change to this
+/// room.
+fn room_change(event: &ducktape_rpc::ModuleEvent, room: &str) -> Option<Result<(), String>> {
+    match event {
+        ducktape_rpc::ModuleEvent::Changed { op, .. } => changes_room(op, room).then_some(Ok(())),
+        ducktape_rpc::ModuleEvent::Lagged { .. } => Some(Ok(())),
+        ducktape_rpc::ModuleEvent::Ready { .. } | ducktape_rpc::ModuleEvent::Tip { .. } => None,
+        ducktape_rpc::ModuleEvent::Refused { .. } => Some(Err(FEED_LOST.into())),
+    }
+}
+
 impl Authority for NodeAuthority {
     fn refresh(&self, room: String) -> BoxFuture<'static, Result<Roster, String>> {
         let client = self.client.clone();
@@ -140,18 +206,12 @@ impl Authority for NodeAuthority {
             }
             let initial = roster(&client, &room, account).await?;
             let changes = events
-                .filter_map(|event| async move {
-                    match event {
-                        Ok(
-                            ducktape_rpc::ModuleEvent::Changed { .. }
-                            | ducktape_rpc::ModuleEvent::Lagged { .. },
-                        ) => Some(Ok(())),
-                        Ok(
-                            ducktape_rpc::ModuleEvent::Ready { .. }
-                            | ducktape_rpc::ModuleEvent::Tip { .. },
-                        ) => None,
-                        Ok(ducktape_rpc::ModuleEvent::Refused { .. }) | Err(_) => {
-                            Some(Err("room event feed lost".into()))
+                .filter_map(move |event| {
+                    let room = room.clone();
+                    async move {
+                        match event {
+                            Ok(event) => room_change(&event, &room),
+                            Err(_) => Some(Err(FEED_LOST.into())),
                         }
                     }
                 })
@@ -184,11 +244,51 @@ enum Control {
     },
 }
 
+/// Rather more than one second of the profile that measured this queue — 50
+/// audio frames and 50 picture frames a second — and the ceiling on how stale
+/// the head of a resumed seat's queue can be.
+///
+/// A peer further behind than this has already lost the call: the deployed
+/// guest buffers three frames and discards the rest of any burst, so a minute
+/// of backlog costs the service a minute of holding and shipping frames the
+/// receiver throws away. Late real-time data is dead data — the queue keeps
+/// the NEWEST second or so and drops the oldest media to make room.
+///
+/// A POWER OF TWO, because the ring rounds up to one and the ceiling should
+/// be the number written here rather than the number that got rounded to.
+/// `a_stalled_reader_resumes_on_the_newest_frames_and_the_drop_is_counted`
+/// fails on a value that is not.
+const QUEUE_FRAMES: usize = 128;
+
 struct Participant {
     id: u64,
     caller: Caller,
-    output: mpsc::UnboundedSender<Message>,
+    /// The roster, a peer's beacon, a peer leaving: the session state a late
+    /// reader needs in order to make sense of the media it does get, so it is
+    /// never what gets dropped to make room.
+    control: mpsc::UnboundedSender<Message>,
+    /// Audio and picture frames, newest [`QUEUE_FRAMES`] only.
+    media: broadcast::Sender<Message>,
     beacon: Beacon,
+}
+
+impl Participant {
+    /// Queue one outbound frame on the lane its kind belongs to. `false` once
+    /// this seat's socket is gone, which is how the hub prunes it.
+    fn queue(&self, message: Message) -> bool {
+        match message {
+            Message::Binary(_) => self.media.send(message).is_ok(),
+            Message::Text(_) | Message::Ping(_) | Message::Pong(_) | Message::Close(_) => {
+                self.control.send(message).is_ok()
+            }
+        }
+    }
+}
+
+/// A seat's two outbound lanes, as the writer reads them.
+struct Outbound {
+    control: mpsc::UnboundedReceiver<Message>,
+    media: broadcast::Receiver<Message>,
 }
 
 #[derive(Default)]
@@ -217,7 +317,7 @@ impl Hub {
         room: &str,
         caller: Caller,
         roster: &Roster,
-    ) -> Result<(u64, mpsc::UnboundedReceiver<Message>), String> {
+    ) -> Result<(u64, Outbound), String> {
         let participants = self.rooms.entry(room.into()).or_default();
         let occupied = participants.contains_key(&caller.account)
             || participants
@@ -235,8 +335,9 @@ impl Hub {
                 "peer": peer(&participant.caller.node), "state": participant.beacon})
             })
             .collect();
-        let (output, input) = mpsc::unbounded_channel();
-        let _ = output.send(Message::Text(
+        let (control, control_input) = mpsc::unbounded_channel();
+        let (media, media_input) = broadcast::channel(QUEUE_FRAMES);
+        let _ = control.send(Message::Text(
             serde_json::json!({"type": "ready", "peers": peers})
                 .to_string()
                 .into(),
@@ -248,11 +349,18 @@ impl Hub {
             Participant {
                 id,
                 caller,
-                output,
+                control,
+                media,
                 beacon: Beacon::default(),
             },
         );
-        Ok((id, input))
+        Ok((
+            id,
+            Outbound {
+                control: control_input,
+                media: media_input,
+            },
+        ))
     }
 
     fn leave(&mut self, room: &str, caller: &Caller, id: u64) {
@@ -272,7 +380,7 @@ impl Hub {
             .to_string()
             .into(),
         );
-        participants.retain(|_, participant| participant.output.send(left.clone()).is_ok());
+        participants.retain(|_, participant| participant.queue(left.clone()));
         if participants.is_empty() {
             self.rooms.remove(room);
         }
@@ -361,7 +469,7 @@ impl Hub {
         };
         participants.retain(|account, participant| {
             let recipient = *account != caller.account && roster.contains(&participant.caller);
-            !recipient || participant.output.send(message.clone()).is_ok()
+            !recipient || participant.queue(message.clone())
         });
         Ok(())
     }
@@ -480,15 +588,58 @@ impl Drop for Seat {
     }
 }
 
-async fn serve(
-    socket: WebSocket,
-    seat: Seat,
-    mut membership: Membership,
-    mut output: mpsc::UnboundedReceiver<Message>,
-) {
+/// A stalled seat losing the oldest frames it had not read yet. Real-time
+/// data this late is dead — the deployed guest keeps three frames of any
+/// burst — but a seat that keeps losing them is a seat in trouble, so the
+/// first loss is a warning and the rest are the same news with a bigger
+/// number. This runs on the frame path: an unconditional `warn!` here would
+/// evict the log ring it is reported into.
+fn report_backlog_dropped(skipped: u64, dropped: u64) {
+    let first_loss_for_this_seat = skipped == dropped;
+    match first_loss_for_this_seat {
+        true => tracing::warn!(
+            target: "ducktape::call",
+            reason = "peer_backlog_dropped",
+            skipped,
+            dropped,
+            "a seat fell behind and its oldest queued frames were dropped"
+        ),
+        false => tracing::debug!(
+            target: "ducktape::call",
+            reason = "peer_backlog_dropped",
+            skipped,
+            dropped,
+            "a seat fell behind and its oldest queued frames were dropped"
+        ),
+    }
+}
+
+/// The next frame to write, control lane first: the roster, a beacon and a
+/// peer leaving are the state that explains the media, and a reader that fell
+/// behind needs them before the frames they describe. `None` ends the seat.
+async fn next_outgoing(output: &mut Outbound, dropped: &mut u64) -> Option<Message> {
+    loop {
+        let media = tokio::select! {
+            biased;
+            control = output.control.recv() => return control,
+            media = output.media.recv() => media,
+        };
+        match media {
+            Ok(message) => return Some(message),
+            Err(broadcast::error::RecvError::Closed) => return None,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                *dropped += skipped;
+                report_backlog_dropped(skipped, *dropped);
+            }
+        }
+    }
+}
+
+async fn serve(socket: WebSocket, seat: Seat, mut membership: Membership, mut output: Outbound) {
     let (mut sink, mut incoming) = socket.split();
     let writer = async {
-        while let Some(outgoing) = output.recv().await {
+        let mut dropped = 0;
+        while let Some(outgoing) = next_outgoing(&mut output, &mut dropped).await {
             if sink.send(outgoing).await.is_err() {
                 break;
             }
@@ -642,7 +793,18 @@ mod tests {
 
     struct TestAuthority {
         roster: Arc<Mutex<Roster>>,
-        changes: tokio::sync::broadcast::Sender<()>,
+        /// Committed chat events exactly as the node's feed delivers them, so
+        /// a seat opened here runs the same [`room_change`] filter a deployed
+        /// one does.
+        changes: broadcast::Sender<ducktape_rpc::ModuleEvent>,
+        /// The room of every re-read, as the seat enters it. A test waits on
+        /// this instead of a clock, and an event that re-read nothing leaves
+        /// nothing here for a later one to hide behind.
+        entered: broadcast::Sender<String>,
+        /// Whether a re-read answers at once. Held shut, every seat parks
+        /// inside its refresh — which is the pause — until a test opens it,
+        /// and the answer is the roster as it stands when it opens.
+        answering: tokio::sync::watch::Sender<bool>,
         /// The canonical roster becoming unreachable, which is a different
         /// answer from "you were removed" and must end the session just the
         /// same: forwarding under a roster nobody can confirm is the one
@@ -654,31 +816,139 @@ mod tests {
         fn seating(roster: Roster) -> Arc<Self> {
             Arc::new(Self {
                 roster: Arc::new(Mutex::new(roster)),
-                changes: tokio::sync::broadcast::channel(8).0,
+                changes: broadcast::channel(16).0,
+                entered: broadcast::channel(16).0,
+                answering: tokio::sync::watch::channel(true).0,
                 unreachable: Arc::new(AtomicBool::new(false)),
             })
         }
     }
 
     impl Authority for TestAuthority {
-        fn refresh(&self, _: String) -> BoxFuture<'static, Result<Roster, String>> {
+        fn refresh(&self, room: String) -> BoxFuture<'static, Result<Roster, String>> {
+            let _ = self.entered.send(room);
             if self.unreachable.load(Ordering::Acquire) {
                 return Box::pin(async { Err("room unavailable".into()) });
             }
-            let roster = self.roster.lock().unwrap().clone();
-            Box::pin(async move { Ok(roster) })
+            let roster = self.roster.clone();
+            let mut answering = self.answering.subscribe();
+            Box::pin(async move {
+                loop {
+                    let open = *answering.borrow_and_update();
+                    if open || answering.changed().await.is_err() {
+                        break;
+                    }
+                }
+                let roster = roster.lock().unwrap().clone();
+                Ok(roster)
+            })
         }
 
-        fn open(&self, _: String) -> BoxFuture<'static, Result<Membership, String>> {
+        fn open(&self, room: String) -> BoxFuture<'static, Result<Membership, String>> {
             let receiver = self.changes.subscribe();
             let roster = self.roster.lock().unwrap().clone();
-            let changes = futures::stream::unfold(receiver, |mut receiver| async move {
-                let event = receiver.recv().await.map_err(|error| error.to_string());
-                Some((event, receiver))
+            let changes = futures::stream::unfold(receiver, move |mut receiver| {
+                let room = room.clone();
+                async move {
+                    loop {
+                        let event = match receiver.recv().await {
+                            Ok(event) => event,
+                            Err(error) => return Some((Err(error.to_string()), receiver)),
+                        };
+                        if let Some(change) = room_change(&event, &room) {
+                            return Some((change, receiver));
+                        }
+                    }
+                }
             })
             .boxed();
             Box::pin(async move { Ok(Membership { roster, changes }) })
         }
+    }
+
+    /// One committed chat op, as the node's event feed delivers it.
+    fn committed(message: &chat::ChatMsg) -> ducktape_rpc::ModuleEvent {
+        ducktape_rpc::ModuleEvent::Changed {
+            module: chat::DEFAULT_CHAT_TARGET.into(),
+            cursor: "1".into(),
+            op: Box::new(ducktape_rpc::StreamOp {
+                height: 1,
+                seq: 0,
+                time: 0,
+                origin: ducktape_rpc::StreamOrigin {
+                    kind: ducktape_rpc::StreamOriginKind::External,
+                    id: None,
+                },
+                payload: Some(serde_json::to_value(message).expect("a chat write serializes")),
+                payload_hex: None,
+                assigned: None,
+                assigned_hex: None,
+            }),
+        }
+    }
+
+    /// The committed op that takes an account out of a room's huddle.
+    fn swept(room: &str, account: u64) -> ducktape_rpc::ModuleEvent {
+        committed(&chat::ChatMsg::SweepHuddle {
+            channel_id: room.into(),
+            party: chat::Party::Account(account),
+        })
+    }
+
+    /// The committed op a busy workspace produces constantly: a message in
+    /// some channel, which for every channel but one changes no roster.
+    fn posted(room: &str) -> ducktape_rpc::ModuleEvent {
+        committed(&chat::ChatMsg::PostMessage {
+            channel_id: room.into(),
+            message_id: "m".into(),
+            blocks: Vec::new(),
+            thread: None,
+        })
+    }
+
+    /// Which committed chat events reach the roster gate at all. The gate
+    /// itself is unchanged: everything that cannot be attributed to another
+    /// channel still re-reads.
+    #[test]
+    fn a_chat_change_re_reads_only_the_room_it_names() {
+        assert!(room_change(&posted("room"), "room").is_some());
+        assert!(room_change(&posted("other-room"), "room").is_none());
+        // Huddle writes are the ones that move a roster, and each names its
+        // channel like every other chat write.
+        assert!(room_change(&swept("room", 42), "room").is_some());
+        assert!(room_change(&swept("other-room", 42), "room").is_none());
+
+        // Unattributable changes re-read: a payload this service cannot read
+        // may be the one that revoked the seat.
+        let mut opaque = posted("other-room");
+        let ducktape_rpc::ModuleEvent::Changed { op, .. } = &mut opaque else {
+            panic!("a committed op");
+        };
+        op.payload = None;
+        assert!(room_change(&opaque, "room").is_some());
+        // A replay gap lost the ops themselves.
+        assert!(
+            room_change(
+                &ducktape_rpc::ModuleEvent::Lagged {
+                    module: chat::DEFAULT_CHAT_TARGET.into(),
+                    cursor: "1".into(),
+                },
+                "room"
+            )
+            .is_some()
+        );
+
+        assert!(room_change(&ducktape_rpc::ModuleEvent::Tip { height: 9 }, "room").is_none());
+        assert!(
+            room_change(
+                &ducktape_rpc::ModuleEvent::Refused {
+                    module: chat::DEFAULT_CHAT_TARGET.into(),
+                    code: "unindexed".into(),
+                },
+                "room"
+            )
+            .is_some_and(|change| change.is_err())
+        );
     }
 
     #[tokio::test]
@@ -787,7 +1057,10 @@ mod tests {
         assert_eq!(picture.data, captured.data);
 
         authority.roster.lock().unwrap().remove(&second);
-        authority.changes.send(()).unwrap();
+        authority
+            .changes
+            .send(swept("room", second.account))
+            .unwrap();
         assert!(matches!(
             right.next().await,
             None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_)))
@@ -799,8 +1072,6 @@ mod tests {
         );
         server.abort();
     }
-
-    type Receiver = mpsc::UnboundedReceiver<Message>;
 
     /// Resident and peak-resident kibibytes, or zeroes where procfs is absent.
     fn memory() -> (u64, u64) {
@@ -818,7 +1089,7 @@ mod tests {
         (field("VmRSS:"), field("VmHWM:"))
     }
 
-    fn seated(hub: &mut Hub, peers: usize) -> (Roster, Vec<Caller>, Vec<u64>, Vec<Receiver>) {
+    fn seated(hub: &mut Hub, peers: usize) -> (Roster, Vec<Caller>, Vec<u64>, Vec<Outbound>) {
         let callers: Vec<Caller> = (0..peers)
             .map(|index| Caller {
                 account: index as u64 + 1,
@@ -854,16 +1125,30 @@ mod tests {
         )
     }
 
-    fn queued_bytes(queue: &mut Receiver) -> u64 {
+    /// What one seat is holding, across both of its lanes. A dropped media
+    /// frame is not held and so is not counted: the queue is bounded now, and
+    /// this is what it is bounded to.
+    fn queued_bytes(queue: &mut Outbound) -> u64 {
         let mut total = 0;
         let mut held = Vec::new();
-        while let Ok(message) = queue.try_recv() {
-            total += match &message {
+        while let Ok(message) = queue.control.try_recv() {
+            held.push(message);
+        }
+        loop {
+            match queue.media.try_recv() {
+                Ok(message) => held.push(message),
+                // What the queue dropped is exactly what it is not holding.
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Empty)
+                | Err(broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+        for message in &held {
+            total += match message {
                 Message::Text(text) => text.len() as u64,
                 Message::Binary(bytes) => bytes.len() as u64,
                 _ => 0,
             };
-            held.push(message);
         }
         total
     }
@@ -916,7 +1201,7 @@ mod tests {
                         }
                     }
                     // Read residency before draining: the drain is what frees it.
-                    let depth = queues[0].len();
+                    let depth = queues[0].media.len() + queues[0].control.len();
                     let rss = memory().0;
                     let stalled = queued_bytes(&mut queues[0]);
                     let egress = relayed_bytes * 8 / stall_s.max(1) / 1000;
@@ -1003,9 +1288,12 @@ mod tests {
             hub.relay("room", &second, second_id, &roster, audio.clone())
                 .unwrap();
         }
-        assert!(matches!(output.recv().await, Some(Message::Text(_))));
+        assert!(matches!(
+            output.control.recv().await,
+            Some(Message::Text(_))
+        ));
         for _ in 0..64 {
-            assert!(matches!(output.recv().await, Some(Message::Binary(_))));
+            assert!(matches!(output.media.recv().await, Ok(Message::Binary(_))));
         }
         drop(output);
         hub.relay("room", &second, second_id, &roster, audio)
@@ -1017,6 +1305,77 @@ mod tests {
         assert!(
             hub.relay("room", &second, second_id, &roster, spoof)
                 .is_err()
+        );
+    }
+
+    /// One audio frame this test can tell from every other.
+    fn numbered_audio(index: usize) -> Message {
+        let mut pcm = vec![0i16; media_service::voice::FRAME_SAMPLES];
+        pcm[0] = index as i16;
+        Message::Binary(media_service::call_wire::encode_audio(&pcm).into())
+    }
+
+    /// That number back out of a forwarded frame: tag, account, node, then
+    /// the sender's PCM verbatim.
+    fn audio_number(message: &Message) -> i16 {
+        let Message::Binary(bytes) = message else {
+            panic!("a forwarded audio frame");
+        };
+        i16::from_le_bytes([bytes[41], bytes[42]])
+    }
+
+    /// A reader that stops taking frames is served the NEWEST of what it
+    /// missed when it resumes, and told how much it lost — not handed a
+    /// backlog whose head is a minute old and whose tail is the only part its
+    /// three-frame jitter buffer can use. Control frames are not media and
+    /// survive the flood: a late reader still knows who is in the room.
+    #[test]
+    fn a_stalled_reader_resumes_on_the_newest_frames_and_the_drop_is_counted() {
+        let talker = Caller {
+            account: 1,
+            node: [1; 32],
+        };
+        let stalled = Caller {
+            account: 2,
+            node: [2; 32],
+        };
+        let roster: Roster = [talker.clone(), stalled.clone()].into_iter().collect();
+        let mut hub = Hub::default();
+        let (id, _talker_queue) = hub.join("room", talker.clone(), &roster).expect("seat");
+        let (_, mut queue) = hub.join("room", stalled, &roster).expect("seat");
+
+        // Three queues' worth with nobody reading: what survives can only be
+        // the tail.
+        let sent = QUEUE_FRAMES * 3;
+        for index in 0..sent {
+            hub.relay("room", &talker, id, &roster, numbered_audio(index))
+                .expect("relay");
+        }
+
+        let Err(broadcast::error::TryRecvError::Lagged(dropped)) = queue.media.try_recv() else {
+            panic!("a stalled reader is told what it lost, not handed the backlog");
+        };
+        assert_eq!(
+            dropped as usize,
+            sent - QUEUE_FRAMES,
+            "the count is the diagnosis"
+        );
+
+        let mut resumed = Vec::new();
+        while let Ok(message) = queue.media.try_recv() {
+            resumed.push(audio_number(&message));
+        }
+        assert_eq!(resumed.len(), QUEUE_FRAMES);
+        assert_eq!(
+            resumed.first().copied(),
+            Some((sent - QUEUE_FRAMES) as i16),
+            "a resumed reader starts on recent audio, not on the oldest frame it missed"
+        );
+        assert_eq!(resumed.last().copied(), Some((sent - 1) as i16));
+
+        assert!(
+            matches!(queue.control.try_recv(), Ok(Message::Text(_))),
+            "the admission roster is not media and is never dropped to make room"
         );
     }
 
@@ -1039,7 +1398,7 @@ mod tests {
         let (id, _talker_queue) = hub.join("room", talker.clone(), &roster).expect("seat");
         let (_, mut heard) = hub.join("room", listener.clone(), &roster).expect("seat");
         assert!(
-            matches!(heard.try_recv(), Ok(Message::Text(_))),
+            matches!(heard.control.try_recv(), Ok(Message::Text(_))),
             "admission sends the roster before any media"
         );
 
@@ -1056,7 +1415,7 @@ mod tests {
         // and the service refuses to describe a muted seat as speaking.
         hub.relay("room", &talker, id, &roster, beacon(true, false))
             .expect("beacon");
-        let Ok(Message::Text(forwarded)) = heard.try_recv() else {
+        let Ok(Message::Text(forwarded)) = heard.control.try_recv() else {
             panic!("a beacon is forwarded");
         };
         let forwarded: serde_json::Value = serde_json::from_str(&forwarded).unwrap();
@@ -1068,7 +1427,7 @@ mod tests {
         hub.relay("room", &talker, id, &roster, audio_frame())
             .expect("accepted and dropped");
         assert!(
-            heard.try_recv().is_err(),
+            heard.media.try_recv().is_err(),
             "a muted seat's voice is not forwarded"
         );
 
@@ -1077,29 +1436,29 @@ mod tests {
         hub.relay("room", &talker, id, &roster, video_frame(64, true))
             .expect("accepted and dropped");
         assert!(
-            heard.try_recv().is_err(),
+            heard.media.try_recv().is_err(),
             "a seat that is not capturing publishes no picture"
         );
 
         // Unmuted with the camera on: both planes flow again.
         hub.relay("room", &talker, id, &roster, beacon(false, true))
             .expect("beacon");
-        assert!(matches!(heard.try_recv(), Ok(Message::Text(_))));
+        assert!(matches!(heard.control.try_recv(), Ok(Message::Text(_))));
         hub.relay("room", &talker, id, &roster, audio_frame())
             .expect("relay");
-        assert!(matches!(heard.try_recv(), Ok(Message::Binary(_))));
+        assert!(matches!(heard.media.try_recv(), Ok(Message::Binary(_))));
         hub.relay("room", &talker, id, &roster, video_frame(64, true))
             .expect("relay");
-        assert!(matches!(heard.try_recv(), Ok(Message::Binary(_))));
+        assert!(matches!(heard.media.try_recv(), Ok(Message::Binary(_))));
 
         // Turning it back off stops the picture plane on the very next frame.
         hub.relay("room", &talker, id, &roster, beacon(false, false))
             .expect("beacon");
-        assert!(matches!(heard.try_recv(), Ok(Message::Text(_))));
+        assert!(matches!(heard.control.try_recv(), Ok(Message::Text(_))));
         hub.relay("room", &talker, id, &roster, video_frame(64, true))
             .expect("accepted and dropped");
         assert!(
-            heard.try_recv().is_err(),
+            heard.media.try_recv().is_err(),
             "the previous source's picture does not outlive the beacon that ended it"
         );
 
@@ -1166,7 +1525,10 @@ mod tests {
 
         // The seat is still in the roster. Only the ability to READ it is lost.
         authority.unreachable.store(true, Ordering::Release);
-        authority.changes.send(()).unwrap();
+        authority
+            .changes
+            .send(swept("room", seated.account))
+            .unwrap();
         assert!(matches!(
             socket.next().await,
             None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_)))
@@ -1174,6 +1536,114 @@ mod tests {
         assert!(
             authority.roster.lock().unwrap().contains(&seated),
             "the session ended because the roster was unreadable, not because it changed"
+        );
+        server.abort();
+    }
+
+    /// Re-reading the canonical roster pauses this seat's media until the
+    /// answer lands, and that pause is the authorization gate: nothing is
+    /// forwarded under a membership that is being replaced. Chat is ONE
+    /// module, so every committed message in the workspace used to buy that
+    /// pause — a media stall driven by traffic that cannot have changed who
+    /// is in this call. What narrowed is which events reach the gate.
+    #[tokio::test]
+    async fn another_rooms_chat_change_never_pauses_and_this_rooms_waits_for_the_answer() {
+        let first = Caller {
+            account: 42,
+            node: [1; 32],
+        };
+        let second = Caller {
+            account: 43,
+            node: [2; 32],
+        };
+        let authority =
+            TestAuthority::seating([first.clone(), second.clone()].into_iter().collect());
+        let service = Arc::new(Service {
+            config: config(),
+            token: [b'a'; 64],
+            authority: authority.clone(),
+            hub: Mutex::default(),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/?channel=room", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, service_router(service)).await;
+        });
+        let request = |caller: &Caller| {
+            let mut request = url.clone().into_client_request().unwrap();
+            request.headers_mut().extend(headers());
+            request.headers_mut().insert(
+                "x-duck-caller-account",
+                caller.account.to_string().parse().unwrap(),
+            );
+            request
+                .headers_mut()
+                .insert("x-duck-caller-node", peer(&caller.node).parse().unwrap());
+            request
+        };
+        let (mut left, _) = tokio_tungstenite::connect_async(request(&first))
+            .await
+            .unwrap();
+        let (mut right, _) = tokio_tungstenite::connect_async(request(&second))
+            .await
+            .unwrap();
+        for socket in [&mut left, &mut right] {
+            let ready = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&ready).unwrap()["type"],
+                "ready"
+            );
+        }
+
+        // From here nothing answers a re-read: a seat that re-reads parks
+        // inside it, and a seat that does not keeps forwarding.
+        let mut entered = authority.entered.subscribe();
+        authority.answering.send_replace(false);
+
+        // A message in another channel cannot have moved this room's huddle.
+        // This frame arriving is the absence of a pause.
+        authority.changes.send(posted("other-room")).unwrap();
+        let audio = media_service::call_wire::encode_audio(&vec![
+                1200;
+                media_service::voice::FRAME_SAMPLES
+            ]);
+        left.send(ClientMessage::Binary(audio.clone()))
+            .await
+            .unwrap();
+        let heard = right.next().await.unwrap().unwrap().into_data();
+        assert_eq!(heard[0], 4);
+        assert_eq!(&heard[1..9], &first.account.to_be_bytes());
+
+        // This room's huddle changes, and every seat in it re-reads. The
+        // first re-read of the whole run is this one: the other room's
+        // message bought no node query at all.
+        authority.roster.lock().unwrap().remove(&second);
+        authority
+            .changes
+            .send(swept("room", second.account))
+            .unwrap();
+        assert_eq!(entered.recv().await.unwrap(), "room");
+        assert_eq!(entered.recv().await.unwrap(), "room");
+
+        // Both seats are parked inside a re-read that has not answered. A
+        // frame sent into that pause is never forwarded under the roster
+        // being replaced: by the time the seat runs again the answer has
+        // taken the recipient out of the room.
+        left.send(ClientMessage::Binary(audio)).await.unwrap();
+        authority.answering.send_replace(true);
+        loop {
+            match right.next().await {
+                None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_))) => break,
+                Some(Ok(ClientMessage::Binary(_))) => {
+                    panic!("media forwarded to a seat whose roster was still being read")
+                }
+                Some(Ok(_)) => continue,
+            }
+        }
+        let left_event = left.next().await.unwrap().unwrap().into_text().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&left_event).unwrap()["type"],
+            "peer_left"
         );
         server.abort();
     }
