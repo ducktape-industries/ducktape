@@ -1192,7 +1192,7 @@ mod tests {
         let mut tree = state.view();
         tree.for_each_mut(&mut |node| {
             if let wire::Node::Float { x, .. } = node {
-                assert_eq!(x.ops, vec![wire::FloatOp::Number(900.0)]);
+                assert_eq!(*x, 900.0);
             }
         });
         let _ = state.update(Message::ClearMessageSelection);

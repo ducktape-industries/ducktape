@@ -307,12 +307,8 @@ impl PagesView {
         let shade = if kit::is_dark() { 0.5 } else { 0.16 };
         Some(Node::Float {
             key,
-            x: wire::FloatExpression {
-                ops: vec![wire::FloatOp::Number(x)],
-            },
-            y: wire::FloatExpression {
-                ops: vec![wire::FloatOp::Number(y)],
-            },
+            x: x as f32,
+            y: y as f32,
             scale: 1.,
             shadow: wire::Shadow {
                 color: Some(wire::Rgba([0., 0., 0., shade])),

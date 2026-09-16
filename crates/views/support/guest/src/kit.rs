@@ -47,9 +47,7 @@ pub fn image_resource(key: impl Into<String>, resource: impl Into<String>) -> No
         data: Some(wire::ImageData::Resource(resource)),
         label: None,
         fit: Some(wire::ContentFit::Contain),
-        rotation: None,
         opacity: None,
-        filter: Default::default(),
         width: Some(Length::Fill),
         height: Some(Length::Fill),
     }

@@ -56,7 +56,7 @@ mod tests {
         wire::Node::Svg {
             key: format!("picture-{hash}"), hash, bytes,
             inherit_button_ink: false, label: None, color: None, hover: None,
-            fit: None, rotation: None, opacity: None, width: None, height: None,
+            fit: None, opacity: None, width: None, height: None,
         }
     }
 
@@ -80,9 +80,7 @@ mod tests {
             data: Some(wire::ImageData::Resource("image:7".into())),
             label: None,
             fit: None,
-            rotation: None,
             opacity: None,
-            filter: Default::default(),
             width: None,
             height: None,
         };

@@ -538,7 +538,6 @@ fn gen_svg(rng: &mut Rng) -> Node {
                 data,
                 label: rng.next_bool().then(|| gen_string(rng)),
                 fit: None,
-                filter: ImageFilter::Nearest,
                 width: gen_opt_length(rng),
                 height: gen_opt_length(rng),
                 options: ViewerOptions {
@@ -554,9 +553,7 @@ fn gen_svg(rng: &mut Rng) -> Node {
             data,
             label: rng.next_bool().then(|| gen_string(rng)),
             fit: None,
-            rotation: Some(Rotation::Solid(gen_f32(rng))),
             opacity: Some(gen_f32(rng)),
-            filter: ImageFilter::Linear,
             width: gen_opt_length(rng),
             height: gen_opt_length(rng),
         };
@@ -577,10 +574,6 @@ fn gen_svg(rng: &mut Rng) -> Node {
                 ContentFit::None,
                 ContentFit::ScaleDown,
             ])
-        }),
-        rotation: rng.next_bool().then(|| match rng.next_bool() {
-            true => Rotation::Floating(gen_f32(rng)),
-            false => Rotation::Solid(gen_f32(rng)),
         }),
         opacity: gen_opt_f32(rng),
         width: gen_opt_length(rng),
@@ -1701,7 +1694,6 @@ fn check_bounds(
         Node::Image {
             data,
             label,
-            rotation,
             opacity,
             width,
             height,
@@ -1714,9 +1706,6 @@ fn check_bounds(
             if let Some(label) = label {
                 check_string(label, ctx, "image label");
             }
-            if let Some(Rotation::Floating(radians) | Rotation::Solid(radians)) = rotation {
-                check_finite(*radians, ctx, "image rotation");
-            }
             if let Some(opacity) = opacity {
                 assert!(opacity.is_finite() && (0.0..=1.0).contains(opacity));
             }
@@ -1728,7 +1717,6 @@ fn check_bounds(
             label,
             color,
             hover,
-            rotation,
             opacity,
             width,
             height,
@@ -1741,9 +1729,6 @@ fn check_bounds(
             check_color(color, ctx);
             if let Some(hover) = hover {
                 check_color(hover, ctx);
-            }
-            if let Some(Rotation::Floating(radians) | Rotation::Solid(radians)) = rotation {
-                check_finite(*radians, ctx, "rotation");
             }
             if let Some(opacity) = opacity {
                 assert!(

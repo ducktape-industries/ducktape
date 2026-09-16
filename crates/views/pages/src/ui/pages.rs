@@ -606,19 +606,14 @@ impl PagesView {
     }
 
     fn comments_layer(&self) -> Node {
-        use wire::FloatOp::Number;
         Node::Float {
             key: "pages/comments/anchor".into(),
-            x: wire::FloatExpression {
-                ops: vec![Number(crate::host::comments_card_x(self.pages_pane_width))],
-            },
-            y: wire::FloatExpression {
-                ops: vec![Number(crate::host::comment_card_offset(
-                    self.pages_pane_width,
-                    self.comment_anchor_y,
-                    self.pages_viewport_height,
-                ))],
-            },
+            x: crate::host::comments_card_x(self.pages_pane_width) as f32,
+            y: crate::host::comment_card_offset(
+                self.pages_pane_width,
+                self.comment_anchor_y,
+                self.pages_viewport_height,
+            ) as f32,
             scale: 1.,
             shadow: Default::default(),
             radius: None,

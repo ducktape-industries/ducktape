@@ -2337,7 +2337,6 @@ fn icon(name: &str) -> Node {
         color: None,
         hover: None,
         fit: None,
-        rotation: None,
         opacity: None,
         width: Some(Length::Fixed(16.)),
         height: Some(Length::Fixed(16.)),
