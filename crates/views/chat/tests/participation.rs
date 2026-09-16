@@ -286,3 +286,54 @@ fn live_discovery_selects_chat_runs_and_keeps_missing_agent_names_cached() {
         );
     });
 }
+
+#[test]
+fn public_run_progress_queries_once_and_emits_only_public_facts() {
+    on_stack(|| {
+        let frame = start(json!({"kind":"run_progress","runs":["one","two"]}));
+        let sessions = request(&frame, "rpc.query");
+        assert_eq!(
+            payload(sessions),
+            json!({"target":"runs","query":"agent_sessions"})
+        );
+        let frame = tick_native(vec![answer(sessions.id, br#"{"agent_sessions":[{"run_id":"one","actions":3,"session_key":"SECRET"},{"run_id":"unrelated","actions":99}]}"#)]);
+        let reads: Vec<_> = frame
+            .requests
+            .iter()
+            .filter(|request| request.kind == "rpc.query")
+            .collect();
+        assert_eq!(reads.len(), 2);
+        let replies = reads
+            .iter()
+            .map(|read| {
+                let query = payload(read);
+                assert_eq!(query["target"], "runs");
+                let run = query["query"]["delegations"]["caller_run_id"]
+                    .as_str()
+                    .unwrap();
+                match run {
+                    "one" => answer(
+                        read.id,
+                        br#"{"delegations":[{"status":"pending","result":"SECRET"}]}"#,
+                    ),
+                    "two" => refuse(read.id, "unavailable"),
+                    _ => panic!("only requested runs are queried"),
+                }
+            })
+            .collect();
+        let frame = tick_native(replies);
+        let progress = payload(request(&frame, "host.emit"));
+        assert_eq!(
+            progress["one"]["sessions"]["agent_sessions"],
+            json!([{"run_id":"one","actions":3}])
+        );
+        assert_eq!(
+            progress["one"]["delegations"]["delegations"],
+            json!([{"status":"pending"}])
+        );
+        assert_eq!(progress["two"]["sessions"]["agent_sessions"], json!([]));
+        assert!(progress["two"]["delegations"]["delegations"].is_null());
+        assert!(!progress.to_string().contains("SECRET"));
+        assert!(progress.get("unrelated").is_none());
+    });
+}

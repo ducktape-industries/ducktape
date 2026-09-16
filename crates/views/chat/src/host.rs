@@ -2901,6 +2901,9 @@ mod tests {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BackgroundRequest {
+    RunProgress {
+        runs: Vec<String>,
+    },
     LiveRuns {
         labels: std::collections::BTreeMap<String, String>,
     },
@@ -3040,6 +3043,7 @@ async fn background_search(
 
 async fn participate(intent: BackgroundRequest) -> Result<serde_json::Value, BackgroundError> {
     match intent {
+        BackgroundRequest::RunProgress { runs } => Ok(crate::live::progress(runs).await),
         BackgroundRequest::LiveRuns { labels } => {
             crate::live::discover(labels).await.map_err(Into::into)
         }

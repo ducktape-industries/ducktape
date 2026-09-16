@@ -47,6 +47,59 @@ pub(crate) async fn discover(
     Ok(json!({"records":records,"labels":labels}))
 }
 
+/// Read one public session snapshot and each requested run's delegations.
+pub(crate) async fn progress(runs: Vec<String>) -> serde_json::Value {
+    use serde_json::json;
+    let sessions = crate::host::ask(
+        "rpc.query",
+        &json!({"target":"runs","query":"agent_sessions"}),
+    )
+    .await
+    .ok();
+    let rows = futures::future::join_all(runs.into_iter().map(|run_id| {
+        let sessions = sessions.as_ref();
+        async move {
+            let delegations = crate::host::ask(
+                "rpc.query",
+                &json!({"target":"runs","query":{"delegations":{"caller_run_id":run_id}}}),
+            )
+            .await
+            .ok();
+            let progress = public_run_progress(&run_id, sessions, delegations.as_ref());
+            (run_id, progress)
+        }
+    }))
+    .await;
+    serde_json::Value::Object(rows.into_iter().collect())
+}
+
+/// Forward only committed progress facts, excluding session keys and results.
+fn public_run_progress(
+    run_id: &str,
+    sessions: Option<&serde_json::Value>,
+    delegations: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let sessions = sessions
+        .and_then(|reply| reply["agent_sessions"].as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| row["run_id"] == run_id)
+                .map(|row| serde_json::json!({"run_id": run_id, "actions": row["actions"]}))
+                .collect::<Vec<_>>()
+        });
+    let delegations = delegations
+        .and_then(|reply| reply["delegations"].as_array())
+        .map(|rows| {
+            rows.iter()
+                .map(|row| serde_json::json!({"status": row["status"]}))
+                .collect::<Vec<_>>()
+        });
+    serde_json::json!({
+        "sessions": {"agent_sessions": sessions},
+        "delegations": {"delegations": delegations},
+    })
+}
+
 /// Interpret the authorized output in the deployed view, not in the host.
 pub(crate) fn project(mut row: LiveRunHint) -> LiveRunHint {
     if let Some(progress) = row.public_progress.take() {
@@ -654,5 +707,30 @@ mod tests {
         assert_eq!(event.kind, "preview");
         assert_eq!(event.answer, "answer");
         assert!(provider_output_event("codex", r#"{"type":"unknown","secret":"no"}"#, 8).is_none());
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    #[test]
+    fn public_progress_excludes_other_runs_and_private_fields() {
+        let progress = public_run_progress(
+            "mine",
+            Some(&serde_json::json!({"agent_sessions": [
+                {"run_id": "mine", "actions": 3, "session_key": "SECRET"},
+                {"run_id": "other", "actions": 99}
+            ]})),
+            Some(&serde_json::json!({"delegations": [
+                {"status": "pending", "result": "SECRET", "delegation_id": "SECRET"}
+            ]})),
+        );
+        assert_eq!(
+            progress,
+            serde_json::json!({
+                "sessions": {"agent_sessions": [{"run_id": "mine", "actions": 3}]},
+                "delegations": {"delegations": [{"status": "pending"}]},
+            })
+        );
     }
 }

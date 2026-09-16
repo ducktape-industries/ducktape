@@ -122,33 +122,6 @@ const MAX_OUTPUT_DIALS: u32 = 5;
 /// progress; keeping it internally prevents retries of an unauthorized read.
 const OUTPUT_UNAVAILABLE: &str = "Working · progress unavailable from this device";
 
-/// Forward only committed progress facts, excluding session keys and results.
-fn public_run_progress(
-    run_id: &str,
-    sessions: Option<&serde_json::Value>,
-    delegations: Option<&serde_json::Value>,
-) -> serde_json::Value {
-    let sessions = sessions
-        .and_then(|reply| reply["agent_sessions"].as_array())
-        .map(|rows| {
-            rows.iter()
-                .filter(|row| row["run_id"] == run_id)
-                .map(|row| serde_json::json!({"run_id": run_id, "actions": row["actions"]}))
-                .collect::<Vec<_>>()
-        });
-    let delegations = delegations
-        .and_then(|reply| reply["delegations"].as_array())
-        .map(|rows| {
-            rows.iter()
-                .map(|row| serde_json::json!({"status": row["status"]}))
-                .collect::<Vec<_>>()
-        });
-    serde_json::json!({
-        "sessions": {"agent_sessions": sessions},
-        "delegations": {"delegations": delegations},
-    })
-}
-
 /// One run's output watcher and how many times it has been dialed.
 struct Watcher {
     handle: tokio::task::JoinHandle<()>,
@@ -234,8 +207,9 @@ fn snapshot(taken: &Taken, rows: &Rows) -> LiveAgentNotice {
                 let private_output = row.status == OUTPUT_UNAVAILABLE;
                 if private_output {
                     row.status.clear();
-                    row.public_progress
-                        .get_or_insert_with(|| public_run_progress(&row.run_id, None, None));
+                    row.public_progress.get_or_insert_with(
+                        || serde_json::json!({"sessions":null,"delegations":null}),
+                    );
                     row.output.clear();
                     row.output_error.clear();
                 }
@@ -258,9 +232,6 @@ pub fn chat_live_agents(
     use futures::StreamExt as _;
     let (sender, receiver) = tokio::sync::mpsc::channel::<LiveAgentNotice>(64);
     tokio::spawn(async move {
-        let Ok(client) = rpc_client(&rpc) else {
-            return;
-        };
         // WHICH PROOF THIS DEVICE CAN MAKE, asked once. A device that hosts the
         // node reads the 0600 token out of its workspace; a device pointed at a
         // node it does not host signs the upgrade for ONE run, which the node
@@ -310,20 +281,28 @@ pub fn chat_live_agents(
                 .into_iter()
                 .flatten()
                 .collect();
-            let output_unreadable = reach == Reach::Nothing
-                || rows
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .values()
-                    .any(|row| row.status == OUTPUT_UNAVAILABLE);
-            let needs_public_progress = !anchored.is_empty() && output_unreadable;
-            let sessions = if needs_public_progress {
-                client
-                    .query::<_, serde_json::Value>("runs", &"agent_sessions")
-                    .await
-                    .ok()
+            let progress_runs: Vec<String> = {
+                let rows = rows.lock().unwrap_or_else(|error| error.into_inner());
+                anchored
+                    .iter()
+                    .filter(|record| {
+                        reach == Reach::Nothing
+                            || rows
+                                .get(record["dispatch_id"].as_str().unwrap_or_default())
+                                .is_some_and(|row| row.status == OUTPUT_UNAVAILABLE)
+                    })
+                    .filter_map(|record| record["run_id"].as_str().map(str::to_owned))
+                    .collect()
+            };
+            let progress = if progress_runs.is_empty() {
+                serde_json::Value::Null
             } else {
-                None
+                chat_background(
+                    &rpc,
+                    serde_json::json!({"kind":"run_progress","runs":progress_runs}),
+                )
+                .await
+                .unwrap_or_default()
             };
             let mut seen = Vec::new();
             for record in anchored {
@@ -379,13 +358,10 @@ pub fn chat_live_agents(
                 }
                 if dial == Dial::Unreadable {
                     let run_id = record["run_id"].as_str().unwrap_or_default();
-                    let ask = serde_json::json!({"delegations": {"caller_run_id": run_id}});
-                    let delegations = client
-                        .query::<_, serde_json::Value>("runs", &ask)
-                        .await
-                        .ok();
-                    let public_progress =
-                        public_run_progress(run_id, sessions.as_ref(), delegations.as_ref());
+                    let public_progress = progress
+                        .get(run_id)
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({"sessions":null,"delegations":null}));
                     if let Some(row) = rows
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -703,27 +679,6 @@ mod tests {
     }
 
     #[test]
-    fn public_progress_excludes_other_runs_and_private_fields() {
-        let progress = public_run_progress(
-            "mine",
-            Some(&serde_json::json!({"agent_sessions": [
-                {"run_id": "mine", "actions": 3, "session_key": "SECRET"},
-                {"run_id": "other", "actions": 99}
-            ]})),
-            Some(&serde_json::json!({"delegations": [
-                {"status": "pending", "result": "SECRET", "delegation_id": "SECRET"}
-            ]})),
-        );
-        assert_eq!(
-            progress,
-            serde_json::json!({
-                "sessions": {"agent_sessions": [{"run_id": "mine", "actions": 3}]},
-                "delegations": {"delegations": [{"status": "pending"}]},
-            })
-        );
-    }
-
-    #[test]
     fn refused_output_publishes_only_public_progress_without_redialing() {
         let taken = Taken {
             rpc: "http://node".into(),
@@ -736,7 +691,7 @@ mod tests {
             "dispatch".into(),
             LiveAgentRow {
                 status: OUTPUT_UNAVAILABLE.into(),
-                public_progress: Some(public_run_progress("run", None, Some(&serde_json::json!({"delegations": [{"status": "pending", "result": "SECRET result"}]})))),
+                public_progress: Some(serde_json::json!({"sessions":null,"delegations":{"delegations":[{"status":"pending"}]}})),
                 output: vec!["SECRET provider output".into()],
                 ..LiveAgentRow::default()
             },
