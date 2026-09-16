@@ -549,8 +549,6 @@ pub struct Session {
     /// subscription, which is the app's door, and the range it copies is this
     /// view's
     pub copy_chord_serial: i64,
-    /// moves once per admitted send: the view's cue to snap to the tail
-    pub sent_serial: i64,
     /// the agent runs anchored in THIS room, live while they run
     pub live_agents: Vec<LiveRunHint>,
 }

@@ -491,7 +491,6 @@ struct ChatProps<'a> {
     call_peers: &'a [crate::call::CallPeer],
     shift_held: bool,
     copy_chord_serial: i64,
-    sent_serial: i64,
     /// THIS ROOM'S runs only, as hints: the reading is taken for the whole
     /// node and cut to `active_channel` on the way out.
     live_agents: Vec<crate::backend::LiveRunHint>,
@@ -535,7 +534,6 @@ pub fn chat_view(
     call_peers: &[crate::call::CallPeer],
     shift_held: bool,
     copy_chord_serial: i64,
-    sent_serial: i64,
     live_agents: &[crate::backend::LiveAgentRow],
 ) -> ViewSpec {
     let props = ChatProps {
@@ -565,7 +563,6 @@ pub fn chat_view(
         call_peers,
         shift_held,
         copy_chord_serial,
-        sent_serial,
         // THIS IS THE ONLY PLACE A RUN IS MATCHED TO A ROOM: the reading
         // covers the whole node, so a row from a room the reader left cannot
         // reach the screen no matter which handler moved `active_channel`.
@@ -6421,7 +6418,6 @@ pub(crate) mod tests {
             call_peers: &[],
             shift_held: false,
             copy_chord_serial: 0,
-            sent_serial: 0,
             live_agents: live_agents_within(live, room, LIVE_AGENT_TEXT_BUDGET),
         };
         Some(serde_json::to_vec(&props).expect("props encode"))

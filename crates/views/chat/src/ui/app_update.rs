@@ -19,7 +19,6 @@ impl super::ChatView {
             Message::VisibilityChanged(visible) => self.on_visibility_changed(visible),
             Message::SessionSettled(moved_room) => self.on_session_settled(moved_room),
             Message::ParticipationFinished => self.on_participation_finished(),
-            Message::SnapStream(moved) => self.on_snap_stream(moved),
             Message::RevealStream(target_key) => self.on_reveal_stream(target_key),
             Message::RevealThread(target_key) => self.on_reveal_thread(target_key),
             Message::RoomArrived(item) => self.on_room_arrived(item),
@@ -222,11 +221,9 @@ impl super::ChatView {
             return ::ducktape_view_guest::Task::none();
         }
         let next = item.next.clone();
-        let sent_now = next.sent_serial != self.sent_serial;
         let chord_now = next.copy_chord_serial != self.copy_chord_serial;
         let moved_room =
             (next.active_channel != self.active_channel) || (next.land_seq != self.land_seq);
-        self.sent_serial = next.sent_serial;
         self.copy_chord_serial = next.copy_chord_serial;
         let changed_reader = self.endpoint != next.endpoint
             || self.network_chain_id != next.network_chain_id
@@ -316,7 +313,6 @@ impl super::ChatView {
                 ducktape_view_guest::Task::none()
             },
             (::ducktape_view_guest::Task::done(moved_room)).map(Message::SessionSettled),
-            (::ducktape_view_guest::Task::done(sent_now)).map(Message::SnapStream),
             (::ducktape_view_guest::Task::done(chord_now)).map(Message::CopyChord),
         ])
     }
@@ -506,18 +502,6 @@ impl super::ChatView {
                 ::ducktape_view_guest::Task::none()
             }
         }
-    }
-    fn on_snap_stream(&mut self, moved: bool) -> ducktape_view_guest::Task<Message> {
-        if !moved {
-            return ::ducktape_view_guest::Task::none();
-        }
-        ::ducktape_view_guest::widget::perform::<Message>(
-            ::ducktape_view_guest::wire::WidgetCommand::Snap {
-                target: String::from("ChatView/chat/message-stream"),
-                x: 0.0_f32,
-                y: 0.0_f32,
-            },
-        )
     }
     fn on_reveal_stream(&mut self, target_key: i64) -> ducktape_view_guest::Task<Message> {
         if target_key <= 0 {
