@@ -77,7 +77,8 @@ fn committed_guests_deliver_a_model_reply_to_chat() {
                 "name": "Alice", "scheme": "ed25519"
             }})).await;
             submit(&mut host, &mut height, 1, "agent", json!({"provision": {
-                "name": "Builder", "program": runs::model_program("builder")
+                "request_id": "provision-builder", "name": "Builder",
+                "program": runs::model_program("builder")
             }})).await;
             submit(&mut host, &mut height, 1, "runs", json!({"configure_model": {
                 "operation": {"register_model": {
