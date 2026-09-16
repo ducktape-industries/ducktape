@@ -104,6 +104,12 @@ pub struct Shape {
     /// point, so the connection follows the card when it moves.
     pub from: Option<Bond>,
     pub to: Option<Bond>,
+    /// Which group this shape belongs to, if any. A group is a NAME the
+    /// members share and nothing else: there is no record of a group apart
+    /// from the shapes in it, so a group cannot outlive its last member or be
+    /// left dangling by a delete. Picking one member picks all of them.
+    #[serde(default)]
+    pub group: Option<String>,
 }
 impl Default for Shape {
     fn default() -> Self {
@@ -120,6 +126,7 @@ impl Default for Shape {
             points: Vec::new(),
             from: None,
             to: None,
+            group: None,
         }
     }
 }
@@ -198,6 +205,17 @@ pub enum Change {
     /// re-stack is undone exactly, rather than approximately.
     Order {
         ids: Vec<String>,
+    },
+    /// Bind these shapes into one group, or free them when the name is absent.
+    /// One change for both directions, because they are one question — which
+    /// group do these shapes belong to — and a board that grouped through one
+    /// verb and ungrouped through another could answer it twice.
+    ///
+    /// Naming every member states the whole group, the way `Order` states the
+    /// whole stack, so a grouping is undone exactly rather than approximately.
+    Group {
+        ids: Vec<String>,
+        group: Option<String>,
     },
     Delete {
         id: String,
@@ -278,6 +296,7 @@ impl Board {
                 to,
             } => self.route(id, [*x, *y, *width, *height], points, from, to),
             Change::Order { ids } => self.order(ids),
+            Change::Group { ids, group } => self.regroup(ids, group.as_deref()),
             Change::Delete { id } => self.delete(id),
         }
     }
@@ -313,6 +332,46 @@ impl Board {
         for (stamp, id) in stack.into_iter().enumerate() {
             if let Some(record) = self.shapes.get_mut(&id) {
                 record.created = stamp as u64;
+            }
+        }
+        Ok(())
+    }
+    /// Put the named shapes in a group, or take them out of whatever group
+    /// they were in. A group is only the name its members share, so freeing
+    /// them is forgetting the name and there is nothing else to clean up.
+    ///
+    /// The whole change is refused if any part of it is, rather than half of
+    /// a selection being grouped: a group that some of the shapes you picked
+    /// are not in is not the group you asked for.
+    fn regroup(&mut self, ids: &[String], group: Option<&str>) -> Result<(), String> {
+        let named: BTreeSet<&String> = ids.iter().collect();
+        let addressable = !ids.is_empty()
+            && named.len() == ids.len()
+            && ids.len() <= MAX_SHAPES
+            && ids.iter().all(|id| self.shapes.contains_key(id));
+        if !addressable {
+            return Err("Grouping names each shape on the board at most once.".into());
+        }
+        // A group of one is allowed, and it has to be: freeing one member of a
+        // pair leaves the other still carrying the name, and undoing that has
+        // to be able to put it back. It reads no differently from no group at
+        // all — picking it picks itself — so it is inert rather than invalid.
+        // Refusing to MAKE one is a question about a gesture, and the view
+        // answers it where the gesture is.
+        if let Some(name) = group
+            && !valid_id(name)
+        {
+            return Err("Use a group name of up to 96 id characters.".into());
+        }
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or("Board revision exhausted.")?;
+        self.revision = revision;
+        for id in ids {
+            if let Some(record) = self.shapes.get_mut(id) {
+                record.shape.group = group.map(str::to_owned);
+                record.revision = revision;
             }
         }
         Ok(())
@@ -460,6 +519,13 @@ impl Board {
         let content_valid = shape.text.len() <= MAX_TEXT && shape.color < 5;
         if !geometry_valid || !content_valid {
             return Err("Shape exceeds the geometry or text limits.".into());
+        }
+        // A group is a name shared by its members, so it has to be a name the
+        // board can address — a shape carrying anything else names a group
+        // nothing can ever be put in or taken out of.
+        let group_valid = shape.group.as_deref().is_none_or(valid_id);
+        if !group_valid {
+            return Err("Use a group name of up to 96 id characters.".into());
         }
         let swapping_family = self
             .shapes

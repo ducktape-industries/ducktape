@@ -882,6 +882,26 @@ fn inverse(board: &Board, change: &Change) -> Vec<Change> {
                 .map(|(id, _)| id.clone())
                 .collect(),
         }],
+        // Putting a grouping back means putting every shape back in the group
+        // it was in, and they need not all have been in the same one — a
+        // selection can be gathered out of two groups and some loose shapes.
+        // So one change per group the selection came from, which is also why
+        // a group of one has to be expressible: freeing half a pair and then
+        // undoing it is exactly that.
+        Change::Group { ids, .. } => {
+            let mut held: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
+            for id in ids {
+                let Some(record) = board.shapes.get(id) else {
+                    continue;
+                };
+                held.entry(record.shape.group.clone())
+                    .or_default()
+                    .push(id.clone());
+            }
+            held.into_iter()
+                .map(|(group, ids)| Change::Group { ids, group })
+                .collect()
+        }
         Change::Delete { id } => {
             let Some(record) = board.shapes.get(id) else {
                 return Vec::new();

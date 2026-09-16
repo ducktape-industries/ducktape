@@ -560,3 +560,97 @@ fn how_the_words_sit_and_how_big_they_are_are_fields_like_any_other() {
         .unwrap();
     assert_eq!(missing.shapes.len(), 1);
 }
+
+/// A group is a name its members share and nothing else, so one change puts
+/// them in it and the same change takes them out.
+#[test]
+fn a_group_is_a_name_its_members_share_and_one_change_binds_or_frees_them() {
+    let board = blank()
+        .changed_many(&[create("a"), create("b"), create("c")])
+        .unwrap();
+    let held = board
+        .changed(&Change::Group {
+            ids: vec!["a".into(), "b".into()],
+            group: Some("pair".into()),
+        })
+        .unwrap();
+    let group = |board: &Board, id: &str| board.shapes[id].shape.group.clone();
+    assert_eq!(group(&held, "a").as_deref(), Some("pair"));
+    assert_eq!(group(&held, "b").as_deref(), Some("pair"));
+    assert_eq!(
+        group(&held, "c"),
+        None,
+        "a shape nobody named joined a group"
+    );
+
+    // The same verb in the other direction: no name, no group.
+    let freed = held
+        .changed(&Change::Group {
+            ids: vec!["a".into(), "b".into()],
+            group: None,
+        })
+        .unwrap();
+    assert_eq!(group(&freed, "a"), None);
+    assert_eq!(group(&freed, "b"), None);
+
+    // Freeing one member of a pair leaves the other where it was: the group is
+    // the name, so what is left is simply a shape still carrying it.
+    let split = held
+        .changed(&Change::Group {
+            ids: vec!["a".into()],
+            group: None,
+        })
+        .unwrap();
+    assert_eq!(group(&split, "a"), None);
+    assert_eq!(group(&split, "b").as_deref(), Some("pair"));
+    // And that lone member can be put back where it was, which is why a group
+    // of one is inert rather than invalid: it is what undoing the split is.
+    let rejoined = split
+        .changed(&Change::Group {
+            ids: vec!["a".into()],
+            group: Some("pair".into()),
+        })
+        .unwrap();
+    assert_eq!(group(&rejoined, "a").as_deref(), Some("pair"));
+}
+
+/// What a board refuses to call a group.
+#[test]
+fn a_group_needs_two_shapes_that_exist_and_a_name_the_board_can_address() {
+    let board = blank().changed_many(&[create("a"), create("b")]).unwrap();
+    let refused = |change: Change| {
+        board
+            .changed(&change)
+            .expect_err("the board took a grouping it should have refused")
+    };
+    // A shape that is not on the board cannot be in a group on it.
+    refused(Change::Group {
+        ids: vec!["a".into(), "ghost".into()],
+        group: Some("pair".into()),
+    });
+    // Naming a shape twice states a group the caller cannot have meant.
+    refused(Change::Group {
+        ids: vec!["a".into(), "a".into()],
+        group: Some("pair".into()),
+    });
+    // Nothing to group.
+    refused(Change::Group {
+        ids: Vec::new(),
+        group: None,
+    });
+    // A name the board cannot address is a group nothing can be put into.
+    refused(Change::Group {
+        ids: vec!["a".into(), "b".into()],
+        group: Some("not a group name".into()),
+    });
+    // And the same name is refused on the way in, through a create.
+    blank()
+        .changed(&Change::Create {
+            id: "a".into(),
+            shape: Shape {
+                group: Some("not a group name".into()),
+                ..Shape::default()
+            },
+        })
+        .expect_err("a shape carried a group name the board cannot address");
+}
