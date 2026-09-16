@@ -395,9 +395,16 @@ pub struct ChatSearchHit {
     pub meta: String,
 }
 
-/// Authorized run observations and the presentation derived by this view.
-/// The host forwards output; provider formats and display choices live here.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+/// What the host forwards about one run in flight: the facts, and the raw
+/// material this view is the one to read — the provider's output, the reason
+/// it stopped, and the committed progress a reader who may not see output is
+/// told instead. Provider formats and display choices are the view's, so
+/// [`crate::live::project`] reads all three and keeps a [`LiveRun`].
+///
+/// A payload, never state. It arrives as the host's JSON, which describes
+/// itself, and `public_progress` is whatever the provider published — a shape
+/// no other format can be asked to decode.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LiveRunHint {
     #[serde(default)]
     pub public_progress: Option<serde_json::Value>,
@@ -421,36 +428,27 @@ pub struct LiveRunHint {
     pub answer_preview: String,
 }
 
-impl LiveRunHint {
-    /// A hint holding one of everything, for the snapshot-schema trace: the
-    /// provider's progress is arbitrary JSON, which has no shape to trace, so
-    /// this value is traced instead and reaches every field it holds.
-    ///
-    /// Every field but the progress, which is `None` here because it is
-    /// `None` in every stored hint: [`crate::live::project`] takes it on the
-    /// way in and leaves the status it read from it. A stored `Some` would
-    /// not survive a snapshot at all — bincode cannot decode a
-    /// `serde_json::Value`, which asks the format to describe itself.
-    #[cfg(test)]
-    pub fn schema_sample() -> Self {
-        Self {
-            public_progress: None,
-            output: vec!["o".into()],
-            output_error: "e".into(),
-            channel_id: "c".into(),
-            anchor_seq: 1,
-            thread_root: 1,
-            run_id: "r".into(),
-            dispatch_id: "d".into(),
-            agent: "a".into(),
-            status: "s".into(),
-            activity: vec![LiveActivity {
-                label: "l".into(),
-                done: true,
-            }],
-            answer_preview: "p".into(),
-        }
-    }
+/// A run in flight as this view reads it, and all a card needs to draw it.
+///
+/// State, and only what the projection kept: the output, the failure and the
+/// progress it read are not here, because reading them is what it did. That
+/// is also the only shape a snapshot can carry — the view's state is bincode,
+/// which has no way to decode a value that describes its own shape, so a
+/// `public_progress` reaching a snapshot would be a view that cannot restore.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct LiveRun {
+    pub channel_id: String,
+    pub anchor_seq: i64,
+    pub thread_root: i64,
+    pub run_id: String,
+    /// the run's address: what `open_run` hands the app
+    pub dispatch_id: String,
+    pub agent: String,
+    pub status: String,
+    /// what the run has done so far, oldest first
+    pub activity: Vec<LiveActivity>,
+    /// the answer as it is being written
+    pub answer_preview: String,
 }
 
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
@@ -463,7 +461,7 @@ pub struct LiveActivity {
 /// agent's, the body is what it has done and is writing, the caption its
 /// status. Nothing here is on the chain, so the row is pending and has no
 /// seq to select or thread.
-pub fn live_run_message(run: &LiveRunHint) -> ChatMessage {
+pub fn live_run_message(run: &LiveRun) -> ChatMessage {
     let paragraph = |text: String| ChatBlock {
         kind: "paragraph".into(),
         text,
@@ -2406,7 +2404,7 @@ pub(crate) fn seq_in_copy_range(
 ///
 /// Only ask it with a thread actually open: at `active_thread_seq == 0` every
 /// top-level run answers it, since an unreplied run's `thread_root` is 0 too.
-pub fn run_in_thread(live: &LiveRunHint, active_thread_seq: i64) -> bool {
+pub fn run_in_thread(live: &LiveRun, active_thread_seq: i64) -> bool {
     live.anchor_seq == active_thread_seq || live.thread_root == active_thread_seq
 }
 

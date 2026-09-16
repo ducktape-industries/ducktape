@@ -1,6 +1,6 @@
 //! Provider output interpretation and live run presentation.
 
-use crate::host::{LiveActivity, LiveRunHint};
+use crate::host::{LiveActivity, LiveRun, LiveRunHint};
 
 /// Select chat-anchored runs and cache the deployed product's agent names.
 pub(crate) async fn discover(
@@ -101,8 +101,39 @@ fn public_run_progress(
 }
 
 /// Interpret the authorized output in the deployed view, not in the host.
-pub(crate) fn project(mut row: LiveRunHint) -> LiveRunHint {
-    if let Some(progress) = row.public_progress.take() {
+///
+/// The hint is taken apart here and only what this reads of it goes on: the
+/// destructuring is what makes a field added to the payload a field this
+/// function has to decide about, rather than one that rides into the state.
+pub(crate) fn project(hint: LiveRunHint) -> LiveRun {
+    let LiveRunHint {
+        public_progress,
+        output,
+        output_error,
+        channel_id,
+        anchor_seq,
+        thread_root,
+        run_id,
+        dispatch_id,
+        agent,
+        status,
+        activity,
+        answer_preview,
+    } = hint;
+    let mut row = LiveRun {
+        channel_id,
+        anchor_seq,
+        thread_root,
+        run_id,
+        dispatch_id,
+        agent,
+        status,
+        activity,
+        answer_preview,
+    };
+    // A reader the run's output is not addressed to is told what it
+    // committed instead, and that is the whole status.
+    if let Some(progress) = public_progress {
         row.status = public_run_status(
             &row.run_id,
             progress.get("sessions"),
@@ -113,16 +144,16 @@ pub(crate) fn project(mut row: LiveRunHint) -> LiveRunHint {
     if row.status.is_empty() {
         row.status = "Starting".into();
     }
-    for (id, line) in std::mem::take(&mut row.output).iter().enumerate() {
+    for (id, line) in output.iter().enumerate() {
         // Pending runs do not identify the worker. The parser recognizes
         // distinct provider shapes; Claude enables its assistant/result forms.
         if let Some(event) = provider_output_event("claude", line, id as i64) {
             row = live_row_apply(row, &event);
         }
     }
-    let failed = !row.output_error.is_empty();
+    let failed = !output_error.is_empty();
     if failed {
-        row.status = std::mem::take(&mut row.output_error);
+        row.status = output_error;
     }
     row
 }
@@ -359,7 +390,7 @@ fn json_text(value: Option<&serde_json::Value>) -> String {
 /// Fold one parsed output event into the row. Status lines replace the status;
 /// activities upsert by label and mark done; previews and answers replace the
 /// preview; errors become the status.
-fn live_row_apply(mut row: LiveRunHint, event: &AgentChatEvent) -> LiveRunHint {
+fn live_row_apply(mut row: LiveRun, event: &AgentChatEvent) -> LiveRun {
     match event.kind.as_str() {
         "status" => row.status = event.title.clone(),
         "activity" => {
@@ -416,7 +447,6 @@ mod tests {
         let rendered = project(observed.clone());
         assert_eq!(rendered.answer_preview, "answer");
         assert_eq!(rendered.status, "Answering");
-        assert!(rendered.output.is_empty());
         let failed = project(LiveRunHint {
             output_error: "connection failed".into(),
             ..observed
@@ -476,7 +506,7 @@ mod tests {
 
     #[test]
     fn output_events_fold_into_a_status_line_and_a_checklist() {
-        let row = live_row_apply(LiveRunHint::default(), &event("status", "Thinking", ""));
+        let row = live_row_apply(LiveRun::default(), &event("status", "Thinking", ""));
         assert_eq!(row.status, "Thinking");
         let row = live_row_apply(row, &event("activity", "Command", "running"));
         assert_eq!(row.activity.len(), 1);
@@ -497,7 +527,7 @@ mod tests {
 
     #[test]
     fn a_row_preserves_activity_and_answer_output() {
-        let mut row = LiveRunHint::default();
+        let mut row = LiveRun::default();
         for i in 0..40 {
             row = live_row_apply(row, &event("activity", &format!("Step {i}"), "done"));
         }
