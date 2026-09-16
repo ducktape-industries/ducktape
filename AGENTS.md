@@ -207,6 +207,10 @@ in `skills/` (`qa`, `sim-lane`, `module-dev`).
   `--no-deps` is deliberate. Without it, a crate whose dev-deps pull
   host/dispatch/saga inherits ~a dozen pre-existing version-drift lints from
   those crates; a task is accountable only for lints in the crates it touched.
+- A crate with a bin target AND dev-dependencies (node-bin, simnode, the
+  service bins) also needs `cargo build -p <crate>` with no `--tests`: under
+  `--tests` every target sees the dev-dependency graph, so a source file that
+  reaches a dev-only crate is green in clippy and fails the real binary.
 - Don't run `cargo fmt --all`: large bin files carry pre-existing fmt debt,
   and a tree-wide reformat forces painful rebases on in-flight branches. Only
   format code you touched; the mechanical whole-tree sweep is a dedicated PR.
