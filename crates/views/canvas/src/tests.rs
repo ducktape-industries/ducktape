@@ -2688,13 +2688,21 @@ fn the_caret_sits_on_the_words_whether_they_ride_a_line_or_a_card() {
     let (pos, room) = view.writing_box(&board, &edge, box_);
     let inline = view.inline.clone().unwrap();
     assert_eq!(view.caret_box(&inline, &edge, pos, room), (pos, room));
-    // Once the gauge has answered, the caret is as wide as the words and sits
-    // at the middle of the room — the same middle the painter centres the
-    // saved plate on, so the words do not jump when you stop typing.
+    // Once the gauge has answered, the caret sits at the middle of the room —
+    // the same middle the painter centres the saved plate on, so the words do
+    // not jump when you stop typing.
     view.on_measured(view.zoom, 60., 24.);
     let inline = view.inline.clone().unwrap();
     let (caret, size) = view.caret_box(&inline, &edge, pos, room);
-    assert!(size[0] < room[0], "the caret still took the whole room");
+    // It is where the box STARTS that centres them, never how wide it is. The
+    // box still wraps in the plate's own column: one sized to the words wraps
+    // at where they LANDED rather than where they were ALLOWED to, which is
+    // always a little short, and the plate takes its padding off that width a
+    // second time.
+    assert!(
+        size[0] >= room[0],
+        "the caret wrapped at the measurement instead of the plate's column"
+    );
     // The WORDS are centred, not the box: the editor writes from its box's left
     // edge, so the wrapping margin the box carries is not part of the middle.
     assert!(
@@ -3382,5 +3390,86 @@ fn a_cards_words_sit_where_the_alignment_says_and_the_caret_goes_with_them() {
     assert!(
         !caption.contains("Right"),
         "a text shape's words walked away from the corner they were put at: {caption}"
+    );
+}
+
+/// An arrow's label wraps in the same column whether it is being written or
+/// being read, and starts at the same place.
+///
+/// The plate the painter draws shrinks to the words and is centred on the run,
+/// so the box the caret lives in has to answer two questions at once: where the
+/// words START, and where they BREAK. Reading both off the measurement of the
+/// words made the field forty pixels wide against a plate that wrapped at a
+/// hundred and seventy-six — the plate's padding taken off once by the plate
+/// and again by the pin — so one word re-wrapped the instant you clicked into
+/// it and un-wrapped when you left.
+#[test]
+fn an_arrow_label_wraps_where_it_is_painted_whether_or_not_you_are_typing() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "edge".into(),
+        shape: Shape {
+            text: "carries".into(),
+            ..segment(Kind::Arrow)
+        },
+    });
+    view.selected = ["edge".into()].into();
+    view.begin_text();
+    let live = view.visible().unwrap().clone();
+    let s = live.shapes.get("edge").unwrap().shape.clone();
+    let box_ = view.card_box(&live, &s);
+    let (pos, room) = view.writing_box(&live, &s, box_);
+    // What the painter wraps in: the plate is the room it is given, less the
+    // inset it keeps on either side of the words.
+    let letters = view.lettering(&s, [box_[2] - box_[0], box_[3] - box_[1]]);
+    let painted = room[0] - 2. * letters.inset;
+    // What the caret wraps in, once a measurement of the words has landed.
+    let (wide, tall) = (48., 40.);
+    view.on_measured(view.zoom, wide, tall);
+    let inline = view.inline.clone().unwrap();
+    let (caret, caret_room) = view.caret_box(&inline, &s, pos, room);
+    let field = caret_room[0] - 2. * view.lettering(&s, caret_room).inset;
+    assert!(
+        field >= painted && field - painted <= presentation::WRAP_RESERVE,
+        "the caret wraps at {field} where the plate wraps at {painted}: a field \
+         narrower than the plate breaks a line the label keeps whole, and one \
+         wider than it by more than the caret's own reserve keeps a line the \
+         label breaks"
+    );
+    // And the words start where the plate would have put them: the plate hugs
+    // the words and is centred in the room, so its first glyph sits half the
+    // leftover room in from the edge — which is the whole reason this box is
+    // placed rather than filled.
+    let starts = pos[0] + (room[0] - wide) / 2.;
+    assert!(
+        (caret[0] - starts).abs() < 0.5,
+        "the caret writes from {} where the plate paints from {starts}",
+        caret[0]
+    );
+    // And down the same way. The plate hugs its words in BOTH directions, so a
+    // label shorter than the room it is allowed sits at the middle of it, not
+    // at the top — a two-line label left out of this drop wrote a few pixels
+    // above the plate that replaced it.
+    let drops = pos[1] + (room[1] - tall * view.zoom) / 2.;
+    assert!(
+        (caret[1] - drops).abs() < 0.5,
+        "the caret writes at {} where the plate paints at {drops}",
+        caret[1]
+    );
+    // And a label TALLER than the room it was allowed still follows it. The
+    // plate is not drawn until it is saved and only floats over the run, so it
+    // centres on the line and hangs off both ends rather than sitting on the
+    // room's top edge — which is where a caret clamped to that edge wrote, a
+    // few pixels above the plate it was about to become.
+    let over = room[1] / view.zoom + 8.;
+    view.on_measured(view.zoom, wide, over);
+    let inline = view.inline.clone().unwrap();
+    let (caret, _) = view.caret_box(&inline, &s, pos, room);
+    let hangs = pos[1] + (room[1] - over * view.zoom) / 2.;
+    assert!(
+        caret[1] < pos[1] && (caret[1] - hangs).abs() < 0.5,
+        "a label too tall for its room wrote at {} instead of {hangs}",
+        caret[1]
     );
 }
