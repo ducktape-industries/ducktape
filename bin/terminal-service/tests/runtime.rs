@@ -405,6 +405,31 @@ async fn shared_commands_are_ordered_deduplicated_and_do_not_accept_raw_input() 
     task.await.unwrap().unwrap();
 }
 
+async fn committed_stream_fixture(
+    upgrade: axum::extract::WebSocketUpgrade,
+) -> axum::response::Response {
+    upgrade.on_upgrade(|mut socket| async move {
+        let subscription = socket.recv().await.unwrap().unwrap();
+        let request: serde_json::Value =
+            serde_json::from_str(subscription.to_text().unwrap()).unwrap();
+        assert_eq!(request["topics"], serde_json::json!(["module:chat"]));
+        for frame in [
+            r#"{"type":"subscribed","topics":{"module:chat":"1:0"}}"#,
+            r#"{"type":"heartbeat","height":2,"root_hash":"aa","time_ms":0,"interval_ms":3000}"#,
+            r#"{"type":"lagged","topic":"module:chat","cursor":"2:0"}"#,
+        ] {
+            if socket
+                .send(axum::extract::ws::Message::Text(frame.into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        while socket.recv().await.is_some() {}
+    })
+}
+
 #[tokio::test]
 async fn failed_committed_query_closes_the_shared_session() {
     let directory = tempfile::tempdir().unwrap();
@@ -426,10 +451,12 @@ async fn failed_committed_query_closes_the_shared_session() {
     let client =
         ducktape_rpc::Client::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
     let server = tokio::spawn(async move {
-        let app = axum::Router::new().route(
-            "/v1/query",
-            axum::routing::post(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
-        );
+        let app = axum::Router::new()
+            .route(
+                "/v1/query",
+                axum::routing::post(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+            )
+            .route("/v1/ws", axum::routing::get(committed_stream_fixture));
         axum::serve(listener, app).await.unwrap();
     });
     let error = ducktape_terminal::consensus::project(
@@ -530,6 +557,7 @@ async fn projector_delivers_http_commands_and_session_end_cancels_a_pending_quer
     let pending = Arc::new(Notify::new());
     let app = axum::Router::new()
         .route("/v1/query", axum::routing::post(committed_query_fixture))
+        .route("/v1/ws", axum::routing::get(committed_stream_fixture))
         .with_state(pending.clone());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();

@@ -157,11 +157,41 @@ async fn feed(
     caller: &crate::state::Caller,
     owner: &chat::Party,
 ) -> Result<(), String> {
+    use futures::StreamExt as _;
+    use ducktape_rpc::ModuleEvent;
+    // Subscribe before the initial snapshot so commands committed during a
+    // read remain queued. Idle block heartbeats never trigger another query.
+    let mut events = client
+        .module_events(vec!["chat".into()], Default::default())
+        .await
+        .map_err(|error| error.to_string())?;
+    while let Some(event) = events.next().await {
+        let changed = match event.map_err(|error| error.to_string())? {
+            ModuleEvent::Ready { .. } => true,
+            ModuleEvent::Changed { module, .. } | ModuleEvent::Lagged { module, .. } => {
+                module == "chat"
+            }
+            ModuleEvent::Refused { code, .. } => {
+                return Err(format!("terminal command stream refused: {code}"));
+            }
+            ModuleEvent::Tip { .. } => false,
+        };
+        if changed {
+            drain_committed(runtime, client, session, caller, owner).await?;
+        }
+    }
+    Err("terminal command stream closed".into())
+}
+
+async fn drain_committed(
+    runtime: &crate::runtime::Runtime,
+    client: &ducktape_rpc::Client,
+    session: &str,
+    caller: &crate::state::Caller,
+    owner: &chat::Party,
+) -> Result<(), String> {
     let channel = session_channel(session);
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        interval.tick().await;
         let status = runtime.status(session.into(), caller.clone()).await?;
         if status.ended {
             return Ok(());
@@ -201,9 +231,17 @@ async fn feed(
         let chat::ChatReply::Messages(views) = reply else {
             return Err("unexpected terminal messages reply".into());
         };
+        let last_page = views.len() < chat::MAX_QUERY_LIMIT as usize;
+        let progressed = views.last().is_none_or(|view| view.seq >= from_seq);
+        if !progressed {
+            return Err("terminal command page precedes its requested cursor".into());
+        }
         runtime
             .committed(session.into(), caller.clone(), owner.clone(), views)
             .await?;
+        if last_page {
+            return Ok(());
+        }
     }
 }
 
