@@ -226,6 +226,17 @@ impl EditorView {
         }
     }
 
+    /// Whether this editor takes the box it is given or takes the room its
+    /// words need. The field's own element decides its height, so the node's
+    /// answer has to reach it — a box told to shrink around an element that
+    /// still asks for all of its parent's height shrinks around nothing.
+    fn fills(&self, fills: bool, cx: &mut App) {
+        match self {
+            Self::Text(view) => view.update(cx, |editor, cx| editor.set_fills(fills, cx)),
+            Self::Rich(view) => view.update(cx, |editor, cx| editor.set_fills(fills, cx)),
+        }
+    }
+
     fn widget_command(&self, command: &wire::WidgetCommand, window: &mut Window, cx: &mut App) {
         match self {
             Self::Text(view) => view.update(cx, |editor, cx| {
@@ -2770,6 +2781,9 @@ impl ViewTree {
             );
         }
         let editor = self.editors.get(key).expect("editor inserted");
+        editor
+            .view
+            .fills(!matches!(height, Some(wire::Length::Shrink)), cx);
         editor.view.sync(window, cx);
         if let Some(command) = replaced_focus {
             editor.view.widget_command(&command, window, cx);
@@ -3753,7 +3767,14 @@ fn dimensions<T: Styled>(
         Some(wire::Length::Fixed(value)) => element.h(px(value)).min_h(px(value)),
         Some(wire::Length::Fill) => element.h_full().min_h_0(),
         Some(wire::Length::FillPortion(_)) => element.flex_1(),
-        Some(wire::Length::Shrink) | None => element,
+        // Shrink is "as tall as what is in you", and leaving the element alone
+        // does not say that: a flex child stretches to its row's cross axis by
+        // default, which is the parent's height every time and the content's
+        // never. Refusing the stretch is the other half of asking to shrink.
+        // An author who leaves the height out (`None`) is not asking for
+        // anything and keeps the stretch.
+        Some(wire::Length::Shrink) => element.self_start(),
+        None => element,
     }
 }
 
@@ -5447,6 +5468,114 @@ mod tests {
                 .unwrap();
             assert_eq!(bounds.size, size(px(240.), px(expected)));
         }
+    }
+
+    /// Put a document's text into a store the honest way: the store asks for
+    /// every document it has no text for, so answer the request it just made.
+    fn seed_editor_text(store: &crate::editor::wire::EditorStore, text: &str) {
+        use wire::editor_document::{EditorDocumentMessage as Message, EditorTransfer};
+        let asked = store.drain().into_iter().find_map(|event| match event {
+            wire::Event::EditorDocument {
+                message: Message::Request { id, target },
+                ..
+            } => Some((id, target)),
+            _ => None,
+        });
+        let (id, target) = asked.expect("the store asks for a document it has no text for");
+        store
+            .frame(&wire::Frame {
+                editor_documents: vec![
+                    Message::Transfer(EditorTransfer::Begin {
+                        id: id.clone(),
+                        target,
+                    }),
+                    Message::Transfer(EditorTransfer::Chunk {
+                        id: id.clone(),
+                        index: 0,
+                        bytes: text.as_bytes().to_vec(),
+                    }),
+                    Message::Transfer(EditorTransfer::Complete { id }),
+                ],
+                ..Default::default()
+            })
+            .expect("the answer to the store's own request");
+    }
+
+    /// An editor asked to lay out to its own content is as tall as the words in
+    /// it — every line of them.
+    ///
+    /// A card that grows with what you type is the whole reason a view asks for
+    /// `Shrink`, and a shrunk editor that reported one line's height made every
+    /// such card hide what had just been written in it.
+    #[gpui_kit::test]
+    fn a_shrunk_editor_is_as_tall_as_all_of_its_lines(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let words = "one\ntwo\nthree\nfour\nfive\nsix";
+        let leading = 20.;
+        let root = wire::Node::Editor {
+            key: "document".into(),
+            options: Box::new(wire::EditorOptions {
+                size: Some(14.),
+                line_height: Some(wire::LineHeight::Absolute(leading)),
+                padding: Some(0.),
+                ..Default::default()
+            }),
+            placeholder: String::new(),
+            document: wire::editor_document::EditorDocumentRef {
+                document: "sizing".into(),
+                reset: 1,
+                text_revision: 0,
+                revision: 0,
+                cursor: Default::default(),
+                byte_len: words.len() as u32,
+            },
+            on_document: 0,
+            editable: true,
+            width: Some(240.),
+            height: Some(wire::Length::Shrink),
+            min_height: None,
+            max_height: None,
+        };
+        // In a box with room to spare, which is the only place shrinking means
+        // anything: the editor is the root of nothing in a real view, it sits
+        // inside the card's own layout.
+        let root = wire::Node::Container {
+            key: "card".into(),
+            shadow: Default::default(),
+            max_width: None,
+            max_height: None,
+            clip: false,
+            width: Some(wire::Length::Fill),
+            height: Some(wire::Length::Fill),
+            padding: None,
+            align_x: None,
+            align_y: None,
+            background: None,
+            border: None,
+            snap: None,
+            content: Box::new(root),
+        };
+        let store = crate::editor::wire::EditorStore::new(91);
+        store.replace(&root).unwrap();
+        seed_editor_text(&store, words);
+        let window = cx.open_window(size(px(400.), px(300.)), |_, cx| {
+            let mut tree = ViewTree::new(root);
+            tree.set_editor_store(store, cx);
+            tree
+        });
+        let tree = window.root(cx).unwrap();
+        let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        native.update(|window, cx| window.render_frame(cx));
+        native.update(|window, cx| window.render_frame(cx));
+        let bounds = tree
+            .read_with(&native, |tree, _| tree.measured_bounds("document"))
+            .unwrap();
+        let lines = f32::from(bounds.size.height) / leading;
+        assert!(
+            (lines - 6.).abs() < 0.5,
+            "six lines were laid out {lines} lines tall ({:?})",
+            bounds.size
+        );
     }
 
     #[test]

@@ -2176,7 +2176,10 @@ fn plate(id: &str, words: Node, letters: &Lettering, wash: [f32; 4], room: [f32;
     {
         *clipped = true;
         *width = Some(Length::Shrink);
-        *height = Some(Length::Shrink);
+        // No height: the plate is as tall as its words either way, and saying
+        // Shrink here would ALSO refuse the stretch — which is how the plate
+        // would stop obeying the centring its parent puts it on the line with.
+        *height = None;
         *max_width = Some(room[0]);
         *padding = Some(wire::Edges::all(letters.inset));
         *background = Some(wire::Background::Color(Rgba(wash)));

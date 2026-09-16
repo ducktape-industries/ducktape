@@ -3,6 +3,7 @@
 //! application's canonical document format.
 use super::EditorStore;
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, EventEmitter, Focusable as _,
     InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Pixels, Render,
@@ -244,6 +245,9 @@ pub struct RichWireEditor {
     /// Where the mount painted last frame, so block bounds (window space)
     /// can be turned into overlay offsets.
     bounds: Option<Bounds<Pixels>>,
+    /// Whether the mount takes the box it was given or the room its blocks
+    /// need; see [`RichWireEditor::set_fills`].
+    fills: bool,
     /// Guest-authored margin badges indexed by rich block.
     margins: Vec<EditorMargin>,
     menu: Option<wire::editor_presentation::EditorMenu>,
@@ -311,6 +315,7 @@ impl RichWireEditor {
             reset: None,
             fault: None,
             bounds: None,
+            fills: true,
             margins: Vec::new(),
             menu: None,
             _menu_actions: menu_actions,
@@ -322,6 +327,17 @@ impl RichWireEditor {
         };
         this.sync(window, cx);
         this
+    }
+
+    /// Whether the mount takes the box it was given or the room its blocks
+    /// need. Set from the node's height: a mount that always asked for all of
+    /// its parent's height gave a shrinking box nothing to shrink to.
+    pub fn set_fills(&mut self, fills: bool, cx: &mut Context<Self>) {
+        if self.fills == fills {
+            return;
+        }
+        self.fills = fills;
+        cx.notify();
     }
 
     /// Install the projection when it settled on text this editor did not
@@ -721,15 +737,17 @@ impl Render for RichWireEditor {
         .absolute()
         .inset_0();
         let badges = self.badges(cx);
+        let fills = self.fills;
         div()
-            .size_full()
+            .w_full()
+            .when(fills, |element| element.h_full())
             .relative()
             .flex()
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .h_full()
+                    .when(fills, |element| element.h_full())
                     .ml(-gutter)
                     .mr(-gutter)
                     .child(self.editor.clone()),
