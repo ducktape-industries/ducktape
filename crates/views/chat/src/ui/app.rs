@@ -513,6 +513,36 @@ impl ChatView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrolling_pages_history_and_tracks_the_tail_inside_the_view() {
+        let mut state = ChatView::state();
+        state.active_channel = "general".into();
+        state.loading = false;
+        state.has_older_history = true;
+        let _ = state.update(Message::ChatScrolled(0.0, 10.0, 0.0, 1.0));
+        assert!(!state.at_live_tail);
+        assert!(state.history_loading);
+        assert_eq!(state.history_pages, 1);
+        let requested = state.room_key.clone();
+        let _ = state.update(Message::ChatScrolled(0.0, 10.0, 0.0, 1.0));
+        assert_eq!(
+            state.history_pages, 1,
+            "one request while a page is loading"
+        );
+        assert_eq!(state.room_key, requested);
+        let _ = state.update(Message::RoomArrived(crate::host::RoomItem {
+            channel: "general".into(),
+            has_older: false,
+            ..Default::default()
+        }));
+        assert!(state.history_view);
+        assert!(!state.history_loading);
+        let _ = state.update(Message::ChatScrolled(0.0, 10.0, 0.0, 1.0));
+        assert_eq!(state.history_pages, 1, "the oldest page ends pagination");
+        let _ = state.update(Message::ChatScrolled(0.0, 0.0, 0.0, f64::NAN));
+        assert!(state.at_live_tail, "content that fits is at the tail");
+    }
     #[test]
     fn hiding_a_pending_dm_retires_navigation_and_restores_the_loaded_room() {
         let mut state = ChatView::state();

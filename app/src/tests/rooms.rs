@@ -1,18 +1,6 @@
 use super::*;
 
-/// THE ROUTE LIST IS THE INVARIANT, SO THE ROUTE LIST IS PINNED. A ninth handler
-/// that moves the reader between rooms has to decide whether it abandons a
-/// history request, and nothing about writing one would prompt that thought —
-/// which is exactly how the five uncovered routes above got written. This fails
-/// the build on a new mover so the decision is forced, rather than trusting the
-/// next author to remember an invariant spread across three files.
-///
-/// LAUNCHES clear the flag themselves. LANDINGS do not, and must not be added
-/// here without checking that every launch reaching them already cleared it:
-/// `chat_updated` answers the two pickers, `chat_hit_loaded` answers the search
-/// hit, `workspace_connected` answers the
-/// reconnect. `live_resynced` is a landing with NO launch behind it, which is
-/// why it is the one that asks.
+/// Room navigation names the landing position passed to the deployed view.
 #[test]
 fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
     let handlers = handler_bodies();
@@ -44,13 +32,6 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
         assert!(
             handler_body(launch).contains("self.chat_land_seq="),
             "{launch} names the landing position"
-        );
-    }
-    for mover in movers {
-        let body = handler_body(mover);
-        assert!(
-            body.contains("self.history_view="),
-            "{mover} moves the room without updating history mode"
         );
     }
 }
@@ -403,7 +384,6 @@ fn opening_a_search_hit_moves_the_room_on_the_click() {
         app.loading,
         "so the skeleton draws for the room being entered"
     );
-    assert!(app.history_view, "a hit is a window around one old message");
 }
 
 /// THE LIVE-RUN READING IS REFUSED, NEVER FOLDED. Its rows are the node's whole

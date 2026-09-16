@@ -47,57 +47,12 @@ fn history_windows_offer_a_jump_back_to_latest() {
 
     // landing on a search hit enters history mode…
     let _ = app.update(AppMessage::OpenChatSearchHit("general".into(), 7));
-    assert!(app.history_view);
     assert_eq!(app.chat_land_seq, 7);
 
     // …and the Jump-to-latest press — which the view emits as `choose_channel`
     // on the room it is already in — leaves it
     let _ = app.update(AppMessage::ChooseChannel("general".into()));
-    assert!(!app.history_view);
     assert_eq!(app.chat_land_seq, 0, "and the view opens back on the tail");
-}
-
-/// THE BANNER DESCRIBES THE ROWS IN HAND, SO EVERY WRITER OF THEM ANSWERS IT.
-///
-/// `history_view` was raised by the search hit and lowered by a channel load,
-/// and by nothing else — so a resync (a `files` write in another window, a
-/// teammate joining a huddle, any plane op at all) replaced the window with
-/// `load_chat_data`'s LATEST page and left the amber "Viewing history" banner
-/// up over the live tail, with a "Jump to latest" that reloads the channel the
-/// reader is already at the end of. Same after a create.
-#[test]
-fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
-    let (mut app, _) = Ducktape::boot();
-    app.loading = false;
-    app.active_channel = "general".into();
-    let _ = app.update(AppMessage::OpenChatSearchHit("general".into(), 7));
-    assert!(app.history_view);
-
-    // a resync carrying no chat news leaves the window — and its banner — alone
-    let _ = app.update(AppMessage::LiveResynced(backend::LiveRefresh {
-        chat_loaded: false,
-        ..live_refresh(app.hydration_generation, "general")
-    }));
-    assert!(
-        app.history_view,
-        "a plane-only resync did not touch the timeline, so the window stands"
-    );
-
-    // one that carries chat replaced it with the latest page
-    let _ = app.update(AppMessage::LiveResynced(live_refresh(
-        app.hydration_generation,
-        "general",
-    )));
-    assert!(
-        !app.history_view,
-        "the rows on screen are the tail now — the banner is a lie about them"
-    );
-
-    // and a create lands you in a brand-new room, which has no history at all
-    let _ = app.update(AppMessage::OpenChatSearchHit("general".into(), 7));
-    assert!(app.history_view);
-    let _ = app.update(AppMessage::ChooseChannel("brand-new".into()));
-    assert!(!app.history_view);
 }
 
 /// A PLANE'S OP REFETCHES THAT PLANE AND NO OTHER.

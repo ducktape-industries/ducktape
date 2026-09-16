@@ -202,9 +202,6 @@ impl Ducktape {
             AppMessage::LiveAgentsEvent(next) => self.on_live_agents_event(next),
             AppMessage::CopyMessageLink(link) => self.on_copy_message_link(link),
             AppMessage::OpenMessageLink(url) => self.on_open_message_link(url),
-            AppMessage::ChatScrolled(_absolute_x, _absolute_y, _relative_x, relative_y) => {
-                self.on_chat_scrolled(_absolute_x, _absolute_y, _relative_x, relative_y)
-            }
             AppMessage::CopyChordPressed(event) => self.on_copy_chord_pressed(event),
             AppMessage::ChatViewEvent(event) => self.on_chat_view_event(event),
             AppMessage::PagesViewEvent(event) => self.on_pages_view_event(event),
@@ -680,14 +677,12 @@ impl Ducktape {
         self.loading = true;
         self.connected = false;
         self.channels = Vec::new();
-        self.chat_at_tail = true;
         self.chat_land_seq = 0;
         self.chat_pending_sends = Vec::new();
         self.chat_edit_seq = 0;
         self.chat_edit_rev = 0;
         self.active_channel = "".to_owned();
         self.chat_dm_peer.clear();
-        self.history_view = false;
         self.active_channel_name = "".to_owned();
         self.active_channel_archived = false;
         self.active_channel_members_only = false;
@@ -755,8 +750,6 @@ impl Ducktape {
         self.block_height = next.height;
         self.channels = next.channels.clone();
         self.chat_chain_id = self.network_chain_id.to_owned();
-        self.history_view = false;
-        self.chat_at_tail = true;
         self.chat_land_seq = 0;
         self.active_channel = next.active_channel.to_owned();
         self.active_channel_name = next.active_channel_name.to_owned();
@@ -1289,7 +1282,6 @@ impl Ducktape {
             &self.network_chain_id,
             &self.chat_chain_id,
         );
-        self.history_view = self.history_view && (!next.chat_loaded);
         self.chat_land_seq = crate::backend::keep_i64(next.chat_loaded, 0, self.chat_land_seq);
         self.active_channel = crate::backend::keep_str(
             next.chat_loaded,
@@ -3191,8 +3183,6 @@ impl Ducktape {
         self.active_channel_name = next_channel.name.to_owned();
         self.active_channel_archived = next_channel.archived;
         self.active_channel_members_only = next_channel.members_only;
-        self.history_view = true;
-        self.chat_at_tail = false;
         self.channel_members = Vec::new();
         let post_gate_known = !self.active_channel_members_only;
         self.post_refusal = crate::backend::keep_str(
@@ -3254,8 +3244,6 @@ impl Ducktape {
             return Task::none();
         }
         self.chat_dm_peer.clear();
-        self.history_view = false;
-        self.chat_at_tail = true;
         self.chat_land_seq = 0;
         let next_channel = crate::backend::channel_switch_facts(
             self.channels.clone(),
@@ -3475,7 +3463,6 @@ impl Ducktape {
             next.channels.clone(),
         );
         let landed_elsewhere = self.active_channel != next.active_channel;
-        self.history_view = self.history_view && (!landed_elsewhere);
         self.chat_land_seq = crate::backend::keep_i64(landed_elsewhere, 0, self.chat_land_seq);
         self.active_channel = next.active_channel.to_owned();
         self.active_channel_name = next.active_channel_name.to_owned();
@@ -3707,17 +3694,6 @@ impl Ducktape {
             }
         }
     }
-    fn on_chat_scrolled(
-        &mut self,
-        _absolute_x: f64,
-        _absolute_y: f64,
-        _relative_x: f64,
-        relative_y: f64,
-    ) -> Task<AppMessage> {
-        self.chat_at_tail = crate::backend::near_scroll_tail(relative_y);
-        self.history_view = (!self.chat_at_tail) || (self.chat_land_seq > 0);
-        Task::none()
-    }
     fn on_copy_chord_pressed(&mut self, event: crate::shell::KeyPress) -> Task<AppMessage> {
         if !crate::backend::is_copy_chord(event.key.clone(), event.modifiers) {
             return Task::none();
@@ -3750,20 +3726,6 @@ impl Ducktape {
             ChatIntent::JoinVoice => Task::done(AppMessage::JoinVoice(
                 crate::module_view::event_text(&(event), "id"),
             )),
-            ChatIntent::Scrolled => {
-                let absolute_y = crate::module_view::event_num(&(event), "absolute_y");
-                let relative_x = crate::module_view::event_num(&(event), "relative_x");
-                let relative_y = crate::module_view::event_num(&(event), "relative_y");
-                let pointer_absolute_y = absolute_y;
-                let pointer_relative_x = relative_x;
-                let pointer_relative_y = relative_y;
-                Task::done(AppMessage::ChatScrolled(
-                    crate::module_view::event_num(&(event), "absolute_x"),
-                    pointer_absolute_y,
-                    pointer_relative_x,
-                    pointer_relative_y,
-                ))
-            }
             ChatIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
                 crate::module_view::event_text(&(event), "url"),
             )),
@@ -4644,14 +4606,12 @@ impl Ducktape {
         self.hydration_retry_attempt = 0;
         self.mutation_phase = MutationPhase::Idle;
         self.channels = Vec::new();
-        self.chat_at_tail = true;
         self.chat_land_seq = 0;
         self.chat_pending_sends = Vec::new();
         self.chat_edit_seq = 0;
         self.chat_edit_rev = 0;
         self.active_channel = "".to_owned();
         self.chat_dm_peer.clear();
-        self.history_view = false;
         self.active_channel_name = "".to_owned();
         self.active_channel_archived = false;
         self.active_channel_members_only = false;

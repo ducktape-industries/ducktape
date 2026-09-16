@@ -137,20 +137,6 @@ pub fn channel_switch_facts(
     }
 }
 
-/// Is the reader AT the live tail — the other end of the same offset.
-///
-/// 0.0 is the end the stream is anchored to, so a small band around it counts
-/// as "now": the last row is on screen and the next arrival scrolls itself into
-/// view.
-///
-/// An undefined relative offset (`0/0` when content fits) must read as AT
-/// THE TAIL — a conversation too short to scroll is entirely on screen — and NaN
-/// compares false against everything, so the band is written as the comparison
-/// that must SUCCEED to be at the tail, with NaN taken by the explicit arm.
-pub fn near_scroll_tail(relative_offset: f64) -> bool {
-    relative_offset.is_nan() || relative_offset <= 0.02
-}
-
 /// THE COMPOSER'S INSTANCE KEY (ducktape-ui#697). One retained
 /// `ChatComposer` per room, so a draft never rides a room switch — and the
 /// ENDPOINT is in the key because a channel id is a user-chosen string:

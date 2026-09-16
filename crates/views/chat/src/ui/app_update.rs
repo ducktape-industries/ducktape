@@ -1033,13 +1033,12 @@ impl super::ChatView {
     }
     fn on_chat_scrolled(
         &mut self,
-        absolute_x: f64,
-        absolute_y: f64,
-        relative_x: f64,
+        _absolute_x: f64,
+        _absolute_y: f64,
+        _relative_x: f64,
         relative_y: f64,
     ) -> ducktape_view_guest::Task<Message> {
         self.at_live_tail = crate::host::near_scroll_tail(relative_y);
-        self.sent = crate::host::send_scrolled(absolute_x, absolute_y, relative_x, relative_y);
         if (((((!crate::host::near_scroll_top(relative_y)) || self.history_loading)
             || self.loading)
             || self.busy)

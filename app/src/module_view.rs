@@ -175,13 +175,6 @@ pub fn event_int(event: &ModuleViewEvent, field: &str) -> i64 {
         .unwrap_or_default()
 }
 
-/// The number under `field` in an intent's JSON detail; 0 when absent.
-pub fn event_num(event: &ModuleViewEvent, field: &str) -> f64 {
-    detail(event)
-        .and_then(|detail| detail.get(field).and_then(serde_json::Value::as_f64))
-        .unwrap_or_default()
-}
-
 // ---------- the node seat ----------
 
 /// The Node tab, drawn by the `node` view over the KERNEL CONTRACT: the app
@@ -644,7 +637,6 @@ pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
         "leave_huddle" => Intent::LeaveHuddle,
         "join_huddle" => Intent::JoinHuddle,
         "join_voice" => Intent::JoinVoice,
-        "scrolled" => Intent::Scrolled,
         "open_link" => Intent::OpenLink,
         "copy" => Intent::Copy,
         "copy_link" => Intent::CopyLink,
@@ -741,7 +733,6 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "leave_huddle",
             "join_huddle",
             "join_voice",
-            "scrolled",
             "open_link",
             "copy",
             "copy_link",
@@ -3668,7 +3659,8 @@ pub(crate) mod tests {
         // the agents view signs its own pause and save through `op.submit`
         assert_eq!(intents_of("agents"), ["open_run", "open_link"]);
         let chat = intents_of("chat");
-        assert_eq!(chat.len(), 11);
+        assert_eq!(chat.len(), 10);
+        assert!(!chat.contains(&"scrolled"), "scrolling belongs to the view");
         // the writes the view signs for itself are nobody's intent
         for signed in ["react", "edit", "delete", "rename", "search", "mark_read"] {
             assert!(!chat.contains(&signed), "{signed} is an op.submit now");

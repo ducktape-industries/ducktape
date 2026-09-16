@@ -2182,15 +2182,6 @@ pub struct Channel {
     pub id: String,
 }
 
-/// `chat.scrolled` — the stream's offsets, relative to its end anchor.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Scrolled {
-    pub absolute_x: f64,
-    pub absolute_y: f64,
-    pub relative_x: f64,
-    pub relative_y: f64,
-}
-
 /// `chat.open_link` — a pressed link.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Url {
@@ -2269,18 +2260,6 @@ pub fn send_join_huddle() -> bool {
 /// huddle without changing the room on screen.
 pub fn send_join_voice(id: &str) -> bool {
     notify("chat.join_voice", &Channel { id: id.into() })
-}
-
-pub fn send_scrolled(absolute_x: f64, absolute_y: f64, relative_x: f64, relative_y: f64) -> bool {
-    notify(
-        "chat.scrolled",
-        &Scrolled {
-            absolute_x,
-            absolute_y,
-            relative_x,
-            relative_y,
-        },
-    )
 }
 
 pub fn send_open_link(url: &str) -> bool {
