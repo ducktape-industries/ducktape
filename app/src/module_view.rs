@@ -776,35 +776,69 @@ pub fn registered_view(
     module_view(module, serde_json::to_vec(&props).expect("props encode"))
 }
 
-/// Which module holds each claimed chord. Global, because the claim is:
-/// two seats answering to one chord would make the key mean whichever guest
-/// the shell reached first that frame.
-fn chord_claims() -> &'static Mutex<std::collections::BTreeMap<String, &'static str>> {
-    static CLAIMS: OnceLock<Mutex<std::collections::BTreeMap<String, &'static str>>> =
-        OnceLock::new();
+/// Which module holds each claimed chord, and how many live subscriptions
+/// hold it. Global, because the claim is: two seats answering to one chord
+/// would make the key mean whichever guest the shell reached first that
+/// frame.
+///
+/// The COUNT is what lets a chord move. A claim is made per subscription and
+/// given back per subscription — including the ones a torn-down guest still
+/// had — so a swap, in which the replacement claims before the instance it
+/// replaces is dropped, leaves the holder standing rather than releasing the
+/// key out from under the view that just took it.
+type ChordClaims = std::collections::BTreeMap<String, (&'static str, usize)>;
+
+fn chord_claims() -> &'static Mutex<ChordClaims> {
+    static CLAIMS: OnceLock<Mutex<ChordClaims>> = OnceLock::new();
     CLAIMS.get_or_init(Mutex::default)
 }
 
 /// Claim `chord` for `module`, or name the module that already holds it.
 ///
-/// FIRST COME HOLDS IT, and a module re-claiming its own is the same claim:
-/// a swap installs a new instance of the same id, and a view must not lose
-/// its chord by being replaced with itself.
+/// FIRST COME HOLDS IT, and a module re-claiming its own is another claim on
+/// the same key: a swap installs a new instance of the same id, and a view
+/// must not lose its chord by being replaced with itself.
 pub(crate) fn claim_chord(chord: &str, module: &'static str) -> Result<(), &'static str> {
     let mut claims = chord_claims().lock().expect("chord claims");
-    match claims.get(chord) {
-        Some(holder) if *holder != module => Err(holder),
-        _ => {
-            claims.insert(chord.to_owned(), module);
+    match claims.get_mut(chord) {
+        Some((holder, _)) if *holder != module => Err(holder),
+        Some((_, held)) => {
+            *held += 1;
             Ok(())
         }
+        None => {
+            claims.insert(chord.to_owned(), (module, 1));
+            Ok(())
+        }
+    }
+}
+
+/// Give one claim on `chord` back. The key is free again once the last one
+/// is given back — a chord nothing is listening for is a chord the next view
+/// may have, and a claim that outlived its guest would make the key
+/// unclaimable until the app restarted.
+pub(crate) fn release_chord(chord: &str, module: &'static str) {
+    let mut claims = chord_claims().lock().expect("chord claims");
+    let Some((holder, held)) = claims.get_mut(chord) else {
+        return;
+    };
+    if *holder != module {
+        return;
+    }
+    *held -= 1;
+    if *held == 0 {
+        claims.remove(chord);
     }
 }
 
 /// The module that holds `chord`, if any — what the shell asks before it
 /// carries a press to a seat.
 pub(crate) fn chord_holder(chord: &str) -> Option<&'static str> {
-    chord_claims().lock().expect("chord claims").get(chord).copied()
+    chord_claims()
+        .lock()
+        .expect("chord claims")
+        .get(chord)
+        .map(|(holder, _)| *holder)
 }
 
 /// The ids the connected node's registry lists as `Kind::View` entries, in
@@ -2182,6 +2216,19 @@ fn arm(store: &mut Store<HostState>) {
     let _ = store.set_fuel(FUEL_PER_TICK);
 }
 
+/// EVERY CHORD LEAVES WITH THE GUEST. The claim table is global and outlives
+/// any one instance, so an instance that is retired, replaced, or ended by a
+/// trap and kept its chords would make them unclaimable until the app
+/// restarted — including by the view that takes its seat. This is the one
+/// place that covers all three, because all three end with the box dropped.
+impl Drop for Guest {
+    fn drop(&mut self) {
+        for (_, chord) in &self.chords {
+            release_chord(chord, self.module);
+        }
+    }
+}
+
 impl Guest {
     /// Reusing identical code still retires work started on the old connection.
     fn reconnect(&mut self, revision: u64) {
@@ -2850,7 +2897,18 @@ impl Guest {
             // subscription the view abandoned
             self.tasks.retain(|(task, _)| *task != id);
             self.clocks.retain(|clock| clock.id != id);
-            self.chords.retain(|(chord, _)| *chord != id);
+            // a chord is given back with the subscription its presses were
+            // arriving on, or the next view could never claim it
+            let dropped: Vec<String> = self
+                .chords
+                .iter()
+                .filter(|(subscription, _)| *subscription == id)
+                .map(|(_, chord)| chord.clone())
+                .collect();
+            self.chords.retain(|(subscription, _)| *subscription != id);
+            for chord in dropped {
+                release_chord(&chord, self.module);
+            }
             self.sessions.remove(&id);
             if let Some(session) = self.session.as_mut() {
                 session.media.cancel(id);
@@ -3768,6 +3826,90 @@ pub(crate) mod tests {
         });
         assert_eq!(retained.entries.len(), 1);
         assert_eq!(retained.entries[0].hash, [99; 32]);
+    }
+
+    /// A CHORD CAN MOVE, or the first view to claim one would own it for the
+    /// life of the process — and a swap moving a chord from one module to
+    /// another is the whole point of a chord being a view's to declare. The
+    /// claim is per subscription and given back per subscription, which is
+    /// also what keeps a swap safe: the replacement claims before the
+    /// instance it replaces is dropped, and the key must not go free in
+    /// between.
+    #[test]
+    fn a_chord_moves_on_once_every_claim_on_it_is_given_back() {
+        // This test's own key: the table is global and keyed by the chord,
+        // so a shared name would be a race with every other test.
+        let chord = "cmd-alt-f7";
+        assert_eq!(claim_chord(chord, "chat"), Ok(()));
+        assert_eq!(claim_chord(chord, "pages"), Err("chat"));
+        // a swap: the fresh instance of the same id claims while the one it
+        // replaces still holds, and dropping that one leaves the key held
+        assert_eq!(claim_chord(chord, "chat"), Ok(()));
+        release_chord(chord, "chat");
+        assert_eq!(chord_holder(chord), Some("chat"));
+        // and a module that never held it cannot give it away
+        release_chord(chord, "pages");
+        assert_eq!(chord_holder(chord), Some("chat"));
+        release_chord(chord, "chat");
+        assert_eq!(chord_holder(chord), None);
+        assert_eq!(claim_chord(chord, "pages"), Ok(()));
+        assert_eq!(chord_holder(chord), Some("pages"));
+        release_chord(chord, "pages");
+    }
+
+    /// The same, driven through the kernel and a real guest: a chord a view
+    /// claimed is refused to the next one WHILE it is seated, and is the next
+    /// one's the moment that guest ends. Retired, replaced, trapped — all
+    /// three end with the box dropped, which is where the claim goes back.
+    #[test]
+    fn a_chord_is_the_next_views_once_the_guest_holding_it_ends() {
+        let (Some(first), Some(second)) = (staged("members"), staged("node")) else {
+            return;
+        };
+        let _turn = blocking_connection_turn();
+        let chord = "cmd-shift-f8";
+        // The refusal the kernel gave for `id`, or None if it took the claim.
+        let refusal = |guest: &mut Guest, id: u64| {
+            guest.replies.wait_idle();
+            guest
+                .replies
+                .drain_into(&mut guest.pending)
+                .expect("bounded replies");
+            guest.pending.drain(..).find_map(|event| match event {
+                wire::Event::Response { id: at, result, .. } if at == id => result.err(),
+                _ => None,
+            })
+        };
+
+        let mut members = Guest::load_from("members", &first).expect("the view loads");
+        assert!(kernel::answer(
+            &mut members,
+            "host",
+            "chord",
+            7,
+            chord.as_bytes()
+        ));
+        assert_eq!(refusal(&mut members, 7), None);
+        assert_eq!(chord_holder(chord), Some("members"));
+
+        // A second seat asking is refused BY NAME, so a swap that wanted a
+        // taken chord says so instead of going quiet.
+        let mut node = Guest::load_from("node", &second).expect("the view loads");
+        assert!(kernel::answer(&mut node, "host", "chord", 7, chord.as_bytes()));
+        assert_eq!(
+            refusal(&mut node, 7).as_deref(),
+            Some("`cmd-shift-f8` is already members's")
+        );
+        assert!(!node.chord_pressed(chord), "a refused claim hears nothing");
+
+        drop(members);
+        assert_eq!(chord_holder(chord), None, "the key went with the guest");
+        assert!(kernel::answer(&mut node, "host", "chord", 8, chord.as_bytes()));
+        assert_eq!(refusal(&mut node, 8), None);
+        assert_eq!(chord_holder(chord), Some("node"));
+        assert!(node.chord_pressed(chord), "the press reaches the new holder");
+        drop(node);
+        assert_eq!(chord_holder(chord), None);
     }
 
     /// Only the operations a module declares reach the app; the props
