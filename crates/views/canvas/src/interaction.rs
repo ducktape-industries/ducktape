@@ -1506,15 +1506,8 @@ impl BoardsView {
         if !still_editing {
             return Task::none();
         }
-        let Err(error) = result else {
+        if result.is_ok() {
             return Task::none();
-        };
-        // Native layout and document hydration can replace the requesting frame.
-        // Reissue against the current frame only while the same editor is open;
-        // the host still enforces its original frame-scoped capability check.
-        let replaced_frame = error == "widget request belongs to a replaced frame";
-        if replaced_frame {
-            return self.focus_text();
         }
         self.error = "Could not focus the text editor. Click inside the card to continue.".into();
         Task::none()

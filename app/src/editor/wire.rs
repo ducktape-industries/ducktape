@@ -203,6 +203,18 @@ impl EditorStore {
             editable: field.editable, pending: !document.queue.is_empty(), fault: store.fault.clone() })
     }
 
+    /// A toolbar press on an editor. It is not an edit: only the guest knows
+    /// what its tag means, so it reaches the field's binding as an
+    /// interaction and the decision comes back the way a key's does.
+    pub(crate) fn act(&self, key: &str, tag: String) {
+        self.request(
+            key,
+            wire::EditorRequestInput::Interaction {
+                action: wire::editor_presentation::EditorInteraction::Action { tag },
+            },
+        );
+    }
+
     fn request(&self, key: &str, input: wire::EditorRequestInput) {
         let mut store = self.lock();
         store.enqueue(key, Input::Request(input));
@@ -757,6 +769,62 @@ mod rich_tests {
             }),
         }
     }
+    /// PRESSING Send must send. A composer's toolbar is buttons the view
+    /// draws beside a PLAIN editor, and the press reaches the host as an
+    /// `EditorAction` naming a tag. Only the guest knows what the tag means,
+    /// so it has to arrive at the field's binding as an interaction on that
+    /// document — the shape whose decision comes back as a commit the view
+    /// reads its tag off. A native editor swallowing it is a dead button.
+    #[gpui_kit::test]
+    fn a_toolbar_action_reaches_the_binding_as_an_interaction(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        cx.update(gpui_kit::init);
+        cx.update(init_notion);
+        let key = "unrelated-product/editor";
+        let mut root = node(1);
+        let wire::Node::Editor { options, .. } = &mut root else {
+            unreachable!()
+        };
+        // the composer's own shape: a plain field, formatting is markdown
+        options.rich = None;
+        let store = EditorStore::new(41);
+        store.replace(&root).unwrap();
+        store.lock().documents.get_mut("draft").unwrap().text = Some(Arc::from("draft"));
+        let window = cx.open_window(gpui::size(gpui::px(400.), gpui::px(300.)), |_, cx| {
+            let mut tree = crate::view_tree::ViewTree::new(root.clone());
+            tree.set_editor_store(store.clone(), cx);
+            tree
+        });
+        let tree = window.root(cx).unwrap();
+        let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        native.update(|window, cx| {
+            window.render_frame(cx);
+            tree.update(cx, |tree, cx| {
+                tree.execute_widget_command(
+                    wire::WidgetCommand::EditorAction {
+                        target: key.into(),
+                        tag: "send".into(),
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .expect("the mounted editor takes the action");
+        });
+        let sent = store.drain().into_iter().any(|event| {
+            matches!(event, wire::Event::EditorRequest { request, .. }
+                if matches!(&request.input, wire::EditorRequestInput::Interaction {
+                    action: wire::editor_presentation::EditorInteraction::Action { tag },
+                } if tag == "send"))
+        });
+        assert!(
+            sent,
+            "the press must reach the binding as a `send` interaction"
+        );
+    }
+
     fn seeded(instance: u64) -> EditorStore {
         let store = EditorStore::new(instance);
         store.replace(&node(1)).unwrap();

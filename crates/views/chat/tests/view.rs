@@ -649,6 +649,74 @@ fn a_send_in_flight_paints_its_row_before_the_block() {
     });
 }
 
+/// PRESSING Send must send. The button routes through the editor — the guest
+/// enqueues an `EditorAction` at the composer's editor and the commit that
+/// comes back carries the send — so a press that leaves no command behind is
+/// a Send that does nothing while Enter still works.
+#[test]
+fn pressing_send_enqueues_the_editor_action_that_sends() {
+    on_a_deep_stack(|| {
+        let (frame, _) = connected_room();
+        let frame = tick_native(composer_commit(&frame, Some("pressed, not typed"), None));
+        let frame = tick_native(press(&frame, "Send"));
+        let commands = widget_commands(&frame);
+        let sends: Vec<_> = commands
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    ducktape_view_guest::wire::WidgetCommand::EditorAction { tag, .. }
+                        if tag == "send"
+                )
+            })
+            .collect();
+        assert_eq!(
+            sends.len(),
+            1,
+            "the press must enqueue one send at the composer's editor: {commands:?}"
+        );
+        let ducktape_view_guest::wire::WidgetCommand::EditorAction { target, .. } = sends[0] else {
+            unreachable!()
+        };
+        let Node::Editor { key, .. } = node_ending(&frame, "/composer/editor") else {
+            panic!("composer editor");
+        };
+        assert_eq!(
+            target, key,
+            "the action must name the editor the composer mounted"
+        );
+    });
+}
+
+/// Message after message: typing the next one must leave Send pressable. The
+/// owner hit a composer whose Send went dead after a few messages in a row.
+#[test]
+fn send_stays_live_message_after_message() {
+    on_a_deep_stack(|| {
+        let (mut frame, _) = connected_room();
+        for n in 0..12u32 {
+            frame = tick_native(composer_commit(&frame, Some(&format!("m{n}")), None));
+            let Node::Button { on_press, .. } = node_ending(&frame, "/composer/send") else {
+                panic!("send button");
+            };
+            assert!(
+                on_press.is_some(),
+                "Send went dead with message {n} typed: {:?}",
+                texts(&frame)
+            );
+            frame = tick_native(composer_commit(&frame, None, Some("send")));
+            let mint = request(&frame, "host.id").id;
+            frame = tick_native(vec![answer(mint, format!("op-{n}").as_bytes())]);
+            let submit = request(&frame, "op.submit").id;
+            frame = tick_native(vec![ducktape_view_guest::wire::Event::Response {
+                id: submit,
+                result: Ok(Vec::new()),
+                done: true,
+            }]);
+        }
+    });
+}
+
 #[test]
 fn attachment_upload_uses_file_grants_and_posts_a_guest_built_link() {
     on_a_deep_stack(|| {
