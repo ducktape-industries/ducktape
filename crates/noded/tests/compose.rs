@@ -23,7 +23,19 @@ fn fixtures() -> PathBuf {
 /// one `SnapshotSource` call's future.
 type SnapshotFut<'a> = BoxFut<'a, Result<Option<(Vec<u8>, StateRoot)>, String>>;
 
-const SELECTION: &[&str] = &["kv", "valset", "acl", "governance", "modules", "runs"];
+/// `directory` is the MAP tenant here, and the only one: the reopen half of
+/// [`composes_only_wasm_over_injected_stores`] proves a map installs its
+/// snapshot while a store is never asked, so the selection needs one of each
+/// and every other id below is store-backed.
+const SELECTION: &[&str] = &[
+    "kv",
+    "valset",
+    "acl",
+    "governance",
+    "modules",
+    "runs",
+    "directory",
+];
 
 const BINDINGS: Bindings<'static> = Bindings {
     invite: b"t",
@@ -100,11 +112,11 @@ fn composes_only_wasm_over_injected_stores() {
             let genesis_root = genesis.root_hash();
             let (captured, _) =
                 genesis.capture_current_snapshot(0, CapturePayloads::All, || Duration::ZERO);
-            let runs = captured.module("runs").expect("runs composed");
-            let StateSyncHandle::SnapshotBytes(runs_snapshot) = runs.state_sync.clone() else {
+            let map = captured.module("directory").expect("directory composed");
+            let StateSyncHandle::SnapshotBytes(map_snapshot) = map.state_sync.clone() else {
                 panic!("a map tenant syncs by snapshot bytes");
             };
-            let runs_root = runs.root;
+            let map_root = map.root;
             drop(genesis);
 
             // ---- reopen the same stores at block zero: the wasm set comes off
@@ -116,9 +128,9 @@ fn composes_only_wasm_over_injected_stores() {
                     Backing::Store,
                     "a store-backed module is never asked"
                 );
-                let bytes = runs_snapshot.clone();
-                let is_runs = id == "runs";
-                Box::pin(async move { Ok(is_runs.then_some((bytes, runs_root))) })
+                let bytes = map_snapshot.clone();
+                let is_map = id == "directory";
+                Box::pin(async move { Ok(is_map.then_some((bytes, map_root))) })
             };
             let reopened = compose(
                 &code,
