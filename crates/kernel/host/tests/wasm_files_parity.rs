@@ -765,16 +765,18 @@ fn project_workload_succeeds_with_production_guest_limits() {
 // CASE 13: the per-op object-read consensus cap — ONE BOUND, BOTH RUNTIMES
 // ============================================================================
 
-/// one commit of `count` distinct inline documents of `body` bytes each, under
-/// one directory, base=None. each distinct body stages a chunk and a fileobj —
-/// two distinct `object-stat` probes — and the rewritten trees are staged, not
-/// probed, so the op charges EXACTLY `2 * count` against the cap.
-fn import_of(count: usize, body: usize) -> Msg {
+/// one commit of `count` distinct inline documents of `body` bytes each, into a
+/// directory of its own (so no row can collide with another row's paths and
+/// refuse on the per-path CAS instead of the budget under test), base=None.
+/// each distinct body stages a chunk and a fileobj — two distinct `object-stat`
+/// probes — and the rewritten trees are staged, not probed, so the op charges
+/// EXACTLY `2 * count` against the cap.
+fn import_of(dir: &str, count: usize, body: usize) -> Msg {
     let changes = (0..count)
         .map(|index| {
             let mut bytes = format!("document {index:06}\n").into_bytes();
             bytes.resize(body, b'x');
-            put_inline(&format!("/shared/docs/{index:06}.txt"), &bytes)
+            put_inline(&format!("/shared/{dir}/{index:06}.txt"), &bytes)
         })
         .collect();
     commit_op(None, "import", changes)
@@ -797,12 +799,10 @@ fn import_of(count: usize, body: usize) -> Msg {
 /// [`MAX_INLINE_COMMIT_BYTES`] exactly. it sits on both ceilings at once.
 ///
 /// the reject rows climb from one read over the cap to 16x it — the band where
-/// native used to accept alone — and assert the rejection is mutual and moves
-/// nothing. the guest's own fuel is a SECOND ceiling out there (a commit 16x
-/// over the cap can burn its budget re-treading the doomed prefix before the
-/// core charges the read that refuses it), so the shared `object-read budget`
-/// reason is pinned where the core is what speaks, and agreement + an unmoved
-/// root is the claim everywhere.
+/// native used to accept alone. all of them are refused by both runtimes with
+/// the SAME reason and leave both roots exactly where the accepted commit left
+/// them: the core charges a read BEFORE issuing it, so even the 16x row is
+/// refused on the read that breaches the cap rather than out of fuel much later.
 #[test]
 fn object_read_cap_is_one_bound_on_both_runtimes() {
     let at_cap = MAX_OBJECT_READS_PER_OP / 2;
@@ -816,7 +816,7 @@ fn object_read_cap_is_one_bound_on_both_runtimes() {
     assert_eq!(genesis, all_roots(&wasm), "genesis roots diverge");
 
     // [accept] exactly the cap, with the inline budget spent too.
-    let at_cap_op = import_of(at_cap, saturating_body);
+    let at_cap_op = import_of("at-cap", at_cap, saturating_body);
     block_on(native.submit_at(block(1, Origin::System), at_cap_op.clone()))
         .expect("native commits the whole object-read budget");
     block_on(wasm.submit_at(block(1, Origin::System), at_cap_op))
@@ -834,16 +834,13 @@ fn object_read_cap_is_one_bound_on_both_runtimes() {
         let height = index as u64 + 2;
         // 64-byte bodies keep even the 16x row inside MAX_INLINE_COMMIT_BYTES,
         // so the object-read cap is the bound under test, not the inline budget.
-        let op = import_of(count, 64);
+        let op = import_of(&format!("over-cap-{count}"), count, 64);
         let native_err = block_on(native.submit_at(block(height, Origin::System), op.clone()))
             .expect_err("native rejects past the object-read cap");
         let wasm_err = block_on(wasm.submit_at(block(height, Origin::System), op))
             .expect_err("wasm rejects past the object-read cap");
         assert_module_reject("native", height, &native_err, "object-read budget");
-        let over_by_one = count == at_cap + 1;
-        if over_by_one {
-            assert_module_reject("wasm", height, &wasm_err, "object-read budget");
-        }
+        assert_module_reject("wasm", height, &wasm_err, "object-read budget");
         assert_eq!(
             all_roots(&native),
             committed,
