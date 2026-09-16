@@ -178,13 +178,6 @@ pub enum StreamOriginKind {
 /// One connected module-event session. Reconnect policy belongs to the caller.
 pub type ModuleEventStream = futures::stream::BoxStream<'static, Result<ModuleEvent>>;
 
-/// One log-ring line from the `logs` topic, with its resume cursor.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogLine {
-    pub cursor: String,
-    pub line: String,
-}
-
 /// Route one server frame for a single snapshot topic: the document, a
 /// failure, or `None` for a frame this subscription does not consume.
 ///
@@ -699,76 +692,6 @@ impl Client {
         decode_json(response).await
     }
 
-    /// Subscribe the node's log ring (`logs` topic): each item is one log
-    /// line with its resume cursor. Reconnect policy belongs to the caller.
-    pub async fn log_events(
-        &self,
-        resume: Option<String>,
-    ) -> Result<futures::stream::BoxStream<'static, Result<LogLine>>> {
-        let mut cursors = BTreeMap::new();
-        if let Some(cursor) = resume {
-            cursors.insert("logs".to_string(), cursor);
-        }
-        let subscribe = serde_json::to_string(&SubscribeRequest {
-            op: "subscribe",
-            topics: vec!["logs".to_string()],
-            resume: cursors,
-        })
-        .map_err(|error| Error::new(format!("could not encode log subscription: {error}")))?;
-        let url = self.stream_url()?;
-        let (mut socket, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(&url))
-            .await
-            .map_err(|_| Error::new("RPC stream connection timed out"))?
-            .map_err(|error| Error::new(format!("RPC stream connection failed: {error}")))?;
-        tokio::time::timeout(TIMEOUT, socket.send(Message::Text(subscribe)))
-            .await
-            .map_err(|_| Error::new("RPC stream subscription timed out"))?
-            .map_err(|error| Error::new(format!("RPC stream subscription failed: {error}")))?;
-        let stream = futures::stream::unfold(Some(socket), move |socket| async move {
-            let mut socket = socket?;
-            loop {
-                let message = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, socket.next()).await {
-                    Ok(Some(message)) => message,
-                    Ok(None) => return Some((Err(Error::new("RPC stream closed")), None)),
-                    Err(_) => {
-                        return Some((Err(Error::new("RPC stream heartbeat timed out")), None));
-                    }
-                };
-                let Ok(Message::Text(text)) = message else {
-                    if matches!(message, Ok(Message::Close(_)) | Err(_)) {
-                        return Some((Err(Error::new("RPC stream closed")), None));
-                    }
-                    continue;
-                };
-                #[derive(Deserialize)]
-                #[serde(tag = "type", rename_all = "snake_case")]
-                enum LogFrame {
-                    Subscribed {},
-                    Tail {
-                        cursor: String,
-                        item: serde_json::Value,
-                    },
-                    Heartbeat,
-                    #[serde(other)]
-                    Other,
-                }
-                match serde_json::from_str::<LogFrame>(&text) {
-                    Ok(LogFrame::Tail { cursor, item }) => {
-                        let line = item["line"].as_str().unwrap_or_default().to_string();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        return Some((Ok(LogLine { cursor, line }), Some(socket)));
-                    }
-                    Ok(_) => continue,
-                    Err(_) => continue,
-                }
-            }
-        })
-        .boxed();
-        Ok(stream)
-    }
-
     /// Subscribe ONE snapshot topic on its own socket.
     ///
     /// One topic per socket is what lets the console hold `status` on every tab
@@ -835,14 +758,6 @@ impl Client {
         &self,
     ) -> Result<futures::stream::BoxStream<'static, Result<serde_json::Value>>> {
         self.snapshot_events("status").await
-    }
-
-    /// The direct-peer sample, pushed. EXPENSIVE — every sample encodes the
-    /// node's whole metrics registry — so hold it only while a surface draws it.
-    pub async fn peers_events(
-        &self,
-    ) -> Result<futures::stream::BoxStream<'static, Result<serde_json::Value>>> {
-        self.snapshot_events("peers").await
     }
 
     /// Submit an already-signed operation frame, answering the height of the
