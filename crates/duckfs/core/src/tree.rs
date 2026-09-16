@@ -27,9 +27,11 @@ use crate::store::ObjectStore;
 /// ([`MAX_OBJECT_READS_PER_OP`](crate::MAX_OBJECT_READS_PER_OP)) that makes the
 /// native `Files` module and the wasm files tenant reject the IDENTICAL
 /// oversized commit. it counts each distinct committed object a commit reads on
-/// the execute path that the block-local overlay does NOT answer, mirroring the
-/// wasm kernel's per-dispatch object-plane budget (`wasm_host::MAX_OBJECT_READS`)
-/// EXACTLY, so the two counts never drift:
+/// the execute path that the block-local overlay does NOT answer. it counts what
+/// the wasm kernel's per-dispatch object-plane budget
+/// (`wasm_host::MAX_OBJECT_READS`) counts, EXACTLY, so the two counts never
+/// drift — the cap here is the tighter of the two, because it is the one a guest
+/// dispatch can spend inside its fuel:
 ///
 ///  * `gets` and `stats` are SEPARATE sets, like the kernel's `object_gets` /
 ///    `object_stats` replay memos — a rare id read both ways (only the empty
@@ -48,7 +50,7 @@ use crate::store::ObjectStore;
 /// a read is charged BEFORE it is issued, so when the (cap+1)th distinct read is
 /// reached the core rejects before the underlying `get`/`has` runs — and on the
 /// guest before the WIT `object-get`/`object-stat` is issued, so the kernel's
-/// own budget (equal constant) is never even reached. present only on the
+/// own (looser) budget is never even reached. present only on the
 /// EXECUTE path ([`Fs::commit`](crate::fs::Fs::commit)); the host-side read/query
 /// path builds a [`Store`] with `budget: None` and never charges. `RefCell`
 /// because [`Store::get`] is `&self`.

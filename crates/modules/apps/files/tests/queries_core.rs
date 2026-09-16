@@ -188,14 +188,13 @@ fn head(f: &files::Files) -> String {
 /// commit one bulk fixture: 300 zero-padded inline files under `/shared/bulk/`
 /// plus a sibling `/shared/other`, all in ONE commit (300+1 < the 4096 change
 /// cap), then adopt the block. names are `0000..0299` so string order == numeric.
+/// the bodies are IDENTICAL on purpose: paging is what this fixture feeds, and
+/// one op may read only `MAX_OBJECT_READS_PER_OP` distinct committed objects —
+/// 300 distinct bodies would stage 600 (a chunk and a fileobj each) and be
+/// refused, while 300 copies of one body stage one chunk and one fileobj.
 fn seed_bulk(f: &mut files::Files) {
     let mut changes: Vec<Change> = (0..300)
-        .map(|i| {
-            put_inline(
-                &format!("/shared/bulk/{i:04}"),
-                format!("body-{i}").as_bytes(),
-            )
-        })
+        .map(|i| put_inline(&format!("/shared/bulk/{i:04}"), b"body"))
         .collect();
     changes.push(put_inline("/shared/other", b"other"));
     commit(f, sdk::Origin::System, 1, None, changes).expect("bulk commit");

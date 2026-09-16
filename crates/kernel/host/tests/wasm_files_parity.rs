@@ -639,6 +639,9 @@ fn rejections_match_and_leave_roots_and_odb_unmoved() {
 /// A project-sized workload exercises successful writes and reads with the
 /// production guest fuel and object limits: 128 distinct documents, a 2 MiB
 /// chunked asset, a 32-document edit, historical reads, and durable reopen.
+/// The import spends the whole per-op object-read budget (128 documents × a
+/// chunk and a fileobj each), so the asset rides the next commit — one commit
+/// is one op, and one op gets [`MAX_OBJECT_READS_PER_OP`] committed reads.
 #[test]
 fn project_workload_succeeds_with_production_guest_limits() {
     let dir_n = tempfile::tempdir().unwrap();
@@ -663,19 +666,11 @@ fn project_workload_succeeds_with_production_guest_limits() {
             bytes
         })
         .collect();
-    let mut changes: Vec<_> = documents
+    let changes: Vec<_> = documents
         .iter()
         .enumerate()
         .map(|(index, bytes)| put_inline(&format!("/shared/project/docs/{index:03}.txt"), bytes))
         .collect();
-    changes.push(put_chunks(
-        "/shared/project/asset.bin",
-        2 * CHUNK_SIZE,
-        &chunks
-            .iter()
-            .map(|chunk| chunk_hex(chunk))
-            .collect::<Vec<_>>(),
-    ));
     let operation = commit_op(None, "import project", changes);
     block_on(native.submit_at(block(3, Origin::System), operation.clone())).unwrap();
     block_on(wasm.submit_at(block(3, Origin::System), operation)).unwrap();
@@ -683,13 +678,28 @@ fn project_workload_succeeds_with_production_guest_limits() {
     let snapshot = head(&wasm);
     let operation = commit_op(
         Some(&snapshot),
+        "add the chunked asset",
+        vec![put_chunks(
+            "/shared/project/asset.bin",
+            2 * CHUNK_SIZE,
+            &chunks
+                .iter()
+                .map(|chunk| chunk_hex(chunk))
+                .collect::<Vec<_>>(),
+        )],
+    );
+    block_on(native.submit_at(block(4, Origin::System), operation.clone())).unwrap();
+    block_on(wasm.submit_at(block(4, Origin::System), operation)).unwrap();
+    assert_eq!(all_roots(&native), all_roots(&wasm));
+    let operation = commit_op(
+        Some(&head(&wasm)),
         "edit 32 documents",
         (0..32)
             .map(|index| put_inline(&format!("/shared/project/docs/{index:03}.txt"), b"edited"))
             .collect(),
     );
-    block_on(native.submit_at(block(4, Origin::System), operation.clone())).unwrap();
-    block_on(wasm.submit_at(block(4, Origin::System), operation)).unwrap();
+    block_on(native.submit_at(block(5, Origin::System), operation.clone())).unwrap();
+    block_on(wasm.submit_at(block(5, Origin::System), operation)).unwrap();
     assert_eq!(all_roots(&native), all_roots(&wasm));
     let root = files_root(&wasm);
     drop(wasm);
@@ -752,58 +762,99 @@ fn project_workload_succeeds_with_production_guest_limits() {
 }
 
 // ============================================================================
-// CASE 13: the per-op object-read consensus cap — REJECTED BY BOTH RUNTIMES
+// CASE 13: the per-op object-read consensus cap — ONE BOUND, BOTH RUNTIMES
 // ============================================================================
 
-/// the distinct-object-read cap ([`MAX_OBJECT_READS_PER_OP`]) is a FILES CONSENSUS
-/// RULE single-sourced in `duckfs-core`, so both runtimes reject the identical
-/// oversized commit — closing the sole native↔wasm interchange gap (the wasm
-/// kernel's `MAX_OBJECT_READS` used to bound only the guest, letting native accept
-/// a commit wasm rejected). the cap counts distinct committed-store `object-get`
+/// one commit of `count` distinct inline documents of `body` bytes each, under
+/// one directory, base=None. each distinct body stages a chunk and a fileobj —
+/// two distinct `object-stat` probes — and the rewritten trees are staged, not
+/// probed, so the op charges EXACTLY `2 * count` against the cap.
+fn import_of(count: usize, body: usize) -> Msg {
+    let changes = (0..count)
+        .map(|index| {
+            let mut bytes = format!("document {index:06}\n").into_bytes();
+            bytes.resize(body, b'x');
+            put_inline(&format!("/shared/docs/{index:06}.txt"), &bytes)
+        })
+        .collect();
+    commit_op(None, "import", changes)
+}
+
+/// the distinct-object-read cap ([`MAX_OBJECT_READS_PER_OP`]) is a FILES
+/// CONSENSUS RULE single-sourced in `duckfs-core`, and a cap is only one bound
+/// if it binds in BOTH directions: a commit that spends the whole cap must be
+/// ACCEPTED by both runtimes, and every commit past it REJECTED by both, with
+/// neither root moving. the cap counts distinct committed-store `object-get`
 /// (tree-walk) AND `object-stat` (`stage_object` presence probe) reads in ONE
 /// bound, mirroring the kernel.
 ///
-/// this drives the STAT class at the REAL cap — the cheapest real-4096
-/// A single genesis commit stages more distinct objects than the core permits.
-/// The guest's dispatch fuel is a tighter ceiling for this O(cap²) replay
-/// workload: it must fail explicitly on fuel, while native reaches the object
-/// read limit. Both resource refusals leave the committed roots unchanged.
+/// the accept row is the whole point and the fragile half. the guest spends one
+/// `wasm_host::DEFAULT_FUEL` across one memoized-replay round per unresolved
+/// read, so a cap set above what that fuel admits is not a cap at all — it is a
+/// band in which native accepts what the guest traps on, and nothing below the
+/// band notices. so the accept row is the most expensive commit the other
+/// budgets admit AT the cap: cap/2 documents whose bodies together fill
+/// [`MAX_INLINE_COMMIT_BYTES`] exactly. it sits on both ceilings at once.
+///
+/// the reject rows climb from one read over the cap to 16x it — the band where
+/// native used to accept alone — and assert the rejection is mutual and moves
+/// nothing. the guest's own fuel is a SECOND ceiling out there (a commit 16x
+/// over the cap can burn its budget re-treading the doomed prefix before the
+/// core charges the read that refuses it), so the shared `object-read budget`
+/// reason is pinned where the core is what speaks, and agreement + an unmoved
+/// root is the claim everywhere.
 #[test]
-fn oversized_object_workload_is_rejected_without_advancing_roots() {
+fn object_read_cap_is_one_bound_on_both_runtimes() {
+    let at_cap = MAX_OBJECT_READS_PER_OP / 2;
+    let saturating_body = MAX_INLINE_COMMIT_BYTES / at_cap;
+
     let dir_n = tempfile::tempdir().unwrap();
     let dir_w = tempfile::tempdir().unwrap();
     let mut native = native_host(&dir_n);
     let mut wasm = wasm_host(&dir_w);
-
-    // genesis roots equal + unmoved is the invariant we re-assert after the
-    // rejection: a rejected block leaves the empty refs root untouched on both.
     let genesis = all_roots(&native);
     assert_eq!(genesis, all_roots(&wasm), "genesis roots diverge");
 
-    // one commit, base=None (no tree to walk), staging > cap distinct objects:
-    // each distinct-content inline file stages one chunk + one fileobj, so
-    // `2 * nfiles` distinct object-stat probes accrue against the cap.
-    let nfiles = MAX_OBJECT_READS_PER_OP / 2 + 32;
-    let changes: Vec<Change> = (0..nfiles)
-        .map(|i| put_inline(&format!("/f{i}"), format!("{i}").as_bytes()))
-        .collect();
-    let msg = commit_op(None, "object-read flood", changes);
+    // [accept] exactly the cap, with the inline budget spent too.
+    let at_cap_op = import_of(at_cap, saturating_body);
+    block_on(native.submit_at(block(1, Origin::System), at_cap_op.clone()))
+        .expect("native commits the whole object-read budget");
+    block_on(wasm.submit_at(block(1, Origin::System), at_cap_op))
+        .expect("the guest must REACH the documented cap, not trap on fuel below it");
+    let committed = all_roots(&native);
+    assert_eq!(committed, all_roots(&wasm), "at-cap roots diverge");
+    assert_ne!(committed, genesis, "the at-cap commit must actually land");
 
-    let n_err = block_on(native.submit_at(block(1, Origin::System), msg.clone()))
-        .expect_err("native rejects the over-cap commit");
-    let w_err = block_on(wasm.submit_at(block(1, Origin::System), msg))
-        .expect_err("wasm rejects the over-cap commit");
-    assert_module_reject("native", 1, &n_err, "object-read budget");
-    assert_module_reject("wasm", 1, &w_err, "all fuel consumed");
-
-    // the aborted block moved nothing on either runtime.
-    assert_eq!(all_roots(&native), genesis, "native root moved on reject");
-    assert_eq!(all_roots(&wasm), genesis, "wasm root moved on reject");
-    assert_eq!(
-        all_roots(&native),
-        all_roots(&wasm),
-        "post-reject roots diverge"
-    );
+    // [reject] one read over the cap, then across the band to 16x it. every row
+    // is the same op on both runtimes at the same height.
+    for (index, count) in [at_cap + 1, 2 * at_cap, 4 * at_cap, 8 * at_cap, 16 * at_cap]
+        .into_iter()
+        .enumerate()
+    {
+        let height = index as u64 + 2;
+        // 64-byte bodies keep even the 16x row inside MAX_INLINE_COMMIT_BYTES,
+        // so the object-read cap is the bound under test, not the inline budget.
+        let op = import_of(count, 64);
+        let native_err = block_on(native.submit_at(block(height, Origin::System), op.clone()))
+            .expect_err("native rejects past the object-read cap");
+        let wasm_err = block_on(wasm.submit_at(block(height, Origin::System), op))
+            .expect_err("wasm rejects past the object-read cap");
+        assert_module_reject("native", height, &native_err, "object-read budget");
+        let over_by_one = count == at_cap + 1;
+        if over_by_one {
+            assert_module_reject("wasm", height, &wasm_err, "object-read budget");
+        }
+        assert_eq!(
+            all_roots(&native),
+            committed,
+            "native root moved on reject at {count} documents"
+        );
+        assert_eq!(
+            all_roots(&wasm),
+            committed,
+            "wasm root moved on reject at {count} documents"
+        );
+    }
 }
 
 /// a deterministic module rejection whose reason CONTAINS `needle` — the wasm
@@ -1177,24 +1228,37 @@ fn files_cold_load_warm_dispatch_and_reopen_first_query() {
             staged.elapsed().as_secs_f64() * 1000.0
         );
 
+        // 128 documents is the whole per-op object-read budget (a chunk and a
+        // fileobj each), so the asset rides its own commit.
         let bodies = documents(128, 1024);
-        let mut changes = import_changes(&bodies);
-        changes.push(put_chunks(
-            "/shared/project/asset.bin",
-            2 * CHUNK_SIZE,
-            &chunks.iter().map(|chunk| chunk_hex(chunk)).collect::<Vec<_>>(),
-        ));
         let import = std::time::Instant::now();
-        block_on(wasm.submit_at(block(3, Origin::System), commit_op(None, "import", changes))).unwrap();
+        block_on(wasm.submit_at(
+            block(3, Origin::System),
+            commit_op(None, "import", import_changes(&bodies)),
+        ))
+        .unwrap();
         println!(
-            "commit_import_129\twasm\t{:.1}\trepeat {repeat}",
+            "commit_import_128\twasm\t{:.1}\trepeat {repeat}",
             import.elapsed().as_secs_f64() * 1000.0
         );
+        block_on(wasm.submit_at(
+            block(4, Origin::System),
+            commit_op(
+                Some(&head(&wasm)),
+                "asset",
+                vec![put_chunks(
+                    "/shared/project/asset.bin",
+                    2 * CHUNK_SIZE,
+                    &chunks.iter().map(|chunk| chunk_hex(chunk)).collect::<Vec<_>>(),
+                )],
+            ),
+        ))
+        .unwrap();
 
         let snapshot = head(&wasm);
         let edit = std::time::Instant::now();
         block_on(wasm.submit_at(
-            block(4, Origin::System),
+            block(5, Origin::System),
             commit_op(
                 Some(&snapshot),
                 "edit 32",
@@ -1245,8 +1309,8 @@ fn files_cold_load_warm_dispatch_and_reopen_first_query() {
 /// Document count in ONE commit, held against everything else. Each distinct
 /// inline body stages a chunk and a fileobj, so the op accrues two distinct
 /// object reads per document against `MAX_OBJECT_READS_PER_OP`, and the guest
-/// replays once per read. This is the curve that decides the practical
-/// documents-per-commit ceiling, which sits well below the hard rejection.
+/// replays once per read. This is the curve that decides the documents-per-commit
+/// ceiling, and where on it the cap refuses.
 #[test]
 #[ignore = "measurement harness"]
 fn files_commit_cost_by_document_count() {
@@ -1407,12 +1471,25 @@ fn files_cost_by_object_size_and_query_result_size() {
     println!("entries\tlimit\twasm_ls_ms\tls_reply_bytes\treturned");
     let dir = tempfile::tempdir().unwrap();
     let mut wasm = wasm_host(&dir);
-    let bodies = documents(256, 256);
-    block_on(wasm.submit_at(
-        block(1, Origin::System),
-        commit_op(None, "import", import_changes(&bodies)),
-    ))
-    .unwrap();
+    // 256 entries take two commits: one op gets MAX_OBJECT_READS_PER_OP reads
+    // and each distinct document costs two of them (chunk + fileobj).
+    let per_commit = MAX_OBJECT_READS_PER_OP / 2;
+    let mut base: Option<String> = None;
+    for (batch, first) in (0..256usize).step_by(per_commit).enumerate() {
+        let changes = (first..first + per_commit)
+            .map(|index| {
+                let mut body = format!("document {index:06}\n").into_bytes();
+                body.resize(256, b'x');
+                put_inline(&format!("/shared/project/docs/{index:06}.txt"), &body)
+            })
+            .collect();
+        block_on(wasm.submit_at(
+            block(batch as u64 + 1, Origin::System),
+            commit_op(base.as_deref(), "import", changes),
+        ))
+        .unwrap();
+        base = Some(head(&wasm));
+    }
     for limit in [16u64, 64, 128, 256] {
         let query = FilesQuery::Ls {
             path: "/shared/project/docs".into(),
