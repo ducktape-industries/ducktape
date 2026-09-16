@@ -978,7 +978,7 @@ pub(super) async fn park(
             loop {
                 futures::select_biased! {
                     job = rpc_ingress.next() => {
-                        let Some((req, reply)) = job else { continue };
+                        let Some(RpcJob { req, reply, written }) = job else { continue };
                         let resp = match req {
                             // WITH standing AND a pre-synced boundary, a
                             // write leaves here: sign it, relay to a
@@ -1090,6 +1090,9 @@ pub(super) async fn park(
                                 // a resident writes no checkpoint — nothing to
                                 // flush; a restart parks straight back here.
                                 let _ = reply.send(RpcReply::ok());
+                                // wait for the rpc thread to WRITE it: the
+                                // exit below would otherwise race the write.
+                                let _ = written.await;
                                 tracing::info!(
                                     target: "ducktape::node",
                                     node = %label,

@@ -94,7 +94,14 @@ impl ValidatorRuntime<'_> {
             .with_roles(&validators, &residents)
     }
 
-    pub(super) async fn on_rpc(&mut self, (req, reply): RpcJob) {
+    pub(super) async fn on_rpc(
+        &mut self,
+        RpcJob {
+            req,
+            reply,
+            written,
+        }: RpcJob,
+    ) {
         let Self {
             node,
             orchestrator,
@@ -189,6 +196,10 @@ impl ValidatorRuntime<'_> {
                 // SAME sequence as the signal arm (shared macro).
                 graceful_checkpoint(node, orchestrator, *next_seq).await;
                 let _ = reply.send(RpcReply::ok());
+                // the send only queues the reply on the rpc thread; exiting
+                // here would race its write and close the socket on a caller
+                // that never saw a reply line.
+                let _ = written.await;
                 tracing::info!(
                     target: "ducktape::node",
                     node = %label,
