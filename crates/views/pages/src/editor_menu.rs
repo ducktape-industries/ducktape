@@ -324,24 +324,29 @@ pub fn clear_block(document: &Doc, line: usize) -> EditorDecision {
 const SLASH_EXTRAS: &[(&str, &str, &str)] = &[("mention", "Mention", "@"), ("emoji", "Emoji", ":")];
 
 /// The floating format menu over a selection — Tiptap's floating toolbar
-/// as a list the keyboard can walk.
-const FORMAT_ITEMS: &[(&str, &str)] = &[
-    ("bold", "Bold"),
-    ("italic", "Italic"),
-    ("strike", "Strikethrough"),
-    ("underline", "Underline"),
-    ("code", "Code"),
-    ("highlight", "Highlight"),
-    ("color", "Text color"),
-    ("link", "Link"),
-    ("comment", "Comment"),
-    ("ai", "Ask AI…"),
-    ("align", "Align…"),
-    ("turn", "Turn into…"),
-    ("clear", "Clear formatting"),
+/// as a list the keyboard can walk. Third column is the ASCII glyph the
+/// bubble toolbar button shows instead of the word (#1143: no non-ASCII
+/// glyph in a button label — it walks the font DB). `link` takes `#`
+/// rather than `@`: `@` is already the mention trigger elsewhere in this
+/// menu (see `SLASH_EXTRAS`), so `#` reads as the anchor/permalink glyph
+/// without colliding with it.
+const FORMAT_ITEMS: &[(&str, &str, &str)] = &[
+    ("bold", "Bold", "B"),
+    ("italic", "Italic", "I"),
+    ("strike", "Strikethrough", "S"),
+    ("underline", "Underline", "U"),
+    ("code", "Code", "<>"),
+    ("highlight", "Highlight", "H"),
+    ("color", "Text color", "A"),
+    ("link", "Link", "#"),
+    ("comment", "Comment", "//"),
+    ("ai", "Ask AI…", "AI"),
+    ("align", "Align…", "Align"),
+    ("turn", "Turn into…", "Turn"),
+    ("clear", "Clear formatting", "Clear"),
 ];
 
-pub fn format_items() -> &'static [(&'static str, &'static str)] {
+pub fn format_items() -> &'static [(&'static str, &'static str, &'static str)] {
     FORMAT_ITEMS
 }
 
@@ -626,7 +631,13 @@ impl Menu {
             ),
             Kind::Block { line } => (Some(line), block_items(document, line)?),
             Kind::Turn { line } => (Some(line), turn_items("")),
-            Kind::Format { .. } => (None, owned(FORMAT_ITEMS)),
+            Kind::Format { .. } => (
+                None,
+                FORMAT_ITEMS
+                    .iter()
+                    .map(|(tag, label, _)| ((*tag).to_owned(), (*label).to_owned()))
+                    .collect(),
+            ),
             Kind::Color { .. } => (
                 None,
                 COLORS

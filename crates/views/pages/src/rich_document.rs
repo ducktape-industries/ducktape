@@ -689,11 +689,14 @@ pub fn presentation(text: &str, cursor: wire::EditorCursor) -> RichPresentation 
                 selection: cursor.selection.map(|at| rich_position(&blocks, at)),
             },
         },
+        // The bubble toolbar shows the glyph, not the word — see
+        // `editor_menu::FORMAT_ITEMS`. The keyboard-walkable menu
+        // (`editor_menu::Menu::current`) keeps the word.
         toolbar: crate::editor_menu::format_items()
             .iter()
-            .map(|(tag, label)| wire::editor_presentation::EditorMenuItem {
+            .map(|(tag, _label, glyph)| wire::editor_presentation::EditorMenuItem {
                 tag: (*tag).into(),
-                label: (*label).into(),
+                label: (*glyph).into(),
             })
             .collect(),
     }
