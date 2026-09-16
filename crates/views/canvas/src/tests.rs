@@ -1875,6 +1875,42 @@ fn the_two_keys_that_leave_a_card_are_not_the_same_answer() {
 }
 
 #[test]
+fn a_card_you_are_writing_in_is_prompted_by_its_caret_and_not_by_words() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    // A blank card you are NOT in says what it is for, in a box that is the
+    // card's own and cannot crop it.
+    view.edit(Change::Create {
+        id: "n".into(),
+        shape: Shape::default(),
+    });
+    let painted = serde_json::to_string(&view.view()).unwrap();
+    assert!(
+        painted.contains("Write a thought"),
+        "a blank card stopped inviting a word"
+    );
+    // A text shape is as wide as its words, so one with none yet is a box at
+    // its floor — far too narrow to hold the prompt, which used to arrive cut
+    // off mid-word as the first thing the text tool ever showed you.
+    view.edit(Change::Create {
+        id: "t".into(),
+        shape: Shape {
+            kind: Kind::Text,
+            ..Default::default()
+        },
+    });
+    view.selected = ["t".into()].into();
+    view.begin_text();
+    let writing = serde_json::to_string(&view.view()).unwrap();
+    let prompts = writing.matches("Write a thought").count();
+    assert_eq!(
+        prompts, 1,
+        "the card being written in carried a prompt of its own; only the other \
+         card's painted one belongs in the tree"
+    );
+}
+
+#[test]
 fn every_way_out_of_a_card_keeps_what_you_wrote() {
     let mut view = view();
     view.on_size(1400., 900.);

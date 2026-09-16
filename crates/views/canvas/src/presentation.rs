@@ -162,9 +162,11 @@ const PROMPT: &str = "Write a thought…";
 /// Whether a blank shape of this kind is a card waiting for a word or a
 /// drawing that was never going to carry one. A blank sticky invites a word; a
 /// blank outline is a drawing, and a connector with nothing written on it is
-/// just a line. The painter and the editor ask this together, so a shape the
-/// board would never prompt does not start prompting the moment you click into
-/// it.
+/// just a line.
+///
+/// Only the painter asks. A card you are already writing in needs no invitation
+/// — it has a caret — and the one place a prompt could not fit was the box of a
+/// text shape that has no words to be as wide as yet.
 fn invites_a_word(kind: Kind) -> bool {
     matches!(kind, Kind::Note | Kind::Text)
 }
@@ -2783,10 +2785,14 @@ impl BoardsView {
             document,
             on_document,
             editable: true,
-            placeholder: match invites_a_word(shape.kind) {
-                true => PROMPT.into(),
-                false => String::new(),
-            },
+            // No prompt: the caret is the invitation once you are in the card,
+            // and the prompt is what got clipped. A text shape is as wide as
+            // its words, so one that has none yet is a box at its floor — too
+            // narrow to hold "Write a thought…", which arrived cut off mid-word
+            // as the first thing the text tool ever showed you. The painted
+            // card still says it, where the box is the card's own and nothing
+            // can crop it.
+            placeholder: String::new(),
             width: Some((size[0] - 2. * letters.inset).max(40.)),
             // The editor fills the card. It cannot be asked to lay out to its
             // own content instead — a shrunk editor collapses to its first
