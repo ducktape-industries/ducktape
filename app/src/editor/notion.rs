@@ -36,6 +36,14 @@ pub fn init(cx: &mut App) {
         theme.page_width = px(f32::MAX);
         theme.page_padding = theme.gutter_controls_width;
         theme.page_bottom = theme.rem * 4.;
+        // A heading's air is measured in its OWN size, so the library's 3×
+        // put 72px above an H1 — a field of nothing between a title and the
+        // section under it, and more space above a heading than the reader
+        // has between two paragraphs. A heading needs enough air to read as a
+        // break; the hierarchy is in the sizes, not in the emptiness.
+        for (heading, above) in theme.headings.iter_mut().zip([1.4, 1.3, 1.2, 1.2]) {
+            heading.margin_above = above;
+        }
     });
     // Over the library's own image block, which draws its `src` with `img` —
     // and no image loader can fetch a `duck://` address.

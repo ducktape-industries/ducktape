@@ -424,6 +424,35 @@ mod tests {
         let restored = PagesView::restore(&snapshot).unwrap();
         assert_eq!(restored.snapshot().unwrap(), snapshot);
     }
+    /// `/` → "New page" is a page the writer is going to WRITE: the save that
+    /// makes it opens it, like the sidebar's "+", and the caret owes its
+    /// title line a visit.
+    #[test]
+    fn the_save_that_makes_a_page_opens_it() {
+        let (mut app, _) = PagesView::boot();
+        app.connected = true;
+        app.active_page = "alpha".into();
+        app.buffer_page = "alpha".into();
+        app.update(Message::SaveDone(crate::host::SaveItem {
+            written: true,
+            document: "Handbook\n>> ".into(),
+            page_made: "page-2".into(),
+            ..Default::default()
+        }));
+        assert_eq!(app.active_page, "page-2", "the new page is opened");
+        assert_eq!(
+            app.page_to_name, "page-2",
+            "and its title line is owed the caret"
+        );
+        // A save that made nothing leaves the reader where they are.
+        app.update(Message::SaveDone(crate::host::SaveItem {
+            written: true,
+            document: "Handbook\n>> Onboarding".into(),
+            ..Default::default()
+        }));
+        assert_eq!(app.active_page, "page-2");
+    }
+
     /// A picked picture is on the network before the document hears about it:
     /// what lands in the page is the address every member can read, on the
     /// line that asked for it, and the caret carries on under the picture.

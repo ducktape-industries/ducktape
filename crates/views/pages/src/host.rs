@@ -929,6 +929,11 @@ pub struct SaveItem {
     /// The lines both this reader and someone else changed: the reader's
     /// spelling won, and the screen says so.
     pub conflicts: Vec<String>,
+    /// The page this save MADE, when the buffer asked for one (`/` → "New
+    /// page"). A page is opened the moment it exists, the way the sidebar's
+    /// "+" opens one — the writer is naming a page, and the title line they
+    /// name it on is that page's own.
+    pub page_made: String,
     pub error: String,
 }
 
@@ -1337,6 +1342,7 @@ async fn save_document(page_id: String, text: String, saved: String) -> Result<S
             document: node_text,
             merged: page_moved_under_us,
             conflicts: merge.conflicts,
+            page_made: String::new(),
             error: String::new(),
         });
     }
@@ -1350,8 +1356,15 @@ async fn save_document(page_id: String, text: String, saved: String) -> Result<S
         submit(json!({ "update_text": { "block_id": page_id, "text": title } })).await?;
     }
     let mut anchor = String::new();
+    // The LAST page this plan inserted: `apply_op` leaves every insert's new
+    // id in `anchor`, and a page's id IS the page.
+    let mut page_made = String::new();
     for op in &plan.ops {
         apply_op(&page_id, &mut anchor, op).await?;
+        let made_a_page = matches!(op, BlockOp::Insert { kind, .. } if kind == "Page");
+        if made_a_page {
+            page_made = anchor.clone();
+        }
     }
     let written = title_moved || !plan.ops.is_empty();
     if !written {
@@ -1361,6 +1374,7 @@ async fn save_document(page_id: String, text: String, saved: String) -> Result<S
             document: node_text,
             merged: page_moved_under_us,
             conflicts: merge.conflicts,
+            page_made,
             error: String::new(),
         });
     }
@@ -1375,6 +1389,7 @@ async fn save_document(page_id: String, text: String, saved: String) -> Result<S
         document: page_document_text(&landed_title, &page_blocks(&landed, &page_id)),
         merged: page_moved_under_us,
         conflicts: merge.conflicts,
+        page_made,
         error: String::new(),
     })
 }

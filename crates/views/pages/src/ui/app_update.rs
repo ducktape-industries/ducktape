@@ -337,6 +337,15 @@ impl PagesView {
         );
         self.autosave = "saved".to_owned();
         self.register_serial += crate::host::keep_i64(item.written, 1, 0);
+        // A page the buffer asked for is OPENED, like the sidebar's "+": the
+        // writer picked "New page" to write a page, and its title line is
+        // where they are going. What they typed on the parent's line while
+        // the save flew is that same page's title, so it is waiting for them.
+        let made_a_page = !(item.page_made).is_empty();
+        if made_a_page {
+            self.active_page = item.page_made.to_owned();
+            self.page_to_name = item.page_made.to_owned();
+        }
         if item.merged {
             self.page_refusal = crate::host::merge_notice(&(item.conflicts));
             self.rebase_document(&(item.document));

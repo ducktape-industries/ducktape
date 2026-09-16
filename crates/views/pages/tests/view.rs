@@ -1080,6 +1080,8 @@ fn a_comment_from_the_format_menu_pins_to_the_selected_words() {
 fn ask_ai_posts_the_comment_with_the_agent_mentioned() {
     let (frame, _) = connected_with_register();
     let frame = tick_native(cmd_slash_over(&frame, 1, 4, 9));
+    // The bubble over the selection carries the marks; "Ask AI" is behind "…".
+    let frame = tick_native(menu_pick(&frame, "more"));
     let frame = tick_native(menu_pick(&frame, "ai"));
     // The paused agent is not on the picker, so its account opens nothing.
     let frame = tick_native(menu_pick(&frame, "8"));

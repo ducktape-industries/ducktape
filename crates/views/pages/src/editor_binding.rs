@@ -79,6 +79,13 @@ pub fn menu_paint(
     if !menu.is_open() {
         return presentation;
     }
+    // A SELECTION GETS THE BUBBLE, NEVER A LIST. The host draws its floating
+    // toolbar from `rich.toolbar` (the same items, as glyphs) and hides it
+    // while an application menu is open — so handing this one over is what
+    // replaced the bubble with a dropdown. Everything else IS a list.
+    if menu.over_selection() {
+        return presentation;
+    }
     presentation.affordances.menu = menu
         .current(&document(state.text, state.cursor))
         .map(|view| EditorMenu {
