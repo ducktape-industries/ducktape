@@ -295,7 +295,7 @@ The microVM shim signs the same way: `bin/duck-vz-shim/build.sh` takes
 
 ## Visual language
 
-One palette drives the whole app. `crates/views/support/design` holds it as
+One palette drives the whole app. `crates/design` holds it as
 `design::LIGHT` / `design::DARK` — cool neutral greys, an ink sidebar in both
 modes, one indigo accent: the native shell registers the two as gpui-kit
 themes (`design::kit_theme_json`) and every WASM view reads the same values
@@ -323,7 +323,7 @@ presets onto gpui-kit variants (primary, outline, ghost, link, danger).
   **Pretendard** behind the UI face and **D2Coding** behind the code face, both
   upright: no open Hangul font has an italic, so an italic run slants its Latin
   and leaves its Korean standing. The files are embedded from
-  `crates/views/support/design/assets/fonts/` at build time (that directory's
+  `crates/design/assets/fonts/` at build time (that directory's
   `SOURCES` names each release they come from); the kit's component icons come
   from `gpui_kit::assets::Assets`.
 - Type scale (`design::type_scale`): title 16, section 13.5, body 13,

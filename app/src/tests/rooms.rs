@@ -529,17 +529,20 @@ fn the_app_links_only_what_it_still_speaks_for() {
     // registry and the account records the shell reads off the node.
     let guests: Vec<&str> = linked.intersection(&modules).map(String::as_str).collect();
     assert_eq!(guests, ["chat", "forge", "gateway", "identity"]);
-    // `design` is the palette and the metrics every surface shares, and
-    // `ducktape-view-guest` is linked for its `Task` alone. Each is a wave
-    // of its own (#2303 7b, 7c); until then the app reaches into the view
-    // tree for exactly these two and nothing else.
+    // Nothing the workspace declares inside `crates/views` is the app's to
+    // link: `design` left for the SDK set in 7c, and what is shared is
+    // shared from there.
     let into_views: Vec<&str> = linked.intersection(&views).map(String::as_str).collect();
-    assert_eq!(into_views, ["design"]);
+    assert_eq!(into_views, [] as [&str; 0]);
+    // `ducktape-view-guest` is the last one, reached by path rather than
+    // through the workspace, and linked for its `Task`, `Subscription` and
+    // `kit` alone. #2303 7b moves those three beside the wire they build and
+    // deletes this line.
     assert!(
         app["dependencies"]
             .get("ducktape-view-guest")
             .and_then(|spec| spec.get("path"))
             .is_some(),
-        "the guest SDK moved; the line above is stale"
+        "the guest SDK left the app; delete this and the note above it"
     );
 }

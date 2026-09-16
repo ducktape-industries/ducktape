@@ -14,7 +14,7 @@ futures.workspace = true
 pulldown-cmark = "0.12.2"
 view-wire.workspace = true
 # Shared document font families for Markdown presentation.
-design = { path = "../support/design" }
+design.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ducktape-view-guest.workspace = true

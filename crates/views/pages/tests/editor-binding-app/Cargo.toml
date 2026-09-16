@@ -10,7 +10,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 futures.workspace = true
 pulldown-cmark = "0.12.2"
-design = { path = "../../../support/design" }
+design.workspace = true
 view-wire = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 ducktape-view-guest = { workspace = true }
