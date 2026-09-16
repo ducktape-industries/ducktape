@@ -116,7 +116,7 @@ async fn gateway_attachment_replays_after_disconnect_and_explicit_close_ends_the
     );
     let directory = tempfile::tempdir().unwrap();
     let (runtime, driver) = Runtime::start(providers, "test".into(), directory.path().into());
-    let owner = Caller {
+    let owner = Caller::Account {
         account: 7,
         node: [1; 32],
     };

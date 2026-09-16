@@ -1542,6 +1542,12 @@ async fn authorize_ws(
                 .map_err(|_| GatewayFailure::Invalid("invalid_upstream_identity".into()))?,
         );
     }
+    if head.operator {
+        request.headers_mut().insert(
+            "x-duck-caller-operator",
+            "true".parse().expect("static header"),
+        );
+    }
     if let Some(account) = caller {
         request.headers_mut().insert(
             "x-duck-caller-account",
@@ -3015,6 +3021,12 @@ mod tests {
     #[allow(clippy::result_large_err)]
     #[tokio::test]
     async fn ws_upgrade_bridges_frames_over_the_mesh() {
+        assert_ws_caller(false).await;
+        assert_ws_caller(true).await;
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn assert_ws_caller(operator: bool) {
         use tokio_tungstenite::tungstenite::Message;
         // A WebSocket echo upstream on loopback.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3028,6 +3040,14 @@ mod tests {
                     assert_eq!(request.headers()["x-duck-route-account"], "1");
                     assert_eq!(request.headers()["x-duck-route-label"], "api");
                     assert!(request.headers().contains_key("x-duck-caller-node"));
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("x-duck-caller-operator")
+                            .map(|value| value.as_bytes()),
+                        operator.then_some(b"true".as_slice())
+                    );
+                    assert!(!request.headers().contains_key("x-ducktape-admin-token"));
                     Ok(response)
                 },
             )
@@ -3084,7 +3104,7 @@ mod tests {
 
         let (mut client, server) = tokio::io::duplex(4096);
         let head = gateway::ProxyRequestHead {
-            operator: false,
+            operator,
             account_id: 1,
             name: gateway::RouteName::named("api"),
             revision: 4,

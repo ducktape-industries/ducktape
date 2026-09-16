@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn command_replay_has_an_independent_cursor_and_retains_history() {
-        let caller = crate::state::Caller {
+        let caller = crate::state::Caller::Account {
             account: 7,
             node: [1; 32],
         };
@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn committed_pages_validate_before_advancing_and_never_repeat_consumed_posts() {
-        let caller = crate::state::Caller {
+        let caller = crate::state::Caller::Account {
             account: 7,
             node: [1; 32],
         };

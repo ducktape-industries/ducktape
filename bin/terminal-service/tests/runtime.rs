@@ -13,7 +13,7 @@ async fn create_refusal_is_answered_and_stopping_the_runtime_finishes_its_task()
         "test-service".into(),
         directory.path().into(),
     );
-    let caller = Caller {
+    let caller = Caller::Account {
         account: 7,
         node: [1; 32],
     };
@@ -121,7 +121,7 @@ async fn cancelled_slow_create_does_not_block_existing_input_or_leave_a_pty() {
         "test-service".into(),
         directory.path().into(),
     );
-    let caller = Caller {
+    let caller = Caller::Account {
         account: 7,
         node: [1; 32],
     };
@@ -202,7 +202,7 @@ async fn service_stop_cancels_an_unfinished_spawn_and_closes_running_ptys() {
         "test-service".into(),
         directory.path().into(),
     );
-    let caller = Caller {
+    let caller = Caller::Account {
         account: 7,
         node: [1; 32],
     };
@@ -256,7 +256,7 @@ async fn shared_commands_are_ordered_deduplicated_and_do_not_accept_raw_input() 
         "test".into(),
         directory.path().into(),
     );
-    let owner = Caller {
+    let owner = Caller::Account {
         account: 7,
         node: [1; 32],
     };
@@ -438,7 +438,7 @@ async fn failed_committed_query_closes_the_shared_session() {
         "test".into(),
         directory.path().into(),
     );
-    let owner = Caller {
+    let owner = Caller::Account {
         account: 7,
         node: [1; 32],
     };
@@ -542,7 +542,7 @@ async fn projector_delivers_http_commands_and_session_end_cancels_a_pending_quer
         "test".into(),
         directory.path().into(),
     );
-    let owner = Caller {
+    let owner = Caller::Account {
         account: 7,
         node: [1; 32],
     };

@@ -64,7 +64,6 @@ fn caller(headers: &HeaderMap, token: &[u8; 64], config: &Route) -> Option<Calle
     if !installed_route {
         return None;
     }
-    let account = field("x-duck-caller-account")?.parse().ok()?;
     let node_text = field("x-duck-caller-node")?;
     let mut node = [0; 32];
     let canonical_key = node_text.len() == 64
@@ -77,7 +76,14 @@ fn caller(headers: &HeaderMap, token: &[u8; 64], config: &Route) -> Option<Calle
     for (out, digits) in node.iter_mut().zip(node_text.as_bytes().chunks_exact(2)) {
         *out = u8::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()?;
     }
-    Some(Caller { account, node })
+    if headers.contains_key("x-duck-caller-operator") {
+        return match field("x-duck-caller-operator") {
+            Some("true") => Some(Caller::Operator { node }),
+            _ => None,
+        };
+    }
+    let account = field("x-duck-caller-account")?.parse().ok()?;
+    Some(Caller::Account { account, node })
 }
 
 #[derive(Default, Deserialize)]
@@ -223,5 +229,46 @@ async fn attached(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operator_identity_requires_the_installed_gateway_attestation() {
+        let route = Route {
+            account: 7,
+            label: "terminal".into(),
+        };
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("x-duck-upstream-token", "a".repeat(64)),
+            ("x-duck-route-account", "7".into()),
+            ("x-duck-route-label", "terminal".into()),
+            ("x-duck-route-revision", "1".into()),
+            ("x-duck-caller-node", "01".repeat(32)),
+            ("x-duck-caller-operator", "true".into()),
+        ] {
+            headers.insert(name, value.parse().unwrap());
+        }
+        assert_eq!(
+            caller(&headers, &[b'a'; 64], &route),
+            Some(Caller::Operator { node: [1; 32] })
+        );
+        assert!(caller(&headers, &[b'b'; 64], &route).is_none());
+        headers.append("x-duck-caller-operator", "true".parse().unwrap());
+        assert!(caller(&headers, &[b'a'; 64], &route).is_none());
+        headers.remove("x-duck-caller-operator");
+        assert!(caller(&headers, &[b'a'; 64], &route).is_none());
+        headers.insert("x-duck-caller-account", "7".parse().unwrap());
+        assert_eq!(
+            caller(&headers, &[b'a'; 64], &route),
+            Some(Caller::Account {
+                account: 7,
+                node: [1; 32]
+            })
+        );
     }
 }

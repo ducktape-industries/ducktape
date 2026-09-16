@@ -658,7 +658,7 @@ mod tests {
             events,
         );
         let mut machine = Machine::default();
-        let owner = Caller {
+        let owner = Caller::Account {
             account: 7,
             node: [1; 32],
         };

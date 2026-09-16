@@ -211,6 +211,8 @@ enum Lane {
     RawSubmit,
     /// a fixed path that mutates the NODE ([`NODE_LEVEL_POSTS`]).
     NodeLevel,
+    /// Operator-authenticated application HTTP and WebSocket requests.
+    GatewayOperator,
     /// `/v1/huddle/node-proof` ([`HUDDLE_PROOF_PATH`]) — this node signs that it
     /// will route the SIGNER's huddle media. the handler reads [`SignedBy`]
     /// and binds exactly that key, so possession is the right bar here:
@@ -243,7 +245,7 @@ enum Authority {
 /// to join this mesh for up to a year — neither is a module write any acting
 /// key should be able to ask for. neither handler reads [`SignedBy`], which is
 /// exactly why neither may be admitted on possession alone.
-const NODE_LEVEL_POSTS: &[&str] = &["/v1/log-filter", "/v1/invite", "/v1/gateway/operator"];
+const NODE_LEVEL_POSTS: &[&str] = &["/v1/log-filter", "/v1/invite"];
 
 /// the huddle node-proof mint ([`Lane::HuddleProof`]). an exact path: the
 /// handler binds the verified signer, and the account check is its own.
@@ -266,6 +268,9 @@ const LANE_PREFIXES: &[(&str, Lane)] = &[
 ];
 
 fn lane_of(path: &str) -> Lane {
+    if path == "/v1/gateway/operator" {
+        return Lane::GatewayOperator;
+    }
     if path.starts_with("/v1/submit/raw/") {
         return Lane::RawSubmit;
     }
@@ -325,6 +330,10 @@ impl Lane {
             // the proof binds the SIGNER; the handler refuses a key that holds
             // no account, so possession is the gate's whole job here.
             Lane::HuddleProof | Lane::RunControl => posts.then_some(Authority::Acting),
+            Lane::GatewayOperator => {
+                let exchange = posts || *method == Method::GET;
+                exchange.then_some(Authority::Operator)
+            }
             Lane::Open => None,
         }
     }
@@ -337,6 +346,9 @@ impl Lane {
         match self {
             Lane::Blob => crate::MAX_BLOB_BODY_BYTES,
             Lane::RawSubmit => node::MAX_PAYLOAD_BYTES,
+            Lane::GatewayOperator => {
+                crate::gateway_http::JSON_LANE_REQUEST_BYTES * 2 + gateway::MAX_PROXY_HEAD_BYTES
+            }
             // json bodies and the log-filter string. `Open` never reaches here
             // (the guard returns before asking), and takes the small cap so a
             // table that ever disagreed fails closed rather than wide.
@@ -821,6 +833,7 @@ mod tests {
             (Method::POST, "/v1/log-filter", Authority::Operator),
             (Method::POST, "/v1/invite", Authority::Operator),
             (Method::POST, "/v1/gateway/operator", Authority::Operator),
+            (Method::GET, "/v1/gateway/operator", Authority::Operator),
             // the huddle proof binds the SIGNER, and a remote device has no
             // operator credential to offer: possession, then the handler's
             // own account check.

@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Caller {
-    pub account: u64,
-    pub node: [u8; 32],
+pub enum Caller {
+    Account { account: u64, node: [u8; 32] },
+    Operator { node: [u8; 32] },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -360,9 +360,26 @@ mod tests {
     use super::*;
 
     fn caller(account: u64, node: u8) -> Caller {
-        Caller {
+        Caller::Account {
             account,
             node: [node; 32],
+        }
+    }
+
+    #[test]
+    fn operator_sessions_require_the_same_node_operator_not_an_account() {
+        let mut sessions = Sessions::default();
+        let owner = Caller::Operator { node: [1; 32] };
+        let id = "0000000000000001";
+        sessions
+            .insert(id.into(), owner.clone(), Mode::Single)
+            .unwrap();
+        sessions.created(id);
+        assert!(sessions.write(id, &owner, Write::Input).is_ok());
+        for stranger in [Caller::Operator { node: [2; 32] }, caller(7, 1)] {
+            assert!(sessions.write(id, &stranger, Write::Input).is_err());
+            assert!(sessions.write(id, &stranger, Write::Close).is_err());
+            assert!(sessions.replay(id, &stranger, 0, 0).is_err());
         }
     }
 

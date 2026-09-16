@@ -537,6 +537,39 @@ pub(crate) async fn gateway_native_stream(
             return error_response(StatusCode::BAD_REQUEST, "invalid application stream head");
         }
     };
+    open_application_stream(handle, head, upgrade).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperatorStream {
+    // The head is in the signed URI, not an unsigned header: replacing the
+    // target, route, or replay cursor invalidates the operator's signature.
+    head: String,
+}
+
+pub(crate) async fn gateway_operator_stream(
+    State(handle): State<NodeHandle>,
+    axum::extract::Query(request): axum::extract::Query<OperatorStream>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    if let Some(response) = gateway_api_origin_guard(&headers) {
+        return response;
+    }
+    let mut head = match gateway::decode_proxy_request_head(request.head.as_bytes()) {
+        Ok(head) if head.upgrade => head,
+        _ => return error_response(StatusCode::BAD_REQUEST, "invalid operator stream head"),
+    };
+    head.operator = true;
+    open_application_stream(handle, head, upgrade).await
+}
+
+async fn open_application_stream(
+    handle: NodeHandle,
+    head: gateway::ProxyRequestHead,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     let Some(lane) = handle.gateway.clone() else {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "no gateway overlay");
     };

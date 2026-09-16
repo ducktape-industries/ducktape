@@ -2948,3 +2948,104 @@ async fn blob_upload_capacity_is_reserved_before_signature_body_collection() {
     for request in requests { assert_ne!(request.await.unwrap().unwrap().status(), StatusCode::SERVICE_UNAVAILABLE); }
     assert_ne!(router.oneshot(request()).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
 }
+
+#[tokio::test]
+async fn operator_stream_binds_the_target_in_the_signature_and_forwards_without_an_account() {
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest as _, Message};
+    use futures::SinkExt as _;
+    let (handle, mut cmds, _events) = local_node();
+    let owner = caller();
+    let handle = handle.with_admin(AdminConfig {
+        operator_token: Some(OPERATOR.into()),
+        node_key: Some(NODE_KEY.to_vec()),
+        owner_key: Some(owner.public_key().as_ref().to_vec()),
+        ..Default::default()
+    });
+    let (lane, mut jobs) = tokio::sync::mpsc::channel(1);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            noded::router(handle.with_gateway(lane))
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let head = serde_json::json!({
+        "account_id": 1, "name": {"label":"app"}, "revision": 7,
+        "method": "get", "path_and_query": "/sessions/0000000000000001?after=3",
+        "headers": [], "body_len": 0, "upgrade": true, "user_pop": null,
+    });
+    let mut url = reqwest::Url::parse(&format!("ws://{address}/v1/gateway/operator")).unwrap();
+    url.query_pairs_mut().append_pair("head", &head.to_string());
+    let uri = format!("{}?{}", url.path(), url.query().unwrap());
+    let mut signed_request = url.as_str().into_client_request().unwrap();
+    for (name, value) in noded::signed_req::request_headers(&owner, "GET", &uri, &NODE_KEY, &[]) {
+        signed_request
+            .headers_mut()
+            .insert(name, value.parse().unwrap());
+    }
+    let mut tampered = signed_request.clone();
+    *tampered.uri_mut() = format!("{url}&changed=1").parse().unwrap();
+    let tokio_tungstenite::tungstenite::Error::Http(refused) =
+        tokio_tungstenite::connect_async(tampered)
+            .await
+            .unwrap_err()
+    else {
+        panic!("HTTP refusal")
+    };
+    assert_eq!(refused.status(), 401);
+    assert!(jobs.try_recv().is_err());
+    let actor = tokio::spawn(async move {
+        for _ in 0..2 {
+            let NodeCommand::Query { target, reply, .. } = cmds.next().await.unwrap() else {
+                panic!("route query")
+            };
+            assert_eq!(target, "gateway");
+            let mut route = gateway_route();
+            route.statement.route.as_mut().unwrap().policy.allow_upgrade = true;
+            reply
+                .send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
+                    Box::new(Some(route)),
+                ))))
+                .unwrap();
+            let noded::GatewayJob::Upgrade {
+                head,
+                to_browser,
+                mut from_browser,
+                ..
+            } = jobs.recv().await.unwrap()
+            else {
+                panic!("upgrade")
+            };
+            assert!(head.operator);
+            assert!(head.user_pop.is_none());
+            assert_eq!(head.path_and_query, "/sessions/0000000000000001?after=3");
+            to_browser
+                .send(noded::GatewayWsMsg::Text("ready".into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                from_browser.recv().await,
+                Some(noded::GatewayWsMsg::Text("input".into()))
+            );
+        }
+    });
+    let mut token_request = url.as_str().into_client_request().unwrap();
+    token_request
+        .headers_mut()
+        .insert("x-ducktape-admin-token", OPERATOR.parse().unwrap());
+    for request in [signed_request, token_request] {
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        assert_eq!(
+            socket.next().await.unwrap().unwrap().to_text().unwrap(),
+            "ready"
+        );
+        socket.send(Message::Text("input".into())).await.unwrap();
+    }
+    actor.await.unwrap();
+    server.abort();
+    let _ = server.await;
+}

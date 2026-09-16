@@ -86,12 +86,14 @@ socket. The Gateway strips caller-supplied `x-duck-*` headers and injects its ow
   absent when the route permits an anonymous peer.
 - `x-duck-caller-node`: the authenticated source peer's public key in hexadecimal.
 - `x-duck-caller-operator: true`: the calling node verified its existing operator
-  token or configured operator-key signature through `POST /v1/gateway/operator`.
+  token or configured operator-key signature through `/v1/gateway/operator`.
+  POST carries a buffered HTTP exchange. GET upgrades to a WebSocket; its `head`
+  query parameter contains the JSON request head, so the data-plane signature
+  covers the destination and cursor through the complete path and query.
   This asserts authority on the calling node, not on the service's host. The
   service still applies its existing local/peer admission. The node never
   forwards the operator credential itself. Ordinary proxy and view-stream
   requests cannot supply this assertion.
-
 - `x-duck-route-account`, `x-duck-route-label`, `x-duck-route-revision`: the route
   whose current signed policy admitted the request.
 
