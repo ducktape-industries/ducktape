@@ -153,6 +153,22 @@ struct RunCursor {
     next: u64,
 }
 
+/// what one chat event has already prepared, carried across the rules it
+/// fires. every probe in [`Automations::build_and_emit`] reads
+/// staged-or-committed state, and a follow-up this dispatch emitted is in
+/// NEITHER until the unit applies — so two rules on one post would each see
+/// a free id, or an owner one task under cap, both emit, and the second
+/// follow-up's failure at its target would unwind the post that triggered
+/// it. A rule that loses a race to an earlier one records a refusal instead,
+/// which is the same answer it would have got had the earlier action already
+/// landed. Not persisted: it lives exactly as long as the event.
+#[derive(Default)]
+struct Prepared {
+    message_ids: std::collections::BTreeSet<String>,
+    task_ids: std::collections::BTreeSet<String>,
+    tasks_per_owner: std::collections::BTreeMap<AccountNumber, u64>,
+}
+
 pub struct Automations {
     id: ModuleId,
     /// the chat module id — both the trusted hook origin and the `PostMessage`
@@ -497,6 +513,7 @@ impl Automations {
         let mut budget = 0usize;
         let mut fired: Vec<Rule> = Vec::new();
         let mut records: Vec<RunRecord> = Vec::new();
+        let mut prepared = Prepared::default();
         for rule in candidates {
             let record = |action_ok: bool, detail: String| RunRecord {
                 rule_id: rule.rule_id.clone(),
@@ -533,7 +550,13 @@ impl Automations {
                 mention: &mention_actor,
             };
             match self
-                .build_and_emit(ctx, rule, cursor.next + records.len() as u64, &vars)
+                .build_and_emit(
+                    ctx,
+                    rule,
+                    cursor.next + records.len() as u64,
+                    &vars,
+                    &mut prepared,
+                )
                 .await
             {
                 Ok(detail) => {
@@ -581,21 +604,29 @@ impl Automations {
     /// when the action is structurally impossible or a probe rejects it
     /// (recorded, not a block failure).
     ///
+    /// `prepared` is what THIS event has already emitted. The probes read
+    /// staged-or-committed state, which a follow-up emitted earlier in this
+    /// same dispatch has not reached yet — so without it a second rule sees
+    /// an id that is about to be taken, or an owner that is about to be at
+    /// cap, emits anyway, and its failure at the target unwinds the post
+    /// that triggered it.
+    ///
     /// the probe layer (the no-fail-arm pattern applied to follow-ups):
     /// every structurally-KNOWABLE follow-up failure is checked here via
     /// host-routed queries against the target's staged-or-committed state —
     /// deterministic on every validator — so a missing channel, a squatted
     /// deterministic id, or a task-id collision downgrades to a RunRecord
-    /// instead of aborting the posting user's block. probes cannot catch
-    /// everything (e.g. two rules composing the same id in one event emit past
-    /// each other's probes); a post-probe follow-up failure still aborts the
-    /// block by P2 design.
+    /// instead of aborting the posting user's block. what this event has
+    /// already emitted is checked against [`Prepared`], since the target's
+    /// state does not carry it yet; a post-probe follow-up failure from any
+    /// other cause still aborts the block by P2 design.
     async fn build_and_emit(
         &self,
         ctx: &mut dyn Ctx,
         rule: &Rule,
         run_seq: u64,
         vars: &TemplateVars<'_>,
+        prepared: &mut Prepared,
     ) -> Result<String, String> {
         let event_channel = vars.channel;
         let Some(seq) = vars.seq else {
@@ -648,6 +679,11 @@ impl Automations {
                         _ => return Err("chat probe returned an unexpected reply".into()),
                     },
                 }
+                // probe 3: no rule earlier in THIS event already composed the
+                // same id — chat has not seen that post yet, so probe 2 cannot.
+                if !prepared.message_ids.insert(message_id.clone()) {
+                    return Err(format!("message id already prepared: {message_id}"));
+                }
                 ctx.emit_msg(Msg {
                     target: self.chat.clone(),
                     payload: chat_encode_msg(&ChatMsg::PostMessage {
@@ -667,8 +703,13 @@ impl Automations {
                 if title.is_empty() {
                     return Err("task template produced an empty title".into());
                 }
-                // deterministic, collision-free per (prefix, message).
-                let task_id = format!("{task_id_prefix}-{event_channel}-{seq}");
+                // deterministic, collision-free per (rule, message) — the rule
+                // id is IN the composition for the same reason a posted
+                // message's is: two rules are free to carry the same prefix,
+                // and an id that left them out would have them both compose
+                // one task, the second create failing at tasks and unwinding
+                // the triggering post.
+                let task_id = format!("{task_id_prefix}-{}-{event_channel}-{seq}", rule.rule_id);
                 // composed-id guard BEFORE the probe (see PostMessage), held
                 // against TASKS' rule rather than this module's: an id tasks
                 // rejects at apply (over MAX_TASK_ID, or carrying the reserved
@@ -701,6 +742,12 @@ impl Automations {
                         Err(_) => return Err("tasks probe returned an unexpected reply".into()),
                     },
                 }
+                // probe: no rule earlier in THIS event already composed the
+                // same id — tasks has not applied that create yet, so the
+                // by-id read above cannot see it.
+                if !prepared.task_ids.insert(task_id.clone()) {
+                    return Err(format!("task id already prepared: {task_id}"));
+                }
                 // probe: the RULE OWNER's own open-task census must be under
                 // cap — the task is created under the owner, not this
                 // module's identity (see the created task's `owner` below),
@@ -714,7 +761,13 @@ impl Automations {
                     Err(e) => return Err(format!("tasks probe failed: {e}")),
                     Ok(bytes) => match tasks_decode_reply(&bytes) {
                         Ok(TaskReply::OwnerOpenCount(count)) => {
-                            if count >= tasks::MAX_OPEN_TASKS_PER_OWNER as u64 {
+                            // the census is staged-or-committed state, which
+                            // this event's own creates have not reached: an
+                            // owner one task under cap would otherwise admit
+                            // every rule that fires on this post.
+                            let reserved =
+                                prepared.tasks_per_owner.get(&rule.owner).copied().unwrap_or(0);
+                            if count + reserved >= tasks::MAX_OPEN_TASKS_PER_OWNER as u64 {
                                 return Err(format!(
                                     "rule owner at task cap: {} open tasks",
                                     tasks::MAX_OPEN_TASKS_PER_OWNER
@@ -724,6 +777,7 @@ impl Automations {
                         _ => return Err("tasks probe returned an unexpected reply".into()),
                     },
                 }
+                *prepared.tasks_per_owner.entry(rule.owner).or_insert(0) += 1;
                 ctx.emit_msg(Msg {
                     target: self.tasks.clone(),
                     payload: tasks_encode_msg(&TaskMsg::CreateTask {
