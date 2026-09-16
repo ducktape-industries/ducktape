@@ -17,7 +17,6 @@ use noded::{RunOutputEvent, RunOutputRegistry};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::overlay_book::{BIND_RETRY, OverlayBook, OverlayPeers, Plane, StreamPlane};
-use crate::term_plane::PerPeerLatch;
 
 const RUN_OUTPUT_INTENT: u8 = 1;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
@@ -26,9 +25,8 @@ const MAX_EVENT_BYTES: usize = 64 * 1024;
 const DIAL_RETRY: Duration = Duration::from_secs(3);
 
 /// how many distinct run ids ONE peer may hold a first-sender binding for.
-/// Same basis as term_plane's `MAX_OBSERVED_PER_PEER`: per peer, never
-/// node-wide, so a flooding peer only ever exhausts its own budget and never
-/// displaces another peer's bindings.
+/// Per peer, never node-wide, so a flooding peer only ever exhausts its own
+/// budget and never displaces another peer's bindings.
 const MAX_OBSERVED_RUNS_PER_PEER: usize = 64;
 
 fn run_output_flow() -> FlowId {
@@ -38,13 +36,13 @@ fn run_output_flow() -> FlowId {
 /// which peer a mirrored (not locally hosted) run id accepts lines from.
 ///
 /// A run id is consensus state — every member can learn every hosted run's
-/// id, unlike a term session's 16-hex random id — so "nobody has named this
-/// id yet" is not proof a peer owns it. What this DOES settle: once some peer
+/// id — so "nobody has named this id yet" is not proof a peer owns it. What
+/// this DOES settle: once some peer
 /// has streamed lines for an id this node does not host, that peer is the
 /// only one that may keep streaming them. The first sender binds; every other
 /// peer is refused from then on, and [`MAX_OBSERVED_RUNS_PER_PEER`] bounds how
 /// many such bindings one peer may mint, so a flooding peer only ever spends
-/// its own budget. Mirrors [`noded::term_remote::RemoteSessions::feed_host`].
+/// its own budget.
 #[derive(Default)]
 struct RemoteRunBindings(std::sync::Mutex<HashMap<String, PeerId>>);
 
@@ -70,9 +68,35 @@ impl RemoteRunBindings {
     }
 }
 
-/// refused run-output grain, latched per (reason, peer) like term_plane's
-/// feed refusals: a peer drives this — one frame per output line — so an
-/// unlatched line is a log bomb.
+/// Like [`noded::log::Latch`], but keyed on `(reason, peer)` instead of just
+/// `reason` — `Latch::hit` only takes a `&'static str`, and a peer id is not
+/// one. First occurrence per peer, then every `every`th, per peer.
+struct PerPeerLatch {
+    counts: std::sync::Mutex<std::collections::BTreeMap<(&'static str, PeerId), u64>>,
+    every: u64,
+}
+
+impl PerPeerLatch {
+    const fn new(every: u64) -> Self {
+        Self {
+            counts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            every,
+        }
+    }
+
+    /// returns `Some(occurrences)` when this peer's occurrence of `reason`
+    /// should be logged.
+    fn hit(&self, reason: &'static str, peer: PeerId) -> Option<u64> {
+        let mut counts = self.counts.lock().expect("latch lock poisoned");
+        let count = counts.entry((reason, peer)).or_insert(0);
+        *count += 1;
+        let n = *count;
+        (n == 1 || n.is_multiple_of(self.every)).then_some(n)
+    }
+}
+
+/// refused run-output grain, latched per (reason, peer): a peer drives this —
+/// one frame per output line — so an unlatched line is a log bomb.
 static RUN_REFUSED: PerPeerLatch = PerPeerLatch::new(100);
 
 /// the host gate on an inbound run-output grain: refuses a line naming a run

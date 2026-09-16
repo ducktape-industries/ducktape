@@ -320,10 +320,6 @@ pub(super) async fn park(
     http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
-    session_manager: Option<noded::TerminalSessions>,
-    session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
-    remote_sessions: noded::RemoteSessions,
-    local_gateway_via: String,
     node_api_ports: Vec<u16>,
     stream_hub: &noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
@@ -392,26 +388,6 @@ pub(super) async fn park(
             bulk_pacer.clone(),
             planes.clone(),
             stream_hub.run_output(),
-        );
-        // the terminal-session plane: forwards a session's output ring and
-        // ordered command log to peers, hosts the directed create/close +
-        // creator-gated input control lanes, and drains the guest-side session
-        // lane (the client half).
-        crate::term_plane::spawn(
-            label.clone(),
-            crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
-            std::sync::Arc::clone(&tracked),
-            me,
-            bulk_pacer.clone(),
-            planes.clone(),
-            stream_hub.terminals(),
-            stream_hub.term_commands(),
-            session_manager,
-            gateway_commands.clone(),
-            local_gateway_via,
-            workspace.clone(),
-            session_requests,
-            remote_sessions,
         );
         Some(tracked)
     } else {

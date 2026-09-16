@@ -403,8 +403,6 @@ async fn an_unsigned_mutation_is_refused_and_never_reaches_the_actor() {
         ("POST", "/v1/fs/workspaces/abc/commit"),
         ("DELETE", "/v1/fs/workspaces/abc"),
         ("POST", "/v1/files/blob"),
-        ("POST", "/v1/term/sessions"),
-        ("POST", "/v1/term/sessions/abc/close"),
     ] {
         let response = app
             .clone()
@@ -593,12 +591,6 @@ async fn a_node_level_route_refuses_a_self_minted_key_and_admits_the_operator() 
     for (method, uri, body) in [
         ("POST", "/v1/invite", r#"{"ttl_days":365}"#),
         ("POST", "/v1/log-filter", "info"),
-        (
-            "POST",
-            "/v1/term/sessions",
-            r#"{"agent":"echo","mode":"single"}"#,
-        ),
-        ("POST", "/v1/term/sessions/abc/close", ""),
         ("DELETE", "/v1/fs/workspaces/abc", ""),
     ] {
         // a key nobody knows, signed correctly. the whole vector.

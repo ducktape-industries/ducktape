@@ -1,16 +1,16 @@
-//! the daemon's live ws attachment to its node: pty commands in, session events
-//! out, on ONE connection.
+//! the daemon's live ws attachment to its node: messaging commands in,
+//! delivery receipts out, on ONE connection.
 //!
-//! Unlike compute's link this one is genuinely bidirectional, because an
-//! interactive session is. Compute PULLS its work (it re-reads committed state
-//! on a hint), which is right for placement-driven work that the chain already
-//! records. A keystroke is not on the chain and never will be, so the node
-//! PUSHES it — down the connection the daemon dialed, which is what keeps the
-//! node from ever needing to dial a service.
+//! Unlike compute's link this one is genuinely bidirectional. Compute PULLS its
+//! work (it re-reads committed state on a hint), which is right for
+//! placement-driven work that the chain already records. A delivery's progress
+//! is a fact only this daemon holds, so the node PUSHES the command and this
+//! process pushes the receipt back — down the connection the daemon dialed,
+//! which is what keeps the node from ever needing to dial a service.
 //!
 //! The daemon claims the link with one `service_attach` frame before anything
 //! else. Until the node accepts it, this connection is an ordinary ws client
-//! with no interactive plane behind it; if the node refuses (an unreadable or
+//! with no messaging plane behind it; if the node refuses (an unreadable or
 //! stale link token, another daemon already attached), it says so and this
 //! connection ends.
 //!
@@ -25,12 +25,12 @@
 
 use std::sync::Arc;
 
-use agent_service::{Sessions, messaging, wire};
+use agent_service::{messaging, wire};
 use futures::{SinkExt as _, StreamExt as _};
 use tokio::sync::mpsc;
 
-/// how many session events may queue before a pty pump waits. Deep enough that
-/// a TUI redraw burst never stalls the pty; bounded so a wedged socket applies
+/// how many receipts may queue before the delivery plane waits. Deep enough
+/// that a burst never stalls a delivery; bounded so a wedged socket applies
 /// back-pressure instead of growing without limit.
 pub(crate) const EVENT_LANE: usize = 1024;
 /// how many reconnect failures pass between log lines after the first.
@@ -48,7 +48,6 @@ const REDIAL: std::time::Duration = std::time::Duration::from_secs(2);
 pub(crate) async fn attach(
     ws_url: String,
     workspace: std::path::PathBuf,
-    sessions: Arc<Sessions>,
     deliveries: Option<Arc<messaging::Deliveries>>,
     mut events: mpsc::Receiver<wire::Event>,
 ) {
@@ -69,18 +68,13 @@ pub(crate) async fn attach(
                     );
                 }
                 failures = 0;
-                let end = pump(socket, &workspace, &sessions, &deliveries, &mut events).await;
-                // the connection is gone, and with it every session: the node
-                // forgot them the moment this link dropped, so a surviving pty
-                // would be a container nobody can reach, feed or close.
-                //
+                let end = pump(socket, &workspace, &deliveries, &mut events).await;
                 // `deliveries` is deliberately NOT swept here. Its bindings
                 // name provider sessions this daemon did not start and does
                 // not own, and a reconnecting node expects them still
                 // attached — the whole point of the disconnect case is that a
                 // message queued while it was away is delivered when it comes
                 // back, in sequence, without a second session being spawned.
-                sessions.close_all().await;
                 match end {
                     // a link that lived and dropped is the ordinary case, and
                     // it clears the refusal streak: whatever the node objected
@@ -165,7 +159,6 @@ enum LinkEnd {
 async fn pump<S>(
     socket: S,
     workspace: &std::path::Path,
-    sessions: &Arc<Sessions>,
     deliveries: &Option<Arc<messaging::Deliveries>>,
     events: &mut mpsc::Receiver<wire::Event>,
 ) -> LinkEnd
@@ -205,7 +198,7 @@ where
     loop {
         tokio::select! {
             frame = rx.next() => {
-                if let Some(end) = serve_frame(frame, sessions, deliveries).await {
+                if let Some(end) = serve_frame(frame, deliveries).await {
                     return end;
                 }
             }
@@ -225,7 +218,7 @@ where
     // the event lane is closed for the daemon's lifetime; commands in, nothing
     // out, until the socket itself ends.
     loop {
-        if let Some(end) = serve_frame(rx.next().await, sessions, deliveries).await {
+        if let Some(end) = serve_frame(rx.next().await, deliveries).await {
             return end;
         }
     }
@@ -237,7 +230,6 @@ async fn serve_frame(
     frame: Option<
         Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
     >,
-    sessions: &Arc<Sessions>,
     deliveries: &Option<Arc<messaging::Deliveries>>,
 ) -> Option<LinkEnd> {
     use tokio_tungstenite::tungstenite::Message;
@@ -250,7 +242,7 @@ async fn serve_frame(
     match classify(&text) {
         Incoming::Ignore => None,
         Incoming::Command(command) => {
-            execute(sessions, deliveries, command).await;
+            execute(deliveries, command).await;
             None
         }
         // the only errors this connection can earn are refusals of its claim,
@@ -280,28 +272,11 @@ fn classify(text: &str) -> Incoming {
         Some("service_command") => {
             match serde_json::from_value::<wire::Command>(frame["command"].clone()) {
                 Ok(command) => Incoming::Command(command),
-                // KNOWN GAP, and the one direction that does not refuse
-                // cleanly. Daemon→node skew is a named refusal the sender sees:
-                // an undecodable frame earns a `BadFrame` carrying `unknown
-                // field ...` and the socket stays open. This direction only
-                // drops. A `TermCreate` this daemon cannot decode is warned
-                // about HERE, where nobody is waiting, while the node's
-                // `TerminalSessions::start` awaits a reply that will never come
-                // — and it awaits with no timeout on purpose (a cold image pull
-                // takes minutes), so the operator's `agent pty` hangs.
-                //
-                // Left as-is deliberately: reaching it needs a node and a
-                // daemon built from DIFFERENT trees, nothing here owes that
-                // support, and what it replaced was worse — before
-                // `deny_unknown_fields` the extra field was dropped and the
-                // session RAN without the restriction the node named. Hanging
-                // is a worse failure than a fast refusal and a better one than
-                // a silently weakened session.
-                //
-                // The fix, when it is worth doing, is session-scoped: recover
-                // the `session` id out of the undecodable frame and answer
-                // `TermRefused` on it, so the create fails fast with a
-                // nameable reason instead of waiting.
+                // Node→daemon skew only DROPS: the node's `MsgDeliver` is
+                // idempotent at the module, which re-reads its own record and
+                // re-sends, so a dropped frame costs a round rather than a
+                // wedged caller. Reaching it needs a node and a daemon built
+                // from DIFFERENT trees.
                 Err(_) => {
                     tracing::warn!(
                         target: "ducktape::service",
@@ -319,94 +294,49 @@ fn classify(text: &str) -> Incoming {
     }
 }
 
-/// how many `input_lane_full` refusals pass between log lines after the
-/// first. One comes in per keystroke the daemon refuses, so an unlatched line
-/// here would evict the ring the same way an unlatched per-frame warning does
-/// anywhere else on this plane.
-static INPUT_LANE_FULL: noded::log::Latch = noded::log::Latch::new(100);
-
-/// how many `command_lane_full` drops pass between log lines after the first.
-/// Latched for the same reason `input_lane_full` is: one per refused command,
-/// and an unlatched line evicts the ring that holds the evidence.
+/// how many `collab_lane_full` drops pass between log lines after the first.
+/// One comes in per refused command, and an unlatched line evicts the ring
+/// that holds the evidence.
 static COLLAB_LANE_FULL: noded::log::Latch = noded::log::Latch::new(100);
 
-/// Perform one command, on this task or its own.
+/// Perform one command.
 ///
-/// The link must never stop reading, so nothing slow may run on it:
-///
-/// - **create** starts a container (a cold image pull is minutes) and **close**
-///   tears one down, so both get their own task. Neither needs ordering against
-///   anything: the node does not release a session id to anyone until the create
-///   is answered, and a close is the escape hatch that must not queue behind a
-///   blocked pty.
-/// - **input and resize** only ENQUEUE onto the target session's own ordered
-///   lane, which is a map lookup and a non-blocking `try_send`. That is what
-///   keeps keystrokes in arrival order without making the link the queue — the
-///   pty write itself happens on the session's driver task. The lane is
-///   bounded (frame count and pending bytes both), so a refusal is ordinary
-///   under load, not a bug: it is warned, latched, and the frame is dropped —
-///   never buffered, and never blocks this task.
-async fn execute(
-    sessions: &Arc<Sessions>,
-    deliveries: &Option<Arc<messaging::Deliveries>>,
-    command: wire::Command,
-) {
-    // the collaboration half goes to its own plane, on its own ordered lane.
-    // `enqueue` is a `try_send`, so a bind that starts a child process and a
-    // delivery that fsyncs never happen on this task — while staying in the
-    // order they arrived, which a spawn per command would lose.
-    let command = match messaging::route(command) {
-        Ok(collab) => {
-            let Some(deliveries) = deliveries else {
-                // this daemon serves no messaging (no durable outbox). The
-                // node hears nothing back, exactly as from a node with no
-                // daemon attached — never a fabricated acknowledgement.
-                tracing::debug!(
-                    target: "ducktape::collab",
-                    reason = "messaging_unavailable",
-                    "dropped a collaboration command: this daemon serves no messaging"
-                );
-                return;
-            };
-            if !deliveries.enqueue(collab)
-                && let Some(occurrences) = COLLAB_LANE_FULL.hit("collab_lane_full")
-            {
-                tracing::warn!(
-                    target: "ducktape::collab",
-                    reason = "collab_lane_full",
-                    occurrences,
-                    "collaboration command dropped: the delivery plane is behind"
-                );
-            }
-            return;
-        }
-        Err(terminal) => terminal,
-    };
-    let touches_a_container = matches!(
-        command,
-        wire::Command::TermCreate(_) | wire::Command::TermClose { .. }
-    );
-    if touches_a_container {
-        let sessions = sessions.clone();
-        tokio::spawn(async move {
-            sessions.dispatch(command).await;
-        });
-        return;
-    }
-    // `UnknownSession` is already warned inside `agent_service::Sessions`,
-    // where the lookup happened; only `LaneFull` is this link's to report —
-    // there is no wire refusal frame for input, so the drop plus this warning
-    // is the whole fix.
-    let refused_for_lane_full = matches!(
-        sessions.dispatch(command).await,
-        Some(agent_service::EnqueueRefusal::LaneFull)
-    );
-    if refused_for_lane_full && let Some(occurrences) = INPUT_LANE_FULL.hit("input_lane_full") {
+/// The link must never stop reading, so nothing slow may run on it: `enqueue`
+/// is a `try_send`, so a bind that starts a child process and a delivery that
+/// fsyncs never happen on this task — while staying in the order they arrived,
+/// which a spawn per command would lose. The lane is bounded, so a refusal is
+/// ordinary under load, not a bug: it is warned, latched, and the frame is
+/// dropped — never buffered, and never blocks this task.
+async fn execute(deliveries: &Option<Arc<messaging::Deliveries>>, command: wire::Command) {
+    let Ok(collab) = messaging::route(command) else {
+        // no terminal command ever leaves the node, so one arriving here is a
+        // daemon built against a tree its node is not.
         tracing::warn!(
-            target: "ducktape::agent",
-            reason = "input_lane_full",
+            target: "ducktape::service",
+            reason = "terminal_command",
+            "dropped a terminal command: this daemon runs no terminal"
+        );
+        return;
+    };
+    let Some(deliveries) = deliveries else {
+        // this daemon serves no messaging (no durable outbox). The node hears
+        // nothing back, exactly as from a node with no daemon attached — never
+        // a fabricated acknowledgement.
+        tracing::debug!(
+            target: "ducktape::collab",
+            reason = "messaging_unavailable",
+            "dropped a collaboration command: this daemon serves no messaging"
+        );
+        return;
+    };
+    if !deliveries.enqueue(collab)
+        && let Some(occurrences) = COLLAB_LANE_FULL.hit("collab_lane_full")
+    {
+        tracing::warn!(
+            target: "ducktape::collab",
+            reason = "collab_lane_full",
             occurrences,
-            "term input dropped: the session's drive lane is full"
+            "collaboration command dropped: the delivery plane is behind"
         );
     }
 }

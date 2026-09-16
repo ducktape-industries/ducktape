@@ -111,7 +111,7 @@ pub const FRESHNESS_SECS: u64 = 30;
 
 /// axum's own default body cap, which is what every gated route that sets no
 /// `DefaultBodyLimit` of its own already enforces — the json lanes
-/// (`/v1/submit`, `/v1/invite`, the workspace RPC, the term routes) and the
+/// (`/v1/submit`, `/v1/invite`, the workspace RPC) and the
 /// filter string. Spelled here because the middleware runs OUTSIDE the route's
 /// layers and so cannot read the limit they install.
 const DEFAULT_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -203,8 +203,6 @@ enum Lane {
     Workspace,
     /// The node-local content-addressed blob store's upload endpoint.
     Blob,
-    /// `/v1/term/sessions…` — create and close a node-hosted pty.
-    Term,
     /// `/v1/submit` — the frameless op lane ([`SUBMIT_PATH`]).
     Submit,
     /// Operator-authorized opaque module payload; authored as the node.
@@ -259,13 +257,8 @@ const SUBMIT_PATH: &str = "/v1/submit";
 
 const WORKSPACE_PREFIX: &str = "/v1/fs/workspaces";
 const BLOB_PATH: &str = "/v1/files/blob";
-const TERM_PREFIX: &str = "/v1/term/sessions";
-
 /// Disjoint operating-system service path prefixes.
-const LANE_PREFIXES: &[(&str, Lane)] = &[
-    (WORKSPACE_PREFIX, Lane::Workspace),
-    (TERM_PREFIX, Lane::Term),
-];
+const LANE_PREFIXES: &[(&str, Lane)] = &[(WORKSPACE_PREFIX, Lane::Workspace)];
 
 fn lane_of(path: &str) -> Lane {
     if path == "/v1/gateway/operator" {
@@ -325,8 +318,8 @@ impl Lane {
             // and a user submits through the self-authenticating
             // `/v1/submit/frame` instead, whose signature IS the op's origin.
             Lane::Submit | Lane::RawSubmit => posts.then_some(Authority::Operator),
-            // a pty/microVM on the HOST, and the two fixed node mutations.
-            Lane::Term | Lane::NodeLevel => posts.then_some(Authority::Operator),
+            // the two fixed node mutations.
+            Lane::NodeLevel => posts.then_some(Authority::Operator),
             // the proof binds the SIGNER; the handler refuses a key that holds
             // no account, so possession is the gate's whole job here.
             Lane::HuddleProof | Lane::RunControl => posts.then_some(Authority::Acting),
@@ -353,7 +346,6 @@ impl Lane {
             // (the guard returns before asking), and takes the small cap so a
             // table that ever disagreed fails closed rather than wide.
             Lane::Workspace
-            | Lane::Term
             | Lane::Submit
             | Lane::NodeLevel
             | Lane::HuddleProof
@@ -843,12 +835,6 @@ mod tests {
             (Method::POST, "/v1/submit", Authority::Operator),
             (Method::POST, "/v1/submit/raw/new-product", Authority::Operator),
             (Method::DELETE, "/v1/fs/workspaces/abc", Authority::Operator),
-            (Method::POST, "/v1/term/sessions", Authority::Operator),
-            (
-                Method::POST,
-                "/v1/term/sessions/abc/close",
-                Authority::Operator,
-            ),
         ];
         for (method, path, wanted) in gated {
             assert_eq!(
@@ -909,7 +895,6 @@ mod tests {
         assert_eq!(cap("/v1/submit"), DEFAULT_JSON_BODY_BYTES);
         assert_eq!(cap("/v1/submit/raw/new-product"), node::MAX_PAYLOAD_BYTES);
         assert_eq!(cap("/v1/fs/workspaces"), DEFAULT_JSON_BODY_BYTES);
-        assert_eq!(cap("/v1/term/sessions"), DEFAULT_JSON_BODY_BYTES);
         assert!(cap("/v1/submit") < cap("/v1/files/blob"));
     }
 

@@ -18,19 +18,10 @@ pub(crate) struct Surfaces {
     pub(crate) services: noded::services::ServiceCatalog,
     pub(crate) gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     pub(crate) gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
-    /// the host-side session manager (a clone of the one on the http handle), so
-    /// the term plane's control handler can spawn peer-attached sessions. `None`
-    /// on a node that hosts no terminal plane (sync-only / no http surface).
-    pub(crate) terminals: Option<noded::TerminalSessions>,
-    /// the guest-side remote-session lane the term plane's client half drains.
-    pub(crate) session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
-    /// the guest-side session-id → host-node registry the http handle writes on
-    /// a remote create. The term plane's inbound feeds gate on it: a session's
-    /// chunks and command rows are accepted only from the peer that hosts it.
-    pub(crate) remote_sessions: noded::RemoteSessions,
-    /// the host's own browser-gateway base URL — the `via` a resolved credential
-    /// routes through. Empty when no browser gateway is bound.
-    pub(crate) local_gateway_via: String,
+    /// the node ↔ agent-daemon link (a clone of the one on the http handle), so
+    /// the collaboration pump can drive the messaging bus. `None` on a node
+    /// that serves no app surface (sync-only / no http surface).
+    pub(crate) service_link: Option<noded::ServiceLink>,
     /// the ports THIS node's own surfaces answer on (operator rpc, browser
     /// gateway, app-surface http), as actually bound. The gateway plane
     /// refuses a loopback route aimed at any of them: a member mapping a
@@ -155,15 +146,6 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     };
     let gateway_port = gateway_listener.as_ref().map(|(_, actual)| actual.port());
     let (gateway_lane, gateway_requests) = tokio::sync::mpsc::channel::<noded::GatewayJob>(32);
-    // the guest-side remote-session lane: /v1/term/sessions with a `node` hands a
-    // SessionJob here, drained by the term plane's client half (mirrors the
-    // gateway lane). The host's own browser-gateway base URL is the `via` a
-    // resolved credential routes through.
-    let (session_lane, session_requests) = tokio::sync::mpsc::channel::<noded::SessionJob>(32);
-    let local_gateway_via = gateway_listener
-        .as_ref()
-        .map(|(_, address)| format!("http://{address}"))
-        .unwrap_or_default();
     // the derived per-module index (noded's exact store, <storage>/index),
     // plus the blocks database the explorer reads: the pump folds sealed
     // blocks into it, boot heals it from verified state at sync/recovery
@@ -248,64 +230,36 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // into the compute daemon, which reaches this node over /v1 like any other
     // local client.
     let services = http_handle.services().clone();
-    // the node-local, off-chain interactive terminal-session plane (lives on the
-    // http handle like the stream hub — never consensus). Wired wherever the app
-    // surface is served: not sync-only, and an http address configured. A parked
-    // joiner/resident gets the plane too — its park loop already spawns the full
-    // term plane (guest lane included), and that is the credential-lending guest
-    // shape: a resident laptop routing a pty to a compute host must not need a
-    // validator seat. Membership is not this gate's job: cross-node reach rides
-    // the mesh session plane, which only has tunnels to nodes with standing, so
-    // an unadmitted joiner's directed create dies in the lane, not here.
+    // the node ↔ agent-daemon link (lives on the http handle like the stream
+    // hub — never consensus). Wired wherever the app surface is served: not
+    // sync-only, and an http address configured. It carries the collaboration
+    // messaging bus, and its 0600 secret is what the workspace-gated ws topics
+    // stand on.
     //
-    // This node SPAWNS NO PTY. What is wired here is the rings, the per-session
-    // metadata and the admission entry points; the ptys themselves live in the
-    // agent daemon (`ducktape service run agent`), which attaches over this
-    // node's own ws and owns its own sandbox. So the gate is purely "is there an
-    // app surface to serve it on" — no sandbox backend, no provider discovery,
-    // no execution identity. With no daemon attached a create returns the
-    // "requires an agent service" 503, still distinct from the "terminal
-    // sessions are not enabled" 503 that means the plane is missing entirely.
-    let terminals = if !sync_only && http_listen.is_some() {
-        // the boot marker an operator (and the parked-joiner regression test)
-        // looks for: the plane is WIRED. Whether it can serve is a second
-        // question, answered by whether an agent daemon has attached.
-        tracing::info!(target: "ducktape::term", "terminal_plane_ready");
+    // This node runs no terminal: a terminal session is an independently
+    // installed `ducktape-terminal` process reached through its signed gateway
+    // route, and nothing here spawns, drives or interprets one.
+    let service_link = if !sync_only && http_listen.is_some() {
         // minted fresh each boot and written 0600 beside node.toml; the agent
-        // daemon reads it on every attach. A mint failure disables the plane
-        // rather than handing the link out unguarded.
+        // daemon reads it on every attach. A mint failure disables the link
+        // rather than handing it out unguarded.
         let link_token = noded::services::mint_link_token(workspace)
             .inspect_err(|error| {
                 tracing::error!(
                     target: "ducktape::service",
                     reason = "link_token_unwritable",
-                    "the interactive plane will refuse every agent service: {error}"
+                    "the agent service link will refuse every daemon: {error}"
                 );
             })
             .ok();
-        Some(noded::TerminalSessions::new(
-            stream_hub.terminals(),
-            stream_hub.term_commands(),
-            link_token,
-        ))
+        Some(noded::ServiceLink::new(link_token))
     } else {
         None
     };
-    // the term plane's host side (control handler) takes a clone of the same
-    // manager the http handle serves; the guest side drains the session lane.
-    let http_handle = match terminals.clone() {
-        Some(manager) => http_handle
-            .with_terminals(manager)
-            .with_session_lane(session_lane),
-        None => {
-            drop(session_lane);
-            http_handle
-        }
+    let http_handle = match service_link.clone() {
+        Some(link) => http_handle.with_service_link(link),
+        None => http_handle,
     };
-    // the guest-side session→host registry, taken before the handle moves into
-    // the surface thread: the http routes write it on a remote create, the term
-    // plane's inbound feeds read it to bind a session's grains to its host.
-    let remote_sessions = http_handle.remote_sessions().clone();
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)
     let mut http_port = None;
@@ -384,10 +338,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         services,
         gateway_requests: gateway_enabled.then_some(gateway_requests),
         gateway_commands,
-        terminals,
-        session_requests,
-        remote_sessions,
-        local_gateway_via,
+        service_link,
         node_api_ports: [rpc_port, gateway_port, http_port]
             .into_iter()
             .flatten()

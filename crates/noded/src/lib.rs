@@ -80,16 +80,12 @@ pub mod node_work;
 pub use module_code::{
     CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStageRequest, MAX_MODULE_ARTIFACT_BYTES,
 };
-// the node-local, off-chain interactive terminal-session plane. public so
-// `main.rs` can build the manager and wire it onto the handle.
 pub mod run_control;
-pub mod term;
-pub use term::{
-    AttachGuard, CreatedSession, PeerAttach, TermChunkEvent, TermCommandEvent, TermCommandRing,
-    TermError, TermFeedEvent, TermRing, TerminalSessions,
-};
-
-pub mod term_remote;
+// the node ↔ agent-daemon link: the collaboration messaging bus, and the 0600
+// workspace secret the gated ws topics stand on. public so `main.rs` can build
+// it and wire it onto the handle.
+pub mod service_link;
+pub use service_link::{AttachGuard, ServiceLink};
 
 /// the volatile catalog of service daemons signaling presence to this node.
 pub mod services;
@@ -97,17 +93,6 @@ pub mod services;
 /// A service daemon's handle on the node it serves: the `/v1` twin of the
 /// in-process `NodeCommand` actor lane. See [`node_link::NodeLink`].
 pub mod node_link;
-pub use term_remote::{
-    CONTROL_DEADLINE, RemoteSessions, SessionInputWire, SessionJob, SessionLane,
-};
-// PR2 consensus command source: the chat<->pty bridge (channel scheme + the
-// off-loop projector that drives committed chat commands into a session's pty).
-mod term_consensus;
-// the command wire contract, public so a client / integration test can build
-// the exact chat post a member submits and decode it back the way the pty host
-// does: `command_blocks(line)` -> a `PostMessage` body, `command_text(blocks)`
-// -> the line, `session_channel(id)` -> the carrier channel.
-pub use term_consensus::{command_blocks, command_text, session_channel};
 // the derived-index tier: store construction, boundary stamps, /v1/index/* +
 // /v1/blocks.
 mod index;
@@ -784,13 +769,8 @@ pub fn router(handle: NodeHandle) -> Router {
         // minting an invite is a WRITE to this node's own descriptor and a read
         // of its persisted mesh — the daemon that owns those files does it.
         .route("/v1/invite", post(mint_invite))
-        // ---- interactive terminal sessions (node-local, off-chain) ----
-        // create returns {session_id, topic}; output rides the ws `term:<id>`
-        // topic. same trusted-local gate as the other mutating /v1 routes (see
-        // term.rs). close is idempotent.
+        // ---- run control (node-local, off-chain) ----
         .route("/v1/run-control", post(run_control::control))
-        .route("/v1/term/sessions", post(term::create_session))
-        .route("/v1/term/sessions/{id}/close", post(term::close_session))
         // ---- service signaling (node-local, off-chain, volatile) ----
         // a local service daemon says hello; the entry ages out on its own
         // TTL. Presence only — enablement lives in the workspace's

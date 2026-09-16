@@ -10,8 +10,7 @@
 //! IS this node's pubkey"*), so a node-authored op carries the SUBMITTING
 //! NODE's key. `POST /v1/submit/frame` relays a frame the USER signed with an
 //! account key, so a user-authored op (`ducktape agent run`, a scheduled run)
-//! carries that key. The mesh [`PeerId`](data_plane::PeerId) the terminal
-//! plane hands us is the same kind of fact, proven by the WireGuard transport.
+//! carries that key.
 //!
 //! **If `/v1/submit` ever stamped a caller-supplied origin, this admission
 //! would become decorative.** `the_submit_lane_still_resigns_with_the_node_key`
@@ -28,28 +27,26 @@
 //! this host run this party's workload at all"* — a host deciding its own
 //! policy about a party it identified itself.
 //!
-//! ## one decision, two call sites
+//! ## one decision, one call site
 //!
-//! [`admit`] is the ONLY entry point, and both lanes call it:
-//!
-//! - `term_plane::serve_create` — a mesh peer asking this host for a pty;
-//! - `compute::intake::WorkPump` — a committed saga assigned to or announced
-//!   at this node.
-//!
-//! They are two call sites because they run in two PROCESSES (the wave-2 daemon
-//! split), not two policies. `both_lanes_route_through_one_verdict` is a
+//! [`admit`] is the ONLY entry point, and `compute::intake::WorkPump` — a
+//! committed saga assigned to or announced at this node — is the only lane
+//! that calls it. `the_work_lane_routes_through_one_verdict` is a
 //! source-parsing lint that keeps it that way: two checks that must agree is
 //! the dual-path defect this repo forbids.
+//!
+//! An independently installed service decides its own admission with its own
+//! copy of the policy file (`provider_host::work_admission`); it reaches no
+//! node code, and the node reaches none of its sessions.
 //!
 //! ## what it does NOT close
 //!
 //! - A saga triggered by a MODULE (`dispatch` — i.e. the chat/pages/forge/jobs
 //!   /`RequestRun` family) has no account origin at this layer and is admitted:
 //!   see [`WorkCaller::NotAnAccountOrigin`].
-//! - A mesh PEER (the terminal plane's control stream, a peer node's own
-//!   `/v1/submit`) is a node, not an account, and the default policy names
-//!   only accounts — so a peer's work runs only under [`WorkAdmission::Anyone`]
-//!   until the terminal plane carries a user proof of its own.
+//! - A peer node's own `/v1/submit` is a node, not an account, and the default
+//!   policy names only accounts — so it lands on
+//!   [`WorkCaller::KeyWithoutAccount`].
 //! - The guarantee is bounded by `/v1`'s exposure. `POST /v1/submit` re-signs
 //!   as THIS node, so anything that can reach the node's HTTP or RPC port takes
 //!   the [`WorkCaller::ThisNode`] path by construction. Making un-tokened `/v1`
@@ -80,44 +77,25 @@ pub(crate) fn admit_account_fixture(workspace: &Path, account: u64) -> Result<()
     )
 }
 
-/// Test fixture: the `anyone` policy — the only one under which a mesh PEER's
-/// work runs (a peer is a node, never an account). Same rationale as
-/// [`admit_account_fixture`].
-#[cfg(test)]
-pub(crate) fn admit_anyone_fixture(workspace: &Path) -> Result<(), String> {
-    save(workspace, &WorkAdmission::Anyone)
-}
-
 // ============================================================================
 // the decision
 // ============================================================================
 
-/// What a lane KNOWS about who asked, first-hand. Both arms are derived from a
-/// signature or from the mesh transport; neither is anything a caller supplied.
-pub(crate) enum WorkSource<'a> {
-    /// the mesh-authenticated peer that opened the control stream.
-    Peer(&'a [u8]),
-    /// a committed saga's origin.
-    Saga(&'a SagaOrigin),
-}
-
-/// Who is asking, as far as committed state can say. SIX states, because
+/// Who is asking, as far as committed state can say. FIVE states, because
 /// "could not ask", "a key on no account" and "a peer node" are different
 /// operator problems — the lesson `airlock::server::GrantAnswer` already paid
 /// for.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum WorkCaller {
-    /// the asking key IS this node's key: our own submission, or the terminal
-    /// plane's own-node loopback. Zero queries, and it is what keeps a
-    /// single-node workspace and an account-less node working.
+    /// the asking key IS this node's key: our own submission. Zero queries, and
+    /// it is what keeps a single-node workspace and an account-less node
+    /// working.
     ThisNode,
     /// the signing key is a member of this account.
     Account(u64),
     /// identity answered, and the signing key belongs to no account. A peer
     /// node's own `/v1/submit` lands here too: no account is keyed by a node.
     KeyWithoutAccount,
-    /// a mesh peer on the terminal plane — a node, which is never an account.
-    PeerNode,
     /// the saga was triggered by a MODULE, not an external submitter — the
     /// chat/pages/forge/jobs family, whose requester is one hop further back in
     /// `runs`' own state. Not attributable here, and admitted: see the module
@@ -145,26 +123,6 @@ impl WorkRefusal {
             WorkRefusal::PolicyUnreadable => "work_policy_unreadable",
         }
     }
-
-    /// operator-facing text. Names the verb that fixes it and NEVER echoes the
-    /// account that would have been accepted.
-    pub(crate) fn detail(self) -> &'static str {
-        match self {
-            WorkRefusal::NotAdmitted => {
-                "this node does not run work for that party — its operator admits an account \
-                 with `ducktape node work admit <account>`, or anyone with \
-                 `ducktape node work admit anyone`"
-            }
-            WorkRefusal::CallerUnbound => {
-                "the submitting key is on no Identity account, so no admission can name it — \
-                 submit as a user (`ducktape account create` there, then run user-signed)"
-            }
-            WorkRefusal::PolicyUnreadable => {
-                "this node's work-admission policy could not be read; it runs nothing until \
-                 its operator repairs it"
-            }
-        }
-    }
 }
 
 /// THREE states, not two. Folding "I could not ask" into a refusal is the
@@ -186,13 +144,13 @@ pub(crate) trait CommittedReader: Send + Sync {
     async fn read(&self, target: &str, request: Vec<u8>) -> Result<Vec<u8>, String>;
 }
 
-/// **The** admission decision. Both lanes call this and nothing else; see
-/// `both_lanes_route_through_one_verdict`.
+/// **The** admission decision. The work lane calls this and nothing else; see
+/// `the_work_lane_routes_through_one_verdict`.
 pub(crate) async fn admit(
     reader: &dyn CommittedReader,
     workspace: &Path,
     me: &[u8],
-    source: WorkSource<'_>,
+    origin: &SagaOrigin,
 ) -> WorkVerdict {
     let policy = match load(workspace) {
         Ok(policy) => policy,
@@ -206,7 +164,7 @@ pub(crate) async fn admit(
             return WorkVerdict::Refused(WorkRefusal::PolicyUnreadable);
         }
     };
-    let caller = resolve_caller(reader, me, source).await;
+    let caller = resolve_caller(reader, me, origin).await;
     verdict(&policy, &caller)
 }
 
@@ -226,7 +184,6 @@ fn admits(accounts: &BTreeSet<u64>, caller: &WorkCaller) -> WorkVerdict {
         WorkCaller::NotAnAccountOrigin => WorkVerdict::Admitted,
         WorkCaller::Unresolved => WorkVerdict::AuthorityUnavailable,
         WorkCaller::KeyWithoutAccount => WorkVerdict::Refused(WorkRefusal::CallerUnbound),
-        WorkCaller::PeerNode => WorkVerdict::Refused(WorkRefusal::NotAdmitted),
         WorkCaller::Account(number) => match accounts.contains(number) {
             true => WorkVerdict::Admitted,
             false => WorkVerdict::Refused(WorkRefusal::NotAdmitted),
@@ -234,24 +191,18 @@ fn admits(accounts: &BTreeSet<u64>, caller: &WorkCaller) -> WorkVerdict {
     }
 }
 
-/// Attribute a source. Exhaustive on purpose: a new `SagaOrigin` variant must
-/// fail the build here rather than default to admitted. `me` is this node's
-/// own key and every compared key came from a verified signature or the mesh
-/// transport — nothing a caller sends can reach these comparisons.
+/// Attribute a committed saga origin. Exhaustive on purpose: a new
+/// `SagaOrigin` variant must fail the build here rather than default to
+/// admitted. `me` is this node's own key and every compared key came from a
+/// verified signature — nothing a caller sends can reach these comparisons.
 async fn resolve_caller(
     reader: &dyn CommittedReader,
     me: &[u8],
-    source: WorkSource<'_>,
+    origin: &SagaOrigin,
 ) -> WorkCaller {
-    match source {
-        WorkSource::Peer(node) => match node == me {
-            true => WorkCaller::ThisNode,
-            false => WorkCaller::PeerNode,
-        },
-        WorkSource::Saga(SagaOrigin::Module(_)) | WorkSource::Saga(SagaOrigin::System) => {
-            WorkCaller::NotAnAccountOrigin
-        }
-        WorkSource::Saga(SagaOrigin::External(key)) => {
+    match origin {
+        SagaOrigin::Module(_) | SagaOrigin::System => WorkCaller::NotAnAccountOrigin,
+        SagaOrigin::External(key) => {
             if key == me {
                 return WorkCaller::ThisNode;
             }

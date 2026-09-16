@@ -108,7 +108,6 @@ mod sandbox_cli;
 mod services;
 mod sync;
 mod task_dump;
-mod term_plane;
 mod tty;
 mod userkey_cli;
 mod util;
@@ -547,10 +546,7 @@ fn run_node(
         services,
         gateway_requests,
         gateway_commands,
-        terminals,
-        session_requests,
-        remote_sessions,
-        local_gateway_via,
+        service_link,
         node_api_ports,
     } = boot::surfaces::bind(boot::surfaces::BindConfig {
         sync_only,
@@ -663,7 +659,7 @@ fn run_node(
         collab_pump::spawn(
             gateway_commands.clone(),
             status.clone(),
-            terminals.as_ref(),
+            service_link.as_ref(),
             workspace.clone(),
             &chain_id,
         );
@@ -866,10 +862,6 @@ fn run_node(
                 http_cmds,
                 gateway_requests,
                 gateway_commands.clone(),
-                terminals,
-                session_requests,
-                remote_sessions.clone(),
-                local_gateway_via,
                 node_api_ports,
                 &stream_hub,
                 index.clone(),
@@ -962,10 +954,6 @@ fn run_node(
             http_cmds,
             gateway_requests,
             gateway_commands,
-            terminals,
-            session_requests,
-            remote_sessions,
-            local_gateway_via,
             node_api_ports,
             stream_hub,
             index,
