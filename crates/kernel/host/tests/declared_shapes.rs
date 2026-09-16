@@ -54,7 +54,7 @@ fn expected() -> BTreeMap<String, Shape> {
         ("noop", shape(Backing::Map, NONE, false)),
         ("pages", shape(Backing::Store, NONE, false)),
         // the network binding, and the unit its conversation check-ins are in.
-        ("runs", shape(Backing::Map, CHAIN_ID_AND_TIME_UNIT, false)),
+        ("runs", shape(Backing::Store, CHAIN_ID_AND_TIME_UNIT, false)),
         ("saga", shape(Backing::Store, NONE, false)),
         ("attribution", shape(Backing::Store, NONE, false)),
         ("tasks", shape(Backing::Store, NONE, false)),

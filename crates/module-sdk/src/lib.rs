@@ -559,6 +559,32 @@ pub fn save_state(bytes: &[u8], root: &[u8; ROOT_LEN]) {
     host::state_set(ROOT_KEY, root);
 }
 
+/// the [`load_state`] twin for STORE-BACKED tenants, exactly as
+/// [`load_store_config`] twins [`load_config`]: a host-owned merkle store keys
+/// every record by a 32-byte digest, so the reserved pair sits at
+/// [`sdk::store_key`] of [`STATE_KEY`] and [`ROOT_KEY`]. Same contract
+/// otherwise, half-persisted panic included.
+pub fn load_store_state() -> Option<(Vec<u8>, [u8; ROOT_LEN])> {
+    match (
+        host::state_get(&sdk::store_key(STATE_KEY)),
+        host::state_get(&sdk::store_key(ROOT_KEY)),
+    ) {
+        (None, None) => None,
+        (Some(bytes), Some(root)) => {
+            let root: [u8; ROOT_LEN] = root.try_into().expect("persisted __root must be 32 bytes");
+            Some((bytes, root))
+        }
+        _ => panic!("half-persisted module state: __state/__root must land together"),
+    }
+}
+
+/// the [`save_state`] twin for STORE-BACKED tenants — the same OUTER staging,
+/// under the two digest keys [`load_store_state`] reads.
+pub fn save_store_state(bytes: &[u8], root: &[u8; ROOT_LEN]) {
+    host::state_set(&sdk::store_key(STATE_KEY), bytes);
+    host::state_set(&sdk::store_key(ROOT_KEY), root);
+}
+
 // ============================================================================
 // genesis config — per-network parameters for a fixed component
 // ============================================================================

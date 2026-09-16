@@ -29,6 +29,9 @@ use saga::{
     encode_msg as saga_encode_msg, encode_query as saga_encode_query,
 };
 use sdk::{Error, Event, Msg, Origin, StateRoot};
+use futures::executor::block_on;
+use sdk::MerkleStore as _;
+use sdk_testkit::MemStore;
 use statesync::qmdb::QmdbStore;
 use tasks::{JobsMsg, encode_job_msg as jobs_encode_msg};
 use tasks::{
@@ -43,15 +46,21 @@ use wasm_host::WasmModule;
 const RUNS_WASM: &[u8] = include_bytes!("fixtures/runs.component.wasm");
 
 /// the chain id both hosts run on — the genesis `__config` parameter the
-/// composer installs into this Map tenant, and the network every `duck://`
+/// composer seeds into this store tenant, and the network every `duck://`
 /// link the injector renders names. Both sides take it, or the two disagree
 /// on the `?net=` of a rendered page link.
 const PARITY_CHAIN_ID: &str = "parity#d0cdf950";
 
 fn wasm_runs() -> WasmModule {
-    let mut module = WasmModule::from_bytes("runs", RUNS_WASM).expect("load component");
-    // exactly what `noded::compose` seeds a Map-backed network-bound tenant
-    // with at genesis; without it the guest refuses every dispatch.
+    WasmModule::with_store("runs", RUNS_WASM, Box::new(seeded_runs_store()))
+        .expect("load component")
+}
+
+/// exactly what `noded::compose` seeds a STORE-backed network-bound tenant
+/// with at genesis (`seed_store_config`); without it the guest refuses every
+/// dispatch. The record sits at the digest of `__config`, like every other
+/// record in a merkle store.
+fn seeded_runs_store() -> MemStore {
     let config = sdk::genesis_config::encode_config(&[
         ("chain_id", PARITY_CHAIN_ID.as_bytes()),
         (
@@ -59,10 +68,13 @@ fn wasm_runs() -> WasmModule {
             sdk::genesis_config::TimeUnit::Height.encode(),
         ),
     ]);
-    let (bytes, root) =
-        wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, config.as_slice())]);
-    module.install(&bytes, root).expect("seed genesis config");
-    module
+    let mut store = MemStore::new();
+    block_on(store.commit_batch(vec![(
+        sdk::store_key(sdk::genesis_config::CONFIG_KEY),
+        Some(config),
+    )]))
+    .expect("seed genesis config");
+    store
 }
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`) — the exact
