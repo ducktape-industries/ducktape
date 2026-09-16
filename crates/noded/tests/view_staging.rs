@@ -286,3 +286,50 @@ fn nonregular_view_output_keeps_the_deployment_pending() {
     assert!(error.contains("not a regular file"), "{error}");
     assert!(dest.join("governance.view.pending").exists());
 }
+
+/// A STAGING PASS THAT SUCCEEDS MUST NEVER WRITE THE PENDING MARKER, not even
+/// for the moment between writing it and removing it again.
+///
+/// Every reader of a staged set treats `<id>.view.pending` as "this deployment
+/// is not ready", and on a box where several worktrees share one
+/// `CARGO_TARGET_DIR` the founding set under it is shared too: a marker that
+/// exists for a moment is a set that refuses for that moment, and that is long
+/// enough for another session's test to copy the directory, take the marker
+/// with it, and fail on a view that was in fact fine. Three sessions lost time
+/// to exactly that.
+///
+/// The window is invisible from outside once the pass is over, so this pins it
+/// the one way that needs no clock: leave a `pending` entry the marker write
+/// CANNOT overwrite. An implementation that writes the marker first fails here;
+/// one that only writes it when the view is genuinely not ready stages the view
+/// and clears the entry on its way out.
+#[test]
+fn a_good_view_stages_without_the_marker_write_a_correct_pass_does_not_need() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = scratch.path().join("view.wasm");
+    std::fs::write(&source, b"a perfectly good view").unwrap();
+    let dest = scratch.path().join("staged");
+    // A pending entry no `rename` can land on: writing the marker here is an
+    // error, so only an implementation that does not write it can get through.
+    let pending = dest.join("governance.view.pending");
+    std::fs::create_dir_all(&pending).unwrap();
+    std::fs::write(pending.join("left-behind"), b"from an earlier failed pass").unwrap();
+
+    staging::sync_view(
+        &dest,
+        "governance",
+        true,
+        &source,
+        &scratch.path().join("assets"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read(dest.join("governance.view.wasm")).unwrap(),
+        b"a perfectly good view"
+    );
+    assert!(
+        !pending.exists(),
+        "a staged view clears whatever pending entry an earlier pass left"
+    );
+}
