@@ -303,7 +303,7 @@ fn route(user: &ed25519::PrivateKey, chain: &str, publisher: Vec<u8>) -> gateway
             policy: gateway::RoutePolicy {
                 audience: gateway::RouteAudience::Network,
                 methods: vec![gateway::RouteMethod::Get, gateway::RouteMethod::Post],
-                max_request_bytes: 1024,
+                max_request_bytes: Some(1024),
                 max_response_bytes: 4096,
                 allow_authorization: false,
                 allow_upgrade: true,
@@ -338,7 +338,6 @@ fn proxy(cluster: &Cluster, user: &ed25519::PrivateKey, text: &str) -> (u16, ser
             name: "content-type".into(),
             value: "application/json".into(),
         }],
-        body_len: body.len() as u64,
         upgrade: false,
         user_pop: None,
     };
@@ -346,7 +345,12 @@ fn proxy(cluster: &Cluster, user: &ed25519::PrivateKey, text: &str) -> (u16, ser
     let signature = user
         .sign(
             gateway::GATEWAY_CALLER_NS,
-            &gateway::caller_pop_preimage(&Cluster::identity(1), &head, &body, ts),
+            &gateway::caller_pop_preimage(
+                &Cluster::identity(1),
+                &head,
+                &gateway::body_digest(&body),
+                ts,
+            ),
         )
         .as_ref()
         .to_vec();

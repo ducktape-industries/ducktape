@@ -1,17 +1,18 @@
 //! Bounded request contract for the gateway reverse proxy.
 //!
-//! The stream hello carries only [`ProxyRequestHead`]. A caller writes exactly
-//! `body_len` bytes after the authenticated stream opens, then receives one
-//! bounded response. The publisher re-resolves the route and caller account
-//! before touching DuckFS or loopback, so this is not a raw filesystem, socket,
-//! or reverse-proxy primitive.
+//! The stream hello carries only [`ProxyRequestHead`], which declares no
+//! length: the caller writes its body as `ProxyFrame::BodyChunk` frames ended
+//! by `ProxyFrame::End`, exactly as the response direction already did, and
+//! the publisher counts those bytes against the route's own
+//! [`request_body_allowance`] as they arrive. Nothing holds a request body to
+//! measure it, so what a route accepts is a policy and never a buffer. The
+//! publisher re-resolves the route and caller account before touching DuckFS
+//! or loopback, so this is not a raw filesystem, socket, or reverse-proxy
+//! primitive.
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    MAX_REQUEST_BODY_BYTES, RouteAudience, RouteMethod, RouteName, RouteRecord,
-    validate_account_number,
-};
+use crate::{RouteAudience, RouteMethod, RouteName, RouteRecord, validate_account_number};
 
 pub const PROXY_FLOW_DOMAIN: &[u8] = b"ducktape-gateway-proxy-v1";
 pub const PROXY_INTENT: u8 = 1;
@@ -118,7 +119,6 @@ pub struct ProxyRequestHead {
     pub path_and_query: String,
     /// Strictly name-sorted, unique, allowlisted request headers.
     pub headers: Vec<ProxyHeader>,
-    pub body_len: u64,
     /// Request a WebSocket upgrade (GET, no body) on a route signed
     /// `allow_upgrade`.
     pub upgrade: bool,
@@ -165,16 +165,13 @@ pub fn validate_proxy_request_head(head: &ProxyRequestHead) -> Result<(), String
     }
     validate_origin_form(&head.path_and_query)?;
     validate_headers(&head.headers, "request")?;
-    if head.upgrade && (head.method != RouteMethod::Get || head.body_len != 0) {
+    // A head no longer declares a length — the body streams after it, and the
+    // serving side counts it against the route's own cap as it arrives. What
+    // is checkable here is the METHOD: an upgrade and a GET/HEAD carry no body
+    // at all, so the first body frame on one of those is the refusal, and
+    // `request_body_allowance` is what says so.
+    if head.upgrade && head.method != RouteMethod::Get {
         return Err("gateway proxy: a WebSocket upgrade must be a bodyless GET".into());
-    }
-    if head.body_len > MAX_REQUEST_BODY_BYTES {
-        return Err(format!(
-            "gateway proxy: body exceeds {MAX_REQUEST_BODY_BYTES} bytes"
-        ));
-    }
-    if !head.method.permits_body() && head.body_len != 0 {
-        return Err("gateway proxy: GET/HEAD requests cannot carry a body".into());
     }
     Ok(())
 }
@@ -342,9 +339,27 @@ pub fn request_matches_record(head: &ProxyRequestHead, record: &RouteRecord) -> 
         && statement.name == head.name
         && statement.revision == head.revision
         && route.policy.methods.binary_search(&head.method).is_ok()
-        && head.body_len <= route.policy.max_request_bytes
         && (route.policy.allow_authorization
             || header_value(&head.headers, "authorization").is_none())
+}
+
+/// How many body bytes this request may still send — `None` for no limit.
+///
+/// The head carries no length any more, so this is the whole request-size
+/// decision and it is made ONCE, from the signed policy, before a byte is
+/// read. A method that carries no body gets `Some(0)`, which refuses the
+/// first frame; a route with no cap gets `None` and the transport decides
+/// nothing.
+pub fn request_body_allowance(head: &ProxyRequestHead, record: &RouteRecord) -> Option<u64> {
+    let carries_a_body = head.method.permits_body() && !head.upgrade;
+    if !carries_a_body {
+        return Some(0);
+    }
+    record
+        .statement
+        .route
+        .as_ref()
+        .and_then(|route| route.policy.max_request_bytes)
 }
 
 #[cfg(test)]
@@ -397,7 +412,7 @@ mod tests {
                     policy: RoutePolicy {
                         audience: RouteAudience::Network,
                         methods: vec![RouteMethod::Get, RouteMethod::Post],
-                        max_request_bytes: 1024,
+                        max_request_bytes: Some(1024),
                         max_response_bytes: 4096,
                         allow_authorization: false,
                         allow_upgrade: false,
@@ -411,9 +426,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn invocation_is_record_method_revision_and_header_scoped() {
-        let head = ProxyRequestHead {
+    fn head() -> ProxyRequestHead {
+        ProxyRequestHead {
             operator: false,
             account_id: 1,
             name: RouteName::named("api"),
@@ -424,14 +438,18 @@ mod tests {
                 name: "content-type".into(),
                 value: "application/json".into(),
             }],
-            body_len: 12,
             upgrade: false,
             user_pop: Some(UserPop {
                 key: vec![5; 32],
                 ts: 1_700_000_000,
                 sig: vec![6; 64],
             }),
-        };
+        }
+    }
+
+    #[test]
+    fn invocation_is_record_method_revision_and_header_scoped() {
+        let head = head();
         let encoded = encode_proxy_request_head(&head).unwrap();
         assert_eq!(decode_proxy_request_head(&encoded).unwrap(), head);
         assert!(request_matches_record(&head, &record()));
@@ -460,7 +478,6 @@ mod tests {
             method: RouteMethod::Get,
             path_and_query: "/".into(),
             headers: Vec::new(),
-            body_len: 0,
             upgrade: false,
             user_pop: None,
         })
@@ -479,7 +496,6 @@ mod tests {
             method: RouteMethod::Get,
             path_and_query: "/".into(),
             headers: Vec::new(),
-            body_len: 0,
             upgrade: false,
             user_pop: None,
         })
@@ -589,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn caller_cannot_forge_a_huge_body_len_or_the_zero_account() {
+    fn caller_cannot_forge_the_zero_account() {
         let head = ProxyRequestHead {
             operator: false,
             account_id: 1,
@@ -598,14 +614,49 @@ mod tests {
             method: RouteMethod::Post,
             path_and_query: "/".into(),
             headers: vec![],
-            body_len: MAX_REQUEST_BODY_BYTES + 1,
             upgrade: false,
             user_pop: None,
         };
-        assert!(validate_proxy_request_head(&head).is_err());
+        assert!(validate_proxy_request_head(&head).is_ok());
         let mut json = serde_json::to_value(&head).unwrap();
-        json["body_len"] = serde_json::json!(0);
         json["account_id"] = serde_json::json!(0);
         assert!(decode_proxy_request_head(&serde_json::to_vec(&json).unwrap()).is_err());
+    }
+
+    /// A head cannot declare a size any more, so the size question is settled
+    /// from the SIGNED policy instead: a bodyless method gets no allowance at
+    /// all, a capped route gets its cap, and a route that declined to cap
+    /// itself gets none — the serving side counts as it reads.
+    #[test]
+    fn the_body_allowance_comes_from_the_signed_policy_not_the_caller() {
+        let record = record();
+        let post = ProxyRequestHead {
+            method: RouteMethod::Post,
+            ..head()
+        };
+        assert_eq!(request_body_allowance(&post, &record), Some(1024));
+
+        let get = ProxyRequestHead {
+            method: RouteMethod::Get,
+            ..head()
+        };
+        assert_eq!(request_body_allowance(&get, &record), Some(0));
+
+        let upgrade = ProxyRequestHead {
+            method: RouteMethod::Get,
+            upgrade: true,
+            ..head()
+        };
+        assert_eq!(request_body_allowance(&upgrade, &record), Some(0));
+
+        let mut uncapped = record;
+        uncapped
+            .statement
+            .route
+            .as_mut()
+            .unwrap()
+            .policy
+            .max_request_bytes = None;
+        assert_eq!(request_body_allowance(&post, &uncapped), None);
     }
 }

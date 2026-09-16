@@ -475,7 +475,7 @@ fn gateway_set_route(key: &Ed, node: &str) -> Value {
             policy: gateway::RoutePolicy {
                 audience: gateway::RouteAudience::Owner,
                 methods: vec![gateway::RouteMethod::Get],
-                max_request_bytes: 0,
+                max_request_bytes: Some(0),
                 max_response_bytes: 1024,
                 allow_authorization: false,
                 allow_upgrade: false,

@@ -65,9 +65,10 @@ mod gateway_http;
 pub mod gateway_ws_token;
 pub mod origin_guard;
 pub use gateway_http::{
-    GatewayBody, GatewayFailure, GatewayJob, GatewayLane, GatewayProxyReply, GatewayProxyRequest,
-    GatewayResponse, GatewayWsMsg, PROXY_REPLY_TIMEOUT, collect_body, gateway_browser_router,
-    gateway_caller_account, serve_browser_gateway,
+    EMPTY_BODY_DIGEST, GATEWAY_BODY_FRAMES, GatewayBody, GatewayFailure, GatewayJob, GatewayLane,
+    GatewayProxyReply, GatewayProxyRequest, GatewayRequestBody, GatewayResponse, GatewayWsMsg,
+    PROXY_REPLY_TIMEOUT, collect_body, gateway_browser_router, gateway_caller_account,
+    one_shot_body, serve_browser_gateway,
 };
 // the node-actor command lane and the router's shared state handle.
 mod handle;

@@ -375,7 +375,7 @@ pub(crate) async fn seated_gateway_proof(
     let session = SIGNER.lock().await;
     let signer = session.as_ref()?;
     let ts = ::node::signed_req::now_secs();
-    let preimage = gateway::caller_pop_preimage(publisher, head, body, ts);
+    let preimage = gateway::caller_pop_preimage(publisher, head, &gateway::body_digest(body), ts);
     Some(gateway::UserPop {
         key: signer.key.public_key().as_ref().to_vec(),
         ts,

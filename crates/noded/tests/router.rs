@@ -175,6 +175,16 @@ async fn body_json(response: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).expect("response body is json")
 }
 
+/// A job's request body, assembled — what a publisher lane that buffers by
+/// contract does with the frames a streamed request arrives as.
+async fn request_body(mut body: noded::GatewayRequestBody) -> Vec<u8> {
+    let mut carried = Vec::new();
+    while let Some(chunk) = body.recv().await {
+        carried.extend_from_slice(&chunk.expect("the request body was refused"));
+    }
+    carried
+}
+
 #[tokio::test]
 async fn submit_forwards_the_payload_and_returns_the_block() {
     let (handle, cmd_rx, _events) = local_node();
@@ -238,11 +248,22 @@ async fn raw_submit_preserves_arbitrary_module_bytes_and_node_authority() {
         assert_eq!(target, "new-product");
         assert_eq!(payload, vec![0, 255, 123, 0]);
         assert_eq!(origin, noded::DEFAULT_ORIGIN.as_bytes());
-        reply.send(Ok(BlockSummary { height: 8, root_hash: "ab".repeat(32) })).unwrap();
+        reply
+            .send(Ok(BlockSummary {
+                height: 8,
+                root_hash: "ab".repeat(32),
+            }))
+            .unwrap();
     });
-    let request = with_operator(with_peer(Request::builder().method("POST")
-        .uri("/v1/submit/raw/new-product").header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(Body::from(vec![0, 255, 123, 0])).unwrap(), "127.0.0.1:40000"));
+    let request = with_operator(with_peer(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/submit/raw/new-product")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(vec![0, 255, 123, 0]))
+            .unwrap(),
+        "127.0.0.1:40000",
+    ));
     let response = noded::router(handle).oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_json(response).await["height"], 8);
@@ -700,8 +721,6 @@ async fn reads_stay_open() {
         .await
         .unwrap();
     assert_eq!(status.status(), StatusCode::OK);
-
-
 }
 
 // ---- the signed-frame lane (`POST /v1/submit/frame`) -----------------------
@@ -2022,7 +2041,7 @@ fn gateway_route() -> gateway::RouteRecord {
                 policy: gateway::RoutePolicy {
                     audience: gateway::RouteAudience::Network,
                     methods: vec![gateway::RouteMethod::Get, gateway::RouteMethod::Post],
-                    max_request_bytes: 1024,
+                    max_request_bytes: Some(1024),
                     max_response_bytes: 4096,
                     allow_authorization: false,
                     allow_upgrade: false,
@@ -2106,7 +2125,7 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
         assert_eq!(head.name, gateway::RouteName::named("app"));
         assert_eq!(head.method, gateway::RouteMethod::Post);
         assert_eq!(head.path_and_query, "/api/items");
-        assert_eq!(body, br#"{"name":"duck"}"#);
+        assert_eq!(request_body(body).await, br#"{"name":"duck"}"#);
         let _ = reply.send(Ok(noded::GatewayResponse {
             head: gateway::ProxyResponseHead {
                 status: 201,
@@ -2135,7 +2154,6 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
                 "method": "post",
                 "path_and_query": "/api/items",
                 "headers": [{ "name": "content-type", "value": "application/json" }],
-                "body_len": request_body.len(),
                 "upgrade": false,
             },
             "body_b64": base64::engine::general_purpose::STANDARD.encode(request_body),
@@ -2170,7 +2188,7 @@ async fn gateway_operator_forwards_existing_authentication_without_requiring_an_
         "head": {
             "account_id": 1, "name": {"label": "app"}, "revision": 7,
             "method": "post", "path_and_query": "/sessions", "headers": [],
-            "body_len": 2, "upgrade": false, "user_pop": null,
+            "upgrade": false, "user_pop": null,
         },
         "body_b64": "e30=",
     });
@@ -2218,7 +2236,7 @@ async fn gateway_operator_forwards_existing_authentication_without_requiring_an_
             assert!(head.operator);
             assert!(head.user_pop.is_none());
             assert!(head.headers.is_empty());
-            assert_eq!(body, b"{}");
+            assert_eq!(request_body(body).await, b"{}");
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             drop(tx);
             reply
@@ -2291,7 +2309,7 @@ async fn gateway_browser_proxy_is_duck_origin_scoped_and_cross_origin_safe() {
         };
         assert_eq!(head.method, gateway::RouteMethod::Post);
         assert_eq!(head.path_and_query, "/api");
-        assert_eq!(body, b"payload");
+        assert_eq!(request_body(body).await, b"payload");
         let _ = reply.send(Ok(noded::GatewayResponse {
             head: gateway::ProxyResponseHead {
                 status: 201,
@@ -2366,15 +2384,15 @@ async fn gateway_browser_proxy_is_duck_origin_scoped_and_cross_origin_safe() {
     assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
 }
 
-/// The browser door reads each request body under the RESOLVED route's own
-/// `max_request_bytes` — the per-lane cap — not under one router-wide
-/// limit. Over it is a named 413 before the request reaches the lane; the
-/// route's queries (resolve + get) are the only work done.
+/// The browser door never holds a request body, so it cannot weigh one before
+/// handing it on: it counts the frames as they pass, under the RESOLVED
+/// route's own `max_request_bytes` rather than any router-wide limit, and the
+/// byte past that cap turns the body itself into a named refusal. The job
+/// exists — a streamed request is a job the instant its head is known — but
+/// nothing past the cap is ever carried in it.
 #[tokio::test]
-async fn gateway_browser_proxy_reads_the_body_under_the_routes_own_cap() {
+async fn gateway_browser_proxy_streams_the_body_under_the_routes_own_cap() {
     let (handle, cmds, _events) = local_node();
-    // resolve + get, and nothing after: the over-cap body never reaches
-    // proxy_current's own resolution.
     spawn_duck_actor(cmds, 2);
     let (lane, mut jobs) = tokio::sync::mpsc::channel::<noded::GatewayJob>(1);
     let handle = handle
@@ -2387,20 +2405,55 @@ async fn gateway_browser_proxy_reads_the_body_under_the_routes_own_cap() {
         .route
         .unwrap()
         .policy
-        .max_request_bytes as usize;
-    let response = noded::gateway_browser_router(handle)
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api")
-                .header("x-duck-authority", authority)
-                .header(header::ORIGIN, format!("duck://{authority}"))
-                .header(header::CONTENT_TYPE, "application/octet-stream")
-                .body(Body::from(vec![7u8; cap + 1]))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        .max_request_bytes
+        .expect("the fixture route caps its body") as usize;
+    let door = tokio::spawn(async move {
+        noded::gateway_browser_router(handle)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api")
+                    .header("x-duck-authority", authority)
+                    .header(header::ORIGIN, format!("duck://{authority}"))
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(vec![7u8; cap + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+
+    let noded::GatewayJob::Http {
+        mut body, reply, ..
+    } = jobs.recv().await.expect("the head becomes a job")
+    else {
+        panic!("a POST is an Http job");
+    };
+    let mut carried = 0usize;
+    let refusal = loop {
+        match body.recv().await.expect("the body ends in a refusal") {
+            Ok(chunk) => carried += chunk.len(),
+            Err(failure) => break failure,
+        }
+    };
+    assert!(
+        matches!(refusal, noded::GatewayFailure::TooLarge(ref why)
+            if why.starts_with("gateway_body_exceeds_route_cap") && why.contains(&cap.to_string())),
+        "{refusal:?}"
+    );
+    assert!(
+        carried <= cap,
+        "{carried} bytes crossed a {cap}-byte cap before the refusal"
+    );
+    assert!(
+        body.recv().await.is_none(),
+        "the body kept sending after its refusal"
+    );
+
+    // The publisher side is what turns that refusal into a status; answer as
+    // it would so the door can finish.
+    let _ = reply.send(Err(refusal));
+    let response = door.await.unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     let error = body_json(response).await["error"]
         .as_str()
@@ -2411,10 +2464,6 @@ async fn gateway_browser_proxy_reads_the_body_under_the_routes_own_cap() {
         "{error}"
     );
     assert!(error.contains(&cap.to_string()), "{error}");
-    assert!(
-        jobs.try_recv().is_err(),
-        "an over-cap body must never become a gateway job"
-    );
 }
 
 /// a GET carrying the RFC 6455 upgrade headers axum's `WebSocketUpgrade`
@@ -2538,14 +2587,16 @@ fn spawn_files_actor(
     });
 }
 
-
 #[tokio::test]
 async fn files_refs_route_returns_head() {
     let (handle, cmd_rx, _events) = local_node();
     spawn_files_actor(cmd_rx, None);
 
     let response = noded::router(handle)
-        .oneshot(post("/v1/query", serde_json::json!({"target":"files","query":{"refs":{}}})))
+        .oneshot(post(
+            "/v1/query",
+            serde_json::json!({"target":"files","query":{"refs":{}}}),
+        ))
         .await
         .unwrap();
 
@@ -2579,13 +2630,19 @@ async fn files_has_chunks_route_preserves_request_order() {
     let present = "aa".repeat(32);
     let absent = "bb".repeat(32);
     let response = noded::router(handle)
-        .oneshot(post("/v1/query", serde_json::json!({"target":"files","query":{"has_chunks":{"ids":[present,absent]}}})))
+        .oneshot(post(
+            "/v1/query",
+            serde_json::json!({"target":"files","query":{"has_chunks":{"ids":[present,absent]}}}),
+        ))
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
-    assert_eq!(body["has_chunks"]["present"], serde_json::json!([true, false]));
+    assert_eq!(
+        body["has_chunks"]["present"],
+        serde_json::json!([true, false])
+    );
 }
 
 #[tokio::test]
@@ -2929,22 +2986,45 @@ async fn blob_upload_capacity_is_reserved_before_signature_body_collection() {
             released.await.unwrap();
             Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"blob"))
         }));
-        let request = Request::builder().method("POST").uri("/v1/files/blob").body(body).unwrap();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/files/blob")
+            .body(body)
+            .unwrap();
         requests.push(tokio::spawn(router.clone().oneshot(request)));
         polled.await.unwrap();
         releases.push(release);
     }
-    let request = || Request::builder().method("POST").uri("/v1/files/blob").body(Body::empty()).unwrap();
-    assert_eq!(router.clone().oneshot(request()).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
-    for release in releases { release.send(()).unwrap(); }
-    for request in requests { assert_ne!(request.await.unwrap().unwrap().status(), StatusCode::SERVICE_UNAVAILABLE); }
-    assert_ne!(router.oneshot(request()).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/files/blob")
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        router.clone().oneshot(request()).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    for release in releases {
+        release.send(()).unwrap();
+    }
+    for request in requests {
+        assert_ne!(
+            request.await.unwrap().unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+    assert_ne!(
+        router.oneshot(request()).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 }
 
 #[tokio::test]
 async fn operator_stream_binds_the_target_in_the_signature_and_forwards_without_an_account() {
-    use tokio_tungstenite::tungstenite::{client::IntoClientRequest as _, Message};
     use futures::SinkExt as _;
+    use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _};
     let (handle, mut cmds, _events) = local_node();
     let owner = caller();
     let handle = handle.with_admin(AdminConfig {
@@ -2968,7 +3048,7 @@ async fn operator_stream_binds_the_target_in_the_signature_and_forwards_without_
     let head = serde_json::json!({
         "account_id": 1, "name": {"label":"app"}, "revision": 7,
         "method": "get", "path_and_query": "/sessions/0000000000000001?after=3",
-        "headers": [], "body_len": 0, "upgrade": true, "user_pop": null,
+        "headers": [], "upgrade": true, "user_pop": null,
     });
     let mut url = reqwest::Url::parse(&format!("ws://{address}/v1/gateway/operator")).unwrap();
     url.query_pairs_mut().append_pair("head", &head.to_string());

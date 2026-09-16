@@ -93,7 +93,7 @@ fn signed_airlock_route(
             policy: RoutePolicy {
                 audience: RouteAudience::Network,
                 methods: vec![RouteMethod::Get, RouteMethod::Head, RouteMethod::Post],
-                max_request_bytes: 1024 * 1024,
+                max_request_bytes: Some(1024 * 1024),
                 max_response_bytes: 4 * 1024 * 1024,
                 allow_authorization: true,
                 allow_upgrade: false,

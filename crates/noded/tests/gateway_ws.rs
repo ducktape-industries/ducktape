@@ -24,7 +24,7 @@ fn route_record(publisher: [u8; 32]) -> gateway::RouteRecord {
                 policy: gateway::RoutePolicy {
                     audience: gateway::RouteAudience::Network,
                     methods: vec![gateway::RouteMethod::Get],
-                    max_request_bytes: 0,
+                    max_request_bytes: Some(0),
                     max_response_bytes: 4096,
                     allow_authorization: false,
                     allow_upgrade: true,

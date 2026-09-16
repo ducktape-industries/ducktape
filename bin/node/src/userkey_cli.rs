@@ -623,15 +623,13 @@ fn user_sign_caller(
         Some(path) => std::fs::read(path)?,
         None => Vec::new(),
     };
-    if body.len() as u64 != head.body_len {
-        return Err("request body length differs from the signed head".into());
-    }
     let user = load_user_signer(&args.key, stdin)?;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let preimage = gateway::caller_pop_preimage(&publisher_node, &head, &body, ts);
+    let preimage =
+        gateway::caller_pop_preimage(&publisher_node, &head, &gateway::body_digest(&body), ts);
     let sig = user.sign(gateway::GATEWAY_CALLER_NS, &preimage);
     let out = serde_json::json!({
         "key": hex_bytes(user.public_key().as_ref()),
@@ -889,7 +887,7 @@ mod userkey_verb_tests {
                 policy: gateway::RoutePolicy {
                     audience: gateway::RouteAudience::Network,
                     methods: vec![gateway::RouteMethod::Get, gateway::RouteMethod::Post],
-                    max_request_bytes: 1024,
+                    max_request_bytes: Some(1024),
                     max_response_bytes: 4096,
                     allow_authorization: false,
                     allow_upgrade: false,
@@ -1103,7 +1101,6 @@ mod userkey_verb_tests {
                 name: "content-type".into(),
                 value: "application/octet-stream".into(),
             }],
-            body_len: 3,
             upgrade: false,
             user_pop: None,
         };
@@ -1132,7 +1129,7 @@ mod userkey_verb_tests {
             identity::KeyScheme::Ed25519.verify(
                 signer.public_key().as_ref(),
                 gateway::GATEWAY_CALLER_NS,
-                &gateway::caller_pop_preimage(&publisher, head, body, ts),
+                &gateway::caller_pop_preimage(&publisher, head, &gateway::body_digest(body), ts),
                 &sig,
             )
         };

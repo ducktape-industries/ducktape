@@ -167,7 +167,7 @@ fn content_route(seed: u8) -> RouteDefinition {
         policy: RoutePolicy {
             audience: RouteAudience::Network,
             methods: vec![RouteMethod::Get, RouteMethod::Head],
-            max_request_bytes: 0,
+            max_request_bytes: Some(0),
             max_response_bytes: 1024 * 1024,
             allow_authorization: false,
             allow_upgrade: false,
@@ -183,7 +183,7 @@ fn loopback_route() -> RouteDefinition {
         policy: RoutePolicy {
             audience: RouteAudience::Owner,
             methods: vec![RouteMethod::Get, RouteMethod::Post],
-            max_request_bytes: 1024,
+            max_request_bytes: Some(1024),
             max_response_bytes: 0,
             allow_authorization: false,
             allow_upgrade: true,
@@ -590,7 +590,7 @@ async fn rejections_inner(context: &deterministic::Context) {
     // a content route violating the signed content-policy shape (POST).
     let mut bad_content = content_route(0x44);
     bad_content.policy.methods = vec![RouteMethod::Get, RouteMethod::Post];
-    bad_content.policy.max_request_bytes = 64;
+    bad_content.policy.max_request_bytes = Some(64);
     let bad_content_st = statement(w.a_id(), Some("api"), &w.node_a, 1, Some(bad_content));
 
     // the rejection matrix: the identity gate (an origin on no account — a

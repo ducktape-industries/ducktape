@@ -62,7 +62,7 @@ fn signed_route(
             policy: RoutePolicy {
                 audience,
                 methods: vec![RouteMethod::Get, RouteMethod::Head, RouteMethod::Post],
-                max_request_bytes: 1024,
+                max_request_bytes: Some(1024),
                 max_response_bytes: 4096,
                 allow_authorization: false,
                 allow_upgrade: false,
@@ -205,7 +205,6 @@ fn proxy_request(
                 "method": method,
                 "path_and_query": path,
                 "headers": headers,
-                "body_len": body.len(),
                 // `ProxyRequestHead` is `deny_unknown_fields` AND has no
                 // `serde(default)` on `upgrade`, so omitting it is not a
                 // permissive miss — the whole head fails to deserialize and the

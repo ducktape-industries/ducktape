@@ -609,8 +609,9 @@ struct SigningGateway {
     /// the on-chain seal key, pinned: the trust anchor for the session
     seal_pk: [u8; 32],
     /// the published route's `max_request_bytes`: what the overlay hop admits
-    /// for ONE request, measured from the record rather than assumed
-    max_request_bytes: u64,
+    /// for ONE request, measured from the record rather than assumed. `None`
+    /// is a route that declares no cap at all.
+    max_request_bytes: Option<u64>,
 }
 
 /// What a bundle IS, independent of its signature: the identity and version
@@ -795,13 +796,16 @@ fn owner_handle(base: &str, account_id: u64) -> Result<String, Box<dyn std::erro
 /// read off the published record, so the refusal names the number the
 /// network actually enforces rather than one copied from a crate.
 fn admitted_by_route(sealed_len: usize, target: &SigningGateway) -> Result<(), String> {
-    let fits = sealed_len as u64 <= target.max_request_bytes;
+    let Some(cap) = target.max_request_bytes else {
+        return Ok(());
+    };
+    let fits = sealed_len as u64 <= cap;
     if fits {
         return Ok(());
     }
     Err(format!(
-        "bundle_exceeds_route_cap: the sealed archive is {sealed_len} bytes, the {} route admits {} per request",
-        target.authority, target.max_request_bytes
+        "bundle_exceeds_route_cap: the sealed archive is {sealed_len} bytes, the {} route admits {cap} per request",
+        target.authority
     ))
 }
 
@@ -976,7 +980,7 @@ fn sign_bundle(args: SignBundleArgs) -> CommandResult {
         event = "release_sign_resolved",
         credential = %args.credential,
         authority = %target.authority,
-        route_max_request_bytes = target.max_request_bytes,
+        route_max_request_bytes = ?target.max_request_bytes,
         "signing enclave resolved"
     );
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1202,7 +1206,7 @@ mod tests {
             authority: "airlock-sign.alice.duck".into(),
             via: "http://127.0.0.1:1".into(),
             seal_pk: [7; 32],
-            max_request_bytes,
+            max_request_bytes: Some(max_request_bytes),
         }
     }
 
@@ -1263,18 +1267,15 @@ mod tests {
         );
     }
 
-    /// The signing lane's three caps are one number: what the enclave reads
-    /// (`sign::MAX_BUNDLE_BYTES`), what the `airlock-sign` route pins, and
-    /// the module ceiling a policy may pin at all.
+    /// The signing lane's two caps are one number: what the enclave reads
+    /// (`sign::MAX_BUNDLE_BYTES`) and what the `airlock-sign` route pins. The
+    /// route's own policy is the only ceiling there is — the gateway module
+    /// pins none, so a lane that buffers declares its own.
     #[test]
     fn the_signing_lane_caps_agree() {
         assert_eq!(
             sign::MAX_BUNDLE_BYTES as u64,
             crate::airlock::AIRLOCK_SIGN_REQUEST_BYTES
-        );
-        assert_eq!(
-            crate::airlock::AIRLOCK_SIGN_REQUEST_BYTES,
-            gateway::MAX_REQUEST_BODY_BYTES
         );
     }
 
