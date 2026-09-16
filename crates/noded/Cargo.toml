@@ -60,12 +60,9 @@ runs = { workspace = true }
 dispatch = { workspace = true }
 attribution = { workspace = true }
 compute-service = { workspace = true }
-# the interactive-terminal wire: this node holds the rings, the ws topics and
-# the admission decisions; the agent daemon on the other end of `wire` holds the
-# ptys. Linking the crate is how both sides agree on the protocol — the node
-# never constructs a `Sessions`.
+# the agent-daemon wire: the messaging bus this node's service link carries.
+# Linking the crate is how both sides agree on the protocol.
 agent-service = { workspace = true }
-ducktape-terminal = { path = "../../bin/terminal-service" }
 # host-side provider discovery: the dispatch worker runs the operator's locally
 # installed executor CLIs (BYO), never any credential file.
 provider-host = { workspace = true }

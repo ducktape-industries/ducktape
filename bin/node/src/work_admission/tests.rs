@@ -97,7 +97,6 @@ fn anyone_admits_even_when_the_caller_cannot_be_resolved() {
     for caller in [
         WorkCaller::Unresolved,
         WorkCaller::KeyWithoutAccount,
-        WorkCaller::PeerNode,
         caller(STRANGER),
     ] {
         assert_eq!(
@@ -115,18 +114,6 @@ fn a_key_with_no_account_is_refused_with_its_own_reason() {
         verdict(&WorkAdmission::default(), &WorkCaller::KeyWithoutAccount),
         WorkVerdict::Refused(WorkRefusal::CallerUnbound)
     );
-}
-
-/// A mesh peer is a node, never an account: under an account policy it is
-/// simply not admitted, however the policy is filled.
-#[test]
-fn a_peer_node_is_not_admitted_by_any_account_policy() {
-    for policy in [WorkAdmission::default(), accounts(&[OWNER, FRIEND])] {
-        assert_eq!(
-            verdict(&policy, &WorkCaller::PeerNode),
-            WorkVerdict::Refused(WorkRefusal::NotAdmitted)
-        );
-    }
 }
 
 /// Every refusal token is stable, distinct, and snake_case; none of them can
@@ -203,34 +190,30 @@ fn account_view(number: u64) -> identity::AccountView {
 }
 
 /// The attribution table: a user key resolves to its account, a stranger key
-/// to none, a mesh peer is a node, a module saga is not attributable, and this
-/// node is itself. A new `SagaOrigin` variant fails the build in
-/// `resolve_caller` rather than defaulting to admitted.
+/// to none, a module saga is not attributable, and this node is itself. A new
+/// `SagaOrigin` variant fails the build in `resolve_caller` rather than
+/// defaulting to admitted.
 #[tokio::test]
 async fn a_source_resolves_to_exactly_one_caller() {
     let me = b"this-node";
     let table = KeyTable(vec![(b"friend-key".to_vec(), FRIEND)]);
     let friend = SagaOrigin::External(b"friend-key".to_vec());
     assert_eq!(
-        resolve_caller(&table, me, WorkSource::Saga(&friend)).await,
+        resolve_caller(&table, me, &friend).await,
         WorkCaller::Account(FRIEND)
     );
     let stranger = SagaOrigin::External(b"stranger-key".to_vec());
     assert_eq!(
-        resolve_caller(&table, me, WorkSource::Saga(&stranger)).await,
+        resolve_caller(&table, me, &stranger).await,
         WorkCaller::KeyWithoutAccount
-    );
-    assert_eq!(
-        resolve_caller(&NoReads, me, WorkSource::Peer(b"peer-node")).await,
-        WorkCaller::PeerNode
     );
     let module = SagaOrigin::Module("dispatch".into());
     assert_eq!(
-        resolve_caller(&NoReads, me, WorkSource::Saga(&module)).await,
+        resolve_caller(&NoReads, me, &module).await,
         WorkCaller::NotAnAccountOrigin
     );
     assert_eq!(
-        resolve_caller(&NoReads, me, WorkSource::Saga(&SagaOrigin::System)).await,
+        resolve_caller(&NoReads, me, &SagaOrigin::System).await,
         WorkCaller::NotAnAccountOrigin
     );
 }
@@ -250,17 +233,13 @@ async fn our_own_work_makes_no_committed_read() {
     let me = b"this-node";
     let external = SagaOrigin::External(me.to_vec());
     assert_eq!(
-        admit(&NoReads, &dir, me, WorkSource::Saga(&external)).await,
-        WorkVerdict::Admitted
-    );
-    assert_eq!(
-        admit(&NoReads, &dir, me, WorkSource::Peer(me)).await,
+        admit(&NoReads, &dir, me, &external).await,
         WorkVerdict::Admitted
     );
     // and a module-triggered saga names no key at all, so it reads nothing either.
     let module = SagaOrigin::Module("dispatch".into());
     assert_eq!(
-        admit(&NoReads, &dir, me, WorkSource::Saga(&module)).await,
+        admit(&NoReads, &dir, me, &module).await,
         WorkVerdict::Admitted
     );
 }
@@ -272,7 +251,7 @@ async fn an_unreadable_policy_refuses_without_reading_anything() {
     let dir = scratch("broken");
     std::fs::write(policy_path(&dir), "admit = \"not-a-list\"\n").expect("write");
     assert_eq!(
-        admit(&NoReads, &dir, b"me", WorkSource::Peer(b"stranger")).await,
+        admit(&NoReads, &dir, b"me", &SagaOrigin::External(b"stranger".to_vec())).await,
         WorkVerdict::Refused(WorkRefusal::PolicyUnreadable)
     );
 }
@@ -301,7 +280,7 @@ async fn a_failed_key_read_is_unavailable_not_refused() {
     admit_account_fixture(&dir, FRIEND).expect("policy");
     let external = SagaOrigin::External(b"friend-key".to_vec());
     assert_eq!(
-        admit(&KeyReadFails, &dir, b"me", WorkSource::Saga(&external)).await,
+        admit(&KeyReadFails, &dir, b"me", &external).await,
         WorkVerdict::AuthorityUnavailable
     );
 }
@@ -318,12 +297,12 @@ async fn an_admitted_accounts_saga_runs_and_a_strangers_does_not() {
     ]);
     let friend = SagaOrigin::External(b"friend-key".to_vec());
     assert_eq!(
-        admit(&table, &dir, b"me", WorkSource::Saga(&friend)).await,
+        admit(&table, &dir, b"me", &friend).await,
         WorkVerdict::Admitted
     );
     let stranger = SagaOrigin::External(b"stranger-key".to_vec());
     assert_eq!(
-        admit(&table, &dir, b"me", WorkSource::Saga(&stranger)).await,
+        admit(&table, &dir, b"me", &stranger).await,
         WorkVerdict::Refused(WorkRefusal::NotAdmitted)
     );
 }
@@ -454,11 +433,8 @@ fn source(relative: &str) -> String {
 /// of its own — a second call site, or a lane that loaded the policy and
 /// decided for itself, fails here.
 #[test]
-fn both_lanes_route_through_one_verdict() {
-    const LANES: [(&str, &str); 2] = [
-        ("src/term_plane.rs", "the terminal plane"),
-        ("src/compute/intake.rs", "the compute intake"),
-    ];
+fn the_work_lane_routes_through_one_verdict() {
+    const LANES: [(&str, &str); 1] = [("src/compute/intake.rs", "the compute intake")];
     for (relative, lane) in LANES {
         let code = source(relative);
         let calls = code.matches("work_admission::admit(").count();
@@ -488,7 +464,7 @@ fn both_lanes_route_through_one_verdict() {
     assert_eq!(
         own.matches("fn verdict(").count(),
         1,
-        "there is exactly one verdict function, and both lanes reach it through `admit`"
+        "there is exactly one verdict function, and the work lane reaches it through `admit`"
     );
 }
 

@@ -69,7 +69,6 @@ fn service_name(service: Service) -> &'static str {
         Service::Gateway => "gateway",
         Service::AgentTelemetry => "agent-telemetry",
         Service::ModuleCode => "module-code",
-        Service::TermSession => "term-session",
     }
 }
 

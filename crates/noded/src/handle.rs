@@ -353,19 +353,11 @@ pub struct NodeHandle {
     /// CLOSED — it refuses every admin request; a real serve path mints a
     /// credential and passes it through [`Self::with_admin`].
     pub(crate) admin: crate::admin::AdminConfig,
-    /// the node-local interactive terminal-session manager. `None` on a handle
-    /// that never wires one (router tests, an embedder that omits it) — the
-    /// `/v1/term/*` routes answer 503 there and ws `TermInput`/`TermResize` are
-    /// no-ops. off-chain, node-local: never consensus state.
-    pub(crate) terminals: Option<crate::term::TerminalSessions>,
-    /// the guest-side remote-session request lane into the overlay client half
-    /// (mirrors [`Self::gateway`]). `None` on a handle without a mesh — a cross-
-    /// node create answers 503 there. off-chain, like the gateway lane.
-    pub(crate) session_lane: Option<crate::term_remote::SessionLane>,
-    /// the guest-side session-id → host-node registry. Always present (Default):
-    /// a remote create remembers its host here; the ws input/resize handlers read
-    /// it to pick the forward lane over the absent local session.
-    pub(crate) remote_sessions: crate::term_remote::RemoteSessions,
+    /// the node ↔ agent-daemon link. `None` on a handle that never wires one
+    /// (router tests, an embedder that omits it) — a `ServiceAttach` is refused
+    /// there and every workspace-gated ws topic fails closed. off-chain,
+    /// node-local: never consensus state.
+    pub(crate) service_link: Option<crate::service_link::ServiceLink>,
     /// the volatile catalog of service daemons signaling presence to this node.
     /// Always present (Default) — it is a bounded in-memory map, never durable
     /// and never consensus state, so there is no shape of node that wants the
@@ -419,9 +411,7 @@ impl NodeHandle {
             duckfs_workspaces: None,
             code_stage: None,
             admin: crate::admin::AdminConfig::default(),
-            terminals: None,
-            session_lane: None,
-            remote_sessions: crate::term_remote::RemoteSessions::default(),
+            service_link: None,
             services: crate::services::ServiceCatalog::default(),
             index_view_gate: Arc::new(tokio::sync::Semaphore::new(
                 crate::index::MAX_CONCURRENT_INDEX_VIEWS,
@@ -496,18 +486,17 @@ impl NodeHandle {
         self
     }
 
-    /// wire the node-local interactive terminal-session manager so the
-    /// `/v1/term/*` routes and the ws `TermInput`/`TermResize` handlers can
-    /// reach it. only the daemon wires one; a handle without it 503s the
-    /// routes.
-    pub fn with_terminals(mut self, terminals: crate::term::TerminalSessions) -> Self {
-        self.terminals = Some(terminals);
+    /// wire the node ↔ agent-daemon link so a `ServiceAttach` can take it and
+    /// the workspace-gated ws topics have a secret to check. only the daemon
+    /// wires one; a handle without it refuses both.
+    pub fn with_service_link(mut self, link: crate::service_link::ServiceLink) -> Self {
+        self.service_link = Some(link);
         self
     }
 
-    /// the terminal-session manager, if one is wired.
-    pub(crate) fn terminals(&self) -> Option<&crate::term::TerminalSessions> {
-        self.terminals.as_ref()
+    /// the agent-daemon link, if one is wired.
+    pub(crate) fn service_link(&self) -> Option<&crate::service_link::ServiceLink> {
+        self.service_link.as_ref()
     }
 
     /// Has this caller proved it can read the node's OWN workspace?
@@ -518,35 +507,14 @@ impl NodeHandle {
     /// a signaling hello confers nothing — so this is what a topic gate
     /// (`crate::stream::Admission::Workspace`) stands on. Reusing it invents no
     /// second scheme and adds no second secret file: a holder already owns the
-    /// whole interactive plane via `ServiceAttach`.
+    /// whole daemon link via `ServiceAttach`.
     ///
     /// Constant-time. `false` on a node that minted none (no workspace, or no
-    /// terminal plane wired) — fails closed.
+    /// daemon link wired) — fails closed.
     pub(crate) fn workspace_secret_matches(&self, presented: &str) -> bool {
-        self.terminals
+        self.service_link
             .as_ref()
-            .is_some_and(|terminals| terminals.link_token_matches(presented))
-    }
-
-    /// wire the guest-side remote-session request lane so a cross-node create/
-    /// close/input can reach the overlay client half. only the daemon that owns a
-    /// mesh wires one; a handle without it 503s a cross-node create.
-    pub fn with_session_lane(mut self, lane: crate::term_remote::SessionLane) -> Self {
-        self.session_lane = Some(lane);
-        self
-    }
-
-    /// the guest-side remote-session request lane, if one is wired.
-    pub(crate) fn session_lane(&self) -> Option<&crate::term_remote::SessionLane> {
-        self.session_lane.as_ref()
-    }
-
-    /// the guest-side session-id → host-node registry (always present). Public
-    /// because the term plane's inbound feeds gate on it: a session's chunks and
-    /// command rows are accepted only from the peer this registry names as its
-    /// host.
-    pub fn remote_sessions(&self) -> &crate::term_remote::RemoteSessions {
-        &self.remote_sessions
+            .is_some_and(|link| link.link_token_matches(presented))
     }
 
     /// the volatile service signaling catalog (always present).
@@ -640,6 +608,30 @@ impl NodeHandle {
             .await
             .map_err(|_| error_response(StatusCode::SERVICE_UNAVAILABLE, "node actor is gone"))
     }
+}
+
+/// the account `key` belongs to, read from committed identity state over the
+/// command lane. Shared by the gates that admit only a key holding an account:
+/// the huddle join and node-proof mint (`crate::call`) and the run-output
+/// reader admission (`crate::stream`).
+pub(crate) async fn account_of_key(
+    handle: &NodeHandle,
+    key: Vec<u8>,
+) -> Result<Option<u64>, String> {
+    let (reply, rx) = futures::channel::oneshot::channel();
+    handle
+        .send(NodeCommand::Query {
+            target: "identity".into(),
+            req: identity::encode_query(&identity::IdentityQuery::OfKey { key }),
+            reply,
+        })
+        .await
+        .map_err(|_| "actor gone".to_string())?;
+    let bytes = rx.await.map_err(|_| "reply dropped".to_string())??;
+    let identity::IdentityReply::Account(account) = identity::decode_reply(&bytes)? else {
+        return Err("unexpected identity reply".into());
+    };
+    Ok(account.map(|account| account.number))
 }
 
 #[cfg(test)]

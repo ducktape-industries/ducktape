@@ -195,13 +195,12 @@ mod tests {
             (Service::Gateway, 4u8),
             (Service::AgentTelemetry, 5u8),
             (Service::ModuleCode, 6u8),
-            (Service::TermSession, 7u8),
         ] {
             assert_eq!(service as u8, id);
             assert_eq!(Service::try_from(id), Ok(service));
             assert_eq!(service.overlay_stream_port(), 45800 + id as u16);
             assert_eq!(service.overlay_datagram_port(), 45900 + id as u16);
         }
-        assert_eq!(Service::try_from(8u8), Err(8u8));
+        assert_eq!(Service::try_from(7u8), Err(7u8));
     }
 }

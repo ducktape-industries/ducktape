@@ -128,7 +128,7 @@ fn refuse_huddle(refusal: HuddleRefusal) -> Response {
 /// membership read every huddle gate makes — the node-proof mint and both
 /// realtime upgrades admit a person only as a member of this network.
 pub(crate) async fn account_holder(handle: &NodeHandle, key: Vec<u8>) -> Result<u64, Response> {
-    match crate::term_consensus::account_of_key(handle, key).await {
+    match crate::handle::account_of_key(handle, key).await {
         Ok(Some(account)) => Ok(account),
         Ok(None) => Err(refuse_huddle(HuddleRefusal::KeyWithoutAccount)),
         Err(reason) => Err(error_response(StatusCode::SERVICE_UNAVAILABLE, &reason)),
@@ -262,16 +262,14 @@ mod tests {
 
     const TEST_SECRET: &str = "d3adb33fd3adb33fd3adb33fd3adb33f";
 
-    /// a handle whose terminal plane minted [`TEST_SECRET`] — the same
-    /// workspace-secret shape [`crate::stream::Admission::Workspace`] gates on,
-    /// which is exactly what `presence_ws` now reuse.
+    /// a handle whose service link minted [`TEST_SECRET`] — the same
+    /// workspace-secret shape the gated stream topics stand on, which is
+    /// exactly what `presence_ws` reuses.
     fn handle_with_secret() -> NodeHandle {
         let (handle, _cmds, _hub) = NodeHandle::channel();
-        handle.with_terminals(crate::term::TerminalSessions::new(
-            crate::term::TermRing::default(),
-            crate::term::TermCommandRing::default(),
-            Some(TEST_SECRET.into()),
-        ))
+        handle.with_service_link(crate::service_link::ServiceLink::new(Some(
+            TEST_SECRET.into(),
+        )))
     }
 
     const PATH: &str = "/v1/presence/ws?page=page-1";

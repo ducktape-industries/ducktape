@@ -67,7 +67,7 @@ const PAGE: u64 = 64;
 const PAGES_PER_SWEEP: usize = 8;
 
 /// How deep the daemon's receipts may queue before the terminal plane starts
-/// dropping them ([`noded::TerminalSessions::route_collab_to`]). Each one costs
+/// dropping them ([`noded::ServiceLink::route_collab_to`]). Each one costs
 /// a chain submission, so this is a few blocks of head room and not a buffer to
 /// hide a wedged pump behind.
 const RECEIPT_LANE: usize = 256;
@@ -99,12 +99,12 @@ const SWEEP: std::time::Duration = std::time::Duration::from_secs(5);
 /// Nothing is spawned when there is no terminal plane to pump for, when the
 /// node serves no chain, or when the plane already has a collaboration
 /// consumer — one pump per node, for the reason
-/// [`noded::TerminalSessions::route_collab_to`] gives. Each is an ordinary
+/// [`noded::ServiceLink::route_collab_to`] gives. Each is an ordinary
 /// state and each says which one it was at `info`, once per boot.
 pub(crate) fn spawn(
     commands: mpsc::Sender<noded::NodeCommand>,
     status: noded::StatusCell,
-    terminals: Option<&noded::TerminalSessions>,
+    terminals: Option<&noded::ServiceLink>,
     workspace: PathBuf,
     network: &str,
 ) -> bool {
@@ -168,7 +168,7 @@ fn refuse_to_start(reason: &'static str) -> bool {
 pub(crate) struct Pump {
     commands: mpsc::Sender<noded::NodeCommand>,
     status: noded::StatusCell,
-    terminals: noded::TerminalSessions,
+    terminals: noded::ServiceLink,
     workspace: PathBuf,
     /// the chain id every op is bound to and every key is scoped by. Taken from
     /// the workspace at boot: a node serves exactly one network.
@@ -233,12 +233,12 @@ enum Standing {
 #[derive(Debug, Default)]
 struct Seen {
     /// which daemon this was learned about. A different one knows none of it
-    /// ([`noded::TerminalSessions::attach_epoch`]).
+    /// ([`noded::ServiceLink::attach_epoch`]).
     epoch: u64,
     /// the agreed clock value last sent as a `MsgTime`.
     time: u64,
     /// how many receipts the term plane had dropped when this pump last looked
-    /// ([`noded::TerminalSessions::dropped_receipts`]).
+    /// ([`noded::ServiceLink::dropped_receipts`]).
     dropped: u64,
     /// keyed by (channel, participant handle) — the binding's identity.
     bindings: BTreeMap<(String, String), Announced>,
@@ -249,7 +249,7 @@ impl Pump {
     pub(crate) fn new(
         commands: mpsc::Sender<noded::NodeCommand>,
         status: noded::StatusCell,
-        terminals: noded::TerminalSessions,
+        terminals: noded::ServiceLink,
         workspace: PathBuf,
         network: String,
     ) -> Self {
@@ -304,11 +304,11 @@ impl Pump {
     /// One pass over every binding this device holds a key for.
     ///
     /// Gated on an ATTACHED DAEMON. Without one every command would be dropped
-    /// by the term plane's writer, and a cursor advanced past a message whose
+    /// by the link's writer, and a cursor advanced past a message whose
     /// `MsgDeliver` went nowhere is a message nothing looks at again until the
     /// operator re-attaches. Skipping the sweep keeps the cursor where it is.
     async fn sweep(&self, seen: &mut Seen) {
-        if !self.terminals.has_sandbox() {
+        if !self.terminals.attached() {
             return;
         }
         // a DIFFERENT daemon knows none of what was told to the last one, and
@@ -1634,7 +1634,7 @@ mod tests {
     /// device's binding, and an agent daemon attached to the terminal plane.
     struct Fixture {
         daemon: noded::testkit::InProcDaemon,
-        terminals: noded::TerminalSessions,
+        terminals: noded::ServiceLink,
         /// what the "agent daemon" receives. The real one is a ws connection;
         /// this is the same lane, taken by the same `attach`.
         link: tokio::sync::mpsc::Receiver<wire::Command>,
@@ -1698,12 +1698,7 @@ mod tests {
                 },
                 vec![COLLABORATION.into(), chat::DEFAULT_CHAT_TARGET.into()],
             );
-            let hub = noded::StreamHub::with_log_ring(64, noded::LogRing::default());
-            let terminals = noded::TerminalSessions::new(
-                hub.terminals(),
-                hub.term_commands(),
-                Some(LINK_TOKEN.to_string()),
-            );
+            let terminals = noded::ServiceLink::new(Some(LINK_TOKEN.to_string()));
             let (attached, link) = terminals.attach(LINK_TOKEN).expect("the link is free");
 
             let owner = signer(ALICE_SEED);
@@ -2223,16 +2218,11 @@ mod tests {
         );
     }
 
-    /// The terminal plane's receipts reach the pump's lane and not the floor.
+    /// The daemon link's receipts reach the pump's lane and not the floor.
     /// The wiring `route_collab_to` installs, on its own — awaited, never polled.
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_terminal_planes_collaboration_receipts_reach_the_pumps_lane() {
-        let hub = noded::StreamHub::with_log_ring(64, noded::LogRing::default());
-        let terminals = noded::TerminalSessions::new(
-            hub.terminals(),
-            hub.term_commands(),
-            Some(LINK_TOKEN.to_string()),
-        );
+    async fn the_service_links_collaboration_receipts_reach_the_pumps_lane() {
+        let terminals = noded::ServiceLink::new(Some(LINK_TOKEN.to_string()));
         let (receipts, mut lane) = tokio::sync::mpsc::channel(4);
         assert!(terminals.route_collab_to(receipts), "the lane was free");
         let (second, _unused) = tokio::sync::mpsc::channel(4);
