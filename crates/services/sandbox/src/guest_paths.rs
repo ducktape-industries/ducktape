@@ -10,7 +10,7 @@
 //! the same mountpoints. So this module is a substring rewrite over a handful
 //! of known pairs, not a mount planner.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// the neutral root every per-run input appears under. A guest sees
 /// `/duck/workspace` and `/duck/ro0` — never a host path, so the operator's
@@ -123,15 +123,6 @@ impl GuestLayout {
             out = out.replace(host.as_str(), guest.as_str());
         }
         out
-    }
-
-    /// the guest path for a host path that is mapped exactly.
-    pub fn guest_of(&self, host: &Path) -> Option<PathBuf> {
-        let host = host.to_string_lossy();
-        self.pairs
-            .iter()
-            .find(|(candidate, _)| *candidate == host)
-            .map(|(_, guest)| PathBuf::from(guest))
     }
 }
 
