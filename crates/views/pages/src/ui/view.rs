@@ -18,7 +18,7 @@ pub struct PagesView {
     pub(crate) comment_mention: i64,
     pub(crate) comments_card_height: f64,
     /// The network's named members: what an `@` in the document completes to.
-    pub(crate) member_names: Vec<String>,
+    pub(crate) member_names: Vec<(String, u64)>,
     /// The active agents "Ask AI" can address: display name and account.
     pub(crate) member_agents: Vec<(String, u64)>,
     /// The one comment being rewritten in place, and its words.
@@ -83,6 +83,11 @@ pub struct PagesView {
     pub(crate) scope_pinned: bool,
     pub(crate) thread_total: i64,
     pub(crate) comment_rows: Vec<crate::host::PageCommentThreadRow>,
+    /// The agent an "Ask AI" was just posted to, and how many comments the
+    /// page carried when it went out. The answer arrives as another comment,
+    /// so a page that has grown one has been answered.
+    pub(crate) awaiting_agent: String,
+    pub(crate) awaiting_comments: i64,
     pub(crate) threads_loading: bool,
     pub(crate) commented_hits: Vec<String>,
     pub(crate) reply_thread: String,
@@ -166,6 +171,8 @@ pub enum Message {
     /// Typing in one thread's reply box: the draft belongs to that thread.
     ReplyDraftChangedIn(String, String),
     CommentDraftChanged(String),
+    /// A name picked out of the `@` list under the comment composer.
+    PickCommentMention(String, u64),
     DocumentUpdated(::ducktape_view_guest::EditorDocumentUpdate),
     DocumentTransaction(::ducktape_view_guest::EditorTransaction<Message>),
 }
@@ -236,6 +243,8 @@ impl PagesView {
             scope_pinned: false,
             thread_total: 0,
             comment_rows: Vec::new(),
+            awaiting_agent: String::new(),
+            awaiting_comments: 0,
             threads_loading: false,
             commented_hits: Vec::new(),
             reply_thread: "".to_owned(),
@@ -257,7 +266,7 @@ impl PagesView {
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     /// This state's layout, digested — `snapshot_schema` holds it here.
     const SNAPSHOT_SCHEMA: &'static str =
-        "99f970a5f55760e6d0bf1493c68789be0cf0feceb46861a00c2c76e69e50c24e";
+        "37094f89e5c6a00384a2f4c7ca7c349ef30b1b99216bc3bb86c6caaa9fed58e0";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
@@ -424,6 +433,35 @@ mod tests {
         let restored = PagesView::restore(&snapshot).unwrap();
         assert_eq!(restored.snapshot().unwrap(), snapshot);
     }
+    /// `/` → "New page" is a page the writer is going to WRITE: the save that
+    /// makes it opens it, like the sidebar's "+", and the caret owes its
+    /// title line a visit.
+    #[test]
+    fn the_save_that_makes_a_page_opens_it() {
+        let (mut app, _) = PagesView::boot();
+        app.connected = true;
+        app.active_page = "alpha".into();
+        app.buffer_page = "alpha".into();
+        app.update(Message::SaveDone(crate::host::SaveItem {
+            written: true,
+            document: "Handbook\n>> ".into(),
+            page_made: "page-2".into(),
+            ..Default::default()
+        }));
+        assert_eq!(app.active_page, "page-2", "the new page is opened");
+        assert_eq!(
+            app.page_to_name, "page-2",
+            "and its title line is owed the caret"
+        );
+        // A save that made nothing leaves the reader where they are.
+        app.update(Message::SaveDone(crate::host::SaveItem {
+            written: true,
+            document: "Handbook\n>> Onboarding".into(),
+            ..Default::default()
+        }));
+        assert_eq!(app.active_page, "page-2");
+    }
+
     /// A picked picture is on the network before the document hears about it:
     /// what lands in the page is the address every member can read, on the
     /// line that asked for it, and the caret carries on under the picture.
@@ -680,6 +718,38 @@ mod tests {
                 .any(|key| key == "PagesView/root/pages/page/alpha-child")
         );
     }
+    /// The ask is itself the next comment the page gets. The wait ends on the
+    /// one after it — the answer — not on the reader's own words landing.
+    #[test]
+    fn the_ask_waits_for_the_answer_not_for_itself() {
+        let thread = |comments: i64| crate::host::PageCommentThreadRow {
+            thread: crate::host::PageCommentThread {
+                id: "thread-a".into(),
+                comment_count: comments,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (mut app, _) = PagesView::boot();
+        app.awaiting_agent = "Builder".into();
+        app.awaiting_comments = 2;
+        app.update(Message::RegisterArrived(crate::host::RegisterItem {
+            comment_rows: vec![thread(1)],
+            ..Default::default()
+        }));
+        assert_eq!(app.awaiting_agent, "Builder", "the ask has not landed yet");
+        app.update(Message::RegisterArrived(crate::host::RegisterItem {
+            comment_rows: vec![thread(2)],
+            ..Default::default()
+        }));
+        assert_eq!(app.awaiting_agent, "Builder", "that one is the ask itself");
+        app.update(Message::RegisterArrived(crate::host::RegisterItem {
+            comment_rows: vec![thread(3)],
+            ..Default::default()
+        }));
+        assert!(app.awaiting_agent.is_empty(), "the answer ends the wait");
+    }
+
     #[test]
     fn kit_composition_retains_editor_and_comment_routes_without_custom_control_faces() {
         let (mut app, _) = PagesView::boot();

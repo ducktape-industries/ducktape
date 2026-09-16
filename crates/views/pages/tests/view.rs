@@ -1080,6 +1080,8 @@ fn a_comment_from_the_format_menu_pins_to_the_selected_words() {
 fn ask_ai_posts_the_comment_with_the_agent_mentioned() {
     let (frame, _) = connected_with_register();
     let frame = tick_native(cmd_slash_over(&frame, 1, 4, 9));
+    // The bubble over the selection carries the marks; "Ask AI" is behind "…".
+    let frame = tick_native(menu_pick(&frame, "more"));
     let frame = tick_native(menu_pick(&frame, "ai"));
     // The paused agent is not on the picker, so its account opens nothing.
     let frame = tick_native(menu_pick(&frame, "8"));
@@ -1089,8 +1091,15 @@ fn ask_ai_posts_the_comment_with_the_agent_mentioned() {
         texts(&frame)
     );
     let frame = tick_native(menu_pick(&frame, "7"));
-    let frame = tick_native(type_into(&frame, "Start a thread…", "tighten this?"));
-    let frame = tick_native(press(&frame, "Post"));
+    // The composer says who it is addressed to — otherwise the pick reads as
+    // having done nothing at all.
+    assert!(
+        has_text(&frame, "Builder answers in this thread."),
+        "the ask names its agent: {:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(type_into(&frame, "Ask Builder…", "tighten this?"));
+    let frame = tick_native(press(&frame, "Ask"));
     let mint = request(&frame, "host.id");
     let frame = tick_native(vec![answer(mint.id, b"thread-9")]);
     let mint = request(&frame, "host.id");
@@ -1338,4 +1347,34 @@ fn background_search_preserves_full_hits_and_survives_a_failed_title_lookup() {
         assert_eq!(result["hits"][2]["page_title"], "Untitled");
         assert!(request(&frame, "host.finish").payload.is_empty());
     }
+}
+
+#[test]
+fn an_at_in_a_comment_picks_who_it_mentions_and_says_it_is_working() {
+    let frame = page_card();
+    let frame = tick_native(type_into(&frame, "Start a thread…", "ping @bui"));
+    assert!(
+        find(&frame, "pages/comments/mention(Builder)").is_some(),
+        "a typed handle offers the names it could mean: {:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(press(&frame, "Builder"));
+    let frame = tick_native(press(&frame, "Ask"));
+    let mint = request(&frame, "host.id");
+    let frame = tick_native(vec![answer(mint.id, b"thread-3")]);
+    let mint = request(&frame, "host.id");
+    let frame = tick_native(vec![answer(mint.id, b"comment-3")]);
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(op["payload"]["add_comment"]["text"], "ping @Builder");
+    assert_eq!(
+        op["payload"]["add_comment"]["mentions"],
+        serde_json::json!([7]),
+        "the pick addresses the comment, not just its text"
+    );
+    assert!(
+        has_text(&frame, "Builder is working on it…"),
+        "an ask says who is answering it: {:?}",
+        texts(&frame)
+    );
 }

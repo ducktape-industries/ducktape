@@ -1,9 +1,12 @@
 /// One nesting step of the page tree, Notion's way: the row moves in and
 /// the fold toggle sits in the step it opened.
 const PAGE_TREE_STEP: f32 = 14.;
-/// The fold toggle's column. A leaf keeps the empty column so every title
-/// in the tree lines up whether or not its row has a toggle.
-const PAGE_FOLD_SLOT: f32 = 20.;
+/// The fold toggle's column — ONE nesting step wide, no more. A leaf keeps
+/// the empty column so every title in the tree lines up whether or not its
+/// row has a toggle, but that column is the only thing between the pane's
+/// edge and a top-level page's name: anything wider is a margin the list
+/// pays on every row to hold a caret most of them never draw.
+const PAGE_FOLD_SLOT: f32 = PAGE_TREE_STEP;
 /// The title's trailing pad: room for "…" and "+" to appear over it.
 const PAGE_ROW_ACTIONS_WIDTH: f32 = 52.;
 const PAGE_MENU_WIDTH: f64 = 200.;
@@ -105,7 +108,7 @@ impl PagesView {
                 top: 5.,
                 right: PAGE_ROW_ACTIONS_WIDTH,
                 bottom: 5.,
-                left: 4.,
+                left: 0.,
             });
         }
         let line = kit::spaced(kit::centered_row(format!("{key}/row"), [slot, row]), 0.);
@@ -447,15 +450,10 @@ impl PagesView {
             ));
         }
         if !thread.resolved {
-            rows.push(kit::padded(
-                self.reply_box(&key, &thread.id, disabled),
-                wire::Edges {
-                    top: 2.,
-                    right: 0.,
-                    bottom: 0.,
-                    left: COMMENT_REPLY_INSET,
-                },
-            ));
+            // The box is where the reader WRITES, not a reply that has been
+            // written: it takes the card's full width, so the inset the
+            // written replies sit at would only make it harder to type in.
+            rows.push(self.reply_box(&key, &thread.id, disabled));
         }
         kit::card(
             key.clone(),

@@ -367,21 +367,33 @@ pub const PICTURE: &str = "image";
 /// rather than `@`: `@` is already the mention trigger elsewhere in this
 /// menu (see `SLASH_EXTRAS`), so `#` reads as the anchor/permalink glyph
 /// without colliding with it.
+/// THE BUBBLE OVER A SELECTION, and only what a writer reaches for there.
+/// Thirteen glyphs in a row is a menu wearing a toolbar's clothes: everything
+/// past these is one press further, behind [`MORE`].
 const FORMAT_ITEMS: &[(&str, &str, &str)] = &[
     ("bold", "Bold", "B"),
     ("italic", "Italic", "I"),
-    ("strike", "Strikethrough", "S"),
     ("underline", "Underline", "U"),
+    ("strike", "Strikethrough", "S"),
     ("code", "Code", "<>"),
-    ("highlight", "Highlight", "H"),
-    ("color", "Text color", "A"),
     ("link", "Link", "#"),
     ("comment", "Comment", "//"),
+    (MORE, "More…", "…"),
+];
+
+/// What [`MORE`] opens: the rest of the format menu, as an ordinary list —
+/// the shapes that need a submenu or a word to be legible at all.
+const FORMAT_MORE_ITEMS: &[(&str, &str, &str)] = &[
+    ("highlight", "Highlight", "H"),
+    ("color", "Text color", "A"),
     ("ai", "Ask AI…", "AI"),
     ("align", "Align…", "Align"),
     ("turn", "Turn into…", "Turn"),
     ("clear", "Clear formatting", "Clear"),
 ];
+
+/// The bubble's last button: the rest of the menu.
+pub const MORE: &str = "more";
 
 pub fn format_items() -> &'static [(&'static str, &'static str, &'static str)] {
     FORMAT_ITEMS
@@ -513,6 +525,10 @@ enum Kind {
     Format {
         line: usize,
     },
+    /// What the toolbar's "…" opens: the rest of the format menu, as a list.
+    FormatMore {
+        line: usize,
+    },
     /// The toolbar's colour palette over the selection on `line`.
     Color {
         line: usize,
@@ -556,6 +572,7 @@ impl Kind {
             Kind::Block { line: hung } | Kind::Turn { line: hung } => hung == line,
             Kind::Slash { .. }
             | Kind::Format { .. }
+            | Kind::FormatMore { .. }
             | Kind::Color { .. }
             | Kind::Align { .. }
             | Kind::Ai { .. }
@@ -655,6 +672,16 @@ impl Menu {
         self.open.is_some()
     }
 
+    /// Whether this menu IS the bubble over a selection — the one shape the
+    /// host draws itself, as a row of glyphs anchored to the selection. Its
+    /// overflow ("…") and every other menu are lists the host is handed.
+    pub fn over_selection(&self) -> bool {
+        matches!(
+            self.open.as_ref().map(|open| open.kind),
+            Some(Kind::Format { .. })
+        )
+    }
+
     pub fn current(&self, document: &Doc) -> Option<MenuView> {
         let open = self.open.as_ref()?;
         let (line, items) = match open.kind {
@@ -671,6 +698,13 @@ impl Menu {
             Kind::Format { .. } => (
                 None,
                 FORMAT_ITEMS
+                    .iter()
+                    .map(|(tag, label, _)| ((*tag).to_owned(), (*label).to_owned()))
+                    .collect(),
+            ),
+            Kind::FormatMore { .. } => (
+                None,
+                FORMAT_MORE_ITEMS
                     .iter()
                     .map(|(tag, label, _)| ((*tag).to_owned(), (*label).to_owned()))
                     .collect(),
@@ -775,6 +809,7 @@ impl Menu {
                 Kind::Block { .. }
                 | Kind::Turn { .. }
                 | Kind::Format { .. }
+                | Kind::FormatMore { .. }
                 | Kind::Color { .. }
                 | Kind::Align { .. }
                 | Kind::Ai { .. }
@@ -861,7 +896,11 @@ impl Menu {
             } => self.pick_slash(document, line, strip, slashed, tag),
             Kind::Turn { line } => (turn(document, line, tag), self.closed()),
             Kind::Block { line } => self.pick_block(document, line, tag),
-            Kind::Format { line } => self.pick_format(document, line, tag),
+            // The overflow list picks the same way the bubble does — it is the
+            // same menu, one press further in.
+            Kind::Format { line } | Kind::FormatMore { line } => {
+                self.pick_format(document, line, tag)
+            }
             Kind::Color { .. } => {
                 let rgb = COLORS
                     .iter()
@@ -980,6 +1019,12 @@ impl Menu {
     }
 
     fn pick_format(&self, document: &Doc, line: usize, tag: &str) -> (EditorDecision, Self) {
+        if tag == MORE {
+            return (
+                EditorDecision::Noop,
+                self.reopen(Kind::FormatMore { line }),
+            );
+        }
         if tag == "turn" {
             return (EditorDecision::Noop, self.reopen(Kind::Turn { line }));
         }

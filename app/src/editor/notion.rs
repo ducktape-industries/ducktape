@@ -36,6 +36,14 @@ pub fn init(cx: &mut App) {
         theme.page_width = px(f32::MAX);
         theme.page_padding = theme.gutter_controls_width;
         theme.page_bottom = theme.rem * 4.;
+        // A heading's air is measured in its OWN size, so the library's 3×
+        // put 72px above an H1 — a field of nothing between a title and the
+        // section under it, and more space above a heading than the reader
+        // has between two paragraphs. A heading needs enough air to read as a
+        // break; the hierarchy is in the sizes, not in the emptiness.
+        for (heading, above) in theme.headings.iter_mut().zip([1.4, 1.3, 1.2, 1.2]) {
+            heading.margin_above = above;
+        }
     });
     // Over the library's own image block, which draws its `src` with `img` —
     // and no image loader can fetch a `duck://` address.
@@ -257,6 +265,7 @@ pub struct RichWireEditor {
     _actions: Subscription,
     _annotations: Subscription,
     _links: Subscription,
+    _keystrokes: Subscription,
 }
 
 impl EventEmitter<()> for RichWireEditor {}
@@ -307,6 +316,16 @@ impl RichWireEditor {
         let links = cx.subscribe(&editor, |_, _, pressed: &LinkPressed, _| {
             crate::shell::open_link(pressed.0.to_string())
         });
+        // Native bindings resolve before element listeners — the block editor
+        // answers Cmd+B out of its own mark list and Cmd+Z out of its own
+        // snapshots. A guest claim has to run at GPUI's pre-action seam to
+        // reach the guest at all.
+        let mount = cx.entity().downgrade();
+        let keystrokes = cx.intercept_keystrokes(move |event, window, cx| {
+            let _ = mount.update(cx, |mount, cx| {
+                mount.key_down(&event.keystroke, window, cx);
+            });
+        });
         let mut this = Self {
             key,
             store,
@@ -324,6 +343,7 @@ impl RichWireEditor {
             _actions: actions,
             _annotations: annotations,
             _links: links,
+            _keystrokes: keystrokes,
         };
         this.sync(window, cx);
         this
@@ -683,6 +703,42 @@ impl RichWireEditor {
             .contains_focused(window, cx)
     }
 
+    /// The COMMAND chords the guest claimed belong to the guest: it holds the
+    /// canonical markdown and the only undo history, so Cmd+B spells the
+    /// fence into it and Cmd+Z restores one of its snapshots. Structure —
+    /// Enter, Tab, Backspace — stays the block editor's, which is why a bare
+    /// claim is left on the field.
+    fn key_down(
+        &mut self,
+        keystroke: &gpui_kit::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_focused(window, cx) {
+            return;
+        }
+        let key = super::key_state(keystroke);
+        let claimed = self
+            .store
+            .projection(&self.key)
+            .and_then(|projection| projection.options.binding)
+            .is_some_and(|binding| {
+                binding
+                    .claims
+                    .iter()
+                    .any(|claim| claim.command && claim.matches(&key, cfg!(target_os = "macos")))
+            });
+        if !claimed {
+            return;
+        }
+        self.store.request(
+            &self.key,
+            wire::EditorRequestInput::Key { key, repeat: false },
+        );
+        cx.stop_propagation();
+        cx.emit(());
+    }
+
     pub fn widget_command(
         &mut self,
         command: &wire::WidgetCommand,
@@ -735,6 +791,11 @@ impl Render for RichWireEditor {
         let badges = self.badges(cx);
         let fills = self.fills;
         div()
+            // The shell's interceptor runs ahead of this mount's and cannot be
+            // stopped by it, so it reads this context off the stack to yield
+            // the chords the guest claimed — Ctrl+K is a link here, not the
+            // command palette.
+            .key_context(super::text::GUEST_EDITOR_CONTEXT)
             .w_full()
             .when(fills, |element| element.h_full())
             .relative()

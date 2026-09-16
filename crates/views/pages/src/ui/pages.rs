@@ -580,7 +580,10 @@ impl PagesView {
                     crate::editor_binding::keys(
                         self.document_history.clone(),
                         self.document_menu.clone(),
-                        self.member_names.clone(),
+                        self.member_names
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .collect(),
                         self.member_agents.clone(),
                     )
                     .register(Message::DocumentCommitted, Message::DocumentTransaction),
@@ -711,6 +714,59 @@ impl PagesView {
                 threads.extend(resolved.iter().map(|row| self.comment_thread(&row.thread)));
             }
         }
+        // An "Ask AI" pick opens this composer with an agent already
+        // addressed. Saying so is the whole difference between a comment box
+        // and an ask — without it the pick looks like it did nothing.
+        let asked = self
+            .member_agents
+            .iter()
+            .find(|(_, account)| *account as i64 == self.comment_mention)
+            .map(|(name, _)| name.to_owned());
+        let compose_hint = match &asked {
+            Some(name) => format!("{name} answers in this thread."),
+            None => crate::host::compose_hint_of(
+                &self.blocks,
+                &self.scope_target,
+                &self.active_page,
+            ),
+        };
+        let compose_placeholder = match &asked {
+            Some(name) => format!("Ask {name}…"),
+            None => "Start a thread…".to_owned(),
+        };
+        let compose_submit = match &asked {
+            Some(_) => "Ask",
+            None => "Post",
+        };
+        let working_row: Vec<Node> = (!self.awaiting_agent.is_empty())
+            .then(|| {
+                kit::wrapping(kit::caption(
+                    "pages/comments/working-line",
+                    format!("{} is working on it…", self.awaiting_agent),
+                ))
+            })
+            .into_iter()
+            .collect();
+        // Typing `@` at the end of the draft offers who it can name. The box
+        // is a plain input with no caret to read, so the tail is the query
+        // and a press is how one is picked.
+        let mention_choices = crate::host::mention_query(&self.block_comment_draft)
+            .map(|query| {
+                crate::host::mention_choices(&self.member_names, &self.member_agents, query)
+            })
+            .unwrap_or_default();
+        let mention_rows: Vec<Node> = mention_choices
+            .into_iter()
+            .map(|(name, account)| {
+                menu_item(
+                    format!("pages/comments/mention({name})"),
+                    "@",
+                    &name,
+                    Message::PickCommentMention(name.clone(), account),
+                    disabled,
+                )
+            })
+            .collect();
         let body = fill(kit::spaced(
             kit::column(
                 "pages/comments/content",
@@ -721,21 +777,16 @@ impl PagesView {
                         "pages/comments/scroll",
                         kit::spaced(kit::column("pages/comments/threads", threads), 6.),
                     ),
-                    kit::wrapping(kit::caption(
-                        "pages/comments/hint",
-                        crate::host::compose_hint_of(
-                            &self.blocks,
-                            &self.scope_target,
-                            &self.active_page,
-                        ),
-                    )),
+                    kit::wrapping(kit::caption("pages/comments/hint", compose_hint)),
+                    kit::column("pages/comments/working", working_row),
+                    kit::column("pages/comments/mentions", mention_rows),
                     kit::spaced(
                         kit::row(
                             "pages/comments/compose",
                             [
                                 input(
                                     format!("{PAGE_KEY}/page-comment({})", self.active_page),
-                                    "Start a thread…",
+                                    &compose_placeholder,
                                     &self.block_comment_draft,
                                     Message::CommentDraftChanged,
                                     Some(Message::PostBlockCommentSubmit),
@@ -743,7 +794,7 @@ impl PagesView {
                                 ),
                                 action(
                                     "pages/comments/submit",
-                                    "Post",
+                                    compose_submit,
                                     Message::PostBlockCommentSubmit,
                                     !disabled && !self.block_comment_draft.trim().is_empty(),
                                     ButtonPreset::Primary,

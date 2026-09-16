@@ -267,25 +267,32 @@ fn cmd_slash_opens_the_format_menu_at_the_caret_and_its_picks_wrap_the_selection
     state.format(&selection);
     let view = state.current(&selection).unwrap();
     assert_eq!(view.line, None, "the format menu floats at the caret");
+    // The bubble carries what a writer reaches for, and "…" for the rest.
     assert_eq!(
         tags(&view),
         vec![
             "bold",
             "italic",
-            "strike",
             "underline",
+            "strike",
             "code",
-            "highlight",
-            "color",
             "link",
             "comment",
-            "ai",
-            "align",
-            "turn",
-            "clear"
+            "more"
         ]
     );
-    let (decision, palette) = state.pick(&selection, "color");
+    assert!(state.over_selection(), "the bubble is the host's to draw");
+    let (decision, more) = state.pick(&selection, "more");
+    assert_eq!(decision, EditorDecision::Noop, "\"…\" edits nothing");
+    assert_eq!(
+        tags(&more.current(&selection).unwrap()),
+        vec!["highlight", "color", "ai", "align", "turn", "clear"]
+    );
+    assert!(
+        !more.over_selection(),
+        "the overflow is an ordinary list, not a second bubble"
+    );
+    let (decision, palette) = more.pick(&selection, "color");
     assert_eq!(decision, EditorDecision::Noop);
     let colors = palette.current(&selection).unwrap();
     assert_eq!(
@@ -302,12 +309,13 @@ fn cmd_slash_opens_the_format_menu_at_the_caret_and_its_picks_wrap_the_selection
     assert!(!closed.is_open());
     let (decision, _) = palette.pick(&red, "default");
     assert_eq!(apply(&red, decision).text, "Title\nsome words");
-    let (decision, closed) = state.pick(&selection, "highlight");
+    let (decision, closed) = more.pick(&selection, "highlight");
     assert_eq!(apply(&selection, decision).text, "Title\nsome ==words==");
     assert!(!closed.is_open());
-    let (decision, turning) = state.pick(&selection, "turn");
+    let (decision, turning) = more.pick(&selection, "turn");
     assert_eq!(decision, EditorDecision::Noop);
     assert_eq!(turning.current(&selection).unwrap().items.len(), 12);
+    // "Comment" stays on the bubble itself, where the selection is.
     let intent = state.intent(&selection, "comment");
     assert_eq!(intent.comment_line, Some(1));
     assert_eq!(intent.anchor, Some((5, 10)));
@@ -466,6 +474,8 @@ fn the_align_submenu_sets_a_side_from_the_toolbar_and_the_block_menu() {
     selection.cursor.selection = Some(editor::EditorPosition::new(1, 5));
     let mut state = menu::Menu::default();
     state.format(&selection);
+    // Alignment lives behind the bubble's "…", with the rest of the shapes.
+    let (_, state) = state.pick(&selection, "more");
     let (decision, sides) = state.pick(&selection, "align");
     assert_eq!(decision, EditorDecision::Noop);
     let view = sides.current(&selection).unwrap();
@@ -507,6 +517,8 @@ fn ask_ai_lists_the_agents_and_addresses_the_comment_to_the_one_picked() {
     let agents = vec![("Builder".to_owned(), 7), ("Reviewer".to_owned(), 9)];
     let mut state = menu::Menu::default().with_agents(&agents);
     state.format(&selection);
+    // "Ask AI" lives behind the bubble's "…".
+    let (_, state) = state.pick(&selection, "more");
     let (decision, picker) = state.pick(&selection, "ai");
     assert_eq!(decision, EditorDecision::Noop);
     let view = picker.current(&selection).unwrap();
@@ -543,6 +555,7 @@ fn ask_ai_lists_the_agents_and_addresses_the_comment_to_the_one_picked() {
     // with nobody to ask the picker says so, and that row asks nobody
     let mut nobody = menu::Menu::default();
     nobody.format(&selection);
+    let (_, nobody) = nobody.pick(&selection, "more");
     let (_, picker) = nobody.pick(&selection, "ai");
     let view = picker.current(&selection).expect("the picker opens on its one row");
     assert_eq!(tags(&view), vec!["none"]);

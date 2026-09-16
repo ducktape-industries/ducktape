@@ -765,9 +765,20 @@ fn unfenced_column(block: &BlockContent, source: usize) -> usize {
 
 pub fn presentation(text: &str, cursor: wire::EditorCursor) -> RichPresentation {
     let blocks = blocks_of(text);
+    let mut wire_blocks: Vec<RichBlock> = blocks.iter().map(wire_block).collect();
+    // Line 0 is the page's TITLE, drawn on a heading because a title looks
+    // like one. An empty heading hints "Heading 1", which is the wrong word
+    // for the one line that names the page — it is untitled, exactly as the
+    // sidebar already calls it.
+    if let Some(title) = wire_blocks.first_mut() {
+        title.attributes.push(wire::editor_rich::RichAttribute {
+            name: "extra:placeholder".to_owned(),
+            value: crate::host::UNTITLED.to_owned(),
+        });
+    }
     RichPresentation {
         document: RichDocument {
-            blocks: blocks.iter().map(wire_block).collect(),
+            blocks: wire_blocks,
             cursor: wire::EditorCursor {
                 position: rich_position(&blocks, cursor.position),
                 selection: cursor.selection.map(|at| rich_position(&blocks, at)),
