@@ -182,8 +182,10 @@ async fn run(
         }
     }
     // Nothing to tear down: every live run's VMM is a child of this process
-    // spawned kill_on_drop, so returning from here IS the teardown — and it
-    // covers SIGKILL, which the container backend's sweep could not.
+    // spawned kill_on_drop, so returning from here IS the teardown. A SIGKILL,
+    // which runs no destructor, is covered by the parent-death signal the
+    // launcher arms instead — the case the container backend's sweep could
+    // not reach either.
     tracing::info!(
         target: "ducktape::service",
         instance = %grant.display_id(),

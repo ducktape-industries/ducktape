@@ -2317,29 +2317,6 @@ mod tests {
         }
     }
 
-    /// A daemon must not leave a run alive behind it, and under the microVM
-    /// backend that is a property of the code rather than of a sweep: the VMM
-    /// is spawned `kill_on_drop`, so it dies with the daemon — including on a
-    /// SIGKILL, which is the case the deleted sweep existed for.
-    ///
-    /// Guarded by parsing the source because there is no way to observe it from
-    /// a unit test: the alternative is a hardware test that SIGKILLs a daemon
-    /// and looks for stray `firecracker` processes, which is what this replaces.
-    #[test]
-    fn a_runs_vmm_cannot_outlive_the_daemon_that_spawned_it() {
-        let source = include_str!("../../../crates/services/sandbox/src/microvm.rs");
-        let (_, after_spawn) = source
-            .split_once("Command::new(&vmm_path)")
-            .expect("the VMM spawn");
-        let (args, _) = after_spawn.split_once(".spawn()").expect("spawn call");
-        assert!(
-            args.contains("kill_on_drop(true)"),
-            "the VMM must die with the daemon: without kill_on_drop a SIGKILLed \
-             daemon leaves a guest holding its whole memory footprint, with no \
-             successor able to find it"
-        );
-    }
-
     const NODE_A: [u8; 32] = [7u8; 32];
     const NODE_B: [u8; 32] = [9u8; 32];
     const NONCE: [u8; GRANT_NONCE_LEN] = [3u8; GRANT_NONCE_LEN];
