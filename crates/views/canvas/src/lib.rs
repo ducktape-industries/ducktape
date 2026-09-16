@@ -186,6 +186,11 @@ pub struct BoardsView {
     board_picker: bool,
     snap: bool,
     guides: Vec<[f32; 4]>,
+    /// The line each axis of the drag in hand is currently held to. A drag
+    /// keeps a line it has taken until the hand is clearly past it, so a guide
+    /// answers what you are doing instead of blinking on and off at whatever
+    /// speed the hand happens to be moving.
+    held: [Option<interaction::Hold>; 2],
     /// What the pointer is over with nothing in hand. A canvas answers before
     /// you commit — without it every click is a guess about what you will hit.
     hover: Option<String>,
@@ -295,6 +300,7 @@ impl BoardsView {
                 board_picker: false,
                 snap: true,
                 guides: Vec::new(),
+                held: [None, None],
                 hover: None,
                 clipboard: Vec::new(),
                 cameras: BTreeMap::new(),

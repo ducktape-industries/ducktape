@@ -1513,13 +1513,23 @@ impl BoardsView {
                     self.paint_stroke(*kind, &screen, accent, 8, out);
                     return;
                 }
+                // A card is drawn AS the card it will be, in the ink it will
+                // keep: an ellipse is an ellipse while you make it. A blue box
+                // that turns into an ellipse when you let go is a preview of
+                // the gesture, not of the shape, and it tells you nothing
+                // about what you are about to put on the board.
+                self.paint(board, &shape, 0.8, PREVIEW, out);
+                // Over it, the ring a selection wears — this one is still in
+                // hand — but no wash: a tint over the body would report the
+                // wrong colour for the card you are about to make, and the
+                // ring is the only thing a text box has to show its extent by.
                 out.push(rectangle(
                     self.screen(shape.x as f32, shape.y as f32),
                     [
                         shape.width as f32 * self.zoom,
                         shape.height as f32 * self.zoom,
                     ],
-                    wash,
+                    None,
                     accent,
                     1.,
                     (6. * self.zoom).clamp(2., 20.),
@@ -1564,6 +1574,10 @@ const PARTS: usize = 3600;
 /// and its grips, and it is taken before the shapes rather than after, so the
 /// answer to "what am I holding" does not vanish on a busy board.
 const MARKS: usize = 320;
+/// Out of that, what the shape in flight may spend drawing itself. A card
+/// costs one piece; only a stroke can want more, and a stroke being drawn is
+/// already thinned to what the board will store.
+const PREVIEW: usize = 8;
 
 /// What geometry costs against that budget: the host charges for the command
 /// AND for every segment inside it.

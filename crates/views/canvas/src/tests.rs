@@ -2329,3 +2329,139 @@ fn a_text_shape_is_the_size_of_its_words_and_a_card_keeps_the_room_it_was_given(
         "a sticky gave back the room it was drawn with"
     );
 }
+#[test]
+fn a_wheel_turned_away_from_you_zooms_in_and_leaves_the_point_under_it_alone() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    view.cursor = [400., 300.];
+    // Bare, the wheel pans. Nothing about it is a zoom.
+    view.on_wheel(0., 3., false);
+    assert_eq!(
+        view.zoom, 1.,
+        "a bare wheel moves the board, it does not scale it"
+    );
+    let under = view.world(view.cursor);
+    // Held, the same turn zooms IN — the direction a browser, tldraw and
+    // excalidraw all agree on. Turned the other way it comes back out.
+    for held in [
+        wire::keyboard::Modifiers {
+            control: true,
+            ..Default::default()
+        },
+        wire::keyboard::Modifiers {
+            logo: true,
+            ..Default::default()
+        },
+    ] {
+        view.modifiers = held;
+        // Three lines is one notch of a real wheel, and one notch is a step,
+        // not a leap: a scale that crosses the whole 0.1..8 range in five
+        // notches cannot be aimed.
+        view.on_wheel(0., 3., false);
+        assert!(
+            view.zoom > 1.05 && view.zoom < 1.25,
+            "one notch went from 1 to {}",
+            view.zoom
+        );
+        let after = view.world(view.cursor);
+        assert!(
+            (after[0] - under[0]).abs() < 0.01 && (after[1] - under[1]).abs() < 0.01,
+            "the point under the pointer moved: {under:?} -> {after:?}"
+        );
+        view.on_wheel(0., -3., false);
+        assert!(
+            (view.zoom - 1.).abs() < 0.001,
+            "turning it back did not undo it: {}",
+            view.zoom
+        );
+    }
+}
+/// Whether a mark is a path drawn through an elliptical arc.
+fn an_ellipse(mark: &wire::CanvasCommand) -> bool {
+    let wire::CanvasCommand::Draw {
+        shape: wire::CanvasShape::Path(steps),
+        ..
+    } = mark
+    else {
+        return false;
+    };
+    steps
+        .iter()
+        .any(|step| matches!(step, wire::CanvasSegment::Ellipse { .. }))
+}
+#[test]
+fn a_card_being_drawn_is_drawn_as_the_card_it_will_be() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    view.tool = Tool::Ellipse;
+    view.on_press(100., 100.);
+    view.on_move(300., 240.);
+    let board = view.visible().unwrap();
+    let mut marks = Vec::new();
+    view.paint_marks(&board, 3600, &mut marks);
+    assert!(
+        marks.iter().any(an_ellipse),
+        "an ellipse in hand was previewed as a box: {marks:?}"
+    );
+    // And the box is still drawn over it, because that ring is the only thing
+    // saying how much room the shape will take.
+    assert!(
+        marks.iter().any(|mark| rings(mark, [100., 100.])),
+        "the shape in hand wore no ring: {marks:?}"
+    );
+    let drawn = view
+        .drawn_shape(Kind::Ellipse, [100., 100.], [300., 240.])
+        .expect("a drag with a shape tool leaves a shape");
+    assert_eq!(
+        (drawn.kind, drawn.width, drawn.height),
+        (Kind::Ellipse, 200, 140),
+        "what was previewed is not what the drag leaves behind"
+    );
+}
+#[test]
+fn a_line_once_taken_is_kept_until_the_hand_is_clearly_past_it() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    card(&mut view, "a", 0); // 0,0 out to 200,140
+    // Well clear of a on the other axis, so the only line in play is the one
+    // this test is about.
+    view.edit(Change::Create {
+        id: "b".into(),
+        shape: Shape {
+            x: 400,
+            y: 300,
+            ..Default::default()
+        },
+    });
+    // b by the middle. Five short of a's right edge, it takes that line.
+    view.on_press(500., 370.);
+    view.on_move(305., 370.);
+    let taken = |view: &BoardsView| view.visible().unwrap().shapes["b"].shape.x;
+    assert_eq!(taken(&view), 200, "the line was there and was not taken");
+    assert_eq!(view.guides.len(), 1, "one line taken, one line drawn");
+    // Ten past it now — further than the window that captured it. A line
+    // retested from scratch every frame would drop here, and the guide across
+    // the board would blink off and on at whatever speed the hand moves.
+    view.on_move(310., 370.);
+    assert_eq!(
+        taken(&view),
+        200,
+        "the line let go the moment it was tested again"
+    );
+    assert_eq!(view.guides.len(), 1, "and the guide blinked out with it");
+    // Clearly past it. Now it goes, and the card is where the hand is.
+    view.on_move(325., 370.);
+    assert_eq!(taken(&view), 225, "the line held a card the hand had left");
+    assert!(
+        view.guides.is_empty(),
+        "a guide outlived the line it stood for"
+    );
+    view.on_release();
+    assert!(view.guides.is_empty(), "the guides go with the gesture");
+}
