@@ -403,7 +403,7 @@ pub fn router(config: Config, token: [u8; 64]) -> Result<axum::Router, String> {
 /// transport, not of the call protocol riding it.
 pub fn realtime_listener(
     listener: tokio::net::TcpListener,
-) -> impl axum::serve::Listener<Addr = std::net::SocketAddr> {
+) -> impl axum::serve::Listener<Addr = std::net::SocketAddr, Io = tokio::net::TcpStream> {
     use axum::serve::ListenerExt as _;
     listener.tap_io(|socket| {
         if let Err(error) = socket.set_nodelay(true) {
@@ -524,6 +524,29 @@ mod tests {
     use tokio_tungstenite::tungstenite::{
         Message as ClientMessage, client::IntoClientRequest as _,
     };
+
+    /// The socket option `realtime_listener` exists to set, read back off a
+    /// real accepted socket. `tap_io` swallows a failing option silently
+    /// enough that only the accepted socket can say whether it took, and
+    /// "verified by inspection" is not verification.
+    #[tokio::test]
+    async fn an_accepted_call_socket_has_nagle_disabled() {
+        use axum::serve::Listener as _;
+
+        let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = bound.local_addr().unwrap();
+        let mut listener = realtime_listener(bound);
+        let dial = tokio::spawn(async move { tokio::net::TcpStream::connect(address).await });
+
+        let (accepted, _) = listener.accept().await;
+        let client = dial.await.unwrap().expect("client connects");
+
+        assert!(
+            accepted.nodelay().expect("read the accepted socket's option"),
+            "an accepted call socket must not batch frames behind Nagle"
+        );
+        drop(client);
+    }
 
     fn config() -> Config {
         Config {

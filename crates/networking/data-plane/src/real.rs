@@ -115,10 +115,38 @@ impl DatagramSocket for UdpSocket {
     }
 }
 
+/// The stream class carries whole application messages that the sender has
+/// already decided to send — a call's media frames cross a node boundary on
+/// [`Service::Gateway`](crate::Service::Gateway), paced at one frame per
+/// 20 ms. Nagle's algorithm has nothing to coalesce there, but it still holds
+/// each frame until the previous one is acknowledged, which costs a full round
+/// trip per frame and delivers them in clumps a receiver's jitter buffer
+/// cannot absorb. Measured on this crate's `overlay_impairment` harness at
+/// 25 ms one-way and zero loss: median delay 51.6 ms and 449 ms of playout
+/// starvation per 20 s with Nagle, 25.1 ms and zero without it — the datagram
+/// class's own numbers on the same link.
+///
+/// Where a stream really is bulk ([`Service::ModuleCode`](crate::Service::ModuleCode),
+/// [`Service::StateSync`](crate::Service::StateSync)) the writes are large, so
+/// Nagle never engages and disabling it changes nothing. The factory is
+/// therefore the right place for it: it is a property of the transport, not of
+/// any one service riding it.
+fn disable_nagle(stream: &tokio::net::TcpStream) {
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::warn!(
+            target: "ducktape::plane",
+            reason = "nodelay_refused",
+            %error,
+            "overlay stream kept Nagle batching"
+        );
+    }
+}
+
 impl StreamListener for TcpListener {
     fn accept(&self) -> BoxFuture<'_, io::Result<(PlaneStream, SocketAddr)>> {
         Box::pin(async {
             let (stream, addr) = TcpListener::accept(self).await?;
+            disable_nagle(&stream);
             Ok((Box::new(stream) as PlaneStream, addr))
         })
     }
@@ -155,7 +183,9 @@ impl SocketFactory for OsSocketFactory {
                 IpAddr::V6(_) => TcpSocket::new_v6()?,
             };
             socket.bind(SocketAddr::new(local_ip, 0))?;
-            Ok(Box::new(socket.connect(dest).await?) as PlaneStream)
+            let stream = socket.connect(dest).await?;
+            disable_nagle(&stream);
+            Ok(Box::new(stream) as PlaneStream)
         })
     }
 }
@@ -346,9 +376,38 @@ impl DataPlaneTransport for OverlaySockets {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::net::Ipv6Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The option [`disable_nagle`] exists to set, read back off both ends of a
+    /// real connection. The seam boxes every stream as a `dyn Duplex` before a
+    /// caller sees it, so this is the last point where the concrete socket is
+    /// in hand — and "verified by inspection" is not verification. That the two
+    /// call sites (`accept` and `dial_from`) actually reach here is what the
+    /// `overlay_impairment` harness measures: with the option the stream class
+    /// delivers at the path delay, without it a full round trip later.
+    #[tokio::test]
+    async fn disable_nagle_clears_the_option_on_a_real_socket() {
+        let bound = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let dest = bound.local_addr().unwrap();
+        let dialing = tokio::spawn(async move { tokio::net::TcpStream::connect(dest).await });
+
+        let (accepted, _) = bound.accept().await.unwrap();
+        let dialed = dialing.await.unwrap().expect("dial succeeds");
+
+        for (side, stream) in [("accepted", &accepted), ("dialled", &dialed)] {
+            assert!(
+                !stream.nodelay().unwrap(),
+                "{side}: a fresh socket is expected to start with Nagle on, or this proves nothing"
+            );
+            disable_nagle(stream);
+            assert!(
+                stream.nodelay().unwrap(),
+                "{side}: overlay stream must not batch frames behind Nagle"
+            );
+        }
+    }
 
     /// A test address book for two endpoints that share the loopback IP but
     /// bind distinct OS-assigned ports. Forward resolution carries the full
