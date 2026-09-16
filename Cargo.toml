@@ -162,6 +162,12 @@ members = [
     # the desktop app's self-update state machine + release-manifest verify,
     # pure (no I/O): driven by the launcher at boot and by the app while running.
     "crates/app-update",
+    # the pages document editor: Notion-shaped blocks, marks, slash menu and
+    # toolbar on the same gpui-kit. It was a git dependency on a fork pinned to
+    # one revision, so a change to it never appeared in a ducktape diff. It is
+    # ducktape source now — edit it here like any other crate. There is no
+    # upstream to pull from and nothing to re-sync.
+    "crates/gpui-notion",
     # apps — product feature modules
     "crates/modules/apps/forge",
     "crates/modules/apps/pages",
