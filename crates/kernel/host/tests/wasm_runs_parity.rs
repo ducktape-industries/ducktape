@@ -28,6 +28,7 @@ use saga::{
     SagaMsg, SagaQuery, SagaReply, decode_reply as saga_decode_reply, decode_worker_request,
     encode_msg as saga_encode_msg, encode_query as saga_encode_query,
 };
+use sdk::MerkleStore;
 use sdk::{Error, Event, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
 use tasks::{JobsMsg, encode_job_msg as jobs_encode_msg};
@@ -43,15 +44,64 @@ use wasm_host::WasmModule;
 const RUNS_WASM: &[u8] = include_bytes!("fixtures/runs.component.wasm");
 
 /// the chain id both hosts run on — the genesis `__config` parameter the
-/// composer installs into this Map tenant, and the network every `duck://`
+/// composer seeds into this store tenant, and the network every `duck://`
 /// link the injector renders names. Both sides take it, or the two disagree
 /// on the `?net=` of a rendered page link.
 const PARITY_CHAIN_ID: &str = "parity#d0cdf950";
 
-fn wasm_runs() -> WasmModule {
-    let mut module = WasmModule::from_bytes("runs", RUNS_WASM).expect("load component");
-    // exactly what `noded::compose` seeds a Map-backed network-bound tenant
-    // with at genesis; without it the guest refuses every dispatch.
+fn wasm_runs(store: SharedStore) -> WasmModule {
+    WasmModule::with_store("runs", RUNS_WASM, Box::new(store)).expect("load component")
+}
+
+/// The records a store-backed runs tenant lives on, behind a handle the test
+/// keeps: a store IS the tenant's durable state, so a restart is a new module
+/// handed the same store — the store-backed twin of installing a snapshot.
+#[derive(Clone, Default)]
+struct SharedStore(std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>>);
+
+#[async_trait::async_trait(?Send)]
+impl MerkleStore for SharedStore {
+    async fn get(&self, key: &[u8; 32]) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self.0.borrow().get(key.as_slice()).cloned())
+    }
+
+    async fn commit_batch(
+        &mut self,
+        writes: Vec<([u8; 32], Option<Vec<u8>>)>,
+    ) -> Result<(), Error> {
+        let mut map = self.0.borrow_mut();
+        for (key, value) in writes {
+            match value {
+                Some(value) => map.insert(key.to_vec(), value),
+                None => map.remove(key.as_slice()),
+            };
+        }
+        Ok(())
+    }
+
+    /// the same preimage `sdk_testkit::MemStore` uses — sha256 over the sorted
+    /// pairs, through the one `sdk::hash::encode_pairs` byte contract.
+    fn root(&self) -> StateRoot {
+        StateRoot(
+            <sha2::Sha256 as sha2::Digest>::digest(sdk::hash::encode_pairs(&self.0.borrow()))
+                .into(),
+        )
+    }
+
+    async fn sync_target(&self) -> Result<sdk::ResolverSyncTarget, Error> {
+        Err(Error::Module("a test double has no resolver lane".into()))
+    }
+
+    async fn serve_sync(&self, _req: &[u8]) -> Result<Vec<u8>, Error> {
+        Err(Error::Module("a test double has no sync wire".into()))
+    }
+}
+
+/// exactly what `noded::compose` seeds a STORE-backed network-bound tenant
+/// with at genesis (`seed_store_config`); without it the guest refuses every
+/// dispatch. The record sits at the digest of `__config`, like every other
+/// record in a merkle store.
+fn runs_store() -> SharedStore {
     let config = sdk::genesis_config::encode_config(&[
         ("chain_id", PARITY_CHAIN_ID.as_bytes()),
         (
@@ -59,10 +109,12 @@ fn wasm_runs() -> WasmModule {
             sdk::genesis_config::TimeUnit::Height.encode(),
         ),
     ]);
-    let (bytes, root) =
-        wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, config.as_slice())]);
-    module.install(&bytes, root).expect("seed genesis config");
-    module
+    let store = SharedStore::default();
+    store.0.borrow_mut().insert(
+        sdk::store_key(sdk::genesis_config::CONFIG_KEY).to_vec(),
+        config,
+    );
+    store
 }
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`) — the exact
@@ -208,6 +260,7 @@ async fn wasm_host_with_assignment(
     context: &deterministic::Context,
     files_dir: std::path::PathBuf,
     assignment_members: Option<&[Vec<u8>]>,
+    runs_store: SharedStore,
 ) -> Host {
     let saga = match assignment_members {
         Some(_) => saga::SagaModule::with_assignment(
@@ -229,7 +282,7 @@ async fn wasm_host_with_assignment(
         assignment_members,
     )
     .await;
-    modules.push(Box::new(wasm_runs()));
+    modules.push(Box::new(wasm_runs(runs_store)));
     Host::genesis(modules).expect("genesis")
 }
 
@@ -718,6 +771,9 @@ fn root_of(host: &Host) -> StateRoot {
 struct Pair {
     native: Host,
     wasm: Host,
+    /// the store the wasm tenant lives on — a store-backed module's durable
+    /// state, and what a restart adopts.
+    wasm_runs_store: SharedStore,
     height: u64,
     requests: Vec<saga::WorkerRequest>,
 }
@@ -726,10 +782,18 @@ impl Pair {
         let members = [WORKER_NODE.to_vec()];
         let native =
             native_host_with_assignment(context, directory.join("native"), Some(&members)).await;
-        let wasm = wasm_host_with_assignment(context, directory.join("wasm"), Some(&members)).await;
+        let wasm_runs_store = runs_store();
+        let wasm = wasm_host_with_assignment(
+            context,
+            directory.join("wasm"),
+            Some(&members),
+            wasm_runs_store.clone(),
+        )
+        .await;
         let mut pair = Self {
             native,
             wasm,
+            wasm_runs_store,
             height: 0,
             requests: Vec::new(),
         };
@@ -922,25 +986,26 @@ impl Pair {
     }
 }
 
+/// A restart answers what the running tenant answers — on BOTH runtimes, each
+/// through the restore its backing actually has. The native map-backed twin
+/// installs the checkpoint's snapshot bytes; the store-backed guest has no byte
+/// snapshot by design (its sync surface is the store's resolver lane), so its
+/// restart is a fresh module handed the same store, which is exactly what a
+/// resumed node does with the store it reopened.
 async fn verify_receipt_snapshots(pair: &Pair, request_id: &str) {
     use sdk::Module as _;
-    let capture = |host: &Host| {
-        let (snapshot, _) =
-            host.capture_current_snapshot(pair.height, host::CapturePayloads::All, || {
+    let (snapshot, _) =
+        pair.native
+            .capture_current_snapshot(pair.height, host::CapturePayloads::All, || {
                 std::time::Duration::ZERO
             });
-        let module = snapshot.module("runs").unwrap();
-        let sdk::StateSyncHandle::SnapshotBytes(bytes) = &module.state_sync else {
-            panic!("runs snapshot");
-        };
-        (bytes.clone(), module.root)
+    let captured = snapshot.module("runs").unwrap();
+    let sdk::StateSyncHandle::SnapshotBytes(bytes) = &captured.state_sync else {
+        panic!("a map-backed native runs ships snapshot bytes");
     };
-    let (bytes, root) = capture(&pair.native);
     let mut native = native_runs();
-    native.install(&bytes, root).unwrap();
-    let (bytes, root) = capture(&pair.wasm);
-    let mut wasm = wasm_runs();
-    wasm.install(&bytes, root).unwrap();
+    native.install(bytes, captured.root).unwrap();
+    let wasm = wasm_runs(pair.wasm_runs_store.clone());
     let query = runs_encode_query(&RunsQuery::ActionPlan {
         request_id: request_id.into(),
     });
@@ -1677,7 +1742,7 @@ fn a_live_task_update_retains_its_attempt_on_both_runtimes() {
 fn deployed_registration_program_query_matches_native_and_preserves_state() {
     use sdk::Module as _;
     futures::executor::block_on(async {
-        let guest = wasm_runs();
+        let guest = wasm_runs(runs_store());
         let native = native_runs();
         let before = guest.root();
         for id in ["builder", "another-agent"] {
