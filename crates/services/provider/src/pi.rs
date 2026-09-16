@@ -220,6 +220,29 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// pi speaks no MCP: the extension IS the client, so the route it dials
+    /// and the route the lane serves are two literals in two languages. Pin
+    /// them together here — nothing else compiles the TypeScript.
+    #[test]
+    fn the_pi_extension_dials_the_route_the_lane_serves() {
+        const SOURCE: &str = include_str!("pi/ducktape.ts");
+        assert!(
+            SOURCE.contains(&format!("const MCP_PATH = {:?};", crate::MCP_PATH)),
+            "pi/ducktape.ts does not spell MCP_PATH as {:?}",
+            crate::MCP_PATH
+        );
+        // and it reaches it over the run's own lane, holding nothing: a guest
+        // that execs a server or carries a write token is the design this
+        // replaced.
+        assert!(
+            SOURCE.contains("env.DUCKTAPE_NODE"),
+            "pi/ducktape.ts does not read the run's node url"
+        );
+        for banned in ["child_process", "DUCKTAPE_RUN_ACTION_TOKEN"] {
+            assert!(!SOURCE.contains(banned), "pi/ducktape.ts names {banned}");
+        }
+    }
+
     fn native_context() -> crate::NativeConversationContext {
         crate::NativeConversationContext {
             conversation_id: "resident-1".into(),
