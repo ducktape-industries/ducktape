@@ -232,8 +232,9 @@ impl ForgeView {
         (Self::state(), ::ducktape_view_guest::Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
+    /// This state's layout, digested — `snapshot_schema` holds it here.
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "6f5fe2a551e819c3aa46ee5398c1e2d53f84179b6f029050f43d932320cb977c";
+        "be8e28001029e6cd978e107fc261810b87c570d695269c271c7263553f28ab1c";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
@@ -420,3 +421,18 @@ mod components;
 mod composer;
 mod forge;
 mod kit;
+
+#[cfg(test)]
+mod snapshot_schema {
+    use super::ForgeView;
+
+    #[test]
+    fn the_tag_is_this_state_s_layout() {
+        view_wire::schema::holds::<ForgeView>(ForgeView::SNAPSHOT_SCHEMA, |shape| {
+            // A draft carries an editor document, which refuses to restore
+            // from a byte the tracer made up, so the draft is described by a
+            // value that reaches every field it holds.
+            shape.sample(&ducktape_view_composer::Draft::schema_sample());
+        });
+    }
+}

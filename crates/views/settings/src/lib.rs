@@ -172,8 +172,9 @@ impl SettingsView {
         (Self::state(), Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
+    /// This state's layout, digested — `snapshot_schema` holds it here.
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "c4d7a1e2f0b3958c6d2e4f1a7b9c0d3e5f8a2b4c6d1e3f5a7b9c0d2e4f6a8b1c";
+        "ce3410128672865555ecb44ee823284c572ef8294638ae4679c536dbcecd241b";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         wire::Snapshot {
             schema: Self::SNAPSHOT_SCHEMA.into(),
@@ -1711,3 +1712,13 @@ ducktape_view_guest::export_app!(
     "This device's preferences, the account this key speaks for, and the workspace's lifecycle.",
     ["settings"]
 );
+
+#[cfg(test)]
+mod snapshot_schema {
+    use super::SettingsView;
+
+    #[test]
+    fn the_tag_is_this_state_s_layout() {
+        view_wire::schema::holds::<SettingsView>(SettingsView::SNAPSHOT_SCHEMA, |_| {});
+    }
+}

@@ -29,6 +29,8 @@ pub const WIRE_EPOCH: u32 = 7;
 
 pub mod manifest;
 pub mod native;
+#[cfg(feature = "schema")]
+pub mod schema;
 mod wit;
 pub use wit::WIT;
 

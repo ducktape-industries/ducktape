@@ -372,8 +372,9 @@ impl FilesView {
     }
 
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
+    /// This state's layout, digested — `snapshot_schema` holds it here.
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "7f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+        "90dd66a8f7aae8d943bfe74f65272b4f658d0db93169eddf128d6fe260c23969";
 }
 
 impl FilesView {
@@ -605,3 +606,16 @@ mod inspector;
 mod kit;
 mod listing;
 mod sidebar;
+
+#[cfg(test)]
+mod snapshot_schema {
+    use super::FilesView;
+
+    #[test]
+    fn the_tag_is_this_state_s_layout() {
+        // The draft is an editor document held by the state itself, and it
+        // refuses to restore from a byte the tracer makes up, so there is no
+        // smaller thing to sample and the state is read from a value.
+        view_wire::schema::holds_value(FilesView::SNAPSHOT_SCHEMA, &FilesView::state());
+    }
+}

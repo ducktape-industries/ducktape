@@ -13,10 +13,15 @@ edition = "2024"
 # Reads the manifest custom section out of a built component: host-only, so the
 # guests skip `wasmparser` entirely.
 manifest = ["dep:wasmparser"]
+# Derives a view's snapshot layout from its own serde impls. A dev-dependency
+# feature: the tracer never enters wasm, so a guest builds without either crate.
+schema = ["dep:serde-reflection", "dep:sha2"]
 authored-tests = []
 
 [dependencies]
 wasmparser = { version = "0.251", optional = true }
+serde-reflection = { version = "0.6", optional = true }
+sha2 = { version = "0.10", optional = true }
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
 memchr = "2"

@@ -1941,6 +1941,15 @@ struct HostState {
 /// The guest's `restore(state, macos)` export.
 type Restore = TypedFunc<(Vec<u8>, bool), (Result<(), String>,)>;
 
+/// What a fresh instance did with the state the drawn view left it. A trap
+/// is not one of these — it takes the instance with it and is the load's
+/// error. A refusal is the guest's own word, reported before it builds
+/// anything, so the instance is untouched and can start clean instead.
+enum Restored {
+    Carried,
+    Refused(String),
+}
+
 struct Guest {
     /// Shared immutable deployed code; isolated sessions own independent stores.
     component: Component,
@@ -2325,7 +2334,25 @@ impl Guest {
                         match snapshot {
                             Some(snapshot) => {
                                 wire::Snapshot::decode(&snapshot)?;
-                                fresh.restore(&snapshot, &shown)?;
+                                match fresh.restore(&snapshot, &shown)? {
+                                    Restored::Carried => {}
+                                    // State this build cannot read is state
+                                    // lost, not a deployment refused: the
+                                    // alternative is a tab that runs the old
+                                    // code until the app restarts, because
+                                    // every retry offers the same snapshot.
+                                    Restored::Refused(refusal) => {
+                                        tracing::warn!(
+                                            target: "ducktape::app",
+                                            module,
+                                            hash = %crate::backend::hex_encode(&hash),
+                                            reason = "snapshot_refused",
+                                            refusal = %refusal,
+                                            "view_state_dropped"
+                                        );
+                                        fresh.init(&shown)?;
+                                    }
+                                }
                             }
                             None => fresh.init(&shown)?,
                         }
@@ -2436,16 +2463,20 @@ impl Guest {
             .0
     }
 
-    fn restore(&mut self, snapshot: &[u8], shown: &str) -> Result<(), String> {
+    fn restore(&mut self, snapshot: &[u8], shown: &str) -> Result<Restored, String> {
         arm(&mut self.store);
-        self.restore
+        let answered = self
+            .restore
             .call(
                 &mut self.store,
                 (snapshot.to_vec(), cfg!(target_os = "macos")),
             )
             .map_err(|error| format!("{shown}: restore trapped: {}", first_line(&error)))?
-            .0
-            .map_err(|error| format!("{shown}: {error}"))
+            .0;
+        Ok(match answered {
+            Ok(()) => Restored::Carried,
+            Err(refusal) => Restored::Refused(refusal),
+        })
     }
 
     /// `on mount` runs in here, told which platform it keys for.
@@ -4362,6 +4393,43 @@ pub(crate) mod tests {
             guest.inputs.ready(),
             texts(guest)
         );
+    }
+
+    /// A snapshot the fresh build refuses is state lost, not a deployment
+    /// refused. The guest reports a refusal before it builds anything, so the
+    /// same instance still initializes and the swap goes through — without
+    /// that, every retry offers the same snapshot and the tab runs the old
+    /// code until the app restarts.
+    #[test]
+    fn a_refused_snapshot_leaves_the_instance_able_to_start_clean() {
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let _turn = blocking_connection_turn();
+        let bytes = std::fs::read(&staged).expect("the staged view");
+        let component = Guest::compile(&bytes, "refusal").expect("the view compiles");
+        let mut guest =
+            Guest::instantiate("governance", &component, "refusal").expect("the view instantiates");
+        // Well-formed, and tagged with a layout that is not this build's:
+        // what a snapshot written before the state moved looks like.
+        let foreign = wire::Snapshot {
+            schema: "0".repeat(64),
+            state: wire::SnapshotValue::Bytes(Vec::new()),
+        }
+        .encode()
+        .expect("a snapshot another build could have written");
+        let answered = guest
+            .restore(&foreign, "refusal")
+            .expect("a refusal is the guest's word, not a trap");
+        assert!(
+            matches!(answered, Restored::Refused(_)),
+            "a foreign layout must be refused, not decoded"
+        );
+        guest
+            .init("refusal")
+            .expect("the refused instance starts clean");
+        guest.redraw(&None);
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
     fn staged(module: &str) -> Option<std::path::PathBuf> {

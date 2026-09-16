@@ -1497,8 +1497,9 @@ impl AgentsView {
         (Self::state(), ::ducktape_view_guest::Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
+    /// This state's layout, digested — `snapshot_schema` holds it here.
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "90861baea4a7d861997b4f106a9991cf39c4192cec2df39ef6433046e10c9ff5";
+        "b4af6857860fc1fedcbf5402adbf1fa3df726117feef73754437cd57fc4e005c";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
@@ -2574,3 +2575,13 @@ ducktape_view_guest::export_app!(
     "The registry of who may act, on which executor, and what their runs did.",
     ["agents"]
 );
+
+#[cfg(test)]
+mod snapshot_schema {
+    use super::AgentsView;
+
+    #[test]
+    fn the_tag_is_this_state_s_layout() {
+        view_wire::schema::holds::<AgentsView>(AgentsView::SNAPSHOT_SCHEMA, |_| {});
+    }
+}

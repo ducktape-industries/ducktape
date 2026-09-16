@@ -63,8 +63,9 @@ pub enum Message {
     CopyToClipboard(String, String),
 }
 impl NodeView {
+    /// This state's layout, digested — `snapshot_schema` holds it here.
     const SNAPSHOT_SCHEMA: &'static str =
-        "5c1e0b7a9d2f4e6c8a1b3d5f7e9c0a2b4d6f8e1c3a5b7d9f0e2c4a6b8d1f3e5a";
+        "a3c71212f7dd37b4968727ff2aa8999979360e8d6a5c0ee634db40e8823988eb";
     fn state() -> Self {
         Self {
             node_data_dir: "".to_owned(),
@@ -298,3 +299,13 @@ ducktape_view_guest::export_app!(
     "This node: coherent status, standing, peers, logs and the code registry.",
     ["node"]
 );
+
+#[cfg(test)]
+mod snapshot_schema {
+    use super::NodeView;
+
+    #[test]
+    fn the_tag_is_this_state_s_layout() {
+        view_wire::schema::holds::<NodeView>(NodeView::SNAPSHOT_SCHEMA, |_| {});
+    }
+}

@@ -521,7 +521,11 @@ fn actual_menu_edit_commits_after_accept_and_undo_survives_restore() {
     assert_eq!(guest.text, "- 한글\n");
     let menu = guest.menu().expect("accepted plus opens the caret menu");
     assert_eq!(menu.anchor, EditorMenuAnchor::Caret);
-    assert_eq!(menu.items.len(), 14, "the twelve turns and the two pickers");
+    assert_eq!(
+        menu.items.len(),
+        15,
+        "the twelve turns, the two pickers and the picture"
+    );
     let pick = || EditorInteraction::MenuPick { tag: "h1".into() };
     let cancelled = guest.interaction(pick());
     assert!(
