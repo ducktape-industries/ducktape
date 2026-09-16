@@ -1,6 +1,7 @@
 use ducktape_view_guest::{kit as native, wire};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Act {
+    Issue,
     Review,
     Merge,
 }
@@ -64,6 +65,9 @@ pub struct ForgeView {
     pub(crate) focus_number: i64,
     pub(crate) merge_conflicts: Vec<String>,
     pub(crate) merge_busy: bool,
+    pub(crate) issue_title: String,
+    pub(crate) issue_body: String,
+    pub(crate) issue_busy: bool,
     pub(crate) review_verdict: String,
     pub(crate) review_busy: bool,
     pub(crate) staged_comments: Vec<crate::host::ForgeDraftComment>,
@@ -133,6 +137,9 @@ pub enum Message {
     SelectTrackerSide(String),
     TrackerFilterChanged(String),
     Key(wire::keyboard::Event, bool),
+    IssueTitleChanged(String),
+    IssueBodyChanged(String),
+    ForgeIssueOpen,
     ForgeReviewPick(String),
     ForgeReviewSubmit(String),
     ForgeMergeSubmit,
@@ -209,6 +216,9 @@ impl ForgeView {
             focus_number: 0,
             merge_conflicts: Vec::new(),
             merge_busy: false,
+            issue_title: "".to_owned(),
+            issue_body: "".to_owned(),
+            issue_busy: false,
             review_verdict: "comment".to_owned(),
             review_busy: false,
             staged_comments: Vec::new(),
@@ -251,7 +261,7 @@ impl ForgeView {
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     /// This state's layout, digested — `snapshot_schema` holds it here.
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "b5935054fe8ee6997fe7a1c524ddbf574b1414fe877435ad5296f95fcbeaf857";
+        "fba7d83f8bd8615cc26f4b967f334729cbe6a45ae3099286f4492b387fede5c7";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {

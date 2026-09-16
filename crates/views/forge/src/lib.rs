@@ -1,9 +1,9 @@
 //! Forge as a module-owned view: the repo overview, one repo's code, pull
 //! requests and issues, and an item's merge box, reviews and discussion,
 //! all read off the node through the kernel contract. Opening a repo, an
-//! item, a directory or a file is this view's own state and its own read; a
-//! review and a merge leave as `op.submit`, signed by the kernel with the
-//! seated key. The app holds no forge state at all.
+//! item, a directory or a file is this view's own state and its own read;
+//! opening an issue, a review and a merge leave as `op.submit`, signed by
+//! the kernel with the seated key. The app holds no forge state at all.
 
 /// The tracker filter's key, named once: the view draws the field with it
 /// and `/` asks the host to focus exactly that.

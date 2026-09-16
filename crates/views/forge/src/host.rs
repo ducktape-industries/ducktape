@@ -8,7 +8,8 @@
 //! repo namespace, one repo's branches and tracker, one item with its patch
 //! and reviews, the code browse's listing and file, and the item's
 //! discussion all come from `rpc.query` / `rpc.view`, re-read on every
-//! `rpc.live` hit for the forge plane. A review leaves as `op.submit`
+//! `rpc.live` hit for the forge plane. Opening an issue and reviewing both
+//! leave as `op.submit`
 //! carrying the module's own `ForgeMsg`, signed by the kernel with the
 //! seated key — the view never sees the key, the endpoint or the password.
 //!
@@ -1114,7 +1115,7 @@ fn net_query(chain_id: &str) -> String {
 /// refusal if any.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ActItem {
-    /// `review` | `merge`
+    /// `issue` | `review` | `merge`
     pub kind: String,
     pub merge_oid: String,
     pub conflicts: Vec<String>,
@@ -1190,6 +1191,28 @@ async fn submit_with_blob(
     host::request("op.submit", &serde_json::to_vec(&op).expect("encodes"))
         .await
         .map(|_| ())
+}
+
+/// Open an issue on `repo` as the seated key: the module numbers it, opens
+/// its discussion channel, and the live hit re-reads the tracker.
+pub fn issue_open(repo: String, title: String, body: String) -> bool {
+    start(async move {
+        let message = serde_json::json!({ "open_issue": {
+            "repo": repo,
+            "title": title,
+            "body": body,
+        }});
+        let error = submit(message).await.err().unwrap_or_default();
+        let error = match error.is_empty() {
+            true => error,
+            false => failure("The issue was not opened", &error),
+        };
+        ActItem {
+            kind: "issue".to_owned(),
+            error,
+            ..ActItem::default()
+        }
+    })
 }
 
 /// Submit a batched review pinned to the source head the reviewer saw. A
@@ -1895,6 +1918,7 @@ pub fn phase_of(error: &str) -> String {
 pub(crate) fn act_of(kind: &str) -> crate::Act {
     match kind {
         "merge" => crate::Act::Merge,
+        "issue" => crate::Act::Issue,
         _ => crate::Act::Review,
     }
 }

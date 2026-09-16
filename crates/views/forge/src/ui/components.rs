@@ -785,7 +785,7 @@ impl ForgeView {
                                 native::row(
                                     "forge/comment-row",
                                     [
-                                        self.review_input(
+                                        self.draft_input(
                                             "forge/comment-body",
                                             "Comment on this line…",
                                             &self.comment_draft,
@@ -795,6 +795,7 @@ impl ForgeView {
                                                     self.comment_draft.clone(),
                                                 )
                                             }),
+                                            self.review_busy,
                                         ),
                                         action(
                                             "forge/add-comment",
@@ -871,12 +872,13 @@ impl ForgeView {
             native::row(
                 "forge/review-row",
                 [
-                    self.review_input(
+                    self.draft_input(
                         "forge/review-body",
                         "Leave a review…",
                         &self.review_draft,
                         Message::ReviewDraftChanged,
                         submit.then(|| Message::ForgeReviewSubmit(self.review_draft.clone())),
+                        self.review_busy,
                     ),
                     primary(
                         "forge/submit-review",
@@ -902,13 +904,74 @@ impl ForgeView {
         )
     }
 
-    fn review_input(
+    /// Open an issue on the repo the tracker is showing: a title, a body,
+    /// and the one button that submits them. It sits above the list, so an
+    /// empty tracker is still the place an issue is opened from.
+    pub(super) fn issue_composer(&self) -> wire::Node {
+        let open = self.can_open_issue().then_some(Message::ForgeIssueOpen);
+        native::card(
+            "forge/new-issue",
+            native::spaced(
+                native::column(
+                    "forge/new-issue-column",
+                    [
+                        self.draft_input(
+                            "forge/new-issue-title",
+                            "Title",
+                            &self.issue_title,
+                            Message::IssueTitleChanged,
+                            open.clone(),
+                            self.issue_busy,
+                        ),
+                        native::spaced(
+                            native::row(
+                                "forge/new-issue-row",
+                                [
+                                    self.draft_input(
+                                        "forge/new-issue-body",
+                                        "Describe it…",
+                                        &self.issue_body,
+                                        Message::IssueBodyChanged,
+                                        open.clone(),
+                                        self.issue_busy,
+                                    ),
+                                    primary(
+                                        "forge/open-issue",
+                                        if self.issue_busy {
+                                            "Opening…"
+                                        } else {
+                                            "Open issue"
+                                        },
+                                        open,
+                                    ),
+                                ],
+                            ),
+                            6.,
+                        ),
+                    ],
+                ),
+                6.,
+            ),
+        )
+    }
+
+    /// An issue leaves only with a repo to land in and a title the module
+    /// will take — it refuses a blank one.
+    pub(super) fn can_open_issue(&self) -> bool {
+        self.connected
+            && !self.issue_busy
+            && !self.open_repo.is_empty()
+            && !self.issue_title.trim().is_empty()
+    }
+
+    fn draft_input(
         &self,
         key: &str,
         hint: &str,
         value: &str,
         route: fn(String) -> Message,
         submit: Option<Message>,
+        busy: bool,
     ) -> wire::Node {
         let mut input = native::input(
             key,
@@ -918,7 +981,7 @@ impl ForgeView {
             submit.map(slots::message),
         );
         if let wire::Node::Input { options, width, .. } = &mut input {
-            options.disabled = self.review_busy || !self.connected;
+            options.disabled = busy || !self.connected;
             *width = Some(wire::Length::Fill);
         }
         input

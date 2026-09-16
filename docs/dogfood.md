@@ -169,9 +169,13 @@ curl -s <base>/v1/index/pages/view -X POST -H 'content-type: application/json' \
 
 ## 4. Open the issue with a page link
 
-The desktop Forge view lists issues but cannot open one. Open it with forge's
-`open_issue` message through the `submit` helper from step 2, so the issue is
-authored by the node's operator account, and put the page link in its body:
+In the desktop Forge view, open the repo's **Issues** tab, type the title and
+the body — the page link goes in the body — and press **Open issue**: the
+message leaves as a signed `op.submit`, authored by the seated key, and the
+tracker lists it when the block lands.
+
+Scripted instead, authored by the node's operator account, through the
+`submit` helper from step 2:
 
 ```sh
 submit forge '{"open_issue":{"repo":"ducktape","title":"<title>","body":"[spec](duck://page/<your-page-id>)"}}'

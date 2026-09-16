@@ -2,7 +2,7 @@
 //! facts and nothing else; the repo namespace, one repo's branches and
 //! tracker, one item with its patch and reviews, and the discussion are all
 //! read HERE through `rpc.query` / `rpc.view`, re-read on every `rpc.live`
-//! hit. A review and a merge leave as `op.submit`.
+//! hit. Opening an issue, a review and a merge leave as `op.submit`.
 
 use ducktape_view_guest::testing::{answer, has_text, item, press, refuse, texts, type_into};
 use ducktape_view_guest::wire::{Event, Frame, Node, Request};
@@ -612,6 +612,129 @@ fn a_diff_line_comment_keeps_its_anchor_and_submits_without_a_review_body() {
     assert_eq!(review["comments"][0]["path"], "main.rs");
     assert_eq!(review["comments"][0]["line"], 1);
     assert_eq!(review["comments"][0]["body"], "Keep this guard");
+}
+
+/// The tracker with the Issues tab open: the repo the link named, its
+/// refs, its items and the roster behind their authors.
+fn open_issues_tab() -> Drive {
+    let (mut drive, _) = namespace("duck://forge/core");
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    drive.tick(press(&drive.frame, "Issues"));
+    drive
+}
+
+/// A forge block, as every read the view holds sees it: each subscription
+/// opens its OWN `rpc.live` on the plane, so one block is a hit on each.
+fn forge_block(drive: &Drive) -> Vec<Event> {
+    let mut ids: Vec<u64> = Vec::new();
+    for request in drive.frames.iter().flat_map(|frame| &frame.requests) {
+        if request.kind == "rpc.live" && !ids.contains(&request.id) {
+            ids.push(request.id);
+        }
+    }
+    ids.into_iter().map(|id| item(id, b"{}")).collect()
+}
+
+/// The value the input under `suffix` is carrying.
+fn input_value(frame: &Frame, suffix: &str) -> String {
+    let Node::Input { value, .. } = node_ending(frame, suffix) else {
+        panic!("{suffix} is not an input");
+    };
+    value
+}
+
+/// Opening an issue leaves as one `op.submit` carrying the module's own
+/// `open_issue`, signed by the kernel with the seated key. The block that
+/// lands it moves the live subscription, so the tracker re-reads itself and
+/// the issue is on the list without a restart.
+#[test]
+fn an_issue_opens_from_the_tracker_and_the_live_hit_lists_it() {
+    let mut drive = open_issues_tab();
+    drive.tick(type_into(&drive.frame, "Title", "the pond is cold"));
+    drive.tick(type_into(&drive.frame, "Describe it…", "every morning"));
+    drive.tick(press(&drive.frame, "Open issue"));
+
+    let submit = request(&drive.frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(op["target"], "forge");
+    assert_eq!(
+        op["payload"]["open_issue"],
+        serde_json::json!({
+            "repo": "core", "title": "the pond is cold", "body": "every morning"
+        })
+    );
+
+    // the write lands: the composer empties, and the forge plane's live hit
+    // re-reads the tracker the issue is now in.
+    let id = submit.id;
+    drive.tick(vec![answer(id, b"{}")]);
+    assert_eq!(input_value(&drive.frame, "new-issue-title"), "");
+    assert_eq!(input_value(&drive.frame, "new-issue-body"), "");
+    let block = forge_block(&drive);
+    drive.tick(block);
+    // the tracker re-reads itself in the order `read_repo` asks: the refs,
+    // then the items the issue is now one of.
+    drive.answer("list_refs", &refs());
+    let listed = serde_json::json!({ "items": [{
+        "number": 8, "kind": "issue", "state": "open", "title": "the pond is cold",
+        "author": { "account": 1 }
+    }]});
+    drive.answer("list_items", listed.to_string().as_bytes());
+    drive.answer("all", &accounts());
+    assert!(
+        has_text(&drive.frame, "the pond is cold"),
+        "{:?}",
+        texts(&drive.frame)
+    );
+}
+
+/// Escape is the way out of every forge screen, and a started issue is a
+/// screen too: the draft goes first, and only a second press leaves the
+/// repository. One press that did both would take the words with it.
+#[test]
+fn escape_clears_a_started_issue_before_it_leaves_the_repository() {
+    let mut drive = open_issues_tab();
+    drive.tick(type_into(&drive.frame, "Title", "the pond is cold"));
+    drive.tick(key_press("Escape"));
+    assert_eq!(input_value(&drive.frame, "new-issue-title"), "");
+    assert!(
+        has_text(&drive.frame, "Issues"),
+        "the repository stays open: {:?}",
+        texts(&drive.frame)
+    );
+    drive.tick(key_press("Escape"));
+    assert!(
+        has_text(&drive.frame, "duckhouse"),
+        "the namespace is back: {:?}",
+        texts(&drive.frame)
+    );
+}
+
+/// The module refuses a blank title, so the composer never spends a
+/// transaction on one: the button is dead until a title is typed.
+#[test]
+fn a_blank_title_opens_nothing() {
+    let mut drive = open_issues_tab();
+    let Node::Button { on_press, .. } = node_ending(&drive.frame, "open-issue") else {
+        panic!("no open-issue button");
+    };
+    assert!(on_press.is_none(), "{:?}", texts(&drive.frame));
+    drive.tick(type_into(&drive.frame, "Title", "   "));
+    let Node::Button { on_press, .. } = node_ending(&drive.frame, "open-issue") else {
+        panic!("no open-issue button");
+    };
+    assert!(on_press.is_none(), "{:?}", texts(&drive.frame));
+    assert!(
+        !drive
+            .frame
+            .requests
+            .iter()
+            .any(|request| request.kind == "op.submit"),
+        "{:?}",
+        kinds(&drive.frame.requests)
+    );
 }
 
 fn service_reply(body: serde_json::Value) -> Vec<u8> {

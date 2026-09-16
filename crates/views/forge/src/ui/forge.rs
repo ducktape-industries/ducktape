@@ -366,6 +366,10 @@ impl ForgeView {
             "loading" => content.push(self.loading_tracker("forge/tracker-loading".into())),
             "failed" => content.push(self.tracker_unavailable("forge/tracker-failed".into())),
             "ready" => {
+                let issues = tab == "issues";
+                if issues {
+                    content.push(self.issue_composer());
+                }
                 if items.is_empty() {
                     content.push(self.nothing_to_show(tab));
                 }
