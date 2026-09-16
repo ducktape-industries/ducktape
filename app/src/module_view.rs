@@ -1101,14 +1101,7 @@ pub fn connected(client: &ducktape_rpc::Client) -> Loads {
             let left_alone = desktop_view && (seated || locked.in_flight);
             if left_alone {
                 if let Slot::Ready(guest) = &mut locked.slot {
-                    let ids: Vec<_> = guest.tasks.iter().map(|(id, _)| *id).collect();
-                    guest.tasks.clear();
-                    guest.sessions.clear();
-                    guest.filesystem = Default::default();
-                    for id in ids {
-                        guest.refuse(id, "network connection changed".into());
-                    }
-                    guest.connection_rev = snapshot.rev;
+                    guest.reconnect(snapshot.rev);
                 }
                 return None;
             }
@@ -1570,7 +1563,11 @@ fn spawn_load(
                 *hash = guest.hash;
                 *slot = Slot::Ready(guest);
             }
-            Ok(Loaded::Unchanged) => {}
+            Ok(Loaded::Unchanged) => {
+                if let Slot::Ready(guest) = slot {
+                    guest.reconnect(connection.rev);
+                }
+            }
             Ok(Loaded::Empty(removed)) => {
                 *hash = Some(removed);
                 *slot = Slot::Empty;
@@ -1797,6 +1794,22 @@ pub(crate) mod canary {
     use std::sync::{Mutex, mpsc};
 
     pub(crate) use super::tests::connection_turn;
+    /// Native backend integration tests use the actual staged Chat guest.
+    pub(crate) fn stage_chat(client: &ducktape_rpc::Client) {
+        {
+            let mut connection = super::connection().lock().unwrap();
+            connection.client = Some(client.clone());
+            connection.rev += 1;
+        }
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/views/chat_view.wasm");
+        let guest = super::Guest::load_from("chat", &path).expect("build the current Chat view");
+        let source = super::mounted("chat");
+        let mut source = source.lock().unwrap();
+        source.slot = super::Slot::Ready(Box::new(guest));
+        source.generation += 1;
+    }
+
     pub(crate) fn input_presentation(
         view: &super::NativeModuleView,
         key: &str,
@@ -2096,6 +2109,21 @@ fn arm(store: &mut Store<HostState>) {
 }
 
 impl Guest {
+    /// Reusing identical code still retires work started on the old connection.
+    fn reconnect(&mut self, revision: u64) {
+        if self.connection_rev == revision {
+            return;
+        }
+        let ids: Vec<_> = self.tasks.iter().map(|(id, _)| *id).collect();
+        self.tasks.clear();
+        self.sessions.clear();
+        self.filesystem = Default::default();
+        for id in ids {
+            self.refuse(id, "network connection changed".into());
+        }
+        self.connection_rev = revision;
+    }
+
     /// A module-owned view comes from the module's active deployment on the
     /// connected node — nothing else, so with no node there is nothing to
     /// load yet, and no staged file is ever opened for it; the desktop's own

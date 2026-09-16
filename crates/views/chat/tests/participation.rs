@@ -198,3 +198,91 @@ fn a_join_notification_reads_the_first_seat_and_names_it_in_the_view() {
         );
     });
 }
+
+#[test]
+fn a_live_channel_fold_uses_cached_identity_and_only_the_index_lane() {
+    on_stack(|| {
+        let key = "07".repeat(32);
+        let frame = start(json!({"kind":"channel","channel":"room","key":key,
+            "names":{"accounts":{key:{"number":1,"name":"Reader"}},"by_account":{"1":"Reader","2":"Peer"},"programs":[]}
+        }));
+        assert!(
+            !frame
+                .requests
+                .iter()
+                .any(|request| request.kind == "rpc.query")
+        );
+        let channel = request(&frame, "rpc.view");
+        assert_eq!(
+            payload(channel),
+            json!({"target":"chat","query":{"channel":{"channel_id":"room"}}})
+        );
+        let frame = tick_native(vec![answer(channel.id,br#"{"channel":{"id":"room","name":"General","post_policy":"members_only","head_seq":9,"huddle":[{"party":"acct:1","node":"aa","joined_at":4},{"party":"acct:2","node":"bb","joined_at":5}]}}"#)]);
+        let response = payload(request(&frame, "host.emit"));
+        assert_eq!(response["channel"][0]["members_only"], true);
+        let roster = &response["channel"][1];
+        assert_eq!(roster[0]["label"], "Reader");
+        assert_eq!(roster[0]["key"], "acct:1");
+        assert_eq!(roster[0]["node"], "aa");
+        assert_eq!(roster[0]["joined_at"], 4);
+        assert_eq!(roster[0]["is_you"], true);
+        assert_eq!(roster[1]["label"], "Peer");
+        assert_eq!(roster[1]["is_you"], false);
+        assert!(
+            !frame
+                .requests
+                .iter()
+                .any(|request| request.kind == "rpc.query")
+        );
+    });
+}
+
+#[test]
+fn live_discovery_selects_chat_runs_and_keeps_missing_agent_names_cached() {
+    on_stack(|| {
+        let frame = start(json!({"kind":"live_runs","labels":{"known":"Known agent"}}));
+        let pending = request(&frame, "rpc.query");
+        assert_eq!(
+            payload(pending),
+            json!({"target":"runs","query":"pending_runs"})
+        );
+        let frame = tick_native(vec![answer(
+            pending.id,
+            &serde_json::to_vec(&json!({"pending_runs":[
+                {"dispatch_id":"job","channel_id":"","agent_id":"job-agent"},
+                {"dispatch_id":"chat","channel_id":"room","agent_id":"missing"}
+            ]}))
+            .unwrap(),
+        )]);
+        let roster = request(&frame, "rpc.query");
+        assert_eq!(
+            payload(roster),
+            json!({"target":"runs","query":{"model":{"query":"agents"}}})
+        );
+        let frame = tick_native(vec![refuse(roster.id, "roster unavailable")]);
+        let result = payload(request(&frame, "host.emit"));
+        assert_eq!(result["records"].as_array().unwrap().len(), 1);
+        assert_eq!(result["records"][0]["dispatch_id"], "chat");
+        assert_eq!(
+            result["labels"],
+            json!({"known":"Known agent","missing":"missing"})
+        );
+
+        let frame = start(json!({"kind":"live_runs","labels":result["labels"]}));
+        let pending = request(&frame, "rpc.query");
+        let frame = tick_native(vec![answer(
+            pending.id,
+            &serde_json::to_vec(&json!({"pending_runs":result["records"]})).unwrap(),
+        )]);
+        assert!(
+            !frame
+                .requests
+                .iter()
+                .any(|request| request.kind == "rpc.query")
+        );
+        assert_eq!(
+            payload(request(&frame, "host.emit"))["labels"],
+            result["labels"]
+        );
+    });
+}

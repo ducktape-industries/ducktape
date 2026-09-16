@@ -56,7 +56,7 @@ pub struct SettingsFacts {
     /// This workspace's directory on this device — the Node overview's data dir.
     pub data_dir: String,
     /// THE VIEWER'S OWN KEY, full hex — the `me` every membership test needs.
-    /// `ChatMember.key` is `member_id(..)` at full width, and the account card
+    /// `ChatMember.key` carries the full key id, and the account card
     /// carries an account NUMBER, not a key, so neither the account card nor
     /// the node key can answer "is this row me". Empty on a device with no user
     /// key, which `post_gate` reads as "not seated" — the honest answer when

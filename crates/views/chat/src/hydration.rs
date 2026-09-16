@@ -1,0 +1,145 @@
+//! Channel selection and the remaining native shell's room facts.
+use crate::host::{self, ChatChannel, Names};
+use serde_json::{Value, json};
+
+async fn reader(key: &str) -> (Names, String) {
+    let names = host::names_at(0).await;
+    let handle = names
+        .account_of(key)
+        .map(|number| format!("acct:{number}"))
+        .unwrap_or_else(|| format!("user:{key}"));
+    host::seat_reader(&handle, key);
+    (names, handle)
+}
+
+fn landing(channels: &[ChatChannel]) -> Option<&ChatChannel> {
+    let has_traffic = |channel: &&ChatChannel| !channel.archived && channel.head_seq > 0;
+    let is_open = |channel: &&ChatChannel| !channel.archived;
+    channels
+        .iter()
+        .find(has_traffic)
+        .or_else(|| channels.iter().find(is_open))
+        .or_else(|| channels.first())
+}
+
+async fn facts(id: &str, names: &Names) -> Result<Option<(ChatChannel, Value)>, String> {
+    let row = host::view("channel", json!({"channel":{"channel_id":id}})).await?;
+    if row.is_null() {
+        return Ok(None);
+    }
+    let matches_id = row["id"].as_str() == Some(id);
+    if !matches_id {
+        return Err("channel reply names another room".into());
+    }
+    let channel = host::channel_row(&row, names);
+    let roster = row["huddle"].as_array().into_iter().flatten().zip(&channel.huddle)
+        .map(|(raw, seat)| json!({
+            "key":raw["party"],"label":seat.label,"initials":seat.initials,
+            "is_agent":false,"is_you":seat.is_you,"joined_at":raw["joined_at"].as_i64().unwrap_or_default(),
+            "node":seat.node
+        })).collect::<Vec<_>>();
+    Ok(Some((channel, json!(roster))))
+}
+
+fn data(
+    channels: Vec<ChatChannel>,
+    active: Option<ChatChannel>,
+    roster: Value,
+    members: Value,
+) -> Value {
+    let active = active.unwrap_or_default();
+    json!({
+        "generation":0, "channels":channels,
+        "active_channel":active.id,"active_channel_name":active.name,
+        "active_channel_archived":active.archived,"active_channel_members_only":active.members_only,
+        "huddle_roster":roster,"channel_members":members
+    })
+}
+
+pub(crate) async fn workspace(requested: Option<String>, key: String) -> Result<Value, String> {
+    let (names, handle) = reader(&key).await;
+    let sidebar = host::read_sidebar_now(0, 0, &handle).await?;
+    let selected = requested
+        .as_deref()
+        .and_then(|id| sidebar.channels.iter().find(|row| row.id == id))
+        .or_else(|| landing(&sidebar.channels));
+    let Some(selected) = selected else {
+        return Ok(data(sidebar.channels, None, json!([]), json!([])));
+    };
+    let id = selected.id.clone();
+    let (facts, members) = futures::try_join!(facts(&id, &names), host::read_members(&id, &names))?;
+    let (active, roster) = facts.ok_or("selected channel disappeared during loading")?;
+    Ok(data(sidebar.channels, Some(active), roster, json!(members)))
+}
+
+pub(crate) async fn window(id: String, key: String) -> Result<Value, String> {
+    let (names, _) = reader(&key).await;
+    let (facts, members) = futures::try_join!(facts(&id, &names), host::read_members(&id, &names))?;
+    let Some((active, roster)) = facts else {
+        return workspace(None, key).await;
+    };
+    Ok(data(
+        vec![active.clone()],
+        Some(active),
+        roster,
+        json!(members),
+    ))
+}
+
+pub(crate) async fn channel(id: String, key: String, snapshot: Value) -> Result<Value, String> {
+    let names = host::cached_names(snapshot)?;
+    let handle = names
+        .account_of(&key)
+        .map(|number| format!("acct:{number}"))
+        .unwrap_or_else(|| format!("user:{key}"));
+    host::seat_reader(&handle, &key);
+    let result = facts(&id, &names).await?;
+    Ok(json!({"channel":result}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn a_cold_start_lands_on_a_room_with_something_in_it() {
+        let channel = |id: &str, head: i64, archived: bool| ChatChannel {
+            id: id.into(),
+            name: id.into(),
+            archived,
+            members_only: false,
+            huddle_count: 0,
+            voice: false,
+            huddle: Vec::new(),
+            head_seq: head,
+        };
+        let landing = |channels: &[ChatChannel]| {
+            super::landing(channels)
+                .map(|channel| channel.id.clone())
+                .unwrap_or_default()
+        };
+
+        // The demo's own shape: the empty room sorts first by ID.
+        let demo = vec![
+            channel("channel-1786073", 0, false),
+            channel("engineering", 46, false),
+            channel("general", 9, false),
+        ];
+        assert_eq!(landing(&demo), "engineering");
+
+        // An archived room is not a landing even when it is the only one with
+        // traffic — you cannot post into it.
+        let archived_history = vec![channel("archive", 500, true), channel("general", 0, false)];
+        assert_eq!(landing(&archived_history), "general");
+
+        // Every room empty, and every room archived: still land somewhere.
+        assert_eq!(
+            landing(&[channel("a", 0, false), channel("b", 0, false)]),
+            "a"
+        );
+        assert_eq!(
+            landing(&[channel("a", 0, true), channel("b", 5, true)]),
+            "a"
+        );
+        assert_eq!(landing(&[]), "");
+    }
+}

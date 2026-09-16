@@ -113,62 +113,6 @@ fn the_roster_answers_admin_tier_and_filters() {
 }
 
 #[test]
-fn the_huddle_roster_marks_the_row_this_device_holds() {
-    // The wire truth: `HuddleEntry.user` is the kernel's BARE user id, never
-    // `user:{hex}` — the previous fixture invented prefixed entries and
-    // asserted a compare no real roster row could satisfy.
-    let me = [0xaau8; 32];
-    let my_passkey = [0xacu8; 32];
-    let peer = [0xbbu8; 32];
-    // A seat taken with the person's passkey is the person's: the directory
-    // binds both keys to one account, and the roster recognises it.
-    let names = NameDirectory::new(BTreeMap::from([
-        (
-            hex_encode(&me),
-            BoundAccount {
-                number: 1,
-                name: "me".into(),
-            },
-        ),
-        (
-            hex_encode(&my_passkey),
-            BoundAccount {
-                number: 1,
-                name: "me".into(),
-            },
-        ),
-        (
-            hex_encode(&peer),
-            BoundAccount {
-                number: 2,
-                name: "peer".into(),
-            },
-        ),
-    ]));
-    let roster = huddle_roster(
-        &[
-            chat::index::HuddleEntry {
-                party: "acct:1".into(),
-                node: "0a0a".into(),
-                joined_at: 10,
-            },
-            chat::index::HuddleEntry {
-                party: format!("user:{}", hex_encode(&peer)),
-                node: "0b0b".into(),
-                joined_at: 20,
-            },
-        ],
-        ChatReader::new(Some(&me), &names),
-    );
-    assert_eq!(roster.len(), 2);
-    assert!(roster[0].is_you && !roster[0].is_agent);
-    assert!(!roster[1].is_you && !roster[1].is_agent);
-    assert_eq!(roster[0].label, "me");
-    assert!(huddle_self(roster.clone()));
-    assert!(!huddle_self(vec![roster[1].clone()]));
-}
-
-#[test]
 fn palette_keys_use_native_platform_shortcuts() {
     let plain = gpui_kit::Modifiers::default();
     let command = gpui_kit::Modifiers {

@@ -2,6 +2,51 @@
 
 use crate::host::{LiveActivity, LiveRunHint};
 
+/// Select chat-anchored runs and cache the deployed product's agent names.
+pub(crate) async fn discover(
+    mut labels: std::collections::BTreeMap<String, String>,
+) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let pending = crate::host::ask(
+        "rpc.query",
+        &json!({"target":"runs","query":"pending_runs"}),
+    )
+    .await?;
+    let records: Vec<_> = pending["pending_runs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|record| !record["channel_id"].as_str().unwrap_or_default().is_empty())
+        .cloned()
+        .collect();
+    let unnamed = records
+        .iter()
+        .any(|record| !labels.contains_key(record["agent_id"].as_str().unwrap_or_default()));
+    if unnamed {
+        let roster = crate::host::ask(
+            "rpc.query",
+            &json!({"target":"runs","query":{"model":{"query":"agents"}}}),
+        )
+        .await;
+        if let Ok(roster) = roster {
+            for agent in roster["model"]["agents"].as_array().into_iter().flatten() {
+                let Some(id) = agent["agent_id"].as_str() else {
+                    continue;
+                };
+                let label = agent["display_name"].as_str().unwrap_or(id);
+                labels.insert(id.into(), label.into());
+            }
+        }
+        // A missing or deleted agent gets a stable fallback, avoiding a
+        // second roster read on every poll of the same run.
+        for record in &records {
+            let id = record["agent_id"].as_str().unwrap_or_default();
+            labels.entry(id.into()).or_insert_with(|| id.into());
+        }
+    }
+    Ok(json!({"records":records,"labels":labels}))
+}
+
 /// Interpret the authorized output in the deployed view, not in the host.
 pub(crate) fn project(mut row: LiveRunHint) -> LiveRunHint {
     if let Some(progress) = row.public_progress.take() {

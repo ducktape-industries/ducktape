@@ -707,14 +707,6 @@ pub(crate) fn retry_delay(attempt: u32) -> Duration {
     Duration::from_secs(1_u64 << exponent)
 }
 
-pub(crate) fn number_i64(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
-
-pub(crate) fn count_i64(value: usize) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::user_error;

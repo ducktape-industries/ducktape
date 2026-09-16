@@ -290,41 +290,26 @@ pub fn chat_live_agents(
         let rows: Rows = Arc::default();
         let mut watchers: BTreeMap<String, Watcher> = BTreeMap::new();
         let mut labels: BTreeMap<String, String> = BTreeMap::new();
-        let ask = serde_json::json!("pending_runs");
         while !sender.is_closed() {
-            let Ok(pending) = client.query::<_, serde_json::Value>("runs", &ask).await else {
+            let discovery = chat_background(
+                &rpc,
+                serde_json::json!({"kind":"live_runs","labels":labels}),
+            )
+            .await;
+            let Ok(discovery) = discovery else {
                 tokio::time::sleep(PENDING_POLL).await;
                 continue;
             };
-            let anchored: Vec<&serde_json::Value> = pending["pending_runs"]
+            let Ok(next_labels) = serde_json::from_value(discovery["labels"].clone()) else {
+                tokio::time::sleep(PENDING_POLL).await;
+                continue;
+            };
+            labels = next_labels;
+            let anchored: Vec<_> = discovery["records"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                // A job-backed run has no anchor in any room (`PendingRun`
-                // leaves `channel_id` empty for one), so there is nowhere in
-                // chat to draw it.
-                .filter(|record| !record["channel_id"].as_str().unwrap_or_default().is_empty())
                 .collect();
-            // ONE ROSTER READ PER NEW AGENT, not one per poll: a run's agent
-            // cannot be renamed mid-run, and a quiet node must not pay a query
-            // every two seconds to learn nothing.
-            let unnamed = anchored.iter().any(|record| {
-                !labels.contains_key(record["agent_id"].as_str().unwrap_or_default())
-            });
-            if unnamed {
-                labels.extend(agent_labels(&client).await);
-                // AND ASKED ONLY ONCE. A run whose agent the roster does not
-                // name (it was deleted, or the query failed) falls back to the
-                // agent id — without seating that fallback, `unnamed` would
-                // stand for as long as the run does and cost a second query
-                // every poll for a name that is not coming.
-                for record in &anchored {
-                    let id = record["agent_id"].as_str().unwrap_or_default();
-                    labels
-                        .entry(id.to_string())
-                        .or_insert_with(|| id.to_string());
-                }
-            }
             let output_unreadable = reach == Reach::Nothing
                 || rows
                     .lock()
@@ -465,25 +450,6 @@ pub fn chat_live_agents(
         receiver.recv().await.map(|event| (event, receiver))
     })
     .boxed()
-}
-
-/// Every registered agent's display name by id — the same record the Agents
-/// tab and the roster label an agent from, so one agent reads the same in all
-/// three. A node that cannot answer names nobody, and the row falls back to
-/// the agent id.
-async fn agent_labels(client: &RpcClient) -> BTreeMap<String, String> {
-    let ask = runs::RunsQuery::Model {
-        query: runs::ModelQuery::Agents,
-    };
-    let Ok(runs::RunsReply::Model(runs::ModelReply::Agents(records))) =
-        client.query::<_, runs::RunsReply>("runs", &ask).await
-    else {
-        return BTreeMap::new();
-    };
-    records
-        .into_iter()
-        .map(|record| (record.agent_id, record.display_name))
-        .collect()
 }
 
 /// `/v1/ws?run=<dispatch>` — the signed arm's path AND the exact string its

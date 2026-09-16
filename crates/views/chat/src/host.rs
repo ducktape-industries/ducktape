@@ -667,6 +667,31 @@ pub struct Names {
     programs: BTreeSet<u64>,
 }
 
+/// Cached host identity facts let a live channel fold avoid a dispatch query.
+pub(crate) fn cached_names(value: serde_json::Value) -> Result<Names, String> {
+    #[derive(Deserialize)]
+    struct Account {
+        number: u64,
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct Snapshot {
+        accounts: BTreeMap<String, Account>,
+        by_account: BTreeMap<u64, String>,
+        programs: BTreeSet<u64>,
+    }
+    let snapshot: Snapshot = serde_json::from_value(value).map_err(|error| error.to_string())?;
+    Ok(Names {
+        keys: snapshot
+            .accounts
+            .into_iter()
+            .map(|(key, account)| (key, (account.number, account.name)))
+            .collect(),
+        by_account: snapshot.by_account,
+        programs: snapshot.programs,
+    })
+}
+
 impl Names {
     fn name_of_handle(&self, handle: &str) -> Option<&str> {
         match handle.split_once(':') {
@@ -846,13 +871,12 @@ pub(crate) async fn read_sidebar(
     }
 }
 
-async fn read_sidebar_now(
+pub(crate) async fn read_sidebar_now(
     connection_serial: i64,
     names_serial: i64,
     reader: &str,
 ) -> Result<SidebarItem, String> {
-    let mut channels = Vec::new();
-    let mut seats = BTreeMap::new();
+    let mut records = Vec::new();
     let mut after: Option<String> = None;
     loop {
         let page = view(
@@ -861,27 +885,7 @@ async fn read_sidebar_now(
         )
         .await?;
         let rows = page["channels"].as_array().ok_or("missing channels page")?;
-        for row in rows {
-            seats.insert(
-                row["id"].as_str().unwrap_or_default().to_owned(),
-                row["huddle"].as_array().cloned().unwrap_or_default(),
-            );
-        }
-        channels.extend(rows.iter().map(|row| {
-            let channel = row;
-            ChatChannel {
-                id: channel["id"].as_str().unwrap_or_default().into(),
-                name: channel["name"].as_str().unwrap_or_default().into(),
-                archived: channel["archived"].as_bool().unwrap_or_default(),
-                members_only: channel["post_policy"].as_str() == Some("members_only"),
-                huddle_count: channel["huddle"]
-                    .as_array()
-                    .map_or(0, |rows| count_i64(rows.len())),
-                head_seq: row["head_seq"].as_i64().unwrap_or_default(),
-                voice: channel["voice"].as_bool().unwrap_or_default(),
-                ..ChatChannel::default()
-            }
-        }));
+        records.extend(rows.iter().cloned());
         if page["has_more"].as_bool() != Some(true) {
             break;
         }
@@ -895,24 +899,10 @@ async fn read_sidebar_now(
         after = Some(next.into());
     }
     let names = names_at(names_serial).await;
-    let me = ME.with_borrow(Clone::clone);
-    for channel in &mut channels {
-        channel.huddle = seats
-            .remove(&channel.id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|seat| {
-                let party = seat["party"].as_str().unwrap_or_default();
-                let label = names.member_label(party);
-                HuddleSeat {
-                    initials: sidebar_initials(&label),
-                    label,
-                    is_you: owns_handle(party, &me, &names),
-                    node: seat["node"].as_str().unwrap_or_default().into(),
-                }
-            })
-            .collect();
-    }
+    let channels = records
+        .iter()
+        .map(|record| channel_row(record, &names))
+        .collect();
     let mine = reader
         .strip_prefix("acct:")
         .and_then(|number| number.parse::<u64>().ok());
@@ -939,6 +929,36 @@ async fn read_sidebar_now(
         peers,
         error: String::new(),
     })
+}
+
+/// Interpret one canonical channel row for every Chat presentation.
+pub(crate) fn channel_row(row: &serde_json::Value, names: &Names) -> ChatChannel {
+    let me = ME.with_borrow(Clone::clone);
+    let huddle = row["huddle"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|seat| {
+            let party = seat["party"].as_str().unwrap_or_default();
+            let label = names.member_label(party);
+            HuddleSeat {
+                initials: sidebar_initials(&label),
+                label,
+                is_you: owns_handle(party, &me, names),
+                node: seat["node"].as_str().unwrap_or_default().into(),
+            }
+        })
+        .collect::<Vec<_>>();
+    ChatChannel {
+        id: row["id"].as_str().unwrap_or_default().into(),
+        name: row["name"].as_str().unwrap_or_default().into(),
+        archived: row["archived"].as_bool().unwrap_or_default(),
+        members_only: row["post_policy"].as_str() == Some("members_only"),
+        huddle_count: count_i64(huddle.len()),
+        huddle,
+        head_seq: row["head_seq"].as_i64().unwrap_or_default(),
+        voice: row["voice"].as_bool().unwrap_or_default(),
+    }
 }
 
 fn sidebar_initials(name: &str) -> String {
@@ -1049,7 +1069,10 @@ pub async fn open_dm(reader: String, peer: String) -> Result<String, String> {
 
 // ---------- the reads ----------
 
-async fn ask(kind: &str, query: &serde_json::Value) -> Result<serde_json::Value, String> {
+pub(crate) async fn ask(
+    kind: &str,
+    query: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let bytes = host::request(kind, &serde_json::to_vec(query).expect("encodes")).await?;
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
@@ -1273,7 +1296,7 @@ async fn older_roots_exist(channel: &str, floor: u64) -> Result<bool, String> {
     Ok(!page["roots"].as_array().map(Vec::is_empty).unwrap_or(true))
 }
 
-async fn read_members(channel: &str, names: &Names) -> Result<Vec<ChatMember>, String> {
+pub(crate) async fn read_members(channel: &str, names: &Names) -> Result<Vec<ChatMember>, String> {
     let mut members = Vec::new();
     let mut after: Option<String> = None;
     loop {
@@ -2878,11 +2901,39 @@ mod tests {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BackgroundRequest {
-    Notice { request: crate::notice::Request },
-    Search { channel: String, text: String },
-    Join { channel: String },
-    Move { from: String, channel: String },
-    Leave { channel: String },
+    LiveRuns {
+        labels: std::collections::BTreeMap<String, String>,
+    },
+    Workspace {
+        requested: Option<String>,
+        key: String,
+    },
+    Window {
+        channel: String,
+        key: String,
+    },
+    Channel {
+        channel: String,
+        key: String,
+        names: serde_json::Value,
+    },
+    Notice {
+        request: crate::notice::Request,
+    },
+    Search {
+        channel: String,
+        text: String,
+    },
+    Join {
+        channel: String,
+    },
+    Move {
+        from: String,
+        channel: String,
+    },
+    Leave {
+        channel: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -2989,6 +3040,24 @@ async fn background_search(
 
 async fn participate(intent: BackgroundRequest) -> Result<serde_json::Value, BackgroundError> {
     match intent {
+        BackgroundRequest::LiveRuns { labels } => {
+            crate::live::discover(labels).await.map_err(Into::into)
+        }
+        BackgroundRequest::Workspace { requested, key } => {
+            crate::hydration::workspace(requested, key)
+                .await
+                .map_err(Into::into)
+        }
+        BackgroundRequest::Window { channel, key } => crate::hydration::window(channel, key)
+            .await
+            .map_err(Into::into),
+        BackgroundRequest::Channel {
+            channel,
+            key,
+            names,
+        } => crate::hydration::channel(channel, key, names)
+            .await
+            .map_err(Into::into),
         BackgroundRequest::Notice { request } => {
             Ok(serde_json::json!({"notice":crate::notice::notice(request).await}))
         }

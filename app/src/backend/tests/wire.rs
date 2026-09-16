@@ -71,6 +71,7 @@ async fn one_unlock_signs_every_request_of_the_session() {
 /// Channel hydration preserves each participant's identity and node key.
 #[tokio::test(flavor = "current_thread")]
 async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
+    let _turn = crate::module_view::canary::connection_turn().await;
     let storage = tempfile::tempdir().unwrap();
     let sim = simnode::boot(
         storage.path(),
@@ -82,6 +83,7 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
     )
     .unwrap();
     let rpc = RpcClient::new(&format!("http://{}", sim.addr())).unwrap();
+    crate::module_view::canary::stage_chat(&rpc);
     let (me, peer) = (
         ed25519::PrivateKey::from_seed(11),
         ed25519::PrivateKey::from_seed(12),
@@ -185,6 +187,7 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
 /// the room there is to read.
 #[tokio::test(flavor = "current_thread")]
 async fn a_window_on_an_unseen_room_lands_instead_of_failing() {
+    let _turn = crate::module_view::canary::connection_turn().await;
     let storage = tempfile::tempdir().unwrap();
     let sim = simnode::boot(
         storage.path(),
@@ -196,6 +199,7 @@ async fn a_window_on_an_unseen_room_lands_instead_of_failing() {
     )
     .unwrap();
     let rpc = RpcClient::new(&format!("http://{}", sim.addr())).unwrap();
+    crate::module_view::canary::stage_chat(&rpc);
     let me = ed25519::PrivateKey::from_seed(11);
 
     // The joining resident: nothing folded yet, so no id resolves — including
@@ -247,20 +251,47 @@ async fn a_window_on_an_unseen_room_lands_instead_of_failing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn chat_round_trips_over_signed_frames() {
+    let _turn = crate::module_view::canary::connection_turn().await;
     let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     let storage = tempfile::tempdir().unwrap();
+    let modules = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(workspace_config::sim_modules_dir().unwrap()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().is_file() {
+            std::fs::copy(entry.path(), modules.path().join(entry.file_name())).unwrap();
+        }
+    }
+    let view =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/views/chat_view.wasm");
+    std::fs::copy(view, modules.path().join("chat.view.wasm")).unwrap();
+    let artifact = workspace_config::read_module_artifact(modules.path(), "chat").unwrap();
+    let signer = ed25519::PrivateKey::from_seed(7);
     let sim = simnode::boot(
         storage.path(),
         "127.0.0.1:0".parse().unwrap(),
         simnode::SimOpts {
             auto: true,
+            valset_keys: vec![signer.public_key().as_ref().to_vec()],
+            modules_dir: Some(modules.path().into()),
             ..Default::default()
         },
     )
     .unwrap();
     let origin = format!("http://{}", sim.addr());
     let rpc = RpcClient::new(&origin).unwrap();
-    let signer = ed25519::PrivateKey::from_seed(7);
+    // The registry pins the founding artifact; serve those same bytes through
+    // the ordinary content-addressed download used by connected views.
+    let token = std::fs::read_to_string(storage.path().join("admin.token")).unwrap();
+    reqwest::Client::new()
+        .post(format!("{origin}/v1/admin/module-code/stage?fanout=false"))
+        .header("x-ducktape-admin-token", token.trim())
+        .body(artifact.encode())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    crate::module_view::connected(&rpc).settled().await;
 
     submit_test(
         &rpc,
@@ -293,9 +324,6 @@ async fn chat_round_trips_over_signed_frames() {
     assert_eq!(posted[0].body, "hello from the app");
 
     let origin = rpc.origin().to_string();
-    // the module views load from whatever node connects last: take the
-    // turn the deployment tests take, so this node is not theirs
-    let _turn = crate::module_view::tests::connection_turn().await;
     let mut opening = connect(origin.clone(), 0, 0).into_stream();
     assert!(matches!(
         opening.next().await,
@@ -304,13 +332,13 @@ async fn chat_round_trips_over_signed_frames() {
             "Loading chat and workspace…"
         ))
     ));
-    assert!(matches!(
-        opening.next().await,
-        Some(crate::AppMessage::ConnectionProgress(
-            0,
-            "Preparing workspace screens…"
-        ))
-    ));
+    match opening.next().await {
+        Some(crate::AppMessage::ConnectionProgress(0, "Preparing workspace screens…")) => {}
+        Some(crate::AppMessage::ConnectFailed(error)) => {
+            panic!("workspace load failed: {}", error.message)
+        }
+        _ => panic!("workspace load must publish its screen preparation"),
+    }
     let Some(crate::AppMessage::WorkspaceConnected(workspace)) = opening.next().await else {
         panic!("workspace connects after both progress publications");
     };
@@ -332,7 +360,14 @@ async fn chat_round_trips_over_signed_frames() {
         }),
     )
     .await;
-    let changed = next_change(&mut live).await;
+    // The full founding set also publishes governance/registry plane events.
+    // Drain those publications until the committed Chat event arrives.
+    let changed = loop {
+        let update = next_change(&mut live).await;
+        if update.kind == crate::LiveKind::Chat {
+            break update;
+        }
+    };
     assert_eq!(
         changed.kind,
         crate::LiveKind::Chat,

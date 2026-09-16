@@ -224,7 +224,19 @@ async fn run(
                 Slot::Loading => Ok(None),
                 Slot::Empty => Err("session view was removed".into()),
                 Slot::Failed(error) => Err(error.clone()),
-                Slot::Ready(guest) => Ok(Some(SessionCode::capture(guest))),
+                Slot::Ready(guest) => {
+                    let current = guest.connection_rev == revision;
+                    if current {
+                        Ok(Some(SessionCode::capture(guest)))
+                    } else if state.in_flight {
+                        // Reconnection keeps the visible previous instance
+                        // until its replacement loads. A new session must wait
+                        // for the instance belonging to its own connection.
+                        Ok(None)
+                    } else {
+                        Err("session view belongs to a previous connection".into())
+                    }
+                }
             }
         };
         match loaded {

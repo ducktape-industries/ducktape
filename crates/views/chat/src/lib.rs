@@ -2,6 +2,7 @@
 
 pub mod host;
 mod live;
+mod hydration;
 pub mod notice;
 
 #[path = "ui/app.rs"]

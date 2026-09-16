@@ -36,7 +36,7 @@ pub const THREAD_HOT_WINDOW_LIMIT: usize = CHAT_HOT_WINDOW_LIMIT + 1;
 // rendered row types — what a chat view iterates over
 // ============================================================================
 
-#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
+#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ChatChannel {
     pub id: String,
     pub name: String,
@@ -51,7 +51,7 @@ pub struct ChatChannel {
     pub voice: bool,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
+#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct HuddleSeat {
     pub label: String,
     pub initials: String,
@@ -71,7 +71,7 @@ pub struct ChatReaction {
     pub reactors: Vec<String>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
+#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ChatMember {
     pub key: String,
     pub label: String,
@@ -79,7 +79,7 @@ pub struct ChatMember {
 
 /// The account a user key is bound to: its number (the identity, which the
 /// DM derivation and every "same person" test hang on) and its display name.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct BoundAccount {
     pub number: u64,
     pub name: String,
@@ -92,7 +92,7 @@ pub struct BoundAccount {
 /// Names are display text, NOT identity — two accounts may share one — so
 /// nothing here compares names; "the same person" is the account NUMBER, and
 /// a person's passkey, wallet and device key all resolve to one.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct NameDirectory {
     accounts: BTreeMap<String, BoundAccount>,
     by_account: BTreeMap<u64, String>,

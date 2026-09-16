@@ -1,9 +1,8 @@
 use super::*;
-use ::chat;
 
 /// One participant of a channel's live huddle — the roster is consensus state
 /// (`HuddleMember{user, node, joined_at}`), not a count.
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HuddleParticipant {
     pub key: String,
     pub label: String,
@@ -16,11 +15,8 @@ pub struct HuddleParticipant {
     pub node: String,
 }
 
-/// Render canonical account or historical key seats from the huddle index.
-/// The roster of a room the reader is seated in but not looking at (a voice
-/// room), read off the room list's own seats: the seat carries the person
-/// and the node, which is all the huddle window and the beacon match need.
-pub(crate) fn roster_of_seats(seats: &[chat::client::HuddleSeat]) -> Vec<HuddleParticipant> {
+/// Adapt the view's roster seats for the native device session.
+pub(crate) fn roster_of_seats(seats: &[HuddleSeat]) -> Vec<HuddleParticipant> {
     seats
         .iter()
         .map(|seat| HuddleParticipant {
@@ -31,49 +27,6 @@ pub(crate) fn roster_of_seats(seats: &[chat::client::HuddleSeat]) -> Vec<HuddleP
             is_you: seat.is_you,
             joined_at: 0,
             node: seat.node.clone(),
-        })
-        .collect()
-}
-
-pub(crate) fn huddle_roster(
-    members: &[chat::index::HuddleEntry],
-    reader: ChatReader<'_>,
-) -> Vec<HuddleParticipant> {
-    members
-        .iter()
-        .map(|member| {
-            let handle = member.party.clone();
-            let label = author_display(&handle, reader.names);
-            HuddleParticipant {
-                initials: initials_of(&label),
-                // Joining requires an external signer with a node proof.
-                is_agent: false,
-                // The reader's ACCOUNT, not one key: a seat taken with the
-                // person's passkey or wallet is still their own seat, and a
-                // roster that could not recognise it wiped itself on load.
-                is_you: reader.is_me(&handle),
-                joined_at: number_i64(member.joined_at),
-                key: member.party.clone(),
-                node: member.node.clone(),
-                label,
-            }
-        })
-        .collect()
-}
-
-/// The roster as the room list shows it under the room: a name, its
-/// initials, and whether the seat is the reader's own.
-pub(crate) fn huddle_seats(
-    members: &[chat::index::HuddleEntry],
-    reader: ChatReader<'_>,
-) -> Vec<HuddleSeat> {
-    huddle_roster(members, reader)
-        .into_iter()
-        .map(|seat| HuddleSeat {
-            label: seat.label,
-            initials: seat.initials,
-            is_you: seat.is_you,
-            node: seat.node,
         })
         .collect()
 }
