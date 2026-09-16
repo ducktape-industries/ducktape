@@ -359,6 +359,17 @@ fn keyline(s: &mut String, key: &str, value: std::fmt::Arguments<'_>, note: &str
     let _ = writeln!(s, "\n# {note}\n{key} = {value}");
 }
 
+/// a STRING entry: the value is encoded by the TOML serializer, never by
+/// hand. Every string this file carries is a path or an address, and a path
+/// is filesystem bytes — an apostrophe, a double quote and a backslash are
+/// all legal in one and all fatal to hand-built quoting (`'…'` around a name
+/// holding an apostrophe is invalid TOML; a backslash-n inside `"…"` is a
+/// newline, silently a different path).
+fn keystr(s: &mut String, key: &str, value: &str, note: &str) {
+    let encoded = toml::Value::String(value.to_string());
+    keyline(s, key, format_args!("{encoded}"), note);
+}
+
 /// write the network-shape node.toml (init/join): the COMPLETE key set,
 /// every key live under a brief comment — the parser requires every key, so
 /// the file IS the reference: what each key does, and what its sentinel
@@ -369,82 +380,82 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
         "# ducktape node config (network shape) — see network.toml for the network.\n\
          # every key is required; edit values, don't delete lines (rewrites re-fill).\n",
     );
-    keyline(
+    keystr(
         &mut s,
         "network",
-        format_args!("\"network.toml\""),
+        "network.toml",
         "the network descriptor, beside this file",
     );
-    keyline(
+    keystr(
         &mut s,
         "key_file",
-        format_args!("\"identity.key\""),
+        "identity.key",
         "this node's identity secret, beside this file",
     );
-    keyline(
+    keystr(
         &mut s,
         "listen",
-        format_args!("\"{}\"", p.listen),
+        &p.listen,
         "p2p mesh listener (dual-stack)",
     );
-    keyline(
+    keystr(
         &mut s,
         "advertised",
-        format_args!("\"{}\"", p.advertised),
+        &p.advertised,
         "what peers dial: \"overlay\" = the chain ULA, or host:port",
     );
-    keyline(
+    keystr(
         &mut s,
         "storage_dir",
-        format_args!("'{}'", p.storage_dir),
+        &p.storage_dir,
         "chain + module state, beside this file",
     );
-    keyline(
+    keystr(
         &mut s,
         "http_listen",
-        format_args!("\"{}\"", p.http_listen),
+        &p.http_listen,
         "HTTP app API; reads open to any peer, writes signed",
     );
-    keyline(
+    keystr(
         &mut s,
         "gateway_listen",
-        format_args!("\"{}\"", p.gateway_listen),
+        &p.gateway_listen,
         "browser gateway; loopback only, port 0 = pick free",
     );
-    keyline(
+    keystr(
         &mut s,
         "rpc_listen",
-        format_args!("\"{}\"", p.rpc_listen),
+        &p.rpc_listen,
         "local admin RPC (keep loopback)",
     );
-    keyline(
+    keystr(
         &mut s,
         "wireguard_listen",
-        format_args!("\"{}\"", p.wireguard_listen),
+        &p.wireguard_listen,
         "the WireGuard tunnel plane (UDP)",
     );
-    keyline(
+    keystr(
         &mut s,
         "invite_listen",
-        format_args!("\"{}\"", p.invite_listen),
+        &p.invite_listen,
         "invite intro listener (UDP; convention: wireguard port + 1)",
     );
-    keyline(
+    keystr(
         &mut s,
         "wireguard_advertised",
-        format_args!("\"{}\"", p.wireguard_advertised),
+        &p.wireguard_advertised,
         "tunnel endpoint peers dial; \"auto\" = derive from wireguard_listen",
     );
-    keyline(
+    keystr(
         &mut s,
         "primary_coordinator",
-        format_args!("\"{}\"", p.primary_coordinator),
+        &p.primary_coordinator,
         "ambient rendezvous coordinator; \"none\" disables",
     );
-    keyline(
+    keystr(
         &mut s,
         "coordinator_relay",
-        format_args!("\"{}\"", p.coordinator_relay),
+        &p.coordinator_relay,
         "TCP first-contact fallback; \"none\" disables",
     );
     keyline(
@@ -463,10 +474,10 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
                  # can announce capabilities. delete the whole table for a consensus-only node.\n\
                  [sandbox]"
             );
-            keyline(
+            keystr(
                 &mut s,
                 "runtime",
-                format_args!("\"{}\"", sb.runtime),
+                &sb.runtime,
                 "isolation adapter: \"firecracker\" on Linux, \"vz\" on macOS (runs never execute bare on the host)",
             );
             keyline(
@@ -499,6 +510,59 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
                  #mem_gb = 0"
             );
         }
+    }
+    // publish only what survives its own encoding. This file is a REWRITE:
+    // it replaces a workspace's live plumbing, so a value that does not read
+    // back as itself is a corrupted workspace, not a cosmetic defect. Parsing
+    // the rendered text before it reaches the disk turns any future quoting
+    // slip into a loud error at the verb that caused it.
+    let rendered: NodeToml = toml::from_str(&s).map_err(|e| format!("node.toml render: {e}"))?;
+    let drifted = [
+        ("listen", &rendered.listen, &p.listen),
+        ("advertised", &rendered.advertised, &p.advertised),
+        ("storage_dir", &rendered.storage_dir, &p.storage_dir),
+        ("http_listen", &rendered.http_listen, &p.http_listen),
+        (
+            "gateway_listen",
+            &rendered.gateway_listen,
+            &p.gateway_listen,
+        ),
+        ("rpc_listen", &rendered.rpc_listen, &p.rpc_listen),
+        (
+            "wireguard_listen",
+            &rendered.wireguard_listen,
+            &p.wireguard_listen,
+        ),
+        ("invite_listen", &rendered.invite_listen, &p.invite_listen),
+        (
+            "wireguard_advertised",
+            &rendered.wireguard_advertised,
+            &p.wireguard_advertised,
+        ),
+        (
+            "primary_coordinator",
+            &rendered.primary_coordinator,
+            &p.primary_coordinator,
+        ),
+        (
+            "coordinator_relay",
+            &rendered.coordinator_relay,
+            &p.coordinator_relay,
+        ),
+    ]
+    .into_iter()
+    .find(|(_, got, want)| got != want);
+    if let Some((key, got, want)) = drifted {
+        return Err(format!(
+            "node.toml render: {key} did not round-trip ({want:?} -> {got:?})"
+        ));
+    }
+    let sandbox_drifted = rendered.sandbox != p.sandbox;
+    if sandbox_drifted {
+        return Err(format!(
+            "node.toml render: [sandbox] did not round-trip ({:?} -> {:?})",
+            p.sandbox, rendered.sandbox
+        ));
     }
     let path = dir.join("node.toml");
     std::fs::write(&path, s).map_err(|e| format!("write {path:?}: {e}"))?;
@@ -666,6 +730,35 @@ mod tests {
         let sandbox = raw.sandbox.expect("hand-added [sandbox] survives rewrite");
         assert_eq!(sandbox.runtime, "firecracker");
         assert_eq!(sandbox.cores, 4);
+    }
+
+    /// a path is filesystem bytes, not a quoting-friendly subset: an
+    /// apostrophe, a double quote, a backslash and non-ASCII all survive the
+    /// write → read → merge → rewrite chain that init/join and `sandbox
+    /// enable` run. Hand-built quoting corrupted every one of them —
+    /// `'…'` around a path holding an apostrophe is invalid TOML, and a
+    /// literal backslash-n inside `"…"` reads back as a newline.
+    #[test]
+    fn awkward_paths_survive_every_rewrite() {
+        let dir = tmp("awkward-paths");
+        let awkward = "/srv/eddy's \"chain\"\\note/보관함";
+        let p = Plumbing {
+            storage_dir: awkward.to_string(),
+            primary_coordinator: awkward.to_string(),
+            ..fresh_default_plumbing(&dir)
+        };
+        write_node_toml(&dir, &p).expect("write");
+        let (raw, _) = load_node_toml(&dir.join("node.toml")).expect("reload");
+        assert_eq!(raw.storage_dir, awkward);
+        assert_eq!(raw.primary_coordinator, awkward);
+
+        // and through the merge every rewriting verb runs first.
+        let p = merged_plumbing(&dir, &PlumbingOverrides::default()).expect("merge");
+        assert_eq!(p.storage_dir, awkward);
+        write_node_toml(&dir, &p).expect("rewrite");
+        let (raw, _) = load_node_toml(&dir.join("node.toml")).expect("reload after rewrite");
+        assert_eq!(raw.storage_dir, awkward);
+        assert_eq!(raw.primary_coordinator, awkward);
     }
 
     /// the dev-seed shape parses through the same loader, discriminated by
