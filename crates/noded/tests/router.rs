@@ -2393,7 +2393,9 @@ async fn gateway_browser_proxy_is_duck_origin_scoped_and_cross_origin_safe() {
 #[tokio::test]
 async fn gateway_browser_proxy_streams_the_body_under_the_routes_own_cap() {
     let (handle, cmds, _events) = local_node();
-    spawn_duck_actor(cmds, 2);
+    // resolve + get at the door, then `proxy_authorized`'s own re-resolve: the
+    // body is handed on before any of it is weighed, so the whole path runs.
+    spawn_duck_actor(cmds, 3);
     let (lane, mut jobs) = tokio::sync::mpsc::channel::<noded::GatewayJob>(1);
     let handle = handle
         .with_gateway(lane)
@@ -2986,21 +2988,32 @@ async fn blob_upload_capacity_is_reserved_before_signature_body_collection() {
             released.await.unwrap();
             Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"blob"))
         }));
-        let request = Request::builder()
-            .method("POST")
-            .uri("/v1/files/blob")
-            .body(body)
-            .unwrap();
+        // A LOCAL DAEMON's upload: the write gate refuses an unsigned one
+        // before its body is read (that is the blob lane's deferred proof),
+        // so an unauthorized request would never reach the handler that
+        // polls this stream — and the capacity this test is about is the
+        // layer OUTSIDE that gate.
+        let request = with_operator(with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/files/blob")
+                .body(body)
+                .unwrap(),
+            "127.0.0.1:40000",
+        ));
         requests.push(tokio::spawn(router.clone().oneshot(request)));
         polled.await.unwrap();
         releases.push(release);
     }
     let request = || {
-        Request::builder()
-            .method("POST")
-            .uri("/v1/files/blob")
-            .body(Body::empty())
-            .unwrap()
+        with_operator(with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/files/blob")
+                .body(Body::empty())
+                .unwrap(),
+            "127.0.0.1:40000",
+        ))
     };
     assert_eq!(
         router.clone().oneshot(request()).await.unwrap().status(),
