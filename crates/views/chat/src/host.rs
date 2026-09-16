@@ -395,39 +395,6 @@ pub struct ChatSearchHit {
     pub meta: String,
 }
 
-/// What the host forwards about one run in flight: the facts, and the raw
-/// material this view is the one to read — the provider's output, the reason
-/// it stopped, and the committed progress a reader who may not see output is
-/// told instead. Provider formats and display choices are the view's, so
-/// [`crate::live::project`] reads all three and keeps a [`LiveRun`].
-///
-/// A payload, never state. It arrives as the host's JSON, which describes
-/// itself, and `public_progress` is whatever the provider published — a shape
-/// no other format can be asked to decode.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct LiveRunHint {
-    #[serde(default)]
-    pub public_progress: Option<serde_json::Value>,
-    #[serde(default)]
-    pub output: Vec<String>,
-    #[serde(default)]
-    pub output_error: String,
-    pub channel_id: String,
-    pub anchor_seq: i64,
-    pub thread_root: i64,
-    pub run_id: String,
-    /// the run's address: what `open_run` hands the app
-    pub dispatch_id: String,
-    pub agent: String,
-    pub status: String,
-    /// what the run has done so far, oldest first
-    #[serde(default)]
-    pub activity: Vec<LiveActivity>,
-    /// the answer as it is being written
-    #[serde(default)]
-    pub answer_preview: String,
-}
-
 /// A run in flight as this view reads it, and all a card needs to draw it.
 ///
 /// State, and only what the projection kept: the output, the failure and the
@@ -585,8 +552,6 @@ pub struct Session {
     /// subscription, which is the app's door, and the range it copies is this
     /// view's
     pub copy_chord_serial: i64,
-    /// the agent runs anchored in THIS room, live while they run
-    pub live_agents: Vec<LiveRunHint>,
 }
 
 /// One item of the session subscription: the facts, or why not.
@@ -1164,6 +1129,237 @@ pub struct RoomItem {
     /// the thread a landing seq sits in, so a hit on a reply opens its rail
     pub thread_root: i64,
     pub error: String,
+}
+
+/// How often this view re-reads WHICH runs are anchored in chat. A run's
+/// progress does not ride this clock — that is its output stream, which
+/// pushes — so the period only decides how quickly a run that just started
+/// gets a card.
+const LIVE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One reading of the runs anchored in a chat message and still pending, and
+/// the agent names to draw them under.
+///
+/// Seeds, not rows: what a card SAYS is folded from the run's own output
+/// ([`LiveOutputItem`]), which this view reads itself.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LiveSeedsItem {
+    pub seeds: Vec<LiveSeed>,
+    pub error: String,
+}
+
+/// One anchored run as discovery names it: where its card goes and whose it
+/// is. Every field is a fact from the chain, so a snapshot can carry it.
+///
+/// No status: a pending run on the chain is a claimed turn, not a progress
+/// report. What the card SAYS is the run's output, folded here.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct LiveSeed {
+    pub channel_id: String,
+    pub anchor_seq: i64,
+    pub thread_root: i64,
+    pub run_id: String,
+    /// the run's address, and the topic its output arrives on
+    pub dispatch_id: String,
+    pub agent: String,
+}
+
+/// What one run's output stream has said so far, as this view folded it.
+///
+/// State as well as payload — a card is rebuilt from it — so every field is
+/// something bincode can carry: lines, a reason and a flag, never a shape
+/// that describes itself.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LiveOutputItem {
+    pub dispatch_id: String,
+    /// the provider's lines, oldest first, exactly as they arrived
+    pub lines: Vec<String>,
+    /// a failure the reader can act on — empty while the stream is healthy
+    pub error: String,
+    /// the node would not admit this device as the run's reader: not a
+    /// failure, an entitlement. The card falls back to public progress.
+    pub unavailable: bool,
+}
+
+/// The runs anchored in chat, discovered by THIS view.
+///
+/// Keyed on the connection, so a reconnect starts the reading over instead
+/// of leaving cards from a chain this window is no longer on — the fold that
+/// used to need a staleness stamp, because it lived in a host task that
+/// outlived the connection it was taken over.
+///
+/// `labels` rides the fold rather than the key: the agent roster is only
+/// re-read when a run names an agent the last reading could not, which is
+/// why the poll cannot be a function of the tick alone.
+pub fn live_runs(seat: (i64, String)) -> ducktape_view_guest::Subscription<LiveSeedsItem> {
+    ducktape_view_guest::Subscription::run_with(seat, |_| {
+        let ticks = ducktape_view_guest::ticks(LIVE_POLL);
+        stream::unfold(
+            (ticks, BTreeMap::<String, String>::new(), true),
+            |(mut ticks, labels, first)| async move {
+                // the first reading is taken at once; every later one waits
+                // for the host's clock.
+                if !first && ticks.next().await.is_none() {
+                    return None;
+                }
+                let read = crate::live::discover(labels.clone()).await;
+                let (item, labels) = match read {
+                    Ok(read) => seeds_of(read, labels),
+                    Err(error) => (
+                        LiveSeedsItem {
+                            seeds: Vec::new(),
+                            error,
+                        },
+                        labels,
+                    ),
+                };
+                Some((item, (ticks, labels, false)))
+            },
+        )
+    })
+}
+
+/// Split one discovery answer into the seeds to draw and the labels to keep.
+///
+/// A reading that fails leaves the labels alone: they are a cache of the
+/// roster, and dropping them would make the next poll read it again.
+fn seeds_of(
+    read: serde_json::Value,
+    labels: BTreeMap<String, String>,
+) -> (LiveSeedsItem, BTreeMap<String, String>) {
+    let labels: BTreeMap<String, String> =
+        serde_json::from_value(read["labels"].clone()).unwrap_or(labels);
+    let seeds = read["records"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|record| {
+            let agent_id = record["agent_id"].as_str().unwrap_or_default();
+            LiveSeed {
+                channel_id: record["channel_id"].as_str().unwrap_or_default().into(),
+                anchor_seq: record["anchor_seq"].as_i64().unwrap_or_default(),
+                thread_root: record["thread_root"].as_i64().unwrap_or_default(),
+                run_id: record["run_id"].as_str().unwrap_or_default().into(),
+                dispatch_id: record["dispatch_id"].as_str().unwrap_or_default().into(),
+                agent: labels
+                    .get(agent_id)
+                    .cloned()
+                    .unwrap_or_else(|| agent_id.into()),
+            }
+        })
+        .collect();
+    (
+        LiveSeedsItem {
+            seeds,
+            error: String::new(),
+        },
+        labels,
+    )
+}
+
+/// One run's output, off the node's own stream: `rpc.stream` opens
+/// `run-output:<dispatch>` under the seated key — the node admits the key
+/// that asked for the run and nobody else — and hands this view every frame
+/// verbatim. The lines are accumulated here and interpreted here; the kernel
+/// carries bytes and knows nothing about a run.
+pub fn live_output(
+    dispatch: String,
+    seat: (i64, String),
+) -> ducktape_view_guest::Subscription<LiveOutputItem> {
+    ducktape_view_guest::Subscription::run_with((dispatch, seat), |(dispatch, _)| {
+        let topic = format!("run-output:{dispatch}");
+        let ask = serde_json::json!({
+            "topic": topic,
+            "params": { "run": dispatch },
+        });
+        let frames = host::subscribe(
+            "rpc.stream",
+            &serde_json::to_vec(&ask).expect("a request encodes"),
+        );
+        let start = LiveOutputItem {
+            dispatch_id: dispatch.clone(),
+            ..LiveOutputItem::default()
+        };
+        stream::once(std::future::ready(start.clone())).chain(frames.scan(
+            start,
+            move |item, frame| {
+                fold_run_output(item, &topic, frame);
+                std::future::ready(Some(item.clone()))
+            },
+        ))
+    })
+}
+
+/// Whether a refusal says WHO may read rather than that something broke.
+///
+/// Three shapes reach this view, all of them from the kernel's own words: no
+/// seated key to sign with, and the node's `401`/`403` for a key it does not
+/// admit as this run's reader. None is a failure the reader can act on — the
+/// card keeps its agent, room and anchor and shows public committed progress
+/// instead, which is the whole difference between "I may not look" and
+/// "something is wrong".
+fn entitlement_refusal(detail: &str) -> bool {
+    detail.contains("needs the session key unlocked")
+        || detail.contains("401")
+        || detail.contains("403")
+        || detail.contains("Unauthorized")
+        || detail.contains("Forbidden")
+}
+
+/// One frame of a run's output stream, folded into the reading. A frame this
+/// view cannot read — another topic, or a shape with no line in it — leaves
+/// the reading as it was.
+fn fold_run_output(item: &mut LiveOutputItem, topic: &str, frame: Result<Vec<u8>, String>) {
+    let bytes = match frame {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            item.unavailable = entitlement_refusal(&error);
+            item.error = match item.unavailable {
+                true => String::new(),
+                false => error,
+            };
+            return;
+        }
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return;
+    };
+    if value["type"] == "error" {
+        let detail = value["detail"]
+            .as_str()
+            .unwrap_or("The node refused this run output subscription.");
+        item.unavailable = entitlement_refusal(detail);
+        item.error = match item.unavailable {
+            true => String::new(),
+            false => detail.to_owned(),
+        };
+        return;
+    }
+    if value["topic"].as_str() != Some(topic) {
+        return;
+    }
+    let Some(line) = value["item"]["line"].as_str() else {
+        return;
+    };
+    item.error.clear();
+    item.unavailable = false;
+    item.lines.push(line.to_owned());
+}
+
+/// The committed progress of runs this device may not read the output of,
+/// re-read on the same clock the discovery poll uses. A card that cannot
+/// show what the agent is writing shows what it has published instead.
+pub fn live_progress(
+    runs: Vec<String>,
+    seat: (i64, String),
+) -> ducktape_view_guest::Subscription<serde_json::Value> {
+    ducktape_view_guest::Subscription::run_with((runs, seat), |(runs, _)| {
+        let runs = runs.clone();
+        stream::once(crate::live::progress(runs.clone())).chain(
+            ducktape_view_guest::ticks(LIVE_POLL)
+                .then(move |()| crate::live::progress(runs.clone())),
+        )
+    })
 }
 
 /// The room now and after every chat block: read once per key, then again on

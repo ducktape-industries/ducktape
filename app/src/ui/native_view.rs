@@ -36,7 +36,6 @@ impl Ducktape {
                     &self.call_peers,
                     self.shift_held,
                     self.chat_copy_chord_serial,
-                    &self.live_agents,
                 ),
                 AppMessage::ChatViewEvent,
             ),

@@ -94,7 +94,17 @@ pub struct ChatView {
     pub(crate) call_speaking: bool,
     pub(crate) call_peers: Vec<crate::host::CallPeer>,
     pub(crate) unread_boundary: i64,
+    /// the cards on screen: folded here, from this view's own reads
     pub(crate) live_agents: Vec<crate::host::LiveRun>,
+    /// the runs anchored in chat and still pending, as this view discovered
+    /// them — every room's, so a room switch draws without a new poll
+    pub(crate) live_seeds: Vec<crate::host::LiveSeed>,
+    /// what each run's output stream has said, keyed by dispatch
+    pub(crate) live_output: std::collections::BTreeMap<String, crate::host::LiveOutputItem>,
+    /// the status of a run whose output this device may not read, taken from
+    /// its public committed progress. A String, because state is bincode and
+    /// the progress itself is a shape only serde_json can describe.
+    pub(crate) live_public: std::collections::BTreeMap<String, String>,
     pub(crate) shift_held: bool,
     pub(crate) copy_chord_serial: i64,
     pub(crate) pending_sends: Vec<crate::host::PendingSend>,
@@ -271,6 +281,12 @@ pub enum Message {
     SearchDraftChanged(String),
     ChannelNameDraftChanged(String),
     MemberKeyDraftChanged(String),
+    /// one reading of which runs are anchored in chat and still pending
+    LiveRunsArrived(crate::host::LiveSeedsItem),
+    /// one run's output stream said something
+    LiveOutputArrived(crate::host::LiveOutputItem),
+    /// the committed progress of the runs this device may not read
+    LiveProgressArrived(serde_json::Value),
 }
 impl ::std::fmt::Debug for Message {
     fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -319,6 +335,9 @@ impl ChatView {
             call_peers: Vec::new(),
             unread_boundary: 0,
             live_agents: Vec::new(),
+            live_seeds: Vec::new(),
+            live_output: Default::default(),
+            live_public: Default::default(),
             shift_held: false,
             copy_chord_serial: 0,
             pending_sends: Vec::new(),
@@ -407,7 +426,7 @@ impl ChatView {
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     /// This state's layout, digested — `snapshot_schema` holds it here.
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "df27bb7dbae8ffe718fb0a17cd5655da4935ac6fee540b3a8a53af79f1cb2307";
+        "c27364dd4ab41bc0aac3719c4ddc27d5fea5ef598d33d1a4a29b950245c43f58";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
@@ -505,7 +524,68 @@ impl ChatView {
                 ::ducktape_view_guest::Subscription::none()
             },
             crate::host::acts().map(Message::ActDone),
+            // THE LIVE AGENT LANE IS THIS VIEW'S, end to end: which runs are
+            // anchored here, what each one's output says, and what a reader
+            // who may not see that output is told instead.
+            //
+            // Keyed on the SEAT as well as the connection. A reconnect moves
+            // `connection_serial`, but taking or locking a seat moves neither
+            // it nor the endpoint — and what a reading was entitled to see is
+            // the seated key's. Keying on both is what the host lane needed a
+            // staleness stamp for, because its task outlived the identity it
+            // was taken under.
+            if self.connected {
+                crate::host::live_runs(self.live_key()).map(Message::LiveRunsArrived)
+            } else {
+                ::ducktape_view_guest::Subscription::none()
+            },
+            ::ducktape_view_guest::Subscription::batch(self.watched_runs().map(|dispatch| {
+                crate::host::live_output(dispatch, self.live_key()).map(Message::LiveOutputArrived)
+            })),
+            if self.public_progress_runs().is_empty() {
+                ::ducktape_view_guest::Subscription::none()
+            } else {
+                crate::host::live_progress(self.public_progress_runs(), self.live_key())
+                    .map(Message::LiveProgressArrived)
+            },
         ])
+    }
+
+    /// What identity the live readings belong to: this connection, under
+    /// this seat. Every live subscription is keyed on it, so either one
+    /// moving starts the readings over instead of carrying rows across.
+    fn live_key(&self) -> (i64, String) {
+        (self.connection_serial, self.me_key.clone())
+    }
+
+    /// The dispatches whose output this view is watching: every pending run
+    /// it discovered, until one answers that this device may not read it.
+    /// Dropping that one is what ends the dial — the subscription is keyed on
+    /// the dispatch, so it is never re-opened for the same run.
+    fn watched_runs(&self) -> impl Iterator<Item = String> + '_ {
+        self.live_seeds
+            .iter()
+            .filter(|seed| {
+                !self
+                    .live_output
+                    .get(&seed.dispatch_id)
+                    .is_some_and(|item| item.unavailable)
+            })
+            .map(|seed| seed.dispatch_id.clone())
+    }
+
+    /// The runs to read committed progress for: the ones whose output this
+    /// device was refused.
+    fn public_progress_runs(&self) -> Vec<String> {
+        self.live_seeds
+            .iter()
+            .filter(|seed| {
+                self.live_output
+                    .get(&seed.dispatch_id)
+                    .is_some_and(|item| item.unavailable)
+            })
+            .map(|seed| seed.run_id.clone())
+            .collect()
     }
 }
 #[cfg(test)]
@@ -1396,12 +1476,14 @@ mod tests {
             "delegations": {"delegations": [{"status": "pending"}]},
         });
         let mut state = ChatView::state();
-        state.live_agents = vec![crate::live::project(crate::host::LiveRunHint {
-            public_progress: Some(progress),
+        let seed = crate::host::LiveSeed {
             run_id: "run-7".into(),
             agent: "chiefduck".into(),
             ..Default::default()
-        })];
+        };
+        let mut row = crate::live::project(&seed, &[], "");
+        row.status = crate::live::public_status(&seed.run_id, &progress);
+        state.live_agents = vec![row];
         assert!(
             !state.live_agents[0].status.is_empty(),
             "the progress is read into a status"

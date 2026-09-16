@@ -35,21 +35,6 @@ pub(crate) fn read_link_token(workspace: &Path) -> Result<String, String> {
     Ok(token)
 }
 
-pub(crate) fn subscription_refusal(value: &serde_json::Value) -> Option<String> {
-    let is_refusal =
-        value["type"].as_str() == Some("refused") || value["type"].as_str() == Some("error");
-    if !is_refusal {
-        return None;
-    }
-    Some(
-        value["detail"]
-            .as_str()
-            .or_else(|| value["error"].as_str())
-            .unwrap_or("The node refused the agent event stream.")
-            .to_string(),
-    )
-}
-
 /// The Markdown surface owns its selection and parse across host frames.
 pub struct MarkdownSurface {
     source: String,
