@@ -2536,6 +2536,38 @@ fn the_type_ladder_moves_the_words_and_the_room_they_ask_for() {
         TextSize::Medium,
         "the size it was is not what undo restored"
     );
+    // A text shape IS its words, so the box steps with them — a box left at
+    // the old size holds the new words clipped, with nothing to re-measure it
+    // until somebody types in it again. A card keeps the room it was given.
+    view.edit(Change::Create {
+        id: "t".into(),
+        shape: Shape {
+            kind: Kind::Text,
+            x: 700,
+            width: 120,
+            height: 40,
+            text: "a caption".into(),
+            ..Default::default()
+        },
+    });
+    let card = view.visible().unwrap().shapes["a"].shape.clone();
+    view.selected = ["t".into(), "a".into()].into();
+    view.on_lettering(TextSize::Huge);
+    let board = view.visible().unwrap();
+    let grown = &board.shapes["t"].shape;
+    let ratio =
+        super::presentation::step(TextSize::Huge) / super::presentation::step(TextSize::Medium);
+    assert_eq!(
+        (grown.width, grown.height),
+        ((120. * ratio).ceil() as i32, (40. * ratio).ceil() as i32),
+        "a text shape's box did not step with its words"
+    );
+    let kept = &board.shapes["a"].shape;
+    assert_eq!(
+        (kept.width, kept.height),
+        (card.width, card.height),
+        "a card did not keep the room it was given"
+    );
 }
 #[test]
 fn a_cards_words_sit_where_the_alignment_says_and_the_caret_goes_with_them() {

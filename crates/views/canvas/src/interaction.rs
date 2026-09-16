@@ -1557,15 +1557,42 @@ impl BoardsView {
         )
     }
     pub(super) fn on_lettering(&mut self, text_size: TextSize) -> Task<Message> {
-        self.edit_many(
-            self.selected
-                .iter()
-                .map(|id| Change::TextSize {
-                    id: id.clone(),
-                    text_size,
-                })
-                .collect(),
-        )
+        let Some(board) = self.visible() else {
+            return Task::none();
+        };
+        let mut changes = Vec::new();
+        for id in &self.selected {
+            changes.push(Change::TextSize {
+                id: id.clone(),
+                text_size,
+            });
+            let Some(record) = board.shapes.get(id) else {
+                continue;
+            };
+            // A text shape IS its words, so its box is the size of them and
+            // has to step with them: a line of type scales in both directions
+            // at once, so the ratio between the two steps is the whole of it.
+            // Nothing else here is measured, so nothing else can be fitted —
+            // a card keeps the room it was given, wraps the bigger words in
+            // the column it already has, and grows to them the next time it
+            // is written in.
+            let hugging = record.shape.kind == Kind::Text;
+            if !hugging {
+                continue;
+            }
+            let ratio = presentation::step(text_size) / presentation::step(record.shape.text_size);
+            let fitted = |side: i32, floor: i32| {
+                (side as f32 * ratio)
+                    .ceil()
+                    .clamp(floor as f32, boards::MAX_SIZE as f32) as i32
+            };
+            changes.push(Change::Resize {
+                id: id.clone(),
+                width: fitted(record.shape.width, presentation::MIN_CARD[0]),
+                height: fitted(record.shape.height, presentation::MIN_CARD[1]),
+            });
+        }
+        self.edit_many(changes)
     }
     pub(super) fn on_delete(&mut self) -> Task<Message> {
         let changes = self
