@@ -2409,11 +2409,7 @@ fn an_arrow_held_at_one_end_still_moves_the_end_it_owns() {
     );
     let board = view.visible().unwrap();
     let edge = &board.shapes["edge"].shape;
-    assert_eq!(
-        holds(&edge.from),
-        Some("a"),
-        "the drag broke the binding"
-    );
+    assert_eq!(holds(&edge.from), Some("a"), "the drag broke the binding");
     let after = super::interaction::stroke(&board, edge);
     let moved = *after.last().unwrap();
     assert!(

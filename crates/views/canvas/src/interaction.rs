@@ -1074,8 +1074,8 @@ impl BoardsView {
         let card = |p| self.holding(&board, shape.kind, p);
         shape.from = card(start);
         shape.to = card(end);
-        let one_card =
-            boards::held(&shape.from).is_some() && boards::held(&shape.from) == boards::held(&shape.to);
+        let one_card = boards::held(&shape.from).is_some()
+            && boards::held(&shape.from) == boards::held(&shape.to);
         if one_card {
             shape.from = None;
             shape.to = None;
@@ -2357,7 +2357,9 @@ fn bond_at(card_id: &str, card: &Shape, point: [f32; 2]) -> boards::Bond {
     let span = boards::ANCHOR_SPAN as f32;
     let share = |value: f32, origin: i32, size: i32| {
         let size = (size as f32).max(1.);
-        ((value - origin as f32) / size * span).round().clamp(0., span) as i32
+        ((value - origin as f32) / size * span)
+            .round()
+            .clamp(0., span) as i32
     };
     boards::Bond {
         card: card_id.to_owned(),
@@ -2501,10 +2503,7 @@ pub(super) fn meeting(s: &Shape, anchor: [f32; 2], toward: [f32; 2]) -> [f32; 2]
     }
     let mut outside = toward;
     for _ in 0..CROSSINGS {
-        let middle = [
-            (inside[0] + outside[0]) / 2.,
-            (inside[1] + outside[1]) / 2.,
-        ];
+        let middle = [(inside[0] + outside[0]) / 2., (inside[1] + outside[1]) / 2.];
         match covers(s, middle) {
             true => inside = middle,
             false => outside = middle,
