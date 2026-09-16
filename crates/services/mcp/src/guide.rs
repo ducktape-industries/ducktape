@@ -79,8 +79,13 @@ the pack digest the upload returned.
 
 modules.update: build the module using its repository's toolchain and \
 dependencies. The standard Linux guest includes Rust, the wasm32-unknown-unknown \
-target and wasm-tools, and reaches the internet through the HTTP proxy its \
-HTTP_PROXY/HTTPS_PROXY name, so cargo and git fetch what the build needs. \
+target, wasm-tools, and a vendored registry carrying every module's dependency \
+closure: /.cargo/config.toml replaces crates.io with that directory, so `cargo \
+build --offline --target wasm32-unknown-unknown` resolves without the network — \
+and a crate OUTSIDE that closure does not resolve at all, whatever the proxy \
+allows, so prefer the dependencies the module already declares. Point CARGO_HOME \
+at a writable path; the rootfs is read-only. git and everything else reach the \
+internet through the HTTP proxy its HTTP_PROXY/HTTPS_PROXY name. \
 Package the deployment with `ducktape module pack component.wasm --out \
 module.artifact`, adding `--index index.wasm` for a mapper and `--view view.wasm \
 --assets <dir>` for a desktop view. The artifact is the WHOLE deployment: a part \
