@@ -44,6 +44,11 @@ pub(crate) async fn files_read_all(rpc: &RpcClient, path: &str) -> Result<Option
 
 /// The files read lane's wire: standard alphabet, padded — the same engine
 /// duckfs-core encodes with, so both ends share one reading of a byte.
+///
+/// Only the suites compose that wire — the app reads it, and `base64_decode`
+/// is the half the running binary calls — so this half is test-only and says
+/// so, rather than warning in every build that it is never used.
+#[cfg(test)]
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)

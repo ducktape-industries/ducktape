@@ -88,8 +88,10 @@ pub struct UpdatePaths {
 }
 
 impl UpdatePaths {
-    /// The macOS shape: everything under one directory. Tests use it on
-    /// every platform; only `from_env` reads the host's.
+    /// The macOS shape: everything under one directory. Only the suites build
+    /// it — the running binary goes through `from_env`, which reads the host's
+    /// — so it is test-only and says so rather than warning in every build.
+    #[cfg(test)]
     pub fn under(updates_dir: &Path) -> Self {
         UpdatePaths {
             updates_dir: updates_dir.to_path_buf(),

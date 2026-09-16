@@ -100,6 +100,7 @@ pub fn message(row: usize) -> Option<Message> {
 const TOP_LEVEL: [usize; 14] = [0, 1, 2, 3, 4, 5, 10, 11, 14, 18, 19, 20, 21, 22];
 
 /// Rows the layout never shows a label for (separators).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const SEPARATORS: [usize; 4] = [2, 10, 18, 21];
 
 /// Each submenu row with the child rows it holds, in menu order.
@@ -122,6 +123,7 @@ fn attached_position(next: &Snapshot, row: usize) -> usize {
 /// `previous` (first sync) every row is relabelled and every shown top-level
 /// row is attached.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct MenuDiff {
     relabelled: Vec<usize>,
     hidden: Vec<usize>,
@@ -129,6 +131,7 @@ struct MenuDiff {
 }
 
 impl MenuDiff {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn between(previous: Option<&Snapshot>, next: &Snapshot) -> Self {
         let relabelled = (0..next.labels.len())
             .filter(|row| !SEPARATORS.contains(row))
