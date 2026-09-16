@@ -691,6 +691,15 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
     // run3 → run2 → run1 → seed. The objects fanned out with the refs.
     let checkout = tempfile::tempdir().expect("git checkout parent");
     let dest = checkout.path().join("after-run3");
+    // Node 2 executed nothing, so wait for the branch to reach ITS store: the
+    // waits above are on node 0, which says nothing about node 2. Cloning
+    // before it has the refs succeeds against an EMPTY repository, and the
+    // assertions below then fail on an unborn HEAD rather than on anything
+    // they are about. `resident_submit_e2e` waits the same way, for the same
+    // reason, before cloning from a node that did not push.
+    cluster.await_committed(2, "the PR work branch to reach node 2", CONVERGE, || {
+        (branch_tip(&cluster, 2, &pr_work_branch)? == run3_oid).then_some(())
+    });
     cluster.clone_forge(2, REPO, &dest);
     assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD"]), run3_oid);
     assert_eq!(
