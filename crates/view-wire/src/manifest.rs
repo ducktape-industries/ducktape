@@ -1,6 +1,6 @@
-//! Static metadata for an Ice view. Parsing never instantiates or runs a guest.
+//! Static metadata for a ducktape view. Parsing never instantiates or runs a guest.
 
-pub const MANIFEST_SECTION: &str = "ice.manifest";
+pub const MANIFEST_SECTION: &str = "ducktape.view.manifest";
 
 /// A finite positive logical size, bounded like wire geometry. Private bits
 /// keep equality and hashing exact without admitting NaN or signed zero.
@@ -94,9 +94,9 @@ pub(crate) fn read_manifest_with(
 }
 
 impl Manifest {
-    /// Parses the strict six-line `ice.manifest.v2` text and its bounds.
+    /// Parses the strict six-line `ducktape.view.manifest.v1` text and its bounds.
     pub fn parse(text: &str) -> Option<Self> {
-        Self::parse_with_header(text, "ice.manifest.v2")
+        Self::parse_with_header(text, "ducktape.view.manifest.v1")
     }
 
     pub(crate) fn parse_with_header(text: &str, header: &str) -> Option<Self> {
@@ -176,20 +176,23 @@ mod tests {
     use super::*;
     #[test]
     fn manifest_requires_an_explicit_canonical_wire_epoch() {
-        let current = "ice.manifest.v2\nSized\nDescription\nclock,\nnone\n1";
+        let current = "ducktape.view.manifest.v1\nSized\nDescription\nclock,\nnone\n1";
         assert!(
             Manifest::parse(current).is_some(),
             "current epoch manifest rejected"
         );
-        assert!(Manifest::parse("ice.manifest.v1\nSized\nDescription\nclock,\nnone").is_none());
+        assert!(
+            Manifest::parse("ducktape.view.manifest\nSized\nDescription\nclock,\nnone").is_none(),
+            "a header that is not ours, short one line, must not parse"
+        );
         for epoch in ["", "0", "01", "+1", "-1", " 1", "1 ", "4294967296"] {
             assert!(
-                Manifest::parse(&format!("ice.manifest.v2\nSized\n\n\nnone\n{epoch}")).is_none(),
+                Manifest::parse(&format!("ducktape.view.manifest.v1\nSized\n\n\nnone\n{epoch}")).is_none(),
                 "accepted {epoch:?}"
             );
         }
         assert!(
-            Manifest::parse("ice.manifest.v2\nSized\n\n\nnone\n2").is_some(),
+            Manifest::parse("ducktape.view.manifest.v1\nSized\n\n\nnone\n2").is_some(),
             "unsupported is distinct from malformed"
         );
     }
@@ -197,7 +200,7 @@ mod tests {
     #[test]
     fn wire_protocol_mismatch_reports_both_epochs() {
         let current = Manifest::parse(&format!(
-            "ice.manifest.v2\nApp\n\n\nnone\n{}",
+            "ducktape.view.manifest.v1\nApp\n\n\nnone\n{}",
             crate::WIRE_EPOCH
         ))
         .unwrap();
@@ -226,7 +229,7 @@ mod tests {
     #[test]
     fn extraction_rejects_duplicate_and_truncated_sections() {
         let mut bytes = b"\0asm\x0d\0\x01\0".to_vec();
-        let text = b"ice.manifest.v2\nSized\n\n\n640.5,480.25\n1";
+        let text = b"ducktape.view.manifest.v1\nSized\n\n\n640.5,480.25\n1";
         let mut section = vec![
             0,
             (1 + MANIFEST_SECTION.len() + text.len()) as u8,
@@ -264,22 +267,22 @@ mod tests {
     // finite positive bounded preferred size. Dropping those guards is Red.
     #[test]
     fn manifest_format_and_preferred_size_are_strict() {
-        let good = "ice.manifest.v2\nSized\nDescription\nclock,storage,\n640.5,480.25\n1";
+        let good = "ducktape.view.manifest.v1\nSized\nDescription\nclock,storage,\n640.5,480.25\n1";
         let parsed = Manifest::parse(good).unwrap();
         assert_eq!(parsed.preferred_size.unwrap().dimensions(), [640.5, 480.25]);
         assert_eq!(parsed.capabilities, ["clock", "storage"]);
         assert!(
-            Manifest::parse("ice.manifest.v2\nDefault\n\n\nnone\n1")
+            Manifest::parse("ducktape.view.manifest.v1\nDefault\n\n\nnone\n1")
                 .unwrap()
                 .preferred_size
                 .is_none()
         );
         for invalid in [
             "Sized\nDescription\nclock,", // no legacy format
-            "ice.manifest.v2\nSized\nDescription\n\nnone",
-            "ice.manifest.v2\nSized\nDescription\n\nnone\nextra\n1",
-            "ice.manifest.v2\nSized\nDescription\nclock\nnone\n1",
-            "ice.manifest.v2\nSized\nDescription\nclock,,\nnone\n1",
+            "ducktape.view.manifest.v1\nSized\nDescription\n\nnone",
+            "ducktape.view.manifest.v1\nSized\nDescription\n\nnone\nextra\n1",
+            "ducktape.view.manifest.v1\nSized\nDescription\nclock\nnone\n1",
+            "ducktape.view.manifest.v1\nSized\nDescription\nclock,,\nnone\n1",
         ] {
             assert!(
                 Manifest::parse(invalid).is_none(),
@@ -301,7 +304,7 @@ mod tests {
         ] {
             assert!(
                 Manifest::parse(&format!(
-                    "ice.manifest.v2\nSized\nDescription\n\n{invalid}\n1"
+                    "ducktape.view.manifest.v1\nSized\nDescription\n\n{invalid}\n1"
                 ))
                 .is_none(),
                 "accepted {invalid}"

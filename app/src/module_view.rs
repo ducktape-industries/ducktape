@@ -2548,7 +2548,7 @@ impl Guest {
             },
         );
         store.limiter(|state| &mut state.limits);
-        // The `ice:view` world's one import is the panic hook's; anything
+        // The `ducktape:view` world's one import is the panic hook's; anything
         // else the component asks for traps if it is ever called.
         let mut linker = Linker::<HostState>::new(engine);
         linker

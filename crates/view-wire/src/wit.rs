@@ -10,7 +10,7 @@
 macro_rules! with_view_wit {
     ($callback:ident) => {
         $callback!(
-            r#"package ice:view@0.1.0;
+            r#"package ducktape:view@0.1.0;
 
 world view {
     // The guest's panic hook hands the host its message before the abort

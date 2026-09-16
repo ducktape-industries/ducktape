@@ -25,7 +25,7 @@ pub enum Request {
 macro_rules! with_test_view_wit {
     ($callback:ident) => {
         $callback!(
-            r#"package ice:view@0.1.0;
+            r#"package ducktape:view@0.1.0;
 world view {
     import panicked: func(message: string);
     export init: func(macos: bool);
@@ -41,7 +41,7 @@ world view {
 
 /// Explicit opt-in parser: the production parser rejects this artifact kind.
 pub fn parse_manifest(text: &str) -> Option<crate::manifest::Manifest> {
-    crate::manifest::Manifest::parse_with_header(text, "ice.test.manifest.v3")
+    crate::manifest::Manifest::parse_with_header(text, "ducktape.view.test-manifest.v1")
 }
 
 #[cfg(feature = "manifest")]
@@ -51,24 +51,20 @@ pub fn read_manifest(bytes: &[u8]) -> Option<crate::manifest::Manifest> {
 
 #[cfg(test)]
 mod tests {
+    /// The two manifest kinds never read each other's artifacts: a test guest
+    /// carries an extra export, so admitting one as production would run a
+    /// command surface the host never checked.
     #[test]
-    fn previous_test_protocol_is_rejected_before_any_command() {
-        let old = format!(
-            "ice.test.manifest.v2\nCounter\n\n\nnone\n{}",
+    fn production_and_test_manifests_do_not_cross() {
+        let test = format!(
+            "ducktape.view.test-manifest.v1\nCounter\n\n\nnone\n{}",
             crate::WIRE_EPOCH
         );
-        assert!(super::parse_manifest(&old).is_none());
-        assert!(
-            super::parse_manifest(&old.replacen("test.manifest.v2", "test.manifest.v3", 1))
-                .is_some()
-        );
-        assert!(
-            crate::manifest::Manifest::parse(&old.replacen(
-                "test.manifest.v2",
-                "test.manifest.v3",
-                1
-            ))
-            .is_none()
-        );
+        assert!(super::parse_manifest(&test).is_some());
+        assert!(crate::manifest::Manifest::parse(&test).is_none());
+
+        let production = test.replacen("test-manifest", "manifest", 1);
+        assert!(crate::manifest::Manifest::parse(&production).is_some());
+        assert!(super::parse_manifest(&production).is_none());
     }
 }

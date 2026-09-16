@@ -895,7 +895,7 @@ fn deployment_readiness_rejects_invalid_view_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let index = indexer::IndexStore::open_bare(dir.path(), &["pages"]).unwrap();
     let mut view = ice_view();
-    let marker = b"ice.manifest.v2";
+    let marker = b"ducktape.view.manifest.v1";
     // The guest retains the text in data as well as its custom section.
     // Corrupt every copy so the actual metadata, not just data, is invalid.
     let offsets: Vec<_> = view
@@ -937,9 +937,9 @@ fn deployment_readiness_rejects_invalid_view_abi() {
 }
 
 fn append_manifest(view: &mut Vec<u8>) {
-    let name = b"ice.manifest";
+    let name = b"ducktape.view.manifest";
     let text = format!(
-        "ice.manifest.v2\nTest\n\n\nnone\n{}",
+        "ducktape.view.manifest.v1\nTest\n\n\nnone\n{}",
         view_wire::WIRE_EPOCH
     );
     let text = text.as_bytes();
