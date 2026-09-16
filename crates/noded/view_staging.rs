@@ -52,9 +52,30 @@ pub fn sync_view(
     // view never creates one at all — see [`Ready`].
     match classify(source) {
         Ready::Bytes(bytes) => stage_ready(&view, &bytes, assets, &owned_assets, &pending),
-        Ready::NotBuilt => mark_pending(&pending),
+        Ready::NotBuilt => mark_pending_loudly(id, &pending),
         Ready::Unusable(reason) => mark_pending(&pending).and(Err(reason)),
     }
+}
+
+/// Mark the deployment pending, and SAY SO IN THIS BUILD'S OWN OUTPUT.
+///
+/// The marker is deliberate and stays: a staged view whose source is gone came
+/// from some build that is not this one, and founding a network with view bytes
+/// nobody in this checkout can account for is the bug it exists to stop. It has
+/// happened — a `node init` once read the shared set seconds after another
+/// worktree restaged it and carried that worktree's view into the genesis.
+///
+/// What was missing is WHO HEARS ABOUT IT. The destination is shared (several
+/// worktrees, one `CARGO_TARGET_DIR`), so the refusal surfaces minutes later in
+/// somebody else's `node init` or test run, with nothing to say which build
+/// wrote it. `cargo:warning=` puts it in the output of the build that skipped
+/// `make views`, which is the only place it can teach anyone anything.
+fn mark_pending_loudly(id: &str, pending: &Path) -> Result<(), String> {
+    println!(
+        "cargo:warning=no {id} view is built in this checkout, so the founding set beside the \
+         binaries is now marked pending and `node init` will refuse it — run `make views` here"
+    );
+    mark_pending(pending)
 }
 
 /// What the source turned out to be for a DECLARED view.
@@ -71,7 +92,8 @@ enum Ready {
     /// the view, ready to stage
     Bytes(Vec<u8>),
     /// declared but not built yet, or built empty — pending, and no error: the
-    /// next pass takes it, and `make views` is the thing that was missed
+    /// next pass takes it, and `make views` is the thing that was missed. Said
+    /// out loud in this build's output too — see [`mark_pending_loudly`]
     NotBuilt,
     /// declared, and what is on disk cannot be staged — pending, AND the build
     /// fails, because a set that silently kept the last good view would hide it
