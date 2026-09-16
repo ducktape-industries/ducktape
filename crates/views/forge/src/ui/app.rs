@@ -26,6 +26,11 @@ pub struct ForgeView {
     pub(crate) branches: Vec<crate::host::ForgeBranch>,
     pub(crate) items: Vec<crate::host::ForgeItem>,
     pub(crate) tab: String,
+    /// Which side of a tracker is on screen: `open` or `closed`, as every
+    /// forge opens on the open one.
+    pub(crate) item_side: String,
+    /// What the reader typed into the tracker filter.
+    pub(crate) item_filter: String,
     pub(crate) forge_item_number: i64,
     pub(crate) item_phase: String,
     pub(crate) forge_item_kind: String,
@@ -39,6 +44,9 @@ pub struct ForgeView {
     pub(crate) forge_item_additions: i64,
     pub(crate) forge_item_deletions: i64,
     pub(crate) diff_rows: Vec<crate::host::DiffLine>,
+    /// The changed files put away in the patch, by the header line each
+    /// one wears; a fold is the reader's, so it rides the snapshot.
+    pub(crate) diff_folded: Vec<String>,
     pub(crate) forge_item_diff_truncated: bool,
     pub(crate) forge_item_merge_oid: String,
     pub(crate) forge_item_source_branch: String,
@@ -117,13 +125,18 @@ pub enum Message {
     ForgeCloseRepo,
     ForgePickBranch(String),
     ForgeOpenDir(String),
+    ForgeRevealDir(String),
     ForgeOpenFile(String),
     ForgeOpenItem(i64),
     ForgeCloseItem,
     SelectForgeTab(String),
+    SelectTrackerSide(String),
+    TrackerFilterChanged(String),
+    Key(wire::keyboard::Event, bool),
     ForgeReviewPick(String),
     ForgeReviewSubmit(String),
     ForgeMergeSubmit,
+    ForgeFoldFile(String),
     ForgeCommentOpen(String, String, String),
     ForgeCommentCancel,
     ForgeCommentStage(String),
@@ -163,6 +176,8 @@ impl ForgeView {
             branches: Vec::new(),
             items: Vec::new(),
             tab: "code".to_owned(),
+            item_side: "open".to_owned(),
+            item_filter: "".to_owned(),
             forge_item_number: 0,
             item_phase: "idle".to_owned(),
             forge_item_kind: "".to_owned(),
@@ -176,6 +191,7 @@ impl ForgeView {
             forge_item_additions: 0,
             forge_item_deletions: 0,
             diff_rows: Vec::new(),
+            diff_folded: Vec::new(),
             forge_item_diff_truncated: false,
             forge_item_merge_oid: "".to_owned(),
             forge_item_source_branch: "".to_owned(),
@@ -235,7 +251,7 @@ impl ForgeView {
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     /// This state's layout, digested — `snapshot_schema` holds it here.
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "be8e28001029e6cd978e107fc261810b87c570d695269c271c7263553f28ab1c";
+        "b5935054fe8ee6997fe7a1c524ddbf574b1414fe877435ad5296f95fcbeaf857";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
@@ -334,6 +350,14 @@ impl ForgeView {
                 ::ducktape_view_guest::Subscription::none()
             },
             crate::host::acts().map(Message::ActDone),
+            // the window's keys, after the native widgets have had them:
+            // Escape walks back out, `/` goes to the tracker filter
+            ::ducktape_view_guest::Subscription::filter_events(|event| match event {
+                wire::Event::Keyboard { event, captured } => {
+                    Some(Message::Key(event.clone(), *captured))
+                }
+                _ => None,
+            }),
         ])
     }
 }

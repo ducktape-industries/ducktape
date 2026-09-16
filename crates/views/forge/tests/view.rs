@@ -592,7 +592,8 @@ fn a_file_link_unfolds_the_tree_down_to_it() {
 #[test]
 fn a_diff_line_comment_keeps_its_anchor_and_submits_without_a_review_body() {
     let mut drive = open_item("duck://forge/core/7");
-    drive.tick(press(&drive.frame, "Comment on this line"));
+    // the mark reads `+` and carries the line it belongs to as its name
+    drive.tick(press(&drive.frame, "main.rs:1"));
     drive.tick(type_into(
         &drive.frame,
         "Comment on this line…",
@@ -636,4 +637,371 @@ fn a_merge_without_its_deployment_service_asset_is_refused() {
             .iter()
             .any(|request| matches!(request.kind.as_str(), "net.request" | "op.submit"))
     );
+}
+
+/// The surface a file is drawn on, by name — `code`, `markdown`, `picture`.
+fn surface_named(frame: &Frame) -> String {
+    match node_ending(frame, "forge/file-text") {
+        Node::Surface { name, .. } => name,
+        node => panic!("the reader draws a surface: {node:?}"),
+    }
+}
+
+/// A repository opens on what it says about itself: the root listing's
+/// README is read and drawn without anyone pressing anything, the way every
+/// forge lands.
+#[test]
+fn a_repository_opens_on_its_readme() {
+    let (mut drive, _) = namespace("duck://forge/core");
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    drive.answer_tree(
+        "",
+        &listing(&[
+            ("LICENSE", "file"),
+            ("README.md", "file"),
+            ("src", "dir"),
+        ]),
+    );
+    assert!(
+        has_text(&drive.frame, "Loading file…"),
+        "the README is read on landing: {:?}",
+        texts(&drive.frame)
+    );
+    let blob = drive.take("blob");
+    drive.tick(vec![answer(
+        blob,
+        serde_json::json!({ "blob": {
+            "path": "README.md", "rev": "1111222233334444",
+            "text": "# core\n\nwhat this repository is", "binary": false, "truncated": false
+        }})
+        .to_string()
+        .as_bytes(),
+    )]);
+    // a markdown body parks its inline pictures with the host before it
+    // reaches the reader
+    let parked = request(&drive.frame, "picture.inline").id;
+    drive.tick(vec![answer(parked, b"{}")]);
+    assert_eq!(surface_named(&drive.frame), "markdown");
+    assert!(has_text(&drive.frame, "README.md"), "{:?}", texts(&drive.frame));
+}
+
+/// A repository without a README leaves the reader's own empty state on
+/// screen — the landing never invents a file to open.
+#[test]
+fn a_repository_without_a_readme_lands_on_its_empty_state() {
+    let (mut drive, _) = namespace("duck://forge/core");
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    drive.answer_tree("", &listing(&[("src", "dir")]));
+    assert!(
+        has_text(&drive.frame, "Choose a file from the tree."),
+        "{:?}",
+        texts(&drive.frame)
+    );
+    assert!(
+        !drive.open.iter().any(|(_, tag)| tag == "blob"),
+        "nothing was read: {:?}",
+        drive.open
+    );
+}
+
+/// A link into a file beats the landing README: the reader holds what the
+/// link named, and the README is never read over it.
+#[test]
+fn a_deep_link_beats_the_landing_readme() {
+    let (mut drive, _) = namespace("duck://forge/core/blob/src/main.rs");
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    drive.answer_tree("src", &listing(&[("src/main.rs", "file")]));
+    drive.answer_tree("", &listing(&[("README.md", "file"), ("src", "dir")]));
+    let blob = drive.take("blob");
+    drive.tick(vec![answer(
+        blob,
+        serde_json::json!({ "blob": {
+            "path": "src/main.rs", "rev": "1111222233334444",
+            "text": "fn main() {}", "binary": false, "truncated": false
+        }})
+        .to_string()
+        .as_bytes(),
+    )]);
+    assert_eq!(surface_named(&drive.frame), "code");
+    assert!(
+        !drive.open.iter().any(|(_, tag)| tag == "blob"),
+        "the README was not read as well: {:?}",
+        drive.open
+    );
+}
+
+/// The reader's header is the path as crumbs: each directory above the file
+/// presses to show that directory, and pressing one already unfolded leaves
+/// it unfolded — a crumb names where to be, not a fold to flip.
+#[test]
+fn a_crumb_shows_its_directory_and_never_folds_it() {
+    let (mut drive, _) = namespace("duck://forge/core/blob/src/util/mod.rs");
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &items());
+    drive.answer("all", &accounts());
+    drive.answer_tree("src/util", &listing(&[("src/util/mod.rs", "file")]));
+    drive.answer_tree("", &listing(&[("src", "dir")]));
+    drive.answer_tree("src", &listing(&[("src/util", "dir")]));
+    let blob = drive.take("blob");
+    drive.tick(vec![answer(
+        blob,
+        serde_json::json!({ "blob": {
+            "path": "src/util/mod.rs", "rev": "1111222233334444",
+            "text": "pub fn greeting() {}", "binary": false, "truncated": false
+        }})
+        .to_string()
+        .as_bytes(),
+    )]);
+    assert!(has_key_ending(&drive.frame, "forge/tree/src/util/mod.rs"));
+    let asked = tree_asks(&drive.frames);
+    drive.tick(press(&drive.frame, "forge/crumb/0"));
+    assert!(
+        has_key_ending(&drive.frame, "forge/tree/src/util/mod.rs"),
+        "the tree stayed unfolded: {:?}",
+        texts(&drive.frame)
+    );
+    assert_eq!(tree_asks(&drive.frames), asked, "a crumb reads nothing");
+}
+
+#[test]
+fn the_landing_file_is_the_readme_whatever_it_is_called() {
+    use forge_view::host::{readme_of, TreeEntry};
+    let entry = |path: &str, kind: &str| TreeEntry {
+        name: path.rsplit('/').next().unwrap().to_owned(),
+        path: path.to_owned(),
+        kind: kind.to_owned(),
+    };
+    // `.md` wins over every other spelling, whatever order they arrive in
+    assert_eq!(
+        readme_of(&[entry("readme", "file"), entry("README.md", "file")]),
+        "README.md"
+    );
+    assert_eq!(readme_of(&[entry("Readme.markdown", "file")]), "Readme.markdown");
+    assert_eq!(readme_of(&[entry("README", "file")]), "README");
+    assert_eq!(readme_of(&[entry("README.txt", "file")]), "README.txt");
+    // a directory called README is not a file to open, and nothing else is a README
+    assert_eq!(readme_of(&[entry("README.md", "dir")]), "");
+    assert_eq!(readme_of(&[entry("src/readme.md", "file")]), "src/readme.md");
+    assert_eq!(readme_of(&[entry("READMEISH.md", "file")]), "");
+    assert_eq!(readme_of(&[]), "");
+}
+
+#[test]
+fn a_crumb_trail_presses_every_directory_but_the_file() {
+    use forge_view::host::crumbs_of;
+    assert_eq!(
+        crumbs_of("src/util/mod.rs"),
+        vec![
+            ("src".to_owned(), "src".to_owned()),
+            ("src/util".to_owned(), "util".to_owned()),
+            (String::new(), "mod.rs".to_owned()),
+        ]
+    );
+    assert_eq!(
+        crumbs_of("README.md"),
+        vec![(String::new(), "README.md".to_owned())]
+    );
+    assert_eq!(crumbs_of(""), Vec::new());
+}
+
+/// The events the host sends when a key is pressed with nothing focused.
+fn key_press(named: &str) -> Vec<Event> {
+    use ducktape_view_guest::wire::keyboard::{
+        Event as Key, Key as Pressed, KeyState, Location, Modifiers, NativeCode, Named, Physical,
+    };
+    let key = match named {
+        "Escape" => Pressed::Named(Named::Escape),
+        character => Pressed::Character(character.into()),
+    };
+    vec![Event::Keyboard {
+        event: Key::Press {
+            state: KeyState {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: Physical::Unidentified(NativeCode::Unidentified),
+                location: Location::Standard,
+                modifiers: Modifiers::default(),
+            },
+            text: None,
+            repeat: false,
+        },
+        captured: false,
+    }]
+}
+
+/// Three issues and two pull requests, mixed open and closed: what a
+/// tracker's two sides are read off.
+fn mixed_items() -> Vec<u8> {
+    serde_json::json!({ "items": [
+        { "number": 1, "kind": "issue", "state": "open", "title": "The landing shows no README",
+          "author": { "account": 1 } },
+        { "number": 2, "kind": "issue", "state": "closed", "title": "Tabs miss their counts",
+          "author": { "account": 1 } },
+        { "number": 3, "kind": "issue", "state": "open", "title": "Breadcrumbs are one string",
+          "author": { "account": 1 } },
+        { "number": 7, "kind": "pr", "state": "open", "title": "Bound every list",
+          "author": { "account": 1 } },
+        { "number": 8, "kind": "pr", "state": "closed", "title": "Abandoned rewrite",
+          "author": { "account": 1 } }
+    ]})
+    .to_string()
+    .into_bytes()
+}
+
+/// The repo open on its issue tracker, with both sides populated.
+fn tracker() -> Drive {
+    let (mut drive, _) = namespace("duck://forge/core");
+    drive.answer("list_refs", &refs());
+    drive.answer("list_items", &mixed_items());
+    drive.answer("all", &accounts());
+    drive.answer_tree("", &listing(&[("src", "dir")]));
+    drive.tick(press(&drive.frame, "forge/tab/issues"));
+    drive
+}
+
+/// A tracker opens on its open side — a closed issue is one press away, and
+/// never mixed into the open list.
+#[test]
+fn a_tracker_opens_on_the_open_side_and_the_closed_side_is_a_press_away() {
+    let mut drive = tracker();
+    assert!(has_text(&drive.frame, "The landing shows no README"));
+    assert!(has_text(&drive.frame, "Breadcrumbs are one string"));
+    assert!(
+        !has_text(&drive.frame, "Tabs miss their counts"),
+        "the closed issue is not on the open side: {:?}",
+        texts(&drive.frame)
+    );
+    // each side wears its own count
+    assert!(has_text(&drive.frame, "Open 2"), "{:?}", texts(&drive.frame));
+    assert!(has_text(&drive.frame, "Closed 1"));
+    drive.tick(press(&drive.frame, "forge/tracker-side/closed"));
+    assert!(has_text(&drive.frame, "Tabs miss their counts"));
+    assert!(!has_text(&drive.frame, "The landing shows no README"));
+}
+
+/// The filter keeps the rows that match its text or their number, and says
+/// so when none do.
+#[test]
+fn a_tracker_filter_keeps_what_matches_and_names_the_empty_case() {
+    let mut drive = tracker();
+    drive.tick(type_into(&drive.frame, "Filter by title or number", "readme"));
+    assert!(has_text(&drive.frame, "The landing shows no README"));
+    assert!(!has_text(&drive.frame, "Breadcrumbs are one string"));
+    drive.tick(type_into(&drive.frame, "Filter by title or number", "#3"));
+    assert!(has_text(&drive.frame, "Breadcrumbs are one string"));
+    drive.tick(type_into(&drive.frame, "Filter by title or number", "zzz"));
+    assert!(
+        has_text(&drive.frame, "Nothing matches"),
+        "{:?}",
+        texts(&drive.frame)
+    );
+}
+
+/// Escape leaves what is open, one step at a time: the item, then the
+/// repository — and a key a native field took is that field's, not ours.
+#[test]
+fn escape_walks_back_out_of_the_item_then_the_repository() {
+    let mut drive = open_item("duck://forge/core/7");
+    assert!(has_text(&drive.frame, "Bound every list"));
+    let held = {
+        let mut events = key_press("Escape");
+        if let Some(Event::Keyboard { captured, .. }) = events.first_mut() {
+            *captured = true;
+        }
+        events
+    };
+    drive.tick(held);
+    assert!(
+        has_text(&drive.frame, "Bound every list"),
+        "a captured key belongs to the field that took it"
+    );
+    drive.tick(key_press("Escape"));
+    assert!(!has_text(&drive.frame, "Back to tracker"));
+    drive.tick(key_press("Escape"));
+    assert!(
+        has_text(&drive.frame, "duckhouse"),
+        "the namespace is back: {:?}",
+        texts(&drive.frame)
+    );
+}
+
+/// `/` asks the host to put the keyboard in the tracker filter, and asks
+/// for nothing while the code browse is what is on screen.
+#[test]
+fn a_slash_reaches_for_the_filter_only_where_a_tracker_is() {
+    let mut drive = tracker();
+    let before = focus_asks(&drive).len();
+    drive.tick(key_press("/"));
+    let focused: Vec<String> = focus_asks(&drive).split_off(before);
+    assert_eq!(focused.len(), 1, "one focus ask: {focused:?}");
+    assert!(
+        focused[0].contains("tracker-filter"),
+        "it names the filter: {focused:?}"
+    );
+    // the tab press takes the keyboard to the page (that is what makes the
+    // key arrive at all), so what is counted here is the FILTER ask
+    drive.tick(press(&drive.frame, "forge/tab/code"));
+    let before = focus_asks(&drive).len();
+    drive.tick(key_press("/"));
+    let after: Vec<String> = focus_asks(&drive).split_off(before);
+    assert!(
+        !after.iter().any(|ask| ask.contains("tracker-filter")),
+        "the code browse reaches for no filter: {after:?}"
+    );
+}
+
+/// The window's keys reach a view only while something inside it holds the
+/// focus, so every press that moves the forge screen asks for the page.
+#[test]
+fn a_move_between_screens_takes_the_keyboard_to_the_page() {
+    let mut drive = tracker();
+    let takes_the_page = |asks: Vec<String>| asks.iter().any(|ask| ask.contains("ForgeView/page"));
+    let opened = focus_asks(&drive);
+    assert!(takes_the_page(opened), "opening the repository takes it");
+    for step in ["forge/tracker-side/closed", "forge/tab/code"] {
+        let before = focus_asks(&drive).len();
+        drive.tick(press(&drive.frame, step));
+        let asks = focus_asks(&drive).split_off(before);
+        assert!(takes_the_page(asks.clone()), "{step} takes it: {asks:?}");
+    }
+    // and leaving the repository, which is where Escape lands
+    let before = focus_asks(&drive).len();
+    drive.tick(key_press("Escape"));
+    let asks = focus_asks(&drive).split_off(before);
+    assert!(takes_the_page(asks.clone()), "Escape keeps it: {asks:?}");
+}
+
+/// Every focus the view has asked the host for, oldest first.
+fn focus_asks(drive: &Drive) -> Vec<String> {
+    drive
+        .frames
+        .iter()
+        .flat_map(|frame| &frame.requests)
+        .filter(|request| request.kind == "host.widget")
+        .map(|request| String::from_utf8_lossy(&request.payload).into_owned())
+        .collect()
+}
+
+/// A changed file folds its hunks away and brings them back, and folding one
+/// file leaves the others open.
+#[test]
+fn a_changed_file_folds_its_hunks_away_and_back() {
+    let mut drive = open_item("duck://forge/core/7");
+    let hunk = "@@ -1 +1 @@";
+    assert!(has_text(&drive.frame, hunk), "{:?}", texts(&drive.frame));
+    drive.tick(press(&drive.frame, "main.rs"));
+    assert!(
+        !has_text(&drive.frame, hunk),
+        "the hunks are away: {:?}",
+        texts(&drive.frame)
+    );
+    assert!(has_text(&drive.frame, "main.rs"), "the header stays");
+    drive.tick(press(&drive.frame, "main.rs"));
+    assert!(has_text(&drive.frame, hunk), "and they come back");
 }

@@ -311,20 +311,63 @@ impl ForgeView {
         )
     }
 
+    /// Which side of the tracker is being read, and the filter over it: the
+    /// switch carries each side's count, the way a forge shows them.
+    fn tracker_head(&self, tab: &str) -> wire::Node {
+        let kind = match tab {
+            "issues" => "issue",
+            _ => "pr",
+        };
+        let sides = [("open", "Open"), ("closed", "Closed")]
+            .into_iter()
+            .map(|(side, label)| {
+                let count = host::forge_side_count(&self.items, kind, side);
+                (
+                    side.to_owned(),
+                    format!("{label} {count}"),
+                    self.item_side == side,
+                    Some(slots::message(Message::SelectTrackerSide(side.to_owned()))),
+                )
+            });
+        native::spaced(
+            native::centered_row(
+                "forge/tracker-head",
+                [
+                    native::sized(
+                        native::tabs("forge/tracker-side", sides),
+                        Some(wire::Length::Shrink),
+                        None,
+                    ),
+                    native::sized(
+                        native::input(
+                            crate::TRACKER_FILTER_KEY,
+                            "Filter by title or number",
+                            &self.item_filter,
+                            slots::handler(Box::new(|text: String| {
+                                Some(Message::TrackerFilterChanged(text))
+                            })),
+                            None,
+                        ),
+                        Some(wire::Length::Fixed(280.)),
+                        None,
+                    ),
+                ],
+            ),
+            8.,
+        )
+    }
+
     /// The tracker separates each title and state from its number and author.
     fn tracker_screen(&self, tab: &str) -> wire::Node {
-        let items = host::filter_forge_items(&self.items, tab);
-        let mut content = Vec::new();
+        let items =
+            host::filter_forge_items(&self.items, tab, &self.item_side, &self.item_filter);
+        let mut content = vec![self.tracker_head(tab)];
         match self.repo_phase.as_str() {
             "loading" => content.push(self.loading_tracker("forge/tracker-loading".into())),
             "failed" => content.push(self.tracker_unavailable("forge/tracker-failed".into())),
             "ready" => {
                 if items.is_empty() {
-                    content.push(if tab == "issues" {
-                        self.empty_issues("forge/no-issues".into())
-                    } else {
-                        self.empty_pulls("forge/no-pulls".into())
-                    });
+                    content.push(self.nothing_to_show(tab));
                 }
                 for item in items {
                     let key = format!("forge/item/{}", item.number);
@@ -401,6 +444,31 @@ impl ForgeView {
         )
     }
 
+    /// Why a tracker is showing nothing: the filter matched none of them,
+    /// this side is empty, or there is no work of this kind at all.
+    fn nothing_to_show(&self, tab: &str) -> wire::Node {
+        let filtered = !self.item_filter.trim().is_empty();
+        if filtered {
+            return native::empty_state(
+                "forge/no-match",
+                "Nothing matches",
+                "No work on this side matches the filter.",
+            );
+        }
+        let closed_side = self.item_side == "closed";
+        if closed_side {
+            return native::empty_state(
+                "forge/none-closed",
+                "Nothing closed yet",
+                "Closed work shows up here.",
+            );
+        }
+        if tab == "issues" {
+            return self.empty_issues("forge/no-issues".into());
+        }
+        self.empty_pulls("forge/no-pulls".into())
+    }
+
     fn item_screen(&self) -> wire::Node {
         let mut content = vec![native::row(
             "forge/item-nav",
@@ -435,7 +503,9 @@ impl ForgeView {
                         &self.forge_item_branches,
                     )));
                 }
-                meta.push(native::spacer());
+                // no spacer here: a Fill-height space inside a WRAPPING row
+                // takes a line of its own and leaves the button drawn over
+                // the body text under it
                 meta.push(subtle(
                     "forge/copy-item",
                     "Copy link",

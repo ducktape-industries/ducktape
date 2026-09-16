@@ -17,13 +17,18 @@ impl super::ForgeView {
             Message::ForgeCloseRepo => self.on_forge_close_repo(),
             Message::ForgePickBranch(name) => self.on_forge_pick_branch(name),
             Message::ForgeOpenDir(path) => self.on_forge_open_dir(path),
+            Message::ForgeRevealDir(path) => self.on_forge_reveal_dir(path),
             Message::ForgeOpenFile(path) => self.on_forge_open_file(path),
             Message::ForgeOpenItem(number) => self.on_forge_open_item(number),
             Message::ForgeCloseItem => self.on_forge_close_item(),
             Message::SelectForgeTab(next) => self.on_select_forge_tab(next),
+            Message::SelectTrackerSide(side) => self.on_select_tracker_side(side),
+            Message::TrackerFilterChanged(text) => self.on_tracker_filter_changed(text),
+            Message::Key(event, captured) => self.on_key(event, captured),
             Message::ForgeReviewPick(verdict) => self.on_forge_review_pick(verdict),
             Message::ForgeReviewSubmit(body) => self.on_forge_review_submit(body),
             Message::ForgeMergeSubmit => self.on_forge_merge_submit(),
+            Message::ForgeFoldFile(name) => self.on_forge_fold_file(name),
             Message::ForgeCommentOpen(path, line, side) => {
                 self.on_forge_comment_open(path, line, side)
             }
@@ -266,12 +271,28 @@ impl super::ForgeView {
             .insert(next.path.clone(), next.entries.clone());
         self.unfold_to(&next.path);
         self.request_missing_dir();
-        if (self.focus_path).is_empty() {
+        let parked = self.focus_path.to_owned();
+        self.focus_path = "".to_owned();
+        // a deep link owns the reader; otherwise the repository opens on
+        // what it says about itself
+        let opening = match parked.is_empty() {
+            false => parked,
+            true => self.landing_readme(&next),
+        };
+        if (opening).is_empty() {
             return ::ducktape_view_guest::Task::none();
         }
-        let path = self.focus_path.to_owned();
-        self.focus_path = "".to_owned();
-        (::ducktape_view_guest::Task::done(path.to_owned())).map(Message::ForgeOpenFile)
+        (::ducktape_view_guest::Task::done(opening)).map(Message::ForgeOpenFile)
+    }
+    /// The README a freshly opened repository lands on: only off the root
+    /// listing, and never over a file the reader already holds.
+    fn landing_readme(&self, next: &crate::host::TreeItem) -> String {
+        let root = next.path.is_empty();
+        let reader_is_empty = self.file_path.is_empty();
+        if !(root && reader_is_empty) {
+            return String::new();
+        }
+        crate::host::readme_of(&next.entries)
     }
     fn on_blob_arrived(
         &mut self,
@@ -328,12 +349,15 @@ impl super::ForgeView {
         self.branches = Vec::new();
         self.items = Vec::new();
         self.tab = "code".to_owned();
+        self.item_side = "open".to_owned();
+        self.item_filter = "".to_owned();
         self.tree_pick = "".to_owned();
         self.forge_item_number = 0;
         self.item_phase = "idle".to_owned();
         self.forge_item_channel = "".to_owned();
         self.linked_note = Vec::new();
         self.diff_rows = Vec::new();
+        self.diff_folded = Vec::new();
         self.discussion = Vec::new();
         self.discussion_clipped = false;
         self.merge_conflicts = Vec::new();
@@ -352,7 +376,7 @@ impl super::ForgeView {
         self.file_phase = "idle".to_owned();
         self.opened_dir = "".to_owned();
         self.opened_rev = "".to_owned();
-        ::ducktape_view_guest::Task::none()
+        self.take_the_keyboard()
     }
     fn on_forge_close_repo(&mut self) -> ducktape_view_guest::Task<Message> {
         self.open_repo = "".to_owned();
@@ -366,6 +390,7 @@ impl super::ForgeView {
         self.linked_note = Vec::new();
         self.focus_seq = 0;
         self.diff_rows = Vec::new();
+        self.diff_folded = Vec::new();
         self.discussion = Vec::new();
         self.discussion_clipped = false;
         self.merge_conflicts = Vec::new();
@@ -384,7 +409,7 @@ impl super::ForgeView {
         self.file_phase = "idle".to_owned();
         self.opened_dir = "".to_owned();
         self.opened_rev = "".to_owned();
-        ::ducktape_view_guest::Task::none()
+        self.take_the_keyboard()
     }
     fn on_forge_pick_branch(&mut self, name: String) -> ducktape_view_guest::Task<Message> {
         if (!self.connected) || (self.open_repo).is_empty() {
@@ -455,6 +480,17 @@ impl super::ForgeView {
         self.tree_truncated = false;
         self.tree_phase = "loading".to_owned();
     }
+    /// A breadcrumb names a directory to SHOW, not to toggle: pressing the
+    /// crumb of a directory already unfolded must leave it unfolded, which
+    /// is exactly what `ForgeOpenDir` would not do.
+    fn on_forge_reveal_dir(&mut self, path: String) -> ducktape_view_guest::Task<Message> {
+        if (!self.connected) || (self.open_repo).is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.unfold_to(&path);
+        self.request_missing_dir();
+        ::ducktape_view_guest::Task::none()
+    }
     fn on_forge_open_file(&mut self, path: String) -> ducktape_view_guest::Task<Message> {
         if (!self.connected) || (self.open_repo).is_empty() {
             return ::ducktape_view_guest::Task::none();
@@ -488,9 +524,10 @@ impl super::ForgeView {
         self.comment_side = "".to_owned();
         self.merge_conflicts = Vec::new();
         self.diff_rows = Vec::new();
+        self.diff_folded = Vec::new();
         self.discussion = Vec::new();
         self.discussion_clipped = false;
-        ::ducktape_view_guest::Task::none()
+        self.take_the_keyboard()
     }
     fn on_forge_close_item(&mut self) -> ducktape_view_guest::Task<Message> {
         self.forge_item_number = 0;
@@ -499,18 +536,94 @@ impl super::ForgeView {
         self.linked_note = Vec::new();
         self.focus_seq = 0;
         self.diff_rows = Vec::new();
+        self.diff_folded = Vec::new();
         self.discussion = Vec::new();
         self.discussion_clipped = false;
         self.merge_conflicts = Vec::new();
         self.staged_comments = Vec::new();
-        ::ducktape_view_guest::Task::none()
+        self.take_the_keyboard()
     }
     fn on_select_forge_tab(&mut self, next: String) -> ducktape_view_guest::Task<Message> {
         self.tab = next.to_owned();
         if self.forge_item_number <= 0 {
+            return self.take_the_keyboard();
+        }
+        // the close carries its own focus request; this one is for the tab
+        // press itself, so the keys land on the page either way
+        (::ducktape_view_guest::Task::done(true)).map(|_value| Message::ForgeCloseItem)
+    }
+    fn on_select_tracker_side(&mut self, side: String) -> ducktape_view_guest::Task<Message> {
+        self.item_side = side;
+        self.take_the_keyboard()
+    }
+    fn on_tracker_filter_changed(&mut self, text: String) -> ducktape_view_guest::Task<Message> {
+        self.item_filter = text;
+        ::ducktape_view_guest::Task::none()
+    }
+    /// The window's keys. A native field that took the key owns it, so
+    /// typing a slash into the filter does not re-focus it.
+    fn on_key(
+        &mut self,
+        event: ducktape_view_guest::wire::keyboard::Event,
+        captured: bool,
+    ) -> ducktape_view_guest::Task<Message> {
+        use ducktape_view_guest::wire::keyboard::{Event, Key};
+        let Event::Press { state, .. } = event else {
+            return ::ducktape_view_guest::Task::none();
+        };
+        let typing_or_modified = captured || state.modifiers.alt || state.modifiers.control;
+        if typing_or_modified {
             return ::ducktape_view_guest::Task::none();
         }
-        (::ducktape_view_guest::Task::done(true)).map(|_value| Message::ForgeCloseItem)
+        let pressed = match &state.key {
+            Key::Character(text) => text.to_owned(),
+            Key::Named(named) => format!("{named:?}"),
+            _ => return ::ducktape_view_guest::Task::none(),
+        };
+        match pressed.as_str() {
+            "Escape" => self.on_walk_back(),
+            "/" => self.on_reach_for_the_filter(),
+            _ => ::ducktape_view_guest::Task::none(),
+        }
+    }
+    /// Escape leaves whatever is open, one step at a time: the item, then
+    /// the repository, and it does nothing at the namespace.
+    fn on_walk_back(&mut self) -> ducktape_view_guest::Task<Message> {
+        let item_open = self.forge_item_number > 0;
+        if item_open {
+            return self.on_forge_close_item();
+        }
+        let repo_open = !self.open_repo.is_empty();
+        if repo_open {
+            return self.on_forge_close_repo();
+        }
+        ::ducktape_view_guest::Task::none()
+    }
+    /// The window's keys reach a view only while something inside it holds
+    /// the focus, so every press that MOVES the forge screen takes it back
+    /// to the page. Nothing takes it after that, which leaves a field the
+    /// reader clicked into holding the keyboard while they type.
+    fn take_the_keyboard(&self) -> ducktape_view_guest::Task<Message> {
+        ::ducktape_view_guest::widget::perform::<Message>(
+            ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                target: crate::PAGE_KEY.to_owned(),
+            },
+        )
+    }
+    /// `/` puts the keyboard in the tracker filter, where a tracker is what
+    /// is on screen.
+    fn on_reach_for_the_filter(&mut self) -> ducktape_view_guest::Task<Message> {
+        let tracker_on_screen =
+            self.connected && !self.open_repo.is_empty() && self.forge_item_number == 0;
+        let tracker_tab = self.tab == "issues" || self.tab == "pulls";
+        if !(tracker_on_screen && tracker_tab) {
+            return ::ducktape_view_guest::Task::none();
+        }
+        ::ducktape_view_guest::widget::perform::<Message>(
+            ::ducktape_view_guest::wire::WidgetCommand::Focus {
+                target: crate::TRACKER_FILTER_KEY.to_owned(),
+            },
+        )
     }
     fn on_forge_review_pick(&mut self, verdict: String) -> ducktape_view_guest::Task<Message> {
         self.review_verdict = verdict.to_owned();
@@ -549,6 +662,15 @@ impl super::ForgeView {
             self.forge_item_source_oid.to_owned(),
             self.forge_item_target_oid.to_owned(),
         );
+        ::ducktape_view_guest::Task::none()
+    }
+    /// Put one changed file away, or bring it back.
+    fn on_forge_fold_file(&mut self, name: String) -> ducktape_view_guest::Task<Message> {
+        let folded = self.diff_folded.iter().any(|held| held == &name);
+        match folded {
+            true => self.diff_folded.retain(|held| held != &name),
+            false => self.diff_folded.push(name),
+        }
         ::ducktape_view_guest::Task::none()
     }
     fn on_forge_comment_open(

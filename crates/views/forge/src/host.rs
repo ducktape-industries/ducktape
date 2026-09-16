@@ -1478,31 +1478,54 @@ pub fn plural(count: i64, one: &str, many: &str) -> String {
 }
 
 /// The tracker's Pull requests / Issues split; the Code seat lists nothing.
-pub fn filter_forge_items(items: &[ForgeItem], tab: &str) -> Vec<ForgeItem> {
+pub fn filter_forge_items(items: &[ForgeItem], tab: &str, side: &str, query: &str) -> Vec<ForgeItem> {
     let kind = match tab {
         "pulls" => "pr",
         "issues" => "issue",
         _ => return Vec::new(),
     };
+    let wanted = query.trim().to_lowercase();
     items
         .iter()
         .filter(|item| item.kind == kind)
+        .filter(|item| item_is_open(item) == (side == "open"))
+        .filter(|item| item_matches(item, &wanted))
         .cloned()
         .collect()
 }
 
-/// The tab count chips — open work only: a PR counts until it merges, an
-/// issue until it closes.
-pub fn forge_open_count(items: &[ForgeItem], kind: &str) -> i64 {
-    let open = items
+/// Whether an item stands on the Open side of its tracker. One reading for
+/// the list and the tab chip both, so the count can never disagree with the
+/// rows under it — and a closed pull request is closed, which is what
+/// `state != "merged"` used to deny.
+pub fn item_is_open(item: &ForgeItem) -> bool {
+    item.state == "open"
+}
+
+/// Whether a row survives what the reader typed: its title or its number.
+/// An empty filter keeps everything.
+fn item_matches(item: &ForgeItem, wanted: &str) -> bool {
+    if wanted.is_empty() {
+        return true;
+    }
+    let titled = item.title.to_lowercase().contains(wanted);
+    let numbered = format!("#{}", item.number).contains(wanted);
+    titled || numbered
+}
+
+/// How many rows each side of a tracker holds, as its switch shows them.
+pub fn forge_side_count(items: &[ForgeItem], kind: &str, side: &str) -> i64 {
+    let counted = items
         .iter()
         .filter(|item| item.kind == kind)
-        .filter(|item| match kind {
-            "pr" => item.state != "merged",
-            _ => item.state == "open",
-        })
+        .filter(|item| item_is_open(item) == (side == "open"))
         .count();
-    i64::try_from(open).unwrap_or(i64::MAX)
+    i64::try_from(counted).unwrap_or(i64::MAX)
+}
+
+/// The tab count chips — the open work on each tracker.
+pub fn forge_open_count(items: &[ForgeItem], kind: &str) -> i64 {
+    forge_side_count(items, kind, "open")
 }
 
 /// The seat an open item belongs to, by its kind: a pull request lights the
@@ -1684,6 +1707,58 @@ pub fn forge_file_header(opened_rev: &str, rev: &str, path: &str) -> String {
         true => path.to_owned(),
         false => String::new(),
     }
+}
+
+/// The file a repository lands on when it opens — the README at its root,
+/// preferring `README.md` over any other spelling, as every forge does.
+/// Empty when the root carries none, which leaves the reader's own empty
+/// state on screen.
+pub fn readme_of(entries: &[TreeEntry]) -> String {
+    let rank = |name: &str| {
+        let name = name.to_ascii_lowercase();
+        let (stem, extension) = match name.rsplit_once('.') {
+            Some((stem, extension)) => (stem.to_owned(), extension.to_owned()),
+            None => (name, String::new()),
+        };
+        if stem != "readme" {
+            return None;
+        }
+        match extension.as_str() {
+            "md" => Some(0),
+            "markdown" => Some(1),
+            "" => Some(2),
+            _ => Some(3),
+        }
+    };
+    entries
+        .iter()
+        .filter(|entry| entry.kind == "file")
+        .filter_map(|entry| rank(&entry.name).map(|rank| (rank, entry)))
+        // the listing is sorted, so the first of equal rank is stable
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, entry)| entry.path.to_owned())
+        .unwrap_or_default()
+}
+
+/// One breadcrumb per path segment: the directory each one stands for, and
+/// the name it shows. The last crumb is the file itself — it stands for no
+/// directory, which is what makes it the one that does not press.
+pub fn crumbs_of(path: &str) -> Vec<(String, String)> {
+    let mut walked = String::new();
+    let names = path.split('/').filter(|segment| !segment.is_empty());
+    let mut crumbs: Vec<(String, String)> = names
+        .map(|name| {
+            if !walked.is_empty() {
+                walked.push('/');
+            }
+            walked.push_str(name);
+            (walked.to_owned(), name.to_owned())
+        })
+        .collect();
+    if let Some(last) = crumbs.last_mut() {
+        last.0 = String::new();
+    }
+    crumbs
 }
 
 /// The PR stats line: `3 files, +12 −4`.
