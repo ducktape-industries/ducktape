@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # The fixed HEAD snapshot includes every tracked dependency of a view. Neither
 # private worktrees nor the source checkout are modified by the two builds.
+# The two snapshots sit at different paths: a view whose bytes move with the
+# source root fails here, which is what `ops/build-views.sh` compiles through
+# one constant path to prevent. That path is a prefix below, so the constant
+# itself may not reach a component either.
 set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 wasm_tools_root=$1
@@ -26,6 +30,7 @@ for component in "$work/here/target/views/"*.wasm; do
   name=$(basename "$component")
   cmp "$component" "$work/there/target/views/$name"
   for prefix in "$work/here" "$work/there" "$work/outside-target" \
+    /var/tmp/ducktape-view-root \
     "$(cd "${CARGO_HOME:-$HOME/.cargo}" && pwd -P)" \
     "$(cd "${RUSTUP_HOME:-$HOME/.rustup}" && pwd -P)" \
     "$(cd "$HOME" && pwd -P)"; do
