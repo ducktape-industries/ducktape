@@ -5,7 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
-use ui_lang_wire as wire;
+use view_wire as wire;
 use wire::editor_document::{
     EditorDocumentMessage as DocumentMessage, EditorDocumentRef, EditorTransferId,
     EditorTransferReceiver, EditorTransferSender,

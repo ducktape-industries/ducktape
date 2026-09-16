@@ -510,7 +510,7 @@ fn a_view_entry_composes_no_module_and_the_boundary_leaves_it_alone() {
                 codes.insert(id.to_string(), source.add(Artifact::module(bytes)));
             }
             let home = source.add(Artifact::View(ViewArtifact {
-                component: ice_view(),
+                component: view_component(),
                 assets: [("icons/tab.svg".to_owned(), b"<svg/>".to_vec())].into(),
             }));
             codes.insert("home".into(), home);
@@ -564,7 +564,7 @@ fn a_view_entry_composes_no_module_and_the_boundary_leaves_it_alone() {
             // (the drain's verdict), the swap latches at R = n and advances
             // with no core ever asked of the factory.
             let dashboard = source.add(Artifact::View(ViewArtifact {
-                component: ice_view(),
+                component: view_component(),
                 assets: [("icons/tab.svg".to_owned(), b"<svg>2</svg>".to_vec())].into(),
             }));
             let index = indexer::IndexStore::open_bare(dir.join("index"), &["modules"]).unwrap();
@@ -867,9 +867,9 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
     });
 }
 
-fn ice_view() -> Vec<u8> {
+fn view_component() -> Vec<u8> {
     std::fs::read(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ice-view.component.wasm"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/view.component.wasm"),
     )
     .unwrap()
 }
@@ -894,8 +894,8 @@ fn encode(artifact: &module_artifact::ModuleArtifact) -> Vec<u8> {
 fn deployment_readiness_rejects_invalid_view_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let index = indexer::IndexStore::open_bare(dir.path(), &["pages"]).unwrap();
-    let mut view = ice_view();
-    let marker = b"ice.manifest.v2";
+    let mut view = view_component();
+    let marker = b"ducktape.view.manifest.v1";
     // The guest retains the text in data as well as its custom section.
     // Corrupt every copy so the actual metadata, not just data, is invalid.
     let offsets: Vec<_> = view
@@ -907,7 +907,7 @@ fn deployment_readiness_rejects_invalid_view_manifest() {
     for offset in offsets {
         view[offset] = b'x';
     }
-    assert!(ui_lang_wire::manifest::read_manifest(&view).is_none());
+    assert!(view_wire::manifest::read_manifest(&view).is_none());
     let error =
         noded::compose::validate_deployment("pages", modules::Kind::Module, &encode(&view_deployment(view)), &index)
             .expect_err("invalid view manifest must refuse readiness");
@@ -937,10 +937,10 @@ fn deployment_readiness_rejects_invalid_view_abi() {
 }
 
 fn append_manifest(view: &mut Vec<u8>) {
-    let name = b"ice.manifest";
+    let name = b"ducktape.view.manifest";
     let text = format!(
-        "ice.manifest.v2\nTest\n\n\nnone\n{}",
-        ui_lang_wire::WIRE_EPOCH
+        "ducktape.view.manifest.v1\nTest\n\n\nnone\n{}",
+        view_wire::WIRE_EPOCH
     );
     let text = text.as_bytes();
     view.extend_from_slice(&[0, (1 + name.len() + text.len()) as u8, name.len() as u8]);
@@ -952,7 +952,7 @@ fn append_manifest(view: &mut Vec<u8>) {
 fn deployment_readiness_accepts_actual_view() {
     let dir = tempfile::tempdir().unwrap();
     let index = indexer::IndexStore::open_bare(dir.path(), &["pages"]).unwrap();
-    noded::compose::validate_deployment("pages", modules::Kind::Module, &encode(&view_deployment(ice_view())), &index)
+    noded::compose::validate_deployment("pages", modules::Kind::Module, &encode(&view_deployment(view_component())), &index)
         .unwrap();
 }
 
@@ -963,7 +963,7 @@ fn a_view_entry_is_ready_on_the_view_alone_and_the_tag_must_match_the_kind() {
     let dir = tempfile::tempdir().unwrap();
     let index = indexer::IndexStore::open_bare(dir.path(), &["pages"]).unwrap();
     let view_frame = module_artifact::Artifact::View(module_artifact::ViewArtifact {
-        component: ice_view(),
+        component: view_component(),
         assets: [("icons/tab.svg".to_owned(), b"<svg/>".to_vec())].into(),
     })
     .encode();
@@ -976,7 +976,7 @@ fn a_view_entry_is_ready_on_the_view_alone_and_the_tag_must_match_the_kind() {
         noded::compose::validate_deployment("home", modules::Kind::Module, &view_frame, &index)
             .unwrap_err();
     assert!(error.starts_with("artifact_kind_mismatch"), "{error}");
-    let module_frame = encode(&view_deployment(ice_view()));
+    let module_frame = encode(&view_deployment(view_component()));
     assert_eq!(
         noded::compose::artifact_kind(&module_frame).unwrap(),
         modules::Kind::Module
@@ -1070,7 +1070,7 @@ fn wasm_registry_activates_view_assets_and_reopens_after_view_removal() {
                 let bytes = std::fs::read(fixtures().join(format!("{id}.component.wasm"))).unwrap();
                 codes.insert(id.to_string(), source.add(Artifact::module(bytes)));
             }
-            let mut first = view_deployment(ice_view());
+            let mut first = view_deployment(view_component());
             first.index = Some(
                 std::fs::read(
                     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

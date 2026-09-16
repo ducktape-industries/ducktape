@@ -1,0 +1,18 @@
+A real ducktape view component, used by the tests that need a valid
+`ducktape:view@0.1.0` artifact without building one.
+
+Source: this checkout, crates/views/members (package members-view).
+Build:  make views      # ops/build-views.sh, release, wasm32-unknown-unknown,
+                        # then `wasm-tools component new`
+Copy:   target/views/members_view.wasm -> view.component.wasm
+SHA-256: 36ad3a6e029e1ef6c08f32abd307384f02ccc9b7ed2145d5e2bd095fd9480c5a
+
+It carries the `ducktape.view.manifest` custom section holding
+`ducktape.view.manifest.v1` text, which is what the readiness and
+view-registration tests read. members-view is here only because it is the
+smallest view in the set; any view works, so re-copy from whichever one is
+smallest if this ever needs refreshing, and update the digest above.
+
+`ops/build-views.sh` pins the path prefixes and the target dir, so the bytes
+are reproducible from this checkout — regenerating does not need an external
+toolchain.

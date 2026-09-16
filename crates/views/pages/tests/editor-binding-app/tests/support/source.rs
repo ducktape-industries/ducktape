@@ -1,6 +1,6 @@
 //! Synthetic mutable chunk producer for ingress interruption and snapshot tests.
 use std::sync::Arc;
-use ui_lang_wire as wire;
+use view_wire as wire;
 use wire::editor_document::{
     EditorDocumentRef, EditorTransfer, EditorTransferId, EditorTransferSender,
 };

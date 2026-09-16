@@ -327,7 +327,7 @@ impl Desktop {
             let closing = view.downgrade();
             window.on_window_should_close(cx, move |window, cx| {
                 let _ = closing.update(cx, |this, cx| {
-                    this.observe_module_window(ui_lang_wire::events::Window::CloseRequested, cx)
+                    this.observe_module_window(view_wire::events::Window::CloseRequested, cx)
                 });
                 release_window_input(window, cx);
                 true
@@ -360,7 +360,7 @@ impl Desktop {
         };
         if let Some(view) = self.views.remove(&key) {
             let _ = view.update(cx, |this, cx| {
-                this.observe_module_window(ui_lang_wire::events::Window::CloseRequested, cx)
+                this.observe_module_window(view_wire::events::Window::CloseRequested, cx)
             });
         }
         cx.defer(move |cx| {
@@ -521,7 +521,7 @@ impl DesktopWindow {
 
     fn released(&mut self, cx: &mut gpui_kit::App) {
         self.hide_module(cx);
-        self.observe_module_window(ui_lang_wire::events::Window::Closed, cx);
+        self.observe_module_window(view_wire::events::Window::Closed, cx);
     }
     fn hide_module(&mut self, cx: &mut gpui_kit::App) {
         let (Some((_, module)), Some(route)) = (&self.module, self.module_route) else {
@@ -537,7 +537,7 @@ impl DesktopWindow {
     }
     fn observe_module_window(
         &mut self,
-        event: ui_lang_wire::events::Window,
+        event: view_wire::events::Window,
         cx: &mut gpui_kit::App,
     ) {
         let (Some((_, module)), Some(route)) = (&self.module, self.module_route) else {
@@ -1191,11 +1191,11 @@ impl DesktopWindow {
                         .as_ref()
                         .is_none_or(|(current, _)| current != &payload);
                     if changed {
-                        let node = ui_lang_wire::Node::Qr {
+                        let node = view_wire::Node::Qr {
                             key: "account-qr".into(),
-                            code: ui_lang_wire::Qr {
+                            code: view_wire::Qr {
                                 payload: Some(payload.as_bytes().to_vec()),
-                                size: Some(ui_lang_wire::QrSize::Total(220.0)),
+                                size: Some(view_wire::QrSize::Total(220.0)),
                                 ..Default::default()
                             },
                         };
@@ -2559,7 +2559,7 @@ mod close_tests {
         // Routing inline here would re-enter it and panic.
         model.update(cx, |_, cx| {
             presenter.update(cx, |view, cx| {
-                view.observe_module_window(ui_lang_wire::events::Window::CloseRequested, cx);
+                view.observe_module_window(view_wire::events::Window::CloseRequested, cx);
             });
         });
         assert_eq!(close_observer_reading(), (baseline + 1, 0));

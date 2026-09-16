@@ -253,7 +253,7 @@ fn register_a_view_only_entry_across_three_validators() {
     let cluster = three_validators();
     let view = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../crates/noded/tests/fixtures/ice-view.component.wasm"
+        "/../../crates/noded/tests/fixtures/view.component.wasm"
     );
     let scratch = tempfile::tempdir().unwrap();
     let assets = scratch.path().join("assets");

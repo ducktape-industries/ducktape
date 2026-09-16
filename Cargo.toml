@@ -190,6 +190,10 @@ members = [
     "crates/testing/nettest",
     # topology — the module composition catalog every composer draws from
     "crates/topology",
+    # view-wire — the host<->wasm-view format: the tree a view emits, the
+    # events it takes back, and the manifest a host checks before running one.
+    # Built once here and shared with the views workspace by path.
+    "crates/view-wire",
     # noded — the daemon library behind the /v1 surface
     "crates/noded",
     # bin — runnable binaries
@@ -217,6 +221,9 @@ edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
+# the host<->wasm-view wire. `manifest` is host-only (it pulls wasmparser to
+# read a built component's custom section); the guests take it bare.
+view-wire = { path = "crates/view-wire" }
 # the ducktape CLI's argument grammar (derive). already in the graph
 # transitively, so this costs no new compilation unit.
 clap = { version = "4.6", features = ["derive"] }

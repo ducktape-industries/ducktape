@@ -12,7 +12,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 futures.workspace = true
 pulldown-cmark = "0.12.2"
-ui-lang-wire.workspace = true
+view-wire.workspace = true
 # Shared document font families for Markdown presentation.
 design = { path = "../support/design" }
 serde.workspace = true

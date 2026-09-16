@@ -184,7 +184,7 @@ async fn judge(
     if !honest_core {
         return Some(Refusal::CoreChangesToo);
     }
-    let speaks_our_wire = ui_lang_wire::manifest::read_manifest(&view.component)
+    let speaks_our_wire = view_wire::manifest::read_manifest(&view.component)
         .is_some_and(|manifest| manifest.check_wire_protocol().is_ok());
     if !speaks_our_wire {
         return Some(Refusal::WireProtocol);

@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use crate::editor::wire::EditorStore;
 use gpui_kit::AppContext as _;
 use pictures::Pictures;
-use ui_lang_wire as wire;
+use view_wire as wire;
 use wasmtime::component::{Component, Linker, TypedFunc};
 use wasmtime::{
     Cache, CacheConfig, Config, Engine, OptLevel, Store, StoreContextMut, StoreLimits,
@@ -2514,7 +2514,7 @@ impl Guest {
             ));
         }
         // its preferred size is for placing a new window; the tab embeds
-        ui_lang_wire::manifest::read_manifest(bytes)
+        view_wire::manifest::read_manifest(bytes)
             .ok_or_else(|| format!("{shown}: the component's manifest cannot be read"))?
             .check_wire_protocol()
             .map_err(|error| format!("{shown}: {error}"))?;
@@ -2548,7 +2548,7 @@ impl Guest {
             },
         );
         store.limiter(|state| &mut state.limits);
-        // The `ice:view` world's one import is the panic hook's; anything
+        // The `ducktape:view` world's one import is the panic hook's; anything
         // else the component asks for traps if it is ever called.
         let mut linker = Linker::<HostState>::new(engine);
         linker
@@ -3072,7 +3072,7 @@ mod surfaces;
 /// The name a component's manifest gives it; "" for one whose manifest
 /// cannot be read (`compile` refuses those before a seat).
 fn manifest_name(bytes: &[u8]) -> String {
-    ui_lang_wire::manifest::read_manifest(bytes)
+    view_wire::manifest::read_manifest(bytes)
         .map(|manifest| manifest.name)
         .unwrap_or_default()
 }
@@ -7593,10 +7593,10 @@ pub(crate) mod tests {
     fn a_view_carries_a_readable_manifest() {
         if let Some(staged) = staged("governance") {
             let bytes = std::fs::read(staged).expect("the staged view");
-            let manifest = ui_lang_wire::manifest::read_manifest(&bytes).expect("a manifest");
+            let manifest = view_wire::manifest::read_manifest(&bytes).expect("a manifest");
             assert_eq!(manifest.name, "Approvals");
             assert!(
-                ui_lang_wire::manifest::read_manifest(b"\0asm\x01\0\0\0").is_none(),
+                view_wire::manifest::read_manifest(b"\0asm\x01\0\0\0").is_none(),
                 "a bare core module has no manifest"
             );
         }

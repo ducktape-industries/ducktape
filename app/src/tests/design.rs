@@ -1,7 +1,7 @@
 //! Native layout and authored WASM presentation contracts.
 use super::*;
 use gpui_kit::{AppContext, px, size};
-use ui_lang_wire as wire;
+use view_wire as wire;
 
 #[test]
 fn full_view_fits_the_default_test_stack() {

@@ -22,7 +22,7 @@ mod view_abi {
             wasmtime::component::bindgen!({ inline: $wit, world: "view" });
         };
     }
-    ui_lang_wire::with_view_wit!(bindings);
+    view_wire::with_view_wit!(bindings);
 }
 
 /// a boxed, non-`Send` future (the host and every store are `!Send`).
@@ -468,7 +468,7 @@ fn validate_module(
 }
 
 fn validate_view(bytes: &[u8]) -> Result<(), String> {
-    ui_lang_wire::manifest::read_manifest(bytes)
+    view_wire::manifest::read_manifest(bytes)
         .ok_or_else(|| "invalid Ice view manifest".to_string())?;
     let engine = wasmtime::Engine::default();
     let component = wasmtime::component::Component::from_binary(&engine, bytes)

@@ -25,8 +25,8 @@ testkit = ["dep:nettest"]
 verify = ["provider-host/verify"]
 
 [dependencies]
-# Static Ice view readiness; no graphics or guest execution.
-ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "3d8ba98833c48e030e1b955ac2799bc27755b2bf", features = ["manifest"] }
+# Static view readiness; no graphics or guest execution.
+view-wire = { workspace = true, features = ["manifest"] }
 wasmtime.workspace = true
 
 node-work = { workspace = true }

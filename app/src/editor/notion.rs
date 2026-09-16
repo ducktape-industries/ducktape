@@ -16,7 +16,7 @@ use gpui_notion::editor::theme::ActiveEditorTheme as _;
 use gpui_notion::editor::toolbar::{ToolbarAction, ToolbarItem};
 use gpui_notion::editor::slash::{ApplicationMenu, ApplicationMenuAnchor, MenuAction};
 use gpui_notion::editor::view::{Caret, DocumentChanged, SelectionChanged};
-use ui_lang_wire as wire;
+use view_wire as wire;
 use wire::editor_presentation::EditorMargin;
 
 /// Register gpui-notion after `gpui_kit::init`. The guest already sizes and

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-pub use ui_lang_wire as wire;
+pub use view_wire as wire;
 pub use wit_bindgen;
 
 use futures::StreamExt;
@@ -542,9 +542,9 @@ macro_rules! export_app {
             fn restore(bytes: &[u8]) -> ::std::result::Result<Self, ::std::string::String> { <$app>::restore(bytes) }
         }
 
-        const MANIFEST: &str = concat!("ice.manifest.v2\n", $name, "\n", $description, "\n" $(, $capability, ",")*, "\n");
+        const MANIFEST: &str = concat!("ducktape.view.manifest.v1\n", $name, "\n", $description, "\n" $(, $capability, ",")*, "\n");
 
-        #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "ice.manifest"))]
+        #[cfg_attr(target_arch = "wasm32", unsafe(link_section = "ducktape.view.manifest"))]
         #[used]
         static MANIFEST_SECTION: [u8; MANIFEST.len() + <$app>::PREFERRED_WINDOW_SIZE.len() + 2 + $crate::wire::WIRE_EPOCH.ilog10() as usize] =
             $crate::manifest_bytes(MANIFEST, <$app>::PREFERRED_WINDOW_SIZE);

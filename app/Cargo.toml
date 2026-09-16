@@ -117,7 +117,7 @@ zeroize.workspace = true
 # events cross on, and the runtime that executes the view's component. The
 # same wasmtime pin as the node — a view is not consensus, but one runtime
 # in one binary is one set of semantics to reason about.
-ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "3d8ba98833c48e030e1b955ac2799bc27755b2bf", features = ["manifest"] }
+view-wire = { workspace = true, features = ["manifest"] }
 wasmtime.workspace = true
 
 # The native notification leg (`src/backend/notify.rs`): being @mentioned or
