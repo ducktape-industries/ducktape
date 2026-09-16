@@ -23,6 +23,8 @@ fn node_ending(frame: &Frame, suffix: &str) -> Node {
 const THIS_NODE: &str = "01020304";
 /// The resident's key: a live peer, and the ballot's subject.
 const RESIDENT: &str = "05060708";
+/// Another network's validator — the seat this node does NOT hold.
+const STRANGER: &str = "09090909";
 /// The height the roster is read at — the ballot's proposal id carries it.
 const HEIGHT: i64 = 42;
 
@@ -46,10 +48,9 @@ fn request<'a>(frame: &'a Frame, kind: &str) -> &'a Request {
         .unwrap_or_else(|| panic!("no `{kind}` request in {:?}", frame.requests))
 }
 
-fn session(connected: bool, admin: bool) -> Vec<u8> {
+fn session(connected: bool) -> Vec<u8> {
     serde_json::to_vec(&Session {
         connected,
-        admin,
         dark: false,
     })
     .expect("session encodes")
@@ -61,10 +62,14 @@ fn json(value: serde_json::Value) -> Vec<u8> {
 
 /// Boots, connects, and answers the whole roster read: the frame with the
 /// roster on screen, and the id of the live subscription.
-fn connected_roster(admin: bool) -> (Frame, u64) {
+///
+/// `holds_a_seat` decides who the VALSET names as validator — this node or
+/// a stranger. Nothing in the session says it: the view's authority is its
+/// own fold of that answer, so this knob is the only way to move it.
+fn connected_roster(holds_a_seat: bool) -> (Frame, u64) {
     let frame = boot();
     let session_id = request(&frame, "members.props").id;
-    let frame = tick_native(vec![item(session_id, &session(true, admin))]);
+    let frame = tick_native(vec![item(session_id, &session(true))]);
     let live = request(&frame, "rpc.live").id;
 
     let status = request(&frame, "rpc.status").id;
@@ -79,10 +84,14 @@ fn connected_roster(admin: bool) -> (Frame, u64) {
         &json(serde_json::json!({ "peers": [{ "connected": true, "peer": RESIDENT }] })),
     )]);
 
+    let seated = match holds_a_seat {
+        true => [1, 2, 3, 4],
+        false => [9, 9, 9, 9],
+    };
     let validators = request(&frame, "rpc.query").id;
     let frame = tick_native(vec![answer(
         validators,
-        &json(serde_json::json!({ "validators": [[1, 2, 3, 4]] })),
+        &json(serde_json::json!({ "validators": [seated] })),
     )]);
 
     let residents = request(&frame, "rpc.query").id;
@@ -105,8 +114,8 @@ fn connected_roster(admin: bool) -> (Frame, u64) {
 }
 
 /// Boots connected, then opens the record for `label`.
-fn opened(admin: bool, label: &str) -> Frame {
-    let (frame, _) = connected_roster(admin);
+fn opened(holds_a_seat: bool, label: &str) -> Frame {
+    let (frame, _) = connected_roster(holds_a_seat);
     assert!(has_text(&frame, label), "{:?}", texts(&frame));
     tick_native(press(&frame, label))
 }
@@ -262,7 +271,7 @@ fn a_pause_leaves_as_a_signed_runs_op() {
 fn the_list_says_it_is_reading_until_the_roster_answers() {
     let frame = boot();
     let session_id = request(&frame, "members.props").id;
-    let frame = tick_native(vec![item(session_id, &session(true, false))]);
+    let frame = tick_native(vec![item(session_id, &session(true))]);
     assert!(
         has_text(&frame, "Reading the roster…"),
         "{:?}",
@@ -270,7 +279,7 @@ fn the_list_says_it_is_reading_until_the_roster_answers() {
     );
     assert!(!has_text(&frame, "No members yet"), "{:?}", texts(&frame));
 
-    let (frame, _) = connected_roster(false);
+    let (frame, _) = connected_roster(true);
     assert!(
         !has_text(&frame, "Reading the roster…"),
         "{:?}",
@@ -286,7 +295,7 @@ fn the_list_says_it_is_reading_until_the_roster_answers() {
 fn a_roster_refusal_reads_as_a_sentence() {
     let frame = boot();
     let session_id = request(&frame, "members.props").id;
-    let frame = tick_native(vec![item(session_id, &session(true, false))]);
+    let frame = tick_native(vec![item(session_id, &session(true))]);
     let status = request(&frame, "rpc.status").id;
     let frame = tick_native(vec![refuse(status, "not connected to a node")]);
     assert!(
@@ -374,6 +383,69 @@ fn every_row_cell_keeps_one_line() {
             "cells that may wrap in a fixed-height box, with {label} open: {wrapping:?}"
         );
     }
+}
+
+/// THE SEAT WORD AND THE BALLOT GATE ARE ONE FOLD, AND IT IS THE VIEW'S.
+///
+/// The session carries no standing at all; only the valset's own answer
+/// does. So the single knob that moves the word on this node's row —
+/// `Validator` when the valset seats it, absent from the roster when it
+/// seats a stranger — is the same knob that decides whether a ballot may be
+/// opened. A host that computed either one could be contradicted by the
+/// other; folded here, they cannot disagree, and swapping this view
+/// re-decides both.
+#[test]
+fn the_seat_word_and_the_ballot_gate_are_folded_from_the_valset_answer() {
+    let (seated, _) = connected_roster(true);
+    for expected in [THIS_NODE, "Validator", RESIDENT, "Resident"] {
+        assert!(
+            has_text(&seated, expected),
+            "missing {expected:?} in {:?}",
+            texts(&seated)
+        );
+    }
+    assert!(!has_text(&seated, STRANGER), "{:?}", texts(&seated));
+
+    let (unseated, _) = connected_roster(false);
+    assert!(has_text(&unseated, STRANGER), "{:?}", texts(&unseated));
+    assert!(!has_text(&unseated, THIS_NODE), "{:?}", texts(&unseated));
+
+    let frame = opened(true, RESIDENT);
+    assert!(
+        has_text(&frame, "Promote to validator"),
+        "{:?}",
+        texts(&frame)
+    );
+}
+
+/// The kernel has no say in this node's standing: `members.props` carries
+/// no such field, and the one assignment to `admin` reads the rows the view
+/// folded itself. A prop sneaking back would make the host the decider
+/// again with nothing on screen to show for it — so the shape is parsed,
+/// not just commented.
+#[test]
+fn no_session_prop_can_decide_this_nodes_standing() {
+    let session = include_str!("../src/host.rs")
+        .split_once("pub struct Session {")
+        .expect("the session block")
+        .1
+        .split_once('}')
+        .expect("the session block ends")
+        .0;
+    assert!(
+        !session.contains("admin") && !session.contains("tier"),
+        "the kernel pushes no standing: {session:?}"
+    );
+    let view = include_str!("../src/lib.rs");
+    assert_eq!(
+        view.matches("self.admin =").count(),
+        1,
+        "one writer of the seat flag"
+    );
+    assert!(
+        view.contains("self.admin = crate::host::roster_is_admin(&self.rows);"),
+        "and it folds the rows the view read itself"
+    );
 }
 
 /// An admin opens a ballot over a resident: `op.submit` carrying the

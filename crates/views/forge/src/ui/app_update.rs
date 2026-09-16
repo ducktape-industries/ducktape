@@ -4,6 +4,7 @@ impl super::ForgeView {
         match message {
             Message::Composer(message) => self.on_composer(*message),
             Message::SessionArrived(item) => self.on_session_arrived(item),
+            Message::SeatArrived(item) => self.on_seat_arrived(item),
             Message::ForgeLandLink(url) => self.on_forge_land_link(url),
             Message::ReposArrived(next) => self.on_repos_arrived(next),
             Message::RepoArrived(next) => self.on_repo_arrived(next),
@@ -62,7 +63,6 @@ impl super::ForgeView {
         self.dark = next.dark;
         self.org = next.org.to_owned();
         self.about = next.about.to_owned();
-        self.tier = next.tier.to_owned();
         self.network_chain_id = next.network_chain_id.to_owned();
         self.connected_rpc = next.connected_rpc.to_owned();
         let routed = next.link_tick != self.link_tick;
@@ -70,6 +70,19 @@ impl super::ForgeView {
         ducktape_view_guest::Task::done(Message::ForgeLandLink(crate::host::routed_link(
             routed, &next.link,
         )))
+    }
+
+    fn on_seat_arrived(
+        &mut self,
+        item: crate::host::SeatItem,
+    ) -> ducktape_view_guest::Task<Message> {
+        let refused = !(item.error).is_empty();
+        if refused {
+            self.host_error = item.error;
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.tier = item.tier;
+        ::ducktape_view_guest::Task::none()
     }
 
     fn on_forge_land_link(&mut self, url: String) -> ducktape_view_guest::Task<Message> {

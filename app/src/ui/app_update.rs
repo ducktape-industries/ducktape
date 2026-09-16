@@ -20,9 +20,6 @@ impl Ducktape {
             AppMessage::BellLoadReply(request_generation, reply_message) => {
                 self.on_bell_load_reply(request_generation, reply_message)
             }
-            AppMessage::MembersLoadReply(request_generation, reply_message) => {
-                self.on_members_load_reply(request_generation, reply_message)
-            }
             AppMessage::SettingsLoadReply(request_generation, reply_message) => {
                 self.on_settings_load_reply(request_generation, reply_message)
             }
@@ -102,7 +99,6 @@ impl Ducktape {
             AppMessage::LiveResynced(next) => self.on_live_resynced(next),
             AppMessage::LiveResyncFailed(cause) => self.on_live_resync_failed(cause),
             AppMessage::SelectShellTab(next) => self.on_select_shell_tab(next),
-            AppMessage::MembersLoadSelected(request) => self.on_members_load_selected(request),
             AppMessage::SettingsLoadSelected(request) => self.on_settings_load_selected(request),
             AppMessage::AccountLoadSelected(request) => self.on_account_load_selected(request),
             AppMessage::DmPeersLoadSelected(request) => self.on_dm_peers_load_selected(request),
@@ -140,8 +136,6 @@ impl Ducktape {
             AppMessage::OpenRunPanel(dispatch_id) => self.on_open_run_panel(dispatch_id),
             AppMessage::GovernanceViewEvent(event) => self.on_governance_view_event(event),
             AppMessage::MembersViewEvent(event) => self.on_members_view_event(event),
-            AppMessage::MembersLoaded(next) => self.on_members_loaded(next),
-            AppMessage::MembersFailed(cause) => self.on_members_failed(cause),
             AppMessage::DmPeersLoaded(next) => self.on_dm_peers_loaded(next),
             AppMessage::DmPeersFailed(cause) => self.on_dm_peers_failed(cause),
             AppMessage::AgentsViewEvent(event) => self.on_agents_view_event(event),
@@ -349,17 +343,6 @@ impl Ducktape {
     ) -> Task<AppMessage> {
         if self.bell_load_generation == request_generation {
             self.bell_load_task = None;
-            return self.update(*reply_message);
-        }
-        Task::none()
-    }
-    fn on_members_load_reply(
-        &mut self,
-        request_generation: u64,
-        reply_message: Box<AppMessage>,
-    ) -> Task<AppMessage> {
-        if self.members_load_generation == request_generation {
-            self.members_load_task = None;
             return self.update(*reply_message);
         }
         Task::none()
@@ -772,7 +755,6 @@ impl Ducktape {
         if entering {
             self.onboarding_error.clear();
         }
-        self.members_generation += 1;
         self.agents_open_run = "".to_owned();
         self.agents_live = false;
         self.account_generation += 1;
@@ -857,30 +839,6 @@ impl Ducktape {
                 }
                 pending_task.map(move |reply_message| {
                     AppMessage::BellLoadReply(request_generation, Box::new(reply_message))
-                })
-            },
-            {
-                let pending_task = Task::perform(
-                    crate::backend::load_members(
-                        self.connected_rpc.to_owned(),
-                        self.members_generation,
-                    ),
-                    |result| match result {
-                        Ok(value) => AppMessage::MembersLoaded(value),
-                        Err(error) => AppMessage::MembersFailed(error),
-                    },
-                );
-                self.members_load_generation = self.members_load_generation.wrapping_add(1);
-                let request_generation = self.members_load_generation;
-                let (pending_task, request_handle) = pending_task.abortable();
-                if let Some(previous_handle) = self
-                    .members_load_task
-                    .replace(request_handle.abort_on_drop())
-                {
-                    previous_handle.abort();
-                }
-                pending_task.map(move |reply_message| {
-                    AppMessage::MembersLoadReply(request_generation, Box::new(reply_message))
                 })
             },
             {
@@ -1121,15 +1079,6 @@ impl Ducktape {
             LiveKind::Plane => {
                 self.views_live_serial =
                     crate::module_view::view_live_hit(&(next.module), self.views_live_serial);
-                self.members_generation = crate::backend::keep_i64(
-                    crate::backend::plane_live_hit(
-                        next.kind,
-                        next.module.to_owned(),
-                        "valset".to_owned(),
-                    ),
-                    self.members_generation + 1,
-                    self.members_generation,
-                );
                 self.account_generation = crate::backend::keep_i64(
                     crate::backend::plane_live_hit(
                         next.kind,
@@ -1149,18 +1098,6 @@ impl Ducktape {
                     self.dm_peers_generation,
                 );
                 Task::batch([
-                    Task::done(crate::backend::load_request(
-                        crate::backend::plane_live_hit(
-                            next.kind,
-                            next.module.to_owned(),
-                            "valset".to_owned(),
-                        ),
-                        self.connected_rpc.to_owned(),
-                        "".to_owned(),
-                        self.members_generation,
-                    ))
-                    .and_then(Task::done)
-                    .map(AppMessage::MembersLoadSelected),
                     Task::done(crate::backend::load_request(
                         crate::backend::plane_live_hit(
                             next.kind,
@@ -1359,22 +1296,12 @@ impl Ducktape {
         if (self.shell_tab == ShellTab::Chat) || (self.shell_tab == ShellTab::Pages) {
             return Task::none();
         }
-        self.members_generation += 1;
-        self.account_generation += 1;
         self.settings_generation = crate::backend::keep_i64(
             self.shell_tab == ShellTab::Settings,
             self.settings_generation + 1,
             self.settings_generation,
         );
         Task::batch([
-            Task::done(crate::backend::load_request(
-                crate::backend::tab_reads_plane(self.shell_tab, "members".to_owned()),
-                self.connected_rpc.to_owned(),
-                "".to_owned(),
-                self.members_generation,
-            ))
-            .and_then(Task::done)
-            .map(AppMessage::MembersLoadSelected),
             Task::done(crate::backend::load_request(
                 self.shell_tab == ShellTab::Settings,
                 self.connected_rpc.to_owned(),
@@ -1392,35 +1319,6 @@ impl Ducktape {
             .and_then(Task::done)
             .map(AppMessage::AccountLoadSelected),
         ])
-    }
-    fn on_members_load_selected(
-        &mut self,
-        request: crate::backend::LoadRequest,
-    ) -> Task<AppMessage> {
-        let obsolete_request =
-            (request.rpc != self.connected_rpc) || (request.generation != self.members_generation);
-        if obsolete_request {
-            return Task::none();
-        }
-        let pending_task = Task::perform(
-            crate::backend::load_members(request.rpc.to_owned(), request.generation),
-            |result| match result {
-                Ok(value) => AppMessage::MembersLoaded(value),
-                Err(error) => AppMessage::MembersFailed(error),
-            },
-        );
-        self.members_load_generation = self.members_load_generation.wrapping_add(1);
-        let request_generation = self.members_load_generation;
-        let (pending_task, request_handle) = pending_task.abortable();
-        if let Some(previous_handle) = self
-            .members_load_task
-            .replace(request_handle.abort_on_drop())
-        {
-            previous_handle.abort();
-        }
-        pending_task.map(move |reply_message| {
-            AppMessage::MembersLoadReply(request_generation, Box::new(reply_message))
-        })
     }
     fn on_settings_load_selected(
         &mut self,
@@ -2209,20 +2107,6 @@ impl Ducktape {
         self.toast = crate::module_view::event_text(&(event), "label");
         self.toast_age = 0;
         crate::shell::clipboard::<AppMessage>(crate::module_view::event_text(&(event), "text"))
-    }
-    fn on_members_loaded(&mut self, next: crate::backend::MembersData) -> Task<AppMessage> {
-        if next.generation != self.members_generation {
-            return Task::none();
-        }
-        self.members_answered = true;
-        self.members_rows = next.members.clone();
-        Task::none()
-    }
-    fn on_members_failed(&mut self, cause: crate::backend::HydrationError) -> Task<AppMessage> {
-        if cause.generation != self.members_generation {
-            return Task::none();
-        }
-        Task::none()
     }
     fn on_dm_peers_loaded(&mut self, _generation: i64) -> Task<AppMessage> {
         Task::none()

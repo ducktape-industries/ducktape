@@ -127,7 +127,6 @@ fn session(link: &str) -> Vec<u8> {
         dark: false,
         org: "duckhouse".into(),
         about: "a pond".into(),
-        tier: "validator".into(),
         network_chain_id: "mynet#d0cdf950".into(),
         connected_rpc: "http://127.0.0.1:1".into(),
         link: link.into(),

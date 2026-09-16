@@ -869,7 +869,6 @@ fn forge_wasm_merges_through_the_real_service(cx: &mut TestAppContext) {
             "",
             "",
             "",
-            "",
             &rpc,
             "duck://forge/wasm-merge/1",
             1,

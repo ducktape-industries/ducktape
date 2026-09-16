@@ -56,7 +56,6 @@ impl Ducktape {
                     self.connected,
                     &self.network_name,
                     &self.account_bio,
-                    &crate::backend::member_tier(&self.members_rows),
                     &self.network_chain_id,
                     &self.connected_rpc,
                     &self.forge_link,
@@ -102,8 +101,6 @@ impl Ducktape {
                 crate::module_view::node_view(
                     self.is_dark(),
                     self.connected,
-                    crate::backend::members_is_admin(&self.members_rows),
-                    &crate::backend::member_tier(&self.members_rows),
                     &self.status,
                     &self.node_data_dir,
                     self.wall_now,
@@ -111,19 +108,11 @@ impl Ducktape {
                 AppMessage::NodeViewEvent,
             ),
             ShellTab::Members => (
-                crate::module_view::members_view(
-                    self.is_dark(),
-                    self.connected,
-                    crate::backend::members_is_admin(&self.members_rows),
-                ),
+                crate::module_view::members_view(self.is_dark(), self.connected),
                 AppMessage::MembersViewEvent,
             ),
             ShellTab::Governance => (
-                crate::module_view::governance_view(
-                    self.is_dark(),
-                    self.connected,
-                    crate::backend::members_is_admin(&self.members_rows),
-                ),
+                crate::module_view::governance_view(self.is_dark(), self.connected),
                 AppMessage::GovernanceViewEvent,
             ),
             ShellTab::Settings => (

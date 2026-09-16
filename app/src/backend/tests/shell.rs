@@ -71,45 +71,51 @@ fn a_chat_load_answers_for_the_huddle_only_when_it_loaded_the_huddles_channel() 
     assert_eq!(quiet, joined);
 }
 
+/// THE ROSTER IS NOT THE HOST'S. Who a network calls a validator, who it
+/// calls a resident, and whether THIS node may act on either are folds of
+/// `valset` — and every screen that draws one reads it for itself through
+/// the kernel. A host-side row type is how those folds diverge: the app
+/// would decide the gate while the view decided the word, and a view swap
+/// could no longer change either. The directory beneath is walked rather
+/// than a fixed file list, so a new backend file cannot reintroduce one.
 #[test]
-fn the_roster_answers_admin_tier_and_filters() {
-    let rows = vec![
-        MemberRow {
-            key: "aa".into(),
-            label: "aa".into(),
-            role: "validator".into(),
-            is_this_node: true,
-            is_agent: false,
-            model: String::new(),
-            live: true,
-        },
-        MemberRow {
-            key: "bb".into(),
-            label: "bb".into(),
-            role: "resident".into(),
-            is_this_node: false,
-            is_agent: false,
-            model: String::new(),
-            live: false,
-        },
-        MemberRow {
-            key: "triage".into(),
-            label: "triage".into(),
-            role: "agent".into(),
-            is_this_node: false,
-            is_agent: true,
-            model: "codex".into(),
-            live: true,
-        },
-    ];
-    assert!(members_is_admin(&rows));
-    assert_eq!(member_tier(&rows), "validator");
-    // the two halves of "no row for this node", kept apart: an unanswered
-    // roster is unknown, an answered one without this node is a real guest.
-    assert_eq!(member_tier(&[]), "");
-    let mut answered_without_this_node = rows.clone();
-    answered_without_this_node[0].is_this_node = false;
-    assert_eq!(member_tier(&answered_without_this_node), "guest");
+fn the_backend_builds_no_roster_of_its_own() {
+    let backend = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backend");
+    let mut offenders = Vec::new();
+    let mut pending = vec![backend.clone()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("the backend directory is readable") {
+            let path = entry.expect("a backend entry").path();
+            if path.is_dir() {
+                // this walk names the banned symbols, and it lives here
+                let is_the_suite = path.file_name().is_some_and(|name| name == "tests");
+                if !is_the_suite {
+                    pending.push(path);
+                }
+                continue;
+            }
+            if path.extension().is_none_or(|kind| kind != "rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("a backend file is readable");
+            let named = [
+                "MemberRow",
+                "MembersData",
+                "load_members",
+                "members_is_admin",
+            ]
+            .into_iter()
+            .filter(|name| source.contains(name))
+            .collect::<Vec<_>>();
+            if !named.is_empty() {
+                offenders.push(format!("{}: {named:?}", path.display()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "the roster belongs to the members view: {offenders:?}"
+    );
 }
 
 #[test]
@@ -191,22 +197,13 @@ fn a_tab_move_only_refetches_what_its_destination_draws() {
         ShellTab::Settings,
     ];
 
-    // the roster is drawn by five panes: its own, the admin gate under
-    // Approvals, the forge write gate, the Node permissions, and the Settings
-    // standing card. The rest are narrow: Settings draws the account card,
-    // Forge the org "about", and proposals and agent rows belong to one pane
-    // each.
+    // every plane left is one pane's: Settings draws the account card, Forge
+    // the org "about", and proposals and agent rows belong to one pane each.
+    // The ROSTER is on no line here at all — the members, governance, node,
+    // forge and settings views each read the valset for themselves, so no tab
+    // click loads one.
     for (plane, drawn) in [
-        (
-            "members",
-            &[
-                ShellTab::Forge,
-                ShellTab::Node,
-                ShellTab::Members,
-                ShellTab::Governance,
-                ShellTab::Settings,
-            ][..],
-        ),
+        ("members", &[][..]),
         ("governance", &[ShellTab::Governance][..]),
         ("agents", &[ShellTab::Agents][..]),
         ("account", &[ShellTab::Forge, ShellTab::Settings][..]),

@@ -2,9 +2,11 @@
 //! standing, peers, the log ring and the code registry, rendered from a
 //! wasm component the desktop app loads from a file.
 //!
-//! The kernel pushes session facts only (`node.props`: connected, dark, this
-//! seat's admin standing and tier, the app's connection reading, the
-//! daemon's workspace directory and the wall clock). The node's own facts,
+//! The kernel pushes session facts only (`node.props`: connected, dark, the
+//! app's connection reading, the daemon's workspace directory and the wall
+//! clock). This node's STANDING is not among them — the view folds it off
+//! `rpc.status` and the valset, so the badge and the gate that reads it
+//! move together. The node's own facts,
 //! its peers and its code registry are read here through the kernel's
 //! `rpc.status` / `rpc.peers` / `rpc.query`, re-read on every `rpc.live` hit
 //! for the `block` plane, and the log ring arrives through `rpc.stream` on
@@ -49,6 +51,7 @@ pub struct NodeView {
 #[derive(Clone, Debug)]
 pub enum Message {
     SessionArrived(crate::host::SessionItem),
+    StandingArrived(crate::host::StandingItem),
     FactsArrived(crate::host::FactsItem),
     PeersArrived(crate::host::PeersItem),
     ModulesArrived(crate::host::ModulesItem),
@@ -124,6 +127,7 @@ impl NodeView {
             return Subscription::batch(subscriptions);
         }
         subscriptions.push(host::facts(self.connection_serial).map(Message::FactsArrived));
+        subscriptions.push(host::standing(self.connection_serial).map(Message::StandingArrived));
         let tab = match self.node_tab {
             NodeTab::Overview => host::peers(self.connection_serial).map(Message::PeersArrived),
             NodeTab::Permissions => Subscription::none(),
@@ -184,6 +188,7 @@ impl NodeView {
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::SessionArrived(item) => self.on_session_arrived(item),
+            Message::StandingArrived(item) => self.on_standing_arrived(item),
             Message::FactsArrived(item) => self.on_facts_arrived(item),
             Message::PeersArrived(item) => self.on_peers_arrived(item),
             Message::ModulesArrived(item) => self.on_modules_arrived(item),
@@ -211,11 +216,19 @@ impl NodeView {
         );
         self.connected = next.connected;
         self.dark = next.dark;
-        self.admin = next.admin;
-        self.tier = next.tier;
         self.status = next.status;
         self.node_data_dir = next.data_dir;
         self.wall_now = next.wall_now;
+        Task::none()
+    }
+    fn on_standing_arrived(&mut self, item: crate::host::StandingItem) -> Task<Message> {
+        let refused = !(item.error).is_empty();
+        if refused {
+            self.host_error = item.error;
+            return Task::none();
+        }
+        self.admin = item.next.admin;
+        self.tier = item.next.tier;
         Task::none()
     }
     fn on_facts_arrived(&mut self, item: crate::host::FactsItem) -> Task<Message> {

@@ -2,12 +2,12 @@
 //! the node itself.
 //!
 //! The kernel pushes SESSION FACTS ONLY (`node.props`: connected, dark,
-//! whether this seat is an admin, its standing, the app's connection
-//! reading, the workspace directory the daemon runs out of, and the wall
-//! clock — the four things no `/v1` route publishes). Everything the node
-//! itself knows is read HERE: `rpc.status` for the consensus and sync
-//! facts, `rpc.peers` for the mesh sample, `rpc.status` + a `modules` query
-//! for the code registry, each re-read on every `rpc.live` hit for the
+//! the app's connection reading, the workspace directory the daemon runs
+//! out of, and the wall clock — the four things no `/v1` route publishes).
+//! Everything the node itself knows is read HERE: `rpc.status` for the
+//! consensus and sync facts, `rpc.status` + the valset for THIS NODE'S OWN
+//! STANDING, `rpc.peers` for the mesh sample, `rpc.status` + a `modules`
+//! query for the code registry, each re-read on every `rpc.live` hit for the
 //! `block` plane; and the node's OWN LOG RING through `rpc.stream` on the
 //! `logs` topic, one frame at a time, folded into the timeline this view
 //! holds. The live tracing filter is one `rpc.admin` POST the kernel signs
@@ -27,6 +27,10 @@ use serde::{Deserialize, Serialize};
 /// The plane every block moves: this view re-reads the node's own facts on
 /// it, because a height, a checkpoint and a peer sample answer to no module.
 const BLOCK_PLANE: &[u8] = b"block";
+
+/// The plane a seat changes on: this node's standing is re-read when the
+/// valset module commits, not on every block.
+const VALSET_PLANE: &[u8] = b"valset";
 
 /// The node's own log ring, as a `/v1/ws` topic.
 const LOGS_TOPIC: &str = "logs";
@@ -50,15 +54,13 @@ pub struct HostError {
 // ---------- the session ----------
 
 /// What the kernel knows and this view cannot: whether there is a node,
-/// the colour mode, this seat's standing on the network, the app's own
-/// connection reading, the directory the daemon runs out of, and the clock.
+/// the colour mode, the app's own connection reading, the directory the
+/// daemon runs out of, and the clock. NOT this node's standing — the view
+/// folds that off the valset itself ([`standing`]).
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub connected: bool,
     pub dark: bool,
-    pub admin: bool,
-    /// `validator` | `resident` | `guest`, or "" while the roster is silent
-    pub tier: String,
     /// the app's connection reading — `Live`, `Offline`, `Sync delayed`
     pub status: String,
     /// the workspace directory this daemon runs out of; no `/v1` route
@@ -119,6 +121,97 @@ async fn status_json() -> Result<serde_json::Value, String> {
 /// are re-read on.
 fn every_block() -> impl Stream<Item = host::Answer> {
     host::subscribe("rpc.live", BLOCK_PLANE)
+}
+
+// ---------- this node's standing ----------
+
+/// What this node may do on its own network: its seat word, and whether
+/// that seat is a quorum one.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Standing {
+    /// `validator` | `resident` | `guest`, or "" while the valset is silent
+    pub tier: String,
+    pub admin: bool,
+}
+
+/// One item of the standing subscription: the reading, or why not.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct StandingItem {
+    pub next: Standing,
+    pub error: String,
+}
+
+/// This node's standing now and after every valset block. The screen's
+/// tier badge, its capability marks and the live-filter gate all read it,
+/// and it is the view's own fold of `rpc.status` against the valset — no
+/// host prop carries it, so swapping this view re-decides what the card
+/// says this node is.
+pub fn standing(connection: i64) -> ducktape_view_guest::Subscription<StandingItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
+        let live = host::subscribe("rpc.live", VALSET_PLANE);
+        stream::once(load_standing()).chain(live.then(|_| load_standing()))
+    })
+}
+
+async fn load_standing() -> StandingItem {
+    match read_standing().await {
+        Ok(next) => StandingItem {
+            next,
+            error: String::new(),
+        },
+        Err(error) => StandingItem {
+            next: Standing::default(),
+            error,
+        },
+    }
+}
+
+async fn read_standing() -> Result<Standing, String> {
+    let status = status_json().await?;
+    let node_key = status["public_key"].as_str().unwrap_or_default().to_owned();
+    let validators = seat_keys(&valset("validators").await?, "validators");
+    let residents = seat_keys(&valset("residents").await?, "residents");
+    Ok(fold_standing(&node_key, &validators, &residents))
+}
+
+async fn valset(seat: &str) -> Result<serde_json::Value, String> {
+    ask(
+        "rpc.query",
+        &serde_json::json!({ "target": "valset", "query": seat }),
+    )
+    .await
+}
+
+/// A valset key list — `{"validators": [[byte, …], …]}` — as hex.
+pub fn seat_keys(reply: &serde_json::Value, seat: &str) -> Vec<String> {
+    reply[seat]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|key| hex_encode(&json_bytes(key)))
+        .collect()
+}
+
+/// This node's seat, as the two valset lists name it.
+///
+/// AN UNANSWERED VALSET IS NOT A GUEST. Folding silence into `guest` told a
+/// validator's operator — with no error anywhere on screen — that this
+/// device holds no seat. A valset that DID answer always carries the
+/// chain's own validators, so an empty pair of lists is silence and reads
+/// `""`; a valset that answered and holds no seat for this node is a real
+/// guest.
+pub fn fold_standing(node_key: &str, validators: &[String], residents: &[String]) -> Standing {
+    let silent = validators.is_empty() && residents.is_empty();
+    let admin = validators.iter().any(|key| key == node_key);
+    let resident = residents.iter().any(|key| key == node_key);
+    let tier = match (silent, admin, resident) {
+        (true, _, _) => String::new(),
+        (false, true, _) => "validator".into(),
+        (false, false, true) => "resident".into(),
+        (false, false, false) => "guest".into(),
+    };
+    Standing { tier, admin }
 }
 
 // ---------- the node's own facts ----------

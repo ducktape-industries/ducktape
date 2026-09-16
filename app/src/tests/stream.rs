@@ -42,24 +42,13 @@ fn a_plane_op_refetches_only_the_plane_it_names() {
         }));
     };
 
-    let (members, account, dm) = (
-        app.members_generation,
-        app.account_generation,
-        app.dm_peers_generation,
-    );
+    let (account, dm) = (app.account_generation, app.dm_peers_generation);
 
+    // the valset, governance and files planes are their VIEWS' to re-read,
+    // through the kernel's `rpc.live`; no app reading moves for any of them
     plane(&mut app, "valset");
-    assert_eq!(app.members_generation, members + 1, "valset feeds members");
-    assert_eq!(app.account_generation, account, "and nothing else");
-
-    // the governance and files planes are their VIEWS' to re-read, through
-    // the kernel's `rpc.live`; no app reading moves for either
     plane(&mut app, "governance");
-    assert_eq!(
-        app.members_generation,
-        members + 1,
-        "unchanged by governance"
-    );
+    assert_eq!(app.account_generation, account, "and nothing else");
 
     // identity feeds TWO surfaces: the account card and the DM directory.
     plane(&mut app, "identity");
@@ -74,13 +63,13 @@ fn a_plane_op_refetches_only_the_plane_it_names() {
     assert_eq!(app.account_generation, account + 1, "and nothing else");
 
     plane(&mut app, "files");
-    assert_eq!(app.members_generation, members + 1, "unchanged by files");
+    assert_eq!(app.account_generation, account + 1, "unchanged by files");
 
     // A module with no plane of its own moves nothing.
-    let before = app.members_generation;
+    let before = app.dm_peers_generation;
     plane(&mut app, "attribution");
     assert_eq!(
-        app.members_generation, before,
+        app.dm_peers_generation, before,
         "an unrouted module is inert"
     );
 }

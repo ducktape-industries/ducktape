@@ -47,18 +47,39 @@ fn request<'a>(frame: &'a Frame, kind: &str) -> &'a Request {
 fn session(connected: bool) -> Vec<u8> {
     serde_json::to_vec(&Session {
         connected,
-        admin: true,
         dark: false,
         tasting: Vec::new(),
     })
     .expect("session encodes")
 }
 
+/// This node's key, as `/v1/status` reports it and the valset lists it.
+const THIS_NODE: &str = "01020304";
+
+/// Answers the seat read the view starts on connect: `rpc.status`, then the
+/// valset's validators. `seated` is the ONE knob behind every ballot button
+/// on this screen, and it is the VALSET'S answer — the session carries no
+/// standing at all, so a host cannot decide who votes here.
+fn answer_seat(frame: &Frame, seated: bool) {
+    let status = request(frame, "rpc.status").id;
+    let frame = tick_native(vec![answer(
+        status,
+        serde_json::json!({ "public_key": THIS_NODE })
+            .to_string()
+            .as_bytes(),
+    )]);
+    let validators = match seated {
+        true => serde_json::json!({ "validators": [[1, 2, 3, 4]] }),
+        false => serde_json::json!({ "validators": [[9, 9, 9, 9]] }),
+    };
+    let query = request(&frame, "rpc.query").id;
+    tick_native(vec![answer(query, validators.to_string().as_bytes())]);
+}
+
 /// The session with one taste row for the open code ballot below.
 fn session_tasting(tasting: bool, reason: &str) -> Vec<u8> {
     serde_json::to_vec(&Session {
         connected: true,
-        admin: true,
         dark: false,
         tasting: vec![TasteRow {
             module: "chat".into(),
@@ -136,6 +157,7 @@ fn connected_with_register() -> (Frame, u64) {
     let frame = tick_native(vec![item(session_id, &session(true))]);
     let live = request(&frame, "rpc.live").id;
     let query = request(&frame, "rpc.query").id;
+    answer_seat(&frame, true);
     let frame = tick_native(vec![answer(query, &proposals())]);
     let blocks_id = request(&frame, "rpc.blocks").id;
     let frame = tick_native(vec![answer(blocks_id, &blocks())]);
@@ -287,20 +309,15 @@ fn a_register_still_being_read_is_not_an_empty_one() {
 }
 
 /// A node without validator standing reads every card but presses nothing:
-/// the ballot buttons are not there to refuse.
+/// the ballot buttons are not there to refuse. What makes it a reader is
+/// the VALSET's answer — the same session the validator above got.
 #[test]
 fn a_reader_without_standing_sees_the_tally_and_no_ballot() {
     let frame = boot();
     let session_id = request(&frame, "governance.props").id;
-    let reader = serde_json::to_vec(&Session {
-        connected: true,
-        admin: false,
-        dark: false,
-        tasting: Vec::new(),
-    })
-    .expect("session encodes");
-    let frame = tick_native(vec![item(session_id, &reader)]);
+    let frame = tick_native(vec![item(session_id, &session(true))]);
     let query = request(&frame, "rpc.query").id;
+    answer_seat(&frame, false);
     let frame = tick_native(vec![answer(query, &proposals())]);
     let blocks_id = request(&frame, "rpc.blocks").id;
     let frame = tick_native(vec![answer(blocks_id, &blocks())]);
@@ -333,6 +350,7 @@ fn a_met_rule_offers_settle_which_leaves_as_execute() {
     let session_id = request(&frame, "governance.props").id;
     let frame = tick_native(vec![item(session_id, &session(true))]);
     let query = request(&frame, "rpc.query").id;
+    answer_seat(&frame, true);
     let met = serde_json::json!({ "proposals": [{
         "proposal_id": "prop-met",
         "action": { "signal": { "text": "ship it" } },
@@ -449,6 +467,7 @@ fn every_row_cell_keeps_one_line() {
     let session_id = request(&ballot, "governance.props").id;
     let ballot = tick_native(vec![item(session_id, &session_tasting(false, ""))]);
     let query = request(&ballot, "rpc.query").id;
+    answer_seat(&ballot, true);
     let ballot = tick_native(vec![answer(query, &code_proposals())]);
     let refused = tick_native(vec![item(
         session_id,
@@ -489,6 +508,7 @@ fn a_code_ballots_view_can_be_tried_and_left_from_its_card() {
     let session_id = request(&frame, "governance.props").id;
     let frame = tick_native(vec![item(session_id, &session_tasting(false, ""))]);
     let query = request(&frame, "rpc.query").id;
+    answer_seat(&frame, true);
     let frame = tick_native(vec![answer(query, &code_proposals())]);
     assert!(has_text(&frame, "On the ballot"), "{:?}", texts(&frame));
     assert!(!has_text(&frame, "Back to current"), "{:?}", texts(&frame));

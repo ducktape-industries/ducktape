@@ -82,9 +82,8 @@ const RETRY_MAX: Duration = Duration::from_secs(60);
 /// register through `rpc.query` / `rpc.blocks` / `rpc.live`, and a vote or
 /// a settle comes back as `op.submit`, signed here with the seated key. The
 /// one event the app hears is the kernel's `badge` (the tab's open count).
-pub fn governance_view(dark: bool, connected: bool, admin: bool) -> ViewSpec {
+pub fn governance_view(dark: bool, connected: bool) -> ViewSpec {
     let props = serde_json::json!({
-        "admin": admin,
         "connected": connected,
         "dark": dark,
         "tasting": taste_props(),
@@ -101,9 +100,8 @@ pub fn governance_view(dark: bool, connected: bool, admin: bool) -> ViewSpec {
 /// reads the roster itself off the node and signs its writes through
 /// `op.submit`. The one intent left is `copy` (`text`, `label`) — the
 /// clipboard is an OS door the kernel has not opened.
-pub fn members_view(dark: bool, connected: bool, admin: bool) -> ViewSpec {
+pub fn members_view(dark: bool, connected: bool) -> ViewSpec {
     let props = serde_json::json!({
-        "admin": admin,
         "connected": connected,
         "dark": dark,
     });
@@ -187,8 +185,6 @@ pub fn event_int(event: &ModuleViewEvent, field: &str) -> i64 {
 pub fn node_view(
     dark: bool,
     connected: bool,
-    admin: bool,
-    tier: &str,
     status: &str,
     data_dir: &str,
     wall_now: i64,
@@ -196,8 +192,6 @@ pub fn node_view(
     let props = serde_json::json!({
         "connected": connected,
         "dark": dark,
-        "admin": admin,
-        "tier": tier,
         "status": status,
         "data_dir": data_dir,
         "wall_now": wall_now,
@@ -386,7 +380,6 @@ pub fn forge_view(
     connected: bool,
     org: &str,
     about: &str,
-    tier: &str,
     network_chain_id: &str,
     connected_rpc: &str,
     link: &str,
@@ -397,7 +390,6 @@ pub fn forge_view(
         "dark": dark,
         "org": org,
         "about": about,
-        "tier": tier,
         "network_chain_id": network_chain_id,
         "connected_rpc": connected_rpc,
         "link": link,
@@ -4132,8 +4124,9 @@ pub(crate) mod tests {
         guest.redraw(&session);
         assert_eq!(
             guest.live_subscriptions.len(),
-            1,
-            "the view holds one `rpc.live` subscription on its plane"
+            2,
+            "the register follows the governance plane; this node's own seat \
+             follows the valset"
         );
         // no node behind the kernel: the query is refused, and the view
         // says so in place
@@ -4654,7 +4647,7 @@ pub(crate) mod tests {
 
         let session = Some(
             serde_json::to_vec(&serde_json::json!({
-                "connected": true, "dark": false, "admin": true, "tier": "validator",
+                "connected": true, "dark": false,
                 "status": "Live", "data_dir": "/var/ducktape/demo", "wall_now": 1700000030
             }))
             .expect("props encode"),
@@ -4667,8 +4660,9 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             planes,
-            ["block", "block"],
-            "the status facts and the peers sample each follow the block plane"
+            ["block", "valset", "block"],
+            "the status facts and the peers sample follow the block plane; \
+             this node's standing follows the valset"
         );
         // no node behind the kernel: the status read is refused, and the
         // view says so in place — but the session facts are its own
@@ -5077,7 +5071,9 @@ pub(crate) mod tests {
         guest.redraw(&session);
         // one per open slice — the namespace, the repo, the item, the
         // browse — on the forge plane, plus the item's discussion on the
-        // CHAT plane, which is where a note it draws is committed
+        // CHAT plane, which is where a note it draws is committed, plus this
+        // node's own standing on the VALSET plane, which is the word the org
+        // head wears
         let planes: std::collections::BTreeSet<&str> = guest
             .live_subscriptions
             .iter()
@@ -5085,7 +5081,7 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             planes,
-            ["chat", "forge"].into_iter().collect(),
+            ["chat", "forge", "valset"].into_iter().collect(),
             "{:?}",
             guest.live_subscriptions
         );
@@ -5299,12 +5295,13 @@ pub(crate) mod tests {
         });
     }
 
-    /// The session facts a kernel-contract view is pushed: connected, as an
-    /// admin. Governance and members take the same three.
+    /// The session facts a kernel-contract view is pushed: connected, in
+    /// this colour, with the taste set. Whether this node may act is the
+    /// VIEW's own read of the valset, so it is not here.
     fn session_props() -> Option<Vec<u8>> {
         Some(
             serde_json::to_vec(&serde_json::json!({
-                "admin": true, "connected": true, "dark": false, "tasting": []
+                "connected": true, "dark": false, "tasting": []
             }))
             .expect("props encode"),
         )
@@ -6443,7 +6440,7 @@ pub(crate) mod tests {
         Some(
             br#"{
           "dark": false, "connected": true, "org": "duckhouse", "about": "",
-          "tier": "validator", "network_chain_id": "mynet#d0cdf950",
+          "network_chain_id": "mynet#d0cdf950",
           "connected_rpc": "http://127.0.0.1:1", "link": "", "link_tick": 0
         }"#
             .to_vec(),
@@ -6757,7 +6754,7 @@ pub(crate) mod tests {
     fn redrawn_texts(mounted: &Arc<Mutex<Mounted>>) -> Vec<String> {
         // the props read the seat's taste under its own lock, as the
         // shell's render does: built before this seat is held
-        let props = Some(governance_view(false, true, true).props);
+        let props = Some(governance_view(false, true).props);
         let mut locked = mounted.lock().expect("module view lock");
         let Slot::Ready(guest) = &mut locked.slot else {
             panic!("a seated view");

@@ -72,6 +72,26 @@ fn module_status() -> Value {
     ]}})
 }
 
+thread_local! {
+    /// Whether the valset below seats THIS node. It is the only thing that
+    /// decides what the card calls this device and whether the live filter
+    /// may be retuned — the session carries no standing at all.
+    static SEATED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// The valset's two seat lists. This node's key is `status()`'s
+/// `public_key`, so seating it here is what makes the card read
+/// `Validator`; unseated, the same key is nowhere and the card reads
+/// `Guest`.
+fn valset(seat: &str) -> Value {
+    let seated = SEATED.with(std::cell::Cell::get);
+    match (seat, seated) {
+        ("validators", true) => json!({ "validators": [[0xab, 0x12, 0xcd, 0x34]] }),
+        ("validators", false) => json!({ "validators": [[0x99, 0x99]] }),
+        (_, _) => json!({ "residents": [[0x05, 0x06]] }),
+    }
+}
+
 /// Every read this view makes, answered the way the node serves it. A read
 /// with no row here is left pending, which is what makes the request
 /// assertions below exact.
@@ -81,6 +101,7 @@ fn reply_for(request: &Request) -> Option<Value> {
         ("rpc.status", _) => Some(status()),
         ("rpc.peers", _) => Some(peers()),
         ("rpc.query", Some("modules")) => Some(module_status()),
+        ("rpc.query", Some("valset")) => Some(valset(body["query"].as_str().unwrap_or_default())),
         _ => None,
     }
 }
@@ -108,15 +129,9 @@ fn request<'a>(frame: &'a Frame, kind: &str) -> &'a Request {
 }
 
 fn session() -> Vec<u8> {
-    session_as(true)
-}
-
-fn session_as(admin: bool) -> Vec<u8> {
     serde_json::to_vec(&Session {
         connected: true,
         dark: false,
-        admin,
-        tier: "validator".into(),
         status: "Live".into(),
         data_dir: "/var/ducktape/demo".into(),
         wall_now: 1_700_000_030,
@@ -150,9 +165,13 @@ fn connected() -> (Frame, Vec<Request>) {
     connected_as(true)
 }
 
-fn connected_as(admin: bool) -> (Frame, Vec<Request>) {
+/// `seated` names what the VALSET answers, not what the kernel pushes:
+/// this node either holds a quorum seat or it does not, and the view folds
+/// that for itself.
+fn connected_as(seated: bool) -> (Frame, Vec<Request>) {
+    SEATED.with(|held| held.set(seated));
     let props = request(&boot(), "node.props").id;
-    settle(tick_native(vec![item(props, &session_as(admin))]))
+    settle(tick_native(vec![item(props, &session())]))
 }
 
 /// The one `node.copy` intent a frame carries.
@@ -236,18 +255,28 @@ fn a_connected_view_reads_the_node_for_itself() {
             texts(&frame)
         );
     }
+    // the card names this node a validator because the VALSET does — the
+    // session it was handed says nothing about standing
+    assert!(has_text(&frame, "Validator"), "{:?}", texts(&frame));
+
     let live: Vec<&Request> = left
         .iter()
         .filter(|request| request.kind == "rpc.live")
         .collect();
+    let planes: Vec<&[u8]> = live
+        .iter()
+        .map(|request| request.payload.as_slice())
+        .collect();
     assert_eq!(
-        live.len(),
-        2,
-        "the facts and the peers each follow the block plane: {left:?}"
+        planes,
+        [
+            b"block".as_slice(),
+            b"valset".as_slice(),
+            b"block".as_slice()
+        ],
+        "the facts and the peers follow the block plane, this node's seat \
+         follows the valset: {left:?}"
     );
-    for request in &live {
-        assert_eq!(request.payload, b"block");
-    }
     let mut names = Vec::new();
     surfaces(frame.root.as_ref().expect("a tree"), &mut names);
     assert!(
