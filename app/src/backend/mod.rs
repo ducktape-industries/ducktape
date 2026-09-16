@@ -22,7 +22,7 @@ use zeroize::Zeroizing;
 // row types, the composer parsing, the optimistic merges, and the op-delta
 // splices. Re-exported here for app state handlers.
 pub use ::chat::client::{
-    ChatChannel, ChatDelta, ChatReader, HuddleSeat, NameDirectory, author_display, short_label,
+    ChatChannel, ChatReader, HuddleSeat, NameDirectory, author_display, short_label,
 };
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.

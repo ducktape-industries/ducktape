@@ -58,24 +58,6 @@ pub(crate) async fn load_chat_data(
     Ok(chat)
 }
 
-/// A live fold supplies cached identity facts so its view makes only an index read.
-pub(crate) async fn load_channel_facts(
-    rpc: &RpcClient,
-    channel_id: &str,
-    reader: ChatReader<'_>,
-) -> Result<Option<(ChatChannel, Vec<HuddleParticipant>)>, String> {
-    let key = reader.key.map(hex_encode).unwrap_or_default();
-    let result = chat_background(
-        rpc.origin(),
-        serde_json::json!({
-            "kind":"channel","channel":channel_id,"key":key,"names":reader.names
-        }),
-    )
-    .await
-    .map_err(|error| error.message)?;
-    serde_json::from_value(result["channel"].clone()).map_err(|error| error.to_string())
-}
-
 /// A switch returns only the refreshed row, or the view's cold-start fallback.
 pub(crate) async fn load_channel_window_data(
     rpc: &RpcClient,

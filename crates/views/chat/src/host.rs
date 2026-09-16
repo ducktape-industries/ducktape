@@ -2901,6 +2901,12 @@ mod tests {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BackgroundRequest {
+    ShellDelta {
+        payload: serde_json::Value,
+        assigned: Option<serde_json::Value>,
+        key: String,
+        names: serde_json::Value,
+    },
     RunProgress {
         runs: Vec<String>,
     },
@@ -3043,6 +3049,14 @@ async fn background_search(
 
 async fn participate(intent: BackgroundRequest) -> Result<serde_json::Value, BackgroundError> {
     match intent {
+        BackgroundRequest::ShellDelta {
+            payload,
+            assigned,
+            key,
+            names,
+        } => crate::hydration::delta(payload, assigned, key, names)
+            .await
+            .map_err(Into::into),
         BackgroundRequest::RunProgress { runs } => Ok(crate::live::progress(runs).await),
         BackgroundRequest::LiveRuns { labels } => {
             crate::live::discover(labels).await.map_err(Into::into)

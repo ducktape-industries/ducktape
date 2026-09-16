@@ -207,9 +207,9 @@ fn the_live_chat_batch_budget_counts_invisible_frames() {
         kind: crate::LiveKind::Chat,
         status: "Live".into(),
         height,
-        chat: vec![ChatDelta::ChannelArchived {
+        chat: vec![ChatDelta::Head {
             channel_id: "general".into(),
-            archived: false,
+            seq: height,
         }],
         ..LiveUpdate::default()
     };

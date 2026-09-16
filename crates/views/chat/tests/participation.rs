@@ -337,3 +337,79 @@ fn public_run_progress_queries_once_and_emits_only_public_facts() {
         assert!(progress.get("unrelated").is_none());
     });
 }
+
+#[test]
+fn shell_posts_use_assigned_heads_without_fetching_or_rendering_message_bodies() {
+    on_stack(|| {
+        for thread in [Value::Null, json!(3)] {
+            let frame = start(json!({"kind":"shell_delta", "key":"", "names":{},
+                "payload":{"post_message":{"channel_id":"room","thread":thread,"blocks":[]}},
+                "assigned":{"posted":{"seq":7}}
+            }));
+            assert_eq!(
+                payload(request(&frame, "host.emit")),
+                json!({"delta":{"head":{"channel_id":"room","seq":7}}})
+            );
+            assert!(
+                !frame
+                    .requests
+                    .iter()
+                    .any(|request| request.kind.starts_with("rpc."))
+            );
+        }
+        let frame = start(json!({"kind":"shell_delta", "key":"", "names":{},
+            "payload":{"post_message":{"channel_id":"room"}},"assigned":null}));
+        assert!(payload(request(&frame, "host.emit"))["error"].is_object());
+    });
+}
+
+#[test]
+fn shell_channel_changes_read_the_current_row_and_dm_uses_the_assigned_id() {
+    on_stack(|| {
+        for (operation, assigned) in [
+            (
+                json!({"rename_channel":{"channel_id":"room","name":"new"}}),
+                Value::Null,
+            ),
+            (json!({"join_huddle":{"channel_id":"room"}}), Value::Null),
+            (
+                json!({"create_dm_channel":{"counterpart":2}}),
+                json!({"dm_channel":{"channel_id":"room"}}),
+            ),
+        ] {
+            let frame = start(
+                json!({"kind":"shell_delta","payload":operation,"assigned":assigned,
+                "key":"", "names":{"accounts":{},"by_account":{},"programs":[]}}),
+            );
+            let read = request(&frame, "rpc.view");
+            assert_eq!(
+                payload(read),
+                json!({"target":"chat","query":{"channel":{"channel_id":"room"}}})
+            );
+            let frame = tick_native(vec![answer(
+                read.id,
+                br#"{"channel":{"id":"room","name":"new","head_seq":9,"huddle":[]}}"#,
+            )]);
+            let result = payload(request(&frame, "host.emit"));
+            assert_eq!(result["delta"]["channel"]["channel"]["name"], "new");
+            assert_eq!(result["delta"]["channel"]["channel"]["head_seq"], 9);
+        }
+    });
+}
+
+#[test]
+fn view_only_changes_do_not_send_message_payloads_to_the_shell() {
+    on_stack(|| {
+        for operation in [
+            "edit_message",
+            "delete_message",
+            "add_reaction",
+            "set_membership",
+            "register_hook",
+        ] {
+            let frame = start(json!({"kind":"shell_delta", "key":"", "names":{},
+                "payload":{operation:{"channel_id":"room"}},"assigned":null}));
+            assert_eq!(payload(request(&frame, "host.emit")), json!({"delta":null}));
+        }
+    });
+}

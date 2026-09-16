@@ -149,10 +149,19 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
 
     let mine = me.public_key().as_ref().to_vec();
     let names = NameDirectory::default();
-    let (_channel, roster) = load_channel_facts(&rpc, "eng", ChatReader::new(Some(&mine), &names))
-        .await
-        .expect("the huddle's channel reads back")
-        .expect("the huddle's channel is on this node");
+    let result = chat_background(
+        rpc.origin(),
+        serde_json::json!({
+            "kind":"channel", "channel":"eng", "key":hex_encode(&mine), "names":names
+        }),
+    )
+    .await
+    .expect("the huddle's channel reads back");
+    let (_channel, roster): (ChatChannel, Vec<HuddleParticipant>) = serde_json::from_value::<
+        Option<(ChatChannel, Vec<HuddleParticipant>)>,
+    >(result["channel"].clone())
+    .expect("channel facts decode")
+    .expect("the huddle's channel is on this node");
     assert_eq!(roster.len(), 2, "both people are on the roster");
     assert_eq!(
         roster.iter().filter(|row| row.is_you).count(),
@@ -374,20 +383,14 @@ async fn chat_round_trips_over_signed_frames() {
         "a chat op folds into a chat delta"
     );
     assert_eq!(changed.chat.len(), 1);
-    let ChatDelta::Posted {
-        channel_id,
-        seq,
-        message,
-    } = &changed.chat[0]
-    else {
-        panic!("a post must publish a Posted payload")
+    let ChatDelta::Head { channel_id, seq } = &changed.chat[0] else {
+        panic!("a post must publish its unread head")
     };
     assert_eq!(channel_id, "general");
     assert_eq!(
         *seq, 2,
         "the delta carries the module-assigned sequence from the feed stamp"
     );
-    assert_eq!(message.body, "arrived on the next block");
     assert!(!changed.load_chat, "a folded chat delta requires no reload");
     assert!(changed.height > workspace.height);
     let base_height = changed.height;

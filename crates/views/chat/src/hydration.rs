@@ -87,6 +87,49 @@ pub(crate) async fn channel(id: String, key: String, snapshot: Value) -> Result<
     Ok(json!({"channel":result}))
 }
 
+/// The shell retains channel rows and unread heads, never message bodies.
+pub(crate) async fn delta(
+    payload: Value,
+    assigned: Option<Value>,
+    key: String,
+    names: Value,
+) -> Result<Value, String> {
+    let operation = payload
+        .as_object()
+        .ok_or("Chat operation is not an object")?;
+    let single = operation.len() == 1;
+    if !single {
+        return Err("Chat operation must name one action".into());
+    }
+    let (kind, body) = operation.iter().next().unwrap();
+    let stamp = assigned.unwrap_or(Value::Null);
+    if kind == "post_message" {
+        let channel_id = body["channel_id"].as_str().ok_or("post has no channel")?;
+        let seq = stamp["posted"]["seq"]
+            .as_u64()
+            .ok_or("post has no assigned sequence")?;
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        return Ok(json!({"delta":{"head":{"channel_id":channel_id,"seq":seq}}}));
+    }
+    let id = match kind.as_str() {
+        "create_dm_channel" => stamp["dm_channel"]["channel_id"].as_str(),
+        "create_channel"
+        | "create_voice_channel"
+        | "rename_channel"
+        | "set_channel_archived"
+        | "join_huddle"
+        | "leave_huddle" => body["channel_id"].as_str(),
+        _ => return Ok(json!({"delta":null})),
+    }
+    .ok_or("channel operation has no channel")?;
+    let result = channel(id.into(), key, names).await?;
+    let row = result["channel"][0].clone();
+    if row.is_null() {
+        return Err("changed channel disappeared".into());
+    }
+    Ok(json!({"delta":{"channel":{"channel":row}}}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

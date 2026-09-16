@@ -178,7 +178,7 @@ fn a_switch_reply_keeps_what_the_live_stream_folded_while_it_was_in_flight() {
         kind: LiveKind::Chat,
         status: "Live".into(),
         height: 1,
-        chat: vec![backend::ChatDelta::ChannelCreated {
+        chat: vec![backend::ChatDelta::Channel {
             channel: room("brand-new", 0),
         }],
         ..backend::LiveUpdate::default()
@@ -227,7 +227,7 @@ fn a_resync_keeps_channel_heads_and_rooms_added_while_it_was_in_flight() {
         kind: LiveKind::Chat,
         status: "Live".into(),
         height: 1,
-        chat: vec![backend::ChatDelta::ChannelCreated {
+        chat: vec![backend::ChatDelta::Channel {
             channel: room("brand-new", 0),
         }],
         ..backend::LiveUpdate::default()

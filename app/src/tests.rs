@@ -55,10 +55,9 @@ fn posted_delta(channel: &str, row: backend::ChatMessage) -> backend::LiveUpdate
         kind: LiveKind::Chat,
         status: "Live".into(),
         height: row.seq.max(1),
-        chat: vec![backend::ChatDelta::Posted {
+        chat: vec![backend::ChatDelta::Head {
             channel_id: channel.into(),
             seq: row.seq,
-            message: row,
         }],
         ..backend::LiveUpdate::default()
     }

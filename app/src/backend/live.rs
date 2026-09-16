@@ -391,43 +391,30 @@ pub struct ChatLiveFold {
     pub refresh_chat: bool,
 }
 
+/// Changes to the shell's retained rows, projected by the deployed Chat view.
+#[derive(Clone, Debug, Hash, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChatDelta {
+    Channel { channel: ChatChannel },
+    Head { channel_id: String, seq: i64 },
+}
+
 struct ChatFoldState {
     channels: Vec<ChatChannel>,
     active_channel: String,
     refresh_chat: bool,
 }
 
-fn fold_channel_created(state: &mut ChatFoldState, channel: ChatChannel) {
-    state.channels = chat::client::insert_channel(std::mem::take(&mut state.channels), channel);
-}
-
-fn fold_channel_renamed(state: &mut ChatFoldState, channel_id: String, name: String) {
-    state.channels =
-        chat::client::rename_channel(std::mem::take(&mut state.channels), &channel_id, name);
-}
-
-fn fold_channel_archived(state: &mut ChatFoldState, channel_id: String, archived: bool) {
-    state.channels =
-        chat::client::archive_channel(std::mem::take(&mut state.channels), &channel_id, archived);
-}
-
-/// A post moves the room's head, which is the whole of what the app reads off
-/// a message now: the unread mark, the sidebar order and the bell all count
-/// heads. The MESSAGE is the chat view's, and it re-reads the room on the same
-/// block this fold runs for.
-fn fold_posted(state: &mut ChatFoldState, channel_id: String, seq: i64) {
+fn fold_head(state: &mut ChatFoldState, channel_id: String, seq: i64) {
     state.channels =
         chat::client::advance_channel_head(std::mem::take(&mut state.channels), &channel_id, seq);
 }
 
-fn fold_channel_refresh(state: &mut ChatFoldState, channel_id: String) {
-    state.refresh_chat |= channel_id == state.active_channel;
-}
-
-fn fold_channel_updated(state: &mut ChatFoldState, channel_id: String, channel: ChatChannel) {
-    state.refresh_chat |= channel_id == state.active_channel;
+fn fold_channel(state: &mut ChatFoldState, channel: ChatChannel) {
+    state.refresh_chat |= channel.id == state.active_channel;
+    let id = channel.id.clone();
     state.channels =
-        chat::client::replace_channel(std::mem::take(&mut state.channels), &channel_id, channel);
+        chat::client::replace_channel(std::mem::take(&mut state.channels), &id, channel);
 }
 
 /// Fold one ordered live chat batch in one Rust ownership domain. Lists move
@@ -447,41 +434,11 @@ pub fn fold_live_chat(
     };
     for delta in deltas {
         match delta {
-            ChatDelta::ChannelCreated { channel } => fold_channel_created(&mut state, channel),
-            ChatDelta::ChannelRenamed { channel_id, name } => {
-                fold_channel_renamed(&mut state, channel_id, name)
-            }
-            ChatDelta::ChannelArchived {
-                channel_id,
-                archived,
-            } => fold_channel_archived(&mut state, channel_id, archived),
-            ChatDelta::Posted {
-                channel_id,
-                seq,
-                message: _,
-            } => fold_posted(&mut state, channel_id, seq),
-            ChatDelta::Reply {
-                channel_id,
-                seq,
-                root_seq: _,
-                message: _,
-            } => fold_posted(&mut state, channel_id, seq),
-            // A ROW CHANGING IN PLACE MOVES NOTHING THE APP HOLDS. An edit, a
-            // delete and a reaction all leave the room's head where it was, and
-            // the only reader of a message body is the chat view — which reads
-            // its own room on this very block. Routed and dropped, so a new
-            // delta still has to be named here.
-            ChatDelta::Edited { .. } | ChatDelta::Deleted { .. } | ChatDelta::Reaction { .. } => {}
-            ChatDelta::Membership { .. } => {}
-            ChatDelta::ChannelRefresh { channel_id } => {
-                fold_channel_refresh(&mut state, channel_id)
-            }
-            ChatDelta::ChannelUpdated {
-                channel_id,
-                channel,
-            } => fold_channel_updated(&mut state, channel_id, channel),
+            ChatDelta::Channel { channel } => fold_channel(&mut state, channel),
+            ChatDelta::Head { channel_id, seq } => fold_head(&mut state, channel_id, seq),
         }
     }
+
     let ChatFoldState {
         channels,
         active_channel,
@@ -537,52 +494,24 @@ pub(crate) async fn folded_update(
     };
     match module {
         "chat" => {
-            // THE DIRECTORY AS LAST READ, NOT A FRESH READ: this is inside the
-            // live decoder fold, where a query would freeze every subscriber
-            // for as long as the node's select loop is busy (issue #1018). It
-            // is warm by the connect that opened this stream.
             let facts = ReaderFacts::current().await;
-            let origin_kind = stream_origin_kind(&op.origin.kind);
-            // Notification execution is queued; the live fold never waits on it.
             notify_chat_op(rpc, &payload, op.assigned.as_ref());
-            let folded = chat::client::delta_from_op(
-                &payload,
-                op.assigned.as_ref(),
-                origin_kind,
-                op.origin.id.as_deref(),
-                facts.reader(),
-                op.height,
-            );
-            let delta = match folded {
-                Ok(Some(delta)) => delta,
-                Ok(None) => return None,
+            let key = facts.reader().key.map(hex_encode).unwrap_or_default();
+            let projected = chat_background(
+                rpc,
+                serde_json::json!({
+                    "kind":"shell_delta", "payload":op.payload, "assigned":op.assigned,
+                    "key":key, "names":facts.names()
+                }),
+            )
+            .await;
+            let delta = match projected {
+                Ok(value) => serde_json::from_value::<Option<ChatDelta>>(value["delta"].clone()),
                 Err(_) => return Some(live_resync("chat", height)),
             };
-            // huddle membership is roster-derived — reload the one channel
-            // row from its canonical record instead of guessing the count.
             let delta = match delta {
-                ChatDelta::ChannelRefresh { channel_id } => {
-                    // Named through the same cached directory as the fold:
-                    // the seats under the room are the reader's own "you"
-                    // and their peers' names, not bare account numbers.
-                    let channel = match load_channel_row(rpc, &channel_id, facts.reader()).await
-                    {
-                        Ok(Some(channel)) => channel,
-                        Ok(None) | Err(_) => return Some(live_resync("chat", height)),
-                    };
-                    tracing::debug!(
-                        target: "ducktape::live",
-                        channel = %channel_id,
-                        seats = channel.huddle.len(),
-                        height,
-                        "chat.channel_refresh"
-                    );
-                    ChatDelta::ChannelUpdated {
-                        channel_id,
-                        channel,
-                    }
-                }
-                ready => ready,
+                Ok(delta) => delta,
+                Err(_) => return Some(live_resync("chat", height)),
             };
             Some(LiveUpdate {
                 kind: crate::LiveKind::Chat,
@@ -591,7 +520,7 @@ pub(crate) async fn folded_update(
                 module: "chat".into(),
                 load_chat: false,
                 debounce: false,
-                chat: vec![delta],
+                chat: delta.into_iter().collect(),
                 bell: BellDelta::default(),
                 permit: LivePermit::default(),
             })
@@ -663,22 +592,6 @@ fn stream_origin_kind(kind: &ducktape_rpc::StreamOriginKind) -> &'static str {
 /// THE VIEW LANE, NOT `/v1/query`. This is awaited inside the live stream's
 /// decoder fold, so a `/v1/query` here freezes every subscriber's fold for as
 /// long as the node's select loop is busy writing a checkpoint (issue #1018).
-/// `ChatViewQuery::Channel` reads the same `ChannelInfo` off an MVCC snapshot,
-/// off-loop — identical payload, no checkpoint tax.
-///
-/// An unseen row is `None`, and the caller turns it into a scoped resync rather
-/// than a banner: the op named a channel this node's index cannot answer for
-/// yet, and a reload is the only thing that heals that.
-pub(crate) async fn load_channel_row(
-    rpc: &str,
-    channel_id: &str,
-    reader: ChatReader<'_>,
-) -> Result<Option<ChatChannel>, String> {
-    let rpc = rpc_client(rpc)?;
-    let room = load_channel_facts(&rpc, channel_id, reader).await?;
-    Ok(room.map(|(channel, _roster)| channel))
-}
-
 /// One scoped catch-up load of the chat slices: the channel list, the active
 /// window and its members. Runs on stream `ready` (the subscribe→hydrate
 /// ordering race) and on a `resync` (lag or an unfoldable op), never per chat
