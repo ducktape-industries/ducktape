@@ -22,9 +22,7 @@ pub(crate) async fn load_workspace(
         active_channel: chat.active_channel,
         active_channel_name: chat.active_channel_name,
         active_channel_archived: chat.active_channel_archived,
-        active_channel_members_only: chat.active_channel_members_only,
         huddle_roster: chat.huddle_roster,
-        channel_members: chat.channel_members,
     })
 }
 

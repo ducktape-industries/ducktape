@@ -41,18 +41,13 @@ async fn facts(id: &str, names: &Names) -> Result<Option<(ChatChannel, Value)>, 
     Ok(Some((channel, json!(roster))))
 }
 
-fn data(
-    channels: Vec<ChatChannel>,
-    active: Option<ChatChannel>,
-    roster: Value,
-    members: Value,
-) -> Value {
+fn data(channels: Vec<ChatChannel>, active: Option<ChatChannel>, roster: Value) -> Value {
     let active = active.unwrap_or_default();
     json!({
         "generation":0, "channels":channels,
         "active_channel":active.id,"active_channel_name":active.name,
-        "active_channel_archived":active.archived,"active_channel_members_only":active.members_only,
-        "huddle_roster":roster,"channel_members":members
+        "active_channel_archived":active.archived,
+        "huddle_roster":roster
     })
 }
 
@@ -64,26 +59,21 @@ pub(crate) async fn workspace(requested: Option<String>, key: String) -> Result<
         .and_then(|id| sidebar.channels.iter().find(|row| row.id == id))
         .or_else(|| landing(&sidebar.channels));
     let Some(selected) = selected else {
-        return Ok(data(sidebar.channels, None, json!([]), json!([])));
+        return Ok(data(sidebar.channels, None, json!([])));
     };
     let id = selected.id.clone();
-    let (facts, members) = futures::try_join!(facts(&id, &names), host::read_members(&id, &names))?;
+    let facts = facts(&id, &names).await?;
     let (active, roster) = facts.ok_or("selected channel disappeared during loading")?;
-    Ok(data(sidebar.channels, Some(active), roster, json!(members)))
+    Ok(data(sidebar.channels, Some(active), roster))
 }
 
 pub(crate) async fn window(id: String, key: String) -> Result<Value, String> {
     let (names, _) = reader(&key).await;
-    let (facts, members) = futures::try_join!(facts(&id, &names), host::read_members(&id, &names))?;
+    let facts = facts(&id, &names).await?;
     let Some((active, roster)) = facts else {
         return workspace(None, key).await;
     };
-    Ok(data(
-        vec![active.clone()],
-        Some(active),
-        roster,
-        json!(members),
-    ))
+    Ok(data(vec![active.clone()], Some(active), roster))
 }
 
 pub(crate) async fn channel(id: String, key: String, snapshot: Value) -> Result<Value, String> {

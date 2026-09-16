@@ -384,10 +384,8 @@ async fn collect_ready_chat_updates(
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatLiveFold {
     pub channels: Vec<ChatChannel>,
-    pub channel_members: Vec<ChatMember>,
     pub active_channel_name: String,
     pub active_channel_archived: bool,
-    pub active_channel_members_only: bool,
     /// A huddle roster change in the active channel needs the canonical roster
     /// read that a delta cannot derive.
     pub refresh_chat: bool,
@@ -395,7 +393,6 @@ pub struct ChatLiveFold {
 
 struct ChatFoldState {
     channels: Vec<ChatChannel>,
-    channel_members: Vec<ChatMember>,
     active_channel: String,
     refresh_chat: bool,
 }
@@ -423,17 +420,6 @@ fn fold_posted(state: &mut ChatFoldState, channel_id: String, seq: i64) {
         chat::client::advance_channel_head(std::mem::take(&mut state.channels), &channel_id, seq);
 }
 
-fn fold_membership(state: &mut ChatFoldState, channel_id: String, added: bool, member: ChatMember) {
-    let updates_active_members = channel_id == state.active_channel;
-    if updates_active_members {
-        state.channel_members = chat::client::apply_membership(
-            std::mem::take(&mut state.channel_members),
-            added,
-            member,
-        );
-    }
-}
-
 fn fold_channel_refresh(state: &mut ChatFoldState, channel_id: String) {
     state.refresh_chat |= channel_id == state.active_channel;
 }
@@ -447,19 +433,15 @@ fn fold_channel_updated(state: &mut ChatFoldState, channel_id: String, channel: 
 /// Fold one ordered live chat batch in one Rust ownership domain. Lists move
 /// into this function once, then each delta mutates those owned lists in
 /// sequence, without cloning the whole timeline for every operation.
-#[allow(clippy::too_many_arguments)]
 pub fn fold_live_chat(
     deltas: Vec<ChatDelta>,
     channels: Vec<ChatChannel>,
-    channel_members: Vec<ChatMember>,
     active_channel: String,
     mut active_channel_name: String,
     mut active_channel_archived: bool,
-    mut active_channel_members_only: bool,
 ) -> ChatLiveFold {
     let mut state = ChatFoldState {
         channels,
-        channel_members,
         active_channel,
         refresh_chat: false,
     };
@@ -490,11 +472,7 @@ pub fn fold_live_chat(
             // its own room on this very block. Routed and dropped, so a new
             // delta still has to be named here.
             ChatDelta::Edited { .. } | ChatDelta::Deleted { .. } | ChatDelta::Reaction { .. } => {}
-            ChatDelta::Membership {
-                channel_id,
-                added,
-                member,
-            } => fold_membership(&mut state, channel_id, added, member),
+            ChatDelta::Membership { .. } => {}
             ChatDelta::ChannelRefresh { channel_id } => {
                 fold_channel_refresh(&mut state, channel_id)
             }
@@ -506,7 +484,6 @@ pub fn fold_live_chat(
     }
     let ChatFoldState {
         channels,
-        channel_members,
         active_channel,
         refresh_chat,
         ..
@@ -515,14 +492,11 @@ pub fn fold_live_chat(
     if let Some(channel) = channels.iter().find(|channel| channel.id == active_channel) {
         active_channel_name.clone_from(&channel.name);
         active_channel_archived = channel.archived;
-        active_channel_members_only = channel.members_only;
     }
     ChatLiveFold {
         channels,
-        channel_members,
         active_channel_name,
         active_channel_archived,
-        active_channel_members_only,
         refresh_chat,
     }
 }
@@ -718,9 +692,7 @@ pub struct LiveRefresh {
     pub active_channel: String,
     pub active_channel_name: String,
     pub active_channel_archived: bool,
-    pub active_channel_members_only: bool,
     pub huddle_roster: Vec<HuddleParticipant>,
-    pub channel_members: Vec<ChatMember>,
 }
 
 /// One scoped catch-up load of the chat slices. `load_chat` false is the
@@ -749,9 +721,7 @@ pub async fn live_resync_load(
             active_channel: String::new(),
             active_channel_name: String::new(),
             active_channel_archived: false,
-            active_channel_members_only: false,
             huddle_roster: Vec::new(),
-            channel_members: Vec::new(),
         };
         if !load_chat {
             return Ok(refresh);
@@ -763,9 +733,7 @@ pub async fn live_resync_load(
         refresh.active_channel = chat.active_channel;
         refresh.active_channel_name = chat.active_channel_name;
         refresh.active_channel_archived = chat.active_channel_archived;
-        refresh.active_channel_members_only = chat.active_channel_members_only;
         refresh.huddle_roster = chat.huddle_roster;
-        refresh.channel_members = chat.channel_members;
         Ok(refresh)
     }
     .await
@@ -809,14 +777,6 @@ pub fn keep_channels(
         return next;
     }
     upsert_channel_rows(current, next)
-}
-
-pub fn keep_members(
-    loaded: bool,
-    next: Vec<ChatMember>,
-    current: Vec<ChatMember>,
-) -> Vec<ChatMember> {
-    if loaded { next } else { current }
 }
 
 /// Everything a chat load says about the huddle — the one rule, in one place,

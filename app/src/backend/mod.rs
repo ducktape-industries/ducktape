@@ -22,8 +22,7 @@ use zeroize::Zeroizing;
 // row types, the composer parsing, the optimistic merges, and the op-delta
 // splices. Re-exported here for app state handlers.
 pub use ::chat::client::{
-    ChatChannel, ChatDelta, ChatMember, ChatReader, HuddleSeat, NameDirectory, author_display,
-    short_label,
+    ChatChannel, ChatDelta, ChatReader, HuddleSeat, NameDirectory, author_display, short_label,
 };
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.
@@ -46,10 +45,8 @@ pub struct ChatData {
     pub active_channel: String,
     pub active_channel_name: String,
     pub active_channel_archived: bool,
-    pub active_channel_members_only: bool,
     /// the huddle's roster, not just its length — the faces and the tiles.
     pub huddle_roster: Vec<HuddleParticipant>,
-    pub channel_members: Vec<ChatMember>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -94,9 +91,7 @@ pub struct WorkspaceData {
     pub active_channel: String,
     pub active_channel_name: String,
     pub active_channel_archived: bool,
-    pub active_channel_members_only: bool,
     pub huddle_roster: Vec<HuddleParticipant>,
-    pub channel_members: Vec<ChatMember>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]

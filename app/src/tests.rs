@@ -46,9 +46,7 @@ fn live_refresh(generation: i64, active_channel: &str) -> backend::LiveRefresh {
         active_channel: active_channel.into(),
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
-        active_channel_members_only: false,
         huddle_roster: Vec::new(),
-        channel_members: Vec::new(),
     }
 }
 
@@ -73,9 +71,7 @@ fn chat_data(active_channel: &str) -> backend::ChatData {
         active_channel: active_channel.into(),
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
-        active_channel_members_only: false,
         huddle_roster: Vec::new(),
-        channel_members: Vec::new(),
     }
 }
 
@@ -110,9 +106,7 @@ fn workspace(active_channel: &str) -> backend::WorkspaceData {
         active_channel: active_channel.into(),
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
-        active_channel_members_only: false,
         huddle_roster: Vec::new(),
-        channel_members: Vec::new(),
     }
 }
 

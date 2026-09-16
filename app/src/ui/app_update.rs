@@ -677,8 +677,6 @@ impl Ducktape {
         self.chat_dm_peer.clear();
         self.active_channel_name = "".to_owned();
         self.active_channel_archived = false;
-        self.active_channel_members_only = false;
-        self.channel_members = Vec::new();
 
         self.page_route = "".to_owned();
         self.palette_search_phase = SearchPhase::Idle;
@@ -746,7 +744,6 @@ impl Ducktape {
         self.active_channel = next.active_channel.to_owned();
         self.active_channel_name = next.active_channel_name.to_owned();
         self.active_channel_archived = next.active_channel_archived;
-        self.active_channel_members_only = next.active_channel_members_only;
         self.huddle_joined_at =
             crate::backend::keep_i64(self.huddle_joined, self.huddle_joined_at, self.huddle_now);
         let huddle = crate::backend::huddle_after_load(
@@ -763,7 +760,6 @@ impl Ducktape {
         self.huddle_roster = huddle.roster.clone();
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
-        self.channel_members = next.channel_members.clone();
 
         self.connected = true;
         self.loading = false;
@@ -998,18 +994,14 @@ impl Ducktape {
                 let folded_chat = crate::backend::fold_live_chat(
                     next.chat.clone(),
                     self.channels.clone(),
-                    self.channel_members.clone(),
                     self.active_channel.to_owned(),
                     self.active_channel_name.to_owned(),
                     self.active_channel_archived,
-                    self.active_channel_members_only,
                 );
                 self.channels = folded_chat.channels.clone();
-                self.channel_members = folded_chat.channel_members.clone();
                 self.follow_voice_room_roster();
                 self.active_channel_name = folded_chat.active_channel_name.to_owned();
                 self.active_channel_archived = folded_chat.active_channel_archived;
-                self.active_channel_members_only = folded_chat.active_channel_members_only;
 
                 if !folded_chat.refresh_chat {
                     return Task::none();
@@ -1278,11 +1270,6 @@ impl Ducktape {
             next.active_channel_archived,
             self.active_channel_archived,
         );
-        self.active_channel_members_only = crate::backend::keep_bool(
-            next.chat_loaded,
-            next.active_channel_members_only,
-            self.active_channel_members_only,
-        );
         self.huddle_joined_at =
             crate::backend::keep_i64(self.huddle_joined, self.huddle_joined_at, self.huddle_now);
         let huddle = crate::backend::huddle_after_load(
@@ -1299,11 +1286,6 @@ impl Ducktape {
         self.huddle_roster = huddle.roster.clone();
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
-        self.channel_members = crate::backend::keep_members(
-            next.chat_loaded,
-            next.channel_members.clone(),
-            ::std::mem::take(&mut self.channel_members),
-        );
 
         self.mutation_phase = crate::backend::mutation_phase_after_recovery(self.mutation_phase);
         self.error = "".to_owned();
@@ -3133,8 +3115,6 @@ impl Ducktape {
         self.chat_land_seq = target_seq;
         self.active_channel_name = next_channel.name.to_owned();
         self.active_channel_archived = next_channel.archived;
-        self.active_channel_members_only = next_channel.members_only;
-        self.channel_members = Vec::new();
 
         self.palette_open = false;
         self.account_qr_auth_generation = self.account_qr_auth_generation.wrapping_add(1);
@@ -3194,8 +3174,6 @@ impl Ducktape {
         self.active_channel = id.to_owned();
         self.active_channel_name = next_channel.name.to_owned();
         self.active_channel_archived = next_channel.archived;
-        self.active_channel_members_only = next_channel.members_only;
-        self.channel_members = Vec::new();
 
         self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
@@ -3381,7 +3359,6 @@ impl Ducktape {
         self.active_channel = next.active_channel.to_owned();
         self.active_channel_name = next.active_channel_name.to_owned();
         self.active_channel_archived = next.active_channel_archived;
-        self.active_channel_members_only = next.active_channel_members_only;
         self.huddle_joined_at =
             crate::backend::keep_i64(self.huddle_joined, self.huddle_joined_at, self.huddle_now);
         let huddle = crate::backend::huddle_after_load(
@@ -3398,7 +3375,6 @@ impl Ducktape {
         self.huddle_roster = huddle.roster.clone();
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
-        self.channel_members = next.channel_members.clone();
 
         self.loading = false;
         self.error = "".to_owned();
@@ -4487,8 +4463,6 @@ impl Ducktape {
         self.chat_dm_peer.clear();
         self.active_channel_name = "".to_owned();
         self.active_channel_archived = false;
-        self.active_channel_members_only = false;
-        self.channel_members = Vec::new();
 
         self.page_route = "".to_owned();
         self.palette_draft = "".to_owned();
