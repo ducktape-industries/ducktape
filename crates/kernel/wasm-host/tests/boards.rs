@@ -13,7 +13,7 @@ async fn boards_component_commits_collaborative_fields_and_rolls_back_rejections
     env.origin = Origin::External(vec![8; 32]);
     env.me = "boards".into();
     let mut ctx = TestCtx::with_env(env);
-    let shape = serde_json::json!({"kind":"note","x":0,"y":0,"width":200,"height":140,"text":"","color":0,"from":null,"to":null});
+    let shape = serde_json::json!({"kind":"note","x":0,"y":0,"width":200,"height":140,"text":"","color":0,"align":"middle","text_size":"medium","points":[],"from":null,"to":null});
     let operations = [
         serde_json::json!({"create":{"id":"room","title":"Planning"}}),
         serde_json::json!({"edit":{"board":"room","change":{"create":{"id":"a","shape":shape}}}}),

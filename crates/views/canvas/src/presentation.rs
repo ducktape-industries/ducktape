@@ -7,7 +7,7 @@ use ducktape_view_guest::{
     },
 };
 
-fn stroke(color: Rgba, width: f32) -> wire::CanvasStroke {
+fn pen(color: Rgba, width: f32) -> wire::CanvasStroke {
     wire::CanvasStroke {
         color,
         width,
@@ -22,7 +22,7 @@ fn line(from: [f32; 2], to: [f32; 2], color: Rgba, width: f32) -> Draw {
         shape: Geometry::Line { from, to },
         fill: None,
         even_odd: false,
-        stroke: Some(stroke(color, width)),
+        stroke: Some(pen(color, width)),
     }
 }
 fn rectangle(
@@ -31,16 +31,59 @@ fn rectangle(
     fill: Option<Rgba>,
     border: Rgba,
     width: f32,
+    radius: f32,
 ) -> Draw {
     Draw::Draw {
         shape: Geometry::Rectangle {
             position,
             size,
-            radius: [6.; 4],
+            radius: [radius; 4],
         },
         fill,
         even_odd: false,
-        stroke: Some(stroke(border, width)),
+        stroke: Some(pen(border, width)),
+    }
+}
+fn ellipse(
+    position: [f32; 2],
+    size: [f32; 2],
+    fill: Option<Rgba>,
+    border: Rgba,
+    width: f32,
+) -> Draw {
+    Draw::Draw {
+        shape: Geometry::Path(vec![wire::CanvasSegment::Ellipse {
+            center: [position[0] + size[0] / 2., position[1] + size[1] / 2.],
+            radius: [size[0] / 2., size[1] / 2.],
+            rotation: 0.,
+            start: 0.,
+            end: std::f32::consts::TAU,
+        }]),
+        fill,
+        even_odd: false,
+        stroke: Some(pen(border, width)),
+    }
+}
+fn diamond(
+    position: [f32; 2],
+    size: [f32; 2],
+    fill: Option<Rgba>,
+    border: Rgba,
+    width: f32,
+) -> Draw {
+    use wire::CanvasSegment as Segment;
+    let middle = [position[0] + size[0] / 2., position[1] + size[1] / 2.];
+    Draw::Draw {
+        shape: Geometry::Path(vec![
+            Segment::Move([middle[0], position[1]]),
+            Segment::Line([position[0] + size[0], middle[1]]),
+            Segment::Line([middle[0], position[1] + size[1]]),
+            Segment::Line([position[0], middle[1]]),
+            Segment::Close,
+        ]),
+        fill,
+        even_odd: false,
+        stroke: Some(pen(border, width)),
     }
 }
 /// The five card hues, softened onto the app's cool greys: a fill per
@@ -95,6 +138,39 @@ fn alpha(mut color: [f32; 4], alpha: f32) -> [f32; 4] {
 }
 /// The inset a card keeps around its text, in board units.
 const CARD_INSET: f32 = 12.;
+/// The finest the board's lattice is drawn at, in board units. Every step the
+/// grid ever takes is this doubled, so a dot always stands on a coordinate a
+/// reader could name.
+const GRID: f32 = 32.;
+/// The plate a connector's words sit on, in board units. A connector has no
+/// box of its own to write in — its rectangle is only the span of its samples
+/// — so its label rides a plate of this size at the middle of the run. The
+/// painter draws it, the editor opens over it, and a press inside it takes the
+/// connector, so the size is stated once here.
+pub(super) const PLATE: [f32; 2] = [200., 56.];
+/// The smallest box the board will take for a card, as `validate_shape` in the
+/// boards module states it. A shape outside the limits is refused whole, so a
+/// card being fitted to its words has to ask for a box inside them: asking for
+/// one pixel less than the floor is not a card fitted to the floor, it is a
+/// card that quietly stopped being fitted at all.
+pub(super) const MIN_CARD: [i32; 2] = [40, 32];
+/// The smallest type the board will draw. Under it letters stop being letters
+/// and start being grey noise, so nothing is drawn at all.
+const SMALLEST: f32 = 8.;
+/// One card's words, as both the painter and the editor must lay them out.
+pub(super) struct Lettering {
+    /// Screen-space type size, already scaled by the camera.
+    pub(super) size: f32,
+    /// How far in from the card's box the words start, on every side.
+    pub(super) inset: f32,
+    /// Whether the words are being drawn at the size they were asked for.
+    /// Type has a floor and a card does not, so far enough out the letters
+    /// stop shrinking with the box they are in and a card fills up with a
+    /// fragment of its first sentence. A card too small to read carries no
+    /// words: a board zoomed right out is blocks of colour, which is what it
+    /// is for at that distance.
+    pub(super) legible: bool,
+}
 /// The inset every island keeps from the stage's edge.
 const ISLAND: f32 = 12.;
 /// The side of an icon-only tool.
@@ -119,16 +195,26 @@ impl BoardsView {
             ),
         ];
         if let Some(inline) = &self.inline
-            && let Some(record) = board
-                .as_ref()
-                .and_then(|board| board.shapes.get(&inline.id))
+            && let Some(live) = board.as_ref()
+            && let Some(record) = live.shapes.get(&inline.id)
         {
             let s = &record.shape;
-            layers.push(self.inline_editor(
-                s,
-                self.screen(s.x as f32, s.y as f32),
-                [s.width as f32 * self.zoom, s.height as f32 * self.zoom],
-            ));
+            // The same box the painter writes this shape's words in, so the
+            // editor opens exactly over the label it replaces — for a
+            // connector that is the plate at the middle of the run, which is
+            // nowhere near the rectangle its samples were stored with.
+            let origin = self.screen(s.x as f32, s.y as f32);
+            let stored = [
+                origin[0],
+                origin[1],
+                origin[0] + s.width as f32 * self.zoom,
+                origin[1] + s.height as f32 * self.zoom,
+            ];
+            let box_ = self.on_screen(live, s).unwrap_or(stored);
+            let (pos, size) = self.writing_box(live, s, box_);
+            layers.push(self.text_gauge(inline, s, pos, size));
+            let (caret, room) = self.caret_box(inline, s, pos, size);
+            layers.push(self.inline_editor(s, caret, room));
         }
         if let Some(board) = &board {
             let hint_shown = !editing && !compact;
@@ -158,7 +244,7 @@ impl BoardsView {
         // press on an overlay's surface, where a pinned card lets it fall
         // through to the canvas underneath and the gesture it starts
         // re-renders the card out from under the click.
-        let picker_open = self.board_picker || board.is_none();
+        let picker_open = self.picking_a_board();
         let dismiss = (picker_open && board.is_some()).then_some(Message::BoardPicker);
         stage = float(
             "boards/menu-float",
@@ -333,7 +419,7 @@ impl BoardsView {
             checked(
                 "boards/snap",
                 "Snap",
-                "Snap to other cards · hold Alt to bypass",
+                "Snap to other cards · hold Ctrl to bypass",
                 Message::Snap,
                 self.snap,
             ),
@@ -360,21 +446,32 @@ impl BoardsView {
     }
     /// Top-right, while cards are chosen: what can be done to them.
     fn inspector_island(&self, board: &Board) -> Option<Node> {
-        let count = self.selected.len();
-        let shown = count > 0 && self.inline.is_none();
-        if !shown {
+        if self.inline.is_some() {
             return None;
         }
-        let name = if count == 1 {
-            self.only_selected()
-                .and_then(|id| board.shapes.get(id))
-                .map_or("Selection", |r| kind_name(r.shape.kind))
-                .to_owned()
-        } else {
-            format!("{count} selected")
+        let count = self.selected.len();
+        // With nothing picked the palette still says what the next shape will
+        // be drawn in — and it was the one control on this panel you could not
+        // reach, so the only way to choose a colour was to draw something in
+        // the wrong one and recolour it. It stands on its own.
+        if count == 0 {
+            return Some(kit::sized(
+                self.next_color(),
+                Some(Length::Fixed(204.)),
+                None,
+            ));
+        }
+        let only = self.only_selected().and_then(|id| board.shapes.get(id));
+        let name = match only {
+            Some(record) => kind_name(record.shape.kind).to_owned(),
+            None => format!("{count} selected"),
         };
+        // a connector has no box to write in; the inspector does not offer one
+        let writable = only
+            .map(|record| &record.shape)
+            .filter(|s| !s.kind.is_path());
         Some(kit::sized(
-            self.inspector(name, count),
+            self.inspector(name, count, writable),
             Some(Length::Fixed(204.)),
             None,
         ))
@@ -391,7 +488,17 @@ impl BoardsView {
                     [
                         kit::nowrap(kit::caption(
                             "boards/typing-hint",
-                            format!("Enter for a new line · {length}/{}", boards::MAX_TEXT),
+                            // Past the limit the count stops being background
+                            // information and becomes the only thing that
+                            // matters, so it says what to do about it.
+                            if length > boards::MAX_TEXT {
+                                format!(
+                                    "{} too long · Escape leaves the card as it was",
+                                    length - boards::MAX_TEXT
+                                )
+                            } else {
+                                format!("Enter for a new line · {length}/{}", boards::MAX_TEXT)
+                            },
                         )),
                         kit::spacer(),
                         action(
@@ -445,18 +552,17 @@ impl BoardsView {
     }
     fn hint(&self) -> &'static str {
         match self.tool {
-            Tool::Select => "Double-click to write · Shift-click to add to selection",
+            Tool::Select => "Double-click to write · Alt-drag to duplicate",
             Tool::Hand => "Drag to explore · Release Space to return to your tool",
             Tool::Note => "Click to place a note and start typing",
             Tool::Rectangle => "Drag to draw a box · Shift-resize to keep proportions",
-            Tool::Text => "Click to write · Double-click any card to edit",
-            Tool::Connect => {
-                if self.connection.is_some() {
-                    "Choose the destination card · Esc to cancel"
-                } else {
-                    "Choose two cards to connect"
-                }
-            }
+            Tool::Ellipse => "Drag to draw an ellipse · Shift-resize to keep proportions",
+            Tool::Diamond => "Drag to draw a diamond · double-click it to write",
+            Tool::Text => "Click to write · Double-click any shape to edit",
+            Tool::Arrow => "Drag between shapes to connect them · Shift for straight runs",
+            Tool::Line => "Drag to draw a line · Shift for straight runs",
+            Tool::Draw => "Draw freehand · release to keep the stroke",
+            Tool::Eraser => "Drag across what you want gone · release to erase",
         }
     }
     /// The prompt an empty board shows, centred on the stage.
@@ -522,19 +628,39 @@ impl BoardsView {
             None,
         ))
     }
-    fn inspector(&self, name: String, count: usize) -> Node {
+    /// The colour the next shape will be drawn in, on its own, for when there
+    /// is no selection to recolour.
+    fn next_color(&self) -> Node {
+        kit::card(
+            "boards/next-color",
+            kit::spaced(
+                kit::column(
+                    "boards/next-color-body",
+                    [
+                        kit::caption("boards/next-color-label", "New shape"),
+                        self.swatches(),
+                    ],
+                ),
+                6.,
+            ),
+        )
+    }
+    fn swatches(&self) -> Node {
+        kit::spaced(
+            kit::row(
+                "boards/colors",
+                (0..5).map(|color| swatch(color, self.palette == color)),
+            ),
+            4.,
+        )
+    }
+    fn inspector(&self, name: String, count: usize, writable: Option<&Shape>) -> Node {
         let mut properties = vec![
             kit::heading("boards/selection-title", name),
-            kit::spaced(
-                kit::row(
-                    "boards/colors",
-                    (0..5).map(|color| swatch(color, self.palette == color)),
-                ),
-                4.,
-            ),
+            self.swatches(),
             kit::divider("boards/properties-rule"),
         ];
-        if count == 1 {
+        if let Some(shape) = writable {
             properties.push(wide(action(
                 "boards/edit-text",
                 "Edit text",
@@ -542,29 +668,47 @@ impl BoardsView {
                 Message::EditText,
                 true,
             )));
+            properties.push(text_size_row(shape.text_size));
+            // A text shape IS its words: the box is the block, so there is no
+            // room in it for an alignment to move them into and the row would
+            // be a control that does nothing. A card has a box wider than its
+            // writing, which is the whole of what aligning means.
+            if middling(shape.kind) {
+                properties.push(align_row(shape.align));
+            }
         }
-        properties.push(wide(action(
-            "boards/duplicate",
-            "Duplicate",
-            "⌘ / Ctrl D",
-            Message::Duplicate,
-            true,
-        )));
+        // stacking, then arranging: the rows a canvas app keeps in its panel
+        properties.push(kit::spaced(
+            kit::row(
+                "boards/stacking",
+                [
+                    tile(
+                        "front",
+                        "Bring to front",
+                        "⌘ / Ctrl ]",
+                        Message::Stack(true),
+                    ),
+                    tile("back", "Send to back", "⌘ / Ctrl [", Message::Stack(false)),
+                    tile("copy", "Duplicate", "⌘ / Ctrl D", Message::Duplicate),
+                ],
+            ),
+            4.,
+        ));
         if count > 1 {
-            properties.push(wide(action(
-                "boards/align-left",
-                "Align left",
-                "Align selected cards",
-                Message::Align(false),
-                true,
-            )));
-            properties.push(wide(action(
-                "boards/align-top",
-                "Align top",
-                "Align selected cards",
-                Message::Align(true),
-                true,
-            )));
+            properties.push(kit::divider("boards/arrange-rule"));
+            properties.push(kit::caption("boards/arrange-label", "Arrange"));
+            for (key, row) in [("x", ARRANGE_X.as_slice()), ("y", ARRANGE_Y.as_slice())] {
+                properties.push(kit::spaced(
+                    kit::row(
+                        format!("boards/arrange-{key}"),
+                        row.iter().map(|(how, label, name)| {
+                            tile(name, label, "Arrange the selection", Message::Arrange(*how))
+                        }),
+                    ),
+                    4.,
+                ));
+            }
+            properties.push(kit::divider("boards/arrange-rule-b"));
         }
         properties.push(wide(button(
             "boards/delete",
@@ -626,17 +770,25 @@ impl BoardsView {
             ("H / 2 · hold Space", "Pan"),
             ("N / 3", "Sticky note"),
             ("R / 4", "Rectangle"),
-            ("T / 5", "Text"),
-            ("A / 6", "Connector"),
+            ("O / 5", "Ellipse"),
+            ("D / 6", "Diamond"),
+            ("A / 7", "Arrow"),
+            ("L / 8", "Line"),
+            ("P / 9", "Draw freehand"),
+            ("T", "Text"),
+            ("E", "Eraser"),
             ("Q", "Keep tool active"),
             ("Shift-click / drag", "Multiple selection"),
             ("Enter / double-click", "Edit text"),
             ("⌘ / Ctrl Enter", "Finish text / next note"),
-            ("⌘ / Ctrl D", "Duplicate selection"),
+            ("⌘ / Ctrl C · X · V", "Copy / cut / paste at pointer"),
+            ("⌘ / Ctrl D · Alt drag", "Duplicate selection"),
+            ("⌘ / Ctrl ] · [", "Bring to front / send to back"),
             ("⌘ / Ctrl Z · Shift Z", "Undo / redo"),
             ("Arrow · Shift Arrow", "Move 1 / 10 units"),
             ("⌘ / Ctrl + scroll", "Zoom at pointer"),
             ("F · Shift F · 0", "Fit board / selection / 100%"),
+            ("Hold Ctrl", "Ignore snapping while dragging"),
             ("Esc", "Cancel the current gesture"),
         ];
         let mut rows = vec![
@@ -688,228 +840,80 @@ impl BoardsView {
             }
         }
     }
-    fn screen(&self, x: f32, y: f32) -> [f32; 2] {
+    pub(super) fn screen(&self, x: f32, y: f32) -> [f32; 2] {
         [
             x * self.zoom + self.camera[0],
             y * self.zoom + self.camera[1],
         ]
     }
+    /// The scene, bottom to top: the grid, then every shape as its own layer
+    /// with its words pinned straight over it, then one overlay for the marks
+    /// that belong to the pointer rather than to the board.
+    ///
+    /// A shape is a layer of its own because the alternative — one canvas of
+    /// bodies under one stack of labels — lets an earlier shape's text show
+    /// through a later shape that covers it.
     fn canvas(&self, board: &Board) -> Node {
-        let p = kit::palette();
-        let muted = Rgba(p.border_strong);
-        let accent = Rgba(p.accent);
-        let mut commands = Vec::new();
+        let erasing = match &self.gesture {
+            Gesture::Erase { swept, .. } => swept.clone(),
+            _ => BTreeSet::new(),
+        };
+        let mut layers = Vec::new();
+        // The host decodes a fixed number of geometry pieces per frame and
+        // REFUSES the whole frame past it, so the budget is spent in priority
+        // order: the pointer's marks first, then the shapes, each taking a
+        // fair share of what is left, then the grid with the remainder.
+        //
+        // The marks come off the top rather than take what the shapes leave: a
+        // board dense enough to spend the whole budget is exactly the board
+        // where you cannot tell what is selected without them, and selection
+        // chrome that disappears as the work grows reads as broken.
+        let ordered = board.ordered();
+        let mut budget = PARTS - MARKS;
+        // Cards off screen cost no words, so the text allowance is shared out
+        // among the ones actually drawn — on any ordinary board that is the
+        // whole of every card's text, which is the point.
+        let shown = ordered
+            .iter()
+            .filter(|(_, record)| self.on_screen(board, &record.shape).is_some())
+            .count();
+        let share = LETTERS / shown.max(1);
+        for (index, (id, record)) in ordered.iter().enumerate() {
+            let s = &record.shape;
+            let Some(box_) = self.on_screen(board, s) else {
+                continue;
+            };
+            let opacity = if erasing.contains(*id) { 0.25 } else { 1. };
+            let allowance = budget / (ordered.len() - index);
+            let mut body = Vec::new();
+            self.paint(board, s, opacity, allowance, &mut body);
+            if cost(&body) > budget {
+                body.clear();
+            }
+            budget -= cost(&body);
+            if !body.is_empty() {
+                layers.push(Node::Canvas {
+                    key: format!("boards/body/{id}"),
+                    width: Some(Length::Fill),
+                    height: Some(Length::Fill),
+                    commands: body,
+                });
+            }
+            if let Some(label) = self.label(board, id, s, box_, opacity, share) {
+                layers.push(label);
+            }
+        }
         let mut top = Vec::new();
-        let mut labels = Vec::new();
-        let spacing = (32. * self.zoom).max(28.);
-        for col in 0..((self.viewport[0] / spacing).ceil() as usize).min(60) {
-            for row in 0..((self.viewport[1] / spacing).ceil() as usize).min(40) {
-                let center = [
-                    self.camera[0].rem_euclid(spacing) + col as f32 * spacing,
-                    self.camera[1].rem_euclid(spacing) + row as f32 * spacing,
-                ];
-                commands.push(Draw::Draw {
-                    shape: Geometry::Circle {
-                        center,
-                        radius: 0.7,
-                    },
-                    fill: Some(muted),
-                    even_odd: false,
-                    stroke: None,
-                });
-            }
-        }
-        for (id, record) in board.ordered() {
-            let s = &record.shape;
-            if s.kind != Kind::Arrow {
-                continue;
-            }
-            let (Some(from), Some(to)) = (&s.from, &s.to) else {
-                continue;
-            };
-            let (Some(a), Some(b)) = (board.shapes.get(from), board.shapes.get(to)) else {
-                continue;
-            };
-            let start = anchor(&a.shape, &b.shape);
-            let end = anchor(&b.shape, &a.shape);
-            let start = self.screen(start[0], start[1]);
-            let end = self.screen(end[0], end[1]);
-            let color = if self.selected.contains(id) {
-                accent
-            } else {
-                Rgba(tint(s.color))
-            };
-            commands.push(line(start, end, color, 1.5));
-            if !s.text.is_empty() {
-                labels.push(Node::Pin {
-                    key: format!("boards/arrow-label/{id}"),
-                    x: (start[0] + end[0]) / 2.,
-                    y: (start[1] + end[1]) / 2. - 20.,
-                    width: Some(Length::Fixed(180.)),
-                    height: Some(Length::Fixed(40.)),
-                    content: Box::new(kit::wrapping(kit::text(
-                        format!("boards/arrow-text/{id}"),
-                        excerpt(&s.text),
-                    ))),
-                });
-            }
-            let angle = (end[1] - start[1]).atan2(end[0] - start[0]);
-            for turn in [-0.5_f32, 0.5] {
-                commands.push(line(
-                    end,
-                    [
-                        end[0] - 12. * (angle + turn).cos(),
-                        end[1] - 12. * (angle + turn).sin(),
-                    ],
-                    color,
-                    1.5,
-                ));
-            }
-        }
-        for (id, record) in board.ordered() {
-            let s = &record.shape;
-            if s.kind == Kind::Arrow {
-                continue;
-            }
-            let pos = self.screen(s.x as f32, s.y as f32);
-            let size = [s.width as f32 * self.zoom, s.height as f32 * self.zoom];
-            let outside = pos[0] + size[0] < 0.
-                || pos[1] + size[1] < 0.
-                || pos[0] > self.viewport[0]
-                || pos[1] > self.viewport[1];
-            if outside {
-                continue;
-            }
-            let selected = self.selected.contains(id) || self.connection.as_ref() == Some(id);
-            let fill = match s.kind {
-                Kind::Note => Some(Rgba(fill(s.color))),
-                Kind::Rectangle => Some(Rgba(alpha(fill(s.color), 0.45))),
-                Kind::Text | Kind::Arrow => None,
-            };
-            let border = match s.kind {
-                Kind::Note => Some(Rgba(alpha(tint(s.color), 0.35))),
-                Kind::Rectangle => Some(Rgba(tint(s.color))),
-                Kind::Text | Kind::Arrow => None,
-            };
-            if selected {
-                top.push(rectangle(pos, size, None, accent, 1.5));
-            }
-            if selected && self.inline.is_none() && self.selected.len() == 1 {
-                for corner in [[-1, -1], [1, -1], [-1, 1], [1, 1]] {
-                    let world = interaction::corner_point(s, corner);
-                    let handle = self.screen(world[0], world[1]);
-                    top.push(Draw::Draw {
-                        shape: Geometry::Rectangle {
-                            position: [handle[0] - 3.5, handle[1] - 3.5],
-                            size: [7., 7.],
-                            radius: [1.5; 4],
-                        },
-                        fill: Some(Rgba(p.background)),
-                        even_odd: false,
-                        stroke: Some(stroke(accent, 1.5)),
-                    });
-                }
-            }
-            let editing = self.inline.as_ref().is_some_and(|inline| &inline.id == id);
-            let text = if s.text.is_empty() {
-                "Write a thought…"
-            } else {
-                excerpt(&s.text)
-            };
-            let label = if editing {
-                kit::space(None, None)
-            } else {
-                kit::colored(
-                    kit::text_size(
-                        kit::wrapping(kit::text(format!("boards/label/{id}"), text)),
-                        (if s.kind == Kind::Text { 20. } else { 14. } * self.zoom).clamp(8., 60.),
-                    ),
-                    if s.text.is_empty() {
-                        p.faint
-                    } else {
-                        p.foreground
-                    },
-                )
-            };
-            // THE BOX IS ITS OWN LAYER, TEXT INCLUDED: a later shape's fill
-            // covers an earlier one's words, which one canvas of fills under
-            // one stack of labels never could.
-            let mut card = kit::container(format!("boards/label-clip/{id}"), label);
-            if let Node::Container {
-                clip,
-                height,
-                padding,
-                background,
-                border: edge,
-                ..
-            } = &mut card
-            {
-                *clip = true;
-                *height = Some(Length::Fill);
-                *padding = Some(wire::Edges::all(CARD_INSET * self.zoom));
-                *background = fill.map(wire::Background::Color);
-                *edge = border.map(|color| wire::Border {
-                    radius: Some([6.; 4]),
-                    width: Some(1.),
-                    color: Some(color),
-                });
-            }
-            labels.push(Node::Pin {
-                key: format!("boards/pin/{id}"),
-                x: pos[0],
-                y: pos[1],
-                width: Some(Length::Fixed(size[0].max(1.))),
-                height: Some(Length::Fixed(size[1].max(1.))),
-                content: Box::new(card),
-            });
-        }
-        for guide in &self.guides {
-            top.push(line(
-                self.screen(guide[0], guide[1]),
-                self.screen(guide[2], guide[3]),
-                accent,
-                1.,
-            ));
-        }
-        if let Gesture::Marquee { start, point, .. } = &self.gesture {
-            let b = interaction::points_rect(*start, *point);
-            let pos = self.screen(b[0], b[1]);
-            top.push(rectangle(
-                pos,
-                [(b[2] - b[0]) * self.zoom, (b[3] - b[1]) * self.zoom],
-                Some(Rgba(alpha(p.accent, 0.08))),
-                accent,
-                1.,
-            ));
-        }
-        if let Gesture::Create { kind, start, point } = &self.gesture {
-            let shape = self.creation_shape(*kind, *start, *point);
-            let pos = self.screen(shape.x as f32, shape.y as f32);
-            top.push(rectangle(
-                pos,
-                [
-                    shape.width as f32 * self.zoom,
-                    shape.height as f32 * self.zoom,
-                ],
-                Some(Rgba(alpha(p.accent, 0.08))),
-                accent,
-                1.,
-            ));
-        }
-        if let Some(from) = self.connection.as_ref().and_then(|id| board.shapes.get(id)) {
-            let start = self.screen(
-                (from.shape.x + from.shape.width / 2) as f32,
-                (from.shape.y + from.shape.height / 2) as f32,
-            );
-            top.push(line(start, self.cursor, accent, 1.5));
-        }
+        self.paint_marks(board, MARKS, &mut top);
+        let overrun = cost(&top).saturating_sub(MARKS);
+        let grid = self.grid(budget.saturating_sub(overrun));
         let mut children = vec![Node::Canvas {
-            key: "boards/geometry".into(),
+            key: "boards/grid".into(),
             width: Some(Length::Fill),
             height: Some(Length::Fill),
-            commands,
+            commands: grid,
         }];
-        children.extend(labels);
+        children.extend(layers);
         children.push(Node::Canvas {
             key: "boards/overlay".into(),
             width: Some(Length::Fill),
@@ -947,12 +951,15 @@ impl BoardsView {
             on_enter: None,
             content: Box::new(scene),
         };
-        let measure = || Some(slots::handler(Box::new(|(w, h)| Some(Message::Size(w, h)))));
         let sensor = Node::Sensor {
             key: "boards/viewport".into(),
             reset: None,
-            on_show: measure(),
-            on_resize: measure(),
+            // The first sight of the stage is also when the canvas takes the
+            // keyboard; every later one is only a measurement.
+            on_show: Some(slots::handler(Box::new(|(w, h)| {
+                Some(Message::Mounted(w, h))
+            }))),
+            on_resize: Some(slots::handler(Box::new(|(w, h)| Some(Message::Size(w, h))))),
             on_hide: None,
             anticipate: None,
             delay: None,
@@ -969,45 +976,795 @@ impl BoardsView {
             Some(Length::Fill),
         )
     }
+    /// The screen box a shape occupies, or nothing when it is off stage. A
+    /// connector's box is the stroke it draws, which a bound end moves.
+    pub(super) fn on_screen(&self, board: &Board, s: &Shape) -> Option<[f32; 4]> {
+        let world = if s.kind.is_path() {
+            let path = interaction::stroke(board, s);
+            span(&path)?
+        } else {
+            interaction::rect(s)
+        };
+        let a = self.screen(world[0], world[1]);
+        let b = self.screen(world[2], world[3]);
+        let margin = 48.;
+        let shown = b[0] >= -margin
+            && b[1] >= -margin
+            && a[0] <= self.viewport[0] + margin
+            && a[1] <= self.viewport[1] + margin;
+        shown.then_some([a[0], a[1], b[0], b[1]])
+    }
+    /// A faint dot lattice that tracks the camera, drawn no denser than the
+    /// parts it was given.
+    pub(super) fn grid(&self, budget: usize) -> Vec<Draw> {
+        let muted = Rgba(kit::palette().border_strong);
+        // A lattice the camera moves over, not wallpaper stuck to the screen:
+        // the step is always a whole number of board units, doubled until the
+        // dots are far enough apart to read. So zooming out coarsens the ruler
+        // by whole factors — every dot still stands on a round coordinate —
+        // instead of stretching the same dots over ever larger distances.
+        let mut step = GRID;
+        while step * self.zoom < 24. {
+            step *= 2.;
+        }
+        let mut spacing = step * self.zoom;
+        let counts = |spacing: f32| {
+            [
+                (self.viewport[0] / spacing).ceil() as usize + 1,
+                (self.viewport[1] / spacing).ceil() as usize + 1,
+            ]
+        };
+        // widen the lattice rather than truncate it: half a grid reads as a bug
+        while counts(spacing)[0] * counts(spacing)[1] > budget {
+            if spacing > self.viewport[0].max(self.viewport[1]) {
+                return Vec::new();
+            }
+            spacing *= 2.;
+        }
+        let [columns, rows] = counts(spacing);
+        let mut dots = Vec::with_capacity(columns * rows);
+        for column in 0..columns {
+            for row in 0..rows {
+                dots.push(Draw::Draw {
+                    shape: Geometry::Circle {
+                        center: [
+                            self.camera[0].rem_euclid(spacing) + column as f32 * spacing,
+                            self.camera[1].rem_euclid(spacing) + row as f32 * spacing,
+                        ],
+                        radius: 0.7,
+                    },
+                    fill: Some(muted),
+                    even_odd: false,
+                    stroke: None,
+                });
+            }
+        }
+        dots
+    }
+    /// One shape's body, within `budget` pieces of geometry. `opacity` is
+    /// what the eraser has already swept.
+    fn paint(&self, board: &Board, s: &Shape, opacity: f32, budget: usize, out: &mut Vec<Draw>) {
+        let pos = self.screen(s.x as f32, s.y as f32);
+        let size = [s.width as f32 * self.zoom, s.height as f32 * self.zoom];
+        let body = |strength: f32| Rgba(alpha(fill(s.color), strength * opacity));
+        let edge = |strength: f32| Rgba(alpha(tint(s.color), strength * opacity));
+        let line_width = (1.5 * self.zoom).clamp(1., 8.);
+        let radius = (6. * self.zoom).clamp(2., 20.);
+        match s.kind {
+            Kind::Note => out.push(rectangle(pos, size, Some(body(1.)), edge(0.35), 1., radius)),
+            Kind::Rectangle => out.push(rectangle(
+                pos,
+                size,
+                Some(body(0.45)),
+                edge(1.),
+                line_width,
+                radius,
+            )),
+            Kind::Ellipse => out.push(ellipse(pos, size, Some(body(0.45)), edge(1.), line_width)),
+            Kind::Diamond => out.push(diamond(pos, size, Some(body(0.45)), edge(1.), line_width)),
+            // text carries no body: the words are the shape
+            Kind::Text => {}
+            Kind::Arrow | Kind::Line | Kind::Draw => {
+                let world = interaction::stroke(board, s);
+                let screen: Vec<_> = world.iter().map(|p| self.screen(p[0], p[1])).collect();
+                self.paint_stroke(s.kind, &screen, edge(1.), budget, out);
+            }
+        }
+    }
+    fn paint_stroke(
+        &self,
+        kind: Kind,
+        screen: &[[f32; 2]],
+        color: Rgba,
+        budget: usize,
+        out: &mut Vec<Draw>,
+    ) {
+        if screen.len() < 2 {
+            return;
+        }
+        // Samples finer than a pixel buy nothing; past that the budget decides.
+        // The run costs one command plus a segment each, and an arrowhead two
+        // more commands on top.
+        let head = if kind == Kind::Arrow { 2 } else { 0 };
+        let limit = budget.saturating_sub(1 + head);
+        if limit < 2 {
+            return;
+        }
+        // A connector bent by hand has exactly one interior sample and it is a
+        // handle somebody put where they wanted the line. Thinning could drop
+        // it and the smoothing would ride past it either way, so a bent
+        // connector is drawn through its samples instead.
+        let bent = kind != Kind::Draw && screen.len() == 3;
+        let path = match bent {
+            true => screen.to_vec(),
+            false => decimate(&interaction::thin(screen, 0.75), limit),
+        };
+        let end = path[path.len() - 1];
+        let weight = if kind == Kind::Draw { 2.5 } else { 1.8 };
+        let width = (weight * self.zoom).clamp(1.2, 14.);
+        out.push(Draw::Draw {
+            shape: Geometry::Path(match bent {
+                true => through(&path),
+                false => polyline(&path),
+            }),
+            fill: None,
+            even_odd: false,
+            stroke: Some(pen(color, width)),
+        });
+        if kind != Kind::Arrow {
+            return;
+        }
+        // The head points the way the line arrives, which on a curve is the way
+        // its last control point leaves — not the way the sample before it lies.
+        let before = match bent {
+            true => bend_control(&path),
+            false => path[path.len() - 2],
+        };
+        let angle = (end[1] - before[1]).atan2(end[0] - before[0]);
+        let head = (12. * self.zoom).clamp(7., 30.);
+        for turn in [-0.5_f32, 0.5] {
+            out.push(line(
+                end,
+                [
+                    end[0] - head * (angle + turn).cos(),
+                    end[1] - head * (angle + turn).sin(),
+                ],
+                color,
+                width,
+            ));
+        }
+    }
+    /// How a card's words are laid out. The painter and the inline editor both
+    /// ask, and both get this answer, so a label never changes size or jumps to
+    /// a different corner the moment you start typing — which would read as the
+    /// editor having its own opinion about the text rather than showing yours.
+    /// The native editor writes from the top-left of the box it is given and
+    /// cannot be aligned inside it, so wherever the painter puts a card's words
+    /// the editor has to be able to put them too: the box the caret lives in
+    /// carries the alignment instead of the words, and it is sized and placed
+    /// off this same answer.
+    pub(super) fn lettering(&self, s: &Shape, size: [f32; 2]) -> Lettering {
+        let plain = s.kind == Kind::Text;
+        let edge = CARD_INSET * self.zoom;
+        // an ellipse and a diamond pinch away from their corners, so their
+        // words start further in — far enough to sit on the body, not beside it
+        let pinch = match s.kind {
+            Kind::Ellipse => 0.14,
+            Kind::Diamond => 0.22,
+            Kind::Note | Kind::Rectangle | Kind::Text => 0.,
+            Kind::Arrow | Kind::Line | Kind::Draw => 0.,
+        };
+        // A card's label is smaller than a text shape's writing at the same
+        // step — a label sits inside a box that has other things in it, and
+        // the writing IS the thing — and the step multiplies whichever it is,
+        // so choosing a size says the same thing on both.
+        let asked = if plain { 20. } else { 14. } * step(s.text_size) * self.zoom;
+        Lettering {
+            size: asked.clamp(SMALLEST, 60.),
+            inset: edge + size[0].min(size[1]) * pinch,
+            legible: asked >= SMALLEST,
+        }
+    }
+    /// The box a shape's words are written in, on screen: where the painter
+    /// writes them and where the editor opens over them. A card writes inside
+    /// its own outline. A connector has none to write in, so its words ride a
+    /// plate at the middle of the run — the middle of where the run is drawn
+    /// now, which a bound end moves every time the card it holds does.
+    pub(super) fn writing_box(
+        &self,
+        board: &Board,
+        s: &Shape,
+        box_: [f32; 4],
+    ) -> ([f32; 2], [f32; 2]) {
+        if !s.kind.is_path() {
+            return (
+                [box_[0], box_[1]],
+                [(box_[2] - box_[0]).max(1.), (box_[3] - box_[1]).max(1.)],
+            );
+        }
+        // The plate rides the camera like everything else on the board: one
+        // that kept its pixels while the run under it shrank would swallow the
+        // whole drawing at a distance. Where it sits is the hit test's answer
+        // and not a second opinion — that is the difference between a
+        // double-click that opens a label and one that opens the board.
+        let plate = [PLATE[0] * self.zoom, PLATE[1] * self.zoom];
+        let at = interaction::plate(&interaction::stroke(board, s));
+        let middle = self.screen((at[0] + at[2]) / 2., (at[1] + at[3]) / 2.);
+        (
+            [middle[0] - plate[0] / 2., middle[1] - plate[1] / 2.],
+            plate,
+        )
+    }
+    /// The box the caret lives in while you type, which is the room the words
+    /// are given for a card and the plate they hug for a connector. A card is
+    /// written across the whole card, so the two are the same thing; a
+    /// connector's words are centred on its line once saved, and an editor
+    /// given the whole room would write them from the room's left edge and
+    /// throw them a hundred units across the board the moment you were done.
+    /// The host does not centre text inside an editor, so the box is centred
+    /// instead — with a margin, because the editor wraps a shade tighter than
+    /// the label the gauge measures and a box trimmed to the last glyph would
+    /// break a line the painter keeps whole.
+    pub(super) fn caret_box(
+        &self,
+        inline: &Inline,
+        s: &Shape,
+        pos: [f32; 2],
+        room: [f32; 2],
+    ) -> ([f32; 2], [f32; 2]) {
+        let kind = s.kind;
+        // A shape's words sit in the middle of it, so the editor's box is the
+        // words' own box placed in the middle rather than the whole card: the
+        // editor writes from the top-left of whatever box it is given and there
+        // is no verb on the wire for aligning it, so the box IS the alignment.
+        // Until the first measurement lands there is nothing to centre on and
+        // the box is the room itself.
+        let Some(words) = inline.wide else {
+            return (pos, room);
+        };
+        let letters = self.lettering(s, room);
+        let wide = words * self.zoom;
+        // The box is wider than the words by a margin, so the editor does not
+        // wrap a word earlier than the label it is standing in for did. The
+        // margin hangs off the right, where it is empty: the editor writes from
+        // the left edge of whatever box it is given, so a box kept inside the
+        // card would spend the margin pushing the words off the middle exactly
+        // when the words are wide enough to need it.
+        let width = (wide + margin(&letters)).max(1.);
+        // A text shape IS its words: its corner is where you put it, so they
+        // start there and the box is only the room they need to be written in.
+        // It has no slack for an alignment to move them into.
+        if kind == Kind::Text {
+            return (pos, [width, room[1]]);
+        }
+        // It is the WORDS that are set against the card, not the box around
+        // them: the box carries a margin the painter's block does not, and
+        // aligning the box would spend that margin pushing the words off the
+        // edge they were asked to sit on.
+        let slack = room[0] - wide;
+        let x = pos[0]
+            + match s.align {
+                Align::Start => 0.,
+                Align::Middle => (slack / 2.).max(0.),
+                Align::End => slack.max(0.),
+            };
+        // A connector's plate is centred on the run by the room it is given, so
+        // its top is already the top of the plate.
+        let Some(tall) = inline.grown.filter(|_| middling(kind)) else {
+            return ([x, pos[1]], [width, room[1]]);
+        };
+        let down = ((room[1] - tall * self.zoom) / 2.).max(0.);
+        ([x, pos[1] + down], [width, room[1] - down])
+    }
+    /// The box a text shape's words have come to, in board units: the words
+    /// themselves plus the margin the caret needs around them. It follows them
+    /// in both directions because the measurement it reads does not depend on
+    /// the box — a text shape has no column, so nothing about its size can feed
+    /// back into the size of its words.
+    pub(super) fn hugged_width(&self, inline: &Inline, shape: &Shape) -> i32 {
+        let Some(words) = inline.wide else {
+            return shape.width;
+        };
+        let room = [
+            shape.width as f32 * self.zoom,
+            shape.height as f32 * self.zoom,
+        ];
+        let letters = self.lettering(shape, room);
+        let hugged = words + margin(&letters) / self.zoom;
+        hugged
+            .ceil()
+            .clamp(MIN_CARD[0] as f32, boards::MAX_SIZE as f32) as i32
+    }
+    /// A shape's words, pinned over its body and clipped to it.
+    fn label(
+        &self,
+        board: &Board,
+        id: &str,
+        s: &Shape,
+        box_: [f32; 4],
+        opacity: f32,
+        share: usize,
+    ) -> Option<Node> {
+        let p = kit::palette();
+        let editing = self.inline.as_ref().is_some_and(|inline| inline.id == *id);
+        if editing {
+            return None;
+        }
+        let letters = self.lettering(s, [box_[2] - box_[0], box_[3] - box_[1]]);
+        if !letters.legible {
+            return None;
+        }
+        let blank = s.text.is_empty();
+        // a blank sticky invites a word; a blank outline is a drawing, not a
+        // card, and a connector with nothing written on it is just a line
+        let prompt = matches!(s.kind, Kind::Note | Kind::Text);
+        if blank && !prompt {
+            return None;
+        }
+        let text = if blank {
+            "Write a thought…"
+        } else {
+            excerpt(&s.text, share)
+        };
+        let ink = if blank { p.faint } else { p.foreground };
+        let label = kit::colored(
+            kit::text_size(
+                kit::wrapping(kit::text(format!("boards/label/{id}"), text)),
+                letters.size,
+            ),
+            alpha(ink, opacity),
+        );
+        let (pos, size) = self.writing_box(board, s, box_);
+        let riding_a_line = s.kind.is_path();
+        let body = match riding_a_line {
+            true => plate(id, label, &letters, alpha(p.surface, opacity), size),
+            false => card_words(
+                id,
+                label,
+                &letters,
+                s.align,
+                middling(s.kind),
+                column(s.kind, size[0], &letters, self.zoom),
+            ),
+        };
+        Some(Node::Pin {
+            key: format!("boards/pin/{id}"),
+            x: pos[0],
+            y: pos[1],
+            width: Some(Length::Fixed(size[0])),
+            height: Some(Length::Fixed(size[1])),
+            content: Box::new(body),
+        })
+    }
+    /// What belongs to the pointer, not to the board: the selection, its
+    /// handles, the snapping guides and whatever the current gesture is about
+    /// to leave behind.
+    pub(super) fn paint_marks(&self, board: &Board, budget: usize, out: &mut Vec<Draw>) {
+        let p = kit::palette();
+        let accent = Rgba(p.accent);
+        let ring = (6. * self.zoom).clamp(2., 20.);
+        // What a press would take, drawn faintly so it reads as an answer and
+        // not as a selection. Already-selected shapes wear the real ring.
+        if let Some(id) = self
+            .hover
+            .as_ref()
+            .filter(|id| !self.selected.contains(*id))
+            && let Some(record) = board.shapes.get(id)
+            && let Some(box_) = self.on_screen(board, &record.shape)
+        {
+            let inset = if record.shape.kind.is_path() { 4. } else { 0. };
+            out.push(rectangle(
+                [box_[0] - inset, box_[1] - inset],
+                [
+                    box_[2] - box_[0] + inset * 2.,
+                    box_[3] - box_[1] + inset * 2.,
+                ],
+                None,
+                Rgba(alpha(p.accent, 0.45)),
+                1.,
+                ring,
+            ));
+        }
+        // leave the gesture and the guides their own room out of the budget
+        let rings = budget.saturating_sub(32);
+        for id in &self.selected {
+            if cost(out) >= rings {
+                break;
+            }
+            let Some(record) = board.shapes.get(id) else {
+                continue;
+            };
+            let s = &record.shape;
+            let Some(box_) = self.on_screen(board, s) else {
+                continue;
+            };
+            let inset = if s.kind.is_path() { 4. } else { 0. };
+            out.push(rectangle(
+                [box_[0] - inset, box_[1] - inset],
+                [
+                    box_[2] - box_[0] + inset * 2.,
+                    box_[3] - box_[1] + inset * 2.,
+                ],
+                None,
+                accent,
+                1.5,
+                ring,
+            ));
+            let alone = self.selected.len() == 1 && self.inline.is_none();
+            if !alone {
+                continue;
+            }
+            let grip = |at: [f32; 2]| Draw::Draw {
+                shape: Geometry::Rectangle {
+                    position: [at[0] - 3.5, at[1] - 3.5],
+                    size: [7., 7.],
+                    radius: [1.5; 4],
+                },
+                fill: Some(Rgba(p.background)),
+                even_odd: false,
+                stroke: Some(pen(accent, 1.5)),
+            };
+            // A connector is taken by its ends, a card by its corners: the grip
+            // a shape offers is the edit it can be given, and they differ.
+            if s.kind.is_path() {
+                let run = interaction::stroke(board, s);
+                for end in [run.first(), run.last()].into_iter().flatten() {
+                    out.push(grip(self.screen(end[0], end[1])));
+                }
+                // The bend is offered the same way whether it has been used or
+                // not, so it is drawn hollow: it is a place the line will go,
+                // not a place the line is.
+                if let Some((_, _, at)) = self.bend(s, &run) {
+                    let at = self.screen(at[0], at[1]);
+                    out.push(Draw::Draw {
+                        shape: Geometry::Rectangle {
+                            position: [at[0] - 3., at[1] - 3.],
+                            size: [6., 6.],
+                            radius: [3.; 4],
+                        },
+                        fill: Some(Rgba(p.background)),
+                        even_odd: false,
+                        stroke: Some(pen(Rgba(alpha(p.accent, 0.6)), 1.5)),
+                    });
+                }
+                continue;
+            }
+            if !interaction::free(s) {
+                continue;
+            }
+            for corner in interaction::HANDLES {
+                let world = interaction::corner_point(s, corner);
+                out.push(grip(self.screen(world[0], world[1])));
+            }
+        }
+        // Several shapes are one thing to hold, so they get one box to hold it
+        // by. Without it a multiple selection is a scatter of rings that says
+        // what is in it and nothing about what taking hold of it would do.
+        if let Some((bounds, _)) = self.group(board) {
+            let origin = self.screen(bounds[0], bounds[1]);
+            let size = [bounds[2] * self.zoom, bounds[3] * self.zoom];
+            out.push(rectangle(
+                [origin[0] - 6., origin[1] - 6.],
+                [size[0] + 12., size[1] + 12.],
+                None,
+                Rgba(alpha(p.accent, 0.7)),
+                1.,
+                2.,
+            ));
+            let grip = |at: [f32; 2]| Draw::Draw {
+                shape: Geometry::Rectangle {
+                    position: [at[0] - 3.5, at[1] - 3.5],
+                    size: [7., 7.],
+                    radius: [1.5; 4],
+                },
+                fill: Some(Rgba(p.background)),
+                even_odd: false,
+                stroke: Some(pen(accent, 1.5)),
+            };
+            for corner in interaction::HANDLES {
+                let world = interaction::handle_point(bounds, corner);
+                out.push(grip(self.screen(world[0], world[1])));
+            }
+        }
+        for guide in &self.guides {
+            out.push(line(
+                self.screen(guide[0], guide[1]),
+                self.screen(guide[2], guide[3]),
+                accent,
+                1.,
+            ));
+        }
+        self.paint_gesture(board, out);
+    }
+    /// The card an arrow's end would take if it were let go here, ringed. An
+    /// end in hand says what it is about to hold, so releasing is a decision
+    /// you already made rather than one you find out about afterwards.
+    fn ring_the_card(&self, board: &Board, kind: Kind, point: [f32; 2], out: &mut Vec<Draw>) {
+        let p = kit::palette();
+        let Some(id) = self.holding(board, kind, point) else {
+            return;
+        };
+        let Some(record) = board.shapes.get(&id) else {
+            return;
+        };
+        let card = &record.shape;
+        out.push(rectangle(
+            self.screen(card.x as f32, card.y as f32),
+            [
+                card.width as f32 * self.zoom,
+                card.height as f32 * self.zoom,
+            ],
+            Some(Rgba(alpha(p.accent, 0.08))),
+            Rgba(p.accent),
+            2.,
+            (6. * self.zoom).clamp(2., 20.),
+        ));
+    }
+    fn paint_gesture(&self, board: &Board, out: &mut Vec<Draw>) {
+        let p = kit::palette();
+        let accent = Rgba(p.accent);
+        let wash = Some(Rgba(alpha(p.accent, 0.08)));
+        match &self.gesture {
+            Gesture::Marquee { start, point, .. } => {
+                let b = interaction::points_rect(*start, *point);
+                out.push(rectangle(
+                    self.screen(b[0], b[1]),
+                    [(b[2] - b[0]) * self.zoom, (b[3] - b[1]) * self.zoom],
+                    wash,
+                    accent,
+                    1.,
+                    2.,
+                ));
+            }
+            Gesture::Create { kind, start, point } => {
+                let shape = self.creation_shape(*kind, *start, *point);
+                if kind.is_path() {
+                    // An arrow being drawn says what it would take hold of at
+                    // both ends, the same way one being re-routed does: the
+                    // cards it is about to bind are ringed while you drag, not
+                    // reported by the line jumping to their edges after you let
+                    // go.
+                    for end in [*start, *point] {
+                        self.ring_the_card(board, *kind, end, out);
+                    }
+                    // And it is drawn as the shape it would become, stopping at
+                    // the borders of the cards it is taking rather than running
+                    // on into them and snapping back when you let go. Below the
+                    // threshold there is no shape yet, so the raw run stands in.
+                    let run = self.drawn_shape(*kind, *start, *point).map_or_else(
+                        || interaction::path_points(&shape),
+                        |bound| interaction::stroke(board, &bound),
+                    );
+                    let screen: Vec<_> = run.iter().map(|q| self.screen(q[0], q[1])).collect();
+                    self.paint_stroke(*kind, &screen, accent, 8, out);
+                    return;
+                }
+                // A card is drawn AS the card it will be, in the ink it will
+                // keep: an ellipse is an ellipse while you make it. A blue box
+                // that turns into an ellipse when you let go is a preview of
+                // the gesture, not of the shape, and it tells you nothing
+                // about what you are about to put on the board.
+                self.paint(board, &shape, 0.8, PREVIEW, out);
+                // And nothing else. A shape that draws its own outline needs
+                // no box drawn around it: over an ellipse that box is a second
+                // outline belonging to no shape, and while the ellipse is
+                // small the two read as one rounded rectangle that turns into
+                // a circle as it grows — which is the jump this preview was
+                // put here to remove.
+                let its_own_outline = shape.kind != Kind::Text;
+                if its_own_outline {
+                    return;
+                }
+                // A text shape has no body: the ring is the only thing that
+                // says how much room it is taking. No wash under it either —
+                // a tint would report a colour the words will not be in.
+                out.push(rectangle(
+                    self.screen(shape.x as f32, shape.y as f32),
+                    [
+                        shape.width as f32 * self.zoom,
+                        shape.height as f32 * self.zoom,
+                    ],
+                    None,
+                    accent,
+                    1.,
+                    (6. * self.zoom).clamp(2., 20.),
+                ));
+            }
+            Gesture::Sketch { points } => {
+                let screen: Vec<_> = points.iter().map(|q| self.screen(q[0], q[1])).collect();
+                self.paint_stroke(
+                    Kind::Draw,
+                    &screen,
+                    Rgba(tint(self.palette)),
+                    boards::MAX_POINTS,
+                    out,
+                );
+            }
+            // Only an end reaches for a card; a bend crossing one binds nothing
+            // and must not say that it would.
+            Gesture::Endpoint {
+                point, shape, end, ..
+            } if interaction::reaches_for_a_card(shape, *end) => {
+                self.ring_the_card(board, shape.kind, *point, out)
+            }
+            Gesture::Endpoint { .. } => {}
+            Gesture::Idle
+            | Gesture::Pan { .. }
+            | Gesture::Move { .. }
+            | Gesture::Scale { .. }
+            | Gesture::Nudge { .. }
+            | Gesture::Resize { .. }
+            | Gesture::Erase { .. } => {
+                let _ = board;
+            }
+        }
+    }
 }
-pub(super) fn anchor(from: &Shape, to: &Shape) -> [f32; 2] {
-    let center = [
-        from.x as f32 + from.width as f32 / 2.,
-        from.y as f32 + from.height as f32 / 2.,
-    ];
-    let delta = [
-        to.x as f32 + to.width as f32 / 2. - center[0],
-        to.y as f32 + to.height as f32 / 2. - center[1],
-    ];
-    let scale = (from.width as f32 / 2. / delta[0].abs().max(0.001))
-        .min(from.height as f32 / 2. / delta[1].abs().max(0.001));
-    [center[0] + delta[0] * scale, center[1] + delta[1] * scale]
+/// The host decodes at most `MAX_CANVAS_PARTS` (4096) pieces of geometry per
+/// frame, shared across every canvas in it, and REFUSES a frame that exceeds
+/// it. Everything the scene draws is spent out of this one budget.
+const PARTS: usize = 3600;
+/// Held back out of it for what belongs to the pointer — the selection, its
+/// handles, the guides and the gesture in flight. Enough for a wide selection
+/// and its grips, and it is taken before the shapes rather than after, so the
+/// answer to "what am I holding" does not vanish on a busy board.
+const MARKS: usize = 320;
+/// Out of that, what the shape in flight may spend drawing itself. A card
+/// costs one piece; only a stroke can want more, and a stroke being drawn is
+/// already thinned to what the board will store.
+const PREVIEW: usize = 8;
+
+/// What geometry costs against that budget: the host charges for the command
+/// AND for every segment inside it.
+fn cost(commands: &[Draw]) -> usize {
+    commands
+        .iter()
+        .map(|command| {
+            let segments = match command {
+                Draw::Draw {
+                    shape: Geometry::Path(path),
+                    ..
+                } => path.len(),
+                _ => 0,
+            };
+            1 + segments
+        })
+        .sum()
+}
+/// Keep the ends and an even spread between them, so a stroke that cannot
+/// afford every sample this frame still reads as the same line.
+fn decimate(points: &[[f32; 2]], limit: usize) -> Vec<[f32; 2]> {
+    if points.len() <= limit || limit < 2 {
+        return points.to_vec();
+    }
+    let last = points.len() - 1;
+    (0..limit)
+        .map(|index| points[index * last / (limit - 1)])
+        .collect()
 }
 
-// Keep every visible card below its share of the host's 64 KiB text budget.
-// The inspector retains the full text for editing.
-fn excerpt(text: &str) -> &str {
-    let mut end = text.len().min(256);
+fn span(points: &[[f32; 2]]) -> Option<[f32; 4]> {
+    points
+        .iter()
+        .copied()
+        .map(|p| [p[0], p[1], p[0], p[1]])
+        .reduce(|a, b| {
+            [
+                a[0].min(b[0]),
+                a[1].min(b[1]),
+                a[2].max(b[2]),
+                a[3].max(b[3]),
+            ]
+        })
+}
+/// A run of points as one path: a straight segment between two, and a round
+/// one through the midpoints of a longer run, so a pen stroke reads as drawn.
+/// The control point that makes one quadratic pass exactly through the sample
+/// between its ends: a quadratic sits halfway between its control and the chord
+/// at t=½, so the control is twice the sample less the chord's middle.
+fn bend_control(points: &[[f32; 2]]) -> [f32; 2] {
+    let [first, middle, last] = points[..] else {
+        return points[points.len().saturating_sub(2)];
+    };
+    [
+        2. * middle[0] - (first[0] + last[0]) / 2.,
+        2. * middle[1] - (first[1] + last[1]) / 2.,
+    ]
+}
+/// A curve THROUGH the sample it was bent by rather than near it. `polyline`'s
+/// smoothing treats every sample as a control and rides past it, which is right
+/// for ink — a pen's jitter should not be honoured — and wrong for a connector,
+/// where the one interior sample is a handle somebody placed. A line that does
+/// not go where the handle went is a handle that does not work.
+fn through(points: &[[f32; 2]]) -> Vec<wire::CanvasSegment> {
+    use wire::CanvasSegment as Segment;
+    let [first, _, last] = points[..] else {
+        return polyline(points);
+    };
+    vec![
+        Segment::Move(first),
+        Segment::Quadratic {
+            control: bend_control(points),
+            end: last,
+        },
+    ]
+}
+fn polyline(points: &[[f32; 2]]) -> Vec<wire::CanvasSegment> {
+    use wire::CanvasSegment as Segment;
+    let mut path = vec![Segment::Move(points[0])];
+    if points.len() == 2 {
+        path.push(Segment::Line(points[1]));
+        return path;
+    }
+    for pair in points.windows(2).skip(1) {
+        path.push(Segment::Quadratic {
+            control: pair[0],
+            end: [
+                (pair[0][0] + pair[1][0]) / 2.,
+                (pair[0][1] + pair[1][1]) / 2.,
+            ],
+        });
+    }
+    path.push(Segment::Line(points[points.len() - 1]));
+    path
+}
+
+/// The host decodes at most 64 KiB of text per frame and refuses the whole
+/// frame past it. Most of that is the chrome's, which is short and fixed; the
+/// rest is the board's to share out among the cards actually on screen.
+const LETTERS: usize = 48 * 1024;
+/// One card's share of that, given how many are on screen with it. A board of
+/// a dozen cards gives every one of them room for its whole text — which is
+/// the point: what a card shows and what its editor holds are the same words.
+/// Only a screen packed past readability has to cut anything, and it cuts the
+/// tail rather than the frame.
+fn excerpt(text: &str, share: usize) -> &str {
+    let mut end = text.len().min(share);
     while !text.is_char_boundary(end) {
         end -= 1;
     }
     &text[..end]
 }
 
-const TOOLS: [(Tool, &str, &str, &str); 6] = [
+/// The tool bar, in the order a canvas app prints it: what points, what pans,
+/// then the shapes, then the pen and what takes it back.
+const TOOLS: [(Tool, &str, &str, &str); 11] = [
     (Tool::Select, "Select", "V", "select"),
     (Tool::Hand, "Pan", "H", "hand"),
     (Tool::Note, "Note", "N", "note"),
     (Tool::Rectangle, "Box", "R", "box"),
+    (Tool::Ellipse, "Ellipse", "O", "ellipse"),
+    (Tool::Diamond, "Diamond", "D", "diamond"),
+    (Tool::Arrow, "Arrow", "A", "arrow"),
+    (Tool::Line, "Line", "L", "line"),
+    (Tool::Draw, "Draw", "P", "draw"),
     (Tool::Text, "Text", "T", "text"),
-    (Tool::Connect, "Connect", "A", "arrow"),
+    (Tool::Eraser, "Eraser", "E", "eraser"),
+];
+/// The arrange rows, an axis each: the three edges to line up on, then the
+/// even spread along the same axis.
+const ARRANGE_X: [(Arrange, &str, &str); 4] = [
+    (Arrange::Left, "Align left", "align-left"),
+    (Arrange::CentreX, "Align centres", "align-centre-x"),
+    (Arrange::Right, "Align right", "align-right"),
+    (Arrange::SpreadX, "Spread across", "spread-x"),
+];
+const ARRANGE_Y: [(Arrange, &str, &str); 4] = [
+    (Arrange::Top, "Align top", "align-top"),
+    (Arrange::CentreY, "Align middles", "align-centre-y"),
+    (Arrange::Bottom, "Align bottom", "align-bottom"),
+    (Arrange::SpreadY, "Spread down", "spread-y"),
 ];
 fn kind_name(kind: Kind) -> &'static str {
     match kind {
         Kind::Note => "Sticky note",
         Kind::Rectangle => "Rectangle",
+        Kind::Ellipse => "Ellipse",
+        Kind::Diamond => "Diamond",
         Kind::Text => "Text",
-        Kind::Arrow => "Connector",
+        Kind::Arrow => "Arrow",
+        Kind::Line => "Line",
+        Kind::Draw => "Drawing",
     }
 }
 fn pin(key: &str, x: f32, y: f32, width: f32, content: Node) -> Node {
@@ -1041,6 +1798,165 @@ fn float(
         on_dismiss: dismiss.map(slots::message),
         children: vec![base, card],
     }
+}
+/// A card's words: the top-left of its own box, clipped to it, because a card
+/// is a page and a page fills from its corner.
+/// The room a card keeps around its column, because the native editor keeps
+/// room inside the box it is given that a plain label does not: with the same
+/// words in the same column it takes one line more than the label does. It
+/// rides the type size so a card's height is the same whatever the camera is
+/// doing — a box that reflowed as you zoomed would resize itself for being
+/// looked at.
+///
+/// The label, the gauge that measures it, the caret and the box a text shape
+/// hugs its words with all read this one description of it.
+pub(super) fn margin(letters: &Lettering) -> f32 {
+    2. * letters.size
+}
+/// What one step of the type ladder multiplies the writing by. Four steps and
+/// not a slider: the size decides the column a card wraps in and the box a
+/// text shape hugs, so every step has to leave writing a board can hold and a
+/// box can be fitted to.
+pub(super) fn step(text_size: TextSize) -> f32 {
+    match text_size {
+        TextSize::Small => 0.72,
+        TextSize::Medium => 1.,
+        TextSize::Large => 1.45,
+        TextSize::Huge => 2.1,
+    }
+}
+/// The column a shape's words are written in, on screen.
+pub(super) fn column(kind: Kind, room: f32, letters: &Lettering, zoom: f32) -> f32 {
+    match kind {
+        // A text shape has no column. It IS its words: as wide as the longest
+        // line, breaking only where you broke it. Wrapping it inside its own
+        // box would make the box the column, and a box that is its own column
+        // walks itself shut — each measurement narrower than the one that sized
+        // the box it was measured in.
+        Kind::Text => boards::MAX_SIZE as f32 * zoom,
+        Kind::Note | Kind::Rectangle | Kind::Ellipse | Kind::Diamond => {
+            (room - margin(letters)).max(40. + 2. * letters.inset)
+        }
+        // A connector's plate is the room, and the room is already the widest
+        // label a line is allowed to carry.
+        Kind::Arrow | Kind::Line | Kind::Draw => room,
+    }
+}
+/// Whether a shape's words belong in the middle of it. A card drawn as a box
+/// carries its label in the centre, the way every canvas app does; a text shape
+/// IS its words, so its corner is where you put it and they start there.
+///
+/// One answer, read by the painter and by the caret, because a label that is
+/// centred when it is drawn and top-left when it is typed in is the same defect
+/// as one that moves when you save it.
+pub(super) fn middling(kind: Kind) -> bool {
+    !kind.is_path() && kind != Kind::Text
+}
+fn card_words(
+    id: &str,
+    words: Node,
+    letters: &Lettering,
+    align: Align,
+    middling: bool,
+    room: f32,
+) -> Node {
+    let mut held = kit::container(format!("boards/label-box/{id}"), words);
+    if let Node::Container {
+        padding,
+        width,
+        max_width,
+        ..
+    } = &mut held
+    {
+        // The card is the words plus the room they are written in.
+        *padding = Some(wire::Edges::all(letters.inset));
+        // The BLOCK of words is as wide as its longest line and no wider, so
+        // that the middle of the block is somewhere the caret can reach. The
+        // lines inside it stay where they fall: centring each line would look
+        // better and the caret could not follow it — the native editor writes
+        // from the left edge of the box it is given and there is no verb on the
+        // wire for aligning it, so a line centred here would be a line that
+        // jumped the moment you clicked on it.
+        //
+        // Wrapping rides the box's max width rather than the text's own width,
+        // because a text told to fill cannot shrink, and a block that cannot
+        // shrink has no middle of its own — nor any width for a text shape to
+        // take as its own.
+        *width = Some(Length::Shrink);
+        *max_width = Some(room.max(1.));
+    }
+    let mut clip = kit::container(format!("boards/label-clip/{id}"), held);
+    if let Node::Container {
+        clip: clipped,
+        width,
+        height,
+        align_x,
+        align_y,
+        ..
+    } = &mut clip
+    {
+        *clipped = true;
+        // The card itself, so the block has something to be in the middle of.
+        *width = Some(Length::Fill);
+        *height = Some(Length::Fill);
+        // Where the BLOCK of words sits against the card. The lines inside it
+        // keep falling from its left edge, because that is the one thing the
+        // native editor can also do: a line centred here would be a line that
+        // jumped the moment you clicked on it.
+        //
+        // A text shape IS its words, so its block is its box and there is
+        // nothing for this to move — its corner is where you put it.
+        let set = match align {
+            Align::Start => wire::AlignX::Left,
+            Align::Middle => wire::AlignX::Center,
+            Align::End => wire::AlignX::Right,
+        };
+        *align_x = middling.then_some(set);
+        *align_y = middling.then_some(wire::AlignY::Center);
+    }
+    clip
+}
+/// A connector's words on a plate at the middle of its run: the plate hugs the
+/// words rather than filling the room set aside for them, because the room is
+/// sized for the longest label a line could carry and a plate that big would
+/// rub out the line either side of a short one. The words are centred in that
+/// room, which is what puts them ON the line instead of beside it.
+fn plate(id: &str, words: Node, letters: &Lettering, wash: [f32; 4], room: [f32; 2]) -> Node {
+    let mut riding = kit::container(format!("boards/plate/{id}"), words);
+    if let Node::Container {
+        clip: clipped,
+        width,
+        height,
+        max_width,
+        padding,
+        background,
+        align_x,
+        align_y,
+        ..
+    } = &mut riding
+    {
+        *clipped = true;
+        *width = Some(Length::Shrink);
+        *height = Some(Length::Shrink);
+        *max_width = Some(room[0]);
+        *padding = Some(wire::Edges::all(letters.inset));
+        *background = Some(wire::Background::Color(Rgba(wash)));
+        *align_x = Some(wire::AlignX::Center);
+        *align_y = Some(wire::AlignY::Center);
+    }
+    let mut middle = kit::container(format!("boards/plate-centre/{id}"), riding);
+    if let Node::Container {
+        height,
+        align_x,
+        align_y,
+        ..
+    } = &mut middle
+    {
+        *height = Some(Length::Fill);
+        *align_x = Some(wire::AlignX::Center);
+        *align_y = Some(wire::AlignY::Center);
+    }
+    middle
 }
 /// An island: a card at a stage corner, its controls packed tight.
 fn island(key: &str, content: Node) -> Node {
@@ -1124,11 +2040,44 @@ fn icon(name: &str) -> Node {
         }
         "note" => "<path d='M4 3h16v12l-5 6H4z'/><path d='M15 21v-6h5M8 8h8M8 12h5'/>",
         "box" => "<rect x='4' y='4' width='16' height='16' rx='3'/>",
+        "ellipse" => "<ellipse cx='12' cy='12' rx='9' ry='7'/>",
+        "diamond" => "<path d='M12 3 21 12 12 21 3 12z'/>",
+        "line" => "<path d='M4 20 20 4'/>",
+        "draw" => "<path d='M4 20h4L19 9l-4-4L4 16z'/><path d='m14 6 4 4M4 16l4 4'/>",
+        "eraser" => "<path d='m13 4 7 7-8 8H7l-4-4z'/><path d='M8 9l7 7M11 19h9'/>",
         "text" => "<path d='M4 6V4h16v2M12 4v16M8 20h8'/>",
         "arrow" => "<path d='M4 19 20 4M10 4h10v10'/>",
         "lock" => {
             "<rect x='5' y='10' width='14' height='11' rx='3'/><path d='M8 10V7a4 4 0 0 1 8 0v3M12 14v3'/>"
         }
+        // the arrange tiles: a rule on the edge the boxes line up against
+        "align-left" => {
+            "<path d='M3 3v18'/><rect x='6' y='5' width='14' height='5'/><rect x='6' y='14' width='9' height='5'/>"
+        }
+        "align-centre-x" => {
+            "<path d='M12 3v18'/><rect x='5' y='5' width='14' height='5'/><rect x='8' y='14' width='8' height='5'/>"
+        }
+        "align-right" => {
+            "<path d='M21 3v18'/><rect x='4' y='5' width='14' height='5'/><rect x='9' y='14' width='9' height='5'/>"
+        }
+        "align-top" => {
+            "<path d='M3 3h18'/><rect x='5' y='6' width='5' height='14'/><rect x='14' y='6' width='5' height='9'/>"
+        }
+        "align-centre-y" => {
+            "<path d='M3 12h18'/><rect x='5' y='5' width='5' height='14'/><rect x='14' y='8' width='5' height='8'/>"
+        }
+        "align-bottom" => {
+            "<path d='M3 21h18'/><rect x='5' y='4' width='5' height='14'/><rect x='14' y='9' width='5' height='9'/>"
+        }
+        // how a card's words are set: lines of writing flush to one side
+        "text-start" => "<path d='M4 6h16M4 11h10M4 16h13M4 21h8'/>",
+        "text-middle" => "<path d='M4 6h16M7 11h10M5 16h14M8 21h8'/>",
+        "text-end" => "<path d='M4 6h16M10 11h10M7 16h13M12 21h8'/>",
+        "spread-x" => "<path d='M3 3v18M21 3v18'/><rect x='10' y='7' width='4' height='10'/>",
+        "spread-y" => "<path d='M3 3h18M3 21h18'/><rect x='7' y='10' width='10' height='4'/>",
+        "front" => "<rect x='3' y='3' width='12' height='12' rx='2'/><path d='M9 21h12V9'/>",
+        "back" => "<rect x='9' y='9' width='12' height='12' rx='2'/><path d='M15 3H3v12'/>",
+        "copy" => "<rect x='9' y='9' width='12' height='12' rx='2'/><path d='M5 15H3V3h12v2'/>",
         "undo" => "<path d='M9 14 4 9l5-5'/><path d='M4 9h10a5 5 0 0 1 0 10h-3'/>",
         "redo" => "<path d='m15 14 5-5-5-5'/><path d='M20 9H10a5 5 0 0 0 0 10h3'/>",
         "help" => {
@@ -1263,6 +2212,19 @@ fn tool_button_message(
         ],
     }
 }
+/// An icon-only square in an inspector row: the panel packs its arrangements
+/// the way a canvas app does, six to a strip rather than six stacked labels.
+fn tile(name: &str, label: &str, hint: &str, message: Message) -> Node {
+    icon_button(
+        &format!("boards/tile/{name}"),
+        name,
+        label,
+        hint,
+        message,
+        true,
+        false,
+    )
+}
 /// A 28px icon-only control with a name and a hint, checked when `on`.
 fn icon_button(
     key: &str,
@@ -1295,6 +2257,97 @@ fn icon_button(
         *height = Some(Length::Fixed(28.));
         *padding = Some(wire::Edges::all(6.));
         *description = Some(hint.into());
+    }
+    node
+}
+/// The four steps of the type ladder, the one this shape is at checked.
+fn text_size_row(current: TextSize) -> Node {
+    kit::spaced(
+        kit::row(
+            "boards/text-size",
+            [
+                (TextSize::Small, "small", "A", "Small", 10.),
+                (TextSize::Medium, "medium", "A", "Medium", 13.),
+                (TextSize::Large, "large", "A", "Large", 17.),
+                (TextSize::Huge, "huge", "A", "Huge", 21.),
+            ]
+            .map(|(step, key, letter, label, size)| {
+                letter_button(
+                    key,
+                    letter,
+                    label,
+                    size,
+                    Message::Lettering(step),
+                    step == current,
+                )
+            }),
+        ),
+        4.,
+    )
+}
+/// Where this card's words sit across it, the one it is set to checked.
+fn align_row(current: Align) -> Node {
+    kit::spaced(
+        kit::row(
+            "boards/text-align",
+            [
+                (Align::Start, "text-start", "Align left"),
+                (Align::Middle, "text-middle", "Align centre"),
+                (Align::End, "text-end", "Align right"),
+            ]
+            .map(|(align, name, label)| {
+                icon_button(
+                    &format!("boards/align/{name}"),
+                    name,
+                    label,
+                    "Where this card's words sit across it",
+                    Message::Align(align),
+                    true,
+                    align == current,
+                )
+            }),
+        ),
+        4.,
+    )
+}
+/// A 28px control labelled with a letter rather than a glyph, checked when
+/// `on`, the letter drawn at the size it stands for. Four steps of type size
+/// are four sizes of the same letter, and no icon says that as plainly as the
+/// letter itself does.
+fn letter_button(
+    key: &str,
+    letter: &str,
+    label: &str,
+    size: f32,
+    message: Message,
+    on: bool,
+) -> Node {
+    let glyph = kit::nowrap(kit::text_size(
+        kit::text(format!("boards/letter/{key}"), letter),
+        size,
+    ));
+    let mut node = kit::button_child(
+        format!("boards/text-size/{key}"),
+        glyph,
+        Some(slots::message(message)),
+        ButtonPreset::Subtle,
+    );
+    if let Node::Button {
+        label: accessible,
+        checked,
+        width,
+        height,
+        padding,
+        description,
+        ..
+    } = &mut node
+    {
+        *accessible = Some(label.into());
+        *checked = Some(on);
+        *width = Some(Length::Fixed(28.));
+        *height = Some(Length::Fixed(28.));
+        *padding = Some(wire::Edges::all(2.));
+        *description = Some("How big this shape's words are".into());
     }
     node
 }
@@ -1347,6 +2400,79 @@ fn swatch(color: u8, selected: bool) -> Node {
     node
 }
 impl BoardsView {
+    /// The card's words a second time, invisibly, laid out exactly the way the
+    /// painter writes them and left to take whatever height they need. The
+    /// host reports what that came to, and the card grows to it.
+    ///
+    /// The native editor cannot answer this itself: asked to lay out to its
+    /// own content it shows one line of however many it holds, and there is no
+    /// verb on the wire for measuring a document. So the gauge measures the
+    /// label instead — the same text node, the same size, the same width and
+    /// the same padding — which is the right authority anyway. The card ends
+    /// up as tall as the words it will be *drawn* with.
+    fn text_gauge(&self, inline: &Inline, shape: &Shape, pos: [f32; 2], size: [f32; 2]) -> Node {
+        let letters = self.lettering(shape, size);
+        let words = inline.document.text();
+        let measure = || {
+            Some(slots::handler(Box::new(|(w, h)| {
+                Some(Message::Measured(w, h))
+            })))
+        };
+        let gauge = kit::colored(
+            kit::text_size(
+                kit::wrapping(kit::text("boards/gauge-text", excerpt(&words, LETTERS))),
+                letters.size,
+            ),
+            alpha(kit::palette().foreground, 0.),
+        );
+        // Both halves of the answer, from one measurement: how TALL the words
+        // are in the column they are given, and how WIDE the longest of them
+        // came out. The card needs the height to grow to and the caret needs
+        // the width to be centred on, and a gauge held to a fixed width can
+        // only answer the first — it reports the column back whatever is
+        // written in it. So the gauge shrinks to its words and wraps at the
+        // column instead, which is the same wrap and therefore the same height.
+        let room = column(shape.kind, size[0], &letters, self.zoom);
+        let mut padded = kit::container("boards/gauge-pad", gauge);
+        if let Node::Container {
+            padding,
+            width,
+            max_width,
+            ..
+        } = &mut padded
+        {
+            // The card is the words plus the room they are written in, so the
+            // gauge carries the same inset and reports a card height, not a
+            // text height.
+            *padding = Some(wire::Edges::all(letters.inset));
+            *width = Some(Length::Shrink);
+            *max_width = Some(room.max(1.));
+        }
+        Node::Pin {
+            key: "boards/gauge-pin".into(),
+            x: pos[0],
+            y: pos[1],
+            // Neither width nor height: this is the one node on the stage
+            // allowed to be exactly as big as it likes, because its size IS the
+            // answer. A pin held to the card's width hands that width straight
+            // back down to a container that shrinks, and the gauge reports the
+            // column it was given rather than the words in it. The column lives
+            // on the container's max_width instead, which wraps the words
+            // without stretching them.
+            width: None,
+            height: None,
+            content: Box::new(Node::Sensor {
+                key: format!("boards/gauge/{}", inline.id),
+                reset: None,
+                on_show: measure(),
+                on_resize: measure(),
+                on_hide: None,
+                anticipate: None,
+                delay: None,
+                child: Box::new(padded),
+            }),
+        }
+    }
     fn inline_editor(&self, shape: &Shape, pos: [f32; 2], size: [f32; 2]) -> Node {
         use ducktape_view_guest::{EditorBinding, EditorTransactionEvent};
         use wire::keyboard::{Key, Named};
@@ -1368,22 +2494,30 @@ impl BoardsView {
                 },
             ],
             |_| wire::EditorDecision::Noop,
+            // Both claimed keys leave the card, and they are not the same
+            // answer: ⌘Enter keeps what you wrote, Escape is the way out when
+            // the board will not take it. The commit says which key asked, so
+            // this is where they part.
             |event| match event {
-                EditorTransactionEvent::Commit { origin, .. } => {
-                    origin.is_some().then_some(Message::FinishText)
-                }
+                EditorTransactionEvent::Commit { origin, .. } => match origin {
+                    Some(wire::EditorRequestInput::Key { key, .. })
+                        if key.key == Key::Named(Named::Escape) =>
+                    {
+                        Some(Message::Cancel)
+                    }
+                    Some(_) => Some(Message::FinishText),
+                    None => None,
+                },
                 _ => None,
             },
         )
         .register(std::convert::identity, Message::TextTransaction);
-        let color = if shape.kind == Kind::Note {
-            fill(shape.color)
-        } else {
-            self.canvas_color()
-        };
+        // The card is already painted underneath, fill and outline and all; an
+        // opaque field over it would replace the shape you are writing inside
+        // with a plain rectangle for as long as you typed.
         let style = wire::InputStyle {
             active: wire::InputFace {
-                background: Some(Rgba(color)),
+                background: Some(Rgba([0.; 4])),
                 value: Some(Rgba(kit::palette().foreground)),
                 border: Some(wire::Border {
                     width: Some(0.),
@@ -1395,25 +2529,35 @@ impl BoardsView {
             focus_border: Some(Rgba([0.; 4])),
             ..Default::default()
         };
+        let letters = self.lettering(shape, size);
         let editor = Node::Editor {
             key: format!("boards/editor/{}", inline.id),
             document,
             on_document,
             editable: true,
             placeholder: "Write a thought…".into(),
-            width: Some((size[0] - 2. * CARD_INSET * self.zoom).max(40.)),
+            width: Some((size[0] - 2. * letters.inset).max(40.)),
+            // The editor fills the card. It cannot be asked to lay out to its
+            // own content instead — a shrunk editor collapses to its first
+            // line on the native side, which is how a card would learn to
+            // hide five of the six lines it is holding.
             height: Some(Length::Fill),
-            min_height: Some(32.),
+            min_height: Some(letters.size * 1.6),
             max_height: None,
             options: Box::new(wire::EditorOptions {
                 binding: Some(Box::new(binding)),
-                size: Some((14. * self.zoom).clamp(10., 42.)),
+                size: Some(letters.size),
                 padding: Some(0.),
                 style,
                 ..Default::default()
             }),
         };
-        let inset = CARD_INSET * self.zoom;
+        let layout = kit::sized(
+            kit::container("boards/editor-layout", editor),
+            Some(Length::Fill),
+            Some(Length::Fill),
+        );
+        let inset = letters.inset;
         Node::Pin {
             key: "boards/editor-pin".into(),
             x: pos[0] + inset,
@@ -1430,11 +2574,7 @@ impl BoardsView {
                 on_hide: None,
                 anticipate: None,
                 delay: None,
-                child: Box::new(kit::sized(
-                    kit::container("boards/editor-layout", editor),
-                    Some(Length::Fill),
-                    Some(Length::Fill),
-                )),
+                child: Box::new(layout),
             }),
         }
     }
