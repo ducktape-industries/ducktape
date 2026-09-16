@@ -718,3 +718,55 @@ fn settle_native_documents(native: &mut VisualTestContext, seat: &Arc<Mutex<Moun
         );
     }
 }
+
+#[gpui_kit::test]
+fn call_panel_renders_staged_wasm_and_routes_native_control_clicks(cx: &mut TestAppContext) {
+    let _turn = tests::blocking_connection_turn();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/views/call_view.wasm");
+    let mut guest = Guest::load_from("call", &path).expect("build current Call view first");
+    let props = Some(br#"{"panel":{"status":"live","muted":false}}"#.to_vec());
+    guest.redraw(&None);
+    settle(&mut guest, &props);
+    assert!(guest.fault.is_none(), "{:?}", guest.fault);
+    let seat = Arc::new(Mutex::new(Mounted {
+        changes: tokio::sync::watch::channel(()).0,
+        slot: Slot::Ready(Box::new(guest)),
+        props,
+        generation: 1,
+        hash: None,
+        in_flight: false,
+        wanted: None,
+        tasting: None,
+        waiting_since: None,
+        replacement: Replacement::Preserve,
+        retry: None,
+    }));
+    registry().lock().unwrap().insert("call", seat.clone());
+    cx.update(gpui_kit::init);
+    let window = cx.open_window(gpui::size(gpui::px(560.), gpui::px(600.)), |_, _| {
+        NativeModuleView::new("call")
+    });
+    let view = window.root(cx).unwrap();
+    let mut native = VisualTestContext::from_window(window.into(), cx);
+    let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    native.update(|_, cx| {
+        let events = events.clone();
+        cx.subscribe(&view, move |_, event: &ModuleViewEvent, _| {
+            events.borrow_mut().push(event.kind.clone());
+        })
+        .detach();
+    });
+    native.update(|window, cx| window.render_frame(cx));
+    for (label, intent) in [
+        ("Mute", "mute"),
+        ("Camera", "camera"),
+        ("Share screen", "screen"),
+        ("Go to channel", "channel"),
+        ("Leave huddle", "leave"),
+    ] {
+        click_before_frame(&mut native, button(&seat, label));
+        native.update(|window, cx| window.render_frame(cx));
+        native.run_until_parked();
+        assert_eq!(events.borrow_mut().drain(..).collect::<Vec<_>>(), [intent]);
+    }
+}
