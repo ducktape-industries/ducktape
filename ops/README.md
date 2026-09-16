@@ -192,6 +192,10 @@ under `target`, records their SHA-256 values and the supplied exact source/UI
 revisions in `owner.json`, and allocates fresh loopback ports. The binary's
 version must match the source revision. Build the input files from the stated
 revisions; the supervisor cannot infer the compiler provenance of view bytes.
+`$MODULES` is the set the build staged for THAT checkout —
+`target/<profile>/modules%<checkout path>` (`%` for each `/`) — not a plain
+`modules`, which on a box where checkouts share a target dir is whichever
+build ran last.
 
 ```sh
 python3 ops/proxmox-view-local.py --binary "$NODE_BINARY" --modules "$MODULES" \

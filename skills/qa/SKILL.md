@@ -46,15 +46,17 @@ node that is still emitting lines at the deadline (`module installed`,
 not wedged. Never widen a deadline to make one pass: the deadline is what makes
 stopped progress visible at all.
 
-**Pin what the run reads, and guard it.** `workspace_config::modules_dir()`
-honours `$DUCKTAPE_MODULES_DIR` before anything else and `founding_set()`
-resolves through it, so a private snapshot takes the run off the shared
-founding set that any peer's `noded` build restages:
+**Pin what the run reads, and guard it.** A build stages into the set named for
+its own checkout (`modules%<path>`), so a peer's `noded` build no longer
+restages yours — but YOUR next `cargo build` does, and that is enough to shift
+artifacts under an iteration. `workspace_config::modules_dir()` honours
+`$DUCKTAPE_MODULES_DIR` before anything else and `founding_set()` resolves
+through it, so a private snapshot holds one set still for the whole run:
 
 ```bash
 make views                                             # once, in this worktree
 touch crates/noded/build.rs && cargo check -p noded    # restage; expect 0 *.pending
-cp -a "$CARGO_TARGET_DIR/debug/modules/." target/pin-modules/
+cp -a "$CARGO_TARGET_DIR/debug/modules$(pwd | tr / %)/." target/pin-modules/
 export DUCKTAPE_MODULES_DIR=$PWD/target/pin-modules
 ```
 
@@ -219,8 +221,9 @@ A running daemon (`cargo run -p noded-bin -- --modules <dir>`, or a workspace
 node seeded by `make demo-seed`) serves the full `/v1` surface at
 `http://127.0.0.1:8844` by default. Its genesis composes every tenant from
 `<dir>/<id>.component.wasm` and converges every `<dir>/<id>.index.wasm`;
-without `--modules` it reads the founding set the build staged beside the
-binary (`target/<profile>/modules`, or `$DUCKTAPE_MODULES_DIR`) and refuses
+without `--modules` it reads the founding set its own build staged beside the
+binary (`target/<profile>/modules%<checkout path>`, or
+`$DUCKTAPE_MODULES_DIR`) and refuses
 to boot, naming the first file it could not find, if that set is incomplete.
 Query it directly, or drive its module surface with the
 `ops/agent-system` operator CLI (raw query/submit, agent list/pause/resume).

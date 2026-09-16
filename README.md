@@ -210,9 +210,11 @@ ducktape node status                # height + root hash of the running node
 
 `node init` composes the network's wasm — every module's
 `<id>.component.wasm` and `<id>.index.wasm` — into `<workspace>/genesis` out of
-the founding set `cargo build` stages beside the binary
-(`target/<profile>/modules`; `--modules <dir>` or `$DUCKTAPE_MODULES_DIR`
-overrides it), and pins that file in `network.toml`. An incomplete set is
+the founding set `cargo build` stages beside the binary, in the directory
+named for the checkout that built it (`target/<profile>/modules%<checkout
+path>`, so several checkouts can share one target dir without staging over
+each other; `--modules <dir>` or `$DUCKTAPE_MODULES_DIR` overrides it, and an
+installed node reads a plain `modules` beside its binary), and pins that file in `network.toml`. An incomplete set is
 refused by file name at `init`. A joiner installs the founder's file with
 `node join --genesis <file>` (a member must; a resident may, and otherwise
 fetches it off the mesh at first boot); the node hydrates its blob store and

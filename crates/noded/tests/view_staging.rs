@@ -116,6 +116,112 @@ fn declared_views_become_pending_restore_and_remove_only_with_ownership() {
     }
 }
 
+/// TWO CHECKOUTS, ONE PROFILE DIRECTORY — the shared-target shape this box
+/// runs. The checkout WITHOUT built views stages last, which used to leave
+/// `<id>.view.pending` in the one set every checkout read: the other
+/// checkout's `node init` then refused a set whose bytes were perfectly good
+/// ("declared view is pending"), and the cure was manual. Each checkout now
+/// owns its own set, so the view-less build can only refuse itself.
+#[test]
+fn a_view_less_checkout_cannot_poison_another_checkouts_staged_set() {
+    let scratch = tempfile::tempdir().unwrap();
+    // one CARGO_TARGET_DIR, as several worktrees share on a dev box
+    let profile = scratch.path().join("target/debug");
+    let built = fake_checkout(&scratch.path().join("has-views"), true);
+    let bare = fake_checkout(&scratch.path().join("no-views"), false);
+
+    let staged = |checkout: &std::path::Path| {
+        build_script::staged_dir(&profile, "modules", checkout)
+    };
+    build_script::stage_preset(&built, &staged(&built), &["chat"], &["home"]);
+    // the view-less checkout builds LAST: this is the poisoning order
+    build_script::stage_preset(&bare, &staged(&bare), &["chat"], &["home"]);
+
+    let ours = staged(&built);
+    for id in ["chat", "home"] {
+        assert!(
+            !ours.join(format!("{id}.view.pending")).exists(),
+            "{id}: another checkout's missing view left a marker in our set"
+        );
+        assert_eq!(
+            std::fs::read(ours.join(format!("{id}.view.wasm"))).unwrap(),
+            b"view"
+        );
+    }
+    workspace_config::Genesis::compose(&ours)
+        .expect("the set we built still founds after a view-less checkout built");
+
+    // and the view-less checkout still refuses ITS OWN set, loudly — that
+    // fail-closed is the point, it just stops being everyone's problem
+    let theirs = staged(&bare);
+    assert!(theirs.join("chat.view.pending").exists());
+    assert!(
+        workspace_config::Genesis::compose(&theirs)
+            .unwrap_err()
+            .contains("pending")
+    );
+    assert_ne!(ours, theirs, "two checkouts, two sets");
+}
+
+/// A checkout with the module, the netstack and (optionally) its built views.
+fn fake_checkout(checkout: &std::path::Path, with_views: bool) -> std::path::PathBuf {
+    let module = checkout.join("crates/modules/apps/chat");
+    std::fs::create_dir_all(module.join("src")).unwrap();
+    std::fs::write(module.join("src/index_guest.rs"), "").unwrap();
+    std::fs::write(module.join("component.wasm"), b"module").unwrap();
+    std::fs::write(module.join("index.wasm"), b"index").unwrap();
+    let network = checkout.join("crates/networking/netstack-machine");
+    std::fs::create_dir_all(&network).unwrap();
+    std::fs::write(network.join("component.wasm"), b"network").unwrap();
+    for id in ["chat", "home"] {
+        let package = checkout.join("crates/views").join(id);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("Cargo.toml"), "[package]\n").unwrap();
+        if !with_views {
+            continue;
+        }
+        std::fs::create_dir_all(checkout.join("target/views")).unwrap();
+        std::fs::write(
+            checkout.join(format!("target/views/{id}_view.wasm")),
+            b"view",
+        )
+        .unwrap();
+    }
+    // the destination name is the checkout's absolute path, so the fake has to
+    // be one (a tempdir already is)
+    checkout.to_path_buf()
+}
+
+/// The keying holds only while every destination comes from `staged_dir`. A
+/// `join("modules")` back in the staging path is the whole bug, and it would
+/// pass every behavioural test that uses `staged_dir` itself — so this one
+/// reads the build script.
+#[test]
+fn a_staging_destination_is_always_keyed_to_the_checkout() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("build.rs"),
+    )
+    .unwrap();
+    let bare_joins: Vec<&str> = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .filter(|line| {
+            line.contains("join(\"modules\")") || line.contains("join(\"sim-modules\")")
+        })
+        .collect();
+    assert!(
+        bare_joins.is_empty(),
+        "a staged destination must come from staged_dir (which names the checkout): {bare_joins:?}"
+    );
+    // and the name it produces actually carries the checkout
+    let name = build_script::staged_dir(
+        std::path::Path::new("/t/debug"),
+        "modules",
+        std::path::Path::new("/home/dev/wt"),
+    );
+    assert_eq!(name, std::path::Path::new("/t/debug/modules%home%dev%wt"));
+}
+
 #[test]
 fn desktop_globals_are_never_module_views() {
     let scratch = tempfile::tempdir().unwrap();

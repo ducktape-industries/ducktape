@@ -6,7 +6,7 @@ namespace = "ducktape-demo"
 # mesh = validators + the sync-only joiner (seed 2); consensus stays [0, 1].
 peer_seeds = [0, 1, 2, 3]
 validator_seeds = [0, 1, 2]
-modules = "target/debug/modules"
+# no `modules`: the set this binary's own build staged beside it (see node0.toml)
 bootstrapper_addr = "127.0.0.1:52200"
 storage_dir = "/tmp/ducktape-1"
 rpc_listen = "127.0.0.1:52301"

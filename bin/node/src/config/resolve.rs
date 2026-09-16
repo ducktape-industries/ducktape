@@ -869,7 +869,10 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
     // whatever `<dir>/<id>.component.wasm` hashes to is what this node seeds.
     // LAST, because it is the only check that touches the disk — a config with
     // a typo'd `listen` must be told about the typo, not about the bundle.
-    let founding_set = PathBuf::from(&raw.modules);
+    let founding_set = match &raw.modules {
+        Some(dir) => PathBuf::from(dir),
+        None => workspace_config::modules_dir()?,
+    };
     let genesis = GenesisModules {
         hashes: workspace_config::Genesis::compose(&founding_set)?.module_hashes(),
         source: GenesisSource::FoundingSet(founding_set),
