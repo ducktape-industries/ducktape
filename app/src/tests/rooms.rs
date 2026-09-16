@@ -473,3 +473,73 @@ pub(crate) fn collect_rust_files(dir: &std::path::Path, files: &mut Vec<std::pat
         }
     }
 }
+
+/// THE APP LINKS NO GUEST IT DOES NOT SPEAK FOR. Every crate under
+/// `crates/modules` the desktop links is a piece of a wasm guest compiled
+/// into a GUI, and every crate under `crates/views` it links is the same
+/// leak the other way — #2303's bar is that either tree could be its own
+/// repository and still build. So the line is READ OFF THE MANIFESTS rather
+/// than remembered: each name below is here because the app holds a wire
+/// that tree owns, a new name is a leak, and a name that leaves is a wave's
+/// progress.
+#[test]
+fn the_app_links_only_what_it_still_speaks_for() {
+    use std::collections::BTreeSet;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let read = |path: &str| {
+        std::fs::read_to_string(root.join(path))
+            .unwrap_or_else(|error| panic!("{path}: {error}"))
+            .parse::<toml::Table>()
+            .unwrap_or_else(|error| panic!("{path}: {error}"))
+    };
+    // Which workspace crates live in each tree, by the path the workspace
+    // declares them at — the trees name themselves, so a crate that moves
+    // moves here too.
+    let workspace = read("Cargo.toml");
+    let declared = workspace["workspace"]["dependencies"]
+        .as_table()
+        .expect("the workspace declares its dependencies");
+    let living_in = |tree: &'static str| -> BTreeSet<String> {
+        declared
+            .iter()
+            .filter(|(_, spec)| {
+                spec.get("path")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|path| path.starts_with(tree))
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+    let modules = living_in("crates/modules/");
+    let views = living_in("crates/views/");
+    assert!(modules.len() > 10, "the walk found no module crates");
+
+    let app = read("app/Cargo.toml");
+    let linked: BTreeSet<String> = app["dependencies"]
+        .as_table()
+        .expect("the app declares its dependencies")
+        .keys()
+        .cloned()
+        .collect();
+    assert!(linked.len() > 20, "the walk found no app dependencies");
+
+    // chat: the client view model a composer's text is parsed by and a
+    // mention's account link is spelled by. forge: the blob read lane's own
+    // page bound and reply shape. gateway and identity: the provider
+    // registry and the account records the shell reads off the node.
+    let guests: Vec<&str> = linked.intersection(&modules).map(String::as_str).collect();
+    assert_eq!(guests, ["chat", "forge", "gateway", "identity"]);
+    // `design` is the palette and the metrics every surface shares, and
+    // `ducktape-view-guest` is linked for its `Task` alone. Each is a wave
+    // of its own (#2303 7b, 7c); until then the app reaches into the view
+    // tree for exactly these two and nothing else.
+    let into_views: Vec<&str> = linked.intersection(&views).map(String::as_str).collect();
+    assert_eq!(into_views, ["design"]);
+    assert!(
+        app["dependencies"]
+            .get("ducktape-view-guest")
+            .and_then(|spec| spec.get("path"))
+            .is_some(),
+        "the guest SDK moved; the line above is stale"
+    );
+}
