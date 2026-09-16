@@ -26,34 +26,60 @@
 //!
 //! json on the wire: matches the module-interface idiom. blob chunks use hex rather than a
 //! JSON byte array so the encoded message stays below commonware's 2 MiB cap.
+//!
+//! THE PACK HAS NO SIZE LIMIT, and the chunk transfer is what makes that safe.
+//! commonware sizes a channel's inbound mailbox to one burst per peer and
+//! DROPS what overruns it rather than blocking the sender, so a pack blasted
+//! chunk after chunk arrives with holes and no way to learn of them. Instead a
+//! sender keeps at most [`RELAY_BLOB_WINDOW_CHUNKS`] outstanding per target
+//! and moves that window on the receiver's [`RelayMsg::BlobAck`]; the receiver
+//! appends strictly in order into a [`blobstore::StagedBlob`] — on DISK, never
+//! a pack held whole in memory — and answers a chunk that would leave a hole
+//! with [`RelayMsg::BlobResend`], the offset to resume from. A drop that
+//! swallows a whole window instead shows up as silence, which the sender's
+//! own stall timer rewinds. Either way the bytes are re-sent, and the transfer
+//! completes only when the file on disk re-hashes to the offered digest.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
-
-/// Relayed blobs share the generic CAS transfer ceiling. One offer plus all
-/// chunks must fit the sender's inbound-mailbox quota burst; this transport
-/// does not retransmit dropped chunks.
-pub const MAX_RELAY_BLOB_BYTES: usize = blobstore::MAX_TRANSFER_BYTES;
 
 /// 768 KiB raw -> 1.5 MiB hex plus a small JSON envelope, safely below the
 /// process-wide 2 MiB commonware message cap.
 pub const RELAY_BLOB_CHUNK_BYTES: usize = 768 * 1024;
 
-// every chunk of a max-size pack plus its one offer fits one sender's burst
-// of the inbound mailbox — a DROP boundary, not a backpressure one.
-const RELAY_MESSAGES_PER_PACK: usize = MAX_RELAY_BLOB_BYTES.div_ceil(RELAY_BLOB_CHUNK_BYTES) + 1;
-const _: () = assert!(RELAY_MESSAGES_PER_PACK <= crate::constants::MESH_QUOTA_BURST);
-// this repository's own full-history pack (83 MiB) fits.
-const _: () = assert!(MAX_RELAY_BLOB_BYTES >= 83 * 1024 * 1024);
+/// how many chunks one transfer keeps in flight to one target before it waits
+/// for that target's [`RelayMsg::BlobAck`].
+///
+/// THE PACK SIZE IS NOT BOUNDED — this window is what makes that safe.
+/// commonware sizes a channel's inbound mailbox to one burst per peer and
+/// DROPS an inbound message when it is full (it never blocks a sender), so an
+/// unpaced blast of a pack's chunks silently loses whatever overruns the
+/// burst. A sender that keeps at most this many chunks outstanding never
+/// reaches that boundary: with [`MAX_INCOMING_BLOBS`](crate::relay_runtime)
+/// transfers to the same peer at once, the offers plus every in-flight chunk
+/// stay well inside one burst, leaving the rest of it for submits and replies.
+pub const RELAY_BLOB_WINDOW_CHUNKS: usize = 16;
+
+/// how many appended chunks a receiver takes before it reports its contiguous
+/// high-water mark. Small enough that the sender's window never drains
+/// waiting for credit, large enough that a transfer is not one ack per chunk.
+pub const RELAY_BLOB_ACK_EVERY: usize = 4;
+
+// one window's worth of chunks, plus its offer, plus every other transfer this
+// node may have open to the same peer, fits one sender's burst of the inbound
+// mailbox — the DROP boundary the window exists to stay under.
+const RELAY_MESSAGES_PER_WINDOW: usize = RELAY_BLOB_WINDOW_CHUNKS + 1;
+const _: () = assert!(
+    RELAY_MESSAGES_PER_WINDOW * crate::relay_runtime::MAX_INCOMING_BLOBS
+        < crate::constants::MESH_QUOTA_BURST
+);
 
 /// The extra hold a blob transfer earns on top of `SUBMIT_HOLD`,
 /// budgeted at a 1 MiB/s floor over the bytes that actually cross the wire:
-/// chunks ride hex-encoded (2x), and the fan-out is SERIAL per target, so the
-/// last target only starts receiving after every earlier one is done. The
-/// base hold alone assumed the pack lands within an app-submit budget —
-/// structurally impossible for a multi-MB pack crossing a WAN validator
-/// link — and a single-target 1 MiB/s window still timed out every multi-
-/// validator push of a large pack.
+/// chunks ride hex-encoded (2x), and every target's copy crosses the same
+/// uplink, so the budget counts the fan-out width whether the windows are
+/// filled one after another or side by side. The base hold alone assumed the
+/// pack lands within an app-submit budget — structurally impossible for a
+/// repository-sized pack crossing a WAN validator link.
 pub fn blob_transfer_allowance(total: u64, targets: usize) -> std::time::Duration {
     const FLOOR_BYTES_PER_SEC: u64 = 1024 * 1024;
     const HEX_INFLATION: u64 = 2;
@@ -97,6 +123,28 @@ pub enum RelayMsg {
         offset: u64,
         chunk_hex: String,
     },
+    /// The receiver's contiguous high-water mark for one transfer: every byte
+    /// below `received_through` is on its disk. This is the transfer's CREDIT
+    /// and its REPAIR in one message — it refills the sender's window, and
+    /// after a dropped chunk it is the offset the sender rewinds to, because
+    /// the receiver appends strictly in order and answers an out-of-order
+    /// chunk with this mark instead of taking it.
+    BlobAck {
+        frame_id: [u8; 32],
+        digest: [u8; 32],
+        received_through: u64,
+    },
+    /// The receiver REFUSING a chunk that would leave a hole, naming the
+    /// offset the sender must resume from. A receiver appends strictly in
+    /// order, so this is what a dropped chunk turns into — a repair, instead
+    /// of a pack that quietly completes short. (When the drop swallows the
+    /// rest of the window too, the sender's stall timer rewinds it instead:
+    /// silence is the other symptom of the same loss.)
+    BlobResend {
+        frame_id: [u8; 32],
+        digest: [u8; 32],
+        from: u64,
+    },
     /// A validator's acknowledgement (or clean refusal) of one blob offer.
     BlobResult {
         frame_id: [u8; 32],
@@ -134,38 +182,105 @@ pub fn required_blob_digest(frame: &[u8]) -> Option<[u8; 32]> {
 
 pub use duckfs_core::{to_hex as encode_hex, unhex as decode_hex};
 
-/// Ordered, bounded assembly for one accepted blob offer. The digest check is
-/// completed before bytes enter the shared blob store.
+/// What an offered chunk did to a transfer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChunkProgress {
+    /// appended in order; `received_through` is the new high-water mark.
+    Appended { received_through: u64 },
+    /// REFUSED — it would have left a hole. `received_through` is where the
+    /// sender has to resume, and nothing was written.
+    Gap { received_through: u64 },
+    /// refused for the same hole the sender has already been told about:
+    /// the rest of a window arriving behind one dropped chunk. Nothing to
+    /// write, nothing to say.
+    Waiting,
+    /// the last byte landed, the file re-hashed to its digest, and the bytes
+    /// are published in the store under it.
+    Complete,
+}
+
+/// Ordered, disk-backed assembly for one accepted blob offer. The bytes stream
+/// into the store's staging slot — a pack is never held whole in memory — and
+/// [`blobstore::StagedBlob::finish`] re-reads the FILE to verify its length and
+/// hash, so nothing is addressable until it verifies.
+///
+/// Appending is STRICTLY sequential: the staging slot's high-water offset is
+/// the only place a chunk may land. That is what makes a dropped chunk
+/// impossible to lose silently — the chunk after a gap does not fit, and the
+/// receiver answers with the mark the sender must rewind to instead of taking
+/// bytes that would leave a hole.
 pub struct BlobAssembly {
-    digest: [u8; 32],
-    total: usize,
-    bytes: Vec<u8>,
+    /// the live slot, taken at completion: `finish` consumes it because what
+    /// it verifies and publishes is the FILE, not this writer's history.
+    staged: Option<blobstore::StagedBlob>,
+    total: u64,
+    chunks_since_ack: usize,
+    /// the mark this transfer has ALREADY asked its sender to resume from.
+    /// One dropped chunk is followed by the whole window arriving out of
+    /// order; without this, each of those would ask for the same repair again
+    /// and the sender would re-send the window once per straggler.
+    asked_resend_at: Option<u64>,
 }
 
 impl BlobAssembly {
-    pub fn new(digest: [u8; 32], total: u64) -> Result<Self, String> {
-        let total = usize::try_from(total).map_err(|_| "relay blob length does not fit usize")?;
-        if total == 0 || total > MAX_RELAY_BLOB_BYTES {
-            return Err(format!(
-                "relay blob must be 1..={MAX_RELAY_BLOB_BYTES} bytes, got {total}"
-            ));
+    /// open (or RESUME) the staging slot for this offer. A partial file left
+    /// by an earlier attempt resumes at its own length, so a retried push
+    /// re-sends only what never landed.
+    pub fn new(
+        blobs: &blobstore::BlobHandle,
+        digest: [u8; 32],
+        total: u64,
+    ) -> Result<Self, String> {
+        if total == 0 {
+            return Err("relay blob must carry at least one byte".into());
         }
+        let staged = blobs
+            .stage(digest, total)
+            .map_err(|e| format!("cannot stage the required blob: {e}"))?;
         Ok(Self {
-            digest,
+            staged: Some(staged),
             total,
-            bytes: Vec::new(),
+            chunks_since_ack: 0,
+            asked_resend_at: None,
         })
     }
 
-    /// Append one exact-next chunk. `Ok(None)` needs more data;
-    /// `Ok(Some(bytes))` is a complete, digest-verified pack.
-    pub fn push(&mut self, offset: u64, chunk_hex: &str) -> Result<Option<Vec<u8>>, String> {
-        let offset = usize::try_from(offset).map_err(|_| "blob chunk offset does not fit usize")?;
-        if offset != self.bytes.len() {
-            return Err(format!(
-                "blob chunk offset {offset} does not match next offset {}",
-                self.bytes.len()
-            ));
+    /// the contiguous high-water mark: every byte below it is on disk.
+    pub fn received_through(&self) -> u64 {
+        match &self.staged {
+            Some(staged) => staged.offset(),
+            None => self.total,
+        }
+    }
+
+    /// whether the receiver owes its sender a mark — either the ack cadence
+    /// came round or the chunk did not fit and the sender must rewind.
+    pub fn owes_ack(&self) -> bool {
+        self.chunks_since_ack >= RELAY_BLOB_ACK_EVERY
+    }
+
+    pub fn ack_sent(&mut self) {
+        self.chunks_since_ack = 0;
+    }
+
+    /// Append one exact-next chunk. A chunk at any other offset is a
+    /// REPAIR SIGNAL, not an error: it leaves the slot untouched and asks for
+    /// the mark to be re-sent, which is how the sender learns where the drop
+    /// began.
+    pub fn push(&mut self, offset: u64, chunk_hex: &str) -> Result<ChunkProgress, String> {
+        let Some(staged) = self.staged.as_mut() else {
+            return Ok(ChunkProgress::Complete);
+        };
+        let received_through = staged.offset();
+        if offset != received_through {
+            // one repair per gap: the rest of the window is still arriving
+            // behind this chunk and every frame of it lands here too.
+            let already_asked = self.asked_resend_at == Some(received_through);
+            if already_asked {
+                return Ok(ChunkProgress::Waiting);
+            }
+            self.asked_resend_at = Some(received_through);
+            return Ok(ChunkProgress::Gap { received_through });
         }
         if chunk_hex.len() > RELAY_BLOB_CHUNK_BYTES * 2 {
             return Err("blob chunk exceeds the relay chunk ceiling".into());
@@ -174,18 +289,29 @@ impl BlobAssembly {
         if chunk.is_empty() {
             return Err("blob chunk must not be empty".into());
         }
-        if self.bytes.len().saturating_add(chunk.len()) > self.total {
-            return Err("blob chunks exceed the offered total".into());
+        staged
+            .append(&chunk)
+            .map_err(|e| format!("staging the required blob: {e}"))?;
+        self.chunks_since_ack += 1;
+        // the hole is filled; the next one earns its own repair.
+        self.asked_resend_at = None;
+        let received_through = staged.offset();
+        if received_through < self.total {
+            return Ok(ChunkProgress::Appended { received_through });
         }
-        self.bytes.extend_from_slice(&chunk);
-        if self.bytes.len() != self.total {
-            return Ok(None);
+        self.staged
+            .take()
+            .expect("the slot was live one statement ago")
+            .finish()
+            .map_err(|e| format!("completing the required blob: {e}"))?;
+        Ok(ChunkProgress::Complete)
+    }
+
+    /// drop the staged bytes — a refused or superseded transfer keeps nothing.
+    pub fn abort(self) {
+        if let Some(staged) = self.staged {
+            staged.abort();
         }
-        let actual: [u8; 32] = Sha256::digest(&self.bytes).into();
-        if actual != self.digest {
-            return Err("completed relay blob does not match its digest".into());
-        }
-        Ok(Some(std::mem::take(&mut self.bytes)))
     }
 }
 
@@ -259,6 +385,7 @@ pub fn verify_blob_offer(
 mod tests {
     use super::*;
     use commonware_cryptography::Signer as _;
+    use sha2::{Digest as _, Sha256};
 
     fn sk(seed: u64) -> commonware_cryptography::ed25519::PrivateKey {
         commonware_cryptography::ed25519::PrivateKey::from_seed(seed)
@@ -291,20 +418,21 @@ mod tests {
             "the budget grows with the pack"
         );
         assert_eq!(
-            blob_transfer_allowance(MAX_RELAY_BLOB_BYTES as u64, 1),
-            Duration::from_secs(191),
-            "the relay cap (95.25 MiB, 190.5 MiB of hex) bounds a single-target allowance"
+            blob_transfer_allowance(127 * 1024 * 1024, 1),
+            Duration::from_secs(254),
+            "a pack's allowance is the bytes it actually puts on the wire, hex included"
         );
     }
 
-    /// A pack the door accepts is a pack the assembly accepts, right up to
-    /// the shared limit — and not one byte past it.
+    /// There is no pack this assembly refuses for its SIZE: a push carries
+    /// whatever history it carries, and the transfer is windowed and staged to
+    /// disk rather than sized to a mailbox. Only an empty offer is nonsense.
     #[test]
-    fn the_relay_assembly_accepts_every_pack_the_door_does() {
-        let digest = [1; 32];
-        assert!(BlobAssembly::new(digest, 83 * 1024 * 1024).is_ok());
-        assert!(BlobAssembly::new(digest, blobstore::MAX_TRANSFER_BYTES as u64).is_ok());
-        assert!(BlobAssembly::new(digest, blobstore::MAX_TRANSFER_BYTES as u64 + 1).is_err());
+    fn the_relay_assembly_takes_a_pack_of_any_size() {
+        let blobs = blobstore::BlobHandle::default();
+        assert!(BlobAssembly::new(&blobs, [1; 32], 4 * 1024 * 1024 * 1024).is_ok());
+        assert!(BlobAssembly::new(&blobs, [2; 32], 127 * 1024 * 1024).is_ok());
+        assert!(BlobAssembly::new(&blobs, [3; 32], 0).is_err());
     }
 
     #[test]
@@ -480,33 +608,44 @@ mod tests {
         }
     }
 
+    /// ordered, digest-checked, and — the property the whole window protocol
+    /// rests on — a chunk that would leave a HOLE is refused with the mark to
+    /// resume from, never quietly appended somewhere else.
     #[test]
-    fn blob_assembly_is_ordered_bounded_and_digest_checked() {
+    fn blob_assembly_is_ordered_repairable_and_digest_checked() {
+        let blobs = blobstore::BlobHandle::default();
         let bytes = b"the complete git pack";
         let digest: [u8; 32] = Sha256::digest(bytes).into();
-        let mut assembly = BlobAssembly::new(digest, bytes.len() as u64).unwrap();
-        assert!(
-            assembly
-                .push(0, &encode_hex(&bytes[..7]))
-                .unwrap()
-                .is_none()
-        );
-        let complete = assembly
-            .push(7, &encode_hex(&bytes[7..]))
-            .unwrap()
-            .expect("complete");
-        assert_eq!(complete, bytes);
+        let mut assembly = BlobAssembly::new(&blobs, digest, bytes.len() as u64).unwrap();
+        assert!(matches!(
+            assembly.push(0, &encode_hex(&bytes[..7])).unwrap(),
+            ChunkProgress::Appended {
+                received_through: 7
+            }
+        ));
+        // the chunk that would skip bytes 7..9 names where to resume instead.
+        assert!(matches!(
+            assembly.push(9, &encode_hex(&bytes[9..])).unwrap(),
+            ChunkProgress::Gap {
+                received_through: 7
+            }
+        ));
+        assert!(matches!(
+            assembly.push(7, &encode_hex(&bytes[7..])).unwrap(),
+            ChunkProgress::Complete
+        ));
+        assert_eq!(blobs.get_chunk(&digest).as_deref(), Some(bytes.as_slice()));
 
-        let mut wrong_offset = BlobAssembly::new(digest, bytes.len() as u64).unwrap();
-        assert!(wrong_offset.push(1, "00").unwrap_err().contains("offset"));
-        let mut wrong_digest = BlobAssembly::new([0; 32], bytes.len() as u64).unwrap();
+        // bytes that do not hash to the offered digest are never published.
+        let lie = [0xAB; 32];
+        let mut wrong_digest = BlobAssembly::new(&blobs, lie, bytes.len() as u64).unwrap();
         assert!(
             wrong_digest
                 .push(0, &encode_hex(bytes))
                 .unwrap_err()
-                .contains("digest")
+                .contains("hash")
         );
-        assert!(BlobAssembly::new(digest, (MAX_RELAY_BLOB_BYTES + 1) as u64).is_err());
+        assert!(blobs.get_chunk(&lie).is_none());
     }
 
     #[test]
@@ -514,7 +653,7 @@ mod tests {
         let msg = RelayMsg::BlobChunk {
             frame_id: [0xFF; 32],
             digest: [0xFF; 32],
-            offset: MAX_RELAY_BLOB_BYTES as u64,
+            offset: u64::MAX,
             chunk_hex: encode_hex(&vec![0xFF; RELAY_BLOB_CHUNK_BYTES]),
         };
         assert!(

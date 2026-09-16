@@ -389,7 +389,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         std::collections::HashMap::new();
     let gating: std::collections::HashMap<Vec<u8>, node::FrameId> =
         std::collections::HashMap::new();
-    let validator_relay = relay_runtime::ValidatorRelay::new(std::sync::Arc::new(blobs.clone()));
+    let validator_relay = relay_runtime::ValidatorRelay::new(blobs.clone());
     let last_published: Option<u64> = None;
     // verified-but-unapproved join requests, keyed by joiner key. NODE-
     // LOCAL and in-memory by design: this is a doorbell, not state — the

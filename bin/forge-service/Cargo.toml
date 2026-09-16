@@ -12,6 +12,8 @@ commonware-cryptography.workspace = true
 ducktape-rpc.workspace = true
 flate2 = "1"
 forge.workspace = true
+# a push's body is read frame by frame onto disk rather than collected.
+futures.workspace = true
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 hex = "0.4"
 keyscheme.workspace = true

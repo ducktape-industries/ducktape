@@ -27,8 +27,22 @@ const GIT_RECEIVE_PACK_CAPS: &str =
 /// filter): the answer is either the full closure or a have-bounded delta.
 const GIT_UPLOAD_PACK_CAPS: &str =
     "multi_ack_detailed side-band-64k thin-pack ofs-delta agent=ducktape-forge/0.1";
-/// Uploads fit the common bounded blob relay transport.
-pub const GIT_PACK_BODY_LIMIT: usize = blobstore::MAX_TRANSFER_BYTES;
+/// what a git request that is NOT a push may carry: a fetch's want/have
+/// negotiation and a merge request are lists of oids, not content. A push has
+/// no limit at all — see the receive-pack route.
+pub const GIT_NEGOTIATION_BODY_LIMIT: usize = 8 * 1024 * 1024;
+
+/// how much of a spooled push this bridge reads to find the end of the
+/// pkt-line command section. [`MAX_GIT_PKT_LINES`] lines of `<old> <new>
+/// <ref>` fit inside it several times over; a command section that somehow
+/// does not is read in further doublings rather than refused.
+const GIT_COMMAND_HEAD_BYTES: usize = 1024 * 1024;
+
+/// the most a gzip-encoded body may INFLATE to, as a multiple of what arrived.
+/// Not a size limit — a bomb guard: gzip's ratio tops out around 1030:1, and
+/// this door writes what it inflates to disk before anything has proved
+/// itself. A real git request compresses nowhere near this.
+const GIT_MAX_INFLATE_RATIO: u64 = 64;
 /// max PACK bytes per side-band-64k data pkt-line: prefixed with the 1-byte band
 /// id, plus the 4-byte pkt length header, this yields a 65520-byte line — git's
 /// `LARGE_PACKET_MAX`, the ceiling a side-band-64k client accepts.
@@ -591,15 +605,126 @@ enum GitBodyError {
     OverCap,
 }
 
-/// return the request body, gzip-inflated if `Content-Encoding: gzip`. git may
-/// compress a receive-pack request; any other encoding is passed through.
+/// a push's body on disk: what the client sent (gzip already inflated), and
+/// where its packfile starts once the command section has been read. The file
+/// goes away with this value, whether the push landed or died.
+pub(crate) struct SpooledPush {
+    path: std::path::PathBuf,
+    len: u64,
+}
+
+impl Drop for SpooledPush {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Stream a request body onto disk under `<git_store>/.incoming/`, inflating
+/// `Content-Encoding: gzip` as it goes. THE SIZE IS NOT BOUNDED — a push
+/// carries whatever history it carries, and holding it in this process to
+/// measure it is the thing this avoids. What is bounded is gzip's expansion
+/// ([`GIT_MAX_INFLATE_RATIO`]), because a bomb is not a push.
+async fn spool_request_body(
+    git_store: &std::path::Path,
+    headers: &HeaderMap,
+    body: axum::body::Body,
+) -> Result<SpooledPush, GitBodyError> {
+    use futures::StreamExt as _;
+    use std::io::Write;
+
+    let dir = git_store.join(".incoming");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| GitBodyError::BadEncoding(format!("cannot spool the push: {e}")))?;
+    let path = dir.join(format!(
+        "push-{}-{:x}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default()
+    ));
+    let file = std::fs::File::create(&path)
+        .map_err(|e| GitBodyError::BadEncoding(format!("cannot spool the push: {e}")))?;
+    // the file is live from here: this guard deletes it on every exit below,
+    // including the `?`s, and hands it to the caller on success.
+    let mut spooled = SpooledPush { path, len: 0 };
+
+    let gzip = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("gzip"));
+    // `write::GzDecoder` inflates what is WRITTEN into it, which is what lets
+    // a compressed body stream through this door instead of being
+    // materialized to be decoded.
+    let mut sink: Box<dyn Write + Send> = match gzip {
+        true => Box::new(flate2::write::GzDecoder::new(file)),
+        false => Box::new(file),
+    };
+    let mut received = 0u64;
+    let mut frames = body.into_data_stream();
+    while let Some(frame) = frames.next().await {
+        let frame = frame.map_err(|e| GitBodyError::BadEncoding(format!("body: {e}")))?;
+        received += frame.len() as u64;
+        sink.write_all(&frame)
+            .map_err(|e| GitBodyError::BadEncoding(format!("cannot spool the push: {e}")))?;
+        let inflated = std::fs::metadata(&spooled.path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let bomb = gzip && inflated > received.saturating_mul(GIT_MAX_INFLATE_RATIO);
+        if bomb {
+            return Err(GitBodyError::OverCap);
+        }
+    }
+    sink.flush()
+        .map_err(|e| GitBodyError::BadEncoding(format!("cannot spool the push: {e}")))?;
+    drop(sink);
+    spooled.len = std::fs::metadata(&spooled.path)
+        .map_err(|e| GitBodyError::BadEncoding(format!("cannot spool the push: {e}")))?
+        .len();
+    Ok(spooled)
+}
+
+impl SpooledPush {
+    /// the pkt-line command section at the head of the body, plus the offset
+    /// its packfile starts at. Read in doublings so a push updating thousands
+    /// of refs is read further rather than refused.
+    fn commands(&self) -> Result<(Vec<Vec<u8>>, u64), String> {
+        use std::io::Read as _;
+        let mut want = GIT_COMMAND_HEAD_BYTES;
+        loop {
+            let mut head = vec![0u8; want.min(self.len as usize)];
+            let mut file = std::fs::File::open(&self.path).map_err(|e| e.to_string())?;
+            file.read_exact(&mut head).map_err(|e| e.to_string())?;
+            let read_everything = head.len() as u64 == self.len;
+            match parse_pkt_lines(&head) {
+                Ok((lines, rest)) => {
+                    let pack_offset = (head.len() - rest.len()) as u64;
+                    return Ok((lines, pack_offset));
+                }
+                // the command section did not fit the window — unless the
+                // window WAS the whole body, in which case it is malformed.
+                Err(detail) if !read_everything => {
+                    let truncated = detail.contains("truncated") || detail.contains("out of range");
+                    if !truncated {
+                        return Err(detail);
+                    }
+                    want *= 2;
+                }
+                Err(detail) => return Err(detail),
+            }
+        }
+    }
+}
+
+/// return the request body, gzip-inflated if `Content-Encoding: gzip`. git
+/// compresses a fetch's negotiation list; any other encoding is passed through.
 ///
-/// the inflate is read through `cap` — the SAME limit that bounds the
-/// compressed body (`GIT_PACK_BODY_LIMIT` at both call sites) — because gzip's
-/// max compression ratio is ~1030:1: an uncapped `read_to_end` on a body that
-/// already fits under the compressed-body limit could still allocate tens of
-/// gigabytes. a body that inflates to more than `cap` bytes is refused rather
-/// than fully materialized.
+/// A PUSH does not come through here — it streams to disk
+/// ([`spool_request_body`]) because it has no size limit to be measured
+/// against. What remains is the negotiation lane, and there the inflate is
+/// read through `cap` because gzip's max compression ratio is ~1030:1: an
+/// uncapped `read_to_end` on a body that already fits the compressed limit
+/// could still allocate tens of gigabytes.
 fn decode_git_body(headers: &HeaderMap, body: &[u8], cap: usize) -> Result<Vec<u8>, GitBodyError> {
     let gzip = headers
         .get(header::CONTENT_ENCODING)
@@ -663,29 +788,18 @@ pub(crate) async fn git_receive_pack(
     State(handle): State<ServiceState>,
     Path(repo): Path<String>,
     headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
+    body: axum::body::Body,
 ) -> Response {
     let Ok(repo) = forge::norm_repo(&repo) else {
         return error_response(StatusCode::NOT_FOUND, "no such repo");
     };
-    let body = match body {
-        Ok(bytes) => bytes,
-        // the DefaultBodyLimit layer rejects an oversized pack with 413.
-        Err(rejection) => {
-            let over_cap = rejection.status() == StatusCode::PAYLOAD_TOO_LARGE;
-            let reason = if over_cap {
-                "pack_over_cap"
-            } else {
-                "body_unreadable"
-            };
-            push_refused(&repo, reason, &rejection.body_text());
-            return error_response(rejection.status(), &rejection.body_text());
-        }
-    };
-    let body = match decode_git_body(&headers, &body, GIT_PACK_BODY_LIMIT) {
-        Ok(bytes) => bytes,
+    // the push lands on DISK, however big it is: this bridge holds one frame
+    // of it at a time, and the packfile goes on to the node's store from the
+    // file rather than through this process's memory.
+    let spooled = match spool_request_body(&handle.forge_repo, &headers, body).await {
+        Ok(spooled) => spooled,
         Err(GitBodyError::OverCap) => {
-            const REASON: &str = "gzip-inflated body exceeds the pack body limit";
+            const REASON: &str = "gzip-encoded body inflates beyond any plausible ratio";
             push_refused(&repo, "gzip_bomb", REASON);
             return error_response(StatusCode::BAD_REQUEST, REASON);
         }
@@ -696,7 +810,7 @@ pub(crate) async fn git_receive_pack(
     };
 
     // the body is a pkt-line command list, a flush-pkt, then the raw packfile.
-    let (commands, pack) = match parse_pkt_lines(&body) {
+    let (commands, pack_offset) = match spooled.commands() {
         Ok(parsed) => parsed,
         Err(msg) => {
             push_refused(&repo, "malformed_commands", &msg);
@@ -832,18 +946,22 @@ pub(crate) async fn git_receive_pack(
 
     // stash the WHOLE packfile as one node-local blob, keyed by its sha256;
     // forge materializes it by this digest (the bytes never cross consensus).
-    // a delete-only push carries no objects, so nothing is stashed.
-    let pack_bytes = pack.len();
+    // a delete-only push carries no objects, so nothing is stashed. The bytes
+    // stream from the spool file straight into the node's store — neither end
+    // ever holds the pack.
+    let pack_bytes = spooled.len.saturating_sub(pack_offset);
     let pack_digest = if updates.iter().any(|u| u.new_oid.is_some()) {
-        match handle.client.put_blob(pack.to_vec()).await {
-            Ok(digest) => match hex::decode(digest) {
-                Ok(digest) => match <[u8; 32]>::try_from(digest) {
-                    Ok(digest) => Some(digest),
-                    Err(_) => {
-                        return error_response(StatusCode::BAD_GATEWAY, "invalid blob digest");
-                    }
-                },
-                Err(_) => return error_response(StatusCode::BAD_GATEWAY, "invalid blob digest"),
+        match handle
+            .client
+            .put_blob_file(&spooled.path, pack_offset)
+            .await
+        {
+            Ok(digest) => match hex::decode(digest)
+                .ok()
+                .and_then(|raw| <[u8; 32]>::try_from(raw).ok())
+            {
+                Some(digest) => Some(digest),
+                None => return error_response(StatusCode::BAD_GATEWAY, "invalid blob digest"),
             },
             Err(error) => return error_response(StatusCode::BAD_GATEWAY, &error.to_string()),
         }
@@ -917,7 +1035,7 @@ pub(crate) async fn git_upload_pack(
         // the DefaultBodyLimit layer rejects an oversized request with 413.
         Err(rejection) => return error_response(rejection.status(), &rejection.body_text()),
     };
-    let body = match decode_git_body(&headers, &body, GIT_PACK_BODY_LIMIT) {
+    let body = match decode_git_body(&headers, &body, GIT_NEGOTIATION_BODY_LIMIT) {
         Ok(bytes) => bytes,
         Err(GitBodyError::OverCap) => {
             return error_response(

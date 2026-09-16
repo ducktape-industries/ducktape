@@ -189,12 +189,12 @@ impl NodeLink {
     }
 
     /// Store opaque content under its digest using this service's node authority.
+    ///
+    /// No size bound: the route this posts to streams what it receives onto
+    /// disk. The caller that must not hold its bytes at all — the git push
+    /// bridge — uploads from a file through `ducktape_rpc::Client::put_blob_file`.
     pub async fn put_blob(&self, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
         use sha2::{Digest as _, Sha256};
-        let bounded = bytes.len() <= blobstore::MAX_TRANSFER_BYTES;
-        if !bounded {
-            return Err("blob exceeds transfer limit".into());
-        }
         let digest = Sha256::digest(&bytes).to_vec();
         let response = self
             .credentialed(self.client.post(format!("{}/v1/files/blob", self.base)))

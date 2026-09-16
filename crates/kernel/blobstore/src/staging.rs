@@ -217,6 +217,129 @@ impl BlobHandle {
     }
 }
 
+/// an append-only ingest for bytes whose digest is not known until they stop
+/// arriving — the door a client pushes through, where the store NAMES what it
+/// received instead of being told. The bytes land on disk as they arrive (a
+/// rootless store buffers, as everywhere else here), so the size of what
+/// someone uploads is a disk question, never a memory one.
+pub struct IngestBlob {
+    store: BlobHandle,
+    /// taken at `publish`; what is left at drop is an upload that died.
+    sink: Option<Sink>,
+    /// the name `seal` read off the bytes — the only thing `publish` will use.
+    sealed: Option<[u8; 32]>,
+    written: u64,
+}
+
+impl BlobHandle {
+    /// open a streaming ingest. The unknown-digest half of [`BlobHandle::stage`]:
+    /// no slot is claimed, because there is no name to claim until
+    /// [`IngestBlob::finish`] hashes what arrived.
+    pub fn ingest(&self) -> Result<IngestBlob, StageError> {
+        let sink = match self.persistence_root() {
+            None => Sink::Memory(Vec::new()),
+            Some(root) => {
+                let dir = root.join("staging");
+                std::fs::create_dir_all(&dir)?;
+                // unique per writer: two concurrent uploads of the SAME bytes
+                // must not share a file, and neither is named by its content
+                // yet. the counter is what separates two opens inside one
+                // nanosecond.
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let nonce = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|since| since.as_nanos())
+                    .unwrap_or_default();
+                let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let path = dir.join(format!("ingest-{}-{nonce:x}-{seq:x}", std::process::id()));
+                let file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .read(true)
+                    .write(true)
+                    .open(&path)?;
+                Sink::Disk { file, path }
+            }
+        };
+        Ok(IngestBlob {
+            store: self.clone(),
+            sink: Some(sink),
+            sealed: None,
+            written: 0,
+        })
+    }
+}
+
+impl IngestBlob {
+    /// how many bytes have landed so far.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    pub fn append(&mut self, bytes: &[u8]) -> Result<(), StageError> {
+        let Some(sink) = self.sink.as_mut() else {
+            return Err(StageError::Io(std::io::Error::other(
+                "this ingest already published",
+            )));
+        };
+        match sink {
+            Sink::Disk { file, .. } => file.write_all(bytes)?,
+            Sink::Memory(buf) => buf.extend_from_slice(bytes),
+        }
+        self.written += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// hash what arrived WITHOUT publishing it. The caller may still have to
+    /// decide whether these bytes are admitted at all — a signed upload proves
+    /// itself over this digest — and bytes nobody admitted must not be
+    /// addressable. Like [`StagedBlob::finish`] this hashes the FILE, not a
+    /// running digest over what one writer appended.
+    pub fn seal(&mut self) -> Result<[u8; 32], StageError> {
+        let Some(sink) = self.sink.as_mut() else {
+            return Err(StageError::Io(std::io::Error::other(
+                "this ingest already published",
+            )));
+        };
+        let digest = match sink {
+            Sink::Disk { file, .. } => hash_whole_file(file)?.0,
+            Sink::Memory(buf) => sha256(buf),
+        };
+        self.sealed = Some(digest);
+        Ok(digest)
+    }
+
+    /// publish the sealed bytes under the digest [`IngestBlob::seal`] read off
+    /// them. Unsealed bytes have no name, so there is nothing to publish.
+    pub fn publish(mut self) -> Result<[u8; 32], StageError> {
+        let (Some(sink), Some(digest)) = (self.sink.take(), self.sealed) else {
+            return Err(StageError::Io(std::io::Error::other(
+                "this ingest was never sealed",
+            )));
+        };
+        match sink {
+            Sink::Disk { file, path } => {
+                file.sync_all()?;
+                drop(file);
+                self.store.publish_staged(&digest, &path)?;
+            }
+            Sink::Memory(buf) => {
+                self.store.put_chunk(buf);
+            }
+        }
+        Ok(digest)
+    }
+}
+
+impl Drop for IngestBlob {
+    /// an upload that died mid-flight leaves nothing behind: its file is named
+    /// by nobody and no resume will ever ask for it.
+    fn drop(&mut self) {
+        if let Some(Sink::Disk { path, .. }) = &self.sink {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 impl StagedBlob {
     /// the resume high-water: how many bytes are already staged. a sender
     /// continues from exactly here.

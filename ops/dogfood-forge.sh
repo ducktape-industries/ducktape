@@ -128,37 +128,14 @@ composes from beside the binary), or set DUCKTAPE_DEV_FORGE_URL to a \
 running node."
 fi
 
-# Retry only an HTTP body-limit rejection, splitting the remaining first-parent
-# history in half. Each accepted tip is an ancestor of the final tip; no history
-# is rewritten. A single commit (including a large merge) may still exceed the
-# server cap, in which case stop with the last accepted ancestor intact.
+# One push, whatever it weighs. The node's blob door streams what it receives
+# onto disk and the relay carries it in an acknowledged window, so a first
+# import of a whole history is the same operation as a one-commit update — no
+# ranges, no retries, nothing here that a plain `git push` would not also get.
 push_history() {
-  local tip="$1" base="${2:-}" output remaining count middle
-  output="$(mktemp)"
-  if python3 "$IMPORT_TOOL" push --node-url "$BASE_URL" --token-file "$WORKSPACE/admin.token" --repo "$FORGE_REPO" --branch dev --tip "$tip" >"$output" 2>&1; then
-    cat "$output"
-    rm -f "$output"
-    return
-  fi
-  cat "$output" >&2
-  if ! grep -Eq 'HTTP 413|HTTP code = 413|returned error: 413' "$output"; then
-    rm -f "$output"
+  local tip="$1"
+  python3 "$IMPORT_TOOL" push --node-url "$BASE_URL" --token-file "$WORKSPACE/admin.token" --repo "$FORGE_REPO" --branch dev --tip "$tip" ||
     die "Forge push failed; any accepted ancestor remains safe to resume from"
-  fi
-  rm -f "$output"
-  if [ -n "$base" ]; then
-    remaining="$(git rev-list --first-parent --ancestry-path --reverse "$tip" "^$base")"
-  else
-    remaining="$(git rev-list --first-parent --reverse "$tip")"
-  fi
-  count="$(printf '%s\n' "$remaining" | grep -c .)"
-  if [ "$count" -le 1 ]; then
-    die "commit $tip exceeds the Forge HTTP pack limit even on its own; cannot split its history further"
-  fi
-  middle="$(printf '%s\n' "$remaining" | sed -n "$((count / 2))p")"
-  log "pack exceeds the node limit; importing ancestor $middle first"
-  push_history "$middle" "$base"
-  push_history "$tip" "$middle"
 }
 
 FORGE_REF=refs/heads/dev
@@ -176,7 +153,7 @@ else
     log "Forge dev already matches GitHub dev"
   elif git merge-base --is-ancestor "$FORGE_OID" "$SOURCE_OID"; then
     log "fast-forwarding Forge dev to GitHub dev"
-    push_history "$SOURCE_OID" "$FORGE_OID"
+    push_history "$SOURCE_OID"
   elif git merge-base --is-ancestor "$SOURCE_OID" "$FORGE_OID"; then
     log "Forge dev already contains GitHub dev"
     EXPECTED_OID=$FORGE_OID
@@ -199,7 +176,7 @@ Join provenance-equivalent development histories without rewriting either side.
 EOF
     )
     log "joining provenance-equivalent dev histories at $EXPECTED_OID"
-    push_history "$EXPECTED_OID" "$FORGE_OID"
+    push_history "$EXPECTED_OID"
   else
     die "Forge dev $FORGE_OID and GitHub dev $SOURCE_OID diverged with different trees; reconcile them in a reviewed PR"
   fi

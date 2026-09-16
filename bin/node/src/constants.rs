@@ -80,8 +80,10 @@ const _: () = assert!(MAX_MESSAGE_SIZE as usize >= statesync::MAX_APPLIED_FRAMES
 /// commonware sizes each channel's inbound mailbox to one burst from every
 /// peer the network may retain, and DROPS an inbound message when that
 /// mailbox is full (it never blocks a peer), so one peer's burst is the drop
-/// boundary a single sender can rely on — `relay::MAX_RELAY_BLOB_BYTES` is
-/// pinned so one offer plus every chunk of a max-size pack fits inside it.
+/// boundary a single sender can rely on — a blob transfer's in-flight WINDOW
+/// (`relay::RELAY_BLOB_WINDOW_CHUNKS`) is pinned so one offer plus a whole
+/// window, times every transfer a node accepts at once, fits inside it. The
+/// pack itself is unbounded: what is outstanding is a window, not a pack.
 /// a node registers EIGHT channels in total (the five fixed engine lanes plus
 /// submit-relay / statesync / reachability), so this burst is paid eight
 /// times over, not once per epoch.
