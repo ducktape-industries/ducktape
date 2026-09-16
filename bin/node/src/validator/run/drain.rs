@@ -1672,7 +1672,7 @@ impl ValidatorRuntime<'_> {
         self.next_seq += 1;
         if let Err(error) = self.node.submit(&self.signer, seq, msg).await {
             tracing::debug!(
-                target: "ducktape::runs",
+                target: "ducktape::agent",
                 node = %self.label,
                 reason = "conversation_crank_submit_failed",
                 error = %error,

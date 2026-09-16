@@ -516,7 +516,7 @@ pub fn realtime_listener(
     listener.tap_io(|socket| {
         if let Err(error) = socket.set_nodelay(true) {
             tracing::warn!(
-                target: "ducktape::call",
+                target: "ducktape::voice",
                 reason = "nodelay_refused",
                 %error,
                 "accepted socket kept Nagle batching"
@@ -598,14 +598,14 @@ fn report_backlog_dropped(skipped: u64, dropped: u64) {
     let first_loss_for_this_seat = skipped == dropped;
     match first_loss_for_this_seat {
         true => tracing::warn!(
-            target: "ducktape::call",
+            target: "ducktape::voice",
             reason = "peer_backlog_dropped",
             skipped,
             dropped,
             "a seat fell behind and its oldest queued frames were dropped"
         ),
         false => tracing::debug!(
-            target: "ducktape::call",
+            target: "ducktape::voice",
             reason = "peer_backlog_dropped",
             skipped,
             dropped,

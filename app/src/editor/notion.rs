@@ -437,7 +437,7 @@ impl RichWireEditor {
             return;
         }
         if let Some(fault) = fault {
-            tracing::warn!(target: "ducktape::editor", fault, "the notion editor store faulted");
+            tracing::warn!(target: "ducktape::app", fault, "the notion editor store faulted");
         }
         self.fault = fault.map(str::to_owned);
     }

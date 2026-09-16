@@ -245,7 +245,7 @@ pub(crate) fn store_image(peer: String, jpeg: Vec<u8>, alive: &std::sync::atomic
         let mut store = store().lock().expect("video store");
         if !store.decoding.insert(peer.clone()) {
             tracing::debug!(
-                target: "ducktape::call",
+                target: "ducktape::voice",
                 reason = "tile_decode_in_flight",
                 "peer frame dropped, a decode for this peer is already running"
             );
@@ -283,7 +283,7 @@ fn decode_frame(data: &[u8]) -> Option<TileFrame> {
         // debug, not warn: a hostile sender can repeat this every frame at
         // 25 fps, and a per-frame warn would evict the whole ring in minutes.
         tracing::debug!(
-            target: "ducktape::call",
+            target: "ducktape::voice",
             reason = "tile_refused",
             "peer tile refused: over budget or not a picture"
         );

@@ -1214,7 +1214,7 @@ fn find_workspace_config_in(root: &Path, needle: &str) -> Result<PathBuf, String
             Ok(d) => d,
             Err(e) => {
                 warn!(
-                    target: "ducktape::workspace",
+                    target: "ducktape::node",
                     reason = "descriptor_unreadable",
                     dir = %dir.display(),
                     error = %e,
@@ -1325,7 +1325,7 @@ pub fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String>
             Ok(d) => d,
             Err(e) => {
                 warn!(
-                    target: "ducktape::workspace",
+                    target: "ducktape::node",
                     reason = "descriptor_unreadable",
                     dir = %dir.display(),
                     error = %e,

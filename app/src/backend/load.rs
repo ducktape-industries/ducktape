@@ -41,7 +41,7 @@ pub(crate) async fn load_chat_data(
 ) -> Result<ChatData, String> {
     // Other native live readers still use the shared identity cache.
     if let Err(error) = refresh_names(rpc).await {
-        tracing::debug!(target: "ducktape::chat", %error, "name directory unavailable");
+        tracing::debug!(target: "ducktape::app", %error, "name directory unavailable");
     }
     let key = local_user_key()
         .await
