@@ -791,10 +791,10 @@ fn import_of(dir: &str, count: usize, body: usize) -> Msg {
 /// bound, mirroring the kernel.
 ///
 /// the accept row is the whole point and the fragile half. the guest spends one
-/// `wasm_host::DEFAULT_FUEL` across one memoized-replay round per unresolved
-/// read, so a cap set above what that fuel admits is not a cap at all — it is a
-/// band in which native accepts what the guest traps on, and nothing below the
-/// band notices. so the accept row is the most expensive commit the other
+/// `wasm_host::DEFAULT_FUEL` on the whole dispatch, so a cap set above what that
+/// fuel admits is not a cap at all — it is a band in which native accepts what
+/// the guest traps on, and nothing below the band notices. so the accept row is
+/// the most expensive commit the other
 /// budgets admit AT the cap: cap/2 documents whose bodies together fill
 /// [`MAX_INLINE_COMMIT_BYTES`] exactly. it sits on both ceilings at once.
 ///
@@ -1157,11 +1157,10 @@ fn reopen_preserves_equal_roots() {
 //
 // Not measured here: guest fuel and the per-op object-read counter. Neither
 // crosses the `Host` API, and instrumenting the kernel to export them is a
-// change to the execution engine, not a measurement of it. The relation is
-// documented on `wasm_host::DEFAULT_FUEL`: one dispatch replays the pure guest
-// once per DISTINCT unresolved read, so an op that spends the whole
-// `MAX_OBJECT_READS_PER_OP` budget re-treads a prefix growing by one read per
-// round and costs ~n²/2 read calls. Wall time below is that curve, observed.
+// change to the execution engine, not a measurement of it. An object read is
+// answered inside its import (`wasm_host`'s module docs), so one dispatch runs
+// the guest ONCE and issues one read call per read: the wall time below is
+// linear in the objects an operation touches.
 
 /// Resident and peak-resident kibibytes, or zeroes where procfs is absent.
 fn measured_memory() -> (u64, u64) {
@@ -1305,9 +1304,9 @@ fn files_cold_load_warm_dispatch_and_reopen_first_query() {
 
 /// Document count in ONE commit, held against everything else. Each distinct
 /// inline body stages a chunk and a fileobj, so the op accrues two distinct
-/// object reads per document against `MAX_OBJECT_READS_PER_OP`, and the guest
-/// replays once per read. This is the curve that decides the documents-per-commit
-/// ceiling, and where on it the cap refuses.
+/// object reads per document against `MAX_OBJECT_READS_PER_OP`. This is the
+/// curve that decides the documents-per-commit ceiling, and where on it the cap
+/// refuses.
 #[test]
 #[ignore = "measurement harness"]
 fn files_commit_cost_by_document_count() {
@@ -1468,9 +1467,11 @@ fn files_cost_by_object_size_and_query_result_size() {
     println!("entries\tlimit\twasm_ls_ms\tls_reply_bytes\treturned");
     let dir = tempfile::tempdir().unwrap();
     let mut wasm = wasm_host(&dir);
-    // 256 entries take two commits: one op gets MAX_OBJECT_READS_PER_OP reads
-    // and each distinct document costs two of them (chunk + fileobj).
-    let per_commit = MAX_OBJECT_READS_PER_OP / 2;
+    // 256 entries take four commits: one op gets MAX_OBJECT_READS_PER_OP reads,
+    // each distinct document costs two of them (chunk + fileobj), and every
+    // commit past the first also re-reads the path trees it rewrites — so a
+    // batch of cap/2 documents overruns the cap by those few reads.
+    let per_commit = MAX_OBJECT_READS_PER_OP / 4;
     let mut base: Option<String> = None;
     for (batch, first) in (0..256usize).step_by(per_commit).enumerate() {
         let changes = (first..first + per_commit)
