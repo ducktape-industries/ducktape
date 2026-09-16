@@ -34,13 +34,13 @@ use crate::store::ObjectStore;
 /// dispatch can spend inside its fuel:
 ///
 ///  * `gets` and `stats` are SEPARATE sets, like the kernel's `object_gets` /
-///    `object_stats` replay memos — a rare id read both ways (only the empty
+///    `object_stats` read memos — a rare id read both ways (only the empty
 ///    tree can be) counts twice on BOTH sides, so neither runtime out-counts the
 ///    other by that phantom.
 ///  * a read whose id is in the block-local object index (`block_index`:
 ///    native's live `Pending::object_ids`, the guest's `__block_objects` re-seed)
 ///    is NOT charged — the kernel serves it from the same-block object-put
-///    overlay WITHOUT pausing/counting, so it must not count here either. this
+///    overlay WITHOUT counting it, so it must not count here either. this
 ///    also reconciles the two runtimes' `Store::pending`: native's holds the
 ///    block bodies (so a block-local read returns before ever reaching the
 ///    charge), while the guest's per-dispatch `pending` is empty (so the read

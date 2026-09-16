@@ -1,8 +1,8 @@
 //! proof of the object-plane host imports (`object-stat` / `object-get` /
 //! `object-put`): a wasm guest reaches the content-addressed object store
 //! through the host, a just-put id answers same-dispatch stat/get from the
-//! staged overlay WITHOUT a pause, an absent id resolves to `None` (through the
-//! memoized-replay resolver, not a trap loop), the object-read budget rejects
+//! staged overlay, an absent id resolves to `None` (answered in the import
+//! against the backing, not a trap loop), the object-read budget rejects
 //! deterministically, and staged puts are discarded on an aborted dispatch.
 //!
 //! the backing holds nothing (an empty odb, an empty refs image), so every read
@@ -162,8 +162,8 @@ async fn absent_object_resolves_to_none_not_a_trap_loop() {
     let mut m = module();
     let mut ctx = MockCtx::new("object");
 
-    // an id that was never put: get/stat/has must answer absent through the
-    // resolver (one pause + replay), never spin. a trap loop would blow the
+    // an id that was never put: get/stat/has must answer absent from the
+    // backing, inside the import, never spin. a trap loop would blow the
     // budget or hang instead of returning Ok.
     let ghost = object_id(1, b"nobody-put-this");
     exec(&mut m, &mut ctx, absent_op(&ghost))
@@ -176,18 +176,16 @@ async fn object_read_budget_is_a_deterministic_rejection() {
     let mut m = module();
     let mut ctx = MockCtx::new("object");
 
-    // a modest run of distinct object reads fits the budget (the mechanism —
-    // shared with the sibling/store budgets — is proven end-to-end at N=64 by
-    // `sibling.rs`; the object budget rides the identical `within_budgets` /
-    // `budget_error` path over `object_len`).
+    // a modest run of distinct object reads fits the budget.
     exec(&mut m, &mut ctx, budget_op(16))
         .await
         .expect("under the object-read budget");
 
     // exceeding MAX_OBJECT_READS distinct reads is a deterministic rejection
     // carrying the object-specific budget message; the module is untouched.
-    // NOTE: this is the true-boundary probe (4097 replay rounds, O(N²) — the
-    // reason the equally-large store budget is not boundary-tested at all).
+    // the boundary is probed at its true value because an object read is
+    // answered in its import: cap+1 reads are cap+1 read calls in ONE guest run,
+    // not cap+1 replay rounds over a growing prefix.
     let root_before = m.root();
     let err = exec(&mut m, &mut ctx, budget_op(MAX_OBJECT_READS as u64 + 1))
         .await
