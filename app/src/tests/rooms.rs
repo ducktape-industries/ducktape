@@ -84,8 +84,6 @@ fn opening_a_network_clears_the_previous_networks_state() {
     app.connected_rpc = "http://node-a".into();
     app.rpc = "http://node-b".into();
     app.password = "device-key-password".into();
-    app.chat_edit_seq = 1;
-    app.chat_edit_rev = 2;
     app.chat_land_seq = 9;
     // The page a `duck://page/…` address asked for is the one pages fact the
     // app still holds — and it named the network being left.
@@ -98,8 +96,6 @@ fn opening_a_network_clears_the_previous_networks_state() {
 
     assert_eq!(app.connected_rpc, "http://node-b");
     assert_eq!(app.password, "device-key-password");
-    assert_eq!(app.chat_edit_seq, 0);
-    assert_eq!(app.chat_edit_rev, 0);
     assert_eq!(app.chat_land_seq, 0);
     assert!(app.page_route.is_empty());
     // The forge screen is the Forge VIEW's: what the app clears is the link

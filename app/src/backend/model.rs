@@ -43,31 +43,6 @@ pub fn mutation_phase_after_recovery(current: crate::MutationPhase) -> crate::Mu
     }
 }
 
-fn committed_message_change(phase: crate::MutationPhase, committed: bool) -> bool {
-    if !committed {
-        return false;
-    }
-    match phase {
-        crate::MutationPhase::MessageEdit => true,
-        crate::MutationPhase::Idle
-        | crate::MutationPhase::Recovering
-        | crate::MutationPhase::Huddle
-        | crate::MutationPhase::Onboarding => false,
-    }
-}
-
-pub fn message_seq_after_failure(
-    current: i64,
-    phase: crate::MutationPhase,
-    committed: bool,
-) -> i64 {
-    if committed_message_change(phase, committed) {
-        0
-    } else {
-        current
-    }
-}
-
 /// FOLD A LOAD'S ROWS INTO THE LIST ON SCREEN — do not replace it with them.
 ///
 /// The switch loader is handed the list the reader is already looking at and
@@ -180,18 +155,6 @@ pub fn submit_verdict(
     } else {
         crate::SubmitVerdict::Admitted
     }
-}
-
-/// ONE SEND IN FLIGHT, as the screen must paint it before any block carries
-/// it. The room's timeline is the chat view's own reading of the index, which
-/// cannot know about an operation the node has not committed yet — so the app
-/// keeps the admitted sends here and the view paints them at the tail of the
-/// surface each was written in (`thread_seq` 0 is the room itself).
-#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
-pub struct PendingSend {
-    pub id: String,
-    pub body: String,
-    pub thread_seq: i64,
 }
 
 pub(crate) struct Tip {

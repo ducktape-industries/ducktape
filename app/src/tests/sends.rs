@@ -21,25 +21,6 @@ fn no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer() {
     );
 }
 
-#[test]
-fn committed_message_change_cannot_be_submitted_twice() {
-    let (mut app, _) = Ducktape::boot();
-    app.connected_rpc = "http://node".into();
-    app.active_channel = "general".into();
-    app.chat_edit_seq = 7;
-    app.chat_edit_rev = 2;
-    app.mutation_phase = MutationPhase::MessageEdit;
-
-    let _ = app.update(AppMessage::MutationFailed(backend::AppError {
-        message: "read failed after commit".into(),
-        committed: true,
-    }));
-
-    assert_eq!(app.chat_edit_seq, 0);
-    assert_eq!(app.chat_edit_rev, 0);
-    assert_eq!(app.mutation_phase, MutationPhase::Recovering);
-}
-
 /// AND "recovering" HAS A TERMINAL. It is the phase a write the node COMMITTED
 /// but could not read back parks in — ordinary enough, a `/v1/query` can block
 /// past the RPC timeout (#1018) — and the resync `mutation_failed` launches is

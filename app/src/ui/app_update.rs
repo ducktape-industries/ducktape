@@ -678,9 +678,6 @@ impl Ducktape {
         self.connected = false;
         self.channels = Vec::new();
         self.chat_land_seq = 0;
-        self.chat_pending_sends = Vec::new();
-        self.chat_edit_seq = 0;
-        self.chat_edit_rev = 0;
         self.active_channel = "".to_owned();
         self.chat_dm_peer.clear();
         self.active_channel_name = "".to_owned();
@@ -1868,16 +1865,6 @@ impl Ducktape {
         crate::shell::clipboard::<AppMessage>(self.node_key.to_owned())
     }
     fn on_mutation_failed(&mut self, cause: crate::backend::AppError) -> Task<AppMessage> {
-        self.chat_edit_seq = crate::backend::message_seq_after_failure(
-            self.chat_edit_seq,
-            self.mutation_phase,
-            cause.committed,
-        );
-        self.chat_edit_rev = crate::backend::message_seq_after_failure(
-            self.chat_edit_rev,
-            self.mutation_phase,
-            cause.committed,
-        );
         self.mutation_phase = crate::backend::mutation_failure_phase(cause.committed);
         self.error = cause.message.to_owned();
         if !cause.committed {
@@ -4607,9 +4594,6 @@ impl Ducktape {
         self.mutation_phase = MutationPhase::Idle;
         self.channels = Vec::new();
         self.chat_land_seq = 0;
-        self.chat_pending_sends = Vec::new();
-        self.chat_edit_seq = 0;
-        self.chat_edit_rev = 0;
         self.active_channel = "".to_owned();
         self.chat_dm_peer.clear();
         self.active_channel_name = "".to_owned();
