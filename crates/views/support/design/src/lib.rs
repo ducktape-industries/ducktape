@@ -11,11 +11,24 @@ pub mod fonts {
     /// the data face — hashes, seqs, diffs, code, the log ring.
     pub const FAMILY_MONO: &str = "Geist Mono";
     /// Bundled files relative to this crate. The emoji face supplies fallback
-    /// glyphs; it is not a separate product type role.
-    pub const ASSETS: [&str; 3] = [
+    /// glyphs; it is not a separate product type role. ONE FILE PER WEIGHT:
+    /// the shell's text system draws a whole family at the weight of the face
+    /// it matched, so a family holding one variable face has one weight. Two
+    /// weights, not four — a heavier request lands on the nearer of these
+    /// (see `app/src/shell.rs`'s `LATIN_FACES`).
+    pub const ASSETS: [&str; 5] = [
+        "assets/fonts/Geist-Regular.ttf",
+        "assets/fonts/Geist-Bold.ttf",
+        "assets/fonts/GeistMono-Regular.ttf",
+        "assets/fonts/GeistMono-Bold.ttf",
+        "assets/fonts/NotoColorEmoji.ttf",
+    ];
+    /// The variable faces [`ASSETS`]' Latin instances are cut from, by
+    /// `ops/build-font-instances.sh`. Kept so a regeneration needs nothing
+    /// off the network; nothing registers them.
+    pub const SOURCES: [&str; 2] = [
         "assets/fonts/Geist[wght].ttf",
         "assets/fonts/GeistMono[wght].ttf",
-        "assets/fonts/NotoColorEmoji.ttf",
     ];
 }
 
@@ -334,7 +347,7 @@ mod tests {
     use super::*;
     #[test]
     fn every_embedded_font_file_exists_and_is_truetype() {
-        for asset in fonts::ASSETS {
+        for asset in fonts::ASSETS.iter().chain(&fonts::SOURCES) {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(asset);
             let bytes = std::fs::read(&path)
                 .unwrap_or_else(|error| panic!("font asset {asset} unreadable: {error}"));
