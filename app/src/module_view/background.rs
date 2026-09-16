@@ -9,8 +9,17 @@ use tokio::sync::{mpsc, watch};
 use super::{Guest, Mounted, Slot, connection, intern, kernel, mounted, runtime, spawn_load};
 
 pub(crate) struct Session {
+    revision: u64,
     pub input: watch::Sender<Vec<u8>>,
     pub events: BoxStream<'static, Result<Vec<u8>, String>>,
+}
+
+impl Session {
+    /// A completed response still belongs to the network that started it.
+    pub(crate) fn is_current(&self) -> bool {
+        let current = connection().lock().expect("views rpc");
+        current.rev == self.revision && current.client.is_some()
+    }
 }
 
 pub(super) struct Attachment {
@@ -127,7 +136,11 @@ pub(super) fn start_at(module: &str, props: Vec<u8>, revision: u64) -> Result<Se
         receiver.recv().await.map(|event| (event, (receiver, task)))
     })
     .boxed();
-    Ok(Session { input, events })
+    Ok(Session {
+        revision,
+        input,
+        events,
+    })
 }
 
 /// The network may change after start is queued. Check again under the

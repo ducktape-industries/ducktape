@@ -1,6 +1,5 @@
 use super::*;
 use ::chat;
-use identity::AccountView;
 
 /// One UI publication may carry at most this many consecutive chat deltas.
 /// The cap bounds one reducer pass; the capacity-one publication gate below
@@ -582,11 +581,8 @@ pub(crate) async fn folded_update(
             // is warm by the connect that opened this stream.
             let facts = ReaderFacts::current().await;
             let origin_kind = stream_origin_kind(&op.origin.kind);
-            // THE ONE ARRIVAL A READER CANNOT AFFORD TO FIND LATER. A mention
-            // and a DM used to reach nothing but the in-app bell, which is
-            // worth nothing behind another window. Pure decision, cached
-            // reads, no query — see `notify`.
-            notify_chat_op(&payload, op.assigned.as_ref(), facts.names());
+            // Notification execution is queued; the live fold never waits on it.
+            notify_chat_op(rpc, &payload, op.assigned.as_ref());
             let folded = chat::client::delta_from_op(
                 &payload,
                 op.assigned.as_ref(),
@@ -619,13 +615,6 @@ pub(crate) async fn folded_update(
                         height,
                         "chat.channel_refresh"
                     );
-                    let a_join = matches!(
-                        chat::decode_msg(&payload),
-                        Ok(ChatMsg::JoinHuddle { .. })
-                    );
-                    if a_join {
-                        notify_huddle_started(&channel);
-                    }
                     ChatDelta::ChannelUpdated {
                         channel_id,
                         channel,
@@ -943,35 +932,11 @@ pub async fn load_channel_window(
     })
 }
 
-/// Refresh account names and this reader's DM room labels for desktop notices.
-/// The deployed view reads and presents its own directory independently.
-pub async fn refresh_dm_notifications(rpc: String, generation: i64) -> Result<i64, HydrationError> {
+/// Refresh the native readers' shared identity directory.
+pub async fn refresh_name_directory(rpc: String, generation: i64) -> Result<i64, HydrationError> {
     async {
         let client = rpc_client(&rpc)?;
-        let me = local_user_key().await;
-        // The same read that refreshes the name directory: an identity op
-        // reloads this directory, and every label on screen moves with it.
-        let accounts = read_accounts(&client).await?;
-        // self is the account THIS key is a member of (a key holds at most one).
-        let is_mine = |account: &AccountView| {
-            me.as_ref()
-                .is_some_and(|me| account.keys.iter().any(|key| &key.pubkey == me))
-        };
-        let my_number = accounts
-            .iter()
-            .find(|account| is_mine(account))
-            .map(|account| account.number.to_string());
-        let mut rooms = std::collections::BTreeMap::new();
-        if let Some(mine) = my_number {
-            for account in accounts {
-                if is_mine(&account) {
-                    continue;
-                }
-                let channel_id = dm_channel_id(mine.clone(), account.number.to_string());
-                rooms.insert(channel_id, account.name);
-            }
-        }
-        note_dm_rooms(rooms);
+        read_accounts(&client).await?;
         Ok(generation)
     }
     .await
@@ -979,17 +944,6 @@ pub async fn refresh_dm_notifications(rpc: String, generation: i64) -> Result<i6
         generation,
         message: user_error(message),
     })
-}
-
-/// The two-party channel id of a pair of member keys, derived by the chat
-/// module's own client so the app and the module agree on one id.
-///
-/// It carries NO ':' deliberately: chat refuses a user-authored channel id in
-/// the module namespace (`crates/modules/apps/chat/src/lib.rs`,
-/// `validate_channel_namespace`), and a DM is created by the pair's own user
-/// key. `chat::client`'s test round-trips the minted id against that rule.
-pub fn dm_channel_id(a: String, b: String) -> String {
-    chat::client::dm_channel_id(&a, &b)
 }
 
 /// Why the viewer may not post here, as a stable reason token — empty when

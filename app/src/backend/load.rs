@@ -126,12 +126,8 @@ pub(crate) async fn load_chat_data(
         .find(|channel| channel.id == active_channel)
         .map(|channel| channel.name.clone())
         .unwrap_or_default();
-    // WHAT THE READER IS LOOKING AT, recorded where it is decided. This load
-    // runs on every room open and every chat resync, and it is the only place
-    // that knows both the room names and which one won — the live decoder,
-    // which needs both to word and to suppress a desktop notification, may not
-    // query for either inside the fold. See `notify`.
-    note_rooms(&channels, &active_channel);
+    // The view receives this navigation fact when deciding notifications.
+    note_active_channel(&active_channel);
     let active_wire_channel = wire_channels
         .iter()
         .find(|info| info.channel.id == active_channel);

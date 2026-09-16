@@ -2,6 +2,7 @@
 
 pub mod host;
 mod live;
+pub mod notice;
 
 #[path = "ui/app.rs"]
 mod app;

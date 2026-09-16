@@ -1,29 +1,6 @@
 use super::*;
 
 #[test]
-fn a_dm_id_is_pair_derived_and_cannot_be_forged() {
-    // the viewer's key, and a peer's ACCOUNT NUMBER as the directory keys it.
-    let a = "aa".repeat(32);
-    let b = "42".to_string();
-    assert_eq!(
-        dm_channel_id(a.clone(), b.clone()),
-        dm_channel_id(b.clone(), a.clone()),
-        "both sides derive the same channel"
-    );
-    // the id the app mints is the id chat will accept from a USER author:
-    // ':' is reserved for module origins and '/' is refused outright, so a
-    // minted id carrying either is a DM that can never be created.
-    // `chat::client`'s own test runs the id through that rule directly.
-    let id = dm_channel_id(a, b);
-    assert!(
-        !id.contains(':'),
-        "a user-authored channel id may not carry ':'"
-    );
-    assert!(!id.contains('/'), "a channel id may not carry '/'");
-    assert!(id.starts_with("dm-") && id.len() == 67);
-}
-
-#[test]
 fn the_post_gate_names_why_a_viewer_cannot_post() {
     let members = vec![ChatMember {
         key: "beef".into(),

@@ -2,7 +2,50 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
+use std::collections::BTreeMap;
+
 pub type AccountNumber = u64;
+
+/// Reconstruct a committed body from the original payload and its assigned
+/// key resolutions. Every distinct key consumes one account, in appearance
+/// order; repeated keys reuse that resolution. This never consults identity,
+/// whose current key ownership may differ from the committed operation's.
+pub fn resolve_assigned_mentions(
+    mut blocks: Vec<Block>,
+    key_mentions: &[AccountNumber],
+) -> Result<Vec<Block>, String> {
+    let mut accounts = key_mentions.iter();
+    let mut resolved = BTreeMap::new();
+    for block in &mut blocks {
+        let spans = match block {
+            Block::Paragraph(spans) | Block::Quote(spans) => spans,
+            Block::Code { .. } | Block::Divider => continue,
+        };
+        for span in spans {
+            for mark in &mut span.marks {
+                let Mark::Mention(Party::Key(key)) = mark else {
+                    continue;
+                };
+                let account = match resolved.get(key) {
+                    Some(account) => *account,
+                    None => {
+                        let account = *accounts.next().ok_or("missing assigned mention account")?;
+                        if account == 0 {
+                            return Err("assigned mention account is zero".into());
+                        }
+                        resolved.insert(key.clone(), account);
+                        account
+                    }
+                };
+                *mark = Mark::Mention(Party::Account(account));
+            }
+        }
+    }
+    if accounts.next().is_some() {
+        return Err("unused assigned mention accounts".into());
+    }
+    Ok(blocks)
+}
 
 /// who acts on chat state — the ONE party shape every author, owner, member,
 /// huddle participant, reactor and mention target takes.

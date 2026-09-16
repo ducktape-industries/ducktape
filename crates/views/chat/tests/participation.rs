@@ -137,3 +137,64 @@ fn background_search_names_the_room_once_without_requesting_a_signature() {
         assert!(request(&frame, "host.finish").payload.is_empty());
     });
 }
+
+#[test]
+fn notification_background_resolves_committed_mentions_and_reads_the_flat_channel_row() {
+    on_stack(|| {
+        let frame = start(json!({"kind":"notice","request":{
+            "payload":{"post_message":{"channel_id":"room","message_id":"m","thread":null,
+                "blocks":[{"paragraph":[{"text":"old","marks":[{"mention":{"key":vec![8;32]}}]}]}]}},
+            "assigned":{"posted":{"seq":1,"actor":{"account":2},"key_mentions":[1]}},
+            "context":{"key":vec![7;32],"screen":{"app_focused":false,"active_channel":""}}
+        }}));
+        let directory = request(&frame, "rpc.query");
+        assert_eq!(payload(directory)["target"], "identity");
+        let accounts = json!({"accounts":[
+            {"number":1,"name":"Reader","keys":[{"pubkey":vec![7;32]}]},
+            {"number":2,"name":"Reporter","keys":[]}
+        ]});
+        let frame = tick_native(vec![answer(
+            directory.id,
+            &serde_json::to_vec(&accounts).unwrap(),
+        )]);
+        let channel = request(&frame, "rpc.view");
+        assert_eq!(
+            payload(channel),
+            json!({"target":"chat","query":{"channel":{"channel_id":"room"}}})
+        );
+        let frame = tick_native(vec![answer(
+            channel.id,
+            br#"{"channel":{"id":"room","name":"General","huddle":[]}}"#,
+        )]);
+        assert_eq!(
+            payload(request(&frame, "host.emit")),
+            json!({"notice":{
+                "title":"#General","subtitle":"Reporter mentioned you","body":"@Reader","thread":"room"
+            }})
+        );
+        assert!(request(&frame, "host.finish").payload.is_empty());
+    });
+}
+
+#[test]
+fn a_join_notification_reads_the_first_seat_and_names_it_in_the_view() {
+    on_stack(|| {
+        let frame = start(json!({"kind":"notice","request":{
+            "payload":{"join_huddle":{"channel_id":"room"}},"assigned":null,
+            "context":{"key":vec![7;32],"screen":{"app_focused":false,"active_channel":""}}
+        }}));
+        let channel = request(&frame, "rpc.view");
+        let frame = tick_native(vec![answer(channel.id,br#"{"channel":{"id":"room","name":"General","huddle":[{"party":"acct:2","node":"aa"}]}}"#)]);
+        let directory = request(&frame, "rpc.query");
+        let frame = tick_native(vec![answer(
+            directory.id,
+            br#"{"accounts":[{"number":2,"name":"Reporter","keys":[]}]}"#,
+        )]);
+        assert_eq!(
+            payload(request(&frame, "host.emit")),
+            json!({"notice":{
+                "title":"#General","subtitle":"Reporter started a huddle","body":"Join from the room list.","thread":"room"
+            }})
+        );
+    });
+}

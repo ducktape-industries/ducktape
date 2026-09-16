@@ -7,8 +7,6 @@
 //! a membership, a huddle sweep), and replies and events carry the party the
 //! module resolved.
 
-use std::collections::BTreeMap;
-
 use sdk::AccountNumber;
 use serde::{Deserialize, Serialize};
 
@@ -59,7 +57,7 @@ pub const PROGRAM_HUDDLE_JOIN_NS: &[u8] = b"ducktape/huddle-join/program/v1";
 /// `MAX_OPEN_TASKS_PER_OWNER`.
 pub const MAX_CHANNELS_PER_CREATOR: usize = 256;
 
-pub use chat_message::{Block, Mark, Party, Span};
+pub use chat_message::{Block, Mark, Party, Span, resolve_assigned_mentions};
 
 /// who may post (and react) in a channel.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,47 +382,6 @@ pub enum ChatAssigned {
     Actor { actor: Party },
     /// Exact existing/new party whose reaction or huddle entry was affected.
     Participant { actor: Party, participant: Party },
-}
-
-/// Reconstruct a committed body from the original payload and its assigned
-/// key resolutions. Every distinct key consumes one account, in appearance
-/// order; repeated keys reuse that resolution. This never consults identity,
-/// whose current key ownership may differ from the committed operation's.
-pub fn resolve_assigned_mentions(
-    mut blocks: Vec<Block>,
-    key_mentions: &[AccountNumber],
-) -> Result<Vec<Block>, String> {
-    let mut accounts = key_mentions.iter();
-    let mut resolved = BTreeMap::new();
-    for block in &mut blocks {
-        let spans = match block {
-            Block::Paragraph(spans) | Block::Quote(spans) => spans,
-            Block::Code { .. } | Block::Divider => continue,
-        };
-        for span in spans {
-            for mark in &mut span.marks {
-                let Mark::Mention(Party::Key(key)) = mark else {
-                    continue;
-                };
-                let account = match resolved.get(key) {
-                    Some(account) => *account,
-                    None => {
-                        let account = *accounts.next().ok_or("missing assigned mention account")?;
-                        if account == 0 {
-                            return Err("assigned mention account is zero".into());
-                        }
-                        resolved.insert(key.clone(), account);
-                        account
-                    }
-                };
-                *mark = Mark::Mention(Party::Account(account));
-            }
-        }
-    }
-    if accounts.next().is_some() {
-        return Err("unused assigned mention accounts".into());
-    }
-    Ok(blocks)
 }
 
 impl ChatAssigned {

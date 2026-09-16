@@ -662,7 +662,7 @@ pub(crate) fn landing_thread(root: i64) -> crate::LandingThread {
 pub struct Names {
     /// key hex -> (account number, display name)
     keys: BTreeMap<String, (u64, String)>,
-    by_account: BTreeMap<u64, String>,
+    pub(crate) by_account: BTreeMap<u64, String>,
     /// the program-controlled accounts: software, drawn with the AGENT plate
     programs: BTreeSet<u64>,
 }
@@ -762,7 +762,7 @@ pub(crate) fn reset_directory() {
 /// The directory as of `serial`, read once per identity change. A directory
 /// that cannot be read is an empty one — every author renders by handle,
 /// which is a name, not a failure.
-async fn names_at(serial: i64) -> Names {
+pub(crate) async fn names_at(serial: i64) -> Names {
     let cached = NAMES.with_borrow(|(at, names)| (*at == serial).then(|| names.clone()));
     if let Some(names) = cached {
         return names;
@@ -949,7 +949,7 @@ fn sidebar_initials(name: &str) -> String {
         .collect()
 }
 
-fn dm_channel_id(a: &str, b: &str) -> String {
+pub(crate) fn dm_channel_id(a: &str, b: &str) -> String {
     use sha2::{Digest, Sha256};
     let (low, high) = if a < b { (a, b) } else { (b, a) };
     let digest = Sha256::digest(format!("{low}\u{1f}{high}").as_bytes());
@@ -1059,7 +1059,10 @@ async fn ask(kind: &str, query: &serde_json::Value) -> Result<serde_json::Value,
 /// (`{"roots": {"roots": […], "has_more": false}}`), so every caller would
 /// otherwise have to peel the same tag off by hand — and reading one field
 /// short of it silently answers an empty page.
-async fn view(variant: &str, query: serde_json::Value) -> Result<serde_json::Value, String> {
+pub(crate) async fn view(
+    variant: &str,
+    query: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let reply = ask(
         "rpc.view",
         &serde_json::json!({ "target": "chat", "query": query }),
@@ -1698,7 +1701,7 @@ fn deleted_block() -> ChatBlock {
 
 /// The message as one run of plain text — the palette's preview and the copy
 /// range's lines. A mention reads as the NAME it addresses, not as its token.
-fn message_body(blocks: &serde_json::Value, names: &Names) -> String {
+pub(crate) fn message_body(blocks: &serde_json::Value, names: &Names) -> String {
     blocks
         .as_array()
         .cloned()
@@ -2025,7 +2028,7 @@ fn json_bytes(value: &serde_json::Value) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         let _ = write!(output, "{byte:02x}");
@@ -2875,6 +2878,7 @@ mod tests {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BackgroundRequest {
+    Notice { request: crate::notice::Request },
     Search { channel: String, text: String },
     Join { channel: String },
     Move { from: String, channel: String },
@@ -2985,6 +2989,9 @@ async fn background_search(
 
 async fn participate(intent: BackgroundRequest) -> Result<serde_json::Value, BackgroundError> {
     match intent {
+        BackgroundRequest::Notice { request } => {
+            Ok(serde_json::json!({"notice":crate::notice::notice(request).await}))
+        }
         BackgroundRequest::Search { channel, text } => background_search(channel, text).await,
         BackgroundRequest::Join { channel } => participation_join(channel)
             .await

@@ -788,7 +788,7 @@ impl Ducktape {
         Task::batch([
             {
                 let pending_task = Task::perform(
-                    crate::backend::refresh_dm_notifications(
+                    crate::backend::refresh_name_directory(
                         self.connected_rpc.to_owned(),
                         self.dm_peers_generation,
                     ),
@@ -1518,7 +1518,7 @@ impl Ducktape {
             return Task::none();
         }
         let pending_task = Task::perform(
-            crate::backend::refresh_dm_notifications(request.rpc.to_owned(), request.generation),
+            crate::backend::refresh_name_directory(request.rpc.to_owned(), request.generation),
             |result| match result {
                 Ok(value) => AppMessage::DmPeersLoaded(value),
                 Err(error) => AppMessage::DmPeersFailed(error),

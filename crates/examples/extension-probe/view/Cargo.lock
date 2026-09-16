@@ -336,7 +336,7 @@ dependencies = [
 [[package]]
 name = "ui-lang-wire"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=3a7e02378a135839d32019dd835b2a5b2473252f#3a7e02378a135839d32019dd835b2a5b2473252f"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=3d8ba98833c48e030e1b955ac2799bc27755b2bf#3d8ba98833c48e030e1b955ac2799bc27755b2bf"
 dependencies = [
  "bincode",
  "memchr",
