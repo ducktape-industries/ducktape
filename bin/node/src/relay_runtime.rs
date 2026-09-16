@@ -268,7 +268,7 @@ impl ResidentRelay {
                 // push was otherwise EMPTY — this line is the server-side
                 // evidence.
                 tracing::warn!(
-                    target: "ducktape::relay",
+                    target: "ducktape::submit",
                     digest = %relay::encode_hex(&fanout.digest),
                     awaiting = fanout.awaiting.len(),
                     reason = "blob_fanout_expired",
@@ -634,7 +634,7 @@ impl ValidatorRelay {
         for id in expired_local {
             if let Some(fanout) = self.local_fanouts.remove(&id) {
                 tracing::warn!(
-                    target: "ducktape::relay",
+                    target: "ducktape::submit",
                     digest = %relay::encode_hex(&fanout.digest),
                     awaiting = fanout.awaiting.len(),
                     reason = "blob_fanout_expired",
@@ -658,7 +658,7 @@ impl ValidatorRelay {
                 // ride the p2p channel with no retransmit, so a tunnel that
                 // drops mid-transfer can never complete this assembly.
                 tracing::warn!(
-                    target: "ducktape::relay",
+                    target: "ducktape::submit",
                     digest = %relay::encode_hex(&incoming.digest),
                     reason = "blob_receive_expired",
                     "required blob receive expired mid-transfer; refusing so the pusher sees the timeout"

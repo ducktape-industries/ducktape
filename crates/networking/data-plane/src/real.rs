@@ -134,7 +134,7 @@ impl DatagramSocket for UdpSocket {
 fn disable_nagle(stream: &tokio::net::TcpStream) {
     if let Err(error) = stream.set_nodelay(true) {
         tracing::warn!(
-            target: "ducktape::plane",
+            target: "ducktape::dataplane",
             reason = "nodelay_refused",
             %error,
             "overlay stream kept Nagle batching"
