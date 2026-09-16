@@ -788,8 +788,14 @@ fn a_swap_preserves_kind_and_a_view_swaps_like_a_module() {
     run(&mut lc, &mut at, &advance()).unwrap();
     commit(&mut lc);
     let status = module_status(&lc);
-    let home = status.iter().find(|entry| entry.module_id == "home").unwrap();
-    let chat = status.iter().find(|entry| entry.module_id == "chat").unwrap();
+    let home = status
+        .iter()
+        .find(|entry| entry.module_id == "home")
+        .unwrap();
+    let chat = status
+        .iter()
+        .find(|entry| entry.module_id == "chat")
+        .unwrap();
     assert_eq!(home.kind, Kind::View, "the swap kept the view's kind");
     assert_eq!(chat.kind, Kind::Module);
     for entry in [home, chat] {
@@ -806,7 +812,10 @@ fn a_swap_preserves_kind_and_a_view_swaps_like_a_module() {
     let mut sys = ctx(Origin::System, 0);
     run(&mut lc, &mut sys, &cancel_swap("home", "third")).unwrap();
     commit(&mut lc);
-    let home = module_status(&lc).into_iter().find(|entry| entry.module_id == "home").unwrap();
+    let home = module_status(&lc)
+        .into_iter()
+        .find(|entry| entry.module_id == "home")
+        .unwrap();
     assert!(home.pending.is_none());
     assert_eq!(home.kind, Kind::View);
 }
@@ -1056,9 +1065,16 @@ fn lanes_of(lc: &Modules) -> Vec<LaneRecord> {
     }
 }
 
+/// a lane whose name is derived from its id — these tests are about the ID
+/// rules, so the name only has to be well-formed and distinct.
 fn lane(id: u8) -> LaneDecl {
+    named_lane(id, &format!("lane{id}"))
+}
+
+fn named_lane(id: u8, name: &str) -> LaneDecl {
     LaneDecl {
         id,
+        name: name.to_string(),
         stream: Some(LaneStream {
             pacing: LanePacing::Shared,
             accept_backlog: 8,
@@ -1066,7 +1082,11 @@ fn lane(id: u8) -> LaneDecl {
     }
 }
 
-fn register_with_lanes(lc: &mut Modules, module_id: &str, lanes: Vec<LaneDecl>) -> Result<(), Error> {
+fn register_with_lanes(
+    lc: &mut Modules,
+    module_id: &str,
+    lanes: Vec<LaneDecl>,
+) -> Result<(), Error> {
     let mut sys = ctx(Origin::System, 0);
     run(
         lc,
@@ -1081,16 +1101,31 @@ fn register_with_lanes(lc: &mut Modules, module_id: &str, lanes: Vec<LaneDecl>) 
 }
 
 #[test]
-fn a_declared_lane_is_readable_with_its_owner() {
+fn a_declared_lane_is_readable_by_its_owner_and_name() {
     let mut lc = fresh();
-    register_with_lanes(&mut lc, "chat", vec![lane(2), lane(3)]).unwrap();
+    register_with_lanes(
+        &mut lc,
+        "chat",
+        vec![named_lane(2, "voice"), named_lane(3, "video")],
+    )
+    .unwrap();
     commit(&mut lc);
     let lanes = lanes_of(&lc);
     assert_eq!(lanes.len(), 2);
-    assert_eq!(lanes[0].id, 2);
-    assert_eq!(lanes[0].module_id, "chat");
-    assert_eq!(lanes[1].id, 3);
-    assert_eq!(lanes[1].stream.as_ref().unwrap().accept_backlog, 8);
+    // (module_id, name) is the binding key — the id is only the port it
+    // resolves to. A host that bound by position would swap voice and video
+    // the day chat declares a third lane.
+    let voice = lanes
+        .iter()
+        .find(|l| l.module_id == "chat" && l.name == "voice")
+        .expect("chat declares a lane named voice");
+    assert_eq!(voice.id, 2);
+    let video = lanes
+        .iter()
+        .find(|l| l.module_id == "chat" && l.name == "video")
+        .expect("chat declares a lane named video");
+    assert_eq!(video.id, 3);
+    assert_eq!(video.stream.as_ref().unwrap().accept_backlog, 8);
 }
 
 #[test]
@@ -1099,7 +1134,16 @@ fn a_datagram_only_lane_declares_no_stream_half() {
     // pace and no backlog. A record that forced a budget on them would be
     // inventing a number the node does not use.
     let mut lc = fresh();
-    register_with_lanes(&mut lc, "chat", vec![LaneDecl { id: 2, stream: None }]).unwrap();
+    register_with_lanes(
+        &mut lc,
+        "chat",
+        vec![LaneDecl {
+            id: 2,
+            name: "voice".into(),
+            stream: None,
+        }],
+    )
+    .unwrap();
     commit(&mut lc);
     assert!(lanes_of(&lc)[0].stream.is_none());
 }
@@ -1130,6 +1174,55 @@ fn a_second_module_cannot_take_a_declared_lane_id() {
         text.contains("already declared by module chat"),
         "the refusal must name the OWNER, or an operator cannot tell who took it: {text}"
     );
+}
+
+#[test]
+fn one_module_cannot_declare_two_lanes_of_one_name() {
+    // the host binds by (module_id, name), so a duplicate name is a lookup
+    // with two answers. A module declares its whole set in ONE op, so this is
+    // where the collision has to be caught — the check reads the table as it
+    // grows, not once before the loop.
+    let mut lc = fresh();
+    let err = register_with_lanes(
+        &mut lc,
+        "chat",
+        vec![named_lane(2, "voice"), named_lane(3, "voice")],
+    )
+    .unwrap_err();
+    let Error::Module(text) = err else {
+        panic!("expected a module error")
+    };
+    assert!(text.contains("already declares a lane named"), "{text}");
+    commit(&mut lc);
+    assert!(lanes_of(&lc).is_empty(), "the refused op left nothing");
+
+    // a DIFFERENT module may use the same name: the key is the pair, and two
+    // modules each having a "telemetry" lane is normal.
+    register_with_lanes(&mut lc, "chat", vec![named_lane(2, "voice")]).unwrap();
+    register_with_lanes(&mut lc, "agent", vec![named_lane(4, "voice")]).unwrap();
+    commit(&mut lc);
+    assert_eq!(lanes_of(&lc).len(), 2);
+}
+
+#[test]
+fn a_malformed_lane_name_is_refused() {
+    // the name is stored in the root-hashed table and read by every node, so
+    // it is bounded and lowercase-ASCII — never free-form text a module could
+    // grow the table with.
+    let mut lc = fresh();
+    let too_long = "a".repeat(MAX_LANE_NAME_BYTES + 1);
+    for bad in ["", "Voice", "voice-lane", "voice lane", "보이스", &too_long] {
+        let err = register_with_lanes(&mut lc, "chat", vec![named_lane(2, bad)]).unwrap_err();
+        let Error::Module(text) = err else {
+            panic!("expected a module error")
+        };
+        assert!(text.contains("malformed"), "name {bad:?}: {text}");
+    }
+    // the longest legal name still lands
+    let longest = "a".repeat(MAX_LANE_NAME_BYTES);
+    register_with_lanes(&mut lc, "chat", vec![named_lane(2, &longest)]).unwrap();
+    commit(&mut lc);
+    assert_eq!(lanes_of(&lc)[0].name, longest);
 }
 
 #[test]
@@ -1175,7 +1268,10 @@ fn a_refused_lane_registers_no_module() {
     commit(&mut lc);
     register_with_lanes(&mut lc, "agent", vec![lane(4), lane(2)]).unwrap_err();
     commit(&mut lc);
-    let ids: Vec<String> = module_status(&lc).into_iter().map(|m| m.module_id).collect();
+    let ids: Vec<String> = module_status(&lc)
+        .into_iter()
+        .map(|m| m.module_id)
+        .collect();
     assert_eq!(ids, ["chat"], "the refused module must not be rostered");
     let lanes: Vec<u8> = lanes_of(&lc).iter().map(|l| l.id).collect();
     assert_eq!(lanes, [2], "and lane 4 from the same op must not survive");
@@ -1223,6 +1319,7 @@ fn a_genesis_seed_declares_its_lanes() {
             hash(1),
             vec![LaneDecl {
                 id: 2,
+                name: "voice".into(),
                 stream: Some(LaneStream {
                     pacing: LanePacing::Local {
                         bulk_bytes_per_sec: 24 * 1024 * 1024,

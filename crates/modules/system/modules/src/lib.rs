@@ -403,6 +403,23 @@ impl Modules {
                     decl.id
                 )));
             }
+            if !lane_name_is_well_formed(&decl.name) {
+                return Err(Error::Module(format!(
+                    "lane name {:?} is malformed: 1..={MAX_LANE_NAME_BYTES} bytes of [a-z0-9_]",
+                    decl.name
+                )));
+            }
+            // the NAME is what a host binds by, so a module with two lanes of
+            // one name is a binding with no answer — refused like a taken id.
+            let name_taken = table
+                .iter()
+                .any(|lane| lane.module_id == module_id && lane.name == decl.name);
+            if name_taken {
+                return Err(Error::Module(format!(
+                    "module {module_id} already declares a lane named {:?}",
+                    decl.name
+                )));
+            }
             let Err(position) = table.binary_search_by_key(&decl.id, |lane| lane.id) else {
                 let owner = table
                     .iter()
@@ -418,6 +435,7 @@ impl Modules {
                 LaneRecord {
                     id: decl.id,
                     module_id: module_id.to_string(),
+                    name: decl.name,
                     stream: decl.stream,
                 },
             );
@@ -426,11 +444,7 @@ impl Modules {
     }
 
     /// declare `decls` for `module_id` and persist the table.
-    async fn declare_lanes(
-        &mut self,
-        module_id: &str,
-        decls: Vec<LaneDecl>,
-    ) -> Result<(), Error> {
+    async fn declare_lanes(&mut self, module_id: &str, decls: Vec<LaneDecl>) -> Result<(), Error> {
         if decls.is_empty() {
             return Ok(());
         }

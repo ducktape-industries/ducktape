@@ -149,7 +149,7 @@ pub fn genesis_seeds(founding: &[Founding]) -> BTreeMap<String, modules::Seed> {
         .collect()
 }
 
-/// The data-plane lanes a founding module brings, by id.
+/// The data-plane lanes a founding module brings, by name.
 ///
 /// This table is native for the same reason `topology::TOPOLOGY` is: it IS the
 /// founding set's content, and a network has no registry to read until genesis
@@ -164,23 +164,28 @@ pub fn genesis_seeds(founding: &[Founding]) -> BTreeMap<String, modules::Seed> {
 /// the binary and the registry refuses to hand their ids out.
 fn founding_lanes(module_id: &str) -> Vec<modules::LaneDecl> {
     // a lane with no stream half binds its sockets and speaks datagrams only.
-    let datagram_only = |id| modules::LaneDecl { id, stream: None };
-    let shared_stream = |id, accept_backlog| modules::LaneDecl {
+    let datagram_only = |id, name: &str| modules::LaneDecl {
         id,
+        name: name.to_string(),
+        stream: None,
+    };
+    let shared_stream = |id, name: &str, accept_backlog| modules::LaneDecl {
+        id,
+        name: name.to_string(),
         stream: Some(modules::LaneStream {
             pacing: modules::LanePacing::Shared,
             accept_backlog,
         }),
     };
     match module_id {
-        // voice (2) and camera video (3): media rides the overlay datagrams,
-        // and neither binds a stream plane today.
-        "chat" => vec![datagram_only(2), datagram_only(3)],
+        // media rides the overlay datagrams, and neither binds a stream plane
+        // today. The host binds these by name, never by id or position.
+        "chat" => vec![datagram_only(2, "voice"), datagram_only(3, "video")],
         // the reverse-proxy door every installed service is reached through —
         // one lane for all of them, which is why a service declares none.
-        "gateway" => vec![shared_stream(4, 16)],
+        "gateway" => vec![shared_stream(4, "gateway", 16)],
         // live agent run output between member nodes; observability only.
-        "agent" => vec![shared_stream(5, 64)],
+        "agent" => vec![shared_stream(5, "telemetry", 64)],
         _ => Vec::new(),
     }
 }
