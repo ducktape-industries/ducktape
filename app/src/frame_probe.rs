@@ -164,18 +164,18 @@ pub(crate) fn headless_context() -> HeadlessAppContext {
     cx.update(|cx| {
         gpui_kit::init(cx);
         crate::editor::wire::init_notion(cx);
+        // The SAME set the shell registers: a probe that holds a different
+        // set cannot see what the app draws — a single variable face passed
+        // every weight test in this context while the app drew them all at
+        // regular.
+        let mut fonts: Vec<Cow<'static, [u8]>> = crate::shell::LATIN_FACES
+            .iter()
+            .copied()
+            .map(Cow::Borrowed)
+            .collect();
+        fonts.push(Cow::Borrowed(crate::shell::EMOJI_FACE));
         cx.text_system()
-            .add_fonts(vec![
-                Cow::Borrowed(include_bytes!(
-                    "../../crates/views/support/design/assets/fonts/Geist[wght].ttf"
-                )),
-                Cow::Borrowed(include_bytes!(
-                    "../../crates/views/support/design/assets/fonts/GeistMono[wght].ttf"
-                )),
-                Cow::Borrowed(include_bytes!(
-                    "../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf"
-                )),
-            ])
+            .add_fonts(fonts)
             .expect("bundled fonts load into the production text system");
     });
     cx

@@ -2809,6 +2809,35 @@ fn nav_icon(tab: ShellTab) -> gpui_kit::component::Icon {
     }
 }
 
+/// The Latin faces the app registers: ONE FILE PER WEIGHT, not the variable
+/// source they are cut from. The text system keeps the requested weight only
+/// long enough to match a face — `gpui-pre-wgpu`'s `cosmic_text_system.rs`
+/// then shapes with the matched face's own `usWeightClass` and rasterizes
+/// from a font built at `Weight::NORMAL` with no variation settings — so a
+/// family holding one variable face draws every weight at 400 and no slant
+/// at all. A static face has no axes and is immune to both.
+/// `ops/build-font-instances.sh` cuts these from `Geist[wght]`.
+///
+/// TWO WEIGHTS, NOT FOUR, and the reason is that same substitution read the
+/// other way: the matched face's weight is also the weight every FALLBACK
+/// lookup runs at. No system face declares 500 or 600, so registering a
+/// Medium or a SemiBold sent every non-Latin run off to walk the font
+/// database — one uncached line of Korean measured 5.0ms at 500 and 6.0ms at
+/// 600, against 0.2ms at 400 and 700. A `SEMIBOLD` request lands on Bold and
+/// a `MEDIUM` on Regular instead; `app/src/tests/font_fallback.rs` holds
+/// that line.
+pub(crate) const LATIN_FACES: [&[u8]; 4] = [
+    include_bytes!("../../crates/views/support/design/assets/fonts/Geist-Regular.ttf"),
+    include_bytes!("../../crates/views/support/design/assets/fonts/Geist-Bold.ttf"),
+    include_bytes!("../../crates/views/support/design/assets/fonts/GeistMono-Regular.ttf"),
+    include_bytes!("../../crates/views/support/design/assets/fonts/GeistMono-Bold.ttf"),
+];
+
+/// The emoji face, kept apart from the Latin set because the two platforms
+/// differ on it (see the registration below).
+pub(crate) const EMOJI_FACE: &[u8] =
+    include_bytes!("../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf");
+
 pub(crate) fn run() {
     // The kit's component icons (search, bell, folder, …) are SVGs the app
     // loads by path; without a source they draw as nothing.
@@ -2827,16 +2856,14 @@ pub(crate) fn run() {
         // Ask the host about banners at launch, so the macOS prompt is a
         // launch event and its answer is in the log before the first mention.
         crate::backend::boot_desktop_notifications();
-        let fonts: Vec<std::borrow::Cow<'static, [u8]>> = vec![
-            std::borrow::Cow::Borrowed(include_bytes!("../../crates/views/support/design/assets/fonts/Geist[wght].ttf")),
-            std::borrow::Cow::Borrowed(include_bytes!("../../crates/views/support/design/assets/fonts/GeistMono[wght].ttf")),
-        ];
+        let fonts: Vec<std::borrow::Cow<'static, [u8]>> =
+            LATIN_FACES.iter().copied().map(std::borrow::Cow::Borrowed).collect();
         // CoreGraphics cannot load Noto's CBDT color font. Including it in
         // the batch rejects both Latin families too; macOS supplies emoji.
         #[cfg(not(target_os = "macos"))]
         let fonts = {
             let mut fonts = fonts;
-            fonts.push(std::borrow::Cow::Borrowed(include_bytes!("../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf")));
+            fonts.push(std::borrow::Cow::Borrowed(EMOJI_FACE));
             fonts
         };
         if let Err(error) = cx.text_system().add_fonts(fonts) {
