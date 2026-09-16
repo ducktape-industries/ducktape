@@ -5,10 +5,10 @@
 //! hold their own overlay `/128`, carrying a paced 50 fps media source. The
 //! same source is run over BOTH lane classes under one impairment:
 //!
-//! - `Service::Gateway` — the stream class, reliable and ordered, its writes
+//! - `GATEWAY_LANE` — the stream class, reliable and ordered, its writes
 //!   drawn from the process-wide bulk budget. This is what a deployed call's
 //!   frames cross a node boundary on today.
-//! - `Service::Voice` — the datagram class, unreliable and unordered, with a
+//! - `VOICE_LANE` — the datagram class, unreliable and unordered, with a
 //!   drop-oldest queue bounded per sending peer. This is the lane built for
 //!   real-time media.
 //!
@@ -34,6 +34,12 @@ use data_plane::{
     StreamListener, StreamPolicy,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+/// the lane ids a founding network's registry hands out for the declared
+/// lanes these tests exercise. VALUES, not variants: the id is the
+/// registry's to choose, and this is simply what it chose.
+const VOICE_LANE: Service = Service::from_lane_id(2);
+const GATEWAY_LANE: Service = Service::from_lane_id(4);
+const TELEMETRY_LANE: Service = Service::from_lane_id(5);
 
 /// The production ceiling, from `bin/node/src/overlay_book.rs`. Restated
 /// rather than imported: that constant is private to the node binary, and a
@@ -321,17 +327,17 @@ async fn pace(
     Some(frame(seq, clock.elapsed().as_nanos() as u64, size))
 }
 
-/// `Service::Voice`: the datagram class. Unreliable and unordered by design —
+/// `VOICE_LANE`: the datagram class. Unreliable and unordered by design —
 /// a frame that does not arrive is not retransmitted, and late real-time data
 /// is dead data.
 async fn datagram_lane(trial: Duration, warmup: Duration, size: usize) -> Cell {
     let (left, right) = endpoints(BulkPacer::new(BULK_BYTES_PER_SEC, BULK_BURST_BYTES)).await;
     let flow = FlowId::derive(b"call:media");
     let sender = left
-        .datagram_flow(Service::Voice, flow, DatagramPolicy { max_queued: 64 })
+        .datagram_flow(VOICE_LANE, flow, DatagramPolicy { max_queued: 64 })
         .expect("voice flow");
     let receiver = right
-        .datagram_flow(Service::Voice, flow, DatagramPolicy { max_queued: 64 })
+        .datagram_flow(VOICE_LANE, flow, DatagramPolicy { max_queued: 64 })
         .expect("voice flow");
     let clock = Instant::now();
     let reading = tokio::spawn(async move {
@@ -379,7 +385,7 @@ async fn datagram_lane(trial: Duration, warmup: Duration, size: usize) -> Cell {
     }
 }
 
-/// `Service::Gateway`: the stream class. Reliable, ordered, and paced from the
+/// `GATEWAY_LANE`: the stream class. Reliable, ordered, and paced from the
 /// shared bulk budget — the lane a deployed call's frames cross a node
 /// boundary on today. A stream has no message boundaries of its own, so every
 /// frame in a run is the same size and the reader takes exactly that many
@@ -390,16 +396,10 @@ async fn stream_lane(trial: Duration, warmup: Duration, size: usize, bulk: bool)
     let (left, right) = endpoints(pacer.clone()).await;
     let flow = FlowId::derive(b"call:media");
     let acceptor = right
-        .stream_service(
-            Service::Gateway,
-            StreamPolicy { accept_backlog: 8 },
-        )
+        .stream_service(GATEWAY_LANE, StreamPolicy { accept_backlog: 8 })
         .expect("gateway service");
     let opener = left
-        .stream_service(
-            Service::Gateway,
-            StreamPolicy { accept_backlog: 8 },
-        )
+        .stream_service(GATEWAY_LANE, StreamPolicy { accept_backlog: 8 })
         .expect("gateway service");
     let clock = Instant::now();
     let reading = tokio::spawn(async move {
@@ -440,10 +440,10 @@ async fn stream_lane(trial: Duration, warmup: Duration, size: usize, bulk: bool)
             let (a, b) = endpoints(pacer).await;
             let flow = FlowId::derive(b"agent:telemetry");
             let sink = b
-                .stream_service(Service::AgentTelemetry, StreamPolicy { accept_backlog: 8 })
+                .stream_service(TELEMETRY_LANE, StreamPolicy { accept_backlog: 8 })
                 .expect("telemetry service");
             let source = a
-                .stream_service(Service::AgentTelemetry, StreamPolicy { accept_backlog: 8 })
+                .stream_service(TELEMETRY_LANE, StreamPolicy { accept_backlog: 8 })
                 .expect("telemetry service");
             let drain = tokio::spawn(async move {
                 let Some((_, _, mut stream)) = sink.accept().await else {
@@ -501,9 +501,11 @@ async fn overlay_lane_classes_under_impairment() {
     // Head to head at ONE payload both lanes can carry, so the difference is
     // the lane class and nothing else.
     let load = load_average();
-    datagram_lane(trial, warmup, OPUS_FRAME_BYTES)
-        .await
-        .report(&label, "voice_datagram_opus", &load);
+    datagram_lane(trial, warmup, OPUS_FRAME_BYTES).await.report(
+        &label,
+        "voice_datagram_opus",
+        &load,
+    );
     let load = load_average();
     stream_lane(trial, warmup, OPUS_FRAME_BYTES, false)
         .await
@@ -521,7 +523,9 @@ async fn overlay_lane_classes_under_impairment() {
     // And the same payload offered to the lane built for media, which refuses
     // it: the datagram class never fragments.
     let load = load_average();
-    datagram_lane(trial, warmup, CALL_FRAME_BYTES)
-        .await
-        .report(&label, "voice_datagram_call", &load);
+    datagram_lane(trial, warmup, CALL_FRAME_BYTES).await.report(
+        &label,
+        "voice_datagram_call",
+        &load,
+    );
 }

@@ -27,6 +27,7 @@ pub fn spawn_hub(
     peers: Arc<OverlayPeers>,
     me: [u8; 32],
     planes: data_plane::PlaneMonitor,
+    node: String,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("voice-hub".into())
@@ -36,7 +37,7 @@ pub fn spawn_hub(
                 .enable_all()
                 .build()
                 .expect("voice-hub tokio runtime")
-                .block_on(hub_loop(requests, factory, peers, me, planes));
+                .block_on(hub_loop(requests, factory, peers, me, planes, node));
         })
         .expect("spawn voice-hub thread")
 }
@@ -111,20 +112,25 @@ async fn hub_loop(
     peers: Arc<OverlayPeers>,
     me: [u8; 32],
     planes: data_plane::PlaneMonitor,
+    node: String,
 ) {
     let flows = Arc::new(ActiveFlows::default());
+    // the lane wait lives INSIDE this future on purpose: the grace/refuse
+    // loop below already answers every join that arrives before the plane is
+    // up, and an undeclared lane is just one more reason it is not up yet.
     let binding = crate::voice_plane::bind_presence_plane(
         factory,
         peers,
         me,
         flows.clone() as Arc<dyn AdmissionPolicy>,
+        &node,
     );
     tokio::pin!(binding);
     let bound = tokio::select! {
         bound = &mut binding => Some(bound),
         () = tokio::time::sleep(OVERLAY_GRACE) => None,
     };
-    let voice_plane = match bound {
+    let (voice_plane, service) = match bound {
         Some(bound) => bound,
         // The overlay is late (or never coming). Whatever queued during the
         // grace window is answered here, as is every join until the bind lands.
@@ -141,9 +147,20 @@ async fn hub_loop(
             }
         },
     };
-    tracing::info!(target: "ducktape::voice", event = "voice_hub_bound", "Pages presence plane bound");
-    planes.register("pages", Service::Voice, voice_plane.watch());
-    serve_sessions(requests, voice_plane, flows).await;
+    tracing::info!(
+        target: "ducktape::voice",
+        event = "voice_hub_bound",
+        lane = service.lane_id(),
+        "Pages presence plane bound"
+    );
+    planes.register("pages", "voice", voice_plane.watch());
+    crate::lane_table::serve_until_lane_changes(
+        crate::voice_plane::VOICE_LANE,
+        service,
+        &node,
+        serve_sessions(requests, voice_plane, flows, service),
+    )
+    .await;
 }
 
 fn refuse_request(request: noded::PresenceSessionRequest) {
@@ -155,13 +172,15 @@ async fn serve_sessions<T: DataPlaneTransport>(
     mut requests: mpsc::Receiver<noded::PresenceSessionRequest>,
     plane: DataPlane<T>,
     flows: Arc<ActiveFlows>,
+    service: Service,
 ) {
     let mut active: Option<SessionGuard> = None;
     while let Some(request) = requests.recv().await {
         if let Some(previous) = active.take() {
             previous.teardown().await;
         }
-        let (session, guard) = match open_presence_session(&plane, &flows, &request.page_id).await {
+        let opened = open_presence_session(&plane, &flows, &request.page_id, service).await;
+        let (session, guard) = match opened {
             Ok(opened) => opened,
             Err(refusal) => {
                 let _ = request.reply.send(Err(refusal));
@@ -206,18 +225,19 @@ async fn open_presence_session<T: DataPlaneTransport>(
     voice_plane: &DataPlane<T>,
     flows: &Arc<ActiveFlows>,
     page_id: &str,
+    service: Service,
 ) -> Result<(noded::PresenceSession, SessionGuard), String> {
     let flow = presence_flow(page_id);
     let datagram = register_datagram_flow(
         voice_plane,
-        Service::Voice,
+        service,
         flow,
         CTL_FLOW_QUEUE,
         page_id,
         "presence",
     )
     .await?;
-    let registered = vec![(Service::Voice, flow)];
+    let registered = vec![(service, flow)];
     flows.insert(registered[0]);
 
     let (recipients_tx, recipients_rx) = watch::channel(Vec::new());
@@ -360,6 +380,11 @@ mod tests {
     use super::*;
     use data_plane::{PlaneConfig, TransportError};
 
+    /// what the registry hands back for chat's voice lane on a founding net —
+    /// a VALUE here, because the id is the registry's to choose.
+    const VOICE: Service = Service::from_lane_id(2);
+    const VIDEO: Service = Service::from_lane_id(3);
+
     struct Link {
         outgoing: mpsc::Sender<(PeerId, Vec<u8>)>,
         incoming: tokio::sync::Mutex<mpsc::Receiver<(PeerId, Vec<u8>)>>,
@@ -391,13 +416,13 @@ mod tests {
     #[test]
     fn presence_admission_tracks_current_peer_roster_and_cursor_bounds() {
         let flows = ActiveFlows::default();
-        let key = (Service::Voice, presence_flow("page"));
+        let key = (VOICE, presence_flow("page"));
         let peer = PeerId([7; 32]);
         flows.insert(key);
         assert!(!flows.permits(peer, key.0, key.1));
         flows.set_roster(&[key], &[peer.0]);
         assert!(flows.permits(peer, key.0, key.1));
-        assert!(!flows.permits(peer, Service::Video, key.1));
+        assert!(!flows.permits(peer, VIDEO, key.1));
         flows.remove(&key);
         assert!(!flows.permits(peer, key.0, key.1));
         let cursor = noded::PageCursor {
@@ -436,7 +461,7 @@ mod tests {
             },
         );
         let (requests, receiver) = mpsc::channel(1);
-        let hub = tokio::spawn(serve_sessions(receiver, plane, flows.clone()));
+        let hub = tokio::spawn(serve_sessions(receiver, plane, flows.clone(), VOICE));
         async fn open(requests: &noded::PresenceLane) -> noded::PresenceSession {
             let (reply, received) = tokio::sync::oneshot::channel();
             requests
@@ -452,7 +477,7 @@ mod tests {
         let peer = PeerId([7; 32]);
         first.recipients.send(vec![peer.0]).unwrap();
         // Pin admission directly; the cursor itself synchronizes transport.
-        flows.set_roster(&[(Service::Voice, presence_flow("page"))], &[peer.0]);
+        flows.set_roster(&[(VOICE, presence_flow("page"))], &[peer.0]);
         let cursor = noded::PageCursor {
             block_id: Some("block".into()),
             anchor: 2,

@@ -14,6 +14,10 @@ use data_plane::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
+/// the lane ids a founding network's registry hands out for the declared
+/// lanes these tests exercise. VALUES, not variants: the id is the
+/// registry's to choose, and this is simply what it chose.
+const VOICE_LANE: Service = Service::from_lane_id(2);
 
 fn peer(n: u8) -> PeerId {
     PeerId([n; 32])
@@ -70,8 +74,8 @@ fn two_planes() -> (
 
     let admission = Arc::new(TestAdmission::default());
     for p in [a, b] {
-        admission.allow(p, Service::Voice, voice_flow());
-        admission.allow(p, Service::StateSync, sync_flow());
+        admission.allow(p, VOICE_LANE, voice_flow());
+        admission.allow(p, Service::STATE_SYNC, sync_flow());
     }
     (
         DataPlane::new(a_end, admission.clone(), CONFIG),
@@ -92,18 +96,10 @@ async fn traffic_counts_datagrams_and_stream_bytes() {
     let (plane_a, plane_b) = two_planes();
 
     let flow_a = plane_a
-        .datagram_flow(
-            Service::Voice,
-            voice_flow(),
-            DatagramPolicy { max_queued: 16 },
-        )
+        .datagram_flow(VOICE_LANE, voice_flow(), DatagramPolicy { max_queued: 16 })
         .expect("register a");
     let flow_b = plane_b
-        .datagram_flow(
-            Service::Voice,
-            voice_flow(),
-            DatagramPolicy { max_queued: 16 },
-        )
+        .datagram_flow(VOICE_LANE, voice_flow(), DatagramPolicy { max_queued: 16 })
         .expect("register b");
 
     // Datagram class: 5 × 160-byte payloads A→B, all received.
@@ -132,10 +128,10 @@ async fn traffic_counts_datagrams_and_stream_bytes() {
 
     // Stream class: A opens to B and pushes 8 KiB; B reads it all.
     let svc_a = plane_a
-        .stream_service(Service::StateSync, StreamPolicy { accept_backlog: 4 })
+        .stream_service(Service::STATE_SYNC, StreamPolicy { accept_backlog: 4 })
         .expect("service a");
     let svc_b = plane_b
-        .stream_service(Service::StateSync, StreamPolicy { accept_backlog: 4 })
+        .stream_service(Service::STATE_SYNC, StreamPolicy { accept_backlog: 4 })
         .expect("service b");
 
     const BULK: usize = 8 * 1024;
@@ -172,19 +168,11 @@ async fn overflow_shed_lands_in_plane_traffic() {
     let (plane_a, plane_b) = two_planes();
 
     let flow_a = plane_a
-        .datagram_flow(
-            Service::Voice,
-            voice_flow(),
-            DatagramPolicy { max_queued: 16 },
-        )
+        .datagram_flow(VOICE_LANE, voice_flow(), DatagramPolicy { max_queued: 16 })
         .expect("register a");
     // A one-deep consumer queue: of 3 delivered datagrams, 2 are shed.
     let flow_b = plane_b
-        .datagram_flow(
-            Service::Voice,
-            voice_flow(),
-            DatagramPolicy { max_queued: 1 },
-        )
+        .datagram_flow(VOICE_LANE, voice_flow(), DatagramPolicy { max_queued: 1 })
         .expect("register b");
 
     for seq in 0..3u8 {
@@ -207,14 +195,14 @@ async fn monitor_attributes_planes_and_prunes_dead_ones() {
     let (plane_a, _plane_b) = two_planes();
 
     let monitor = PlaneMonitor::default();
-    monitor.register("chat", Service::Voice, plane_a.watch());
+    monitor.register("chat", "voice", plane_a.watch());
     // A watch whose plane is already gone: observe() = None from the start.
-    monitor.register("gateway", Service::Gateway, PlaneWatch::new(|| None));
+    monitor.register("gateway", "gateway", PlaneWatch::new(|| None));
 
     let reports = monitor.snapshot();
     assert_eq!(reports.len(), 1, "the dead plane is pruned");
     assert_eq!(reports[0].owner, "chat");
-    assert_eq!(reports[0].service, Service::Voice);
+    assert_eq!(reports[0].service, "voice");
     assert_eq!(
         reports[0].observation,
         PlaneObservation {

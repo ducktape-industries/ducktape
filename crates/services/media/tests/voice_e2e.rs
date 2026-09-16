@@ -16,6 +16,10 @@ use media_service::voice::{
 };
 use tokio::sync::watch;
 use tokio::time::sleep;
+/// the lane ids a founding network's registry hands out for the declared
+/// lanes these tests exercise. VALUES, not variants: the id is the
+/// registry's to choose, and this is simply what it chose.
+const VOICE_LANE: Service = Service::from_lane_id(2);
 
 fn peer(n: u8) -> PeerId {
     PeerId([n; 32])
@@ -69,7 +73,7 @@ fn mesh(n: u8, link: LinkModel, config: VoiceConfig) -> Vec<(PeerId, VoiceEngine
     let flow = FlowId::derive(b"voice-channel:e2e");
     let admission = Arc::new(TestAdmission::default());
     for p in &peers {
-        admission.allow(*p, Service::Voice, flow);
+        admission.allow(*p, VOICE_LANE, flow);
     }
     for (i, a) in peers.iter().enumerate() {
         for b in &peers[i + 1..] {
@@ -91,7 +95,7 @@ fn mesh(n: u8, link: LinkModel, config: VoiceConfig) -> Vec<(PeerId, VoiceEngine
                 },
             );
             let flow_handle = plane
-                .datagram_flow(Service::Voice, flow, DatagramPolicy { max_queued: 64 })
+                .datagram_flow(VOICE_LANE, flow, DatagramPolicy { max_queued: 64 })
                 .expect("register voice flow");
             let (_roster_tx, roster_rx) = watch::channel(roster.clone());
             (
@@ -128,8 +132,8 @@ fn rejoin_rig() -> RejoinRig {
     );
     let flow = FlowId::derive(b"voice-channel:rejoin");
     let admission = Arc::new(TestAdmission::default());
-    admission.allow(a, Service::Voice, flow);
-    admission.allow(b, Service::Voice, flow);
+    admission.allow(a, VOICE_LANE, flow);
+    admission.allow(b, VOICE_LANE, flow);
     let plane = |end| {
         DataPlane::new(
             end,
@@ -141,10 +145,10 @@ fn rejoin_rig() -> RejoinRig {
         )
     };
     let flow_a = plane(net.endpoint(a))
-        .datagram_flow(Service::Voice, flow, DatagramPolicy { max_queued: 64 })
+        .datagram_flow(VOICE_LANE, flow, DatagramPolicy { max_queued: 64 })
         .expect("A flow");
     let flow_b = plane(net.endpoint(b))
-        .datagram_flow(Service::Voice, flow, DatagramPolicy { max_queued: 64 })
+        .datagram_flow(VOICE_LANE, flow, DatagramPolicy { max_queued: 64 })
         .expect("B flow");
     // A's roster starts with B in it; tests that shrink it get the sender back.
     let (roster_tx, roster_rx) = watch::channel(vec![b.0]);

@@ -12,7 +12,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::Service;
 use crate::plane::{StatsSnapshot, TrafficSnapshot};
 
 /// A point-in-time view of one open plane's accounting: drop/error stats and
@@ -51,14 +50,18 @@ impl std::fmt::Debug for PlaneWatch {
 pub struct PlaneReport {
     /// The module that created the plane (registration-time attribution).
     pub owner: &'static str,
-    pub service: Service,
+    /// The `service` metric label — a MACHINE contract a dashboard keys on,
+    /// so the plane supplies it rather than deriving it from the lane id: an
+    /// id now comes from the registry, and a label that moved with it would
+    /// rename a metric every time a network renumbered a lane.
+    pub service: &'static str,
     pub age: Duration,
     pub observation: PlaneObservation,
 }
 
 struct PlaneEntry {
     owner: &'static str,
-    service: Service,
+    service: &'static str,
     opened_at: Instant,
     watch: PlaneWatch,
 }
@@ -73,7 +76,7 @@ pub struct PlaneMonitor {
 impl PlaneMonitor {
     /// Record an open plane under the module that created it. Call once per
     /// plane, right after bring-up.
-    pub fn register(&self, owner: &'static str, service: Service, watch: PlaneWatch) {
+    pub fn register(&self, owner: &'static str, service: &'static str, watch: PlaneWatch) {
         self.planes.lock().expect("planes lock").push(PlaneEntry {
             owner,
             service,

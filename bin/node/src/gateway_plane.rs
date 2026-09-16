@@ -18,8 +18,7 @@ use base64::engine::general_purpose::STANDARD;
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519;
 use data_plane::{
-    BulkPacer, FlowId, OverlaySockets, PeerId, Service, StreamPacing, StreamPlaneSpec,
-    StreamPolicy, StreamService, bind_stream_plane,
+    BulkPacer, FlowId, OverlaySockets, PeerId, StreamPlaneSpec, StreamService, bind_stream_plane,
 };
 use duckfs_core::{EntryKindWire, FilesQuery, FilesReply};
 use futures::channel::{mpsc, oneshot};
@@ -150,7 +149,11 @@ fn proxy_flow() -> FlowId {
 pub struct GatewayPlane;
 
 impl crate::overlay_book::Plane for GatewayPlane {
-    const SERVICE: Service = Service::Gateway;
+    const LANE: crate::overlay_book::LaneSource =
+        crate::overlay_book::LaneSource::Declared(crate::overlay_book::LaneKey {
+            module_id: "gateway",
+            name: "gateway",
+        });
 }
 
 impl crate::overlay_book::StreamPlane for GatewayPlane {
@@ -336,12 +339,38 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
     // installed and becomes live automatically once the node owns its ULA.
     tokio::spawn(async move {
         let _bindings = bindings;
+        // the book is built at boot and shared with the announce pump, so the
+        // lane it stamps is latched HERE, once the registry answers — until
+        // then the book resolves no address and nothing dials a guessed port.
+        let binding = crate::lane_table::lane_table()
+            .resolve(<GatewayPlane as crate::overlay_book::Plane>::LANE, &label)
+            .await;
+        let Some((pacing, policy)) = binding.stream_spec(&pacer) else {
+            tracing::error!(
+                target: "ducktape::gateway",
+                node = %label,
+                reason = "lane_has_no_stream_half",
+                "the gateway lane is declared datagram-only; the reverse proxy needs a stream lane"
+            );
+            return;
+        };
+        if let Err(bound) = book.bind_lane(binding.service) {
+            tracing::error!(
+                target: "ducktape::gateway",
+                node = %label,
+                reason = "lane_renumbered",
+                bound = bound.lane_id(),
+                declared = binding.service.lane_id(),
+                "the gateway lane was renumbered under a running plane; restart to follow it"
+            );
+            return;
+        }
         let own = book.own_addr(&me);
         let spec = StreamPlaneSpec {
             own_ip: own,
-            service: Service::Gateway,
-            pacing: StreamPacing::Shared(pacer),
-            policy: StreamPolicy { accept_backlog: 16 },
+            service: binding.service,
+            pacing,
+            policy,
             retry: crate::overlay_book::BIND_RETRY,
         };
         let (plane, service) = match bind_stream_plane(spec, factory, book).await {
@@ -359,95 +388,110 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
         tracing::info!(
             target: "ducktape::gateway",
             node = %label,
+            lane = binding.service.lane_id(),
             own = %own,
             "gateway plane: overlay stream bound"
         );
-        planes.register("gateway", Service::Gateway, plane.watch());
+        planes.register("gateway", "gateway", plane.watch());
         let _ = slot.set(Arc::clone(&service));
         let _plane = plane;
         let budget = GatewayBudget::new();
-        loop {
-            let Some((requester, hello, mut stream)) = service.accept().await else {
-                return;
-            };
-            let commands = commands.clone();
-            let workspace = workspace.clone();
-            let node_api_ports = node_api_ports.clone();
-            let budget = Arc::clone(&budget);
-            // Mirrors the client lane: which budget a stream draws on is only
-            // knowable after its head decodes, so the permit is taken inside
-            // the task and the accept loop keeps draining.
-            tokio::spawn(async move {
-                if hello.intent != gateway::PROXY_INTENT {
-                    let _ = write_proxy_response(
-                        &mut stream,
-                        Err(GatewayFailure::Invalid(
-                            "gateway proxy: unsupported stream intent".into(),
-                        )),
-                    )
-                    .await;
+        // the accept loop, but only for as long as this lane is ours: the
+        // sockets sit on ports derived from the id the registry gave, so a
+        // withdrawn lane has to take the plane with it.
+        let accepting = async {
+            loop {
+                let Some((requester, hello, mut stream)) = service.accept().await else {
                     return;
-                }
-                let head = match gateway::decode_proxy_request_head(&hello.meta) {
-                    Ok(head) => head,
-                    Err(error) => {
-                        let _ =
-                            write_proxy_response(&mut stream, Err(GatewayFailure::Invalid(error)))
-                                .await;
+                };
+                let commands = commands.clone();
+                let workspace = workspace.clone();
+                let node_api_ports = node_api_ports.clone();
+                let budget = Arc::clone(&budget);
+                // Mirrors the client lane: which budget a stream draws on is only
+                // knowable after its head decodes, so the permit is taken inside
+                // the task and the accept loop keeps draining.
+                tokio::spawn(async move {
+                    if hello.intent != gateway::PROXY_INTENT {
+                        let _ = write_proxy_response(
+                            &mut stream,
+                            Err(GatewayFailure::Invalid(
+                                "gateway proxy: unsupported stream intent".into(),
+                            )),
+                        )
+                        .await;
                         return;
                     }
-                };
-                let scope = LoopbackScope {
-                    workspace: &workspace,
-                    node_api_ports: &node_api_ports,
-                    own_node: &own_node,
-                };
-                // A WebSocket upgrade is long-lived; it owns the stream and
-                // writes its own responses, so it bypasses the one-shot timeout.
-                if head.upgrade {
-                    let Some(_permit) = budget.admit_upgrade() else {
+                    let head = match gateway::decode_proxy_request_head(&hello.meta) {
+                        Ok(head) => head,
+                        Err(error) => {
+                            let _ = write_proxy_response(
+                                &mut stream,
+                                Err(GatewayFailure::Invalid(error)),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    let scope = LoopbackScope {
+                        workspace: &workspace,
+                        node_api_ports: &node_api_ports,
+                        own_node: &own_node,
+                    };
+                    // A WebSocket upgrade is long-lived; it owns the stream and
+                    // writes its own responses, so it bypasses the one-shot timeout.
+                    if head.upgrade {
+                        let Some(_permit) = budget.admit_upgrade() else {
+                            tracing::warn!(
+                                target: "ducktape::gateway",
+                                reason = "upgrade_budget_full",
+                                open = MAX_CONCURRENT_UPGRADES,
+                                "inbound gateway upgrade refused"
+                            );
+                            let _ = write_proxy_response(
+                                &mut stream,
+                                Err(GatewayFailure::Unavailable(
+                                    "gateway upgrade budget is full".into(),
+                                )),
+                            )
+                            .await;
+                            return;
+                        };
+                        serve_ws(&commands, &scope, &requester.0, &head, stream).await;
+                        return;
+                    }
+                    let Some(permit) = budget.admit_request().await else {
                         tracing::warn!(
                             target: "ducktape::gateway",
-                            reason = "upgrade_budget_full",
-                            open = MAX_CONCURRENT_UPGRADES,
-                            "inbound gateway upgrade refused"
+                            reason = "request_budget_full",
+                            open = MAX_CONCURRENT_REQUESTS,
+                            "inbound gateway request refused"
                         );
                         let _ = write_proxy_response(
                             &mut stream,
                             Err(GatewayFailure::Unavailable(
-                                "gateway upgrade budget is full".into(),
+                                "gateway request budget is full".into(),
                             )),
                         )
                         .await;
                         return;
                     };
-                    serve_ws(&commands, &scope, &requester.0, &head, stream).await;
-                    return;
-                }
-                let Some(permit) = budget.admit_request().await else {
-                    tracing::warn!(
-                        target: "ducktape::gateway",
-                        reason = "request_budget_full",
-                        open = MAX_CONCURRENT_REQUESTS,
-                        "inbound gateway request refused"
-                    );
-                    let _ = write_proxy_response(
-                        &mut stream,
-                        Err(GatewayFailure::Unavailable(
-                            "gateway request budget is full".into(),
-                        )),
-                    )
-                    .await;
-                    return;
-                };
-                let slot = RequestSlot {
-                    budget: Arc::clone(&budget),
-                    permit,
-                };
-                serve_proxy_stream(&commands, &scope, &requester.0, head, None, slot, stream)
-                    .await;
-            });
-        }
+                    let slot = RequestSlot {
+                        budget: Arc::clone(&budget),
+                        permit,
+                    };
+                    serve_proxy_stream(&commands, &scope, &requester.0, head, None, slot, stream)
+                        .await;
+                });
+            }
+        };
+        crate::lane_table::serve_until_lane_changes(
+            <GatewayPlane as crate::overlay_book::Plane>::LANE,
+            binding.service,
+            &label,
+            accepting,
+        )
+        .await;
     });
 }
 
@@ -2539,10 +2583,7 @@ mod tests {
         );
 
         // The next self-serve drain is admitted.
-        let permit = budget
-            .admit_request()
-            .await
-            .expect("under the request cap");
+        let permit = budget.admit_request().await.expect("under the request cap");
         let slot = RequestSlot {
             budget: Arc::clone(&budget),
             permit,
@@ -3302,16 +3343,21 @@ mod tests {
 
     #[test]
     fn admission_is_service_flow_and_member_scoped() {
-        use data_plane::AdmissionPolicy as _;
+        use data_plane::{AdmissionPolicy as _, Service};
         let signer = ed25519::PrivateKey::from_seed(99);
         let book = OverlayBook::new(crate::overlay_book::OverlayPeers::new("test".into()));
         book.peers()
             .set_peers(std::iter::once(&signer.public_key()));
         let peer = PeerId(signer.public_key().as_ref().try_into().unwrap());
-        assert!(book.permits(peer, Service::Gateway, proxy_flow()));
-        assert!(!book.permits(peer, Service::StateSync, proxy_flow()));
-        assert!(!book.permits(peer, Service::Gateway, FlowId::from_raw(9)));
-        assert!(!book.permits(PeerId([8; 32]), Service::Gateway, proxy_flow()));
+        // an UNBOUND book admits nothing: before the registry answers there
+        // is no lane to be on, and default-deny is the only safe reading.
+        let gateway = Service::from_lane_id(4);
+        assert!(!book.permits(peer, gateway, proxy_flow()));
+        book.bind_lane(gateway).unwrap();
+        assert!(book.permits(peer, gateway, proxy_flow()));
+        assert!(!book.permits(peer, Service::STATE_SYNC, proxy_flow()));
+        assert!(!book.permits(peer, gateway, FlowId::from_raw(9)));
+        assert!(!book.permits(PeerId([8; 32]), gateway, proxy_flow()));
     }
 
     fn signed_route(
