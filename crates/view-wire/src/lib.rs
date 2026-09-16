@@ -2019,6 +2019,25 @@ mod tests {
         }
     }
 
+    /// The tree a host is left holding. Most tests here want only that —
+    /// the `Frame` around it is scaffolding, and the report is the business
+    /// of the few tests that read it.
+    fn sanitized_root(root: Node) -> Node {
+        let mut frame = Frame {
+            root: Some(root),
+            ..Frame::default()
+        };
+        sanitize(&mut frame).unwrap();
+        frame.root.unwrap()
+    }
+
+    fn sanitized_children(root: Node) -> Vec<Node> {
+        let Node::Linear { children, .. } = sanitized_root(root) else {
+            panic!("a sanitized column is still a column")
+        };
+        children
+    }
+
     fn column(children: Vec<Node>) -> Node {
         Node::Linear {
             max_width: None,
@@ -2087,22 +2106,17 @@ mod tests {
         let mut applied = node;
         apply(&mut applied, patches).unwrap();
         assert_eq!(applied, changed);
-        let mut frame = Frame {
-            root: Some(Node::Surface {
-                key: "view".into(),
-                name: "preview".into(),
-                args: std::iter::once(V::F64(f64::NAN))
-                    .chain(std::iter::repeat_n(
-                        V::Str("é".repeat(MAX_STRING_BYTES)),
-                        MAX_SURFACE_ARGS + 1,
-                    ))
-                    .collect(),
-                on_event: None,
-            }),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Node::Surface { name, args, .. } = frame.root.unwrap() else {
+        let Node::Surface { name, args, .. } = sanitized_root(Node::Surface {
+            key: "view".into(),
+            name: "preview".into(),
+            args: std::iter::once(V::F64(f64::NAN))
+                .chain(std::iter::repeat_n(
+                    V::Str("é".repeat(MAX_STRING_BYTES)),
+                    MAX_SURFACE_ARGS + 1,
+                ))
+                .collect(),
+            on_event: None,
+        }) else {
             unreachable!()
         };
         assert_eq!(args.len(), MAX_SURFACE_ARGS);
@@ -2479,16 +2493,9 @@ mod tests {
         const NODES: usize = 8;
         const EACH: usize = MAX_TEXT_BYTES_PER_FRAME / 4;
 
-        let mut frame = Frame {
-            root: Some(column(
-                (0..NODES).map(|_| text(&"é".repeat(EACH / 2))).collect(),
-            )),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Linear { children, .. }) = &frame.root else {
-            panic!()
-        };
+        let children = sanitized_children(column(
+            (0..NODES).map(|_| text(&"é".repeat(EACH / 2))).collect(),
+        ));
         let shaped: Vec<usize> = children
             .iter()
             .map(|child| match child {
@@ -2596,40 +2603,33 @@ mod tests {
     #[test]
     fn every_shaped_string_spends_the_same_budget() {
         let long = "x".repeat(MAX_TEXT_BYTES_PER_FRAME);
-        let mut frame = Frame {
-            root: Some(column(vec![
-                Node::Input {
-                    options: Default::default(),
-                    key: "App/i".into(),
-                    placeholder: long.clone(),
-                    value: long.clone(),
-                    on_input: 0,
-                    on_submit: None,
-                    width: None,
-                    secure: false,
-                    style: Box::default(),
-                },
-                Node::Button {
-                    checked: None,
-                    expanded: None,
-                    description: Some("Details".into()),
-                    key: "App/b".into(),
-                    content: ButtonContent::Label(long.clone()),
-                    label: Some(long),
-                    on_press: None,
-                    width: None,
-                    height: None,
-                    padding: None,
-                    style: ButtonStyle::default(),
-                },
-                text("tail"),
-            ])),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Linear { children, .. }) = &frame.root else {
-            panic!()
-        };
+        let children = sanitized_children(column(vec![
+            Node::Input {
+                options: Default::default(),
+                key: "App/i".into(),
+                placeholder: long.clone(),
+                value: long.clone(),
+                on_input: 0,
+                on_submit: None,
+                width: None,
+                secure: false,
+                style: Box::default(),
+            },
+            Node::Button {
+                checked: None,
+                expanded: None,
+                description: Some("Details".into()),
+                key: "App/b".into(),
+                content: ButtonContent::Label(long.clone()),
+                label: Some(long),
+                on_press: None,
+                width: None,
+                height: None,
+                padding: None,
+                style: ButtonStyle::default(),
+            },
+            text("tail"),
+        ]));
         let Node::Input {
             placeholder, value, ..
         } = &children[0]
@@ -2663,25 +2663,20 @@ mod tests {
             deep = column(vec![deep]);
         }
         let wide = column((0..MAX_NODES + 5).map(|_| text("x")).collect());
-        let mut frame = Frame {
-            root: Some(column(vec![
-                Node::Text {
-                    options: Default::default(),
-                    key: "k".repeat(MAX_STRING_BYTES + 3),
-                    content: "é".repeat(MAX_STRING_BYTES),
-                    size: Some(f32::NAN),
-                    color: Some(Rgba([2.0, -1.0, f32::INFINITY, 0.5])),
-                    font: Font::default(),
-                    width: Some(Length::Fixed(-5.0)),
-                    align_x: None,
-                },
-                deep,
-                wide,
-            ])),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let root = frame.root.unwrap();
+        let root = sanitized_root(column(vec![
+            Node::Text {
+                options: Default::default(),
+                key: "k".repeat(MAX_STRING_BYTES + 3),
+                content: "é".repeat(MAX_STRING_BYTES),
+                size: Some(f32::NAN),
+                color: Some(Rgba([2.0, -1.0, f32::INFINITY, 0.5])),
+                font: Font::default(),
+                width: Some(Length::Fixed(-5.0)),
+                align_x: None,
+            },
+            deep,
+            wide,
+        ]));
         // A container whose child fell past the budget keeps an empty
         // stand-in, one per level at most.
         assert!(root.count() <= MAX_NODES + MAX_DEPTH, "{}", root.count());
@@ -2712,13 +2707,9 @@ mod tests {
         for _ in 0..MAX_DEPTH * 2 {
             deep = column(vec![deep]);
         }
-        let mut frame = Frame {
-            root: Some(deep),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
+        let root = sanitized_root(deep);
         let mut depth = 0;
-        let mut node = frame.root.as_ref().unwrap();
+        let mut node = &root;
         while let Node::Linear { children, .. } = node {
             depth += 1;
             node = &children[0];
@@ -2805,17 +2796,10 @@ mod tests {
         assert_eq!(old, new);
 
         // Two areas on one key: the second is moved off it, its child kept.
-        let mut frame = Frame {
-            root: Some(column(vec![
-                mouse_area("App/m", None, text("a")),
-                mouse_area("App/m", None, text("b")),
-            ])),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Linear { children, .. }) = &frame.root else {
-            panic!()
-        };
+        let children = sanitized_children(column(vec![
+            mouse_area("App/m", None, text("a")),
+            mouse_area("App/m", None, text("b")),
+        ]));
         assert_eq!(children[1].key(), Some("App/m#2"));
         assert_eq!(children[1].children().len(), 1);
     }
@@ -2915,14 +2899,7 @@ mod tests {
 
     #[test]
     fn a_key_used_twice_is_moved_off_the_one_already_taken() {
-        let mut frame = Frame {
-            root: Some(column(vec![text("one"), text("two"), text("three")])),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Linear { children, .. }) = &frame.root else {
-            panic!()
-        };
+        let children = sanitized_children(column(vec![text("one"), text("two"), text("three")]));
         let keys: Vec<&str> = children.iter().filter_map(Node::key).collect();
         assert_eq!(keys, ["App/t", "App/t#2", "App/t#3"]);
     }
@@ -2978,6 +2955,7 @@ mod tests {
             delay: None,
             child: Box::new(text("child")),
         };
+        // Not `sanitized_children`: the frame itself is asserted on below.
         let mut frame = Frame {
             root: Some(column(vec![sensor("first"), sensor("second")])),
             ..Frame::default()
@@ -3014,33 +2992,29 @@ mod tests {
 
     #[test]
     fn a_sensor_is_pulled_into_range_and_keeps_its_child() {
-        let mut frame = Frame {
-            root: Some(Node::Sensor {
-                key: "App/watch".into(),
-                reset: None,
-                on_show: Some(0),
-                on_resize: Some(0),
-                on_hide: Some(1),
-                anticipate: Some(f32::INFINITY),
-                delay: Some(-5.0),
-                child: Box::new(text("a")),
-            }),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Sensor {
+        let root = sanitized_root(Node::Sensor {
+            key: "App/watch".into(),
+            reset: None,
+            on_show: Some(0),
+            on_resize: Some(0),
+            on_hide: Some(1),
+            anticipate: Some(f32::INFINITY),
+            delay: Some(-5.0),
+            child: Box::new(text("a")),
+        });
+        let Node::Sensor {
             anticipate,
             delay,
             child,
             ..
-        }) = &frame.root
+        } = &root
         else {
-            panic!("{:?}", frame.root)
+            panic!("{root:?}")
         };
         assert_eq!(*anticipate, Some(MAX_PIXELS));
         assert_eq!(*delay, Some(0.0));
         assert_eq!(**child, text("a"));
-        assert_eq!(frame.root.as_ref().unwrap().count(), 2);
+        assert_eq!(root.count(), 2);
     }
 
     /// The form controls: a menu is cut to `MAX_OPTIONS` with a selection
@@ -3048,47 +3022,40 @@ mod tests {
     /// clamped like a size — a value of a million is the app's to send.
     #[test]
     fn form_controls_are_pulled_into_range() {
-        let mut frame = Frame {
-            root: Some(column(vec![
-                Node::PickList {
-                    settings: Default::default(),
-                    key: "App/pick".into(),
-                    options: (0..MAX_OPTIONS + 3).map(|i| i.to_string()).collect(),
-                    selected: Some((MAX_OPTIONS + 1) as u32),
-                    placeholder: Some("é".repeat(MAX_STRING_BYTES)),
-                    on_select: 0,
-                    width: Some(Length::Fixed(f32::INFINITY)),
-                    style: PickListStyle::default(),
-                },
-                Node::Slider {
-                    key: "App/slide".into(),
-                    value: f32::NAN,
-                    min: f32::NEG_INFINITY,
-                    max: 1_000_000.0,
-                    step: f32::INFINITY,
-                    on_change: 1,
-                    on_release: None,
-                    axis: Axis::Row,
-                    width: None,
-                    height: None,
-                    style: SliderStyle::default(),
-                },
-                Node::Toggle {
-                    key: "App/pick".into(),
-                    kind: ToggleKind::Switch,
-                    label: "x".repeat(MAX_STRING_BYTES + 1),
-                    checked: true,
-                    on_toggle: None,
-                    width: None,
-                    style: ToggleStyle::default(),
-                },
-            ])),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Linear { children, .. }) = &frame.root else {
-            panic!()
-        };
+        let children = sanitized_children(column(vec![
+            Node::PickList {
+                settings: Default::default(),
+                key: "App/pick".into(),
+                options: (0..MAX_OPTIONS + 3).map(|i| i.to_string()).collect(),
+                selected: Some((MAX_OPTIONS + 1) as u32),
+                placeholder: Some("é".repeat(MAX_STRING_BYTES)),
+                on_select: 0,
+                width: Some(Length::Fixed(f32::INFINITY)),
+                style: PickListStyle::default(),
+            },
+            Node::Slider {
+                key: "App/slide".into(),
+                value: f32::NAN,
+                min: f32::NEG_INFINITY,
+                max: 1_000_000.0,
+                step: f32::INFINITY,
+                on_change: 1,
+                on_release: None,
+                axis: Axis::Row,
+                width: None,
+                height: None,
+                style: SliderStyle::default(),
+            },
+            Node::Toggle {
+                key: "App/pick".into(),
+                kind: ToggleKind::Switch,
+                label: "x".repeat(MAX_STRING_BYTES + 1),
+                checked: true,
+                on_toggle: None,
+                width: None,
+                style: ToggleStyle::default(),
+            },
+        ]));
         let Node::PickList {
             options,
             selected,
@@ -3129,24 +3096,20 @@ mod tests {
     /// stood in for.
     #[test]
     fn a_grid_is_pulled_into_range_and_cut_like_a_linear_layout() {
-        let mut frame = Frame {
-            root: Some(Node::Grid {
-                key: "App/cells".into(),
-                columns: Some(u32::MAX),
-                fluid: Some(f32::NAN),
-                spacing: Some(-3.0),
-                padding: Some(Edges::all(f32::INFINITY)),
-                width: Some(Length::Fixed(f32::MAX)),
-                height: None,
-                aspect: Some(f32::NEG_INFINITY),
-                background: None,
-                border: None,
-                children: (0..MAX_NODES + 5).map(|_| text("x")).collect(),
-            }),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Grid {
+        let root = sanitized_root(Node::Grid {
+            key: "App/cells".into(),
+            columns: Some(u32::MAX),
+            fluid: Some(f32::NAN),
+            spacing: Some(-3.0),
+            padding: Some(Edges::all(f32::INFINITY)),
+            width: Some(Length::Fixed(f32::MAX)),
+            height: None,
+            aspect: Some(f32::NEG_INFINITY),
+            background: None,
+            border: None,
+            children: (0..MAX_NODES + 5).map(|_| text("x")).collect(),
+        });
+        let Node::Grid {
             columns,
             fluid,
             spacing,
@@ -3155,7 +3118,7 @@ mod tests {
             aspect,
             children,
             ..
-        }) = &frame.root
+        } = &root
         else {
             panic!()
         };
@@ -3166,7 +3129,7 @@ mod tests {
         assert_eq!(*width, Some(Length::Fixed(MAX_PIXELS)));
         assert_eq!(*aspect, Some(0.0));
         assert_eq!(children.len(), MAX_NODES - 1);
-        assert_eq!(frame.root.as_ref().unwrap().count(), MAX_NODES);
+        assert_eq!(root.count(), MAX_NODES);
     }
 
     fn picture(bytes: Option<Vec<u8>>) -> Node {
@@ -3226,19 +3189,12 @@ mod tests {
     #[test]
     fn a_frame_past_the_picture_budget_drops_whole_pictures_from_its_tail() {
         const EACH: usize = MAX_PICTURE_BYTES_PER_FRAME / 4 * 3;
-        let mut frame = Frame {
-            root: Some(column(vec![
-                picture(Some(vec![b'<'; EACH])),
-                picture(Some(vec![b'<'; EACH])),
-                picture(None),
-                picture(Some(vec![b'<'; MAX_PICTURE_BYTES_PER_FRAME / 4])),
-            ])),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Linear { children, .. }) = &frame.root else {
-            panic!()
-        };
+        let children = sanitized_children(column(vec![
+            picture(Some(vec![b'<'; EACH])),
+            picture(Some(vec![b'<'; EACH])),
+            picture(None),
+            picture(Some(vec![b'<'; MAX_PICTURE_BYTES_PER_FRAME / 4])),
+        ]));
         let carried: Vec<Option<usize>> = children
             .iter()
             .map(|child| match child {
@@ -3265,15 +3221,10 @@ mod tests {
         };
         *size = Some(f32::MAX);
         *width = Some(Length::Fixed(f32::MAX));
-        let mut frame = Frame {
-            root: Some(huge),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Text { size, width, .. }) = &frame.root else {
+        let Node::Text { size, width, .. } = sanitized_root(huge) else {
             panic!()
         };
-        assert_eq!(*size, Some(MAX_TEXT_PIXELS));
-        assert_eq!(*width, Some(Length::Fixed(MAX_PIXELS)));
+        assert_eq!(size, Some(MAX_TEXT_PIXELS));
+        assert_eq!(width, Some(Length::Fixed(MAX_PIXELS)));
     }
 }

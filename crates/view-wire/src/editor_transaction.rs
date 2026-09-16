@@ -134,30 +134,29 @@ mod tests {
 
     #[test]
     fn malformed_late_patch_rejects_the_entire_batch() {
-        assert_eq!(
-            patched_editor_text(
+        for (case, text, patches) in [
+            (
+                "second patch splits a grapheme",
                 "한글",
-                &[patch(0, 3, "A"), patch(4, 6, "B")],
-                EditorCursor::default()
+                [patch(0, 3, "A"), patch(4, 6, "B")],
             ),
-            Err(EditorPatchError::Range)
-        );
-        assert_eq!(
-            patched_editor_text(
+            (
+                "ranges overlap",
                 "abc",
-                &[patch(0, 2, "A"), patch(1, 3, "B")],
-                EditorCursor::default()
+                [patch(0, 2, "A"), patch(1, 3, "B")],
             ),
-            Err(EditorPatchError::Range)
-        );
-        assert_eq!(
-            patched_editor_text(
+            (
+                "ranges run backwards",
                 "abc",
-                &[patch(2, 3, "A"), patch(0, 1, "B")],
-                EditorCursor::default()
+                [patch(2, 3, "A"), patch(0, 1, "B")],
             ),
-            Err(EditorPatchError::Range)
-        );
+        ] {
+            assert_eq!(
+                patched_editor_text(text, &patches, EditorCursor::default()),
+                Err(EditorPatchError::Range),
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -174,22 +173,22 @@ mod tests {
 
     #[test]
     fn transaction_limits_reject_instead_of_truncating() {
-        assert_eq!(
-            patched_editor_text(
-                "",
-                &[patch(0, 0, &"x".repeat(MAX_EDITOR_PATCH_BYTES + 1))],
-                EditorCursor::default()
+        for (case, patches) in [
+            (
+                "one over-long replacement",
+                vec![patch(0, 0, &"x".repeat(MAX_EDITOR_PATCH_BYTES + 1))],
             ),
-            Err(EditorPatchError::Limit)
-        );
-        assert_eq!(
-            patched_editor_text(
-                "",
-                &vec![patch(0, 0, ""); MAX_EDITOR_PATCHES + 1],
-                EditorCursor::default()
+            (
+                "one patch too many",
+                vec![patch(0, 0, ""); MAX_EDITOR_PATCHES + 1],
             ),
-            Err(EditorPatchError::Limit)
-        );
+        ] {
+            assert_eq!(
+                patched_editor_text("", &patches, EditorCursor::default()),
+                Err(EditorPatchError::Limit),
+                "{case}"
+            );
+        }
     }
 }
 

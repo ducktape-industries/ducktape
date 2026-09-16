@@ -541,11 +541,8 @@ mod tests {
     #[test]
     fn frames_allow_one_document_message_and_reject_a_second_before_delivery() {
         let (id, _) = metadata(MAX_EDITOR_DOCUMENT_BYTES);
-        let message = EditorDocumentMessage::Transfer(EditorTransfer::Chunk {
-            id,
-            index: 0,
-            bytes: vec![b'x'; MAX_EDITOR_CHUNK_BYTES],
-        });
+        let message =
+            EditorDocumentMessage::Transfer(chunk(&id, 0, vec![b'x'; MAX_EDITOR_CHUNK_BYTES]));
         let mut frame = crate::Frame {
             editor_documents: vec![message.clone()],
             ..Default::default()
@@ -579,12 +576,7 @@ mod tests {
         );
         for (index, length) in [(16, 1), (0, 0), (0, MAX_EDITOR_CHUNK_BYTES + 1)] {
             assert_eq!(
-                EditorDocumentMessage::Transfer(EditorTransfer::Chunk {
-                    id: id.clone(),
-                    index,
-                    bytes: vec![b'x'; length],
-                })
-                .validate(),
+                EditorDocumentMessage::Transfer(chunk(&id, index, vec![b'x'; length])).validate(),
                 Err(EditorTransferError::Limit)
             );
         }
@@ -778,6 +770,16 @@ mod tests {
         )
     }
 
+    /// The bytes stay the caller's: which byte a chunk carries is what the
+    /// append, prefix and UTF-8 cases are each testing.
+    fn chunk(id: &EditorTransferId, index: u8, bytes: Vec<u8>) -> EditorTransfer {
+        EditorTransfer::Chunk {
+            id: id.clone(),
+            index,
+            bytes,
+        }
+    }
+
     fn begun(len: usize) -> (EditorTransferId, EditorTransferReceiver) {
         let (id, target) = metadata(len);
         let mut receiver = EditorTransferReceiver::new(id.clone(), target.clone()).unwrap();
@@ -802,11 +804,7 @@ mod tests {
         for (index, bytes) in chunks.iter().enumerate() {
             assert!(
                 matches!(
-                    receiver.receive(&EditorTransfer::Chunk {
-                        id: id.clone(),
-                        index: index as u8,
-                        bytes: bytes.to_vec(),
-                    }),
+                    receiver.receive(&chunk(&id, index as u8, bytes.to_vec())),
                     Ok(None)
                 ),
                 "a chunk must not publish a document prefix"
@@ -829,11 +827,7 @@ mod tests {
             let (id, mut receiver) = begun(MAX_EDITOR_DOCUMENT_BYTES);
             for index in 0..boundary {
                 assert_eq!(
-                    receiver.receive(&EditorTransfer::Chunk {
-                        id: id.clone(),
-                        index: index as u8,
-                        bytes: vec![b'x'; MAX_EDITOR_CHUNK_BYTES],
-                    }),
+                    receiver.receive(&chunk(&id, index as u8, vec![b'x'; MAX_EDITOR_CHUNK_BYTES])),
                     Ok(None)
                 );
             }
@@ -853,11 +847,7 @@ mod tests {
     fn stale_identity_cannot_abort_or_append_to_the_requested_document() {
         let (id, mut receiver) = begun(MAX_EDITOR_CHUNK_BYTES + 1);
         assert_eq!(
-            receiver.receive(&EditorTransfer::Chunk {
-                id: id.clone(),
-                index: 0,
-                bytes: vec![b'a'; MAX_EDITOR_CHUNK_BYTES],
-            }),
+            receiver.receive(&chunk(&id, 0, vec![b'a'; MAX_EDITOR_CHUNK_BYTES])),
             Ok(None)
         );
         for change in 0..4 {
@@ -870,24 +860,14 @@ mod tests {
             }
             for event in [
                 EditorTransfer::Abort { id: stale.clone() },
-                EditorTransfer::Chunk {
-                    id: stale.clone(),
-                    index: 1,
-                    bytes: vec![b'b'],
-                },
+                chunk(&stale, 1, vec![b'b']),
                 EditorTransfer::Complete { id: stale },
             ] {
                 assert_eq!(receiver.receive(&event), Err(EditorTransferError::Identity));
                 assert_eq!(receiver.buffered_bytes(), MAX_EDITOR_CHUNK_BYTES);
             }
         }
-        receiver
-            .receive(&EditorTransfer::Chunk {
-                id: id.clone(),
-                index: 1,
-                bytes: vec![b'b'],
-            })
-            .unwrap();
+        receiver.receive(&chunk(&id, 1, vec![b'b'])).unwrap();
         let text = receiver
             .receive(&EditorTransfer::Complete { id })
             .unwrap()
@@ -900,28 +880,12 @@ mod tests {
         for bad in 0..4 {
             let (id, mut receiver) = begun(MAX_EDITOR_CHUNK_BYTES + 1);
             receiver
-                .receive(&EditorTransfer::Chunk {
-                    id: id.clone(),
-                    index: 0,
-                    bytes: vec![b'a'; MAX_EDITOR_CHUNK_BYTES],
-                })
+                .receive(&chunk(&id, 0, vec![b'a'; MAX_EDITOR_CHUNK_BYTES]))
                 .unwrap();
             let event = match bad {
-                0 => EditorTransfer::Chunk {
-                    id: id.clone(),
-                    index: 0,
-                    bytes: vec![b'a'; MAX_EDITOR_CHUNK_BYTES],
-                },
-                1 => EditorTransfer::Chunk {
-                    id: id.clone(),
-                    index: 2,
-                    bytes: vec![b'b'],
-                },
-                2 => EditorTransfer::Chunk {
-                    id: id.clone(),
-                    index: 1,
-                    bytes: vec![b'b'; 2],
-                },
+                0 => chunk(&id, 0, vec![b'a'; MAX_EDITOR_CHUNK_BYTES]),
+                1 => chunk(&id, 2, vec![b'b']),
+                2 => chunk(&id, 1, vec![b'b'; 2]),
                 _ => EditorTransfer::Complete { id: id.clone() },
             };
             assert!(receiver.receive(&event).is_err());
@@ -936,13 +900,7 @@ mod tests {
     #[test]
     fn complete_checks_utf8_and_native_cursor_and_empty_documents_need_no_chunk() {
         let (id, mut receiver) = begun(2);
-        receiver
-            .receive(&EditorTransfer::Chunk {
-                id: id.clone(),
-                index: 0,
-                bytes: vec![0xff, 0xff],
-            })
-            .unwrap();
+        receiver.receive(&chunk(&id, 0, vec![0xff, 0xff])).unwrap();
         assert_eq!(
             receiver.receive(&EditorTransfer::Complete { id }),
             Err(EditorTransferError::Utf8)
@@ -957,11 +915,7 @@ mod tests {
             })
             .unwrap();
         receiver
-            .receive(&EditorTransfer::Chunk {
-                id: id.clone(),
-                index: 0,
-                bytes: "e\u{301}".as_bytes().to_vec(),
-            })
+            .receive(&chunk(&id, 0, "e\u{301}".as_bytes().to_vec()))
             .unwrap();
         assert_eq!(
             receiver.receive(&EditorTransfer::Complete { id }),
@@ -999,11 +953,7 @@ mod tests {
     #[test]
     fn decoder_rejects_advertised_oversized_chunks_before_reading_their_payload() {
         let (id, _) = metadata(0);
-        let event = EditorTransfer::Chunk {
-            id,
-            index: 0,
-            bytes: vec![],
-        };
+        let event = chunk(&id, 0, vec![]);
         let mut encoded = crate::encode(&event);
         let end = encoded.len();
         encoded[end - 8..].copy_from_slice(&((MAX_EDITOR_CHUNK_BYTES + 1) as u64).to_le_bytes());
