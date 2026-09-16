@@ -137,7 +137,7 @@ async fn seeded_registry() -> Modules {
         "governance",
     );
     registry
-        .seed("hello", modules::Kind::Module, vec![0xAA; 32])
+        .seed("hello", modules::Kind::Module, vec![0xAA; 32], Vec::new())
         .await
         .expect("seed stages");
     registry.finish_seed().await.expect("seed commits");

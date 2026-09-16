@@ -391,6 +391,12 @@ impl Module for RegistryBoundary {
                     swaps: Vec::new(),
                 }))
             }
+            // this stub's network declares no data-plane lanes
+            modules::ModulesQuery::Lanes => {
+                Ok(modules::encode_reply(&modules::ModulesReply::Lanes {
+                    lanes: Vec::new(),
+                }))
+            }
         }
     }
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

@@ -2279,6 +2279,7 @@ mod tests {
                 kind: modules::Kind::Module,
                 activation_lead: 60,
                 code_hash: hash.clone(),
+                lanes: Vec::new(),
             },
         );
         let views = vec![settled, other, founders];

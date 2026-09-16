@@ -76,6 +76,7 @@ async fn gov_host_with_modreg() -> Host {
                 module_id: "hello".into(),
                 kind: modules::Kind::Module,
                 code_hash: hash(1),
+                lanes: Vec::new(),
             }),
         },
     )
@@ -509,6 +510,7 @@ fn a_passing_register_module_admits_a_new_pending_entry() {
                 kind: modules::Kind::Module,
                 activation_lead: 500,
                 code_hash: hash(7),
+                lanes: Vec::new(),
             },
         )
         .await;
@@ -543,6 +545,7 @@ fn a_passing_cancel_removes_an_admission_entry_entirely() {
                 kind: modules::Kind::Module,
                 activation_lead: 500,
                 code_hash: hash(7),
+                lanes: Vec::new(),
             },
         )
         .await;
@@ -587,6 +590,7 @@ fn register_module_of_an_existing_id_fails_execute_atomically() {
                     kind: modules::Kind::Module,
                     activation_lead: 500,
                     code_hash: hash(9),
+                    lanes: Vec::new(),
                 },
                 voting_period: 100,
             }),

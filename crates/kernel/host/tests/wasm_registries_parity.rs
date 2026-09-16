@@ -144,6 +144,7 @@ fn registry_staged_queries_and_committed_advance_match_native() {
         let seed = |kind, byte| modules::Seed {
             kind,
             code_hash: vec![byte; 32],
+            lanes: Vec::new(),
         };
         let roster = std::collections::BTreeMap::from([
             ("weather", seed(modules::Kind::Module, 1u8)),
@@ -199,6 +200,7 @@ fn registry_staged_queries_and_committed_advance_match_native() {
                     kind: modules::Kind::View,
                     activation_height: 5,
                     code_hash: vec![6; 32],
+                    lanes: Vec::new(),
                 },
             ),
             (

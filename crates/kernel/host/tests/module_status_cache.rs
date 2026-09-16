@@ -105,6 +105,7 @@ fn register(host: &mut Host, height: u64, module_id: &str) {
             module_id: module_id.into(),
             kind: modules::Kind::Module,
             code_hash: vec![height as u8; 32],
+            lanes: Vec::new(),
         }),
     };
     block_on(host.submit_at(ctx, msg)).expect("block applies");

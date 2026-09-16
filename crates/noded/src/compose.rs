@@ -142,10 +142,47 @@ pub fn genesis_seeds(founding: &[Founding]) -> BTreeMap<String, modules::Seed> {
             let seed = modules::Seed {
                 kind: entry.kind,
                 code_hash: entry.hash.to_vec(),
+                lanes: founding_lanes(&entry.id),
             };
             (entry.id.clone(), seed)
         })
         .collect()
+}
+
+/// The data-plane lanes a founding module brings, by id.
+///
+/// This table is native for the same reason `topology::TOPOLOGY` is: it IS the
+/// founding set's content, and a network has no registry to read until genesis
+/// has seeded one. It is not the coupling #2202 removes — POST-genesis, a
+/// module declares its lanes through governance and the host learns them from
+/// the registry, with no native entry anywhere.
+///
+/// The ids and values are what the node binds today, carried over unchanged so
+/// founding a network changes no wire behaviour. Kernel lanes
+/// ([`modules::RESERVED_LANE_IDS`]) are absent on purpose: state sync and the
+/// code plane are bound before any registry can be read, so they are fixed in
+/// the binary and the registry refuses to hand their ids out.
+fn founding_lanes(module_id: &str) -> Vec<modules::LaneDecl> {
+    // a lane with no stream half binds its sockets and speaks datagrams only.
+    let datagram_only = |id| modules::LaneDecl { id, stream: None };
+    let shared_stream = |id, accept_backlog| modules::LaneDecl {
+        id,
+        stream: Some(modules::LaneStream {
+            pacing: modules::LanePacing::Shared,
+            accept_backlog,
+        }),
+    };
+    match module_id {
+        // voice (2) and camera video (3): media rides the overlay datagrams,
+        // and neither binds a stream plane today.
+        "chat" => vec![datagram_only(2), datagram_only(3)],
+        // the reverse-proxy door every installed service is reached through —
+        // one lane for all of them, which is why a service declares none.
+        "gateway" => vec![shared_stream(4, 16)],
+        // live agent run output between member nodes; observability only.
+        "agent" => vec![shared_stream(5, 64)],
+        _ => Vec::new(),
+    }
 }
 
 /// Compose the boot mode's deployment set into a [`Host`];

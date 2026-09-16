@@ -148,6 +148,11 @@ impl Verb {
                 kind,
                 activation_lead,
                 code_hash,
+                // a lane belongs to the module, so it is read off the artifact
+                // frame rather than typed at the command line. Until the frame
+                // carries one, a post-genesis admission declares no lanes and
+                // the registry's genesis seeding is the only declarer.
+                lanes: Vec::new(),
             },
         }
     }
@@ -913,6 +918,7 @@ mod tests {
                     kind: modules::Kind::View,
                     activation_lead: 10,
                     code_hash: vec![0xab; 32],
+                    lanes: Vec::new(),
                 },
                 ProposalStatus::Open,
             ),

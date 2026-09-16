@@ -145,6 +145,7 @@ fn schedule_register_msg() -> Msg {
         kind: modules::Kind::Module,
         activation_height: H,
         code_hash: sha(COMPONENT),
+        lanes: Vec::new(),
     })
 }
 
@@ -276,6 +277,7 @@ fn a_module_that_touches_nothing_admits_over_the_empty_root_and_never_moves_it()
             kind: modules::Kind::Module,
             activation_height: H,
             code_hash: sha(NOOP),
+            lanes: Vec::new(),
         }),
     );
     submit(
@@ -410,6 +412,7 @@ fn a_foreign_abi_record_is_skipped_and_the_boundary_keeps_sealing() {
                 kind: modules::Kind::Module,
                 activation_height: H,
                 code_hash: sha(code),
+                lanes: Vec::new(),
             }),
         );
         submit(
@@ -499,6 +502,7 @@ fn a_non_frame_registry_blob_is_skipped_and_the_boundary_keeps_sealing() {
                 kind: modules::Kind::Module,
                 activation_height: H,
                 code_hash: code_hash.clone(),
+                lanes: Vec::new(),
             }),
         );
         submit(
