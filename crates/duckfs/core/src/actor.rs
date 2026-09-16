@@ -17,11 +17,6 @@ pub enum Actor {
 }
 
 impl Actor {
-    /// The label segment below `/home`, also the canonical display label.
-    pub fn home_label(&self) -> String {
-        self.to_string()
-    }
-
     pub(crate) fn encoded_len(&self) -> usize {
         match self {
             Self::Account(_) => 9,
