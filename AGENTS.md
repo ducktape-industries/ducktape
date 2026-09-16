@@ -102,6 +102,33 @@ in `skills/` (`qa`, `sim-lane`, `module-dev`).
   or low, leave the PR open with the risks, failed checks, or follow-up review
   needed instead of merging by default.
 
+## Delivery Speed (high confidence is the gate, not the calendar)
+
+- **Local gates decide the merge; CI is not waited on.** When the touched
+  crates' gates are green locally and the change is understood, merge at once
+  (`gh pr merge --squash`). Do not arm a watch on the CI run, do not wait for
+  a review round, do not open a follow-up "verify" pass. CI stays light and
+  catches what the box missed after the fact; a red there is a new issue, not
+  a reason to have waited.
+- **Gate what you touched, not the tree.** Run the per-crate clippy gate and
+  the tests of the crates the diff changes. A whole-workspace run is for a
+  change that spans the workspace. Never run the e2e node suites for a change
+  that cannot reach them.
+- **One session, one task, end to end.** The session that implements a unit
+  also gates it, opens the PR, merges it, and closes the issue by hand (a
+  merge into `dev` closes nothing; `main` is the default branch). No
+  implement → review → verify chains; a second pair of eyes is for a change
+  the author says they do not understand.
+- **Reproduce before fixing, at current `dev`.** A report names a symptom; an
+  attached cause may be stale. If it does not reproduce, close the issue with
+  the evidence and move on — that is delivery, not a skipped task.
+- **Merged means gone.** Remove the worktree and delete the branch as soon as
+  the PR merges. Then `git grep` your symbol on `origin/dev`: a sibling's
+  merge commit can revert it.
+- **Hold only what is really uncertain.** A PR stays open only when the
+  author can name the risk in one sentence. "Waiting for CI", "waiting for
+  review", or "someone else should look" are not risks.
+
 ## Worktree Cleanup (a merged worktree is garbage — remove it)
 
 - **A worktree's life ends when its PR merges.** Once merged, remove the
