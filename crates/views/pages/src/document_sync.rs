@@ -146,12 +146,14 @@ pub struct DocumentPlan {
     pub refusal: String,
 }
 
-/// Subpages are navigation, not prose — they have no markdown spelling, and a
-/// text diff has no business deciding they were deleted. They are rendered
-/// beside the document and skipped by every function here.
-pub fn is_prose(block: &PageBlock) -> bool {
-    block.kind != "Page"
-}
+/// A SUBPAGE IS A LINE OF THE DOCUMENT, where it was made. Notion's `/page`
+/// puts the new page at the caret and the writer types its title there; a
+/// page listed only underneath the body can be made from nowhere but the
+/// sidebar. The module's page read gives the child page rows in document
+/// order and does NOT descend into them (`index.rs`, `following_page_block`),
+/// so a page block is exactly one line here, like every other block: the diff
+/// inserts it, renames it and moves it with the same three ops.
+pub const PAGE_MARKER: &str = ">> ";
 
 /// THE TITLE IS LINE 0. It is a page property on the wire, not a block, but in
 /// the buffer it is simply the document's first line — which is what makes
@@ -208,7 +210,6 @@ fn rendered_blocks(blocks: &[PageBlock]) -> Vec<(String, String)> {
     let mut counts: Vec<usize> = Vec::new();
     blocks
         .iter()
-        .filter(|block| is_prose(block))
         .map(|block| {
             let line = Line {
                 kind: block.kind.clone(),
@@ -240,7 +241,6 @@ fn ordinal(counts: &mut Vec<usize>, line: &Line) -> usize {
 pub fn stored_lines(blocks: &[PageBlock]) -> Vec<StoredLine> {
     blocks
         .iter()
-        .filter(|block| is_prose(block))
         .map(|block| StoredLine {
             id: block.id.clone(),
             has_children: block.child_count > 0,
@@ -262,6 +262,8 @@ pub fn stored_lines(blocks: &[PageBlock]) -> Vec<StoredLine> {
 pub fn render_line(line: &Line, ordinal: usize) -> String {
     let indent = INDENT.repeat(line.depth);
     let marker = match line.kind.as_str() {
+        // A subpage: its title on its own line, where the writer made it.
+        "Page" => PAGE_MARKER,
         "Heading 1" => "# ",
         "Heading 2" => "## ",
         "Heading 3" => "### ",
@@ -394,8 +396,10 @@ fn parse_line(rest: &str, depth: usize) -> Line {
     if trimmed.trim_end() == "---" {
         return plain("Divider", "", false);
     }
-    // Ordered longest-first: `### ` must not be read as `# ` plus prose.
+    // Ordered longest-first: `### ` must not be read as `# ` plus prose, and
+    // a subpage's `>> ` must not be read as a Quote of `> `.
     let markers = [
+        (PAGE_MARKER, "Page"),
         ("### ", "Heading 3"),
         ("## ", "Heading 2"),
         ("# ", "Heading 1"),
@@ -469,14 +473,24 @@ pub fn document_plan(stored: &[StoredLine], wanted: &[Line]) -> DocumentPlan {
     let stored_middle = &stored[common_head..stored.len() - common_tail];
     let wanted_middle = &wanted[common_head..wanted.len() - common_tail];
 
+    // A PAGE IS A ROW OF ITS OWN and `SetKind` refuses it in both directions
+    // (`block_ops`), so a line that became a page is not the line that was
+    // there: the pairing stops at the first one. The stored line is removed
+    // and the page inserted, which IS the write the module has for it — that
+    // is what `/` → "New page" writes, on the line it was typed.
+    let paired = stored_middle
+        .iter()
+        .zip(wanted_middle)
+        .take_while(|(have, want)| have.line.kind == "Page" || want.kind != "Page")
+        .count();
+
     // A removal may take a parent ONLY when its whole subtree goes with it —
     // `RemoveBlock` is defined to take the subtree, so deleting the lines of a
     // nested list together is ONE remove on its root. A parent whose subtree
     // extends past the removed run would take survivors with it; that is
     // refused, and the caller resyncs and says so.
     let doomed_end = common_head + stored_middle.len();
-    let survivors = stored_middle.len().min(wanted_middle.len());
-    for (offset, doomed) in stored_middle.iter().enumerate().skip(survivors) {
+    for (offset, doomed) in stored_middle.iter().enumerate().skip(paired) {
         if !doomed.has_children {
             continue;
         }
@@ -498,7 +512,12 @@ pub fn document_plan(stored: &[StoredLine], wanted: &[Line]) -> DocumentPlan {
     }
 
     let mut ops = Vec::new();
-    for (offset, (have, want)) in stored_middle.iter().zip(wanted_middle).enumerate() {
+    for (offset, (have, want)) in stored_middle
+        .iter()
+        .zip(wanted_middle)
+        .take(paired)
+        .enumerate()
+    {
         // Depth becomes a `MoveBlock` direction, never a guessed parent — and
         // an indent is only asked for when the stored tree can PERFORM it (a
         // previous sibling to move under). An unperformable step is deferred:
@@ -521,6 +540,19 @@ pub fn document_plan(stored: &[StoredLine], wanted: &[Line]) -> DocumentPlan {
                     },
                 });
             }
+        }
+        // Unmaking a page is not an edit: `SetKind` refuses it, and removing
+        // the row would take the whole subpage — everything written inside it
+        // — with it. The buffer resyncs and says so.
+        let unpages = have.line.kind == "Page" && want.kind != "Page";
+        if unpages {
+            return DocumentPlan {
+                ops: Vec::new(),
+                refusal: format!(
+                    "\"{}\" is a page — it cannot become another kind of block",
+                    summarize(&have.line.text)
+                ),
+            };
         }
         if have.line.text != want.text {
             ops.push(BlockOp::SetText {
@@ -546,7 +578,7 @@ pub fn document_plan(stored: &[StoredLine], wanted: &[Line]) -> DocumentPlan {
     // REVERSE document order: a parent precedes its subtree in preorder, so
     // walking backwards removes leaves first and every parent is childless by
     // the time its own `Remove` lands — no op ever takes a survivor.
-    for surplus in stored_middle.iter().skip(survivors).rev() {
+    for surplus in stored_middle.iter().skip(paired).rev() {
         ops.push(BlockOp::Remove {
             id: surplus.id.clone(),
         });
@@ -554,9 +586,8 @@ pub fn document_plan(stored: &[StoredLine], wanted: &[Line]) -> DocumentPlan {
 
     // An insert anchors on the last block that is still there ahead of it. The
     // stored middle's own survivors come first, then the head run.
-    let survivors = stored_middle.len().min(wanted_middle.len());
     let mut anchor = stored_middle
-        .get(survivors.wrapping_sub(1))
+        .get(paired.wrapping_sub(1))
         .map(|stored| stored.id.clone())
         .or_else(|| {
             stored
@@ -564,7 +595,7 @@ pub fn document_plan(stored: &[StoredLine], wanted: &[Line]) -> DocumentPlan {
                 .map(|stored| stored.id.clone())
         })
         .unwrap_or_default();
-    for fresh in wanted_middle.iter().skip(stored_middle.len()) {
+    for fresh in wanted_middle.iter().skip(paired) {
         ops.push(BlockOp::Insert {
             after: anchor.clone(),
             kind: fresh.kind.clone(),
@@ -700,11 +731,15 @@ pub fn commented_lines(blocks: &[PageBlock], targets: &[String]) -> Vec<i64> {
     lines
 }
 
-/// The page's child pages, in document order. Subpages are navigation, not
-/// prose: they have no markdown spelling, so the document editor never holds
-/// them and the screen lists them underneath it instead.
-pub fn subpages(blocks: &[PageBlock]) -> Vec<&PageBlock> {
-    blocks.iter().filter(|block| !is_prose(block)).collect()
+/// The page's child pages, IN DOCUMENT ORDER — which is the order their lines
+/// appear in the buffer, so the screen can pair the nth page line with the nth
+/// address without trusting a line number the writer may already have moved.
+pub fn subpage_ids(blocks: &[PageBlock]) -> Vec<String> {
+    blocks
+        .iter()
+        .filter(|block| block.kind == "Page")
+        .map(|block| block.id.clone())
+        .collect()
 }
 
 // ---------- the three-way merge ----------

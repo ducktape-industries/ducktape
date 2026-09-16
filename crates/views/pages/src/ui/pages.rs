@@ -431,26 +431,9 @@ impl PagesView {
                 Tone::Danger,
             ));
         }
+        // A subpage is a LINE of the document now, not a list underneath it:
+        // it is drawn where the writer made it, and pressing it opens it.
         content.push(self.document_editor());
-        if !self.subpages.is_empty() {
-            let mut links = vec![kit::heading("pages/subpages/title", "Subpages")];
-            links.extend(self.subpages.iter().map(|page| {
-                // Held left: a page inside this one reads as a line of a
-                // list, not a banner centred under the document.
-                leading(
-                    format!("pages/subpage/{}/lead", page.id),
-                    action(
-                        format!("pages/subpage/{}", page.id),
-                        &page.title,
-                        Message::ChoosePage(page.id.clone()),
-                        !self.unavailable(),
-                        ButtonPreset::Text,
-                    ),
-                )
-            }));
-            content.push(kit::divider("pages/subpages/rule"));
-            content.push(kit::spaced(kit::column("pages/subpages", links), 4.));
-        }
         let mut surface = fill(kit::padded(
             kit::container(
                 "pages/document/surface",
@@ -573,6 +556,14 @@ impl PagesView {
         if let Some(menu) = &presentation.affordances.menu {
             rich.toolbar = menu.items.clone();
         }
+        // A subpage line carries a link to its own page, so pressing its title
+        // opens it through the one link plane the document already uses.
+        let addresses: Vec<String> = self
+            .subpages
+            .iter()
+            .map(|page| crate::host::page_address(&(page.id), &(self.chain)))
+            .collect();
+        crate::rich_document::link_page_blocks(&mut rich.document, &addresses);
         Node::Editor {
             key: format!("{PAGE_KEY}/document"),
             document,

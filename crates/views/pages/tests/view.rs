@@ -309,6 +309,85 @@ fn a_page_asks_the_host_to_page_in_every_picture_it_names() {
     );
 }
 
+/// A subpage is a LINE of the open document, drawn where the writer made it —
+/// never a list bolted under the body. The projection gives that line its own
+/// block kind and marks the whole title as a link into the page, so pressing
+/// it opens the page through the document's own link plane.
+#[test]
+fn a_subpage_is_a_line_of_the_document_that_links_into_it() {
+    let frame = boot();
+    let session_id = request(&frame, "pages.props").id;
+    let mut frame = tick_native(vec![item(session_id, &session(true))]);
+    for _ in 0..16 {
+        let read = frame
+            .requests
+            .iter()
+            .find(|one| one.kind == "rpc.view" || one.kind == "rpc.query");
+        let Some(read) = read else { break };
+        let ask: serde_json::Value = serde_json::from_slice(&read.payload).expect("a view ask");
+        let reply = match ask["query"]["get_page"].is_null() {
+            true => answered(read),
+            false => nested_page(),
+        };
+        frame = tick_native(vec![answer(read.id, &reply)]);
+    }
+    let Some(Node::Editor { options, .. }) = frame.root.as_ref().and_then(find_editor) else {
+        panic!("the document editor is on screen")
+    };
+    let rich = options.rich.as_ref().expect("the rich projection");
+    let kinds: Vec<&str> = rich
+        .document
+        .blocks
+        .iter()
+        .map(|block| block.kind.as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["heading", "paragraph", "page"],
+        "the title, the prose, then the subpage on its own line"
+    );
+    let subpage = &rich.document.blocks[2];
+    assert_eq!(subpage.text, "Onboarding");
+    assert_eq!(
+        subpage.marks,
+        vec![wire::editor_rich::RichMark {
+            start: 0,
+            end: "Onboarding".len() as u32,
+            kind: "link".into(),
+            value: "duck://page/alpha-2?net=d0cdf950".into(),
+        }],
+        "the whole title opens the page it names"
+    );
+    assert!(
+        !has_text(&frame, "Subpages"),
+        "a page inside this one is not a footer any more: {:?}",
+        texts(&frame)
+    );
+}
+
+/// `page_blocks`, with a child page under the paragraph.
+fn nested_page() -> Vec<u8> {
+    serde_json::json!({ "page": {
+        "blocks": [
+            {
+                "id": "alpha", "parent": null, "page": "alpha", "kind": "page",
+                "text": "Alpha", "checked": false, "children": ["alpha-1", "alpha-2"]
+            },
+            {
+                "id": "alpha-1", "parent": "alpha", "page": "alpha", "kind": "paragraph",
+                "text": "the first paragraph", "checked": false, "children": []
+            },
+            {
+                "id": "alpha-2", "parent": "alpha", "page": "alpha-2", "kind": "page",
+                "text": "Onboarding", "checked": false, "children": []
+            }
+        ],
+        "next_after": null
+    }})
+    .to_string()
+    .into_bytes()
+}
+
 /// `page_blocks`, with a picture named twice and one off the web.
 fn illustrated_page() -> Vec<u8> {
     serde_json::json!({ "page": {

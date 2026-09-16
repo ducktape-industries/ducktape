@@ -103,7 +103,7 @@ fn menu_lifecycle_filters_at_byte_columns_and_closes_on_caret_movement() {
     let slash = doc("Title\n한글 /", 1, 8);
     let mut state = menu::Menu::default();
     state.after_edit(&slash, Some('/'));
-    assert_eq!(state.current(&slash).unwrap().items.len(), 15);
+    assert_eq!(state.current(&slash).unwrap().items.len(), 16);
     let filter = doc("Title\n한글 /h", 1, 9);
     state.after_edit(&filter, None);
     let view = state.current(&filter).unwrap();
@@ -139,6 +139,50 @@ fn a_picture_pick_clears_its_line_and_asks_the_view_for_a_file() {
         closed.current(&slash).is_none(),
         "the palette closes behind the pick"
     );
+}
+
+/// THE FIRST ROW OF `/` IS A NEW PAGE, as in Notion. Picking it turns the
+/// line it was typed on into a page line — whatever marker that line wore —
+/// and leaves the caret in the empty title, which is the page's name.
+#[test]
+fn a_slash_opens_on_new_page_and_the_pick_makes_one_where_it_was_typed() {
+    let slash = doc("Title\n/", 1, 1);
+    let mut state = menu::Menu::default();
+    state.after_edit(&slash, Some('/'));
+    assert_eq!(
+        tags(&state.current(&slash).unwrap())[0],
+        menu::NEW_PAGE,
+        "a page is the palette's first offer"
+    );
+    let (decision, closed) = state.pick(&slash, menu::NEW_PAGE);
+    assert_eq!(apply(&slash, decision), doc("Title\n>> ", 1, 3));
+    assert!(closed.current(&slash).is_none());
+
+    // In a document that already holds a picture and a page — the shapes the
+    // dialect spells without a marker — the pick still lands on its own line.
+    let live = "Handbook\nEverything a new member needs.\n/\n\
+                ![duck](duck://files/shared/a/duck.png)\n>> Onboarding";
+    let typed = doc(live, 2, 1);
+    let mut state = menu::Menu::default();
+    state.after_edit(&doc(&live.replace("\n/\n", "\n\n"), 2, 0), None);
+    state.after_edit(&typed, Some('/'));
+    assert_eq!(
+        tags(&state.current(&typed).expect("the palette is open"))[0],
+        menu::NEW_PAGE
+    );
+    let (decision, _) = state.pick(&typed, menu::NEW_PAGE);
+    assert_eq!(
+        apply(&typed, decision),
+        doc(&live.replace("\n/\n", "\n>> \n"), 2, 3)
+    );
+
+    // Typed inside a bullet, the bullet goes: a page is nobody's list item.
+    let inside = doc("Title\n- /page", 1, 7);
+    let mut state = menu::Menu::default();
+    state.after_edit(&doc("Title\n- /", 1, 3), Some('/'));
+    state.after_edit(&inside, None);
+    let (decision, _) = state.pick(&inside, menu::NEW_PAGE);
+    assert_eq!(apply(&inside, decision), doc("Title\n>> ", 1, 3));
 }
 
 fn tags(view: &menu::MenuView) -> Vec<&str> {
@@ -363,7 +407,7 @@ fn menu_lifecycle_plans_do_not_change_the_current_menu_before_commit() {
     let (decision, opened) = state.plus(&before, 2);
     assert!(state.current(&before).is_none());
     let after = apply(&before, decision);
-    assert_eq!(opened.current(&after).unwrap().items.len(), 15);
+    assert_eq!(opened.current(&after).unwrap().items.len(), 16);
     let (decision, closed) = opened.pick(&after, "h1");
     assert!(
         opened.current(&after).is_some(),

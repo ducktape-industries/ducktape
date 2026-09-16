@@ -55,11 +55,11 @@ pub struct PageItem {
     pub child_count: i64,
 }
 
-/// A subpage block of the open page: navigation, listed under the body.
+/// A page inside the open page. Its title is a line of the document, and the
+/// screen marks that line as a link into it.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Subpage {
     pub id: String,
-    pub title: String,
 }
 
 /// One page-search hit: the page it was found in, the block and its text.
@@ -354,12 +354,9 @@ async fn read_register(requested: &str) -> Result<RegisterItem, String> {
         .map(|block| block.text.clone())
         .unwrap_or_default();
     let blocks = page_blocks(&wire, &active_page);
-    let subpages = document_sync::subpages(&blocks)
+    let subpages = document_sync::subpage_ids(&blocks)
         .into_iter()
-        .map(|block| Subpage {
-            id: block.id.clone(),
-            title: titled(&block.text),
-        })
+        .map(|id| Subpage { id })
         .collect();
     let document = page_document_text(&active_page_title, &blocks);
     // One grouped read, so the surface knows its comment story — the header
@@ -1496,9 +1493,6 @@ async fn insert_block(
 ) -> Result<String, String> {
     let wire_kind = block_kind_wire(kind)?;
     let text = bounded_block_text(kind, text)?;
-    if kind == "Page" && text.trim().is_empty() {
-        return Err("page title must not be empty".into());
-    }
     let blocks = read_page_blocks(page_id).await?;
     // The page's own record is element 0 and is never an anchor: failing to
     // find it is exactly what makes an unanchored insert land under the page
@@ -1512,7 +1506,13 @@ async fn insert_block(
         .as_ref()
         .and_then(|block| block.parent.clone())
         .unwrap_or_else(|| page_id.to_owned());
-    let id = mint("block").await?;
+    // A page block IS the page: its own id is what every `duck://page/…`
+    // address names, so it is minted from the page space like the sidebar's.
+    let id = mint(match kind {
+        "Page" => "page",
+        _ => "block",
+    })
+    .await?;
     submit(json!({ "insert_block": {
         "parent": parent,
         "after": anchor.map(|block| block.id),
