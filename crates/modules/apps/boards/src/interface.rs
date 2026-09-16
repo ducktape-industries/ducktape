@@ -9,6 +9,12 @@ pub const MAX_SIZE: i32 = 4000;
 pub const MAX_BOARD_BYTES: usize = 768 * 1024;
 /// A stroke's samples. A pen drawn at screen resolution is simplified to fit.
 pub const MAX_POINTS: usize = 256;
+/// The whole of a card, as a [`Bond`] measures across it: an anchor is that
+/// many thousandths from the card's top-left corner, so half of it is the
+/// middle. Thousandths and not a float because every other number a shape
+/// carries is an integer, and a board that mixed the two would round
+/// differently depending on which field a reader asked.
+pub const ANCHOR_SPAN: i32 = 1000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -57,6 +63,28 @@ pub enum TextSize {
     Huge,
 }
 
+/// Which card a connector's end holds, and where on it. Both halves are one
+/// fact: an anchor without a card names nothing, and a card without an anchor
+/// is an arrow that forgets where you put it every time the card moves.
+///
+/// The place is stored against the CARD's own box and not against the board —
+/// thousandths of its width and height from its top-left corner — so it
+/// survives the card being moved and resized, which is the whole reason an end
+/// binds to a card rather than standing on a point.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Bond {
+    pub card: String,
+    /// `[500, 500]` is the middle of the card, which is what an arrow dropped
+    /// anywhere near the middle means: "this card", not "this spot on it".
+    pub at: [i32; 2],
+}
+/// Which card an end holds, if it holds one — the question nearly every reader
+/// of a connector's ends is actually asking.
+pub fn held(end: &Option<Bond>) -> Option<&str> {
+    end.as_ref().map(|bond| bond.card.as_str())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Shape {
@@ -72,10 +100,10 @@ pub struct Shape {
     /// A path's samples, relative to `x`/`y` and spanning `width`/`height`,
     /// so a move carries the stroke and a resize scales it. Cards hold none.
     pub points: Vec<[i32; 2]>,
-    /// An arrow endpoint may name a card instead of standing on its own
+    /// An arrow endpoint may hold a card instead of standing on its own
     /// point, so the connection follows the card when it moves.
-    pub from: Option<String>,
-    pub to: Option<String>,
+    pub from: Option<Bond>,
+    pub to: Option<Bond>,
 }
 impl Default for Shape {
     fn default() -> Self {
@@ -162,8 +190,8 @@ pub enum Change {
         width: i32,
         height: i32,
         points: Vec<[i32; 2]>,
-        from: Option<String>,
-        to: Option<String>,
+        from: Option<Bond>,
+        to: Option<Bond>,
     },
     /// Raise these shapes, in this order, above everything else on the board.
     /// Naming every shape therefore states the whole stack — which is how a
@@ -355,8 +383,8 @@ impl Board {
         id: &str,
         box_: [i32; 4],
         points: &[[i32; 2]],
-        from: &Option<String>,
-        to: &Option<String>,
+        from: &Option<Bond>,
+        to: &Option<Bond>,
     ) -> Result<(), String> {
         let Some(record) = self.shapes.get(id) else {
             return Ok(());
@@ -410,8 +438,7 @@ impl Board {
             None => {
                 self.shapes.remove(id);
                 self.shapes.retain(|_, record| {
-                    record.shape.from.as_deref() != Some(id)
-                        && record.shape.to.as_deref() != Some(id)
+                    held(&record.shape.from) != Some(id) && held(&record.shape.to) != Some(id)
                 });
             }
         }
@@ -473,18 +500,32 @@ impl Board {
         if !bindable && bound.iter().any(|end| end.is_some()) {
             return Err("Only arrows bind to cards.".into());
         }
-        if shape.from.is_some() && shape.from == shape.to {
+        let holds_one_card = held(&shape.from).is_some() && held(&shape.from) == held(&shape.to);
+        if holds_one_card {
             return Err("An arrow connects two different cards.".into());
         }
-        let endpoints_valid = bound.into_iter().flatten().all(|key| {
-            key != id
+        let endpoints_valid = bound.into_iter().flatten().all(|bond| {
+            bond.card != id
                 && self
                     .shapes
-                    .get(key)
+                    .get(&bond.card)
                     .is_some_and(|record| !record.shape.kind.is_path())
         });
         if !endpoints_valid {
             return Err("An arrow binds to an existing card.".into());
+        }
+        // An anchor is a place ON the card, so it is meaningless outside it —
+        // and a board that accepted one would draw an arrow ending in empty
+        // space that no card could ever move.
+        let anchors_valid = bound
+            .into_iter()
+            .flatten()
+            .flat_map(|bond| bond.at)
+            .all(|share| (0..=ANCHOR_SPAN).contains(&share));
+        if !anchors_valid {
+            return Err(format!(
+                "An arrow's anchor sits between 0 and {ANCHOR_SPAN} of its card."
+            ));
         }
         Ok(())
     }

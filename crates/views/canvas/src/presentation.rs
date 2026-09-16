@@ -1557,10 +1557,10 @@ impl BoardsView {
     /// you already made rather than one you find out about afterwards.
     fn ring_the_card(&self, board: &Board, kind: Kind, point: [f32; 2], out: &mut Vec<Draw>) {
         let p = kit::palette();
-        let Some(id) = self.holding(board, kind, point) else {
+        let Some(bond) = self.holding(board, kind, point) else {
             return;
         };
-        let Some(record) = board.shapes.get(&id) else {
+        let Some(record) = board.shapes.get(&bond.card) else {
             return;
         };
         let card = &record.shape;

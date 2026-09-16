@@ -895,7 +895,8 @@ fn inverse(board: &Board, change: &Change) -> Vec<Change> {
                     .shapes
                     .iter()
                     .filter(|(_, r)| {
-                        r.shape.from.as_ref() == Some(id) || r.shape.to.as_ref() == Some(id)
+                        let holds = |end| boards::held(end) == Some(id.as_str());
+                        holds(&r.shape.from) || holds(&r.shape.to)
                     })
                     .map(|(id, r)| Change::Create {
                         id: id.clone(),
