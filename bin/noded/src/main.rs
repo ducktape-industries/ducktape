@@ -145,18 +145,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // in the compute daemon and reaches this node over /v1.
     let actor_handle = handle.clone();
 
-    // the node-local, off-chain interactive terminal-session plane (lives in the
-    // daemon like the stream hub — never consensus). This node spawns no pty:
-    // the plane is the RINGS and the metadata, and an agent daemon (`ducktape
-    // service run agent`) attaches over the ws to own the ptys. With none
-    // attached, create returns a clear 503 — a bare spawn is unrepresentable.
-    let term_ring = handle.stream_hub().terminals();
-    let term_cmd_ring = handle.stream_hub().term_commands();
-    // no link token: this test daemon has no workspace to hold one, so it
-    // refuses every attach and therefore has no interactive plane. Nothing
-    // runs an agent daemon against it.
-    let handle =
-        handle.with_terminals(noded::TerminalSessions::new(term_ring, term_cmd_ring, None));
     std::thread::Builder::new()
         .name("node-actor".into())
         .spawn(move || {
