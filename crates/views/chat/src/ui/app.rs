@@ -405,8 +405,9 @@ impl ChatView {
         (Self::state(), ::ducktape_view_guest::Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
+    /// This state's layout, digested — `snapshot_schema` holds it here.
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "9ea6f38a08808cd55a30e2275cefb28fa11cabf11be9f5ea5b2d04664c7d1bc6";
+        "a471c81bc5374e9e750a95c28f44a0d422b90bcf8b968b03723cadd10f83203a";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
@@ -1409,6 +1410,24 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+}
+#[cfg(test)]
+mod snapshot_schema {
+    use super::ChatView;
+
+    #[test]
+    fn the_tag_is_this_state_s_layout() {
+        view_wire::schema::holds::<ChatView>(ChatView::SNAPSHOT_SCHEMA, |shape| {
+            // A draft carries an editor document, which refuses to restore
+            // from a byte the tracer made up, and a run hint carries the
+            // provider's own JSON, which has no static shape at all. Both are
+            // described by a value instead, and both values reach every field
+            // they hold.
+            shape
+                .sample(&ducktape_view_composer::Draft::schema_sample())
+                .sample(&crate::host::LiveRunHint::schema_sample());
+        });
     }
 }
 mod app_update;

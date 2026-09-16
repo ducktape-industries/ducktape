@@ -421,6 +421,38 @@ pub struct LiveRunHint {
     pub answer_preview: String,
 }
 
+impl LiveRunHint {
+    /// A hint holding one of everything, for the snapshot-schema trace: the
+    /// provider's progress is arbitrary JSON, which has no shape to trace, so
+    /// this value is traced instead and reaches every field it holds.
+    ///
+    /// Every field but the progress, which is `None` here because it is
+    /// `None` in every stored hint: [`crate::live::project`] takes it on the
+    /// way in and leaves the status it read from it. A stored `Some` would
+    /// not survive a snapshot at all — bincode cannot decode a
+    /// `serde_json::Value`, which asks the format to describe itself.
+    #[cfg(test)]
+    pub fn schema_sample() -> Self {
+        Self {
+            public_progress: None,
+            output: vec!["o".into()],
+            output_error: "e".into(),
+            channel_id: "c".into(),
+            anchor_seq: 1,
+            thread_root: 1,
+            run_id: "r".into(),
+            dispatch_id: "d".into(),
+            agent: "a".into(),
+            status: "s".into(),
+            activity: vec![LiveActivity {
+                label: "l".into(),
+                done: true,
+            }],
+            answer_preview: "p".into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct LiveActivity {
     pub label: String,

@@ -255,8 +255,9 @@ impl PagesView {
         (Self::initial_state(), Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
+    /// This state's layout, digested — `snapshot_schema` holds it here.
     const SNAPSHOT_SCHEMA: &'static str =
-        "ddab2698f12a601ef232bf2cb53ee7cb4618866c31a238b9f25208c4ea70af56";
+        "2ab020a6340d03d1bee4c1be13e9d7a86cc797eeed91fdaabce209f1899c04f1";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
@@ -883,3 +884,16 @@ include!("app_view.rs");
 include!("kit.rs");
 include!("pages.rs");
 include!("rows.rs");
+
+#[cfg(test)]
+mod snapshot_schema {
+    use super::PagesView;
+
+    #[test]
+    fn the_tag_is_this_state_s_layout() {
+        // The document is an editor held by the state itself, and it refuses
+        // to restore from a byte the tracer makes up, so there is no smaller
+        // thing to sample and the state is read from a value.
+        view_wire::schema::holds_value(PagesView::SNAPSHOT_SCHEMA, &PagesView::initial_state());
+    }
+}

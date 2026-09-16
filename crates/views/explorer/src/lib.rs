@@ -48,8 +48,9 @@ pub enum Message {
     BindQuery(String),
 }
 impl ExplorerView {
+    /// This state's layout, digested — `snapshot_schema` holds it here.
     const SNAPSHOT_SCHEMA: &'static str =
-        "7c1f0b6e2a9d4f83b5e6c7d8a9f0e1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8";
+        "b953dcaf342cbc42a2d6b9b740f358974966958beb3af8cba6d354a1110a630f";
     fn state() -> Self {
         Self {
             connected: false,
@@ -304,3 +305,13 @@ ducktape_view_guest::export_app!(
     "The ledger this network wrote: blocks, their operations, and a search over the workspace.",
     ["explorer"]
 );
+
+#[cfg(test)]
+mod snapshot_schema {
+    use super::ExplorerView;
+
+    #[test]
+    fn the_tag_is_this_state_s_layout() {
+        view_wire::schema::holds::<ExplorerView>(ExplorerView::SNAPSHOT_SCHEMA, |_| {});
+    }
+}

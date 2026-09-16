@@ -73,8 +73,9 @@ impl GovernanceView {
         (Self::state(), ::ducktape_view_guest::Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
+    /// This state's layout, digested — `snapshot_schema` holds it here.
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "9b1e5c0d2a6f4e8b7c3d1a5f9e2b4c6d8a0f3e1b5d7c9a2e4f6b8d0c1a3e5f7b";
+        "61beb4743f339e45590d0962fd1cda0a97eca946bd242172dcc91f3f9e594521";
 }
 impl GovernanceView {
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
@@ -559,3 +560,13 @@ ducktape_view_guest::export_app!(
     "Every decision this network is being asked to make, and the ones it has settled.",
     ["governance"]
 );
+
+#[cfg(test)]
+mod snapshot_schema {
+    use super::GovernanceView;
+
+    #[test]
+    fn the_tag_is_this_state_s_layout() {
+        view_wire::schema::holds::<GovernanceView>(GovernanceView::SNAPSHOT_SCHEMA, |_| {});
+    }
+}

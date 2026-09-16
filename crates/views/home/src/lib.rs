@@ -62,8 +62,9 @@ pub enum Message {
 }
 
 impl HomeView {
+    /// This state's layout, digested — `snapshot_schema` holds it here.
     const SNAPSHOT_SCHEMA: &'static str =
-        "7a4c1e9b3d5f2a8c6e0b4d7f9a1c3e5b8d0f2a4c6e8b1d3f5a7c9e0b2d4f6a8c";
+        "8daafe6080dcc059168a71dcfc0cad19402d491be661c99d8af39e000b20563a";
 
     fn state() -> Self {
         Self {
@@ -325,5 +326,15 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod snapshot_schema {
+    use super::HomeView;
+
+    #[test]
+    fn the_tag_is_this_state_s_layout() {
+        view_wire::schema::holds::<HomeView>(HomeView::SNAPSHOT_SCHEMA, |_| {});
     }
 }

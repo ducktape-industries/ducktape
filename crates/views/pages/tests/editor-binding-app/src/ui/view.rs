@@ -36,8 +36,9 @@ impl std::fmt::Debug for Message {
 
 impl PagesEditorFixture {
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
+    /// This state's layout, digested — `snapshot_schema` holds it here.
     const SNAPSHOT_SCHEMA: &'static str =
-        "9892d966d395d7a36d84bf74ccb9098e147486b1bf3f865c0eeb35fd5a2d1961";
+        "c44a2fb3a0147ada93ab6c2c5a50f22a40bb54c5d87454e8c080496fba016afa";
     fn boot() -> (Self, Task<Message>) {
         (
             Self {
@@ -118,3 +119,17 @@ mod tests {
 }
 include!("app_update.rs");
 include!("app_view.rs");
+
+#[cfg(test)]
+mod snapshot_schema {
+    use super::PagesEditorFixture;
+
+    #[test]
+    fn the_tag_is_this_state_s_layout() {
+        // The document is an editor held by the state itself, and it refuses
+        // to restore from a byte the tracer makes up, so there is no smaller
+        // thing to sample and the state is read from a value.
+        let (booted, _) = PagesEditorFixture::boot();
+        view_wire::schema::holds_value(PagesEditorFixture::SNAPSHOT_SCHEMA, &booted);
+    }
+}

@@ -77,8 +77,9 @@ impl MembersView {
         (Self::state(), ::ducktape_view_guest::Task::none())
     }
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
+    /// This state's layout, digested — `snapshot_schema` holds it here.
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "2e83a4474a83cd1cec8a9b8c5c55db557002ca8afe7872c545a6e15969be41c1";
+        "9fb3daa55fbaeaa6455cd506f6a89a7be71658c4a6d7e3009bb081a86dc7f0cd";
 }
 impl MembersView {
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
@@ -812,3 +813,13 @@ ducktape_view_guest::export_app!(
     "Who may act on this network: validators, residents and registered agents.",
     ["members"]
 );
+
+#[cfg(test)]
+mod snapshot_schema {
+    use super::MembersView;
+
+    #[test]
+    fn the_tag_is_this_state_s_layout() {
+        view_wire::schema::holds::<MembersView>(MembersView::SNAPSHOT_SCHEMA, |_| {});
+    }
+}

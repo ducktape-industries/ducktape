@@ -19,3 +19,8 @@ ducktape-view-guest.workspace = true
 ducktape-view-composer.workspace = true
 sha2 = "0.10"
 chat-message = { path = "../../modules/apps/chat/message" }
+
+[dev-dependencies]
+# The snapshot tag is a digest of this view's own state layout; the tracer
+# that derives it is host-only and never reaches the built component.
+view-wire = { workspace = true, features = ["schema"] }
