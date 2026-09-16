@@ -45,6 +45,9 @@ pub struct ModuleNode {
     /// receipt reaches the engine. that window is a real one — a commit waits on
     /// consensus — and it is where a test moves the working copy on purpose.
     during_commit: RefCell<Option<Box<dyn Fn()>>>,
+    /// answer `history` empty, as a node does once the page a client can read
+    /// has advanced past the height it is looking for.
+    history_hidden: Cell<bool>,
 }
 
 impl Default for ModuleNode {
@@ -64,12 +67,20 @@ impl ModuleNode {
             stage_calls: Cell::new(0),
             commit_calls: Cell::new(0),
             during_commit: RefCell::new(None),
+            history_hidden: Cell::new(false),
         }
     }
 
     /// run `f` inside every accepted commit (see `during_commit`).
     pub fn on_commit(&self, f: impl Fn() + 'static) {
         *self.during_commit.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// answer every `history` call empty from here on — what a client sees when
+    /// its receipt's height has fallen off the page it can read, while `refs`
+    /// still names a head that belongs to somebody else's commit.
+    pub fn hide_history(&self) {
+        self.history_hidden.set(true);
     }
 
     fn block_on<F: Future>(f: F) -> F::Output {
@@ -233,6 +244,9 @@ impl NodeApi for ModuleNode {
     }
 
     fn history(&self, limit: u64) -> Result<Vec<SnapshotInfo>, ApiError> {
+        if self.history_hidden.get() {
+            return Ok(Vec::new());
+        }
         match self.run_query(&FilesQuery::History { limit })? {
             FilesReply::History(snaps) => Ok(snaps),
             other => Err(unexpected(other)),

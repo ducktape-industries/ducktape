@@ -55,6 +55,16 @@ pub enum CommitError {
     /// small-`Err` `Result` cheap (clippy `result_large_err`).
     #[error("duckfs: commit conflict ({} clashing path(s)); {}", .0.clashing.len(), .0.remedy)]
     Conflict(Box<ConflictReport>),
+    /// the commit LANDED on the cluster but the client cannot name the snapshot
+    /// it produced, so the index was left on the old base. the distinction the
+    /// message carries is the whole point: the work is upstream, and committing
+    /// again would submit it a second time.
+    #[error(
+        "duckfs: the commit landed at height {height} but its snapshot cannot be resolved \
+         ({reason}). the change IS on the cluster — do not commit it again; re-checkout \
+         the directory to resync the base"
+    )]
+    Landed { height: u64, reason: String },
     /// a module rejection (the verbatim `"files: ..."` string).
     #[error("{0}")]
     Rejected(String),
@@ -404,12 +414,19 @@ fn resolve_snapshot(
     let history = api.history(MAX_PAGE)?;
     let at_height: Vec<&SnapshotInfo> = history.iter().filter(|s| s.height == height).collect();
     match at_height.as_slice() {
-        // nothing at that height yet (the window may have advanced past it): the
-        // head is the best the client can name.
-        [] => api
-            .refs()?
-            .head
-            .ok_or_else(|| CommitError::Transport("commit landed but head is empty".into())),
+        // nothing at that height: the page we can see has advanced past it (more
+        // than MAX_PAGE commits landed since), and `history` has no cursor to
+        // look further back. the current head is SOMEONE ELSE'S commit — naming
+        // it would record another writer's snapshot as the base this working
+        // copy descends from, which is the corruption this whole function
+        // exists to refuse.
+        [] => Err(CommitError::Landed {
+            height,
+            reason: format!(
+                "no entry at that height in the newest {MAX_PAGE} commits, and history \
+                 cannot be paged further back"
+            ),
+        }),
         // exactly one commit at this height — unambiguous. the common case: a
         // 1-op-1-block lane, or a single committer in an aggregated batch.
         [only] => Ok(only.id.clone()),
@@ -440,13 +457,13 @@ fn resolve_snapshot(
             }
             // fail SAFE: never silently record a wrong base (which would make the
             // next status/commit treat a peer's concurrent files as deletions).
-            found.ok_or_else(|| {
-                CommitError::Transport(format!(
-                    "commit landed at height {height} but its snapshot is ambiguous among \
-                     {} same-height commits and could not be matched to the committed paths; \
-                     re-checkout to resync the base",
+            found.ok_or_else(|| CommitError::Landed {
+                height,
+                reason: format!(
+                    "ambiguous among {} same-height commits, none of which could be matched \
+                     to the committed paths",
                     candidates.len()
-                ))
+                ),
             })
         }
     }
