@@ -237,6 +237,8 @@ impl BoardsView {
             (true, "]") if !repeat => self.on_stack(true),
             (true, "[") if !repeat => self.on_stack(false),
             (true, "d") if !repeat => self.on_duplicate(),
+            (true, "g") if shift && !repeat => self.on_group(false),
+            (true, "g") if !repeat => self.on_group(true),
             (true, "z") if shift => self.on_redo(),
             (true, "z") => self.on_undo(),
             (true, "y") => self.on_redo(),
@@ -543,14 +545,19 @@ impl BoardsView {
         // deselects instead.
         let extending = self.modifiers.shift && !self.planting();
         if extending {
-            if !self.selected.remove(&id) {
-                self.selected.insert(id);
+            // A group goes in and out of a selection whole, the same way it is
+            // picked whole: shift-clicking one member of a group you already
+            // hold puts the WHOLE group down, not a hole in the middle of it.
+            let mates = with_group_mates(&board, [id.clone()]);
+            match self.selected.contains(&id) {
+                true => self.selected.retain(|held| !mates.contains(held)),
+                false => self.selected.extend(mates),
             }
             self.gesture = Gesture::Idle;
             return Task::none();
         }
         if !self.selected.contains(&id) {
-            self.selected = [id.clone()].into();
+            self.selected = with_group_mates(&board, [id.clone()]);
         }
         self.palette = board.shapes[&id].shape.color;
         let shapes = self
@@ -802,13 +809,14 @@ impl BoardsView {
                     // dragged: a bound arrow is drawn where its cards put it,
                     // so that is the geometry it is caught by. Sweeping a
                     // diagram must take its edges or a recolour misses them.
-                    self.selected.extend(
-                        board
-                            .shapes
-                            .iter()
-                            .filter(|(_, r)| intersects(bounds, drawn_rect(board, &r.shape)))
-                            .map(|(id, _)| id.clone()),
-                    );
+                    let swept = board
+                        .shapes
+                        .iter()
+                        .filter(|(_, r)| intersects(bounds, drawn_rect(board, &r.shape)))
+                        .map(|(id, _)| id.clone());
+                    // Touching any member takes the group, so a band drawn
+                    // across half a diagram does not tear a group in two.
+                    self.selected.extend(with_group_mates(board, swept));
                 }
             }
         }
@@ -1698,6 +1706,39 @@ impl BoardsView {
         }
         Task::none()
     }
+    /// Bind the selection into a group, or free whatever groups it touches.
+    ///
+    /// The name is the lowest id in the selection, which is already unique on
+    /// the board and already a name the board can address. Minting a fresh one
+    /// would need a source of names the view does not have, and a group's name
+    /// is never read by anyone — only shared.
+    pub(super) fn on_group(&mut self, binding: bool) -> Task<Message> {
+        let Some(board) = self.visible() else {
+            return Task::none();
+        };
+        // Whole groups, both ways. Picking a member already picks its group,
+        // so this is usually what the selection holds anyway — but a selection
+        // assembled some other way must not be able to bind or free HALF of a
+        // group, which would leave the rest carrying a name with nothing to
+        // share it with.
+        let ids: Vec<String> = with_group_mates(&board, self.selected.iter().cloned())
+            .into_iter()
+            .filter(|id| board.shapes.contains_key(id))
+            .collect();
+        let enough = match binding {
+            // A group of one never reads differently from no group at all, and
+            // the board refuses one — so the board would print an error at a
+            // writer who only pressed the chord on a single card.
+            true => ids.len() >= 2,
+            // Nothing to free unless something in the selection is held.
+            false => ids.iter().any(|id| board.shapes[id].shape.group.is_some()),
+        };
+        if !enough {
+            return Task::none();
+        }
+        let group = binding.then(|| ids[0].clone());
+        self.edit(Change::Group { ids, group })
+    }
     fn nudge(&mut self, x: i32, y: i32) -> Task<Message> {
         if let Gesture::Nudge { offset, .. } = &mut self.gesture {
             offset[0] += x;
@@ -1849,12 +1890,23 @@ impl BoardsView {
             .zip(&ids)
             .map(|((old, _), id)| (old.clone(), id.clone()))
             .collect();
+        // A copy of a group is its OWN group. Copies that kept the original
+        // name would join the group they were copied from, so picking the
+        // original would pick its copies and moving it would drag them along.
+        let regrouped: BTreeMap<String, String> = shapes
+            .iter()
+            .zip(&ids)
+            .filter_map(|((old, s), id)| {
+                Some((s.group.clone()?, mapping.get(old).unwrap_or(id).clone()))
+            })
+            .collect();
         let changes = shapes
             .into_iter()
             .zip(&ids)
             .map(|((_, mut s), id)| {
                 s.x = coordinate((s.x + offset[0]) as f32);
                 s.y = coordinate((s.y + offset[1]) as f32);
+                s.group = s.group.and_then(|group| regrouped.get(&group).cloned());
                 // A copy holds the COPIES of the cards it was bound to, at the
                 // same places on them: an arrow planted beside its own cards
                 // that still reached back to the originals would be a copy of
@@ -2564,6 +2616,39 @@ pub(super) fn rect(s: &Shape) -> [f32; 4] {
         (s.x + s.width) as f32,
         (s.y + s.height) as f32,
     ]
+}
+/// The picked shapes, plus everything grouped with any of them.
+///
+/// A group is a name its members share, and nothing on the board addresses one
+/// member alone: picking one picks all of them, which is what makes a group
+/// move, recolour and delete as one thing without a single gesture knowing
+/// that groups exist. Ids in no group stand for themselves.
+pub(super) fn with_group_mates(
+    board: &Board,
+    picked: impl IntoIterator<Item = String>,
+) -> BTreeSet<String> {
+    let picked: BTreeSet<String> = picked.into_iter().collect();
+    let held: BTreeSet<&str> = picked
+        .iter()
+        .filter_map(|id| board.shapes.get(id)?.shape.group.as_deref())
+        .collect();
+    if held.is_empty() {
+        return picked;
+    }
+    board
+        .shapes
+        .iter()
+        .filter(|(id, record)| {
+            let named = picked.contains(*id);
+            let mate = record
+                .shape
+                .group
+                .as_deref()
+                .is_some_and(|group| held.contains(group));
+            named || mate
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 /// The box a shape actually occupies on the board. A card's is its own; a
 /// connector's is the span of the stroke it draws, which for a bound end is

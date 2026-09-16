@@ -3393,6 +3393,84 @@ fn a_cards_words_sit_where_the_alignment_says_and_the_caret_goes_with_them() {
     );
 }
 
+/// A group is picked whole, however you reach for one of its members.
+///
+/// The board has no gesture that knows groups exist: move, recolour, stack and
+/// delete all act on the selection. Making the SELECTION whole is therefore the
+/// whole of grouping — and a selection that could hold half a group would be a
+/// group you could tear in two by clicking carefully.
+#[test]
+fn picking_one_member_of_a_group_picks_all_of_it() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    card(&mut view, "a", 0);
+    card(&mut view, "b", 300);
+    card(&mut view, "loose", 900);
+    view.selected = ["a".into(), "b".into()].into();
+    view.on_group(true);
+    let board = view.visible().unwrap();
+    let group = |id: &str| board.shapes[id].shape.group.clone();
+    assert_eq!(group("a"), group("b"), "the pair did not share a name");
+    assert!(group("a").is_some(), "the pair was not grouped at all");
+    assert_eq!(group("loose"), None);
+
+    // A plain press on one member takes the other with it.
+    view.selected = BTreeSet::new();
+    let board = view.visible().unwrap().clone();
+    assert_eq!(
+        super::interaction::with_group_mates(&board, ["a".to_string()]),
+        ["a".to_string(), "b".to_string()].into(),
+    );
+    // A shape in no group still stands for itself.
+    assert_eq!(
+        super::interaction::with_group_mates(&board, ["loose".to_string()]),
+        ["loose".to_string()].into(),
+    );
+
+    // And freeing them puts each back on its own.
+    view.selected = ["a".into()].into();
+    view.on_group(false);
+    let board = view.visible().unwrap();
+    assert_eq!(board.shapes["a"].shape.group, None);
+    assert_eq!(
+        board.shapes["b"].shape.group, None,
+        "half a group was freed"
+    );
+}
+
+/// Undoing a grouping puts every shape back in the group it came from, which
+/// need not be the same one for all of them.
+#[test]
+fn undoing_a_grouping_returns_each_shape_to_the_group_it_came_from() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    card(&mut view, "a", 0);
+    card(&mut view, "b", 300);
+    card(&mut view, "c", 600);
+    view.selected = ["a".into(), "b".into()].into();
+    view.on_group(true);
+    let first = view.visible().unwrap().shapes["a"].shape.group.clone();
+    assert!(first.is_some());
+
+    // Now gather the pair AND a loose shape into one bigger group.
+    view.selected = ["a".into(), "b".into(), "c".into()].into();
+    view.on_group(true);
+    let board = view.visible().unwrap();
+    assert_eq!(board.shapes["c"].shape.group, board.shapes["a"].shape.group);
+
+    view.on_undo();
+    let board = view.visible().unwrap();
+    assert_eq!(
+        board.shapes["a"].shape.group, first,
+        "the pair did not go back to the group it was in"
+    );
+    assert_eq!(board.shapes["b"].shape.group, first);
+    assert_eq!(
+        board.shapes["c"].shape.group, None,
+        "a shape that was in no group came back holding one"
+    );
+}
+
 /// A connector keeps its plate under the caret, because the plate IS the label.
 ///
 /// The painter draws nothing for the shape being written in, which is right for

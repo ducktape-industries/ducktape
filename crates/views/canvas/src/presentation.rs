@@ -819,6 +819,7 @@ impl BoardsView {
             ("⌘ / Ctrl C · X · V", "Copy / cut / paste at pointer"),
             ("⌘ / Ctrl D · Alt or ⌘⇧ drag", "Duplicate selection"),
             ("⌘ / Ctrl ] · [", "Bring to front / send to back"),
+            ("⌘ / Ctrl G · Shift G", "Group / ungroup selection"),
             ("⌘ / Ctrl Z · Shift Z", "Undo / redo"),
             ("Arrow · Shift Arrow", "Move 1 / 10 units"),
             ("⌘ / Ctrl + scroll", "Zoom at pointer"),
