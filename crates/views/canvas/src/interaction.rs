@@ -1025,6 +1025,8 @@ impl BoardsView {
         Shape {
             kind,
             color: self.palette,
+            fill: self.fill,
+            dash: self.dash,
             x: coordinate(corner[0]),
             y: coordinate(corner[1]),
             width: size[0] as i32,
@@ -1062,6 +1064,8 @@ impl BoardsView {
         Shape {
             kind,
             color: self.palette,
+            fill: self.fill,
+            dash: self.dash,
             x: coordinate(b[0]),
             y: coordinate(b[1]),
             width: size(b[2] - b[0]) as i32,
@@ -1636,6 +1640,35 @@ impl BoardsView {
                 .collect(),
         )
     }
+    /// Whether the selection's bodies are painted, and what the next shape's
+    /// will be. Like a colour and unlike an alignment: emptying a box is a
+    /// choice about how you are drawing, not about the box in hand — you
+    /// reach for it to outline a region and then outline three more.
+    pub(super) fn on_fill(&mut self, fill: Fill) -> Task<Message> {
+        self.fill = fill;
+        self.edit_many(
+            self.selected
+                .iter()
+                .map(|id| Change::Fill {
+                    id: id.clone(),
+                    fill,
+                })
+                .collect(),
+        )
+    }
+    /// Whether the selection's outlines are unbroken, and the next shape's.
+    pub(super) fn on_dash(&mut self, dash: Dash) -> Task<Message> {
+        self.dash = dash;
+        self.edit_many(
+            self.selected
+                .iter()
+                .map(|id| Change::Dash {
+                    id: id.clone(),
+                    dash,
+                })
+                .collect(),
+        )
+    }
     /// Where the selection's words sit across the boxes they are written in.
     /// It is not remembered for the NEXT shape the way a colour is: a colour
     /// is a choice about the board, and how a card's words are set is a choice
@@ -2000,6 +2033,8 @@ impl BoardsView {
                 width: 220,
                 height: 180,
                 color: self.palette,
+                fill: self.fill,
+                dash: self.dash,
                 ..Default::default()
             });
         self.mint_shape(Shape {

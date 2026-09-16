@@ -49,6 +49,29 @@ pub enum Align {
     Middle,
     End,
 }
+/// Whether a shape's body is painted at all. A card washed in its colour says
+/// "this is a thing"; a card with nothing behind its outline says "these are
+/// the things inside me" — which is the gesture a whiteboard is for, and the
+/// one a board that always washes cannot draw. A run has no body and ignores
+/// it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Fill {
+    #[default]
+    Solid,
+    None,
+}
+/// Whether a shape's outline is drawn unbroken. Dashed is how every diagram
+/// says "proposed", "optional", "not yet" — about a box and about an arrow
+/// alike, which is why it is one property of every shape rather than a
+/// connector's own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Dash {
+    #[default]
+    Solid,
+    Dashed,
+}
 /// How big a shape's words are. Four steps and not a number: the size decides
 /// the box a text shape hugs and the column a card wraps in, so a free number
 /// would let a board hold writing that no zoom level can read and no box can
@@ -95,6 +118,14 @@ pub struct Shape {
     pub height: i32,
     pub text: String,
     pub color: u8,
+    /// Whether the body behind the outline is painted. A run has no body, so
+    /// it is stored for every shape and read for the ones that have one.
+    #[serde(default)]
+    pub fill: Fill,
+    /// Whether the outline is drawn unbroken — a card's border and a run's
+    /// stroke are the same line as far as this is concerned.
+    #[serde(default)]
+    pub dash: Dash,
     pub align: Align,
     pub text_size: TextSize,
     /// A path's samples, relative to `x`/`y` and spanning `width`/`height`,
@@ -121,6 +152,8 @@ impl Default for Shape {
             height: 140,
             text: String::new(),
             color: 0,
+            fill: Fill::Solid,
+            dash: Dash::Solid,
             align: Align::Middle,
             text_size: TextSize::Medium,
             points: Vec::new(),
@@ -177,6 +210,14 @@ pub enum Change {
     Color {
         id: String,
         color: u8,
+    },
+    Fill {
+        id: String,
+        fill: Fill,
+    },
+    Dash {
+        id: String,
+        dash: Dash,
     },
     Align {
         id: String,
@@ -283,6 +324,8 @@ impl Board {
             Change::Resize { id, width, height } => self.resize(id, *width, *height),
             Change::Text { id, text } => self.text(id, text),
             Change::Color { id, color } => self.color(id, *color),
+            Change::Fill { id, fill } => self.fill(id, *fill),
+            Change::Dash { id, dash } => self.dash(id, *dash),
             Change::Align { id, align } => self.align(id, *align),
             Change::TextSize { id, text_size } => self.text_size(id, *text_size),
             Change::Route {
@@ -417,6 +460,22 @@ impl Board {
         };
         let mut shape = record.shape.clone();
         shape.color = color;
+        self.replace(id, Some(shape))
+    }
+    fn fill(&mut self, id: &str, fill: Fill) -> Result<(), String> {
+        let Some(record) = self.shapes.get(id) else {
+            return Ok(());
+        };
+        let mut shape = record.shape.clone();
+        shape.fill = fill;
+        self.replace(id, Some(shape))
+    }
+    fn dash(&mut self, id: &str, dash: Dash) -> Result<(), String> {
+        let Some(record) = self.shapes.get(id) else {
+            return Ok(());
+        };
+        let mut shape = record.shape.clone();
+        shape.dash = dash;
         self.replace(id, Some(shape))
     }
     fn align(&mut self, id: &str, align: Align) -> Result<(), String> {

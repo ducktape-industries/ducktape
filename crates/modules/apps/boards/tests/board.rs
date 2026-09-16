@@ -654,3 +654,56 @@ fn a_group_needs_two_shapes_that_exist_and_a_name_the_board_can_address() {
         })
         .expect_err("a shape carried a group name the board cannot address");
 }
+
+/// How a shape is painted is two questions and the board answers each on its
+/// own: whether the body behind the outline is there, and whether the outline
+/// is unbroken. Both ride every shape, because a dashed box and a dashed arrow
+/// are the same statement and a board that stored them apart could disagree
+/// with itself about what dashed means.
+#[test]
+fn a_shape_carries_its_fill_and_its_dash_and_each_changes_alone() {
+    let board = blank().changed_many(&[create("a")]).unwrap();
+    assert_eq!(board.shapes["a"].shape.fill, Fill::Solid);
+    assert_eq!(board.shapes["a"].shape.dash, Dash::Solid);
+
+    let hollow = board
+        .changed(&Change::Fill {
+            id: "a".into(),
+            fill: Fill::None,
+        })
+        .unwrap();
+    assert_eq!(hollow.shapes["a"].shape.fill, Fill::None);
+    assert_eq!(
+        hollow.shapes["a"].shape.dash,
+        Dash::Solid,
+        "emptying a shape also broke its outline"
+    );
+
+    let broken = hollow
+        .changed(&Change::Dash {
+            id: "a".into(),
+            dash: Dash::Dashed,
+        })
+        .unwrap();
+    assert_eq!(broken.shapes["a"].shape.dash, Dash::Dashed);
+    assert_eq!(
+        broken.shapes["a"].shape.fill,
+        Fill::None,
+        "breaking an outline also filled the shape back in"
+    );
+
+    // And a run takes the same two answers, so the panel can ask one question
+    // of whatever is picked rather than one question per family.
+    let run = blank()
+        .changed_many(&[Change::Create {
+            id: "line".into(),
+            shape: path(Kind::Arrow),
+        }])
+        .unwrap()
+        .changed(&Change::Dash {
+            id: "line".into(),
+            dash: Dash::Dashed,
+        })
+        .unwrap();
+    assert_eq!(run.shapes["line"].shape.dash, Dash::Dashed);
+}
