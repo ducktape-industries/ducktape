@@ -53,6 +53,26 @@ if [[ -z "${ROOTFS_SETUP+x}" && "$(uname -s)" == "Linux" ]]; then
   WASM_TOOLS_VERSION="1.$(sed -n 's/^wit-component = "=0\.\([0-9.]*\)".*/\1/p' "$HERE/bin/guest-builder/Cargo.toml")"
   set -- "$RUST_CHANNEL" "$WASM_TOOLS_VERSION"
 fi
+# The setup step is the ONLY one that needs to be root inside the tree, and a
+# host can refuse to give an unprivileged process the user namespace that gets
+# it there: Ubuntu 23.10+ ships `kernel.apparmor_restrict_unprivileged_userns=1`,
+# and bwrap dies with "setting up uid map: Permission denied" before any of
+# this runs.
+#
+#   GUEST_SETUP_SUDO=sudo OUT=… ops/build-guest-rootfs.sh
+#
+# lends privilege to THAT STEP ALONE — the download, the extraction, the init
+# build and the image all stay rootless, and an operator never has to loosen a
+# host-wide kernel setting to build a guest.
+#
+# The two modes differ by exactly the flags that buy rootlessness. Under sudo
+# we are ALREADY root, so asking for the namespace anyway buys nothing and
+# costs the build: the same hosts attach an `unprivileged_userns` AppArmor
+# profile to whatever creates one, root included, and the confined bwrap is
+# then refused the bind itself ("Can't find source path …: Permission denied").
+SETUP_PRIVILEGE="${GUEST_SETUP_SUDO:-}"
+SETUP_AS_ROOT=(--unshare-user --uid 0 --gid 0)
+[[ -z "$SETUP_PRIVILEGE" ]] || SETUP_AS_ROOT=()
 if [[ -n "${ROOTFS_SETUP:-}" ]]; then
   command -v bwrap >/dev/null || { echo "guest setup requires bubblewrap" >&2; exit 1; }
 fi
@@ -162,7 +182,7 @@ if [[ -n "${ROOTFS_SETUP:-}" ]]; then
   [[ -f "$SETUP" ]] || { echo "ROOTFS_SETUP is not a file: $SETUP" >&2; exit 1; }
   mkdir -p "$WORK/setup-tmp"
   say "preparing guest tools"
-  bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --die-with-parent \
+  $SETUP_PRIVILEGE bwrap "${SETUP_AS_ROOT[@]}" --unshare-pid --die-with-parent \
     --bind "$TREE" / --proc /proc --dev /dev \
     --bind "$WORK/setup-tmp" /tmp \
     --ro-bind /etc/resolv.conf /etc/resolv.conf \
@@ -170,6 +190,11 @@ if [[ -n "${ROOTFS_SETUP:-}" ]]; then
     --clearenv --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     --setenv DEBIAN_FRONTEND noninteractive \
     /bin/bash /run/ducktape-guest-setup "$@"
+  # A privileged setup writes root-owned files, and `mke2fs -d` below stays
+  # rootless — it would fail on the first one it cannot read. The extracted
+  # base is already the operator's, so hand the additions over to match it
+  # rather than escalate the image build too.
+  [[ -z "$SETUP_PRIVILEGE" ]] || $SETUP_PRIVILEGE chown -R "$(id -u):$(id -g)" "$TREE"
 fi
 
 # ---- 3. the init -----------------------------------------------------------

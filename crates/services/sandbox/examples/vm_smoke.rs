@@ -6,30 +6,38 @@
 //!   cargo run -p sandbox-host --example vm_smoke -- \
 //!       --kernel <workspace>/guest/vmlinux \
 //!       --rootfs <workspace>/guest/rootfs.ext4 \
-//!       [--vmm firecracker|vz]
+//!       [--vmm firecracker|vz] [--exec '<shell command>']
 //!
 //! `--vmm` defaults to this OS's flavor (vz on macOS, Firecracker elsewhere).
-//! Exit 0 means a guest booted, ran `/bin/sh`, wrote a file into its
-//! workspace, and the file came back to the host.
+//! `--exec` runs a command of your own inside the guest FIRST — what an image
+//! carries is a question you ask by running something against it — and the
+//! probe still follows it. Exit 0 means a guest booted, ran `/bin/sh`, wrote a
+//! file into its workspace, and the file came back to the host.
 
 use std::path::PathBuf;
 
 use sandbox_host::firecracker_api::{self, VmConfig};
 use sandbox_host::guest_manifest::RunManifest;
-use sandbox_host::guest_paths::GUEST_WORKSPACE;
+use sandbox_host::guest_paths::{GUEST_HOME, GUEST_PATH, GUEST_WORKSPACE};
 use sandbox_host::microvm::ScratchDir;
 use sandbox_host::{MicroVm, Vmm};
 
-fn parse_args() -> Result<(PathBuf, PathBuf, Vmm), String> {
+/// what the guest runs before the probe when `--exec` names nothing: read the
+/// one file the host put in the workspace.
+const DEFAULT_EXEC: &str = "cat input.txt";
+
+fn parse_args() -> Result<(PathBuf, PathBuf, Vmm, String), String> {
     let mut kernel = None;
     let mut rootfs = None;
     let mut vmm = Vmm::platform_default();
+    let mut exec = DEFAULT_EXEC.to_string();
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--kernel" => kernel = Some(PathBuf::from(value)),
             "--rootfs" => rootfs = Some(PathBuf::from(value)),
+            "--exec" => exec = value,
             "--vmm" => {
                 vmm = match value.as_str() {
                     "firecracker" => Vmm::Firecracker,
@@ -42,7 +50,7 @@ fn parse_args() -> Result<(PathBuf, PathBuf, Vmm), String> {
     }
     let kernel = kernel.ok_or("--kernel is required")?;
     let rootfs = rootfs.ok_or("--rootfs is required")?;
-    Ok((kernel, rootfs, vmm))
+    Ok((kernel, rootfs, vmm, exec))
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -55,7 +63,7 @@ async fn main() {
 }
 
 async fn smoke() -> Result<(), String> {
-    let (kernel, rootfs, vmm) = parse_args()?;
+    let (kernel, rootfs, vmm, exec) = parse_args()?;
 
     // scratch: a workspace with one input file, a run dir, and a SHORT socket
     // dir (`SUN_LEN` caps a unix socket path near 104 bytes on macOS).
@@ -88,13 +96,25 @@ async fn smoke() -> Result<(), String> {
         vsock_uds: socket_dir.join("v.sock"),
         tap: None,
     };
+    // `--exec` is a PREFIX, never a replacement: whatever the run does, it ends
+    // by writing the probe file and printing the probe line, because those two
+    // are what tell "the guest ran to completion" apart from "the VM died
+    // somewhere in the middle" — and every assertion below rests on them.
+    // by ABSOLUTE path: a command that ends somewhere else (a build runs from
+    // the directory it cloned into) would otherwise drop the probe file there
+    // and fail the read-back for a reason that has nothing to do with the run.
+    let script =
+        format!("{exec} && echo smoke > {GUEST_WORKSPACE}/vm-smoke.txt && echo guest-side-ok");
     let manifest = RunManifest {
-        argv: vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            "cat input.txt && echo smoke > vm-smoke.txt && echo guest-side-ok".into(),
+        argv: vec!["/bin/sh".into(), "-c".into(), script],
+        // the REAL run environment, not a hand-written subset of it: this
+        // example is what answers "does this image work", and it can only
+        // answer for the paths a run actually searches. A narrower PATH here
+        // hides everything the image installs into /usr/local/bin.
+        env: vec![
+            ("PATH".into(), GUEST_PATH.into()),
+            ("HOME".into(), GUEST_HOME.into()),
         ],
-        env: vec![("PATH".into(), "/usr/sbin:/usr/bin:/sbin:/bin".into())],
         cwd: GUEST_WORKSPACE.into(),
         mounts: firecracker_api::manifest_mounts(&cfg),
         tunnel_ports: vec![],
