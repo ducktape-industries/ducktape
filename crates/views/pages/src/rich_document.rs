@@ -763,6 +763,12 @@ fn unfenced_column(block: &BlockContent, source: usize) -> usize {
     plain + source.saturating_sub(written)
 }
 
+/// What a page with no title of its own is called on screen — the hint on its
+/// empty title line, and the name every list falls back to. It lives here
+/// rather than beside the host's other page vocabulary because this module is
+/// compiled on its own into the editor-binding fixture, which has no host.
+pub const UNTITLED: &str = "Untitled";
+
 pub fn presentation(text: &str, cursor: wire::EditorCursor) -> RichPresentation {
     let blocks = blocks_of(text);
     let mut wire_blocks: Vec<RichBlock> = blocks.iter().map(wire_block).collect();
@@ -773,7 +779,7 @@ pub fn presentation(text: &str, cursor: wire::EditorCursor) -> RichPresentation 
     if let Some(title) = wire_blocks.first_mut() {
         title.attributes.push(wire::editor_rich::RichAttribute {
             name: "extra:placeholder".to_owned(),
-            value: crate::host::UNTITLED.to_owned(),
+            value: UNTITLED.to_owned(),
         });
     }
     RichPresentation {
