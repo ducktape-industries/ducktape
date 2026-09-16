@@ -192,12 +192,99 @@ failures return an error instead of a session receipt. The terminal executable's
 public `identity`, route `account` and `label`, and absolute `capabilities`,
 `kernel`, `rootfs`, and `executors` paths.
 
+### Installing the terminal
+
+Build with `cargo build --release -p ducktape-terminal`. An installation manifest
+mounts the node workspace read-only, grants `/dev/kvm`, and carries the process
+configuration:
+
+```json
+{
+  "name": "terminal",
+  "binary": "/srv/releases/ducktape-terminal",
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "workspace": "/home/duck/.ducktape/team",
+  "node_user": "duck",
+  "account": 12,
+  "label": "terminal",
+  "port": 29140,
+  "config": {
+    "workspace": "/var/lib/application-storage/node-workspace",
+    "node_api": "http://127.0.0.1:3000",
+    "identity": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    "account": 12,
+    "label": "terminal",
+    "capabilities": "/srv/terminal/capabilities",
+    "kernel": "/srv/terminal/guest/vmlinux",
+    "rootfs": "/srv/terminal/guest/rootfs.ext4",
+    "executors": "/srv/terminal/executors"
+  },
+  "memory_max": 2147483648,
+  "cpu_quota": 400,
+  "tasks_max": 512,
+  "readonly_paths": [
+    {
+      "source": "/home/duck/.ducktape/team",
+      "destination": "/var/lib/application-storage/node-workspace"
+    }
+  ],
+  "devices": ["/dev/kvm"]
+}
+```
+
+`config.identity` is the publisher node's public key as exactly 32 bytes — the
+same key `/v1/status` reports as `public_key`; the service compares an attested
+caller node against it to decide local from remote, and never signs with it.
+`config.workspace` is the mount DESTINATION, not the manifest's `workspace`: the
+isolated process reads `work-admit.toml` through the read-only mount, and the
+node's own directory path is not readable under `DynamicUser`. Mount the
+directory rather than the policy file — the node replaces the file atomically
+and a file bind mount would keep the old inode. Listing `/dev/kvm` in `devices`
+binds that device into the isolated process, allows read/write on it, and —
+unless the device is world read/write — adds its owning group as a supplementary
+group, so that group must hold read/write on it.
+
+Readiness proves the process validated its configuration and credential, adopted
+the inherited listener, probed the sandbox backend (the VMM binary and its host
+tools resolve on `PATH`, `/dev/kvm` opens read-write for this process, the
+kernel and rootfs files exist) and discovered at least one provider capability
+under `capabilities`. It does NOT prove an executor boots a guest: the first
+`POST /sessions` is what tries that, and a failure there returns an error rather
+than a session receipt.
+
+Sign this `(account, label)` route with `ducktape user sign-gateway-route` and
+submit it. Its `policy` must list both `get` and `post` methods and set
+`allow_upgrade` — create is a POST and the attachment is a GET upgrade — and its
+`audience` must be `network`: an operator-attested request carries no user proof,
+so its caller account is absent and `owner`/`accounts` would refuse it. The
+audience is not the service's admission. The Gateway still admits only a caller
+holding this node's operator credential, and the service still refuses a remote
+node without `cred`.
+
+### Attaching from the CLI
+
+```sh
+ducktape agent pty claude --account 12 --route terminal -n <chain-id>
+ducktape agent pty claude --account 12 --route terminal --cred <name> \
+  --cpu 4 --mem 8 -n <chain-id>
+```
+
+Both selectors are required: nothing defaults to an account or invents a route
+label. The CLI POSTs the create and opens the attachment through its own node's
+`/v1/gateway/operator`, presenting the node's existing operator credential;
+that credential never leaves the node. The node hosts no terminal sessions of
+its own — there is no `/v1/term` route and no `term:` stream topic.
+
 Terminal attachments use `/sessions/{session}?after=<output-seq>&after_command=<chat-seq>`.
 Both cursors default to zero. Replay metadata gives `first`, `head`,
 `command_first`, and `command_head`; following `command` frames carry `seq`,
 `origin`, and `text`, while `output` frames carry `seq` and `data_b64`.
 Resume from frames actually consumed, not a snapshot head announced before those
-frames. Command sequence gaps include refused or deleted Chat posts. Command
+frames: `agent pty` advances its cursors on the frames it wrote to the terminal,
+reconnects at those cursors, replays no input, and reports a retained `first`
+past its cursor as a visible gap. Command sequence gaps include refused or
+deleted Chat posts. Command
 history records accepted execution requests, not proof that the program executed
 them. Output and command history remain in process memory without a configured
 retention ceiling; process restart does not restore terminal sessions. Each

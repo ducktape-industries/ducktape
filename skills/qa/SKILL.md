@@ -240,8 +240,8 @@ credential, in the same `x-ducktape-admin-token` header. Reads stay open.
   generic frame lane. No product-specific Files HTTP endpoints are registered.
 - ACTING KEY — the blob upload, `POST /v1/fs/workspaces` and its commit accept
   a request signature; the workspace adapter carries that acting identity.
-- NODE-LEVEL — `/v1/submit`, `/v1/submit/raw/{target}`, `/v1/invite`, `/v1/log-filter`, `/v1/term/sessions`,
-  `DELETE /v1/fs/workspaces/{id}` — take the operator credential or a signature
+- NODE-LEVEL — `/v1/submit`, `/v1/submit/raw/{target}`, `/v1/invite`, `/v1/log-filter`,
+  `/v1/gateway/operator`, `DELETE /v1/fs/workspaces/{id}` — take the operator credential or a signature
   by the node's own operator key (its active wallet key at boot). A signature by
   any other key is `403 not_operator`.
 
