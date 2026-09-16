@@ -939,6 +939,122 @@ fn an_arrow_bends_by_the_handle_on_its_line_and_straightens_when_you_put_it_back
     assert_eq!(run.len(), 2, "the bend outlived the curve: {run:?}");
 }
 
+/// How far along a run's chord its bend lies and how far off it stands, both
+/// as fractions of the chord: the shape of the arc, with where it happens to
+/// be on the board taken out of it.
+fn arc(run: &[[f32; 2]]) -> [f32; 2] {
+    let axis = [run[2][0] - run[0][0], run[2][1] - run[0][1]];
+    let span = axis[0] * axis[0] + axis[1] * axis[1];
+    let off = [run[1][0] - run[0][0], run[1][1] - run[0][1]];
+    [
+        (off[0] * axis[0] + off[1] * axis[1]) / span,
+        (off[0] * -axis[1] + off[1] * axis[0]) / span,
+    ]
+}
+
+#[test]
+fn a_bent_arrow_keeps_its_arc_when_a_card_it_holds_moves() {
+    let mut view = linked();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    let board = view.visible().unwrap();
+    let run = super::interaction::stroke(&board, &board.shapes["edge"].shape);
+    let middle = [(run[0][0] + run[1][0]) / 2., (run[0][1] + run[1][1]) / 2.];
+    drag(
+        &mut view,
+        &[
+            middle,
+            [middle[0], middle[1] - 60.],
+            [middle[0], middle[1] - 120.],
+        ],
+    );
+    let board = view.visible().unwrap();
+    let bent = super::interaction::stroke(&board, &board.shapes["edge"].shape);
+    assert_eq!(bent.len(), 3, "the arrow did not bend: {bent:?}");
+    // The card the far end holds is dragged down and away. The arc goes with
+    // it: the same bend of the same line, turned and stretched onto the chord
+    // the two cards now make.
+    view.edit(Change::Move {
+        id: "b".into(),
+        x: 300,
+        y: 320,
+    });
+    let board = view.visible().unwrap();
+    let moved = super::interaction::stroke(&board, &board.shapes["edge"].shape);
+    assert_eq!(moved.len(), 3, "the bend was lost with the move: {moved:?}");
+    let (before, after) = (arc(&bent), arc(&moved));
+    // How far OFF the chord the bend stands is the arc itself, and it is
+    // carried exactly. How far ALONG it sits drifts a little, because the run
+    // is measured between the card borders and the bend is carried between
+    // their centres — the two ends do not leave their cards symmetrically once
+    // one of them has moved.
+    assert!(
+        (after[1] - before[1]).abs() < 0.02,
+        "the arc changed depth when the card moved: {before:?} became {after:?}"
+    );
+    assert!(
+        (after[0] - before[0]).abs() < 0.08,
+        "the bend slid along the chord when the card moved: {before:?} became \
+         {after:?}"
+    );
+    // And it did not simply stay where it was left, which is the hook the old
+    // reading drew across the gap.
+    assert!(
+        (moved[1][1] - bent[1][1]).abs() > 20.,
+        "the bend stayed at {:?} while the card it belongs to moved to meet it",
+        moved[1]
+    );
+}
+
+#[test]
+fn a_bend_goes_where_you_put_it_even_after_the_cards_have_moved() {
+    let mut view = linked();
+    view.on_size(1400., 900.);
+    view.camera = [0., 0.];
+    view.zoom = 1.;
+    let board = view.visible().unwrap();
+    let run = super::interaction::stroke(&board, &board.shapes["edge"].shape);
+    let middle = [(run[0][0] + run[1][0]) / 2., (run[0][1] + run[1][1]) / 2.];
+    drag(
+        &mut view,
+        &[
+            middle,
+            [middle[0], middle[1] - 60.],
+            [middle[0], middle[1] - 120.],
+        ],
+    );
+    // The card the far end holds is dragged well away, so the run the arrow is
+    // DRAWN along is nothing like the one its samples were written against.
+    // Taking the bend has to start from the line on the board, or the handle
+    // jumps out from under the pointer the moment it is pressed.
+    view.edit(Change::Move {
+        id: "b".into(),
+        x: 300,
+        y: 320,
+    });
+    let board = view.visible().unwrap();
+    let run = super::interaction::stroke(&board, &board.shapes["edge"].shape);
+    let held = run[1];
+    let put = [held[0] + 40., held[1] - 70.];
+    drag(
+        &mut view,
+        &[
+            held,
+            [(held[0] + put[0]) / 2., (held[1] + put[1]) / 2.],
+            put,
+        ],
+    );
+    let board = view.visible().unwrap();
+    let run = super::interaction::stroke(&board, &board.shapes["edge"].shape);
+    assert_eq!(run.len(), 3, "the bend was lost in the drag: {run:?}");
+    assert!(
+        (run[1][0] - put[0]).abs() < 2. && (run[1][1] - put[1]).abs() < 2.,
+        "the bend settled at {:?} rather than where it was let go, {put:?}",
+        run[1]
+    );
+}
+
 #[test]
 fn a_bend_dragged_across_a_card_binds_nothing() {
     let mut view = linked();
