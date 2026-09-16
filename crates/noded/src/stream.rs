@@ -3245,28 +3245,28 @@ mod tests {
         }
     }
 
-    /// A workspace-gated family hands back NO handle without the secret.
+    /// The workspace-gated family hands back NO handle without the secret.
     #[test]
-    fn gated_families_refuse_a_caller_with_no_workspace_secret() {
-        for gated in ["run-output:r1"] {
-            let Err(ServerFrame::Error { code, detail, .. }) =
-                prepare_topic(gated, NO_SECRET, NO_RUN, None, None)
-            else {
-                panic!("{gated} must refuse a caller with no workspace secret");
-            };
-            assert_eq!(code, StreamErrorCode::Forbidden);
-            // A TRIPWIRE, not the live check: `detail()` is a `&'static str`
-            // with no access to any secret, so this cannot fail today — it fails
-            // the day someone gives the refusal a formatted body. The real
-            // guarantee is structural and is stated where it is enforced, on
-            // `TopicRefusal::detail`.
-            assert!(
-                !detail.contains(TEST_SECRET),
-                "a refusal must never carry the secret: {detail}"
-            );
-            // and it admits the same caller once the secret matches.
-            assert!(prepare_topic(gated, HOLDS_SECRET, NO_RUN, None, None).is_ok());
-        }
+    fn the_gated_family_refuses_a_caller_with_no_workspace_secret() {
+        // the one family the workspace secret still gates: a run's output.
+        const GATED: &str = "run-output:r1";
+        let Err(ServerFrame::Error { code, detail, .. }) =
+            prepare_topic(GATED, NO_SECRET, NO_RUN, None, None)
+        else {
+            panic!("{GATED} must refuse a caller with no workspace secret");
+        };
+        assert_eq!(code, StreamErrorCode::Forbidden);
+        // A TRIPWIRE, not the live check: `detail()` is a `&'static str`
+        // with no access to any secret, so this cannot fail today — it fails
+        // the day someone gives the refusal a formatted body. The real
+        // guarantee is structural and is stated where it is enforced, on
+        // `TopicRefusal::detail`.
+        assert!(
+            !detail.contains(TEST_SECRET),
+            "a refusal must never carry the secret: {detail}"
+        );
+        // and it admits the same caller once the secret matches.
+        assert!(prepare_topic(GATED, HOLDS_SECRET, NO_RUN, None, None).is_ok());
         // the public families need nothing, on the same call.
         assert!(prepare_topic("logs", NO_SECRET, NO_RUN, None, None).is_ok());
         assert!(prepare_topic("metrics", NO_SECRET, NO_RUN, None, None).is_ok());

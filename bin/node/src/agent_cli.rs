@@ -536,7 +536,8 @@ async fn attach(
     // blocking thread on `read(0)`, so a reader per connection would leak one
     // per drop. Keystrokes typed while disconnected queue here and are sent
     // when the socket returns — they are the operator's input, never a replay.
-    let (keys, mut typed) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    let (keys, typed) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    let mut typed = Some(typed);
     let reader = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let mut buf = [0u8; 4096];
@@ -583,6 +584,24 @@ async fn attach(
     outcome
 }
 
+/// The next keystrokes this terminal typed, or a future that never completes
+/// once stdin has ended.
+///
+/// A closed channel is READY forever, so an attachment that kept selecting on
+/// one would spin at 100% CPU the moment stdin hit EOF — which is every
+/// `agent pty < script` and every closed tty. Ending the attachment there would
+/// be wrong the other way: the operator's input is over, the session is not, so
+/// the receiver is dropped and this arm parks.
+async fn typed_keys(typed: &mut Option<tokio::sync::mpsc::Receiver<Vec<u8>>>) -> Vec<u8> {
+    if let Some(keys) = typed.as_mut() {
+        if let Some(bytes) = keys.recv().await {
+            return bytes;
+        }
+        *typed = None;
+    }
+    std::future::pending().await
+}
+
 /// One attachment: open the session's WebSocket at the cursor this terminal has
 /// consumed, then pump until it ends or drops.
 #[allow(clippy::too_many_arguments)]
@@ -592,7 +611,7 @@ async fn attached(
     destination: &Destination,
     session: &str,
     cursor: &mut Cursor,
-    typed: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    typed: &mut Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     winch: &mut tokio::signal::unix::Signal,
     term: &mut tokio::signal::unix::Signal,
     hup: &mut tokio::signal::unix::Signal,
@@ -648,9 +667,8 @@ async fn attached(
                     return Ok(Detached::Ended);
                 }
             }
-            keys = typed.recv() => {
-                let Some(bytes) = keys else { continue };
-                socket.0.send(Message::text(input_command(&STANDARD.encode(bytes)))).await
+            keys = typed_keys(typed) => {
+                socket.0.send(Message::text(input_command(&STANDARD.encode(keys)))).await
                     .map_err(|e| format!("input: {e}"))?;
             }
             _ = winch.recv() => {
