@@ -14,3 +14,7 @@ futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ducktape-view-guest.workspace = true
+
+[dev-dependencies]
+runs = { path = "../../modules/apps/runs" }
+agent = { path = "../../modules/apps/agent" }

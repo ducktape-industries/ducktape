@@ -32,6 +32,75 @@ pub struct LocalRoute {
     pub account: u64,
     pub name: gateway::RouteName,
     pub port: u16,
+    pub trust: UpstreamTrust,
+}
+
+/// The authority the local process accepts. The field is required on disk;
+/// an installed application never silently becomes a trusted loopback service.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UpstreamTrust {
+    TrustedLoopback,
+    AuthenticatedLoopback { credential_file: PathBuf },
+}
+
+/// Reserved handoff header. Caller-supplied x-duck-* headers are stripped.
+pub const UPSTREAM_TOKEN_HEADER: &str = "x-duck-upstream-token";
+
+impl UpstreamTrust {
+    pub fn credential(&self) -> Result<Option<String>, String> {
+        let Self::AuthenticatedLoopback { credential_file } = self else {
+            return Ok(None);
+        };
+        read_credential(credential_file).map(Some)
+    }
+}
+
+/// Read exactly 32 random bytes encoded as 64 lowercase hex characters.
+/// Open without following symlinks, then check the opened file's ownership
+/// and mode; no pathname metadata check races an independent open.
+#[cfg(unix)]
+pub fn read_credential(path: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    if !path.is_absolute() {
+        return Err("upstream_credential_path_must_be_absolute".into());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| "upstream_credential_unreadable")?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "upstream_credential_metadata")?;
+    // SAFETY: geteuid has no arguments and only reads this process's identity.
+    let owner = unsafe { libc::geteuid() };
+    let private_regular = metadata.is_file()
+        && metadata.uid() == owner
+        && metadata.mode() & 0o077 == 0
+        && metadata.len() == 64;
+    if !private_regular {
+        return Err("upstream_credential_must_be_private_owner_file".into());
+    }
+    let mut bytes = Vec::with_capacity(65);
+    file.by_ref()
+        .take(65)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "upstream_credential_read")?;
+    let valid = bytes.len() == 64
+        && bytes
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    if !valid {
+        return Err("upstream_credential_invalid".into());
+    }
+    String::from_utf8(bytes).map_err(|_| "upstream_credential_invalid".into())
+}
+
+#[cfg(not(unix))]
+pub fn read_credential(_path: &Path) -> Result<String, String> {
+    Err("upstream_credential_requires_unix_isolation".into())
 }
 
 /// The one serve-time and file-order key: an (account, label) pair.
@@ -74,11 +143,15 @@ impl LocalRoutes {
 
     /// The port bound for THIS account's label, and nothing else — see
     /// [`LocalRoute::account`].
-    pub fn port(&self, account: u64, name: &gateway::RouteName) -> Option<u16> {
+    pub fn binding(&self, account: u64, name: &gateway::RouteName) -> Option<&LocalRoute> {
         self.routes
             .binary_search_by(|route| key(route).cmp(&(name, account)))
             .ok()
-            .map(|index| self.routes[index].port)
+            .map(|index| &self.routes[index])
+    }
+
+    pub fn port(&self, account: u64, name: &gateway::RouteName) -> Option<u16> {
+        self.binding(account, name).map(|route| route.port)
     }
 
     /// Is `name` bound here for some OTHER account? The one thing that
@@ -104,6 +177,7 @@ impl LocalRoutes {
                     account,
                     name,
                     port,
+                    trust: UpstreamTrust::TrustedLoopback,
                 },
             ),
         }
@@ -155,16 +229,23 @@ pub fn load(workspace: &Path) -> Result<LocalRoutes, String> {
     Ok(routes)
 }
 
-/// Every way this file is refused has ONE remedy, and it is cheap: the file is
-/// a cache of ports the daemons themselves chose, so deleting it loses nothing
-/// a heartbeat does not put straight back.
-///
-/// Worth spelling out because the refusal reads like data loss when it is not.
-/// A stale field name in here took down a whole `make dev` — the message named
-/// the offending field, and nothing else — and the remedy people reached for
-/// was hand-editing JSON under `~/.ducktape`.
-const REMEDY: &str = "this file only caches which local port each daemon chose: \
-                      delete it and restart the node, and each re-registers its own route";
+/// Invalid bindings must be repaired with an explicit authority choice.
+const REMEDY: &str =
+    "re-bind each route with an explicit --credential-file or --trusted-loopback authority";
+
+/// All route writers share one process-safe lock; readers see atomic renames.
+fn lock_routes(workspace: &Path) -> Result<std::fs::File, String> {
+    std::fs::create_dir_all(workspace).map_err(|error| error.to_string())?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(workspace.join(".gateway-routes.lock"))
+        .map_err(|error| error.to_string())?;
+    file.lock().map_err(|error| error.to_string())?;
+    Ok(file)
+}
 
 fn temporary_path(workspace: &Path) -> PathBuf {
     workspace.join(format!(".{FILE_NAME}.{}.tmp", std::process::id()))
@@ -174,15 +255,8 @@ fn save(workspace: &Path, routes: &LocalRoutes) -> Result<(), String> {
     routes.validate()?;
     std::fs::create_dir_all(workspace).map_err(|error| format!("create {workspace:?}: {error}"))?;
     let path = workspace.join(FILE_NAME);
-    // Per-process temp name. This file is read-modify-written on a service
-    // daemon's heartbeat, so a FIXED name lets that beat and an operator's
-    // `gateway bind` interleave until one rename publishes the other's bytes.
-    // The leftovers a crash leaves behind are reaped by
-    // [`sweep_stale_temporaries`], which is what the fixed name gave for free.
-    //
-    // ponytail: the read-modify-write itself is still last-writer-wins across
-    // processes — a lost update, not a torn file. Take a lock only if a second
-    // route-writing daemon ever appears.
+    // Writers hold lock_routes through load and rename. Per-process temporary
+    // names also isolate interrupted writes from the next process.
     let temporary = temporary_path(workspace);
     if routes.routes.is_empty() {
         match std::fs::remove_file(&path) {
@@ -208,7 +282,7 @@ pub(crate) enum GatewayCmd {
     /// register (or update) a loopback route (apex or --label) to --port
     Bind(BindArgs),
     /// remove a route (prints its local key)
-    Unbind(RouteArgs),
+    Unbind(UnbindArgs),
     /// print the local routes as one JSON array
     List(WorkspaceArgs),
 }
@@ -221,6 +295,15 @@ pub(crate) struct RouteArgs {
     label: Option<String>,
     #[command(flatten)]
     workspace: WorkspaceArgs,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct UnbindArgs {
+    #[command(flatten)]
+    route: RouteArgs,
+    /// Withdraw only this account's binding; omit to withdraw the whole label.
+    #[arg(long)]
+    account: Option<u64>,
 }
 
 impl RouteArgs {
@@ -246,6 +329,20 @@ pub(crate) struct BindArgs {
     /// than its operator's — the bind is where it says WHICH.
     #[arg(long, value_name = "ACCOUNT")]
     account: Option<u64>,
+    /// Private node-owned handoff token file shared with an isolated application.
+    #[arg(
+        long,
+        conflicts_with = "trusted_loopback",
+        required_unless_present = "trusted_loopback"
+    )]
+    credential_file: Option<PathBuf>,
+    /// Explicitly trust this local process without a handoff credential.
+    #[arg(
+        long,
+        conflicts_with = "credential_file",
+        required_unless_present = "credential_file"
+    )]
+    trusted_loopback: bool,
 }
 
 /// Run one verb of the `ducktape gateway` family.
@@ -266,7 +363,23 @@ fn bind(args: BindArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
     // the verb IS `register` plus a printed key — its own copy of the
     // load/upsert/save was a duplicate waiting to diverge from the daemon path.
-    register(&workspace, account, name.clone(), args.port.get())?;
+    let trust = match (args.credential_file, args.trusted_loopback) {
+        (Some(credential_file), false) => {
+            read_credential(&credential_file)?;
+            UpstreamTrust::AuthenticatedLoopback { credential_file }
+        }
+        (None, true) => UpstreamTrust::TrustedLoopback,
+        _ => return Err("select exactly one upstream trust mode".into()),
+    };
+    let _lock = lock_routes(&workspace)?;
+    let mut routes = load(&workspace)?;
+    routes.upsert(account, name.clone(), args.port.get());
+    let index = routes
+        .routes
+        .binary_search_by(|route| key(route).cmp(&(&name, account)))
+        .expect("upsert installed the binding");
+    routes.routes[index].trust = trust;
+    save(&workspace, &routes)?;
     println!("{}", name.local_key());
     Ok(())
 }
@@ -296,6 +409,7 @@ pub fn register(
         return Err("gateway route port must be non-zero".into());
     }
     name.validate()?;
+    let _lock = lock_routes(workspace)?;
     let mut routes = load(workspace)?;
     routes.upsert(account, name, port);
     save(workspace, &routes)
@@ -307,11 +421,11 @@ pub fn register(
 /// it was good for). One `read_dir` where a daemon starts restores that, at a
 /// cadence no hot path pays for.
 ///
-/// ponytail: a temp belonging to a LIVE writer mid-`save` is removed too, whose
-/// rename then fails loudly and whose caller retries — a failed command, never a
-/// corrupt file. Checking liveness would need `/proc`, which is not portable to
-/// the macOS boxes this runs on.
+/// The writer lock keeps cleanup from removing a live writer's temporary.
 pub fn sweep_stale_temporaries(workspace: &Path) {
+    let Ok(_lock) = lock_routes(workspace) else {
+        return;
+    };
     let Ok(entries) = std::fs::read_dir(workspace) else {
         return;
     };
@@ -365,6 +479,7 @@ pub fn reassert(
     port: u16,
 ) -> Result<RouteOwner, String> {
     // ONE load, and the write comes out of that same snapshot — see [`retire`].
+    let _lock = lock_routes(workspace)?;
     let mut routes = load(workspace)?;
     let owner = routes.owner(account, name, port);
     match owner {
@@ -401,6 +516,7 @@ pub fn retire(
     name: &gateway::RouteName,
     port: u16,
 ) -> Result<RouteOwner, String> {
+    let _lock = lock_routes(workspace)?;
     let mut routes = load(workspace)?;
     let owner = routes.owner(account, name, port);
     match owner {
@@ -413,19 +529,19 @@ pub fn retire(
     Ok(owner)
 }
 
-fn unbind(args: RouteArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let workspace = args.workspace.dir()?;
-    let name = args.name()?;
+fn unbind(args: UnbindArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let workspace = args.route.workspace.dir()?;
+    let name = args.route.name()?;
+    let _lock = lock_routes(&workspace)?;
     let mut routes = load(&workspace)?;
-    // Withdrawing consent is per LABEL, not per account: the operator is saying
-    // "this node stops serving that label", and every account it was bound for
-    // goes with it. Deliberately not the bind's twin — unbind must never need a
-    // running node to answer whose account the active wallet is on.
-    let before = routes.routes.len();
-    routes.routes.retain(|route| route.name != name);
-    if routes.routes.len() == before {
-        return Err(format!("gateway route {:?} does not exist", name.label).into());
-    }
+    // Explicit account scope lets one application retire without removing a
+    // different account's binding for the same label. Neither form dials a node.
+    routes.routes.retain(|route| {
+        let matches_scope =
+            route.name == name && args.account.is_none_or(|account| route.account == account);
+        !matches_scope
+    });
+    // No matching binding already satisfies withdrawal, including first startup.
     save(&workspace, &routes)?;
     println!("{}", name.local_key());
     Ok(())
@@ -455,6 +571,52 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn upstream_credentials_require_private_regular_owner_files() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credential");
+        let token = "ab".repeat(32);
+        std::fs::write(&path, &token).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_credential(&path).unwrap(), token);
+        let link = dir.path().join("link");
+        symlink(&path, &link).unwrap();
+        assert!(read_credential(&link).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_credential(&path).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, "ab".repeat(33)).unwrap();
+        assert!(read_credential(&path).is_err());
+        assert!(read_credential(Path::new("relative")).is_err());
+        assert!(read_credential(dir.path()).is_err());
+    }
+
+    #[test]
+    fn local_routes_require_an_explicit_trust_mode() {
+        let old = serde_json::json!({"account":1,"name":{"label":"api"},"port":9000});
+        assert!(serde_json::from_value::<LocalRoute>(old).is_err());
+    }
+
+    #[test]
+    fn scoped_withdrawal_preserves_other_accounts_on_the_same_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = gateway::RouteName::named("api");
+        register(dir.path(), ACCOUNT, name.clone(), 4000).unwrap();
+        register(dir.path(), ACCOUNT + 1, name.clone(), 4001).unwrap();
+        unbind(UnbindArgs {
+            route: route(dir.path(), Some("api"), None),
+            account: Some(ACCOUNT),
+        })
+        .unwrap();
+        assert_eq!(load(dir.path()).unwrap().port(ACCOUNT, &name), None);
+        assert_eq!(
+            load(dir.path()).unwrap().port(ACCOUNT + 1, &name),
+            Some(4001)
+        );
+    }
+
     #[test]
     fn apex_and_named_routes_are_canonical_and_leave_no_empty_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -470,8 +632,16 @@ mod tests {
             Some(4000)
         );
 
-        unbind(route(dir.path(), None, None)).unwrap();
-        unbind(route(dir.path(), Some("api"), None)).unwrap();
+        unbind(UnbindArgs {
+            route: route(dir.path(), None, None),
+            account: None,
+        })
+        .unwrap();
+        unbind(UnbindArgs {
+            route: route(dir.path(), Some("api"), None),
+            account: None,
+        })
+        .unwrap();
         assert!(!dir.path().join(FILE_NAME).exists());
         assert!(
             register(
@@ -492,9 +662,24 @@ mod tests {
         let name = gateway::RouteName::named("api");
         register(dir.path(), ACCOUNT, name.clone(), 4000).unwrap();
         register(dir.path(), ACCOUNT + 1, name.clone(), 4001).unwrap();
-        unbind(route(dir.path(), Some("api"), None)).unwrap();
+        unbind(UnbindArgs {
+            route: route(dir.path(), Some("api"), None),
+            account: None,
+        })
+        .unwrap();
         assert!(!dir.path().join(FILE_NAME).exists());
-        assert!(unbind(route(dir.path(), Some("api"), None)).is_err());
+        // Repeated withdrawal and first activation both start from no binding.
+        unbind(UnbindArgs {
+            route: route(dir.path(), Some("api"), None),
+            account: None,
+        })
+        .unwrap();
+        unbind(UnbindArgs {
+            route: route(dir.path(), Some("fresh-service"), None),
+            account: Some(ACCOUNT),
+        })
+        .unwrap();
+        assert!(!dir.path().join(FILE_NAME).exists());
     }
 
     /// A restarted daemon comes back on a FRESH ephemeral port, so registering

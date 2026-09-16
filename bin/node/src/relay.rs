@@ -3,11 +3,11 @@
 //!
 //! transport: ordinary submits ship the frame bytes on `CHANNEL_SUBMIT_RELAY`
 //! to one current validator, exactly as `node::encode_frame` produced them.
-//! a frame that references a node-local forge pack first fans that pack out to
+//! a frame that references a node-local blob first fans those bytes out to
 //! EVERY current validator in bounded, content-addressed chunks; only after all
 //! validators acknowledge the bytes does one validator take consensus custody.
 //! the frame's OWN signature is the AUTHORSHIP: it binds
-//! (origin, seq, target, payload) to the origin key, so forgery is impossible,
+//! (origin, seq, target, payload, required_blob) to the origin key, so forgery is impossible,
 //! and a byte-identical replay collapses in the consensus lane's exactly-once
 //! digest gate. authorship is not admission, though — the RELAYING peer must
 //! itself hold committed node standing (member or resident), exactly as
@@ -30,17 +30,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-/// Forge packs relayed by a resident or fanned out by a validator are bounded
-/// at exactly the smart-HTTP lane's ceiling (`noded::GIT_PACK_BODY_LIMIT`):
-/// a pack the door accepted, hashed and stored is one the relay carries. The
-/// two were separate numbers once (64 MiB here, 512 MiB there) and this
-/// repository's own 83 MiB pack was refused by the relay after the door had
-/// taken it in. The shared number is sized by THIS lane: every chunk of a
-/// pack crosses an inbound mailbox the p2p peer actor DROPS on when full,
-/// with no chunk retransmit, and one sender can count on exactly its own
-/// quota burst of that mailbox (`constants::MESH_QUOTA_BURST`) — the pins
-/// below keep one offer plus a max-size pack's chunks inside it.
-pub const MAX_RELAY_BLOB_BYTES: usize = noded::GIT_PACK_BODY_LIMIT;
+/// Relayed blobs share the generic CAS transfer ceiling. One offer plus all
+/// chunks must fit the sender's inbound-mailbox quota burst; this transport
+/// does not retransmit dropped chunks.
+pub const MAX_RELAY_BLOB_BYTES: usize = blobstore::MAX_TRANSFER_BYTES;
 
 /// 768 KiB raw -> 1.5 MiB hex plus a small JSON envelope, safely below the
 /// process-wide 2 MiB commonware message cap.
@@ -53,7 +46,7 @@ const _: () = assert!(RELAY_MESSAGES_PER_PACK <= crate::constants::MESH_QUOTA_BU
 // this repository's own full-history pack (83 MiB) fits.
 const _: () = assert!(MAX_RELAY_BLOB_BYTES >= 83 * 1024 * 1024);
 
-/// The extra hold a forge pack transfer earns on top of `SUBMIT_HOLD`,
+/// The extra hold a blob transfer earns on top of `SUBMIT_HOLD`,
 /// budgeted at a 1 MiB/s floor over the bytes that actually cross the wire:
 /// chunks ride hex-encoded (2x), and the fan-out is SERIAL per target, so the
 /// last target only starts receiving after every earlier one is done. The
@@ -133,32 +126,10 @@ pub fn decode_msg(b: &[u8]) -> Result<RelayMsg, String> {
     serde_json::from_slice(b).map_err(|e| e.to_string())
 }
 
-/// The one node-local blob a signed frame needs before entering consensus.
-/// Non-forge and malformed forge payloads return `None`: malformed module ops
-/// still reach the deterministic module rejection path instead of becoming a
-/// relay-specific policy decision.
+/// The optional storage prerequisite bound by the frame's verified signature.
+/// Module target and payload are opaque to the relay.
 pub fn required_blob_digest(frame: &[u8]) -> Option<[u8; 32]> {
-    // the door reads policy fields only.
-    let (_, msg) = node::decode_frame(frame).ok()?;
-    if msg.target != "forge" {
-        return None;
-    }
-    match forge::decode_msg(&msg.payload).ok()? {
-        forge::ForgeMsg::PushRefs { pack_digest, .. } => {
-            pack_digest.as_deref().and_then(digest_bytes)
-        }
-        forge::ForgeMsg::MergePr { pack_digest, .. } => digest_hex(&pack_digest),
-        _ => None,
-    }
-}
-
-fn digest_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
-    bytes.try_into().ok()
-}
-
-fn digest_hex(hex: &str) -> Option<[u8; 32]> {
-    let bytes = decode_hex(hex).ok()?;
-    digest_bytes(&bytes)
+    node::decode_frame_with_blob(frame).ok()?.2
 }
 
 pub use duckfs_core::{to_hex as encode_hex, unhex as decode_hex};
@@ -238,7 +209,8 @@ pub fn verify_relay_submit(
     members: &[Vec<u8>],
     residents: &[Vec<u8>],
 ) -> Result<node::FrameId, String> {
-    let (origin, _msg) = node::decode_frame(frame).map_err(|e| format!("bad frame: {e}"))?;
+    let (origin, _msg, _required_blob) =
+        node::decode_frame_with_blob(frame).map_err(|e| format!("bad frame: {e}"))?;
     let sdk::Origin::External(_) = origin else {
         return Err("relayed frames carry an external origin".into());
     };
@@ -260,21 +232,24 @@ fn holds_node_standing(key: &[u8], members: &[Vec<u8>], residents: &[Vec<u8>]) -
 
 /// Blob offers may originate from a standing resident or a current validator
 /// (the latter is the direct-to-validator HTTP push path fanning out to its
-/// peers). The signed frame authorizes the offered digest before allocation.
+/// peers). Standing belongs to the authenticated courier; the original user
+/// frame keeps its own signature and binds the offered digest before allocation.
 pub fn verify_blob_offer(
+    courier: &[u8],
     frame: &[u8],
     digest: &[u8; 32],
     members: &[Vec<u8>],
     residents: &[Vec<u8>],
 ) -> Result<node::FrameId, String> {
-    let (origin, _msg) = node::decode_frame(frame).map_err(|e| format!("bad frame: {e}"))?;
-    let sdk::Origin::External(origin_bytes) = origin else {
+    let (origin, _msg, required_blob) =
+        node::decode_frame_with_blob(frame).map_err(|e| format!("bad frame: {e}"))?;
+    let sdk::Origin::External(_) = origin else {
         return Err("blob offers carry an external origin".into());
     };
-    if !holds_node_standing(&origin_bytes, members, residents) {
-        return Err("blob offer origin holds no committed node standing".into());
+    if !holds_node_standing(courier, members, residents) {
+        return Err("blob offer courier holds no committed node standing".into());
     }
-    if required_blob_digest(frame).as_ref() != Some(digest) {
+    if required_blob.as_ref() != Some(digest) {
         return Err("blob offer digest is not referenced by its signed frame".into());
     }
     Ok(node::frame_id(frame))
@@ -328,8 +303,8 @@ mod tests {
     fn the_relay_assembly_accepts_every_pack_the_door_does() {
         let digest = [1; 32];
         assert!(BlobAssembly::new(digest, 83 * 1024 * 1024).is_ok());
-        assert!(BlobAssembly::new(digest, noded::GIT_PACK_BODY_LIMIT as u64).is_ok());
-        assert!(BlobAssembly::new(digest, noded::GIT_PACK_BODY_LIMIT as u64 + 1).is_err());
+        assert!(BlobAssembly::new(digest, blobstore::MAX_TRANSFER_BYTES as u64).is_ok());
+        assert!(BlobAssembly::new(digest, blobstore::MAX_TRANSFER_BYTES as u64 + 1).is_err());
     }
 
     #[test]
@@ -431,58 +406,78 @@ mod tests {
         let me = author.public_key().as_ref().to_vec();
         let digest = [0xCD; 32];
         let msg = sdk::Msg {
-            target: "forge".into(),
-            payload: forge::encode_msg(&forge::ForgeMsg::PushRefs {
-                repo: "ducktape".into(),
-                updates: Vec::new(),
-                pack_digest: Some(digest.to_vec()),
-                cert: None,
-            }),
+            target: "independently-installed-module".into(),
+            payload: b"opaque module operation".to_vec(),
         };
-        let frame = node::encode_frame(&author, 1, &msg);
-        assert!(verify_blob_offer(&frame, &digest, std::slice::from_ref(&me), &[]).is_ok());
-        assert!(verify_blob_offer(&frame, &digest, &[], std::slice::from_ref(&me)).is_ok());
-        assert!(verify_blob_offer(&frame, &digest, &[], &[]).is_err());
-        assert!(verify_blob_offer(&frame, &[0; 32], std::slice::from_ref(&me), &[]).is_err());
+        let frame = node::encode_frame_with_blob(&author, 1, &msg, Some(digest));
+        let courier = sk(9).public_key().as_ref().to_vec();
+        let admitted = verify_blob_offer(
+            &courier,
+            &frame,
+            &digest,
+            std::slice::from_ref(&courier),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(admitted, node::frame_id(&frame));
+        assert!(
+            verify_blob_offer(
+                &courier,
+                &frame,
+                &[0; 32],
+                std::slice::from_ref(&courier),
+                &[]
+            )
+            .is_err()
+        );
+        assert_eq!(
+            node::decode_frame(&frame).unwrap().0,
+            sdk::Origin::External(me.clone())
+        );
+        assert!(
+            verify_blob_offer(&courier, &frame, &digest, std::slice::from_ref(&me), &[]).is_err()
+        );
+        let mut tampered = frame.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(
+            verify_blob_offer(
+                &courier,
+                &tampered,
+                &digest,
+                std::slice::from_ref(&courier),
+                &[]
+            )
+            .is_err()
+        );
+        assert!(verify_blob_offer(&me, &frame, &digest, std::slice::from_ref(&me), &[]).is_ok());
+        assert!(verify_blob_offer(&me, &frame, &digest, &[], std::slice::from_ref(&me)).is_ok());
+        assert!(verify_blob_offer(&me, &frame, &digest, &[], &[]).is_err());
+        let undeclared = node::encode_frame(&author, 2, &msg);
+        assert!(
+            verify_blob_offer(&me, &undeclared, &digest, std::slice::from_ref(&me), &[]).is_err()
+        );
+        assert!(verify_blob_offer(&me, &frame, &[0; 32], std::slice::from_ref(&me), &[]).is_err());
     }
 
     #[test]
-    fn forge_pack_digest_is_discovered_from_signed_pushes_and_merges() {
+    fn prerequisite_comes_only_from_signed_metadata_for_any_target() {
         let author = sk(9);
         let digest = [0xAB; 32];
-        let push = sdk::Msg {
-            target: "forge".into(),
-            payload: forge::encode_msg(&forge::ForgeMsg::PushRefs {
-                repo: "ducktape".into(),
-                updates: Vec::new(),
-                pack_digest: Some(digest.to_vec()),
-                cert: None,
-            }),
-        };
-        assert_eq!(
-            required_blob_digest(&node::encode_frame(&author, 1, &push)),
-            Some(digest)
-        );
-
-        let merge = sdk::Msg {
-            target: "forge".into(),
-            payload: forge::encode_msg(&forge::ForgeMsg::MergePr {
-                repo: "ducktape".into(),
-                number: 1,
-                prev_target_oid: "1".repeat(40),
-                expected_source_oid: "2".repeat(40),
-                merge_oid: "3".repeat(40),
-                pack_digest: encode_hex(&digest),
-            }),
-        };
-        assert_eq!(
-            required_blob_digest(&node::encode_frame(&author, 2, &merge)),
-            Some(digest)
-        );
-        assert_eq!(
-            required_blob_digest(&node::encode_frame(&author, 3, &msg())),
-            None
-        );
+        for target in ["custom-storage", "forge", "files"] {
+            let message = sdk::Msg {
+                target: target.into(),
+                payload: b"opaque payload that is not any native module schema".to_vec(),
+            };
+            let frame = node::encode_frame_with_blob(&author, 1, &message, Some(digest));
+            assert_eq!(required_blob_digest(&frame), Some(digest));
+            assert_eq!(
+                required_blob_digest(&node::encode_frame(&author, 2, &message)),
+                None
+            );
+            let mut tampered = frame;
+            *tampered.last_mut().unwrap() ^= 1;
+            assert_eq!(required_blob_digest(&tampered), None);
+        }
     }
 
     #[test]

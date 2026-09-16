@@ -128,23 +128,7 @@ impl Ducktape {
             AppMessage::DismissError => self.on_dismiss_error(),
             AppMessage::ConnectFailed(cause) => self.on_connect_failed(cause),
             AppMessage::ForgeViewEvent(event) => self.on_forge_view_event(event),
-            AppMessage::ForgeComposerEvent(scope, body) => {
-                self.on_forge_composer_event(scope, body)
-            }
-            AppMessage::ForgeNoteSent(op, next) => self.on_forge_note_sent(op, next),
-            AppMessage::ForgeNoteFailed(scope, op, cause) => {
-                self.on_forge_note_failed(scope, op, cause)
-            }
             AppMessage::FilesViewEvent(event) => self.on_files_view_event(event),
-            AppMessage::FsFileDropped(path) => self.on_fs_file_dropped(path),
-            AppMessage::AttachmentQueued(scope, id, path) => {
-                self.on_attachment_queued(scope, id, path)
-            }
-            AppMessage::AttachmentUploaded(scope, id, outcome) => {
-                self.on_attachment_uploaded(scope, id, outcome)
-            }
-            AppMessage::FsDropped(_result) => self.on_fs_dropped(_result),
-            AppMessage::FsDropFailed(cause) => self.on_fs_drop_failed(cause),
             AppMessage::AccountLoaded(next) => self.on_account_loaded(next),
             AppMessage::AccountFailed(cause) => self.on_account_failed(cause),
             AppMessage::AccountRenamed(_result) => self.on_account_renamed(_result),
@@ -161,7 +145,6 @@ impl Ducktape {
             AppMessage::DmPeersLoaded(next) => self.on_dm_peers_loaded(next),
             AppMessage::DmPeersFailed(cause) => self.on_dm_peers_failed(cause),
             AppMessage::AgentsViewEvent(event) => self.on_agents_view_event(event),
-            AppMessage::AgentStatusSet(_result) => self.on_agent_status_set(_result),
             AppMessage::NodeViewEvent(event) => self.on_node_view_event(event),
             AppMessage::NodeFactsLoaded(next) => self.on_node_facts_loaded(next),
             AppMessage::UpdateJobReplied(reply) => self.on_update_job_replied(reply),
@@ -210,38 +193,14 @@ impl Ducktape {
             }
             AppMessage::ChooseChannel(id) => self.on_choose_channel(id),
             AppMessage::ChooseDm(peer_key) => self.on_choose_dm(peer_key),
-            AppMessage::CreateChannelSubmit => self.on_create_channel_submit(),
-            AppMessage::ToggleChannelCreateMembersOnly => {
-                self.on_toggle_channel_create_members_only()
-            }
-            AppMessage::ToggleChannelCreate => self.on_toggle_channel_create(),
             AppMessage::JoinHuddleSubmit => self.on_join_huddle_submit(),
             AppMessage::HuddleJoinedAck(_result) => self.on_huddle_joined_ack(_result),
             AppMessage::JoinVoice(id) => self.on_join_voice(id),
             AppMessage::VoiceJoined(id) => self.on_voice_joined(id),
-            AppMessage::ToggleChannelCreateVoice => self.on_toggle_channel_create_voice(),
-            AppMessage::ChatBeginEdit(scope, body, seq, rev) => {
-                self.on_chat_begin_edit(scope, body, seq, rev)
-            }
-            AppMessage::ComposerSubmitted(kind, pending_body, pending_id, scope) => {
-                self.on_composer_submitted(kind, pending_body, pending_id, scope)
-            }
-            AppMessage::EditMessageSubmit(text) => self.on_edit_message_submit(text),
-            AppMessage::MessageSent(next) => self.on_message_sent(next),
-            AppMessage::MessageSendFailed(cause) => self.on_message_send_failed(cause),
-            AppMessage::ThreadReplySendFailed(cause) => self.on_thread_reply_send_failed(cause),
-            AppMessage::ThreadReplySent(next) => self.on_thread_reply_sent(next),
             AppMessage::ChatUpdated(next) => self.on_chat_updated(next),
             AppMessage::ChatLoadFailed(cause) => self.on_chat_load_failed(cause),
-            AppMessage::ChannelCreated(next) => self.on_channel_created(next),
             AppMessage::LiveAgentsEvent(next) => self.on_live_agents_event(next),
-            AppMessage::LiveCancelAcked(_ok) => self.on_live_cancel_acked(_ok),
-            AppMessage::ChatAcked(_result) => self.on_chat_acked(_result),
-            AppMessage::CopyMessageLink(link) => self.on_copy_message_link(link),
             AppMessage::OpenMessageLink(url) => self.on_open_message_link(url),
-            AppMessage::ChatScrolled(_absolute_x, _absolute_y, _relative_x, relative_y) => {
-                self.on_chat_scrolled(_absolute_x, _absolute_y, _relative_x, relative_y)
-            }
             AppMessage::CopyChordPressed(event) => self.on_copy_chord_pressed(event),
             AppMessage::ChatViewEvent(event) => self.on_chat_view_event(event),
             AppMessage::PagesViewEvent(event) => self.on_pages_view_event(event),
@@ -314,12 +273,7 @@ impl Ducktape {
             AppMessage::HuddleGoChannel => self.on_huddle_go_channel(),
             AppMessage::LeaveHuddleHere => self.on_leave_huddle_here(),
             AppMessage::HuddleLeft(_result) => self.on_huddle_left(_result),
-            AppMessage::HuddleInviteesLoaded(members) => self.on_huddle_invitees_loaded(members),
-            AppMessage::InviteToHuddle(key) => self.on_invite_to_huddle(key),
-            AppMessage::HuddleInviteSent(key) => self.on_huddle_invite_sent(key),
-            AppMessage::HuddleInviteFailed(key, error) => self.on_huddle_invite_failed(key, error),
             AppMessage::SecretTyped(slot, text) => self.on_secret_typed(slot, text),
-            AppMessage::ChannelDraftChanged(value) => self.on_channel_draft_changed(value),
         }
     }
     fn on_appearance_save_reply(
@@ -718,25 +672,12 @@ impl Ducktape {
         self.loading = true;
         self.connected = false;
         self.channels = Vec::new();
-        self.rooms = Vec::new();
-        self.dm_rows = Vec::new();
-        self.chat_at_tail = true;
         self.chat_land_seq = 0;
-        self.chat_pending_sends = Vec::new();
-        self.chat_edit_seq = 0;
-        self.chat_edit_rev = 0;
-        self.channel_reads = Vec::new();
-        self.unread_boundary = 0;
         self.active_channel = "".to_owned();
-        self.active_dm_peer = "".to_owned();
-        self.active_dm = crate::backend::no_dm_peer();
-        self.history_view = false;
+        self.chat_dm_peer.clear();
         self.active_channel_name = "".to_owned();
         self.active_channel_archived = false;
-        self.active_channel_members_only = false;
-        self.channel_members = Vec::new();
-        self.post_refusal = "".to_owned();
-        self.pending_channel = "".to_owned();
+
         self.page_route = "".to_owned();
         self.palette_search_phase = SearchPhase::Idle;
         self.error = "".to_owned();
@@ -799,35 +740,10 @@ impl Ducktape {
         self.block_height = next.height;
         self.channels = next.channels.clone();
         self.chat_chain_id = self.network_chain_id.to_owned();
-        self.channel_reads = crate::backend::initial_channel_reads(
-            next.channels.clone(),
-            ::std::mem::take(&mut self.channel_reads),
-        );
-        self.rooms = crate::backend::chat_sidebar_rooms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
-        self.dm_rows = crate::backend::chat_sidebar_dms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
-        self.unread_boundary = 0;
-        self.history_view = false;
-        self.chat_at_tail = true;
         self.chat_land_seq = 0;
         self.active_channel = next.active_channel.to_owned();
-        self.active_dm_peer = crate::backend::dm_peer_of_channel(
-            self.active_dm_peer.to_owned(),
-            self.dm_peers.clone(),
-            self.active_channel.to_owned(),
-        );
-        self.active_dm =
-            crate::backend::dm_peer_named(self.dm_peers.clone(), self.active_dm_peer.to_owned());
         self.active_channel_name = next.active_channel_name.to_owned();
         self.active_channel_archived = next.active_channel_archived;
-        self.active_channel_members_only = next.active_channel_members_only;
         self.huddle_joined_at =
             crate::backend::keep_i64(self.huddle_joined, self.huddle_joined_at, self.huddle_now);
         let huddle = crate::backend::huddle_after_load(
@@ -842,25 +758,9 @@ impl Ducktape {
         );
         self.huddle_joined = huddle.joined;
         self.huddle_roster = huddle.roster.clone();
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
-        self.channel_members = next.channel_members.clone();
-        crate::module_view::chat_composer_roster(
-            &(crate::backend::composer_scope(&self.connected_rpc, &self.active_channel)),
-            &self.channel_members,
-        );
-        self.post_refusal = crate::backend::post_gate(
-            self.active_channel_archived,
-            self.active_channel_members_only,
-            self.channel_members.clone(),
-            self.settings_user_key.to_owned(),
-        );
+
         self.connected = true;
         self.loading = false;
         self.mutation_phase = MutationPhase::Idle;
@@ -879,7 +779,7 @@ impl Ducktape {
         Task::batch([
             {
                 let pending_task = Task::perform(
-                    crate::backend::load_dm_peers(
+                    crate::backend::refresh_name_directory(
                         self.connected_rpc.to_owned(),
                         self.dm_peers_generation,
                     ),
@@ -1094,31 +994,15 @@ impl Ducktape {
                 let folded_chat = crate::backend::fold_live_chat(
                     next.chat.clone(),
                     self.channels.clone(),
-                    self.channel_members.clone(),
-                    self.channel_reads.clone(),
-                    self.dm_peers.clone(),
-                    self.settings_user_key.to_owned(),
                     self.active_channel.to_owned(),
-                    self.history_view,
-                    self.shell_tab == ShellTab::Chat,
                     self.active_channel_name.to_owned(),
                     self.active_channel_archived,
-                    self.active_channel_members_only,
                 );
                 self.channels = folded_chat.channels.clone();
-                self.channel_members = folded_chat.channel_members.clone();
                 self.follow_voice_room_roster();
-                crate::module_view::chat_composer_roster(
-                    &(crate::backend::composer_scope(&self.connected_rpc, &self.active_channel)),
-                    &self.channel_members,
-                );
-                self.channel_reads = folded_chat.channel_reads.clone();
-                self.rooms = folded_chat.rooms.clone();
-                self.dm_rows = folded_chat.dm_rows.clone();
                 self.active_channel_name = folded_chat.active_channel_name.to_owned();
                 self.active_channel_archived = folded_chat.active_channel_archived;
-                self.active_channel_members_only = folded_chat.active_channel_members_only;
-                self.post_refusal = folded_chat.post_refusal.to_owned();
+
                 if !folded_chat.refresh_chat {
                     return Task::none();
                 }
@@ -1365,33 +1249,17 @@ impl Ducktape {
             next.channels.clone(),
             ::std::mem::take(&mut self.channels),
         );
-        self.channel_reads = crate::backend::initial_channel_reads(
-            self.channels.clone(),
-            ::std::mem::take(&mut self.channel_reads),
-        );
         self.chat_chain_id = crate::backend::keep_str(
             next.chat_loaded && (!(self.network_chain_id).is_empty()),
             &self.network_chain_id,
             &self.chat_chain_id,
         );
-        self.history_view = self.history_view && (!next.chat_loaded);
         self.chat_land_seq = crate::backend::keep_i64(next.chat_loaded, 0, self.chat_land_seq);
         self.active_channel = crate::backend::keep_str(
             next.chat_loaded,
             &(next.active_channel),
             &self.active_channel,
         );
-        self.active_dm_peer = crate::backend::keep_str(
-            next.chat_loaded && (!self.loading),
-            &(crate::backend::dm_peer_of_channel(
-                self.active_dm_peer.to_owned(),
-                self.dm_peers.clone(),
-                self.active_channel.to_owned(),
-            )),
-            &self.active_dm_peer,
-        );
-        self.active_dm =
-            crate::backend::dm_peer_named(self.dm_peers.clone(), self.active_dm_peer.to_owned());
         self.active_channel_name = crate::backend::keep_str(
             next.chat_loaded,
             &(next.active_channel_name),
@@ -1401,11 +1269,6 @@ impl Ducktape {
             next.chat_loaded,
             next.active_channel_archived,
             self.active_channel_archived,
-        );
-        self.active_channel_members_only = crate::backend::keep_bool(
-            next.chat_loaded,
-            next.active_channel_members_only,
-            self.active_channel_members_only,
         );
         self.huddle_joined_at =
             crate::backend::keep_i64(self.huddle_joined, self.huddle_joined_at, self.huddle_now);
@@ -1421,52 +1284,9 @@ impl Ducktape {
         );
         self.huddle_joined = huddle.joined;
         self.huddle_roster = huddle.roster.clone();
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
-        self.channel_members = crate::backend::keep_members(
-            next.chat_loaded,
-            next.channel_members.clone(),
-            ::std::mem::take(&mut self.channel_members),
-        );
-        self.post_refusal = crate::backend::post_gate(
-            self.active_channel_archived,
-            self.active_channel_members_only,
-            self.channel_members.clone(),
-            self.settings_user_key.to_owned(),
-        );
-        let resync_tail_channel = crate::backend::keep_str(
-            (!self.history_view) && (self.shell_tab == ShellTab::Chat),
-            &self.active_channel,
-            "",
-        );
-        self.unread_boundary = crate::backend::frozen_unread_boundary(
-            self.channel_reads.clone(),
-            self.channels.clone(),
-            self.active_channel.to_owned(),
-            self.active_channel.to_owned(),
-            self.unread_boundary,
-        );
-        self.channel_reads = crate::backend::mark_channel_read(
-            ::std::mem::take(&mut self.channel_reads),
-            resync_tail_channel.to_owned(),
-            crate::backend::channel_head_seq(self.channels.clone(), resync_tail_channel.to_owned()),
-        );
-        self.rooms = crate::backend::chat_sidebar_rooms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
-        self.dm_rows = crate::backend::chat_sidebar_dms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
+
         self.mutation_phase = crate::backend::mutation_phase_after_recovery(self.mutation_phase);
         self.error = "".to_owned();
         crate::shell::close::<AppMessage>(crate::backend::window_target_unless(
@@ -1530,40 +1350,6 @@ impl Ducktape {
         self.account_ceremony_detail = "".to_owned();
         self.account_ceremony_left = "".to_owned();
         self.shell_tab = next;
-        let chat_tab_channel = crate::backend::keep_str(
-            (self.shell_tab == ShellTab::Chat) && (!self.history_view),
-            &self.active_channel,
-            "",
-        );
-        let chat_tab_arrivals =
-            crate::backend::channel_head_seq(self.channels.clone(), chat_tab_channel.to_owned())
-                > crate::backend::channel_last_read(
-                    self.channel_reads.clone(),
-                    chat_tab_channel.to_owned(),
-                );
-        self.unread_boundary = crate::backend::keep_i64(
-            chat_tab_arrivals,
-            crate::backend::channel_last_read(
-                self.channel_reads.clone(),
-                chat_tab_channel.to_owned(),
-            ),
-            self.unread_boundary,
-        );
-        self.channel_reads = crate::backend::mark_channel_read(
-            ::std::mem::take(&mut self.channel_reads),
-            chat_tab_channel.to_owned(),
-            crate::backend::channel_head_seq(self.channels.clone(), chat_tab_channel.to_owned()),
-        );
-        self.rooms = crate::backend::chat_sidebar_rooms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
-        self.dm_rows = crate::backend::chat_sidebar_dms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
         self.error = "".to_owned();
         if !self.connected {
             return Task::none();
@@ -1703,7 +1489,7 @@ impl Ducktape {
             return Task::none();
         }
         let pending_task = Task::perform(
-            crate::backend::load_dm_peers(request.rpc.to_owned(), request.generation),
+            crate::backend::refresh_name_directory(request.rpc.to_owned(), request.generation),
             |result| match result {
                 Ok(value) => AppMessage::DmPeersLoaded(value),
                 Err(error) => AppMessage::DmPeersFailed(error),
@@ -2033,23 +1819,7 @@ impl Ducktape {
         crate::shell::clipboard::<AppMessage>(self.node_key.to_owned())
     }
     fn on_mutation_failed(&mut self, cause: crate::backend::AppError) -> Task<AppMessage> {
-        self.chat_edit_seq = crate::backend::message_seq_after_failure(
-            self.chat_edit_seq,
-            self.mutation_phase,
-            cause.committed,
-        );
-        self.chat_edit_rev = crate::backend::message_seq_after_failure(
-            self.chat_edit_rev,
-            self.mutation_phase,
-            cause.committed,
-        );
         self.mutation_phase = crate::backend::mutation_failure_phase(cause.committed);
-        self.channel_draft = crate::backend::restore_draft(
-            self.channel_draft.to_owned(),
-            self.pending_channel.to_owned(),
-            cause.committed,
-        );
-        self.pending_channel = "".to_owned();
         self.error = cause.message.to_owned();
         if !cause.committed {
             return Task::none();
@@ -2163,26 +1933,6 @@ impl Ducktape {
             ForgeIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
                 crate::module_view::event_text(&(event), "url"),
             )),
-            ForgeIntent::Attach => Task::done(AppMessage::AttachmentQueued(
-                crate::module_view::event_text(&(event), "scope"),
-                crate::module_view::event_text(&(event), "id"),
-                crate::module_view::event_text(&(event), "path"),
-            )),
-            ForgeIntent::Composer => {
-                let scope = crate::module_view::event_text(&(event), "scope");
-                let submitted_scope = scope.to_owned();
-                // the files the submit sent, linked into the note's body
-                let links = crate::composer_surface::take_attachments(
-                    &crate::module_view::event_text(&(event), "id"),
-                );
-                Task::done(AppMessage::ForgeComposerEvent(
-                    submitted_scope.clone(),
-                    crate::backend::attachment_body(
-                        crate::module_view::event_text(&(event), "body"),
-                        &links,
-                    ),
-                ))
-            }
             ForgeIntent::Copy => {
                 self.toast = crate::module_view::event_text(&(event), "label");
                 self.toast_age = 0;
@@ -2193,82 +1943,10 @@ impl Ducktape {
             }
         }
     }
-    fn on_forge_composer_event(&mut self, scope: String, body: String) -> Task<AppMessage> {
-        let channel = crate::backend::scope_channel(&(scope), &self.connected_rpc);
-        match crate::backend::submit_verdict(
-            self.loading,
-            self.connected,
-            channel.to_owned(),
-            self.forge_note_pending.to_owned(),
-            !(channel).is_empty(),
-            scope.to_owned(),
-            scope.to_owned(),
-        ) {
-            SubmitVerdict::Refused => {
-                crate::module_view::chat_composer_unsent(&(scope), &(body), false);
-                Task::none()
-            }
-            SubmitVerdict::Admitted => {
-                let op = crate::backend::fresh_operation_id("forge-note".to_owned());
-                self.forge_note_pending = op.to_owned();
-                let send_operation = op.to_owned();
-                let receipt_scope = scope.to_owned();
-                let receipt_operation = op.to_owned();
-                Task::perform(
-                    crate::backend::send_message(
-                        self.connected_rpc.to_owned(),
-                        self.password.to_owned(),
-                        channel.to_owned(),
-                        op.to_owned(),
-                        (body).trim().to_owned(),
-                    ),
-                    move |result| match result {
-                        Ok(value) => AppMessage::ForgeNoteSent(send_operation.clone(), value),
-                        Err(error) => AppMessage::ForgeNoteFailed(
-                            receipt_scope.clone(),
-                            receipt_operation.clone(),
-                            error,
-                        ),
-                    },
-                )
-            }
-        }
-    }
-    fn on_forge_note_sent(
-        &mut self,
-        op: String,
-        _next: crate::backend::SendReceipt,
-    ) -> Task<AppMessage> {
-        if op != self.forge_note_pending {
-            return Task::none();
-        }
-        self.forge_note_pending = "".to_owned();
-        self.error = "".to_owned();
-        Task::none()
-    }
-    fn on_forge_note_failed(
-        &mut self,
-        scope: String,
-        op: String,
-        cause: crate::backend::OptimisticMutationError,
-    ) -> Task<AppMessage> {
-        crate::module_view::chat_composer_unsent(&(scope), &(cause.body), cause.committed);
-        if op != self.forge_note_pending {
-            return Task::none();
-        }
-        self.forge_note_pending = "".to_owned();
-        self.error = cause.message.to_owned();
-        Task::none()
-    }
     fn on_files_view_event(
         &mut self,
         event: crate::module_view::ModuleViewEvent,
     ) -> Task<AppMessage> {
-        self.fs_drop_dir = crate::backend::keep_str(
-            event.kind == "at",
-            &(crate::module_view::event_text(&(event), "path")),
-            &self.fs_drop_dir,
-        );
         if event.kind != "open_link" {
             return Task::none();
         }
@@ -2276,96 +1954,6 @@ impl Ducktape {
             &(event),
             "url",
         )))
-    }
-    fn on_fs_file_dropped(&mut self, path: String) -> Task<AppMessage> {
-        // a drop on the chat attaches to the room's composer
-        if self.shell_tab == ShellTab::Chat {
-            return self.on_chat_file_dropped(path);
-        }
-        if ((self.shell_tab != ShellTab::Files) || self.fs_dropping) || (!self.connected) {
-            return Task::none();
-        }
-        self.error = crate::backend::files_write_gate(
-            self.fs_drop_dir.to_owned(),
-            self.settings_user_key.to_owned(),
-        );
-        if !(self.error).is_empty() {
-            return Task::none();
-        }
-        self.fs_dropping = true;
-        Task::perform(
-            crate::backend::files_upload(
-                self.connected_rpc.to_owned(),
-                self.password.to_owned(),
-                self.fs_drop_dir.to_owned(),
-                path.to_owned(),
-            ),
-            |result| match result {
-                Ok(value) => AppMessage::FsDropped(value),
-                Err(error) => AppMessage::FsDropFailed(error),
-            },
-        )
-    }
-    /// A file dropped anywhere on the chat: into the standby zone of the
-    /// open room's composer, and on its way into DuckFS.
-    fn on_chat_file_dropped(&mut self, path: String) -> Task<AppMessage> {
-        if !self.connected || self.active_channel.is_empty() {
-            return Task::none();
-        }
-        let scope = crate::backend::composer_scope(&self.connected_rpc, &self.active_channel);
-        match crate::composer_surface::attach(&scope, &[path]) {
-            Ok(queued) => Task::batch(queued.into_iter().map(|attachment| {
-                Task::done(AppMessage::AttachmentQueued(
-                    scope.clone(),
-                    attachment.id,
-                    attachment.path,
-                ))
-            })),
-            Err(reason) => {
-                self.error = reason;
-                Task::none()
-            }
-        }
-    }
-    /// An attached file starts its upload under its own id.
-    fn on_attachment_queued(
-        &mut self,
-        scope: String,
-        id: String,
-        path: String,
-    ) -> Task<AppMessage> {
-        let answer_scope = scope.clone();
-        let answer_id = id.clone();
-        Task::perform(
-            crate::backend::attach_file(
-                self.connected_rpc.to_owned(),
-                self.password.to_owned(),
-                id,
-                path,
-            ),
-            move |outcome| {
-                AppMessage::AttachmentUploaded(answer_scope.clone(), answer_id.clone(), outcome)
-            },
-        )
-    }
-    /// Where the file landed, or why it did not, back to its chip.
-    fn on_attachment_uploaded(
-        &mut self,
-        scope: String,
-        id: String,
-        outcome: Result<String, String>,
-    ) -> Task<AppMessage> {
-        crate::composer_surface::attached(&scope, &id, outcome);
-        Task::none()
-    }
-    fn on_fs_dropped(&mut self, _result: bool) -> Task<AppMessage> {
-        self.fs_dropping = false;
-        Task::none()
-    }
-    fn on_fs_drop_failed(&mut self, cause: crate::backend::AppError) -> Task<AppMessage> {
-        self.fs_dropping = false;
-        self.error = cause.message.to_owned();
-        Task::none()
     }
     fn on_account_loaded(&mut self, next: crate::backend::AccountData) -> Task<AppMessage> {
         if next.generation != self.account_generation {
@@ -2634,23 +2222,7 @@ impl Ducktape {
         }
         Task::none()
     }
-    fn on_dm_peers_loaded(&mut self, next: crate::backend::DmPeersData) -> Task<AppMessage> {
-        if next.generation != self.dm_peers_generation {
-            return Task::none();
-        }
-        self.dm_peers = next.peers.clone();
-        self.rooms = crate::backend::chat_sidebar_rooms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
-        self.dm_rows = crate::backend::chat_sidebar_dms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
-        self.active_dm =
-            crate::backend::dm_peer_named(self.dm_peers.clone(), self.active_dm_peer.to_owned());
+    fn on_dm_peers_loaded(&mut self, _generation: i64) -> Task<AppMessage> {
         Task::none()
     }
     fn on_dm_peers_failed(&mut self, cause: crate::backend::HydrationError) -> Task<AppMessage> {
@@ -2671,29 +2243,10 @@ impl Ducktape {
                 self.agents_live = crate::module_view::event_int(&(event), "count") > 0;
                 Task::none()
             }
-            AgentsIntent::Register => Task::perform(
-                crate::backend::register_agent(
-                    self.connected_rpc.to_owned(),
-                    self.password.to_owned(),
-                    self.account_number.to_owned(),
-                    event.detail.to_owned(),
-                ),
-                |result| match result {
-                    Ok(value) => AppMessage::AgentStatusSet(value),
-                    Err(error) => AppMessage::MutationFailed(error),
-                },
-            ),
-            AgentsIntent::OpenRun => Task::done(AppMessage::OpenRunPanel(
-                crate::module_view::event_text(&(event), "dispatch_id"),
-            )),
             AgentsIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
                 crate::module_view::event_text(&(event), "url"),
             )),
         }
-    }
-    fn on_agent_status_set(&mut self, _result: bool) -> Task<AppMessage> {
-        self.error = "".to_owned();
-        Task::none()
     }
     fn on_node_view_event(
         &mut self,
@@ -2766,12 +2319,7 @@ impl Ducktape {
         self.settings_key_path = next.key_path.to_owned();
         self.settings_key_state = next.key_state.to_owned();
         self.settings_user_key = next.user_key.to_owned();
-        self.post_refusal = crate::backend::post_gate(
-            self.active_channel_archived,
-            self.active_channel_members_only,
-            self.channel_members.clone(),
-            self.settings_user_key.to_owned(),
-        );
+
         Task::none()
     }
     fn on_settings_failed(&mut self, cause: crate::backend::HydrationError) -> Task<AppMessage> {
@@ -3472,12 +3020,8 @@ impl Ducktape {
         }
     }
     fn on_global_key_pressed(&mut self, event: crate::shell::KeyPress) -> Task<AppMessage> {
-        let escape_key = crate::backend::escape_target(
-            event.key.clone(),
-            self.palette_open,
-            self.bell_open,
-            self.channel_create_open,
-        );
+        let escape_key =
+            crate::backend::escape_target(event.key.clone(), self.palette_open, self.bell_open);
         let palette_key = crate::backend::palette_key_action(
             event.key.clone(),
             event.modifiers,
@@ -3487,7 +3031,6 @@ impl Ducktape {
             return Task::none();
         }
         self.bell_open = self.bell_open && (escape_key != "bell");
-        self.channel_create_open = self.channel_create_open && (escape_key != "channel_create");
         if palette_key == "none" {
             return Task::none();
         }
@@ -3562,41 +3105,17 @@ impl Ducktape {
         if self.mutation_phase != MutationPhase::Idle {
             return Task::none();
         }
+        self.chat_dm_peer.clear();
         let next_channel = crate::backend::channel_switch_facts(
-            self.channel_reads.clone(),
             self.channels.clone(),
-            self.active_channel.to_owned(),
             channel_id.to_owned(),
-            self.unread_boundary,
             self.active_channel_name.to_owned(),
         );
-        self.unread_boundary = next_channel.unread_boundary;
         self.active_channel = channel_id.to_owned();
         self.chat_land_seq = target_seq;
-        self.active_dm_peer = crate::backend::dm_peer_of_channel(
-            self.active_dm_peer.to_owned(),
-            self.dm_peers.clone(),
-            self.active_channel.to_owned(),
-        );
-        self.active_dm =
-            crate::backend::dm_peer_named(self.dm_peers.clone(), self.active_dm_peer.to_owned());
         self.active_channel_name = next_channel.name.to_owned();
         self.active_channel_archived = next_channel.archived;
-        self.active_channel_members_only = next_channel.members_only;
-        self.history_view = true;
-        self.chat_at_tail = false;
-        self.channel_members = Vec::new();
-        let post_gate_known = !self.active_channel_members_only;
-        self.post_refusal = crate::backend::keep_str(
-            post_gate_known,
-            &(crate::backend::post_gate(
-                self.active_channel_archived,
-                self.active_channel_members_only,
-                self.channel_members.clone(),
-                self.settings_user_key.to_owned(),
-            )),
-            "",
-        );
+
         self.palette_open = false;
         self.account_qr_auth_generation = self.account_qr_auth_generation.wrapping_add(1);
         if let Some(previous_handle) = self.account_qr_auth_task.take() {
@@ -3645,36 +3164,17 @@ impl Ducktape {
         if self.mutation_phase != MutationPhase::Idle {
             return Task::none();
         }
-        self.active_dm_peer = "".to_owned();
-        self.active_dm = crate::backend::no_dm_peer();
-        self.history_view = false;
-        self.chat_at_tail = true;
+        self.chat_dm_peer.clear();
         self.chat_land_seq = 0;
         let next_channel = crate::backend::channel_switch_facts(
-            self.channel_reads.clone(),
             self.channels.clone(),
-            self.active_channel.to_owned(),
             id.to_owned(),
-            self.unread_boundary,
             self.active_channel_name.to_owned(),
         );
-        self.unread_boundary = next_channel.unread_boundary;
         self.active_channel = id.to_owned();
         self.active_channel_name = next_channel.name.to_owned();
         self.active_channel_archived = next_channel.archived;
-        self.active_channel_members_only = next_channel.members_only;
-        self.channel_members = Vec::new();
-        let post_gate_known = !self.active_channel_members_only;
-        self.post_refusal = crate::backend::keep_str(
-            post_gate_known,
-            &(crate::backend::post_gate(
-                self.active_channel_archived,
-                self.active_channel_members_only,
-                self.channel_members.clone(),
-                self.settings_user_key.to_owned(),
-            )),
-            "",
-        );
+
         self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         self.loading = true;
@@ -3704,95 +3204,16 @@ impl Ducktape {
             AppMessage::ChannelWindowLoadReply(request_generation, Box::new(reply_message))
         })
     }
-    fn on_choose_dm(&mut self, peer_key: String) -> Task<AppMessage> {
-        if (self.mutation_phase != MutationPhase::Idle) || (peer_key).is_empty() {
+    fn on_choose_dm(&mut self, peer: String) -> Task<AppMessage> {
+        let may_navigate = self.mutation_phase == MutationPhase::Idle && !peer.is_empty();
+        if !may_navigate {
             return Task::none();
         }
-        self.channel_window_load_generation = self.channel_window_load_generation.wrapping_add(1);
-        if let Some(previous_handle) = self.channel_window_load_task.take() {
-            previous_handle.abort();
-        }
-        self.active_dm_peer = peer_key.to_owned();
-        self.active_dm =
-            crate::backend::dm_peer_named(self.dm_peers.clone(), self.active_dm_peer.to_owned());
-        let dm_room =
-            crate::backend::dm_room_of_peer(self.dm_peers.clone(), self.active_dm_peer.to_owned());
-        self.history_view = false;
-        self.chat_at_tail = true;
-        self.chat_land_seq = 0;
-        let next_channel = crate::backend::channel_switch_facts(
-            self.channel_reads.clone(),
-            self.channels.clone(),
-            self.active_channel.to_owned(),
-            dm_room.to_owned(),
-            self.unread_boundary,
-            self.active_channel_name.to_owned(),
-        );
-        self.unread_boundary = next_channel.unread_boundary;
-        self.active_channel = dm_room.to_owned();
-        self.active_channel_name = next_channel.name.to_owned();
-        self.active_channel_archived = next_channel.archived;
-        self.active_channel_members_only = next_channel.members_only;
-        self.channel_members = Vec::new();
-        self.post_refusal = "".to_owned();
-        self.hydration_generation += 1;
-        self.hydration_retry_attempt = 0;
-        self.loading = true;
-        self.error = "".to_owned();
-        self.chat_generation += 1;
-        Task::perform(
-            crate::backend::open_dm(
-                self.connected_rpc.to_owned(),
-                self.password.to_owned(),
-                self.active_dm_peer.to_owned(),
-                self.chat_generation,
-            ),
-            |result| match result {
-                Ok(value) => AppMessage::ChatUpdated(value),
-                Err(error) => AppMessage::ChatLoadFailed(error),
-            },
-        )
-    }
-    fn on_create_channel_submit(&mut self) -> Task<AppMessage> {
-        if (self.loading || (self.mutation_phase != MutationPhase::Idle))
-            || ((self.channel_draft).trim().to_owned()).is_empty()
-        {
-            return Task::none();
-        }
-        self.hydration_generation += 1;
-        self.hydration_retry_attempt = 0;
-        self.mutation_phase = MutationPhase::Channel;
-        self.pending_channel = (self.channel_draft).trim().to_owned();
-        self.channel_draft = "".to_owned();
-        self.error = "".to_owned();
-        self.chat_generation += 1;
-        Task::perform(
-            crate::backend::create_channel(
-                self.connected_rpc.to_owned(),
-                self.password.to_owned(),
-                self.pending_channel.to_owned(),
-                self.channel_create_members_only,
-                self.channel_create_voice,
-                self.chat_generation,
-            ),
-            |result| match result {
-                Ok(value) => AppMessage::ChannelCreated(value),
-                Err(error) => AppMessage::MutationFailed(error),
-            },
-        )
-    }
-    fn on_toggle_channel_create_members_only(&mut self) -> Task<AppMessage> {
-        self.channel_create_members_only = !self.channel_create_members_only;
+        self.chat_dm_peer = peer;
+        self.chat_dm_serial = self.chat_dm_serial.wrapping_add(1);
         Task::none()
     }
-    fn on_toggle_channel_create_voice(&mut self) -> Task<AppMessage> {
-        self.channel_create_voice = !self.channel_create_voice;
-        Task::none()
-    }
-    fn on_toggle_channel_create(&mut self) -> Task<AppMessage> {
-        self.channel_create_open = !self.channel_create_open;
-        Task::none()
-    }
+
     fn on_join_huddle_submit(&mut self) -> Task<AppMessage> {
         if ((self.loading || (self.mutation_phase != MutationPhase::Idle))
             || (self.active_channel).is_empty())
@@ -3885,12 +3306,6 @@ impl Ducktape {
             return;
         };
         self.huddle_roster = crate::backend::roster_of_seats(&room.huddle);
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
     }
     /// The reader is seated in `channel`'s huddle: open the huddle window and
     /// re-read the room on screen so its seats catch up.
@@ -3898,24 +3313,13 @@ impl Ducktape {
         self.mutation_phase = MutationPhase::Idle;
         self.error = "".to_owned();
         self.huddle_joined = true;
+        self.huddle_instance = self.huddle_instance.wrapping_add(1);
         self.huddle_channel = channel;
         self.huddle_channel_name = name;
         self.huddle_joined_at = self.huddle_now;
-        self.huddle_invitees = Vec::new();
         self.follow_voice_room_roster();
         self.chat_generation += 1;
-        let invitees = Task::perform(
-            crate::backend::load_huddle_invitees(
-                self.connected_rpc.to_owned(),
-                self.huddle_channel.to_owned(),
-            ),
-            |result| match result {
-                Ok(members) => AppMessage::HuddleInviteesLoaded(members),
-                // no roll, no chips: the invite is a convenience, not the call
-                Err(_) => AppMessage::HuddleInviteesLoaded(Vec::new()),
-            },
-        );
-        Task::batch([Task::done(AppMessage::ShowHuddle), invitees, {
+        Task::batch([Task::done(AppMessage::ShowHuddle), {
             let pending_task = Task::perform(
                 crate::backend::load_channel_window(
                     self.connected_rpc.to_owned(),
@@ -3942,298 +3346,6 @@ impl Ducktape {
             })
         }])
     }
-    fn on_chat_begin_edit(
-        &mut self,
-        scope: String,
-        body: String,
-        seq: i64,
-        rev: i64,
-    ) -> Task<AppMessage> {
-        if (body).is_empty() || (seq <= 0) {
-            return Task::none();
-        }
-        self.chat_edit_seq = seq;
-        self.chat_edit_rev = rev;
-        crate::module_view::chat_composer_seed(&(scope), &(body));
-        Task::none()
-    }
-    fn on_composer_submitted(
-        &mut self,
-        kind: ComposerKind,
-        pending_body: String,
-        pending_id: String,
-        scope: String,
-    ) -> Task<AppMessage> {
-        // the files the submit sent, already in DuckFS, and the body that links them
-        let links = crate::composer_surface::take_attachments(&pending_id);
-        let pending_body = crate::backend::attachment_body(pending_body, &links);
-        match kind {
-            ComposerKind::Message => {
-                match crate::backend::submit_verdict(
-                    self.loading,
-                    self.connected,
-                    self.active_channel.to_owned(),
-                    self.post_refusal.to_owned(),
-                    true,
-                    scope.to_owned(),
-                    crate::backend::composer_scope(&self.connected_rpc, &self.active_channel),
-                ) {
-                    SubmitVerdict::Refused => {
-                        crate::module_view::chat_composer_unsent(&(scope), &(pending_body), false);
-                        Task::none()
-                    }
-                    SubmitVerdict::Admitted => {
-                        self.hydration_generation += 1;
-                        self.hydration_retry_attempt = 0;
-                        self.chat_pending_sends = crate::backend::send_pending(
-                            ::std::mem::take(&mut self.chat_pending_sends),
-                            pending_id.to_owned(),
-                            pending_body.to_owned(),
-                            0,
-                        );
-                        self.error = "".to_owned();
-                        self.chat_at_tail = true;
-                        self.history_view = false;
-                        self.chat_sent_serial += 1;
-                        Task::perform(
-                            crate::backend::send_message(
-                                self.connected_rpc.to_owned(),
-                                self.password.to_owned(),
-                                self.active_channel.to_owned(),
-                                pending_id.to_owned(),
-                                pending_body.to_owned(),
-                            ),
-                            |result| match result {
-                                Ok(value) => AppMessage::MessageSent(value),
-                                Err(error) => AppMessage::MessageSendFailed(error),
-                            },
-                        )
-                    }
-                }
-            }
-            ComposerKind::Reply => {
-                let thread_seq = crate::backend::scope_thread_seq(&(scope));
-                match crate::backend::submit_verdict(
-                    false,
-                    self.connected,
-                    self.active_channel.to_owned(),
-                    self.post_refusal.to_owned(),
-                    thread_seq > 0,
-                    scope.to_owned(),
-                    crate::backend::thread_scope(
-                        &self.connected_rpc,
-                        &self.active_channel,
-                        thread_seq,
-                    ),
-                ) {
-                    SubmitVerdict::Refused => {
-                        crate::module_view::chat_composer_unsent(&(scope), &(pending_body), false);
-                        Task::none()
-                    }
-                    SubmitVerdict::Admitted => {
-                        self.hydration_generation += 1;
-                        self.hydration_retry_attempt = 0;
-                        self.chat_pending_sends = crate::backend::send_pending(
-                            ::std::mem::take(&mut self.chat_pending_sends),
-                            pending_id.to_owned(),
-                            pending_body.to_owned(),
-                            thread_seq,
-                        );
-                        self.error = "".to_owned();
-                        Task::perform(
-                            crate::backend::send_reply(
-                                self.connected_rpc.to_owned(),
-                                self.password.to_owned(),
-                                self.active_channel.to_owned(),
-                                thread_seq,
-                                pending_id.to_owned(),
-                                pending_body.to_owned(),
-                            ),
-                            |result| match result {
-                                Ok(value) => AppMessage::ThreadReplySent(value),
-                                Err(error) => AppMessage::ThreadReplySendFailed(error),
-                            },
-                        )
-                    }
-                }
-            }
-            ComposerKind::Edit => {
-                if scope
-                    != crate::backend::edit_scope(
-                        &self.connected_rpc,
-                        &self.active_channel,
-                        self.chat_edit_seq,
-                    )
-                {
-                    return Task::none();
-                }
-                Task::done(AppMessage::EditMessageSubmit(
-                    (pending_body).trim().to_owned(),
-                ))
-            }
-            ComposerKind::ThreadEdit => {
-                if scope
-                    != crate::backend::edit_scope(
-                        &self.connected_rpc,
-                        &self.active_channel,
-                        self.chat_edit_seq,
-                    )
-                {
-                    return Task::none();
-                }
-                Task::done(AppMessage::EditMessageSubmit(
-                    (pending_body).trim().to_owned(),
-                ))
-            }
-        }
-    }
-    fn on_edit_message_submit(&mut self, text: String) -> Task<AppMessage> {
-        if (((self.loading || (self.mutation_phase != MutationPhase::Idle))
-            || (self.active_channel).is_empty())
-            || (self.chat_edit_seq <= 0))
-            || ((text).trim().to_owned()).is_empty()
-        {
-            return Task::none();
-        }
-        self.hydration_generation += 1;
-        self.hydration_retry_attempt = 0;
-        self.mutation_phase = MutationPhase::MessageEdit;
-        self.error = "".to_owned();
-        Task::perform(
-            crate::backend::edit_message(
-                self.connected_rpc.to_owned(),
-                self.password.to_owned(),
-                self.active_channel.to_owned(),
-                self.chat_edit_seq,
-                self.chat_edit_rev,
-                (text).trim().to_owned(),
-            ),
-            |result| match result {
-                Ok(value) => AppMessage::ChatAcked(value),
-                Err(error) => AppMessage::MutationFailed(error),
-            },
-        )
-    }
-    fn on_message_sent(&mut self, next: crate::backend::SendReceipt) -> Task<AppMessage> {
-        self.chat_pending_sends = crate::backend::send_settled(
-            ::std::mem::take(&mut self.chat_pending_sends),
-            &(next.operation_id),
-        );
-        if self.active_channel != next.channel_id {
-            return Task::none();
-        }
-        self.error = "".to_owned();
-        Task::none()
-    }
-    fn on_message_send_failed(
-        &mut self,
-        cause: crate::backend::OptimisticMutationError,
-    ) -> Task<AppMessage> {
-        self.error = cause.message.to_owned();
-        self.chat_pending_sends = crate::backend::send_failed(
-            ::std::mem::take(&mut self.chat_pending_sends),
-            &(cause.operation_id),
-            cause.committed,
-        );
-        crate::module_view::chat_composer_unsent(
-            &(crate::backend::composer_scope(&self.connected_rpc, &(cause.scope_id))),
-            &(cause.body),
-            cause.committed,
-        );
-        if (self.active_channel != cause.scope_id) || (!cause.committed) {
-            return Task::none();
-        }
-        self.hydration_generation += 1;
-        self.hydration_retry_attempt = 0;
-        let pending_task = Task::perform(
-            crate::backend::live_resync_load(
-                self.connected_rpc.to_owned(),
-                self.active_channel.to_owned(),
-                true,
-                false,
-                self.hydration_generation,
-                0,
-            ),
-            |result| match result {
-                Ok(value) => AppMessage::LiveResynced(value),
-                Err(error) => AppMessage::LiveResyncFailed(error),
-            },
-        );
-        self.live_resync_generation = self.live_resync_generation.wrapping_add(1);
-        let request_generation = self.live_resync_generation;
-        let (pending_task, request_handle) = pending_task.abortable();
-        if let Some(previous_handle) = self
-            .live_resync_task
-            .replace(request_handle.abort_on_drop())
-        {
-            previous_handle.abort();
-        }
-        pending_task.map(move |reply_message| {
-            AppMessage::LiveResyncReply(request_generation, Box::new(reply_message))
-        })
-    }
-    fn on_thread_reply_send_failed(
-        &mut self,
-        cause: crate::backend::OptimisticMutationError,
-    ) -> Task<AppMessage> {
-        self.error = cause.message.to_owned();
-        self.chat_pending_sends = crate::backend::send_failed(
-            ::std::mem::take(&mut self.chat_pending_sends),
-            &(cause.operation_id),
-            cause.committed,
-        );
-        crate::module_view::chat_composer_unsent(
-            &(crate::backend::thread_scope(
-                &self.connected_rpc,
-                &(cause.scope_id),
-                cause.thread_seq,
-            )),
-            &(cause.body),
-            cause.committed,
-        );
-        if (self.active_channel != cause.scope_id) || (!cause.committed) {
-            return Task::none();
-        }
-        self.hydration_generation += 1;
-        self.hydration_retry_attempt = 0;
-        let pending_task = Task::perform(
-            crate::backend::live_resync_load(
-                self.connected_rpc.to_owned(),
-                self.active_channel.to_owned(),
-                true,
-                false,
-                self.hydration_generation,
-                0,
-            ),
-            |result| match result {
-                Ok(value) => AppMessage::LiveResynced(value),
-                Err(error) => AppMessage::LiveResyncFailed(error),
-            },
-        );
-        self.live_resync_generation = self.live_resync_generation.wrapping_add(1);
-        let request_generation = self.live_resync_generation;
-        let (pending_task, request_handle) = pending_task.abortable();
-        if let Some(previous_handle) = self
-            .live_resync_task
-            .replace(request_handle.abort_on_drop())
-        {
-            previous_handle.abort();
-        }
-        pending_task.map(move |reply_message| {
-            AppMessage::LiveResyncReply(request_generation, Box::new(reply_message))
-        })
-    }
-    fn on_thread_reply_sent(&mut self, next: crate::backend::SendReceipt) -> Task<AppMessage> {
-        self.chat_pending_sends = crate::backend::send_settled(
-            ::std::mem::take(&mut self.chat_pending_sends),
-            &(next.operation_id),
-        );
-        if self.active_channel != next.channel_id {
-            return Task::none();
-        }
-        self.error = "".to_owned();
-        Task::none()
-    }
     fn on_chat_updated(&mut self, next: crate::backend::ChatData) -> Task<AppMessage> {
         if next.generation != self.chat_generation {
             return Task::none();
@@ -4242,42 +3354,11 @@ impl Ducktape {
             ::std::mem::take(&mut self.channels),
             next.channels.clone(),
         );
-        self.unread_boundary = crate::backend::frozen_unread_boundary(
-            self.channel_reads.clone(),
-            self.channels.clone(),
-            self.active_channel.to_owned(),
-            next.active_channel.to_owned(),
-            self.unread_boundary,
-        );
-        self.channel_reads = crate::backend::mark_channel_read(
-            ::std::mem::take(&mut self.channel_reads),
-            next.active_channel.to_owned(),
-            crate::backend::channel_head_seq(self.channels.clone(), next.active_channel.to_owned()),
-        );
-        self.rooms = crate::backend::chat_sidebar_rooms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
-        self.dm_rows = crate::backend::chat_sidebar_dms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
         let landed_elsewhere = self.active_channel != next.active_channel;
-        self.history_view = self.history_view && (!landed_elsewhere);
         self.chat_land_seq = crate::backend::keep_i64(landed_elsewhere, 0, self.chat_land_seq);
         self.active_channel = next.active_channel.to_owned();
-        self.active_dm_peer = crate::backend::dm_peer_of_channel(
-            self.active_dm_peer.to_owned(),
-            self.dm_peers.clone(),
-            self.active_channel.to_owned(),
-        );
-        self.active_dm =
-            crate::backend::dm_peer_named(self.dm_peers.clone(), self.active_dm_peer.to_owned());
         self.active_channel_name = next.active_channel_name.to_owned();
         self.active_channel_archived = next.active_channel_archived;
-        self.active_channel_members_only = next.active_channel_members_only;
         self.huddle_joined_at =
             crate::backend::keep_i64(self.huddle_joined, self.huddle_joined_at, self.huddle_now);
         let huddle = crate::backend::huddle_after_load(
@@ -4292,25 +3373,9 @@ impl Ducktape {
         );
         self.huddle_joined = huddle.joined;
         self.huddle_roster = huddle.roster.clone();
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
         self.huddle_channel = huddle.channel.to_owned();
         self.huddle_channel_name = huddle.channel_name.to_owned();
-        self.channel_members = next.channel_members.clone();
-        crate::module_view::chat_composer_roster(
-            &(crate::backend::composer_scope(&self.connected_rpc, &self.active_channel)),
-            &self.channel_members,
-        );
-        self.post_refusal = crate::backend::post_gate(
-            self.active_channel_archived,
-            self.active_channel_members_only,
-            self.channel_members.clone(),
-            self.settings_user_key.to_owned(),
-        );
+
         self.loading = false;
         self.error = "".to_owned();
         crate::shell::close::<AppMessage>(crate::backend::window_target_unless(
@@ -4328,94 +3393,7 @@ impl Ducktape {
         self.error = cause.message.to_owned();
         Task::none()
     }
-    fn on_channel_created(&mut self, next: crate::backend::ChatData) -> Task<AppMessage> {
-        self.pending_channel = "".to_owned();
-        self.channel_create_open = false;
-        self.channel_create_members_only = false;
-        self.channel_create_voice = false;
-        self.mutation_phase = MutationPhase::Idle;
-        if next.generation != self.chat_generation {
-            return Task::none();
-        }
-        self.history_view = false;
-        self.chat_at_tail = true;
-        self.chat_land_seq = 0;
-        self.channels = crate::backend::upsert_channel_rows(
-            ::std::mem::take(&mut self.channels),
-            next.channels.clone(),
-        );
-        self.unread_boundary = crate::backend::frozen_unread_boundary(
-            self.channel_reads.clone(),
-            self.channels.clone(),
-            self.active_channel.to_owned(),
-            next.active_channel.to_owned(),
-            self.unread_boundary,
-        );
-        self.channel_reads = crate::backend::mark_channel_read(
-            ::std::mem::take(&mut self.channel_reads),
-            next.active_channel.to_owned(),
-            crate::backend::channel_head_seq(self.channels.clone(), next.active_channel.to_owned()),
-        );
-        self.rooms = crate::backend::chat_sidebar_rooms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
-        self.dm_rows = crate::backend::chat_sidebar_dms(
-            self.channels.clone(),
-            self.dm_peers.clone(),
-            self.channel_reads.clone(),
-        );
-        self.active_channel = next.active_channel.to_owned();
-        self.active_dm_peer = crate::backend::dm_peer_of_channel(
-            self.active_dm_peer.to_owned(),
-            self.dm_peers.clone(),
-            self.active_channel.to_owned(),
-        );
-        self.active_dm =
-            crate::backend::dm_peer_named(self.dm_peers.clone(), self.active_dm_peer.to_owned());
-        self.active_channel_name = next.active_channel_name.to_owned();
-        self.active_channel_archived = next.active_channel_archived;
-        self.active_channel_members_only = next.active_channel_members_only;
-        self.huddle_joined_at =
-            crate::backend::keep_i64(self.huddle_joined, self.huddle_joined_at, self.huddle_now);
-        let huddle = crate::backend::huddle_after_load(
-            true,
-            self.huddle_joined,
-            self.huddle_channel.to_owned(),
-            self.huddle_channel_name.to_owned(),
-            self.huddle_roster.clone(),
-            self.active_channel.to_owned(),
-            self.active_channel_name.to_owned(),
-            next.huddle_roster.clone(),
-        );
-        self.huddle_joined = huddle.joined;
-        self.huddle_roster = huddle.roster.clone();
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
-        self.huddle_channel = huddle.channel.to_owned();
-        self.huddle_channel_name = huddle.channel_name.to_owned();
-        self.channel_members = next.channel_members.clone();
-        crate::module_view::chat_composer_roster(
-            &(crate::backend::composer_scope(&self.connected_rpc, &self.active_channel)),
-            &self.channel_members,
-        );
-        self.post_refusal = crate::backend::post_gate(
-            self.active_channel_archived,
-            self.active_channel_members_only,
-            self.channel_members.clone(),
-            self.settings_user_key.to_owned(),
-        );
-        self.error = "".to_owned();
-        crate::shell::close::<AppMessage>(crate::backend::window_target_unless(
-            self.huddle_joined,
-            self.huddle_win,
-        ))
-    }
+
     fn on_live_agents_event(&mut self, next: crate::backend::LiveAgentNotice) -> Task<AppMessage> {
         if crate::backend::live_agents_stale(
             &(next),
@@ -4428,29 +3406,6 @@ impl Ducktape {
         }
         self.live_agents = next.rows.clone();
         Task::none()
-    }
-    fn on_live_cancel_acked(&mut self, _ok: bool) -> Task<AppMessage> {
-        self.error = "".to_owned();
-        Task::none()
-    }
-    fn on_chat_acked(&mut self, _result: bool) -> Task<AppMessage> {
-        self.chat_edit_seq = 0;
-        self.chat_edit_rev = 0;
-        self.pending_channel = "".to_owned();
-        self.channel_create_open = false;
-        self.mutation_phase = MutationPhase::Idle;
-        self.error = "".to_owned();
-        Task::none()
-    }
-    fn on_copy_message_link(&mut self, link: String) -> Task<AppMessage> {
-        if (link).is_empty() {
-            return Task::none();
-        }
-        let confirmation = "Message link copied".to_owned();
-        Task::done(AppMessage::CopyToClipboard(
-            link.to_owned(),
-            confirmation.clone(),
-        ))
     }
     fn on_open_message_link(&mut self, url: String) -> Task<AppMessage> {
         if (url).is_empty() {
@@ -4608,17 +3563,6 @@ impl Ducktape {
             }
         }
     }
-    fn on_chat_scrolled(
-        &mut self,
-        _absolute_x: f64,
-        _absolute_y: f64,
-        _relative_x: f64,
-        relative_y: f64,
-    ) -> Task<AppMessage> {
-        self.chat_at_tail = crate::backend::near_scroll_tail(relative_y);
-        self.history_view = (!self.chat_at_tail) || (self.chat_land_seq > 0);
-        Task::none()
-    }
     fn on_copy_chord_pressed(&mut self, event: crate::shell::KeyPress) -> Task<AppMessage> {
         if !crate::backend::is_copy_chord(event.key.clone(), event.modifiers) {
             return Task::none();
@@ -4634,41 +3578,12 @@ impl Ducktape {
         event: crate::module_view::ModuleViewEvent,
     ) -> Task<AppMessage> {
         match crate::module_view::chat_intent(&(event)) {
-            ChatIntent::OpenHit => {
-                let target_seq = crate::module_view::event_int(&(event), "target_seq");
-                let target_sequence = target_seq;
-                Task::done(AppMessage::OpenChatSearchHit(
-                    crate::module_view::event_text(&(event), "channel"),
-                    target_sequence,
-                ))
-            }
-            ChatIntent::ToggleCreate => Task::done(AppMessage::ToggleChannelCreate),
-            ChatIntent::ChooseChannel => Task::done(AppMessage::ChooseChannel(
-                crate::module_view::event_text(&(event), "id"),
-            )),
-            ChatIntent::ChooseDm => Task::done(AppMessage::ChooseDm(
-                crate::module_view::event_text(&(event), "key"),
-            )),
             ChatIntent::ShowHuddle => Task::done(AppMessage::ShowHuddle),
             ChatIntent::LeaveHuddle => Task::done(AppMessage::LeaveHuddleHere),
             ChatIntent::JoinHuddle => Task::done(AppMessage::JoinHuddleSubmit),
             ChatIntent::JoinVoice => Task::done(AppMessage::JoinVoice(
                 crate::module_view::event_text(&(event), "id"),
             )),
-            ChatIntent::Scrolled => {
-                let absolute_y = crate::module_view::event_num(&(event), "absolute_y");
-                let relative_x = crate::module_view::event_num(&(event), "relative_x");
-                let relative_y = crate::module_view::event_num(&(event), "relative_y");
-                let pointer_absolute_y = absolute_y;
-                let pointer_relative_x = relative_x;
-                let pointer_relative_y = relative_y;
-                Task::done(AppMessage::ChatScrolled(
-                    crate::module_view::event_num(&(event), "absolute_x"),
-                    pointer_absolute_y,
-                    pointer_relative_x,
-                    pointer_relative_y,
-                ))
-            }
             ChatIntent::OpenLink => Task::done(AppMessage::OpenMessageLink(
                 crate::module_view::event_text(&(event), "url"),
             )),
@@ -4678,56 +3593,6 @@ impl Ducktape {
                 Task::done(AppMessage::CopyToClipboard(
                     crate::module_view::event_text(&(event), "text"),
                     clipboard_label.clone(),
-                ))
-            }
-            ChatIntent::CopyLink => Task::done(AppMessage::CopyMessageLink(
-                crate::module_view::event_text(&(event), "link"),
-            )),
-            ChatIntent::BeginEdit => {
-                let body = crate::module_view::event_text(&(event), "body");
-                let seq = crate::module_view::event_int(&(event), "seq");
-                let rev = crate::module_view::event_int(&(event), "rev");
-                let edit_body = body.to_owned();
-                let edit_sequence = seq;
-                let edit_revision = rev;
-                Task::done(AppMessage::ChatBeginEdit(
-                    crate::module_view::event_text(&(event), "scope"),
-                    edit_body.clone(),
-                    edit_sequence,
-                    edit_revision,
-                ))
-            }
-            ChatIntent::CancelRun => Task::perform(
-                crate::backend::cancel_agent_run(
-                    self.connected_rpc.to_owned(),
-                    self.password.to_owned(),
-                    crate::module_view::event_text(&(event), "run_id"),
-                ),
-                |result| match result {
-                    Ok(value) => AppMessage::LiveCancelAcked(value),
-                    Err(error) => AppMessage::MutationFailed(error),
-                },
-            ),
-            ChatIntent::OpenRun => Task::done(AppMessage::OpenRunPanel(
-                crate::module_view::event_text(&(event), "dispatch_id"),
-            )),
-            ChatIntent::Attach => Task::done(AppMessage::AttachmentQueued(
-                crate::module_view::event_text(&(event), "scope"),
-                crate::module_view::event_text(&(event), "id"),
-                crate::module_view::event_text(&(event), "path"),
-            )),
-            ChatIntent::Composer => {
-                let kind = crate::module_view::chat_event_kind(&(event));
-                let id = crate::module_view::event_text(&(event), "id");
-                let scope = crate::module_view::event_text(&(event), "scope");
-                let reaction_kind = kind;
-                let reaction_id = id.to_owned();
-                let reaction_scope = scope.to_owned();
-                Task::done(AppMessage::ComposerSubmitted(
-                    reaction_kind,
-                    crate::module_view::event_text(&(event), "body"),
-                    reaction_id.clone(),
-                    reaction_scope.clone(),
                 ))
             }
         }
@@ -5593,26 +4458,12 @@ impl Ducktape {
         self.hydration_retry_attempt = 0;
         self.mutation_phase = MutationPhase::Idle;
         self.channels = Vec::new();
-        self.rooms = Vec::new();
-        self.dm_rows = Vec::new();
-        self.chat_at_tail = true;
         self.chat_land_seq = 0;
-        self.chat_pending_sends = Vec::new();
-        self.chat_edit_seq = 0;
-        self.chat_edit_rev = 0;
-        self.channel_reads = Vec::new();
-        self.unread_boundary = 0;
         self.active_channel = "".to_owned();
-        self.active_dm_peer = "".to_owned();
-        self.active_dm = crate::backend::no_dm_peer();
-        self.history_view = false;
+        self.chat_dm_peer.clear();
         self.active_channel_name = "".to_owned();
         self.active_channel_archived = false;
-        self.active_channel_members_only = false;
-        self.channel_members = Vec::new();
-        self.post_refusal = "".to_owned();
-        self.channel_draft = "".to_owned();
-        self.pending_channel = "".to_owned();
+
         self.page_route = "".to_owned();
         self.palette_draft = "".to_owned();
         self.palette_chat_hits = Vec::new();
@@ -5625,7 +4476,6 @@ impl Ducktape {
         self.huddle_channel_name = "".to_owned();
         self.huddle_joined_at = 0;
         self.huddle_roster = Vec::new();
-        self.huddle_rows = Vec::new();
         self.call_status = "".to_owned();
         self.call_muted = false;
         self.call_speaking = false;
@@ -5633,6 +4483,7 @@ impl Ducktape {
         self.call_sharing = false;
         self.call_video_live = false;
         self.huddle_stage = "".to_owned();
+        self.huddle_tiles.clear();
         self.call_peers = Vec::new();
         if (self.connected_rpc).is_empty() {
             return Task::none();
@@ -5979,30 +4830,35 @@ impl Ducktape {
         ])
     }
     fn on_call_event(&mut self, event: crate::call::CallEvent) -> Task<AppMessage> {
-        self.call_status =
-            crate::call::call_status_after(self.call_status.to_owned(), event.clone());
-        self.call_muted =
-            crate::backend::keep_bool(event.kind == "connecting", false, self.call_muted);
-        self.call_camera =
-            crate::backend::keep_bool(event.kind == "connecting", false, self.call_camera);
-        self.call_sharing =
-            crate::backend::keep_bool(event.kind == "connecting", false, self.call_sharing);
+        if let Some(status) = &event.status {
+            self.call_status.clone_from(status);
+        }
+        match event.kind.as_str() {
+            "connecting" => {
+                self.call_muted = false;
+                self.call_camera = false;
+                self.call_sharing = false;
+            }
+            "error" | "refused" | "closed" => {
+                self.call_peers.clear();
+                self.huddle_stage.clear();
+                self.huddle_tiles.clear();
+                self.call_video_live = false;
+            }
+            "presentation" => {
+                self.huddle_stage = event.stage.clone();
+                self.huddle_tiles = event.tiles.clone();
+                self.call_video_live = event.video_live;
+                self.call_peers = event.peers.clone();
+            }
+            "self" => {
+                self.call_muted = event.muted;
+                self.call_camera = event.camera_on;
+                self.call_sharing = event.sharing;
+            }
+            _ => {}
+        }
         self.call_speaking = crate::call::call_speaking_after(self.call_speaking, &event);
-        self.call_peers =
-            crate::call::apply_call_peer(::std::mem::take(&mut self.call_peers), event.clone());
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
-        self.call_video_live = crate::call::call_video_live_after(
-            self.call_peers.clone(),
-            self.call_camera,
-            self.call_sharing,
-        );
-        self.huddle_stage =
-            crate::call::huddle_stage_peer(self.call_peers.clone(), self.call_sharing);
         Task::none()
     }
     fn on_toggle_call_mute(&mut self) -> Task<AppMessage> {
@@ -6010,38 +4866,18 @@ impl Ducktape {
             return Task::none();
         }
         self.call_muted = crate::call::call_set_muted(!self.call_muted);
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
         Task::none()
     }
     fn on_toggle_call_camera(&mut self) -> Task<AppMessage> {
         let source = crate::video::call_use_camera(!self.call_camera);
         self.call_camera = source.camera;
         self.call_sharing = source.sharing;
-        self.call_video_live = crate::call::call_video_live_after(
-            self.call_peers.clone(),
-            self.call_camera,
-            self.call_sharing,
-        );
-        self.huddle_stage =
-            crate::call::huddle_stage_peer(self.call_peers.clone(), self.call_sharing);
         Task::none()
     }
     fn on_toggle_call_screen(&mut self) -> Task<AppMessage> {
         let source = crate::video::call_use_screen(!self.call_sharing);
         self.call_camera = source.camera;
         self.call_sharing = source.sharing;
-        self.call_video_live = crate::call::call_video_live_after(
-            self.call_peers.clone(),
-            self.call_camera,
-            self.call_sharing,
-        );
-        self.huddle_stage =
-            crate::call::huddle_stage_peer(self.call_peers.clone(), self.call_sharing);
         Task::none()
     }
     fn on_show_huddle(&mut self) -> Task<AppMessage> {
@@ -6118,78 +4954,12 @@ impl Ducktape {
         self.call_sharing = false;
         self.call_video_live = false;
         self.huddle_stage = "".to_owned();
+        self.huddle_tiles.clear();
         self.call_peers = Vec::new();
-        self.huddle_rows = crate::call::huddle_tile_rows(
-            self.huddle_roster.clone(),
-            self.call_peers.clone(),
-            self.call_muted,
-            self.call_speaking,
-        );
-    }
-    fn on_huddle_invitees_loaded(
-        &mut self,
-        members: Vec<crate::backend::ChatMember>,
-    ) -> Task<AppMessage> {
-        if !self.huddle_joined {
-            return Task::none();
-        }
-        self.huddle_invitees = members;
-        Task::none()
-    }
-    /// An invite is a post in the huddle's room that mentions the person; the
-    /// chip leaves the window the moment it is pressed and comes back only if
-    /// the post fails.
-    fn on_invite_to_huddle(&mut self, key: String) -> Task<AppMessage> {
-        let seated = self.huddle_joined && !self.huddle_channel.is_empty();
-        if !seated || self.loading {
-            return Task::none();
-        }
-        let Some(index) = self
-            .huddle_invitees
-            .iter()
-            .position(|member| member.key == key)
-        else {
-            return Task::none();
-        };
-        self.huddle_invitees.remove(index);
-        let body = crate::backend::huddle_invite_text(&key, &self.huddle_channel_name);
-        let sent_key = key.clone();
-        Task::perform(
-            crate::backend::send_message(
-                self.connected_rpc.to_owned(),
-                self.password.to_owned(),
-                self.huddle_channel.to_owned(),
-                crate::backend::fresh_operation_id("huddle-invite".to_owned()),
-                body,
-            ),
-            move |result| match result {
-                Ok(_) => AppMessage::HuddleInviteSent(sent_key.clone()),
-                Err(error) => AppMessage::HuddleInviteFailed(key.clone(), error),
-            },
-        )
-    }
-    fn on_huddle_invite_sent(&mut self, _key: String) -> Task<AppMessage> {
-        Task::none()
-    }
-    fn on_huddle_invite_failed(
-        &mut self,
-        key: String,
-        error: crate::backend::OptimisticMutationError,
-    ) -> Task<AppMessage> {
-        self.error = error.message;
-        let names = crate::backend::names();
-        let member = crate::backend::ChatMember {
-            label: names.member_label(&key),
-            key,
-        };
-        self.huddle_invitees.push(member);
-        Task::none()
     }
     fn on_huddle_left(&mut self, _result: bool) -> Task<AppMessage> {
         self.huddle_joined = false;
         self.huddle_roster = Vec::new();
-        self.huddle_rows = Vec::new();
-        self.huddle_invitees = Vec::new();
         self.huddle_channel = "".to_owned();
         self.huddle_channel_name = "".to_owned();
         self.huddle_joined_at = 0;
@@ -6205,10 +4975,6 @@ impl Ducktape {
         } {
             self.secrets.set(slot, text);
         }
-        Task::none()
-    }
-    fn on_channel_draft_changed(&mut self, value: String) -> Task<AppMessage> {
-        self.channel_draft = value;
         Task::none()
     }
 }

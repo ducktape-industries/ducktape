@@ -383,32 +383,43 @@ fn a_review_leaves_as_a_signed_op() {
     assert_eq!(review["commit_oid"], "aaaabbbbccccdddd");
 }
 
-/// A merge is two kernel calls, in this order: `git.merge` builds the
-/// client-computed merge commit and lands its pack, then the double-CAS'd
-/// `merge_pr` goes out as a signed op over what it built.
+/// The deployment asset selects the service; its merge reply supplies the
+/// pack for the guest's signed operation with both expected branch heads.
 #[test]
-fn a_merge_builds_the_commit_through_the_kernel_then_submits_it() {
+fn a_merge_uses_its_deployed_service_then_submits_the_commit() {
     let mut drive = open_item("duck://forge/core/7");
     let events = press(&drive.frame, "Merge pull request");
     drive.tick(events);
-    let build = request(&drive.frame, "git.merge");
-    let ask: serde_json::Value = serde_json::from_slice(&build.payload).expect("an ask decodes");
-    assert_eq!(ask["target"], "forge");
+    let config = request(&drive.frame, "asset.read");
+    assert_eq!(config.payload, b"service.json");
+    drive.tick(vec![answer(config.id, br#"{"account":42,"route":"git"}"#)]);
+    let build = request(&drive.frame, "net.request");
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&build.payload).expect("an ask decodes");
+    assert_eq!(envelope["account"], 42);
+    assert_eq!(envelope["route"], "git");
+    assert_eq!(envelope["path"], "/merge");
+    let body: Vec<u8> = serde_json::from_value(envelope["body"].clone()).unwrap();
+    let ask: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(ask["repo"], "core");
     assert_eq!(ask["ours"], "1111222233334444", "the target tip");
     assert_eq!(ask["theirs"], "aaaabbbbccccdddd", "the source tip");
 
-    let built = serde_json::json!({ "merge_oid": "99998888", "pack_digest": "de1a" });
-    drive.tick(vec![answer(build.id, built.to_string().as_bytes())]);
+    let built = serde_json::json!({ "merge_oid": "99998888", "pack_b64": "UEFDSw==" });
+    drive.tick(vec![answer(build.id, &service_reply(built))]);
+    let upload = request(&drive.frame, "blob.put");
+    assert_eq!(upload.payload, b"PACK");
+    drive.tick(vec![answer(upload.id, "de".repeat(32).as_bytes())]);
     let submit = request(&drive.frame, "op.submit");
     let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(op["required_blob"], "de".repeat(32));
     assert_eq!(
         op["payload"]["merge_pr"],
         serde_json::json!({
             "repo": "core", "number": 7,
             "prev_target_oid": "1111222233334444",
             "expected_source_oid": "aaaabbbbccccdddd",
-            "merge_oid": "99998888", "pack_digest": "de1a"
+            "merge_oid": "99998888", "pack_digest": "de".repeat(32)
         })
     );
 }
@@ -420,9 +431,11 @@ fn a_conflicting_merge_submits_nothing() {
     let mut drive = open_item("duck://forge/core/7");
     let events = press(&drive.frame, "Merge pull request");
     drive.tick(events);
-    let build = request(&drive.frame, "git.merge").id;
+    let config = request(&drive.frame, "asset.read").id;
+    drive.tick(vec![answer(config, br#"{"account":42,"route":"git"}"#)]);
+    let build = request(&drive.frame, "net.request").id;
     let conflicts = serde_json::json!({ "conflicts": ["main.rs"] });
-    drive.tick(vec![answer(build, conflicts.to_string().as_bytes())]);
+    drive.tick(vec![answer(build, &service_reply(conflicts))]);
     assert!(
         !drive
             .frame
@@ -599,4 +612,29 @@ fn a_diff_line_comment_keeps_its_anchor_and_submits_without_a_review_body() {
     assert_eq!(review["comments"][0]["path"], "main.rs");
     assert_eq!(review["comments"][0]["line"], 1);
     assert_eq!(review["comments"][0]["body"], "Keep this guard");
+}
+
+fn service_reply(body: serde_json::Value) -> Vec<u8> {
+    use base64::Engine as _;
+    serde_json::to_vec(&serde_json::json!({"head":{"status":200,"headers":[]},"body_b64":base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&body).unwrap())})).unwrap()
+}
+
+#[test]
+fn a_merge_without_its_deployment_service_asset_is_refused() {
+    let mut drive = open_item("duck://forge/core/7");
+    let events = press(&drive.frame, "Merge pull request");
+    drive.tick(events);
+    let config = request(&drive.frame, "asset.read").id;
+    drive.tick(vec![refuse(config, "missing deployment asset")]);
+    assert!(has_text(
+        &drive.frame,
+        "The merge did not go through: Forge merge service is not configured: missing deployment asset"
+    ));
+    assert!(
+        !drive
+            .frame
+            .requests
+            .iter()
+            .any(|request| matches!(request.kind.as_str(), "net.request" | "op.submit"))
+    );
 }

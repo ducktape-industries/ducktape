@@ -62,7 +62,7 @@ pub enum NetstackCmd {
     Swap(NetstackSwapArgs),
 }
 
-/// `ducktape node netstack swap --native | --component <PATH>` — the operator
+/// `ducktape node netstack swap --component <PATH>` — the operator
 /// client for `POST /v1/admin/netstack/swap`.
 ///
 /// The swap is node-local and epoch-safe: the running machine's snapshot
@@ -72,14 +72,10 @@ pub enum NetstackCmd {
 /// retry, because a component built against another contract is refused by
 /// name every time.
 #[derive(Debug, clap::Args)]
-#[command(group(clap::ArgGroup::new("backend").required(true).args(["native", "component"])))]
 pub struct NetstackSwapArgs {
-    /// run the machine compiled into the node binary
-    #[arg(long)]
-    pub native: bool,
     /// run a `ducktape:netstack` component at this path ON THE NODE's disk
     #[arg(long, value_name = "PATH")]
-    pub component: Option<PathBuf>,
+    pub component: PathBuf,
     #[command(flatten)]
     pub selector: Selector,
 }

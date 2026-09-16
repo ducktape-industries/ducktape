@@ -1664,6 +1664,7 @@ dependencies = [
  "async-trait",
  "attribution",
  "borsh",
+ "chat-message",
  "commonware-cryptography",
  "commonware-runtime",
  "ducktape-module-sdk",
@@ -1681,6 +1682,14 @@ dependencies = [
  "statesync",
  "tempfile",
  "unicode-normalization",
+]
+
+[[package]]
+name = "chat-message"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "serde",
 ]
 
 [[package]]
@@ -3793,8 +3802,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "ducktape-forge-service"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "blobstore",
+ "commonware-codec",
+ "commonware-cryptography",
+ "ducktape-rpc",
+ "ducktape-view-guest",
+ "flate2",
+ "forge",
+ "forge-view",
+ "git2",
+ "hex",
+ "http-body-util",
+ "keyscheme",
+ "libc",
+ "node",
+ "sdk",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ducktape-home"
 version = "0.1.0"
+
+[[package]]
+name = "ducktape-media"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chat",
+ "ducktape-rpc",
+ "futures",
+ "libc",
+ "media-service",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
+]
 
 [[package]]
 name = "ducktape-module-sdk"
@@ -3816,6 +3875,53 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.24.0",
+]
+
+[[package]]
+name = "ducktape-terminal"
+version = "0.1.0"
+dependencies = [
+ "agent-service",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chat",
+ "ducktape-rpc",
+ "futures",
+ "gateway",
+ "libc",
+ "provider-host",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "sdk",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+]
+
+[[package]]
+name = "ducktape-view-composer"
+version = "0.1.0"
+dependencies = [
+ "chat-message",
+ "ducktape-view-files",
+ "ducktape-view-guest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ducktape-view-files"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "duckfs-core",
+ "ducktape-view-guest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4507,6 +4613,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-view"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "ducktape-view-composer",
+ "ducktape-view-guest",
+ "futures",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5152,7 +5270,7 @@ dependencies = [
 [[package]]
 name = "gpui-notion"
 version = "0.1.0"
-source = "git+https://github.com/orthory/gpui-notion?rev=8f6bc373397d5e29fe0d395d3bca25c254bf14ca#8f6bc373397d5e29fe0d395d3bca25c254bf14ca"
+source = "git+https://github.com/byeongsu-hong/gpui-notion?rev=2ef0e331838531a0ef8f4d4cc80655f5c4c99303#2ef0e331838531a0ef8f4d4cc80655f5c4c99303"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -7804,11 +7922,14 @@ dependencies = [
  "duckfs-client",
  "duckfs-core",
  "duckfs-disk",
+ "ducktape-forge-service",
+ "ducktape-terminal",
  "files",
  "flate2",
  "forge",
  "futures",
  "gateway",
+ "git2",
  "governance",
  "greeter",
  "guest-builder",
@@ -7820,7 +7941,6 @@ dependencies = [
  "keystore",
  "kv",
  "libc",
- "media-service",
  "module-artifact",
  "modules",
  "nat-traversal",
@@ -7894,8 +8014,8 @@ dependencies = [
  "dispatch 0.1.0",
  "duckfs-client",
  "duckfs-core",
+ "ducktape-terminal",
  "files",
- "flate2",
  "forge",
  "futures",
  "gateway",
@@ -7906,7 +8026,6 @@ dependencies = [
  "indexer",
  "keyscheme",
  "kv",
- "media-service",
  "module-artifact",
  "modules",
  "nettest",
@@ -7951,10 +8070,10 @@ dependencies = [
  "async-trait",
  "attribution",
  "base64 0.22.1",
+ "commonware-cryptography",
  "commonware-runtime",
  "duckfs-client",
  "futures",
- "git2",
  "host",
  "indexer",
  "nettest",
@@ -10150,12 +10269,14 @@ dependencies = [
  "netstack-machine",
  "netstack-wasm",
  "rand 0.8.6",
+ "reachability",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "wat",
  "wireguard",
  "x25519-dalek 2.0.1",
 ]
@@ -13102,7 +13223,7 @@ dependencies = [
 [[package]]
 name = "ui-lang-wire"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=5abde0db4ebe6a3c4d26e86c7ceadb0153de4623#5abde0db4ebe6a3c4d26e86c7ceadb0153de4623"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=3d8ba98833c48e030e1b955ac2799bc27755b2bf#3d8ba98833c48e030e1b955ac2799bc27755b2bf"
 dependencies = [
  "bincode",
  "memchr",

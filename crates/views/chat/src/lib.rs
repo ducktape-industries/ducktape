@@ -1,10 +1,9 @@
-//! Chat as a module-owned view: the channel sidebar, the message stream,
-//! the thread rail and the channel-details drawer, from the facts the
-//! desktop app pushes. Every act — a room, a reaction, an edit, a search —
-//! leaves as an intent the app signs; the two composers are the app's own
-//! surfaces, left as slots.
+//! Guest-owned conversations, composers, and module operations.
 
 pub mod host;
+mod live;
+mod hydration;
+pub mod notice;
 
 #[path = "ui/app.rs"]
 mod app;

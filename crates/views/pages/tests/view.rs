@@ -1028,3 +1028,139 @@ fn a_save_lands_only_this_readers_edits_on_a_page_someone_else_moved() {
         frame.requests
     );
 }
+
+#[test]
+fn rich_toolbar_comment_uses_guest_selection_conversion_and_comment_routing() {
+    rich_annotation_route("comment", None);
+}
+
+#[test]
+fn rich_annotation_gesture_uses_guest_selection_conversion_and_comment_routing() {
+    rich_annotation_route(
+        "",
+        Some(wire::editor_presentation::EditorInteraction::Margin { line: 1 }),
+    );
+}
+
+fn rich_annotation_route(
+    action: &str,
+    interaction: Option<wire::editor_presentation::EditorInteraction>,
+) {
+    let (frame, _) = connected_with_register();
+    let Node::Editor {
+        options, document, ..
+    } = frame.root.as_ref().and_then(find_editor).unwrap()
+    else {
+        unreachable!()
+    };
+    let rich = options.rich.as_ref().expect("explicit rich projection");
+    let mut snapshot = rich.document.clone();
+    snapshot.cursor = wire::EditorCursor {
+        position: wire::EditorPosition { line: 1, column: 9 },
+        selection: Some(wire::EditorPosition { line: 1, column: 4 }),
+    };
+    let input = wire::EditorRequestInput::RichEdit {
+        edit: Box::new(wire::editor_rich::RichEdit {
+            before: Some(rich.document.clone()),
+            document: snapshot,
+            action: action.into(),
+            interaction,
+        }),
+    };
+    let id = transaction_id(document);
+    let before = document.clone();
+    let on_request = options.binding.as_ref().unwrap().on_request;
+    let frame = tick_native(vec![Event::EditorRequest {
+        handler: on_request,
+        request: wire::EditorRequest {
+            id: id.clone(),
+            state: before.clone(),
+            input: input.clone(),
+            input_time_ms: 0,
+        },
+    }]);
+    let response = frame
+        .editor_decisions
+        .iter()
+        .find(|response| response.id == id)
+        .expect("guest rich decision");
+    let wire::EditorDecision::Apply {
+        patches,
+        cursor,
+        history,
+    } = &response.decision
+    else {
+        panic!("comment must commit its selection");
+    };
+    let mut after = before.clone();
+    after.revision += 1;
+    after.cursor = *cursor;
+    let handler = editor_of(&frame).1;
+    let frame = tick_native(vec![Event::EditorTransaction {
+        handler,
+        event: wire::EditorTransactionEvent::Commit {
+            id,
+            origin: Some(input),
+            before,
+            after,
+            patches: patches.clone(),
+            kind: wire::EditorEditKind::GuestPatch,
+            history: *history,
+            input_time_ms: 0,
+        },
+    }]);
+    assert!(has_text(&frame, "the opening claim") && !has_text(&frame, "the page reads well"));
+    let frame = tick_native(type_into(&frame, "Start a thread…", "rich selection?"));
+    let frame = tick_native(press(&frame, "Post"));
+    let mint = request(&frame, "host.id");
+    let frame = tick_native(vec![answer(mint.id, b"thread-rich")]);
+    let mint = request(&frame, "host.id");
+    let frame = tick_native(vec![answer(mint.id, b"comment-rich")]);
+    let submit = request(&frame, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).unwrap();
+    assert_eq!(
+        op["payload"]["add_comment"]["anchor"],
+        serde_json::json!({"start": 4, "end": 9})
+    );
+}
+
+#[test]
+fn background_search_preserves_full_hits_and_survives_a_failed_title_lookup() {
+    for titles_available in [true, false] {
+        let frame = boot();
+        let frame = tick_native(vec![item(
+            request(&frame, "pages.props").id,
+            br#"{"background":{"text":"needle","page":""}}"#,
+        )]);
+        let content = "needle ".repeat(6000);
+        let hits = serde_json::json!({"hits":[
+            {"page_id":"named","block_id":"block","kind":"paragraph","text":content},
+            {"page_id":"untitled","block_id":"second","kind":"paragraph","text":"needle"},
+            {"page_id":"missing","block_id":"third","kind":"paragraph","text":"needle"}
+        ]});
+        let frame = tick_native(vec![answer(
+            request(&frame, "rpc.view").id,
+            hits.to_string().as_bytes(),
+        )]);
+        let titles = request(&frame, "rpc.view").id;
+        let reply = match titles_available {
+            true => answer(titles, br#"{"pages":{"pages":[{"id":"named","title":"Design"},{"id":"untitled","title":""}],"has_more":false,"next_after":null}}"#),
+            false => ducktape_view_guest::testing::refuse(titles, "page index unavailable"),
+        };
+        let frame = tick_native(vec![reply]);
+        let result: serde_json::Value =
+            serde_json::from_slice(&request(&frame, "host.emit").payload).unwrap();
+        assert_eq!(result["hits"][0]["text"], content);
+        assert_eq!(
+            result["hits"][0]["page_title"],
+            if titles_available {
+                "Design"
+            } else {
+                "Untitled"
+            }
+        );
+        assert_eq!(result["hits"][1]["page_title"], "Untitled");
+        assert_eq!(result["hits"][2]["page_title"], "Untitled");
+        assert!(request(&frame, "host.finish").payload.is_empty());
+    }
+}

@@ -104,7 +104,15 @@ pub fn odb_shape() -> host::ModuleShape {
     host::ModuleShape {
         backing: host::Backing::Odb,
         config: Vec::new(),
-        committed_queries: false,
+        committed_queries: true,
+    }
+}
+
+/// A Git object substrate, selected by capability rather than module name.
+pub fn git_shape() -> host::ModuleShape {
+    host::ModuleShape {
+        backing: host::Backing::Git,
+        ..odb_shape()
     }
 }
 
@@ -259,7 +267,7 @@ pub fn ack_from_wit(ack: host::Ack) -> Ack {
 /// the exact INVERSE of wasm-host's `to_wit_error`, so an error that crossed
 /// the boundary out and back reads the same to the ported logic as it would
 /// have natively.
-fn error_from_wit(e: host::Error) -> Error {
+pub fn error_from_wit(e: host::Error) -> Error {
     match e {
         host::Error::Rejected(m) => Error::Module(m),
         host::Error::UnknownModule(id) => Error::UnknownModule(id),
@@ -629,7 +637,9 @@ pub fn store_genesis_time_unit(
         .map_err(|e| host::Error::Rejected(format!("{module_label} genesis config: {e}")))?;
     let value =
         sdk::genesis_config::find(&params, sdk::genesis_config::TIME_UNIT).ok_or_else(|| {
-            host::Error::Rejected(format!("{module_label} genesis config carries no time_unit"))
+            host::Error::Rejected(format!(
+                "{module_label} genesis config carries no time_unit"
+            ))
         })?;
     sdk::genesis_config::TimeUnit::decode(value)
         .map_err(|e| host::Error::Rejected(format!("{module_label} {e}")))

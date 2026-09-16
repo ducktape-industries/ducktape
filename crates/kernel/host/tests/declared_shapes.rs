@@ -40,8 +40,8 @@ fn expected() -> BTreeMap<String, Shape> {
         // committed-only queries: the between-block delivery injection must
         // never observe a same-block staged write.
         ("dispatch", shape(Backing::Store, NONE, true)),
-        ("files", shape(Backing::Odb, NONE, false)),
-        ("forge", shape(Backing::Odb, CHAIN_ID, false)),
+        ("files", shape(Backing::Odb, NONE, true)),
+        ("forge", shape(Backing::Git, CHAIN_ID, true)),
         ("gateway", shape(Backing::Store, CHAIN_ID, false)),
         ("governance", shape(Backing::Store, INVITE, false)),
         ("hello", shape(Backing::Map, NONE, false)),

@@ -1,59 +1,18 @@
-//! The huddle's video leg: capture → intra-only JPEG → the call socket's
-//! video frames, and inbound peer frames → decode → the tile strip and the
-//! stage.
-//!
-//! TWO SOURCES, ONE STREAM. A participant occupies one video flow and one
-//! tile, and the beacon's `camera_on`/`sharing` pair says which of the two the
-//! far end is looking at — so [`Source`] is one discriminant and starting
-//! either source ends the other. The camera is a device (`nokhwa`); the screen
-//! is the desktop: a root-window grab over X11 (`x11rb`, already in this
-//! binary under winit — see [`ScreenSource`] for why not the portal), or the
-//! main display through Core Graphics on macOS.
-//!
-//! CODEC v1 IS BASELINE JPEG, EVERY FRAME A KEYFRAME. The wire (ws
-//! `media_service::call_wire` and the mesh fragmentation in `media_service::video`) treats the
-//! encoded bytes as opaque and both ends of the webview leg are THIS app, so
-//! the client picks the codec. Pure-Rust JPEG keeps the build free of C
-//! toolchains on every platform; intra-only means a lost frame costs nothing
-//! (the next one is a sync point), so inbound `KeyframeRequest`s are
-//! meaningless and never sent. The codec itself is
-//! `media_service::video::codec` — NOT this crate, because its two APIs are
-//! generic and would instantiate here at the app's dev `opt-level = 0`, where
-//! a VGA frame cost ~90 ms of encode, decode and channel swap and the loop
-//! fell behind the camera (the "video latency" under `make dev`). The seam to
-//! a delta codec (VP8/AV1) is that module and `store_peer_frame`; nothing
-//! else knows JPEG exists. MAX_FRAME_BYTES on the mesh is ~129 KB; 640×480 at
-//! q60 runs 30–60 KB.
-// ponytail: fixed 640x480-ish @ q60, wire ≤60 fps, no rate-ladder response —
-// ducktape is a private-network workspace app, so the generous ceiling is
-// deliberate (q60 VGA at 60 fps ≈ 2-4 MB/s per sender); wire the RateHint →
-// (fps, quality) ladder when a real WAN leg complains.
-//
-//! THREADING mirrors the audio leg: one OS thread owns the open source (the
-//! nokhwa camera is not `Send`), follows the toggle, holds a source only while
-//! it is the one asked for, and dies with the session's shutdown sender.
-//! Decoded peer frames land in a global store the `call_video_tiles` and
-//! `call_video_stage` extern components read; both are SELF-REDRAWING widgets
-//! that repaint their own window at the capture cadence — no app message, no
-//! view rebuild, no other window woken.
-//!
-//! EVERY FRAME IS A NEW RENDERER IMAGE, AND THE RENDERER FREES NOTHING ON ITS
-//! OWN. `img(Arc<RenderImage>)` uploads a sprite-atlas tile per image id and
-//! keeps it until `Window::drop_image`; a call that never called it grew the
-//! atlas by a VGA tile per frame, ~36 MB/s, for as long as it ran. So the
-//! store RETIRES every handle it replaces, and the surfaces drop the retired
-//! ones on their next paint — the one place a `Window` is in hand.
+//! Native camera/screen capture, JPEG codec and renderer image resources.
+//! Devices expose encoded images; deployed guests own transport and peer identity.
+//! Captures and decoded images are bounded, and their session owns their lifetime.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use gpui_kit::StyledImage;
-use gpui_kit::{
-    Context, IntoElement, ObjectFit, ParentElement, Render, RenderImage, Styled, Window, div, img,
-    px,
-};
-use media_service::call_wire::{CapturedFrame, PeerFrame};
+use gpui_kit::RenderImage;
+#[derive(serde::Serialize)]
+pub(crate) struct CapturedImage {
+    pub preview: &'static str,
+    pub timestamp_ms: u32,
+    pub jpeg: Vec<u8>,
+}
 use media_service::video::codec;
 
 /// Toggle/shutdown poll while no source is open. WITH A CAMERA OPEN THE LOOP
@@ -98,7 +57,7 @@ struct VideoStore {
     /// the local camera's preview, when on.
     preview: Option<TileFrame>,
     /// peer node-key hex → a decode for that peer is running right now.
-    /// `store_peer_frame` checks-and-sets this BEFORE decoding and clears it
+    /// `store_image` checks-and-sets this BEFORE decoding and clears it
     /// after, so a peer with a decode already in flight gets its next frame
     /// DROPPED rather than queued — a hostile 25 fps sender must not stack
     /// concurrent decodes on the blocking pool.
@@ -189,7 +148,7 @@ pub struct VideoSource {
 /// Point the video leg at `next`. The capture thread notices on its next pass
 /// (it holds no device it is not currently asked for); the beacon rides the
 /// call module's control channel.
-fn use_source(next: Source) -> VideoSource {
+pub(crate) fn use_source(next: Source) -> VideoSource {
     SOURCE.store(next.code(), Ordering::Relaxed);
     // The outgoing preview belongs to the source that is ending — a camera
     // still on screen under a "sharing" beacon is a lie for one frame.
@@ -197,7 +156,6 @@ fn use_source(next: Source) -> VideoSource {
     let ended = store.preview.take();
     store.retire(ended);
     drop(store);
-    crate::call::beacon_state();
     VideoSource {
         camera: next == Source::Camera,
         sharing: next == Source::Screen,
@@ -206,12 +164,14 @@ fn use_source(next: Source) -> VideoSource {
 
 /// Turn the camera on or off. On ends any screen share.
 pub fn call_use_camera(on: bool) -> VideoSource {
-    use_source(if on { Source::Camera } else { Source::Off })
+    crate::call::set_video_source(if on { "camera" } else { "off" });
+    VideoSource { camera: on, sharing: false }
 }
 
 /// Start or stop sharing the screen. Starting one turns the camera off.
 pub fn call_use_screen(on: bool) -> VideoSource {
-    use_source(if on { Source::Screen } else { Source::Off })
+    crate::call::set_video_source(if on { "screen" } else { "off" });
+    VideoSource { camera: false, sharing: on }
 }
 
 /// Clear everything at session end — the next session must not open on the
@@ -237,8 +197,7 @@ pub(crate) fn reset() {
 /// legitimate one over a slow host) would otherwise stack concurrent decodes
 /// without bound. The next frame is a keyframe too, so a dropped one costs
 /// nothing.
-pub(crate) fn store_peer_frame(frame: PeerFrame) {
-    let peer = hex_of(&frame.peer);
+pub(crate) fn store_image(peer: String, jpeg: Vec<u8>, alive: &std::sync::atomic::AtomicBool) {
     {
         let mut store = store().lock().expect("video store");
         if !store.decoding.insert(peer.clone()) {
@@ -250,12 +209,11 @@ pub(crate) fn store_peer_frame(frame: PeerFrame) {
             return;
         }
     }
-    let tile = decode_frame(&frame.data);
+    let tile = decode_frame(&jpeg);
     let mut store = store().lock().expect("video store");
     store.decoding.remove(&peer);
-    let Some(tile) = tile else {
-        return;
-    };
+    if !alive.load(Ordering::Acquire) { return; }
+    let Some(tile) = tile else { return; };
     let replaced = store.peers.insert(peer, tile);
     store.retire(replaced);
 }
@@ -269,14 +227,7 @@ pub(crate) fn forget_peer(node: &str) {
     store.retire(gone);
 }
 
-fn hex_of(key: &[u8; 32]) -> String {
-    let mut out = String::with_capacity(64);
-    for byte in key {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
+
 
 /// A peer's JPEG as a tile: refused before allocation over
 /// SCREEN_PIXEL_BUDGET (the larger receive-side budget — today the tile's,
@@ -311,6 +262,21 @@ fn decode_frame(data: &[u8]) -> Option<TileFrame> {
 /// thread is its only product caller; the codec does the work.
 pub(crate) fn encode_frame(bgra: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     codec::encode_bgra(bgra, width, height)
+}
+
+fn encode_bounded(bgra: &[u8], mut width: u32, mut height: u32, max_bytes: usize) -> Option<Vec<u8>> {
+    let mut pixels = std::borrow::Cow::Borrowed(bgra);
+    loop {
+        if let Some(encoded) = encode_frame(&pixels, width, height)
+            && encoded.len() <= max_bytes {
+            return Some(encoded);
+        }
+        if width <= 1 || height <= 1 { return None; }
+        let smaller = codec::halve(&pixels, width, height);
+        pixels = std::borrow::Cow::Owned(smaller.pixels);
+        width = smaller.width;
+        height = smaller.height;
+    }
 }
 
 /// How the self-view is ARRIVING: frames stored, and the worst and total gap
@@ -386,7 +352,7 @@ pub(crate) fn store_preview(bgra: Vec<u8>, width: u32, height: u32) {
 /// A refusal turns the toggle back off and surfaces as "live · camera: …"
 /// through the status fold; the caller has nothing to decide.
 fn open_camera(
-    events: &futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
+    events: &tokio::sync::mpsc::Sender<String>,
 ) -> Option<nokhwa::Camera> {
     use nokhwa::pixel_format::RgbAFormat;
     use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType, Resolution};
@@ -460,14 +426,10 @@ fn budget_format(
 /// the toggle back where the user can see it is off. The capture thread has
 /// nothing left to decide.
 fn refuse_source(
-    events: &futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
+    events: &tokio::sync::mpsc::Sender<String>,
     message: String,
 ) {
-    let _ = events.unbounded_send(crate::call::CallEvent {
-        kind: "live".into(),
-        message,
-        ..crate::call::CallEvent::default()
-    });
+    let _ = events.try_send(message);
     SOURCE.store(Source::Off.code(), Ordering::Relaxed);
 }
 
@@ -667,7 +629,7 @@ impl Open {
 
 fn open_source(
     source: Source,
-    events: &futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
+    events: &tokio::sync::mpsc::Sender<String>,
 ) -> Open {
     match source {
         Source::Off => Open::None,
@@ -728,9 +690,10 @@ fn grab(open: &mut Open) -> Result<(Vec<u8>, u32, u32), String> {
 /// that reason it is a DEADLINE the grab's own cost comes out of, not a nap
 /// laid end to end with it.
 pub(crate) fn capture_thread(
-    frames: tokio::sync::mpsc::UnboundedSender<CapturedFrame>,
+    frames: tokio::sync::mpsc::Sender<CapturedImage>,
     shutdown: std::sync::mpsc::Receiver<()>,
-    events: futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
+    events: tokio::sync::mpsc::Sender<String>,
+    max_bytes: usize,
 ) {
     let mut open = Open::None;
     let started = std::time::Instant::now();
@@ -787,136 +750,23 @@ pub(crate) fn capture_thread(
         // frame the encoder refuses (over the mesh cap) must not freeze it.
         let wire_due = last_sent.is_none_or(|at| at.elapsed() >= WIRE_INTERVAL);
         let encoded = wire_due
-            .then(|| encode_frame(&bgra, width, height))
+            .then(|| encode_bounded(&bgra, width, height, max_bytes))
             .flatten();
         store_preview(bgra, width, height);
         let Some(encoded) = encoded else {
             continue;
         };
         last_sent = Some(std::time::Instant::now());
-        let captured = CapturedFrame {
-            keyframe: true,
-            ts_ms: started.elapsed().as_millis() as u32,
-            data: encoded,
+        let captured = CapturedImage {
+            preview: SELF_STAGE,
+            timestamp_ms: started.elapsed().as_millis() as u32,
+            jpeg: encoded,
         };
-        if frames.send(captured).is_err() {
-            break;
+        match frames.try_send(captured) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
         }
     }
-}
-
-/// Native video surfaces read the latest decoded frame at the window's vsync.
-/// Empty stores park redraws; the call roster update mounts/re-arms the surface.
-pub struct VideoView {
-    source: VideoDisplay,
-}
-enum VideoDisplay {
-    Tiles(String),
-    Stage(String),
-}
-
-pub fn call_video_tiles(staged: &str) -> VideoView {
-    VideoView {
-        source: VideoDisplay::Tiles(staged.to_owned()),
-    }
-}
-pub fn call_video_stage(peer: &str) -> VideoView {
-    VideoView {
-        source: VideoDisplay::Stage(peer.to_owned()),
-    }
-}
-impl VideoView {
-    pub fn replace_tiles(&mut self, staged: String, cx: &mut Context<Self>) {
-        self.source = VideoDisplay::Tiles(staged);
-        cx.notify();
-    }
-    pub fn replace_stage(&mut self, peer: String, cx: &mut Context<Self>) {
-        self.source = VideoDisplay::Stage(peer);
-        cx.notify();
-    }
-}
-impl Render for VideoView {
-    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        // the frames a newer one replaced since the last paint give their
-        // atlas tiles back here, the one place a Window is in hand
-        for handle in take_retired() {
-            let _ = window.drop_image(handle);
-        }
-        // EVERY SURFACE FILLS THE BOX IT IS GIVEN; the window decides the box.
-        // The stage is the picture, whole, in whatever room is left; the
-        // tiles are a strip under a stage, or an even grid of the room when
-        // there is none — so a bigger window is a bigger picture, never the
-        // same 128-pixel plate with more air around it.
-        match &self.source {
-            VideoDisplay::Stage(peer) => {
-                let Some((_, _, handle)) = stage_frame(peer) else {
-                    return div().into_any_element();
-                };
-                window.request_animation_frame();
-                img(handle)
-                    .size_full()
-                    .object_fit(ObjectFit::Contain)
-                    .rounded(px(8.))
-                    .into_any_element()
-            }
-            VideoDisplay::Tiles(staged) => {
-                let tiles = tiles_snapshot(staged);
-                if !tiles.is_empty() {
-                    window.request_animation_frame();
-                }
-                let under_a_stage = !staged.is_empty();
-                if under_a_stage {
-                    return div()
-                        .w_full()
-                        .h(px(TILE_HEIGHT))
-                        .flex_shrink_0()
-                        .flex()
-                        .gap(px(TILE_GAP))
-                        .overflow_hidden()
-                        .children(tiles.into_iter().map(|(_, _, handle)| {
-                            img(handle)
-                                .w(px(TILE_HEIGHT * 4. / 3.))
-                                .h_full()
-                                .object_fit(ObjectFit::Cover)
-                                .rounded(px(6.))
-                        }))
-                        .into_any_element();
-                }
-                let (rows, cols) = grid_shape(tiles.len());
-                let mut grid = div().size_full().flex().flex_col().gap(px(TILE_GAP));
-                let mut tiles = tiles.into_iter();
-                for _ in 0..rows {
-                    let mut row = div().flex_1().min_h_0().flex().gap(px(TILE_GAP));
-                    for _ in 0..cols {
-                        let Some((_, _, handle)) = tiles.next() else {
-                            break;
-                        };
-                        row = row.child(
-                            img(handle)
-                                .flex_1()
-                                .min_w_0()
-                                .h_full()
-                                .object_fit(ObjectFit::Cover)
-                                .rounded(px(6.)),
-                        );
-                    }
-                    grid = grid.child(row);
-                }
-                grid.into_any_element()
-            }
-        }
-    }
-}
-
-/// The grid a stage-less huddle lays its tiles in: as square as the count
-/// allows (1, 2 side by side, 2×2, 2×3, 3×3 …), rows filled left to right.
-fn grid_shape(tiles: usize) -> (usize, usize) {
-    if tiles == 0 {
-        return (0, 0);
-    }
-    let rows = (tiles as f32).sqrt().floor() as usize;
-    let cols = tiles.div_ceil(rows);
-    (rows, cols)
 }
 
 /// The stage's stand-in for "the screen this device is sharing" — a sentinel
@@ -934,35 +784,6 @@ pub(crate) fn stage_frame(peer: &str) -> Option<(u32, u32, Arc<RenderImage>)> {
         key => store.peers.get(key),
     }?;
     Some((frame.width, frame.height, frame.handle.clone()))
-}
-
-/// The strip under a stage: 4:3 plates of this height, the frame
-/// Cover-cropped onto them. The stage-less grid ignores it and fills the room.
-const TILE_HEIGHT: f32 = 96.0;
-const TILE_GAP: f32 = 8.0;
-/// Peers in stable key order, the local preview last — the same order the
-/// row-based strip always drew, minus whatever the stage is showing whole.
-/// `Handle` is `Bytes`-backed (Arc) and its `Id` survives the clone, so each
-/// entry is a refcount bump that keeps pointing at the renderer's cached
-/// upload.
-fn tiles_snapshot(staged: &str) -> Vec<(u32, u32, Arc<RenderImage>)> {
-    let store = store().lock().expect("video store");
-    let mut ordered: Vec<(&String, &TileFrame)> = store
-        .peers
-        .iter()
-        .filter(|(node, _)| node.as_str() != staged)
-        .collect();
-    ordered.sort_by(|a, b| a.0.cmp(b.0));
-    let mut tiles: Vec<_> = ordered
-        .into_iter()
-        .map(|(_, frame)| (frame.width, frame.height, frame.handle.clone()))
-        .collect();
-    if staged != SELF_STAGE
-        && let Some(preview) = &store.preview
-    {
-        tiles.push((preview.width, preview.height, preview.handle.clone()));
-    }
-    tiles
 }
 
 #[cfg(test)]
@@ -1027,18 +848,6 @@ mod tests {
         assert_eq!(budget_format(&[], CAPTURE_PIXEL_BUDGET), None);
     }
 
-    #[test]
-    fn the_grid_is_as_square_as_the_count_allows() {
-        assert_eq!(grid_shape(0), (0, 0));
-        assert_eq!(grid_shape(1), (1, 1));
-        assert_eq!(grid_shape(2), (1, 2));
-        assert_eq!(grid_shape(3), (1, 3));
-        assert_eq!(grid_shape(4), (2, 2));
-        assert_eq!(grid_shape(5), (2, 3));
-        assert_eq!(grid_shape(9), (3, 3));
-        assert_eq!(grid_shape(10), (3, 4));
-    }
-
     /// One global store AND one global source, so this stays ONE test, in
     /// sequence — and it carries the blink's property: a stored frame owns ONE
     /// renderer handle, so every view rebuild between two captures reads the
@@ -1053,11 +862,11 @@ mod tests {
                 .as_ref()
                 .map(|frame| frame.handle.id)
         };
-        // "" is "nothing is staged" — the strip's ordinary reading.
+        // A guest may select an image before its first decoded frame arrives.
         reset();
-        assert!(tiles_snapshot("").is_empty());
+        assert!(stage_frame(SELF_STAGE).is_none());
         store_preview(vec![10, 20, 30, 0xff], 1, 1);
-        assert_eq!(tiles_snapshot("").len(), 1);
+        assert!(stage_frame(SELF_STAGE).is_some());
         let first = preview_id().expect("preview");
         assert_eq!(first, preview_id().expect("preview"));
         store_preview(vec![40, 50, 60, 0xff], 1, 1);
@@ -1079,45 +888,50 @@ mod tests {
         let (width, height, _) = stage_frame(SELF_STAGE).unwrap();
         assert_eq!((width, height), (2, 1));
         assert!(stage_frame("a-peer-nobody-sent").is_none());
-        // ...and what the stage shows whole, the strip leaves out, so a
-        // desktop is not also a cropped plate beside itself.
-        assert!(tiles_snapshot(SELF_STAGE).is_empty());
-        assert_eq!(tiles_snapshot("").len(), 1);
+        assert!(stage_frame(SELF_STAGE).is_some());
+
+        let remote = render_bgra(vec![0xff; 4], 1, 1).unwrap();
+        let remote_id = remote.id;
+        store().lock().unwrap().peers.insert(
+            "remote-image".into(),
+            TileFrame {
+                width: 1,
+                height: 1,
+                handle: remote,
+            },
+        );
+        assert_eq!(stage_frame("remote-image").unwrap().2.id, remote_id);
+        assert!(stage_frame("missing").is_none());
+        crate::view_tree::assert_released_image_is_not_cached("remote-image");
 
         // ONE SOURCE: starting either one ends the other, and either one off
         // is off — there is no state where both are live.
-        let camera = call_use_camera(true);
+        let camera = use_source(Source::Camera);
         assert_eq!(source(), Source::Camera);
         assert!(camera.camera && !camera.sharing);
-        let screen = call_use_screen(true);
+        let screen = use_source(Source::Screen);
         assert_eq!(source(), Source::Screen);
         assert!(screen.sharing && !screen.camera);
         // ...and the outgoing source's last frame goes with it, so the tile
         // strip cannot paint a camera under a "sharing" beacon.
         assert!(preview_id().is_none());
-        let off = call_use_screen(false);
+        let off = use_source(Source::Off);
         assert_eq!(source(), Source::Off);
         assert!(!off.camera && !off.sharing);
 
         // A peer's frame arriving while a decode for that SAME peer is
-        // already running is DROPPED, never queued. `store_peer_frame`
+        // already running is DROPPED, never queued. `store_image`
         // checks-and-sets the in-flight marker before it ever touches the
         // bytes, so pre-arming that marker here stands in for a real decode
         // still running on another blocking-pool thread.
         reset();
-        let peer_key = [7u8; 32];
-        let peer_hex = hex_of(&peer_key);
+        let peer_hex = "opaque-image-7".to_owned();
         store()
             .lock()
             .expect("video store")
             .decoding
             .insert(peer_hex.clone());
-        store_peer_frame(PeerFrame {
-            peer: peer_key,
-            keyframe: true,
-            ts_ms: 0,
-            data: Vec::new(),
-        });
+        store_image(peer_hex.clone(), Vec::new(), &std::sync::atomic::AtomicBool::new(true));
         assert!(
             !store()
                 .lock()

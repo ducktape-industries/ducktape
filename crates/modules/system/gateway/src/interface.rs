@@ -397,25 +397,31 @@ fn grant_op_preimage(op: u8, statement: &CredentialGrantStatement) -> Result<Vec
     Ok(out)
 }
 
-/// The bytes a caller's user key signs under [`GATEWAY_CALLER_NS`] to prove
-/// possession on ONE proxied request: the serving node, the route's account,
-/// the route name, the HTTP method, the origin-form path and a caller
-/// timestamp (the serving side bounds its skew). Every field is framed, so no
-/// two requests share a preimage.
+/// The caller signs the publisher and every forwarded request field, including
+/// the route revision, headers, upgrade mode and body digest. The proof itself
+/// is excluded: installing its signature cannot change the signed bytes.
 pub fn caller_pop_preimage(
     publisher_node: &[u8],
-    account_id: u64,
-    route: &RouteName,
-    method: RouteMethod,
-    path: &str,
+    head: &crate::ProxyRequestHead,
+    body: &[u8],
     ts: u64,
 ) -> Vec<u8> {
+    use sha2::{Digest as _, Sha256};
     let mut out = Vec::new();
     push_bytes(&mut out, publisher_node);
-    out.extend_from_slice(&account_id.to_le_bytes());
-    push_opt_str(&mut out, route.label.as_deref());
-    push_bytes(&mut out, method.as_http_str().as_bytes());
-    push_bytes(&mut out, path.as_bytes());
+    out.extend_from_slice(&head.account_id.to_le_bytes());
+    push_opt_str(&mut out, head.name.label.as_deref());
+    out.extend_from_slice(&head.revision.to_le_bytes());
+    push_bytes(&mut out, head.method.as_http_str().as_bytes());
+    push_bytes(&mut out, head.path_and_query.as_bytes());
+    out.extend_from_slice(&(head.headers.len() as u64).to_le_bytes());
+    for header in &head.headers {
+        push_bytes(&mut out, header.name.as_bytes());
+        push_bytes(&mut out, header.value.as_bytes());
+    }
+    out.extend_from_slice(&head.body_len.to_le_bytes());
+    out.push(u8::from(head.upgrade));
+    out.extend_from_slice(&Sha256::digest(body));
     out.extend_from_slice(&ts.to_le_bytes());
     out
 }

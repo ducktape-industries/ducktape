@@ -1,8 +1,7 @@
 //! the forge lane: a per-run isolated git clone of a node-local forge repo at the
 //! run's pinned commit, committed with agent authorship and pushed back
-//! through this node's own loopback smart-HTTP lane (receive-pack → blob →
-//! `PushRefs`) so the branch move settles through consensus, CAS included
-//! (wire contract §4).
+//! through generic blob storage and node-authorized `PushRefs`, so the branch
+//! move settles through consensus with compare-and-swap.
 //!
 //! host `git` is a REAL runtime dependency of this lane — the first in the
 //! tree (forge itself is vendored libgit2 and never shells out). it is probed
@@ -20,11 +19,11 @@
 //! commit onto the moved tip with the worktree's old tree (reverting the
 //! interloper's content, fast-forward push, no reject ever fired). a
 //! detached HEAD is immune: the base stays the pin, and the remote tip is
-//! read ONLY via `git fetch` (never the untrustworthy local ref).
+//! read from the committed module query and fetched by object ID.
 //!
 //! ordering over CAS-degrade: the push is a plain (never forced)
 //! `HEAD:refs/heads/<branch>` update. a concurrently advanced branch rejects
-//! at the fork base (production's receive-pack/`PushRefs` CAS, stock git's
+//! at the fork base (production's `PushRefs` CAS, stock git's
 //! fetch-first refusal elsewhere), and the reject is an internal RETRY
 //! trigger, not a failure: fetch the new tip, rebase the run's commits onto
 //! FETCH_HEAD, push again (bounded — [`PUSH_ATTEMPTS`]). the CAS stays the
@@ -34,6 +33,8 @@
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
+use std::sync::Arc;
+use super::forge_publication::{Publication, ModulePublication};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -62,24 +63,18 @@ pub(super) struct ForgeLane {
     /// the forge module's on-disk repo base — `<repo_base>/<repo>` is a real
     /// (non-bare, never-checked-out) libgit2 repo the module materializes.
     repo_base: PathBuf,
-    /// the push base URL — production `http://127.0.0.1:<port>/forge`
-    /// (loopback smart-HTTP receive-pack); `<push_base>/<repo>` is the remote.
-    /// tests inject a `file://` base at bare rendezvous repos — the CAS
-    /// behavior asserted there is stock git's, the http lane is Task 6's e2e.
-    push_base: String,
+    publication: Arc<dyn Publication>,
     /// the committer identity on every run commit (the node, never the agent).
     committer_name: String,
 }
 
 impl ForgeLane {
-    /// decide the lane ONCE: all three legs (repo base on the link, a push
-    /// base, a worktree-capable host git) must hold, else the lane is
+    /// Decide the lane once: a repo base and worktree-capable host Git
+    /// must exist, otherwise the lane is
     /// `Err(reason)` — permanent for this provisioner's lifetime. the probe
-    /// runs only when the config legs are present (no point probing git on a
-    /// node that serves no http surface).
+    /// runs only when the materialized repository base is configured.
     pub(super) fn configure(
         node: &NodeLink,
-        push_base: Option<String>,
         committer_name: String,
         probe: impl FnOnce() -> Result<(), String>,
     ) -> Result<Self, String> {
@@ -90,28 +85,16 @@ impl ForgeLane {
                     .into(),
             );
         };
-        let Some(push_base) = push_base else {
-            return Err(
-                "this node serves no http surface, so the loopback smart-HTTP push lane \
-                 (receive-pack → PushRefs) that lands agent branches is unavailable"
-                    .into(),
-            );
-        };
         probe()?;
         Ok(Self {
+            publication: Arc::new(ModulePublication {
+                node: node.clone(),
+                repo_base: repo_base.clone(),
+            }),
             repo_base,
-            push_base,
             committer_name,
         })
     }
-}
-
-/// the forge smart-HTTP base: this node's OWN http base ([`super::node_http_base`]
-/// — same loopback normalisation, one implementation) plus the `/forge` mount.
-/// the lane is loopback by design (the node pushes to ITSELF; the bridge submits
-/// the ref move to consensus). `None` in = no http surface = no push lane.
-pub fn forge_push_base(http_listen: Option<&str>) -> Option<String> {
-    Some(format!("{}/forge", super::node_http_base(http_listen)?))
 }
 
 /// the construction-time probe: host `git` exists AND supports the clone and
@@ -194,7 +177,7 @@ fn probe_host_git_with(program: &str) -> Result<(), String> {
 /// a hermetic git command: no host/global/system config, no prompts, no
 /// gpg — identity comes ONLY from the env vars the caller sets (D2). the
 /// same posture as the e2e suites' git helpers.
-fn git(dir: &Path) -> Command {
+pub(super) fn git(dir: &Path) -> Command {
     git_program("git", dir)
 }
 
@@ -237,7 +220,7 @@ fn git_program(program: &str, dir: &Path) -> Command {
 
 /// run a git command to completion; non-zero exit becomes `Err` carrying the
 /// command and its stderr (the operator-facing failure text).
-fn run_git(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
+pub(super) fn run_git(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
     run_git_program("git", dir, args, envs)
 }
 
@@ -336,7 +319,6 @@ pub(super) async fn provision(
     };
     validate_coords(repo, commit, branch)?;
     let repo_dir = lane.repo_base.join(repo);
-    let push_url = format!("{}/{repo}", lane.push_base);
 
     let blocking = ProvisionArgs {
         repo_dir,
@@ -404,7 +386,8 @@ pub(super) async fn provision(
     Ok(Box::new(ForgeWorkspace {
         run_dir: workspace_args.run_dir,
         ro_dir,
-        push_url,
+        publication: lane.publication.clone(),
+        repo: repo.clone(),
         node,
         source: spec.source.clone(),
         agent: spec.agent.clone(),
@@ -492,13 +475,9 @@ struct ForgeWorkspace {
     /// tracked ONLY so cleanup can remove it; the commit/push never look at it
     /// (it lives outside the worktree, so git cannot see it either).
     ro_dir: Option<PathBuf>,
-    push_url: String,
-    /// the link the push credential is read from, per push attempt and never
-    /// latched: the node re-mints `admin.token` every boot, and this
-    /// workspace outlives a node restart. `git-receive-pack` refuses a push
-    /// carrying neither git's own certificate nor that credential, and a run
-    /// has no SSH signing key to make a certificate with — the NODE is the
-    /// pusher here, which is exactly what the credential says.
+    publication: Arc<dyn Publication>,
+    repo: String,
+    /// Credentials are read from the live link for each publication.
     node: NodeLink,
     source: WorkspaceSource,
     agent: Option<compute_service::AgentExecution>,
@@ -880,8 +859,8 @@ fn commit_blocking(
     run_dir: &Path,
     pinned_commit: &str,
     branch: &str,
-    push_url: &str,
-    node: &NodeLink,
+    publication: &dyn Publication,
+    repo: &str,
     response_proposal: Option<&str>,
     item_title: &str,
     identity: &CommitIdentity,
@@ -936,32 +915,13 @@ fn commit_blocking(
     // env), push again. ONLY a genuine rebase conflict degrades (Err → the
     // pool's commit_failed + Degraded; the reply still delivers, R4), and
     // the interloper's tip stays branch head.
-    let refspec = format!("HEAD:refs/heads/{branch}");
-    let fetchspec = format!("refs/heads/{branch}");
     let committer_env = [
         ("GIT_COMMITTER_NAME", identity.committer_name.as_str()),
         ("GIT_COMMITTER_EMAIL", committer_email.as_str()),
     ];
     let mut rebased = false;
     for attempt in 1..=PUSH_ATTEMPTS {
-        // re-read the operator credential on EVERY attempt, never once before
-        // the loop: the node re-mints `admin.token` on a restart, and this
-        // workspace's clone predates any restart that happens mid-run. the
-        // credential rides GIT_CONFIG_*, not `-c` — an argv is world-readable
-        // through /proc on Linux, and this is a secret.
-        let header = node
-            .operator_token()
-            .map(|token| format!("{}: {token}", crate::admin::ADMIN_TOKEN_HEADER))
-            .unwrap_or_default();
-        let push_env: Vec<(&str, &str)> = match header.is_empty() {
-            true => Vec::new(),
-            false => vec![
-                ("GIT_CONFIG_COUNT", "1"),
-                ("GIT_CONFIG_KEY_0", "http.extraHeader"),
-                ("GIT_CONFIG_VALUE_0", header.as_str()),
-            ],
-        };
-        match run_git(run_dir, &["push", push_url, &refspec], &push_env) {
+        match publication.push(repo, run_dir, branch) {
             Ok(_) => {
                 // re-read AFTER any rebase: the pushed head is the output_commit.
                 let oid = run_git(run_dir, &["rev-parse", "HEAD"], &[])?;
@@ -969,7 +929,7 @@ fn commit_blocking(
             }
             Err(e) if attempt == PUSH_ATTEMPTS => {
                 return Err(format!(
-                    "push of branch {branch:?} to {push_url} was rejected after \
+                    "push of branch {branch:?} in {repo} was rejected after \
                      {PUSH_ATTEMPTS} attempts: {e}"
                 ));
             }
@@ -979,7 +939,7 @@ fn commit_blocking(
                 // fetch miss means the branch is unborn remotely (a create
                 // race that resolved away, or a non-tip reject like a hook):
                 // skip the rebase and just push again.
-                if run_git(run_dir, &["fetch", push_url, &fetchspec], &push_env).is_ok() {
+                if publication.fetch(repo, run_dir, branch).is_ok() {
                     run_git(
                         run_dir,
                         &[
@@ -1047,8 +1007,8 @@ impl ProvisionedWorkspace for ForgeWorkspace {
     ) -> Result<WorkspaceReceipt, String> {
         let (pinned_commit, branch, item_title) = self.coords();
         let run_dir = self.run_dir.clone();
-        let push_url = self.push_url.clone();
-        let node = self.node.clone();
+        let publication = self.publication.clone();
+        let repo = self.repo.clone();
         let (agent_id, agent_display_name) = match &self.agent {
             Some(agent) => (agent.agent_id.clone(), agent.display_name.clone()),
             None => ("agent".into(), "agent".into()),
@@ -1065,8 +1025,8 @@ impl ProvisionedWorkspace for ForgeWorkspace {
                 &run_dir,
                 &pinned_commit,
                 &branch,
-                &push_url,
-                &node,
+                publication.as_ref(),
+                &repo,
                 proposal.as_deref(),
                 &item_title,
                 &identity,

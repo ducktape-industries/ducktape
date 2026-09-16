@@ -2,8 +2,8 @@
 //! surface to: [`FilesOdbBacking`] implements [`wasm_host::OdbBacking`] over the
 //! SAME `duckfs_core::Fs<DiskStore>` + `DiskRefs` machinery the native
 //! [`Files`](crate::module::Files) module runs on. it is native files with the
-//! `sdk::Module` trait peeled off: the guest owns `execute`, the host owns the
-//! committed surface (`root`/`query`/`snapshot`/`install`/`serve_sync` + the
+//! `sdk::Module` trait peeled off: the guest owns `execute` and `query`, the host owns the
+//! committed surface (`root`/`snapshot`/`install`/`serve_sync` + the
 //! object plane), and the block boundary is driven by the kernel through the two
 //! backing hooks in the duckfs durability order.
 //!
@@ -42,9 +42,7 @@ use duckfs_core::store::ObjectStore as _;
 // trait, so the trait must be in scope for the inherent-looking `refs_store.load()`
 // below to resolve — mirrors the `ObjectStore as _` import already here.
 use duckfs_core::store::RefsStore as _;
-use duckfs_core::{
-    Kind, ObjectId, decode_query, decode_refs, decode_sync_req, encode_reply, encode_sync_resp,
-};
+use duckfs_core::{Kind, ObjectId, decode_refs, decode_sync_req, encode_sync_resp};
 use duckfs_disk::{DiskRefs, DiskStore};
 use sdk::{Error, ModuleId};
 use wasm_host::{HostOdb, OdbBacking};
@@ -215,15 +213,6 @@ impl OdbBacking for FilesOdbBacking {
     /// stay untouched.
     fn discard_block(&mut self) {
         self.pending_objects.clear();
-    }
-
-    /// serve a committed-only query — the exact native `Module::query`
-    /// (`decode_query` → `Fs::query` → `encode_reply`). off the execute path, so a
-    /// body-reading query is allowed here.
-    fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let q = decode_query(req).map_err(Error::Module)?;
-        let reply = self.fs.query(q).map_err(Error::Module)?;
-        Ok(encode_reply(&reply))
     }
 
     /// serve one committed-only state-sync request — the exact native

@@ -169,7 +169,7 @@ in `sim-modules/` beside the binaries.
 | Where | What to touch |
 |---|---|
 | `crates/topology/src/lib.rs` | Add a catalog row and selection only when the module belongs in a shipped default. The component declares its own backing and configuration. Arbitrary founding directories and live admissions need no catalog entry. |
-| `crates/noded/src/compose.rs` | Only a new ODB substrate needs an `open_odb` implementation and an entry in `ODB_SUBSTRATES`. Store and map modules use the generic Wasm path. |
+| `crates/noded/src/compose.rs` | Components select a supported `Backing` engine over a private module directory. A genuinely new engine needs a host capability; a new module id needs no native table entry. |
 | the indexer | Ship `src/index_guest.rs`, add the crate to `INDEX_MODULES` in the Makefile, and pass `--index` on live registration or update. `converge_host_modules` installs the running deployment's mapper at boot and activation. Omitting `--index` removes an old mapper; its derived rows clear while the feed survives. |
 
 The deployment hash covers component and mapper together. A mapper-only

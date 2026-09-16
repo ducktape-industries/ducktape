@@ -54,3 +54,55 @@ fn task_chaining_and_abort_preserve_effect_order() {
     handle.abort();
     assert!(futures::executor::block_on(task.into_stream().collect::<Vec<_>>()).is_empty());
 }
+
+#[test]
+fn subscription_updates_follow_response_order_instead_of_recipe_order() {
+    struct Ordered {
+        received: Vec<&'static str>,
+    }
+    impl App for Ordered {
+        type Message = &'static str;
+        fn boot() -> (Self, Task<Self::Message>) {
+            (
+                Self {
+                    received: Vec::new(),
+                },
+                Task::none(),
+            )
+        }
+        fn view(&self) -> wire::Node {
+            wire::Node::empty()
+        }
+        fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
+            self.received.push(message);
+            Task::none()
+        }
+        fn subscription(&self) -> Subscription<Self::Message> {
+            Subscription::batch([
+                Subscription::run_with("visible", |kind| {
+                    host::subscribe(kind, &[]).map(|_| "visible")
+                }),
+                Subscription::run_with("data", |kind| host::subscribe(kind, &[]).map(|_| "data")),
+            ])
+        }
+    }
+    let mut driver = Driver::<Ordered>::new();
+    let requests = driver.tick(vec![]).requests;
+    for order in [["data", "visible"], ["visible", "data"]] {
+        driver.app.received.clear();
+        let events = order
+            .iter()
+            .map(|kind| wire::Event::Response {
+                id: requests
+                    .iter()
+                    .find(|request| request.kind == *kind)
+                    .unwrap()
+                    .id,
+                result: Ok(Vec::new()),
+                done: false,
+            })
+            .collect();
+        driver.tick(events);
+        assert_eq!(driver.app.received, order);
+    }
+}

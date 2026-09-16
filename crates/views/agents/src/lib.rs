@@ -683,9 +683,10 @@ impl AgentsView {
     fn markdown(&self, key: &str, text: &str) -> Node {
         Node::Surface {
             key: key.into(),
-            name: "agent_markdown".into(),
+            name: "markdown".into(),
             args: vec![
                 wire::SurfaceValue::Str(text.into()),
+                wire::SurfaceValue::Str(String::new()),
                 wire::SurfaceValue::Bool(self.dark),
             ],
             on_event: Some(slots::handler::<wire::SurfaceValue, Message>(Box::new(
@@ -1301,8 +1302,10 @@ impl AgentsView {
             (true, _) => Some(primary(
                 "agents/register",
                 "Register agent",
-                (complete_record && host::valid_agent_id(&self.draft_id))
-                    .then_some(Message::SubmitRegister),
+                (complete_record
+                    && host::valid_agent_id(&self.draft_id)
+                    && self.registration.is_none())
+                .then_some(Message::SubmitRegister),
             )),
             (false, true) => Some(primary(
                 "agents/save",
@@ -1366,6 +1369,10 @@ pub struct AgentsView {
     pub(crate) account: String,
     pub(crate) committed: i64,
     pub(crate) seeded: i64,
+    #[serde(skip)]
+    registration: Option<ducktape_view_guest::task::Handle>,
+    #[serde(skip)]
+    registration_serial: u64,
     pub(crate) connected: bool,
     pub(crate) connection_serial: i64,
     pub(crate) answered: bool,
@@ -1426,6 +1433,7 @@ pub enum Message {
     SetStatus(String, bool),
     SubmitSave,
     SubmitRegister,
+    RegistrationDone(u64, Result<(), String>),
     BindDraftId(String),
     BindDraftName(String),
     BindSkillName(String),
@@ -1463,6 +1471,8 @@ impl AgentsView {
             account: "".to_owned(),
             committed: 0,
             seeded: 0,
+            registration: None,
+            registration_serial: 0,
             connected: false,
             connection_serial: 0,
             answered: false,
@@ -1552,7 +1562,72 @@ impl AgentsView {
 }
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn local_run_navigation_survives_session_refresh_until_another_external_request() {
+        let mut view = super::AgentsView::state();
+        let session = |opened, run: &str| {
+            super::Message::SessionArrived(crate::host::SessionItem {
+                next: crate::host::Session {
+                    connected: true,
+                    open_run: run.into(),
+                    opened,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        };
+        let _ = view.update(session(1, "external"));
+        assert_eq!(view.open_run, "external");
+        let _ = view.update(super::Message::CloseRun);
+        let _ = view.update(session(1, "external"));
+        assert!(
+            view.open_run.is_empty(),
+            "ordinary props cannot reopen a closed run"
+        );
+        view.open_run = "local".into();
+        let _ = view.update(session(1, "external"));
+        assert_eq!(view.open_run, "local");
+        let _ = view.update(session(2, "external"));
+        assert_eq!(
+            view.open_run, "external",
+            "a fresh external request is navigation"
+        );
+    }
     use super::*;
+
+    #[test]
+    fn registration_completion_preserves_a_different_open_draft() {
+        for creating in [false, true] {
+            let (mut view, _) = AgentsView::boot();
+            view.registration_serial = 4;
+            view.connected = true;
+            view.account = "7".into();
+            view.selected = "other-agent".into();
+            view.draft_id = "other-agent".into();
+            view.draft_name = "Unsaved name".into();
+            view.creating = creating;
+            let _ = view.on_registration_done(4, Ok(()));
+            let mut rows = vec![host::AgentRow {
+                id: "registered-agent".into(),
+                ..Default::default()
+            }];
+            if !creating {
+                rows.push(host::AgentRow {
+                    id: "other-agent".into(),
+                    name: "Stored name".into(),
+                    ..Default::default()
+                });
+            }
+            let _ = view.on_register_arrived(host::RegisterItem {
+                rows,
+                ..Default::default()
+            });
+            assert_eq!(view.draft_name, "Unsaved name");
+            assert_eq!(view.creating, creating);
+        }
+    }
+
     #[test]
     fn long_reply_links_wrap_within_the_journal_width() {
         let label =
@@ -1725,6 +1800,7 @@ impl AgentsView {
             Message::SetStatus(agent_id, paused) => self.on_set_status(agent_id, paused),
             Message::SubmitSave => self.on_submit_save(),
             Message::SubmitRegister => self.on_submit_register(),
+            Message::RegistrationDone(serial, result) => self.on_registration_done(serial, result),
             Message::BindDraftId(value) => self.on_bind_draft_id(value),
             Message::BindDraftName(value) => self.on_bind_draft_name(value),
             Message::BindSkillName(value) => self.on_bind_skill_name(value),
@@ -1915,6 +1991,13 @@ impl AgentsView {
                 return ::ducktape_view_guest::Task::none();
             }
             let next = item.next.clone();
+            let navigation_changed = next.opened != self.opened;
+            let connection_changed = next.connected != self.connected;
+            let registration_context_changed = !next.connected || self.account != next.account;
+            if registration_context_changed {
+                self.registration.take();
+                self.registration_serial = self.registration_serial.wrapping_add(1);
+            }
             {
                 self.connection_serial = crate::host::connection_serial_after(
                     self.connected,
@@ -1932,7 +2015,8 @@ impl AgentsView {
                 self.account = next.account.to_owned();
             }
             {
-                if self.open_run != next.open_run {
+                let accept_navigation = navigation_changed || connection_changed;
+                if accept_navigation {
                     self.control_state = host::ControlState::Idle;
                     self.control_serial = self.control_serial.wrapping_add(1);
                     self.control_draft.clear();
@@ -1941,8 +2025,11 @@ impl AgentsView {
                     self.raw_event_open = None;
                     self.message_preview_open = None;
                     self.run_tab = RunTab::Conversation;
+                    self.open_run = match next.connected {
+                        true => next.open_run.clone(),
+                        false => String::new(),
+                    };
                 }
-                self.open_run = next.open_run.to_owned();
             }
             {
                 self.open_row = crate::host::run_at(
@@ -2251,11 +2338,6 @@ impl AgentsView {
                 }
                 self.open_run = self.open_row.dispatch_id.to_owned();
             }
-            {
-                self.sent = crate::host::open_run(::std::convert::AsRef::as_ref(
-                    &(self.open_row.dispatch_id),
-                ));
-            }
             ::ducktape_view_guest::Task::none()
         }
     }
@@ -2282,9 +2364,6 @@ impl AgentsView {
             }
             {
                 self.live = crate::host::empty_live();
-            }
-            {
-                self.sent = crate::host::open_run(::std::convert::AsRef::as_ref(&("")));
             }
             ::ducktape_view_guest::Task::none()
         }
@@ -2405,22 +2484,48 @@ impl AgentsView {
             ::ducktape_view_guest::Task::none()
         }
     }
-    fn on_submit_register(&mut self) -> ::ducktape_view_guest::Task<Message> {
-        {
-            {
-                self.sent = crate::host::register_agent(
-                    ::std::convert::AsRef::as_ref(&(self.draft_id)),
-                    ::std::convert::AsRef::as_ref(&(self.draft_name)),
-                    ::std::convert::AsRef::as_ref(
-                        &(crate::host::or_empty(::std::borrow::Borrow::borrow(
-                            &(self.draft_capability),
-                        ))),
-                    ),
-                    ::std::convert::AsRef::as_ref(&(self.draft_skills)),
-                );
-            }
-            ::ducktape_view_guest::Task::none()
+    fn on_submit_register(&mut self) -> ducktape_view_guest::Task<Message> {
+        let may_start = self.connected && self.registration.is_none();
+        if !may_start {
+            return ducktape_view_guest::Task::none();
         }
+        let draft = host::Draft {
+            agent_id: self.draft_id.trim().into(),
+            display_name: self.draft_name.trim().into(),
+            capability: self
+                .draft_capability
+                .clone()
+                .unwrap_or_default()
+                .trim()
+                .into(),
+            skills: self.draft_skills.clone(),
+        };
+        self.registration_serial = self.registration_serial.wrapping_add(1);
+        let serial = self.registration_serial;
+        let (task, handle) = ducktape_view_guest::Task::perform(
+            host::register_agent(self.account.clone(), draft),
+            move |result| Message::RegistrationDone(serial, result),
+        )
+        .abortable();
+        self.registration = Some(handle.abort_on_drop());
+        task
+    }
+    fn on_registration_done(
+        &mut self,
+        serial: u64,
+        result: Result<(), String>,
+    ) -> ducktape_view_guest::Task<Message> {
+        if serial != self.registration_serial {
+            return ducktape_view_guest::Task::none();
+        }
+        self.registration.take();
+        // Registration consumes only the creation draft whose id appears in
+        // the registry. A later callback must not consume another open editor.
+        self.host_error = host::fault(
+            "The change was not accepted",
+            &result.err().unwrap_or_default(),
+        );
+        ducktape_view_guest::Task::none()
     }
     fn on_bind_draft_id(&mut self, value: String) -> ::ducktape_view_guest::Task<Message> {
         {

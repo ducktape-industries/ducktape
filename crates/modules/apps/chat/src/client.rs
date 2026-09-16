@@ -14,6 +14,8 @@
 //! shell.
 
 use sha2::{Digest, Sha256};
+pub use chat_message::parse_message;
+use chat_message::inline_spans;
 
 use crate::index::{self, MsgRow};
 use crate::{Block, ChatAssigned, ChatMsg, Mark, Party, PostPolicy, Span, decode_msg};
@@ -34,7 +36,7 @@ pub const THREAD_HOT_WINDOW_LIMIT: usize = CHAT_HOT_WINDOW_LIMIT + 1;
 // rendered row types — what a chat view iterates over
 // ============================================================================
 
-#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
+#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ChatChannel {
     pub id: String,
     pub name: String,
@@ -49,7 +51,7 @@ pub struct ChatChannel {
     pub voice: bool,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
+#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct HuddleSeat {
     pub label: String,
     pub initials: String,
@@ -69,7 +71,7 @@ pub struct ChatReaction {
     pub reactors: Vec<String>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
+#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ChatMember {
     pub key: String,
     pub label: String,
@@ -77,7 +79,7 @@ pub struct ChatMember {
 
 /// The account a user key is bound to: its number (the identity, which the
 /// DM derivation and every "same person" test hang on) and its display name.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct BoundAccount {
     pub number: u64,
     pub name: String,
@@ -90,7 +92,7 @@ pub struct BoundAccount {
 /// Names are display text, NOT identity — two accounts may share one — so
 /// nothing here compares names; "the same person" is the account NUMBER, and
 /// a person's passkey, wallet and device key all resolve to one.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct NameDirectory {
     accounts: BTreeMap<String, BoundAccount>,
     by_account: BTreeMap<u64, String>,
@@ -1554,52 +1556,7 @@ pub fn draft_mentions(
     text: &str,
     names: &NameDirectory,
 ) -> (String, Vec<(std::ops::Range<usize>, Party)>) {
-    let chars: Vec<char> = text.chars().collect();
-    let mut display = String::new();
-    let mut mentions = Vec::new();
-    let mut index = 0;
-    while index < chars.len() {
-        if let Some(consumed) = code_fence_len(&chars, index) {
-            display.extend(&chars[index..index + consumed]);
-            index += consumed;
-            continue;
-        }
-        if let Some((party, consumed)) = mention_at(&chars, index) {
-            let start = display.len();
-            display.push_str(&mention_label(&party, names));
-            mentions.push((start..display.len(), party));
-            index += consumed;
-        } else {
-            display.push(chars[index]);
-            index += 1;
-        }
-    }
-    (display, mentions)
-}
-
-/// Fenced code is literal, including token-shaped text inside it.
-fn code_fence_len(chars: &[char], at: usize) -> Option<usize> {
-    let line_start = at == 0 || chars[at - 1] == '\n';
-    if !line_start {
-        return None;
-    }
-    let mut lines = chars[at..].split_inclusive(|ch| *ch == '\n');
-    let opener = lines.next()?;
-    let opener_text: String = opener.iter().collect();
-    let opens_fence = opener_text.trim().starts_with("```");
-    if !opens_fence {
-        return None;
-    }
-    let mut consumed = opener.len();
-    for line in lines {
-        consumed += line.len();
-        let line_text: String = line.iter().collect();
-        let closes_fence = line_text.trim() == "```";
-        if closes_fence {
-            break;
-        }
-    }
-    Some(consumed)
+    chat_message::draft_mentions(text, |party| mention_label(party, names))
 }
 
 /// The optimistic row's render blocks: the SAME grammar the send commits
@@ -1880,202 +1837,6 @@ fn count_i64(value: usize) -> i64 {
 // composer parsing — markdown → wire blocks
 // ============================================================================
 
-/// Parse composer text into wire `Block`s: fenced ```code``` (optional language),
-/// `>` quotes, `---`/`***` dividers, and paragraphs with inline `**bold**` /
-/// `__bold__`, `*italic*` / `_italic_`, and bare `http(s)` links. Everything the
-/// `chat` wire enums can round-trip — nothing client-only.
-///
-/// A SINGLE NEWLINE IS A HARD BREAK, not CommonMark's soft break. The composer
-/// hint says `⇧↵ newline` and `⇧↵` really does put a `\n` in the buffer, so
-/// folding consecutive lines into one paragraph with a space posted a typed
-/// list as "- apples - bananas - pears" — and the fold happens on the way to
-/// the CHAIN, so no renderer recovers it. Each line is therefore its own block.
-/// A rendered break has to be a block boundary rather than a `\n` inside one:
-/// a marked-up line renders as a single rich-text paragraph (`run_spans`),
-/// one paragraph widget per typed line.
-/// Parse canonical `<@account>` and `<@key:hex>` tokens into mention marks.
-/// Display names are never interpreted as recipient identities.
-pub fn parse_message(input: &str) -> Vec<Block> {
-    let lines: Vec<&str> = input.lines().collect();
-    let mut blocks = Vec::new();
-    let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index];
-        let trimmed = line.trim();
-        let opens_fence = trimmed.starts_with("```");
-        let is_divider = trimmed == "---" || trimmed == "***";
-        let is_quote = trimmed.starts_with('>');
-        let is_blank = trimmed.is_empty();
-        if opens_fence {
-            index = push_code_block(&lines, index, trimmed, &mut blocks);
-        } else if is_divider {
-            blocks.push(Block::Divider);
-            index += 1;
-        } else if is_quote {
-            index = push_quote_block(&lines, index, &mut blocks);
-        } else if is_blank {
-            index += 1;
-        } else {
-            index = push_paragraph_block(&lines, index, &mut blocks);
-        }
-    }
-    if blocks.is_empty() {
-        blocks.push(Block::paragraph(input.trim().to_string()));
-    }
-    blocks
-}
-
-fn push_code_block(lines: &[&str], start: usize, opener: &str, blocks: &mut Vec<Block>) -> usize {
-    let lang = opener.trim_start_matches('`').trim().to_string();
-    let mut index = start + 1;
-    let mut code = Vec::new();
-    while index < lines.len() && lines[index].trim() != "```" {
-        code.push(lines[index]);
-        index += 1;
-    }
-    let closed = index < lines.len();
-    blocks.push(Block::Code {
-        lang: (!lang.is_empty()).then_some(lang),
-        text: code.join("\n"),
-    });
-    if closed { index + 1 } else { index }
-}
-
-fn push_quote_block(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize {
-    let mut index = start;
-    while index < lines.len() && lines[index].trim().starts_with('>') {
-        let stripped = lines[index].trim().trim_start_matches('>').trim_start();
-        blocks.push(Block::Quote(inline_spans(stripped)));
-        index += 1;
-    }
-    index
-}
-
-fn push_paragraph_block(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize {
-    let mut index = start;
-    while index < lines.len() {
-        let trimmed = lines[index].trim();
-        let breaks = trimmed.is_empty()
-            || trimmed.starts_with('>')
-            || trimmed.starts_with("```")
-            || trimmed == "---"
-            || trimmed == "***";
-        if breaks {
-            break;
-        }
-        blocks.push(Block::Paragraph(inline_spans(trimmed)));
-        index += 1;
-    }
-    index
-}
-
-/// Scan a single line of text for inline marks, preserving mention identity
-/// inside emphasis. Bare `http(s)://` and `duck://`
-/// runs become `Link`s, as does a `[label](url)` reference — one span whose
-/// text is the label and whose mark carries the target.
-fn inline_spans(text: &str) -> Vec<Span> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut spans: Vec<Span> = Vec::new();
-    let mut plain = String::new();
-    let mut index = 0;
-    while index < chars.len() {
-        let url = url_len(&chars, index);
-        let reference = reference_at(&chars, index);
-        let bold = fenced(&chars, index, "**").or_else(|| fenced(&chars, index, "__"));
-        let italic = fenced(&chars, index, "*").or_else(|| fenced(&chars, index, "_"));
-        if let Some((target, len)) = mention_at(&chars, index) {
-            flush_plain(&mut plain, &mut spans);
-            let handle: String = chars[index..index + len].iter().collect();
-            spans.push(Span {
-                text: handle,
-                // A directory account is one mark, regardless of its keys.
-                marks: vec![Mark::Mention(target)],
-            });
-            index += len;
-        } else if let Some((label, target, len)) = reference {
-            flush_plain(&mut plain, &mut spans);
-            spans.push(Span {
-                text: label,
-                marks: vec![Mark::Link(target)],
-            });
-            index += len;
-        } else if let Some(len) = url {
-            flush_plain(&mut plain, &mut spans);
-            let target: String = chars[index..index + len].iter().collect();
-            spans.push(Span {
-                text: target.clone(),
-                marks: vec![Mark::Link(target)],
-            });
-            index += len;
-        } else if let Some((inner, len)) = bold {
-            flush_plain(&mut plain, &mut spans);
-            spans.extend(inline_spans(&inner).into_iter().map(|mut span| {
-                span.marks.push(Mark::Bold);
-                span
-            }));
-            index += len;
-        } else if let Some((inner, len)) = italic {
-            flush_plain(&mut plain, &mut spans);
-            spans.extend(inline_spans(&inner).into_iter().map(|mut span| {
-                span.marks.push(Mark::Italic);
-                span
-            }));
-            index += len;
-        } else {
-            plain.push(chars[index]);
-            index += 1;
-        }
-    }
-    flush_plain(&mut plain, &mut spans);
-    if spans.is_empty() {
-        spans.push(Span::plain(String::new()));
-    }
-    spans
-}
-
-fn flush_plain(plain: &mut String, spans: &mut Vec<Span>) {
-    if !plain.is_empty() {
-        spans.push(Span::plain(std::mem::take(plain)));
-    }
-}
-
-/// If `chars[at..]` opens a bare link, its length in chars; else `None`.
-///
-/// `duck://` is a link scheme here exactly as `http(s)://` is: the app
-/// classifies a pressed link through its own module table
-/// (`backend/duck_uri.rs`) and refuses what it cannot open, so the tokenizer
-/// marks the run and decides nothing about where it points.
-fn url_len(chars: &[char], at: usize) -> Option<usize> {
-    let rest: String = chars[at..].iter().collect();
-    let starts_link = LINK_SCHEMES.iter().any(|scheme| rest.starts_with(scheme));
-    if !starts_link {
-        return None;
-    }
-    let mut len = chars[at..]
-        .iter()
-        .take_while(|c| !c.is_whitespace())
-        .count();
-    // A run stops at whitespace, but the `)` that closes `[x](duck://page/p1)`
-    // or `(see https://x)` belongs to the prose around the address, not to it.
-    while dangling_close(&chars[at..at + len]) {
-        len -= 1;
-    }
-    (len > 0).then_some(len)
-}
-
-/// Does this run end in a `)` that opens nowhere inside it? A balanced one
-/// (`…/wiki/Foo_(bar)`) is part of the address and stays.
-fn dangling_close(run: &[char]) -> bool {
-    let closed = run.last() == Some(&')');
-    let opens = run.iter().filter(|c| **c == '(').count();
-    let closes = run.iter().filter(|c| **c == ')').count();
-    closed && closes > opens
-}
-
-/// The schemes a bare run and a `[label](url)` target may carry. Anything
-/// else stays plain text.
-const LINK_SCHEMES: [&str; 3] = ["http://", "https://", "duck://"];
-
 /// How many hex characters `mint_chain_id` puts after the `#`.
 const CHAIN_DIGEST_HEX: usize = 8;
 
@@ -2110,39 +1871,6 @@ pub fn is_chain_digest(digest: &str) -> bool {
         && digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-/// If `chars[at..]` opens a `[label](url)` reference — the form agents already
-/// emit for `duck://` refs (`runs::inject`) — the label, the target, and the
-/// total consumed length. The label is one line with no nested brackets and
-/// the target is one whitespace-free run in a known scheme; anything else is
-/// not a reference and stays the plain text it was typed as.
-fn reference_at(chars: &[char], at: usize) -> Option<(String, String, usize)> {
-    if chars[at] != '[' {
-        return None;
-    }
-    let label_end = chars[at + 1..]
-        .iter()
-        .position(|c| *c == ']' || *c == '[')?
-        + at
-        + 1;
-    let labelled = chars[label_end] == ']' && chars.get(label_end + 1) == Some(&'(');
-    if !labelled {
-        return None;
-    }
-    let url_start = label_end + 2;
-    let url_end = chars[url_start..]
-        .iter()
-        .position(|c| *c == ')' || c.is_whitespace())?
-        + url_start;
-    let closed = chars[url_end] == ')';
-    if !closed {
-        return None;
-    }
-    let label: String = chars[at + 1..label_end].iter().collect();
-    let target: String = chars[url_start..url_end].iter().collect();
-    let linkable = !label.is_empty() && LINK_SCHEMES.iter().any(|s| target.starts_with(s));
-    linkable.then(|| (label, target, url_end + 1 - at))
 }
 
 /// Autocomplete candidates carry identity separately from their display labels.
@@ -2229,26 +1957,6 @@ pub fn handle_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '-' | '_' | '.')
 }
 
-fn mention_at(chars: &[char], at: usize) -> Option<(Party, usize)> {
-    let opens = chars.get(at) == Some(&'<') && chars.get(at + 1) == Some(&'@');
-    if !opens {
-        return None;
-    }
-    let end = chars[at + 2..].iter().position(|c| *c == '>')? + at + 2;
-    let id: String = chars[at + 2..end].iter().collect();
-    let party = match id.strip_prefix("key:") {
-        Some(key) => Party::Key(hex_bytes(key)?),
-        None => {
-            let decimal = !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit());
-            if !decimal {
-                return None;
-            }
-            Party::Account(id.parse().ok()?)
-        }
-    };
-    Some((party, end + 1 - at))
-}
-
 /// True when any `Mark::Mention` in `blocks` addresses one of `keys` — the
 /// reader's own account keys, so "was I mentioned?" is answered for the
 /// PERSON and not for the one device that happens to be signing here.
@@ -2273,29 +1981,6 @@ pub fn mentions_reach(blocks: &[Block], parties: &[Party]) -> bool {
 fn member_key_bytes(member: &ChatMember) -> Vec<u8> {
     let key = member.key.strip_prefix("user:").unwrap_or(&member.key);
     hex_bytes(key).unwrap_or_else(|| key.as_bytes().to_vec())
-}
-
-/// If `chars[at..]` opens with `marker` and has a later closing `marker`, the
-/// enclosed text and the total consumed length (markers included).
-fn fenced(chars: &[char], at: usize, marker: &str) -> Option<(String, usize)> {
-    let marks: Vec<char> = marker.chars().collect();
-    let opens = chars[at..].starts_with(marks.as_slice());
-    if !opens {
-        return None;
-    }
-    let body_start = at + marks.len();
-    let mut cursor = body_start;
-    while cursor + marks.len() <= chars.len() {
-        if chars[cursor..].starts_with(marks.as_slice()) {
-            let inner: String = chars[body_start..cursor].iter().collect();
-            if inner.is_empty() {
-                return None;
-            }
-            return Some((inner, cursor + marks.len() - at));
-        }
-        cursor += 1;
-    }
-    None
 }
 
 // ============================================================================

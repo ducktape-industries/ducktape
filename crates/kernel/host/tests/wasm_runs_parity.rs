@@ -1672,3 +1672,29 @@ fn a_live_task_update_retains_its_attempt_on_both_runtimes() {
         );
     });
 }
+
+#[test]
+fn deployed_registration_program_query_matches_native_and_preserves_state() {
+    use sdk::Module as _;
+    futures::executor::block_on(async {
+        let guest = wasm_runs();
+        let native = native_runs();
+        let before = guest.root();
+        for id in ["builder", "another-agent"] {
+            let query = runs_encode_query(&RunsQuery::ModelProgram {
+                agent_id: id.into(),
+            });
+            let actual = guest.query(&query).await.unwrap();
+            assert_eq!(actual, native.query(&query).await.unwrap());
+            assert_eq!(
+                runs_decode_reply(&actual).unwrap(),
+                RunsReply::ModelProgram(runs::model_program(id))
+            );
+        }
+        let invalid = runs_encode_query(&RunsQuery::ModelProgram {
+            agent_id: "Invalid ID".into(),
+        });
+        assert!(guest.query(&invalid).await.is_err());
+        assert_eq!(guest.root(), before);
+    });
+}

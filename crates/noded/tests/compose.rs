@@ -41,8 +41,12 @@ fn run(body: impl FnOnce(commonware_runtime::tokio::Context, PathBuf) -> BoxFut<
 
 fn substrates(dir: &std::path::Path) -> Substrates {
     Substrates {
-        forge_repo: dir.join("forge"),
-        duckfs_dir: dir.join("duckfs"),
+        directory: dir.join("module-storage"),
+        bindings: [
+            ("forge".into(), dir.join("forge")),
+            ("files".into(), dir.join("duckfs")),
+        ]
+        .into(),
         blobs: blobstore::BlobHandle::default(),
     }
 }
@@ -246,24 +250,19 @@ fn a_code_source_whose_bytes_miss_the_hash_is_refused() {
     });
 }
 
-/// a shape this host cannot realize is refused BY NAME, before any substrate
-/// is touched: an odb declaration under an id the host has no substrate for,
-/// or a config key no network binds. the same check the readiness probe runs
-/// before a validator signals a swap ready.
+/// Supported engines are available to every valid tenant; host-provided
+/// configuration keys remain an explicit capability contract.
 #[test]
-fn a_shape_the_host_cannot_realize_is_refused_by_name() {
-    let odb = Shape {
-        backing: Backing::Odb,
-        config: Vec::new(),
-        committed_queries: false,
-    };
-    let err = check_realizable("kanban", &odb).unwrap_err();
-    assert!(
-        err.contains("kanban") && err.contains("odb"),
-        "an odb declaration without a substrate names the module: {err}"
-    );
-    check_realizable("files", &odb).expect("files has an odb substrate");
-    check_realizable("forge", &odb).expect("forge has an odb substrate");
+fn supported_storage_is_not_restricted_to_founding_module_names() {
+    for backing in [Backing::Odb, Backing::Git] {
+        let shape = Shape {
+            backing,
+            config: Vec::new(),
+            committed_queries: true,
+        };
+        check_realizable("kanban", &shape).expect("supported engine for a new module");
+        assert!(check_realizable("../escape", &shape).is_err());
+    }
 
     let unknown_key = Shape {
         backing: Backing::Store,
@@ -286,11 +285,8 @@ fn a_shape_the_host_cannot_realize_is_refused_by_name() {
     check_realizable("kanban", &bound).expect("the network binds both keys");
 }
 
-/// a post-genesis admission builds through the SAME wasm path a genesis
-/// tenant took: the factory wraps the bytes over the substrate they declare
-/// (a map-declared fixture over a fresh map) and refuses a declaration the
-/// host cannot realize under that id (the odb-declared fixture under an id
-/// with no substrate), by name.
+/// Post-genesis admission uses the same factory as genesis for maps and
+/// tenant-scoped object storage, including module ids unknown to the host.
 #[test]
 fn admissions_build_through_the_one_wasm_path() {
     run(|context, dir| {
@@ -314,18 +310,22 @@ fn admissions_build_through_the_one_wasm_path() {
                 panic!("the hello fixture is a `ducktape:module`");
             };
             assert_eq!(module.id(), "hello");
-            let err = host::ModuleFactory::instantiate(
+            let admitted = host::ModuleFactory::instantiate(
                 &admissions,
                 "kanban",
                 &module_artifact::Artifact::module(object).encode(),
             )
             .await
-            .err()
-            .expect("an odb declaration under an id with no substrate is refused");
-            assert!(
-                err.to_string().contains("kanban"),
-                "the refusal names the module: {err}"
+            .expect("a new tenant can use supported object storage");
+            let host::Admitted::Module(module) = admitted else {
+                panic!("object fixture is a module")
+            };
+            assert_eq!(module.id(), "kanban");
+            assert_eq!(
+                substrates.path("kanban").unwrap(),
+                dir.join("module-storage/kanban")
             );
+            assert!(substrates.path("../escape").is_err());
             // and the ONE refusal that is not fail-closed: bytes that are no
             // `ducktape:module` at all are another plane's commitment record.
             let netstack = std::fs::read(

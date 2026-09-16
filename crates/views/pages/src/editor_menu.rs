@@ -36,6 +36,32 @@ fn replace(document: &Doc, range: Range<usize>, replacement: &str) -> Doc {
     next
 }
 
+/// Replace a completed punctuation shortcut at the caret in canonical source.
+pub fn typography(document: &Doc) -> EditorDecision {
+    const RULES: &[(&str, &str)] = &[
+        ("(c)", "©"),
+        ("(C)", "©"),
+        ("(r)", "®"),
+        ("(R)", "®"),
+        ("(tm)", "™"),
+        ("(TM)", "™"),
+        ("...", "…"),
+        ("<-", "←"),
+        ("->", "→"),
+        ("--", "–"),
+        ("!=", "≠"),
+        ("<=", "≤"),
+        (">=", "≥"),
+        ("+/-", "±"),
+    ];
+    let caret = document.offset(document.cursor.position);
+    let prefix = &document.text[..caret];
+    let Some((from, to)) = RULES.iter().find(|(from, _)| prefix.ends_with(from)) else {
+        return EditorDecision::Noop;
+    };
+    finish(document, replace(document, caret - from.len()..caret, to))
+}
+
 /// Rewrite one line's block marker while retaining its content and indentation.
 pub fn turn(document: &Doc, line: usize, tag: &str) -> EditorDecision {
     finish(document, turned(document, line, tag))
@@ -314,6 +340,10 @@ const FORMAT_ITEMS: &[(&str, &str)] = &[
     ("turn", "Turn into…"),
     ("clear", "Clear formatting"),
 ];
+
+pub fn format_items() -> &'static [(&'static str, &'static str)] {
+    FORMAT_ITEMS
+}
 
 /// The alignment submenu: the three sides the wire can lay a line on.
 const ALIGN_ITEMS: &[(&str, &str)] = &[
@@ -649,6 +679,29 @@ impl Menu {
         if on_link {
             *self = self.reopen(Kind::Link { line, column });
         }
+    }
+
+    pub fn open_trigger(&self, document: &Doc, trigger: char) -> (EditorDecision, Self) {
+        let offset = document.offset(document.cursor.position);
+        let prefix = &document.text[..offset];
+        let already_present = prefix.ends_with(trigger);
+        let next = if already_present {
+            document.clone()
+        } else {
+            let needs_space = prefix
+                .chars()
+                .next_back()
+                .is_some_and(|last| !last.is_whitespace());
+            let insertion = if needs_space {
+                format!(" {trigger}")
+            } else {
+                trigger.to_string()
+            };
+            replace(document, offset..offset, &insertion)
+        };
+        let mut menu = self.closed();
+        menu.after_edit(&next, Some(trigger));
+        (finish(document, next), menu)
     }
 
     pub fn select(&mut self, document: &Doc, selected: usize) {

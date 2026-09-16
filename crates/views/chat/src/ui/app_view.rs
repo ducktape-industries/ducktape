@@ -79,6 +79,21 @@ impl super::ChatView {
                 children: vec![stack, card],
             },
         };
+        let overlay = match self.channel_creation(&format!("{node_scope}/create")) {
+            None => overlay,
+            Some(card) => wire::Node::Overlay {
+                key: format!("{node_scope}/create-overlay"),
+                padding: 24.,
+                backdrop: wire::Rgba([0., 0., 0., 0.55]),
+                align_x: wire::AlignX::Center,
+                align_y: wire::AlignY::Center,
+                on_dismiss: self
+                    .channel_creating
+                    .is_none()
+                    .then(|| slots::message(Message::ToggleChannelCreate)),
+                children: vec![overlay, card],
+            },
+        };
         wire::Node::Sensor {
             key: format!("{}/@sensor:906", "ChatView"),
             reset: None,

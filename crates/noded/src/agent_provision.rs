@@ -49,6 +49,7 @@ use provider_host::OperatorCredential;
 
 mod duckfs;
 mod forge;
+mod forge_publication;
 mod session;
 
 /// Serve `handle`'s own `/v1` router on loopback and return a [`NodeLink`] to
@@ -94,8 +95,6 @@ pub(crate) async fn test_link(handle: crate::NodeHandle) -> NodeLink {
         None => link,
     }
 }
-
-pub use forge::forge_push_base;
 
 #[cfg(test)]
 #[path = "agent_provision/plane_tests.rs"]
@@ -212,9 +211,8 @@ fn mount_dir_name(subpath: &str) -> Result<(), String> {
 /// address, with a wildcard bind rewritten to the SAME family's loopback
 /// (`0.0.0.0` → `127.0.0.1`, `[::]` → `[::1]` — a bindv6only `[::]` listener
 /// refuses v4 loopback dials). the base must be a CONNECTABLE host: a run's
-/// tool plane dials it back (`DUCKTAPE_NODE`), and the forge lane pushes to it
-/// ([`forge_push_base`] is exactly this base plus `/forge`). `None` in = no
-/// http surface = nothing to dial.
+/// tool plane dials it back (`DUCKTAPE_NODE`), as does module publication.
+/// `None` means there is no HTTP surface to dial.
 pub fn node_http_base(http_listen: Option<&str>) -> Option<String> {
     let listen = http_listen?;
     let base = match listen.parse::<std::net::SocketAddr>() {
@@ -455,28 +453,20 @@ impl NodedProvisioner {
         self
     }
 
-    /// configure the forge worktree lane: `push_base` is the loopback
-    /// smart-HTTP base URL ([`forge_push_base`] derives it from the node's
-    /// http listen address; `None` = this node serves no http surface) and
-    /// `committer_name` is this node's stable identity — the COMMITTER on
-    /// every run commit (D2: author is the agent, committer is the node).
-    /// the repo base is read off the link's forge repo (the same base the
-    /// forge module materializes into). host `git` is probed ONCE here —
-    /// a probe failure makes the lane permanently unavailable, loudly.
-    pub fn with_forge(self, push_base: Option<String>, committer_name: impl Into<String>) -> Self {
-        self.with_forge_probed(push_base, committer_name, forge::probe_host_git)
+    /// Configure local Git materialization and node-authorized module publication.
+    /// Git is probed once before any workspace can be provisioned.
+    pub fn with_forge(self, committer_name: impl Into<String>) -> Self {
+        self.with_forge_probed(committer_name, forge::probe_host_git)
     }
 
     /// [`Self::with_forge`] with the construction-time probe injected — the
     /// seam that lets tests exercise a probe failure without uninstalling git.
     fn with_forge_probed(
         mut self,
-        push_base: Option<String>,
         committer_name: impl Into<String>,
         probe: impl FnOnce() -> Result<(), String>,
     ) -> Self {
-        self.forge =
-            forge::ForgeLane::configure(&self.node, push_base, committer_name.into(), probe);
+        self.forge = forge::ForgeLane::configure(&self.node, committer_name.into(), probe);
         if let Err(reason) = &self.forge {
             tracing::warn!(
                 target: "ducktape::saga",

@@ -2,13 +2,15 @@
 # A separate workspace keeps the WASM build profile independent of the desktop.
 [workspace]
 resolver = "2"
-members = ["canvas", "governance", "home", "members", "agents", "node", "explorer", "settings", "chat", "files", "pages", "forge", "support/design", "support/guest", "pages/tests/editor-binding-app"]
+members = ["canvas", "governance", "home", "members", "agents", "node", "explorer", "settings", "chat", "call", "files", "pages", "forge", "support/design", "support/guest", "support/composer", "support/files", "pages/tests/editor-binding-app"]
 
 [workspace.dependencies]
 futures = "0.3"
 ducktape-view-guest = { path = "support/guest" }
+ducktape-view-composer = { path = "support/composer" }
+ducktape-view-files = { path = "support/files" }
 design = { path = "support/design" }
-ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "5abde0db4ebe6a3c4d26e86c7ceadb0153de4623" }
+ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "3d8ba98833c48e030e1b955ac2799bc27755b2bf" }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

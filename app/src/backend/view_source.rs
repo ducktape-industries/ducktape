@@ -692,16 +692,18 @@ pub(crate) mod tests {
                             }
                             // a view's own read names its module; anything
                             // else is the app's registry read
-                            let target = head
+                            let ask = head
                                 .rsplit("\r\n\r\n")
                                 .next()
                                 .and_then(|body| {
                                     serde_json::from_str::<serde_json::Value>(body).ok()
                                 })
-                                .and_then(|ask| ask["target"].as_str().map(str::to_owned));
-                            let answered = target.and_then(|target| {
-                                deployment.queries.lock().unwrap().get(&target).cloned()
-                            });
+                                .unwrap_or_default();
+                            let target = ask["target"].as_str().unwrap_or_default();
+                            let answered = match target {
+                                "files" => files_reply(&deployment, &ask["query"]),
+                                _ => deployment.queries.lock().unwrap().get(target).cloned(),
+                            };
                             let reply = answered
                                 .unwrap_or_else(|| deployment.status.lock().unwrap().clone());
                             ("200 OK", reply.to_string().into_bytes())
@@ -744,23 +746,6 @@ pub(crate) mod tests {
                                 Some(reply) => ("200 OK", reply.to_string().into_bytes()),
                                 None => ("404 Not Found", Vec::new()),
                             }
-                        } else if let Some(page) = route
-                            .strip_prefix("/v1/files/read?")
-                            .and_then(|query| file_page(&deployment, query))
-                        {
-                            // a byte-ranged read of a published file, as the
-                            // node's read lane answers it
-                            ("200 OK", page.to_string().into_bytes())
-                        } else if let Some(lane) = route.strip_prefix("/v1/files/") {
-                            // a view's own duckfs read: the lane names it, the
-                            // query string carries its params
-                            let lane = lane.split('?').next().unwrap_or_default();
-                            let answered =
-                                deployment.files_lanes.lock().unwrap().get(lane).cloned();
-                            match answered {
-                                Some(reply) => ("200 OK", reply.to_string().into_bytes()),
-                                None => ("404 Not Found", Vec::new()),
-                            }
                         } else {
                             ("404 Not Found", Vec::new())
                         };
@@ -779,30 +764,38 @@ pub(crate) mod tests {
 
     /// One HTTP request off the socket, head and body: the body arrives in
     /// its own write as often as not, and a query's target is in it.
-    /// One page of a published file for a `read`-lane query string, or
-    /// `None` when the path is not published (the caller falls through).
-    fn file_page(deployment: &FakeDeployment, query: &str) -> Option<serde_json::Value> {
-        let params: BTreeMap<String, String> = query
-            .split('&')
-            .filter_map(|pair| pair.split_once('='))
-            .map(|(key, value)| (key.to_owned(), percent_decode(value)))
-            .collect();
-        let path = params.get("path")?;
+    fn files_reply(
+        deployment: &FakeDeployment,
+        query: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let (lane, params) = query.as_object()?.iter().next()?;
+        let reply = match lane.as_str() {
+            "read" => file_page(deployment, params),
+            _ => deployment.files_lanes.lock().unwrap().get(lane).cloned(),
+        }?;
+        let value = match lane.as_str() {
+            "history" => reply["snapshots"].clone(),
+            _ => reply,
+        };
+        Some(serde_json::json!({lane:value}))
+    }
+
+    fn file_page(
+        deployment: &FakeDeployment,
+        params: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let path = params["path"].as_str()?;
         let bytes = deployment.files.lock().unwrap().get(path)?.clone();
-        let offset = params
-            .get("offset")
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
-        let len = params
-            .get("len")
-            .and_then(|value| value.parse::<u64>().ok())
+        let offset = params["offset"].as_u64().unwrap_or(0);
+        let len = params["len"]
+            .as_u64()
             .unwrap_or(1024 * 1024)
             .min(1024 * 1024);
         deployment
             .file_reads
             .lock()
             .unwrap()
-            .push((path.clone(), offset, len));
+            .push((path.to_owned(), offset, len));
         let start = (offset as usize).min(bytes.len());
         let end = (start + len as usize).min(bytes.len());
         let page = &bytes[start..end];
@@ -811,36 +804,6 @@ pub(crate) mod tests {
             "b64": base64::engine::general_purpose::STANDARD.encode(page),
             "eof": end == bytes.len(),
         }))
-    }
-
-    /// `%2F` → `/` and `+` → space: what reqwest's query encoder produces
-    /// for a duckfs path.
-    fn percent_decode(text: &str) -> String {
-        let mut out = Vec::with_capacity(text.len());
-        let bytes = text.as_bytes();
-        let mut index = 0;
-        while index < bytes.len() {
-            let escaped = bytes[index] == b'%' && index + 3 <= bytes.len();
-            let decoded = escaped
-                .then(|| std::str::from_utf8(&bytes[index + 1..index + 3]).ok())
-                .flatten()
-                .and_then(|hex| u8::from_str_radix(hex, 16).ok());
-            match decoded {
-                Some(byte) => {
-                    out.push(byte);
-                    index += 3;
-                }
-                None => {
-                    out.push(if bytes[index] == b'+' {
-                        b' '
-                    } else {
-                        bytes[index]
-                    });
-                    index += 1;
-                }
-            }
-        }
-        String::from_utf8_lossy(&out).into_owned()
     }
 
     async fn read_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {

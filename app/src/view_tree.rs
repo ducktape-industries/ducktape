@@ -212,18 +212,17 @@ fn drain_editor(store: &crate::editor::wire::EditorStore, cx: &mut Context<ViewT
     }
 }
 
-/// The two editors a `Node::Editor` can mount: the plain text field every
-/// view gets, or gpui-notion for the pages document.
+/// Native editor primitives selected by the guest's explicit projection.
 enum EditorView {
     Text(Entity<crate::editor::wire::TextEditor>),
-    Notion(Entity<crate::editor::wire::NotionWireEditor>),
+    Rich(Entity<crate::editor::wire::RichWireEditor>),
 }
 
 impl EditorView {
     fn sync(&self, window: &mut Window, cx: &mut App) {
         match self {
             Self::Text(view) => view.update(cx, |editor, cx| editor.sync(window, cx)),
-            Self::Notion(view) => view.update(cx, |editor, cx| editor.sync(window, cx)),
+            Self::Rich(view) => view.update(cx, |editor, cx| editor.sync(window, cx)),
         }
     }
 
@@ -232,7 +231,7 @@ impl EditorView {
             Self::Text(view) => view.update(cx, |editor, cx| {
                 editor.widget_command(command, window, cx);
             }),
-            Self::Notion(view) => view.update(cx, |editor, cx| {
+            Self::Rich(view) => view.update(cx, |editor, cx| {
                 editor.widget_command(command, window, cx);
             }),
         }
@@ -257,14 +256,14 @@ impl EditorView {
     fn is_focused(&self, window: &Window, cx: &App) -> bool {
         match self {
             Self::Text(view) => view.read(cx).is_focused(window, cx),
-            Self::Notion(view) => view.read(cx).is_focused(window, cx),
+            Self::Rich(view) => view.read(cx).is_focused(window, cx),
         }
     }
 
     fn element(&self) -> AnyElement {
         match self {
             Self::Text(view) => view.clone().into_any_element(),
-            Self::Notion(view) => view.clone().into_any_element(),
+            Self::Rich(view) => view.clone().into_any_element(),
         }
     }
 }
@@ -364,6 +363,7 @@ struct InputPresentation {
 }
 
 pub struct ViewTree {
+    user_activation: std::cell::Cell<Option<u32>>,
     root: wire::Node,
     // Structural nodes enter the native focus path only on an explicit Focus request.
     focus_targets: HashMap<String, (std::mem::Discriminant<wire::Node>, FocusHandle)>,
@@ -392,6 +392,17 @@ pub struct ViewTree {
 impl EventEmitter<wire::Event> for ViewTree {}
 
 impl ViewTree {
+    pub(crate) fn take_user_activation(&self, event: &wire::Event) -> Option<()> {
+        let wire::Event::Message(message) = event else {
+            return None;
+        };
+        let actual_click = self.user_activation.get() == Some(*message);
+        if !actual_click {
+            return None;
+        }
+        self.user_activation.take().map(|_| ())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn virtual_scroll(
         &mut self,
@@ -617,6 +628,7 @@ impl ViewTree {
 
     pub fn new(root: wire::Node) -> Self {
         Self {
+            user_activation: Default::default(),
             root,
             focus_targets: HashMap::new(),
             fields: HashMap::new(),
@@ -685,7 +697,8 @@ impl ViewTree {
             C::Focused { target } => Ok(wire::encode(&self.target_focused(&target, window, cx))),
             C::FocusPrevious => self.focus_relative(false, window, cx),
             C::FocusNext => self.focus_relative(true, window, cx),
-            C::Focus { ref target }
+            C::EditorAction { ref target, .. }
+            | C::Focus { ref target }
             | C::CursorFront { ref target }
             | C::CursorEnd { ref target }
             | C::Cursor { ref target, .. }
@@ -808,6 +821,9 @@ impl ViewTree {
         if let Some(editor) = self.editors.get(target) {
             editor.view.widget_command(command, window, cx);
             return Ok(wire::encode(&()));
+        }
+        if matches!(command, C::EditorAction { .. }) {
+            return Err("editor action target is not a mounted editor".into());
         }
         if let Some(picker) = self.pickers.get(target) {
             if matches!(command, C::Focus { .. }) {
@@ -1427,22 +1443,7 @@ impl ViewTree {
             Node::Hover { .. } => self.hover(node, window, cx),
             Node::Tooltip { .. } => self.tooltip(node, window, cx),
             Node::Float { .. } => self.float(node, window, cx),
-            Node::Image {
-                hash,
-                data,
-                width,
-                height,
-                fit,
-                opacity,
-                ..
-            } => self.picture(
-                *hash,
-                data.as_ref(),
-                *width,
-                *height,
-                *fit,
-                opacity.unwrap_or(1.0),
-            ),
+            Node::Image { .. } => self.picture(node, window),
             Node::ImageViewer { .. } => self.image_viewer(node, window, cx),
             Node::Svg { .. } => self.vector(node, window),
             Node::Canvas { .. } => self.drawing(node, cx),
@@ -1870,7 +1871,8 @@ impl ViewTree {
         }
         if let Some(message) = on_press {
             let message = *message;
-            button = button.on_click(cx.listener(move |_, _, _, cx| {
+            button = button.on_click(cx.listener(move |this, _, _, cx| {
+                this.user_activation.set(Some(message));
                 cx.emit(wire::Event::Message(message));
                 cx.stop_propagation();
             }));
@@ -2729,17 +2731,36 @@ impl ViewTree {
         let Some(store) = self.editor_store.clone() else {
             return div().child("Editor host is unavailable").into_any_element();
         };
+        let rich = matches!(node, wire::Node::Editor { options, .. } if options.rich.is_some());
+        let changed_renderer = self
+            .editors
+            .get(key)
+            .is_some_and(|mount| matches!(mount.view, EditorView::Rich(_)) != rich);
+        let replaced_focus = self
+            .editors
+            .get(key)
+            .filter(|_| changed_renderer)
+            .and_then(|mount| {
+                mount
+                    .view
+                    .is_focused(window, cx)
+                    .then(|| wire::WidgetCommand::Focus {
+                        target: key.clone(),
+                    })
+            });
+        if changed_renderer {
+            self.editors.remove(key);
+        }
         if !self.editors.contains_key(key) {
             let events = store.clone();
-            let notion = key.ends_with(crate::editor::wire::NOTION_DOCUMENT_KEY);
-            let (view, subscription) = match notion {
+            let (view, subscription) = match rich {
                 true => {
                     let view = cx.new(|cx| {
-                        crate::editor::wire::NotionWireEditor::new(key.clone(), store, window, cx)
+                        crate::editor::wire::RichWireEditor::new(key.clone(), store, window, cx)
                     });
                     let subscription =
                         cx.subscribe(&view, move |_, _, _: &(), cx| drain_editor(&events, cx));
-                    (EditorView::Notion(view), subscription)
+                    (EditorView::Rich(view), subscription)
                 }
                 false => {
                     let view = cx.new(|cx| {
@@ -2760,6 +2781,9 @@ impl ViewTree {
         }
         let editor = self.editors.get(key).expect("editor inserted");
         editor.view.sync(window, cx);
+        if let Some(command) = replaced_focus {
+            editor.view.widget_command(&command, window, cx);
+        }
         if self.presentation.editors.remove(key).as_ref() == Some(document) {
             editor.view.restore_focus(key, window, cx);
         }
@@ -3320,32 +3344,36 @@ impl ViewTree {
         outer.child(element).into_any_element()
     }
 
+    fn refresh_resource(&self, data: Option<&wire::ImageData>, window: &mut Window) {
+        if let Some(wire::ImageData::Resource(_)) = data {
+            window.request_animation_frame();
+        }
+    }
+
     fn remember_image(&mut self, hash: u64, data: &wire::ImageData) {
-        if self.images.contains_key(&hash) || self.images.len() >= 4096 {
+        if matches!(data, wire::ImageData::Resource(_)) {
             return;
         }
-        let bytes: usize = self
-            .images
-            .values()
-            .filter_map(|image| image.as_bytes(0))
-            .map(<[u8]>::len)
-            .sum();
+        if self.images.contains_key(&hash) {
+            return;
+        }
         let Some(image) = decode_image(data) else {
             return;
         };
-        let next = image.as_bytes(0).map_or(0, <[u8]>::len);
-        if bytes.saturating_add(next) > 64 << 20 {
-            return;
-        }
         self.images.insert(hash, Arc::new(image));
     }
 
-    fn remember_vector(&mut self, hash: u64, bytes: &[u8]) {
-        if self.vectors.contains_key(&hash) || self.vectors.len() >= 4096 {
-            return;
+    fn image_frame(&self, hash: u64, data: Option<&wire::ImageData>) -> Option<Arc<RenderImage>> {
+        match data {
+            Some(wire::ImageData::Resource(key)) => {
+                crate::video::stage_frame(key).map(|(_, _, image)| image)
+            }
+            _ => self.images.get(&hash).cloned(),
         }
-        let total: usize = self.vectors.values().map(|bytes| bytes.len()).sum();
-        if total.saturating_add(bytes.len()) > 16 << 20 {
+    }
+
+    fn remember_vector(&mut self, hash: u64, bytes: &[u8]) {
+        if self.vectors.contains_key(&hash) {
             return;
         }
         self.vectors.insert(hash, Arc::from(bytes));
@@ -3369,16 +3397,18 @@ impl ViewTree {
         else {
             unreachable!()
         };
+        self.refresh_resource(data.as_ref(), window);
         if let Some(data) = data {
             self.remember_image(*hash, data);
         }
+        let frame = self.image_frame(*hash, data.as_ref());
         let viewer = self.viewers.entry(key.clone()).or_default();
         if viewer.scale == 0.0 {
             viewer.scale = 1.0;
         }
         let mut element =
             dimensions(div().relative().overflow_hidden(), *width, *height).id(key.clone());
-        if let Some(image) = self.images.get(hash) {
+        if let Some(image) = frame {
             let original = image.size(0);
             let viewport = self
                 .bounds
@@ -3456,21 +3486,26 @@ impl ViewTree {
         element.child(self.measure(key, cx)).into_any_element()
     }
 
-    fn picture(
-        &mut self,
-        hash: u64,
-        data: Option<&wire::ImageData>,
-        width: Option<wire::Length>,
-        height: Option<wire::Length>,
-        fit: Option<wire::ContentFit>,
-        opacity: f32,
-    ) -> AnyElement {
+    fn picture(&mut self, node: &wire::Node, window: &mut Window) -> AnyElement {
+        let wire::Node::Image {
+            hash,
+            data,
+            width,
+            height,
+            fit,
+            opacity,
+            ..
+        } = node
+        else {
+            unreachable!()
+        };
+        self.refresh_resource(data.as_ref(), window);
         if let Some(data) = data {
-            self.remember_image(hash, data);
+            self.remember_image(*hash, data);
         }
-        let mut element = dimensions(div(), width, height).opacity(opacity);
-        if let Some(image) = self.images.get(&hash) {
-            element = element.child(img(image.clone()).size_full().object_fit(object_fit(fit)));
+        let mut element = dimensions(div(), *width, *height).opacity(opacity.unwrap_or(1.0));
+        if let Some(image) = self.image_frame(*hash, data.as_ref()) {
+            element = element.child(img(image.clone()).size_full().object_fit(object_fit(*fit)));
         }
         element.into_any_element()
     }
@@ -3648,6 +3683,9 @@ impl ViewTree {
 
 impl Render for ViewTree {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for image in crate::video::take_retired() {
+            let _ = window.drop_image(image);
+        }
         self.mounted.clear();
         let node = self.node(&self.root.clone(), window, cx);
         // Only controls mounted by this replacement frame may recover focus.
@@ -4088,6 +4126,7 @@ fn object_fit(fit: Option<wire::ContentFit>) -> ObjectFit {
 
 fn decode_image(data: &wire::ImageData) -> Option<RenderImage> {
     let mut pixels = match data {
+        wire::ImageData::Resource(_) => return None,
         wire::ImageData::Rgba {
             width,
             height,
@@ -4570,9 +4609,93 @@ fn append_arc_to(
 }
 
 #[cfg(test)]
+pub(crate) fn assert_released_image_is_not_cached(key: &str) {
+    let mut tree = ViewTree::new(wire::Node::empty());
+    let resource = wire::ImageData::Resource(key.into());
+    tree.remember_image(7, &resource);
+    let image = tree.image_frame(7, Some(&resource)).expect("live resource");
+    let released = Arc::downgrade(&image);
+    drop(image);
+    crate::video::forget_peer(key);
+    drop(crate::video::take_retired());
+    assert!(tree.image_frame(7, Some(&resource)).is_none());
+    assert!(
+        released.upgrade().is_none(),
+        "the renderer must not retain a released resource"
+    );
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt as _;
+
+    #[gpui_kit::test]
+    fn rich_editor_selection_uses_the_contract_and_replaces_a_changed_primitive(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        cx.update(crate::editor::wire::init_notion);
+        for key in ["another-app/body", "/pages/document"] {
+            let mut root = wire::Node::Editor {
+                key: key.into(),
+                document: wire::editor_document::EditorDocumentRef {
+                    document: key.into(),
+                    reset: 1,
+                    text_revision: 0,
+                    revision: 0,
+                    cursor: Default::default(),
+                    byte_len: 0,
+                },
+                on_document: 0,
+                editable: true,
+                placeholder: String::new(),
+                width: None,
+                height: None,
+                min_height: None,
+                max_height: None,
+                options: Box::new(wire::EditorOptions {
+                    rich: Some(Box::new(wire::editor_rich::RichPresentation {
+                        document: wire::editor_rich::RichDocument {
+                            blocks: vec![wire::editor_rich::RichBlock {
+                                kind: "paragraph".into(),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }),
+            };
+            let store = crate::editor::wire::EditorStore::new(99);
+            store.replace(&root).unwrap();
+            let window = cx.open_window(size(px(400.), px(300.)), |_, cx| {
+                let mut tree = ViewTree::new(root.clone());
+                tree.set_editor_store(store, cx);
+                tree
+            });
+            let tree = window.root(cx).unwrap();
+            let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+            native.update(|window, cx| {
+                window.render_frame(cx);
+                assert!(matches!(
+                    tree.read(cx).editors.get(key).unwrap().view,
+                    EditorView::Rich(_)
+                ));
+                let wire::Node::Editor { options, .. } = &mut root else {
+                    unreachable!()
+                };
+                options.rich = None;
+                tree.update(cx, |tree, cx| tree.replace(root.clone(), cx));
+                window.render_frame(cx);
+                assert!(matches!(
+                    tree.read(cx).editors.get(key).unwrap().view,
+                    EditorView::Text(_)
+                ));
+            });
+        }
+    }
 
     #[gpui_kit::test]
     fn primitive_canvas_paints_in_the_first_frame_and_after_a_move(
@@ -5271,7 +5394,16 @@ mod tests {
             events.borrow().is_empty(),
             "old hide ID 11 must not invoke the replacement action 11"
         );
+        tree.update(&mut native, |tree, _| {
+            assert!(tree.take_user_activation(&wire::Event::Message(11)).is_none(),
+                "a generated event cannot grant device authority");
+        });
         native.update(|window, cx| window.click("watched", cx));
+        tree.update(&mut native, |tree, _| {
+            assert!(tree.take_user_activation(&wire::Event::Message(11)).is_some());
+            assert!(tree.take_user_activation(&wire::Event::Message(11)).is_none(),
+                "one native click authorizes at most one session");
+        });
         assert_eq!(
             &*events.borrow(),
             &[wire::Event::Message(11)],

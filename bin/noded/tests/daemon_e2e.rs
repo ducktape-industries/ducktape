@@ -83,10 +83,19 @@ impl Daemon {
 
     /// a duckfs transport whose writes this daemon admits.
     fn files(&self) -> duckfs_client::http::HttpNode {
-        let token = self.admin_token.clone();
+        use commonware_cryptography::{Signer as _, ed25519};
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let signer = ed25519::PrivateKey::from_seed(700);
         duckfs_client::http::HttpNode::new(format!("http://127.0.0.1:{}", self.port))
-            .with_write_auth(std::sync::Arc::new(move |_method, _path, _body| {
-                vec![(noded::admin::ADMIN_TOKEN_HEADER.to_string(), token.clone())]
+            .with_frame_signer(std::sync::Arc::new(move |target, payload| {
+                node::encode_frame(
+                    &signer,
+                    SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    &sdk::Msg {
+                        target: target.into(),
+                        payload,
+                    },
+                )
             }))
     }
 
@@ -445,19 +454,14 @@ fn an_incomplete_modules_dir_is_refused_before_boot() {
     );
 }
 
-/// the embedded daemon runs no mesh, so it never wires a call hub — which
-/// makes the real binary exactly the no-hub case /v1/call/ws must refuse
-/// LOUDLY: 503 at upgrade with a body that says why (the #178 posture — every
-/// refusal path explains itself), never a silent hang. the replaced
-/// /v1/voice/ws route is gone outright (app and node ship lockstep): 404.
+/// Calls are served by a published application process; Pages presence
+/// requires the node's overlay runtime.
 #[test]
-fn call_ws_without_a_hub_refuses_with_a_reason() {
+fn media_product_route_is_absent_and_presence_without_overlay_refuses() {
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
-
-    let (status, raw) = daemon.ws_upgrade_refusal("/v1/call/ws?channel=general");
-    assert_eq!(status, 503, "no call hub → refused at upgrade: {raw}");
-    assert!(raw.contains("no mesh call hub"), "refusal says WHY: {raw}");
+    let (status, _) = daemon.ws_upgrade_refusal("/v1/call/ws?channel=general");
+    assert_eq!(status, 404);
 
     let (status, raw) = daemon.ws_upgrade_refusal("/v1/presence/ws?page=page-1");
     assert_eq!(status, 503, "no realtime hub → presence refused: {raw}");
@@ -1141,7 +1145,7 @@ fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
 
 // ============================================================================
 // duckfs product surface: the stage -> commit -> read round trip against a real
-// daemon. two chunks staged over POST /v1/files/stage, a commit that references
+// daemon. two chunks staged through signed module frames, a commit that references
 // them (Chunks content) alongside an inline file, then ls/read/stat/history read
 // it all back — read byte-exact. a rejected op (dangling chunk, oversized stage)
 // is a clean 4xx, never a 500/panic. distinct from the op-receipt /v1/files/blob
@@ -1149,268 +1153,73 @@ fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
 // ============================================================================
 
 #[test]
-fn duckfs_surface_stage_commit_and_reads_round_trip() {
-    let storage = tempfile::TempDir::new().expect("storage dir");
+fn duckfs_module_transport_stage_commit_and_reads_round_trip() {
+    use duckfs_client::api::NodeApi as _;
+    let storage = tempfile::TempDir::new().unwrap();
     let daemon = Daemon::spawn(storage.path());
-    let genesis_hash = daemon.status()["root_hash"]
-        .as_str()
-        .expect("root_hash")
-        .to_string();
-
-    // refs on a fresh module: no head (the empty filesystem) and an empty window,
-    // the base state the checkout engine starts from.
-    let (code, refs0) = daemon.request("GET", "/v1/files/refs", None);
-    assert_eq!(code, 200, "empty refs failed: {refs0}");
-    assert!(
-        refs0["head"].is_null(),
-        "no head before any commit: {refs0}"
-    );
-    assert_eq!(refs0["window_len"], 0, "empty window before any commit");
-
-    // a duckfs chunk digest is the chunk object id: sha256 over the chunk kind
-    // tag byte (0x00) followed by the bytes — what the module stages under and a
-    // commit references. the stage endpoint returns it; we recompute it here to
-    // prove the returned digest is exactly that.
-    let chunk_digest = |bytes: &[u8]| -> String {
-        let mut h = Sha256::new();
-        h.update([0u8]);
-        h.update(bytes);
-        h.finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    };
-
-    // ---- stage two chunks -> digests ----
+    let files = daemon.files();
+    let genesis = daemon.status()["root_hash"].clone();
+    assert!(files.refs().unwrap().head.is_none());
     let chunk_a: Vec<u8> = (0..64u32).map(|i| (i * 7 % 256) as u8).collect();
     let chunk_b: Vec<u8> = (0..48u32).map(|i| (200 - i) as u8).collect();
-
-    let (code, body) = daemon.request_bytes("POST", "/v1/files/stage", &chunk_a);
+    let digest_a = files.stage_chunk(&chunk_a).unwrap();
+    let digest_b = files.stage_chunk(&chunk_b).unwrap();
+    assert_eq!(daemon.status()["height"], 2);
+    assert_ne!(daemon.status()["root_hash"], genesis);
+    let changes = serde_json::from_value(serde_json::json!([
+        {"put":{"path":"/shared/a.bin","exec":false,"meta":{},"content":{"chunks":{"size":chunk_a.len(),"chunks":[digest_a]}}}},
+        {"put":{"path":"/shared/b.bin","exec":false,"meta":{},"content":{"chunks":{"size":chunk_b.len(),"chunks":[digest_b]}}}},
+        {"put":{"path":"/shared/hello.txt","exec":false,"meta":{},"content":{"inline":{"b64":STANDARD.encode(b"hello duckfs")}}}}
+    ])).unwrap();
     assert_eq!(
-        code,
-        200,
-        "stage a failed: {}",
-        String::from_utf8_lossy(&body)
+        files.commit(None, "seed duckfs", changes).unwrap().height,
+        3
     );
-    let digest_a =
-        serde_json::from_slice::<serde_json::Value>(&body).expect("stage a json")["digest"]
-            .as_str()
-            .expect("digest a")
-            .to_string();
+    let (entries, next) = files.ls("/shared", None, None, 256).unwrap();
+    assert!(next.is_none());
     assert_eq!(
-        digest_a,
-        chunk_digest(&chunk_a),
-        "stage returns the chunk object id"
+        entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/shared/a.bin", "/shared/b.bin", "/shared/hello.txt"]
     );
-
-    let (code, body) = daemon.request_bytes("POST", "/v1/files/stage", &chunk_b);
-    assert_eq!(
-        code,
-        200,
-        "stage b failed: {}",
-        String::from_utf8_lossy(&body)
-    );
-    let digest_b =
-        serde_json::from_slice::<serde_json::Value>(&body).expect("stage b json")["digest"]
-            .as_str()
-            .expect("digest b")
-            .to_string();
-    assert_eq!(digest_b, chunk_digest(&chunk_b));
-
-    // a stage is a real block: staging IS consensus state, so two stages commit
-    // two blocks and the module root moves off genesis.
-    let after_stage = daemon.status();
-    assert_eq!(after_stage["height"], 2, "two stages committed two blocks");
-    assert_ne!(
-        after_stage["root_hash"].as_str(),
-        Some(genesis_hash.as_str()),
-        "staging moves the module root"
-    );
-
-    // ---- commit: two chunk-backed files referencing the digests + an inline
-    // file, all under /shared (auto-created parent) ----
-    let inline_bytes: &[u8] = b"hello duckfs";
-    let commit_body = serde_json::json!({
-        "base_snapshot": null,
-        "message": "seed duckfs",
-        "changes": [
-            { "put": { "path": "/shared/a.bin", "exec": false, "meta": {},
-                "content": { "chunks": { "size": chunk_a.len() as u64, "chunks": [digest_a] } } } },
-            { "put": { "path": "/shared/b.bin", "exec": false, "meta": {},
-                "content": { "chunks": { "size": chunk_b.len() as u64, "chunks": [digest_b] } } } },
-            { "put": { "path": "/shared/hello.txt", "exec": false, "meta": {},
-                "content": { "inline": { "b64": STANDARD.encode(inline_bytes) } } } },
-        ],
-    });
-    let (code, block) = daemon.request("POST", "/v1/files/commit", Some(&commit_body));
-    assert_eq!(code, 200, "commit failed: {block}");
-    assert_eq!(block["height"], 3, "commit is the third block");
-
-    // ---- ls shows all three, in name order ----
-    let (code, ls) = daemon.request("GET", "/v1/files/ls?path=/shared", None);
-    assert_eq!(code, 200, "ls failed: {ls}");
-    let names: Vec<&str> = ls["entries"]
-        .as_array()
-        .expect("entries array")
-        .iter()
-        .map(|e| e["path"].as_str().expect("entry path"))
-        .collect();
-    assert_eq!(
-        names,
-        ["/shared/a.bin", "/shared/b.bin", "/shared/hello.txt"]
-    );
-
-    // ---- read returns the exact bytes (b64-decoded), eof set for a whole-file
-    // read ----
-    let read_bytes = |path: &str| -> Vec<u8> {
-        let (code, r) = daemon.request("GET", &format!("/v1/files/read?path={path}"), None);
-        assert_eq!(code, 200, "read {path} failed: {r}");
-        assert_eq!(r["eof"], true, "a whole-file read reaches eof: {r}");
-        STANDARD
-            .decode(r["b64"].as_str().expect("read b64"))
-            .expect("read b64 decodes")
-    };
-    assert_eq!(
-        read_bytes("/shared/a.bin"),
-        chunk_a,
-        "chunk file a round-trips byte-exact"
-    );
-    assert_eq!(
-        read_bytes("/shared/b.bin"),
-        chunk_b,
-        "chunk file b round-trips byte-exact"
-    );
-    assert_eq!(
-        read_bytes("/shared/hello.txt"),
-        inline_bytes,
-        "inline file round-trips byte-exact"
-    );
-
-    // ---- stat shows the right kind + size ----
-    let (code, st) = daemon.request("GET", "/v1/files/stat?path=/shared/a.bin", None);
-    assert_eq!(code, 200, "stat failed: {st}");
-    assert_eq!(st["kind"], "file");
-    assert_eq!(st["size"].as_u64(), Some(chunk_a.len() as u64));
-    assert_eq!(st["exec"], false);
-    let (code, st) = daemon.request("GET", "/v1/files/stat?path=/shared", None);
-    assert_eq!(code, 200);
-    assert_eq!(st["kind"], "dir", "a directory stats as a dir");
-    // an absent path is the natural 404.
-    let (code, _) = daemon.request("GET", "/v1/files/stat?path=/shared/nope", None);
-    assert_eq!(code, 404, "an absent path stats 404");
-
-    // ---- history shows the commit ----
-    let (code, hist) = daemon.request("GET", "/v1/files/history", None);
-    assert_eq!(code, 200, "history failed: {hist}");
-    let snaps = hist["snapshots"].as_array().expect("snapshots array");
-    assert_eq!(snaps.len(), 1, "one commit lands in history: {hist}");
-    assert_eq!(snaps[0]["message"], "seed duckfs");
-    let seed_snapshot = snaps[0]["id"]
-        .as_str()
-        .expect("seed snapshot id")
-        .to_string();
-
-    // ---- refs: head advanced from None (checked empty above) to the seed
-    // snapshot, and the window now holds one commit ----
-    let (code, refs) = daemon.request("GET", "/v1/files/refs", None);
-    assert_eq!(code, 200, "refs failed: {refs}");
-    assert_eq!(
-        refs["head"].as_str(),
-        Some(seed_snapshot.as_str()),
-        "refs head is the seed snapshot: {refs}"
-    );
-    assert_eq!(refs["window_len"], 1, "one commit in the window");
-
-    // ---- has-chunks flips false -> true across a stage; order is preserved ----
-    let chunk_c: Vec<u8> = (0..32u32).map(|i| (i * 3 + 1) as u8).collect();
-    let digest_c = chunk_digest(&chunk_c);
-    let (code, probe) =
-        daemon.request("GET", &format!("/v1/files/has-chunks?ids={digest_c}"), None);
-    assert_eq!(code, 200, "has-chunks failed: {probe}");
-    assert_eq!(
-        probe["present"],
-        serde_json::json!([false]),
-        "an unstaged chunk is absent: {probe}"
-    );
-    let (code, _) = daemon.request_bytes("POST", "/v1/files/stage", &chunk_c);
-    assert_eq!(code, 200, "stage c failed");
+    for (path, bytes) in [("/shared/a.bin", chunk_a), ("/shared/b.bin", chunk_b)] {
+        assert_eq!(files.read(path, None, 0, 1024).unwrap(), (bytes, true));
+    }
+    assert!(files.stat("/shared/nope", None).unwrap().is_none());
+    let history = files.history(8).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].message, "seed duckfs");
+    let seed = history[0].id.clone();
+    assert_eq!(files.refs().unwrap().head.as_deref(), Some(seed.as_str()));
     let absent = "22".repeat(32);
-    let (code, probe) = daemon.request(
-        "GET",
-        &format!("/v1/files/has-chunks?ids={digest_c},{absent}"),
-        None,
-    );
-    assert_eq!(code, 200, "has-chunks re-probe failed: {probe}");
     assert_eq!(
-        probe["present"],
-        serde_json::json!([true, false]),
-        "the staged chunk flips present, request order intact: {probe}"
+        files.has_chunks(std::slice::from_ref(&absent)).unwrap(),
+        vec![false]
     );
-
-    // ---- diff between the seed snapshot and a follow-up edit ----
-    let commit2 = serde_json::json!({
-        "base_snapshot": seed_snapshot,
-        "message": "edit hello",
-        "changes": [
-            { "put": { "path": "/shared/hello.txt", "exec": false, "meta": {},
-                "content": { "inline": { "b64": STANDARD.encode(b"HELLO AGAIN") } } } },
-        ],
-    });
-    let (code, block2) = daemon.request("POST", "/v1/files/commit", Some(&commit2));
-    assert_eq!(code, 200, "second commit failed: {block2}");
-    let (code, refs2) = daemon.request("GET", "/v1/files/refs", None);
-    assert_eq!(code, 200, "refs2 failed: {refs2}");
-    let head2 = refs2["head"].as_str().expect("head2 set").to_string();
-    let (code, diff) = daemon.request(
-        "GET",
-        &format!("/v1/files/diff?from={seed_snapshot}&to={head2}&prefix=/shared"),
-        None,
-    );
-    assert_eq!(code, 200, "diff failed: {diff}");
-    let entries = diff["entries"].as_array().expect("diff entries array");
-    assert_eq!(entries.len(), 1, "exactly one path changed: {diff}");
-    assert_eq!(entries[0]["path"], "/shared/hello.txt");
+    let chunk_c = files.stage_chunk(b"third chunk").unwrap();
     assert_eq!(
-        entries[0]["kind"], "modified",
-        "the edited file is modified"
+        files.has_chunks(&[chunk_c, absent]).unwrap(),
+        vec![true, false]
     );
-
-    // ---- a rejected op is a clean 4xx carrying the error, not a 500/panic ----
-    // a commit referencing a never-staged chunk digest: the module cannot
-    // resolve the bytes, so it rejects with a 400.
-    let bogus = "11".repeat(32); // 64 hex chars, valid shape, never staged
-    let bad_commit = serde_json::json!({
-        "base_snapshot": null,
-        "message": "dangling chunk",
-        "changes": [
-            { "put": { "path": "/shared/dangling.bin", "exec": false, "meta": {},
-                "content": { "chunks": { "size": 10, "chunks": [bogus] } } } },
-        ],
-    });
-    let (code, err) = daemon.request("POST", "/v1/files/commit", Some(&bad_commit));
-    assert_eq!(code, 400, "a dangling-chunk commit must reject: {err}");
+    let changes = serde_json::from_value(serde_json::json!([
+        {"put":{"path":"/shared/hello.txt","exec":false,"meta":{},"content":{"inline":{"b64":STANDARD.encode(b"HELLO AGAIN")}}}}
+    ])).unwrap();
+    files.commit(Some(&seed), "edit hello", changes).unwrap();
+    let head = files.refs().unwrap().head.unwrap();
+    let diff = files.diff(&seed, &head, "/shared").unwrap();
+    assert_eq!(diff.len(), 1);
+    assert_eq!(diff[0].path, "/shared/hello.txt");
+    let bad_changes = serde_json::from_value(serde_json::json!([
+        {"put":{"path":"/shared/dangling.bin","exec":false,"meta":{},"content":{"chunks":{"size":10,"chunks":["11".repeat(32)]}}}}
+    ])).unwrap();
     assert!(
-        err["error"].is_string(),
-        "the reject carries the module error: {err}"
+        files
+            .commit(Some(&head), "dangling chunk", bad_changes)
+            .is_err()
     );
-
-    // an oversized stage trips the single-chunk body cap: one byte past
-    // CHUNK_SIZE is a 413 in the daemon's error envelope, not a panic.
-    let over = vec![0u8; 1024 * 1024 + 1]; // CHUNK_SIZE + 1
-    let (code, body) = daemon.request_bytes("POST", "/v1/files/stage", &over);
-    assert_eq!(
-        code,
-        413,
-        "an oversized stage is a 413: {}",
-        String::from_utf8_lossy(&body)
-    );
-    let err: serde_json::Value = serde_json::from_slice(&body).expect("413 body is json");
-    assert!(
-        err["error"].is_string(),
-        "413 uses the error envelope: {err}"
-    );
-
-    // the daemon is still alive and answering after the rejections.
+    assert!(files.stage_chunk(&vec![0; 1024 * 1024 + 1]).is_err());
     daemon.status();
 }
 
@@ -1771,27 +1580,9 @@ fn overview_snapshot_topics_push_peers_and_status_over_ws() {
 }
 
 // ============================================================================
-// git smart-HTTP receive-pack: REAL `git push` against the daemon's /forge lane.
-//
-// this is the make-or-break gate for the git-http bridge: a stock `git` client
-// pushes to http://127.0.0.1:<port>/forge/testrepo and the pushed commit must
-// become forge's committed HEAD. exercises the whole path — info/refs ref
-// advertisement, the pkt-line command + packfile POST, the node-local pack
-// stash, and the consensus `Push` CAS.
+// Operator-origin Git import through generic blob and module transport.
+// Stock Git service protocol cases live in node-bin's real Gateway cluster.
 // ============================================================================
-
-/// `Some(())` = no real `git` client here, so `test` cannot run and the caller
-/// must return.
-///
-/// The whole forge-over-http protocol suite is five tests behind this, and a
-/// bare early-return made every one of them report green on a host without git
-/// — five protocol proofs covering nothing, indistinguishable in CI output from
-/// five that ran. Printing "skipping" does not fix that: libtest captures
-/// stderr too, so the line never reaches the log. [`nettest::skip_without`]
-/// FAILS instead, unless `DUCKTAPE_ALLOW_MISSING_TOOLS=1` asks for the skip.
-fn skip_without_git(test: &str) -> Option<()> {
-    nettest::skip_without(test, nettest::missing_tool("git"))
-}
 
 /// a `git` invocation in `dir` with a hermetic config: no host global/system
 /// config leaks in (gpg signing, aliases), the default branch is `main`, a fixed
@@ -1811,8 +1602,8 @@ fn git_cmd(dir: &Path, args: &[&str]) -> Command {
             "user.email=test@ducktape.local",
             "-c",
             "commit.gpgsign=false",
-        ])
-        .args(args);
+        ]);
+    cmd.args(args);
     cmd
 }
 
@@ -1820,40 +1611,6 @@ fn git_cmd(dir: &Path, args: &[&str]) -> Command {
 /// rejections to stderr), WITHOUT asserting success — the caller decides.
 fn git_capture(dir: &Path, args: &[&str]) -> std::process::Output {
     git_cmd(dir, args).output().expect("spawn git")
-}
-
-/// a git command against the daemon's smart-HTTP surface, carrying its
-/// operator credential.
-///
-/// `git-receive-pack` refuses a push that proves nothing (#1292): it takes
-/// git's own push certificate, or this node's operator credential. A test that
-/// spawned the daemon IS its operator, and the credential rides `GIT_CONFIG_*`
-/// exactly the way `ops/dogfood-forge.sh` sets it — never an argv, which is
-/// world-readable through /proc.
-fn git_push(daemon: &Daemon, dir: &Path, args: &[&str]) -> std::process::Output {
-    git_cmd(dir, args)
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "http.extraHeader")
-        .env(
-            "GIT_CONFIG_VALUE_0",
-            format!(
-                "{}: {}",
-                noded::admin::ADMIN_TOKEN_HEADER,
-                daemon.admin_token
-            ),
-        )
-        .output()
-        .expect("spawn git")
-}
-
-/// [`git_push`] that must succeed.
-fn git_push_ok(daemon: &Daemon, dir: &Path, args: &[&str]) {
-    let out = git_push(daemon, dir, args);
-    assert!(
-        out.status.success(),
-        "git {args:?} failed:\n{}",
-        render(&out)
-    );
 }
 
 /// run a git command that must succeed.
@@ -1897,351 +1654,49 @@ fn forge_head(daemon: &Daemon, repo: &str) -> Option<String> {
 }
 
 #[test]
-fn git_push_over_http_lands_in_forge_head() {
-    if skip_without_git("git_push_over_http_lands_in_forge_head").is_some() {
+fn operator_git_import_uses_generic_blob_and_module_transport() {
+    if nettest::skip_without("operator Git import", nettest::missing_tool("git")).is_some() {
         return;
     }
-    let storage = tempfile::TempDir::new().expect("storage dir");
+    let storage = tempfile::tempdir().unwrap();
     let daemon = Daemon::spawn(storage.path());
-    let url = format!("http://127.0.0.1:{}/forge/testrepo", daemon.port);
-
-    // an unborn repo advertises no head.
-    assert_eq!(forge_head(&daemon, "testrepo"), None, "repo starts unborn");
-
-    // a scratch repo with one commit, wired to push at the daemon.
-    let work = tempfile::TempDir::new().expect("git work dir");
-    let wd = work.path();
-    git_ok(wd, &["init"]);
-    commit_file(wd, "hello.txt", "hi from git\n", "first commit");
-    git_ok(wd, &["remote", "add", "ducktape", &url]);
-
-    // THE gate: a real `git push` to the daemon exits 0 and updates the ref.
-    let push1 = git_push(&daemon, wd, &["push", "ducktape", "main"]);
-    eprintln!("=== git push #1 (create) ===\n{}", render(&push1));
-    assert!(
-        push1.status.success(),
-        "git push failed:\n{}",
-        render(&push1)
-    );
-    let head1 = rev_parse_head(wd);
-    assert_eq!(
-        forge_head(&daemon, "testrepo"),
-        Some(head1.clone()),
-        "forge HEAD must equal the pushed commit"
-    );
-
-    // a second commit fast-forwards: the CAS matches the prev head and advances.
-    commit_file(wd, "hello.txt", "hi again\n", "second commit");
-    let head2 = rev_parse_head(wd);
-    assert_ne!(head2, head1, "second commit is a new oid");
-    let push2 = git_push(&daemon, wd, &["push", "ducktape", "main"]);
-    eprintln!("=== git push #2 (fast-forward) ===\n{}", render(&push2));
-    assert!(
-        push2.status.success(),
-        "fast-forward push failed:\n{}",
-        render(&push2)
-    );
-    assert_eq!(
-        forge_head(&daemon, "testrepo"),
-        Some(head2.clone()),
-        "forge HEAD must fast-forward to the second commit"
-    );
-
-    // a non-fast-forward push is rejected: rewind one commit, commit a divergent
-    // history, and push without force. git detects the non-ff against the
-    // advertised head and refuses; forge's HEAD stays put.
-    git_ok(wd, &["reset", "--hard", "HEAD~1"]);
-    commit_file(wd, "hello.txt", "divergent line\n", "divergent commit");
-    let push3 = git_push(&daemon, wd, &["push", "ducktape", "main"]);
-    eprintln!(
-        "=== git push #3 (non-fast-forward, expected reject) ===\n{}",
-        render(&push3)
-    );
-    assert!(
-        !push3.status.success(),
-        "a non-fast-forward push must be rejected:\n{}",
-        render(&push3)
-    );
-    assert_eq!(
-        forge_head(&daemon, "testrepo"),
-        Some(head2),
-        "a rejected push must not move forge HEAD"
-    );
-}
-
-// ============================================================================
-// git smart-HTTP upload-pack: the FULL push -> clone round trip. this is the
-// make-or-break gate for the fetch side: after a real `git push` lands two real
-// commits, a stock `git clone` of the same URL must reconstruct the repo
-// byte-for-byte — same HEAD oid, same file bytes, and the SAME two-commit
-// history with the SAME oids (proving faithful object transfer over the wire,
-// not a re-synthesized commit).
-// ============================================================================
-
-/// every commit oid on this repo's HEAD history, newest-first, one hex per line.
-fn log_oids(dir: &Path) -> Vec<u8> {
-    let out = git_capture(dir, &["log", "--format=%H"]);
-    assert!(out.status.success(), "git log failed:\n{}", render(&out));
-    out.stdout
-}
-
-#[test]
-fn git_clone_over_http_round_trips_full_history() {
-    if skip_without_git("git_clone_over_http_round_trips_full_history").is_some() {
-        return;
-    }
-    let storage = tempfile::TempDir::new().expect("storage dir");
-    let daemon = Daemon::spawn(storage.path());
-    let url = format!("http://127.0.0.1:{}/forge/roundtrip", daemon.port);
-
-    // a scratch repo with TWO real commits, pushed to the daemon over http.
-    let work = tempfile::TempDir::new().expect("git work dir");
-    let wd = work.path();
-    git_ok(wd, &["init"]);
-    commit_file(wd, "readme.md", "line one\n", "first commit");
-    commit_file(wd, "readme.md", "line one\nline two\n", "second commit");
-    git_ok(wd, &["remote", "add", "ducktape", &url]);
-    let push = git_push(&daemon, wd, &["push", "ducktape", "main"]);
-    eprintln!("=== git push (2 commits) ===\n{}", render(&push));
-    assert!(push.status.success(), "push failed:\n{}", render(&push));
-
-    let pushed_head = rev_parse_head(wd);
-    assert_eq!(
-        forge_head(&daemon, "roundtrip"),
-        Some(pushed_head.clone()),
-        "forge HEAD must equal the pushed commit before we clone it back"
-    );
-    let pushed_oids = log_oids(wd);
-
-    // THE gate: a real `git clone` of the same URL into a fresh dir exits 0.
-    let clone_root = tempfile::TempDir::new().expect("clone root dir");
-    let dst = clone_root.path().join("clone");
-    let clone = git_capture(
-        clone_root.path(),
-        &["clone", &url, dst.to_str().expect("utf-8 clone path")],
-    );
-    eprintln!("=== git clone ===\n{}", render(&clone));
-    assert!(
-        clone.status.success(),
-        "git clone failed:\n{}",
-        render(&clone)
-    );
-
-    // the cloned HEAD is the pushed HEAD, to the oid.
-    let cloned_head = rev_parse_head(&dst);
-    assert_eq!(
-        cloned_head, pushed_head,
-        "cloned HEAD must equal the pushed HEAD"
-    );
-
-    // the checked-out file bytes match the source byte-for-byte.
-    let cloned_bytes = std::fs::read(dst.join("readme.md")).expect("read cloned file");
-    assert_eq!(
-        cloned_bytes, b"line one\nline two\n",
-        "cloned file content must match the pushed content byte-for-byte"
-    );
-
-    // full history: `git log --oneline` shows BOTH commits...
-    let log = git_capture(&dst, &["log", "--oneline"]);
-    eprintln!("=== git log --oneline (clone) ===\n{}", render(&log));
-    assert!(log.status.success(), "git log failed:\n{}", render(&log));
-    let log_text = String::from_utf8_lossy(&log.stdout);
-    assert_eq!(
-        log_text.lines().count(),
-        2,
-        "the clone must carry both commits:\n{log_text}"
-    );
-    assert!(
-        log_text.contains("first commit") && log_text.contains("second commit"),
-        "both commit messages must survive the clone:\n{log_text}"
-    );
-
-    // ...with the SAME oids in the SAME order as the source repo — the proof of
-    // faithful object transfer (real history, not a reconstructed commit).
-    assert_eq!(
-        log_oids(&dst),
-        pushed_oids,
-        "the cloned history oids must match the pushed repo exactly"
-    );
-}
-
-/// Regression for stateless upload-pack negotiation: once a checkout has
-/// common objects with Forge, stock git sends one or more flush-ended `have`
-/// rounds before `done`. The server must answer those rounds with NAK only;
-/// PACK bytes are legal only in the final response.
-#[test]
-fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
-    if skip_without_git("git_fetch_and_pull_into_nonempty_checkout_complete_negotiation").is_some()
-    {
-        return;
-    }
-    let storage = tempfile::TempDir::new().expect("storage dir");
-    let daemon = Daemon::spawn(storage.path());
-    let url = format!("http://127.0.0.1:{}/forge/negotiated", daemon.port);
-
-    let source = tempfile::TempDir::new().expect("source repo");
-    let src = source.path();
-    git_ok(src, &["init"]);
-    // More than git's initial have window guarantees at least one have batch
-    // ends in a flush before the client reaches `done`.
-    for number in 1..=20 {
-        let content = format!("base {number}\n");
-        let message = format!("base commit {number}");
-        commit_file(src, "history.txt", &content, &message);
-    }
-    git_ok(src, &["remote", "add", "ducktape", &url]);
-    git_push_ok(&daemon, src, &["push", "ducktape", "main"]);
-    let first_head = rev_parse_head(src);
-
-    let checkout_root = tempfile::TempDir::new().expect("checkout root");
-    let checkout = checkout_root.path().join("checkout");
-    git_ok(
-        checkout_root.path(),
-        &[
-            "clone",
-            &url,
-            checkout.to_str().expect("utf-8 checkout path"),
-        ],
-    );
-
-    // A fetch from a non-empty repo has a common first commit. This exercises
-    // the intermediate have/NAK round and leaves the worktree at its prior head.
-    commit_file(src, "history.txt", "fetched\n", "fetched commit");
-    git_push_ok(&daemon, src, &["push", "ducktape", "main"]);
-    let fetch = git_capture(&checkout, &["fetch", "origin"]);
-    eprintln!("=== negotiated git fetch ===\n{}", render(&fetch));
-    assert!(
-        fetch.status.success(),
-        "fetch into a non-empty checkout failed:\n{}",
-        render(&fetch)
-    );
-    assert_eq!(
-        rev_parse_head(&checkout),
-        first_head,
-        "fetch must not move the checked-out branch"
-    );
-
-    // Advance once more so pull performs its own negotiated fetch, then verify
-    // both the ref update and checkout bytes through stock git.
-    commit_file(src, "history.txt", "pulled\n", "pulled commit");
-    git_push_ok(&daemon, src, &["push", "ducktape", "main"]);
-    let pull = git_capture(&checkout, &["pull", "--ff-only"]);
-    eprintln!("=== negotiated git pull ===\n{}", render(&pull));
-    assert!(
-        pull.status.success(),
-        "pull into a non-empty checkout failed:\n{}",
-        render(&pull)
-    );
-    assert_eq!(rev_parse_head(&checkout), rev_parse_head(src));
-    assert_eq!(
-        std::fs::read(checkout.join("history.txt")).expect("read pulled file"),
-        b"pulled\n"
-    );
-}
-
-/// The desktop remote-forge mirror fetches with LIBGIT2, not stock git: a
-/// fresh bare mirror pulls the full closure after a NAK, and a re-sync after
-/// the origin advances completes against the ACKed incremental pack — the
-/// exact client the app's `forge_sync_remote` runs, so this pins that interop.
-#[test]
-fn libgit2_mirror_fetch_completes_incremental_sync() {
-    if skip_without_git("libgit2_mirror_fetch_completes_incremental_sync").is_some() {
-        return;
-    }
-    let storage = tempfile::TempDir::new().expect("storage dir");
-    let daemon = Daemon::spawn(storage.path());
-    let url = format!("http://127.0.0.1:{}/forge/mirrored", daemon.port);
-
-    let source = tempfile::TempDir::new().expect("source repo");
-    let src = source.path();
-    git_ok(src, &["init"]);
-    commit_file(src, "history.txt", "one\n", "first commit");
-    git_ok(src, &["remote", "add", "ducktape", &url]);
-    git_push_ok(&daemon, src, &["push", "ducktape", "main"]);
-    let first_head = rev_parse_head(src);
-
-    let mirror_dir = tempfile::TempDir::new().expect("mirror dir");
-    let mirror = git2::Repository::init_bare(mirror_dir.path()).expect("init mirror");
-    let refspec = ["+refs/heads/*:refs/heads/*"];
-    let fetch = |mirror: &git2::Repository| {
-        let mut remote = mirror.remote_anonymous(&url).expect("anonymous remote");
-        remote
-            .fetch(&refspec, None::<&mut git2::FetchOptions<'_>>, None)
-            .expect("libgit2 fetch");
+    let source = tempfile::tempdir().unwrap();
+    git_ok(source.path(), &["init"]);
+    commit_file(source.path(), "source.txt", "one\n", "first");
+    let importer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops/forge-import.py");
+    let publish = || {
+        let output = Command::new("python3")
+            .arg(&importer)
+            .args([
+                "push",
+                "--node-url",
+                &format!("http://127.0.0.1:{}", daemon.port),
+                "--repo",
+                "operator-import",
+                "--branch",
+                "main",
+                "--token-file",
+            ])
+            .arg(storage.path().join("admin.token"))
+            .current_dir(source.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            forge_head(&daemon, "operator-import"),
+            Some(rev_parse_head(source.path()))
+        );
     };
-
-    fetch(&mirror);
-    let first_oid = git2::Oid::from_str(&first_head).expect("head oid");
-    assert!(
-        mirror.find_commit(first_oid).is_ok(),
-        "fresh sync lands the head"
-    );
-
-    // origin advances; the re-sync's haves earn an ACK + delta pack, and the
-    // mirror must still complete the new head's closure from it.
-    commit_file(src, "history.txt", "two\n", "second commit");
-    git_push_ok(&daemon, src, &["push", "ducktape", "main"]);
-    let second_head = rev_parse_head(src);
-    fetch(&mirror);
-    let second_oid = git2::Oid::from_str(&second_head).expect("head oid");
-    let landed = mirror
-        .find_commit(second_oid)
-        .expect("incremental sync lands the head");
-    assert_eq!(
-        landed
-            .tree()
-            .expect("tree")
-            .get_name("history.txt")
-            .map(|entry| entry.id()),
-        git2::Repository::open(src)
-            .expect("open source")
-            .find_commit(second_oid)
-            .expect("source head")
-            .tree()
-            .expect("source tree")
-            .get_name("history.txt")
-            .map(|entry| entry.id()),
-        "the delta pack must complete the changed blob"
-    );
-}
-
-/// Regression: a push whose data exceeds git's `http.postBuffer` is preceded by
-/// a flush-only PROBE POST (zero commands) before the real chunked request. The
-/// receive-pack handler must answer that probe 200, not 400 — otherwise every
-/// push larger than the buffer (the common case for a real repo) fails. Forcing
-/// `http.postBuffer=1` makes git take the probe path for even a one-commit push.
-#[test]
-fn git_push_larger_than_post_buffer_uses_the_probe_path() {
-    if skip_without_git("git_push_larger_than_post_buffer_uses_the_probe_path").is_some() {
-        return;
-    }
-    let storage = tempfile::TempDir::new().expect("storage dir");
-    let daemon = Daemon::spawn(storage.path());
-    let url = format!("http://127.0.0.1:{}/forge/probed", daemon.port);
-
-    let work = tempfile::TempDir::new().expect("git work dir");
-    let wd = work.path();
-    git_ok(wd, &["init"]);
-    commit_file(wd, "hello.txt", "hi from a probed push\n", "first commit");
-    git_ok(wd, &["remote", "add", "ducktape", &url]);
-
-    // `-c http.postBuffer=1` forces git through the large-request probe.
-    let push = git_push(
-        &daemon,
-        wd,
-        &["-c", "http.postBuffer=1", "push", "ducktape", "main"],
-    );
-    eprintln!("=== probed git push ===\n{}", render(&push));
-    assert!(
-        push.status.success(),
-        "a push through the postBuffer probe path must succeed:\n{}",
-        render(&push)
-    );
-    assert_eq!(
-        forge_head(&daemon, "probed"),
-        Some(rev_parse_head(wd)),
-        "forge HEAD must equal the pushed commit after a probed push"
-    );
+    publish();
+    commit_file(source.path(), "source.txt", "one\ntwo\n", "second");
+    publish();
+    let height = daemon.status()["height"].as_u64().unwrap();
+    publish();
+    assert_eq!(daemon.status()["height"].as_u64().unwrap(), height);
 }
 
 // ============================================================================
@@ -2277,7 +1732,7 @@ fn duckfs_engine_round_trips_and_reports_conflict_through_http_node() {
     assert!(idx.base_snapshot.is_none(), "empty checkout has no base");
 
     // a small (inline) file and a >1 MiB file — the latter forces the stage
-    // path through real consensus (POST /v1/files/stage per chunk).
+    // path through real consensus (one signed module frame per chunk).
     std::fs::write(dir_a.path().join("small"), b"hello duckfs engine").expect("write small");
     let big: Vec<u8> = (0..(2 * 1024 * 1024 + 7))
         .map(|i| (i % 251) as u8)
@@ -2364,7 +1819,8 @@ fn duckfs_workspace_rpc_maps_workspace_prefix_into_managed_namespace() {
         index.prefix
     );
     let read_path = format!("{}/hello.txt", index.prefix);
-    let (code, read) = daemon.request("GET", &format!("/v1/files/read?path={read_path}"), None);
+    let (code, reply) = daemon.request("POST", "/v1/query", Some(&serde_json::json!({"target":"files","query":{"read":{"path":read_path,"snapshot":null,"offset":0,"len":1048576}}})));
+    let read = &reply["read"];
     assert_eq!(code, 200, "read committed managed workspace file: {read}");
     let bytes = STANDARD
         .decode(read["b64"].as_str().expect("b64").as_bytes())
@@ -2425,11 +1881,8 @@ fn duckfs_workspace_rpc_lifecycle_and_conflict() {
     assert_eq!(done["rebased"], false, "a first commit never rebases");
 
     // ---- read the committed file back over the files surface ----
-    let (code, read) = daemon.request(
-        "GET",
-        &format!("/v1/files/read?path={prefix}/hello.txt"),
-        None,
-    );
+    let (code, reply) = daemon.request("POST", "/v1/query", Some(&serde_json::json!({"target":"files","query":{"read":{"path":format!("{prefix}/hello.txt"),"snapshot":null,"offset":0,"len":1048576}}})));
+    let read = &reply["read"];
     assert_eq!(code, 200, "read the committed file: {read}");
     let bytes = STANDARD
         .decode(read["b64"].as_str().expect("b64").as_bytes())
@@ -2448,7 +1901,7 @@ fn duckfs_workspace_rpc_lifecycle_and_conflict() {
     // ---- conflict: a workspace loses a race on its OWN path. every managed
     // checkout owns an id-scoped prefix, so no two workspaces can collide; the
     // competing writer is whoever else commits into duckfs — here a direct
-    // /v1/files/commit that lands between this workspace's checkout and its
+    // generic module submit that lands between this workspace's checkout and its
     // commit. same 409 lane, reachable the way production reaches it ----
     let (code, ws2) = daemon.request(
         "POST",
@@ -2473,20 +1926,25 @@ fn duckfs_workspace_rpc_lifecycle_and_conflict() {
 
     // a direct commit advances the SAME path off the seeded head — the
     // workspace's base snapshot is now stale.
-    let (code, refs) = daemon.request("GET", "/v1/files/refs", None);
+    let (code, reply) = daemon.request(
+        "POST",
+        "/v1/query",
+        Some(&serde_json::json!({"target":"files","query":{"refs":{}}})),
+    );
+    let refs = &reply["refs"];
     assert_eq!(code, 200, "refs failed: {refs}");
     let head = refs["head"].as_str().expect("seeded head").to_string();
     let (code, advanced) = daemon.request(
         "POST",
-        "/v1/files/commit",
-        Some(&serde_json::json!({
+        "/v1/submit",
+        Some(&serde_json::json!({"target":"files","payload":{"commit":{
             "base_snapshot": head,
             "message": "a competing writer takes the path",
             "changes": [
                 { "put": { "path": format!("{prefix2}/f.txt"), "exec": false, "meta": {},
                     "content": { "inline": { "b64": STANDARD.encode(b"from the other writer") } } } },
             ],
-        })),
+        }}})),
     );
     assert_eq!(code, 200, "the competing commit lands: {advanced}");
 

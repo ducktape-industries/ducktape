@@ -1,0 +1,12 @@
+[package]
+name = "ducktape-view-composer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ducktape-view-guest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chat-message = { path = "../../../modules/apps/chat/message" }
+ducktape-view-files.workspace = true

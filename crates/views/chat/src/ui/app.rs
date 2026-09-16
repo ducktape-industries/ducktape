@@ -40,8 +40,25 @@ pub(crate) enum LandingThread {
     Absent,
     Seated,
 }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ReadVisit {
+    #[default]
+    Hidden,
+    Entering,
+    Reading,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ChatView {
+    #[serde(skip)]
+    pub(crate) dm_opening: Option<ducktape_view_guest::task::Handle>,
+    #[serde(skip)]
+    pub(crate) dm_generation: u64,
+    pub(crate) dm_request_serial: i64,
+    #[serde(skip)]
+    pub(crate) upload_handles: std::collections::HashMap<String, ducktape_view_guest::task::Handle>,
+    pub(crate) sending: std::collections::BTreeMap<String, (String, crate::host::PendingSend)>,
+    pub(crate) composers: std::collections::BTreeMap<String, ducktape_view_composer::Draft>,
     pub(crate) endpoint: String,
     pub(crate) network_name: String,
     pub(crate) network_chain_id: String,
@@ -50,9 +67,21 @@ pub struct ChatView {
     pub(crate) connected: bool,
     pub(crate) session_loading: bool,
     pub(crate) session_busy: bool,
+    #[serde(skip)]
+    pub(crate) read_visit: ReadVisit,
+    pub(crate) read_cursors: std::collections::BTreeMap<String, i64>,
     pub(crate) rooms: Vec<crate::host::ChatSidebarRow>,
     pub(crate) dm_rows: Vec<crate::host::DmSidebarRow>,
     pub(crate) channel_create_open: bool,
+    pub(crate) channel_draft: String,
+    pub(crate) channel_create_voice: bool,
+    pub(crate) channel_create_members_only: bool,
+    pub(crate) channel_create_id: String,
+    pub(crate) channel_create_error: String,
+    #[serde(skip)]
+    pub(crate) channel_creating: Option<ducktape_view_guest::task::Handle>,
+    #[serde(skip)]
+    pub(crate) channel_create_generation: u64,
     pub(crate) active_channel: String,
     pub(crate) active_dm_peer: String,
     pub(crate) active_dm: crate::host::DmPeer,
@@ -63,12 +92,11 @@ pub struct ChatView {
     pub(crate) huddle_now: i64,
     pub(crate) call_muted: bool,
     pub(crate) call_speaking: bool,
-    pub(crate) speaking_peers: Vec<String>,
+    pub(crate) call_peers: Vec<crate::host::CallPeer>,
     pub(crate) unread_boundary: i64,
     pub(crate) live_agents: Vec<crate::host::LiveRunHint>,
     pub(crate) shift_held: bool,
     pub(crate) copy_chord_serial: i64,
-    pub(crate) sent_serial: i64,
     pub(crate) pending_sends: Vec<crate::host::PendingSend>,
     pub(crate) me: String,
     pub(crate) me_key: String,
@@ -163,6 +191,7 @@ impl ::std::fmt::Debug for ChatView {
 }
 #[derive(Clone)]
 pub enum Message {
+    Composer(Box<composer::ComposerMessage>),
     SidebarResized(f64, f64),
     DetailsResized(f64, f64),
     ThreadResized(f64, f64),
@@ -176,8 +205,10 @@ pub enum Message {
     PreviewArrived(crate::host::PreviewItem),
     /// Boxed: the session item dwarfs every other variant.
     SessionArrived(Box<crate::host::SessionItem>),
+    SidebarArrived(crate::host::SidebarItem),
+    VisibilityChanged(bool),
     SessionSettled(bool),
-    SnapStream(bool),
+    BackgroundFinished,
     RevealStream(i64),
     RevealThread(i64),
     RoomArrived(crate::host::RoomItem),
@@ -188,8 +219,15 @@ pub enum Message {
     ClearChatSearch,
     OpenChatSearchHit(String, i64, i64),
     ToggleChannelCreate,
+    ChannelDraftChanged(String),
+    ToggleChannelVoice,
+    ToggleChannelMembersOnly,
+    CreateChannel,
+    ChannelIdReady(u64, Result<String, String>),
+    ChannelCreated(u64, Result<(), String>),
     ChooseChannel(String),
     ChooseDm(String),
+    DmOpened(u64, Result<String, String>),
     ToggleChannelSettings,
     ShowHuddle,
     LeaveHuddleHere,
@@ -199,6 +237,7 @@ pub enum Message {
     CopyToClipboard(String, String),
     CopyMessageLink(String),
     CancelRun(String),
+    RunCancelled(i64, crate::host::ActItem),
     OpenRun(String),
     ChatScrolled(f64, f64, f64, f64),
     LoadMoreHistory,
@@ -241,6 +280,12 @@ impl ::std::fmt::Debug for Message {
 impl ChatView {
     fn state() -> Self {
         Self {
+            dm_opening: None,
+            dm_generation: 0,
+            dm_request_serial: 0,
+            composers: Default::default(),
+            sending: Default::default(),
+            upload_handles: Default::default(),
             endpoint: "".to_owned(),
             network_name: "".to_owned(),
             network_chain_id: "".to_owned(),
@@ -249,9 +294,18 @@ impl ChatView {
             connected: false,
             session_loading: false,
             session_busy: false,
+            read_visit: ReadVisit::Hidden,
+            read_cursors: Default::default(),
             rooms: Vec::new(),
             dm_rows: Vec::new(),
             channel_create_open: false,
+            channel_draft: String::new(),
+            channel_create_voice: false,
+            channel_create_members_only: false,
+            channel_create_id: String::new(),
+            channel_create_error: String::new(),
+            channel_creating: None,
+            channel_create_generation: 0,
             active_channel: "".to_owned(),
             active_dm_peer: "".to_owned(),
             active_dm: crate::host::no_dm_peer(),
@@ -262,12 +316,11 @@ impl ChatView {
             huddle_now: 0,
             call_muted: false,
             call_speaking: false,
-            speaking_peers: Vec::new(),
+            call_peers: Vec::new(),
             unread_boundary: 0,
             live_agents: Vec::new(),
             shift_held: false,
             copy_chord_serial: 0,
-            sent_serial: 0,
             pending_sends: Vec::new(),
             me: "".to_owned(),
             me_key: "".to_owned(),
@@ -371,7 +424,11 @@ impl ChatView {
         let wire::SnapshotValue::Bytes(state) = snapshot.state else {
             return Err("invalid Chat snapshot".into());
         };
-        let state: Self = wire::decode(&state)?;
+        let mut state: Self = wire::decode(&state)?;
+        state.read_visit = ReadVisit::Hidden;
+        for draft in state.composers.values_mut() {
+            draft.retire_device_requests();
+        }
         state.validate_snapshot()?;
         Ok(state)
     }
@@ -398,6 +455,20 @@ impl ChatView {
 impl ChatView {
     pub(crate) fn subscription(&self) -> ::ducktape_view_guest::Subscription<Message> {
         ::ducktape_view_guest::Subscription::batch([
+            self.composer_drops(),
+            crate::host::visibility().map(Message::VisibilityChanged),
+            if self.connected {
+                crate::host::sidebar(
+                    self.connection_serial,
+                    self.names_serial,
+                    self.me.clone(),
+                    self.active_channel.clone(),
+                    self.land_seq != 0 || self.history_pages != 0,
+                )
+                .map(Message::SidebarArrived)
+            } else {
+                ducktape_view_guest::Subscription::none()
+            },
             crate::host::session().map(|item| Message::SessionArrived(Box::new(item))),
             if self.connected {
                 ::ducktape_view_guest::Subscription::batch([crate::host::room(
@@ -439,6 +510,338 @@ impl ChatView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrolling_pages_history_and_tracks_the_tail_inside_the_view() {
+        let mut state = ChatView::state();
+        state.active_channel = "general".into();
+        state.loading = false;
+        state.has_older_history = true;
+        let _ = state.update(Message::ChatScrolled(0.0, 10.0, 0.0, 1.0));
+        assert!(!state.at_live_tail);
+        assert!(state.history_loading);
+        assert_eq!(state.history_pages, 1);
+        let requested = state.room_key.clone();
+        let _ = state.update(Message::ChatScrolled(0.0, 10.0, 0.0, 1.0));
+        assert_eq!(
+            state.history_pages, 1,
+            "one request while a page is loading"
+        );
+        assert_eq!(state.room_key, requested);
+        let _ = state.update(Message::RoomArrived(crate::host::RoomItem {
+            channel: "general".into(),
+            has_older: false,
+            ..Default::default()
+        }));
+        assert!(state.history_view);
+        assert!(!state.history_loading);
+        let _ = state.update(Message::ChatScrolled(0.0, 10.0, 0.0, 1.0));
+        assert_eq!(state.history_pages, 1, "the oldest page ends pagination");
+        let _ = state.update(Message::ChatScrolled(0.0, 0.0, 0.0, f64::NAN));
+        assert!(state.at_live_tail, "content that fits is at the tail");
+    }
+    #[test]
+    fn hiding_a_pending_dm_retires_navigation_and_restores_the_loaded_room() {
+        let mut state = ChatView::state();
+        state.connected = true;
+        state.active_channel = "general".into();
+        state.room_channel = "general".into();
+        state.loading = true;
+        state.dm_generation = 4;
+        state.message_edit_draft = "unsaved edit".into();
+        let _ = state.update(Message::VisibilityChanged(false));
+        let _ = state.update(Message::DmOpened(4, Ok("dm-stale".into())));
+        assert!(!state.loading);
+        assert_eq!(state.active_channel, "general");
+        assert_eq!(state.message_edit_draft, "unsaved edit");
+    }
+
+    #[test]
+    fn run_cancel_replies_preserve_edits_and_belong_to_their_connection() {
+        let mut state = ChatView::state();
+        state.connection_serial = 7;
+        state.message_edit_draft = "unfinished edit".into();
+        state.thread_edit_draft = "unfinished reply edit".into();
+        state.selected_message_seq = 12;
+        let _ = state.update(Message::RunCancelled(
+            7,
+            crate::host::ActItem {
+                error: "refused".into(),
+            },
+        ));
+        assert!(state.host_error.contains("refused"));
+        assert_eq!(state.message_edit_draft, "unfinished edit");
+        assert_eq!(state.thread_edit_draft, "unfinished reply edit");
+        assert_eq!(state.selected_message_seq, 12);
+        let _ = state.update(Message::RunCancelled(7, crate::host::ActItem::default()));
+        assert!(state.host_error.is_empty());
+        state.connection_serial = 8;
+        let _ = state.update(Message::RunCancelled(
+            7,
+            crate::host::ActItem {
+                error: "old refusal".into(),
+            },
+        ));
+        assert!(state.host_error.is_empty());
+    }
+
+    #[test]
+    fn dm_identity_comes_from_guest_directory_across_navigation_and_refresh() {
+        let mut state = ChatView::state();
+        let session = |channel: &str, network: &str| {
+            Message::SessionArrived(Box::new(crate::host::SessionItem {
+                next: crate::host::Session {
+                    active_channel: channel.into(),
+                    network_chain_id: network.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+        };
+        let directory = |name: &str, connection_serial| {
+            Message::SidebarArrived(crate::host::SidebarItem {
+                connection_serial,
+                peers: vec![crate::host::DmPeer {
+                    key: "peer-key".into(),
+                    name: name.into(),
+                    initials: "PN".into(),
+                    channel_id: "private-room".into(),
+                    is_agent: true,
+                }],
+                ..Default::default()
+            })
+        };
+        let _ = state.update(session("private-room", "network"));
+        let _ = state.update(directory("Peer Name", state.connection_serial));
+        assert_eq!(state.active_dm.name, "Peer Name");
+        assert_eq!(state.active_dm_peer, "peer-key");
+        assert!(state.active_dm.is_agent);
+        let _ = state.update(directory("Renamed Peer", state.connection_serial));
+        assert_eq!(state.active_dm.name, "Renamed Peer");
+        let _ = state.update(session("public-room", "network"));
+        assert!(state.active_dm.name.is_empty());
+        assert!(state.active_dm_peer.is_empty());
+        let _ = state.update(session("private-room", "network"));
+        assert_eq!(state.active_dm.name, "Renamed Peer");
+        let delayed_directory = directory("Previous network peer", state.connection_serial);
+        let _ = state.update(session("private-room", "different-network"));
+        let _ = state.update(delayed_directory);
+        assert!(state.active_dm.name.is_empty());
+        assert!(state.active_dm_peer.is_empty());
+        let _ = state.update(directory("New network peer", state.connection_serial));
+        assert_eq!(state.active_dm.name, "New network peer");
+        let _ = state.update(session("", "different-network"));
+        let _ = state.update(Message::SidebarArrived(crate::host::SidebarItem {
+            connection_serial: state.connection_serial,
+            peers: vec![crate::host::DmPeer {
+                name: "Unresolved account".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+        assert!(state.active_dm.name.is_empty());
+    }
+
+    #[test]
+    fn guest_freezes_unread_boundary_on_room_entry_and_hidden_return() {
+        let mut state = ChatView::state();
+        let session = |channel: &str| {
+            Message::SessionArrived(Box::new(crate::host::SessionItem {
+                next: crate::host::Session {
+                    active_channel: channel.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+        };
+        let sidebar = |head| {
+            Message::SidebarArrived(crate::host::SidebarItem {
+                channels: vec![crate::host::ChatChannel {
+                    id: "a".into(),
+                    head_seq: head,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        };
+        let _ = state.update(sidebar(30));
+        let _ = state.update(sidebar(50));
+        let _ = state.update(session("a"));
+        let _ = state.update(Message::VisibilityChanged(true));
+        state.messages = vec![crate::host::ChatMessage {
+            seq: 31,
+            ..Default::default()
+        }];
+        let _ = state.update(sidebar(50));
+        assert_eq!(state.unread_boundary, 30);
+        assert_eq!(
+            state.unread_marker_seq, 31,
+            "sidebar arrival updates already loaded rows"
+        );
+        assert_eq!(state.read_cursors["a"], 50);
+        let _ = state.update(session("a"));
+        let _ = state.update(sidebar(60));
+        assert_eq!(state.unread_boundary, 30, "live refresh keeps the divider");
+        let _ = state.update(Message::VisibilityChanged(false));
+        let _ = state.update(sidebar(70));
+        assert_eq!(state.read_cursors["a"], 60);
+        let _ = state.update(Message::VisibilityChanged(true));
+        let _ = state.update(sidebar(70));
+        assert_eq!(state.unread_boundary, 60);
+        let _ = state.update(Message::VisibilityChanged(false));
+        let _ = state.update(Message::VisibilityChanged(true));
+        let _ = state.update(sidebar(70));
+        assert_eq!(
+            state.unread_boundary, 60,
+            "empty tab roundtrip keeps the divider"
+        );
+        let mut restored = ChatView::restore(&state.snapshot().unwrap()).unwrap();
+        let _ = restored.update(Message::VisibilityChanged(true));
+        let _ = restored.update(sidebar(70));
+        assert_eq!(
+            restored.unread_boundary, 60,
+            "replacement retains the visit boundary"
+        );
+        state.land_seq = 3;
+        let _ = state.update(sidebar(75));
+        assert_eq!(
+            state.read_cursors["a"], 70,
+            "history does not consume new arrivals"
+        );
+        let _ = state.update(session("a"));
+        let _ = state.update(sidebar(75));
+        assert_eq!(state.read_cursors["a"], 75);
+        assert_eq!(
+            state.unread_boundary, 60,
+            "history return retains the same-room divider"
+        );
+        let _ = state.update(session("b"));
+        let _ = state.update(session("a"));
+        let _ = state.update(sidebar(70));
+        assert_eq!(
+            state.unread_boundary, 0,
+            "caught-up room entry has no divider"
+        );
+    }
+
+    #[test]
+    fn hidden_room_arrivals_do_not_advance_the_guest_read_cursor() {
+        let mut state = ChatView::state();
+        state.active_channel = "a".into();
+        let sidebar = |head| {
+            Message::SidebarArrived(crate::host::SidebarItem {
+                channels: vec![crate::host::ChatChannel {
+                    id: "a".into(),
+                    head_seq: head,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        };
+        let _ = state.update(sidebar(4));
+        let _ = state.update(sidebar(5));
+        assert_eq!(state.read_cursors["a"], 4);
+        assert!(state.rooms[0].unread);
+        let _ = state.update(Message::VisibilityChanged(true));
+        let _ = state.update(sidebar(6));
+        assert_eq!(state.read_cursors["a"], 6);
+        assert!(!state.rooms[0].unread);
+        state.land_seq = 2;
+        let _ = state.update(sidebar(7));
+        assert_eq!(
+            state.read_cursors["a"], 6,
+            "reading history does not read the live tail"
+        );
+        assert!(state.rooms[0].unread);
+        let restored = ChatView::restore(&state.snapshot().unwrap()).unwrap();
+        assert!(
+            restored.read_visit == ReadVisit::Hidden,
+            "visibility comes from the current host, not the snapshot"
+        );
+        assert_eq!(restored.read_cursors["a"], 6);
+    }
+
+    #[test]
+    fn sidebar_keeps_dm_rows_separate_and_tracks_their_unread_heads() {
+        let mut state = ChatView::state();
+        state.read_visit = ReadVisit::Reading;
+        state.active_channel = "general".into();
+        let mine = format!("dm-{}", "a".repeat(64));
+        let theirs = format!("dm-{}", "b".repeat(64));
+        let sidebar = |head| crate::host::SidebarItem {
+            channels: ["general", "dm-standup", &mine, &theirs]
+                .into_iter()
+                .map(|id| crate::host::ChatChannel {
+                    id: id.into(),
+                    head_seq: head,
+                    ..Default::default()
+                })
+                .collect(),
+            peers: vec![crate::host::DmPeer {
+                key: "8".into(),
+                channel_id: mine.clone(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let _ = state.update(Message::SidebarArrived(sidebar(4)));
+        assert_eq!(
+            state
+                .rooms
+                .iter()
+                .map(|row| row.channel.id.as_str())
+                .collect::<Vec<_>>(),
+            ["general", "dm-standup"]
+        );
+        assert_eq!(state.dm_rows.len(), 1);
+        assert!(!state.dm_rows[0].unread);
+        let _ = state.update(Message::SidebarArrived(sidebar(5)));
+        assert!(!state.rooms[0].unread);
+        assert!(state.rooms[1].unread);
+        assert!(state.dm_rows[0].unread);
+        state.active_channel = mine.clone();
+        let _ = state.update(Message::SidebarArrived(sidebar(5)));
+        assert!(!state.dm_rows[0].unread);
+        assert_eq!(state.active_dm.channel_id, mine);
+        let _ = state.update(Message::SessionArrived(Box::new(
+            crate::host::SessionItem {
+                next: crate::host::Session {
+                    active_channel: "general".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )));
+        assert!(state.active_dm.channel_id.is_empty());
+        assert!(
+            state.active_dm_peer.is_empty(),
+            "a room change retires the DM header immediately"
+        );
+    }
+
+    #[test]
+    fn sidebar_reads_seed_cursors_then_mark_only_inactive_rooms_unread() {
+        let mut state = ChatView::state();
+        state.read_visit = ReadVisit::Reading;
+        state.active_channel = "a".into();
+        let sidebar = |head| crate::host::SidebarItem {
+            channels: ["a", "b"]
+                .into_iter()
+                .map(|id| crate::host::ChatChannel {
+                    id: id.into(),
+                    head_seq: head,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let _ = state.update(Message::SidebarArrived(sidebar(4)));
+        assert!(state.rooms.iter().all(|row| !row.unread));
+        let _ = state.update(Message::SidebarArrived(sidebar(5)));
+        assert!(!state.rooms[0].unread);
+        assert!(state.rooms[1].unread);
+    }
+
     #[test]
     fn native_composition_retains_timeline_identity_unread_and_action_admission() {
         let mut state = ChatView::state();
@@ -919,7 +1322,7 @@ mod tests {
             text: "fn main() {}".into(),
             ..Default::default()
         }));
-        assert_eq!(surfaces(&state), vec![("forge_code".to_owned(), false)]);
+        assert_eq!(surfaces(&state), vec![("code".to_owned(), false)]);
         let readme = "duck://files/shared/attachments/u1/README.md".to_owned();
         let _ = state.update(Message::OpenAttachment(readme));
         let _ = state.update(Message::PreviewArrived(crate::host::PreviewItem {
@@ -928,7 +1331,7 @@ mod tests {
             text: "# hi".into(),
             ..Default::default()
         }));
-        assert_eq!(surfaces(&state), vec![("agent_markdown".to_owned(), true)]);
+        assert_eq!(surfaces(&state), vec![("markdown".to_owned(), true)]);
 
         let _ = state.update(Message::OpenAttachment(shot.clone()));
         assert!(
@@ -1012,5 +1415,6 @@ mod app_update;
 mod app_view;
 mod chat;
 mod components;
+mod composer;
 mod dm;
 mod kit;

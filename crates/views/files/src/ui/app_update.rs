@@ -10,6 +10,9 @@ impl FilesView {
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::SessionArrived(item) => self.on_session_arrived(item),
+            Message::FilesDropped(files) => self.on_files_dropped(files),
+            Message::FilesUploaded(serial, result) => self.on_files_uploaded(serial, result),
+            Message::GrantsReleased => self.on_grants_released(),
             Message::RouteTo(target) => self.on_route_to(target),
             Message::WorkspaceArrived(item) => self.on_workspace_arrived(item),
             Message::PreviewArrived(item) => self.on_preview_arrived(item),
@@ -53,6 +56,54 @@ impl FilesView {
         }
     }
 
+    fn on_files_dropped(
+        &mut self,
+        files: Result<Vec<ducktape_view_files::SelectedFile>, String>,
+    ) -> Task<Message> {
+        let files = match files {
+            Ok(files) => files,
+            Err(error) => {
+                self.notice = error;
+                return Task::none();
+            }
+        };
+        let unavailable = !self.connected || self.busy_writing();
+        if unavailable {
+            return Task::perform(
+                async move {
+                    for file in files {
+                        ducktape_view_files::release(&file.token).await;
+                    }
+                },
+                |_| Message::GrantsReleased,
+            );
+        }
+        self.upload_serial += 1;
+        let serial = self.upload_serial;
+        let directory = self.nav.path.clone();
+        let (task, handle) =
+            Task::perform(crate::host::upload_files(files, directory), move |result| {
+                Message::FilesUploaded(serial, result)
+            })
+            .abortable();
+        self.upload = Some(handle.abort_on_drop());
+        task
+    }
+
+    fn on_grants_released(&mut self) -> Task<Message> {
+        Task::none()
+    }
+
+    fn on_files_uploaded(&mut self, serial: u64, result: Result<(), String>) -> Task<Message> {
+        if serial != self.upload_serial {
+            return Task::none();
+        }
+        self.upload = None;
+        self.notice = result.err().unwrap_or_default();
+        self.generation += 1;
+        Task::none()
+    }
+
     // ---- the one reset ----
 
     /// The reader has moved: everything that belonged to the directory she
@@ -68,7 +119,6 @@ impl FilesView {
         self.notice.clear();
         self.name_prompt = NamePrompt::Closed;
         self.name_draft.clear();
-        self.sent = crate::host::at(&self.nav.path);
     }
 
     /// Nothing is chosen: no preview, no provenance, no comparison.
@@ -127,6 +177,11 @@ impl FilesView {
             return Task::none();
         }
         let next = item.next;
+        let rebound = self.chain != next.chain || !next.connected;
+        if rebound {
+            self.upload = None;
+            self.upload_serial += 1;
+        }
         let came_up = next.connected && !self.connected;
         if came_up {
             self.generation += 1;

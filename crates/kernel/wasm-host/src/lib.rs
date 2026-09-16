@@ -76,6 +76,8 @@ mod bindings {
             // the driver resolves them against the odb backing and replays.
             "ducktape:module/host.object-stat": trappable,
             "ducktape:module/host.object-get": trappable,
+            "ducktape:module/host.git-object-read": trappable,
+            "ducktape:module/host.git-diff-read": trappable,
             // every WRITING import traps on one thing only: the bytes it would
             // add push this dispatch past [`MAX_HOST_BYTES`]. the copy happens
             // in host code, which fuel does not price, so this is the meter
@@ -113,6 +115,8 @@ pub enum Backing {
     /// a host-side content-addressed substrate the host provides by module
     /// id: root = the substrate's fold of its refs image.
     Odb,
+    /// Local Git objects with durable refs.
+    Git,
 }
 
 /// what a component declares about itself — the `module.wit` `shape` export,
@@ -135,6 +139,7 @@ impl Shape {
                 WitBacking::Map => Backing::Map,
                 WitBacking::Store => Backing::Store,
                 WitBacking::Odb => Backing::Odb,
+                WitBacking::Git => Backing::Git,
             },
             config: declared.config,
             committed_queries: declared.committed_queries,
@@ -265,13 +270,24 @@ impl Default for GuestLimits {
     }
 }
 
-/// the host-side content-addressed object store a wasm odb tenant reads from
-/// and stages puts against. Task 1 ships only the trait + the plumbing that
-/// routes the object imports here; NO backing is wired (`WasmModule::odb` is
-/// `None`), so every read that misses the same-dispatch put overlay answers
-/// `None`. Task 2 implements this over `DiskStore`/`DiskRefs` and injects it via
-/// a builder. Existing Map/Store tenants never call the object imports, so they
-/// never reach a resolver that would consult it — the plane is inert for them.
+/// Typed local Git storage results shared with native substrate implementations.
+pub use bindings::ducktape::module::host::{
+    GitCommit, GitDiff, GitDiffError, GitObject, GitObjectData, GitTreeEntry,
+};
+
+/// A local Git object read: confined repository, exact object id, body cap.
+fn valid_git_repository(repository: &str) -> bool {
+    let bounded = !repository.is_empty() && repository.len() <= 255 && !repository.starts_with('.');
+    let safe = repository
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    bounded && safe
+}
+
+type GitObjectKey = (String, Vec<u8>, u64);
+type GitDiffKey = (String, Vec<u8>, Vec<u8>, u64, u64, u64);
+
+/// Content-addressed object storage; writes publish only at the block boundary.
 pub trait HostOdb {
     /// metadata-only: `(kind-tag, body-byte-length)` of a refs-reachable
     /// object, or `None` if absent. answered from metadata alone (map lookup /
@@ -304,6 +320,30 @@ pub trait HostOdb {
 /// durability order — staged objects published FIRST, then the refs image
 /// adopted — the crash-safety contract a disk backing realizes.
 pub trait OdbBacking: HostOdb {
+    /// The concrete storage engine this instance offers. Code swaps preserve it.
+    fn kind(&self) -> Backing {
+        Backing::Odb
+    }
+    fn git_object_read(
+        &self,
+        _repository: &str,
+        _oid: &[u8],
+        _max_bytes: u64,
+    ) -> Result<GitObject, SdkError> {
+        Err(SdkError::QueryUnsupported)
+    }
+    fn git_diff_read(
+        &self,
+        _repository: &str,
+        _target: &[u8],
+        _source: &[u8],
+        _max_bytes: u64,
+        _max_files: u64,
+        _max_blob_bytes: u64,
+    ) -> Result<GitDiff, GitDiffError> {
+        Err(GitDiffError::Unsupported)
+    }
+
     /// the committed refs image — the `root()` preimage and the snapshot bytes.
     /// byte-identical to native `Fs::snapshot_refs` / `encode_refs`.
     fn refs_bytes(&self) -> Vec<u8>;
@@ -359,11 +399,6 @@ pub trait OdbBacking: HostOdb {
     /// `Fs::abort_block` drops the in-memory pending; a disk backing may also
     /// sweep orphan object files). the committed refs + odb stay untouched.
     fn discard_block(&mut self);
-    /// serve a committed-only query — the files read lane is HOST-side (never the
-    /// guest) so an in-block sibling `FilesQuery::Refs` reads committed refs+odb,
-    /// byte-identical to native `Fs::query` (`fs.rs:601-605`). off the execute
-    /// path, so disk body reads are fine here.
-    fn query(&self, req: &[u8]) -> Result<Vec<u8>, SdkError>;
     /// serve one committed-only state-sync request — the duckfs object-possession
     /// protocol (native `Fs::serve_sync`). the delegation twin of a store-backed
     /// tenant's `MerkleStore::serve_sync`.
@@ -429,6 +464,8 @@ enum PendingRead {
     /// an `object-get` miss of the same-dispatch put overlay: resolved against
     /// the odb backing, exactly like [`PendingRead::ObjectStat`].
     ObjectGet(Vec<u8>),
+    GitObject(GitObjectKey),
+    GitDiff(GitDiffKey),
 }
 
 /// resolved read answers, accumulated across the replay rounds of ONE
@@ -451,6 +488,8 @@ struct SiblingMemo {
     /// entry is unreachable. counted together against [`MAX_OBJECT_READS`].
     object_stats: BTreeMap<Vec<u8>, Option<(u8, u64)>>,
     object_gets: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    git_objects: BTreeMap<GitObjectKey, Result<GitObject, WitError>>,
+    git_diffs: BTreeMap<GitDiffKey, Result<GitDiff, GitDiffError>>,
 }
 
 impl SiblingMemo {
@@ -486,7 +525,10 @@ impl SiblingMemo {
     /// stats and gets share one budget, like roots and queries share the
     /// sibling budget.
     fn object_len(&self) -> usize {
-        self.object_stats.len() + self.object_gets.len()
+        self.object_stats.len()
+            + self.object_gets.len()
+            + self.git_objects.len()
+            + self.git_diffs.len()
     }
 
     /// every replay budget still holds — the loop guard every driver shares.
@@ -543,7 +585,10 @@ impl SiblingMemo {
             PendingRead::States(_) => {
                 unreachable!("state reads resolve against the injected store, never the ctx")
             }
-            PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_) => {
+            PendingRead::ObjectStat(_)
+            | PendingRead::ObjectGet(_)
+            | PendingRead::GitObject(_)
+            | PendingRead::GitDiff(_) => {
                 unreachable!("object reads resolve against the odb backing, never the ctx")
             }
         }
@@ -553,6 +598,7 @@ impl SiblingMemo {
 
 #[derive(Default)]
 struct HostData {
+    local_reads: bool,
     env: Option<WitEnv>,
     committed: BTreeMap<Vec<u8>, Vec<u8>>,
     staged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
@@ -733,6 +779,62 @@ impl host::Host for HostData {
     }
     /// overlay-over-backing full read: staged puts (the tagged body verbatim)
     /// first, then the memo, else pause for the driver.
+    fn git_object_read(
+        &mut self,
+        repository: String,
+        oid: Vec<u8>,
+        max_bytes: u64,
+    ) -> wasmtime::Result<Result<GitObject, WitError>> {
+        if !self.local_reads {
+            return Ok(Err(WitError::Unsupported));
+        }
+        let valid =
+            valid_git_repository(&repository) && oid.len() == 20 && max_bytes <= 16 * 1024 * 1024;
+        if !valid {
+            return Ok(Err(WitError::Rejected("invalid_git_object_read".into())));
+        }
+        let key = (repository, oid, max_bytes);
+        if let Some(answer) = self.memo.git_objects.get(&key) {
+            return Ok(answer.clone());
+        }
+        self.pending = Some(PendingRead::GitObject(key));
+        Err(wasmtime::Error::msg(PENDING_READ_TRAP))
+    }
+    fn git_diff_read(
+        &mut self,
+        repository: String,
+        target: Vec<u8>,
+        source: Vec<u8>,
+        max_bytes: u64,
+        max_files: u64,
+        max_blob_bytes: u64,
+    ) -> wasmtime::Result<Result<GitDiff, GitDiffError>> {
+        if !self.local_reads {
+            return Ok(Err(GitDiffError::Unsupported));
+        }
+        let valid = valid_git_repository(&repository)
+            && target.len() == 20
+            && source.len() == 20
+            && max_bytes <= 1024 * 1024
+            && max_files <= 4096
+            && max_blob_bytes <= 16 * 1024 * 1024;
+        if !valid {
+            return Ok(Err(GitDiffError::Limit("invalid_git_diff_read".into())));
+        }
+        let key = (
+            repository,
+            target,
+            source,
+            max_bytes,
+            max_files,
+            max_blob_bytes,
+        );
+        if let Some(answer) = self.memo.git_diffs.get(&key) {
+            return Ok(answer.clone());
+        }
+        self.pending = Some(PendingRead::GitDiff(key));
+        Err(wasmtime::Error::msg(PENDING_READ_TRAP))
+    }
     fn object_get(&mut self, id: Vec<u8>) -> wasmtime::Result<Option<Vec<u8>>> {
         if let Some(tagged) = self.object_puts.get(&id) {
             return Ok(Some(tagged.clone()));
@@ -839,7 +941,7 @@ impl StateBacking {
         match self {
             StateBacking::Map { .. } => Backing::Map,
             StateBacking::Store { .. } => Backing::Store,
-            StateBacking::Odb { .. } => Backing::Odb,
+            StateBacking::Odb { backing } => backing.kind(),
         }
     }
 }
@@ -1190,9 +1292,63 @@ impl WasmModule {
             }
             PendingRead::ObjectGet(id) => {
                 memo.check_capacity(id.len())?;
+                if let Some((_, size)) = backing.and_then(|b| b.stat(&id)) {
+                    let body_bytes = usize::try_from(size).map_err(|_| memo.budget_error())?;
+                    memo.check_capacity(id.len().saturating_add(body_bytes).saturating_add(1))?;
+                }
                 let answer = backing.and_then(|b| b.get(&id));
                 memo.charge(id.len() + answer.as_ref().map_or(0, Vec::len))?;
                 memo.object_gets.insert(id, answer);
+            }
+            PendingRead::GitObject(key) => {
+                let key_bytes = key.0.len() + key.1.len() + 8;
+                memo.check_capacity(key_bytes)?;
+                let answer = backing
+                    .ok_or(SdkError::QueryUnsupported)
+                    .and_then(|b| b.git_object_read(&key.0, &key.1, key.2))
+                    .map_err(to_wit_error);
+                let bytes = match &answer {
+                    Ok(object) => {
+                        9 + match &object.data {
+                            None => 0,
+                            Some(GitObjectData::Blob(bytes) | GitObjectData::Tag(bytes)) => {
+                                bytes.len()
+                            }
+                            Some(GitObjectData::Commit(commit)) => {
+                                commit.tree.len()
+                                    + commit
+                                        .parents
+                                        .iter()
+                                        .map(|parent| parent.len() + HOST_ENTRY_BYTES)
+                                        .sum::<usize>()
+                            }
+                            Some(GitObjectData::Tree(entries)) => entries
+                                .iter()
+                                .map(|entry| entry.name.len() + entry.oid.len() + HOST_ENTRY_BYTES)
+                                .sum(),
+                        }
+                    }
+                    Err(WitError::Rejected(message)) => message.len(),
+                    Err(_) => 0,
+                };
+                memo.charge(key_bytes + bytes)?;
+                memo.git_objects.insert(key, answer);
+            }
+            PendingRead::GitDiff(key) => {
+                let key_bytes = key.0.len() + key.1.len() + key.2.len() + 24;
+                memo.check_capacity(key_bytes)?;
+                let answer = backing
+                    .ok_or(GitDiffError::Unsupported)
+                    .and_then(|b| b.git_diff_read(&key.0, &key.1, &key.2, key.3, key.4, key.5));
+                let bytes = match &answer {
+                    Ok(diff) => diff.patch.len() + 25,
+                    Err(GitDiffError::Unavailable(message) | GitDiffError::Limit(message)) => {
+                        message.len()
+                    }
+                    Err(_) => 0,
+                };
+                memo.charge(key_bytes + bytes)?;
+                memo.git_diffs.insert(key, answer);
             }
             PendingRead::Root(_) | PendingRead::Query(_, _) | PendingRead::States(_) => {
                 unreachable!("resolve_object_read only handles object-plane reads")
@@ -1279,8 +1435,6 @@ impl WasmModule {
             StateBacking::Store { .. } => BTreeMap::new(),
             // the refs image is the whole committed state, served under the one
             // reserved key; the guest reads it staged-over via the state lane.
-            // (queries delegate to the backing, so this only feeds execute
-            // rounds — a query never instantiates the guest for this backing.)
             StateBacking::Odb { backing } => odb_committed(backing.as_ref(), &self.odb_config),
         }
     }
@@ -1340,6 +1494,7 @@ impl WasmModule {
             // adds a byte (see `MAX_HOST_BYTES`).
             let host_bytes = staged_bytes(&round_staged) + object_bytes(&round_objects);
             let data = HostData {
+                local_reads: false,
                 env: Some(env.clone()),
                 committed: round_committed,
                 staged: round_staged,
@@ -1382,9 +1537,10 @@ impl WasmModule {
             if let Some(read) = data.pending {
                 let resolved = match read {
                     PendingRead::States(keys) => self.resolve_state_reads(keys, &mut memo).await,
-                    read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_)) => {
-                        self.resolve_object_read(read, &mut memo)
-                    }
+                    read @ (PendingRead::ObjectStat(_)
+                    | PendingRead::ObjectGet(_)
+                    | PendingRead::GitObject(_)
+                    | PendingRead::GitDiff(_)) => self.resolve_object_read(read, &mut memo),
                     read @ (PendingRead::Root(_) | PendingRead::Query(_, _)) => {
                         memo.resolve(
                             ctx.as_deref().expect("unsealed mutation has a context"),
@@ -1583,6 +1739,7 @@ impl WasmModule {
         // read-view change, not a loss of read-your-writes.
         let committed_only = self.committed_queries;
         self.read_round(env, memo, sealed, committed_only, fuel, |inst, store| {
+            store.data_mut().local_reads = true;
             inst.call_query(store, req)
         })
     }
@@ -1624,6 +1781,7 @@ impl WasmModule {
         // this call.
         let host_bytes = staged_bytes(&staged);
         let data = HostData {
+            local_reads: false,
             env: Some(env),
             committed: self.committed_for_round(),
             staged,
@@ -1632,8 +1790,7 @@ impl WasmModule {
             sealed,
             store_backed: self.is_store_backed(),
             // a query never stages puts; its object reads answer from the
-            // committed backing alone (the files query lane is host-side per
-            // Task 2, so the guest query never reaches the object plane).
+            // committed backing alone, excluding the open block's objects.
             object_puts: BTreeMap::new(),
             out_msgs: Vec::new(),
             out_events: Vec::new(),
@@ -1935,7 +2092,7 @@ fn to_wit_ack(ack: &SdkAck) -> WitAck {
 /// code runs on every validator under the same fuel budget, so it traps at the
 /// same point. Surfaced as [`SdkError::Module`] → the host rolls the op back.
 fn module_err(e: impl std::fmt::Display) -> SdkError {
-    SdkError::Module(e.to_string())
+    SdkError::Module(format!("{e:#}"))
 }
 
 fn wit_err(e: WitError) -> SdkError {
@@ -2184,7 +2341,12 @@ impl Module for WasmModule {
                 Some(PendingRead::States(keys)) => {
                     self.resolve_state_reads(keys, &mut memo).await?;
                 }
-                Some(read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_))) => {
+                Some(
+                    read @ (PendingRead::ObjectStat(_)
+                    | PendingRead::ObjectGet(_)
+                    | PendingRead::GitObject(_)
+                    | PendingRead::GitDiff(_)),
+                ) => {
                     self.resolve_object_read(read, &mut memo)?;
                 }
                 Some(PendingRead::Root(_) | PendingRead::Query(_, _)) => {
@@ -2203,14 +2365,6 @@ impl Module for WasmModule {
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, SdkError> {
-        // an odb-backed (files) tenant answers queries HOST-side from committed
-        // refs+odb — the read lane NEVER instantiates the guest — so an in-block
-        // sibling `FilesQuery::Refs` reads committed-only, byte-identical to
-        // native `Fs::query`. every other backing runs the guest's query export.
-        match &self.backing {
-            StateBacking::Odb { backing } => return backing.query(req),
-            StateBacking::Map { .. } | StateBacking::Store { .. } => {}
-        }
         // ctx-less direct read: no SIBLING resolver, so module-root/query-module
         // answer the sealed stub surface (root `None`, query `unsupported`) —
         // host-routed reads go through `query_with` instead, which resolves
@@ -2230,7 +2384,12 @@ impl Module for WasmModule {
                 }
                 // object reads are the module's own state (not sibling reads),
                 // so they resolve against the backing even ctx-less, like State.
-                Some(read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_))) => {
+                Some(
+                    read @ (PendingRead::ObjectStat(_)
+                    | PendingRead::ObjectGet(_)
+                    | PendingRead::GitObject(_)
+                    | PendingRead::GitDiff(_)),
+                ) => {
                     self.resolve_object_read(read, &mut memo)?;
                 }
                 Some(PendingRead::Root(_) | PendingRead::Query(_, _)) => {
@@ -2242,12 +2401,6 @@ impl Module for WasmModule {
     }
 
     async fn query_with(&self, ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, SdkError> {
-        // odb-backed queries are host-side committed-only (see `query`); the
-        // ctx (sibling reads) is unused, matching native files' standalone query.
-        match &self.backing {
-            StateBacking::Odb { backing } => return backing.query(req),
-            StateBacking::Map { .. } | StateBacking::Store { .. } => {}
-        }
         let mut memo = SiblingMemo::default();
         let mut fuel_left = self.fuel;
         while memo.within_budgets() {
@@ -2259,7 +2412,12 @@ impl Module for WasmModule {
                 Some(PendingRead::States(keys)) => {
                     self.resolve_state_reads(keys, &mut memo).await?;
                 }
-                Some(read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_))) => {
+                Some(
+                    read @ (PendingRead::ObjectStat(_)
+                    | PendingRead::ObjectGet(_)
+                    | PendingRead::GitObject(_)
+                    | PendingRead::GitDiff(_)),
+                ) => {
                     self.resolve_object_read(read, &mut memo)?;
                 }
                 Some(read @ (PendingRead::Root(_) | PendingRead::Query(_, _))) => {
@@ -2366,6 +2524,7 @@ mod bounds {
         let accepted = MAX_HOST_BYTES / entry_bytes;
         let (module, reads) = counting_state_reads(entry_bytes - HOST_ENTRY_BYTES - ROOT_LEN);
         let mut data = HostData {
+            local_reads: false,
             store_backed: true,
             ..HostData::default()
         };
@@ -2492,8 +2651,50 @@ mod bounds {
     }
 
     #[test]
+    fn local_git_reads_are_query_only_and_bounded_before_resolution() {
+        let mut data = HostData::default();
+        let refused =
+            host::Host::git_object_read(&mut data, "repo".into(), vec![0; 20], 1024).unwrap();
+        assert!(matches!(refused, Err(WitError::Unsupported)));
+        assert!(data.pending.is_none());
+        data.local_reads = true;
+        for (repository, oid, cap) in [
+            ("../outside", vec![0; 20], 1024),
+            ("repo", vec![0; 19], 1024),
+            ("repo", vec![0; 20], 16 * 1024 * 1024 + 1),
+        ] {
+            assert!(
+                host::Host::git_object_read(&mut data, repository.into(), oid, cap)
+                    .unwrap()
+                    .is_err()
+            );
+            assert!(data.pending.is_none());
+        }
+        assert!(host::Host::git_object_read(&mut data, "repo".into(), vec![0; 20], 1024).is_err());
+        assert!(matches!(
+            data.pending.take(),
+            Some(PendingRead::GitObject(_))
+        ));
+        assert!(
+            host::Host::git_diff_read(
+                &mut data,
+                "repo".into(),
+                vec![0; 20],
+                vec![0; 20],
+                1024,
+                4097,
+                1024
+            )
+            .unwrap()
+            .is_err()
+        );
+        assert!(data.pending.is_none());
+    }
+
+    #[test]
     fn prefetch_collects_one_frontier_and_keeps_overlay_reads_distinct() {
         let mut data = HostData {
+            local_reads: false,
             store_backed: true,
             ..HostData::default()
         };
@@ -2528,6 +2729,7 @@ mod bounds {
     #[test]
     fn prefetch_refuses_invalid_or_excess_keys_before_loading_any() {
         let mut data = HostData {
+            local_reads: false,
             store_backed: true,
             ..HostData::default()
         };

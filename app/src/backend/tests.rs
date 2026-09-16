@@ -158,91 +158,6 @@ async fn submit_test(
     rpc.submit_frame(frame).await.unwrap();
 }
 
-/// One commit in `repo` holding exactly `files`, on top of `parent`.
-fn mirror_commit(
-    repo: &git2::Repository,
-    parent: Option<git2::Oid>,
-    files: &[(&str, &str)],
-) -> git2::Oid {
-    let mut tree = repo.treebuilder(None).unwrap();
-    for (path, contents) in files {
-        let blob = repo.blob(contents.as_bytes()).unwrap();
-        tree.insert(path, blob, 0o100644).unwrap();
-    }
-    let tree = repo.find_tree(tree.write().unwrap()).unwrap();
-    let signature = git2::Signature::now("mule", "mule@localhost").unwrap();
-    let parents: Vec<git2::Commit> = parent
-        .map(|oid| vec![repo.find_commit(oid).unwrap()])
-        .unwrap_or_default();
-    let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-    repo.commit(None, &signature, &signature, "mule", &tree, &parent_refs)
-        .unwrap()
-}
-
-/// A node whose page SEARCH answers and whose page LIST refuses — the exact
-/// split the title join has to survive. Answers one request per connection and
-/// closes, so the two views of a search never share a socket. Returns its
-/// origin.
-async fn node_with_a_broken_page_list() -> String {
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-    /// The request is in hand once the body reaches its declared length.
-    fn request_is_complete(request: &[u8]) -> bool {
-        let text = String::from_utf8_lossy(request);
-        let Some((head, body)) = text.split_once("\r\n\r\n") else {
-            return false;
-        };
-        let declared = head
-            .to_lowercase()
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("content-length:")?
-                    .trim()
-                    .parse::<usize>()
-                    .ok()
-            })
-            .unwrap_or(0);
-        body.len() >= declared
-    }
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind the stub node");
-    let origin = format!("http://{}", listener.local_addr().expect("stub address"));
-    tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 2048];
-            while let Ok(read) = stream.read(&mut chunk).await {
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&chunk[..read]);
-                if request_is_complete(&request) {
-                    break;
-                }
-            }
-            // Both views POST to `/v1/index/pages/view`; only the body says
-            // which one this is. Shapes copied from the live demo node.
-            let asked_for_the_index = String::from_utf8_lossy(&request).contains("list_pages");
-            let (status, body) = match asked_for_the_index {
-                true => ("500 Internal Server Error", "pages index unavailable"),
-                false => (
-                    "200 OK",
-                    r#"{"hits":[{"block_id":"block-1","author":"system","page_id":"page-1","parent":"page-1","kind":"paragraph","text":"Tail paragraph after the list","height":1,"time":1}]}"#,
-                ),
-            };
-            let response = format!(
-                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.shutdown().await;
-        }
-    });
-    origin
-}
-
 /// One function's body out of a backend module: from its declaration to the
 /// first closing brace at column zero, which in fmt'd Rust is its own. Sliced
 /// rather than scanned to the next `pub` — `pub(crate)` does not start with
@@ -263,9 +178,8 @@ fn backend_fn<'a>(source: &'a str, declaration: &str) -> &'a str {
 /// its origin plus the live request count, which is how the bound on
 /// `await_fold` is observed rather than assumed.
 ///
-/// One request per connection, then close — the same discipline as
-/// `node_with_a_broken_page_list`, so no probe can share a socket with the
-/// next and read a stale header off it.
+/// One request per connection, then close, so a probe cannot share a socket
+/// with the next and read a stale header off it.
 async fn node_scripting_its_fold_watermark(
     script: Vec<Option<&'static str>>,
 ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {

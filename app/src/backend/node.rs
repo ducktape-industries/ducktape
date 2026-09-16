@@ -55,12 +55,8 @@ pub struct SettingsFacts {
     pub key_state: String,
     /// This workspace's directory on this device — the Node overview's data dir.
     pub data_dir: String,
-    /// THE VIEWER'S OWN KEY, full hex — the `me` every membership test needs.
-    /// `ChatMember.key` is `member_id(..)` at full width, and the account card
-    /// carries an account NUMBER, not a key, so neither the account card nor
-    /// the node key can answer "is this row me". Empty on a device with no user
-    /// key, which `post_gate` reads as "not seated" — the honest answer when
-    /// there is no identity to seat.
+    /// The viewer's full public-key hex, or empty without a local user key.
+    /// Views resolve account membership from this key and the identity module.
     pub user_key: String,
 }
 
@@ -418,22 +414,6 @@ impl From<runs::SkillRef> for AgentSkill {
     }
 }
 
-impl From<AgentSkill> for runs::SkillRef {
-    fn from(skill: AgentSkill) -> Self {
-        let pinned = !skill.source_snapshot.is_empty();
-        Self {
-            name: skill.name,
-            source_prefix: skill.source_prefix,
-            source_snapshot: pinned.then_some(skill.source_snapshot),
-            load: if skill.always {
-                runs::LoadMode::Always
-            } else {
-                runs::LoadMode::OnDemand
-            },
-        }
-    }
-}
-
 /// One configured model: its record, whole, with its live-run fact.
 #[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct AgentRow {
@@ -538,100 +518,6 @@ async fn agents_with_a_run_in_flight(rpc: &RpcClient) -> BTreeSet<String> {
         .iter()
         .filter_map(|run| run["agent_id"].as_str().map(str::to_string))
         .collect()
-}
-
-/// The editor's record as the Agents view hands it back: every field the
-/// controller may set, in one piece. The view holds the drafts; this is what
-/// leaves it with the save.
-#[derive(Debug, serde::Deserialize)]
-pub struct AgentDraft {
-    pub agent_id: String,
-    pub display_name: String,
-    pub capability: String,
-    pub skills: Vec<AgentSkill>,
-}
-
-impl AgentDraft {
-    fn decode(draft: &str) -> Result<Self, String> {
-        serde_json::from_str(draft)
-            .map_err(|error| format!("the agent draft does not decode: {error}"))
-    }
-}
-
-/// Bring a new agent into the register: provision its keyless program account
-/// under the signing account (`controller`, the wallet's own account number),
-/// read its provisioning receipt, and register the draft against that account.
-/// Two committed writes and one read, in order; the first write is a full
-/// block, so the read never runs ahead of it.
-pub async fn register_agent(
-    rpc: String,
-    password: String,
-    controller: String,
-    draft: String,
-) -> Result<bool, AppError> {
-    async {
-        let draft = AgentDraft::decode(&draft)?;
-        let controller: u64 = controller.parse().map_err(|_| {
-            "registering an agent needs an account to control it — create one in Settings first"
-                .to_string()
-        })?;
-        runs::validate_agent_id(&draft.agent_id)?;
-        let display_name = draft.display_name.trim().to_owned();
-        if display_name.is_empty() {
-            return Err("give the agent a display name".to_string());
-        }
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "agent",
-            ::agent::encode_msg(&::agent::AgentMsg::Provision {
-                request_id: draft.agent_id.clone(),
-                name: display_name.clone(),
-                program: runs::model_program(&draft.agent_id),
-            }),
-            password.clone(),
-        )
-        .await?;
-        let account = provisioned_program_account(&rpc, controller, &draft.agent_id).await?;
-        let operation = runs::ModelMsg::RegisterModel {
-            account,
-            agent_id: draft.agent_id,
-            display_name,
-            capability: draft.capability,
-            recipe_hash: None,
-            skills: Some(draft.skills.into_iter().map(runs::SkillRef::from).collect()),
-        };
-        let payload = runs::encode_msg(&runs::RunsMsg::ConfigureModel { operation });
-        signed_write(&rpc, "runs", payload, password).await
-    }
-    .await
-    .map_err(app_error)?;
-    Ok(true)
-}
-
-/// The controller-scoped receipt is authoritative even when a retry returns
-/// an older account and newer accounts share its display name.
-async fn provisioned_program_account(
-    rpc: &RpcClient,
-    controller: u64,
-    request_id: &str,
-) -> Result<u64, String> {
-    let reply: ::agent::AgentReply = rpc
-        .query(
-            "agent",
-            &::agent::AgentQuery::Provision {
-                controller,
-                request_id: request_id.into(),
-            },
-        )
-        .await?;
-    let ::agent::AgentReply::Provision(receipt) = reply else {
-        return Err("the agent module returned the wrong provisioning reply".to_string());
-    };
-    let Some(receipt) = receipt else {
-        return Err("the agent provisioning receipt was not found after provisioning".to_string());
-    };
-    Ok(receipt.account)
 }
 
 /// The local account picture: whether the local user key belongs to an
@@ -1482,129 +1368,6 @@ pub async fn remove_account_key(
     .await
     .map_err(app_error)?;
     Ok(true)
-}
-
-#[cfg(test)]
-mod agent_registration_tests {
-    use super::*;
-    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
-
-    const CONTROLLER: u64 = 7;
-    const REQUEST_ID: &str = "agent-a";
-    const ORIGINAL_ACCOUNT: u64 = 41;
-
-    /// A node with two same-name programs, but a receipt for the older one.
-    /// It serves exactly one query; closing the listener rejects any fallback.
-    async fn lookup_with_reply(
-        reply: ::agent::AgentReply,
-    ) -> (Result<u64, String>, serde_json::Value) {
-        let accounts =
-            [ORIGINAL_ACCOUNT, ORIGINAL_ACCOUNT + 1].map(|number| identity::AccountView {
-                number,
-                name: "Helper".into(),
-                control: identity::Control::Program {
-                    controller: CONTROLLER,
-                    executor: "agent".into(),
-                    generation: 0,
-                    standing: identity::ProgramStanding::Active,
-                },
-                keys: Vec::new(),
-                avatar: None,
-                bio: None,
-                updated_at: 0,
-            });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let rpc = RpcClient::new(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
-        let serve = async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            drop(listener);
-            let mut socket = BufReader::new(socket);
-            let mut line = String::new();
-            socket.read_line(&mut line).await.unwrap();
-            assert_eq!(line, "POST /v1/query HTTP/1.1\r\n");
-            let mut content_length = None;
-            loop {
-                line.clear();
-                assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
-                let headers_complete = line == "\r\n";
-                if headers_complete {
-                    break;
-                }
-                let (name, value) = line.split_once(':').expect("HTTP header");
-                let is_content_length = name.eq_ignore_ascii_case("content-length");
-                if is_content_length {
-                    content_length = Some(value.trim().parse::<usize>().unwrap());
-                }
-            }
-            let mut body = vec![0; content_length.expect("JSON content length")];
-            socket.read_exact(&mut body).await.unwrap();
-            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            let response = match request["target"].as_str().expect("query target") {
-                "agent" => serde_json::to_string(&reply).unwrap(),
-                "identity" => {
-                    serde_json::to_string(&identity::IdentityReply::Accounts(accounts.to_vec()))
-                        .unwrap()
-                }
-                target => panic!("unexpected query target: {target}"),
-            };
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{response}",
-                response.len()
-            );
-            socket
-                .get_mut()
-                .write_all(response.as_bytes())
-                .await
-                .unwrap();
-            request
-        };
-        tokio::join!(
-            provisioned_program_account(&rpc, CONTROLLER, REQUEST_ID),
-            serve
-        )
-    }
-
-    fn assert_receipt_query(request: &serde_json::Value) {
-        assert_eq!(
-            request,
-            &serde_json::json!({
-                "target": "agent",
-                "query": {"provision": {"controller": CONTROLLER, "request_id": REQUEST_ID}}
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn registration_retry_uses_the_original_receipt_when_program_names_collide() {
-        let (result, request) = lookup_with_reply(::agent::AgentReply::Provision(Some(
-            ::agent::ProvisionReceipt {
-                account: ORIGINAL_ACCOUNT,
-                request_digest: [3; 32],
-            },
-        )))
-        .await;
-        assert_receipt_query(&request);
-        assert_eq!(result.unwrap(), ORIGINAL_ACCOUNT);
-    }
-
-    #[tokio::test]
-    async fn registration_refuses_missing_or_wrong_receipts_without_name_lookup() {
-        for (reply, expected_error) in [
-            (
-                ::agent::AgentReply::Provision(None),
-                "the agent provisioning receipt was not found after provisioning",
-            ),
-            (
-                ::agent::AgentReply::Binding(None),
-                "the agent module returned the wrong provisioning reply",
-            ),
-        ] {
-            let (result, request) = lookup_with_reply(reply).await;
-            assert_receipt_query(&request);
-            assert_eq!(result.unwrap_err(), expected_error);
-        }
-    }
 }
 
 #[cfg(test)]

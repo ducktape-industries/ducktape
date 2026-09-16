@@ -483,7 +483,7 @@ impl ValidatorRuntime<'_> {
         }
     }
 
-    /// take custody of an already-framed op on THIS validator: fan a forge pack
+    /// take custody of an already-framed op on THIS validator: fan a required blob
     /// out to the peers that need it, then pin + propose the frame and hold the
     /// caller's reply against the frame id until the drain answers it.
     ///
@@ -565,12 +565,18 @@ impl ValidatorRuntime<'_> {
             noded::NodeCommand::Submit {
                 target,
                 payload,
+                required_blob,
                 origin: _,
                 reply,
             } => {
                 let seq = self.next_seq;
                 self.next_seq += 1;
-                let frame = node::encode_frame(&self.signer, seq, &Msg { target, payload });
+                let frame = node::encode_frame_with_blob(
+                    &self.signer,
+                    seq,
+                    &Msg { target, payload },
+                    required_blob,
+                );
                 self.submit_local_frame(frame, reply).await;
             }
             // an ALREADY-SIGNED frame: submitted VERBATIM, never re-signed and

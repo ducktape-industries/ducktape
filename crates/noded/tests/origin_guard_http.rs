@@ -92,9 +92,9 @@ async fn the_guard_covers_every_control_plane_route() {
         ("POST", "/v1/query"),
         ("GET", "/v1/status"),
         ("GET", "/v1/blocks"),
-        ("GET", "/v1/files/ls?path=/"),
+        ("POST", "/v1/query"),
         ("POST", "/v1/fs/workspaces"),
-        ("GET", "/forge/repo/info/refs"),
+        ("GET", "/v1/status"),
     ] {
         let response = app
             .clone()

@@ -2,10 +2,8 @@
 //! EXACT payload files-client.ts builds (`JSON.stringify({ commit: body })`,
 //! serde's externally-tagged `FilesMsg`), wrapped in the op frame
 //! `user-sign-frame` prints, POSTed raw to `/v1/submit/frame` — and the files
-//! module records the frame's VERIFIED signer as the commit's author, with
-//! real `/home/<signer>` authority. the negative half proves the point of the
-//! lane: the same commit through the unsigned convenience lane (author
-//! `ext:noded`) is REJECTED from that home subtree.
+//! module records the frame's verified signer as author. The node-authored
+//! operator lane stays a distinct author; tampered frames are refused.
 
 #[path = "fs_support/mod.rs"]
 mod support;
@@ -98,25 +96,25 @@ fn signed_commit_lands_with_the_signer_as_author_and_home_authority() {
     // the history records the SIGNER as the author.
     let (status, body) = http(
         port,
-        "GET",
-        "/v1/files/history?limit=8",
+        "POST",
+        "/v1/query",
         "application/json",
-        b"",
+        br#"{"target":"files","query":{"history":{"limit":8}}}"#,
     );
     assert_eq!(status, 200);
     let history: serde_json::Value = serde_json::from_slice(&body).expect("history json");
     let author: duckfs_core::Actor =
-        serde_json::from_value(history["snapshots"][0]["author"].clone()).expect("typed author");
+        serde_json::from_value(history["history"][0]["author"].clone()).expect("typed author");
     assert_eq!(
         author,
         duckfs_core::Actor::Key(signer.public_key().as_ref().to_vec()),
         "the commit's author is the frame's verified signer"
     );
 
-    // the negative half: the unsigned convenience lane writes as ext:noded,
-    // which has NO authority over this signer's home subtree — rejected.
+    // Home labels are shared namespace in the current module policy. A node
+    // write may edit this path, but must never borrow the earlier user author.
     let commit_body = serde_json::json!({
-        "base_snapshot": history["snapshots"][0]["id"],
+        "base_snapshot": history["history"][0]["id"],
         "message": "forged from the daemon lane",
         "changes": [{
             "put": {
@@ -131,16 +129,18 @@ fn signed_commit_lands_with_the_signer_as_author_and_home_authority() {
         &h,
         port,
         "POST",
-        "/v1/files/commit",
+        "/v1/submit",
         "application/json",
-        &serde_json::to_vec(&commit_body).unwrap(),
+        &serde_json::to_vec(
+            &serde_json::json!({"target":"files","payload":{"commit":commit_body}}),
+        )
+        .unwrap(),
     );
-    assert_eq!(
-        status,
-        400,
-        "the daemon-origin lane cannot write another owner's home: {}",
-        String::from_utf8_lossy(&body)
-    );
+    assert_eq!(status, 200, "node-authored write: {}", String::from_utf8_lossy(&body));
+    let (_, body) = http(port, "POST", "/v1/query", "application/json", br#"{"target":"files","query":{"history":{"limit":8}}}"#);
+    let history: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let author: duckfs_core::Actor = serde_json::from_value(history["history"][0]["author"].clone()).unwrap();
+    assert_eq!(author, duckfs_core::Actor::Key(noded::DEFAULT_ORIGIN.as_bytes().to_vec()));
 
     // and a tampered frame (payload swapped after signing) never executes.
     let mut tampered = node::encode_frame(
@@ -237,14 +237,14 @@ fn admitted_signer_keeps_its_key_home_and_records_the_account_author() {
     );
     let (status, body) = http(
         port,
-        "GET",
-        "/v1/files/history?limit=8",
+        "POST",
+        "/v1/query",
         "application/json",
-        b"",
+        br#"{"target":"files","query":{"history":{"limit":8}}}"#,
     );
     assert_eq!(status, 200);
     let history: serde_json::Value = serde_json::from_slice(&body).expect("history json");
-    let authors: Vec<duckfs_core::Actor> = history["snapshots"]
+    let authors: Vec<duckfs_core::Actor> = history["history"]
         .as_array()
         .expect("snapshots")
         .iter()

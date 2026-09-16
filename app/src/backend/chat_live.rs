@@ -1,17 +1,12 @@
 //! An agent run anchored to a chat message, shown live in its thread
 //! while it runs. The chain carries only the anchor and the committed reply;
-//! the progress rides the node's `run-output:<dispatch>` topic, folded here
-//! into a bounded row of status, activity titles and an answer preview. A row
+//! the progress rides the node's `run-output:<dispatch>` topic. The guest
+//! interprets provider output and builds the presentation. A row
 //! lives exactly as long as its run is pending in `runs`: the entry prunes in
 //! the block that posts the reply, so the committed message takes the row's
 //! place.
 //!
-//! ONE READING PER NODE, NOT PER ROOM. Every pending run the node knows is
-//! folded here and each row NAMES ITS ROOM, so which rows reach the screen is
-//! a filter on `channel_id` (`module_view::encode_chat_props`) rather than a
-//! stream that has to be torn down and relaunched on every room switch — the
-//! eight handlers that move `active_channel` would each have had to remember
-//! to, and the one that forgot would have drawn another room's runs.
+//! One reading covers the node. The Chat guest selects rows for its room.
 //!
 //! A reading is stamped with the CONNECTION it was taken over — endpoint, chain
 //! id and connect attempt — because room ids are not unique across networks and
@@ -26,21 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
-/// Activity titles kept per row; older ones fall off the front.
-pub(crate) const MAX_LIVE_ACTIVITY: usize = 12;
-/// The answer preview a row carries across the wire, in bytes. Small on
-/// purpose: the committed message replaces the row within a block or two, and
-/// every byte here is taken out of the timeline's frame budget
-/// (`module_view::LIVE_AGENT_TEXT_BUDGET`).
-pub(crate) const MAX_LIVE_PREVIEW_BYTES: usize = 512;
-const ACTIVITY_DETAIL_CHARS: usize = 60;
 const PENDING_POLL: std::time::Duration = std::time::Duration::from_secs(2);
-
-#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
-pub struct LiveActivity {
-    pub label: String,
-    pub done: bool,
-}
 
 /// One agent run in flight, as the row drawn under its anchor.
 ///
@@ -62,47 +43,10 @@ pub struct LiveAgentRow {
     pub dispatch_id: String,
     pub agent: String,
     pub status: String,
-    /// Public committed progress used when this device cannot read stdout.
-    /// Kept off the view wire; `snapshot` selects one display status.
-    #[serde(skip)]
-    pub public_status: String,
-    pub activity: Vec<LiveActivity>,
-    pub answer_preview: String,
-}
-
-/// The chat view's cut of a run in flight: enough to show its status in
-/// its thread, whose it is, and which run to open for its progress —
-/// never the progress itself, which the run panel draws. What the row knows
-/// beyond this stays out of the timeline's frame budget.
-#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
-pub struct LiveRunHint {
-    pub channel_id: String,
-    pub anchor_seq: i64,
-    pub thread_root: i64,
-    pub run_id: String,
-    pub dispatch_id: String,
-    pub agent: String,
-    pub status: String,
-    /// What the run has done so far, as the message it draws as lists it.
-    pub activity: Vec<LiveActivity>,
-    /// The answer as it is being written, clipped.
-    pub answer_preview: String,
-}
-
-impl From<&LiveAgentRow> for LiveRunHint {
-    fn from(row: &LiveAgentRow) -> Self {
-        Self {
-            channel_id: row.channel_id.clone(),
-            anchor_seq: row.anchor_seq,
-            thread_root: row.thread_root,
-            run_id: row.run_id.clone(),
-            dispatch_id: row.dispatch_id.clone(),
-            agent: row.agent.clone(),
-            status: row.status.clone(),
-            activity: row.activity.clone(),
-            answer_preview: row.answer_preview.clone(),
-        }
-    }
+    /// Public committed facts used when this device cannot read stdout.
+    pub public_progress: Option<serde_json::Value>,
+    pub output: Vec<String>,
+    pub output_error: String,
 }
 
 /// One reading of the node's pending runs, stamped with the connection it was
@@ -150,57 +94,6 @@ pub fn live_agents_stale(
         || notice.signer_key != signer_key
 }
 
-/// Fold one parsed output event into the row. Status lines replace the status;
-/// activities upsert by label and mark done; previews and answers replace the
-/// preview; errors become the status.
-pub(crate) fn live_row_apply(mut row: LiveAgentRow, event: &AgentChatEvent) -> LiveAgentRow {
-    match event.kind.as_str() {
-        "status" => row.status = event.title.clone(),
-        "activity" => {
-            let label = if event.detail.is_empty() {
-                event.title.clone()
-            } else {
-                format!(
-                    "{}: {}",
-                    event.title,
-                    clip_text(&event.detail, ACTIVITY_DETAIL_CHARS)
-                )
-            };
-            let done = event.status == "done";
-            match row.activity.iter_mut().find(|act| act.label == label) {
-                Some(act) => act.done |= done,
-                None => row.activity.push(LiveActivity { label, done }),
-            }
-            let overflow = row.activity.len().saturating_sub(MAX_LIVE_ACTIVITY);
-            row.activity.drain(..overflow);
-            row.status = event.title.clone();
-        }
-        "preview" | "answer" => {
-            // A provider's last item can be its structured payload (a JSON
-            // block list) before the words: not a preview anyone reads, and
-            // it flashed in the card for a poll before the reply landed.
-            let raw_payload = matches!(event.answer.trim_start().chars().next(), Some('{' | '['));
-            if !raw_payload {
-                row.answer_preview = clip_text(&event.answer, MAX_LIVE_PREVIEW_BYTES);
-            }
-            row.status = if event.kind == "answer" {
-                "Done".into()
-            } else {
-                "Answering".into()
-            };
-        }
-        "error" => {
-            row.status = if event.answer.is_empty() {
-                event.title.clone()
-            } else {
-                clip_text(&event.answer, 200)
-            };
-        }
-        _ => {}
-    }
-    row
-}
-
 /// The live rows, keyed by the dispatch whose output feeds them. The dispatch
 /// id never reaches the screen — it is the watcher's handle, nothing the
 /// reader can act on.
@@ -228,36 +121,6 @@ const MAX_OUTPUT_DIALS: u32 = 5;
 /// Internal refusal marker. The snapshot replaces it with public committed
 /// progress; keeping it internally prevents retries of an unauthorized read.
 const OUTPUT_UNAVAILABLE: &str = "Working · progress unavailable from this device";
-
-/// Only committed public facts, never provider text, prompts or tool arguments.
-fn public_run_status(
-    run_id: &str,
-    sessions: Option<&serde_json::Value>,
-    delegations: Option<&serde_json::Value>,
-) -> String {
-    let calls = delegations.and_then(|reply| reply["delegations"].as_array());
-    let peer_pending =
-        calls.is_some_and(|calls| calls.iter().any(|call| call["status"] == "pending"));
-    if peer_pending {
-        return "Working · peer call pending".into();
-    }
-    let peer_delivered =
-        calls.is_some_and(|calls| calls.iter().any(|call| call["status"] == "delivered"));
-    if peer_delivered {
-        return "Working · peer reply received".into();
-    }
-    let Some(sessions) = sessions.and_then(|reply| reply["agent_sessions"].as_array()) else {
-        return "Working".into();
-    };
-    let Some(session) = sessions.iter().find(|session| session["run_id"] == run_id) else {
-        return "Starting".into();
-    };
-    match session["actions"].as_u64().unwrap_or_default() {
-        0 => "Working".into(),
-        1 => "Working · 1 action recorded".into(),
-        count => format!("Working · {count} actions recorded"),
-    }
-}
 
 /// One run's output watcher and how many times it has been dialed.
 struct Watcher {
@@ -343,13 +206,12 @@ fn snapshot(taken: &Taken, rows: &Rows) -> LiveAgentNotice {
             .map(|mut row| {
                 let private_output = row.status == OUTPUT_UNAVAILABLE;
                 if private_output {
-                    row.status = if row.public_status.is_empty() {
-                        "Working".into()
-                    } else {
-                        row.public_status.clone()
-                    };
-                    row.activity.clear();
-                    row.answer_preview.clear();
+                    row.status.clear();
+                    row.public_progress.get_or_insert_with(
+                        || serde_json::json!({"sessions":null,"delegations":null}),
+                    );
+                    row.output.clear();
+                    row.output_error.clear();
                 }
                 row
             })
@@ -370,9 +232,6 @@ pub fn chat_live_agents(
     use futures::StreamExt as _;
     let (sender, receiver) = tokio::sync::mpsc::channel::<LiveAgentNotice>(64);
     tokio::spawn(async move {
-        let Ok(client) = rpc_client(&rpc) else {
-            return;
-        };
         // WHICH PROOF THIS DEVICE CAN MAKE, asked once. A device that hosts the
         // node reads the 0600 token out of its workspace; a device pointed at a
         // node it does not host signs the upgrade for ONE run, which the node
@@ -402,55 +261,48 @@ pub fn chat_live_agents(
         let rows: Rows = Arc::default();
         let mut watchers: BTreeMap<String, Watcher> = BTreeMap::new();
         let mut labels: BTreeMap<String, String> = BTreeMap::new();
-        let ask = serde_json::json!("pending_runs");
         while !sender.is_closed() {
-            let Ok(pending) = client.query::<_, serde_json::Value>("runs", &ask).await else {
+            let discovery = chat_background(
+                &rpc,
+                serde_json::json!({"kind":"live_runs","labels":labels}),
+            )
+            .await;
+            let Ok(discovery) = discovery else {
                 tokio::time::sleep(PENDING_POLL).await;
                 continue;
             };
-            let anchored: Vec<&serde_json::Value> = pending["pending_runs"]
+            let Ok(next_labels) = serde_json::from_value(discovery["labels"].clone()) else {
+                tokio::time::sleep(PENDING_POLL).await;
+                continue;
+            };
+            labels = next_labels;
+            let anchored: Vec<_> = discovery["records"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                // A job-backed run has no anchor in any room (`PendingRun`
-                // leaves `channel_id` empty for one), so there is nowhere in
-                // chat to draw it.
-                .filter(|record| !record["channel_id"].as_str().unwrap_or_default().is_empty())
                 .collect();
-            // ONE ROSTER READ PER NEW AGENT, not one per poll: a run's agent
-            // cannot be renamed mid-run, and a quiet node must not pay a query
-            // every two seconds to learn nothing.
-            let unnamed = anchored.iter().any(|record| {
-                !labels.contains_key(record["agent_id"].as_str().unwrap_or_default())
-            });
-            if unnamed {
-                labels.extend(agent_labels(&client).await);
-                // AND ASKED ONLY ONCE. A run whose agent the roster does not
-                // name (it was deleted, or the query failed) falls back to the
-                // agent id — without seating that fallback, `unnamed` would
-                // stand for as long as the run does and cost a second query
-                // every poll for a name that is not coming.
-                for record in &anchored {
-                    let id = record["agent_id"].as_str().unwrap_or_default();
-                    labels
-                        .entry(id.to_string())
-                        .or_insert_with(|| id.to_string());
-                }
-            }
-            let output_unreadable = reach == Reach::Nothing
-                || rows
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .values()
-                    .any(|row| row.status == OUTPUT_UNAVAILABLE);
-            let needs_public_progress = !anchored.is_empty() && output_unreadable;
-            let sessions = if needs_public_progress {
-                client
-                    .query::<_, serde_json::Value>("runs", &"agent_sessions")
-                    .await
-                    .ok()
+            let progress_runs: Vec<String> = {
+                let rows = rows.lock().unwrap_or_else(|error| error.into_inner());
+                anchored
+                    .iter()
+                    .filter(|record| {
+                        reach == Reach::Nothing
+                            || rows
+                                .get(record["dispatch_id"].as_str().unwrap_or_default())
+                                .is_some_and(|row| row.status == OUTPUT_UNAVAILABLE)
+                    })
+                    .filter_map(|record| record["run_id"].as_str().map(str::to_owned))
+                    .collect()
+            };
+            let progress = if progress_runs.is_empty() {
+                serde_json::Value::Null
             } else {
-                None
+                chat_background(
+                    &rpc,
+                    serde_json::json!({"kind":"run_progress","runs":progress_runs}),
+                )
+                .await
+                .unwrap_or_default()
             };
             let mut seen = Vec::new();
             for record in anchored {
@@ -495,7 +347,7 @@ pub fn chat_live_agents(
                             .cloned()
                             .unwrap_or_else(|| agent_id.to_string()),
                         status: match reach {
-                            Reach::Workspace | Reach::Signed => "Starting".into(),
+                            Reach::Workspace | Reach::Signed => String::new(),
                             Reach::Nothing => OUTPUT_UNAVAILABLE.into(),
                         },
                         ..LiveAgentRow::default()
@@ -506,19 +358,16 @@ pub fn chat_live_agents(
                 }
                 if dial == Dial::Unreadable {
                     let run_id = record["run_id"].as_str().unwrap_or_default();
-                    let ask = serde_json::json!({"delegations": {"caller_run_id": run_id}});
-                    let delegations = client
-                        .query::<_, serde_json::Value>("runs", &ask)
-                        .await
-                        .ok();
-                    let public_status =
-                        public_run_status(run_id, sessions.as_ref(), delegations.as_ref());
+                    let public_progress = progress
+                        .get(run_id)
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({"sessions":null,"delegations":null}));
                     if let Some(row) = rows
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .get_mut(&dispatch)
                     {
-                        row.public_status = public_status;
+                        row.public_progress = Some(public_progress);
                     }
                 }
                 let dials = match dial {
@@ -577,25 +426,6 @@ pub fn chat_live_agents(
         receiver.recv().await.map(|event| (event, receiver))
     })
     .boxed()
-}
-
-/// Every registered agent's display name by id — the same record the Agents
-/// tab and the roster label an agent from, so one agent reads the same in all
-/// three. A node that cannot answer names nobody, and the row falls back to
-/// the agent id.
-async fn agent_labels(client: &RpcClient) -> BTreeMap<String, String> {
-    let ask = runs::RunsQuery::Model {
-        query: runs::ModelQuery::Agents,
-    };
-    let Ok(runs::RunsReply::Model(runs::ModelReply::Agents(records))) =
-        client.query::<_, runs::RunsReply>("runs", &ask).await
-    else {
-        return BTreeMap::new();
-    };
-    records
-        .into_iter()
-        .map(|record| (record.agent_id, record.display_name))
-        .collect()
 }
 
 /// `/v1/ws?run=<dispatch>` — the signed arm's path AND the exact string its
@@ -718,16 +548,9 @@ async fn watch_live_output(
 ) {
     let rpc = taken.rpc.clone();
     use futures::StreamExt as _;
-    let fold = |event: &AgentChatEvent| {
-        let mut rows = rows.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(row) = rows.get_mut(&dispatch) {
-            *row = live_row_apply(std::mem::take(row), event);
-        }
-    };
     let watch = async {
         let topic = format!("run-output:{dispatch}");
         let mut socket = open_run_output(&rpc, reach, &dispatch).await?;
-        let mut id = 1i64;
         while let Some(Ok(Message::Text(text))) = socket.next().await {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(text.as_ref()) else {
                 continue;
@@ -741,17 +564,15 @@ async fn watch_live_output(
             let Some(line) = value["item"]["line"].as_str() else {
                 continue;
             };
-            // A PENDING RUN DOES NOT NAME ITS PROVIDER (`PendingRun` carries
-            // the agent and the anchor, not the worker). Passing Claude enables
-            // its message/result parsing; distinct Codex item and Pi message_end
-            // and tool_execution_start/end shapes are read independently of that
-            // argument. This is not a claim about which worker took the run.
-            if let Some(event) = provider_output_event("claude", line, id) {
-                id += 1;
-                fold(&event);
-                if sender.send(snapshot(&taken, &rows)).await.is_err() {
-                    return Ok(());
+            {
+                let mut rows = rows.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(row) = rows.get_mut(&dispatch) {
+                    row.output_error.clear();
+                    row.output.push(line.to_owned());
                 }
+            }
+            if sender.send(snapshot(&taken, &rows)).await.is_err() {
+                return Ok(());
             }
         }
         Ok::<(), String>(())
@@ -762,99 +583,22 @@ async fn watch_live_output(
         // `dial_for` reads it as settled, so it is asked once and never
         // re-dialed; `snapshot` shows public progress instead. Every other
         // failure is an error the reader can act on.
-        let refused = message == OUTPUT_UNAVAILABLE;
-        fold(&AgentChatEvent {
-            id: 0,
-            // a `status` event IS the row's status line (`live_row_apply`), so
-            // the refusal reads as the working-but-unreadable card; an `error`
-            // keeps its own shape.
-            kind: if refused { "status" } else { "error" }.into(),
-            title: message,
-            detail: String::new(),
-            status: String::new(),
-            answer: String::new(),
-            saga_id: String::new(),
-        });
+        {
+            let mut rows = rows.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(row) = rows.get_mut(&dispatch) {
+                match message.as_str() {
+                    OUTPUT_UNAVAILABLE => row.status = message,
+                    _ => row.output_error = message,
+                }
+            }
+        }
         let _ = sender.send(snapshot(&taken, &rows)).await;
     }
-}
-
-/// Stop an anchored run: the runs module gates the cancel to the requester
-/// or the agent's owner, so the signature is the reader's own.
-pub async fn cancel_agent_run(
-    rpc: String,
-    password: String,
-    run_id: String,
-) -> Result<bool, AppError> {
-    async {
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "runs",
-            runs::encode_msg(&runs::RunsMsg::CancelRun { run_id }),
-            password,
-        )
-        .await?;
-        Ok(true)
-    }
-    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn event(kind: &str, title: &str, status: &str) -> AgentChatEvent {
-        AgentChatEvent {
-            id: 1,
-            kind: kind.into(),
-            title: title.into(),
-            detail: String::new(),
-            status: status.into(),
-            answer: String::new(),
-            saga_id: String::new(),
-        }
-    }
-
-    #[test]
-    fn output_events_fold_into_a_status_line_and_a_checklist() {
-        let row = live_row_apply(LiveAgentRow::default(), &event("status", "Thinking", ""));
-        assert_eq!(row.status, "Thinking");
-        let row = live_row_apply(row, &event("activity", "Command", "running"));
-        assert_eq!(row.activity.len(), 1);
-        assert!(!row.activity[0].done);
-        let row = live_row_apply(row, &event("activity", "Command", "done"));
-        assert_eq!(row.activity.len(), 1, "the same title upserts");
-        assert!(row.activity[0].done);
-        let row = live_row_apply(
-            row,
-            &AgentChatEvent {
-                answer: "the reply".into(),
-                ..event("answer", "", "")
-            },
-        );
-        assert_eq!(row.answer_preview, "the reply");
-        assert_eq!(row.status, "Done");
-    }
-
-    #[test]
-    fn a_row_stays_bounded_however_long_the_run_talks() {
-        let mut row = LiveAgentRow::default();
-        for i in 0..40 {
-            row = live_row_apply(row, &event("activity", &format!("Step {i}"), "done"));
-        }
-        assert_eq!(row.activity.len(), MAX_LIVE_ACTIVITY);
-        assert_eq!(row.activity[0].label, "Step 28", "the oldest fall off");
-        let long = "x".repeat(10_000);
-        let row = live_row_apply(
-            row,
-            &AgentChatEvent {
-                answer: long,
-                ..event("preview", "", "")
-            },
-        );
-        assert!(row.answer_preview.len() <= MAX_LIVE_PREVIEW_BYTES + '…'.len_utf8());
-    }
 
     /// A DROPPED OUTPUT STREAM IS RE-DIALED, and the presence of a handle is not
     /// evidence that anything is watching. `contains_key` was the whole test
@@ -932,54 +676,6 @@ mod tests {
             OUTPUT_UNAVAILABLE, "Working · progress unavailable from this device",
             "the internal refusal marker remains distinct from public progress"
         );
-        // THE REFUSAL IS A STATUS, NOT AN ERROR — that is the byte the poll
-        // reads back to decide it has already asked.
-        let row = live_row_apply(
-            LiveAgentRow::default(),
-            &AgentChatEvent {
-                kind: "status".into(),
-                title: OUTPUT_UNAVAILABLE.into(),
-                ..event("status", "", "")
-            },
-        );
-        assert_eq!(row.status, OUTPUT_UNAVAILABLE);
-    }
-
-    #[test]
-    fn public_progress_uses_committed_counts_not_private_content() {
-        use serde_json::json;
-        let sessions = json!({"agent_sessions": [
-            {"run_id": "mine", "actions": 3, "session_key": "private-looking-key"},
-            {"run_id": "other", "actions": 99}
-        ]});
-        assert_eq!(public_run_status("mine", None, None), "Working");
-        assert_eq!(
-            public_run_status("missing", Some(&sessions), None),
-            "Starting"
-        );
-        assert_eq!(
-            public_run_status("mine", Some(&sessions), None),
-            "Working · 3 actions recorded"
-        );
-        let calls = json!({"delegations": [{
-            "status": "pending", "delegation_id": "long-private-looking-id",
-            "result": {"text": "SECRET provider result"}
-        }]});
-        assert_eq!(
-            public_run_status("mine", Some(&sessions), Some(&calls)),
-            "Working · peer call pending"
-        );
-        let delivered =
-            json!({"delegations": [{"status": "delivered", "result": {"text": "SECRET"}}]});
-        assert_eq!(
-            public_run_status("mine", Some(&sessions), Some(&delivered)),
-            "Working · peer reply received"
-        );
-        let failed = json!({"delegations": [{"status": "failed", "result": {"text": "SECRET"}}]});
-        assert_eq!(
-            public_run_status("mine", Some(&sessions), Some(&failed)),
-            "Working · 3 actions recorded"
-        );
     }
 
     #[test]
@@ -995,22 +691,20 @@ mod tests {
             "dispatch".into(),
             LiveAgentRow {
                 status: OUTPUT_UNAVAILABLE.into(),
-                public_status: "Working · peer call pending".into(),
-                activity: vec![LiveActivity {
-                    label: "SECRET tool argument".into(),
-                    done: false,
-                }],
-                answer_preview: "SECRET provider answer".into(),
+                public_progress: Some(serde_json::json!({"sessions":null,"delegations":{"delegations":[{"status":"pending"}]}})),
+                output: vec!["SECRET provider output".into()],
                 ..LiveAgentRow::default()
             },
         );
         let notice = snapshot(&taken, &rows);
         let row = &notice.rows[0];
-        assert_eq!(row.status, "Working · peer call pending");
-        assert!(row.activity.is_empty());
-        assert!(row.answer_preview.is_empty());
+        assert!(row.status.is_empty());
+        assert_eq!(
+            row.public_progress.as_ref().unwrap()["delegations"]["delegations"][0]["status"],
+            "pending"
+        );
+        assert!(row.output.is_empty());
         let encoded = serde_json::to_value(row).unwrap();
-        assert!(encoded.get("public_status").is_none());
         assert!(!encoded.to_string().contains("SECRET"));
         let status = &rows.lock().unwrap()["dispatch"].status;
         assert_eq!(

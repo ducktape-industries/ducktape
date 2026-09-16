@@ -524,9 +524,11 @@ impl NodeMetrics {
     /// Name the machine the reachability plane runs on — at boot, and again
     /// after every swap that took. A refused swap does NOT call this: the
     /// current machine keeps running, so the name must not move.
-    pub fn set_netstack_backend(&self, backend: impl Into<String>) {
+    pub fn set_netstack_execution(&self, backend: impl Into<String>, code_hash: Option<String>) {
         let mut status = self.operations.write().expect("operations lock poisoned");
-        status.netstack.get_or_insert_with(Default::default).backend = backend.into();
+        let netstack = status.netstack.get_or_insert_with(Default::default);
+        netstack.backend = backend.into();
+        netstack.code_hash = code_hash;
     }
 
     /// Record one swap attempt's outcome against the height it landed at.
@@ -673,13 +675,14 @@ mod tests {
             let metrics = NodeMetrics::register(&context);
             assert!(metrics.operational_status().netstack.is_none());
 
-            metrics.set_netstack_backend("native");
+            metrics.set_netstack_execution("starting", None);
             let netstack = metrics.operational_status().netstack.unwrap();
-            assert_eq!(netstack.backend, "native");
+            assert_eq!(netstack.backend, "starting");
+            assert_eq!(netstack.code_hash, None);
             assert!(netstack.last_swap.is_none());
 
             metrics.record_height(7);
-            metrics.set_netstack_backend("guest");
+            metrics.set_netstack_execution("guest", Some("abc".into()));
             metrics.record_netstack_swap(NetstackSwapOutcome::Swapped, None);
             let netstack = metrics.operational_status().netstack.unwrap();
             assert_eq!(netstack.backend, "guest");
@@ -699,6 +702,12 @@ mod tests {
             );
             let netstack = metrics.operational_status().netstack.unwrap();
             assert_eq!(netstack.backend, "guest", "a refusal must not move backend");
+            assert_eq!(netstack.code_hash.as_deref(), Some("abc"));
+            metrics.set_netstack_execution("failed", None);
+            assert_eq!(
+                metrics.operational_status().netstack.unwrap().code_hash,
+                None
+            );
             assert_eq!(
                 netstack.last_swap,
                 Some(NetstackSwap {

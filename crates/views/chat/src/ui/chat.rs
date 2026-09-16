@@ -452,28 +452,13 @@ impl ChatView {
         children.push(native::padded(
             native::container(
                 format!("{key}/composer-room"),
-                wire::Node::Surface {
-                    key: format!("{key}/composer"),
-                    name: "chat_composer".into(),
-                    args: vec![
-                        wire::SurfaceValue::Str(crate::host::composer_scope(
-                            &self.endpoint,
-                            &self.active_channel,
-                        )),
-                        wire::SurfaceValue::Str("message".into()),
-                        wire::SurfaceValue::Bool(false),
-                        wire::SurfaceValue::Str(self.composer_hint()),
-                        wire::SurfaceValue::Bool(
-                            self.loading
-                                || !self.connected
-                                || self.active_channel.is_empty()
-                                || !self.post_refusal.is_empty(),
-                        ),
-                        wire::SurfaceValue::Bool(self.busy),
-                        wire::SurfaceValue::Str("An earlier message wasn’t sent".into()),
-                    ],
-                    on_event: None,
-                },
+                self.composer(
+                    format!("{key}/composer"),
+                    crate::host::composer_scope(&self.endpoint, &self.active_channel),
+                    ducktape_view_composer::host::Target::Post { channel: self.active_channel.clone(), thread: None },
+                    &self.composer_hint(),
+                    !self.loading && self.connected && !self.active_channel.is_empty() && self.post_refusal.is_empty(),
+                ),
             ),
             COMPOSER_MARGIN,
         ));
@@ -1043,26 +1028,13 @@ impl ChatView {
         children.push(native::padded(
             native::container(
                 format!("{key}/reply_composer-room"),
-                wire::Node::Surface {
-                    key: format!("{key}/reply_composer"),
-                    name: "chat_composer".into(),
-                    args: vec![
-                        wire::SurfaceValue::Str(crate::host::thread_scope(
-                            &self.endpoint,
-                            &self.active_channel,
-                            self.active_thread_seq,
-                        )),
-                        wire::SurfaceValue::Str("reply".into()),
-                        wire::SurfaceValue::Bool(true),
-                        wire::SurfaceValue::Str("Reply in thread".into()),
-                        wire::SurfaceValue::Bool(
-                            self.thread_loading || !self.connected || !self.post_refusal.is_empty(),
-                        ),
-                        wire::SurfaceValue::Bool(false),
-                        wire::SurfaceValue::Str("Unsent reply".into()),
-                    ],
-                    on_event: None,
-                },
+                self.composer(
+                    format!("{key}/reply_composer"),
+                    crate::host::thread_scope(&self.endpoint, &self.active_channel, self.active_thread_seq),
+                    ducktape_view_composer::host::Target::Post { channel: self.active_channel.clone(), thread: Some(self.active_thread_seq as u64) },
+                    "Reply in thread",
+                    !self.thread_loading && self.connected && self.post_refusal.is_empty(),
+                ),
             ),
             COMPOSER_MARGIN,
         ));
@@ -1426,24 +1398,13 @@ impl ChatView {
                 });
             }
             MessageAction::Editing => {
-                children.push(wire::Node::Surface {
-                    key: format!("{key}/{prefix}edit-composer"),
-                    name: "chat_composer".into(),
-                    args: vec![
-                        wire::SurfaceValue::Str(crate::host::edit_scope(
-                            &self.endpoint,
-                            &self.active_channel,
-                            seq,
-                        )),
-                        wire::SurfaceValue::Str(if thread { "thread_edit" } else { "edit" }.into()),
-                        wire::SurfaceValue::Bool(true),
-                        wire::SurfaceValue::Str("Edit message".into()),
-                        wire::SurfaceValue::Bool(self.busy),
-                        wire::SurfaceValue::Bool(false),
-                        wire::SurfaceValue::Str("Could not save changes".into()),
-                    ],
-                    on_event: None,
-                });
+                children.push(self.composer(
+                    format!("{key}/{prefix}edit-composer"),
+                    crate::host::edit_scope(&self.endpoint, &self.active_channel, seq),
+                    ducktape_view_composer::host::Target::Edit { channel: self.active_channel.clone(), seq: seq as u64, base_rev: if thread { self.thread_selected_rev } else { self.selected_message_rev } as u32 },
+                    "Edit message",
+                    !self.busy,
+                ));
                 children.push(native::aligned(
                     native::column(
                         format!("{key}/{prefix}close-row"),
@@ -1611,8 +1572,8 @@ impl ChatView {
         let document = match crate::host::markdown_path(path) {
             true => wire::Node::Surface {
                 key: format!("{key}/markdown"),
-                name: "agent_markdown".into(),
-                args: vec![Str(preview.text.clone()), Bool(self.dark)],
+                name: "markdown".into(),
+                args: vec![Str(preview.text.clone()), Str(String::new()), Bool(self.dark)],
                 on_event: Some(slots::handler::<wire::SurfaceValue, Message>(Box::new(
                     |value| match value {
                         Str(link) => Some(Message::OpenMessageLink(link)),
@@ -1622,7 +1583,7 @@ impl ChatView {
             },
             false => wire::Node::Surface {
                 key: format!("{key}/code"),
-                name: "forge_code".into(),
+                name: "code".into(),
                 args: vec![
                     Str(preview.text.clone()),
                     Str(path.to_owned()),
@@ -1777,4 +1738,74 @@ fn emoji_cell(key: String, emoji: &str, message: Message, disabled: bool) -> wir
         *padding = Some(wire::Edges::all(0.));
     }
     button
+}
+
+impl super::ChatView {
+    pub(crate) fn channel_creation(&self, key: &str) -> Option<wire::Node> {
+        if !self.channel_create_open {
+            return None;
+        }
+        let busy = self.channel_creating.is_some();
+        let voice = if self.channel_create_voice {
+            "Voice room: On"
+        } else {
+            "Voice room: Off"
+        };
+        let members = if self.channel_create_members_only {
+            "Members only: On"
+        } else {
+            "Members only: Off"
+        };
+        let mut children = vec![
+            native::text(format!("{key}/title"), "Create a channel"),
+            field(
+                format!("{key}/name"),
+                "Channel name",
+                &self.channel_draft,
+                Message::ChannelDraftChanged,
+                Some(Message::CreateChannel),
+                busy,
+            ),
+            action(
+                format!("{key}/voice"),
+                voice,
+                Message::ToggleChannelVoice,
+                busy,
+            ),
+            action(
+                format!("{key}/members"),
+                members,
+                Message::ToggleChannelMembersOnly,
+                busy || self.channel_create_voice,
+            ),
+        ];
+        if !self.channel_create_error.is_empty() {
+            children.push(native::text(
+                format!("{key}/error"),
+                &self.channel_create_error,
+            ));
+        }
+        children.push(native::row(
+            format!("{key}/actions"),
+            [
+                subtle(
+                    format!("{key}/cancel"),
+                    "Cancel",
+                    Message::ToggleChannelCreate,
+                    busy,
+                ),
+                primary(
+                    format!("{key}/create"),
+                    "Create channel",
+                    Message::CreateChannel,
+                    busy || !self.connected || self.session_busy,
+                ),
+            ],
+        ));
+        Some(native::sized(
+            native::column(key, children),
+            Some(wire::Length::Fixed(480.)),
+            None,
+        ))
+    }
 }

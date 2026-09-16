@@ -435,6 +435,10 @@ pub(super) async fn park(
         book.peers().set_peers(peers.iter());
         crate::gateway_plane::spawn(
             crate::gateway_plane::SpawnConfig {
+                bindings: crate::plane_metrics::ApplicationBindings::register(
+                    &context,
+                    workspace.clone(),
+                ),
                 label: label.clone(),
                 book: std::sync::Arc::clone(&book),
                 me: signer.public_key(),
@@ -755,6 +759,14 @@ pub(super) async fn park(
         // the live replica fold realizes code-registry swaps through the SAME
         // source recovery replay just used — the park loop's one fetching
         // source, installed on this journal above.
+        let plane_generation = crate::reachability_plane::watch_execution()
+            .borrow()
+            .generation;
+        crate::reachability_plane::start_pending_netstack(
+            plane_generation,
+            crate::netstack_governance::startup_backend(&host, rec.height.unwrap_or(0), &blobs)
+                .await,
+        );
         let mut node_r = node::OrderedNode::resume(
             host,
             follower,
@@ -1123,6 +1135,7 @@ pub(super) async fn park(
                             noded::NodeCommand::Submit {
                                 target,
                                 payload,
+                                required_blob,
                                 origin: _,
                                 reply,
                             } => {
@@ -1130,12 +1143,13 @@ pub(super) async fn park(
                                     let _ =
                                         reply.send(Err(not_serving(resident_standing)));
                                 } else {
-                                    match resident_relay.submit(
+                                    match resident_relay.submit_with_blob(
                                         &signer,
                                         &announce_targets,
                                         &mut relay_tx,
                                         target,
                                         payload,
+                                        required_blob,
                                         relay_runtime::ResidentHold::Http(reply),
                                     ) {
                                         Ok(_) => {}

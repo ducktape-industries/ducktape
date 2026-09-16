@@ -693,7 +693,7 @@ fn run_node(
         // without one names no backend rather than naming a plane it never
         // started.
         if wireguard_listen.is_some() {
-            metrics.set_netstack_backend(reachability_plane::netstack_backend().name());
+            tokio::spawn(reachability_plane::observe_execution(metrics.clone()));
             let swap_metrics = metrics.clone();
             status.wire_netstack_swapper(move |request| {
                 let metrics = swap_metrics.clone();

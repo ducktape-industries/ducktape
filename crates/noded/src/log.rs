@@ -273,22 +273,6 @@ impl ModuleNotes {
     }
 }
 
-/// the snake_case `reason` behind a refusal that arrived as prose. a module
-/// rejection or a parser error is a sentence (the client prints it); a reason
-/// is a token (a dashboard counts it) — so a plane that bridges the two keeps
-/// ONE ordered table and looks the sentence up here. first match wins: list
-/// the specific needle ahead of the general one.
-pub(crate) fn reason_of(
-    message: &str,
-    table: &[(&str, &'static str)],
-    fallback: &'static str,
-) -> &'static str {
-    table
-        .iter()
-        .find(|(needle, _)| message.contains(*needle))
-        .map_or(fallback, |(_, reason)| *reason)
-}
-
 /// a first-and-every-Nth latch for a failure that REPEATS on a retry loop.
 ///
 /// a peer that cannot sync retries forever, so an unconditional `warn!` on the

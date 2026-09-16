@@ -35,6 +35,26 @@ pub fn rgba(color: design::Color) -> wire::Rgba {
     wire::Rgba(color)
 }
 
+/// Show a host-issued image without copying its changing pixels through WASM.
+pub fn image_resource(key: impl Into<String>, resource: impl Into<String>) -> Node {
+    use std::hash::{Hash, Hasher};
+    let resource = resource.into();
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    ("host-image", &resource).hash(&mut hash);
+    Node::Image {
+        key: key.into(),
+        hash: hash.finish(),
+        data: Some(wire::ImageData::Resource(resource)),
+        label: None,
+        fit: Some(wire::ContentFit::Contain),
+        rotation: None,
+        opacity: None,
+        filter: Default::default(),
+        width: Some(Length::Fill),
+        height: Some(Length::Fill),
+    }
+}
+
 // ---------- text roles ----------
 
 pub fn text(key: impl Into<String>, content: impl Into<String>) -> Node {

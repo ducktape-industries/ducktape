@@ -15,8 +15,6 @@ use ::chat::{ChatMsg, PostPolicy};
 use commonware_cryptography::{Signer as _, ed25519};
 use ducktape_rpc::{Client as RpcClient, ModuleEvent, Status as NodeStatus};
 use futures::{FutureExt as _, StreamExt as _};
-use pages::BlockKind;
-use pages::index::{PageRow, PagesViewQuery, PagesViewReply};
 use tokio::sync::OwnedSemaphorePermit;
 use zeroize::Zeroizing;
 
@@ -24,29 +22,19 @@ use zeroize::Zeroizing;
 // row types, the composer parsing, the optimistic merges, and the op-delta
 // splices. Re-exported here for app state handlers.
 pub use ::chat::client::{
-    ChatChannel, ChatDelta, ChatMember, ChatReader, HuddleSeat, MentionCandidates, NameDirectory,
-    author_display, short_label,
+    ChatChannel, ChatReader, HuddleSeat, NameDirectory, author_display, short_label,
 };
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.
 #[cfg(test)]
-pub use ::chat::client::{BoundAccount, ChatMessage, author_name, paragraph_blocks};
+pub use ::chat::client::{ChatMessage, author_name, paragraph_blocks};
 pub use inbox::client::{BellDelta, BellItem};
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 /// How many one-second polls the provisioning screen waits before it says the
 /// node is not running and names the command that starts it.
 const PROVISION_PATIENCE: u32 = 8;
 
-/// Client-local read cursor for one channel: the newest `seq` this device has
-/// "seen". There is no wire read-cursor — this list lives only in app state and
-/// is never sent to the node.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ChannelRead {
-    pub channel: String,
-    pub seq: i64,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Deserialize)]
 pub struct ChatData {
     /// The switch this window answers for. Every route that moves the reader
     /// bumps `chat_generation` and stamps it here, so a room she has already
@@ -57,22 +45,11 @@ pub struct ChatData {
     pub active_channel: String,
     pub active_channel_name: String,
     pub active_channel_archived: bool,
-    pub active_channel_members_only: bool,
     /// the huddle's roster, not just its length — the faces and the tiles.
     pub huddle_roster: Vec<HuddleParticipant>,
-    pub channel_members: Vec<ChatMember>,
 }
 
-/// The submit receipt of an optimistic send: the client-minted operation id
-/// and its channel. The committed row arrives on the delta stream and settles
-/// the pending row by id — there is no snapshot to merge.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct SendReceipt {
-    pub operation_id: String,
-    pub channel_id: String,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChatSearchHit {
     pub channel_id: String,
     pub seq: i64,
@@ -87,12 +64,12 @@ pub struct ChatSearchData {
     pub hits: Vec<ChatSearchHit>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PageSearchHit {
     pub page_id: String,
     /// The title of the page the block lives in. The index's hit row carries
     /// only `page_id`, so without this join no surface could name the page a
-    /// match came from — see [`titled_page_hits`].
+    /// match came from; the Pages guest joins the title to each result.
     pub page_title: String,
     pub block_id: String,
     pub kind: String,
@@ -114,28 +91,13 @@ pub struct WorkspaceData {
     pub active_channel: String,
     pub active_channel_name: String,
     pub active_channel_archived: bool,
-    pub active_channel_members_only: bool,
     pub huddle_roster: Vec<HuddleParticipant>,
-    pub channel_members: Vec<ChatMember>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct AppError {
     pub message: String,
     pub committed: bool,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct OptimisticMutationError {
-    pub message: String,
-    pub committed: bool,
-    pub operation_id: String,
-    pub scope_id: String,
-    /// The thread a REPLY was for, `0` for a message. The composer that let
-    /// the body go is keyed by its room and its thread, so a failure can only
-    /// be handed back to the box it came from if it says which one that was.
-    pub thread_seq: i64,
-    pub body: String,
 }
 
 impl From<String> for AppError {
@@ -273,7 +235,7 @@ pub use roster::*;
 pub use rpc::*;
 pub use search::*;
 pub use shell::*;
-pub use storage::*;
+pub(crate) use storage::*;
 pub(crate) use style::*;
 
 #[cfg(test)]

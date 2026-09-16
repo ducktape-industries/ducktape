@@ -3,6 +3,10 @@ name = "reachability"
 edition.workspace = true
 version.workspace = true
 
+[features]
+# The native backend is only available to deterministic scenario harnesses.
+native-tests = []
+
 [dependencies]
 # the rendezvous retry loop runs forever; its failures were discarded.
 tracing = { workspace = true }
@@ -20,6 +24,8 @@ wireguard = { workspace = true }
 x25519-dalek = { workspace = true }
 
 [dev-dependencies]
+wat = "1"
+reachability = { path = ".", features = ["native-tests"] }
 nat-traversal = { workspace = true, features = ["simnat"] }
 tempfile = { workspace = true }
 # test-util: the simulated-NAT acceptance suite runs the resolver's real

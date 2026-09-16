@@ -1,9 +1,8 @@
 use super::*;
-use ::chat;
 
 /// One participant of a channel's live huddle — the roster is consensus state
 /// (`HuddleMember{user, node, joined_at}`), not a count.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HuddleParticipant {
     pub key: String,
     pub label: String,
@@ -16,11 +15,8 @@ pub struct HuddleParticipant {
     pub node: String,
 }
 
-/// Render canonical account or historical key seats from the huddle index.
-/// The roster of a room the reader is seated in but not looking at (a voice
-/// room), read off the room list's own seats: the seat carries the person
-/// and the node, which is all the huddle window and the beacon match need.
-pub(crate) fn roster_of_seats(seats: &[chat::client::HuddleSeat]) -> Vec<HuddleParticipant> {
+/// Adapt the view's roster seats for the native device session.
+pub(crate) fn roster_of_seats(seats: &[HuddleSeat]) -> Vec<HuddleParticipant> {
     seats
         .iter()
         .map(|seat| HuddleParticipant {
@@ -35,420 +31,68 @@ pub(crate) fn roster_of_seats(seats: &[chat::client::HuddleSeat]) -> Vec<HuddleP
         .collect()
 }
 
-pub(crate) fn huddle_roster(
-    members: &[chat::index::HuddleEntry],
-    reader: ChatReader<'_>,
-) -> Vec<HuddleParticipant> {
-    members
-        .iter()
-        .map(|member| {
-            let handle = member.party.clone();
-            let label = author_display(&handle, reader.names);
-            HuddleParticipant {
-                initials: initials_of(&label),
-                // Joining requires an external signer with a node proof.
-                is_agent: false,
-                // The reader's ACCOUNT, not one key: a seat taken with the
-                // person's passkey or wallet is still their own seat, and a
-                // roster that could not recognise it wiped itself on load.
-                is_you: reader.is_me(&handle),
-                joined_at: number_i64(member.joined_at),
-                key: member.party.clone(),
-                node: member.node.clone(),
-                label,
-            }
-        })
-        .collect()
-}
-
-/// Who the huddle window offers to invite: the room's members not yet seated,
-/// the reader included among the seated. A member row's key is a bare user
-/// key or an `acct:` handle; a seat's is a party handle — `member_id` makes
-/// them comparable.
-// ponytail: a voice room's seats (`roster_of_seats`) carry the NODE key, not
-// the party, so those match by label — both come off the one name directory.
-// Carry the party on `HuddleSeat` when a same-named pair shows up (a module
-// byte change, so a pin move).
-pub(crate) fn huddle_invitees(
-    members: &[ChatMember],
-    roster: &[HuddleParticipant],
-) -> Vec<ChatMember> {
-    members
-        .iter()
-        .filter(|member| {
-            let seated = roster
-                .iter()
-                .any(|seat| member_id(&seat.key) == member.key || seat.label == member.label);
-            !seated
-        })
-        .cloned()
-        .collect()
-}
-
-/// The invite is a post in the room addressed to the person: the mention is
-/// what reaches them (the desktop banner names the room and the sender), and
-/// the room's own timeline shows who was asked. `key` is a member row's key.
-pub(crate) fn huddle_invite_text(key: &str, room: &str) -> String {
-    let mention = match key.strip_prefix("acct:") {
-        Some(account) => format!("<@{account}>"),
-        None => format!("<@key:{key}>"),
-    };
-    format!("{mention} come join the huddle in #{room}")
-}
-
-/// The roster as the room list shows it under the room: a name, its
-/// initials, and whether the seat is the reader's own.
-pub(crate) fn huddle_seats(
-    members: &[chat::index::HuddleEntry],
-    reader: ChatReader<'_>,
-) -> Vec<HuddleSeat> {
-    huddle_roster(members, reader)
-        .into_iter()
-        .map(|seat| HuddleSeat {
-            label: seat.label,
-            initials: seat.initials,
-            is_you: seat.is_you,
-            node: seat.node,
-        })
-        .collect()
-}
-
 /// Am *I* in this huddle — the discriminant that splits the `Huddle` start
 /// button from the LIVE pill with its ✕ Leave.
 pub fn huddle_self(roster: Vec<HuddleParticipant>) -> bool {
     roster.iter().any(|participant| participant.is_you)
 }
 
-/// The call fan-out set: every roster peer's node key, self excluded — the
-/// shape `CallClientControl::Recipients` wants.
-///
-/// Excludes by NODE, never by `is_you`: `is_you` answers by ACCOUNT (own key,
-/// or any key bound to the same account), so two devices of one account in
-/// the same huddle both answer it true, and a filter on `is_you` alone drops
-/// BOTH rows — the devices go mutually dark instead of each excluding only
-/// itself. `self_node` is THIS device's own node key; a roster row's
-/// `node_proof` only proves that row's user holds the node key it names,
-/// never that the name is unique, so any row naming this node — including a
-/// stale or replayed one riding another user's `user` field — is a loopback
-/// echo and never a recipient, regardless of whose row it rides in on. Only
-/// when this device's own node key is unknown (no status read yet) is there
-/// nothing to compare against, so `is_you` is the fallback then: it cannot
-/// tell two of the reader's devices apart, but it is still the best guess
-/// available for a lone-device roster.
-pub fn huddle_recipient_nodes(
-    roster: Vec<HuddleParticipant>,
-    self_node: Option<&str>,
-) -> Vec<String> {
-    roster
-        .into_iter()
-        .filter(|participant| match self_node {
-            Some(node) => participant.node != node,
-            None => !participant.is_you,
-        })
-        .map(|participant| participant.node)
-        .collect()
-}
-
-/// THE FAN-OUT SET, READ FROM CONSENSUS — the live call session's own poll
-/// (`crate::call`), not the roster on screen.
-///
-/// The hub gates admission on this set at BOTH ends: a datagram from a peer
-/// the local session does not list is dropped at demux, media and 1 Hz
-/// presence beacon alike. So a peer who joins after us has to enter the set
-/// from somewhere, and the only thing that used to re-steer it was a peer
-/// beacon — which their join could not deliver, because they were not in the
-/// set yet. Two people joining a huddle therefore heard and saw nothing of
-/// each other, forever.
-///
-/// It is read here rather than taken from `huddle_roster` because that field
-/// belongs to the channel the user is LOOKING at, which need not be the
-/// channel they are huddling in.
-pub(crate) async fn huddle_fanout_nodes(
-    rpc: &str,
-    channel_id: &str,
-) -> Result<Vec<String>, String> {
-    let client = rpc_client(rpc)?;
-    let facts = ReaderFacts::current().await;
-    let status = client.status().await.map_err(|error| error.to_string())?;
-    let self_node = (!status.public_key.is_empty()).then_some(status.public_key);
-    // A huddle in a room this node cannot see has no fan-out set — an empty
-    // one, not a failure: the poll re-reads on its own cadence and picks the
-    // roster up as soon as the index answers for the room.
-    let room = load_channel_facts(&client, channel_id, facts.reader()).await?;
-    let roster = room.map_or_else(Vec::new, |(_channel, roster)| roster);
-    Ok(huddle_recipient_nodes(roster, self_node.as_deref()))
-}
-
 // The huddle's elapsed clock is a LOCAL session fact on a NATIVE `every 1s`
 // subscription — ui-lang ships one, so this app has no tick stream of its own.
 
-pub async fn join_huddle(
-    rpc: String,
-    password: String,
-    channel_id: String,
-) -> Result<bool, AppError> {
-    async {
-        let channel_id = required_id(channel_id, "channel")?;
-        let rpc = rpc_client(&rpc)?;
-        let status = rpc.status().await.map_err(|error| error.to_string())?;
-        let node = public_key(&status.public_key, "node public key")?;
-        // Proof of possession: THIS node signs the join under its own key —
-        // never asserted by the joiner — so the roster can only ever name a
-        // node that agreed to route this user's media (issue #1792). The mint
-        // is a SIGNED request: the node binds the key that signed it, which
-        // is what lets a device join through a node it does not host — no
-        // operator token, just the person's own account key.
-        let signed = rpc
-            .clone()
-            .with_write_auth(data_plane_signer(&rpc, password.clone()).await?);
-        let (_, node_proof_hex) = signed
-            .huddle_node_proof(&channel_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let node_proof = hex_decode(&node_proof_hex)
-            .map_err(|_| "huddle node proof must be hexadecimal".to_string())?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::JoinHuddle {
-                channel_id: channel_id.clone(),
-                node,
-                node_proof,
-            }),
-            password,
-        )
-        .await?;
-        Ok(true)
-    }
-    .await
+pub async fn join_huddle(rpc: String, password: String, channel_id: String) -> Result<bool, AppError> {
+    guest_participation(rpc, password, serde_json::json!({"kind":"join","channel":channel_id})).await?;
+    Ok(true)
 }
 
-/// Enter a voice room from the list: leave the huddle the reader is in (if
-/// any) and join `channel_id`'s. Two ops, in order — the roster is consensus
-/// state, so a person is never seated in two rooms at once. Answers the room
-/// joined.
-pub async fn move_huddle(
-    rpc: String,
-    password: String,
-    leaving: String,
-    channel_id: String,
-) -> Result<String, AppError> {
-    if !leaving.is_empty() {
-        leave_huddle(rpc.clone(), password.clone(), leaving).await?;
-    }
-    join_huddle(rpc, password, channel_id.clone()).await?;
-    Ok(channel_id)
+pub async fn move_huddle(rpc: String, password: String, leaving: String, channel_id: String) -> Result<String, AppError> {
+    guest_participation(rpc, password, serde_json::json!({"kind":"move","from":leaving,"channel":channel_id})).await
 }
 
-pub async fn leave_huddle(
-    rpc: String,
-    password: String,
-    channel_id: String,
-) -> Result<bool, AppError> {
-    async {
-        let channel_id = required_id(channel_id, "channel")?;
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::LeaveHuddle {
-                channel_id: channel_id.clone(),
-            }),
-            password,
-        )
-        .await?;
-        Ok(true)
-    }
-    .await
+pub async fn leave_huddle(rpc: String, password: String, channel_id: String) -> Result<bool, AppError> {
+    guest_participation(rpc, password, serde_json::json!({"kind":"leave","channel":channel_id})).await?;
+    Ok(true)
 }
 
-pub async fn send_message(
-    rpc: String,
-    password: String,
-    channel_id: String,
-    message_id: String,
-    body: String,
-) -> Result<SendReceipt, OptimisticMutationError> {
-    let operation_id = message_id.clone();
-    let operation_scope = channel_id.clone();
-    let operation_body = body.clone();
-    let result = async {
-        if channel_id.is_empty() {
-            return Err("choose a channel first".to_string().into());
-        }
-        let body = bounded_text(body, "message", 16 * 1024)?;
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::PostMessage {
-                channel_id: channel_id.clone(),
-                message_id: required_id(message_id, "message")?,
-                blocks: ::chat::client::parse_message(&body),
-                thread: None,
-            }),
-            password,
-        )
-        .await?;
-        Ok(())
-    }
-    .await;
-    result
-        .map(|()| SendReceipt {
-            operation_id: operation_id.clone(),
-            channel_id: operation_scope.clone(),
-        })
-        .map_err(|cause: AppError| OptimisticMutationError {
-            message: cause.message,
-            committed: cause.committed,
-            operation_id,
-            scope_id: operation_scope,
-            // A message is not in a thread; the stream's composer is keyed
-            // by its room alone.
-            thread_seq: 0,
-            body: operation_body,
-        })
+/// The shell relays user intent; the deployed Chat component owns participation.
+async fn guest_participation(rpc: String, password: String, intent: serde_json::Value) -> Result<String, AppError> {
+    require_seated_signer(password).await?;
+    let result = chat_background(&rpc, intent).await?;
+    result["channel"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "invalid Chat participation result".to_owned().into())
 }
 
-pub async fn send_reply(
-    rpc: String,
-    password: String,
-    channel_id: String,
-    root_seq: i64,
-    message_id: String,
-    body: String,
-) -> Result<SendReceipt, OptimisticMutationError> {
-    let operation_id = message_id.clone();
-    let operation_scope = channel_id.clone();
-    let operation_thread = root_seq;
-    let operation_body = body.clone();
-    let result = async {
-        let root_seq = positive_sequence(root_seq)?;
-        let body = bounded_text(body, "reply", 16 * 1024)?;
-        let rpc = rpc_client(&rpc)?;
-        let message_id = required_id(message_id, "message")?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::PostMessage {
-                channel_id: channel_id.clone(),
-                message_id: message_id.clone(),
-                blocks: ::chat::client::parse_message(&body),
-                thread: Some(root_seq),
-            }),
-            password,
-        )
-        .await?;
-        Ok(())
+pub(crate) async fn chat_background(
+    rpc: &str,
+    intent: serde_json::Value,
+) -> Result<serde_json::Value, AppError> {
+    let props = serde_json::to_vec(&serde_json::json!({"background":intent}))
+        .map_err(|error| error.to_string())?;
+    let bytes = crate::module_view::background::request("chat", props, rpc).await?;
+    let result: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if let Some(error) = result.get("error") {
+        return Err(AppError {message:error["message"].as_str().unwrap_or("Chat participation refused").into(),
+            committed:error["committed"].as_bool().unwrap_or(false)});
     }
-    .await;
-    result
-        .map(|()| SendReceipt {
-            operation_id: operation_id.clone(),
-            channel_id: operation_scope.clone(),
-        })
-        .map_err(|cause: AppError| OptimisticMutationError {
-            message: cause.message,
-            committed: cause.committed,
-            operation_id,
-            scope_id: operation_scope,
-            thread_seq: operation_thread,
-            body: operation_body,
-        })
+    Ok(result)
 }
 
-pub async fn edit_message(
-    rpc: String,
-    password: String,
-    channel_id: String,
-    seq: i64,
-    base_rev: i64,
-    body: String,
-) -> Result<bool, AppError> {
-    async {
-        let seq = positive_sequence(seq)?;
-        let base_rev =
-            u32::try_from(base_rev).map_err(|_| "invalid message revision".to_string())?;
-        let body = bounded_text(body, "message", 16 * 1024)?;
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "chat",
-            chat::encode_msg(&ChatMsg::EditMessage {
-                channel_id: channel_id.clone(),
-                seq,
-                blocks: ::chat::client::parse_message(&body),
-                base_rev: Some(base_rev),
-            }),
-            password,
-        )
-        .await?;
-        Ok(true)
-    }
-    .await
-}
-
-/// THE COMMAND PALETTE'S CHAT SEARCH. The Chat tab searches the index for
-/// itself now; this is the workspace-wide search the palette runs across chat
-/// and pages at once, which is the app's own screen.
+/// The deployed Chat view owns workspace message search and its display rows.
 pub async fn search_chat(
     rpc: String,
     channel_id: String,
     text: String,
 ) -> Result<ChatSearchData, AppError> {
-    // The same naming the timeline does — a search hit was showing the RAW
-    // wire author (`user:3f8dc8…773`, the full 64-hex key with its prefix) as
-    // the row's headline, above the text it matched.
-    let facts = ReaderFacts::current().await;
-    let result = async {
-        let text = bounded_text(text, "search", 512)?;
-        let rpc = rpc_client(&rpc)?;
-        // a `#tag` query filters by the exact hashtag (the index's tag
-        // postings); anything else is full-text search.
-        let query = match text.strip_prefix('#') {
-            Some(tag) if !tag.is_empty() => serde_json::json!({
-                "tag_search": {
-                    "tag": tag.to_lowercase(),
-                    "channel_id": (!channel_id.is_empty()).then_some(channel_id),
-                    "limit": 50
-                }
-            }),
-            _ => serde_json::json!({
-                "search": {
-                    "text": text,
-                    "channel_id": (!channel_id.is_empty()).then_some(channel_id),
-                    "limit": 50
-                }
-            }),
-        };
-        let reply: chat::index::ChatViewReply = rpc.view("chat", &query).await?;
-        let chat::index::ChatViewReply::Hits(hits) = reply else {
-            return Err("chat search returned an invalid reply".into());
-        };
-        Ok(ChatSearchData {
-            hits: hits
-                .into_iter()
-                .map(|hit| ChatSearchHit {
-                    // THE ROOM COMES FIRST, because it is the thing a hit is
-                    // missing. `#12` alone reads as a CHANNEL in this app —
-                    // every channel is written `# General` — while it is
-                    // actually the message's sequence number, and the channel
-                    // it was found in went unsaid in both the palette and the
-                    // sidebar. Every renderer of a hit shows `meta`, so the
-                    // room belongs in it rather than composed at one call site
-                    // (which is what the Explorer was doing alone).
-                    meta: format!("{} · #{}", hit.channel_id, hit.seq),
-                    channel_id: hit.channel_id,
-                    seq: number_i64(hit.seq),
-                    root_seq: number_i64(hit.thread.unwrap_or(hit.seq)),
-                    author: author_display(&hit.author, facts.names()),
-                    text: ::chat::client::draft_mentions(&hit.text, facts.names()).0,
-                })
-                .collect(),
-        })
-    }
-    .await;
-    result.map_err(app_error)
+    let result = chat_background(
+        &rpc,
+        serde_json::json!({"kind":"search", "channel":channel_id, "text":text}),
+    )
+    .await?;
+    let hits = serde_json::from_value(result["hits"].clone()).map_err(|error| error.to_string())?;
+    Ok(ChatSearchData { hits })
 }
 
 /// Hand a WEB link to the OS opener — the `DuckKind::Web` arm of the open
@@ -481,120 +125,20 @@ pub async fn open_external_url(url: String) -> Result<bool, AppError> {
     .map_err(app_error)
 }
 
-/// Every hit joined to the TITLE of the page it lives in.
-///
-/// A hit row from the index names only its page id, so every surface that
-/// rendered one had to say something else instead: the Explorer printed the
-/// block text as BOTH the row's title and its snippet, the palette showed a
-/// bare block kind, and the pages search panel showed an opaque block id.
-/// None of the three said which page the match was in.
-pub(crate) fn titled_page_hits(
-    hits: Vec<pages::index::PageBlockRow>,
-    index: Vec<PageRow>,
-) -> Vec<PageSearchHit> {
-    let titles = index
-        .into_iter()
-        .map(|page| (page.id, page.title))
-        .collect::<BTreeMap<_, _>>();
-    hits.into_iter()
-        .map(|hit| PageSearchHit {
-            // An untitled page reads "Untitled" in the sidebar (`page_items`),
-            // so a hit must not read differently. A page id the index does not
-            // carry takes the same fallback rather than a blank run.
-            page_title: titles
-                .get(&hit.page_id)
-                .filter(|title| !title.is_empty())
-                .cloned()
-                .unwrap_or_else(|| "Untitled".to_string()),
-            page_id: hit.page_id,
-            block_id: hit.block_id,
-            kind: block_kind_name(hit.kind).into(),
-            text: hit.text,
-        })
-        .collect()
-}
-
+/// The Pages guest resolves search hits and titles for the workspace palette.
 pub async fn search_pages(
     rpc: String,
     page_id: String,
     text: String,
 ) -> Result<PageSearchData, AppError> {
-    let result = async {
-        let text = bounded_text(text, "search", 512)?;
-        let rpc = rpc_client(&rpc)?;
-        let reply: pages::index::PagesViewReply = rpc
-            .view(
-                "pages",
-                &serde_json::json!({
-                    "search": {
-                        "text": text,
-                        "page_id": (!page_id.is_empty()).then_some(page_id),
-                        "limit": 50
-                    }
-                }),
-            )
-            .await?;
-        let pages::index::PagesViewReply::Hits(hits) = reply else {
-            return Err("page search returned an invalid reply".into());
-        };
-        if hits.is_empty() {
-            return Ok(PageSearchData { hits: Vec::new() });
-        }
-        // The titles live one view over, in the same index — this is the very
-        // call the pages sidebar makes. Paid once per search that matched
-        // something, never on the empty keystrokes that dominate the palette.
-        //
-        // A LABEL IS DECORATION AND MUST NEVER DESTROY THE PAYLOAD. Taking `?`
-        // here turned a search the node had already ANSWERED into an `Err`, and
-        // both readers throw those away without a word: the Explorer's
-        // `if let Ok(pages)` (backend/search.rs) drops every page hit from a
-        // workspace search, and the palette keeps whichever leg survived. So one
-        // failed `ListPages` — a second round trip, on a paged view, after the
-        // search already returned — silently emptied page results that existed.
-        // An index we could not read leaves every hit on the "Untitled"
-        // fallback `titled_page_hits` already takes for an unknown page id.
-        let index = load_page_index(&rpc).await.unwrap_or_default();
-        Ok(PageSearchData {
-            hits: titled_page_hits(hits, index),
-        })
+    let props = serde_json::to_vec(&serde_json::json!({"background":{"page":page_id,"text":text}}))
+        .map_err(|error| error.to_string())?;
+    let bytes = crate::module_view::background::request("pages", props, &rpc).await?;
+    let reply: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if let Some(error) = reply.get("error").and_then(serde_json::Value::as_str) {
+        return Err(error.to_owned().into());
     }
-    .await;
-    result.map_err(app_error)
-}
-
-#[cfg(test)]
-mod invite_tests {
-    use super::*;
-
-    #[test]
-    fn invitees_are_the_unseated_members_and_the_invite_mentions_them() {
-        let member = |key: &str| ChatMember {
-            key: key.into(),
-            label: key.into(),
-        };
-        let seat = |key: &str| HuddleParticipant {
-            key: key.into(),
-            label: String::new(),
-            initials: String::new(),
-            is_agent: false,
-            is_you: false,
-            joined_at: 0,
-            node: String::new(),
-        };
-        let members = [member("aa"), member("bb"), member("acct:7")];
-        let roster = [seat("user:aa"), seat("acct:7")];
-        let left: Vec<_> = huddle_invitees(&members, &roster)
-            .into_iter()
-            .map(|member| member.key)
-            .collect();
-        assert_eq!(left, vec!["bb"]);
-        assert_eq!(
-            huddle_invite_text("bb", "lounge"),
-            "<@key:bb> come join the huddle in #lounge"
-        );
-        assert_eq!(
-            huddle_invite_text("acct:7", "lounge"),
-            "<@7> come join the huddle in #lounge"
-        );
-    }
+    let hits = serde_json::from_value(reply["hits"].clone()).map_err(|error| error.to_string())?;
+    Ok(PageSearchData { hits })
 }

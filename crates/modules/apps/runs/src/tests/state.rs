@@ -78,3 +78,29 @@ fn model_run_session_and_request_state_round_trip() {
     );
     assert_eq!(restored.snapshot(), before);
 }
+
+#[test]
+fn registration_queries_the_deployed_model_program_without_changing_state() {
+    let module = RunsModule::new(
+        "runs",
+        "chat",
+        "saga",
+        "attribution",
+        "dispatch",
+        "agent",
+        None,
+        None,
+    );
+    let before = module.snapshot();
+    for id in ["builder", "another-agent"] {
+        let query =
+            serde_json::to_vec(&serde_json::json!({"model_program":{"agent_id":id}})).unwrap();
+        let reply = block_on(module.query(&query)).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&reply).unwrap(),
+            serde_json::json!({"model_program":crate::model_program(id)})
+        );
+    }
+    assert!(block_on(module.query(br#"{"model_program":{"agent_id":"Invalid ID"}}"#)).is_err());
+    assert_eq!(module.snapshot(), before);
+}

@@ -100,13 +100,14 @@ pub(crate) struct FrameArgs {
     key: PathBuf,
 }
 
-/// One `<target> <seq> <payload-hex>` request line off the signer's stdin.
+/// One `<target> <seq> <payload-hex> [required-blob-hex]` request line off the signer's stdin.
 /// `seq` is the frame's ordering/dedup tie-breaker (any u64); it is NOT
 /// tracked in state.
 struct FrameRequest {
     target: String,
     seq: u64,
     payload: Vec<u8>,
+    required_blob: Option<[u8; 32]>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -136,18 +137,12 @@ pub(crate) struct CallerArgs {
     /// the route's publisher node (hex consensus key)
     #[arg(long = "publisher-node", value_name = "HEX")]
     publisher_node: String,
-    /// the account number the route belongs to
-    #[arg(long, value_name = "N")]
-    account: u64,
-    /// the route label; omit for the account's apex route
-    #[arg(long, value_name = "NAME", default_value = "")]
-    route: String,
-    /// the HTTP method of the request (GET, HEAD, POST, PUT, PATCH, DELETE)
-    #[arg(long, value_name = "M")]
-    method: String,
-    /// the request path and query
-    #[arg(long, value_name = "PATH-AND-QUERY")]
-    path: String,
+    /// JSON ProxyRequestHead for the exact request (without user_pop)
+    #[arg(long, value_name = "PATH")]
+    head: PathBuf,
+    /// Raw request body file; omitted for an empty body
+    #[arg(long, value_name = "PATH")]
+    body: Option<PathBuf>,
 }
 
 /// Run one verb of the `ducktape user` family. secrets cross via stdin only
@@ -447,20 +442,33 @@ fn cmd_user_sign_gateway_route(
     Ok(())
 }
 
-/// Parse one request line. Whitespace-separated, exactly three fields — the
+/// Parse one request line. Whitespace-separated, three fields and an optional blob digest — the
 /// target and seq ride the line rather than flags precisely because the
 /// unlock is per PROCESS and the requests are per OP.
 fn parse_frame_request(line: &str) -> Result<FrameRequest, String> {
     let mut fields = line.split_whitespace();
-    let (Some(target), Some(seq), Some(payload_hex), None) =
-        (fields.next(), fields.next(), fields.next(), fields.next())
-    else {
-        return Err("frame request must be `<target> <seq> <payload-hex>`".into());
+    let (Some(target), Some(seq), Some(payload_hex), required_blob, None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return Err(
+            "frame request must be `<target> <seq> <payload-hex> [required-blob-hex]`".into(),
+        );
     };
     Ok(FrameRequest {
         target: target.to_string(),
         seq: seq.parse().map_err(|_| format!("frame seq: {seq:?}"))?,
         payload: config::unhex(payload_hex).map_err(|e| format!("payload hex: {e}"))?,
+        required_blob: required_blob
+            .map(|digest| {
+                duckfs_core::from_hex_32(digest).ok_or_else(|| {
+                    "required blob must be 64 lowercase hexadecimal characters".to_owned()
+                })
+            })
+            .transpose()?,
     })
 }
 
@@ -490,7 +498,15 @@ fn user_sign_frame(
     // would blow past OS argv limits.
     let user = load_user_signer(&args.key, stdin)?;
     while let Some(request) = read_frame_request(stdin)? {
-        let frame = user_frame_at(&user, request.seq, &request.target, request.payload);
+        let frame = node::encode_frame_with_blob(
+            &user,
+            request.seq,
+            &sdk::Msg {
+                target: request.target,
+                payload: request.payload,
+            },
+            request.required_blob,
+        );
         writeln!(out, "{}", hex_bytes(&frame))?;
         out.flush()?;
     }
@@ -531,7 +547,7 @@ fn user_frame_at(user: &ed25519::PrivateKey, seq: u64, target: &str, payload: Ve
 }
 
 /// `user-sign-frame --key <path>` — stdin: one password line, then one
-/// `<target> <seq> <payload-hex>` request line per frame; stdout: one frame
+/// `<target> <seq> <payload-hex> [required-blob-hex]` request line per frame; stdout: one frame
 /// hex line per request, in order.
 ///
 /// Wraps each payload in a `node` op frame signed by the user key. POSTed raw
@@ -602,25 +618,20 @@ fn user_sign_caller(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let publisher_node =
         config::unhex(&args.publisher_node).map_err(|e| format!("--publisher-node hex: {e}"))?;
-    let method = parse_route_method(&args.method)?;
-    let route = match args.route.as_str() {
-        "" => gateway::RouteName::apex(),
-        label => gateway::RouteName::named(label),
+    let head = gateway::decode_proxy_request_head(&std::fs::read(&args.head)?)?;
+    let body = match args.body {
+        Some(path) => std::fs::read(path)?,
+        None => Vec::new(),
     };
-    // stdin: password only — there is no payload.
+    if body.len() as u64 != head.body_len {
+        return Err("request body length differs from the signed head".into());
+    }
     let user = load_user_signer(&args.key, stdin)?;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let preimage = gateway::caller_pop_preimage(
-        &publisher_node,
-        args.account,
-        &route,
-        method,
-        &args.path,
-        ts,
-    );
+    let preimage = gateway::caller_pop_preimage(&publisher_node, &head, &body, ts);
     let sig = user.sign(gateway::GATEWAY_CALLER_NS, &preimage);
     let out = serde_json::json!({
         "key": hex_bytes(user.public_key().as_ref()),
@@ -630,29 +641,9 @@ fn user_sign_caller(
     Ok(out.to_string())
 }
 
-/// the HTTP methods a gateway route statement can name, by their wire
-/// spelling; anything else is refused before the key is unlocked.
-fn parse_route_method(method: &str) -> Result<gateway::RouteMethod, String> {
-    let method = match method.to_ascii_uppercase().as_str() {
-        "GET" => gateway::RouteMethod::Get,
-        "HEAD" => gateway::RouteMethod::Head,
-        "POST" => gateway::RouteMethod::Post,
-        "PUT" => gateway::RouteMethod::Put,
-        "PATCH" => gateway::RouteMethod::Patch,
-        "DELETE" => gateway::RouteMethod::Delete,
-        other => {
-            return Err(format!(
-                "--method {other:?} is not a gateway route method (GET, HEAD, POST, PUT, PATCH, DELETE)"
-            ));
-        }
-    };
-    Ok(method)
-}
-
-/// `user-sign-caller --key <path> --publisher-node <hex> --account <n>
-/// [--route <name>] --method <M> --path <path-and-query>` — stdin: password
-/// line. Prints one JSON line `{"key","ts","sig"}`: the `x-duck-user-key`,
-/// `x-duck-user-ts`, `x-duck-user-sig` headers of a gateway request.
+/// `user sign-caller --key <path> --publisher-node <hex> --head <json-file>
+/// [--body <bytes-file>]` — stdin: password line. Prints the key, timestamp
+/// and signature for the exact gateway request.
 fn cmd_user_sign_caller(args: CallerArgs, stdin: &mut impl std::io::BufRead) -> CommandResult {
     println!("{}", user_sign_caller(args, stdin)?);
     Ok(())
@@ -665,6 +656,41 @@ mod userkey_verb_tests {
     // themselves get theirs from `keystore` now.
     use commonware_codec::DecodeExt as _;
     use std::io::Cursor;
+
+    #[test]
+    fn frame_request_declares_a_signed_generic_blob() {
+        let request =
+            parse_frame_request(&format!("new-product 7 ff00 {}", "ab".repeat(32))).unwrap();
+        assert_eq!(request.required_blob, Some([0xab; 32]));
+        let signer = ed25519::PrivateKey::decode(&[9u8; 32][..]).unwrap();
+        let frame = node::encode_frame_with_blob(
+            &signer,
+            request.seq,
+            &sdk::Msg {
+                target: request.target,
+                payload: request.payload,
+            },
+            request.required_blob,
+        );
+        let (_, message, digest) = node::decode_frame_with_blob(&frame).unwrap();
+        assert_eq!(message.target, "new-product");
+        assert_eq!(message.payload, vec![255, 0]);
+        assert_eq!(digest, Some([0xab; 32]));
+        assert_eq!(
+            parse_frame_request("new-product 7 ff00")
+                .unwrap()
+                .required_blob,
+            None
+        );
+        for suffix in [
+            "AB".repeat(32),
+            "ab".repeat(31),
+            "gg".repeat(32),
+            format!("{} extra", "ab".repeat(32)),
+        ] {
+            assert!(parse_frame_request(&format!("new-product 7 ff00 {suffix}")).is_err());
+        }
+    }
 
     /// a Parser wrapper so tests can exercise the derived verb SHAPE (kebab
     /// spellings, parse rejection) the same way `main.rs`'s integrator will.
@@ -974,9 +1000,13 @@ mod userkey_verb_tests {
         let payload: &[u8] = b"\x00raw chunk bytes";
         let frames = sign_frames(
             &key_path,
-            &[TEST_PASSWORD, &format!("files 42 {}", hex_bytes(payload))],
+            &[
+                TEST_PASSWORD,
+                &format!("files 42 {}", hex_bytes(payload)),
+                &format!("new-product 43 {} {}", hex_bytes(payload), "ab".repeat(32)),
+            ],
         );
-        assert_eq!(frames.len(), 1);
+        assert_eq!(frames.len(), 2);
 
         let (origin, msg) =
             node::decode_frame(&config::unhex(&frames[0]).unwrap()).expect("frame verifies");
@@ -987,6 +1017,12 @@ mod userkey_verb_tests {
         );
         assert_eq!(msg.target, "files");
         assert_eq!(msg.payload, payload);
+        let (blob_origin, blob_msg, required_blob) =
+            node::decode_frame_with_blob(&config::unhex(&frames[1]).unwrap()).unwrap();
+        assert_eq!(blob_origin, origin);
+        assert_eq!(blob_msg.target, "new-product");
+        assert_eq!(blob_msg.payload, payload);
+        assert_eq!(required_blob, Some([0xab; 32]));
     }
 
     /// THE session property: one password line, one key open, N frames — each
@@ -1048,66 +1084,75 @@ mod userkey_verb_tests {
         }
     }
 
-    /// the printed proof is exactly what the publisher's gateway plane
-    /// rebuilds — `caller_pop_preimage` over the same six fields, verified
-    /// under `GATEWAY_CALLER_NS` with the key's scheme — and it is bound to
-    /// every one of them.
     #[test]
     fn sign_caller_returns_the_pop_a_publisher_would_accept() {
         let dir = tempfile::tempdir().unwrap();
         let key_path = dir.path().join("user.key");
         write_encrypted(&key_path, &[9u8; 32]);
         let publisher = [0xabu8; 32];
-
-        let mut stdin = stdin_of(&[TEST_PASSWORD]);
+        let head_path = dir.path().join("head.json");
+        let body_path = dir.path().join("body.bin");
+        let head = gateway::ProxyRequestHead {
+            operator: false,
+            account_id: 7,
+            name: gateway::RouteName::named("api"),
+            revision: 3,
+            method: gateway::RouteMethod::Post,
+            path_and_query: "/item?x=1".into(),
+            headers: vec![gateway::ProxyHeader {
+                name: "content-type".into(),
+                value: "application/octet-stream".into(),
+            }],
+            body_len: 3,
+            upgrade: false,
+            user_pop: None,
+        };
+        std::fs::write(
+            &head_path,
+            gateway::encode_proxy_request_head(&head).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&body_path, [0, 1, 255]).unwrap();
         let out = user_sign_caller(
             CallerArgs {
                 key: key_path,
                 publisher_node: hex_bytes(&publisher),
-                account: 7,
-                route: "api".into(),
-                method: "get".into(),
-                path: "/whoami?x=1".into(),
+                head: head_path,
+                body: Some(body_path),
             },
-            &mut stdin,
+            &mut stdin_of(&[TEST_PASSWORD]),
         )
         .unwrap();
-
-        let parsed: serde_json::Value = serde_json::from_str(&out).expect("one json line");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         let signer = ed25519::PrivateKey::decode([9u8; 32].as_slice()).unwrap();
         assert_eq!(parsed["key"], hex_bytes(signer.public_key().as_ref()));
         let ts: u64 = parsed["ts"].as_str().unwrap().parse().unwrap();
         let sig = config::unhex(parsed["sig"].as_str().unwrap()).unwrap();
-        let preimage = |account, path: &str| {
-            gateway::caller_pop_preimage(
-                &publisher,
-                account,
-                &gateway::RouteName::named("api"),
-                gateway::RouteMethod::Get,
-                path,
-                ts,
-            )
-        };
-        let verifies = |account, path: &str| {
+        let verifies = |head: &gateway::ProxyRequestHead, body: &[u8]| {
             identity::KeyScheme::Ed25519.verify(
                 signer.public_key().as_ref(),
                 gateway::GATEWAY_CALLER_NS,
-                &preimage(account, path),
+                &gateway::caller_pop_preimage(&publisher, head, body, ts),
                 &sig,
             )
         };
-        assert!(verifies(7, "/whoami?x=1"));
-        assert!(!verifies(8, "/whoami?x=1"), "bound to the account");
-        assert!(!verifies(7, "/whoami"), "bound to the path");
-    }
-
-    #[test]
-    fn sign_caller_refuses_a_method_the_gateway_cannot_name() {
-        assert!(parse_route_method("TRACE").is_err());
-        assert_eq!(
-            parse_route_method("delete").unwrap(),
-            gateway::RouteMethod::Delete
+        assert!(verifies(&head, &[0, 1, 255]));
+        assert!(
+            !verifies(&head, &[0, 2, 255]),
+            "same-length body substitution must fail"
         );
+        let mut changed = head.clone();
+        changed.revision += 1;
+        assert!(!verifies(&changed, &[0, 1, 255]));
+        changed = head.clone();
+        changed.headers[0].value = "text/plain".into();
+        assert!(!verifies(&changed, &[0, 1, 255]));
+        changed = head.clone();
+        changed.path_and_query = "/item?x=2".into();
+        assert!(!verifies(&changed, &[0, 1, 255]));
+        changed = head.clone();
+        changed.upgrade = true;
+        assert!(!verifies(&changed, &[0, 1, 255]));
     }
 
     #[test]

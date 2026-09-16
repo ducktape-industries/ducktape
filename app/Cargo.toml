@@ -10,7 +10,7 @@ authors = ["Ducktape contributors"]
 gpui-kit = { version = "=0.6.1", features = ["tree-sitter-languages"] }
 # the pages document editor: Notion-shaped blocks, marks, slash menu and
 # toolbar on the same gpui-kit; the guest keeps the markdown canonical.
-gpui-notion = { git = "https://github.com/orthory/gpui-notion", rev = "8f6bc373397d5e29fe0d395d3bca25c254bf14ca" }
+gpui-notion = { git = "https://github.com/byeongsu-hong/gpui-notion", rev = "2ef0e331838531a0ef8f4d4cc80655f5c4c99303" }
 unicode-segmentation = "1"
 ducktape-view-guest = { path = "../crates/views/support/guest" }
 qrcode = { version = "0.14", default-features = false }
@@ -117,7 +117,7 @@ zeroize.workspace = true
 # events cross on, and the runtime that executes the view's component. The
 # same wasmtime pin as the node — a view is not consensus, but one runtime
 # in one binary is one set of semantics to reason about.
-ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "5abde0db4ebe6a3c4d26e86c7ceadb0153de4623", features = ["manifest"] }
+ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "3d8ba98833c48e030e1b955ac2799bc27755b2bf", features = ["manifest"] }
 wasmtime.workspace = true
 
 # The native notification leg (`src/backend/notify.rs`): being @mentioned or

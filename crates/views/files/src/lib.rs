@@ -7,7 +7,7 @@
 //! chain a draft belongs to, and the reader's account). The view lists the
 //! directory, the homes and the snapshot history, reads the preview, asks
 //! which snapshot last touched a path and diffs a snapshot for itself through
-//! `files.get`, re-reads on every files block (`rpc.live`), and every write
+//! generic `rpc.query`, re-reads on every files block (`rpc.live`), and every write
 //! leaves as `op.submit` carrying the duckfs commit the kernel signs with the
 //! seated key. The pictures, the highlighted reader and the Markdown document
 //! are the app's own surfaces, painted into the slots the view leaves for them;

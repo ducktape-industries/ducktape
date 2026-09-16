@@ -2,9 +2,7 @@
 //! reads, and the writes that leave as `op.submit`.
 //!
 //! The kernel pushes SESSION facts only (`chat.props`): the connection, the
-//! reader, the sidebar the rest of the app also draws from, the huddle (native
-//! media), the agent runs in flight in this process, and the sends the
-//! composer surface has admitted but not yet landed. Everything ABOUT the room
+//! reader, the huddle media and agent runs in flight in this process. Everything ABOUT the room
 //! on screen — its record, its roster, its messages, its threads and its
 //! search — this view reads for itself through `rpc.view`, re-read on every
 //! `rpc.live` hit for the chat plane. A reaction, a delete, a rename, an
@@ -20,7 +18,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
 use ducktape_view_guest::host;
-use futures::{Stream, StreamExt, stream};
+use futures::{FutureExt, Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 
 /// One page of roots, replies or hits — chat's own index page size.
@@ -57,16 +55,25 @@ pub struct HuddleSeat {
     pub label: String,
     pub initials: String,
     pub is_you: bool,
-    /// The seat's node key — what `speaking_peers` names.
+    /// The seat's node key — what `call_peers` names.
     pub node: String,
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct CallPeer {
+    pub peer: String,
+    pub muted: bool,
+    pub speaking: bool,
 }
 
 /// Is this seat talking: the reader's own seat reads the local voice gate,
 /// any other reads the peer beacons by node key.
-pub fn seat_speaking(seat: &HuddleSeat, call_speaking: bool, speaking_peers: &[String]) -> bool {
+pub fn seat_speaking(seat: &HuddleSeat, call_speaking: bool, call_peers: &[CallPeer]) -> bool {
     match seat.is_you {
         true => call_speaking,
-        false => speaking_peers.contains(&seat.node),
+        false => call_peers
+            .iter()
+            .any(|peer| peer.peer == seat.node && peer.speaking && !peer.muted),
     }
 }
 
@@ -277,11 +284,18 @@ async fn read_text(path: &str) -> Result<PreviewItem, String> {
 }
 
 async fn files_get(lane: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
-    ask(
-        "files.get",
-        &serde_json::json!({ "lane": lane, "params": params }),
+    let reply = ask(
+        "rpc.query",
+        &serde_json::json!({
+            "target": "files", "query": {lane: params}
+        }),
     )
-    .await
+    .await?;
+    let value = reply.get(lane).cloned().ok_or("unexpected Files reply")?;
+    match lane {
+        "history" => Ok(serde_json::json!({"snapshots": value})),
+        _ => Ok(value),
+    }
 }
 
 /// A file that is text, or the plate that says it is not. A page that ended
@@ -381,11 +395,17 @@ pub struct ChatSearchHit {
     pub meta: String,
 }
 
-/// An agent run in flight under its anchor message: whose it is, where it
-/// stands, and which run to open for its progress. A run lives in THIS
-/// process, off the node, so it reaches the view as a session fact.
+/// Authorized run observations and the presentation derived by this view.
+/// The host forwards output; provider formats and display choices live here.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct LiveRunHint {
+    #[serde(default)]
+    pub public_progress: Option<serde_json::Value>,
+    #[serde(default)]
+    pub output: Vec<String>,
+    #[serde(default)]
+    pub output_error: String,
+    pub channel_id: String,
     pub anchor_seq: i64,
     pub thread_root: i64,
     pub run_id: String,
@@ -396,7 +416,7 @@ pub struct LiveRunHint {
     /// what the run has done so far, oldest first
     #[serde(default)]
     pub activity: Vec<LiveActivity>,
-    /// the answer as it is being written, clipped by the app
+    /// the answer as it is being written
     #[serde(default)]
     pub answer_preview: String,
 }
@@ -488,8 +508,7 @@ pub fn run_of_message(id: &str) -> String {
 
 // ---------- the session ----------
 
-/// The facts the kernel pushes: the connection, the reader, the sidebar the
-/// bell and the tray share, the huddle's native media, this process's agent
+/// The facts the kernel pushes: the connection, the reader, the huddle media, this process's agent
 /// runs, and the room the app has navigated to. Never module data, never this
 /// screen's own UI state.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -507,21 +526,15 @@ pub struct Session {
     pub me_key: String,
     /// moves when the identity plane does, so the name directory is re-read
     pub names_serial: i64,
-    /// the sidebar, folded by the app because the bell, the tray and the
-    /// command palette read the same rows
-    pub rooms: Vec<ChatSidebarRow>,
-    pub dm_rows: Vec<DmSidebarRow>,
-    pub channel_create_open: bool,
     /// the room the app is in — chosen here, but steered by `duck://` links,
     /// notifications and the tray as well
     pub active_channel: String,
-    pub active_dm_peer: String,
-    pub active_dm: DmPeer,
+    /// An external account link requests a DM; the view owns opening it.
+    pub dm_peer: String,
+    pub dm_serial: i64,
     /// the seq a landing (a search hit, a `duck://channel/…#seq`) asks the
     /// window to open around; 0 opens the live tail
     pub land_seq: i64,
-    /// the read cursor the app keeps per room, for the unread divider
-    pub unread_boundary: i64,
     /// a write the app itself is running (a create, a huddle join)
     pub busy: bool,
     pub loading: bool,
@@ -533,8 +546,8 @@ pub struct Session {
     pub call_muted: bool,
     /// the reader's own mic voice gate is open
     pub call_speaking: bool,
-    /// the node keys of the peers whose call beacons say they are talking
-    pub speaking_peers: Vec<String>,
+    /// The call guest's peer observations; this view owns their display rules.
+    pub call_peers: Vec<CallPeer>,
     /// the reader is holding ⇧: the copy range's gesture, and the guest sees
     /// no modifiers of its own
     pub shift_held: bool,
@@ -542,9 +555,6 @@ pub struct Session {
     /// subscription, which is the app's door, and the range it copies is this
     /// view's
     pub copy_chord_serial: i64,
-    /// moves once per admitted send: the view's cue to snap to the tail
-    pub sent_serial: i64,
-    pub pending_sends: Vec<PendingSend>,
     /// the agent runs anchored in THIS room, live while they run
     pub live_agents: Vec<LiveRunHint>,
 }
@@ -554,6 +564,19 @@ pub struct Session {
 pub struct SessionItem {
     pub next: Session,
     pub error: String,
+    pub background: Option<BackgroundRequest>,
+}
+
+/// The host reports tab presentation independently of product session facts.
+pub fn visibility() -> ducktape_view_guest::Subscription<bool> {
+    ducktape_view_guest::Subscription::run(|| {
+        host::subscribe("host.visible", &[]).map(|answer| {
+            answer
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or(false)
+        })
+    })
 }
 
 /// The session now, and again on every change the kernel sees.
@@ -561,16 +584,35 @@ pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     ducktape_view_guest::Subscription::run(|| {
         host::subscribe("chat.props", &[]).map(|answer| {
             let read = answer.and_then(|bytes| {
-                serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .map_err(|error| error.to_string())
             });
             match read {
-                Ok(next) => SessionItem {
-                    next,
-                    error: String::new(),
+                Ok(value) => match value.get("background") {
+                    Some(intent) => match serde_json::from_value(intent.clone()) {
+                        Ok(participation) => SessionItem {
+                            background: Some(participation),
+                            ..SessionItem::default()
+                        },
+                        Err(error) => SessionItem {
+                            error: error.to_string(),
+                            ..SessionItem::default()
+                        },
+                    },
+                    None => match serde_json::from_value(value) {
+                        Ok(next) => SessionItem {
+                            next,
+                            ..SessionItem::default()
+                        },
+                        Err(error) => SessionItem {
+                            error: error.to_string(),
+                            ..SessionItem::default()
+                        },
+                    },
                 },
                 Err(error) => SessionItem {
-                    next: Session::default(),
                     error,
+                    ..SessionItem::default()
                 },
             }
         })
@@ -620,9 +662,34 @@ pub(crate) fn landing_thread(root: i64) -> crate::LandingThread {
 pub struct Names {
     /// key hex -> (account number, display name)
     keys: BTreeMap<String, (u64, String)>,
-    by_account: BTreeMap<u64, String>,
+    pub(crate) by_account: BTreeMap<u64, String>,
     /// the program-controlled accounts: software, drawn with the AGENT plate
     programs: BTreeSet<u64>,
+}
+
+/// Cached host identity facts let a live channel fold avoid a dispatch query.
+pub(crate) fn cached_names(value: serde_json::Value) -> Result<Names, String> {
+    #[derive(Deserialize)]
+    struct Account {
+        number: u64,
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct Snapshot {
+        accounts: BTreeMap<String, Account>,
+        by_account: BTreeMap<u64, String>,
+        programs: BTreeSet<u64>,
+    }
+    let snapshot: Snapshot = serde_json::from_value(value).map_err(|error| error.to_string())?;
+    Ok(Names {
+        keys: snapshot
+            .accounts
+            .into_iter()
+            .map(|(key, account)| (key, (account.number, account.name)))
+            .collect(),
+        by_account: snapshot.by_account,
+        programs: snapshot.programs,
+    })
 }
 
 impl Names {
@@ -680,16 +747,63 @@ thread_local! {
     /// registry: a wasm module has one thread, and every native test drives
     /// its own app on its own thread.
     static NAMES: RefCell<(i64, Names)> = RefCell::new((-1, Names::default()));
+    static NAMES_READ: RefCell<Option<(i64, futures::future::Shared<futures::future::LocalBoxFuture<'static, Names>>)>> = RefCell::new(None);
+}
+
+/// Canonical mention tokens come from the guest's identity directory.
+pub(crate) fn composer_choices(
+    members: &[ChatMember],
+) -> Vec<ducktape_view_composer::MentionChoice> {
+    NAMES.with_borrow(|(_, names)| {
+        let mut choices: BTreeMap<String, String> = names
+            .by_account
+            .iter()
+            .map(|(number, label)| (format!("<@{number}>"), label.clone()))
+            .collect();
+        for member in members {
+            let key = member.key.strip_prefix("user:").unwrap_or(&member.key);
+            let account = key
+                .strip_prefix("acct:")
+                .and_then(|number| number.parse::<u64>().ok())
+                .or_else(|| names.account_of(key));
+            let token = match account {
+                Some(number) => format!("<@{number}>"),
+                None => format!("<@key:{key}>"),
+            };
+            choices.entry(token).or_insert_with(|| member.label.clone());
+        }
+        choices
+            .into_iter()
+            .map(|(token, label)| ducktape_view_composer::MentionChoice { token, label })
+            .collect()
+    })
+}
+
+pub(crate) fn reset_directory() {
+    NAMES.with_borrow_mut(|names| *names = (-1, Names::default()));
+    NAMES_READ.with_borrow_mut(|pending| *pending = None);
 }
 
 /// The directory as of `serial`, read once per identity change. A directory
 /// that cannot be read is an empty one — every author renders by handle,
 /// which is a name, not a failure.
-async fn names_at(serial: i64) -> Names {
+pub(crate) async fn names_at(serial: i64) -> Names {
     let cached = NAMES.with_borrow(|(at, names)| (*at == serial).then(|| names.clone()));
     if let Some(names) = cached {
         return names;
     }
+    let pending = NAMES_READ.with_borrow_mut(|slot| {
+        if let Some((_, pending)) = slot.as_ref().filter(|(at, _)| *at == serial) {
+            return pending.clone();
+        }
+        let pending = read_names(serial).boxed_local().shared();
+        *slot = Some((serial, pending.clone()));
+        pending
+    });
+    pending.await
+}
+
+async fn read_names(serial: i64) -> Names {
     let mut accounts = Vec::new();
     let mut from = 0u64;
     loop {
@@ -716,9 +830,249 @@ async fn names_at(serial: i64) -> Names {
     names
 }
 
+/// Directory and channel projection owned by the deployed Chat guest.
+#[derive(Clone, Debug, Default)]
+pub struct SidebarItem {
+    pub connection_serial: i64,
+    pub names_serial: i64,
+    pub channels: Vec<ChatChannel>,
+    pub peers: Vec<DmPeer>,
+    pub error: String,
+}
+
+pub fn sidebar(
+    serial: i64,
+    names: i64,
+    reader: String,
+    channel: String,
+    history: bool,
+) -> ducktape_view_guest::Subscription<SidebarItem> {
+    ducktape_view_guest::Subscription::run_with((serial, names, reader, channel, history), |key| {
+        let key = key.clone();
+        let live = host::subscribe("rpc.live", b"chat");
+        stream::once(read_sidebar(key.0, key.1, key.2.clone()))
+            .chain(live.then(move |_| read_sidebar(key.0, key.1, key.2.clone())))
+    })
+}
+
+pub(crate) async fn read_sidebar(
+    connection_serial: i64,
+    names_serial: i64,
+    reader: String,
+) -> SidebarItem {
+    match read_sidebar_now(connection_serial, names_serial, &reader).await {
+        Ok(item) => item,
+        Err(error) => SidebarItem {
+            connection_serial,
+            names_serial,
+            error,
+            ..SidebarItem::default()
+        },
+    }
+}
+
+pub(crate) async fn read_sidebar_now(
+    connection_serial: i64,
+    names_serial: i64,
+    reader: &str,
+) -> Result<SidebarItem, String> {
+    let mut records = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = view(
+            "channels",
+            serde_json::json!({"channels":{"after":after,"limit":PAGE_LIMIT}}),
+        )
+        .await?;
+        let rows = page["channels"].as_array().ok_or("missing channels page")?;
+        records.extend(rows.iter().cloned());
+        if page["has_more"].as_bool() != Some(true) {
+            break;
+        }
+        let next = page["next_after"]
+            .as_str()
+            .ok_or("missing channels cursor")?;
+        let advances = after.as_deref().is_none_or(|previous| next > previous);
+        if !advances {
+            return Err("channels cursor did not advance".into());
+        }
+        after = Some(next.into());
+    }
+    let names = names_at(names_serial).await;
+    let channels = records
+        .iter()
+        .map(|record| channel_row(record, &names))
+        .collect();
+    let mine = reader
+        .strip_prefix("acct:")
+        .and_then(|number| number.parse::<u64>().ok());
+    let peers = names
+        .by_account
+        .iter()
+        .filter(|(number, _)| Some(**number) != mine)
+        .map(|(number, name)| {
+            let key = number.to_string();
+            DmPeer {
+                channel_id: mine
+                    .map_or_else(String::new, |mine| dm_channel_id(&mine.to_string(), &key)),
+                key,
+                name: name.clone(),
+                initials: sidebar_initials(name),
+                is_agent: names.programs.contains(number),
+            }
+        })
+        .collect();
+    Ok(SidebarItem {
+        connection_serial,
+        names_serial,
+        channels,
+        peers,
+        error: String::new(),
+    })
+}
+
+/// Interpret one canonical channel row for every Chat presentation.
+pub(crate) fn channel_row(row: &serde_json::Value, names: &Names) -> ChatChannel {
+    let me = ME.with_borrow(Clone::clone);
+    let huddle = row["huddle"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|seat| {
+            let party = seat["party"].as_str().unwrap_or_default();
+            let label = names.member_label(party);
+            HuddleSeat {
+                initials: sidebar_initials(&label),
+                label,
+                is_you: owns_handle(party, &me, names),
+                node: seat["node"].as_str().unwrap_or_default().into(),
+            }
+        })
+        .collect::<Vec<_>>();
+    ChatChannel {
+        id: row["id"].as_str().unwrap_or_default().into(),
+        name: row["name"].as_str().unwrap_or_default().into(),
+        archived: row["archived"].as_bool().unwrap_or_default(),
+        members_only: row["post_policy"].as_str() == Some("members_only"),
+        huddle_count: count_i64(huddle.len()),
+        huddle,
+        head_seq: row["head_seq"].as_i64().unwrap_or_default(),
+        voice: row["voice"].as_bool().unwrap_or_default(),
+    }
+}
+
+fn sidebar_initials(name: &str) -> String {
+    name.split_whitespace()
+        .filter_map(|word| word.chars().next())
+        .take(2)
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+pub(crate) fn dm_channel_id(a: &str, b: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let (low, high) = if a < b { (a, b) } else { (b, a) };
+    let digest = Sha256::digest(format!("{low}\u{1f}{high}").as_bytes());
+    format!("dm-{digest:x}")
+}
+
+pub async fn mint_channel() -> Result<String, String> {
+    let bytes = host::request("host.id", b"channel").await?;
+    let id = String::from_utf8(bytes).map_err(|error| error.to_string())?;
+    if id.is_empty() {
+        return Err("the host returned no channel ID".into());
+    }
+    Ok(id)
+}
+
+pub async fn create_channel(
+    id: String,
+    name: String,
+    voice: bool,
+    members_only: bool,
+) -> Result<(), String> {
+    let reply = ask(
+        "rpc.view",
+        &serde_json::json!({"target":"chat","query":{"channel":{"channel_id":id}}}),
+    )
+    .await?;
+    let existing = reply
+        .get("channel")
+        .ok_or("the chat module returned no channel reply")?;
+    let policy = if members_only { "members_only" } else { "open" };
+    if !existing.is_null() {
+        let same_channel =
+            existing["id"] == id && existing["name"] == name && existing["voice"] == voice;
+        let same_policy = voice || existing["post_policy"] == policy;
+        if same_channel && same_policy {
+            return Ok(());
+        }
+        return Err("This channel ID already has different details".into());
+    }
+    let payload = if voice {
+        serde_json::json!({"create_voice_channel":{"channel_id":id,"name":name}})
+    } else {
+        serde_json::json!({"create_channel":{"channel_id":id,"name":name,"post_policy":policy}})
+    };
+    ask(
+        "op.submit",
+        &serde_json::json!({"target":"chat","payload":payload}),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Resolve an existing DM or atomically create it through the Chat module.
+/// Navigation waits for the write's commit acknowledgment.
+pub async fn open_dm(reader: String, peer: String) -> Result<String, String> {
+    let mine = reader
+        .strip_prefix("acct:")
+        .and_then(|id| id.parse::<u64>().ok())
+        .ok_or("this key is on no account — a DM needs one")?;
+    let counterpart: u64 = peer
+        .trim()
+        .parse()
+        .map_err(|_| "peer must be an account number")?;
+    let channel = dm_channel_id(&mine.to_string(), &counterpart.to_string());
+    let reply = ask(
+        "rpc.view",
+        &serde_json::json!({"target":"chat","query":{"channel":{"channel_id":channel}}}),
+    )
+    .await?;
+    let existing = reply
+        .get("channel")
+        .ok_or("the chat module returned the wrong channel reply")?;
+    if !existing.is_null() {
+        let matches_channel =
+            existing.get("id").and_then(serde_json::Value::as_str) == Some(channel.as_str());
+        if !matches_channel {
+            return Err("the chat module returned the wrong channel".into());
+        }
+        return Ok(channel);
+    }
+    let reply = ask(
+        "rpc.query",
+        &serde_json::json!({"target":"identity","query":{"get":{"number":counterpart}}}),
+    )
+    .await?;
+    let account = reply
+        .get("account")
+        .filter(|account| account.is_object())
+        .ok_or_else(|| format!("account {counterpart} does not exist"))?;
+    let name = account
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("the identity module returned no account name")?;
+    ask("op.submit", &serde_json::json!({"target":"chat","payload":{"create_dm_channel":{"counterpart":counterpart,"name":name}}})).await?;
+    Ok(channel)
+}
+
 // ---------- the reads ----------
 
-async fn ask(kind: &str, query: &serde_json::Value) -> Result<serde_json::Value, String> {
+pub(crate) async fn ask(
+    kind: &str,
+    query: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let bytes = host::request(kind, &serde_json::to_vec(query).expect("encodes")).await?;
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
@@ -728,7 +1082,10 @@ async fn ask(kind: &str, query: &serde_json::Value) -> Result<serde_json::Value,
 /// (`{"roots": {"roots": […], "has_more": false}}`), so every caller would
 /// otherwise have to peel the same tag off by hand — and reading one field
 /// short of it silently answers an empty page.
-async fn view(variant: &str, query: serde_json::Value) -> Result<serde_json::Value, String> {
+pub(crate) async fn view(
+    variant: &str,
+    query: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let reply = ask(
         "rpc.view",
         &serde_json::json!({ "target": "chat", "query": query }),
@@ -939,7 +1296,7 @@ async fn older_roots_exist(channel: &str, floor: u64) -> Result<bool, String> {
     Ok(!page["roots"].as_array().map(Vec::is_empty).unwrap_or(true))
 }
 
-async fn read_members(channel: &str, names: &Names) -> Result<Vec<ChatMember>, String> {
+pub(crate) async fn read_members(channel: &str, names: &Names) -> Result<Vec<ChatMember>, String> {
     let mut members = Vec::new();
     let mut after: Option<String> = None;
     loop {
@@ -1113,21 +1470,25 @@ pub fn search(key: SearchKey) -> ducktape_view_guest::Subscription<SearchItem> {
     ducktape_view_guest::Subscription::run_with(key, |key| stream::once(read_search(key.clone())))
 }
 
+fn search_query(text: &str, channel: Option<&str>) -> serde_json::Value {
+    // A `#tag` query filters by the exact hashtag (the index's tag postings);
+    // anything else is full-text search.
+    match text.strip_prefix('#').filter(|tag| !tag.is_empty()) {
+        Some(tag) => serde_json::json!({
+            "tag_search": { "tag": tag.to_lowercase(), "channel_id": channel, "limit": 50 },
+        }),
+        None => serde_json::json!({
+            "search": { "text": text, "channel_id": channel, "limit": 50 },
+        }),
+    }
+}
+
 async fn read_search(key: SearchKey) -> SearchItem {
     if key.query.is_empty() {
         return SearchItem::default();
     }
     let names = names_at(key.names).await;
-    // A `#tag` query filters by the exact hashtag (the index's tag postings);
-    // anything else is full-text search.
-    let query = match key.query.strip_prefix('#').filter(|tag| !tag.is_empty()) {
-        Some(tag) => serde_json::json!({
-            "tag_search": { "tag": tag.to_lowercase(), "channel_id": null, "limit": 50 },
-        }),
-        None => serde_json::json!({
-            "search": { "text": key.query, "channel_id": null, "limit": 50 },
-        }),
-    };
+    let query = search_query(&key.query, None);
     match view("hits", query).await {
         Ok(reply) => SearchItem {
             hits: fold_hits(&reply, &names),
@@ -1363,7 +1724,7 @@ fn deleted_block() -> ChatBlock {
 
 /// The message as one run of plain text — the palette's preview and the copy
 /// range's lines. A mention reads as the NAME it addresses, not as its token.
-fn message_body(blocks: &serde_json::Value, names: &Names) -> String {
+pub(crate) fn message_body(blocks: &serde_json::Value, names: &Names) -> String {
     blocks
         .as_array()
         .cloned()
@@ -1690,7 +2051,7 @@ fn json_bytes(value: &serde_json::Value) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         let _ = write!(output, "{byte:02x}");
@@ -1839,32 +2200,10 @@ fn notify<T: Serialize>(operation: &str, payload: &T) -> bool {
     true
 }
 
-/// `chat.open_hit` — land on a search hit: its channel and the target message.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Hit {
-    pub channel: String,
-    pub target_seq: i64,
-}
-
-/// `chat.choose_channel` — the room to open.
+/// The room selected for a voice call.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Channel {
     pub id: String,
-}
-
-/// `chat.choose_dm` — a peer key.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Key {
-    pub key: String,
-}
-
-/// `chat.scrolled` — the stream's offsets, relative to its end anchor.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Scrolled {
-    pub absolute_x: f64,
-    pub absolute_y: f64,
-    pub relative_x: f64,
-    pub relative_y: f64,
 }
 
 /// `chat.open_link` — a pressed link.
@@ -1880,24 +2219,6 @@ pub struct Copy {
     pub label: String,
 }
 
-/// `chat.copy_link` — a built message link for the clipboard.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Link {
-    pub link: String,
-}
-
-/// The run a Stop names.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct RunId {
-    pub run_id: String,
-}
-
-/// The run a "View run" or a message's run chip opens.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct DispatchId {
-    pub dispatch_id: String,
-}
-
 /// `chat.begin_edit` — seed the app's edit composer for one message. The
 /// editor is a host surface (IME + a retained document), so the body it opens
 /// on has to be handed over; the view never sees a keystroke afterwards.
@@ -1907,18 +2228,6 @@ pub struct EditSeed {
     pub body: String,
     pub seq: i64,
     pub rev: i64,
-}
-
-pub fn send_begin_edit(scope: &str, body: &str, seq: i64, rev: i64) -> bool {
-    notify(
-        "chat.begin_edit",
-        &EditSeed {
-            scope: scope.into(),
-            body: body.into(),
-            seq,
-            rev,
-        },
-    )
 }
 
 /// The editable markdown of one row, or "" when it may not be edited: a
@@ -1931,28 +2240,6 @@ pub fn edit_body_of(messages: &[ChatMessage], seq: i64, rev: i64) -> String {
         .filter(|message| !message.deleted && !message.pending && message.rev == rev)
         .map(|message| message.edit_body.clone())
         .unwrap_or_default()
-}
-
-pub fn send_open_hit(channel: &str, target_seq: i64) -> bool {
-    notify(
-        "chat.open_hit",
-        &Hit {
-            channel: channel.into(),
-            target_seq,
-        },
-    )
-}
-
-pub fn send_toggle_create() -> bool {
-    notify("chat.toggle_create", &())
-}
-
-pub fn send_choose_channel(id: &str) -> bool {
-    notify("chat.choose_channel", &Channel { id: id.into() })
-}
-
-pub fn send_choose_dm(key: &str) -> bool {
-    notify("chat.choose_dm", &Key { key: key.into() })
 }
 
 pub fn send_show_huddle() -> bool {
@@ -1973,18 +2260,6 @@ pub fn send_join_voice(id: &str) -> bool {
     notify("chat.join_voice", &Channel { id: id.into() })
 }
 
-pub fn send_scrolled(absolute_x: f64, absolute_y: f64, relative_x: f64, relative_y: f64) -> bool {
-    notify(
-        "chat.scrolled",
-        &Scrolled {
-            absolute_x,
-            absolute_y,
-            relative_x,
-            relative_y,
-        },
-    )
-}
-
 pub fn send_open_link(url: &str) -> bool {
     notify("chat.open_link", &Url { url: url.into() })
 }
@@ -1999,28 +2274,14 @@ pub fn send_copy(text: &str, label: &str) -> bool {
     )
 }
 
-pub fn send_copy_link(link: &str) -> bool {
-    notify("chat.copy_link", &Link { link: link.into() })
-}
-
-pub fn send_cancel_run(run_id: &str) -> bool {
-    notify(
-        "chat.cancel_run",
-        &RunId {
-            run_id: run_id.into(),
-        },
-    )
-}
-
-/// Take the reader to a run's panel: the live hint's "View run", or the run
-/// chip on a message a run posted.
-pub fn send_open_run(dispatch_id: &str) -> bool {
-    notify(
-        "chat.open_run",
-        &DispatchId {
-            dispatch_id: dispatch_id.into(),
-        },
-    )
+/// The runs module decides whether the seated signer may cancel this run.
+pub async fn cancel_run(run_id: String) -> ActItem {
+    let request = serde_json::json!({"target":"runs", "payload":{"cancel_run":{"run_id":run_id}}});
+    let response =
+        host::request("op.submit", &serde_json::to_vec(&request).expect("encodes")).await;
+    ActItem {
+        error: response.err().unwrap_or_default(),
+    }
 }
 
 // ---------- the readings ----------
@@ -2396,6 +2657,10 @@ fn net_query(chain_id: &str) -> String {
     }
 }
 
+pub fn duck_run_link(dispatch_id: String, chain_id: String) -> String {
+    format!("duck://run/{dispatch_id}{}", net_query(&chain_id))
+}
+
 pub fn duck_channel_link(channel: String, chain_id: String) -> String {
     format!("duck://channel/{channel}{}", net_query(&chain_id))
 }
@@ -2511,11 +2776,29 @@ mod tests {
             is_you,
             node: node.into(),
         };
-        let peers = vec!["bb".to_owned()];
+        let peers = vec![
+            CallPeer {
+                peer: "bb".into(),
+                speaking: true,
+                muted: false,
+            },
+            CallPeer {
+                peer: "cc".into(),
+                speaking: true,
+                muted: true,
+            },
+            CallPeer {
+                peer: "dd".into(),
+                speaking: false,
+                muted: false,
+            },
+        ];
         assert!(seat_speaking(&seat(true, "aa"), true, &peers));
         assert!(!seat_speaking(&seat(true, "bb"), false, &peers));
         assert!(seat_speaking(&seat(false, "bb"), false, &peers));
         assert!(!seat_speaking(&seat(false, "aa"), true, &peers));
+        assert!(!seat_speaking(&seat(false, "cc"), true, &peers));
+        assert!(!seat_speaking(&seat(false, "dd"), true, &peers));
     }
 
     #[test]
@@ -2613,4 +2896,206 @@ mod tests {
             serde_json::json!({ "key": vec![0xab_u8; 32] })
         );
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BackgroundRequest {
+    ShellDelta {
+        payload: serde_json::Value,
+        assigned: Option<serde_json::Value>,
+        key: String,
+        names: serde_json::Value,
+    },
+    RunProgress {
+        runs: Vec<String>,
+    },
+    LiveRuns {
+        labels: std::collections::BTreeMap<String, String>,
+    },
+    Workspace {
+        requested: Option<String>,
+        key: String,
+    },
+    Window {
+        channel: String,
+        key: String,
+    },
+    Channel {
+        channel: String,
+        key: String,
+        names: serde_json::Value,
+    },
+    Notice {
+        request: crate::notice::Request,
+    },
+    Search {
+        channel: String,
+        text: String,
+    },
+    Join {
+        channel: String,
+    },
+    Move {
+        from: String,
+        channel: String,
+    },
+    Leave {
+        channel: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct BackgroundError {
+    message: String,
+    committed: bool,
+}
+impl From<String> for BackgroundError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            committed: false,
+        }
+    }
+}
+
+fn participation_channel(channel: &str) -> Result<&str, String> {
+    let channel = channel.trim();
+    let valid = !channel.is_empty() && channel.len() <= 256;
+    if !valid {
+        return Err("a channel is required".into());
+    }
+    Ok(channel)
+}
+
+async fn participation_submit(operation: serde_json::Value) -> Result<(), String> {
+    ask(
+        "op.submit",
+        &serde_json::json!({"target":"chat", "payload":operation}),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn participation_join(channel: String) -> Result<String, BackgroundError> {
+    let channel = participation_channel(&channel)?;
+    let proof = ask(
+        "rpc.admin",
+        &serde_json::json!({"route":"/v1/huddle/node-proof", "payload":{"channel_id":channel}}),
+    )
+    .await?;
+    let node = proof["node"].as_str().unwrap_or_default();
+    let signature = proof["node_proof"].as_str().unwrap_or_default();
+    let canonical = |text: &str, len| {
+        text.len() == len
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if !canonical(node, 64) || !canonical(signature, 128) {
+        return Err("invalid node participation proof".to_owned().into());
+    }
+    participation_submit(serde_json::json!({"join_huddle":{"channel_id":channel,"node":hex_bytes(node),"node_proof":hex_bytes(signature)}})).await?;
+    Ok(channel.to_owned())
+}
+
+async fn participation_leave(channel: String) -> Result<String, BackgroundError> {
+    let channel = participation_channel(&channel)?;
+    participation_submit(serde_json::json!({"leave_huddle":{"channel_id":channel}})).await?;
+    Ok(channel.to_owned())
+}
+
+async fn participation_move(from: String, channel: String) -> Result<String, BackgroundError> {
+    let channel = participation_channel(&channel)?.to_owned();
+    if from == channel {
+        return Ok(channel);
+    }
+    if from.is_empty() {
+        return participation_join(channel).await;
+    }
+    participation_leave(from).await?;
+    participation_join(channel)
+        .await
+        .map_err(|error| BackgroundError {
+            committed: true,
+            ..error
+        })
+}
+
+async fn background_search(
+    channel: String,
+    text: String,
+) -> Result<serde_json::Value, BackgroundError> {
+    let text = text.trim();
+    let invalid = text.is_empty() || text.contains('\0');
+    if invalid {
+        return Err("search must be nonempty and contain no NUL"
+            .to_owned()
+            .into());
+    }
+    let names = read_names(0).await;
+    let channel = (!channel.is_empty()).then_some(channel.as_str());
+    let reply = view("hits", search_query(text, channel)).await?;
+    let mut hits = fold_hits(&reply, &names);
+    for hit in &mut hits {
+        hit.meta = format!("{} · #{}", hit.channel_id, hit.seq);
+        hit.text = chat_message::draft_mentions(&hit.text, |party| {
+            mention_label(&serde_json::to_value(party).expect("party encodes"), &names)
+        })
+        .0;
+    }
+    Ok(serde_json::json!({"hits":hits}))
+}
+
+async fn participate(intent: BackgroundRequest) -> Result<serde_json::Value, BackgroundError> {
+    match intent {
+        BackgroundRequest::ShellDelta {
+            payload,
+            assigned,
+            key,
+            names,
+        } => crate::hydration::delta(payload, assigned, key, names)
+            .await
+            .map_err(Into::into),
+        BackgroundRequest::RunProgress { runs } => Ok(crate::live::progress(runs).await),
+        BackgroundRequest::LiveRuns { labels } => {
+            crate::live::discover(labels).await.map_err(Into::into)
+        }
+        BackgroundRequest::Workspace { requested, key } => {
+            crate::hydration::workspace(requested, key)
+                .await
+                .map_err(Into::into)
+        }
+        BackgroundRequest::Window { channel, key } => crate::hydration::window(channel, key)
+            .await
+            .map_err(Into::into),
+        BackgroundRequest::Channel {
+            channel,
+            key,
+            names,
+        } => crate::hydration::channel(channel, key, names)
+            .await
+            .map_err(Into::into),
+        BackgroundRequest::Notice { request } => {
+            Ok(serde_json::json!({"notice":crate::notice::notice(request).await}))
+        }
+        BackgroundRequest::Search { channel, text } => background_search(channel, text).await,
+        BackgroundRequest::Join { channel } => participation_join(channel)
+            .await
+            .map(|channel| serde_json::json!({"channel":channel})),
+        BackgroundRequest::Move { from, channel } => participation_move(from, channel)
+            .await
+            .map(|channel| serde_json::json!({"channel":channel})),
+        BackgroundRequest::Leave { channel } => participation_leave(channel)
+            .await
+            .map(|channel| serde_json::json!({"channel":channel})),
+    }
+}
+
+pub async fn run_background(intent: BackgroundRequest) {
+    let output = match participate(intent).await {
+        Ok(output) => output,
+        Err(error) => serde_json::json!({"error":error}),
+    };
+    host::finish_response(&serde_json::to_vec(&output).expect("background result encodes"));
 }

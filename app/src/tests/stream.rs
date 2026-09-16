@@ -1,65 +1,5 @@
 use super::*;
 
-/// A MIRRORED VIEW READING IS ONLY AS GOOD AS ITS WRITERS, SO THE WRITERS ARE
-/// PINNED. These fields exist purely so the view stops paying for them —
-/// sidebar rows, page-comment anchors, huddle tile mute readings,
-/// `post_refusal`, and `active_dm` — because a
-/// `sync` extern takes every list BY VALUE and a call in a view expression is
-/// therefore a deep clone per frame (the room projection also ran a SHA-256 per DM
-/// peer, twice a frame). The trade is real: a mirror that a writer forgets is a
-/// sidebar listing DMs under CHANNELS, an unread dot that never lights, a
-/// composer refused in a room she may post in, or a stranger's face over the
-/// header — none of which any type checker can see.
-///
-/// So the rule is mechanical and checked here: a handler that assigns any of a
-/// mirror's SOURCES assigns the mirror too. That is what makes mirroring
-/// cheaper than the per-frame call instead of six chances to drift, and it is
-/// the same shape as the caret-retire and room-mover lints above.
-#[test]
-fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
-    // (mirror, the sources whose movement invalidates it). THE DM DIRECTORY
-    // decides which channels are DMs — `load_dm_peers` stamps each row's
-    // `channel_id` from the account number it resolved itself, and `account_number`
-    // is Settings' reading alone; THIS DEVICE'S KEY decides whether it is seated
-    // in a members-only room.
-    const MIRRORS: [(&str, &[&str]); 5] = [
-        ("rooms", &["channels", "dm_peers", "channel_reads"]),
-        ("dm_rows", &["channels", "dm_peers", "channel_reads"]),
-        (
-            "huddle_rows",
-            &["huddle_roster", "call_peers", "call_muted"],
-        ),
-        (
-            "post_refusal",
-            &[
-                "channel_members",
-                "active_channel_archived",
-                "active_channel_members_only",
-                "settings_user_key",
-            ],
-        ),
-        ("active_dm", &["active_dm_peer", "dm_peers"]),
-    ];
-
-    let mut checked = 0;
-    for (handler, body) in handler_bodies() {
-        for (mirror, sources) in MIRRORS {
-            let moved = sources
-                .iter()
-                .any(|field| body.contains(&format!("self.{field}=")));
-            if !moved {
-                continue;
-            }
-            checked += 1;
-            assert!(
-                body.contains(&format!("self.{mirror}=")),
-                "{handler} moves a source without refreshing {mirror}"
-            );
-        }
-    }
-    assert!(checked >= 20, "the sweep must see actual assignments");
-}
-
 #[test]
 fn history_windows_offer_a_jump_back_to_latest() {
     let (mut app, _) = Ducktape::boot();
@@ -68,59 +8,12 @@ fn history_windows_offer_a_jump_back_to_latest() {
 
     // landing on a search hit enters history mode…
     let _ = app.update(AppMessage::OpenChatSearchHit("general".into(), 7));
-    assert!(app.history_view);
     assert_eq!(app.chat_land_seq, 7);
 
     // …and the Jump-to-latest press — which the view emits as `choose_channel`
     // on the room it is already in — leaves it
     let _ = app.update(AppMessage::ChooseChannel("general".into()));
-    assert!(!app.history_view);
     assert_eq!(app.chat_land_seq, 0, "and the view opens back on the tail");
-}
-
-/// THE BANNER DESCRIBES THE ROWS IN HAND, SO EVERY WRITER OF THEM ANSWERS IT.
-///
-/// `history_view` was raised by the search hit and lowered by a channel load,
-/// and by nothing else — so a resync (a `files` write in another window, a
-/// teammate joining a huddle, any plane op at all) replaced the window with
-/// `load_chat_data`'s LATEST page and left the amber "Viewing history" banner
-/// up over the live tail, with a "Jump to latest" that reloads the channel the
-/// reader is already at the end of. Same after a create.
-#[test]
-fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
-    let (mut app, _) = Ducktape::boot();
-    app.loading = false;
-    app.active_channel = "general".into();
-    let _ = app.update(AppMessage::OpenChatSearchHit("general".into(), 7));
-    assert!(app.history_view);
-
-    // a resync carrying no chat news leaves the window — and its banner — alone
-    let _ = app.update(AppMessage::LiveResynced(backend::LiveRefresh {
-        chat_loaded: false,
-        ..live_refresh(app.hydration_generation, "general")
-    }));
-    assert!(
-        app.history_view,
-        "a plane-only resync did not touch the timeline, so the window stands"
-    );
-
-    // one that carries chat replaced it with the latest page
-    let _ = app.update(AppMessage::LiveResynced(live_refresh(
-        app.hydration_generation,
-        "general",
-    )));
-    assert!(
-        !app.history_view,
-        "the rows on screen are the tail now — the banner is a lie about them"
-    );
-
-    // and a create lands you in a brand-new room, which has no history at all
-    let _ = app.update(AppMessage::OpenChatSearchHit("general".into(), 7));
-    assert!(app.history_view);
-    let mut created = chat_data("brand-new");
-    created.generation = app.chat_generation;
-    let _ = app.update(AppMessage::ChannelCreated(created));
-    assert!(!app.history_view);
 }
 
 /// A PLANE'S OP REFETCHES THAT PLANE AND NO OTHER.
@@ -256,7 +149,11 @@ fn a_resync_across_a_chain_drops_the_previous_networks_rooms() {
         "the room created mid-resync is still in the sidebar"
     );
     assert_eq!(
-        backend::channel_head_seq(app.channels.clone(), "dm-1".into()),
+        app.channels
+            .iter()
+            .find(|row| row.id == "dm-1")
+            .unwrap()
+            .head_seq,
         9,
         "and the head the delta moved does not walk back to the snapshot"
     );

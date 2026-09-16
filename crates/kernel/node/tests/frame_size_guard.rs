@@ -138,3 +138,32 @@ fn oversized_submit_rejects_cleanly_and_node_stays_live() {
         assert_eq!(v.as_deref(), Some("yes"), "the node keeps finalizing");
     });
 }
+
+#[test]
+fn required_blob_budgets_exactly_one_digest_beyond_the_ordinary_frame() {
+    let message = |len| Msg {
+        target: "t".repeat(MAX_TARGET_BYTES),
+        payload: vec![0; len],
+    };
+    let signer = sk(5);
+    assert_eq!(
+        encode_frame(&signer, 0, &message(MAX_PAYLOAD_BYTES)).len(),
+        MAX_FRAME_BYTES
+    );
+    let frame =
+        node::encode_frame_with_blob(&signer, 0, &message(MAX_PAYLOAD_BYTES - 32), Some([9; 32]));
+    assert_eq!(frame.len(), MAX_FRAME_BYTES);
+    assert_eq!(
+        node::decode_frame_with_blob(&frame).unwrap().2,
+        Some([9; 32])
+    );
+    assert_eq!(
+        node::encode_frame_with_blob(&signer, 0, &message(MAX_PAYLOAD_BYTES - 31), Some([9; 32]))
+            .len(),
+        MAX_FRAME_BYTES + 1
+    );
+    assert_eq!(
+        node::encode_frame_with_blob(&signer, 0, &message(0), None),
+        encode_frame(&signer, 0, &message(0))
+    );
+}

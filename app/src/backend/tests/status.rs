@@ -205,34 +205,6 @@ fn a_defaulted_node_facts_prints_as_unserved_everywhere() {
     // duplication wearing the costume of defence in depth.
 }
 
-/// A dropped file's target is composed under the directory the view stands
-/// in, and the duckfs root is `/`, never "": the module's path check is
-/// `starts_with('/')`, so a "" root answered every root write with a 400.
-#[test]
-fn a_dropped_file_lands_under_its_directory() {
-    assert_eq!(fs_child("/".into(), "notes".into()), "/notes");
-    assert_eq!(fs_child("/shared".into(), "notes".into()), "/shared/notes");
-}
-
-/// THE WRITE GATE IS THE FILES MODULE'S OWN RULE, asked before the round
-/// trip: the roots refuse, and every home and `/shared` answer with nothing.
-/// A device without a key has nothing to check; its refusal comes from the
-/// signer.
-#[test]
-fn the_files_write_gate_answers_in_the_modules_words() {
-    let me = "ab".repeat(32);
-    let other = "cd".repeat(32);
-    let gate = |dir: &str| files_write_gate(dir.into(), me.clone());
-    assert_eq!(gate("/"), "path is outside /home and /shared");
-    assert_eq!(gate("/home"), "home root is not writable");
-    assert_eq!(gate("/shared"), "");
-    assert_eq!(gate("/shared/reports"), "");
-    assert_eq!(gate(&format!("/home/ext:{me}")), "");
-    assert_eq!(gate(&format!("/home/ext:{me}/notes")), "");
-    assert_eq!(gate(&format!("/home/ext:{other}")), "");
-    assert_eq!(files_write_gate("/".into(), String::new()), "");
-}
-
 /// THE APP↔NODE CONTRACT IS AN EQUALITY, AND THE READING NAMES WHICH SIDE IS
 /// STALE. Three arms, no window: one behind is as refused as ten behind, and
 /// a node ahead of this app is refused too — that is the app's own staleness,

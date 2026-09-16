@@ -230,8 +230,8 @@ impl FilesView {
         let markdown = crate::host::markdown_path(&preview.path);
         let (name, args, on_event) = match markdown {
             true => (
-                "agent_markdown",
-                vec![Str(preview.display_text.clone()), Bool(self.dark)],
+                "markdown",
+                vec![Str(preview.display_text.clone()), Str(String::new()), Bool(self.dark)],
                 Some(slots::handler::<wire::SurfaceValue, Message>(Box::new(
                     |value| match value {
                         Str(link) => Some(Message::OpenLinkAt(link)),
@@ -240,7 +240,7 @@ impl FilesView {
                 ))),
             ),
             false => (
-                "forge_code",
+                "code",
                 vec![
                     Str(preview.display_text.clone()),
                     Str(preview.path.clone()),

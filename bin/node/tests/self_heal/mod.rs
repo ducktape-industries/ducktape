@@ -289,16 +289,7 @@ fn a_blind_agent_repairs_and_deploys_from_symptoms() {
     });
     inc(&cluster, wrong_step);
 
-    let url = format!(
-        "http://127.0.0.1:{}/forge/{LIVE_REPO}",
-        cluster.http_ports[0]
-    );
-    git_ok(&seed, &["remote", "add", "origin", &url]);
-    run({
-        let mut command = git(&seed, &["push", "origin", "HEAD:dev"]);
-        command.envs(cluster.git_push_env(0));
-        command
-    });
+    cluster.seed_forge(0, &seed, LIVE_REPO, "dev");
     let account = common::provision_model_program(&cluster, 0, LIVE_MODEL);
     cluster.submit(
         0,
@@ -410,10 +401,7 @@ fn a_blind_agent_repairs_and_deploys_from_symptoms() {
     assert_eq!(record.outcome, runs::RunOutcome::ResultAccepted);
     assert!(!record.degraded);
     let delivered = fixtures.join("delivered");
-    git_ok(
-        &fixtures,
-        &["clone", "--quiet", &url, delivered.to_str().unwrap()],
-    );
+    cluster.clone_forge(0, LIVE_REPO, &delivered);
     git_ok(
         &delivered,
         &["checkout", "--detach", &deployment.request.source.commit],

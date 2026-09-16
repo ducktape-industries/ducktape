@@ -104,6 +104,12 @@ pub struct UserPop {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyRequestHead {
+    /// The authenticated calling node attests that its operator authorized this
+    /// exchange. This is not authority on the publisher: services still apply
+    /// their existing local/peer admission. Public ingress never trusts this
+    /// client-supplied field; only the operator-authenticated node door sets it.
+    #[serde(default)]
+    pub operator: bool,
     pub account_id: u64,
     pub name: RouteName,
     pub revision: u64,
@@ -202,6 +208,18 @@ pub fn validate_origin_form(value: &str) -> Result<(), String> {
         || !value.bytes().all(|byte| (b'!'..=b'~').contains(&byte))
     {
         return Err("gateway proxy: invalid origin-form path/query".into());
+    }
+    // URL clients remove these segments before sending. Refuse them so the
+    // path verified by the publisher is the path the upstream receives.
+    let path = value.split('?').next().unwrap_or(value);
+    let normalized_by_clients = path.split('/').any(|segment| {
+        matches!(
+            segment.to_ascii_lowercase().as_str(),
+            "." | ".." | "%2e" | ".%2e" | "%2e." | "%2e%2e"
+        )
+    });
+    if normalized_by_clients {
+        return Err("gateway proxy: path contains a URL-normalized segment".into());
     }
     Ok(())
 }
@@ -337,6 +355,23 @@ mod tests {
     /// The name is remote input; the refusal describes it and never carries
     /// its bytes, so the detail downstream stays ASCII and bounded.
     #[test]
+    fn signed_paths_are_not_normalized_by_url_clients() {
+        for path in [
+            "/a/../b",
+            "/a/./b",
+            "/%2e/b",
+            "/.%2E/b",
+            "/%2e./b",
+            "/%2e%2E/b",
+        ] {
+            assert!(validate_origin_form(path).is_err(), "accepted {path}");
+        }
+        for path in ["/a/b?next=../c", "/v1.0/item", "/a%20b", "/.../item"] {
+            assert!(validate_origin_form(path).is_ok(), "refused {path}");
+        }
+    }
+
+    #[test]
     fn a_malformed_header_name_is_described_not_echoed() {
         let headers = vec![ProxyHeader {
             name: "€".repeat(200),
@@ -379,6 +414,7 @@ mod tests {
     #[test]
     fn invocation_is_record_method_revision_and_header_scoped() {
         let head = ProxyRequestHead {
+            operator: false,
             account_id: 1,
             name: RouteName::named("api"),
             revision: 7,
@@ -417,6 +453,7 @@ mod tests {
     #[test]
     fn request_head_requires_the_upgrade_verdict() {
         let mut value = serde_json::to_value(ProxyRequestHead {
+            operator: false,
             account_id: 1,
             name: RouteName::named("api"),
             revision: 7,
@@ -435,6 +472,7 @@ mod tests {
     #[test]
     fn a_head_without_a_user_pop_decodes_as_an_account_less_caller() {
         let mut value = serde_json::to_value(ProxyRequestHead {
+            operator: false,
             account_id: 1,
             name: RouteName::named("api"),
             revision: 7,
@@ -553,6 +591,7 @@ mod tests {
     #[test]
     fn caller_cannot_forge_a_huge_body_len_or_the_zero_account() {
         let head = ProxyRequestHead {
+            operator: false,
             account_id: 1,
             name: RouteName::apex(),
             revision: 1,

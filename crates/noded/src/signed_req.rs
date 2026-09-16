@@ -177,17 +177,6 @@ pub(crate) fn from_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// the mark [`signed_write_guard`] puts on a request that arrived from a
-/// loopback peer holding this node's operator credential.
-///
-/// It exists for the ONE mutating route this middleware cannot decide for
-/// itself: the forge's `git-receive-pack`, whose other proof (git's own push
-/// certificate) is inside the packfile body. The gate establishes the fact
-/// once, here, and the handler reads it rather than re-deriving the loopback
-/// and constant-time-compare rules a second time.
-#[derive(Clone, Copy, Debug)]
-pub struct OperatorCredential;
-
 /// the verified acting identity, put on the request by [`signed_write_guard`]
 /// and read by any gated handler that submits on the caller's behalf. its
 /// presence IS the proof the gate ran: a handler that finds none was reached
@@ -201,35 +190,29 @@ pub struct SignedBy(pub Vec<u8>);
 /// websocket upgrades, and `/v1/admin/*` (which carries its own gate).
 ///
 /// Two of those websocket upgrades are NOT actually unauthenticated:
-/// `/v1/call/ws` and `/v1/presence/ws` (`crate::call`) stay `Open` here — this
+/// `/v1/presence/ws` (`crate::call`) stays `Open` here — this
 /// gate is PoP-by-signature, and a live huddle/page has no acting key to sign
 /// with — but each checks its own `?token=` query param against this node's
 /// workspace secret before `on_upgrade`, the same [`Admission::Workspace`]
 /// proof `/v1/ws`'s gated topics already ask for (see
 /// `crate::stream::Admission`).
 ///
-/// the ONE route family that mutates and is NOT here is the forge's
-/// `git-receive-pack`: `git push` cannot attach a header of its own, so its
-/// proof is git's OWN push certificate (`git push --signed`), refused inside
-/// `git_http::parse_push_commands` rather than by this middleware.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Lane {
     /// `/v1/fs/workspaces…` — create, commit, delete a managed checkout.
     Workspace,
-    /// `/v1/files/object/{*path}` — the S3-shaped facade. PUT is a
-    /// single-change commit and DELETE a single-change rm; its GET is a read.
-    /// SEPARATE from [`Lane::Files`] because it is the only lane whose write
-    /// verb is PUT, and a `POST`-only arm left it open.
-    Object,
-    /// `/v1/files/…` — blob, stage, commit, pin, unpin, watch. every duckfs
-    /// read on this prefix is a GET, so POST alone names the writes.
-    Files,
+    /// The node-local content-addressed blob store's upload endpoint.
+    Blob,
     /// `/v1/term/sessions…` — create and close a node-hosted pty.
     Term,
     /// `/v1/submit` — the frameless op lane ([`SUBMIT_PATH`]).
     Submit,
+    /// Operator-authorized opaque module payload; authored as the node.
+    RawSubmit,
     /// a fixed path that mutates the NODE ([`NODE_LEVEL_POSTS`]).
     NodeLevel,
+    /// Operator-authenticated application HTTP and WebSocket requests.
+    GatewayOperator,
     /// `/v1/huddle/node-proof` ([`HUDDLE_PROOF_PATH`]) — this node signs that it
     /// will route the SIGNER's huddle media. the handler reads [`SignedBy`]
     /// and binds exactly that key, so possession is the right bar here:
@@ -275,20 +258,25 @@ pub(crate) const HUDDLE_PROOF_PATH: &str = "/v1/huddle/node-proof";
 const SUBMIT_PATH: &str = "/v1/submit";
 
 const WORKSPACE_PREFIX: &str = "/v1/fs/workspaces";
-const OBJECT_PREFIX: &str = "/v1/files/object/";
-const FILES_PREFIX: &str = "/v1/files/";
+const BLOB_PATH: &str = "/v1/files/blob";
 const TERM_PREFIX: &str = "/v1/term/sessions";
 
-/// path prefix → lane, in match order. the object facade sits UNDER the files
-/// prefix, so it has to be tried first; everything else here is disjoint.
+/// Disjoint operating-system service path prefixes.
 const LANE_PREFIXES: &[(&str, Lane)] = &[
     (WORKSPACE_PREFIX, Lane::Workspace),
-    (OBJECT_PREFIX, Lane::Object),
-    (FILES_PREFIX, Lane::Files),
     (TERM_PREFIX, Lane::Term),
 ];
 
 fn lane_of(path: &str) -> Lane {
+    if path == "/v1/gateway/operator" {
+        return Lane::GatewayOperator;
+    }
+    if path.starts_with("/v1/submit/raw/") {
+        return Lane::RawSubmit;
+    }
+    if path == BLOB_PATH {
+        return Lane::Blob;
+    }
     if path == "/v1/run-control" {
         return Lane::RunControl;
     }
@@ -317,7 +305,6 @@ impl Lane {
     fn authority(self, method: &Method) -> Option<Authority> {
         let posts = *method == Method::POST;
         let removes = *method == Method::DELETE;
-        let replaces = *method == Method::PUT;
         match self {
             // POST creates and commits a managed checkout AS the acting key
             // (`workspaces::acting_origin` → the duckfs authority check).
@@ -326,8 +313,7 @@ impl Lane {
             Lane::Workspace => posts
                 .then_some(Authority::Acting)
                 .or(removes.then_some(Authority::Operator)),
-            Lane::Object => (replaces || removes).then_some(Authority::Acting),
-            Lane::Files => posts.then_some(Authority::Acting),
+            Lane::Blob => posts.then_some(Authority::Acting),
             // `/v1/submit` is the FRAMELESS lane: unlike Files/Workspace, the
             // verified `SignedBy` key does NOT ride on as the op's origin — the
             // validator re-signs the framed op with ITS OWN consensus key
@@ -338,32 +324,31 @@ impl Lane {
             // the VALIDATOR's own key (#1808) — so this lane is Operator-only,
             // and a user submits through the self-authenticating
             // `/v1/submit/frame` instead, whose signature IS the op's origin.
-            Lane::Submit => posts.then_some(Authority::Operator),
+            Lane::Submit | Lane::RawSubmit => posts.then_some(Authority::Operator),
             // a pty/microVM on the HOST, and the two fixed node mutations.
             Lane::Term | Lane::NodeLevel => posts.then_some(Authority::Operator),
             // the proof binds the SIGNER; the handler refuses a key that holds
             // no account, so possession is the gate's whole job here.
             Lane::HuddleProof | Lane::RunControl => posts.then_some(Authority::Acting),
+            Lane::GatewayOperator => {
+                let exchange = posts || *method == Method::GET;
+                exchange.then_some(Authority::Operator)
+            }
             Lane::Open => None,
         }
     }
 
     /// the largest body this gate will read in order to hash it.
     ///
-    /// PER LANE, and it has to be: the cap is reached by an UNAUTHENTICATED
-    /// caller — the buffering happens before the signature is checked, which is
-    /// the only order a body digest can be verified in. One shared 64 MiB
-    /// ceiling would therefore let anyone who can dial the port make the node
-    /// hold 64 MiB for a `/v1/files/stage` whose own route rejects anything
-    /// over a 1 MiB chunk. Each lane names the ceiling its route already
-    /// enforces, so hashing adds no new peak on any of them.
+    /// Buffering precedes signature verification, so each lane spends only
+    /// the body budget of its underlying endpoint.
     fn max_body(self) -> usize {
         match self {
-            // the S3 facade's PUT — one whole object.
-            Lane::Object => crate::MAX_OBJECT_BYTES,
-            // the widest write on the `/v1/files/` prefix is the blob receipt;
-            // a staged chunk (1 MiB) and the json commits sit under it.
-            Lane::Files => crate::MAX_BLOB_BODY_BYTES,
+            Lane::Blob => crate::MAX_BLOB_BODY_BYTES,
+            Lane::RawSubmit => node::MAX_PAYLOAD_BYTES,
+            Lane::GatewayOperator => {
+                crate::gateway_http::JSON_LANE_REQUEST_BYTES * 2 + gateway::MAX_PROXY_HEAD_BYTES
+            }
             // json bodies and the log-filter string. `Open` never reaches here
             // (the guard returns before asking), and takes the small cap so a
             // table that ever disagreed fails closed rather than wide.
@@ -524,27 +509,19 @@ pub(crate) fn operator_key_matches(cfg: &crate::AdminConfig, acting: &[u8]) -> b
 /// an open (read) route is passed straight through, body untouched.
 pub(crate) async fn signed_write_guard(
     State(handle): State<NodeHandle>,
-    mut req: axum::extract::Request,
+    req: axum::extract::Request,
     next: Next,
 ) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    // the node's own daemons, acting AS the node. established for EVERY
-    // request, gated or not, because the forge's git lane needs the same fact
-    // and cannot re-derive it (see [`OperatorCredential`]). no `SignedBy` is
-    // inserted, so the acting origin stays the node's own name — which is what
-    // a daemon's write is.
     let on_box = crate::admin::peer_is_loopback(&req);
     let is_operator = operator_credential_matches(&handle.admin, req.headers(), on_box);
-    if is_operator {
-        req.extensions_mut().insert(OperatorCredential);
-    }
     let lane = lane_of(&path);
     let Some(authority) = lane.authority(&method) else {
         return next.run(req).await;
     };
     // admitted without touching the body: nothing is signed over it on this
-    // path, so a whole packfile or a 4 MiB blob still streams to its handler
+    // path, so a bounded blob still streams to its handler
     // instead of buffering in middleware.
     if is_operator {
         return next.run(req).await;
@@ -706,26 +683,26 @@ mod tests {
     #[test]
     fn the_message_binds_method_path_node_time_and_body() {
         // every field moves the signed bytes; none can bleed into another.
-        let base = request_message("POST", "/v1/files/commit", &NODE, 100, b"body");
+        let base = request_message("POST", "/v1/submit", &NODE, 100, b"body");
         assert_ne!(
             base,
-            request_message("PUT", "/v1/files/commit", &NODE, 100, b"body")
+            request_message("PUT", "/v1/submit", &NODE, 100, b"body")
         );
         assert_ne!(
             base,
-            request_message("POST", "/v1/files/pin", &NODE, 100, b"body")
+            request_message("POST", "/v1/query", &NODE, 100, b"body")
         );
         assert_ne!(
             base,
-            request_message("POST", "/v1/files/commit", &[0xcd; 32], 100, b"body")
+            request_message("POST", "/v1/submit", &[0xcd; 32], 100, b"body")
         );
         assert_ne!(
             base,
-            request_message("POST", "/v1/files/commit", &NODE, 101, b"body")
+            request_message("POST", "/v1/submit", &NODE, 101, b"body")
         );
         assert_ne!(
             base,
-            request_message("POST", "/v1/files/commit", &NODE, 100, b"other")
+            request_message("POST", "/v1/submit", &NODE, 100, b"other")
         );
     }
 
@@ -733,22 +710,22 @@ mod tests {
     fn a_signed_request_verifies_and_a_forged_one_does_not() {
         let caller = key(1);
         let now = 1_000_000;
-        let sig = sign_request(&caller, "POST", "/v1/files/stage", &NODE, now, b"chunk");
+        let sig = sign_request(&caller, "POST", "/v1/files/blob", &NODE, now, b"chunk");
         let headers = headers_for(&caller, &sig, now);
         assert_eq!(
-            verify(&headers, "POST", "/v1/files/stage", &NODE, b"chunk", now),
+            verify(&headers, "POST", "/v1/files/blob", &NODE, b"chunk", now),
             Ok(caller.public_key().as_ref().to_vec())
         );
         // the attacker signs, but claims the caller's key.
         let attacker = key(2);
-        let forged = sign_request(&attacker, "POST", "/v1/files/stage", &NODE, now, b"chunk");
+        let forged = sign_request(&attacker, "POST", "/v1/files/blob", &NODE, now, b"chunk");
         let mut bad = headers_for(&caller, &sig, now);
         bad.insert(
             SIG_HEADER,
             duckfs_core::to_hex(forged.as_ref()).parse().unwrap(),
         );
         assert_eq!(
-            verify(&bad, "POST", "/v1/files/stage", &NODE, b"chunk", now),
+            verify(&bad, "POST", "/v1/files/blob", &NODE, b"chunk", now),
             Err(PopError::BadSig)
         );
     }
@@ -762,7 +739,7 @@ mod tests {
         let sig = sign_request(
             &caller,
             "POST",
-            "/v1/files/stage",
+            "/v1/files/blob",
             &NODE,
             now,
             b"the real chunk",
@@ -772,7 +749,7 @@ mod tests {
             verify(
                 &headers,
                 "POST",
-                "/v1/files/stage",
+                "/v1/files/blob",
                 &NODE,
                 b"a swapped chunk",
                 now
@@ -783,7 +760,7 @@ mod tests {
             verify(
                 &headers,
                 "POST",
-                "/v1/files/stage",
+                "/v1/files/blob",
                 &NODE,
                 b"the real chunk",
                 now
@@ -836,8 +813,7 @@ mod tests {
     /// the whole table, in one place: every mutating `/v1` route WITH the
     /// authority it demands, and the reads that must not be dragged in with
     /// them. the pairs that matter most are the ones that share a path with
-    /// their own read — `/v1/files/blob` (POST writes, GET fetches), the object
-    /// facade (PUT/DELETE write, GET reads) and `/v1/submit` vs
+    /// their own read — `/v1/files/blob` (POST writes, GET fetches) and `/v1/submit` vs
     /// `/v1/submit/frame` — and the DELETE that shares its prefix with two
     /// module-bound POSTs on the workspace lane.
     #[test]
@@ -852,25 +828,12 @@ mod tests {
                 Authority::Acting,
             ),
             (Method::POST, "/v1/files/blob", Authority::Acting),
-            (Method::POST, "/v1/files/stage", Authority::Acting),
-            (Method::POST, "/v1/files/commit", Authority::Acting),
-            (Method::POST, "/v1/files/pin", Authority::Acting),
-            (Method::POST, "/v1/files/unpin", Authority::Acting),
-            (Method::POST, "/v1/files/watch", Authority::Acting),
-            (
-                Method::PUT,
-                "/v1/files/object/shared/a.txt",
-                Authority::Acting,
-            ),
-            (
-                Method::DELETE,
-                "/v1/files/object/shared/a.txt",
-                Authority::Acting,
-            ),
             // node-level: the handler reads no identity, so possession of a
             // self-chosen key must not be enough.
             (Method::POST, "/v1/log-filter", Authority::Operator),
             (Method::POST, "/v1/invite", Authority::Operator),
+            (Method::POST, "/v1/gateway/operator", Authority::Operator),
+            (Method::GET, "/v1/gateway/operator", Authority::Operator),
             // the huddle proof binds the SIGNER, and a remote device has no
             // operator credential to offer: possession, then the handler's
             // own account check.
@@ -878,6 +841,7 @@ mod tests {
             // the frameless op lane: the framed op is re-signed as the NODE,
             // never the caller (#1808), so it takes the same operator-only bar.
             (Method::POST, "/v1/submit", Authority::Operator),
+            (Method::POST, "/v1/submit/raw/new-product", Authority::Operator),
             (Method::DELETE, "/v1/fs/workspaces/abc", Authority::Operator),
             (Method::POST, "/v1/term/sessions", Authority::Operator),
             (
@@ -896,8 +860,6 @@ mod tests {
         let open: &[(Method, &str)] = &[
             (Method::GET, "/v1/status"),
             (Method::GET, "/v1/files/blob/aa"),
-            (Method::GET, "/v1/files/ls"),
-            (Method::GET, "/v1/files/object/shared/a.txt"),
             (Method::POST, "/v1/query"),
             (Method::POST, "/v1/index/chat/view"),
             (Method::POST, "/v1/gateway/proxy"),
@@ -905,9 +867,6 @@ mod tests {
             (Method::POST, "/v1/submit/frame"),
             (Method::POST, "/v1/services/hello"),
             (Method::GET, "/v1/ws"),
-            // git cannot attach a header, so the forge's proof is git's own
-            // push certificate — refused in `git_http`, not here.
-            (Method::POST, "/forge/lab/git-receive-pack"),
         ];
         for (method, path) in open {
             assert_eq!(
@@ -946,15 +905,12 @@ mod tests {
     #[test]
     fn no_lane_buffers_more_than_its_own_route_accepts() {
         let cap = |path: &str| lane_of(path).max_body();
-        assert_eq!(
-            cap("/v1/files/object/shared/a.bin"),
-            crate::MAX_OBJECT_BYTES
-        );
-        assert_eq!(cap("/v1/files/stage"), crate::MAX_BLOB_BODY_BYTES);
+        assert_eq!(cap("/v1/files/blob"), crate::MAX_BLOB_BODY_BYTES);
         assert_eq!(cap("/v1/submit"), DEFAULT_JSON_BODY_BYTES);
+        assert_eq!(cap("/v1/submit/raw/new-product"), node::MAX_PAYLOAD_BYTES);
         assert_eq!(cap("/v1/fs/workspaces"), DEFAULT_JSON_BODY_BYTES);
         assert_eq!(cap("/v1/term/sessions"), DEFAULT_JSON_BODY_BYTES);
-        assert!(cap("/v1/files/stage") < cap("/v1/files/object/shared/a.bin"));
+        assert!(cap("/v1/submit") < cap("/v1/files/blob"));
     }
 
     /// the embedded-daemon shape this refusal exists for: no consensus key

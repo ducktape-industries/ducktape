@@ -806,8 +806,8 @@ fn run_sim(
         // wasm, so its code registry is wired and UpdateModule proposals are
         // live in the sim.
         let substrates = Substrates {
-            forge_repo,
-            duckfs_dir,
+            directory: duckfs_dir.with_file_name("module-storage"),
+            bindings: [("forge".into(), forge_repo), ("files".into(), duckfs_dir)].into(),
             blobs: blobs.clone(),
         };
         let bindings = Bindings {
@@ -907,7 +907,7 @@ fn run_sim(
                     None => break,
                 },
                 cmd = cmds.next() => match cmd {
-                    Some(NodeCommand::Submit { target, payload, origin, reply }) => {
+                    Some(NodeCommand::Submit { target, payload, required_blob: _, origin, reply }) => {
                         // the `hex:` origin escape resolves to raw bytes here, so a
                         // client can author as a real ed25519 key; malformed hex is
                         // a hard reject, never a literal-string fall-through.

@@ -64,19 +64,6 @@ pub(crate) fn names() -> NameDirectory {
     read_names().directory.clone()
 }
 
-/// The generation the directory is at: it moves on every read that seats
-/// one, so a holder of [`names_at`]'s snapshot compares generations instead
-/// of directories.
-pub(crate) fn names_generation() -> u64 {
-    read_names().generation
-}
-
-/// The directory and the generation it is at, read together.
-pub(crate) fn names_at() -> (u64, NameDirectory) {
-    let names = read_names();
-    (names.generation, names.directory.clone())
-}
-
 /// Every identity account, paged the way the module serves them: numbered
 /// from 1 with no gaps, at most `MAX_QUERY_LIMIT` per page. THE ONE read of
 /// the identity roster; the name directory is rewritten from what it returns.
@@ -149,21 +136,6 @@ impl Drop for SeededNames {
     fn drop(&mut self) {
         self.seat(NameDirectory::empty());
     }
-}
-
-/// Whether the account or exact key represented by `me` holds a seat.
-pub(crate) fn seated_in(members: &[ChatMember], me: &str) -> bool {
-    let Ok(key) = hex_decode(me) else {
-        return false;
-    };
-    let names = names();
-    members.iter().any(|member| {
-        let handle = match member.key.starts_with("acct:") || member.key.starts_with("user:") {
-            true => member.key.clone(),
-            false => format!("user:{}", member.key),
-        };
-        names.owns_handle(&handle, &key)
-    })
 }
 
 /// Refresh the directory and nothing else — what a chat load does before it

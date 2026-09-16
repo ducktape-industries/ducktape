@@ -10,6 +10,9 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+replacement = []
+
 [dependencies]
 wit-bindgen = "0.57"
 

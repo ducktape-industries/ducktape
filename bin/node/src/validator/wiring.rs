@@ -161,6 +161,10 @@ pub(super) async fn finish(
         );
         crate::gateway_plane::spawn(
             crate::gateway_plane::SpawnConfig {
+                bindings: crate::plane_metrics::ApplicationBindings::register(
+                    context,
+                    gateway_workspace.clone(),
+                ),
                 label: label.clone(),
                 book: std::sync::Arc::clone(&book),
                 me: signer.public_key(),
@@ -603,9 +607,10 @@ pub(super) async fn wire(
     wireguard_advertised: Option<Ingress>,
     invite_listen: Option<std::net::SocketAddr>,
     coord_cap: Option<nat_traversal::CoordCap>,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
+    voice_requests: tokio::sync::mpsc::Receiver<noded::PresenceSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
     planes: data_plane::PlaneMonitor,
+    netstack_backend: Result<reachability::NetstackBackend, String>,
 ) -> PreWiring {
     // consensus membership comes from the RECOVERY RECORD: the epoch's
     // ENGINE PARTICIPANT SET (at genesis: exactly the config seed). the
@@ -804,6 +809,7 @@ pub(super) async fn wire(
                     // a validator never hands this plane off in-process:
                     // demotion exits, promotion already happened.
                     None,
+                    crate::reachability_plane::NetstackBoot::Selected(netstack_backend),
                 ))
             }
             None => {

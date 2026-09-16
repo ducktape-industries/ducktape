@@ -619,16 +619,32 @@ impl PagesView {
         let (document, on_document) = self
             .document
             .document("app:document".into(), Message::DocumentUpdated);
-        let presentation =
+        let mut presentation =
             crate::editor_view::paint(self.document.state_view(), &self.document_paint);
         presentation
             .validate(self.document.state_view().text)
             .expect("invalid editor presentation");
+        for margin in &mut presentation.affordances.margins {
+            margin.line =
+                crate::rich_document::block_index(self.document.state_view().text, margin.line);
+        }
+        if let Some(menu) = &mut presentation.affordances.menu
+            && let wire::editor_presentation::EditorMenuAnchor::Line(line) = &mut menu.anchor
+        {
+            *line = crate::rich_document::block_index(self.document.state_view().text, *line);
+        }
         let editable = self.connected
             && !self.loading
             && self.host_error.is_empty()
             && !self.active_page.is_empty()
             && self.active_page == self.buffer_page;
+        let mut rich = crate::rich_document::presentation(
+            self.document.state_view().text,
+            self.document.state_view().cursor,
+        );
+        if let Some(menu) = &presentation.affordances.menu {
+            rich.toolbar = menu.items.clone();
+        }
         Node::Editor {
             key: format!("{PAGE_KEY}/document"),
             document,
@@ -640,6 +656,7 @@ impl PagesView {
             min_height: None,
             max_height: None,
             options: Box::new(wire::EditorOptions {
+                rich: Some(Box::new(rich)),
                 binding: Some(Box::new(
                     crate::editor_binding::keys(
                         self.document_history.clone(),

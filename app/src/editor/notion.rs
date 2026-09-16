@@ -1,38 +1,23 @@
-//! The pages document on gpui-notion.
-//!
-//! The guest keeps the canonical markdown (title on line 0, then the block
-//! dialect `document_sync` renders: two spaces per depth, `# `/`- `/`1. `/
-//! `- [ ] `/`> `/`!> `/`+ `/`---`/fences, single-level inline fences). This
-//! mount is the bridge: the canonical text becomes `NotionEditor` blocks, and
-//! every `DocumentChanged` serializes the blocks back and submits the whole
-//! text as one native edit, the way the line editor submits a keystroke.
-//!
-//! What the dialect cannot spell (a bold+italic run, an image, a table) is
-//! flattened on the way out; the guest never learns a shape it cannot store.
-use super::{EditorStore, position};
+//! Native rich block rendering over the guest-owned editor transaction lane.
+//! Block snapshots and toolbar tags cross the wire without interpreting the
+//! application's canonical document format.
+use super::EditorStore;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, EventEmitter, Focusable as _,
     InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, canvas, div, px,
 };
 use gpui_notion::NotionEditor;
-use gpui_notion::editor::block::{BlockAttrs, BlockContent, types};
-use gpui_notion::editor::comments::ThreadId;
-use gpui_notion::editor::mark::{Mark, MarkKind, MarkList};
+use gpui_notion::editor::input_rules::InputRuleMode;
+use gpui_notion::editor::comments::{AnnotationMode, AnnotationRequested};
+use gpui_notion::editor::block::{BlockAttrs, BlockContent};
+use gpui_notion::editor::mark::{HighlightColor, Mark, MarkKind, MarkList, TextColor};
 use gpui_notion::editor::theme::ActiveEditorTheme as _;
-use gpui_notion::editor::view::{Caret, DocumentChanged};
-use std::collections::HashSet;
-use std::sync::Arc;
+use gpui_notion::editor::toolbar::{ToolbarAction, ToolbarItem};
+use gpui_notion::editor::slash::{ApplicationMenu, ApplicationMenuAnchor, MenuAction};
+use gpui_notion::editor::view::{Caret, DocumentChanged, SelectionChanged};
 use ui_lang_wire as wire;
-use wire::editor_presentation::{EditorInteraction, EditorMargin};
-
-/// Two spaces per depth: `document_sync::INDENT`.
-const INDENT: &str = "  ";
-const FENCE: &str = "```";
-
-/// The editor key suffix the host mounts on gpui-notion instead of the line
-/// editor: the pages document, nothing else.
-pub const NOTION_DOCUMENT_KEY: &str = "/pages/document";
+use wire::editor_presentation::EditorMargin;
 
 /// Register gpui-notion after `gpui_kit::init`. The guest already sizes and
 /// pads the document column, so the editor's own page column is flush with
@@ -52,55 +37,83 @@ pub fn init(cx: &mut App) {
 /// The badge's height: one marker slot.
 const BADGE_HEIGHT: f32 = 22.;
 
-pub struct NotionWireEditor {
+pub struct RichWireEditor {
     key: String,
     store: EditorStore,
     editor: Entity<NotionEditor>,
-    /// The text the editor currently reflects — what the next native edit is
-    /// diffed against, and what an echoed projection is compared with.
-    installed: Arc<str>,
-    cursor: wire::EditorCursor,
+    installed: wire::editor_rich::RichDocument,
     reset: Option<u64>,
     fault: Option<String>,
     /// Where the mount painted last frame, so block bounds (window space)
     /// can be turned into overlay offsets.
     bounds: Option<Bounds<Pixels>>,
-    /// The guest's comment badges: one per commented line, with its count.
+    /// Guest-authored margin badges indexed by rich block.
     margins: Vec<EditorMargin>,
-    /// gpui-notion threads already handed to the guest. The editor's own
-    /// thread model is a stepping stone: a thread it opens is taken straight
-    /// to the guest's card, which owns comments on the module.
-    threads: HashSet<ThreadId>,
+    menu: Option<wire::editor_presentation::EditorMenu>,
+    _menu_actions: Subscription,
     _changes: Subscription,
+    _selection: Subscription,
+    _actions: Subscription,
+    _annotations: Subscription,
 }
 
-impl EventEmitter<()> for NotionWireEditor {}
+impl EventEmitter<()> for RichWireEditor {}
 
-impl NotionWireEditor {
+impl RichWireEditor {
     pub fn new(
         key: String,
         store: EditorStore,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let editor = cx.new(|cx| NotionEditor::new(window, cx));
+        let editor = cx.new(|cx| {
+            let mut editor = NotionEditor::new(window, cx);
+            editor.set_annotation_mode(AnnotationMode::External);
+            editor.set_application_menu(None, cx);
+            editor.set_input_rule_mode(InputRuleMode::Application);
+            editor
+        });
         let changes = cx.subscribe_in(
             &editor,
             window,
-            |this, _, _: &DocumentChanged, window, cx| this.changed(window, cx),
+            |this, _, _: &DocumentChanged, window, cx| this.changed(String::new(), window, cx),
         );
+        let selection = cx.subscribe_in(
+            &editor,
+            window,
+            |this, _, _: &SelectionChanged, window, cx| this.changed(String::new(), window, cx),
+        );
+        let actions = cx.subscribe_in(
+            &editor,
+            window,
+            |this, _, action: &ToolbarAction, window, cx| {
+                this.changed(action.tag.to_string(), window, cx)
+            },
+        );
+        let annotations = cx.subscribe_in(
+            &editor,
+            window,
+            |this, _, event: &AnnotationRequested, _, cx| this.annotation(event, cx),
+        );
+        let menu_actions =
+            cx.subscribe_in(&editor, window, |this, _, action: &MenuAction, _, cx| {
+                this.menu_action(action, cx);
+            });
         let mut this = Self {
             key,
             store,
             editor,
-            installed: Arc::from(""),
-            cursor: Default::default(),
+            installed: Default::default(),
             reset: None,
             fault: None,
             bounds: None,
             margins: Vec::new(),
-            threads: HashSet::new(),
+            menu: None,
+            _menu_actions: menu_actions,
             _changes: changes,
+            _selection: selection,
+            _actions: actions,
+            _annotations: annotations,
         };
         this.sync(window, cx);
         this
@@ -112,7 +125,10 @@ impl NotionWireEditor {
         let Some(projection) = self.store.projection(&self.key) else {
             return;
         };
-        self.note_fault(projection.fault.as_deref());
+        if let Some(fault) = projection.fault.as_deref() {
+            self.note_fault(Some(fault));
+            return;
+        }
         let margins = projection
             .options
             .presentation
@@ -123,32 +139,88 @@ impl NotionWireEditor {
             self.margins = margins;
             cx.notify();
         }
-        // No text yet (a page just opened, its transfer in flight): nothing to
-        // install — a blank rebuild here would blink the page and drop focus.
-        let Some(canonical) = projection.text.clone() else {
+        let Some(rich) = projection.options.rich.as_ref() else {
             return;
         };
+        let menu = projection
+            .options
+            .presentation
+            .as_ref()
+            .and_then(|paint| paint.affordances.menu.clone());
+        if self.menu != menu {
+            let native = menu.as_ref().map(|menu| ApplicationMenu {
+                anchor: match menu.anchor {
+                    wire::editor_presentation::EditorMenuAnchor::Caret => {
+                        ApplicationMenuAnchor::Caret
+                    }
+                    wire::editor_presentation::EditorMenuAnchor::Line(line) => {
+                        ApplicationMenuAnchor::Block(line as usize)
+                    }
+                },
+                items: menu
+                    .items
+                    .iter()
+                    .map(|item| ToolbarItem {
+                        tag: item.tag.clone().into(),
+                        label: item.label.clone().into(),
+                    })
+                    .collect(),
+                selected: menu.selected as usize,
+            });
+            self.editor
+                .update(cx, |editor, cx| editor.set_application_menu(native, cx));
+            self.menu = menu;
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.set_toolbar(
+                Some(
+                    rich.toolbar
+                        .iter()
+                        .map(|item| ToolbarItem {
+                            tag: item.tag.clone().into(),
+                            label: item.label.clone().into(),
+                        })
+                        .collect(),
+                ),
+                cx,
+            )
+        });
+        // The guest's projection is installed only after its canonical text is
+        // available and the existing transaction queue has settled.
+        if projection.text.is_none() {
+            return;
+        }
         let reset = self.reset != Some(projection.reference.reset);
-        let settled = !projection.pending;
-        let moved = projection.reference.cursor != self.cursor;
-        let install = reset || (settled && (canonical != self.installed || moved));
+        let install = reset || (!projection.pending && rich.document != self.installed);
         if !install {
             return;
         }
-        self.installed = canonical;
-        self.cursor = projection.reference.cursor;
-        self.reset = Some(projection.reference.reset);
-        let content = blocks_of(&self.installed);
-        let unchanged = self.editor.read(cx).content() == content;
-        if unchanged {
+        if let Err(error) = validate_rich(&rich.document) {
+            self.note_fault(Some(error));
             return;
         }
+        self.note_fault(None);
+        self.installed = rich.document.clone();
+        self.reset = Some(projection.reference.reset);
+        let content = self
+            .installed
+            .blocks
+            .iter()
+            .map(|block| native_block(block).expect("validated native rich block"))
+            .collect::<Vec<_>>();
+        let restore = self.is_focused(window, cx).then_some(self.installed.cursor);
         self.editor.update(cx, |editor, cx| {
-            while let Some(id) = editor.block_id_at(0) {
-                editor.remove_block(id, cx);
+            let changed = editor.content() != content;
+            if changed {
+                while let Some(id) = editor.block_id_at(0) {
+                    editor.remove_block(id, cx);
+                }
+                for (ix, block) in content.into_iter().enumerate() {
+                    editor.insert_block(ix, block, window, cx);
+                }
             }
-            for (ix, block) in content.into_iter().enumerate() {
-                editor.insert_block(ix, block, window, cx);
+            if let Some(cursor) = restore {
+                restore_cursor(editor, cursor, window, cx);
             }
         });
         cx.notify();
@@ -160,99 +232,179 @@ impl NotionWireEditor {
             return;
         }
         if let Some(fault) = fault {
-            tracing::warn!(target: "ducktape::pages_editor", fault, "the notion editor store faulted");
+            tracing::warn!(target: "ducktape::editor", fault, "the notion editor store faulted");
         }
         self.fault = fault.map(str::to_owned);
     }
 
-    fn changed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.hand_over_new_thread(cx) {
-            return;
-        }
-        let text = markdown_of(&self.editor.read(cx).content());
-        if text.as_str() == &*self.installed {
-            return;
-        }
-        let next = wire::EditorCursor {
-            position: position(&text, changed_end(&self.installed, &text)),
-            selection: None,
+    fn snapshot(&self, cx: &App) -> Result<wire::editor_rich::RichDocument, &'static str> {
+        let editor = self.editor.read(cx);
+        // A newly installed, unfocused input has a local caret at zero.
+        // Only a focused input can replace the guest's supplied cursor.
+        let cursor = editor
+            .focused_id()
+            .and_then(|_| editor.selection(cx))
+            .and_then(|(id, range)| {
+                let index = editor.index_of(id)?;
+                let caret = editor.caret_offset(id, cx).unwrap_or(range.end);
+                let anchor = if caret == range.start {
+                    range.end
+                } else {
+                    range.start
+                };
+                Some(wire::EditorCursor {
+                    position: wire::EditorPosition {
+                        line: index as u32,
+                        column: caret as u32,
+                    },
+                    selection: (!range.is_empty()).then_some(wire::EditorPosition {
+                        line: index as u32,
+                        column: anchor as u32,
+                    }),
+                })
+            })
+            .unwrap_or(self.installed.cursor);
+        Ok(wire::editor_rich::RichDocument {
+            blocks: editor
+                .content()
+                .iter()
+                .map(wire_block)
+                .collect::<Result<Vec<_>, _>>()?,
+            cursor,
+        })
+    }
+
+    fn menu_action(&mut self, action: &MenuAction, cx: &mut Context<Self>) {
+        use wire::editor_presentation::EditorInteraction;
+        let interaction = match action {
+            MenuAction::Select(index) => EditorInteraction::MenuSelect {
+                index: *index as u32,
+            },
+            MenuAction::Pick(tag) => EditorInteraction::MenuPick {
+                tag: tag.to_string(),
+            },
+            MenuAction::Dismiss => EditorInteraction::MenuDismiss,
+            MenuAction::Open(trigger) => EditorInteraction::Action {
+                tag: trigger.to_string(),
+            },
         };
-        self.store.native(
+        let document = match self.snapshot(cx) {
+            Ok(document) => document,
+            Err(error) => {
+                self.note_fault(Some(error));
+                return;
+            }
+        };
+        self.store.request(
             &self.key,
-            &self.installed,
-            self.cursor,
-            &text,
-            next,
-            wire::EditorEditKind::Insert,
+            wire::EditorRequestInput::RichEdit {
+                edit: Box::new(wire::editor_rich::RichEdit {
+                    before: Some(self.installed.clone()),
+                    document,
+                    action: String::new(),
+                    interaction: Some(interaction),
+                }),
+            },
         );
-        self.installed = Arc::from(text);
-        self.cursor = next;
         cx.emit(());
         cx.notify();
     }
 
-    /// The toolbar's "Comment" opened a gpui-notion thread on the selection.
-    /// The guest's card owns comments, so the thread is dropped here and the
-    /// guest gets the same ask: the selection as the document cursor, then a
-    /// margin press on its line, which opens the card anchored on the words.
-    fn hand_over_new_thread(&mut self, cx: &mut Context<Self>) -> bool {
-        let editor = self.editor.read(cx);
-        let Some(thread) = editor
-            .comment_threads()
-            .iter()
-            .find(|thread| !self.threads.contains(&thread.id()))
-        else {
-            return false;
+    fn changed(&mut self, action: String, _window: &mut Window, cx: &mut Context<Self>) {
+        let document = match self.snapshot(cx) {
+            Ok(document) => document,
+            Err(error) => {
+                self.note_fault(Some(error));
+                return;
+            }
         };
-        let id = thread.id();
-        let block = thread.block();
-        self.threads.insert(id);
-        let ix = editor.index_of(block);
-        let range = editor.block(block).and_then(|block| {
-            block
-                .marks()
-                .iter()
-                .find(|mark| mark.kind == MarkKind::Comment(id))
-                .map(|mark| mark.range.clone())
-        });
-        let content = editor.content();
-        self.editor
-            .update(cx, |editor, cx| editor.remove_comment_thread(id, cx));
-        let (Some(ix), Some(range)) = (ix, range) else {
-            return true;
+        let unchanged = document == self.installed && action.is_empty();
+        if unchanged {
+            return;
+        }
+        if let Err(error) = document.validate() {
+            self.note_fault(Some(error));
+            return;
+        }
+        self.store.request(
+            &self.key,
+            wire::EditorRequestInput::RichEdit {
+                edit: Box::new(wire::editor_rich::RichEdit {
+                    before: Some(self.installed.clone()),
+                    document: document.clone(),
+                    action,
+                    interaction: None,
+                }),
+            },
+        );
+        self.installed = document;
+        cx.emit(());
+        cx.notify();
+    }
+
+    fn annotation(&mut self, event: &AnnotationRequested, cx: &mut Context<Self>) {
+        let Some(line) = self.editor.read(cx).index_of(event.block) else {
+            return;
         };
-        let line = block_starts(&self.installed).get(ix).copied().unwrap_or(0);
-        let Some(block) = content.get(ix) else {
-            return true;
+        let mut document = match self.snapshot(cx) {
+            Ok(document) => document,
+            Err(error) => {
+                self.note_fault(Some(error));
+                return;
+            }
         };
-        let prefix = line_of(block, 1).len() - inline_of(block).len();
-        let at = |plain: usize| (prefix + fenced_column(block, plain)) as u32;
-        let cursor = wire::EditorCursor {
+        document.cursor = wire::EditorCursor {
             position: wire::EditorPosition {
                 line: line as u32,
-                column: at(range.end),
+                column: event.range.end as u32,
             },
             selection: Some(wire::EditorPosition {
                 line: line as u32,
-                column: at(range.start),
+                column: event.range.start as u32,
             }),
         };
-        self.store.native(
+        self.store.request(
             &self.key,
-            &self.installed,
-            self.cursor,
-            &self.installed,
-            cursor,
-            wire::EditorEditKind::Cursor,
+            wire::EditorRequestInput::RichEdit {
+                edit: Box::new(wire::editor_rich::RichEdit {
+                    before: Some(self.installed.clone()),
+                    document,
+                    action: String::new(),
+                    interaction: Some(wire::editor_presentation::EditorInteraction::Margin {
+                        line: line as u32,
+                    }),
+                }),
+            },
         );
-        self.cursor = cursor;
-        self.interaction(EditorInteraction::Margin { line: line as u32 }, cx);
-        true
+        cx.emit(());
+        cx.notify();
     }
 
-    fn interaction(&mut self, action: EditorInteraction, cx: &mut Context<Self>) {
-        self.store
-            .request(&self.key, wire::EditorRequestInput::Interaction { action });
+    fn margin(&mut self, line: u32, cx: &mut Context<Self>) {
+        let mut document = match self.snapshot(cx) {
+            Ok(document) => document,
+            Err(error) => {
+                self.note_fault(Some(error));
+                return;
+            }
+        };
+        document.cursor = wire::EditorCursor {
+            position: wire::EditorPosition { line, column: 0 },
+            selection: None,
+        };
+        self.store.request(
+            &self.key,
+            wire::EditorRequestInput::RichEdit {
+                edit: Box::new(wire::editor_rich::RichEdit {
+                    before: Some(self.installed.clone()),
+                    document,
+                    action: String::new(),
+                    interaction: Some(wire::editor_presentation::EditorInteraction::Margin {
+                        line,
+                    }),
+                }),
+            },
+        );
         cx.emit(());
         cx.notify();
     }
@@ -263,20 +415,19 @@ impl NotionWireEditor {
         let Some(origin) = self.bounds.map(|bounds| bounds.origin) else {
             return Vec::new();
         };
-        let starts = block_starts(&self.installed);
         let editor = self.editor.read(cx);
         let theme = cx.editor_theme().clone();
         self.margins
             .iter()
             .filter_map(|margin| {
                 let line = margin.line as usize;
-                let ix = starts.iter().rposition(|start| *start <= line)?;
+                let ix = line;
                 let bounds = editor.block_bounds(editor.block_id_at(ix)?)?;
                 let top = bounds.bottom() - px(BADGE_HEIGHT) - origin.y;
                 let line = margin.line;
                 Some(
                     div()
-                        .id(("comments", line as usize))
+                        .id(("margin", line as usize))
                         .absolute()
                         .right(px(0.))
                         .top(top)
@@ -296,9 +447,7 @@ impl NotionWireEditor {
                             theme.comment_accent,
                         ))
                         .child(margin.count.to_string())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.interaction(EditorInteraction::Margin { line }, cx)
-                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| this.margin(line, cx)))
                         .into_any_element(),
                 )
             })
@@ -318,6 +467,10 @@ impl NotionWireEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if let wire::WidgetCommand::EditorAction { tag, .. } = command {
+            self.changed(tag.clone(), window, cx);
+            return true;
+        }
         if !matches!(command, wire::WidgetCommand::Focus { .. }) {
             return false;
         }
@@ -327,8 +480,8 @@ impl NotionWireEditor {
         // The caret goes to the block the document cursor names, never to a
         // trailing paragraph the editor would have to insert: focusing a page
         // must not write to it.
-        let line = self.cursor.position.line as usize;
-        let column = self.cursor.position.column as usize;
+        let line = self.installed.cursor.position.line as usize;
+        let column = self.installed.cursor.position.column as usize;
         self.editor.update(cx, |editor, cx| {
             let last = editor.block_count().saturating_sub(1);
             let Some(id) = editor.block_id_at(line.min(last)) else {
@@ -340,7 +493,7 @@ impl NotionWireEditor {
     }
 }
 
-impl Render for NotionWireEditor {
+impl Render for RichWireEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The editor is pulled out of the mount by its gutter width on both
         // sides and pads itself back in by the same amount (`init`): its text
@@ -380,548 +533,505 @@ impl Render for NotionWireEditor {
     }
 }
 
-/// The document line each block starts on: the title is block 0 on line 0,
-/// and a code block spans its two fences and its body.
-fn block_starts(text: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    let Some((_, body)) = text.split_once('\n') else {
-        return starts;
-    };
-    let mut line = 1;
-    let mut source = body.split('\n');
-    while let Some(raw) = source.next() {
-        starts.push(line);
-        line += 1;
-        let (_, rest) = split_indent(raw);
-        if !rest.starts_with(FENCE) {
-            continue;
-        }
-        for inside in source.by_ref() {
-            line += 1;
-            if inside.trim_start_matches([' ', '\t']).starts_with(FENCE) {
-                break;
-            }
-        }
+pub(super) fn validate_rich(
+    document: &wire::editor_rich::RichDocument,
+) -> Result<(), &'static str> {
+    document.validate()?;
+    for block in &document.blocks {
+        native_block(block)?;
     }
-    starts
+    Ok(())
 }
 
-/// A byte offset in a block's plain text as the byte column of the same
-/// character in the block's fenced line, marker excluded.
-fn fenced_column(block: &BlockContent, plain: usize) -> usize {
-    let text = block.text.as_str();
-    let mut out = 0;
-    let mut at = 0;
-    for (range, kinds) in block.marks.runs() {
-        let range = range.start.max(at)..range.end.min(text.len());
-        if range.start >= range.end {
-            continue;
-        }
-        // A selection starting on the run's first character starts INSIDE
-        // its fence, so the anchor covers the words and not the markers.
-        if plain < range.start {
-            return out + (plain - at);
-        }
-        out += range.start - at;
-        let body = &text[range.clone()];
-        let fenced = fence_of(body, &kinds);
-        let open = fenced.find(body).unwrap_or(0);
-        if plain <= range.end {
-            return out + open + (plain - range.start);
-        }
-        out += fenced.len();
-        at = range.end;
-    }
-    out + plain.saturating_sub(at)
-}
-
-/// The byte in `after` just past the edit that turned `before` into it.
-fn changed_end(before: &str, after: &str) -> usize {
-    let prefix = before
-        .bytes()
-        .zip(after.bytes())
-        .take_while(|(a, b)| a == b)
-        .count();
-    let suffix = before[prefix..]
-        .bytes()
-        .rev()
-        .zip(after[prefix..].bytes().rev())
-        .take_while(|(a, b)| a == b)
-        .count();
-    after.len() - suffix
-}
-
-// ----------------------------------------------------------------- markdown → blocks
-
-/// The canonical text as blocks: line 0 is the title, every later line one
-/// block of the guest dialect. Depth is clamped to the line above's + 1, the
-/// only shape the guest tree can hold.
-pub fn blocks_of(text: &str) -> Vec<BlockContent> {
-    let Some((title, body)) = text.split_once('\n') else {
-        return vec![title_block(text)];
-    };
-    let mut blocks = vec![title_block(title)];
-    let mut source = body.split('\n');
-    while let Some(raw) = source.next() {
-        let (steps, rest) = split_indent(raw);
-        let ceiling = match blocks.len() {
-            1 => 0,
-            _ => blocks.last().map_or(0, |block| block.indent + 1),
-        };
-        let indent = steps.min(ceiling);
-        if !rest.starts_with(FENCE) {
-            blocks.push(block_of(rest, indent));
-            continue;
-        }
-        let own_indent = INDENT.repeat(indent);
-        let mut lines = Vec::new();
-        for inside in source.by_ref() {
-            if inside.trim_start_matches([' ', '\t']).starts_with(FENCE) {
-                break;
-            }
-            lines.push(inside.strip_prefix(&own_indent).unwrap_or(inside));
-        }
-        let language = rest[FENCE.len()..].trim();
-        let attrs = match language.is_empty() {
-            true => BlockAttrs::default(),
-            false => BlockAttrs::language(language.to_string()),
-        };
-        blocks.push(
-            BlockContent::new(types::CODE_BLOCK, lines.join("\n"))
-                .with_attrs(attrs)
-                .with_indent(indent),
-        );
-    }
-    blocks
-}
-
-fn title_block(title: &str) -> BlockContent {
-    BlockContent::new(types::HEADING, title).with_attrs(BlockAttrs::level(1))
-}
-
-fn split_indent(raw: &str) -> (usize, &str) {
-    let mut steps = 0;
-    let mut rest = raw;
-    while let Some(next) = rest.strip_prefix(INDENT) {
-        steps += 1;
-        rest = next;
-    }
-    (steps, rest)
-}
-
-fn block_of(rest: &str, indent: usize) -> BlockContent {
-    if rest.trim_end() == "---" {
-        return BlockContent::new(types::HORIZONTAL_RULE, "").with_indent(indent);
-    }
-    // Longest first: `### ` must not be read as `# ` plus prose.
-    let markers: [(&str, &str, BlockAttrs); 11] = [
-        ("### ", types::HEADING, BlockAttrs::level(3)),
-        ("## ", types::HEADING, BlockAttrs::level(2)),
-        ("# ", types::HEADING, BlockAttrs::level(1)),
-        ("- [x] ", types::TASK_LIST, checked()),
-        ("- [X] ", types::TASK_LIST, checked()),
-        ("- [ ] ", types::TASK_LIST, BlockAttrs::default()),
-        ("!> ", types::CALLOUT, BlockAttrs::default()),
-        ("> ", types::BLOCKQUOTE, BlockAttrs::default()),
-        ("+ ", types::TOGGLE, BlockAttrs::default()),
-        ("- ", types::BULLET_LIST, BlockAttrs::default()),
-        ("* ", types::BULLET_LIST, BlockAttrs::default()),
-    ];
-    for (marker, ty, attrs) in markers {
-        let Some(content) = rest.strip_prefix(marker) else {
-            continue;
-        };
-        return inline_block(ty, attrs, content, indent);
-    }
-    if let Some(content) = ordered_content(rest) {
-        return inline_block(types::ORDERED_LIST, BlockAttrs::default(), content, indent);
-    }
-    inline_block(types::PARAGRAPH, BlockAttrs::default(), rest, indent)
-}
-
-fn checked() -> BlockAttrs {
-    BlockAttrs {
-        checked: true,
-        ..Default::default()
+fn supported_block(kind: &str) -> Result<(), &'static str> {
+    match kind {
+        "paragraph" | "heading" | "bulletList" | "orderedList" | "taskList" | "blockquote"
+        | "codeBlock" | "horizontalRule" | "callout" | "details" | "image" | "table" => Ok(()),
+        _ => Err("unsupported rich block kind"),
     }
 }
 
-/// `12. text` → `text`; the number is positional and never stored.
-fn ordered_content(rest: &str) -> Option<&str> {
-    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    if digits == 0 {
-        return None;
-    }
-    rest[digits..].strip_prefix(". ")
-}
-
-fn inline_block(ty: &str, attrs: BlockAttrs, content: &str, indent: usize) -> BlockContent {
-    let (text, marks) = inline(content);
-    BlockContent::new(ty, text)
-        .with_attrs(attrs)
-        .with_marks(marks)
-        .with_indent(indent)
-}
-
-/// The inline fences the guest grammar knows, longest first so `**` is never
-/// read as two `*`. Single level: a body is never scanned again.
-const FENCES: &[(&str, MarkKind)] = &[
-    ("**", MarkKind::Bold),
-    ("__", MarkKind::Bold),
-    ("~~", MarkKind::Strike),
-    ("++", MarkKind::Underline),
-    ("==", MarkKind::Highlight(None)),
-    ("`", MarkKind::Code),
-    ("*", MarkKind::Italic),
-    ("_", MarkKind::Italic),
-];
-
-/// The text with its fences removed, and the marks over the stripped text.
-fn inline(content: &str) -> (String, MarkList) {
-    let mut text = String::with_capacity(content.len());
-    let mut marks = Vec::new();
-    let mut at = 0;
-    while at < content.len() {
-        let rest = &content[at..];
-        if let Some((label, url, len)) = named_link(rest) {
-            marks.push(Mark::new(
-                MarkKind::Link(url.into()),
-                text.len()..text.len() + label.len(),
-            ));
-            text.push_str(label);
-            at += len;
-            continue;
-        }
-        if let Some(len) = url_len(rest) {
-            let url = &rest[..len];
-            marks.push(Mark::new(
-                MarkKind::Link(url.into()),
-                text.len()..text.len() + len,
-            ));
-            text.push_str(url);
-            at += len;
-            continue;
-        }
-        if let Some(len) = mention_len(content, at) {
-            let handle = &rest[1..len];
-            marks.push(Mark::new(
-                MarkKind::Mention(handle.into()),
-                text.len()..text.len() + len,
-            ));
-            text.push_str(&rest[..len]);
-            at += len;
-            continue;
-        }
-        let fence = FENCES.iter().find_map(|(marker, kind)| {
-            fenced(rest, marker).map(|body| (*marker, body, kind.clone()))
-        });
-        let Some((marker, body, kind)) = fence else {
-            let c = rest.chars().next().expect("inside the text");
-            text.push(c);
-            at += c.len_utf8();
-            continue;
-        };
-        marks.push(Mark::new(kind, text.len()..text.len() + body.len()));
-        text.push_str(body);
-        at += marker.len() * 2 + body.len();
-    }
-    (text, MarkList::from_marks(marks))
-}
-
-/// If `rest` opens with `marker` and a later `marker` closes a non-empty body,
-/// that body.
-fn fenced<'a>(rest: &'a str, marker: &str) -> Option<&'a str> {
-    let body = rest.strip_prefix(marker)?;
-    let close = body.find(marker)?;
-    (close > 0).then(|| &body[..close])
-}
-
-/// `[label](url)` at the start of `rest`: the label, the url, the source length.
-fn named_link(rest: &str) -> Option<(&str, &str, usize)> {
-    let inner = rest.strip_prefix('[')?;
-    let label_end = inner.find("](")?;
-    let label = &inner[..label_end];
-    let url_start = label_end + 2;
-    let url_len = inner[url_start..].find(')')?;
-    let url = &inner[url_start..url_start + url_len];
-    let plain = !label.is_empty() && !label.contains('[') && !url.is_empty() && !url.contains(' ');
-    plain.then_some((label, url, 1 + url_start + url_len + 1))
-}
-
-/// A bare `http(s)://` link runs to the next whitespace.
-fn url_len(rest: &str) -> Option<usize> {
-    let starts_link = rest.starts_with("http://") || rest.starts_with("https://");
-    if !starts_link {
-        return None;
-    }
-    Some(rest.find(char::is_whitespace).unwrap_or(rest.len()))
-}
-
-fn handle_char(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '-' | '_' | '.')
-}
-
-/// An `@` at a word start followed by a handle; an `@` inside a word (an
-/// email address) is prose.
-fn mention_len(content: &str, at: usize) -> Option<usize> {
-    let rest = content[at..].strip_prefix('@')?;
-    let mid_word = content[..at]
-        .chars()
-        .next_back()
-        .is_some_and(char::is_alphanumeric);
-    if mid_word {
-        return None;
-    }
-    let handle = rest.find(|c| !handle_char(c)).unwrap_or(rest.len());
-    (handle > 0).then_some(1 + handle)
-}
-
-// ----------------------------------------------------------------- blocks → markdown
-
-/// The blocks as the canonical text. Block 0 is the title, whatever type the
-/// editor gave it; an ordered item's number is its place in the run.
-pub fn markdown_of(blocks: &[BlockContent]) -> String {
-    let mut lines = Vec::with_capacity(blocks.len());
-    let title = blocks.first().map_or("", |block| block.text.as_str());
-    lines.push(title.to_string());
-    let mut ordinals: Vec<usize> = Vec::new();
-    for (ix, block) in blocks.iter().enumerate().skip(1) {
-        let ordinal = ordinal_of(blocks, ix, &mut ordinals);
-        lines.push(line_of(block, ordinal));
-    }
-    lines.join("\n")
-}
-
-/// The number an ordered item wears: one past the previous ordered item at
-/// the same depth, unless another kind at that depth broke the run.
-fn ordinal_of(blocks: &[BlockContent], ix: usize, ordinals: &mut Vec<usize>) -> usize {
-    let block = &blocks[ix];
-    ordinals.resize(block.indent + 1, 0);
-    if block.ty != types::ORDERED_LIST {
-        ordinals[block.indent] = 0;
-        return 0;
-    }
-    ordinals[block.indent] += 1;
-    ordinals[block.indent]
-}
-
-fn line_of(block: &BlockContent, ordinal: usize) -> String {
-    let indent = INDENT.repeat(block.indent);
-    let text = inline_of(block);
-    let marker: String = match block.ty.as_ref() {
-        types::HEADING => "#".repeat(block.attrs.level.clamp(1, 3) as usize) + " ",
-        types::BULLET_LIST => "- ".into(),
-        types::ORDERED_LIST => format!("{ordinal}. "),
-        types::TASK_LIST => match block.attrs.checked {
-            true => "- [x] ".into(),
-            false => "- [ ] ".into(),
-        },
-        types::TOGGLE => "+ ".into(),
-        types::BLOCKQUOTE => "> ".into(),
-        types::CALLOUT => "!> ".into(),
-        types::HORIZONTAL_RULE => return format!("{indent}---"),
-        types::CODE_BLOCK => {
-            let language = block.attrs.language.as_deref().unwrap_or("");
-            let body: Vec<String> = block
-                .text
-                .split('\n')
-                .map(|body| format!("{indent}{body}"))
-                .collect();
-            let body = body.join("\n");
-            return match body.is_empty() {
-                true => format!("{indent}{FENCE}{language}\n{indent}{FENCE}"),
-                false => format!("{indent}{FENCE}{language}\n{body}\n{indent}{FENCE}"),
-            };
-        }
-        // ponytail: images and tables have no line in the guest dialect;
-        // their text rides as a paragraph until the dialect grows a shape.
-        _ => String::new(),
-    };
-    format!("{indent}{marker}{text}")
-}
-
-/// The block text with one fence per marked run. The dialect nests nothing,
-/// so a run wearing several marks keeps the one that reads strongest.
-fn inline_of(block: &BlockContent) -> String {
-    let text = block.text.as_str();
-    let mut out = String::with_capacity(text.len());
-    let mut at = 0;
-    for (range, kinds) in block.marks.runs() {
-        let range = range.start.max(at)..range.end.min(text.len());
-        if range.start >= range.end {
-            continue;
-        }
-        out.push_str(&text[at..range.start]);
-        let body = &text[range.clone()];
-        out.push_str(&fence_of(body, &kinds));
-        at = range.end;
-    }
-    out.push_str(&text[at..]);
-    out
-}
-
-/// The fence order when a run wears several marks: the one the reader would
-/// miss most wins.
-const FENCE_RANK: [fn(&MarkKind) -> bool; 7] = [
-    |kind| matches!(kind, MarkKind::Code),
-    |kind| matches!(kind, MarkKind::Link(_)),
-    |kind| matches!(kind, MarkKind::Bold),
-    |kind| matches!(kind, MarkKind::Italic),
-    |kind| matches!(kind, MarkKind::Strike),
-    |kind| matches!(kind, MarkKind::Underline),
-    |kind| matches!(kind, MarkKind::Highlight(_)),
-];
-
-fn fence_of(body: &str, kinds: &[MarkKind]) -> String {
-    let strongest = FENCE_RANK
+fn native_block(block: &wire::editor_rich::RichBlock) -> Result<BlockContent, &'static str> {
+    supported_block(&block.kind)?;
+    let marks = block
+        .marks
         .iter()
-        .find_map(|ranked| kinds.iter().find(|kind| ranked(kind)));
-    match strongest {
-        Some(MarkKind::Code) => format!("`{body}`"),
-        Some(MarkKind::Link(url)) if url.as_ref() == body => body.to_string(),
-        Some(MarkKind::Link(url)) => format!("[{body}]({url})"),
-        Some(MarkKind::Bold) => format!("**{body}**"),
-        Some(MarkKind::Italic) => format!("*{body}*"),
-        Some(MarkKind::Strike) => format!("~~{body}~~"),
-        Some(MarkKind::Underline) => format!("++{body}++"),
-        Some(MarkKind::Highlight(_)) => format!("=={body}=="),
-        _ => body.to_string(),
+        .map(|mark| {
+            let value = mark.value.as_str();
+            let kind = match mark.kind.as_str() {
+                "bold" | "italic" | "underline" | "strike" | "code" | "superscript"
+                | "subscript" => {
+                    if !value.is_empty() {
+                        return Err("unsupported rich mark value");
+                    }
+                    match mark.kind.as_str() {
+                        "bold" => MarkKind::Bold,
+                        "italic" => MarkKind::Italic,
+                        "underline" => MarkKind::Underline,
+                        "strike" => MarkKind::Strike,
+                        "code" => MarkKind::Code,
+                        "superscript" => MarkKind::Superscript,
+                        "subscript" => MarkKind::Subscript,
+                        _ => unreachable!(),
+                    }
+                }
+                "highlight" => MarkKind::Highlight(if value.is_empty() {
+                    None
+                } else {
+                    Some(
+                        HighlightColor::ALL
+                            .into_iter()
+                            .find(|color| color.label() == value)
+                            .ok_or("unsupported rich highlight color")?,
+                    )
+                }),
+                "textStyle" => MarkKind::TextColor(
+                    TextColor::ALL
+                        .into_iter()
+                        .find(|color| color.label() == value)
+                        .ok_or("unsupported rich text color")?,
+                ),
+                "link" => MarkKind::Link(mark.value.clone().into()),
+                "mention" => MarkKind::Mention(mark.value.clone().into()),
+                _ => return Err("unsupported rich mark kind"),
+            };
+            Ok(Mark::new(kind, mark.start as usize..mark.end as usize))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut attrs = BlockAttrs {
+        level: block.level,
+        checked: block.checked,
+        language: (!block.language.is_empty()).then(|| block.language.clone().into()),
+        ..Default::default()
+    };
+    for attribute in &block.attributes {
+        match attribute.name.as_str() {
+            "collapsed" => {
+                attrs.collapsed = match attribute.value.as_str() {
+                    "true" => true,
+                    _ => return Err("unsupported rich collapsed value"),
+                }
+            }
+            "start" => {
+                let start = attribute
+                    .value
+                    .parse::<u32>()
+                    .map_err(|_| "unsupported rich list start")?;
+                if start.to_string() != attribute.value {
+                    return Err("noncanonical rich list start");
+                }
+                attrs.start = Some(start as usize);
+            }
+            "src" => attrs.src = Some(attribute.value.clone().into()),
+            "alt" => attrs.alt = Some(attribute.value.clone().into()),
+            "emoji" => attrs.emoji = Some(attribute.value.clone().into()),
+            name => {
+                let Some(name) = name.strip_prefix("extra:") else {
+                    return Err("unsupported rich block attribute");
+                };
+                attrs
+                    .extra
+                    .insert(name.to_owned().into(), attribute.value.clone().into());
+            }
+        }
     }
+    Ok(BlockContent::new(block.kind.clone(), block.text.clone())
+        .with_indent(block.indent as usize)
+        .with_attrs(attrs)
+        .with_marks(MarkList::from_marks(marks)))
+}
+
+fn wire_block(block: &BlockContent) -> Result<wire::editor_rich::RichBlock, &'static str> {
+    supported_block(&block.ty)?;
+    let mut attributes = Vec::new();
+    let mut add = |name: &str, value: String| {
+        attributes.push(wire::editor_rich::RichAttribute {
+            name: name.into(),
+            value,
+        })
+    };
+    if block.attrs.collapsed {
+        add("collapsed", "true".into());
+    }
+    if let Some(start) = block.attrs.start {
+        add("start", start.to_string());
+    }
+    if let Some(value) = &block.attrs.src {
+        add("src", value.to_string());
+    }
+    if let Some(value) = &block.attrs.alt {
+        add("alt", value.to_string());
+    }
+    if let Some(value) = &block.attrs.emoji {
+        add("emoji", value.to_string());
+    }
+    for (name, value) in &block.attrs.extra {
+        add(&format!("extra:{name}"), value.to_string());
+    }
+    attributes.sort_by(|a, b| a.name.cmp(&b.name));
+    let marks = block
+        .marks
+        .iter()
+        .map(|mark| {
+            let value = match &mark.kind {
+                MarkKind::Link(value) | MarkKind::Mention(value) => value.to_string(),
+                MarkKind::Highlight(Some(color)) => color.label().into(),
+                MarkKind::TextColor(color) => color.label().into(),
+                MarkKind::Comment(_) => return Err("unsupported rich mark kind"),
+                _ => String::new(),
+            };
+            Ok(wire::editor_rich::RichMark {
+                start: mark.range.start as u32,
+                end: mark.range.end as u32,
+                kind: mark.kind.type_name().into(),
+                value,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(wire::editor_rich::RichBlock {
+        kind: block.ty.to_string(),
+        text: block.text.clone(),
+        indent: block.indent as u32,
+        level: block.attrs.level,
+        checked: block.attrs.checked,
+        language: block
+            .attrs
+            .language
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+        marks,
+        attributes,
+    })
+}
+
+fn restore_cursor(
+    editor: &mut NotionEditor,
+    cursor: wire::EditorCursor,
+    window: &mut Window,
+    cx: &mut Context<NotionEditor>,
+) {
+    let index = cursor.position.line as usize;
+    let Some(id) = editor.block_id_at(index) else {
+        return;
+    };
+    let Some(anchor) = cursor
+        .selection
+        .filter(|anchor| anchor.line == cursor.position.line)
+    else {
+        editor.focus_block(id, Caret::At(cursor.position.column as usize), window, cx);
+        return;
+    };
+    let from = anchor.column.min(cursor.position.column) as usize;
+    let to = anchor.column.max(cursor.position.column) as usize;
+    editor.select_text_in_block(index, from..to, window, cx);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const DOCUMENT: &str = "Welcome\n# Heading\nPlain **bold** and *it* and `code`\n- one\n  - [x] nested\n1. first\n2. second\n> quote\n!> callout\n+ toggle\n---\n```rust\nfn main() {}\n```\nSee [docs](https://x.y) or https://a.b and @ada\n";
-
-    #[test]
-    fn the_canonical_text_round_trips_through_blocks() {
-        let blocks = blocks_of(DOCUMENT);
-        assert_eq!(markdown_of(&blocks), DOCUMENT);
+    #[gpui_kit::test]
+    fn rich_application_menu_returns_opaque_choice_through_the_document_queue(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        application_menu_request(cx, MenuGesture::Pick);
     }
 
-    #[test]
-    fn lines_resolve_to_the_notion_vocabulary() {
-        let blocks = blocks_of(DOCUMENT);
-        let kinds: Vec<(&str, usize)> = blocks
-            .iter()
-            .map(|block| (block.ty.as_ref(), block.indent))
-            .collect();
-        assert_eq!(
-            kinds,
-            [
-                (types::HEADING, 0),
-                (types::HEADING, 0),
-                (types::PARAGRAPH, 0),
-                (types::BULLET_LIST, 0),
-                (types::TASK_LIST, 1),
-                (types::ORDERED_LIST, 0),
-                (types::ORDERED_LIST, 0),
-                (types::BLOCKQUOTE, 0),
-                (types::CALLOUT, 0),
-                (types::TOGGLE, 0),
-                (types::HORIZONTAL_RULE, 0),
-                (types::CODE_BLOCK, 0),
-                (types::PARAGRAPH, 0),
-                (types::PARAGRAPH, 0),
-            ]
+    #[gpui_kit::test]
+    fn rich_application_menu_escape_uses_the_document_queue(cx: &mut gpui_kit::TestAppContext) {
+        application_menu_request(cx, MenuGesture::Dismiss);
+    }
+
+    #[gpui_kit::test]
+    fn rich_application_menu_receives_caret_movement(cx: &mut gpui_kit::TestAppContext) {
+        application_menu_request(cx, MenuGesture::Move);
+    }
+
+    #[gpui_kit::test]
+    fn rich_application_menu_uses_the_guest_line_anchor(cx: &mut gpui_kit::TestAppContext) {
+        application_menu_request(cx, MenuGesture::LinePick);
+    }
+
+    #[gpui_kit::test]
+    fn rich_application_menu_can_anchor_to_a_divider(cx: &mut gpui_kit::TestAppContext) {
+        application_menu_request(cx, MenuGesture::DividerPick);
+    }
+
+    #[derive(Clone, Copy)]
+    enum MenuGesture {
+        DividerPick,
+        LinePick,
+        Pick,
+        Dismiss,
+        Move,
+    }
+
+    fn application_menu_request(cx: &mut gpui_kit::TestAppContext, gesture: MenuGesture) {
+        use gpui_kit::test::TestWindowExt as _;
+        use wire::editor_presentation::{
+            EditorMenu, EditorMenuAnchor, EditorMenuItem, EditorPresentation, EditorInteraction,
+        };
+        cx.update(gpui_kit::init);
+        cx.update(init);
+        let store = EditorStore::new(93);
+        let source = match gesture {
+            MenuGesture::LinePick => "@\nsecond",
+            MenuGesture::DividerPick => "@\n---",
+            _ => "@",
+        };
+        let reference = wire::editor_document::EditorDocumentRef {
+            document: "application-document".into(),
+            reset: 1,
+            revision: 0,
+            text_revision: 0,
+            byte_len: source.len() as u32,
+            cursor: wire::EditorCursor {
+                position: wire::EditorPosition { line: 0, column: 1 },
+                selection: None,
+            },
+        };
+        let mut paint = EditorPresentation::default();
+        paint.affordances.menu = Some(EditorMenu {
+            anchor: match gesture {
+                MenuGesture::LinePick | MenuGesture::DividerPick => EditorMenuAnchor::Line(1),
+                _ => EditorMenuAnchor::Caret,
+            },
+            items: vec![EditorMenuItem {
+                tag: "opaque-choice".into(),
+                label: "Application person".into(),
+            }],
+            selected: 0,
+        });
+        let rich = wire::editor_rich::RichPresentation {
+            document: wire::editor_rich::RichDocument {
+                blocks: source
+                    .lines()
+                    .map(|text| match text {
+                        "---" => wire::editor_rich::RichBlock {
+                            kind: "horizontalRule".into(),
+                            ..Default::default()
+                        },
+                        _ => wire::editor_rich::RichBlock {
+                            kind: "paragraph".into(),
+                            text: text.into(),
+                            ..Default::default()
+                        },
+                    })
+                    .collect(),
+                cursor: reference.cursor,
+            },
+            ..Default::default()
+        };
+        {
+            let mut locked = store.lock();
+            locked.fields.insert(
+                "editor".into(),
+                crate::editor::wire::Field {
+                    reference: reference.clone(),
+                    handler: 1,
+                    editable: true,
+                    placeholder: String::new(),
+                    options: wire::EditorOptions {
+                        presentation: Some(Box::new(paint)),
+                        rich: Some(Box::new(rich)),
+                        binding: Some(Box::new(wire::EditorBinding {
+                            authored: true,
+                            on_request: 2,
+                            on_event: 3,
+                            claims: Vec::new(),
+                        })),
+                        ..Default::default()
+                    },
+                },
+            );
+            locked.documents.insert(
+                reference.document.clone(),
+                crate::editor::wire::Document {
+                    reference,
+                    text: Some(std::sync::Arc::from(source)),
+                    queue: Default::default(),
+                    queued_bytes: 0,
+                    phase: crate::editor::wire::Phase::Ready,
+                },
+            );
+        }
+        let window = cx.open_window(gpui_kit::size(px(600.), px(400.)), |window, cx| {
+            RichWireEditor::new("editor".into(), store.clone(), window, cx)
+        });
+        let editor = window.root(cx).unwrap();
+        let mut native = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        native.update(|window, cx| {
+            window.render_frame(cx);
+            let child = editor.read(cx).editor.clone();
+            child.update(cx, |child, cx| {
+                let id = child.block_id_at(0).unwrap();
+                child.focus_block(id, Caret::End, window, cx);
+            });
+            window.render_frame(cx);
+            assert!(
+                child.read(cx).suggestion_is_open(),
+                "the application supplied the menu"
+            );
+        });
+        native.run_until_parked();
+        let initial = store.drain();
+        assert!(
+            initial.is_empty(),
+            "initial projection must settle without an edit: {initial:?}"
         );
-        assert!(blocks[4].attrs.checked);
-        assert_eq!(blocks[11].text, "fn main() {}");
-        assert_eq!(blocks[11].attrs.language.as_deref(), Some("rust"));
-    }
-
-    #[test]
-    fn fences_become_marks_over_the_stripped_text() {
-        let blocks = blocks_of("T\nPlain **bold** and *it* and `code`");
-        let block = &blocks[1];
-        assert_eq!(block.text, "Plain bold and it and code");
-        let marks: Vec<(MarkKind, std::ops::Range<usize>)> = block
-            .marks
-            .iter()
-            .map(|mark| (mark.kind.clone(), mark.range.clone()))
-            .collect();
+        native.update(|window, cx| {
+            window.render_frame(cx);
+            match gesture {
+                MenuGesture::LinePick | MenuGesture::DividerPick => {
+                    let menu = window.find(("application-suggestion", 0usize)).bounds();
+                    let block = window.find(("block", 3usize)).bounds();
+                    assert!(
+                        menu.top() >= block.bottom(),
+                        "menu {menu:?} must follow the supplied block {block:?}"
+                    );
+                    window.click(("application-suggestion", 0usize), cx);
+                }
+                MenuGesture::Pick => window.click(("application-suggestion", 0usize), cx),
+                MenuGesture::Dismiss => window.press("escape", cx),
+                MenuGesture::Move => window.press("left", cx),
+            }
+        });
+        native.run_until_parked();
+        let requests = store.drain();
+        let expected = match gesture {
+            MenuGesture::Pick | MenuGesture::LinePick | MenuGesture::DividerPick => {
+                Some(EditorInteraction::MenuPick {
+                    tag: "opaque-choice".into(),
+                })
+            }
+            MenuGesture::Dismiss => Some(EditorInteraction::MenuDismiss),
+            MenuGesture::Move => None,
+        };
+        assert!(
+            requests.iter().any(
+                |event| matches!(event, wire::Event::EditorRequest { request, .. }
+            if matches!(&request.input, wire::EditorRequestInput::RichEdit { edit }
+                if edit.interaction == expected && (expected.is_some() || edit.document.cursor.position.column == 0)))
+            ),
+            "menu choice must use the canonical document queue"
+        );
         assert_eq!(
-            marks,
-            [
-                (MarkKind::Bold, 6..10),
-                (MarkKind::Italic, 15..17),
-                (MarkKind::Code, 22..26),
-            ]
+            store.lock().documents["application-document"]
+                .text
+                .as_deref(),
+            Some(source)
         );
     }
 
     #[test]
-    fn links_and_mentions_keep_their_targets() {
-        let blocks = blocks_of("T\nSee [docs](https://x.y) or https://a.b and @ada");
-        let marks: Vec<(MarkKind, &str)> = blocks[1]
-            .marks
-            .iter()
-            .map(|mark| (mark.kind.clone(), &blocks[1].text[mark.range.clone()]))
-            .collect();
-        assert_eq!(
-            marks,
-            [
-                (MarkKind::Link("https://x.y".into()), "docs"),
-                (MarkKind::Link("https://a.b".into()), "https://a.b"),
-                (MarkKind::Mention("ada".into()), "@ada"),
-            ]
+    fn native_attributes_round_trip_through_the_rich_projection() {
+        let mut block = BlockContent::new("details", "한글").with_attrs(BlockAttrs {
+            collapsed: true,
+            start: Some(42),
+            src: Some("uri".into()),
+            alt: Some("alt".into()),
+            emoji: Some("🙂".into()),
+            ..Default::default()
+        });
+        block
+            .attrs
+            .extra
+            .insert("table-json".into(), "{cells:[]}".into());
+        assert_eq!(native_block(&wire_block(&block).unwrap()).unwrap(), block);
+        let mut wire = wire_block(&block).unwrap();
+        for (name, value) in [("collapsed", "false"), ("start", "0002"), ("unknown", "")] {
+            wire.attributes = vec![wire::editor_rich::RichAttribute {
+                name: name.into(),
+                value: value.into(),
+            }];
+            assert!(native_block(&wire).is_err());
+        }
+    }
+
+    #[test]
+    fn unsupported_rich_primitives_are_rejected() {
+        let mut block = wire::editor_rich::RichBlock {
+            kind: "unknown".into(),
+            text: "abc".into(),
+            ..Default::default()
+        };
+        assert!(native_block(&block).is_err());
+        block.kind = "paragraph".into();
+        for (kind, value) in [
+            ("unknown", ""),
+            ("bold", "payload"),
+            ("highlight", "unknown"),
+            ("textStyle", ""),
+            ("comment", "42"),
+        ] {
+            block.marks = vec![wire::editor_rich::RichMark {
+                start: 0,
+                end: 3,
+                kind: kind.into(),
+                value: value.into(),
+            }];
+            assert!(native_block(&block).is_err(), "{kind}:{value}");
+        }
+        for kind in [
+            "paragraph",
+            "heading",
+            "bulletList",
+            "orderedList",
+            "taskList",
+            "blockquote",
+            "codeBlock",
+            "horizontalRule",
+            "callout",
+            "details",
+        ] {
+            block.kind = kind.into();
+            block.marks.clear();
+            assert_eq!(wire_block(&native_block(&block).unwrap()).unwrap(), block);
+        }
+    }
+
+    #[test]
+    fn rich_primitive_marks_round_trip_without_losing_payloads() {
+        let mut marks = vec![
+            ("bold", ""),
+            ("italic", ""),
+            ("underline", ""),
+            ("strike", ""),
+            ("code", ""),
+            ("superscript", ""),
+            ("subscript", ""),
+            ("link", "https://example.test/a"),
+            ("mention", "account:42"),
+            ("highlight", ""),
+        ];
+        marks.extend(
+            gpui_notion::editor::mark::HighlightColor::ALL
+                .iter()
+                .map(|color| ("highlight", color.label())),
         );
-    }
-
-    #[test]
-    fn a_run_with_several_marks_keeps_the_strongest() {
-        let block = BlockContent::paragraph("both").with_marks(MarkList::from_marks(vec![
-            Mark::new(MarkKind::Italic, 0..4),
-            Mark::new(MarkKind::Bold, 0..4),
-        ]));
-        assert_eq!(
-            markdown_of(&[BlockContent::paragraph("T"), block]),
-            "T\n**both**"
+        marks.extend(
+            gpui_notion::editor::mark::TextColor::ALL
+                .iter()
+                .map(|color| ("textStyle", color.label())),
         );
-    }
-
-    #[test]
-    fn depth_is_clamped_to_the_line_above() {
-        let blocks = blocks_of("T\n    - too deep\n- one\n    - two deep");
-        let depths: Vec<usize> = blocks.iter().map(|block| block.indent).collect();
-        assert_eq!(depths, [0, 0, 0, 1]);
-    }
-
-    #[test]
-    fn a_fresh_page_is_a_title_and_one_empty_line() {
-        let blocks = blocks_of("Untitled\n");
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[1].ty, types::PARAGRAPH);
-        assert_eq!(markdown_of(&blocks), "Untitled\n");
-        assert_eq!(markdown_of(&blocks_of("")), "");
-    }
-
-    #[test]
-    fn blocks_start_on_their_document_lines() {
-        assert_eq!(block_starts("T\na\n```\nx\ny\n```\nb"), [0, 1, 2, 6]);
-        assert_eq!(block_starts("T"), [0]);
-        assert_eq!(block_starts("T\n"), [0, 1]);
-    }
-
-    #[test]
-    fn plain_offsets_map_onto_the_fenced_line() {
-        let block = blocks_of("T\nSee **bold** and [docs](https://x.y) now").remove(1);
-        assert_eq!(block.text, "See bold and docs now");
-        // "See " is plain; "bold" opens after `**`; "docs" after `[`.
-        assert_eq!(fenced_column(&block, 0), 0);
-        assert_eq!(fenced_column(&block, 4), 6);
-        assert_eq!(fenced_column(&block, 8), 10);
-        assert_eq!(fenced_column(&block, 13), 18);
-        assert_eq!(fenced_column(&block, 17), 22);
-        assert_eq!(fenced_column(&block, 21), 40);
-    }
-
-    #[test]
-    fn changed_end_lands_after_the_edit() {
-        assert_eq!(changed_end("T\nhello", "T\nhello world"), 13);
-        assert_eq!(changed_end("T\nhello world", "T\nhello"), 7);
-        assert_eq!(changed_end("abc", "abc"), 3);
+        for (kind, value) in marks {
+            let block = wire::editor_rich::RichBlock {
+                kind: "paragraph".into(),
+                text: "한글".into(),
+                marks: vec![wire::editor_rich::RichMark {
+                    start: 0,
+                    end: 6,
+                    kind: kind.into(),
+                    value: value.into(),
+                }],
+                ..Default::default()
+            };
+            assert_eq!(
+                wire_block(&native_block(&block).unwrap()).unwrap(),
+                block,
+                "{kind}:{value}"
+            );
+        }
     }
 }

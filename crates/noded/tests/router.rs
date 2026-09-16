@@ -23,6 +23,7 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                 NodeCommand::Submit {
                     target,
                     payload,
+                    required_blob: _,
                     origin,
                     reply,
                 } => {
@@ -220,6 +221,162 @@ async fn submit_stamps_the_client_origin() {
     assert_eq!(body["root_hash"], "jess");
 }
 
+#[tokio::test]
+async fn raw_submit_preserves_arbitrary_module_bytes_and_node_authority() {
+    let (handle, mut commands, _events) = local_node();
+    tokio::spawn(async move {
+        let NodeCommand::Submit {
+            target,
+            payload,
+            required_blob: _,
+            origin,
+            reply,
+        } = commands.next().await.unwrap()
+        else {
+            panic!("expected module submit");
+        };
+        assert_eq!(target, "new-product");
+        assert_eq!(payload, vec![0, 255, 123, 0]);
+        assert_eq!(origin, noded::DEFAULT_ORIGIN.as_bytes());
+        reply.send(Ok(BlockSummary { height: 8, root_hash: "ab".repeat(32) })).unwrap();
+    });
+    let request = with_operator(with_peer(Request::builder().method("POST")
+        .uri("/v1/submit/raw/new-product").header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(vec![0, 255, 123, 0])).unwrap(), "127.0.0.1:40000"));
+    let response = noded::router(handle).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["height"], 8);
+}
+
+#[tokio::test]
+async fn operator_submit_accepts_an_explicit_generic_blob_prerequisite() {
+    let (handle, mut commands, _events) = local_node();
+    let stored = noded::router(handle.clone())
+        .oneshot(post("/v1/files/blob", serde_json::json!({"opaque":true})))
+        .await
+        .unwrap();
+    assert_eq!(stored.status(), StatusCode::OK);
+    let digest = body_json(stored).await["digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let expected_blob = duckfs_core::from_hex_32(&digest).unwrap();
+    tokio::spawn(async move {
+        let NodeCommand::Submit {
+            target,
+            payload,
+            required_blob,
+            reply,
+            ..
+        } = commands.next().await.unwrap()
+        else {
+            panic!("expected module submit");
+        };
+        assert_eq!(target, "unlisted-application");
+        assert_eq!(required_blob, Some(expected_blob));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&payload).unwrap(),
+            serde_json::json!({"publish":true})
+        );
+        reply
+            .send(Ok(BlockSummary {
+                height: 9,
+                root_hash: "ab".repeat(32),
+            }))
+            .unwrap();
+    });
+    let response = noded::router(handle)
+        .oneshot(post(
+            "/v1/submit",
+            serde_json::json!({
+                "target":"unlisted-application", "payload":{"publish":true},
+                "required_blob":digest,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["height"], 9);
+}
+
+#[tokio::test]
+async fn operator_submit_rejects_invalid_or_missing_blob_before_actor_dispatch() {
+    use futures::FutureExt as _;
+    for (digest, expected_status) in [
+        (serde_json::Value::Null, StatusCode::UNPROCESSABLE_ENTITY),
+        (
+            serde_json::json!("AA".repeat(32)),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (serde_json::json!("00"), StatusCode::UNPROCESSABLE_ENTITY),
+        (
+            serde_json::json!("gg".repeat(32)),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (serde_json::json!("00".repeat(32)), StatusCode::BAD_REQUEST),
+    ] {
+        let (handle, mut commands, _events) = local_node();
+        let response = noded::router(handle.clone()).oneshot(post("/v1/submit", serde_json::json!({
+            "target":"unlisted-application", "payload":{"publish":true}, "required_blob":digest,
+        }))).await.unwrap();
+        assert_eq!(response.status(), expected_status);
+        assert!(
+            commands.next().now_or_never().is_none(),
+            "invalid prerequisite reached actor"
+        );
+    }
+}
+
+#[tokio::test]
+async fn raw_submit_preserves_explicit_blob_and_opaque_bytes() {
+    let (handle, mut commands, _events) = local_node();
+    let stored = noded::router(handle.clone())
+        .oneshot(post("/v1/files/blob", serde_json::json!({"raw":true})))
+        .await
+        .unwrap();
+    assert_eq!(stored.status(), StatusCode::OK);
+    let digest = body_json(stored).await["digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let expected = duckfs_core::from_hex_32(&digest).unwrap();
+    let actor = tokio::spawn(async move {
+        let NodeCommand::Submit {
+            target,
+            payload,
+            required_blob,
+            reply,
+            ..
+        } = commands.next().await.unwrap()
+        else {
+            panic!("expected submit");
+        };
+        assert_eq!(target, "another-product");
+        assert_eq!(payload, [0, 255, 0]);
+        assert_eq!(required_blob, Some(expected));
+        reply
+            .send(Ok(BlockSummary {
+                height: 10,
+                root_hash: "ab".repeat(32),
+            }))
+            .unwrap();
+    });
+    let request = with_operator(with_peer(
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/v1/submit/raw/another-product?required_blob={digest}"
+            ))
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(vec![0, 255, 0]))
+            .unwrap(),
+        "127.0.0.1:40000",
+    ));
+    let response = noded::router(handle).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    actor.await.unwrap();
+}
+
 // ---- the signed-write gate over the mutating routes -------------------------
 
 /// an UNSIGNED mutation is refused before the handler runs — and the refusal
@@ -241,17 +398,11 @@ async fn an_unsigned_mutation_is_refused_and_never_reaches_the_actor() {
         ("POST", "/v1/log-filter"),
         ("POST", "/v1/invite"),
         ("POST", "/v1/submit"),
+        ("POST", "/v1/submit/raw/new-product"),
         ("POST", "/v1/fs/workspaces"),
         ("POST", "/v1/fs/workspaces/abc/commit"),
         ("DELETE", "/v1/fs/workspaces/abc"),
         ("POST", "/v1/files/blob"),
-        ("POST", "/v1/files/stage"),
-        ("POST", "/v1/files/commit"),
-        ("POST", "/v1/files/pin"),
-        ("POST", "/v1/files/unpin"),
-        ("POST", "/v1/files/watch"),
-        ("PUT", "/v1/files/object/shared/a.txt"),
-        ("DELETE", "/v1/files/object/shared/a.txt"),
         ("POST", "/v1/term/sessions"),
         ("POST", "/v1/term/sessions/abc/close"),
     ] {
@@ -394,95 +545,6 @@ async fn submit_refuses_a_self_minted_key_and_the_operators_signature_wins_over_
         .to_string();
     let acting = String::from_utf8_lossy(operator_key.public_key().as_ref()).into_owned();
     assert_eq!(stamped, acting);
-}
-
-/// one git pkt-line: a 4-hex length prefix over the payload INCLUDING itself.
-fn pkt(payload: &str) -> String {
-    format!("{:04x}{payload}", payload.len() + 4)
-}
-
-/// a stock (UNSIGNED) receive-pack body: one ref-update command, the flush that
-/// ends the command list, and an empty pack.
-fn unsigned_push_body() -> String {
-    let zero = "0".repeat(40);
-    let one = "1".repeat(40);
-    format!(
-        "{}0000",
-        pkt(&format!("{zero} {one} refs/heads/main\0report-status\n"))
-    )
-}
-
-/// A PUSH MUST PROVE ITSELF. An unsigned push used to be accepted and re-signed
-/// with the node's key, so the first one to a new repo made this node's raw
-/// pubkey the permanent owner (#1292).
-#[tokio::test]
-async fn an_unproven_push_is_refused() {
-    let (handle, cmd_rx, _events) = local_node();
-    tokio::spawn(async move {
-        let mut cmds = cmd_rx;
-        if cmds.next().await.is_some() {
-            panic!("an unproven push reached the node actor");
-        }
-    });
-
-    let request = Request::builder()
-        .method("POST")
-        .uri("/forge/lab/git-receive-pack")
-        .header(
-            header::CONTENT_TYPE,
-            "application/x-git-receive-pack-request",
-        )
-        .body(Body::from(unsigned_push_body()))
-        .unwrap();
-    let response = noded::router(handle).oneshot(request).await.unwrap();
-    // CONSUME-AND-REFUSE: the pack was received, so the answer is git's own
-    // report-status with the ref rejected — what git prints as
-    // `! [remote rejected] main -> main (<reason>)`. An HTTP error here is
-    // what git reports as "the remote end hung up unexpectedly", with the
-    // reason lost.
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let report = String::from_utf8_lossy(&bytes);
-    assert!(
-        report.contains("unpack ok"),
-        "a report-status answers the push: {report}"
-    );
-    assert!(
-        report.contains("ng refs/heads/main "),
-        "the ref is rejected, not the connection: {report}"
-    );
-    assert!(
-        report.contains("git push --signed"),
-        "the refusal names the two proofs a push can carry: {report}"
-    );
-}
-
-/// The node's own operator credential is the OTHER proof: it is what
-/// `make dogfood-forge` and the agent-run lane present, and it makes the NODE
-/// the repo's owner — right for a node publishing its own mirror.
-#[tokio::test]
-async fn an_operator_credentialed_push_is_admitted() {
-    let (handle, cmd_rx, _events) = local_node();
-    spawn_fake_actor(cmd_rx, None);
-
-    let request = with_operator(with_peer(
-        Request::builder()
-            .method("POST")
-            .uri("/forge/lab/git-receive-pack")
-            .header(
-                header::CONTENT_TYPE,
-                "application/x-git-receive-pack-request",
-            )
-            .body(Body::from(unsigned_push_body()))
-            .unwrap(),
-        "127.0.0.1:40000",
-    ));
-    let response = noded::router(handle).oneshot(request).await.unwrap();
-    assert_ne!(
-        response.status(),
-        StatusCode::UNAUTHORIZED,
-        "the operator credential is a proof this route accepts"
-    );
 }
 
 /// THE NODE-LEVEL ROUTES, one per credential. `signed_write_guard` proves
@@ -647,19 +709,7 @@ async fn reads_stay_open() {
         .unwrap();
     assert_eq!(status.status(), StatusCode::OK);
 
-    // the object facade shares its path with a gated PUT/DELETE — the GET half
-    // must not inherit the gate. (what it answers depends on the actor; that it
-    // is not a 401 is the property.)
-    let read = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/files/object/shared/x.txt")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_ne!(read.status(), StatusCode::UNAUTHORIZED);
+
 }
 
 // ---- the signed-frame lane (`POST /v1/submit/frame`) -----------------------
@@ -717,6 +767,50 @@ async fn a_signed_frame_lands_with_the_signers_key_as_the_origin() {
         Some(64),
         "the frame lane returns the same receipt shape"
     );
+}
+
+#[tokio::test]
+async fn signed_blob_prerequisite_requires_local_bytes_and_preserves_the_frame() {
+    use futures::FutureExt as _;
+    let (handle, mut commands, _events) = local_node();
+    let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
+    let stored = noded::router(handle.clone())
+        .oneshot(post("/v1/files/blob", serde_json::json!({"signed":true})))
+        .await
+        .unwrap();
+    let digest =
+        duckfs_core::from_hex_32(body_json(stored).await["digest"].as_str().unwrap()).unwrap();
+    let message = sdk::Msg {
+        target: "unknown-product".into(),
+        payload: vec![255, 0],
+    };
+    let unavailable = node::encode_frame_with_blob(&signer, 1, &message, Some([0; 32]));
+    let response = noded::router(handle.clone())
+        .oneshot(post_frame(unavailable))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(commands.next().now_or_never().is_none());
+    let frame = node::encode_frame_with_blob(&signer, 2, &message, Some(digest));
+    let expected = frame.clone();
+    let actor = tokio::spawn(async move {
+        let NodeCommand::SubmitFrame { frame, reply } = commands.next().await.unwrap() else {
+            panic!("expected signed frame");
+        };
+        assert_eq!(frame, expected);
+        reply
+            .send(Ok(BlockSummary {
+                height: 12,
+                root_hash: "ab".repeat(32),
+            }))
+            .unwrap();
+    });
+    let response = noded::router(handle)
+        .oneshot(post_frame(frame))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    actor.await.unwrap();
 }
 
 #[tokio::test]
@@ -1454,7 +1548,7 @@ async fn netstack_swap_answers_the_plane_or_says_there_is_none() {
     let response = noded::router(handle)
         .oneshot(post(
             "/v1/admin/netstack/swap",
-            serde_json::json!({ "backend": "native" }),
+            serde_json::json!({ "backend": { "component": "/srv/working.wasm" } }),
         ))
         .await
         .unwrap();
@@ -1471,12 +1565,12 @@ async fn netstack_swap_answers_the_plane_or_says_there_is_none() {
         recorded.lock().unwrap().push(request.clone());
         Box::pin(async move {
             match request {
-                noded::NetstackSwapRequest::Native => Ok("native".to_string()),
                 // the frozen snapshot contract refuses a component built
                 // against another contract BY NAME, before a byte is decoded.
-                noded::NetstackSwapRequest::Component(_) => {
-                    Err("foreign contract: ducktape:netstack@0.2.0".to_string())
-                }
+                noded::NetstackSwapRequest::Component(path) => match path.to_str() {
+                    Some("/srv/working.wasm") => Ok("guest".to_string()),
+                    _ => Err("foreign snapshot contract".to_string()),
+                },
                 // the governance reconciler's variant: node-internal, never
                 // decoded from a request body (asserted below).
                 noded::NetstackSwapRequest::Bytes(_) => Err("bytes are not a route".to_string()),
@@ -1488,12 +1582,12 @@ async fn netstack_swap_answers_the_plane_or_says_there_is_none() {
         .clone()
         .oneshot(post(
             "/v1/admin/netstack/swap",
-            serde_json::json!({ "backend": "native" }),
+            serde_json::json!({ "backend": { "component": "/srv/working.wasm" } }),
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(body_json(response).await["backend"], "native");
+    assert_eq!(body_json(response).await["backend"], "guest");
 
     // a refused swap: 409, the plane's own reason in `error`, and the stable
     // token in `reason`.
@@ -1509,13 +1603,16 @@ async fn netstack_swap_answers_the_plane_or_says_there_is_none() {
     let body = body_json(response).await;
     assert_eq!(body["reason"], "netstack_swap_refused");
     assert!(
-        body["error"].as_str().unwrap().contains("foreign contract"),
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("foreign snapshot contract"),
         "the plane's refusal must reach the operator: {body}"
     );
     assert_eq!(
         *seen.lock().unwrap(),
         vec![
-            noded::NetstackSwapRequest::Native,
+            noded::NetstackSwapRequest::Component("/srv/working.wasm".into()),
             noded::NetstackSwapRequest::Component("/srv/netstack.wasm".into()),
         ],
     );
@@ -1525,6 +1622,7 @@ async fn netstack_swap_answers_the_plane_or_says_there_is_none() {
     // a path on the node's own disk, and nothing off-box ships it component
     // bytes.
     for body in [
+        serde_json::json!({ "backend": "native" }),
         serde_json::json!({ "backends": "native" }),
         serde_json::json!({ "backend": { "bytes": [0, 97, 115, 109] } }),
     ] {
@@ -2067,6 +2165,93 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
 }
 
 #[tokio::test]
+async fn gateway_operator_forwards_existing_authentication_without_requiring_an_account() {
+    let (handle, cmds, _events) = local_node();
+    let owner = caller();
+    let handle = handle.with_admin(AdminConfig {
+        operator_token: Some(OPERATOR.into()),
+        node_key: Some(NODE_KEY.to_vec()),
+        owner_key: Some(owner.public_key().as_ref().to_vec()),
+        ..Default::default()
+    });
+    let body = serde_json::json!({
+        "head": {
+            "account_id": 1, "name": {"label": "app"}, "revision": 7,
+            "method": "post", "path_and_query": "/sessions", "headers": [],
+            "body_len": 2, "upgrade": false, "user_pop": null,
+        },
+        "body_b64": "e30=",
+    });
+    let (lane, mut jobs) = tokio::sync::mpsc::channel(1);
+    let app = noded::router(handle.with_gateway(lane));
+    let path = "/v1/gateway/operator";
+    let stranger = commonware_cryptography::ed25519::PrivateKey::from_seed(78);
+    let requests = [
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        signed_by(&stranger, "POST", path, body.clone()),
+        with_peer(post(path, body.clone()), "192.0.2.1:40000"),
+    ];
+    for (request, status) in requests.into_iter().zip([
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::UNAUTHORIZED,
+    ]) {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), status);
+    }
+    let mut forged = body.clone();
+    forged["head"]["operator"] = true.into();
+    let response = app
+        .clone()
+        .oneshot(post("/v1/gateway/proxy", forged))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(jobs.try_recv().is_err());
+
+    spawn_gateway_actor(cmds, 2);
+    let serving = tokio::spawn(async move {
+        for _ in 0..2 {
+            let noded::GatewayJob::Http {
+                head, body, reply, ..
+            } = jobs.recv().await.unwrap()
+            else {
+                panic!("HTTP exchange expected");
+            };
+            assert!(head.operator);
+            assert!(head.user_pop.is_none());
+            assert!(head.headers.is_empty());
+            assert_eq!(body, b"{}");
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            drop(tx);
+            reply
+                .send(Ok(noded::GatewayResponse {
+                    head: gateway::ProxyResponseHead {
+                        status: 204,
+                        headers: vec![],
+                    },
+                    body: rx,
+                }))
+                .unwrap();
+        }
+    });
+    for request in [
+        post(path, body.clone()),
+        signed_by(&owner, "POST", path, body),
+    ] {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["head"]["status"], 204);
+    }
+    serving.await.unwrap();
+}
+
+#[tokio::test]
 async fn gateway_api_rejects_untrusted_browser_origins_before_network_work() {
     let (handle, _cmds, _events) = local_node();
     for origin in ["https://evil.example", "http://app.demo.duck"] {
@@ -2260,7 +2445,7 @@ fn ws_upgrade(uri: &str) -> Request<Body> {
 }
 
 #[tokio::test]
-async fn call_ws_route_is_wired() {
+async fn call_product_route_is_absent() {
     let (handle, cmd_rx, _events) = local_node();
     spawn_fake_actor(cmd_rx, None);
 
@@ -2269,10 +2454,7 @@ async fn call_ws_route_is_wired() {
         .await
         .unwrap();
 
-    // 401 = the handler's own admission ran on a bare upgrade: the route
-    // matched — anything but 404 proves it exists. admission comes BEFORE
-    // the upgrade is attempted, so an unadmitted caller never learns more.
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -2307,7 +2489,7 @@ async fn the_old_voice_ws_route_is_gone() {
 
 use std::collections::BTreeMap;
 
-use duckfs_core::{DiffEntry, DiffKind, FilesMsg, FilesQuery, FilesReply, RefsInfo};
+use duckfs_core::{DiffEntry, DiffKind, FilesQuery, FilesReply, RefsInfo};
 
 /// a scripted files actor: decodes each `FilesQuery` and answers the matching
 /// canned `FilesReply`, or fails a submit with `submit_err` (the 400-envelope
@@ -2364,141 +2546,6 @@ fn spawn_files_actor(
     });
 }
 
-fn get(uri: &str) -> Request<Body> {
-    Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap()
-}
-
-/// a scripted files actor with a REAL pin table: decodes `FilesMsg::Pin`/
-/// `Unpin` off the submit payload and releases a pin by its exact name, as
-/// `Fs::unpin_apply` does — the piece [`spawn_files_actor`]'s canned replies
-/// don't model. the name has to survive the wire (client encode -> signed
-/// JSON body -> axum decode -> module msg decode) byte-for-byte for the
-/// release to find its entry at all.
-fn spawn_pin_actor(
-    mut cmds: futures::channel::mpsc::Receiver<NodeCommand>,
-    pins: std::sync::Arc<std::sync::Mutex<BTreeMap<String, Vec<u8>>>>,
-) {
-    tokio::spawn(async move {
-        while let Some(cmd) = cmds.next().await {
-            match cmd {
-                NodeCommand::Query { target, req, reply } => {
-                    assert_eq!(target, "files");
-                    let FilesQuery::Refs {} =
-                        duckfs_core::decode_query(&req).expect("files query decodes")
-                    else {
-                        panic!("this actor only answers Refs");
-                    };
-                    let names = pins.lock().unwrap();
-                    let bytes = duckfs_core::encode_reply(&FilesReply::Refs(RefsInfo {
-                        head: None,
-                        pins: names
-                            .keys()
-                            .map(|name| (name.clone(), "ab".repeat(32)))
-                            .collect(),
-                        window_len: 0,
-                    }));
-                    let _ = reply.send(Ok(bytes));
-                }
-                NodeCommand::Submit {
-                    target,
-                    payload,
-                    origin,
-                    reply,
-                } => {
-                    assert_eq!(target, "files");
-                    let msg = duckfs_core::decode_msg(&payload).expect("files msg decodes");
-                    let result = match msg {
-                        FilesMsg::Pin { name, .. } => {
-                            pins.lock().unwrap().insert(name, origin);
-                            Ok(())
-                        }
-                        FilesMsg::Unpin { name } => {
-                            let mut names = pins.lock().unwrap();
-                            match names.remove(&name) {
-                                None => Err("files: pin not found".to_string()),
-                                Some(_) => Ok(()),
-                            }
-                        }
-                        other => panic!("unexpected files msg: {other:?}"),
-                    };
-                    let _ = reply.send(result.map(|()| BlockSummary {
-                        height: 9,
-                        root_hash: "ab".repeat(32),
-                    }));
-                }
-                _ => {}
-            }
-        }
-    });
-}
-
-/// every legal pin name — including `.`/`..`, which `url` collapses as
-/// dot-segments, and a slash, which splits a path — survives
-/// `POST /v1/files/unpin`'s signed JSON body unmangled: a release by another
-/// signer finds the pin by that exact name and removes it, and a second
-/// release of the same name is the module's verbatim "pin not found".
-#[tokio::test]
-async fn unpin_over_http_takes_every_legal_pin_name() {
-    for name in [".", "..", "a/b", "café-🦆"] {
-        let (handle, cmd_rx, _events) = local_node();
-        let pins = std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
-        spawn_pin_actor(cmd_rx, pins.clone());
-        let app = noded::router(handle);
-
-        let owner = commonware_cryptography::ed25519::PrivateKey::from_seed(101);
-        let other = commonware_cryptography::ed25519::PrivateKey::from_seed(102);
-
-        let pin_body = serde_json::json!({ "snapshot": "ab".repeat(32), "name": name });
-        let response = app
-            .clone()
-            .oneshot(signed_by(&owner, "POST", "/v1/files/pin", pin_body))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "pin {name:?} failed");
-
-        // another signer's unpin reaches the module intact and releases the
-        // pin by name, not garbled by a route the wire never touches anymore.
-        let unpin_body = serde_json::json!({ "name": name });
-        let response = app
-            .clone()
-            .oneshot(signed_by(
-                &other,
-                "POST",
-                "/v1/files/unpin",
-                unpin_body.clone(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "another signer's unpin {name:?} failed"
-        );
-
-        let refs = body_json(app.clone().oneshot(get("/v1/files/refs")).await.unwrap()).await;
-        assert!(
-            refs["pins"].get(name).is_none(),
-            "pin {name:?} must be gone once anyone unpins it"
-        );
-
-        let response = app
-            .clone()
-            .oneshot(signed_by(&owner, "POST", "/v1/files/unpin", unpin_body))
-            .await
-            .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "a second unpin of {name:?} must find nothing"
-        );
-        let body = body_json(response).await;
-        assert_eq!(body["error"], "files: pin not found");
-    }
-}
 
 #[tokio::test]
 async fn files_refs_route_returns_head() {
@@ -2506,14 +2553,14 @@ async fn files_refs_route_returns_head() {
     spawn_files_actor(cmd_rx, None);
 
     let response = noded::router(handle)
-        .oneshot(get("/v1/files/refs"))
+        .oneshot(post("/v1/query", serde_json::json!({"target":"files","query":{"refs":{}}})))
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
-    assert_eq!(body["head"], "ab".repeat(32));
-    assert_eq!(body["window_len"], 4);
+    assert_eq!(body["refs"]["head"], "ab".repeat(32));
+    assert_eq!(body["refs"]["window_len"], 4);
 }
 
 #[tokio::test]
@@ -2522,14 +2569,14 @@ async fn files_diff_route_returns_entries() {
     spawn_files_actor(cmd_rx, None);
 
     let response = noded::router(handle)
-        .oneshot(get("/v1/files/diff?from=aa&to=bb&prefix=/"))
+        .oneshot(post("/v1/query", serde_json::json!({"target":"files","query":{"diff":{"from":"aa","to":"bb","prefix":"/"}}})))
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
-    assert_eq!(body["entries"][0]["path"], "/a");
-    assert_eq!(body["entries"][0]["kind"], "modified");
+    assert_eq!(body["diff"][0]["path"], "/a");
+    assert_eq!(body["diff"][0]["kind"], "modified");
 }
 
 #[tokio::test]
@@ -2540,13 +2587,13 @@ async fn files_has_chunks_route_preserves_request_order() {
     let present = "aa".repeat(32);
     let absent = "bb".repeat(32);
     let response = noded::router(handle)
-        .oneshot(get(&format!("/v1/files/has-chunks?ids={present},{absent}")))
+        .oneshot(post("/v1/query", serde_json::json!({"target":"files","query":{"has_chunks":{"ids":[present,absent]}}})))
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
-    assert_eq!(body["present"], serde_json::json!([true, false]));
+    assert_eq!(body["has_chunks"]["present"], serde_json::json!([true, false]));
 }
 
 #[tokio::test]
@@ -2558,8 +2605,8 @@ async fn files_module_rejection_is_a_verbatim_400_envelope() {
 
     let response = noded::router(handle)
         .oneshot(post(
-            "/v1/files/commit",
-            serde_json::json!({ "message": "m", "changes": [] }),
+            "/v1/submit",
+            serde_json::json!({ "target":"files", "payload":{"commit":{"base_snapshot":null,"message":"m","changes":[]}} }),
         ))
         .await
         .unwrap();
@@ -2567,47 +2614,6 @@ async fn files_module_rejection_is_a_verbatim_400_envelope() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = body_json(response).await;
     assert_eq!(body["error"], "files: conflict: /x changed since base");
-}
-
-#[tokio::test]
-async fn upload_pack_have_round_returns_only_plain_nak() {
-    fn pkt(payload: &[u8]) -> Vec<u8> {
-        let mut line = format!("{:04x}", payload.len() + 4).into_bytes();
-        line.extend_from_slice(payload);
-        line
-    }
-
-    let oid = "11".repeat(20);
-    let mut request_body = pkt(format!("want {oid} multi_ack_detailed side-band-64k\n").as_bytes());
-    request_body.extend_from_slice(b"0000");
-    request_body.extend_from_slice(&pkt(format!("have {oid}\n").as_bytes()));
-    request_body.extend_from_slice(b"0000");
-
-    let forge_root = tempfile::tempdir().expect("forge root");
-    let (handle, _cmd_rx, _events) = local_node();
-    let response = noded::router(handle.with_forge_repo(forge_root.path()))
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/forge/repo/git-upload-pack")
-                .header(
-                    header::CONTENT_TYPE,
-                    "application/x-git-upload-pack-request",
-                )
-                .body(Body::from(request_body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers()[header::CONTENT_TYPE],
-        "application/x-git-upload-pack-result"
-    );
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(&body[..], b"0008NAK\n");
-    assert!(!body.windows(4).any(|window| window == b"PACK"));
 }
 
 // ---- duckfs workspace RPC: 503 when unconfigured, slug validation -----------
@@ -2902,63 +2908,6 @@ async fn huddle_node_proof_refuses_the_operator_credential() {
 }
 
 #[tokio::test]
-async fn call_ws_refuses_an_unsigned_upgrade_without_the_workspace_secret() {
-    let response = noded::router(huddle_node())
-        .oneshot(ws_upgrade("/v1/call/ws?channel=general"))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(body_json(response).await["reason"], "signature_missing");
-}
-
-#[tokio::test]
-async fn call_ws_admits_a_signed_roster_member() {
-    // admitted: the gate falls through to the hub, which this handle has none
-    // of — 503 is the first answer PAST admission (an unadmitted upgrade never
-    // learns whether a hub exists).
-    let response = noded::router(huddle_node())
-        .oneshot(signed_ws_upgrade(&member(), "/v1/call/ws?channel=general"))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-}
-
-#[tokio::test]
-async fn call_ws_refuses_a_signed_key_the_roster_does_not_name() {
-    // `caller()` holds no account, so it is not on any roster.
-    let response = noded::router(huddle_node())
-        .oneshot(signed_ws_upgrade(&caller(), "/v1/call/ws?channel=general"))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(body_json(response).await["reason"], "key_without_account");
-
-    // a member of `general`'s huddle is not thereby in any other room's.
-    let response = noded::router(huddle_node())
-        .oneshot(signed_ws_upgrade(&member(), "/v1/call/ws?channel=random"))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(body_json(response).await["reason"], "not_in_huddle");
-}
-
-#[tokio::test]
-async fn call_ws_refuses_a_signature_over_another_path() {
-    // the trio is bound to the exact path+query: a signature minted for one
-    // channel does not open another.
-    let response = noded::router(huddle_node())
-        .oneshot(signed_ws_upgrade_over(
-            &member(),
-            "/v1/call/ws?channel=random",
-            "/v1/call/ws?channel=general",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(body_json(response).await["reason"], "signature_invalid");
-}
-
-#[tokio::test]
 async fn presence_ws_admits_a_signed_account_holder_and_refuses_a_keyless_one() {
     let response = noded::router(huddle_node())
         .oneshot(signed_ws_upgrade(&member(), "/v1/presence/ws?page=page-1"))
@@ -2972,4 +2921,131 @@ async fn presence_ws_admits_a_signed_account_holder_and_refuses_a_keyless_one() 
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(body_json(response).await["reason"], "key_without_account");
+}
+
+#[tokio::test]
+async fn blob_upload_capacity_is_reserved_before_signature_body_collection() {
+    let (handle, _commands, _events) = local_node();
+    let router = noded::router(handle);
+    let mut releases = Vec::new();
+    let mut requests = Vec::new();
+    for _ in 0..2 {
+        let (started, polled) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let body = Body::from_stream(futures::stream::once(async move {
+            started.send(()).unwrap();
+            released.await.unwrap();
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"blob"))
+        }));
+        let request = Request::builder().method("POST").uri("/v1/files/blob").body(body).unwrap();
+        requests.push(tokio::spawn(router.clone().oneshot(request)));
+        polled.await.unwrap();
+        releases.push(release);
+    }
+    let request = || Request::builder().method("POST").uri("/v1/files/blob").body(Body::empty()).unwrap();
+    assert_eq!(router.clone().oneshot(request()).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+    for release in releases { release.send(()).unwrap(); }
+    for request in requests { assert_ne!(request.await.unwrap().unwrap().status(), StatusCode::SERVICE_UNAVAILABLE); }
+    assert_ne!(router.oneshot(request()).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn operator_stream_binds_the_target_in_the_signature_and_forwards_without_an_account() {
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest as _, Message};
+    use futures::SinkExt as _;
+    let (handle, mut cmds, _events) = local_node();
+    let owner = caller();
+    let handle = handle.with_admin(AdminConfig {
+        operator_token: Some(OPERATOR.into()),
+        node_key: Some(NODE_KEY.to_vec()),
+        owner_key: Some(owner.public_key().as_ref().to_vec()),
+        ..Default::default()
+    });
+    let (lane, mut jobs) = tokio::sync::mpsc::channel(1);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            noded::router(handle.with_gateway(lane))
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let head = serde_json::json!({
+        "account_id": 1, "name": {"label":"app"}, "revision": 7,
+        "method": "get", "path_and_query": "/sessions/0000000000000001?after=3",
+        "headers": [], "body_len": 0, "upgrade": true, "user_pop": null,
+    });
+    let mut url = reqwest::Url::parse(&format!("ws://{address}/v1/gateway/operator")).unwrap();
+    url.query_pairs_mut().append_pair("head", &head.to_string());
+    let uri = format!("{}?{}", url.path(), url.query().unwrap());
+    let mut signed_request = url.as_str().into_client_request().unwrap();
+    for (name, value) in noded::signed_req::request_headers(&owner, "GET", &uri, &NODE_KEY, &[]) {
+        signed_request
+            .headers_mut()
+            .insert(name, value.parse().unwrap());
+    }
+    let mut tampered = signed_request.clone();
+    *tampered.uri_mut() = format!("{url}&changed=1").parse().unwrap();
+    let tokio_tungstenite::tungstenite::Error::Http(refused) =
+        tokio_tungstenite::connect_async(tampered)
+            .await
+            .unwrap_err()
+    else {
+        panic!("HTTP refusal")
+    };
+    assert_eq!(refused.status(), 401);
+    assert!(jobs.try_recv().is_err());
+    let actor = tokio::spawn(async move {
+        for _ in 0..2 {
+            let NodeCommand::Query { target, reply, .. } = cmds.next().await.unwrap() else {
+                panic!("route query")
+            };
+            assert_eq!(target, "gateway");
+            let mut route = gateway_route();
+            route.statement.route.as_mut().unwrap().policy.allow_upgrade = true;
+            reply
+                .send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
+                    Box::new(Some(route)),
+                ))))
+                .unwrap();
+            let noded::GatewayJob::Upgrade {
+                head,
+                to_browser,
+                mut from_browser,
+                ..
+            } = jobs.recv().await.unwrap()
+            else {
+                panic!("upgrade")
+            };
+            assert!(head.operator);
+            assert!(head.user_pop.is_none());
+            assert_eq!(head.path_and_query, "/sessions/0000000000000001?after=3");
+            to_browser
+                .send(noded::GatewayWsMsg::Text("ready".into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                from_browser.recv().await,
+                Some(noded::GatewayWsMsg::Text("input".into()))
+            );
+        }
+    });
+    let mut token_request = url.as_str().into_client_request().unwrap();
+    token_request
+        .headers_mut()
+        .insert("x-ducktape-admin-token", OPERATOR.parse().unwrap());
+    for request in [signed_request, token_request] {
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        assert_eq!(
+            socket.next().await.unwrap().unwrap().to_text().unwrap(),
+            "ready"
+        );
+        socket.send(Message::Text("input".into())).await.unwrap();
+    }
+    actor.await.unwrap();
+    server.abort();
+    let _ = server.await;
 }

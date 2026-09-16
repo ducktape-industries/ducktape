@@ -3,7 +3,7 @@
 //! the SAME native [`Forge`] the daemon lanes run. it is native forge with the
 //! `sdk::Module` trait peeled off: the guest owns `execute` (the pure
 //! [`ForgeState`](crate::state::ForgeState) core), the host owns everything
-//! that touches a git object database — `root`, the browse/diff reads,
+//! that touches a git object database — `root`, bounded object/diff primitives,
 //! snapshot packing + install, materialization — and the block boundary is
 //! driven by the kernel through the backing hooks.
 //!
@@ -90,6 +90,36 @@ impl HostOdb for ForgeOdbBacking {
 }
 
 impl OdbBacking for ForgeOdbBacking {
+    fn kind(&self) -> wasm_host::Backing {
+        wasm_host::Backing::Git
+    }
+    fn git_object_read(
+        &self,
+        repository: &str,
+        oid: &[u8],
+        max_bytes: u64,
+    ) -> Result<wasm_host::GitObject, Error> {
+        self.forge.git_object_read(repository, oid, max_bytes)
+    }
+    fn git_diff_read(
+        &self,
+        repository: &str,
+        target: &[u8],
+        source: &[u8],
+        max_bytes: u64,
+        max_files: u64,
+        max_blob_bytes: u64,
+    ) -> Result<wasm_host::GitDiff, wasm_host::GitDiffError> {
+        self.forge.git_diff_read(
+            repository,
+            target,
+            source,
+            max_bytes,
+            max_files,
+            max_blob_bytes,
+        )
+    }
+
     fn refs_bytes(&self) -> Vec<u8> {
         self.forge.state.committed_image()
     }
@@ -125,10 +155,6 @@ impl OdbBacking for ForgeOdbBacking {
     fn discard_block(&mut self) {
         self.targets.clear();
         self.forge.state.abort();
-    }
-
-    fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        self.forge.query_committed(req)
     }
 
     /// the whole state ships as one self-contained container (image + packs

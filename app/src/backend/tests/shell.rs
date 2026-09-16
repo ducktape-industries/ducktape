@@ -113,154 +113,6 @@ fn the_roster_answers_admin_tier_and_filters() {
 }
 
 #[test]
-fn the_huddle_roster_marks_the_row_this_device_holds() {
-    // The wire truth: `HuddleEntry.user` is the kernel's BARE user id, never
-    // `user:{hex}` — the previous fixture invented prefixed entries and
-    // asserted a compare no real roster row could satisfy.
-    let me = [0xaau8; 32];
-    let my_passkey = [0xacu8; 32];
-    let peer = [0xbbu8; 32];
-    // A seat taken with the person's passkey is the person's: the directory
-    // binds both keys to one account, and the roster recognises it.
-    let names = NameDirectory::new(BTreeMap::from([
-        (
-            hex_encode(&me),
-            BoundAccount {
-                number: 1,
-                name: "me".into(),
-            },
-        ),
-        (
-            hex_encode(&my_passkey),
-            BoundAccount {
-                number: 1,
-                name: "me".into(),
-            },
-        ),
-        (
-            hex_encode(&peer),
-            BoundAccount {
-                number: 2,
-                name: "peer".into(),
-            },
-        ),
-    ]));
-    let roster = huddle_roster(
-        &[
-            chat::index::HuddleEntry {
-                party: "acct:1".into(),
-                node: "0a0a".into(),
-                joined_at: 10,
-            },
-            chat::index::HuddleEntry {
-                party: format!("user:{}", hex_encode(&peer)),
-                node: "0b0b".into(),
-                joined_at: 20,
-            },
-        ],
-        ChatReader::new(Some(&me), &names),
-    );
-    assert_eq!(roster.len(), 2);
-    assert!(roster[0].is_you && !roster[0].is_agent);
-    assert!(!roster[1].is_you && !roster[1].is_agent);
-    assert_eq!(roster[0].label, "me");
-    assert!(huddle_self(roster.clone()));
-    assert!(!huddle_self(vec![roster[1].clone()]));
-    // The fan-out the live session polls for is this roster's NODE keys with
-    // our own row removed — the hub admits and fans out by node identity, and
-    // a set that carried our own key would aim this device's media at itself.
-    assert_eq!(
-        huddle_recipient_nodes(roster, None),
-        vec!["0b0b".to_string()]
-    );
-}
-
-#[test]
-fn huddle_recipient_nodes_drops_any_row_naming_this_devices_own_node() {
-    // A `node_proof` only proves ITS OWN user holds that node's key — nothing
-    // stops a stale or replayed roster row from naming a DIFFERENT user
-    // alongside THIS node's key. `is_you` alone would miss it (that row is
-    // not "mine"), and fanning media to your own node is a loopback echo.
-    let me = [0xaau8; 32];
-    let peer = [0xbbu8; 32];
-    let names = NameDirectory::new(BTreeMap::new());
-    let roster = huddle_roster(
-        &[
-            chat::index::HuddleEntry {
-                party: format!("user:{}", hex_encode(&me)),
-                node: "0a0a".into(),
-                joined_at: 10,
-            },
-            chat::index::HuddleEntry {
-                party: format!("user:{}", hex_encode(&peer)),
-                node: "0a0a".into(),
-                joined_at: 20,
-            },
-        ],
-        ChatReader::new(Some(&me), &names),
-    );
-    assert_eq!(
-        huddle_recipient_nodes(roster, Some("0a0a")),
-        Vec::<String>::new(),
-        "the peer row names this device's own node — never fan media there"
-    );
-}
-
-#[test]
-fn huddle_recipient_nodes_keeps_the_readers_other_device() {
-    // Two devices of ONE account in the same huddle: the module dedups a
-    // join by PARTY, so this device's own historical `user:{hex}` row (this
-    // exact key) sits alongside the account's shared `acct:1` row a second,
-    // now-bound device joined onto — and `is_you` answers by ACCOUNT, so
-    // BOTH rows answer it true. Excluding on `is_you` alone used to drop
-    // both, and the two devices went mutually dark. The fan-out has to tell
-    // them apart by NODE, the one thing that is actually per-device, so it
-    // must exclude only THIS device's own row.
-    let laptop = [0xaau8; 32];
-    let phone = [0xadu8; 32];
-    let names = NameDirectory::new(BTreeMap::from([
-        (
-            hex_encode(&laptop),
-            BoundAccount {
-                number: 1,
-                name: "me".into(),
-            },
-        ),
-        (
-            hex_encode(&phone),
-            BoundAccount {
-                number: 1,
-                name: "me".into(),
-            },
-        ),
-    ]));
-    let roster = huddle_roster(
-        &[
-            chat::index::HuddleEntry {
-                party: format!("user:{}", hex_encode(&laptop)),
-                node: "1a1a".into(),
-                joined_at: 10,
-            },
-            chat::index::HuddleEntry {
-                party: "acct:1".into(),
-                node: "2b2b".into(),
-                joined_at: 20,
-            },
-        ],
-        ChatReader::new(Some(&laptop), &names),
-    );
-    assert!(
-        roster.iter().all(|participant| participant.is_you),
-        "is_you answers by account: both rows are ours"
-    );
-    assert_eq!(
-        huddle_recipient_nodes(roster, Some("1a1a")),
-        vec!["2b2b".to_string()],
-        "the phone is still a recipient; only this device's own node is excluded"
-    );
-}
-
-#[test]
 fn palette_keys_use_native_platform_shortcuts() {
     let plain = gpui_kit::Modifiers::default();
     let command = gpui_kit::Modifiers {
@@ -278,56 +130,17 @@ fn palette_keys_use_native_platform_shortcuts() {
 
 #[test]
 fn escape_ladder_names_the_topmost_transient_layer_only() {
-    let escape = String::from("escape");
-    let target = |palette: bool, bell: bool, create: bool| {
-        escape_target(escape.clone(), palette, bell, create)
-    };
-
-    // Not Escape -> nothing, whatever is open.
-    assert_eq!(escape_target(String::from("x"), false, true, true), "");
-    // An open palette swallows Escape — palette_key_action owns it.
-    assert_eq!(target(true, true, true), "");
-    // The ladder order is the z-order: bell over the create modal.
-    assert_eq!(target(false, true, true), "bell");
-    assert_eq!(target(false, false, true), "channel_create");
-
-    // Nothing transient open -> Escape is a no-op. THE PER-TAB RUNGS ARE GONE
-    // WITH THEIR SCREENS: the chat menus and details drawer, the pages armed
-    // delete and comments card, are their views' own layers now, dismissed
-    // inside the guest that painted the scrim.
-    assert_eq!(target(false, false, false), "");
+    assert_eq!(escape_target("x".into(), false, true), "");
+    assert_eq!(escape_target("escape".into(), true, true), "");
+    assert_eq!(escape_target("escape".into(), false, true), "bell");
+    assert_eq!(escape_target("escape".into(), false, false), "");
 }
 
-// EVERY RUNG LEFT RIDES EVERY TAB, WHICH IS WHY NEITHER READER TAKES ONE. The
-// per-tab rungs went to the views that mount their surfaces; the palette, the
-// bell and the create modal are mounted outside the native tab content,
-// so they stay on screen across a switch and must keep
-// answering from wherever the reader lands. The two readers enumerate the SAME
-// layers in the same order, and differ on exactly one verdict.
 #[test]
 fn the_two_ladder_readers_enumerate_the_same_layers() {
-    let escape = String::from("escape");
-    let target = |palette: bool, bell: bool, create: bool| {
-        escape_target(escape.clone(), palette, bell, create)
-    };
-
-    for (palette, bell, create, layer) in [
-        (false, true, true, "bell"),
-        (false, false, true, "channel_create"),
-    ] {
-        assert_eq!(topmost_overlay(palette, bell, create), layer);
-        assert_eq!(target(palette, bell, create), layer);
-    }
-
-    // THE ONE VERDICT THEY DIFFER ON. The scroll reader has to know a palette
-    // is over the pane it would otherwise move; Escape must not close what
-    // `palette_key_action` already owns.
-    assert_eq!(topmost_overlay(true, true, true), "palette");
-    assert_eq!(target(true, true, true), String::new());
-
-    // Nothing transient open, nothing named — for both.
-    assert_eq!(topmost_overlay(false, false, false), String::new());
-    assert_eq!(target(false, false, false), String::new());
+    assert_eq!(topmost_overlay(true, true), "palette");
+    assert_eq!(topmost_overlay(false, true), "bell");
+    assert_eq!(topmost_overlay(false, false), "");
 }
 
 #[test]

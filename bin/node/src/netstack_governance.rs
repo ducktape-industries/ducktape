@@ -28,12 +28,14 @@
 //! A backend that refuses the swap (a component built against another
 //! contract, refused by name before a byte of state is decoded) refuses it
 //! identically every time and keeps running untouched, so that refusal is said
-//! once and never retried; only a NEW designation is acted on again. The two
+//! once per actual plane execution. Recreating the plane or changing its
+//! running component reopens that designation. The two
 //! non-answers heal on their own and retry on the next block: bytes this node
 //! does not hold yet (the code plane's push and the readiness pump's fetch
 //! land them), and a swap no plane was running to answer.
 
 use futures::SinkExt as _;
+use sha2::{Digest as _, Sha256};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::reachability_plane::SwapAnswer;
@@ -113,9 +115,87 @@ fn spends_the_designation(answer: &SwapAnswer) -> bool {
     }
 }
 
-/// Watch the registry and converge the plane. One pass per block wake — the
-/// node's own event, never a timer — and every pass re-derives from committed
-/// state, so a restart, a late join or a dropped wake all heal for free.
+/// Select from restored committed state before any protocol event is stepped.
+/// Bootstrap bytes are used only when that state designates no netstack code.
+pub(crate) async fn startup_backend(
+    host: &host::Host,
+    height: u64,
+    blobs: &noded::blobs::BlobHandle,
+) -> Result<reachability::NetstackBackend, String> {
+    let bytes = host
+        .query(
+            host::MODULES_ID,
+            &modules::encode_query(&modules::ModulesQuery::ModuleStatus),
+        )
+        .await
+        .map_err(|error| format!("netstack registry: {error}"))?;
+    let roster = decode_roster(&bytes)?;
+    backend_from_roster(&roster, height, blobs)
+}
+
+fn backend_from_roster(
+    roster: &[modules::ModuleCode],
+    height: u64,
+    blobs: &noded::blobs::BlobHandle,
+) -> Result<reachability::NetstackBackend, String> {
+    let Some(entry) = roster
+        .iter()
+        .find(|entry| entry.module_id == NETSTACK_MODULE_ID)
+    else {
+        return crate::reachability_plane::netstack_backend();
+    };
+    let designated = designated_code(entry, height);
+    if designated.is_empty() {
+        return crate::reachability_plane::netstack_backend();
+    }
+    let hash: [u8; 32] = designated
+        .try_into()
+        .map_err(|_| "netstack designation is not a code hash".to_string())?;
+    let bytes = blobs
+        .get_chunk(&hash)
+        .ok_or_else(|| "designated netstack component is absent".to_string())?;
+    Ok(reachability::NetstackBackend::Guest {
+        component: artifact_component(&bytes)?,
+        step_fuel: reachability::NETSTACK_STEP_FUEL,
+    })
+}
+
+fn artifact_component(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    match module_artifact::Artifact::decode(bytes)? {
+        module_artifact::Artifact::Module(artifact) => {
+            if artifact.index.is_some() {
+                return Err("the reachability component has no module index".into());
+            }
+            Ok(artifact.component)
+        }
+        module_artifact::Artifact::View(_) => {
+            Err("the reachability component is not a view".into())
+        }
+    }
+}
+
+fn decode_roster(bytes: &[u8]) -> Result<Vec<modules::ModuleCode>, String> {
+    match modules::decode_reply(bytes).map_err(|error| error.to_string())? {
+        modules::ModulesReply::ModuleStatus { modules } => Ok(modules),
+        _ => Err("netstack registry returned no module status".into()),
+    }
+}
+
+struct Answered {
+    generation: u64,
+    revision: u64,
+    hash: [u8; 32],
+}
+
+impl Answered {
+    fn hash_for(&self, live: &crate::reachability_plane::PlaneExecution) -> Option<&[u8; 32]> {
+        let same_execution = self.generation == live.generation && self.revision == live.revision;
+        same_execution.then_some(&self.hash)
+    }
+}
+
+/// Reconcile immediately, then on committed block or actual plane transitions.
+/// No timer is needed to repair a plane recreated after promotion or restart.
 pub(crate) async fn reconcile(
     label: String,
     metrics: noded::NodeMetrics,
@@ -123,70 +203,120 @@ pub(crate) async fn reconcile(
     blobs: noded::blobs::BlobHandle,
     mut blocks: tokio::sync::broadcast::Receiver<noded::BlockWake>,
 ) {
-    let mut acted: Option<[u8; 32]> = None;
-    let mut retries: u64 = 0;
+    let mut execution = crate::reachability_plane::watch_execution();
+    let mut acted = None;
+    let mut retries = 0;
     loop {
-        let woken = blocks.recv().await;
-        let node_is_alive = match woken {
-            // any block wake: the registry may have moved under us.
-            Ok(_) => true,
-            // wakes were dropped; this read is idempotent, so re-read.
-            Err(RecvError::Lagged(_)) => true,
-            // the stream hub is gone, and with it the node.
-            Err(RecvError::Closed) => false,
-        };
-        if !node_is_alive {
-            return;
-        }
-        let Some(modules) = registry_roster(&commands).await else {
-            continue; // the actor is busy or absent — the next block re-asks.
-        };
-        // the committed height this node holds — the gauge every applied block
-        // sets before the wake that carries it.
-        let height = metrics.block_height();
-        let Step::Swap(designated) = step(&modules, height, acted.as_ref()) else {
-            continue;
-        };
-        let Some(component) = blobs.get_chunk(&designated) else {
-            // the code plane's push and the readiness pump's fetch land them.
-            retries += 1;
-            report_retry(
-                &label,
-                &designated,
-                retries,
-                "netstack_code_absent",
-                "this node does not hold the designated component's bytes",
-            );
-            continue;
-        };
-        let answer = match module_artifact::Artifact::decode(&component) {
-            Ok(module_artifact::Artifact::Module(artifact)) => {
-                apply_netstack_artifact(artifact).await
+        let live = execution.borrow_and_update().clone();
+        reconcile_once(
+            &label,
+            &metrics,
+            &commands,
+            &blobs,
+            &live,
+            &mut acted,
+            &mut retries,
+        )
+        .await;
+        tokio::select! {
+            wake = blocks.recv() => match wake {
+                Ok(_) | Err(RecvError::Lagged(_)) => {},
+                Err(RecvError::Closed) => return,
+            },
+            changed = execution.changed() => {
+                if changed.is_err() { return; }
             }
-            Ok(module_artifact::Artifact::View(_)) => {
-                SwapAnswer::Refused("the reachability component is not a view".into())
-            }
-            Err(error) => SwapAnswer::Refused(error),
-        };
-        crate::reachability_plane::record_swap(&metrics, &answer);
-        let decided = spends_the_designation(&answer);
-        retries = match decided {
-            true => 0,
-            false => retries + 1,
-        };
-        if decided {
-            acted = Some(designated);
         }
-        report_answer(&label, &designated, answer, retries);
     }
 }
 
-async fn apply_netstack_artifact(artifact: module_artifact::ModuleArtifact) -> SwapAnswer {
-    if artifact.index.is_some() {
-        return SwapAnswer::Refused("the reachability component has no module index".into());
+async fn reconcile_once(
+    label: &str,
+    metrics: &noded::NodeMetrics,
+    commands: &futures::channel::mpsc::Sender<noded::NodeCommand>,
+    blobs: &noded::blobs::BlobHandle,
+    live: &crate::reachability_plane::PlaneExecution,
+    acted: &mut Option<Answered>,
+    retries: &mut u64,
+) {
+    let Some(roster) = registry_roster(commands).await else {
+        return;
+    };
+    let height = metrics.block_height();
+    if crate::reachability_plane::startup_pending(live.generation) {
+        crate::reachability_plane::start_pending_netstack(
+            live.generation,
+            backend_from_roster(&roster, height, blobs),
+        );
+        return;
     }
-    let request = noded::NetstackSwapRequest::Bytes(artifact.component);
-    crate::reachability_plane::swap_netstack(request).await
+    // Starting planes cannot snapshot yet; faults stop the lane and are
+    // reported through execution status rather than retried as deployments.
+    if live.status.code_hash().is_none() {
+        return;
+    }
+    let answered = acted.as_ref().and_then(|answer| answer.hash_for(live));
+    let Step::Swap(designated) = step(&roster, height, answered) else {
+        return;
+    };
+    let Some(bytes) = blobs.get_chunk(&designated) else {
+        *retries += 1;
+        report_retry(
+            label,
+            &designated,
+            *retries,
+            "netstack_code_absent",
+            "this node does not hold the designated component's bytes",
+        );
+        return;
+    };
+    let component = artifact_component(&bytes);
+    let desired_component = component
+        .as_ref()
+        .ok()
+        .map(|bytes| <[u8; 32]>::from(Sha256::digest(bytes)));
+    let already_running =
+        desired_component.is_some() && desired_component == live.status.code_hash();
+    if already_running {
+        *acted = Some(Answered {
+            generation: live.generation,
+            revision: live.revision,
+            hash: designated,
+        });
+        return;
+    }
+    let answer = match component {
+        Ok(component) => {
+            crate::reachability_plane::swap_netstack(noded::NetstackSwapRequest::Bytes(component))
+                .await
+        }
+        Err(error) => SwapAnswer::Refused(error),
+    };
+    crate::reachability_plane::record_swap(metrics, &answer);
+    let current = crate::reachability_plane::watch_execution()
+        .borrow()
+        .clone();
+    let answered_execution = match &answer {
+        SwapAnswer::Swapped(_) => {
+            let same_plane = current.generation == live.generation;
+            let runs_designated = current.status.code_hash() == desired_component;
+            (same_plane && runs_designated).then_some(&current)
+        }
+        SwapAnswer::Refused(_) => Some(live),
+        SwapAnswer::Unattempted(_) => None,
+    };
+    if let Some(execution) = answered_execution {
+        *acted = Some(Answered {
+            generation: execution.generation,
+            revision: execution.revision,
+            hash: designated,
+        });
+    }
+    *retries = match spends_the_designation(&answer) {
+        true => 0,
+        false => *retries + 1,
+    };
+    report_answer(label, &designated, answer, *retries);
 }
 
 /// the committed modules registry roster, off the drain's own command lane —
@@ -259,6 +389,69 @@ fn report_answer(label: &str, designated: &[u8; 32], answer: SwapAnswer, retries
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_plane_or_running_component_reopens_the_same_designation() {
+        let answer = Answered {
+            generation: 1,
+            revision: 2,
+            hash: [7; 32],
+        };
+        let mut live = crate::reachability_plane::PlaneExecution {
+            generation: 1,
+            revision: 2,
+            status: reachability::BackendStatus::Running { code_hash: [1; 32] },
+        };
+        let roster = vec![entry(Some(answer.hash), &[])];
+        assert_eq!(
+            step(&roster, ACTIVATION, answer.hash_for(&live)),
+            Step::Nothing
+        );
+        live.generation += 1;
+        assert_eq!(
+            step(&roster, ACTIVATION, answer.hash_for(&live)),
+            Step::Swap(answer.hash)
+        );
+        live.generation = 1;
+        live.revision += 1;
+        assert_eq!(
+            step(&roster, ACTIVATION, answer.hash_for(&live)),
+            Step::Swap(answer.hash)
+        );
+    }
+
+    #[test]
+    fn restored_selection_uses_committed_bytes_and_refuses_missing_artifacts() {
+        let blobs = noded::blobs::BlobHandle::default();
+        let component = b"selected component".to_vec();
+        let artifact = module_artifact::Artifact::Module(module_artifact::ModuleArtifact {
+            component: component.clone(),
+            index: None,
+            view: None,
+        });
+        let hash = blobs.put_chunk(artifact.encode());
+        let backend = backend_from_roster(&[entry(None, &hash)], 0, &blobs).unwrap();
+        assert!(
+            matches!(backend, reachability::NetstackBackend::Guest { component: selected, .. } if selected == component)
+        );
+        let replacement = module_artifact::Artifact::Module(module_artifact::ModuleArtifact {
+            component: b"replacement".to_vec(),
+            index: None,
+            view: None,
+        });
+        let next_hash = blobs.put_chunk(replacement.encode());
+        let scheduled = vec![entry(Some(next_hash), &hash)];
+        assert!(
+            matches!(backend_from_roster(&scheduled, ACTIVATION - 1, &blobs).unwrap(),
+            reachability::NetstackBackend::Guest { component, .. } if component == b"selected component")
+        );
+        assert!(
+            matches!(backend_from_roster(&scheduled, ACTIVATION, &blobs).unwrap(),
+            reachability::NetstackBackend::Guest { component, .. } if component == b"replacement")
+        );
+        assert!(backend_from_roster(&[entry(None, &[9; 32])], 0, &blobs).is_err());
+        assert!(backend_from_roster(&[entry(None, &[9; 3])], 0, &blobs).is_err());
+    }
 
     /// governance's own schedule shape: a pending swap AT [`ACTIVATION`], and
     /// whatever code the entry had activated before it.

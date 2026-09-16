@@ -417,15 +417,9 @@ fn a_failed_huddle_leave_keeps_the_retained_roster_visible() {
     assert!(handler_body("JoinVoice").contains("drop_call_state("));
     let dropped = fn_body("drop_call_state");
     assert!(dropped.contains("self.call_peers="));
-    assert!(dropped.contains("huddle_tile_rows("));
-    assert!(!dropped.contains("self.huddle_rows=::std::vec::Vec::new()"));
+    assert!(!dropped.contains("self.huddle_roster="));
     let ack = handler_body("HuddleLeft");
-    for field in [
-        "huddle_joined",
-        "huddle_roster",
-        "huddle_rows",
-        "huddle_channel",
-    ] {
+    for field in ["huddle_joined", "huddle_roster", "huddle_channel"] {
         assert!(ack.contains(&format!("self.{field}=")));
     }
 }
@@ -645,4 +639,82 @@ fn update_facts_reach_settings_and_each_intent_is_one_action() {
     assert!(shell.contains("letupdate_strip=state.update_strip();"));
     assert!(shell.contains("Message::UpdateAction(crate::UpdateAction::RestartToUpdate)"));
     assert!(shell.contains("Message::UpdateAction(crate::UpdateAction::DismissRollbackNotice)"));
+}
+
+#[test]
+fn call_presentation_comes_from_the_deployed_guest() {
+    let (mut app, _) = Ducktape::boot();
+    let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
+        kind: "presentation".into(),
+        stage: "guest-selected-image".into(),
+        tiles: vec!["second".into(), "first".into()],
+        video_live: true,
+        peers: vec![crate::call::CallPeer {
+            peer: "first-peer".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }));
+    assert_eq!(app.huddle_stage, "guest-selected-image");
+    assert!(app.call_video_live);
+    assert_eq!(app.huddle_tiles, ["second", "first"]);
+    assert_eq!(app.call_peers[0].peer, "first-peer");
+    // Native self observations cannot choose a different stage or hide the
+    // strip. The next guest presentation owns that decision.
+    let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
+        kind: "self".into(),
+        sharing: true,
+        ..Default::default()
+    }));
+    assert_eq!(app.huddle_stage, "guest-selected-image");
+    let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
+        kind: "presentation".into(),
+        tiles: vec!["replacement".into()],
+        peers: vec![crate::call::CallPeer {
+            peer: "second-peer".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }));
+    assert_eq!(app.call_peers.len(), 1);
+    assert_eq!(app.call_peers[0].peer, "second-peer");
+    // A host runtime trap cannot ask the retired guest to clear its own
+    // presentation. Disposal still belongs to the native lifecycle adapter.
+    let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
+        kind: "error".into(),
+        message: "guest trapped".into(),
+        ..Default::default()
+    }));
+    assert!(app.call_peers.is_empty());
+    assert!(app.huddle_tiles.is_empty());
+    assert!(app.huddle_stage.is_empty());
+    assert!(!app.call_video_live);
+    let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
+        kind: "presentation".into(),
+        stage: "replacement-image".into(),
+        video_live: true,
+        ..Default::default()
+    }));
+    let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
+        kind: "presentation".into(),
+        ..Default::default()
+    }));
+    assert!(app.huddle_stage.is_empty());
+    assert!(!app.call_video_live);
+}
+
+#[test]
+fn call_status_is_the_deployed_views_text() {
+    let (mut app, _) = Ducktape::boot();
+    let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
+        kind: "live".into(),
+        status: Some("Custom session status".into()),
+        ..Default::default()
+    }));
+    assert_eq!(app.call_status, "Custom session status");
+    let _ = app.update(AppMessage::CallEvent(crate::call::CallEvent {
+        kind: "presentation".into(),
+        ..Default::default()
+    }));
+    assert_eq!(app.call_status, "Custom session status");
 }

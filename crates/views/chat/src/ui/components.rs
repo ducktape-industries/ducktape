@@ -173,7 +173,7 @@ impl ChatView {
     /// (lit while they talk), the name, and "you" (muted or not) on the
     /// reader's own seat.
     fn huddle_seat(&self, key: String, seat: &crate::host::HuddleSeat) -> wire::Node {
-        let speaking = crate::host::seat_speaking(seat, self.call_speaking, &self.speaking_peers);
+        let speaking = crate::host::seat_speaking(seat, self.call_speaking, &self.call_peers);
         let tone = match speaking {
             true => Tone::Success,
             false => Tone::Neutral,

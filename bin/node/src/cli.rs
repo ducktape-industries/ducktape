@@ -289,7 +289,7 @@ fn netstack_line(netstack: &serde_json::Value) -> Option<String> {
     ))
 }
 
-/// `ducktape node netstack swap --native | --component <PATH>` — move a
+/// `ducktape node netstack swap --component <PATH>` — move a
 /// RUNNING node's reachability plane onto another netstack backend, mid-life.
 ///
 /// The operator's trigger, next to the governance-delivered one: roll one node
@@ -305,10 +305,7 @@ fn cmd_netstack_swap(args: crate::cli_args::NetstackSwapArgs) -> CommandResult {
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
-    let backend = match args.component {
-        Some(path) => serde_json::json!({ "component": path }),
-        None => serde_json::json!("native"),
-    };
+    let backend = serde_json::json!({ "component": args.component });
     const PATH: &str = "/v1/admin/netstack/swap";
     let base = config::http_base_in(&workspace)?;
     let token = noded::admin::read_operator_token(&workspace)?;

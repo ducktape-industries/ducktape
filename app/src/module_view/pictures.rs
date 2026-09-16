@@ -4,9 +4,6 @@
 use std::collections::HashMap;
 use ui_lang_wire as wire;
 
-const MAX_PICTURE_BYTES: usize = 8 * wire::MAX_PICTURE_BYTES_PER_FRAME;
-const MAX_PICTURES: usize = 4096;
-
 #[derive(Default)]
 pub(super) struct Pictures {
     raster: HashMap<u64, wire::ImageData>,
@@ -15,29 +12,25 @@ pub(super) struct Pictures {
 
 impl Pictures {
     pub(super) fn adopt(&mut self, root: &mut wire::Node) {
-        // Guests send each hash once. Eviction would lose an image the guest
-        // still believes is present, so the lifetime budget refuses new hashes.
-        let mut used = self.raster.values().map(wire::ImageData::byte_len).sum::<usize>()
-            + self.vector.values().map(Vec::len).sum::<usize>();
         root.for_each_mut(&mut |node| match node {
-            wire::Node::Image { hash, data: Some(data), .. }
-            | wire::Node::ImageViewer { hash, data: Some(data), .. } => {
-                let total = used + data.byte_len();
-                let accepted = !self.raster.contains_key(hash) && total <= MAX_PICTURE_BYTES
-                    && self.raster.len() + self.vector.len() < MAX_PICTURES;
-                if accepted {
-                    self.raster.insert(*hash, data.clone());
-                    used = total;
-                }
+            wire::Node::Image {
+                hash,
+                data: Some(data),
+                ..
             }
-            wire::Node::Svg { hash, bytes: Some(bytes), .. } => {
-                let total = used + bytes.len();
-                let accepted = !self.vector.contains_key(hash) && total <= MAX_PICTURE_BYTES
-                    && self.raster.len() + self.vector.len() < MAX_PICTURES;
-                if accepted {
-                    self.vector.insert(*hash, bytes.clone());
-                    used = total;
-                }
+            | wire::Node::ImageViewer {
+                hash,
+                data: Some(data),
+                ..
+            } => {
+                self.raster.entry(*hash).or_insert_with(|| data.clone());
+            }
+            wire::Node::Svg {
+                hash,
+                bytes: Some(bytes),
+                ..
+            } => {
+                self.vector.entry(*hash).or_insert_with(|| bytes.clone());
             }
             _ => {}
         });
@@ -79,22 +72,28 @@ mod tests {
     }
 
     #[test]
-    fn lifetime_budget_refuses_new_bytes_without_evicting_known_hashes() {
+    fn host_image_resource_survives_a_patch_and_remount() {
         let mut pictures = Pictures::default();
-        pictures.vector.insert(1, vec![0; MAX_PICTURE_BYTES]);
-        pictures.adopt(&mut vector(2, Some(vec![1])));
-        assert!(pictures.vector.contains_key(&1));
-        assert!(!pictures.vector.contains_key(&2));
-        assert_eq!(pictures.vector.values().map(Vec::len).sum::<usize>(), MAX_PICTURE_BYTES);
-    }
-
-    #[test]
-    fn entry_budget_also_bounds_empty_pictures() {
-        let mut pictures = Pictures::default();
-        for hash in 0..MAX_PICTURES as u64 {
-            pictures.adopt(&mut vector(hash, Some(Vec::new())));
+        let mut image = wire::Node::Image {
+            key: "live-image".into(),
+            hash: 11,
+            data: Some(wire::ImageData::Resource("image:7".into())),
+            label: None,
+            fit: None,
+            rotation: None,
+            opacity: None,
+            filter: Default::default(),
+            width: None,
+            height: None,
+        };
+        pictures.adopt(&mut image);
+        if let wire::Node::Image { data, .. } = &mut image {
+            *data = None;
         }
-        pictures.adopt(&mut vector(MAX_PICTURES as u64, Some(Vec::new())));
-        assert_eq!(pictures.vector.len(), MAX_PICTURES);
+        pictures.adopt(&mut image);
+        pictures.hydrate(&mut image);
+        assert!(matches!(image, wire::Node::Image {
+            data: Some(wire::ImageData::Resource(ref key)), ..
+        } if key == "image:7"));
     }
 }

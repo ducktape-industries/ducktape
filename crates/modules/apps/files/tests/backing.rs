@@ -4,7 +4,7 @@
 //!   * **publish ordering on disk** — a staged object is durable BEFORE the refs
 //!     commit point (the object side of the torn-commit fix), observed as the
 //!     object file appearing while the refs file is still absent.
-//!   * **query parity with native** — `backing.query(req)` serves EXACTLY what a
+//!   * **query parity with native** — the guest query over the backing serves EXACTLY what a
 //!     native `Files::query` serves on the identical committed dir (a metadata
 //!     `Refs` query AND a body-reading `Read` query).
 //!   * **snapshot / install round trip** — the refs image out, verify-then-adopt
@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use files::{
-    Change, Content, FilesOdbBacking, FilesMsg, FilesQuery, Kind, Refs, encode_msg, encode_query,
+    Change, Content, FilesMsg, FilesOdbBacking, FilesQuery, Kind, Refs, encode_msg, encode_query,
     encode_refs, to_hex,
 };
 use sdk::Module as _;
@@ -32,7 +32,12 @@ use wasm_host::{HostOdb as _, OdbBacking};
 /// commit one inline file through a native `Files` at `height`, persisting refs +
 /// objects + the height-stamped envelope to `dir` — the committed state a backing
 /// opened on the same dir must serve identically.
-fn native_commit_inline(dir: &tempfile::TempDir, height: u64, path: &str, body: &[u8]) -> files::Files {
+fn native_commit_inline(
+    dir: &tempfile::TempDir,
+    height: u64,
+    path: &str,
+    body: &[u8],
+) -> files::Files {
     let mut f = open_files(dir);
     let op = sdk::Msg {
         target: "files".into(),
@@ -82,15 +87,23 @@ fn publish_makes_objects_durable_before_the_refs_commit_point() {
 
     // publish: the object is durable; the refs commit point has NOT happened.
     backing.publish_block(9).expect("publish");
-    assert!(obj_path.exists(), "publish_block flushed the staged object to disk");
-    assert!(!refs_path.exists(), "objects are durable BEFORE the refs file");
+    assert!(
+        obj_path.exists(),
+        "publish_block flushed the staged object to disk"
+    );
+    assert!(
+        !refs_path.exists(),
+        "objects are durable BEFORE the refs file"
+    );
 
     // adopt: only NOW does the refs file appear — the commit point, after objects.
-    backing.adopt_refs(&encode_refs(&Refs::default())).expect("adopt");
+    backing
+        .adopt_refs(&encode_refs(&Refs::default()))
+        .expect("adopt");
     assert!(refs_path.exists(), "adopt_refs is the refs commit point");
 }
 
-/// the backing's committed query lane serves EXACTLY what native `Files::query`
+/// The deployed guest over the backing serves exactly what native `Files::query`
 /// serves on the identical committed dir — a metadata `Refs` query and a
 /// body-reading `Read` query (which reaches through to the on-disk object).
 #[test]
@@ -106,6 +119,12 @@ fn query_matches_native_files_on_the_same_dir() {
         "root = sha256(refs_bytes) is byte-identical to native"
     );
 
+    let guest = wasm_host::WasmModule::with_odb(
+        "files",
+        include_bytes!("../component.wasm"),
+        Box::new(backing),
+    )
+    .expect("load files guest");
     let refs_q = encode_query(&FilesQuery::Refs {});
     let read_q = encode_query(&FilesQuery::Read {
         path: "/a/hello.txt".into(),
@@ -120,7 +139,7 @@ fn query_matches_native_files_on_the_same_dir() {
 
     for (label, req) in [("refs", refs_q), ("read", read_q), ("stat", stat_q)] {
         let native_reply = futures::executor::block_on(native.query(&req)).expect("native query");
-        let backing_reply = OdbBacking::query(&backing, &req).expect("backing query");
+        let backing_reply = futures::executor::block_on(guest.query(&req)).expect("guest query");
         assert_eq!(
             backing_reply, native_reply,
             "backing {label} query must byte-match native",
@@ -137,15 +156,25 @@ fn snapshot_out_adopt_in_round_trips_the_refs_image() {
     let _native = native_commit_inline(&src, 2, "/x.txt", b"snap me");
     let src_backing = open_backing(&src);
     let snapshot = src_backing.refs_bytes();
-    assert_ne!(snapshot, encode_refs(&Refs::default()), "the snapshot has real state");
+    assert_ne!(
+        snapshot,
+        encode_refs(&Refs::default()),
+        "the snapshot has real state"
+    );
 
     // install into a fresh backing (root verification is the kernel's job; the
     // backing adopts the verified image).
     let dst = tempfile::tempdir().unwrap();
     let mut dst_backing = open_backing(&dst);
-    dst_backing.adopt_refs(&snapshot).expect("adopt the snapshot");
+    dst_backing
+        .adopt_refs(&snapshot)
+        .expect("adopt the snapshot");
 
-    assert_eq!(dst_backing.refs_bytes(), snapshot, "install round-trips the refs image");
+    assert_eq!(
+        dst_backing.refs_bytes(),
+        snapshot,
+        "install round-trips the refs image"
+    );
     assert_eq!(
         sha256(&dst_backing.refs_bytes()),
         sha256(&src_backing.refs_bytes()),
@@ -166,7 +195,11 @@ fn reopen_recovers_refs_and_durable_height() {
     let d = tempfile::tempdir().unwrap();
     {
         let mut backing = open_backing(&d);
-        assert_eq!(backing.durable_height(), 0, "a fresh dir has no durable commit");
+        assert_eq!(
+            backing.durable_height(),
+            0,
+            "a fresh dir has no durable commit"
+        );
         assert_eq!(
             backing.durable_commit_height(),
             None,
@@ -178,7 +211,11 @@ fn reopen_recovers_refs_and_durable_height() {
         backing.publish_block(42).expect("publish");
         backing.adopt_refs(&refs_image).expect("adopt");
         assert_eq!(backing.durable_height(), 42, "the committed height is live");
-        assert_eq!(backing.refs_bytes(), refs_image, "the committed refs are live");
+        assert_eq!(
+            backing.refs_bytes(),
+            refs_image,
+            "the committed refs are live"
+        );
     } // drop: only the durable refs envelope survives.
 
     let reopened = open_backing(&d);

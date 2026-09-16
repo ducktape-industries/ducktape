@@ -24,8 +24,8 @@ mod editor_binding;
 mod editor_documents;
 pub use editor::Editor;
 pub use editor_binding::{
-    EditorBinding, EditorInteractionRequest, EditorKeyRequest, EditorStateView, EditorTransaction,
-    EditorTransactionEvent,
+    EditorBinding, EditorInteractionRequest, EditorKeyRequest, EditorRichRequest, EditorStateView,
+    EditorTransaction, EditorTransactionEvent,
 };
 pub use editor_documents::EditorDocumentUpdate;
 pub mod events;
@@ -258,6 +258,9 @@ impl<A: App> Driver<A> {
                 ),
                 wire::Event::Response { id, result, done } => {
                     host::fulfill(id, result, done);
+                    // Response order is semantic: queued hidden data must be
+                    // applied before a later visibility notification.
+                    self.settle();
                     None
                 }
                 // The host dropped the tree the patches build on.

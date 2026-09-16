@@ -481,6 +481,10 @@ pub struct AgentSession {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunsQuery {
+    /// The deployed default registration program for this model id.
+    ModelProgram {
+        agent_id: String,
+    },
     Conversation {
         conversation_id: String,
     },
@@ -549,6 +553,7 @@ pub enum RunsQuery {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunsReply {
+    ModelProgram(agent::Program),
     Conversation(Option<crate::ConversationView>),
     ConversationEvents(Vec<crate::ConversationEvent>),
     ConversationTurn(Option<crate::ConversationTurn>),

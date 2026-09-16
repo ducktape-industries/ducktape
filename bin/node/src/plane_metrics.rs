@@ -15,6 +15,51 @@
 use commonware_runtime::telemetry::metrics::{EncodeMetric, MetricEncoder, MetricType, Registered};
 use data_plane::{PlaneMonitor, PlaneReport, Service};
 
+/// Operator-installed bindings are named at runtime. Scrape the bounded,
+/// canonical local registry rather than retaining labels after retirement.
+/// This reports local admission, not process health or consensus authorization.
+#[derive(Debug)]
+pub(crate) struct ApplicationBindings(std::path::PathBuf);
+
+impl ApplicationBindings {
+    pub(crate) fn register<C: commonware_runtime::Metrics>(
+        context: &C,
+        workspace: std::path::PathBuf,
+    ) -> Registered<Self> {
+        context.register(
+            "ducktape_application_binding",
+            "locally bound application routes (1 = bound, not a health check)",
+            Self(workspace),
+        )
+    }
+}
+
+impl EncodeMetric for ApplicationBindings {
+    fn encode(&self, mut encoder: MetricEncoder) -> Result<(), std::fmt::Error> {
+        let Ok(bindings) = crate::gateway_routes::load(&self.0) else {
+            return Ok(());
+        };
+        for binding in bindings.routes {
+            let authentication = match binding.trust {
+                crate::gateway_routes::UpstreamTrust::TrustedLoopback => "trusted_loopback",
+                crate::gateway_routes::UpstreamTrust::AuthenticatedLoopback { .. } => "credential",
+            };
+            let account = binding.account.to_string();
+            let labels = [
+                ("account", account.as_str()),
+                ("route", binding.name.local_key()),
+                ("authentication", authentication),
+            ];
+            encoder.encode_family(&labels)?.encode_gauge(&1_i64)?;
+        }
+        Ok(())
+    }
+
+    fn metric_type(&self) -> MetricType {
+        MetricType::Gauge
+    }
+}
+
 /// The metric label for a [`Service`] — wire-stable like the enum itself.
 fn service_name(service: Service) -> &'static str {
     match service {
@@ -241,6 +286,27 @@ mod tests {
                 !scrape.contains("ducktape_dataplane_open{"),
                 "dead plane still encoded:\n{scrape}"
             );
+        });
+    }
+
+    #[test]
+    fn application_names_appear_and_retire_without_native_registration() {
+        use commonware_runtime::{Metrics as _, Runner as _};
+        use crate::gateway_routes::{LocalRoute, LocalRoutes, UpstreamTrust, FILE_NAME};
+        commonware_runtime::deterministic::Runner::default().start(|context| async move {
+            let workspace = tempfile::tempdir().unwrap();
+            let _metric = ApplicationBindings::register(&context, workspace.path().into());
+            let path = workspace.path().join(FILE_NAME);
+            let routes = LocalRoutes { routes: vec![LocalRoute {
+                account: 17,
+                name: gateway::RouteName::named("unlisted-application"),
+                port: 9876,
+                trust: UpstreamTrust::AuthenticatedLoopback { credential_file: workspace.path().join("private-token") },
+            }] };
+            std::fs::write(&path, serde_json::to_vec_pretty(&routes).unwrap()).unwrap();
+            assert!(context.encode().contains(r#"ducktape_application_binding{account="17",route="unlisted-application",authentication="credential"} 1"#));
+            std::fs::write(&path, serde_json::to_vec_pretty(&LocalRoutes::default()).unwrap()).unwrap();
+            assert!(!context.encode().contains("ducktape_application_binding{"));
         });
     }
 

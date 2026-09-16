@@ -2,18 +2,10 @@
 # make dogfood-forge — host ducktape's OWN source in ducktape's forge module.
 # This flows GitHub origin/dev -> Forge dev without moving release-only main.
 #
-# Registers a static git remote `ducktape-dev` pointing at the local dev node's
-# forge git smart-HTTP endpoint, fetches the canonical development branch, then
-# synchronizes that exact history into Forge `dev`. Re-running this command
-# refreshes Forge before agent work. A fast-forward is direct; equal-tree
-# mirror divergence is joined with a two-parent bridge; differing trees fail
-# closed for a reviewed reconciliation.
-#
-# This is the INTENDED big-repo path: `git-receive-pack` lifts the body cap to
-# the relay-safe pack limit and stores each packfile node-locally, submitting a tiny
-# `forge Push` (32-byte digest + oids) through consensus — the pack NEVER crosses
-# consensus. (Contrast POST /v1/files/blob, which is capped at the 4 MB chunk
-# size and 413s a whole-repo pack.)
+# Queries the committed Forge ref and imports local Git packs through generic
+# blob and module-submit APIs as the node. Equal-tree divergent histories are
+# joined; different trees require reviewed reconciliation. Local materialized
+# objects supply remote history without a product HTTP route in the node.
 #
 # Resolution of the node's forge base URL, in order:
 #   1. $DUCKTAPE_DEV_FORGE_URL           — explicit base, e.g. http://127.0.0.1:8844
@@ -23,9 +15,8 @@
 #      (the workspace flow assigns a RANDOM http port, so this is not a fixed :8844)
 #
 # Env knobs:
-#   DUCKTAPE_DEV_FORGE_URL  node base URL override (no trailing /forge/<repo>)
-#   FORGE_REPO              forge repo name in the URL   (default: ducktape)
-#   FORGE_REMOTE            local git remote name        (default: ducktape-dev)
+#   DUCKTAPE_DEV_FORGE_URL  node API base URL override
+#   FORGE_REPO              forge repository name   (default: ducktape)
 #   SOURCE_REMOTE           canonical source remote      (default: origin)
 #   SOURCE_BRANCH           canonical source branch      (default: dev)
 #   SRC_REF                 explicit local ref override  (default: fetched
@@ -36,18 +27,10 @@
 # later agent run to an obsolete source tree. An explicit SRC_REF remains useful
 # for intentional branch dogfood, but callers then own that override.
 #
-# NOTE: `ducktape-dev` is a normal git remote, and git stores remotes in the
-# SHARED .git/config (git-common-dir) — visible to every `git worktree` of this
-# repo. If you run several worktrees each with their own node, they share this
-# one remote; the script re-resolves and re-points it every run (and warns when
-# the URL changes) so a run always targets the resolved node, but a stale
-# `git push ducktape-dev` from another worktree could hit the wrong node. Set
-# FORGE_REMOTE to a per-worktree name if you run many nodes at once.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 FORGE_REPO="${FORGE_REPO:-ducktape}"
-FORGE_REMOTE="${FORGE_REMOTE:-ducktape-dev}"
 SOURCE_REMOTE="${SOURCE_REMOTE:-origin}"
 SOURCE_BRANCH="${SOURCE_BRANCH:-dev}"
 SRC_REF="${SRC_REF:-}"
@@ -105,26 +88,22 @@ EOF
 }
 
 BASE_URL="$(resolve_base_url)"
-REMOTE_URL="$BASE_URL/forge/$FORGE_REPO"
-
-# A push MUST prove itself: `git-receive-pack` takes git's own push certificate
-# (`git push --signed`, whose signer becomes the repo's owner on chain) or this
-# node's operator credential, which makes the NODE the owner. This script seeds
-# the node's own mirror of the canonical repo, so the node is the right owner
-# and this is the right proof.
-#
-# GIT_CONFIG_*, not `git -c`: an argv is world-readable through /proc, and this
-# is a secret. Exported so `git push`/`git fetch` below inherit it.
 WORKSPACE="$(resolve_workspace)"
-if [ -n "$WORKSPACE" ] && [ -r "$WORKSPACE/admin.token" ]; then
-  export GIT_CONFIG_COUNT=1
-  export GIT_CONFIG_KEY_0=http.extraHeader
-  export GIT_CONFIG_VALUE_0="x-ducktape-admin-token: $(cat "$WORKSPACE/admin.token")"
-else
-  log "WARNING: no operator credential found; the node will refuse an unsigned push"
-fi
-
-log "node forge endpoint: $REMOTE_URL"
+[ -n "$WORKSPACE" ] && [ -r "$WORKSPACE/admin.token" ] || die "a local node workspace and operator credential are required"
+IMPORT_TOOL="$PWD/ops/forge-import.py"
+FORGE_STORE=$(python3 - "$WORKSPACE" <<'PYCONFIG'
+import pathlib, sys, tomllib
+workspace = pathlib.Path(sys.argv[1])
+config = tomllib.loads((workspace / 'node.toml').read_text())
+storage = pathlib.Path(config.get('storage_dir', str(workspace / 'storage')))
+if not storage.is_absolute():
+    storage = workspace / storage
+print(storage / 'forge-repo')
+PYCONFIG
+) || die "cannot resolve configured Git substrate"
+forge_head() {
+  python3 "$IMPORT_TOOL" head --node-url "$BASE_URL" --repo "$FORGE_REPO" --branch dev
+}
 
 if [ -z "$SRC_REF" ]; then
   log "fetching canonical source: $SOURCE_REMOTE $SOURCE_BRANCH"
@@ -139,8 +118,7 @@ SOURCE_OID="$(git rev-parse --verify "$SRC_REF^{commit}")" ||
   die "source ref '$SRC_REF' does not resolve to a commit"
 log "source commit: $SOURCE_OID ($SRC_REF)"
 
-# a healthy node is required (git-receive-pack is served off the node's http
-# surface). fail fast with an actionable message rather than a git transport error.
+# A healthy node must serve generic query, blob, and submit APIs.
 if ! curl -fsS -m 5 "$BASE_URL/v1/status" >/dev/null 2>&1; then
   # NOTE: no backticks in this string — it is double-quoted, so they would be
   # command substitution, and the die message would RUN whatever it names.
@@ -150,20 +128,6 @@ composes from beside the binary), or set DUCKTAPE_DEV_FORGE_URL to a \
 running node."
 fi
 
-# idempotent remote wiring: add, or re-point if it already exists.
-if existing="$(git remote get-url "$FORGE_REMOTE" 2>/dev/null)"; then
-  if [ "$existing" != "$REMOTE_URL" ]; then
-    log "WARNING: '$FORGE_REMOTE' currently points at $existing"
-    log "         re-pointing to $REMOTE_URL — this remote is SHARED across all git"
-    log "         worktrees of this repo, so this also moves it for other worktrees."
-  fi
-  git remote set-url "$FORGE_REMOTE" "$REMOTE_URL"
-  log "remote '$FORGE_REMOTE' -> $REMOTE_URL"
-else
-  git remote add "$FORGE_REMOTE" "$REMOTE_URL"
-  log "added remote '$FORGE_REMOTE' -> $REMOTE_URL"
-fi
-
 # Retry only an HTTP body-limit rejection, splitting the remaining first-parent
 # history in half. Each accepted tip is an ancestor of the final tip; no history
 # is rewritten. A single commit (including a large merge) may still exceed the
@@ -171,7 +135,7 @@ fi
 push_history() {
   local tip="$1" base="${2:-}" output remaining count middle
   output="$(mktemp)"
-  if LC_ALL=C git push "$FORGE_REMOTE" "$tip:$FORGE_REF" >"$output" 2>&1; then
+  if python3 "$IMPORT_TOOL" push --node-url "$BASE_URL" --token-file "$WORKSPACE/admin.token" --repo "$FORGE_REPO" --branch dev --tip "$tip" >"$output" 2>&1; then
     cat "$output"
     rm -f "$output"
     return
@@ -198,7 +162,7 @@ push_history() {
 }
 
 FORGE_REF=refs/heads/dev
-FORGE_OID="$(git ls-remote "$REMOTE_URL" "$FORGE_REF" | awk 'NR == 1 { print $1 }')"
+FORGE_OID="$(forge_head)"
 EXPECTED_OID=$SOURCE_OID
 
 if [ -z "$FORGE_OID" ]; then
@@ -207,7 +171,7 @@ if [ -z "$FORGE_OID" ]; then
 else
   TMP_REF="refs/dogfood-sync/$$/forge-dev"
   trap 'git update-ref -d "$TMP_REF" >/dev/null 2>&1 || true' EXIT
-  git fetch --no-tags "$FORGE_REMOTE" "$FORGE_REF:$TMP_REF"
+  git fetch --no-tags "$FORGE_STORE/$FORGE_REPO" "$FORGE_OID:$TMP_REF"
   if [ "$FORGE_OID" = "$SOURCE_OID" ]; then
     log "Forge dev already matches GitHub dev"
   elif git merge-base --is-ancestor "$FORGE_OID" "$SOURCE_OID"; then
@@ -242,7 +206,7 @@ EOF
 fi
 
 # A successful git process is not enough evidence for the next dispatch.
-VERIFIED_OID="$(git ls-remote "$REMOTE_URL" "$FORGE_REF" | awk 'NR == 1 { print $1 }')"
+VERIFIED_OID="$(forge_head)"
 if [ "$VERIFIED_OID" != "$EXPECTED_OID" ]; then
   die "Forge dev verification failed: expected $EXPECTED_OID, got ${VERIFIED_OID:-missing}"
 fi

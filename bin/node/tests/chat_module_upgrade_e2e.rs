@@ -159,17 +159,7 @@ fn chat_commits_a_component_and_the_node_deploys_it_without_an_operator_update()
     }
     git_ok(&seed, &["add", "."]);
     git_ok(&seed, &["commit", "-m", "Seed both reference components"]);
-    let url = format!("http://127.0.0.1:{}/forge/{REPO}", cluster.http_ports[0]);
-    git_ok(&seed, &["remote", "add", "origin", &url]);
-    let pushed = git(&seed, &["push", "origin", "HEAD:dev"])
-        .envs(cluster.git_push_env(0))
-        .output()
-        .unwrap();
-    assert!(
-        pushed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&pushed.stderr)
-    );
+    cluster.seed_forge(0, &seed, REPO, "dev");
     let account = common::provision_model_program(&cluster, 0, MODEL);
     cluster.submit(
         0,
@@ -290,17 +280,8 @@ fn chat_commits_a_component_and_the_node_deploys_it_without_an_operator_update()
     assert_eq!(reply.head.origin, sdk::Origin::Program(account));
 
     let checkout = fixtures.path().join("delivered");
-    git_ok(
-        fixtures.path(),
-        &[
-            "clone",
-            "--quiet",
-            "--branch",
-            &deployment.request.source.branch,
-            &url,
-            checkout.to_str().unwrap(),
-        ],
-    );
+    cluster.clone_forge(0, REPO, &checkout);
+    git_ok(&checkout, &["checkout", &deployment.request.source.branch]);
     let delivered = git_ok(
         &checkout,
         &[

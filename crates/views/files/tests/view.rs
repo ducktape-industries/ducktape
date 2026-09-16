@@ -1,17 +1,41 @@
 //! The view driven natively through the wire: the kernel pushes session
 //! facts, the view lists the directory, the homes and the snapshot history
-//! for itself through `files.get`, re-reads on every `rpc.live` hit for the
+//! for itself through `rpc.query`, re-reads on every `rpc.live` hit for the
 //! files plane, reads the chosen file, and every write leaves as `op.submit`
 //! carrying the duckfs commit.
 
 use ducktape_view_guest::testing::{
-    answer, edit, find, has_text, item, keys, press, refuse, texts, type_into,
+    answer as raw_answer, edit, find, has_text, item, keys, press, refuse, texts, type_into,
 };
 use ducktape_view_guest::wire::{self, Event, Frame, Node, Request, keyboard};
 use files_view::host::Session;
 use files_view::{boot_native, tick_native};
 
+thread_local! {
+    static FILES_REPLIES: std::cell::RefCell<std::collections::BTreeMap<u64, String>> = Default::default();
+}
+
+// The UI fixtures below describe the values displayed by the browser. Wrap
+// them in the module's tagged reply when answering its generic RPC request.
+fn answer(id: u64, bytes: &[u8]) -> Event {
+    let lane = FILES_REPLIES.with(|pending| pending.borrow_mut().remove(&id));
+    let Some(lane) = lane else {
+        return raw_answer(id, bytes);
+    };
+    let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    let value = match lane.as_str() {
+        "history" => value["snapshots"].clone(),
+        "diff" => value["entries"].clone(),
+        _ => value,
+    };
+    raw_answer(
+        id,
+        &serde_json::to_vec(&serde_json::json!({ lane: value })).unwrap(),
+    )
+}
+
 fn boot() -> Frame {
+    FILES_REPLIES.with(|pending| pending.borrow_mut().clear());
     boot_native();
     tick_native(Vec::new())
 }
@@ -35,7 +59,7 @@ fn has_request(frame: &Frame, kind: &str) -> bool {
     frame.requests.iter().any(|request| request.kind == kind)
 }
 
-/// Every `files.get` request on `lane`, with the params each carries.
+/// Every `rpc.query` request on `lane`, with the params each carries.
 fn files_gets<'a>(frame: &'a Frame, lane: &str) -> Vec<(&'a Request, serde_json::Value)> {
     frame
         .requests
@@ -43,13 +67,19 @@ fn files_gets<'a>(frame: &'a Frame, lane: &str) -> Vec<(&'a Request, serde_json:
         .filter_map(|request| {
             let ask: serde_json::Value =
                 serde_json::from_slice(&request.payload).unwrap_or_default();
-            let on_lane = request.kind == "files.get" && ask["lane"] == lane;
-            on_lane.then(|| (request, ask["params"].clone()))
+            let on_lane = request.kind == "rpc.query"
+                && ask["target"] == "files"
+                && ask["query"].get(lane).is_some();
+            on_lane.then(|| {
+                FILES_REPLIES
+                    .with(|pending| pending.borrow_mut().insert(request.id, lane.to_owned()));
+                (request, ask["query"][lane].clone())
+            })
         })
         .collect()
 }
 
-/// The one `files.get` request on `lane`, and the params it carries.
+/// The one `rpc.query` request on `lane`, and the params it carries.
 fn files_get<'a>(frame: &'a Frame, lane: &str) -> (&'a Request, serde_json::Value) {
     files_gets(frame, lane)
         .into_iter()
@@ -134,6 +164,7 @@ fn read(text: &str) -> Vec<u8> {
 /// The subscriptions a connected view holds: the session push it was given
 /// at boot, and the `rpc.live` it keeps on the files plane.
 struct Held {
+    drops: u64,
     session: u64,
     live: u64,
 }
@@ -156,10 +187,12 @@ fn connected_with_listing() -> (Frame, Held) {
     let session_id = request(&frame, "files.props").id;
     let frame = tick_native(vec![item(session_id, &session(true))]);
     let live = request(&frame, "rpc.live").id;
+    let drops = request(&frame, "fs.drops").id;
     let frame = settle_workspace(&frame, "/shared", &listing());
     (
         frame,
         Held {
+            drops,
             session: session_id,
             live,
         },
@@ -392,11 +425,6 @@ fn a_click_chooses_and_a_double_click_opens_a_directory() {
         "the old tally survived the navigation: {:?}",
         texts(&frame)
     );
-    assert_eq!(
-        request(&frame, "files.at").payload,
-        br#"{"path":"/shared/docs"}"#,
-        "the window's drop door is told where the view stands"
-    );
     let frame = settle_workspace(&frame, "/shared/docs", &empty_listing());
     assert!(has_text(&frame, "Empty folder"), "{:?}", texts(&frame));
     assert!(
@@ -486,11 +514,6 @@ fn a_duck_link_lands_the_view_on_the_file_it_names() {
         ls_of(&frame, "/shared/docs").1["path"],
         "/shared/docs",
         "the address's directory is what the browser lists"
-    );
-    assert_eq!(
-        request(&frame, "files.at").payload,
-        br#"{"path":"/shared/docs"}"#,
-        "the window's drop door follows the reader"
     );
     assert!(
         !has_text(&frame, "/shared/README.md"),
@@ -599,7 +622,7 @@ fn get_info_walks_the_history_for_the_last_change() {
         serde_json::json!({ "entries": [] }).to_string().as_bytes(),
     )]);
     assert!(
-        !has_request(&frame, "files.get"),
+        !has_request(&frame, "rpc.query"),
         "the first snapshot needs no diff: {:?}",
         frame.requests
     );
@@ -836,7 +859,7 @@ fn a_deleted_file_leaves_the_inspector_with_it() {
         texts(&frame)
     );
     assert!(
-        !has_request(&frame, "files.get") || files_gets(&frame, "read").is_empty(),
+        !has_request(&frame, "rpc.query") || files_gets(&frame, "read").is_empty(),
         "the gone file is not read again: {:?}",
         frame.requests
     );
@@ -965,7 +988,7 @@ fn the_keyboard_walks_the_rows_and_the_trail() {
     );
     let frame = tick_native(key(keyboard::Named::ArrowDown, false));
     assert!(has_text(&frame, "/shared/README.md"), "{:?}", texts(&frame));
-    assert!(has_request(&frame, "files.get"), "a chosen file reads");
+    assert!(has_request(&frame, "rpc.query"), "a chosen file reads");
     let frame = tick_native(key(keyboard::Named::ArrowDown, false));
     assert!(has_text(&frame, "/shared/README.md"), "clamped at the end");
     let frame = tick_native(key(keyboard::Named::ArrowUp, false));
@@ -1146,7 +1169,7 @@ fn an_edited_body_saves_against_the_snapshot_it_was_read_at() {
     let frame = with_preview(&frame, "# Hello\n");
     assert_eq!(
         surface_names(&frame),
-        ["agent_markdown"],
+        ["markdown"],
         "a markdown path reads as a document"
     );
 
@@ -1509,8 +1532,67 @@ fn a_text_preview_gives_the_native_reader_a_scrollable_height() {
     let frame = tick_native(vec![answer(head, &refs())]);
     let page = files_get(&frame, "read").0.id;
     let frame = tick_native(vec![answer(page, &read("first line\nsecond line"))]);
-    assert_eq!(surface_names(&frame), ["forge_code"]);
+    assert_eq!(surface_names(&frame), ["code"]);
     assert!(matches!(node_ending(&frame, "/code-box"),
         Node::Container { height: Some(wire::Length::Fixed(height)), .. }
             if height >= 240.));
+}
+
+#[test]
+fn a_drop_builds_its_commit_in_the_guest_and_keeps_the_base_read_before_device_io() {
+    use base64::Engine as _;
+    let (_, held) = connected_with_listing();
+    let frame = tick_native(vec![item(
+        held.drops,
+        br#"[{"token":"grant","name":"README.md","bytes":4}]"#,
+    )]);
+    let refs = request(&frame, "rpc.query").id;
+    assert!(!has_request(&frame, "fs.read"));
+    let old = "11".repeat(32);
+    let frame = tick_native(vec![raw_answer(
+        refs,
+        &serde_json::to_vec(&serde_json::json!({"refs":{"head":old}})).unwrap(),
+    )]);
+    let read = request(&frame, "fs.read");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&read.payload).unwrap(),
+        serde_json::json!({"token":"grant","offset":0,"len":4})
+    );
+    // Another writer may advance this path while the device read is outstanding.
+    let frame = tick_native(vec![raw_answer(read.id, b"mine")]);
+    let commit = request(&frame, "op.submit_bytes");
+    let envelope: serde_json::Value = serde_json::from_slice(&commit.payload).unwrap();
+    assert_eq!(envelope["target"], "files");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(envelope["body_b64"].as_str().unwrap())
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(payload["commit"]["base_snapshot"], old);
+    assert_eq!(
+        payload["commit"]["changes"][0]["put"]["path"],
+        "/shared/README.md"
+    );
+    let frame = tick_native(vec![refuse(commit.id, "path changed since base snapshot")]);
+    let release = request(&frame, "fs.release");
+    assert_eq!(release.payload, b"grant");
+    let frame = tick_native(vec![raw_answer(release.id, b"")]);
+    assert!(has_text(&frame, "path changed since base snapshot"));
+}
+
+#[test]
+fn a_drop_into_a_namespace_root_refuses_before_reading_device_bytes() {
+    let (_, held) = connected_with_listing();
+    let frame = tick_native(vec![item(
+        held.session,
+        &routed_session(true, "/README.md", 1),
+    )]);
+    let _ = settle_workspace(&frame, "/", &empty_listing());
+    let frame = tick_native(vec![item(
+        held.drops,
+        br#"[{"token":"grant","name":"README.md","bytes":4}]"#,
+    )]);
+    assert!(!has_request(&frame, "fs.read"));
+    let release = request(&frame, "fs.release");
+    let frame = tick_native(vec![raw_answer(release.id, b"")]);
+    assert!(has_text(&frame, "path is outside /home and /shared"));
 }

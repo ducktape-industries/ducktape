@@ -42,6 +42,7 @@ const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 fn http_client(timeout: std::time::Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .build()
         .expect("build a reqwest client")
@@ -154,26 +155,65 @@ impl NodeLink {
         // other attach: an engine built once at boot must not pin this boot's
         // token into every later commit.
         let link = self.clone();
-        HttpNode::new(self.base.clone()).with_write_auth(Arc::new(move |_method, _path, _body| {
-            match link.operator_token() {
-                Some(token) => vec![(crate::admin::ADMIN_TOKEN_HEADER.to_string(), token)],
-                None => Vec::new(),
-            }
-        }))
+        HttpNode::new(self.base.clone())
+            .with_operator_credential(Arc::new(move || link.operator_token()))
     }
 
     /// submit one module op. `payload` is the module's own serde_json wire
     /// bytes, which `/v1/submit` takes as a json value and re-serializes — the
     /// module decodes the same value either way.
     pub async fn submit(&self, target: &str, payload: &[u8]) -> Result<u64, String> {
+        self.submit_with_blob(target, payload, None).await
+    }
+
+    /// Submit an op with an explicitly declared, already uploaded blob.
+    pub async fn submit_with_blob(
+        &self,
+        target: &str,
+        payload: &[u8],
+        required_blob: Option<[u8; 32]>,
+    ) -> Result<u64, String> {
         let payload: serde_json::Value = serde_json::from_slice(payload)
             .map_err(|error| format!("op payload is not json: {error}"))?;
-        let body = serde_json::json!({ "target": target, "payload": payload });
+        let mut body = serde_json::json!({ "target": target, "payload": payload });
+        if let Some(digest) = required_blob {
+            body["required_blob"] = serde_json::Value::String(
+                digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+            );
+        }
         let text = self.post_json("/v1/submit", &body).await?;
         serde_json::from_str::<serde_json::Value>(&text)
             .ok()
             .and_then(|value| value["height"].as_u64())
             .ok_or_else(|| format!("unexpected submit receipt: {text}"))
+    }
+
+    /// Store opaque content under its digest using this service's node authority.
+    pub async fn put_blob(&self, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+        use sha2::{Digest as _, Sha256};
+        let bounded = bytes.len() <= blobstore::MAX_TRANSFER_BYTES;
+        if !bounded {
+            return Err("blob exceeds transfer limit".into());
+        }
+        let digest = Sha256::digest(&bytes).to_vec();
+        let response = self
+            .credentialed(self.client.post(format!("{}/v1/files/blob", self.base)))
+            .header("content-type", "application/octet-stream")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|error| format!("blob upload: {error}"))?;
+        let body = Self::body_of(response).await?;
+        let reply: serde_json::Value =
+            serde_json::from_str(&body).map_err(|error| error.to_string())?;
+        let expected = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if reply["digest"] != expected {
+            return Err("blob receipt digest mismatch".into());
+        }
+        Ok(digest)
     }
 
     /// submit an ALREADY-SIGNED frame verbatim. The node verifies the signature

@@ -12,8 +12,6 @@ mod sends;
 mod shell;
 mod stream;
 mod window_lifecycle;
-use crate::composer_surface::testing as composer;
-const RAIL_THREAD_SEQ: i64 = 7;
 fn message(seq: i64, body: &str, deleted: bool) -> backend::ChatMessage {
     backend::ChatMessage {
         id: format!("message-{seq}"),
@@ -40,53 +38,6 @@ fn message(seq: i64, body: &str, deleted: bool) -> backend::ChatMessage {
     }
 }
 
-fn composer_scope(app: &Ducktape) -> String {
-    backend::composer_scope(&app.connected_rpc, &app.active_channel)
-}
-
-fn reply_composer_scope(app: &Ducktape, thread_seq: i64) -> String {
-    backend::thread_scope(&app.connected_rpc, &app.active_channel, thread_seq)
-}
-
-fn submit(app: &mut Ducktape, kind: ComposerKind, body: &str) -> String {
-    let id = backend::fresh_operation_id(composer_op_prefix(kind));
-    let scope = match kind {
-        ComposerKind::Message => composer_scope(app),
-        ComposerKind::Reply => reply_composer_scope(app, RAIL_THREAD_SEQ),
-        ComposerKind::Edit | ComposerKind::ThreadEdit => {
-            backend::edit_scope(&app.connected_rpc, &app.active_channel, app.chat_edit_seq)
-        }
-    };
-    let _ = app.update(AppMessage::ComposerSubmitted(
-        kind,
-        body.to_owned(),
-        id.clone(),
-        scope,
-    ));
-    id
-}
-
-fn composer_intent(scope: &str, kind: &str, body: &str) -> module_view::ModuleViewEvent {
-    module_view::ModuleViewEvent {
-        kind: "composer".into(),
-        detail: serde_json::json!({
-            "scope": scope,
-            "kind": kind,
-            "body": body,
-            "id": backend::fresh_operation_id(kind.to_owned()),
-        })
-        .to_string(),
-    }
-}
-
-fn composer_text(scope: &str) -> String {
-    composer::text(scope).trim().to_owned()
-}
-
-fn composer_stash(scope: &str) -> String {
-    composer::failed(scope)
-}
-
 fn live_refresh(generation: i64, active_channel: &str) -> backend::LiveRefresh {
     backend::LiveRefresh {
         generation,
@@ -95,9 +46,7 @@ fn live_refresh(generation: i64, active_channel: &str) -> backend::LiveRefresh {
         active_channel: active_channel.into(),
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
-        active_channel_members_only: false,
         huddle_roster: Vec::new(),
-        channel_members: Vec::new(),
     }
 }
 
@@ -106,10 +55,9 @@ fn posted_delta(channel: &str, row: backend::ChatMessage) -> backend::LiveUpdate
         kind: LiveKind::Chat,
         status: "Live".into(),
         height: row.seq.max(1),
-        chat: vec![backend::ChatDelta::Posted {
+        chat: vec![backend::ChatDelta::Head {
             channel_id: channel.into(),
             seq: row.seq,
-            message: row,
         }],
         ..backend::LiveUpdate::default()
     }
@@ -122,9 +70,7 @@ fn chat_data(active_channel: &str) -> backend::ChatData {
         active_channel: active_channel.into(),
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
-        active_channel_members_only: false,
         huddle_roster: Vec::new(),
-        channel_members: Vec::new(),
     }
 }
 
@@ -159,9 +105,7 @@ fn workspace(active_channel: &str) -> backend::WorkspaceData {
         active_channel: active_channel.into(),
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
-        active_channel_members_only: false,
         huddle_roster: Vec::new(),
-        channel_members: Vec::new(),
     }
 }
 
@@ -178,31 +122,6 @@ fn room(id: &str, head: i64) -> backend::ChatChannel {
     }
 }
 
-fn type_into(scope: &str, text: &str) {
-    composer::append(scope, text);
-}
-fn seed_composer(scope: &str, text: &str) {
-    composer::replace(scope, text);
-}
-fn restore_composer(scope: &str, blocked: bool) {
-    composer::restore(scope, blocked);
-}
-fn submit_composer(app: &mut Ducktape, scope: &str, kind: ComposerKind, blocked: bool) {
-    let Some(value) = composer::submit(scope, &composer_op_prefix(kind), blocked) else {
-        return;
-    };
-    let event = composer_surface::intent(&value).expect("native composer submit intent");
-    let task = app.update(AppMessage::ChatViewEvent(event));
-    pump(app, task);
-}
-/// Drain only this task's messages. Follow-up I/O belongs to the caller's fixture.
-fn pump(app: &mut Ducktape, task: ducktape_view_guest::Task<AppMessage>) {
-    use futures::StreamExt;
-    let messages: Vec<_> = futures::executor::block_on(task.into_stream().collect());
-    for message in messages {
-        let _ = app.update(message);
-    }
-}
 fn command_chord(key: &str) -> crate::shell::KeyPress {
     crate::shell::KeyPress {
         key: key.into(),
@@ -347,13 +266,4 @@ pub(crate) fn handler_body(variant: &str) -> String {
         .unwrap_or_else(|| panic!("missing native handler {variant}"));
     assert!(found.next().is_none(), "one handler per message variant");
     body
-}
-
-fn composer_op_prefix(kind: ComposerKind) -> String {
-    match kind {
-        ComposerKind::Message => "message",
-        ComposerKind::Reply => "reply",
-        ComposerKind::Edit | ComposerKind::ThreadEdit => "edit",
-    }
-    .into()
 }

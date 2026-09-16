@@ -286,6 +286,7 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
     let (ok, output) = cluster.run_verb(&[
         "gateway",
         "bind",
+        "--trusted-loopback",
         "--workspace",
         workspace.to_str().unwrap(),
         "--label",

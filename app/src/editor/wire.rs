@@ -207,10 +207,34 @@ impl EditorStore {
 }
 
 fn collect(node: &wire::Node, fields: &mut HashMap<String, Field>) -> Result<(), String> {
-    if let wire::Node::Editor { key, document, on_document, options, placeholder, editable, .. } = node {
-        let duplicate = fields.insert(key.clone(), Field { reference: document.clone(),
-            handler: *on_document, options: (**options).clone(), placeholder: placeholder.clone(), editable: *editable }).is_some();
-        if duplicate { return Err("duplicate editor projection key".into()); }
+    if let wire::Node::Editor {
+        key,
+        document,
+        on_document,
+        options,
+        placeholder,
+        editable,
+        ..
+    } = node
+    {
+        if let Some(rich) = &options.rich {
+            notion::validate_rich(&rich.document)?;
+        }
+        let duplicate = fields
+            .insert(
+                key.clone(),
+                Field {
+                    reference: document.clone(),
+                    handler: *on_document,
+                    options: (**options).clone(),
+                    placeholder: placeholder.clone(),
+                    editable: *editable,
+                },
+            )
+            .is_some();
+        if duplicate {
+            return Err("duplicate editor projection key".into());
+        }
     }
     for child in node.children() { collect(child, fields)?; }
     Ok(())
@@ -277,16 +301,39 @@ impl Store {
     }
 
     fn enqueue(&mut self, key: &str, input: Input) {
-        if self.fault.is_some() { return; }
-        let Some(field) = self.fields.get(key).cloned() else { return; };
-        let allowed = field.editable || matches!(input, Input::Request(wire::EditorRequestInput::Interaction { .. }));
-        if !allowed { return; }
+        if self.fault.is_some() {
+            return;
+        }
+        let Some(field) = self.fields.get(key).cloned() else {
+            return;
+        };
+        let interaction = matches!(
+            &input,
+            Input::Request(wire::EditorRequestInput::Interaction { .. })
+        ) || matches!(&input, Input::Request(wire::EditorRequestInput::RichEdit { edit }) if edit.interaction.is_some());
+        let allowed = field.editable || interaction;
+        if !allowed {
+            return;
+        }
         let sequence = self.next();
         let at = self.epoch.elapsed().as_millis() as u64;
-        let Some(document) = self.documents.get_mut(&field.reference.document) else { return; };
-        if document.text.is_none() { return; }
-        let bytes = match &input { Input::Native(edit) => edit.replacement.len(), Input::Request(request) => wire::encode(request).len() };
-        let overflow = document.queue.len() >= 128 || document.queued_bytes.saturating_add(bytes) > wire::editor_transaction::MAX_EDITOR_INPUT_BYTES;
+        let Some(document) = self.documents.get_mut(&field.reference.document) else {
+            return;
+        };
+        if document.text.is_none() {
+            return;
+        }
+        let bytes = match &input {
+            Input::Native(edit) => edit.replacement.len(),
+            Input::Request(request) => wire::encode(request).len(),
+        };
+        let budget = if field.options.rich.is_some() {
+            wire::editor_rich::MAX_RICH_QUEUE_BYTES
+        } else {
+            wire::editor_transaction::MAX_EDITOR_INPUT_BYTES
+        };
+        let overflow =
+            document.queue.len() >= 128 || document.queued_bytes.saturating_add(bytes) > budget;
         if overflow {
             self.fault = Some("editor input queue is full; document retained".into());
             self.events.push(wire::Event::EditorTransaction { handler: field.options.binding.as_ref().map_or(0, |b| b.on_event),
@@ -621,5 +668,198 @@ pub(super) fn key_state(key: &gpui_kit::Keystroke) -> wire::keyboard::KeyState {
 mod notion;
 #[path = "text.rs"]
 mod text;
-pub use notion::{NOTION_DOCUMENT_KEY, NotionWireEditor, init as init_notion};
 pub use text::{GUEST_EDITOR_CONTEXT, TextEditor};
+pub use notion::{RichWireEditor, init as init_notion};
+
+#[cfg(test)]
+mod rich_tests {
+    use super::*;
+
+    fn node(reset: u64) -> wire::Node {
+        let rich = wire::editor_rich::RichPresentation {
+            document: wire::editor_rich::RichDocument {
+                blocks: vec![wire::editor_rich::RichBlock {
+                    kind: "paragraph".into(),
+                    text: "draft".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        wire::Node::Editor {
+            key: "unrelated-product/editor".into(),
+            document: EditorDocumentRef {
+                document: "draft".into(),
+                reset,
+                revision: 0,
+                text_revision: 0,
+                byte_len: 5,
+                cursor: Default::default(),
+            },
+            on_document: 1,
+            editable: true,
+            placeholder: String::new(),
+            width: None,
+            height: None,
+            min_height: None,
+            max_height: None,
+            options: Box::new(wire::EditorOptions {
+                rich: Some(Box::new(rich)),
+                binding: Some(Box::new(wire::EditorBinding {
+                    authored: true,
+                    claims: vec![],
+                    on_request: 2,
+                    on_event: 3,
+                })),
+                ..Default::default()
+            }),
+        }
+    }
+    fn seeded(instance: u64) -> EditorStore {
+        let store = EditorStore::new(instance);
+        store.replace(&node(1)).unwrap();
+        store.lock().documents.get_mut("draft").unwrap().text = Some(Arc::from("draft"));
+        store
+    }
+
+    #[test]
+    fn editor_actions_wait_for_native_commit_acknowledgement_and_stay_instance_scoped() {
+        let first = seeded(91);
+        let other = seeded(92);
+        let cursor = wire::EditorCursor {
+            position: wire::EditorPosition { line: 0, column: 6 },
+            selection: None,
+        };
+        first.native(
+            "unrelated-product/editor",
+            "draft",
+            Default::default(),
+            "draft!",
+            cursor,
+            wire::EditorEditKind::Insert,
+        );
+        first.request(
+            "unrelated-product/editor",
+            wire::EditorRequestInput::Interaction {
+                action: wire::editor_presentation::EditorInteraction::Action { tag: "send".into() },
+            },
+        );
+        let events = first.drain();
+        let [
+            wire::Event::EditorTransaction {
+                event: wire::EditorTransactionEvent::Commit { after, .. },
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("typing must commit first: {events:?}");
+        };
+        assert!(first.drain().is_empty());
+        assert!(other.drain().is_empty());
+        let mut next = node(1);
+        let wire::Node::Editor { document, .. } = &mut next else {
+            unreachable!()
+        };
+        *document = after.clone();
+        first.replace(&next).unwrap();
+        first.frame(&wire::Frame::default()).unwrap();
+        let events = first.drain();
+        let [wire::Event::EditorRequest { request, .. }] = events.as_slice() else {
+            panic!("action follows acknowledgement: {events:?}");
+        };
+        assert_eq!(request.id.instance, 91);
+        assert_eq!(request.state.byte_len, 6);
+        assert_eq!(request.state.cursor, cursor);
+        assert!(
+            matches!(&request.input, wire::EditorRequestInput::Interaction { action: wire::editor_presentation::EditorInteraction::Action { tag } } if tag == "send")
+        );
+    }
+
+    #[test]
+    fn large_rich_paste_uses_the_bounded_projection_queue() {
+        let store = seeded(73);
+        let before = store
+            .projection("unrelated-product/editor")
+            .unwrap()
+            .options
+            .rich
+            .unwrap()
+            .document;
+        let mut document = before.clone();
+        document.blocks[0].text = "x".repeat(wire::editor_document::MAX_EDITOR_DOCUMENT_BYTES);
+        store.request(
+            "unrelated-product/editor",
+            wire::EditorRequestInput::RichEdit {
+                edit: Box::new(wire::editor_rich::RichEdit {
+                    before: Some(before),
+                    document,
+                    ..Default::default()
+                }),
+            },
+        );
+        let events = store.drain();
+        assert!(matches!(
+            events.first(),
+            Some(wire::Event::EditorRequest { .. })
+        ));
+        let state = store.lock();
+        assert!(state.fault.is_none());
+        assert!(
+            state.documents["draft"].queued_bytes
+                > wire::editor_transaction::MAX_EDITOR_INPUT_BYTES
+        );
+        assert!(state.documents["draft"].queued_bytes <= wire::editor_rich::MAX_RICH_QUEUE_BYTES);
+    }
+
+    #[test]
+    fn rich_requests_keep_canonical_drafts_isolated_and_cancel_on_reset() {
+        let first = seeded(71);
+        let second = seeded(72);
+        let snapshot = first
+            .projection("unrelated-product/editor")
+            .unwrap()
+            .options
+            .rich
+            .unwrap()
+            .document;
+        let mut next = snapshot.clone();
+        next.blocks[0].text = "changed".into();
+        first.request(
+            "unrelated-product/editor",
+            wire::EditorRequestInput::RichEdit {
+                edit: Box::new(wire::editor_rich::RichEdit {
+                    before: Some(snapshot),
+                    document: next,
+                    ..Default::default()
+                }),
+            },
+        );
+        let events = first.drain();
+        let wire::Event::EditorRequest { request, .. } = &events[0] else {
+            panic!("revision-checked guest request");
+        };
+        assert_eq!(request.id.instance, 71);
+        assert_eq!(
+            first
+                .projection("unrelated-product/editor")
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("draft")
+        );
+        assert!(second.drain().is_empty());
+        assert!(!second.pending());
+        first.replace(&node(2)).unwrap();
+        let cancelled = first.drain();
+        assert!(cancelled.iter().any(|event| matches!(event, wire::Event::EditorTransaction { event: wire::EditorTransactionEvent::Cancelled { id, .. }, .. } if id == &request.id)));
+        assert_eq!(
+            second
+                .projection("unrelated-product/editor")
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("draft")
+        );
+    }
+}

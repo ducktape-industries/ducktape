@@ -5,8 +5,7 @@
 //!   * `root()` = `StateRoot(sha256(refs_bytes()))` — the refs image, NOT a KV
 //!     encoding — and it moves ONLY at the block boundary (publish), never
 //!     mid-block and never on abort.
-//!   * queries NEVER route to the guest: `query`/`query_with` answer from the
-//!     backing's committed lane.
+//!   * queries run the guest over committed refs and objects, excluding staged writes.
 //!   * `serve_sync`/`state_sync_handle` delegate to the backing (the duckfs-odb
 //!     resolver lane), like a store-backed tenant delegates to its store.
 //!   * `snapshot`/`install` are the refs image out / verify-then-adopt in.
@@ -54,20 +53,18 @@ enum Call {
     PublishBlock(u64),
     AdoptRefs(Vec<u8>),
     DiscardBlock,
-    Query(Vec<u8>),
     ServeSync(Vec<u8>),
 }
 
 #[derive(Default)]
 struct MockInner {
+    engine: Option<wasm_host::Backing>,
     /// the committed refs image — the `root()` preimage. moves only at adopt.
     committed_refs: Vec<u8>,
     /// committed odb: id → tagged body (`kind ‖ body`). moves only at publish.
     committed_objects: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
     /// objects staged this block, not yet published (kind, body).
     pending_objects: Vec<(u8, Vec<u8>)>,
-    /// canned committed-query answer (proves query bypasses the guest).
-    query_answer: Vec<u8>,
     /// canned serve-sync answer (proves the sync lane delegates).
     sync_answer: Vec<u8>,
     /// this block's height, captured at publish and stamped at adopt (native's
@@ -126,6 +123,22 @@ impl HostOdb for Mock {
 }
 
 impl OdbBacking for Mock {
+    fn git_object_read(
+        &self,
+        _repository: &str,
+        _oid: &[u8],
+        _max_bytes: u64,
+    ) -> Result<wasm_host::GitObject, Error> {
+        Ok(wasm_host::GitObject {
+            kind: 3,
+            size: 3,
+            data: Some(wasm_host::GitObjectData::Blob(b"git".to_vec())),
+        })
+    }
+
+    fn kind(&self) -> wasm_host::Backing {
+        self.0.borrow().engine.unwrap_or(wasm_host::Backing::Odb)
+    }
     fn refs_bytes(&self) -> Vec<u8> {
         self.0.borrow().committed_refs.clone()
     }
@@ -154,11 +167,7 @@ impl OdbBacking for Mock {
         inner.log.push(Call::DiscardBlock);
         inner.pending_objects.clear();
     }
-    fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let mut inner = self.0.borrow_mut();
-        inner.log.push(Call::Query(req.to_vec()));
-        Ok(inner.query_answer.clone())
-    }
+
     fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         let mut inner = self.0.borrow_mut();
         inner.log.push(Call::ServeSync(req.to_vec()));
@@ -253,31 +262,92 @@ async fn root_is_sha256_of_the_refs_image_and_snapshot_is_that_image() {
         StateRoot(sha256_32(b"REFS-V0")),
         "root is sha256(refs_bytes), NOT a KV encoding"
     );
-    assert_eq!(m.snapshot(), b"REFS-V0", "snapshot ships the refs image verbatim");
+    assert_eq!(
+        m.snapshot(),
+        b"REFS-V0",
+        "snapshot ships the refs image verbatim"
+    );
 }
 
 #[tokio::test]
-async fn query_delegates_to_the_backing_never_the_guest() {
+async fn queries_run_guest_policy_over_committed_refs_and_objects() {
     let mock = Mock::with_refs(b"REFS-V0");
-    mock.0.borrow_mut().query_answer = b"COMMITTED-ANSWER".to_vec();
-    let m = module(&mock);
-
-    // a request the object-wasm guest would REJECT ("unknown query"): if the
-    // backing answered it, the guest was never consulted.
-    let got = m.query(b"anything-the-guest-would-reject").await.expect("committed query");
-    assert_eq!(got, b"COMMITTED-ANSWER");
-
-    let ctx = MockCtx::new();
-    let got = m
-        .query_with(&ctx, b"anything")
+    let mut m = module(&mock);
+    let mut ctx = MockCtx::new();
+    let root = m.root();
+    exec(&mut m, &mut ctx, refs_set_op(b"REFS-STAGED"))
         .await
-        .expect("committed query_with");
-    assert_eq!(got, b"COMMITTED-ANSWER");
-    assert_eq!(
-        mock.log(),
-        vec![Call::Query(b"anything-the-guest-would-reject".to_vec()), Call::Query(b"anything".to_vec())],
-        "both query paths hit the backing, in order, and nothing else"
+        .expect("stage refs");
+    assert_eq!(m.query(b"r").await.unwrap(), b"REFS-V0");
+    assert_eq!(m.query_with(&ctx, b"r").await.unwrap(), b"REFS-V0");
+    assert!(
+        m.query(b"unknown").await.is_err(),
+        "guest owns query dispatch"
     );
+    assert_eq!(m.root(), root);
+    m.commit_block().await.unwrap();
+    assert_eq!(m.query(b"r").await.unwrap(), b"REFS-STAGED");
+}
+
+#[tokio::test]
+async fn query_replays_typed_git_reads_through_the_guest_import() {
+    let mock = Mock::with_refs(b"REFS");
+    let module = module(&mock);
+    let req = [b"g".as_slice(), &[0; 20]].concat();
+    assert_eq!(module.query(&req).await.unwrap(), b"git");
+    assert_eq!(
+        module.query_with(&MockCtx::new(), &req).await.unwrap(),
+        b"git"
+    );
+}
+
+#[test]
+fn object_and_git_backings_are_distinct_storage_contracts() {
+    let mock = Mock::with_refs(b"REFS");
+    mock.0.borrow_mut().engine = Some(wasm_host::Backing::Git);
+    assert!(WasmModule::with_odb("custom", OBJECT, mock.boxed()).is_err());
+    mock.0.borrow_mut().engine = Some(wasm_host::Backing::Odb);
+    assert!(WasmModule::with_odb("custom", OBJECT, mock.boxed()).is_ok());
+}
+
+#[tokio::test]
+async fn replacement_changes_query_policy_without_changing_state() {
+    const REPLACEMENT: &[u8] = include_bytes!("fixtures/object-replacement.component.wasm");
+    let mock = Mock::with_refs(b"REFS-COMMITTED");
+    let mut module = module(&mock);
+    let root = module.root();
+    assert_eq!(module.query(b"r").await.unwrap(), b"REFS-COMMITTED");
+    module
+        .swap_code(&module_artifact::Artifact::module(REPLACEMENT.to_vec()).encode())
+        .unwrap();
+    assert_eq!(module.root(), root);
+    assert_eq!(module.snapshot(), b"REFS-COMMITTED");
+    assert_eq!(module.query(b"r").await.unwrap(), b"updated:REFS-COMMITTED");
+    assert_eq!(
+        module.query_with(&MockCtx::new(), b"r").await.unwrap(),
+        b"updated:REFS-COMMITTED"
+    );
+}
+
+#[tokio::test]
+async fn guest_query_cannot_observe_objects_until_commit_or_after_abort() {
+    let mock = Mock::with_refs(b"REFS");
+    let mut module = module(&mock);
+    let mut ctx = MockCtx::new();
+    let id = object_id(1, b"body");
+    let req = [b"o".as_slice(), id.as_slice()].concat();
+    exec(&mut module, &mut ctx, put_op(1, b"body"))
+        .await
+        .unwrap();
+    assert!(module.query(&req).await.unwrap().is_empty());
+    assert!(module.query_with(&ctx, &req).await.unwrap().is_empty());
+    module.abort_block().await.unwrap();
+    assert!(module.query(&req).await.unwrap().is_empty());
+    exec(&mut module, &mut ctx, put_op(1, b"body"))
+        .await
+        .unwrap();
+    module.commit_block().await.unwrap();
+    assert_eq!(module.query(&req).await.unwrap(), b"\x01body");
 }
 
 #[tokio::test]
@@ -315,7 +385,11 @@ async fn sync_lane_delegates_to_the_backing() {
 async fn durable_commit_height_delegates_to_the_backing() {
     let mock = Mock::with_refs(b"REFS-V0");
     let m = module(&mock);
-    assert_eq!(m.durable_commit_height(), None, "fresh backing: no durable commit cursor");
+    assert_eq!(
+        m.durable_commit_height(),
+        None,
+        "fresh backing: no durable commit cursor"
+    );
 
     // stamp a committed height on the shared backing, in the kernel order
     // (publish captures the height, adopt makes it durable).
@@ -337,11 +411,16 @@ async fn install_verifies_then_adopts_the_refs_image() {
     // a snapshot whose root does not match is refused; committed refs untouched.
     let wrong = StateRoot([9u8; 32]);
     assert!(m.install(b"REFS-V1", wrong).is_err());
-    assert_eq!(mock.committed_refs(), b"REFS-V0", "a bad install adopts nothing");
+    assert_eq!(
+        mock.committed_refs(),
+        b"REFS-V0",
+        "a bad install adopts nothing"
+    );
 
     // the matching root verify-then-adopts; root moves to the new image.
     let expected = StateRoot(sha256_32(b"REFS-V1"));
-    m.install(b"REFS-V1", expected).expect("install a verified snapshot");
+    m.install(b"REFS-V1", expected)
+        .expect("install a verified snapshot");
     assert_eq!(mock.committed_refs(), b"REFS-V1");
     assert_eq!(m.root(), StateRoot(sha256_32(b"REFS-V1")));
 }
@@ -360,8 +439,14 @@ async fn refs_root_moves_only_on_publish() {
 
     // the guest stages a new refs image — but the root does NOT move: the write
     // sits in the block stage, the backing has not adopted it.
-    exec(&mut m, &mut ctx, refs_set_op(b"REFS-V1")).await.expect("stage refs");
-    assert_eq!(m.root(), root0, "a staged refs write does not move the root");
+    exec(&mut m, &mut ctx, refs_set_op(b"REFS-V1"))
+        .await
+        .expect("stage refs");
+    assert_eq!(
+        m.root(),
+        root0,
+        "a staged refs write does not move the root"
+    );
 
     // publish: the root moves, exactly once, to the new image.
     m.commit_block().await.expect("commit");
@@ -369,9 +454,15 @@ async fn refs_root_moves_only_on_publish() {
     assert_eq!(mock.committed_refs(), b"REFS-V1");
 
     // a staged-then-aborted refs write leaves the root untouched.
-    exec(&mut m, &mut ctx, refs_set_op(b"REFS-V2")).await.expect("stage refs");
+    exec(&mut m, &mut ctx, refs_set_op(b"REFS-V2"))
+        .await
+        .expect("stage refs");
     m.abort_block().await.expect("abort");
-    assert_eq!(m.root(), StateRoot(sha256_32(b"REFS-V1")), "abort discards the staged image");
+    assert_eq!(
+        m.root(),
+        StateRoot(sha256_32(b"REFS-V1")),
+        "abort discards the staged image"
+    );
     assert_eq!(mock.committed_refs(), b"REFS-V1");
 }
 
@@ -383,8 +474,12 @@ async fn publish_flushes_objects_before_adopting_refs() {
 
     // dispatch 1 stages an object; dispatch 2 stages the new refs image. one
     // block, two dispatches — the native shape of a files Commit + its objects.
-    exec(&mut m, &mut ctx, put_op(2, b"tree-body")).await.expect("stage object");
-    exec(&mut m, &mut ctx, refs_set_op(b"REFS-V1")).await.expect("stage refs");
+    exec(&mut m, &mut ctx, put_op(2, b"tree-body"))
+        .await
+        .expect("stage object");
+    exec(&mut m, &mut ctx, refs_set_op(b"REFS-V1"))
+        .await
+        .expect("stage refs");
 
     m.commit_block().await.expect("commit");
 
@@ -414,17 +509,26 @@ async fn staged_object_is_cross_dispatch_visible_but_hidden_from_the_backing_unt
     let id = object_id(0, b"chunk-bytes");
 
     // dispatch 1 stages the object.
-    exec(&mut m, &mut ctx, put_op(0, b"chunk-bytes")).await.expect("stage object");
+    exec(&mut m, &mut ctx, put_op(0, b"chunk-bytes"))
+        .await
+        .expect("stage object");
     // dispatch 2 (same block) SEES it — through the in-memory overlay, not the
     // backing: the backing's committed odb is still empty.
-    exec(&mut m, &mut ctx, present_op(&id)).await.expect("cross-dispatch overlay hit");
-    assert!(!mock.committed_has(&id), "invisible to the backing's committed get until publish");
+    exec(&mut m, &mut ctx, present_op(&id))
+        .await
+        .expect("cross-dispatch overlay hit");
+    assert!(
+        !mock.committed_has(&id),
+        "invisible to the backing's committed get until publish"
+    );
 
     // publish: the object lands in the committed odb.
     m.commit_block().await.expect("commit");
     assert!(mock.committed_has(&id));
     // a fresh dispatch now sees it through the BACKING (the overlay is empty).
-    exec(&mut m, &mut ctx, present_op(&id)).await.expect("post-publish backing hit");
+    exec(&mut m, &mut ctx, present_op(&id))
+        .await
+        .expect("post-publish backing hit");
 }
 
 #[tokio::test]
@@ -434,16 +538,26 @@ async fn aborted_block_discards_staged_objects_and_calls_discard() {
     let mut ctx = MockCtx::new();
     let id = object_id(0, b"chunk-bytes");
 
-    exec(&mut m, &mut ctx, put_op(0, b"chunk-bytes")).await.expect("stage object");
-    exec(&mut m, &mut ctx, present_op(&id)).await.expect("cross-dispatch overlay hit");
+    exec(&mut m, &mut ctx, put_op(0, b"chunk-bytes"))
+        .await
+        .expect("stage object");
+    exec(&mut m, &mut ctx, present_op(&id))
+        .await
+        .expect("cross-dispatch overlay hit");
 
     // abort: the staged object is dropped whole and the backing is told to
     // discard (a Task-4 hook for orphan cleanup). committed odb untouched.
     m.abort_block().await.expect("abort");
     assert!(!mock.committed_has(&id), "abort published nothing");
-    assert_eq!(mock.log(), vec![Call::DiscardBlock], "the abort reached the backing");
+    assert_eq!(
+        mock.log(),
+        vec![Call::DiscardBlock],
+        "the abort reached the backing"
+    );
 
     // a later dispatch reads the id ABSENT — the overlay was cleared and the
     // backing never held it.
-    exec(&mut m, &mut ctx, absent_op(&id)).await.expect("aborted put left no trace");
+    exec(&mut m, &mut ctx, absent_op(&id))
+        .await
+        .expect("aborted put left no trace");
 }

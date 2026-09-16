@@ -393,21 +393,6 @@ fn git_ok(dir: &Path, args: &[&str]) {
     );
 }
 
-/// a `git push` carrying a node's operator credential (`cluster.git_push_env`)
-/// — the proof `git-receive-pack` now requires (#1292).
-fn git_push_ok(env: [(String, String); 3], dir: &Path, args: &[&str]) {
-    let output = git_command(dir, args)
-        .envs(env)
-        .output()
-        .expect("spawn git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
 fn git_stdout(dir: &Path, args: &[&str]) -> String {
     let output = git_output(dir, args);
     assert!(
@@ -480,13 +465,7 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
     git_ok(seed.path(), &["add", "README.md"]);
     git_ok(seed.path(), &["commit", "-m", "seed"]);
     let dev_tip = git_stdout(seed.path(), &["rev-parse", "HEAD"]);
-    let seed_url = format!("http://127.0.0.1:{}/forge/{REPO}", cluster.http_ports[0]);
-    git_ok(seed.path(), &["remote", "add", "origin", &seed_url]);
-    git_push_ok(
-        cluster.git_push_env(0),
-        seed.path(),
-        &["push", "origin", "HEAD:dev"],
-    );
+    cluster.seed_forge(0, seed.path(), REPO, "dev");
     // committed on the EXECUTING node before any run pins it.
     cluster.await_committed(1, "the seed push to finalize on node 1", CONVERGE, || {
         (branch_tip(&cluster, 1, "dev")? == dev_tip).then_some(())
@@ -694,19 +673,8 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
     // Parent chain, proven from a node that executed nothing:
     // run3 → run2 → run1 → seed. The objects fanned out with the refs.
     let checkout = tempfile::tempdir().expect("git checkout parent");
-    let clone_url = format!("http://127.0.0.1:{}/forge/{REPO}", cluster.http_ports[2]);
     let dest = checkout.path().join("after-run3");
-    git_ok(
-        checkout.path(),
-        &[
-            "clone",
-            "--quiet",
-            "--branch",
-            &pr_work_branch,
-            &clone_url,
-            dest.to_str().unwrap(),
-        ],
-    );
+    cluster.clone_forge(2, REPO, &dest);
     assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD"]), run3_oid);
     assert_eq!(
         git_stdout(&dest, &["rev-parse", "HEAD^"]),

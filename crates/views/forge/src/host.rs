@@ -11,11 +11,9 @@
 //! carrying the module's own `ForgeMsg`, signed by the kernel with the
 //! seated key — the view never sees the key, the endpoint or the password.
 //!
-//! Three things stay the host's because they are host CAPABILITIES, not
-//! forge readings: the client-computed merge commit (`git.merge` — libgit2
-//! over the node's smart-HTTP remote), the decoded picture behind the
-//! picture surface (`picture.put`), and the pictures a Markdown document
-//! embeds (`picture.inline`).
+//! Merge calculation belongs to the installed service named by this deployment's
+//! `service.json` asset, reached through the generic authenticated Gateway.
+//! Native picture decoding remains a host device capability.
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -611,7 +609,7 @@ pub struct ChatMember {
 pub struct DiscussionItem {
     pub channel_id: String,
     pub messages: Vec<ChatMessage>,
-    pub members: Vec<ChatMember>,
+    pub choices: Vec<ducktape_view_composer::MentionChoice>,
     /// Older notes than the window holds: the list says so rather than
     /// pretending the discussion starts where it does.
     pub clipped: bool,
@@ -663,7 +661,7 @@ async fn read_discussion(channel_id: &str) -> Result<DiscussionItem, String> {
     Ok(DiscussionItem {
         channel_id: channel_id.to_owned(),
         messages: fold_messages(&roots["roots"]["roots"], &names),
-        members: fold_members(&members["members"]["members"], &names),
+        choices: names.composer_choices(&fold_members(&members["members"]["members"], &names)),
         clipped: roots["roots"]["has_more"].as_bool().unwrap_or(false),
         error: String::new(),
     })
@@ -721,14 +719,6 @@ pub fn fold_members(members: &serde_json::Value, names: &Names) -> Vec<ChatMembe
             }
         })
         .collect()
-}
-
-/// Seats the discussion channel's roster on the host composer docked over
-/// `scope`: the composer is the host's, so its mention menu is too.
-pub fn seat_roster(scope: &str, members: &[ChatMember]) -> bool {
-    let ask = serde_json::json!({ "scope": scope, "members": members });
-    host::notify("host.roster", &serde_json::to_vec(&ask).expect("encodes"));
-    true
 }
 
 /// The note a deep link's `#seq` names, as a list of at most one — the card
@@ -1099,7 +1089,17 @@ impl Stream for ActStream {
 }
 
 async fn submit(message: serde_json::Value) -> Result<(), String> {
-    let op = serde_json::json!({ "target": FORGE, "payload": message });
+    submit_with_blob(message, None).await
+}
+
+async fn submit_with_blob(
+    message: serde_json::Value,
+    required_blob: Option<&str>,
+) -> Result<(), String> {
+    let mut op = serde_json::json!({ "target": FORGE, "payload": message });
+    if let Some(digest) = required_blob {
+        op["required_blob"] = serde_json::Value::String(digest.to_owned());
+    }
     host::request("op.submit", &serde_json::to_vec(&op).expect("encodes"))
         .await
         .map(|_| ())
@@ -1165,8 +1165,8 @@ fn review_comments(comments: &[ForgeDraftComment]) -> Vec<serde_json::Value> {
 }
 
 /// Merge an open PR the way the wire demands it: the merge commit is
-/// CLIENT-COMPUTED, so the host builds it against a bare mirror of the
-/// node's git remote and lands the minimal pack, and the double-CAS'd
+/// computed by the configured installed service from its read-only store.
+/// The service lands the minimal pack, and the double-CAS'd
 /// `MergePr` goes out over that. A local conflict submits NOTHING.
 pub fn merge(
     repo: String,
@@ -1207,15 +1207,51 @@ async fn merge_pr(
         return Err("the pull request diff has not loaded yet".to_owned());
     }
     let ask = serde_json::json!({
-        "target": FORGE,
         "repo": &repo,
         "ours": &prev_target_oid,
         "theirs": &expected_source_oid,
         "message": format!("Merge pull request #{number} from {source_branch}"),
     });
-    let built = host::request("git.merge", &serde_json::to_vec(&ask).expect("encodes")).await?;
+    let config = host::request("asset.read", b"service.json")
+        .await
+        .map_err(|error| format!("Forge merge service is not configured: {error}"))?;
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Service {
+        account: u64,
+        route: String,
+    }
+    let service: Service = serde_json::from_slice(&config)
+        .map_err(|error| format!("invalid service.json: {error}"))?;
+    let configured = service.account > 0 && !service.route.is_empty();
+    if !configured {
+        return Err("service.json must name the Forge service account and route".into());
+    }
+    let request = serde_json::json!({"account":service.account,"route":service.route,"method":"post","path":"/merge",
+        "headers":[{"name":"content-type","value":"application/json"}],"body":serde_json::to_vec(&ask).expect("merge request")});
+    let reply = host::request(
+        "net.request",
+        &serde_json::to_vec(&request).expect("application request"),
+    )
+    .await?;
+    let reply: serde_json::Value =
+        serde_json::from_slice(&reply).map_err(|error| error.to_string())?;
+    use base64::Engine as _;
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(
+            reply["body_b64"]
+                .as_str()
+                .ok_or("merge service returned no body")?,
+        )
+        .map_err(|error| error.to_string())?;
     let built: serde_json::Value =
-        serde_json::from_slice(&built).map_err(|error| error.to_string())?;
+        serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+    if reply["head"]["status"].as_u64() != Some(200) {
+        return Err(built["error"]
+            .as_str()
+            .unwrap_or("merge service refused request")
+            .into());
+    }
     let conflicts: Vec<String> = built["conflicts"]
         .as_array()
         .cloned()
@@ -1232,15 +1268,24 @@ async fn merge_pr(
         });
     }
     let merge_oid = built["merge_oid"].as_str().unwrap_or_default().to_owned();
+    let pack = base64::engine::general_purpose::STANDARD
+        .decode(
+            built["pack_b64"]
+                .as_str()
+                .ok_or("merge service returned no pack")?,
+        )
+        .map_err(|error| error.to_string())?;
+    let digest = host::request("blob.put", &pack).await?;
+    let digest = String::from_utf8(digest).map_err(|error| error.to_string())?;
     let message = serde_json::json!({ "merge_pr": {
         "repo": repo,
         "number": number,
         "prev_target_oid": prev_target_oid,
         "expected_source_oid": expected_source_oid,
         "merge_oid": &merge_oid,
-        "pack_digest": built["pack_digest"].as_str().unwrap_or_default(),
+        "pack_digest": &digest,
     }});
-    submit(message).await?;
+    submit_with_blob(message, Some(&digest)).await?;
     Ok(ActItem {
         kind: "merge".to_owned(),
         merge_oid,
@@ -1464,11 +1509,9 @@ pub fn duck_forge_item_link(repo: &str, number: i64, chain_id: &str) -> String {
     format!("duck://forge/{repo}/{number}{}", net_query(chain_id))
 }
 
-/// The command that makes a repo: forge IS a git remote, and a repo comes
-/// into existence when a push lands on it.
-pub fn forge_push_command(rpc: &str) -> String {
-    let endpoint = rpc.trim_end_matches('/');
-    format!("git remote add ducktape {endpoint}/forge/my-repo && git push ducktape main")
+/// The installed service supplies the authenticated Git endpoint.
+pub fn forge_push_instructions() -> String {
+    "Push a repository through your network’s installed Git service. Ask its operator for the authenticated Git endpoint and signing configuration.".into()
 }
 
 /// The label a picked-but-unstaged line wears above the composer, empty

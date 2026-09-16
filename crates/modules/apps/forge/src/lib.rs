@@ -142,6 +142,8 @@ mod module;
 pub mod pushcert;
 pub mod refs;
 pub mod state;
+#[cfg(any(feature = "native", feature = "guest"))]
+mod query;
 #[cfg(feature = "native")]
 pub use module::{
     COMPACT_PACK_LIMIT, Forge, PendingBranch, build_objects, compact_repos, install_objects,

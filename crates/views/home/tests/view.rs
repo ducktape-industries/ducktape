@@ -165,6 +165,10 @@ fn connected_dashboard() -> (Frame, Vec<(String, u64)>) {
     for (id, body) in requests_of(&frame, "rpc.query") {
         let reply = match body["target"].as_str().unwrap_or_default() {
             "governance" => proposals(),
+            "files" => {
+                let history: serde_json::Value = serde_json::from_slice(&history()).unwrap();
+                serde_json::to_vec(&serde_json::json!({"history":history["snapshots"]})).unwrap()
+            },
             other => panic!("unexpected query target {other}"),
         };
         events.push(answer(id, &reply));
@@ -176,9 +180,6 @@ fn connected_dashboard() -> (Frame, Vec<(String, u64)>) {
             other => panic!("unexpected view target {other}"),
         };
         events.push(answer(id, &reply));
-    }
-    for (id, _) in requests_of(&frame, "files.get") {
-        events.push(answer(id, &history()));
     }
     for (id, _) in requests_of(&frame, "rpc.peers") {
         events.push(answer(id, &peers()));

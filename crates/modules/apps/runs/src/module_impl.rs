@@ -218,6 +218,12 @@ impl Module for RunsModule {
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
+            RunsQuery::ModelProgram { agent_id } => {
+                crate::validate_agent_id(&agent_id).map_err(Error::Module)?;
+                Ok(encode_reply(&RunsReply::ModelProgram(
+                    crate::model_program(&agent_id),
+                )))
+            }
             RunsQuery::NextConversationInputDue => Ok(encode_reply(
                 &RunsReply::NextConversationInputDue(self.next_conversation_input_due().await?),
             )),

@@ -345,8 +345,12 @@ fn disk_substrates(
     blobs: blobstore::BlobHandle,
 ) -> Substrates {
     Substrates {
-        forge_repo: forge_repo.to_path_buf(),
-        duckfs_dir: duckfs_dir.to_path_buf(),
+        directory: duckfs_dir.with_file_name("module-storage"),
+        bindings: [
+            ("forge".into(), forge_repo.to_path_buf()),
+            ("files".into(), duckfs_dir.to_path_buf()),
+        ]
+        .into(),
         blobs,
     }
 }
@@ -500,7 +504,7 @@ pub(super) async fn restore_host(
 fn restore_snapshot(manifest: &Manifest, id: &str, backing: Backing) -> Result<Snapshot, String> {
     match backing {
         Backing::Map => manifest_snapshot(manifest, id).map(Some),
-        Backing::Store | Backing::Odb => Ok(None),
+        Backing::Store | Backing::Odb | Backing::Git => Ok(None),
     }
 }
 
@@ -891,7 +895,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "ffb393ada38f70a54c344f2abcaa9d8efa16d95f8b7acc2225f8c86f70643c22";
+        "714c6259d6d21b5cdff758ea48ee6c25bdff44f21e47cedbfef2177f8979fc2e";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's genesis `__config`

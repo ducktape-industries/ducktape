@@ -226,6 +226,37 @@ impl Names {
         self.by_account.get(&account).map(String::as_str)
     }
 
+    pub fn composer_choices(
+        &self,
+        members: &[crate::host::ChatMember],
+    ) -> Vec<ducktape_view_composer::MentionChoice> {
+        use ducktape_view_composer::MentionChoice;
+        let mut choices = self
+            .by_account
+            .iter()
+            .map(|(number, label)| MentionChoice {
+                token: format!("<@{number}>"),
+                label: label.clone(),
+            })
+            .collect::<Vec<_>>();
+        for member in members {
+            let token = match member.key.strip_prefix("acct:") {
+                Some(number) => format!("<@{number}>"),
+                None => match self.by_key.get(&member.key) {
+                    Some(number) => format!("<@{number}>"),
+                    None => format!("<@key:{}>", member.key),
+                },
+            };
+            if !choices.iter().any(|choice| choice.token == token) {
+                choices.push(MentionChoice {
+                    token,
+                    label: member.label.clone(),
+                });
+            }
+        }
+        choices
+    }
+
     /// A member's label: the bound name, else the shortened key.
     pub fn member_label(&self, key_hex: &str) -> String {
         let handle = match key_hex.contains(':') {

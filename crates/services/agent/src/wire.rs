@@ -353,9 +353,9 @@ pub enum Event {
         reason: Refusal,
         detail: String,
     },
-    /// one chunk of pty output, base64. Ordered with respect to every other
-    /// frame on this connection — which is what makes [`Event::TermEnded`] a
-    /// true terminator rather than a race.
+    /// One chunk of pty output, base64. The pump can have a read in flight
+    /// during teardown; receivers discard output after accepting TermEnded
+    /// for that session.
     TermOutput { session: String, chunk_b64: String },
     /// the session is over: the child exited, an explicit close landed, or the
     /// wall-clock ceiling fired. Exactly one per created session, emitted by

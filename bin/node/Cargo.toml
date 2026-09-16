@@ -57,12 +57,12 @@ provider-host = { workspace = true }
 dispatch = { workspace = true }
 attribution = { workspace = true }
 agent-service = { workspace = true }
+ducktape-terminal = { path = "../terminal-service" }
 compute-service = { workspace = true }
 forge = { workspace = true }
 pages = { workspace = true }
 chat = { workspace = true }
 # the huddle media planes the voice hub runs: Opus engine, video wire, call-socket framing.
-media-service = { workspace = true }
 tasks = { workspace = true }
 # `ducktape collab` constructs the module's own ops, so a shape change is a
 # compile error here rather than a hand-rolled json payload that drifts.
@@ -222,6 +222,8 @@ verify = ["airlock/verify", "airlock/testkit", "provider-host/verify"]
 # drives them through the rpc with TYPED interface-crate payloads — payload
 # drift fails to compile instead of rotting silently like the old bash demo.
 [dev-dependencies]
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+ducktape-forge-service = { path = "../forge-service" }
 # the shared raw-http/port/poll harness helpers (was: a per-suite copy each).
 nettest = { path = "../../crates/testing/nettest" }
 # a scripted fixture lifts its guest shell out of the rootfs with the same

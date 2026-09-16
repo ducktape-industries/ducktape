@@ -1,5 +1,4 @@
 use super::*;
-use ::chat;
 
 /// Sign and submit one module op, answering the height of the block that
 /// INCLUDED it.
@@ -32,8 +31,10 @@ pub(crate) async fn seated_write(
     rpc: &RpcClient,
     target: &str,
     payload: Vec<u8>,
+    required_blob: Option<[u8; 32]>,
 ) -> Result<u64, String> {
-    if payload.is_empty() || payload.len() > ::node::MAX_PAYLOAD_BYTES {
+    let limit = ::node::MAX_PAYLOAD_BYTES - required_blob.map_or(0, |_| 32);
+    if payload.is_empty() || payload.len() > limit {
         return Err(format!(
             "{target} transaction exceeds the signed payload limit"
         ));
@@ -43,7 +44,7 @@ pub(crate) async fn seated_write(
         let Some(signer) = session.as_ref() else {
             return Err("the local user key is locked; enter its password".into());
         };
-        signer.sign(target, next_sequence(), &payload)
+        signer.sign_with_blob(target, next_sequence(), &payload, required_blob)
     };
     submit_raw_frame(rpc, target, frame).await
 }
@@ -269,15 +270,26 @@ impl Signer {
 
     /// One signed op frame, ready for `/v1/submit/frame`.
     pub(super) fn sign(&self, target: &str, seq: u64, payload: &[u8]) -> Vec<u8> {
+        self.sign_with_blob(target, seq, payload, None)
+    }
+
+    fn sign_with_blob(
+        &self,
+        target: &str,
+        seq: u64,
+        payload: &[u8],
+        required_blob: Option<[u8; 32]>,
+    ) -> Vec<u8> {
         // `::node`, not `node` — this backend has a module of its own by that
         // name, and it is the sibling that wins the bare path.
-        ::node::encode_frame(
+        ::node::encode_frame_with_blob(
             &self.key,
             seq,
             &sdk::Msg {
                 target: target.to_string(),
                 payload: payload.to_vec(),
             },
+            required_blob,
         )
     }
 }
@@ -312,33 +324,6 @@ pub(crate) async fn sign_add_key_consent(
         generation,
         account,
         expires_at,
-    ))
-}
-
-/// The person's proof for a raw-bytes write (a staged chunk, a forge pack):
-/// this device's key signs each request, bound to the node it is sent to,
-/// through the one message the daemon verifies (`node::signed_req`). The
-/// same seat [`sign_frame`] uses, so it costs no argon2 pass of its own.
-pub(crate) async fn data_plane_signer(
-    rpc: &RpcClient,
-    password: String,
-) -> Result<ducktape_rpc::WriteAuth, String> {
-    let node_key = hex_decode(&rpc.status().await?.public_key)?;
-    let key = {
-        let session = seated_signer(password).await?;
-        session
-            .as_ref()
-            .expect("the session was seated above")
-            .key
-            .clone()
-    };
-    Ok(std::sync::Arc::new(
-        move |method: &str, path: &str, body: &[u8]| {
-            ::node::signed_req::request_headers(&key, method, path, &node_key, body)
-                .into_iter()
-                .map(|(name, value)| (name.to_string(), value))
-                .collect()
-        },
     ))
 }
 
@@ -381,6 +366,27 @@ pub(crate) async fn seated_request_headers(
     ))
 }
 
+/// Mint gateway caller authority without exposing the seated key to a view.
+pub(crate) async fn seated_gateway_proof(
+    publisher: &[u8],
+    head: &gateway::ProxyRequestHead,
+    body: &[u8],
+) -> Option<gateway::UserPop> {
+    let session = SIGNER.lock().await;
+    let signer = session.as_ref()?;
+    let ts = ::node::signed_req::now_secs();
+    let preimage = gateway::caller_pop_preimage(publisher, head, body, ts);
+    Some(gateway::UserPop {
+        key: signer.key.public_key().as_ref().to_vec(),
+        ts,
+        sig: signer
+            .key
+            .sign(gateway::GATEWAY_CALLER_NS, &preimage)
+            .as_ref()
+            .to_vec(),
+    })
+}
+
 /// This node's own public key — the bytes a data-plane signature is bound to, so
 /// a proof minted for one node cannot be replayed at another. Read off the
 /// node's own `status`, which is where every other signing caller reads it.
@@ -397,6 +403,12 @@ pub(crate) async fn node_public_key(rpc: &str) -> Result<Vec<u8>, String> {
 /// key instead of racing five argon2 passes into it. No seat, or another
 /// password, is the locked state: the launch window and Settings are where a
 /// seat is taken, never a write that happened to carry a password.
+/// Confirm the current user unlocked the signing seat for this action.
+pub(crate) async fn require_seated_signer(password: String) -> Result<(), String> {
+    drop(seated_signer(password).await?);
+    Ok(())
+}
+
 async fn seated_signer(
     password: String,
 ) -> Result<tokio::sync::MutexGuard<'static, Option<Signer>>, String> {
@@ -649,22 +661,6 @@ pub(crate) fn required_id(value: String, subject: &str) -> Result<String, String
     bounded_text(value, &format!("{subject} id"), 512)
 }
 
-pub(crate) fn public_key(value: &str, field: &str) -> Result<Vec<u8>, String> {
-    let value = value.trim();
-    let expected = chat::HUDDLE_NODE_KEY_BYTES * 2;
-    if value.len() != expected {
-        return Err(format!("{field} must be {expected} hexadecimal characters"));
-    }
-    hex_decode(value).map_err(|_| format!("{field} must be hexadecimal"))
-}
-
-pub(crate) fn positive_sequence(value: i64) -> Result<u64, String> {
-    u64::try_from(value)
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| "message sequence must be positive".into())
-}
-
 /// One voice at the surface. The global banner prints whatever reaches an
 /// `AppError`/`HydrationError`, so the known developer diagnostics — CLI spawn
 /// chatter, key paths, argv timeouts, serde parse positions — translate to a
@@ -706,29 +702,35 @@ pub(crate) fn app_error(message: String) -> AppError {
     message.into()
 }
 
-pub(crate) fn committed_error(message: String) -> AppError {
-    AppError {
-        message: user_error(message),
-        committed: true,
-    }
-}
-
 pub(crate) fn retry_delay(attempt: u32) -> Duration {
     let exponent = attempt.saturating_sub(1).min(4);
     Duration::from_secs(1_u64 << exponent)
 }
 
-pub(crate) fn number_i64(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
-
-pub(crate) fn count_i64(value: usize) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::user_error;
+    use commonware_cryptography::Signer as _;
+
+    #[test]
+    fn seated_signer_binds_the_declared_blob_for_an_arbitrary_module() {
+        let signer = super::Signer {
+            password: zeroize::Zeroizing::new(String::new()),
+            key: commonware_cryptography::ed25519::PrivateKey::from_seed(73),
+        };
+        let frame =
+            signer.sign_with_blob("independent-app", 7, b"opaque payload", Some([0xab; 32]));
+        let (_, msg, digest) = ::node::decode_frame_with_blob(&frame).unwrap();
+        assert_eq!(msg.target, "independent-app");
+        assert_eq!(msg.payload, b"opaque payload");
+        assert_eq!(digest, Some([0xab; 32]));
+        let mut changed = frame;
+        let digest_start = changed.len() - 64 - 32;
+        changed[digest_start] ^= 1;
+        assert!(::node::decode_frame_with_blob(&changed).is_err());
+        let ordinary = signer.sign("independent-app", 8, b"ordinary");
+        assert_eq!(::node::decode_frame_with_blob(&ordinary).unwrap().2, None);
+    }
 
     /// EVERY refusal a helper reported used to arrive WRAPPED in text naming
     /// that helper — `Signer::reap` built "ducktape signer refused the

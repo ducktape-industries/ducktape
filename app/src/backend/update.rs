@@ -10,7 +10,7 @@
 //!
 //! What runs here:
 //! - `Fetch`: read `/shared/releases/stable.json` and `.sig` through the
-//!   node's `/v1/files/read` lane (both ≤ 256 KiB), verify under the pinned
+//!   deployed Files query (both ≤ 256 KiB), verify under the pinned
 //!   key, answer `ManifestFetched`.
 //! - `Download`: page the archive at its fixed duckfs path 1 MiB at a time
 //!   into `<updates>/releases/<sha>.partial`, resuming from the file's
@@ -692,21 +692,22 @@ async fn read_page(
     offset: u64,
     len: u64,
 ) -> Result<(Vec<u8>, bool), String> {
-    let offset = offset.to_string();
-    let len = len.to_string();
-    let reply = rpc
-        .files_get(
-            "read",
-            &[
-                ("path", path),
-                ("offset", offset.as_str()),
-                ("len", len.as_str()),
-            ],
+    let reply: serde_json::Value = rpc
+        .query(
+            "files",
+            &serde_json::json!({
+                "read": {"path":path, "offset":offset, "len":len}
+            }),
         )
         .await?;
-    let page = base64_decode(reply["b64"].as_str().unwrap_or_default())
-        .ok_or("The node's read page is not valid base64")?;
-    let eof = reply["eof"].as_bool().unwrap_or(true);
+    let reply = &reply["read"];
+    let encoded = reply["b64"]
+        .as_str()
+        .ok_or("The node's read page has no bytes")?;
+    let page = base64_decode(encoded).ok_or("The node's read page is not valid base64")?;
+    let eof = reply["eof"]
+        .as_bool()
+        .ok_or("The node's read page has no end marker")?;
     Ok((page, eof))
 }
 

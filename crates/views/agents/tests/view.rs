@@ -2,9 +2,9 @@
 //! facts, the view reads the register, the run tracker and one run's journal
 //! for itself through `rpc.query` / `rpc.view`, re-reads them on every
 //! `rpc.live` hit, and a pause or a save leaves as `op.submit`. Only the
-//! three navigation-and-provisioning intents still leave as notifications.
+//! navigation intents still leave as notifications.
 
-use agents_view::host::{Draft, OpenLink, OpenRun, Session};
+use agents_view::host::{OpenLink, Session};
 use agents_view::{boot_native, tick_native};
 use ducktape_view_guest::testing::{answer, has_text, item, pick, press, texts, toggle, type_into};
 use ducktape_view_guest::wire::{Event, Frame, Node, Request};
@@ -398,8 +398,8 @@ fn the_controller_pauses_a_record_with_a_signed_op() {
     );
 }
 
-/// A registration is the one write that is still the app's: the agent's
-/// program account has to be provisioned before the record can name it.
+/// Registration provisions an account, reads its controller-scoped receipt,
+/// and only then submits the model configuration.
 #[test]
 fn a_new_agent_registers_from_the_form_once_its_id_is_a_label() {
     let (frame, _) = registered("7");
@@ -427,19 +427,59 @@ fn a_new_agent_registers_from_the_form_once_its_id_is_a_label() {
     let frame = tick_native(toggle(&frame, "Load always (persona)", true));
     let frame = tick_native(press(&frame, "Add skill"));
     let frame = tick_native(press(&frame, "Register agent"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "agents.register");
-    let draft: Draft = serde_json::from_slice(&intent.payload).expect("decodes");
-    assert_eq!(draft.agent_id, "chiefduck");
-    assert_eq!(draft.display_name, "ChiefDuck");
-    assert_eq!(draft.capability, "claude");
-    // a skill named without a prefix lands in the shared library
-    let [only] = draft.skills.as_slice() else {
-        panic!("one skill, got {:?}", draft.skills);
-    };
-    assert_eq!(only.name, "chiefduck");
-    assert_eq!(only.source_prefix, "/shared/skills/chiefduck");
-    assert!(only.always);
+    let program = request(&frame, "rpc.query");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&program.payload).unwrap(),
+        json!({"target":"runs","query":{"model_program":{"agent_id":"chiefduck"}}})
+    );
+    let frame = tick_native(vec![answer(
+        program.id,
+        &serde_json::to_vec(&json!({"model_program":runs::model_program("chiefduck")})).unwrap(),
+    )]);
+    let provision = request(&frame, "op.submit");
+    let payload: Value = serde_json::from_slice(&provision.payload).unwrap();
+    assert_eq!(payload["target"], "agent");
+    agent::decode_msg(&serde_json::to_vec(&payload["payload"]).unwrap()).unwrap();
+    assert_eq!(payload["payload"]["provision"]["request_id"], "chiefduck");
+    assert_eq!(
+        payload["payload"]["provision"]["program"],
+        serde_json::to_value(runs::model_program("chiefduck")).unwrap()
+    );
+    assert!(
+        !frame
+            .requests
+            .iter()
+            .any(|request| request.kind == "rpc.query")
+    );
+    let frame = tick_native(vec![answer(provision.id, b"{}")]);
+    let receipt = request(&frame, "rpc.query");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&receipt.payload).unwrap(),
+        json!({"target":"agent", "query":{"provision":{"controller":7, "request_id":"chiefduck"}}})
+    );
+    let response = serde_json::to_vec(&agent::AgentReply::Provision(Some(
+        agent::ProvisionReceipt {
+            account: 77,
+            request_digest: [3; 32],
+        },
+    )))
+    .unwrap();
+    let frame = tick_native(vec![answer(receipt.id, &response)]);
+    let configure = request(&frame, "op.submit");
+    let payload: Value = serde_json::from_slice(&configure.payload).unwrap();
+    assert_eq!(payload["target"], "runs");
+    runs::decode_msg(&serde_json::to_vec(&payload["payload"]).unwrap()).unwrap();
+    let record = &payload["payload"]["configure_model"]["operation"]["register_model"];
+    assert_eq!(record["account"], 77);
+    assert_eq!(record["agent_id"], "chiefduck");
+    assert_eq!(record["display_name"], "ChiefDuck");
+    assert_eq!(record["capability"], "claude");
+    assert_eq!(
+        record["skills"][0]["source_prefix"],
+        "/shared/skills/chiefduck"
+    );
+    assert_eq!(record["skills"][0]["load"], "always");
+    let _ = tick_native(vec![answer(configure.id, b"{}")]);
 }
 
 /// A write the kernel answered re-seeds the open record from its fresh row:
@@ -505,14 +545,7 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
     assert!(frame.requests.is_empty(), "{:?}", frame.requests);
 
     let frame = tick_native(press(&frame, "run-gone"));
-    let intent = request(&frame, "agents.open_run");
-    assert_eq!(
-        serde_json::from_slice::<OpenRun>(&intent.payload).expect("decodes"),
-        OpenRun {
-            dispatch_id: "dispatch-gone".into()
-        },
-        "the other tabs follow the reader's press"
-    );
+    assert!(!frame.requests.iter().any(|r| r.kind == "agents.open_run"));
     // Answer the subscription requests before a tab-only redraw.
     let (frame, _) = settle(frame);
     assert!(!has_text(&frame, "Dispatched"));
@@ -556,16 +589,15 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
         texts(&frame)
     );
 
-    // closing tells the app to stop reading it
+    // Closing is local to the view and retires its run subscriptions.
     let frame = tick_native(press(&frame, "Close run"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "agents.open_run");
-    assert_eq!(
-        serde_json::from_slice::<OpenRun>(&intent.payload).expect("decodes"),
-        OpenRun {
-            dispatch_id: String::new()
-        }
+    assert!(
+        !frame
+            .requests
+            .iter()
+            .any(|request| request.kind == "agents.open_run")
     );
+    assert!(!has_text(&frame, "Close run"));
 }
 
 /// The journal's places draw as chips: one with an address opens through
@@ -918,7 +950,7 @@ fn trace_exposes_full_provider_details_only_when_opened() {
 fn markdown_texts(frame: &Frame) -> Vec<String> {
     fn collect(node: &Node, texts: &mut Vec<String>) {
         if let Node::Surface { name, args, .. } = node
-            && name == "agent_markdown"
+            && name == "markdown"
             && let Some(ducktape_view_guest::wire::SurfaceValue::Str(text)) = args.first()
         {
             texts.push(text.clone());
@@ -1114,4 +1146,109 @@ fn stream_errors_show_outside_the_disclosure_and_reconnect_the_same_run() {
         &frame,
         "Connected to the session. Waiting for its first process details…"
     ));
+}
+
+fn begin_registration() -> (Frame, u64) {
+    let props = booted();
+    let (frame, _) = connect(props, "7", "", 0);
+    let frame = tick_native(press(&frame, "Runs"));
+    let frame = tick_native(press(&frame, "New agent"));
+    let frame = tick_native(type_into(&frame, AGENT_ID_HINT, "new-agent"));
+    let frame = tick_native(type_into(&frame, "Display name", "New agent"));
+    let frame = tick_native(pick(&frame, CAPABILITY_PICK, "claude"));
+    let frame = tick_native(press(&frame, "Register agent"));
+    let program = request(&frame, "rpc.query").id;
+    let frame = tick_native(vec![answer(
+        program,
+        &serde_json::to_vec(&json!({"model_program":runs::model_program("new-agent")})).unwrap(),
+    )]);
+    (frame, props)
+}
+
+#[test]
+fn registration_refuses_missing_or_wrong_receipts_without_name_lookup() {
+    for reply in [
+        agent::AgentReply::Provision(None),
+        agent::AgentReply::Binding(None),
+    ] {
+        let (frame, _) = begin_registration();
+        let provision = request(&frame, "op.submit").id;
+        let frame = tick_native(vec![answer(provision, b"{}")]);
+        let receipt = request(&frame, "rpc.query");
+        let body: Value = serde_json::from_slice(&receipt.payload).unwrap();
+        assert_eq!(
+            body["query"],
+            json!({"provision":{"controller":7,"request_id":"new-agent"}})
+        );
+        let frame = tick_native(vec![answer(
+            receipt.id,
+            &serde_json::to_vec(&reply).unwrap(),
+        )]);
+        assert!(
+            !frame
+                .requests
+                .iter()
+                .any(|request| matches!(request.kind.as_str(), "op.submit" | "rpc.query"))
+        );
+        assert!(
+            texts(&frame)
+                .iter()
+                .any(|text| text.contains("The change was not accepted"))
+        );
+    }
+}
+
+#[test]
+fn registration_does_not_continue_after_account_change_or_disconnect() {
+    let disconnected = serde_json::to_vec(&Session {
+        connected: false,
+        dark: false,
+        account: "7".into(),
+        open_run: String::new(),
+        opened: 0,
+    })
+    .unwrap();
+    for context in [session("8", "", 0), disconnected] {
+        let (frame, props) = begin_registration();
+        let provision = request(&frame, "op.submit").id;
+        let frame = tick_native(vec![answer(provision, b"{}")]);
+        let receipt = request(&frame, "rpc.query").id;
+        let _ = tick_native(vec![item(props, &context)]);
+        let reply = agent::AgentReply::Provision(Some(agent::ProvisionReceipt {
+            account: 77,
+            request_digest: [3; 32],
+        }));
+        let frame = tick_native(vec![answer(receipt, &serde_json::to_vec(&reply).unwrap())]);
+        assert!(
+            !frame
+                .requests
+                .iter()
+                .any(|request| request.kind == "op.submit")
+        );
+    }
+}
+
+#[test]
+fn registration_stops_on_provision_refusal_and_keeps_the_form_retryable() {
+    let (frame, _) = begin_registration();
+    let provision = request(&frame, "op.submit").id;
+    let frame = tick_native(vec![Event::Response {
+        id: provision,
+        result: Err("provision refused".into()),
+        done: true,
+    }]);
+    assert!(
+        !frame
+            .requests
+            .iter()
+            .any(|request| request.kind == "rpc.query")
+    );
+    assert!(
+        texts(&frame)
+            .iter()
+            .any(|text| text.contains("provision refused"))
+    );
+    let frame = tick_native(press(&frame, "Register agent"));
+    let payload: Value = serde_json::from_slice(&request(&frame, "rpc.query").payload).unwrap();
+    assert_eq!(payload["query"]["model_program"]["agent_id"], "new-agent");
 }

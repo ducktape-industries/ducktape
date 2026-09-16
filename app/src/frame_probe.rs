@@ -134,19 +134,20 @@ fn console_in_huddle() -> (Ducktape, crate::shell::WindowKey) {
         active_channel: "channel-0".into(),
         active_channel_name: "channel-0".into(),
         active_channel_archived: false,
-        active_channel_members_only: false,
         huddle_roster: (0..HUDDLE_ROWS).map(probe_huddle_participant).collect(),
-        channel_members: Vec::new(),
     }));
     let _ = app.update(AppMessage::HuddleOpened(huddle));
-    for index in 0..HUDDLE_ROWS {
-        let _ = app.update(AppMessage::CallEvent(super::call::CallEvent {
-            kind: "peer".into(),
-            peer: format!("node-{index}"),
-            muted: index % 2 == 0,
-            ..super::call::CallEvent::default()
-        }));
-    }
+    let _ = app.update(AppMessage::CallEvent(super::call::CallEvent {
+        kind: "presentation".into(),
+        peers: (0..HUDDLE_ROWS)
+            .map(|index| super::call::CallPeer {
+                peer: format!("node-{index}"),
+                muted: index % 2 == 0,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }));
     assert_eq!(app.huddle_roster.len(), HUDDLE_ROWS);
     assert_eq!(app.call_peers.len(), HUDDLE_ROWS);
     assert_eq!(app.huddle_win, Some(huddle));

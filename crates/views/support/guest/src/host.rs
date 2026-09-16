@@ -147,6 +147,15 @@ pub struct Subscription {
     slot: Arc<Mutex<Slot>>,
 }
 
+impl Subscription {
+    /// This instance's host resource ID, for operations on the open stream
+    /// such as `net.send`. Dropping the subscription cancels that resource;
+    /// the ID grants no access to another view instance's resources.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
 impl Drop for Subscription {
     fn drop(&mut self) {
         close(self.id);
@@ -196,6 +205,12 @@ pub(crate) fn fulfill(id: u64, answer: Answer, done: bool) {
             waker.wake();
         }
     }
+}
+
+/// Return a background response and finish the session.
+pub fn finish_response(bytes: &[u8]) {
+    notify("host.emit", bytes);
+    notify("host.finish", &[]);
 }
 
 #[cfg(test)]
