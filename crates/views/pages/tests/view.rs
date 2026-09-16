@@ -1354,11 +1354,11 @@ fn an_at_in_a_comment_picks_who_it_mentions_and_says_it_is_working() {
     let frame = page_card();
     let frame = tick_native(type_into(&frame, "Start a thread…", "ping @bui"));
     assert!(
-        has_text(&frame, "@Builder"),
+        find(&frame, "pages/comments/mention(Builder)").is_some(),
         "a typed handle offers the names it could mean: {:?}",
         texts(&frame)
     );
-    let frame = tick_native(press(&frame, "@Builder"));
+    let frame = tick_native(press(&frame, "Builder"));
     let frame = tick_native(press(&frame, "Ask"));
     let mint = request(&frame, "host.id");
     let frame = tick_native(vec![answer(mint.id, b"thread-3")]);

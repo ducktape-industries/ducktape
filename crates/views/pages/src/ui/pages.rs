@@ -758,12 +758,12 @@ impl PagesView {
         let mention_rows: Vec<Node> = mention_choices
             .into_iter()
             .map(|(name, account)| {
-                action(
+                menu_item(
                     format!("pages/comments/mention({name})"),
-                    format!("@{name}"),
+                    "@",
+                    &name,
                     Message::PickCommentMention(name.clone(), account),
-                    !disabled,
-                    ButtonPreset::Text,
+                    disabled,
                 )
             })
             .collect();
