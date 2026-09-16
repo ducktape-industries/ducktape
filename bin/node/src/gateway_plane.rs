@@ -64,6 +64,14 @@ const MAX_CONCURRENT_UPGRADES: usize = 64;
 /// reading, so charging it to the request budget lets 16 peers that never read
 /// starve every gateway request on the node.
 const MAX_CONCURRENT_STREAMS: usize = 64;
+/// Inbound exchanges ONE caller node may hold at once. A request permit used
+/// to end within a one-shot deadline; now that a request body streams, it ends
+/// when the caller stops sending, and a caller that dribbles one frame per
+/// [`BODY_IDLE_TIMEOUT`] holds its permit for as long as it likes. The count
+/// is the bound: without this, one peer taking all
+/// [`MAX_CONCURRENT_REQUESTS`] slots is the whole gateway, and with it that
+/// costs four distinct admitted peers instead of one.
+const MAX_INBOUND_REQUESTS_PER_CALLER: usize = 4;
 
 type PlaneSlot = Arc<OnceLock<Arc<StreamService<OverlaySockets>>>>;
 
@@ -79,6 +87,30 @@ struct GatewayBudget {
     requests: Arc<tokio::sync::Semaphore>,
     streams: Arc<tokio::sync::Semaphore>,
     upgrades: Arc<tokio::sync::Semaphore>,
+    /// Inbound exchanges per caller node, so the request budget cannot be
+    /// taken whole by one peer. Only the INBOUND half counts here: the caller
+    /// half serves this node's own browser, which is not a stranger.
+    inbound: std::sync::Mutex<std::collections::HashMap<[u8; 32], usize>>,
+}
+
+/// One caller node's share of the inbound request budget, released on drop.
+struct CallerSlot {
+    budget: Arc<GatewayBudget>,
+    caller: [u8; 32],
+}
+
+impl Drop for CallerSlot {
+    fn drop(&mut self) {
+        let mut inbound = self.budget.inbound.lock().expect("gateway budget poisoned");
+        let std::collections::hash_map::Entry::Occupied(mut entry) = inbound.entry(self.caller)
+        else {
+            return;
+        };
+        *entry.get_mut() -= 1;
+        if *entry.get() == 0 {
+            entry.remove();
+        }
+    }
 }
 
 impl GatewayBudget {
@@ -87,6 +119,24 @@ impl GatewayBudget {
             requests: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
             streams: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS)),
             upgrades: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UPGRADES)),
+            inbound: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// Take `caller`'s share of the inbound budget, or `None` when it already
+    /// holds [`MAX_INBOUND_REQUESTS_PER_CALLER`]. Taken BEFORE the plane-wide
+    /// permit, which queues: a caller already at its own limit must be refused
+    /// outright, not parked in the queue ahead of everyone else.
+    fn admit_caller(self: &Arc<Self>, caller: [u8; 32]) -> Option<CallerSlot> {
+        let mut inbound = self.inbound.lock().expect("gateway budget poisoned");
+        let held = inbound.entry(caller).or_insert(0);
+        if *held >= MAX_INBOUND_REQUESTS_PER_CALLER {
+            return None;
+        }
+        *held += 1;
+        Some(CallerSlot {
+            budget: Arc::clone(self),
+            caller,
         })
     }
 
@@ -468,6 +518,22 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                         serve_ws(&commands, &scope, &requester.0, &head, stream).await;
                         return;
                     }
+                    let Some(_caller_slot) = budget.admit_caller(requester.0) else {
+                        tracing::warn!(
+                            target: "ducktape::gateway",
+                            reason = "caller_request_budget_full",
+                            open = MAX_INBOUND_REQUESTS_PER_CALLER,
+                            "inbound gateway request refused"
+                        );
+                        let _ = write_proxy_response(
+                            &mut stream,
+                            Err(GatewayFailure::Unavailable(
+                                "this caller already holds its share of the gateway".into(),
+                            )),
+                        )
+                        .await;
+                        return;
+                    };
                     let Some(permit) = budget.admit_request().await else {
                         tracing::warn!(
                             target: "ducktape::gateway",
@@ -2627,6 +2693,36 @@ mod tests {
             error.kind(),
             std::io::ErrorKind::TimedOut,
             "the drain ends on its own progress deadline: {error:?}"
+        );
+    }
+
+    /// The wedge a streamed request body opens: a permit now ends when the
+    /// caller stops sending, so one peer dribbling frames could hold the whole
+    /// request budget forever. Its own share is what stops that — and the
+    /// share is released when the exchange ends, not when the peer says so.
+    #[tokio::test(start_paused = true)]
+    async fn one_caller_cannot_take_the_whole_inbound_request_budget() {
+        let budget = GatewayBudget::new();
+        let greedy = [7u8; 32];
+        let held: Vec<_> = (0..MAX_INBOUND_REQUESTS_PER_CALLER)
+            .map(|_| budget.admit_caller(greedy).expect("under its own share"))
+            .collect();
+        assert!(
+            budget.admit_caller(greedy).is_none(),
+            "a caller at its share is refused outright, never queued ahead of others"
+        );
+        // Another peer is unaffected, and the plane-wide budget is untouched:
+        // what the greedy caller spent is four slots, not the gateway.
+        assert!(budget.admit_caller([8u8; 32]).is_some());
+        assert!(budget.admit_request().await.is_some());
+        drop(held);
+        assert!(
+            budget.admit_caller(greedy).is_some(),
+            "a finished exchange frees the caller's share"
+        );
+        assert!(
+            !budget.inbound.lock().unwrap().contains_key(&[9u8; 32]),
+            "a caller that never called holds no entry — the map is not a leak"
         );
     }
 

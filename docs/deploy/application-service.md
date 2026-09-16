@@ -356,8 +356,15 @@ a declared blob absent from its verified store is refused.
 
 The service exposes `/{repo}/info/refs`, `/{repo}/git-receive-pack`, and
 `/{repo}/git-upload-pack`. Configure the signed Gateway route to allow GET/POST
-for the intended network audience. Stock Git can supply the route authority
-through its HTTP header configuration when dialing the node's browser Gateway:
+for the intended network audience, and set its `max_request_bytes` to `null` —
+NO request cap. A push is a whole repository's history and carries no length to
+check against one: stock Git sends anything past `http.postBuffer` (1 MiB by
+default) with `Transfer-Encoding: chunked`. The Gateway counts a request body
+as it streams rather than holding it, so an uncapped route costs the node one
+frame, not one repository. Who may push is this service's own gate — the Git
+SSH push certificate and the module's ref rules — not a byte count on the
+transport. Stock Git can supply the route authority through its HTTP header
+configuration when dialing the node's browser Gateway:
 
 ```sh
 git -c http.extraHeader='x-duck-authority: git.team.duck' \
@@ -369,10 +376,10 @@ git -c http.extraHeader='x-duck-authority: git.team.duck' \
 
 Use the actual browser Gateway port and registered authority. The application
 handoff token is private to the node and service; Git clients never receive it.
-Two concurrent requests are admitted per service process. Pack uploads are
-bounded by the common relay transfer ceiling (127 chunks of 768 KiB); larger
-histories must be imported in smaller advances. Set the manifest memory limit
-to accommodate pack construction and upload within that ceiling.
+Two concurrent requests are admitted per service process. A pack is spooled to
+the service's own disk and transported to the other validators in an
+acknowledged window, so a repository's whole history is one push; set the
+manifest memory limit for pack construction, not for the pack.
 
 ## Media service
 
