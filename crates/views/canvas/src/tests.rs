@@ -14,6 +14,19 @@ fn card(view: &mut BoardsView, id: &str, x: i32) -> Task<Message> {
         },
     })
 }
+/// An end bound to a card at its middle — what dropping an arrow anywhere near
+/// the middle of one comes to, and the only anchor a test needs unless it is
+/// about anchors.
+fn on(card: &str) -> Option<boards::Bond> {
+    Some(boards::Bond {
+        card: card.into(),
+        at: [boards::ANCHOR_SPAN / 2; 2],
+    })
+}
+/// Which card an end holds, for the assertions that only care about that.
+fn holds(end: &Option<boards::Bond>) -> Option<&str> {
+    boards::held(end)
+}
 fn segment(kind: Kind) -> Shape {
     Shape {
         kind,
@@ -143,8 +156,8 @@ fn undo_delete_restores_attached_arrows_and_snapshot_keeps_pending_work() {
     view.edit(Change::Create {
         id: "edge".into(),
         shape: Shape {
-            from: Some("a".into()),
-            to: Some("b".into()),
+            from: on("a"),
+            to: on("b"),
             ..segment(Kind::Arrow)
         },
     });
@@ -440,7 +453,7 @@ fn an_arrow_drag_binds_the_cards_it_starts_and_ends_on() {
         .drawn_shape(Kind::Arrow, [100., 70.], [700., 70.])
         .unwrap();
     assert_eq!(
-        (between.from.as_deref(), between.to.as_deref()),
+        (holds(&between.from), holds(&between.to)),
         (Some("a"), Some("b"))
     );
     assert_eq!(between.points.len(), 2);
@@ -448,7 +461,7 @@ fn an_arrow_drag_binds_the_cards_it_starts_and_ends_on() {
         .drawn_shape(Kind::Arrow, [100., 70.], [900., 400.])
         .unwrap();
     assert_eq!(
-        (leaving.from.as_deref(), leaving.to.clone()),
+        (holds(&leaving.from), holds(&leaving.to)),
         (Some("a"), None),
         "an end in open space stands on its own point"
     );
@@ -456,7 +469,7 @@ fn an_arrow_drag_binds_the_cards_it_starts_and_ends_on() {
         .drawn_shape(Kind::Arrow, [20., 20.], [150., 100.])
         .unwrap();
     assert_eq!(
-        (inside.from.clone(), inside.to.clone()),
+        (holds(&inside.from), holds(&inside.to)),
         (None, None),
         "both ends on one card is a free arrow, not a loop the board refuses"
     );
@@ -605,8 +618,8 @@ fn a_pasted_connector_binds_to_the_copies_and_not_the_originals() {
     view.edit(Change::Create {
         id: "edge".into(),
         shape: Shape {
-            from: Some("a".into()),
-            to: Some("b".into()),
+            from: on("a"),
+            to: on("b"),
             ..segment(Kind::Arrow)
         },
     });
@@ -633,7 +646,7 @@ fn a_pasted_connector_binds_to_the_copies_and_not_the_originals() {
     let board = view.visible().unwrap();
     let copy = &board.shapes["e2"].shape;
     assert_eq!(
-        (copy.from.as_deref(), copy.to.as_deref()),
+        (holds(&copy.from), holds(&copy.to)),
         (Some("a2"), Some("b2"))
     );
     assert_eq!(board.shapes["a2"].shape.x, 40);
@@ -763,8 +776,8 @@ fn linked() -> BoardsView {
     view.edit(Change::Create {
         id: "edge".into(),
         shape: Shape {
-            from: Some("a".into()),
-            to: Some("b".into()),
+            from: on("a"),
+            to: on("b"),
             ..segment(Kind::Arrow)
         },
     });
@@ -778,8 +791,54 @@ fn dragging_an_arrows_end_onto_another_card_rebinds_that_end_and_leaves_the_far_
     drag(&mut view, &[[380., 150.], [600., 150.], [780., 150.]]);
     let board = view.visible().unwrap();
     let edge = &board.shapes["edge"].shape;
-    assert_eq!(edge.from.as_deref(), Some("a"));
-    assert_eq!(edge.to.as_deref(), Some("c"));
+    assert_eq!(holds(&edge.from), Some("a"));
+    assert_eq!(holds(&edge.to), Some("c"));
+}
+
+#[test]
+fn an_arrow_leaves_a_card_from_the_spot_it_was_dropped_on_and_not_from_its_middle() {
+    let mut view = linked();
+    // Screen (700, 100) is world (620, 20): high on card c's left flank, a
+    // long way above the middle of it an arrow used to aim at no matter where
+    // you let go.
+    drag(&mut view, &[[380., 150.], [650., 120.], [700., 100.]]);
+    let board = view.visible().unwrap();
+    let edge = &board.shapes["edge"].shape;
+    assert_eq!(
+        edge.to,
+        Some(boards::Bond {
+            card: "c".into(),
+            at: [100, 143],
+        }),
+        "the drop was not written down as a share of the card's box"
+    );
+    let end = *super::interaction::stroke(&board, edge).last().unwrap();
+    assert!(
+        (end[0] - 600.).abs() < 2. && (end[1] - 22.).abs() < 3.,
+        "the run met c at {end:?} rather than beside the anchor near its top"
+    );
+}
+
+#[test]
+fn stretching_a_card_carries_an_arrow_to_the_same_place_on_the_bigger_box() {
+    let mut view = linked();
+    drag(&mut view, &[[380., 150.], [650., 120.], [700., 100.]]);
+    // Twice as tall, same top: an anchor a seventh of the way down the old box
+    // is a seventh of the way down the new one, so it travels from 20 to 40.
+    // A bond that stored a point on the board would have stayed at 20, and one
+    // that stored only the card would be back at the middle.
+    view.edit(Change::Resize {
+        id: "c".into(),
+        width: 200,
+        height: 280,
+    });
+    let board = view.visible().unwrap();
+    let edge = &board.shapes["edge"].shape;
+    let end = *super::interaction::stroke(&board, edge).last().unwrap();
+    assert!(
+        (end[0] - 600.).abs() < 2. && (end[1] - 41.).abs() < 3.,
+        "the anchor did not stretch with the card: the run met it at {end:?}"
+    );
 }
 
 /// A free arrow lying along `run`, and one card to drop an end on.
@@ -841,8 +900,8 @@ fn an_arrows_start_takes_a_card_exactly_where_its_end_would() {
             let board = view.visible().unwrap();
             let arrow = &board.shapes["e"].shape;
             let bound = match end {
-                0 => arrow.from.as_deref(),
-                _ => arrow.to.as_deref(),
+                0 => holds(&arrow.from),
+                _ => holds(&arrow.to),
             };
             assert_eq!(bound, Some("c"), "end {end} did not take the card");
             let drawn = super::interaction::stroke(&board, arrow);
@@ -881,7 +940,7 @@ fn a_bent_arrow_leaves_its_card_toward_the_bend_and_not_past_it() {
         width: 280,
         height: 280,
         points: vec![[280, 10], [280, 280], [0, 0]],
-        from: Some("c".into()),
+        from: on("c"),
         to: None,
     });
     let board = view.visible().unwrap();
@@ -929,8 +988,8 @@ fn an_arrow_bends_by_the_handle_on_its_line_and_straightens_when_you_put_it_back
         run[1]
     );
     // Its ends are where they were: a bend is a bend, not a re-route.
-    assert_eq!(bent.from.as_deref(), Some("a"));
-    assert_eq!(bent.to.as_deref(), Some("b"));
+    assert_eq!(holds(&bent.from), Some("a"));
+    assert_eq!(holds(&bent.to), Some("b"));
     // And putting it back on the line takes it away again, rather than leaving
     // a sample nobody can see.
     drag(&mut view, &[[middle[0], middle[1] - 160.], middle, middle]);
@@ -1071,9 +1130,9 @@ fn a_bend_dragged_across_a_card_binds_nothing() {
     drag(&mut view, &[middle, [500., 60.], over_c]);
     let board = view.visible().unwrap();
     let bent = &board.shapes["edge"].shape;
-    assert_eq!(bent.from.as_deref(), Some("a"));
+    assert_eq!(holds(&bent.from), Some("a"));
     assert_eq!(
-        bent.to.as_deref(),
+        holds(&bent.to),
         Some("b"),
         "the bend stole the far end's card"
     );
@@ -1171,8 +1230,8 @@ fn a_bent_arrows_words_ride_its_curve_and_not_the_box_around_it() {
         width: 100,
         height: 200,
         points: vec![[0, 0], [50, 200], [100, 0]],
-        from: Some("a".into()),
-        to: Some("b".into()),
+        from: on("a"),
+        to: on("b"),
     });
     view.edit(Change::Text {
         id: "edge".into(),
@@ -1290,7 +1349,7 @@ fn an_end_held_over_a_card_is_already_holding_it() {
     let board = view.visible().unwrap();
     let edge = &board.shapes["edge"].shape;
     assert_eq!(
-        edge.to.as_deref(),
+        holds(&edge.to),
         Some("c"),
         "the end in hand was not holding the card it was over"
     );
@@ -1307,7 +1366,7 @@ fn an_end_held_over_a_card_is_already_holding_it() {
     // and letting go changes nothing, because it was already decided
     view.on_release();
     let board = view.visible().unwrap();
-    assert_eq!(board.shapes["edge"].shape.to.as_deref(), Some("c"));
+    assert_eq!(holds(&board.shapes["edge"].shape.to), Some("c"));
 }
 
 #[test]
@@ -1364,8 +1423,8 @@ fn both_ends_of_an_arrow_being_drawn_ring_the_cards_they_would_take() {
         .values()
         .find(|record| record.shape.kind == Kind::Arrow && record.shape.from.is_some())
         .expect("no arrow was drawn");
-    assert_eq!(drawn.shape.from.as_deref(), Some("a"));
-    assert_eq!(drawn.shape.to.as_deref(), Some("b"));
+    assert_eq!(holds(&drawn.shape.from), Some("a"));
+    assert_eq!(holds(&drawn.shape.to), Some("b"));
 }
 
 /// Whether a mark is a rectangle standing at this screen point.
@@ -1386,7 +1445,7 @@ fn dragging_a_bound_end_onto_open_board_frees_it_and_stands_it_on_its_own_point(
     drag(&mut view, &[[380., 150.], [500., 400.], [520., 480.]]);
     let board = view.visible().unwrap();
     let edge = &board.shapes["edge"].shape;
-    assert_eq!(edge.from.as_deref(), Some("a"));
+    assert_eq!(holds(&edge.from), Some("a"));
     assert_eq!(edge.to, None);
     // the end it let go of now stands where the pointer left it
     let run = super::interaction::path_points(edge);
@@ -1696,11 +1755,12 @@ fn an_arrow_meets_a_circle_on_its_curve_and_a_diamond_on_its_point() {
         height: 200,
         ..Default::default()
     };
+    let middle = [100., 100.];
     // straight out to the right: every outline leaves at the same place
-    let east = super::interaction::border_point(&round, [1000., 100.]);
+    let east = super::interaction::meeting(&round, middle, [1000., 100.]);
     assert!((east[0] - 200.).abs() < 0.5, "east landed at {}", east[0]);
     // on the diagonal a circle is further in than the box around it
-    let corner = super::interaction::border_point(&round, [1000., 1000.]);
+    let corner = super::interaction::meeting(&round, middle, [1000., 1000.]);
     let reach = (corner[0] - 100.).hypot(corner[1] - 100.);
     assert!(
         (reach - 100.).abs() < 0.5,
@@ -1710,7 +1770,7 @@ fn an_arrow_meets_a_circle_on_its_curve_and_a_diamond_on_its_point() {
         kind: Kind::Diamond,
         ..round.clone()
     };
-    let facet = super::interaction::border_point(&gem, [1000., 1000.]);
+    let facet = super::interaction::meeting(&gem, middle, [1000., 1000.]);
     // a diamond's edge runs |dx| + |dy| = half, so the diagonal exit is nearer
     assert!(
         (facet[0] - 150.).abs() < 0.5,
@@ -2326,7 +2386,7 @@ fn an_arrow_held_at_one_end_still_moves_the_end_it_owns() {
         width: 160,
         height: 90,
         points: vec![[0, 0], [160, 90]],
-        from: Some("a".into()),
+        from: on("a"),
         to: None,
     });
     let board = view.visible().unwrap();
@@ -2349,11 +2409,7 @@ fn an_arrow_held_at_one_end_still_moves_the_end_it_owns() {
     );
     let board = view.visible().unwrap();
     let edge = &board.shapes["edge"].shape;
-    assert_eq!(
-        edge.from.as_deref(),
-        Some("a"),
-        "the drag broke the binding"
-    );
+    assert_eq!(holds(&edge.from), Some("a"), "the drag broke the binding");
     let after = super::interaction::stroke(&board, edge);
     let moved = *after.last().unwrap();
     assert!(
@@ -2380,7 +2436,7 @@ fn a_selection_box_holds_the_half_held_arrow_it_carries() {
         shape: Shape {
             x: 200,
             y: 400,
-            from: Some("a".into()),
+            from: on("a"),
             to: None,
             ..segment(Kind::Arrow)
         },
@@ -2418,8 +2474,8 @@ fn the_box_drawn_round_a_selection_is_the_box_round_what_it_moves() {
         shape: Shape {
             x: -400,
             y: -900,
-            from: Some("a".into()),
-            to: Some("b".into()),
+            from: on("a"),
+            to: on("b"),
             ..segment(Kind::Arrow)
         },
     });

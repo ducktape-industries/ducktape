@@ -824,21 +824,21 @@ impl BoardsView {
         end: usize,
         point: [f32; 2],
         shape: &Shape,
-        held: Option<String>,
+        held: Option<boards::Bond>,
     ) -> Option<Change> {
         let mut run = path_points(shape);
         let last = run.len().checked_sub(1)?;
         let sample = run.get_mut(end)?;
         *sample = point;
         let run = self.straightened(run);
-        let carried = |mine: bool, kept: &Option<String>| {
+        let carried = |mine: bool, kept: &Option<boards::Bond>| {
             if mine { held.clone() } else { kept.clone() }
         };
         let from = carried(end == 0, &shape.from);
         let to = carried(end == last, &shape.to);
         // both ends on one card is a loop the board cannot draw, so the end in
         // hand stands on its own point rather than stealing the other's card
-        let looped = from.is_some() && from == to;
+        let looped = boards::held(&from).is_some() && boards::held(&from) == boards::held(&to);
         let from = if looped && end == 0 { None } else { from };
         let to = if looped && end != 0 { None } else { to };
         let next = self.path_shape(shape.kind, &standing(board, &run, &from, &to));
@@ -1074,7 +1074,9 @@ impl BoardsView {
         let card = |p| self.holding(&board, shape.kind, p);
         shape.from = card(start);
         shape.to = card(end);
-        if shape.from.is_some() && shape.from == shape.to {
+        let one_card = boards::held(&shape.from).is_some()
+            && boards::held(&shape.from) == boards::held(&shape.to);
+        if one_card {
             shape.from = None;
             shape.to = None;
         }
@@ -1160,11 +1162,18 @@ impl BoardsView {
     }
     /// The card an endpoint over this point would take: a card for an arrow,
     /// nothing for a line or a stroke, which never bind.
-    pub(super) fn holding(&self, board: &Board, kind: Kind, point: [f32; 2]) -> Option<String> {
+    pub(super) fn holding(
+        &self,
+        board: &Board,
+        kind: Kind,
+        point: [f32; 2],
+    ) -> Option<boards::Bond> {
         if kind != Kind::Arrow {
             return None;
         }
-        self.topmost(board, point, |s: &Shape| !s.kind.is_path())
+        let id = self.topmost(board, point, |s: &Shape| !s.kind.is_path())?;
+        let card = &board.shapes.get(&id)?.shape;
+        Some(bond_at(&id, card, point))
     }
     /// What an endpoint in hand is doing to its connector right now. The drag
     /// and the release read it the same way, so the arrow snaps to the card's
@@ -1782,7 +1791,7 @@ impl BoardsView {
             [&s.from, &s.to]
                 .into_iter()
                 .flatten()
-                .all(|id| picked.contains(id))
+                .all(|bond| picked.contains(&bond.card))
         };
         let mut shapes: Vec<_> = board
             .ordered()
@@ -1853,8 +1862,18 @@ impl BoardsView {
             .map(|((_, mut s), id)| {
                 s.x = coordinate((s.x + offset[0]) as f32);
                 s.y = coordinate((s.y + offset[1]) as f32);
-                s.from = s.from.and_then(|id| mapping.get(&id).cloned());
-                s.to = s.to.and_then(|id| mapping.get(&id).cloned());
+                // A copy holds the COPIES of the cards it was bound to, at the
+                // same places on them: an arrow planted beside its own cards
+                // that still reached back to the originals would be a copy of
+                // the picture with one line left behind in it.
+                let replanted = |bond: boards::Bond| {
+                    mapping.get(&bond.card).map(|card| boards::Bond {
+                        card: card.clone(),
+                        at: bond.at,
+                    })
+                };
+                s.from = s.from.and_then(replanted);
+                s.to = s.to.and_then(replanted);
                 Change::Create {
                     id: id.clone(),
                     shape: s,
@@ -2318,29 +2337,61 @@ pub(super) fn path_points(s: &Shape) -> Vec<[f32; 2]> {
         .map(|p| [s.x as f32 + p[0] as f32 * sx, s.y as f32 + p[1] as f32 * sy])
         .collect()
 }
-/// A connector's run with every bound end put where that end STANDS: the
-/// centre of the card it holds. Where the pointer touched inside a card says
-/// nothing about where the line will meet it — the card decides that, and
-/// decides it again every time either of them moves. Storing the centre
-/// instead makes the sample a record of where the card WAS, which is the only
-/// thing that lets a bend still be a bend of this line once the card moves.
+/// Where on the board a bond points: the anchor it names, read back through
+/// the card's box as the box is NOW. A card that moves carries its anchors
+/// with it, and one that is resized keeps them in the same relative place —
+/// which is the whole reason the bond stores a share of the box rather than a
+/// point on the board.
+pub(super) fn anchor_point(card: &Shape, at: [i32; 2]) -> [f32; 2] {
+    let span = boards::ANCHOR_SPAN as f32;
+    [
+        card.x as f32 + card.width as f32 * at[0] as f32 / span,
+        card.y as f32 + card.height as f32 * at[1] as f32 / span,
+    ]
+}
+/// The bond an end let go of at this point makes with this card: the point as
+/// a share of the card's box. Dropped near the middle it comes out near the
+/// middle, which is what an arrow usually means — so "remember where I put it"
+/// costs nothing at the one place people do not care about it.
+fn bond_at(card_id: &str, card: &Shape, point: [f32; 2]) -> boards::Bond {
+    let span = boards::ANCHOR_SPAN as f32;
+    let share = |value: f32, origin: i32, size: i32| {
+        let size = (size as f32).max(1.);
+        ((value - origin as f32) / size * span)
+            .round()
+            .clamp(0., span) as i32
+    };
+    boards::Bond {
+        card: card_id.to_owned(),
+        at: [
+            share(point[0], card.x, card.width),
+            share(point[1], card.y, card.height),
+        ],
+    }
+}
+/// A connector's run with every bound end put where that end STANDS: the point
+/// on the card its bond anchors to. Where the line MEETS the card is a
+/// different question — the card's outline answers that, and answers it again
+/// every time either of them moves. Storing the anchor makes the sample a
+/// record of where the card WAS, which is the only thing that lets a bend
+/// still be a bend of this line once the card moves.
 ///
 /// Every write of a connector's run goes through here, so the sample and the
 /// card agree at rest and differ afterwards by exactly the drag between them.
 pub(super) fn standing(
     board: &Board,
     run: &[[f32; 2]],
-    from: &Option<String>,
-    to: &Option<String>,
+    from: &Option<boards::Bond>,
+    to: &Option<boards::Bond>,
 ) -> Vec<[f32; 2]> {
     let mut run = run.to_vec();
     let Some(last) = run.len().checked_sub(1) else {
         return run;
     };
-    let at = |key: &Option<String>| {
-        key.as_ref()
-            .and_then(|k| board.shapes.get(k))
-            .map(|r| center(&r.shape))
+    let at = |end: &Option<boards::Bond>| {
+        let bond = end.as_ref()?;
+        let card = &board.shapes.get(&bond.card)?.shape;
+        Some(anchor_point(card, bond.at))
     };
     if let Some(p) = at(from) {
         run[0] = p;
@@ -2379,20 +2430,22 @@ pub(super) fn stroke(board: &Board, s: &Shape) -> Vec<[f32; 2]> {
     if path.len() < 2 {
         return Vec::new();
     }
-    let card = |key: &Option<String>| {
-        key.as_ref()
-            .and_then(|k| board.shapes.get(k))
-            .map(|r| r.shape.clone())
+    let held = |end: &Option<boards::Bond>| {
+        let bond = end.as_ref()?;
+        let card = board.shapes.get(&bond.card)?.shape.clone();
+        Some((card, bond.at))
     };
-    let (from, to) = (card(&s.from), card(&s.to));
+    let (from, to) = (held(&s.from), held(&s.to));
     let last = path.len() - 1;
     // Where the ends stood when the run was written, and where they stand now.
     // For a free end those are the same point. For a bound end they differ by
     // however far the card has been dragged since — see [`standing`].
     let stood = [path[0], path[last]];
     let anchor = [
-        from.as_ref().map_or(stood[0], center),
-        to.as_ref().map_or(stood[1], center),
+        from.as_ref()
+            .map_or(stood[0], |(card, at)| anchor_point(card, *at)),
+        to.as_ref()
+            .map_or(stood[1], |(card, at)| anchor_point(card, *at)),
     ];
     // A bend belongs to the line and not to the board. Left at its stored
     // point it stops being a bend of this arrow the moment a card moves: the
@@ -2412,37 +2465,51 @@ pub(super) fn stroke(board: &Board, s: &Shape) -> Vec<[f32; 2]> {
     // which now stands where it stands rather than where it was dropped.
     let toward_start = path[1];
     let toward_end = path[last - 1];
-    if let Some(card) = &from {
-        path[0] = border_point(card, toward_start);
+    if let Some((card, _)) = &from {
+        path[0] = meeting(card, anchor[0], toward_start);
     }
-    if let Some(card) = &to {
-        path[last] = border_point(card, toward_end);
+    if let Some((card, _)) = &to {
+        path[last] = meeting(card, anchor[1], toward_end);
     }
     path
 }
-/// Where a ray out of a card's centre leaves it, so a connector stops at the
-/// edge instead of burying its head in the card.
-pub(super) fn border_point(s: &Shape, toward: [f32; 2]) -> [f32; 2] {
-    let c = center(s);
-    let d = [toward[0] - c[0], toward[1] - c[1]];
-    // Each outline is a different curve, and an arrow that stops at a box
-    // around a circle stops visibly short of it. The same ray, scaled to
-    // where it leaves the outline the card is actually drawn with.
-    let half = [
-        (s.width as f32 / 2.).max(0.001),
-        (s.height as f32 / 2.).max(0.001),
-    ];
-    let unit = [d[0] / half[0], d[1] / half[1]];
-    let scale = match s.kind {
-        Kind::Ellipse => 1. / unit[0].hypot(unit[1]).max(0.001),
-        Kind::Diamond => 1. / (unit[0].abs() + unit[1].abs()).max(0.001),
-        Kind::Note | Kind::Rectangle | Kind::Text => {
-            (1. / unit[0].abs().max(0.001)).min(1. / unit[1].abs().max(0.001))
-        }
-        Kind::Arrow | Kind::Line | Kind::Draw => 1.,
+/// How finely the crossing below is hunted. Twenty-four halvings put it within
+/// a millionth of the run's length, which is far under a pixel at any zoom the
+/// board allows — and the hunt costs a few dozen floats per bound end.
+const CROSSINGS: u32 = 24;
+/// Where a connector leaves the card it holds: the point at which the line out
+/// of its anchor towards `toward` crosses the card's outline, so the run stops
+/// at the edge instead of burying its head in the card.
+///
+/// The anchor is where the end was DROPPED and the crossing is where the line
+/// is DRAWN, and they are different points on purpose: an arrow coming from
+/// the left meets a card on its left side however near the right edge you let
+/// go of it. What the anchor decides is the aim — let go near the top and the
+/// run meets the card high, which is the whole of "it remembers where I put
+/// it".
+///
+/// The outline is [`covers`], the same answer a press gets, rather than a
+/// second per-kind formula that could disagree with it: the crossing is hunted
+/// by halving the segment. An anchor the outline does not contain is not a
+/// place on the card at all — only a hand-written board has one — so the end
+/// falls back to aiming from the middle.
+pub(super) fn meeting(s: &Shape, anchor: [f32; 2], toward: [f32; 2]) -> [f32; 2] {
+    let mut inside = match covers(s, anchor) {
+        true => anchor,
+        false => center(s),
     };
-    let scale = scale.min(1.);
-    [c[0] + d[0] * scale, c[1] + d[1] * scale]
+    if covers(s, toward) {
+        return inside;
+    }
+    let mut outside = toward;
+    for _ in 0..CROSSINGS {
+        let middle = [(inside[0] + outside[0]) / 2., (inside[1] + outside[1]) / 2.];
+        match covers(s, middle) {
+            true => inside = middle,
+            false => outside = middle,
+        }
+    }
+    inside
 }
 /// Shift on a connector: the nearest eighth turn, so runs come out straight
 /// or squarely diagonal.

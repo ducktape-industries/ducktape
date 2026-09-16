@@ -10,6 +10,14 @@ fn create(id: &str) -> Change {
         shape: Shape::default(),
     }
 }
+/// An end bound to a card at its middle — the only anchor a test needs unless
+/// it is about anchors.
+fn on(card: &str) -> Option<Bond> {
+    Some(Bond {
+        card: card.into(),
+        at: [ANCHOR_SPAN / 2; 2],
+    })
+}
 /// A two-point path. Every connector carries its own samples; binding an
 /// endpoint to a card only overrides where that end is drawn.
 fn path(kind: Kind) -> Shape {
@@ -37,7 +45,7 @@ fn a_connector_is_re_routed_whole_and_a_card_has_no_run_to_re_route() {
             },
         ])
         .unwrap();
-    let route = |id: &str, points: Vec<[i32; 2]>, to: Option<String>| Change::Route {
+    let route = |id: &str, points: Vec<[i32; 2]>, to: Option<Bond>| Change::Route {
         id: id.into(),
         x: 40,
         y: 60,
@@ -51,7 +59,7 @@ fn a_connector_is_re_routed_whole_and_a_card_has_no_run_to_re_route() {
         .changed(&route(
             "edge",
             vec![[0, 0], [100, 60], [200, 120]],
-            Some("card".into()),
+            on("card"),
         ))
         .unwrap();
     let edge = &moved.shapes["edge"].shape;
@@ -61,7 +69,7 @@ fn a_connector_is_re_routed_whole_and_a_card_has_no_run_to_re_route() {
         [40, 60, 200, 120]
     );
     assert_eq!(edge.points, vec![[0, 0], [100, 60], [200, 120]]);
-    assert_eq!(edge.to.as_deref(), Some("card"));
+    assert_eq!(held(&edge.to), Some("card"));
     assert_eq!(moved.revision, board.revision + 1);
     // a card is a box, not a run: naming one here is a mistake, not a no-op
     let refused = moved.changed(&route("card", vec![[0, 0], [10, 10]], None));
@@ -155,8 +163,8 @@ fn deleting_a_card_removes_connections_and_late_edits_do_not_resurrect_it() {
         .changed(&create("b"))
         .unwrap();
     let arrow = Shape {
-        from: Some("a".into()),
-        to: Some("b".into()),
+        from: on("a"),
+        to: on("b"),
         ..path(Kind::Arrow)
     };
     board = board
@@ -194,7 +202,15 @@ fn invalid_geometry_content_and_edges_leave_state_untouched() {
             ..Default::default()
         },
         Shape {
-            to: Some("missing".into()),
+            to: on("missing"),
+            ..path(Kind::Arrow)
+        },
+        // an anchor is a share of the card's box, so it cannot point outside it
+        Shape {
+            to: Some(Bond {
+                card: "a".into(),
+                at: [ANCHOR_SPAN + 1, 0],
+            }),
             ..path(Kind::Arrow)
         },
         // a connector with no samples has nowhere to be drawn
@@ -208,7 +224,7 @@ fn invalid_geometry_content_and_edges_leave_state_untouched() {
         },
         // only arrows bind; a plain line and a card carry neither endpoint
         Shape {
-            to: Some("a".into()),
+            to: on("a"),
             ..path(Kind::Line)
         },
         Shape {
@@ -278,7 +294,7 @@ fn an_arrow_binds_one_end_and_stands_on_its_own_point_at_the_other() {
         .changed(&Change::Create {
             id: "half".into(),
             shape: Shape {
-                from: Some("card".into()),
+                from: on("card"),
                 ..path(Kind::Arrow)
             },
         })
@@ -289,8 +305,8 @@ fn an_arrow_binds_one_end_and_stands_on_its_own_point_at_the_other() {
             .changed(&Change::Create {
                 id: "loop".into(),
                 shape: Shape {
-                    from: Some("card".into()),
-                    to: Some("card".into()),
+                    from: on("card"),
+                    to: on("card"),
                     ..path(Kind::Arrow)
                 },
             })
