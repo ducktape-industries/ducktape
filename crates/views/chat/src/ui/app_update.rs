@@ -101,6 +101,9 @@ impl super::ChatView {
             Message::SearchDraftChanged(value) => self.on_search_draft_changed(value),
             Message::ChannelNameDraftChanged(value) => self.on_channel_name_draft_changed(value),
             Message::MemberKeyDraftChanged(value) => self.on_member_key_draft_changed(value),
+            Message::LiveRunsArrived(item) => self.on_live_runs_arrived(item),
+            Message::LiveOutputArrived(item) => self.on_live_output_arrived(item),
+            Message::LiveProgressArrived(progress) => self.on_live_progress_arrived(progress),
         }
     }
     fn on_sidebar_resized(&mut self, dx: f64, _dy: f64) -> ducktape_view_guest::Task<Message> {
@@ -301,14 +304,21 @@ impl super::ChatView {
         self.call_peers = next.call_peers.clone();
         self.shift_held = next.shift_held;
         self.refresh_pending();
-        self.live_agents = next
-            .live_agents
-            .iter()
-            .filter(|run| run.channel_id == self.active_channel)
-            .cloned()
-            .map(crate::live::project)
-            .collect();
-        self.live_agents.sort_by_key(|run| run.anchor_seq);
+        // A SEAT OR A CONNECTION MOVING TAKES THE CARDS WITH IT, at once and
+        // not when the next reading happens to arrive: what a row showed was
+        // read under the identity that just went away, and a locked seat must
+        // not leave the previous key's private output on screen while the
+        // re-keyed subscriptions take their first reading.
+        if changed_reader {
+            self.live_seeds.clear();
+            self.live_output.clear();
+            self.live_public.clear();
+        }
+        // the seeds cover every room, so the room on screen changing is a
+        // re-fold here and never a re-read.
+        if changed_reader || changed_channel {
+            self.refold_live_agents();
+        }
         self.loading = self.session_loading
             || self.dm_opening.is_some()
             || ((!(self.active_channel).is_empty()) && (self.room_channel != self.active_channel));
@@ -1687,5 +1697,87 @@ impl super::ChatView {
     fn on_member_key_draft_changed(&mut self, value: String) -> ducktape_view_guest::Task<Message> {
         self.member_key_draft = value;
         ::ducktape_view_guest::Task::none()
+    }
+
+    /// A new reading of which runs are anchored in chat.
+    ///
+    /// A reading that failed is not evidence that nothing is running, so it
+    /// leaves the cards alone — the next poll is two seconds away. A run that
+    /// is no longer pending takes its output and its public status with it:
+    /// the committed reply has landed in the room and the card's job is done.
+    fn on_live_runs_arrived(
+        &mut self,
+        item: crate::host::LiveSeedsItem,
+    ) -> ducktape_view_guest::Task<Message> {
+        if !item.error.is_empty() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.live_seeds = item.seeds;
+        let pending: std::collections::BTreeSet<String> = self
+            .live_seeds
+            .iter()
+            .map(|seed| seed.dispatch_id.clone())
+            .collect();
+        let runs: std::collections::BTreeSet<String> = self
+            .live_seeds
+            .iter()
+            .map(|seed| seed.run_id.clone())
+            .collect();
+        self.live_output
+            .retain(|dispatch, _| pending.contains(dispatch));
+        self.live_public.retain(|run, _| runs.contains(run));
+        self.refold_live_agents();
+        ::ducktape_view_guest::Task::none()
+    }
+
+    /// One run's output stream spoke: the lines, or why there are none.
+    fn on_live_output_arrived(
+        &mut self,
+        item: crate::host::LiveOutputItem,
+    ) -> ducktape_view_guest::Task<Message> {
+        self.live_output.insert(item.dispatch_id.clone(), item);
+        self.refold_live_agents();
+        ::ducktape_view_guest::Task::none()
+    }
+
+    /// The committed progress of the runs this device may not read.
+    fn on_live_progress_arrived(
+        &mut self,
+        progress: serde_json::Value,
+    ) -> ducktape_view_guest::Task<Message> {
+        for (run_id, facts) in progress.as_object().into_iter().flatten() {
+            self.live_public
+                .insert(run_id.clone(), crate::live::public_status(run_id, facts));
+        }
+        self.refold_live_agents();
+        ::ducktape_view_guest::Task::none()
+    }
+
+    /// Rebuild the cards from what this view has read: the seeds say where a
+    /// card goes and whose it is, the output says what it shows, and a run
+    /// whose output this device was refused shows its committed progress
+    /// instead. Only this room's runs reach the screen.
+    fn refold_live_agents(&mut self) {
+        self.live_agents = self
+            .live_seeds
+            .iter()
+            .filter(|seed| seed.channel_id == self.active_channel)
+            .map(|seed| {
+                let output = self.live_output.get(&seed.dispatch_id);
+                let refused = output.is_some_and(|item| item.unavailable);
+                let lines = output.map(|item| item.lines.as_slice()).unwrap_or_default();
+                let error = output.map(|item| item.error.as_str()).unwrap_or_default();
+                let mut row = crate::live::project(seed, lines, error);
+                if refused {
+                    row.status = self
+                        .live_public
+                        .get(&seed.run_id)
+                        .cloned()
+                        .unwrap_or_else(|| "Working".into());
+                }
+                row
+            })
+            .collect();
+        self.live_agents.sort_by_key(|run| run.anchor_seq);
     }
 }

@@ -370,67 +370,70 @@ fn opening_a_search_hit_moves_the_room_on_the_click() {
     );
 }
 
-/// THE LIVE-RUN READING IS REFUSED, NEVER FOLDED. Its rows are the node's whole
-/// pending set, and the reading is stamped with the connection it was taken over
-/// — so a reading that crossed with a reconnect has to be DROPPED. Folding it in
-/// would assign its emptiness and blank the cards the current connection just
-/// installed, until the next two-second poll put them back.
+/// THE HOST FOLDS NO LIVE RUN OF ITS OWN. Which runs are anchored in chat,
+/// what each one's output says, and what a reader who may not see that output
+/// is told instead are all the chat view's, off `rpc.stream` and its own
+/// `runs` reads. The app's part is the credential and the socket — platform
+/// capabilities a guest cannot hold — and nothing above them.
 ///
-/// Pinned as statements, not as a substring: the comment above that handler
-/// NAMES the blanking it refuses to do, and a `contains` over the arm would read
-/// the prose as the code.
+/// Parsed, not commented: a host that quietly grew the fold back would be a
+/// second answer about a run, and the one on screen would be whichever
+/// arrived last.
 #[test]
-fn a_stale_live_run_reading_is_dropped_rather_than_folded() {
-    let arm = handler_body("LiveAgentsEvent");
-    let guard = arm
-        .find("live_agents_stale(")
-        .expect("stale identity guard");
-    let assignment = arm.find("self.live_agents=").expect("accepted projection");
-    assert!(guard < assignment);
-    assert!(arm[guard..assignment].contains("return"));
-    let subscriptions = rust_tokens(include_str!("../ui/app.rs"));
-    let (prefix, lane) = subscriptions
-        .split_once("chat_live_agents(")
-        .expect("one node-wide live lane");
-    let arguments = prefix.rsplit_once("Subscription::run_with(").unwrap().1;
-    assert!(lane.starts_with("data.0.clone(),data.1.clone(),data.2,data.3.clone()"));
-    for identity in [
-        "connected_rpc",
-        "network_chain_id",
-        "connect_generation",
-        "signer_key",
-    ] {
-        assert!(
-            arguments.contains(identity),
-            "the live lane carries {identity}"
-        );
+fn the_host_folds_no_live_run_of_its_own() {
+    let app = rust_tokens(include_str!("../ui/app.rs"));
+    for gone in ["live_agents", "chat_live_agents(", "LiveAgentsEvent"] {
+        assert!(!app.contains(gone), "the app still carries {gone}");
     }
-    for seam in [
-        "SettingsUnlocked",
-        "KeyUnlocked",
-        "PhraseConfirmed",
-        "KeyRestored",
-    ] {
-        let arm = handler_body(seam);
-        assert!(arm.contains("self.signer_key=pubkey"));
-        assert!(
-            arm.contains("self.live_agents="),
-            "{seam} retires the previous seat's private output"
-        );
+    let update = rust_tokens(include_str!("../ui/app_update.rs"));
+    assert!(!update.contains("live_agents"), "a fold survived in update");
+    let props = rust_tokens(include_str!("../module_view.rs"));
+    assert!(
+        !props.contains("live_agents"),
+        "chat.props still hands rows in"
+    );
+    let backend = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backend/chat_live.rs");
+    assert!(!backend.exists(), "the host lane's file is back");
+}
+
+/// A CREDENTIAL NEVER CROSSES INTO A VIEW. The kernel reads the node's 0600
+/// link token and attaches it to the socket it opens; what reaches a guest is
+/// a topic and the frames on it. A view naming the token, or the file it
+/// lives in, would be a view holding an operator's capability — so the view
+/// tree is parsed for both.
+#[test]
+fn no_view_names_the_nodes_link_token() {
+    let views = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../crates/views")
+        .canonicalize()
+        .expect("the view tree");
+    let mut files = Vec::new();
+    collect_rust_files(&views, &mut files);
+    assert!(!files.is_empty(), "the walk found no view source at all");
+    for file in files {
+        let source = std::fs::read_to_string(&file).expect("read a view source");
+        for secret in ["read_link_token", "link.token", "admin.token"] {
+            assert!(
+                !source.contains(secret),
+                "{} names {secret}",
+                file.display()
+            );
+        }
     }
-    let settings = handler_body("SettingsViewEvent");
-    let (_, locked) = settings
-        .split_once("SettingsIntent::Lock")
-        .expect("lock route");
-    let locked = locked.split("SettingsIntent::").next().unwrap();
-    assert!(
-        locked.contains("self.signer_key=")
-            && locked.contains("self.live_agents=")
-            && locked.contains("lock_signer(")
-    );
-    let leaving = handler_body("OnboardingReopened");
-    assert!(
-        leaving.contains("self.signer_key=\"\".to_owned()")
-            && leaving.contains("self.live_agents=")
-    );
+}
+
+/// Every `.rs` under `dir`, recursively — source only, never a build output.
+fn collect_rust_files(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("read a source dir") {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            if path.file_name().and_then(|name| name.to_str()) != Some("target") {
+                collect_rust_files(&path, files);
+            }
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            files.push(path);
+        }
+    }
 }

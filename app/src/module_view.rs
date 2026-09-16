@@ -477,8 +477,6 @@ struct ChatProps<'a> {
     call_peers: &'a [crate::call::CallPeer],
     shift_held: bool,
     copy_chord_serial: i64,
-    /// Run observations; the guest selects the room and presentation.
-    live_agents: &'a [crate::backend::LiveAgentRow],
 }
 
 /// The Chat tab, drawn by the `chat` view over the KERNEL CONTRACT: the app
@@ -522,7 +520,6 @@ pub fn chat_view(
     call_peers: &[crate::call::CallPeer],
     shift_held: bool,
     copy_chord_serial: i64,
-    live_agents: &[crate::backend::LiveAgentRow],
 ) -> ViewSpec {
     let props = ChatProps {
         dark,
@@ -551,7 +548,6 @@ pub fn chat_view(
         call_peers,
         shift_held,
         copy_chord_serial,
-        live_agents,
     };
     module_view("chat", serde_json::to_vec(&props).expect("props encode"))
 }
@@ -6500,7 +6496,7 @@ pub(crate) mod tests {
     }
 
     pub(super) fn chat_facts() -> Option<Vec<u8>> {
-        chat_facts_in("channel-a", 0, &[])
+        chat_facts_in("channel-a", 0)
     }
 
     fn chat_row(seq: i64) -> serde_json::Value {
@@ -6565,15 +6561,10 @@ pub(crate) mod tests {
 
     /// The chat SESSION facts, encoded the way the host encodes them. NO
     /// TIMELINE: under the kernel contract the view reads its own room's
-    /// messages off the index, so what the app pushes is who the reader is,
-    /// which room she is in, and the runs the node has in flight — always the
-    /// WHOLE node's rows, because narrowing them to `room` is what the host is
-    /// on the hook for.
-    fn chat_facts_in(
-        room: &'static str,
-        land_seq: i64,
-        live: &[crate::backend::LiveAgentRow],
-    ) -> Option<Vec<u8>> {
+    /// messages off the index, so what the app pushes is who the reader is
+    /// and which room she is in. The runs in flight are not among them: the
+    /// view discovers and folds those itself.
+    fn chat_facts_in(room: &'static str, land_seq: i64) -> Option<Vec<u8>> {
         let props = ChatProps {
             dark: false,
             connected: true,
@@ -6601,35 +6592,8 @@ pub(crate) mod tests {
             call_peers: &[],
             shift_held: false,
             copy_chord_serial: 0,
-            live_agents: live,
         };
         Some(serde_json::to_vec(&props).expect("props encode"))
-    }
-
-    /// One pending run of `agent`, anchored at seq 2 of `room`.
-    fn live_run(room: &str, agent: &str, status: &str) -> crate::backend::LiveAgentRow {
-        crate::backend::LiveAgentRow {
-            channel_id: room.into(),
-            anchor_seq: 2,
-            run_id: "chat\u{1f}channel-a\u{1f}2\u{1f}chiefduck".into(),
-            agent: agent.into(),
-            status: status.into(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn chat_facts_preserve_all_run_observations() {
-        let reading = [
-            live_run("channel-a", "Chief Duck", &"x".repeat(20_000)),
-            live_run("channel-b", "Ops Duck", "Working"),
-        ];
-        let bytes = chat_facts_in("channel-a", 0, &reading).unwrap();
-        let props: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            props["live_agents"],
-            serde_json::to_value(&reading).unwrap()
-        );
     }
 
     /// The facts a module's host pushes, and one word of them the tree

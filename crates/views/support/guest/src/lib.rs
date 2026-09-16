@@ -453,7 +453,11 @@ where
     })
 }
 
-fn ticks(period: Duration) -> BoxStream<()> {
+/// The bare tick stream behind [`every`] and [`repeat`], for a view that
+/// folds its own state across ticks: those two hand a fresh future per tick
+/// and so cannot carry anything from one to the next, which a poll that
+/// remembers what it already read has to do.
+pub fn ticks(period: Duration) -> BoxStream<()> {
     let millis = i64::try_from(period.as_millis()).unwrap_or(i64::MAX);
     Box::pin(
         host::subscribe("clock.ticks", &millis.to_le_bytes()).filter_map(|answer| {

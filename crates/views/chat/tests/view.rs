@@ -198,7 +198,7 @@ fn connected_room_with(seated: &Session, window: Vec<u8>) -> (Frame, Vec<u64>, u
     // after the session item does, so the live subscription can be opened more
     // than once before the reads begin: a block hits whichever one stands.
     let mut live = live_ids(&frame);
-    let names = request(&frame, "rpc.query").id;
+    let names = query_asking(&frame, "identity").id;
     let frame = tick_native(vec![answer(names, &accounts())]);
     live.extend(live_ids(&frame));
     let record = request(&frame, "rpc.view").id;
@@ -215,25 +215,119 @@ fn connected_room_with(seated: &Session, window: Vec<u8>) -> (Frame, Vec<u64>, u
 
 const CHIEF_RUN: &str = "chat\u{1f}channel-a\u{1f}2\u{1f}chiefduck";
 
-/// One run in flight, anchored at seq 2 of the room on screen.
-fn live_run(agent: &str, status: &str) -> chat_view::host::LiveRunHint {
-    chat_view::host::LiveRunHint {
-        public_progress: None,
-        output: Vec::new(),
-        output_error: String::new(),
-        channel_id: "channel-a".into(),
-        anchor_seq: 2,
-        thread_root: 0,
-        run_id: CHIEF_RUN.into(),
-        dispatch_id: "dispatch-1".into(),
-        agent: agent.into(),
-        status: status.into(),
-        activity: vec![chat_view::host::LiveActivity {
-            label: "Reading src/lib.rs".into(),
-            done: true,
-        }],
-        answer_preview: "The repo builds clean.".into(),
-    }
+/// The node's answer to the view's OWN discovery read: the runs anchored in a
+/// chat message and still pending. Nothing here is folded — a status, an
+/// activity or an answer is what the view makes of the run's output.
+fn pending_runs(channel: &str) -> Vec<u8> {
+    serde_json::json!({ "pending_runs": [{
+        "channel_id": channel,
+        "anchor_seq": 2,
+        "thread_root": 0,
+        "run_id": CHIEF_RUN,
+        "dispatch_id": "dispatch-1",
+        "agent_id": "chiefduck",
+    }]})
+    .to_string()
+    .into_bytes()
+}
+
+/// The deployed product's agent names, read once per name the view has not
+/// seen.
+fn agent_roster() -> Vec<u8> {
+    serde_json::json!({ "model": { "agents": [
+        { "agent_id": "chiefduck", "display_name": "Chief Duck" }
+    ]}})
+    .to_string()
+    .into_bytes()
+}
+
+/// The `rpc.query` carrying `needle` — the directory read, the run discovery
+/// and the agent roster all leave as the same kind, and the query they carry
+/// is what tells them apart.
+fn query_asking<'a>(frame: &'a Frame, needle: &str) -> &'a Request {
+    frame
+        .requests
+        .iter()
+        .find(|request| {
+            request.kind == "rpc.query"
+                && String::from_utf8_lossy(&request.payload).contains(needle)
+        })
+        .unwrap_or_else(|| panic!("no `rpc.query` for `{needle}` in {:?}", frame.requests))
+}
+
+/// Drive the view to a room holding one pending run, discovered and named by
+/// the view itself: the frame, the `rpc.stream` it opened for the run's
+/// output, and the clock the discovery poll rides.
+///
+/// It boots the room by hand rather than through [`connected_room_with`]
+/// because the clock is armed on the frame the session lands, before the
+/// room's own reads are answered.
+fn room_with_a_pending_run() -> (Frame, u64, u64) {
+    let (frame, _) = seated_view(&session(true));
+    // The live lane is armed the moment the session lands: its clock and its
+    // first discovery read leave on that frame, beside the room's own reads.
+    let clock = request(&frame, "clock.ticks").id;
+    let discovery = query_asking(&frame, "pending_runs").id;
+    let names = query_asking(&frame, "identity").id;
+    let frame = tick_native(vec![answer(names, &accounts())]);
+    let record = request(&frame, "rpc.view").id;
+    let frame = tick_native(vec![answer(record, &channel_record())]);
+    let window = request(&frame, "rpc.view").id;
+    let frame = tick_native(vec![answer(window, &roots())]);
+    let seats = request(&frame, "rpc.view").id;
+    let _ = tick_native(vec![answer(seats, &members())]);
+
+    let frame = tick_native(vec![answer(discovery, &pending_runs("channel-a"))]);
+    let roster = query_asking(&frame, "agents").id;
+    let frame = tick_native(vec![answer(roster, &agent_roster())]);
+    let stream = frame
+        .requests
+        .iter()
+        .find(|request| request.kind == "rpc.stream")
+        .expect("the view opens the run's output stream itself");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&stream.payload).expect("decodes"),
+        serde_json::json!({
+            "topic": "run-output:dispatch-1",
+            "params": { "run": "dispatch-1" },
+        }),
+        "the topic is the run's, and the upgrade names the run it asks for"
+    );
+    let id = stream.id;
+    (frame, id, clock)
+}
+
+/// One frame of a run's output stream, as the node pushes it.
+fn output_line(stream: u64, body: serde_json::Value) -> ducktape_view_guest::wire::Event {
+    item(
+        stream,
+        serde_json::json!({
+            "topic": "run-output:dispatch-1",
+            "item": { "line": body.to_string() },
+        })
+        .to_string()
+        .as_bytes(),
+    )
+}
+
+/// Open the thread the run is anchored in — where its card rides.
+fn open_the_runs_thread(frame: &Frame) -> Frame {
+    let Node::Button {
+        on_press: Some(open),
+        ..
+    } = node_ending(frame, "/2/contents/thread")
+    else {
+        panic!("no reply chip under the anchor: {:?}", texts(frame))
+    };
+    let frame = tick_native(vec![ducktape_view_guest::wire::Event::Message(*open)]);
+    let thread = request(&frame, "rpc.view").id;
+    let page = serde_json::json!({ "thread": {
+        "root": row(2, "second wind"), "replies": [], "has_more": false,
+        "next_reply_seq": null,
+    }})
+    .to_string()
+    .into_bytes();
+    tick_native(vec![answer(thread, &page)])
 }
 
 /// Boots and hands the view its session: the frame it answers with, and the id
@@ -847,55 +941,34 @@ fn the_channel_list_and_details_drawer_drag_with_horizontal_cursors() {
 }
 
 /// A RUN IN FLIGHT IS A REPLY BEING WRITTEN, AND STOP LEAVES AS A CANCEL. The
-/// run lives in the app's process, not on the chain, so it reaches the view as
-/// a session fact; the timeline shows it the way it shows any thread — the
-/// reply chip under the message that summoned it, counting the answer to come
-/// — and never the run's card. Inside the thread the card rides at the tail,
-/// once, with its controls; Stop submits a guest-authored cancellation through
-/// the common signing contract. A run the app's reading no longer holds takes its card with
-/// it.
+/// view discovers the runs anchored in chat itself — nothing is pushed to it
+/// and nothing about a run is folded for it — and the timeline shows one the
+/// way it shows any thread: the reply chip under the message that summoned
+/// it, counting the answer to come, and never the run's card. Inside the
+/// thread the card rides at the tail, once, with its controls; Stop submits a
+/// guest-authored cancellation through the common signing contract. A run the
+/// next reading no longer names takes its card with it.
 #[test]
 fn a_live_run_opens_its_thread_and_stop_leaves_as_a_cancel() {
     on_a_deep_stack(|| {
-        let mut other_room = live_run("otherduck", "Working elsewhere");
-        other_room.channel_id = "channel-b".into();
-        let seated = Session {
-            live_agents: vec![live_run("chiefduck", "Reading the repo"), other_room],
-            ..session(true)
-        };
-        let (frame, _, props) = connected_room_with(&seated, roots());
+        let (frame, _, clock) = room_with_a_pending_run();
         assert!(
             has_text(&frame, "1 reply"),
             "the run is not counted as the anchor's reply: {:?}",
             texts(&frame)
         );
         assert!(
-            !has_text(&frame, "Reading the repo"),
+            !has_text(&frame, "Starting"),
             "the run's card leaked into the timeline: {:?}",
             texts(&frame)
         );
 
         // the chip opens the thread the run is anchored in, and the replies
         // are a read of their own
-        let Node::Button {
-            on_press: Some(open),
-            ..
-        } = node_ending(&frame, "/2/contents/thread")
-        else {
-            panic!("no reply chip under the anchor: {:?}", texts(&frame))
-        };
-        let frame = tick_native(vec![ducktape_view_guest::wire::Event::Message(*open)]);
-        let thread = request(&frame, "rpc.view").id;
-        let page = serde_json::json!({ "thread": {
-            "root": row(2, "second wind"), "replies": [], "has_more": false,
-            "next_reply_seq": null,
-        }})
-        .to_string()
-        .into_bytes();
-        let frame = tick_native(vec![answer(thread, &page)]);
+        let frame = open_the_runs_thread(&frame);
         let cards = texts(&frame)
             .iter()
-            .filter(|text| *text == "Reading the repo")
+            .filter(|text| *text == "Starting")
             .count();
         assert_eq!(cards, 1, "one run card, in the thread: {:?}", texts(&frame));
 
@@ -931,17 +1004,125 @@ fn a_live_run_opens_its_thread_and_stop_leaves_as_a_cancel() {
             "cancellation must not reset the message editor or reload the room"
         );
 
-        // THE RUN SETTLED: the app's reading no longer holds it, so the card
-        // goes with it.
-        let frame = tick_native(vec![item(props, &encoded(&session(true)))]);
+        // THE RUN SETTLED: the next poll of the anchored runs no longer names
+        // it, so the card goes with it.
+        let frame = tick_native(vec![item(clock, b"")]);
+        let poll = query_asking(&frame, "pending_runs").id;
+        let none = serde_json::json!({ "pending_runs": [] })
+            .to_string()
+            .into_bytes();
+        let frame = tick_native(vec![answer(poll, &none)]);
         let shown = texts(&frame);
         assert!(
-            !shown.iter().any(|text| text == "Reading the repo"),
+            !shown.iter().any(|text| text == "Starting"),
             "the settled run left its status behind: {shown:?}"
         );
         assert!(
             !shown.iter().any(|text| text == "Stop"),
             "the settled run left its Stop behind: {shown:?}"
+        );
+    });
+}
+
+/// A VIEW SWAP CHANGES HOW A RUNNING AGENT'S OUTPUT RENDERS. The lines the
+/// node streams are not rows: they are a provider's raw events, and what a
+/// card says about them — "Using Bash" over a tool call, the answer as it is
+/// written — is folded HERE, by the deployed view, off a stream it opened
+/// itself. Swap this view and the same bytes on the same stream render
+/// differently; nothing on the host decides any of it.
+#[test]
+fn the_run_card_is_folded_from_the_output_this_view_streams() {
+    on_a_deep_stack(|| {
+        let (frame, stream, _) = room_with_a_pending_run();
+        let frame = open_the_runs_thread(&frame);
+        assert!(
+            has_text(&frame, "Starting"),
+            "a run with no output yet says only that it started: {:?}",
+            texts(&frame)
+        );
+
+        // a tool call: the card names the activity, never its arguments
+        let frame = tick_native(vec![output_line(
+            stream,
+            serde_json::json!({
+                "type": "assistant",
+                "message": { "content": [
+                    { "type": "tool_use", "name": "Bash",
+                      "input": { "command": "cat /etc/shadow" } }
+                ]},
+            }),
+        )]);
+        let shown = texts(&frame);
+        assert!(
+            shown.iter().any(|text| text == "Using Bash"),
+            "the stream did not change what the card says: {shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|text| text.contains("/etc/shadow")),
+            "the tool's arguments reached the card: {shown:?}"
+        );
+
+        // the answer as it is written, on the same stream
+        let frame = tick_native(vec![output_line(
+            stream,
+            serde_json::json!({ "type": "result", "result": "the repo builds clean" }),
+        )]);
+        let shown = texts(&frame);
+        assert!(
+            shown.iter().any(|text| text == "the repo builds clean"),
+            "the answer never reached the card: {shown:?}"
+        );
+        assert!(
+            shown.iter().any(|text| text == "Answering"),
+            "the card kept the tool status after the answer: {shown:?}"
+        );
+    });
+}
+
+/// A DEVICE THE RUN'S OUTPUT IS NOT ADDRESSED TO STILL GETS A CARD. The node
+/// admits the key that asked for the run and refuses every other reader; that
+/// is an entitlement, not a failure, so the card keeps its agent and its
+/// anchor and says what the run has COMMITTED instead — never the refusal,
+/// and never the output it may not read.
+#[test]
+fn a_refused_output_stream_falls_back_to_committed_progress() {
+    on_a_deep_stack(|| {
+        let (frame, stream, _) = room_with_a_pending_run();
+        open_the_runs_thread(&frame);
+        // the node's own refusal, on the stream rather than in it
+        let frame = tick_native(vec![item(
+            stream,
+            serde_json::json!({ "type": "error", "detail": "401 Unauthorized" })
+                .to_string()
+                .as_bytes(),
+        )]);
+
+        // refused, so the view reads the public facts of that run instead
+        let sessions = query_asking(&frame, "agent_sessions").id;
+        let frame = tick_native(vec![answer(
+            sessions,
+            serde_json::json!({ "agent_sessions": [
+                { "run_id": CHIEF_RUN, "actions": 3 }
+            ]})
+            .to_string()
+            .as_bytes(),
+        )]);
+        let delegations = query_asking(&frame, "delegations").id;
+        let frame = tick_native(vec![answer(
+            delegations,
+            serde_json::json!({ "delegations": [] })
+                .to_string()
+                .as_bytes(),
+        )]);
+
+        let shown = texts(&frame);
+        assert!(
+            shown.iter().any(|text| text == "Working · 3 actions recorded"),
+            "the refused card does not show committed progress: {shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|text| text.contains("401")),
+            "the entitlement refusal was drawn as an error: {shown:?}"
         );
     });
 }
@@ -994,7 +1175,7 @@ fn a_landing_reveals_the_row_it_named_and_a_menu_does_not() {
         };
         let window = around(&[row(1, "first light"), row(2, "second wind")]);
         let (frame, _) = seated_view(&landed);
-        let names = request(&frame, "rpc.query").id;
+        let names = query_asking(&frame, "identity").id;
         let frame = tick_native(vec![answer(names, &accounts())]);
         let record = view_asking(&frame, "channel").id;
         let frame = tick_native(vec![answer(record, &channel_record())]);
@@ -1058,7 +1239,7 @@ fn a_landing_on_a_reply_reveals_it_inside_the_rail() {
         let mut rows = vec![root.clone()];
         rows.extend(replies.iter().cloned());
         let (frame, _) = seated_view(&landed);
-        let names = request(&frame, "rpc.query").id;
+        let names = query_asking(&frame, "identity").id;
         let frame = tick_native(vec![answer(names, &accounts())]);
         let record = view_asking(&frame, "channel").id;
         let frame = tick_native(vec![answer(record, &channel_record())]);
@@ -1113,7 +1294,7 @@ fn landed_general(head_seq: u64) -> Frame {
     .to_string()
     .into_bytes();
     let (frame, _) = seated_view(&landed);
-    let names = request(&frame, "rpc.query").id;
+    let names = query_asking(&frame, "identity").id;
     let frame = tick_native(vec![answer(names, &accounts())]);
     let channel = view_asking(&frame, "channel").id;
     let frame = tick_native(vec![answer(channel, &record)]);

@@ -1,6 +1,6 @@
 //! Provider output interpretation and live run presentation.
 
-use crate::host::{LiveActivity, LiveRun, LiveRunHint};
+use crate::host::{LiveActivity, LiveRun, LiveSeed};
 
 /// Select chat-anchored runs and cache the deployed product's agent names.
 pub(crate) async fn discover(
@@ -100,26 +100,28 @@ fn public_run_progress(
     })
 }
 
-/// Interpret the authorized output in the deployed view, not in the host.
+/// What a reader who may not see a run's output is told about it, from the
+/// committed facts [`progress`] returned for that run.
+pub(crate) fn public_status(run_id: &str, progress: &serde_json::Value) -> String {
+    public_run_status(run_id, progress.get("sessions"), progress.get("delegations"))
+}
+
+/// A card, from the run discovery named and the output this view streamed.
 ///
-/// The hint is taken apart here and only what this reads of it goes on: the
-/// destructuring is what makes a field added to the payload a field this
+/// The seed is taken apart here and only what this reads of it goes on: the
+/// destructuring is what makes a field added to discovery a field this
 /// function has to decide about, rather than one that rides into the state.
-pub(crate) fn project(hint: LiveRunHint) -> LiveRun {
-    let LiveRunHint {
-        public_progress,
-        output,
-        output_error,
+/// Everything a card SAYS comes from the output — what a run has done and is
+/// writing is not a chain fact, and no host folds it for this view.
+pub(crate) fn project(seed: &LiveSeed, output: &[String], output_error: &str) -> LiveRun {
+    let LiveSeed {
         channel_id,
         anchor_seq,
         thread_root,
         run_id,
         dispatch_id,
         agent,
-        status,
-        activity,
-        answer_preview,
-    } = hint;
+    } = seed.clone();
     let mut row = LiveRun {
         channel_id,
         anchor_seq,
@@ -127,23 +129,10 @@ pub(crate) fn project(hint: LiveRunHint) -> LiveRun {
         run_id,
         dispatch_id,
         agent,
-        status,
-        activity,
-        answer_preview,
+        status: "Starting".into(),
+        activity: Vec::new(),
+        answer_preview: String::new(),
     };
-    // A reader the run's output is not addressed to is told what it
-    // committed instead, and that is the whole status.
-    if let Some(progress) = public_progress {
-        row.status = public_run_status(
-            &row.run_id,
-            progress.get("sessions"),
-            progress.get("delegations"),
-        );
-        return row;
-    }
-    if row.status.is_empty() {
-        row.status = "Starting".into();
-    }
     for (id, line) in output.iter().enumerate() {
         // Pending runs do not identify the worker. The parser recognizes
         // distinct provider shapes; Claude enables its assistant/result forms.
@@ -153,7 +142,7 @@ pub(crate) fn project(hint: LiveRunHint) -> LiveRun {
     }
     let failed = !output_error.is_empty();
     if failed {
-        row.status = output_error;
+        row.status = output_error.to_owned();
     }
     row
 }
@@ -439,18 +428,12 @@ mod tests {
     #[test]
     fn raw_output_is_presented_by_the_guest_and_transport_errors_remain_visible() {
         let line = serde_json::json!({"type": "result", "result": "answer"}).to_string();
-        let observed = LiveRunHint {
-            status: "Starting".into(),
-            output: vec![line],
-            ..Default::default()
-        };
-        let rendered = project(observed.clone());
+        let seed = LiveSeed::default();
+        let output = vec![line];
+        let rendered = project(&seed, &output, "");
         assert_eq!(rendered.answer_preview, "answer");
         assert_eq!(rendered.status, "Answering");
-        let failed = project(LiveRunHint {
-            output_error: "connection failed".into(),
-            ..observed
-        });
+        let failed = project(&seed, &output, "connection failed");
         assert_eq!(failed.answer_preview, "answer");
         assert_eq!(failed.status, "connection failed");
     }

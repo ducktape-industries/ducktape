@@ -1107,11 +1107,11 @@ fn application_stream(guest: &mut Guest, id: u64, payload: &[u8]) {
     ));
 }
 
-/// The node's own event socket for ONE topic, proven with the SEATED key:
-/// the signature rides the upgrade, over the same path the request carries,
-/// and the node admits or refuses this key for that topic before the socket
-/// exists. Nothing here is per-topic — the app's run-output watcher presents
-/// exactly this proof, and this is that door with the run taken out of it.
+/// The node's own event socket for ONE topic, proven with whichever
+/// credential THIS device holds: the 0600 workspace token when the node runs
+/// here, the seated key's signature on the upgrade otherwise. Either way the
+/// node admits or refuses the topic before the socket exists, and nothing
+/// here is per-topic — a view asks for a topic and gets its frames.
 async fn open_topic(
     rpc: &str,
     topic: &str,
@@ -1124,6 +1124,23 @@ async fn open_topic(
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
     use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+    // WHICH PROOF THIS DEVICE CAN MAKE, and it is the kernel's to make: a
+    // credential is a platform capability, never a view's. A device that
+    // hosts the node reads the 0600 link token out of its workspace and
+    // presents it on the subscribe FRAME, which works with the wallet
+    // locked; every other device signs the UPGRADE with the seated key, and
+    // the node admits it only for the runs that key created.
+    //
+    // TWO DEVICE ROLES, NOT TWO ERAS. This is not a compat dual path: the
+    // operator's own machine and a machine pointed at someone else's node
+    // hold different credentials, and neither can present the other's. The
+    // token is read and attached HERE — no view ever sees it, and nothing
+    // below logs the url or the token.
+    let workspace_token = crate::backend::workspace_at(rpc)
+        .and_then(|(_, workspace)| crate::backend::read_link_token(&workspace).ok());
+    if let Some(token) = workspace_token {
+        return open_with_token(rpc, topic, &token).await;
+    }
     let node_key = crate::backend::node_public_key(rpc).await?;
     let signed =
         crate::backend::seated_request_headers("GET", &format!("/v1/ws{query}"), &node_key, b"")
@@ -1152,6 +1169,43 @@ async fn open_topic(
         .await
         .map_err(|error| format!("could not open the node stream: {error}"))?;
     let subscribe = serde_json::json!({"op": "subscribe", "topics": [topic]});
+    socket
+        .send(Message::Text(subscribe.to_string()))
+        .await
+        .map_err(|error| format!("could not subscribe to the node stream: {error}"))?;
+    Ok(socket)
+}
+
+/// The workspace-token half of [`open_topic`]: no signature on the upgrade,
+/// the token rides the subscribe frame instead — and so does the topic, which
+/// is why this arm has no query string to carry. A device holding the node's
+/// own 0600 token is the node's operator, so this path does not need — and
+/// must not wait for — an unlocked wallet.
+async fn open_with_token(
+    rpc: &str,
+    topic: &str,
+    token: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    String,
+> {
+    use futures::SinkExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(MAX_STREAM_FRAME_BYTES),
+        max_frame_size: Some(MAX_STREAM_FRAME_BYTES),
+        ..Default::default()
+    };
+    let (mut socket, _) = tokio_tungstenite::connect_async_with_config(
+        crate::backend::agent_ws_url(rpc),
+        Some(config),
+        // Nagle off, for the reason `open_topic` states: one committed event
+        // per frame, never coalesced.
+        true,
+    )
+    .await
+    .map_err(|error| format!("could not open the node stream: {error}"))?;
+    let subscribe = serde_json::json!({"op": "subscribe", "topics": [topic], "token": token});
     socket
         .send(Message::Text(subscribe.to_string()))
         .await

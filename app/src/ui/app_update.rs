@@ -193,7 +193,6 @@ impl Ducktape {
             AppMessage::VoiceJoined(id) => self.on_voice_joined(id),
             AppMessage::ChatUpdated(next) => self.on_chat_updated(next),
             AppMessage::ChatLoadFailed(cause) => self.on_chat_load_failed(cause),
-            AppMessage::LiveAgentsEvent(next) => self.on_live_agents_event(next),
             AppMessage::OpenMessageLink(url) => self.on_open_message_link(url),
             AppMessage::CopyChordPressed(event) => self.on_copy_chord_pressed(event),
             AppMessage::ChatViewEvent(event) => self.on_chat_view_event(event),
@@ -2246,7 +2245,6 @@ impl Ducktape {
             SettingsIntent::Lock => {
                 self.password = "".to_owned();
                 self.signer_key = "".to_owned();
-                self.live_agents = Vec::new();
                 (Task::perform(crate::backend::lock_signer(), |value| value))
                     .discard::<AppMessage>()
             }
@@ -2574,7 +2572,6 @@ impl Ducktape {
     fn on_settings_unlocked(&mut self, pubkey: String) -> Task<AppMessage> {
         self.error = "".to_owned();
         self.signer_key = pubkey.to_owned();
-        self.live_agents = Vec::new();
         Task::none()
     }
     fn on_settings_unlock_failed(&mut self, cause: crate::backend::AppError) -> Task<AppMessage> {
@@ -3280,19 +3277,6 @@ impl Ducktape {
         Task::none()
     }
 
-    fn on_live_agents_event(&mut self, next: crate::backend::LiveAgentNotice) -> Task<AppMessage> {
-        if crate::backend::live_agents_stale(
-            &(next),
-            &self.connected_rpc,
-            &self.network_chain_id,
-            self.connect_generation,
-            &self.signer_key,
-        ) {
-            return Task::none();
-        }
-        self.live_agents = next.rows.clone();
-        Task::none()
-    }
     fn on_open_message_link(&mut self, url: String) -> Task<AppMessage> {
         if (url).is_empty() {
             return Task::none();
@@ -3685,7 +3669,6 @@ impl Ducktape {
         self.onboarding_error = "".to_owned();
         self.wallet_opening_status = "Checking network account…";
         self.signer_key = pubkey.to_owned();
-        self.live_agents = Vec::new();
         Task::batch([
             {
                 let pending_task = Task::perform(
@@ -3799,7 +3782,6 @@ impl Ducktape {
     fn on_phrase_confirmed(&mut self, pubkey: String) -> Task<AppMessage> {
         self.onboarding_error = "".to_owned();
         self.signer_key = pubkey.to_owned();
-        self.live_agents = Vec::new();
         Task::batch([
             {
                 let pending_task = Task::perform(
@@ -3899,7 +3881,6 @@ impl Ducktape {
         self.secrets.clear("restore_words");
         self.onboarding_error = "".to_owned();
         self.signer_key = pubkey.to_owned();
-        self.live_agents = Vec::new();
         Task::batch([
             {
                 let pending_task = Task::perform(
@@ -4642,7 +4623,6 @@ impl Ducktape {
         self.hub_wallets = Vec::new();
         self.hub_wallet_selected = "".to_owned();
         self.signer_key = "".to_owned();
-        self.live_agents = Vec::new();
         Task::batch([
             crate::shell::close::<AppMessage>(crate::backend::window_target(self.console_win)),
             crate::shell::close::<AppMessage>(crate::backend::window_target(self.huddle_win)),

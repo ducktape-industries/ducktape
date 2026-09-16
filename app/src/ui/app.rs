@@ -290,7 +290,6 @@ pub struct Ducktape {
     pub(crate) active_channel_name: String,
     pub(crate) active_channel_archived: bool,
     pub(crate) chat_land_seq: i64,
-    pub(crate) live_agents: Vec<crate::backend::LiveAgentRow>,
     pub(crate) chat_copy_chord_serial: i64,
     pub(crate) chat_chain_id: String,
     pub(crate) dm_peers_generation: i64,
@@ -539,7 +538,6 @@ pub(crate) enum AppMessage {
     VoiceJoined(String),
     ChatUpdated(crate::backend::ChatData),
     ChatLoadFailed(crate::backend::HydrationError),
-    LiveAgentsEvent(crate::backend::LiveAgentNotice),
     OpenMessageLink(String),
     CopyChordPressed(crate::shell::KeyPress),
     ChatViewEvent(crate::module_view::ModuleViewEvent),
@@ -727,7 +725,6 @@ impl Ducktape {
             active_channel_name: "".to_owned(),
             active_channel_archived: false,
             chat_land_seq: 0,
-            live_agents: Vec::new(),
             chat_copy_chord_serial: 0,
             chat_chain_id: "".to_owned(),
             dm_peers_generation: 0,
@@ -858,25 +855,6 @@ impl Ducktape {
                 })
                 .map(AppMessage::NodeStatusPushed),
             );
-            subscriptions.push(
-                Subscription::run_with(
-                    (
-                        self.connected_rpc.clone(),
-                        self.network_chain_id.clone(),
-                        self.connect_generation,
-                        self.signer_key.clone(),
-                    ),
-                    |data: &(String, String, i64, String)| {
-                        crate::backend::chat_live_agents(
-                            data.0.clone(),
-                            data.1.clone(),
-                            data.2,
-                            data.3.clone(),
-                        )
-                    },
-                )
-                .map(AppMessage::LiveAgentsEvent),
-            );
         }
         let active_call = self.connected && self.huddle_joined && !self.huddle_channel.is_empty();
         if active_call {
@@ -916,8 +894,10 @@ impl Ducktape {
         (state, task)
     }
 
+    /// A connected app on the Chat tab with a seat taken: what a test needs
+    /// to watch the seat move.
     #[cfg(test)]
-    pub(crate) fn fixture_live_agent_session() -> (Self, Task<AppMessage>) {
+    pub(crate) fn fixture_seated_chat_session() -> (Self, Task<AppMessage>) {
         let mut state = Self::initial_state();
         state.connected = true;
         state.connected_rpc = "http://127.0.0.1:8844".to_owned();
@@ -925,14 +905,6 @@ impl Ducktape {
         state.connect_generation = 7;
         state.signer_key = "aa11".to_owned();
         state.shell_tab = ShellTab::Chat;
-        state.live_agents = vec![crate::backend::LiveAgentRow {
-            channel_id: "channel-a".to_owned(),
-            anchor_seq: 2,
-            run_id: "chat:2:agent-1".to_owned(),
-            agent: "Chief Duck".to_owned(),
-            status: "Reading the repo".to_owned(),
-            ..Default::default()
-        }];
         (state, Task::none())
     }
     #[cfg(test)]
@@ -987,39 +959,30 @@ mod state_tests {
         );
         assert_eq!(state.appearance, Appearance::Dark);
     }
+    /// THE SEAT STILL MOVES ON AN UNLOCK IN PLACE — what a new key may read
+    /// is the chat view's fold now, so what is pinned here is the fact the
+    /// view keys on: the seat this app reports.
     #[test]
-    fn an_unlock_in_place_drops_the_previous_keys_live_rows() {
-        let (mut state, _) = Ducktape::fixture_live_agent_session();
-        let actual = !(state.live_agents).is_empty();
-        assert!(actual);
+    fn an_unlock_in_place_moves_the_seat() {
+        let (mut state, _) = Ducktape::fixture_seated_chat_session();
         let reply_message = AppMessage::SettingsUnlocked("bb22".to_owned());
         dispatch(&mut state, reply_message);
-        let actual = state.signer_key.to_owned();
-        let expected = "bb22".to_owned();
-        assert_eq!(actual, expected);
-        let actual = (state.live_agents).is_empty();
-        assert!(actual);
+        assert_eq!(state.signer_key, "bb22".to_owned());
     }
     #[test]
-    fn locking_the_seat_takes_the_private_output_with_it() {
-        let (mut state, _) = Ducktape::fixture_live_agent_session();
-        let actual = !(state.live_agents).is_empty();
-        assert!(actual);
+    fn locking_the_seat_takes_the_key_and_the_password_with_it() {
+        let (mut state, _) = Ducktape::fixture_seated_chat_session();
         let reply_message = AppMessage::SettingsViewEvent(crate::module_view::view_event(
             "lock".to_owned(),
             "".to_owned(),
         ));
         dispatch(&mut state, reply_message);
-        let actual = (state.signer_key).is_empty();
-        assert!(actual);
-        let actual = (state.password).is_empty();
-        assert!(actual);
-        let actual = (state.live_agents).is_empty();
-        assert!(actual);
+        assert!((state.signer_key).is_empty());
+        assert!((state.password).is_empty());
     }
     #[tokio::test]
     async fn a_chat_address_opened_from_another_tab_lands_on_the_chat_tab() {
-        let (mut state, _) = Ducktape::fixture_live_agent_session();
+        let (mut state, _) = Ducktape::fixture_seated_chat_session();
         let reply_message = AppMessage::SelectShellTab(ShellTab::Agents);
         dispatch(&mut state, reply_message);
         let actual = state.shell_tab;
