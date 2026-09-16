@@ -765,22 +765,33 @@ fn project_workload_succeeds_with_production_guest_limits() {
 // CASE 13: the per-op object-read consensus cap — ONE BOUND, BOTH RUNTIMES
 // ============================================================================
 
-/// one commit of `count` distinct inline documents of `body` bytes each, into a
-/// directory of its own (so no row can collide with another row's paths and
-/// refuse on the per-path CAS instead of the budget under test), base=None.
-/// each distinct body stages a chunk and a fileobj — two distinct `object-stat`
-/// probes — and the rewritten trees are staged, not probed, so the op charges
-/// EXACTLY `2 * count` against the cap.
-fn import_of(dir: &str, count: usize, body: usize) -> Msg {
-    let changes = (0..count)
+/// one commit of `count` distinct inline documents of `body` bytes each, named
+/// `first..first + count` under `/shared/<dir>/`. a row picks a directory of its
+/// own, or a `first` past what a previous row wrote, so no row collides with
+/// another row's paths and refuses on the per-path CAS instead of the budget
+/// under test. each distinct body stages a chunk and a fileobj — two distinct
+/// `object-stat` probes — and the rewritten trees are staged, not probed, so the
+/// op charges `2 * count` for its documents, plus [`HEAD_SPINE_READS`] when
+/// `base`/the effective head is a real snapshot rather than the empty tree.
+fn import_of(base: Option<&str>, dir: &str, first: usize, count: usize, body: usize) -> Msg {
+    let changes = (first..first + count)
         .map(|index| {
             let mut bytes = format!("document {index:06}\n").into_bytes();
             bytes.resize(body, b'x');
             put_inline(&format!("/shared/{dir}/{index:06}.txt"), &bytes)
         })
         .collect();
-    commit_op(None, "import", changes)
+    commit_op(base, "import", changes)
 }
+
+/// what a commit spends on the tree it lands on, BEFORE it charges a single
+/// document: the effective head snapshot object, then one `object-get` per
+/// pre-existing directory on the spine of `/shared/<dir>/<name>` — the root
+/// tree, `/shared`, and `/shared/<dir>`. the base snapshot and its spine resolve
+/// to those same ids and dedupe, and the count does not move with the document
+/// count or with how many entries the directory already holds, so it is a flat
+/// per-commit constant on top of the 2 reads each document costs.
+const HEAD_SPINE_READS: usize = 4;
 
 /// the distinct-object-read cap ([`MAX_OBJECT_READS_PER_OP`]) is a FILES
 /// CONSENSUS RULE single-sourced in `duckfs-core`, and a cap is only one bound
@@ -797,6 +808,15 @@ fn import_of(dir: &str, count: usize, body: usize) -> Msg {
 /// the most expensive commit the other
 /// budgets admit AT the cap: cap/2 documents whose bodies together fill
 /// [`MAX_INLINE_COMMIT_BYTES`] exactly. it sits on both ceilings at once.
+///
+/// there are TWO accept rows because there are two shapes, and the one users
+/// meet is the second. cap/2 documents is what an EMPTY tree admits: there is no
+/// spine to walk, so the whole budget goes to documents. every commit after the
+/// first lands on an existing head and pays [`HEAD_SPINE_READS`] off the top, so
+/// its bound is `(cap - HEAD_SPINE_READS) / 2` = 126 documents — asserted here on
+/// the head the genesis row just created, together with the reject one document
+/// past it. without that pair the accept half of the matrix only ever holds for
+/// the one commit in a network's life that has no head.
 ///
 /// the reject rows climb from one read over the cap to 16x it — the band where
 /// native used to accept alone. all of them are refused by both runtimes with
@@ -815,8 +835,9 @@ fn object_read_cap_is_one_bound_on_both_runtimes() {
     let genesis = all_roots(&native);
     assert_eq!(genesis, all_roots(&wasm), "genesis roots diverge");
 
-    // [accept] exactly the cap, with the inline budget spent too.
-    let at_cap_op = import_of("at-cap", at_cap, saturating_body);
+    // [accept] exactly the cap, with the inline budget spent too. base=None onto
+    // an empty tree: the genesis shape, where nothing but documents is charged.
+    let at_cap_op = import_of(None, "at-cap", 0, at_cap, saturating_body);
     block_on(native.submit_at(block(1, Origin::System), at_cap_op.clone()))
         .expect("native commits the whole object-read budget");
     block_on(wasm.submit_at(block(1, Origin::System), at_cap_op))
@@ -834,7 +855,7 @@ fn object_read_cap_is_one_bound_on_both_runtimes() {
         let height = index as u64 + 2;
         // 64-byte bodies keep even the 16x row inside MAX_INLINE_COMMIT_BYTES,
         // so the object-read cap is the bound under test, not the inline budget.
-        let op = import_of(&format!("over-cap-{count}"), count, 64);
+        let op = import_of(None, &format!("over-cap-{count}"), 0, count, 64);
         let native_err = block_on(native.submit_at(block(height, Origin::System), op.clone()))
             .expect_err("native rejects past the object-read cap");
         let wasm_err = block_on(wasm.submit_at(block(height, Origin::System), op))
@@ -852,6 +873,59 @@ fn object_read_cap_is_one_bound_on_both_runtimes() {
             "wasm root moved on reject at {count} documents"
         );
     }
+
+    // [accept] the same cap onto an EXISTING head — the shape every commit after
+    // the first one has. the head snapshot and the directory spine this commit
+    // rewrites are charged before a single document is, so the SAME cap carries
+    // fewer documents here than at genesis: 126 into a directory that already
+    // holds some, not 128. the bodies spend the inline budget too, so this row
+    // sits on both ceilings exactly as the genesis row does.
+    let onto_head = (MAX_OBJECT_READS_PER_OP - HEAD_SPINE_READS) / 2;
+    let onto_head_body = MAX_INLINE_COMMIT_BYTES / onto_head;
+    let head_hex = head(&native);
+    assert_eq!(
+        head_hex,
+        head(&wasm),
+        "heads diverge before the onto-head row"
+    );
+    let onto_head_op = import_of(Some(&head_hex), "at-cap", at_cap, onto_head, onto_head_body);
+    block_on(native.submit_at(block(7, Origin::System), onto_head_op.clone()))
+        .expect("native commits the whole object-read budget onto an existing head");
+    block_on(wasm.submit_at(block(7, Origin::System), onto_head_op))
+        .expect("the guest must REACH the cap onto an existing head, not only onto an empty tree");
+    let extended = all_roots(&native);
+    assert_eq!(extended, all_roots(&wasm), "onto-head roots diverge");
+    assert_ne!(
+        extended, committed,
+        "the onto-head commit must actually land"
+    );
+
+    // [reject] one document past that bound is one read past the cap, refused by
+    // both runtimes. 64-byte bodies keep it well inside MAX_INLINE_COMMIT_BYTES,
+    // so the object-read cap is what refuses it and not the inline budget.
+    let over_bound_op = import_of(
+        Some(&head(&native)),
+        "at-cap",
+        at_cap + onto_head,
+        onto_head + 1,
+        64,
+    );
+    let native_err = block_on(native.submit_at(block(8, Origin::System), over_bound_op.clone()))
+        .expect_err("native rejects one document past the onto-head bound");
+    let wasm_err = block_on(wasm.submit_at(block(8, Origin::System), over_bound_op))
+        .expect_err("wasm rejects one document past the onto-head bound");
+    assert_module_reject("native", 8, &native_err, "object-read budget");
+    assert_module_reject("wasm", 8, &wasm_err, "object-read budget");
+    assert_eq!(
+        all_roots(&native),
+        extended,
+        "native root moved on the onto-head reject"
+    );
+    assert_eq!(
+        all_roots(&wasm),
+        extended,
+        "wasm root moved on the onto-head reject"
+    );
 }
 
 /// a deterministic module rejection whose reason CONTAINS `needle` — the wasm
@@ -1469,8 +1543,9 @@ fn files_cost_by_object_size_and_query_result_size() {
     let mut wasm = wasm_host(&dir);
     // 256 entries take four commits: one op gets MAX_OBJECT_READS_PER_OP reads,
     // each distinct document costs two of them (chunk + fileobj), and every
-    // commit past the first also re-reads the path trees it rewrites — so a
-    // batch of cap/2 documents overruns the cap by those few reads.
+    // commit past the first also spends HEAD_SPINE_READS on the head snapshot
+    // and the path trees it rewrites — so its bound is 126 documents and a batch
+    // of cap/2 overruns the cap by exactly those four reads.
     let per_commit = MAX_OBJECT_READS_PER_OP / 4;
     let mut base: Option<String> = None;
     for (batch, first) in (0..256usize).step_by(per_commit).enumerate() {

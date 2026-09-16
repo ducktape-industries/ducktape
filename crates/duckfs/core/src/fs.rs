@@ -1938,6 +1938,75 @@ mod object_read_budget {
         fs.committed_head_for_test().expect("head present")
     }
 
+    /// one document inside `/shared/docs`, committed and adopted — the smallest
+    /// state that gives a FOLLOW-UP commit what every commit after the first one
+    /// has: a head snapshot to read and a three-tree spine (the root, `/shared`,
+    /// `/shared/docs`) to walk. returns the committed head hex.
+    fn seed_one_doc(fs: &mut Fs<MemStore>) -> String {
+        fs.commit(
+            &crate::Authority::System,
+            1,
+            1,
+            None,
+            "seed".into(),
+            vec![put_inline("/shared/docs/seed", b"seed")],
+        )
+        .expect("seed commits");
+        commit_block(fs);
+        fs.committed_head_for_test().expect("head present")
+    }
+
+    /// `count` fresh documents into the already-existing `/shared/docs`, based on
+    /// and landing on the head `seed_one_doc` left, under a shrunk `cap`.
+    fn commit_onto_head(count: usize, cap: usize) -> Result<(), String> {
+        let mut fs = new_fs();
+        let head = seed_one_doc(&mut fs);
+        fs.set_object_read_budget_for_tests(cap);
+        let changes = (0..count)
+            .map(|i| {
+                put_inline(
+                    &format!("/shared/docs/add{i}"),
+                    format!("body {i}").as_bytes(),
+                )
+            })
+            .collect();
+        fs.commit(
+            &crate::Authority::System,
+            2,
+            2,
+            Some(head),
+            "add".into(),
+            changes,
+        )
+        .map(|_| ())
+    }
+
+    /// the per-commit constant that makes the cap's accept row DIFFERENT once a
+    /// head exists, pinned exactly: N documents into one already-existing
+    /// `/shared/<dir>` cost `2 * N + 4` distinct committed reads — two
+    /// `object-stat` probes per document (its chunk and its fileobj), plus the
+    /// effective head snapshot and the three directory trees on the spine the
+    /// commit rewrites. the base snapshot and its spine resolve to those same
+    /// ids and dedupe, and the spine gets dedupe across every path in the op, so
+    /// the 4 does not move with N. driven from BOTH sides — the op fits in
+    /// exactly `2 * N + 4` and is refused by one read less — because that is what
+    /// makes the production bound `(MAX_OBJECT_READS_PER_OP - 4) / 2` = 126
+    /// documents onto an existing head, not the 128 an empty tree admits.
+    #[test]
+    fn a_commit_onto_an_existing_head_costs_two_reads_per_document_plus_four() {
+        const DOCUMENTS: usize = 2;
+        const SPINE_READS: usize = 4;
+        let exact = 2 * DOCUMENTS + SPINE_READS;
+
+        commit_onto_head(DOCUMENTS, exact).expect("the op must fit in exactly 2N + 4 reads");
+        let err = commit_onto_head(DOCUMENTS, exact - 1)
+            .expect_err("one read less must refuse the very same op");
+        assert!(
+            err.contains("object-read budget"),
+            "reason must carry the shared needle, got: {err}"
+        );
+    }
+
     /// a commit whose committed-store reads exceed the cap is REJECTED with the
     /// stable `object-read budget` reason, and the committed root does NOT move —
     /// the native half of the both-runtimes proof (`wasm_files_parity` pins the

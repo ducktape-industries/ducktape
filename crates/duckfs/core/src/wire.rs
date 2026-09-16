@@ -54,6 +54,18 @@ pub const MAX_CHANGES_PER_COMMIT: usize = 4096;
 /// traps above it, which `wasm_files_parity` drives on the real component from
 /// both runtimes.
 ///
+/// cap/2 documents is the GENESIS shape, and only that: an empty tree has no
+/// spine to walk. every commit after the first also charges the effective head
+/// snapshot plus each pre-existing directory tree on the spine of the paths it
+/// writes. those gets dedupe across the whole op, so they are a per-commit
+/// CONSTANT — it grows with the depth and the spread of the written paths, never
+/// with the document count and never with how many entries those directories
+/// already hold. for the ordinary shape, N documents into one existing
+/// `/shared/<dir>`, the constant is 4 (the head snapshot, then the root tree,
+/// `/shared` and `/shared/<dir>`), so such a commit carries (cap - 4) / 2 = 126
+/// documents and is refused at 127. `wasm_files_parity` drives that accept row
+/// and its one-document-over reject beside the genesis pair.
+///
 /// it must also stay within the wasm kernel's per-dispatch object-plane budget
 /// (`wasm_host::MAX_OBJECT_READS`) — the outer bound the kernel itself enforces
 /// — and the core counts EXACTLY what the kernel counts: the distinct
