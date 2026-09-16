@@ -184,7 +184,7 @@ pub(crate) fn headless_context() -> HeadlessAppContext {
 fn live_chat_batches_take_one_shipping_app_message() {
     let body = crate::tests::handler_body("LiveUpdated");
     assert_eq!(body.matches("matchnext.kind").count(), 1);
-    for variant in ["Retry", "Tip", "Ready", "Chat", "Bell", "Plane", "Resync"] {
+    for variant in ["Retry", "Tip", "Ready", "Chat", "Plane", "Resync"] {
         assert_eq!(body.matches(&format!("LiveKind::{variant}=>")).count(), 1);
     }
     assert_eq!(body.matches("fold_live_chat(").count(), 1);

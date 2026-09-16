@@ -25,7 +25,7 @@ pub(crate) use crate::DuckKind;
 // THE `?net=` FORMAT IS SPELLED ONCE, in the crate that also tokenizes a
 // `duck://` run out of prose — the app and the in-consensus producer
 // (`runs::inject`) are both readers of that one definition.
-use ::chat::client::{chain_digest, duck_net_query as net_query, is_chain_digest};
+use ::chat::client::{chain_digest, is_chain_digest};
 
 /// One classified link. Only the fields its `kind` names are meaningful;
 /// the rest are empty / zero.
@@ -173,32 +173,11 @@ pub fn foreign_network_error(link_net: String, connected_chain_id: String) -> St
     format!("this link belongs to network {link_net} — this app is on {here}")
 }
 
-/// `duck://page/<id>?net=…` — the only handle on a page, whose id is a uuid.
-pub fn duck_page_link(page: String, chain_id: String) -> String {
-    format!("duck://page/{page}{}", net_query(&chain_id))
-}
-
-/// `duck://run/<dispatch_id>?net=…` — one agent run, by the dispatch id that
-/// addresses it everywhere outside the runs module.
-pub fn duck_run_link(dispatch_id: String, chain_id: String) -> String {
-    format!("duck://run/{dispatch_id}{}", net_query(&chain_id))
-}
-
-/// `duck://forge/<repo>/<number>?net=…` — one tracker item, issue or PR.
-pub fn duck_forge_item_link(repo: String, number: i64, chain_id: String) -> String {
-    format!("duck://forge/{repo}/{number}{}", net_query(&chain_id))
-}
-
-/// `duck://forge/<repo>?net=…` — one repository.
-pub fn duck_forge_repo_link(repo: String, chain_id: String) -> String {
-    format!("duck://forge/{repo}{}", net_query(&chain_id))
-}
-
-/// `duck://channel/<id>?net=…#<seq>` — one message. The query precedes the
-/// fragment, as in every other URI.
-pub fn duck_channel_message_link(channel: String, seq: i64, chain_id: String) -> String {
-    format!("duck://channel/{channel}{}#{seq}", net_query(&chain_id))
-}
+// THE APP MINTS NO ADDRESSES. A `duck://` link names an object a module
+// owns, so its spelling belongs to that module's view (`chat`, `pages`,
+// `forge`, `home`, `inbox` each build their own). What is left here is the
+// READER: the app owns the one plane a link is opened on, so it owns
+// classifying and resolving one.
 
 /// The `duck://` URL the OS launched this process with, or "" for a plain
 /// start. `xdg-open 'duck://forge/ducktape/1?net=…'` runs the `Exec=` line of
@@ -614,28 +593,25 @@ mod tests {
                 .is_empty()
         );
 
+        // The query every view appends when it mints an address. The app
+        // reads links rather than writing them, but both halves have to
+        // agree on the spelling, so the reader's tests pin the writer's.
+        use ::chat::client::duck_net_query;
+        assert_eq!(duck_net_query("mynet#d0cdf950"), "?net=d0cdf950");
         assert_eq!(
-            duck_page_link("p1".into(), "mynet#d0cdf950".into()),
-            "duck://page/p1?net=d0cdf950"
-        );
-        assert_eq!(
-            duck_page_link("p1".into(), "my#net#d0cdf950".into()),
-            "duck://page/p1?net=d0cdf950",
+            duck_net_query("my#net#d0cdf950"),
+            "?net=d0cdf950",
             "a name may carry a #; the minted separator is the last one"
         );
         assert_eq!(
-            duck_channel_message_link("general".into(), 42, "mynet#d0cdf950".into()),
-            "duck://channel/general?net=d0cdf950#42"
-        );
-        assert_eq!(
-            duck_page_link("p1".into(), String::new()),
-            "duck://page/p1",
+            duck_net_query(""),
+            "",
             "no chain id yet, no query — never a `?net=` naming nothing"
         );
         for built in [
-            duck_page_link("p1".into(), "mynet#d0cdf950".into()),
+            "duck://page/p1?net=d0cdf950".to_owned(),
             "duck://channel/c1?net=d0cdf950".into(),
-            duck_channel_message_link("c1".into(), 3, "mynet#d0cdf950".into()),
+            "duck://channel/c1?net=d0cdf950#3".into(),
         ] {
             let link = resolve_duck_link(built.clone(), "mynet#d0cdf950".into());
             assert_ne!(link.kind, DuckKind::Unknown, "{built} must round-trip");

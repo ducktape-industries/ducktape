@@ -375,7 +375,7 @@ async fn collect_ready_chat_updates(
 
 /// The complete chat-owned result of one live batch. Each list is folded
 /// once before the app assigns the result fields; no delta in
-/// the batch can wander through Pages, Bell, or Forge lifecycle reducers.
+/// the batch can wander through Pages, Inbox, or Forge lifecycle reducers.
 /// THE CHAT TAB'S TIMELINE IS NOT IN HERE. The Chat tab is a module-owned
 /// view on the kernel contract: it re-reads its own room on the same block
 /// this fold runs for. The app retains channel facts for navigation and the roster
@@ -521,39 +521,8 @@ pub(crate) async fn folded_update(
                 load_chat: false,
                 debounce: false,
                 chat: delta.into_iter().collect(),
-                bell: BellDelta::default(),
                 permit: LivePermit::default(),
             })
-        }
-        "inbox" => {
-            // Stream folds use the cached identity directory, with no RPC read.
-            let facts = ReaderFacts::current().await;
-            let key = facts.reader().key?;
-            let account = facts.names().account_of(&hex_encode(key))?;
-            let origin_kind = stream_origin_kind(&op.origin.kind);
-            let folded = inbox::client::delta_from_op(
-                &payload,
-                op.assigned.as_ref(),
-                origin_kind,
-                op.origin.id.as_deref(),
-                account,
-                "attribution",
-            );
-            match folded {
-                Ok(Some(bell)) => Some(LiveUpdate {
-                    kind: crate::LiveKind::Bell,
-                    status: format!("Live · block {height}"),
-                    height,
-                    module: "inbox".into(),
-                    load_chat: false,
-                    debounce: false,
-                    chat: Vec::new(),
-                    bell,
-                    permit: LivePermit::default(),
-                }),
-                Ok(None) => None,
-                Err(_) => None,
-            }
         }
         // THE RELOAD PLANES. No client fold exists for these modules and none
         // is worth writing: a validator set changes when someone joins, a
@@ -574,15 +543,6 @@ pub(crate) async fn folded_update(
         // and so does a registry-listed module (the only other id the lane
         // subscribes): its registered view re-reads its own plane.
         _ => Some(live_plane(module, height)),
-    }
-}
-
-fn stream_origin_kind(kind: &ducktape_rpc::StreamOriginKind) -> &'static str {
-    match kind {
-        ducktape_rpc::StreamOriginKind::External => "external",
-        ducktape_rpc::StreamOriginKind::Program => "program",
-        ducktape_rpc::StreamOriginKind::Module => "module",
-        ducktape_rpc::StreamOriginKind::System => "system",
     }
 }
 

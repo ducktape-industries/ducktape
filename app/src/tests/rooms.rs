@@ -423,7 +423,7 @@ fn no_view_names_the_nodes_link_token() {
 }
 
 /// Every `.rs` under `dir`, recursively — source only, never a build output.
-fn collect_rust_files(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+pub(crate) fn collect_rust_files(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read a source dir") {
         let path = entry.expect("dir entry").path();
         if path.is_dir() {

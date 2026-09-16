@@ -32,12 +32,18 @@ use super::view_artifact::{self, Frame};
 /// Why a frame could not be fetched and verified, as [`frame`] tells it.
 pub use super::view_artifact::Error as FetchError;
 
-/// The BUILT-IN tabs whose view is drawn by the module's own artifact: each
-/// has a `ShellTab` arm, a props builder and an intent decoder of its own,
-/// and is asked of the connected node at connect and again at every block
-/// that moves its deployment. Every other view off the node is a
-/// registry-listed `Kind::View` entry, seated from `module_status` alone.
-pub const MODULE_OWNED: [&str; 5] = ["governance", "files", "pages", "chat", "forge"];
+/// The BUILT-IN surfaces whose view is drawn by the module's own artifact:
+/// each has a props builder of its own and is asked of the connected node at
+/// connect and again at every block that moves its deployment. Every other
+/// view off the node is a registry-listed `Kind::View` entry, seated from
+/// `module_status` alone.
+///
+/// Most are tabs, with a `ShellTab` arm and an intent decoder each. `inbox`
+/// is not: it is the bell overlay's body, seated in the overlay's own slot
+/// and speaking the two generic doors. It is asked for here rather than
+/// lazily, because the count beside the rail is a headless run of this same
+/// view and it is wanted at connect.
+pub const MODULE_OWNED: [&str; 6] = ["governance", "files", "pages", "chat", "forge", "inbox"];
 
 /// The desktop's own views, staged beside the binary and asked for at boot.
 /// Every view that is not one of these comes off the connected node.

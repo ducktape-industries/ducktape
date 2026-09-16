@@ -468,16 +468,3 @@ pub fn current_wall_seconds() -> i64 {
     now_seconds()
 }
 
-/// The account controlled by the actual local signer, read at the write edge.
-pub(crate) async fn local_account(rpc: &RpcClient) -> Result<Option<u64>, String> {
-    let Some(key) = local_user_key().await else {
-        return Ok(None);
-    };
-    let reply: identity::IdentityReply = rpc
-        .query("identity", &identity::IdentityQuery::OfKey { key })
-        .await?;
-    let identity::IdentityReply::Account(account) = reply else {
-        return Err("the identity module returned the wrong reply".to_string());
-    };
-    Ok(account.map(|account| account.number))
-}

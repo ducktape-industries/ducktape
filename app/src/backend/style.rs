@@ -9,7 +9,6 @@ pub(crate) fn live_update(kind: crate::LiveKind, status: &str, height: i64) -> L
         load_chat: kind == crate::LiveKind::Ready,
         debounce: false,
         chat: Vec::new(),
-        bell: BellDelta::default(),
         permit: LivePermit::default(),
     }
 }
