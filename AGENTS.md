@@ -125,6 +125,14 @@ in `skills/` (`qa`, `sim-lane`, `module-dev`).
 - **Merged means gone.** Remove the worktree and delete the branch as soon as
   the PR merges. Then `git grep` your symbol on `origin/dev`: a sibling's
   merge commit can revert it.
+- **A module's wire moves with its guest.** A change under a module crate's
+  `src/`, the module SDK, or any shape a guest decodes (`Seed`, a module's
+  message or query enum, a `deny_unknown_fields` record) ships the rebuilt
+  `component.wasm`, `index.wasm` and kernel fixture in the SAME PR, for EVERY
+  guest whose source it reached — `make wasm-rebuild-check` names them. The
+  committed guest is what every composed genesis runs; a host that speaks a
+  field the guest never learned fails closed on every network founded from
+  that `dev`, and the failure surfaces as a stranger's red hours later.
 - **Hold only what is really uncertain.** A PR stays open only when the
   author can name the risk in one sentence. "Waiting for CI", "waiting for
   review", or "someone else should look" are not risks.
