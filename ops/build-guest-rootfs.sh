@@ -190,11 +190,14 @@ if [[ -n "${ROOTFS_SETUP:-}" ]]; then
     --clearenv --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     --setenv DEBIAN_FRONTEND noninteractive \
     /bin/bash /run/ducktape-guest-setup "$@"
-  # A privileged setup writes root-owned files, and `mke2fs -d` below stays
-  # rootless — it would fail on the first one it cannot read. The extracted
-  # base is already the operator's, so hand the additions over to match it
-  # rather than escalate the image build too.
-  [[ -z "$SETUP_PRIVILEGE" ]] || $SETUP_PRIVILEGE chown -R "$(id -u):$(id -g)" "$TREE"
+  # A privileged setup writes root-owned files in BOTH places it can write:
+  # the tree that becomes the image, and the scratch it saw as /tmp. The tree
+  # matters because `mke2fs -d` below stays rootless and would fail on the
+  # first file it cannot read; the scratch matters because it lives under the
+  # operator's own target directory, and root-owned build litter there is a
+  # directory they can no longer delete. Hand both back.
+  [[ -z "$SETUP_PRIVILEGE" ]] ||
+    $SETUP_PRIVILEGE chown -R "$(id -u):$(id -g)" "$TREE" "$WORK/setup-tmp"
 fi
 
 # ---- 3. the init -----------------------------------------------------------
