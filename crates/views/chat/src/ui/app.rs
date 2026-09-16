@@ -94,7 +94,7 @@ pub struct ChatView {
     pub(crate) call_speaking: bool,
     pub(crate) call_peers: Vec<crate::host::CallPeer>,
     pub(crate) unread_boundary: i64,
-    pub(crate) live_agents: Vec<crate::host::LiveRunHint>,
+    pub(crate) live_agents: Vec<crate::host::LiveRun>,
     pub(crate) shift_held: bool,
     pub(crate) copy_chord_serial: i64,
     pub(crate) pending_sends: Vec<crate::host::PendingSend>,
@@ -407,7 +407,7 @@ impl ChatView {
     pub(crate) const PREFERRED_WINDOW_SIZE: &'static str = "none";
     /// This state's layout, digested — `snapshot_schema` holds it here.
     pub(crate) const SNAPSHOT_SCHEMA: &'static str =
-        "a471c81bc5374e9e750a95c28f44a0d422b90bcf8b968b03723cadd10f83203a";
+        "df27bb7dbae8ffe718fb0a17cd5655da4935ac6fee540b3a8a53af79f1cb2307";
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, String> {
         self.validate_snapshot()?;
         wire::Snapshot {
@@ -1384,6 +1384,33 @@ mod tests {
         assert_eq!(bytes, restored.snapshot().unwrap());
     }
 
+    /// A reader the run's output is not addressed to is told the progress it
+    /// committed, and that progress is the provider's own JSON — a shape
+    /// bincode has no way to decode, so a snapshot that carried one would be
+    /// a view that cannot restore. The projection reads it into a status and
+    /// the state keeps the status, so what reaches a snapshot is carriable.
+    #[test]
+    fn a_run_seen_only_through_its_progress_still_fits_in_a_snapshot() {
+        let progress = serde_json::json!({
+            "sessions": {"agent_sessions": [{"run_id": "run-7", "actions": 3}]},
+            "delegations": {"delegations": [{"status": "pending"}]},
+        });
+        let mut state = ChatView::state();
+        state.live_agents = vec![crate::live::project(crate::host::LiveRunHint {
+            public_progress: Some(progress),
+            run_id: "run-7".into(),
+            agent: "chiefduck".into(),
+            ..Default::default()
+        })];
+        assert!(
+            !state.live_agents[0].status.is_empty(),
+            "the progress is read into a status"
+        );
+        let bytes = state.snapshot().unwrap();
+        let restored = ChatView::restore(&bytes).unwrap();
+        assert_eq!(wire::encode(&state), wire::encode(&restored));
+    }
+
     #[test]
     fn snapshot_rejects_wrong_envelope_corrupt_state_and_nonfinite_geometry() {
         let mut envelope = wire::Snapshot::decode(&ChatView::state().snapshot().unwrap()).unwrap();
@@ -1420,13 +1447,9 @@ mod snapshot_schema {
     fn the_tag_is_this_state_s_layout() {
         view_wire::schema::holds::<ChatView>(ChatView::SNAPSHOT_SCHEMA, |shape| {
             // A draft carries an editor document, which refuses to restore
-            // from a byte the tracer made up, and a run hint carries the
-            // provider's own JSON, which has no static shape at all. Both are
-            // described by a value instead, and both values reach every field
-            // they hold.
-            shape
-                .sample(&ducktape_view_composer::Draft::schema_sample())
-                .sample(&crate::host::LiveRunHint::schema_sample());
+            // from a byte the tracer made up, so it is described by a value
+            // that reaches every field it holds.
+            shape.sample(&ducktape_view_composer::Draft::schema_sample());
         });
     }
 }
