@@ -268,6 +268,8 @@ impl Ducktape {
             AppMessage::ToggleCallMute => self.on_toggle_call_mute(),
             AppMessage::ToggleCallCamera => self.on_toggle_call_camera(),
             AppMessage::ToggleCallScreen => self.on_toggle_call_screen(),
+            AppMessage::PickShareTarget(target) => self.on_pick_share_target(target),
+            AppMessage::CloseSharePicker => self.on_close_share_picker(),
             AppMessage::ShowHuddle => self.on_show_huddle(),
             AppMessage::HuddleOpened(id) => self.on_huddle_opened(id),
             AppMessage::HuddleGoChannel => self.on_huddle_go_channel(),
@@ -4481,6 +4483,7 @@ impl Ducktape {
         self.call_speaking = false;
         self.call_camera = false;
         self.call_sharing = false;
+        self.share_picker.clear();
         self.call_video_live = false;
         self.huddle_stage = "".to_owned();
         self.huddle_tiles.clear();
@@ -4874,8 +4877,59 @@ impl Ducktape {
         self.call_sharing = source.sharing;
         Task::none()
     }
+    /// The share button, which does one of three things: stop a share, open the
+    /// picker, or — where the host offers exactly one thing to share — start it
+    /// without a picker nobody would read.
     fn on_toggle_call_screen(&mut self) -> Task<AppMessage> {
-        let source = crate::video::call_use_screen(!self.call_sharing);
+        if self.call_sharing {
+            return self.stop_sharing();
+        }
+        // A picker already open is the button toggling it shut, so the second
+        // press is never a second enumeration.
+        if !self.share_picker.is_empty() {
+            return self.on_close_share_picker();
+        }
+        let offered = match crate::video::call_share_targets() {
+            Ok(offered) => offered,
+            Err(reason) => {
+                // The same place a refused capture speaks from, so the reason
+                // lands where the sharer is already looking.
+                self.call_status = format!("share: {reason}");
+                return Task::none();
+            }
+        };
+        let [only] = offered.as_slice() else {
+            self.share_picker = offered;
+            return Task::none();
+        };
+        self.start_sharing(only.target)
+    }
+
+    fn on_pick_share_target(&mut self, index: usize) -> Task<AppMessage> {
+        // A row for a target no longer offered is a picker that outlived its
+        // enumeration — closing it is the whole answer.
+        let Some(choice) = self.share_picker.get(index) else {
+            return self.on_close_share_picker();
+        };
+        let target = choice.target;
+        self.share_picker.clear();
+        self.start_sharing(target)
+    }
+
+    fn on_close_share_picker(&mut self) -> Task<AppMessage> {
+        self.share_picker.clear();
+        Task::none()
+    }
+
+    fn start_sharing(&mut self, target: crate::video::ShareTarget) -> Task<AppMessage> {
+        let source = crate::video::call_use_screen(Some(target));
+        self.call_camera = source.camera;
+        self.call_sharing = source.sharing;
+        Task::none()
+    }
+
+    fn stop_sharing(&mut self) -> Task<AppMessage> {
+        let source = crate::video::call_use_screen(None);
         self.call_camera = source.camera;
         self.call_sharing = source.sharing;
         Task::none()
@@ -4952,6 +5006,7 @@ impl Ducktape {
         self.call_speaking = false;
         self.call_camera = false;
         self.call_sharing = false;
+        self.share_picker.clear();
         self.call_video_live = false;
         self.huddle_stage = "".to_owned();
         self.huddle_tiles.clear();

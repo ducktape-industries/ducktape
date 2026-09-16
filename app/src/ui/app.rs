@@ -398,6 +398,10 @@ pub struct Ducktape {
     pub(crate) call_peers: Vec<crate::call::CallPeer>,
     pub(crate) call_camera: bool,
     pub(crate) call_sharing: bool,
+    /// The share targets offered right now — non-empty IS the picker being
+    /// open, because a picker with nothing in it has nothing to show and the
+    /// refusal reason belongs on `call_status` instead.
+    pub(crate) share_picker: Vec<crate::video::ShareChoice>,
     pub(crate) call_video_live: bool,
     pub(crate) huddle_stage: String,
     pub(crate) huddle_tiles: Vec<String>,
@@ -607,6 +611,12 @@ pub(crate) enum AppMessage {
     ToggleCallMute,
     ToggleCallCamera,
     ToggleCallScreen,
+    /// Share the target the picker was pressed on, by its place in
+    /// `share_picker` — the only thing the view knows about a target is the row
+    /// it drew, so the host resolves the index against its own offered list.
+    PickShareTarget(usize),
+    /// Close the picker without sharing anything.
+    CloseSharePicker,
     ShowHuddle,
     HuddleOpened(crate::shell::WindowKey),
     HuddleGoChannel,
@@ -829,6 +839,7 @@ impl Ducktape {
             call_peers: Vec::new(),
             call_camera: false,
             call_sharing: false,
+            share_picker: Vec::new(),
             call_video_live: false,
             huddle_stage: "".to_owned(),
             huddle_tiles: Vec::new(),

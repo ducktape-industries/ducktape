@@ -79,10 +79,27 @@ async fn this_side_hears_and_sees_the_other_through_the_apps_own_leg() {
     // status line, which is what the failure below prints.
     let sharing = std::env::var("DUCKTAPE_HUDDLE_SOURCE").is_ok_and(|source| source == "screen");
     match sharing {
-        true => assert!(
-            crate::video::call_use_screen(true).sharing,
-            "the share toggle must take"
-        ),
+        // Through the picker's own enumeration, so the lane proves the list as
+        // well as the capture. `DUCKTAPE_HUDDLE_SHARE` names the row — the
+        // default is the first, which is the whole desktop on a multi-head box
+        // and the one head there is otherwise; the printed list is how you pick
+        // a window's row for the next run.
+        true => {
+            let offered =
+                crate::video::call_share_targets().expect("this box offers a share target");
+            for (index, choice) in offered.iter().enumerate() {
+                println!("share target {index}: {}", choice.label);
+            }
+            let row = std::env::var("DUCKTAPE_HUDDLE_SHARE")
+                .ok()
+                .and_then(|row| row.parse::<usize>().ok())
+                .unwrap_or_default();
+            let choice = offered.get(row).expect("that share row is offered");
+            assert!(
+                crate::video::call_use_screen(Some(choice.target)).sharing,
+                "the share toggle must take"
+            );
+        }
         false => assert!(
             crate::video::call_use_camera(true).camera,
             "the camera toggle must take"
