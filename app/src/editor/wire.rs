@@ -74,6 +74,24 @@ struct NativeEdit {
     kind: wire::EditorEditKind,
 }
 
+impl NativeEdit {
+    /// A move of the caret and nothing else: no bytes replaced and none
+    /// removed. Two of these in a row COMPOSE — every offset is relative to the
+    /// caret before the edit, and an edit that writes nothing leaves the text
+    /// the next one is relative to untouched — so the queue can keep the
+    /// destination and forget the way there.
+    fn only_the_caret_moved(&self) -> bool { self.start == self.end && self.replacement.is_empty() }
+
+    /// Fold a later caret move into this one. Both are measured from the caret
+    /// each started at, so the way there is the sum and the anchor comes back
+    /// to the earlier of the two starts.
+    fn then(&mut self, next: &NativeEdit) {
+        self.anchor = next.anchor.map(|anchor| anchor + self.caret);
+        self.caret += next.caret;
+        self.kind = next.kind;
+    }
+}
+
 struct Incoming {
     id: EditorTransferId,
     target: EditorDocumentRef,
@@ -321,6 +339,26 @@ impl Store {
             return;
         };
         if document.text.is_none() {
+            return;
+        }
+        // A drag-selection is one caret move per pointer sample and the queue
+        // drains one item per guest frame, so a drag through a paragraph could
+        // fill it, fault the view and leave the field read-only for good. Two
+        // caret moves in a row compose exactly, so the queue keeps one — never
+        // the one already handed to the guest, which is the front whenever the
+        // document is waiting on it.
+        let sent = !matches!(document.phase, Phase::Ready);
+        let behind_the_one_in_flight = document.queue.len() > usize::from(sent);
+        if behind_the_one_in_flight
+            && let Input::Native(edit) = &input
+            && edit.only_the_caret_moved()
+            && let Some(standing) = document.queue.back_mut()
+            && standing.key == key
+            && let Input::Native(held) = &mut standing.input
+            && held.only_the_caret_moved()
+        {
+            held.then(edit);
+            standing.at = at;
             return;
         }
         let bytes = match &input {

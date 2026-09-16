@@ -381,17 +381,41 @@ impl BoardsView {
         }
         plate(&stroke(board, s))
     }
+    /// What a press on the card being written on means, or `None` when the
+    /// press landed somewhere else on the board.
+    ///
+    /// The native field is only as big as the words in it — that is what puts
+    /// them where the alignment says — so most of a card being written on is
+    /// board, not field. A press there used to do nothing whatsoever: no
+    /// caret, no focus, and on a big sticky holding two words that is almost
+    /// the whole card. It is a press on the writing, so it goes back to the
+    /// writing, at the end of it, which is also the one gesture that gets the
+    /// focus back when something else on screen has taken it.
+    fn writing_under(&self, at: [f32; 2]) -> Option<Task<Message>> {
+        let inline = self.inline.as_ref()?;
+        let board = self.visible()?;
+        let record = board.shapes.get(&inline.id)?;
+        let on_the_card = contains(self.writing_area(&board, &record.shape), self.world(at));
+        if !on_the_card {
+            return None;
+        }
+        let (pos, room) = self.typing_box(&board, &record.shape);
+        let on_the_words = contains([pos[0], pos[1], pos[0] + room[0], pos[1] + room[1]], at);
+        if on_the_words {
+            // The field has it: it puts the caret under the pointer itself,
+            // which is more than any message from here could say.
+            return Some(Task::none());
+        }
+        let target = format!("boards/editor/{}", inline.id);
+        Some(Task::batch([
+            self.focus_text(),
+            ducktape_view_guest::widget::perform(wire::WidgetCommand::CursorEnd { target }),
+        ]))
+    }
     pub(super) fn on_press(&mut self, x: f32, y: f32) -> Task<Message> {
         self.cursor = [x, y];
-        let editing_here = self.inline.as_ref().is_some_and(|inline| {
-            self.visible().is_some_and(|board| {
-                board.shapes.get(&inline.id).is_some_and(|record| {
-                    contains(self.writing_area(&board, &record.shape), self.world([x, y]))
-                })
-            })
-        });
-        if editing_here {
-            return Task::none();
+        if let Some(written_on) = self.writing_under([x, y]) {
+            return written_on;
         }
         let save = Task::batch([self.settle(), self.finish_text()]);
         if self.inline.is_some() {
@@ -512,7 +536,13 @@ impl BoardsView {
             };
             return Task::none();
         };
-        if self.modifiers.shift {
+        // Shift on its own adds a shape to the selection and takes it back
+        // out. Shift as HALF of the duplicate chord is not a selection verb at
+        // all: that press has to become a drag like any other, or ⌘⇧ has
+        // nothing to plant and the board prints a gesture that quietly
+        // deselects instead.
+        let extending = self.modifiers.shift && !self.planting();
+        if extending {
             if !self.selected.remove(&id) {
                 self.selected.insert(id);
             }
@@ -1149,15 +1179,30 @@ impl BoardsView {
         };
         self.edit(change)
     }
+    /// Whether the drag being let go of is planting a copy rather than moving
+    /// the originals.
+    ///
+    /// Alt is the canvas-app answer and the one the board prints. ⌘⇧ is the
+    /// one hands reach for, and it has to work too: a desktop that keeps
+    /// Alt-drag for moving its own windows eats the gesture before the board
+    /// ever sees it, and the writer is left with a chord that does nothing.
+    /// Shift is otherwise a straight run, which is exactly what you want a
+    /// planted copy to travel in anyway.
+    fn planting(&self) -> bool {
+        let reached_for = ducktape_view_guest::keyboard::command(self.modifiers);
+        self.modifiers.alt || (reached_for && self.modifiers.shift)
+    }
     pub(super) fn on_release(&mut self) -> Task<Message> {
         let changes = self.gesture_changes();
+        let planting = self.planting();
         let gesture = std::mem::take(&mut self.gesture);
         self.stop_guiding();
         match gesture {
-            // Alt on a drag duplicates: the shapes it carried are planted
-            // where the pointer let them go and the originals never moved,
-            // which is the same picture as dragging a copy off them.
-            Gesture::Move { start, point, .. } if self.modifiers.alt => {
+            // A held modifier turns a drag into a duplicate: the shapes it
+            // carried are planted where the pointer let them go and the
+            // originals never moved, which is the same picture as dragging a
+            // copy off them.
+            Gesture::Move { start, point, .. } if planting => {
                 let Some(board) = self.visible() else {
                     return Task::none();
                 };
@@ -1232,20 +1277,27 @@ impl BoardsView {
         self.edit_many(swept.into_iter().map(|id| Change::Delete { id }).collect())
     }
     pub(super) fn on_cancel(&mut self) -> Task<Message> {
-        // A card the board will not take must still be one you can leave.
-        // Done keeps your words and asks you to shorten them; Escape is the
-        // other answer to that — put the card back the way it was and let go.
-        let overlong = self
-            .inline
-            .as_ref()
-            .is_some_and(|inline| inline.document.text().len() > boards::MAX_TEXT);
-        if overlong {
-            self.inline = None;
+        // Escape is the way out that keeps NOTHING. ⌘Enter keeps what you
+        // wrote and so does clicking away; one key has to be the other answer
+        // or a card you opened by accident is a card you have already
+        // changed. It used to save as well, which left the board with three
+        // ways to say yes and none to say no — and the message printed over
+        // an overlong card promising Escape would leave it as it was.
+        if let Some(inline) = self.inline.take() {
             self.error.clear();
-            return self.hand_back_focus();
-        }
-        if self.inline.is_some() {
-            return self.finish_text();
+            // Words are the whole of a text shape. One that never had any is
+            // going back to not existing, the same rule that governs leaving
+            // one empty.
+            let never_written =
+                self.kind_of(&inline.id) == Some(Kind::Text) && inline.original.trim().is_empty();
+            if !never_written {
+                return self.hand_back_focus();
+            }
+            self.selected.remove(&inline.id);
+            return Task::batch([
+                self.edit(Change::Delete { id: inline.id }),
+                self.hand_back_focus(),
+            ]);
         }
         if matches!(self.gesture, Gesture::Idle) {
             self.selected.clear();
@@ -1341,18 +1393,19 @@ impl BoardsView {
         let text = record.shape.text.clone();
         self.gesture = Gesture::Idle;
         let mut document = Editor::new(text.clone());
-        // The caret goes after the words already there. Opening a card you have
-        // written on is coming back to add to it, and an editor that started in
-        // front of the first letter would put everything you typed next ahead
-        // of everything you meant to keep. The position is clamped into the
-        // text, so asking for the far end of the last line is asking for the
-        // end of the words whatever they are.
+        // Opening a written card SELECTS what it says, the way every canvas
+        // app does: you go in to replace a label far more often than to add a
+        // word to one, and the first letter typed should be the label. The
+        // caret sits at the far end of the selection, so Right or a click
+        // drops it there and adding to the card is the next keystroke. The
+        // position is clamped into the text, so asking for the far end of the
+        // last line asks for the end of the words whatever they are.
         document.move_to(wire::EditorCursor {
             position: wire::EditorPosition {
                 line: u32::MAX,
                 column: u32::MAX,
             },
-            selection: None,
+            selection: (!text.is_empty()).then(wire::EditorPosition::default),
         });
         self.inline = Some(Inline {
             id: id.clone(),
@@ -1366,9 +1419,9 @@ impl BoardsView {
     /// What the host says the card's words come to, laid out at the size and
     /// width the painter writes them in. It arrives in screen pixels because
     /// that is what was measured; the board is in board units, so the zoom
-    /// comes back out of it here.
-    pub(super) fn on_measured(&mut self, width: f32, height: f32) -> Task<Message> {
-        let zoom = self.zoom;
+    /// comes back out of it here — the zoom the gauge was LAID OUT at, which
+    /// travels with the answer because the camera can move in between.
+    pub(super) fn on_measured(&mut self, zoom: f32, width: f32, height: f32) -> Task<Message> {
         // A card keeps the tallest it has needed while you are in it: the words
         // that wanted the room may come back with the next key, and a card that
         // closed up under the caret would be a card that jumped as you deleted.
@@ -2250,8 +2303,22 @@ pub(super) fn stroke(board: &Board, s: &Shape) -> Vec<[f32; 2]> {
     };
     let (from, to) = (card(&s.from), card(&s.to));
     let last = path.len() - 1;
-    let toward_start = to.as_ref().map_or(path[last], center);
-    let toward_end = from.as_ref().map_or(path[0], center);
+    // A bound end leaves toward the next place the run actually goes: the bend
+    // beside it, not the far end past it. A bent arrow used to leave its card
+    // aimed at where it finishes, which on a curved run is not the way the
+    // line goes at all — it left through one side and kinked back across the
+    // card to reach its own bend.
+    //
+    // With no bend the next place IS the far end, and a far end that has taken
+    // a card stands at that card's centre rather than at its own sample: the
+    // sample is wherever it was dropped, which is inside the card and says
+    // nothing about where the arrow now meets it.
+    let toward = |neighbour: usize, far: usize, beyond: &Option<Shape>| match neighbour == far {
+        true => beyond.as_ref().map_or(path[far], center),
+        false => path[neighbour],
+    };
+    let toward_start = toward(1, last, &to);
+    let toward_end = toward(last - 1, 0, &from);
     if let Some(card) = &from {
         path[0] = border_point(card, toward_start);
     }

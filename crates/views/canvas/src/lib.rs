@@ -2,6 +2,7 @@
 //! input and IME; the host signs field operations for consensus ordering.
 mod host;
 mod interaction;
+mod markdown;
 mod presentation;
 use boards::{Align, Board, Change, Kind, Operation, Shape, TextSize};
 use ducktape_view_guest::{Editor, wire};
@@ -226,7 +227,9 @@ pub enum Message {
     DoubleClick,
     EditText,
     FocusText,
-    Measured(f32, f32),
+    /// The gauge's answer: the zoom it was laid out at, then its width and
+    /// height in pixels at that zoom.
+    Measured(f32, f32, f32),
     Mounted(f32, f32),
     FocusResult(String, Result<(), String>),
     MiddleDown,
@@ -357,7 +360,7 @@ impl BoardsView {
             Message::DoubleClick => self.on_double_click(),
             Message::EditText => self.begin_text(),
             Message::FocusText => self.focus_text(),
-            Message::Measured(width, height) => self.on_measured(width, height),
+            Message::Measured(zoom, width, height) => self.on_measured(zoom, width, height),
             Message::Mounted(width, height) => self.on_mounted(width, height),
             Message::FocusResult(id, result) => self.on_focus_result(id, result),
             Message::MiddleDown => self.on_middle_down(),
@@ -464,6 +467,7 @@ impl BoardsView {
                         }
                     }
                 }
+                self.forget_a_vanished_card();
                 if self.current.is_empty()
                     && let Some(id) = self.catalog.keys().next().cloned()
                 {
@@ -690,7 +694,26 @@ impl BoardsView {
             self.undo.remove(0);
         }
         self.redo.clear();
-        self.enqueue_many(redo)
+        let queued = self.enqueue_many(redo);
+        self.forget_a_vanished_card();
+        queued
+    }
+    /// A card can go out from under the caret: Undo is live while you write,
+    /// another writer can delete the shape, and a refreshed read can arrive
+    /// without it. The editor stops being drawn at once — but the view went on
+    /// believing it was open, which dropped every key on the board and left
+    /// the save to fail against an id nothing answers to.
+    fn forget_a_vanished_card(&mut self) {
+        let Some(inline) = &self.inline else {
+            return;
+        };
+        let still_there = self
+            .settled()
+            .is_some_and(|board| board.shapes.contains_key(&inline.id));
+        if still_there {
+            return;
+        }
+        self.inline = None;
     }
     fn on_create_board(&mut self) -> Task<Message> {
         let allowed =
