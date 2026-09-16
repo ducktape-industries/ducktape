@@ -880,7 +880,8 @@ fn seated_id(module: &str) -> Option<&'static str> {
 /// The seat's taste set to `wanted`, and a load after it started under a
 /// new generation — so a load after the previous taste dies at install.
 fn retaste(module: &'static str, wanted: Option<[u8; 32]>) -> Vec<std::thread::JoinHandle<()>> {
-    // lock order, as everywhere: registry, then connection, then the seat
+    // lock order, as everywhere: the registry, then the seat; the
+    // connection is read and let go between them
     let registry = registry().lock().expect("module views");
     let snapshot = connection().lock().expect("views rpc").clone();
     let Some(mounted) = registry.get(module).cloned() else {
@@ -1070,9 +1071,9 @@ pub fn connected(client: &ducktape_rpc::Client) -> Loads {
     // every one of which dies at install, and the views stay "Loading".
     let mut registry = registry().lock().expect("module views");
     // the client and its revision move as one, and their lock is let go
-    // before any view is touched: a load installs under it (see
-    // `spawn_load`), and takes the view's own lock inside it. Lock order,
-    // everywhere: registry, then connection, then a view.
+    // before any view is touched — the connection lock is a leaf and no
+    // view lock is ever taken under it. Lock order, everywhere: registry,
+    // then a view.
     let snapshot = {
         let mut connection = connection().lock().expect("views rpc");
         connection.rev += 1;
@@ -1379,6 +1380,14 @@ struct Connection {
     rev: u64,
 }
 
+/// THE CONNECTION LOCK IS A LEAF: read or write what you need and let it
+/// go — never hold this guard while taking the registry's or a seat's. The
+/// window thread draws under a seat's lock, and a guest call inside that
+/// redraw asks for the client here, so anything that waits for a seat while
+/// holding this closes the cycle and wedges the app. Lock order everywhere
+/// else: the registry, then a seat. A snapshot read here goes stale the
+/// moment it is let go, and that is fine: a load installs only under the
+/// generation the seat still waits for.
 fn connection() -> &'static Mutex<Connection> {
     static CONNECTION: OnceLock<Mutex<Connection>> = OnceLock::new();
     CONNECTION.get_or_init(Mutex::default)
@@ -1531,10 +1540,9 @@ fn mounted(module: &'static str) -> Arc<Mutex<Mounted>> {
 /// Loads the view on its own thread — a cold cranelift compile is a second
 /// or more; the window thread shows "Loading" instead of freezing for it —
 /// and installs it only if `mounted` still waits for this very load AND,
-/// for a module's view, the app is still on the node it was asked of, both
-/// checked under the connection lock so a move cannot slip between the
-/// check and the seat. The desktop's own view is the same on every node:
-/// its load lands wherever the app has moved to meanwhile.
+/// for a module's view, the app is still on the node it was asked of. The
+/// desktop's own view is the same on every node: its load lands wherever
+/// the app has moved to meanwhile.
 fn spawn_load(
     module: &'static str,
     mounted: &Arc<Mutex<Mounted>>,
@@ -1544,14 +1552,18 @@ fn spawn_load(
     let loading = mounted.clone();
     std::thread::spawn(move || {
         let loaded = Guest::load(module, asked_of.client.as_ref(), generation, &loading);
-        let connection = connection().lock().expect("views rpc");
         let mut locked = loading.lock().expect("module view lock");
         if locked.generation != generation {
             return;
         }
         locked.in_flight = false;
+        // the connection lock is a leaf: read under the seat's lock, never
+        // across it. A connect bumps the revision before it reaches this
+        // seat, so the revision read here is the one the seat installs
+        // against — and `connected` reconnects a seat it passed already
+        let current_rev = connection().lock().expect("views rpc").rev;
         let from_the_node = !crate::backend::view_source::desktop_owned(module);
-        let node_since_left = connection.rev != asked_of.rev;
+        let node_since_left = current_rev != asked_of.rev;
         if from_the_node && node_since_left {
             return;
         }
@@ -1575,7 +1587,7 @@ fn spawn_load(
             }
             Ok(Loaded::Unchanged) => {
                 if let Slot::Ready(guest) = slot {
-                    guest.reconnect(connection.rev);
+                    guest.reconnect(current_rev);
                 }
             }
             Ok(Loaded::Empty(removed)) => {
@@ -7799,6 +7811,83 @@ pub(crate) mod tests {
         assert_eq!(unchanged.root, Some(held_tree));
         let mut patched = wire::Frame::default();
         assert_eq!(merge(&mut None, &mut patched), Err("no tree to patch"));
+    }
+
+    /// The name a line binds the connection guard to, if what it binds IS
+    /// the guard: a read that projects off it (`.rev`, `.clone()`) lets the
+    /// guard go at the end of its own statement and holds nothing.
+    fn bound_connection_guard(line: &str) -> Option<&str> {
+        let (before, after) = line.split_once("connection().lock()")?;
+        let (name, _) = before.trim().strip_prefix("let ")?.split_once('=')?;
+        let name = name.trim().trim_start_matches("mut ").trim();
+        let tail = after.trim();
+        let tail = match tail.strip_prefix(".expect(") {
+            Some(rest) => rest.split_once(')').map_or(rest, |(_, rest)| rest),
+            None => tail.strip_prefix(".unwrap()").unwrap_or(tail),
+        };
+        (tail.trim() == ";").then_some(name)
+    }
+
+    /// Every place a source binds the connection guard and takes another
+    /// lock before that binding goes out of scope.
+    fn guards_spanning_another_lock(path: &str, source: &str) -> Vec<String> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut found = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let Some(name) = bound_connection_guard(line) else {
+                continue;
+            };
+            let mut depth = 0i32;
+            for (offset, inside) in lines.iter().enumerate().skip(index + 1) {
+                depth += inside.matches('{').count() as i32;
+                depth -= inside.matches('}').count() as i32;
+                let scope_ended = depth < 0 || inside.contains(&format!("drop({name})"));
+                if scope_ended {
+                    break;
+                }
+                // `mounted` takes the registry's lock before it hands a seat over
+                let takes_another_lock =
+                    inside.contains(".lock()") || inside.contains("mounted(module)");
+                if takes_another_lock {
+                    found.push(format!(
+                        "{path}:{} binds `{name}`, and {path}:{} locks under it",
+                        index + 1,
+                        offset + 1
+                    ));
+                    break;
+                }
+            }
+        }
+        found
+    }
+
+    /// THE CONNECTION LOCK IS A LEAF. The window thread draws under a
+    /// seat's lock, and a guest call inside that redraw asks
+    /// [`connection`] for its client — so a thread that holds the
+    /// connection while it waits for a seat, or for the registry the seats
+    /// live in, closes the cycle and the app never paints again. The shape
+    /// is the invariant, so the source is what states it.
+    #[test]
+    fn the_connection_guard_never_spans_another_lock() {
+        let held: Vec<String> = [
+            ("app/src/module_view.rs", include_str!("module_view.rs")),
+            (
+                "app/src/module_view/background.rs",
+                include_str!("module_view/background.rs"),
+            ),
+            (
+                "app/src/module_view/kernel.rs",
+                include_str!("module_view/kernel.rs"),
+            ),
+        ]
+        .into_iter()
+        .flat_map(|(path, source)| guards_spanning_another_lock(path, source))
+        .collect();
+        assert!(
+            held.is_empty(),
+            "the connection lock is a leaf; these hold it across another:\n{}",
+            held.join("\n")
+        );
     }
 }
 

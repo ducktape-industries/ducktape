@@ -143,13 +143,17 @@ pub(super) fn start_at(module: &str, props: Vec<u8>, revision: u64) -> Result<Se
     })
 }
 
-/// The network may change after start is queued. Check again under the
-/// connection lock before touching the mounted registry or starting a load.
+/// The network may change after start is queued: check it again before
+/// touching the mounted registry, and ask the load of the very snapshot
+/// that was checked. The connection lock is a leaf — it is let go before
+/// the registry's and the seat's, because the window thread holds a seat
+/// while its guest asks for the connection — so a move that lands in
+/// between leaves a load that dies at install instead of a wedged app.
 fn session_source(
     module: &str,
     revision: u64,
 ) -> Result<(Arc<Mutex<Mounted>>, watch::Receiver<()>), String> {
-    let connection = connection().lock().expect("views rpc");
+    let connection = connection().lock().expect("views rpc").clone();
     if connection.rev != revision || connection.client.is_none() {
         return Err("session belongs to a previous connection".into());
     }
@@ -161,7 +165,7 @@ fn session_source(
         let needs_load = !state.in_flight && !matches!(state.slot, Slot::Ready(_));
         if needs_load {
             let generation = state.start(None);
-            drop(spawn_load(module, &source, generation, connection.clone()));
+            drop(spawn_load(module, &source, generation, connection));
         }
         changes
     };
@@ -169,7 +173,8 @@ fn session_source(
 }
 
 /// Immutable source metadata crosses the mounted lock; instantiation does
-/// not. Guest construction reads the connection, whose lock precedes a view.
+/// not. A cranelift instantiate is a second or more, and the window thread
+/// draws under that same lock.
 struct SessionCode {
     component: wasmtime::component::Component,
     module: &'static str,
