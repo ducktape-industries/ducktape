@@ -1386,27 +1386,49 @@ impl BoardsView {
         share: usize,
     ) -> Option<Node> {
         let p = kit::palette();
-        let editing = self.inline.as_ref().is_some_and(|inline| inline.id == *id);
-        if editing {
-            return None;
-        }
+        let riding_a_line = s.kind.is_path();
+        let editing = self.inline.as_ref().filter(|inline| inline.id == *id);
+        // A card keeps its own body under the caret — fill, outline and all —
+        // so the painter draws nothing for the shape being written in and the
+        // editor's words are the only ones on it. A connector has no body: its
+        // plate IS its label, so drawing nothing took the wash out from under
+        // the words the moment you clicked in and put it back when you left.
+        // The plate stays, sized to the words being TYPED and drawn in no ink
+        // at all, and the editor lays those words over it.
+        let typed = match editing {
+            Some(inline) if riding_a_line => Some(inline.document.text()),
+            Some(_) => return None,
+            None => None,
+        };
         let letters = self.lettering(s, [box_[2] - box_[0], box_[3] - box_[1]]);
         if !letters.legible {
             return None;
         }
-        let blank = s.text.is_empty();
-        if blank && !invites_a_word(s.kind) {
-            return None;
-        }
-        let text = if blank {
-            PROMPT
-        } else {
-            excerpt(&s.text, share)
+        let label = match &typed {
+            // The SOURCE, laid out the way the gauge lays it out: the editor
+            // holds the markers and the plate has to be as wide as what can be
+            // seen in it, which is the wider of the two.
+            Some(words) => headed(
+                &format!("boards/label/{id}"),
+                excerpt(words, share),
+                &letters,
+                alpha(p.foreground, 0.),
+            ),
+            None => {
+                let blank = s.text.is_empty();
+                if blank && !invites_a_word(s.kind) {
+                    return None;
+                }
+                let text = if blank {
+                    PROMPT
+                } else {
+                    excerpt(&s.text, share)
+                };
+                let ink = alpha(if blank { p.faint } else { p.foreground }, opacity);
+                written(id, text, &letters, ink)
+            }
         };
-        let ink = alpha(if blank { p.faint } else { p.foreground }, opacity);
-        let label = written(id, text, &letters, ink);
         let (pos, size) = self.writing_box(board, s, box_);
-        let riding_a_line = s.kind.is_path();
         let body = match riding_a_line {
             true => plate(id, label, &letters, alpha(p.surface, opacity), size),
             false => card_words(
