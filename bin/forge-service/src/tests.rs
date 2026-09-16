@@ -199,3 +199,84 @@ async fn upload_pack_have_round_returns_only_plain_nak() {
     assert_eq!(&body[..], b"0008NAK\n");
     assert!(!body.windows(4).any(|window| window == b"PACK"));
 }
+
+/// a repo materialized on disk with one commit and every branch in `branches`
+/// pointing at it. Returns that commit's oid as hex.
+///
+/// Every branch at the SAME oid is the ordinary shape right after a run cuts
+/// its work branch, and it is exactly when an oid-only `HEAD` line stops being
+/// enough: a client matching HEAD's oid against the advertised refs has more
+/// than one answer to pick from.
+fn seed_repo(store: &std::path::Path, name: &str, branches: &[&str]) -> String {
+    let dir = store.join(name);
+    let repo = git2::Repository::init(&dir).unwrap();
+    let tree = repo.find_tree(repo.index().unwrap().write_tree().unwrap()).unwrap();
+    let who = git2::Signature::now("Forge Test", "test@ducktape.local").unwrap();
+    let oid = repo
+        .commit(
+            Some(&format!("refs/heads/{}", branches[0])),
+            &who,
+            &who,
+            "seed",
+            &tree,
+            &[],
+        )
+        .unwrap();
+    let commit = repo.find_commit(oid).unwrap();
+    for branch in &branches[1..] {
+        repo.branch(branch, &commit, true).unwrap();
+    }
+    oid.to_string()
+}
+
+/// the upload-pack ref advertisement for `repo`, as text.
+async fn advertisement(router: axum::Router, repo: &str) -> String {
+    let response = router
+        .oneshot(authenticated(
+            Request::builder()
+                .uri(format!("/{repo}/info/refs?service=git-upload-pack"))
+                .body(Body::empty())
+                .unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// THE DEFAULT BRANCH IS THE MODULE'S, NOT THE LITERAL `main`. A repo seeded on
+/// `dev` has no `main` at all: the advertisement used to emit a `HEAD` line
+/// only for a branch by that name, so a clone was told nothing, fell back to
+/// `refs/heads/main`, and landed on an unborn HEAD with every ref fetched.
+#[tokio::test]
+async fn a_dev_seeded_repo_advertises_its_integration_branch_as_head() {
+    let (directory, router) = application();
+    let head = seed_repo(directory.path(), "lab", &["dev", "agent/item-1"]);
+    let body = advertisement(router, "lab").await;
+    assert!(body.contains("symref=HEAD:refs/heads/dev"), "{body}");
+    assert!(body.contains(&format!("{head} HEAD")), "{body}");
+}
+
+/// and `main` is still the answer when it is the only one of the two born —
+/// the same order the forge module resolves a repo's head in.
+#[tokio::test]
+async fn a_main_only_repo_still_advertises_main_as_head() {
+    let (directory, router) = application();
+    let head = seed_repo(directory.path(), "lab", &["main", "agent/item-1"]);
+    let body = advertisement(router, "lab").await;
+    assert!(body.contains("symref=HEAD:refs/heads/main"), "{body}");
+    assert!(body.contains(&format!("{head} HEAD")), "{body}");
+}
+
+/// a repo with neither born advertises no HEAD and no symref: there is no
+/// default branch to name, and naming a feature branch would hand a clone a
+/// checkout nobody asked for.
+#[tokio::test]
+async fn a_repo_with_no_default_branch_advertises_no_head() {
+    let (directory, router) = application();
+    seed_repo(directory.path(), "lab", &["agent/item-1"]);
+    let body = advertisement(router, "lab").await;
+    assert!(!body.contains("symref=HEAD"), "{body}");
+    assert!(!body.contains(" HEAD\n"), "{body}");
+}
