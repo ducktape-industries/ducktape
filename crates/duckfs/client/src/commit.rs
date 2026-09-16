@@ -13,13 +13,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use duckfs_core::{Change, MAX_PAGE, MAX_SYNC_IDS, SnapshotInfo, to_hex};
+use duckfs_core::{Change, MAX_PAGE, MAX_SYNC_IDS, SnapshotInfo};
 
 use crate::api::{ApiError, CommitReceipt, ConflictReport, NodeApi};
-use crate::chunk::{chunk_ids, file_object_id};
 use crate::index::{EntryKind, Index, IndexEntry, IndexError};
 use crate::plan::{Plan, PlanError, plan};
-use crate::scan::{ScanKind, disk_path, scan};
+use crate::scan::{ScanEntry, ScanKind, disk_path};
 use crate::status::{Status, status};
 
 /// the conflict strings the engine keys on — verbatim from the module (`fs.rs`),
@@ -142,7 +141,7 @@ pub fn commit_with(
         &change_paths(&planned.changes),
         &index.prefix,
     )?;
-    rebuild_index(&index, &dirty, &selected, dir, &snapshot)?;
+    rebuild_index(&index, &selected, &planned, dir, &snapshot)?;
     Ok(CommitSummary {
         snapshot,
         height: receipt.height,
@@ -453,139 +452,159 @@ fn resolve_snapshot(
     }
 }
 
-/// rewrite the index after a successful commit: the committed part of the
-/// working copy IS the new base. unchanged files keep their recorded object id
-/// (no re-hash of a big untouched file); committed files and every symlink are
-/// recomputed; mtimes are refreshed from a fresh scan, and the index is saved
-/// last so status reads clean.
+/// rewrite the index after a successful commit: the new base is the OLD base
+/// with THIS commit's accepted changes applied, and nothing else.
 ///
-/// `dirty` is the whole working-copy delta, `committed` the part the pathspec
-/// selected. a change in the first and not the second keeps its OLD record
-/// verbatim — recording it against disk would tell the next `status` that a
-/// change nobody committed is already upstream, silently losing it.
+/// it never looks at the disk again. the working copy is LIVE between the
+/// submit and the receipt — a commit waits on consensus — and a rescan here
+/// records whatever it became as if the cluster had accepted it: an edit made
+/// in that window reads back clean and is lost, a file created in it is
+/// recorded as committed without ever being submitted, and a tracked file
+/// deleted in it loses its record, hiding the deletion (#1975). so a committed
+/// path takes the plan's object and size — the bytes that actually landed —
+/// and every other path keeps the record it already had.
+///
+/// `committed` is the part of the working-copy delta the pathspec selected;
+/// what it left out keeps its OLD record, which is exactly what keeps a
+/// deferred change dirty for the next commit (a deferred ADDITION has no
+/// record — leaving it out is what keeps it "added").
 fn rebuild_index(
     old: &Index,
-    dirty: &Status,
     committed: &Status,
+    planned: &Plan,
     dir: &Path,
     snapshot: &str,
 ) -> Result<(), CommitError> {
-    let scanned = scan(dir, &old.prefix).map_err(|e| CommitError::Io(e.to_string()))?;
-    let changed: BTreeSet<&str> = committed
-        .added
-        .iter()
-        .chain(committed.modified.iter())
-        .map(|e| e.path.as_str())
-        .collect();
-    let deferred: BTreeSet<&str> = dirty
-        .added
-        .iter()
-        .chain(dirty.modified.iter())
-        .map(|e| e.path.as_str())
-        .filter(|path| !changed.contains(path))
-        .collect();
-
     let mut index = Index::new(&old.prefix, old.node.clone(), Some(snapshot.to_string()));
-    for entry in &scanned {
-        // a change this commit did not carry: keep the base record so the next
-        // status still reports it (a deferred ADDITION has none — leaving it out
-        // is exactly what keeps it "added").
-        if deferred.contains(entry.path.as_str()) {
-            if let Some(recorded) = old.entries.get(&entry.path) {
-                index.entries.insert(entry.path.clone(), recorded.clone());
-            }
-            continue;
-        }
-        match entry.kind {
-            ScanKind::File => {
-                // unchanged file → reuse the recorded object + meta (its bytes did
-                // not move); otherwise recompute with empty meta (the plan commits
-                // client edits without meta).
-                let reuse = (!changed.contains(entry.path.as_str()))
-                    .then(|| old.entries.get(&entry.path))
-                    .flatten();
-                let (object, meta) = match reuse {
-                    Some(e) => (e.object.clone(), e.meta.clone()),
-                    None => (hash_file(dir, &old.prefix, &entry.path)?, BTreeMap::new()),
-                };
-                index.entries.insert(
-                    entry.path.clone(),
-                    IndexEntry {
-                        object,
-                        size: entry.size,
-                        mtime_secs: entry.mtime_secs,
-                        mtime_nanos: entry.mtime_nanos,
-                        exec: entry.exec,
-                        kind: EntryKind::File,
-                        meta,
-                    },
-                );
-            }
-            ScanKind::Symlink => {
-                let target = entry.target.clone().unwrap_or_default();
-                let object = to_hex(&file_object_id(
-                    target.len() as u64,
-                    &chunk_ids(target.as_bytes()),
-                    &BTreeMap::new(),
-                ));
-                index.entries.insert(
-                    entry.path.clone(),
-                    IndexEntry {
-                        object,
-                        size: entry.size,
-                        mtime_secs: entry.mtime_secs,
-                        mtime_nanos: entry.mtime_nanos,
-                        exec: false,
-                        kind: EntryKind::Symlink,
-                        meta: BTreeMap::new(),
-                    },
-                );
-            }
-            ScanKind::Dir => {
-                if entry.empty_dir {
-                    index.entries.insert(
-                        entry.path.clone(),
-                        IndexEntry {
-                            object: String::new(),
-                            size: 0,
-                            mtime_secs: entry.mtime_secs,
-                            mtime_nanos: entry.mtime_nanos,
-                            exec: false,
-                            kind: EntryKind::Dir,
-                            meta: BTreeMap::new(),
-                        },
-                    );
-                }
-            }
-        }
-    }
+    index.entries = old.entries.clone();
 
-    // a DELETION the pathspec left out: the scan cannot carry it (the path is
-    // gone from disk), so re-record it here or the next status would see the
-    // deletion as already committed.
-    let committed_removals: BTreeSet<&str> = committed.removed.iter().map(String::as_str).collect();
-    for path in &dirty.removed {
-        if committed_removals.contains(path.as_str()) {
+    for path in &committed.removed {
+        index.entries.remove(path);
+    }
+    for entry in committed.added.iter().chain(committed.modified.iter()) {
+        // a file or symlink the plan did not carry has no accepted bytes to
+        // record: keeping its old record leaves it dirty, which is the safe
+        // half of the disagreement.
+        let Some(record) = committed_record(entry, planned) else {
             continue;
-        }
-        if let Some(recorded) = old.entries.get(path) {
-            index.entries.insert(path.clone(), recorded.clone());
-        }
+        };
+        index.entries.insert(entry.path.clone(), record);
+    }
+    for path in emptied_dirs(&index.entries, committed, &old.prefix) {
+        index.entries.insert(
+            path,
+            IndexEntry {
+                object: String::new(),
+                size: 0,
+                // a directory has no content and status compares one by KIND
+                // alone, so there is no mtime worth recording here.
+                mtime_secs: 0,
+                mtime_nanos: 0,
+                exec: false,
+                kind: EntryKind::Dir,
+                meta: BTreeMap::new(),
+            },
+        );
     }
 
     index.save(dir)?;
     Ok(())
 }
 
-/// recompute a file's object id (empty meta) by reading it from disk.
-fn hash_file(dir: &Path, prefix: &str, path: &str) -> Result<String, CommitError> {
-    let disk = disk_path(dir, prefix, path);
-    let bytes = std::fs::read(&disk).map_err(|e| CommitError::Io(e.to_string()))?;
-    Ok(to_hex(&file_object_id(
-        bytes.len() as u64,
-        &chunk_ids(&bytes),
-        &BTreeMap::new(),
-    )))
+/// the record for one path this commit carried: the plan's accepted content,
+/// with the kind, exec bit and mtime the PRE-submit scan observed.
+///
+/// the mtime is that scan's on purpose. it describes the bytes that were
+/// committed, so a file that moved after the observation no longer matches its
+/// record and the next status reports it — the dirty answer, which is the true
+/// one.
+fn committed_record(entry: &ScanEntry, planned: &Plan) -> Option<IndexEntry> {
+    let record = |object: String, size: u64, exec: bool, kind: EntryKind| IndexEntry {
+        object,
+        size,
+        mtime_secs: entry.mtime_secs,
+        mtime_nanos: entry.mtime_nanos,
+        exec,
+        kind,
+        // the plan commits client edits with no meta, and meta is part of the
+        // file id's preimage — so an empty map is what the id was taken over.
+        meta: BTreeMap::new(),
+    };
+    match entry.kind {
+        // an empty dir rides a Mkdir: there is no content to record.
+        ScanKind::Dir => Some(record(String::new(), 0, false, EntryKind::Dir)),
+        ScanKind::File => {
+            let object = planned.objects.get(&entry.path)?;
+            Some(record(
+                object.id.clone(),
+                object.size,
+                entry.exec,
+                EntryKind::File,
+            ))
+        }
+        ScanKind::Symlink => {
+            let object = planned.objects.get(&entry.path)?;
+            Some(record(
+                object.id.clone(),
+                object.size,
+                false,
+                EntryKind::Symlink,
+            ))
+        }
+    }
+}
+
+/// the directories this commit's removals left EMPTY in the new snapshot.
+///
+/// the module's `Rm` takes the entry, never its parent, so a directory whose
+/// last recorded child went away survives in the tree holding nothing. only an
+/// index record says so: without one the next status meets an empty directory
+/// it has never heard of, reports it added, and plans a `Mkdir` the module
+/// rejects because the target already exists.
+fn emptied_dirs(
+    entries: &BTreeMap<String, IndexEntry>,
+    committed: &Status,
+    prefix: &str,
+) -> BTreeSet<String> {
+    let removed: BTreeSet<&str> = committed.removed.iter().map(String::as_str).collect();
+    let root = prefix.trim_end_matches('/');
+    let mut empty = BTreeSet::new();
+    for path in &committed.removed {
+        for ancestor in ancestors(path) {
+            // the checkout root is not a tree entry of its own, and neither is
+            // anything above it.
+            let inside_checkout = ancestor.len() > root.len();
+            if !inside_checkout {
+                break;
+            }
+            let itself_removed = removed.contains(ancestor.as_str());
+            let already_recorded = entries.contains_key(&ancestor);
+            let under = format!("{ancestor}/");
+            let still_has_children = entries
+                .range(under.clone()..)
+                .next()
+                .is_some_and(|(path, _)| path.starts_with(&under));
+            if itself_removed || already_recorded || still_has_children {
+                continue;
+            }
+            empty.insert(ancestor);
+        }
+    }
+    empty
+}
+
+/// every strict ancestor directory of `path`, deepest first.
+fn ancestors(path: &str) -> Vec<String> {
+    let mut dirs = Vec::new();
+    let mut end = path.len();
+    while let Some(slash) = path[..end].rfind('/') {
+        if slash == 0 {
+            break;
+        }
+        dirs.push(path[..slash].to_string());
+        end = slash;
+    }
+    dirs
 }
 
 #[cfg(test)]

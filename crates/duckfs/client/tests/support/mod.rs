@@ -41,6 +41,10 @@ pub struct ModuleNode {
     height: Cell<u64>,
     pub stage_calls: Cell<usize>,
     pub commit_calls: Cell<usize>,
+    /// run inside an accepted commit: after the module applied it, before the
+    /// receipt reaches the engine. that window is a real one — a commit waits on
+    /// consensus — and it is where a test moves the working copy on purpose.
+    during_commit: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 impl Default for ModuleNode {
@@ -59,7 +63,13 @@ impl ModuleNode {
             height: Cell::new(0),
             stage_calls: Cell::new(0),
             commit_calls: Cell::new(0),
+            during_commit: RefCell::new(None),
         }
+    }
+
+    /// run `f` inside every accepted commit (see `during_commit`).
+    pub fn on_commit(&self, f: impl Fn() + 'static) {
+        *self.during_commit.borrow_mut() = Some(Box::new(f));
     }
 
     fn block_on<F: Future>(f: F) -> F::Output {
@@ -268,6 +278,9 @@ impl NodeApi for ModuleNode {
             message: message.into(),
             changes,
         }))?;
+        if let Some(during) = self.during_commit.borrow().as_ref() {
+            during();
+        }
         Ok(CommitReceipt { height })
     }
 
