@@ -187,9 +187,7 @@ pub const MAX_LANE_ID: u8 = 99;
 /// Whether a lane owns its stream budget or shares the process-wide link
 /// budget. Mirrors the host's `StreamPacing` minus the live pacer handle,
 /// which is the host's to supply.
-#[derive(
-    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum LanePacing {
     /// participate in the process-wide bulk budget
@@ -208,9 +206,7 @@ pub enum LanePacing {
 /// stream PLANE (queues, pacing, an accept backlog) is bound over them. The
 /// media lanes carry none: they bind sockets and speak datagrams only, which
 /// is why they have no budget to declare.
-#[derive(
-    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LaneStream {
     pub pacing: LanePacing,
@@ -223,26 +219,47 @@ pub struct LaneStream {
 /// registry refuses a collision rather than renumbering, because a renumber
 /// would make the same lane mean different ports on nodes that read the
 /// registry at different heights.
-#[derive(
-    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LaneDecl {
     pub id: u8,
+    /// What this lane IS to the module that declares it — `voice`, `video`,
+    /// `telemetry`. The host binds by `(module_id, name)`, because a module
+    /// with two lanes is otherwise indistinguishable from itself: only the id
+    /// differs, and the id is a port, not a purpose. NEVER positional — a
+    /// binding that depended on declaration order would break silently the
+    /// first time a module declared a third lane.
+    pub name: String,
     /// `None` is datagram-only — sockets, no stream plane.
     pub stream: Option<LaneStream>,
+}
+
+/// The longest a lane name may be. The table is one consensus record that
+/// every node decodes, so an unbounded name is a poison vector rather than a
+/// style question.
+pub const MAX_LANE_NAME_BYTES: usize = 32;
+
+/// A lane name is a stable token, not prose: lowercase, digits, underscore.
+/// It is matched exactly by a host looking for the lane it serves, so a name
+/// that varies by case or spacing is a binding that silently does not happen.
+pub fn lane_name_is_well_formed(name: &str) -> bool {
+    let within_bound = !name.is_empty() && name.len() <= MAX_LANE_NAME_BYTES;
+    within_bound
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
 /// The lane table's readable entry: a declaration plus who owns it. The table
 /// is the ONE place a lane's fields live; a module's record does not repeat
 /// them, so there is no second copy to disagree.
-#[derive(
-    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LaneRecord {
     pub id: u8,
     pub module_id: String,
+    /// unique within `module_id` — what the host binds by.
+    pub name: String,
     pub stream: Option<LaneStream>,
 }
 
@@ -383,6 +400,7 @@ mod tests {
             // a lane rides the admission that brings it
             lanes: vec![LaneDecl {
                 id: 7,
+                name: "board_sync".into(),
                 stream: Some(LaneStream {
                     pacing: LanePacing::Shared,
                     accept_backlog: 32,
@@ -422,11 +440,13 @@ mod tests {
                 LaneRecord {
                     id: 2,
                     module_id: "chat".into(),
+                    name: "voice".into(),
                     stream: None,
                 },
                 LaneRecord {
                     id: 5,
                     module_id: "agent".into(),
+                    name: "telemetry".into(),
                     stream: Some(LaneStream {
                         pacing: LanePacing::Local {
                             bulk_bytes_per_sec: 24 * 1024 * 1024,
@@ -473,5 +493,19 @@ mod tests {
         // the genesis table spells the field only for a module that has one.
         let bare: Seed = sdk::wire::decode(br#"{"kind":"view","code_hash":[]}"#).unwrap();
         assert!(bare.lanes.is_empty());
+    }
+
+    #[test]
+    fn a_lane_name_is_a_bounded_snake_case_token() {
+        for good in ["voice", "video", "gateway", "telemetry", "run_output2"] {
+            assert!(lane_name_is_well_formed(good), "{good}");
+        }
+        for bad in ["", "Voice", "voice-lane", "voice lane", "보이스", "v.1"] {
+            assert!(!lane_name_is_well_formed(bad), "{bad:?}");
+        }
+        assert!(lane_name_is_well_formed(&"a".repeat(MAX_LANE_NAME_BYTES)));
+        assert!(!lane_name_is_well_formed(
+            &"a".repeat(MAX_LANE_NAME_BYTES + 1)
+        ));
     }
 }
