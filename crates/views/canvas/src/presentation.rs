@@ -213,7 +213,7 @@ impl BoardsView {
             let box_ = self.on_screen(live, s).unwrap_or(stored);
             let (pos, size) = self.writing_box(live, s, box_);
             layers.push(self.text_gauge(inline, s, pos, size));
-            let (caret, room) = self.caret_box(inline, s.kind, pos, size);
+            let (caret, room) = self.caret_box(inline, s, pos, size);
             layers.push(self.inline_editor(s, caret, room));
         }
         if let Some(board) = &board {
@@ -467,7 +467,9 @@ impl BoardsView {
             None => format!("{count} selected"),
         };
         // a connector has no box to write in; the inspector does not offer one
-        let writable = only.is_some_and(|record| !record.shape.kind.is_path());
+        let writable = only
+            .map(|record| &record.shape)
+            .filter(|s| !s.kind.is_path());
         Some(kit::sized(
             self.inspector(name, count, writable),
             Some(Length::Fixed(204.)),
@@ -652,13 +654,13 @@ impl BoardsView {
             4.,
         )
     }
-    fn inspector(&self, name: String, count: usize, writable: bool) -> Node {
+    fn inspector(&self, name: String, count: usize, writable: Option<&Shape>) -> Node {
         let mut properties = vec![
             kit::heading("boards/selection-title", name),
             self.swatches(),
             kit::divider("boards/properties-rule"),
         ];
-        if writable {
+        if let Some(shape) = writable {
             properties.push(wide(action(
                 "boards/edit-text",
                 "Edit text",
@@ -666,6 +668,14 @@ impl BoardsView {
                 Message::EditText,
                 true,
             )));
+            properties.push(text_size_row(shape.text_size));
+            // A text shape IS its words: the box is the block, so there is no
+            // room in it for an alignment to move them into and the row would
+            // be a control that does nothing. A card has a box wider than its
+            // writing, which is the whole of what aligning means.
+            if middling(shape.kind) {
+                properties.push(align_row(shape.align));
+            }
         }
         // stacking, then arranging: the rows a canvas app keeps in its panel
         properties.push(kit::spaced(
@@ -1133,18 +1143,22 @@ impl BoardsView {
     /// the editor has to be able to put them too: the box the caret lives in
     /// carries the alignment instead of the words, and it is sized and placed
     /// off this same answer.
-    pub(super) fn lettering(&self, kind: Kind, size: [f32; 2]) -> Lettering {
-        let plain = kind == Kind::Text;
+    pub(super) fn lettering(&self, s: &Shape, size: [f32; 2]) -> Lettering {
+        let plain = s.kind == Kind::Text;
         let edge = CARD_INSET * self.zoom;
         // an ellipse and a diamond pinch away from their corners, so their
         // words start further in — far enough to sit on the body, not beside it
-        let pinch = match kind {
+        let pinch = match s.kind {
             Kind::Ellipse => 0.14,
             Kind::Diamond => 0.22,
             Kind::Note | Kind::Rectangle | Kind::Text => 0.,
             Kind::Arrow | Kind::Line | Kind::Draw => 0.,
         };
-        let asked = if plain { 20. } else { 14. } * self.zoom;
+        // A card's label is smaller than a text shape's writing at the same
+        // step — a label sits inside a box that has other things in it, and
+        // the writing IS the thing — and the step multiplies whichever it is,
+        // so choosing a size says the same thing on both.
+        let asked = if plain { 20. } else { 14. } * step(s.text_size) * self.zoom;
         Lettering {
             size: asked.clamp(SMALLEST, 60.),
             inset: edge + size[0].min(size[1]) * pinch,
@@ -1194,10 +1208,11 @@ impl BoardsView {
     pub(super) fn caret_box(
         &self,
         inline: &Inline,
-        kind: Kind,
+        s: &Shape,
         pos: [f32; 2],
         room: [f32; 2],
     ) -> ([f32; 2], [f32; 2]) {
+        let kind = s.kind;
         // A shape's words sit in the middle of it, so the editor's box is the
         // words' own box placed in the middle rather than the whole card: the
         // editor writes from the top-left of whatever box it is given and there
@@ -1207,7 +1222,7 @@ impl BoardsView {
         let Some(words) = inline.wide else {
             return (pos, room);
         };
-        let letters = self.lettering(kind, room);
+        let letters = self.lettering(s, room);
         let wide = words * self.zoom;
         // The box is wider than the words by a margin, so the editor does not
         // wrap a word earlier than the label it is standing in for did. The
@@ -1218,11 +1233,21 @@ impl BoardsView {
         let width = (wide + margin(&letters)).max(1.);
         // A text shape IS its words: its corner is where you put it, so they
         // start there and the box is only the room they need to be written in.
+        // It has no slack for an alignment to move them into.
         if kind == Kind::Text {
             return (pos, [width, room[1]]);
         }
-        // It is the WORDS that go in the middle, not the box around them.
-        let x = (pos[0] + (room[0] - wide) / 2.).max(pos[0]);
+        // It is the WORDS that are set against the card, not the box around
+        // them: the box carries a margin the painter's block does not, and
+        // aligning the box would spend that margin pushing the words off the
+        // edge they were asked to sit on.
+        let slack = room[0] - wide;
+        let x = pos[0]
+            + match s.align {
+                Align::Start => 0.,
+                Align::Middle => (slack / 2.).max(0.),
+                Align::End => slack.max(0.),
+            };
         // A connector's plate is centred on the run by the room it is given, so
         // its top is already the top of the plate.
         let Some(tall) = inline.grown.filter(|_| middling(kind)) else {
@@ -1244,7 +1269,7 @@ impl BoardsView {
             shape.width as f32 * self.zoom,
             shape.height as f32 * self.zoom,
         ];
-        let letters = self.lettering(shape.kind, room);
+        let letters = self.lettering(shape, room);
         let hugged = words + margin(&letters) / self.zoom;
         hugged
             .ceil()
@@ -1265,7 +1290,7 @@ impl BoardsView {
         if editing {
             return None;
         }
-        let letters = self.lettering(s.kind, [box_[2] - box_[0], box_[3] - box_[1]]);
+        let letters = self.lettering(s, [box_[2] - box_[0], box_[3] - box_[1]]);
         if !letters.legible {
             return None;
         }
@@ -1297,6 +1322,7 @@ impl BoardsView {
                 id,
                 label,
                 &letters,
+                s.align,
                 middling(s.kind),
                 column(s.kind, size[0], &letters, self.zoom),
             ),
@@ -1778,6 +1804,18 @@ fn float(
 pub(super) fn margin(letters: &Lettering) -> f32 {
     2. * letters.size
 }
+/// What one step of the type ladder multiplies the writing by. Four steps and
+/// not a slider: the size decides the column a card wraps in and the box a
+/// text shape hugs, so every step has to leave writing a board can hold and a
+/// box can be fitted to.
+pub(super) fn step(text_size: TextSize) -> f32 {
+    match text_size {
+        TextSize::Small => 0.72,
+        TextSize::Medium => 1.,
+        TextSize::Large => 1.45,
+        TextSize::Huge => 2.1,
+    }
+}
 /// The column a shape's words are written in, on screen.
 pub(super) fn column(kind: Kind, room: f32, letters: &Lettering, zoom: f32) -> f32 {
     match kind {
@@ -1805,7 +1843,14 @@ pub(super) fn column(kind: Kind, room: f32, letters: &Lettering, zoom: f32) -> f
 pub(super) fn middling(kind: Kind) -> bool {
     !kind.is_path() && kind != Kind::Text
 }
-fn card_words(id: &str, words: Node, letters: &Lettering, middling: bool, room: f32) -> Node {
+fn card_words(
+    id: &str,
+    words: Node,
+    letters: &Lettering,
+    align: Align,
+    middling: bool,
+    room: f32,
+) -> Node {
     let mut held = kit::container(format!("boards/label-box/{id}"), words);
     if let Node::Container {
         padding,
@@ -1845,10 +1890,19 @@ fn card_words(id: &str, words: Node, letters: &Lettering, middling: bool, room: 
         // The card itself, so the block has something to be in the middle of.
         *width = Some(Length::Fill);
         *height = Some(Length::Fill);
-        // A text shape IS its words: its corner is where you put it, so its
-        // words start there rather than walking to the middle of a box nobody
-        // drew.
-        *align_x = middling.then_some(wire::AlignX::Center);
+        // Where the BLOCK of words sits against the card. The lines inside it
+        // keep falling from its left edge, because that is the one thing the
+        // native editor can also do: a line centred here would be a line that
+        // jumped the moment you clicked on it.
+        //
+        // A text shape IS its words, so its block is its box and there is
+        // nothing for this to move — its corner is where you put it.
+        let set = match align {
+            Align::Start => wire::AlignX::Left,
+            Align::Middle => wire::AlignX::Center,
+            Align::End => wire::AlignX::Right,
+        };
+        *align_x = middling.then_some(set);
         *align_y = middling.then_some(wire::AlignY::Center);
     }
     clip
@@ -2006,6 +2060,10 @@ fn icon(name: &str) -> Node {
         "align-bottom" => {
             "<path d='M3 21h18'/><rect x='5' y='4' width='5' height='14'/><rect x='14' y='9' width='5' height='9'/>"
         }
+        // how a card's words are set: lines of writing flush to one side
+        "text-start" => "<path d='M4 6h16M4 11h10M4 16h13M4 21h8'/>",
+        "text-middle" => "<path d='M4 6h16M7 11h10M5 16h14M8 21h8'/>",
+        "text-end" => "<path d='M4 6h16M10 11h10M7 16h13M12 21h8'/>",
         "spread-x" => "<path d='M3 3v18M21 3v18'/><rect x='10' y='7' width='4' height='10'/>",
         "spread-y" => "<path d='M3 3h18M3 21h18'/><rect x='7' y='10' width='10' height='4'/>",
         "front" => "<rect x='3' y='3' width='12' height='12' rx='2'/><path d='M9 21h12V9'/>",
@@ -2193,6 +2251,97 @@ fn icon_button(
     }
     node
 }
+/// The four steps of the type ladder, the one this shape is at checked.
+fn text_size_row(current: TextSize) -> Node {
+    kit::spaced(
+        kit::row(
+            "boards/text-size",
+            [
+                (TextSize::Small, "small", "A", "Small", 10.),
+                (TextSize::Medium, "medium", "A", "Medium", 13.),
+                (TextSize::Large, "large", "A", "Large", 17.),
+                (TextSize::Huge, "huge", "A", "Huge", 21.),
+            ]
+            .map(|(step, key, letter, label, size)| {
+                letter_button(
+                    key,
+                    letter,
+                    label,
+                    size,
+                    Message::Lettering(step),
+                    step == current,
+                )
+            }),
+        ),
+        4.,
+    )
+}
+/// Where this card's words sit across it, the one it is set to checked.
+fn align_row(current: Align) -> Node {
+    kit::spaced(
+        kit::row(
+            "boards/text-align",
+            [
+                (Align::Start, "text-start", "Align left"),
+                (Align::Middle, "text-middle", "Align centre"),
+                (Align::End, "text-end", "Align right"),
+            ]
+            .map(|(align, name, label)| {
+                icon_button(
+                    &format!("boards/align/{name}"),
+                    name,
+                    label,
+                    "Where this card's words sit across it",
+                    Message::Align(align),
+                    true,
+                    align == current,
+                )
+            }),
+        ),
+        4.,
+    )
+}
+/// A 28px control labelled with a letter rather than a glyph, checked when
+/// `on`, the letter drawn at the size it stands for. Four steps of type size
+/// are four sizes of the same letter, and no icon says that as plainly as the
+/// letter itself does.
+fn letter_button(
+    key: &str,
+    letter: &str,
+    label: &str,
+    size: f32,
+    message: Message,
+    on: bool,
+) -> Node {
+    let glyph = kit::nowrap(kit::text_size(
+        kit::text(format!("boards/letter/{key}"), letter),
+        size,
+    ));
+    let mut node = kit::button_child(
+        format!("boards/text-size/{key}"),
+        glyph,
+        Some(slots::message(message)),
+        ButtonPreset::Subtle,
+    );
+    if let Node::Button {
+        label: accessible,
+        checked,
+        width,
+        height,
+        padding,
+        description,
+        ..
+    } = &mut node
+    {
+        *accessible = Some(label.into());
+        *checked = Some(on);
+        *width = Some(Length::Fixed(28.));
+        *height = Some(Length::Fixed(28.));
+        *padding = Some(wire::Edges::all(2.));
+        *description = Some("How big this shape's words are".into());
+    }
+    node
+}
 fn swatch(color: u8, selected: bool) -> Node {
     let name = ["Yellow", "Blue", "Green", "Purple", "Coral"][color as usize];
     let mut circle = kit::container(
@@ -2253,7 +2402,7 @@ impl BoardsView {
     /// the same padding — which is the right authority anyway. The card ends
     /// up as tall as the words it will be *drawn* with.
     fn text_gauge(&self, inline: &Inline, shape: &Shape, pos: [f32; 2], size: [f32; 2]) -> Node {
-        let letters = self.lettering(shape.kind, size);
+        let letters = self.lettering(shape, size);
         let words = inline.document.text();
         let measure = || {
             Some(slots::handler(Box::new(|(w, h)| {
@@ -2371,7 +2520,7 @@ impl BoardsView {
             focus_border: Some(Rgba([0.; 4])),
             ..Default::default()
         };
-        let letters = self.lettering(shape.kind, size);
+        let letters = self.lettering(shape, size);
         let editor = Node::Editor {
             key: format!("boards/editor/{}", inline.id),
             document,

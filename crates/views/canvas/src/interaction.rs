@@ -1541,6 +1541,32 @@ impl BoardsView {
                 .collect(),
         )
     }
+    /// Where the selection's words sit across the boxes they are written in.
+    /// It is not remembered for the NEXT shape the way a colour is: a colour
+    /// is a choice about the board, and how a card's words are set is a choice
+    /// about that card's words.
+    pub(super) fn on_align(&mut self, align: Align) -> Task<Message> {
+        self.edit_many(
+            self.selected
+                .iter()
+                .map(|id| Change::Align {
+                    id: id.clone(),
+                    align,
+                })
+                .collect(),
+        )
+    }
+    pub(super) fn on_lettering(&mut self, text_size: TextSize) -> Task<Message> {
+        self.edit_many(
+            self.selected
+                .iter()
+                .map(|id| Change::TextSize {
+                    id: id.clone(),
+                    text_size,
+                })
+                .collect(),
+        )
+    }
     pub(super) fn on_delete(&mut self) -> Task<Message> {
         let changes = self
             .selected

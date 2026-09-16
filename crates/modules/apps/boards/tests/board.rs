@@ -493,3 +493,54 @@ fn batch_is_atomic_and_editing_does_not_change_stacking_order() {
     assert_eq!(board.shapes["z"].shape.x, 0);
     assert!(original.shapes.is_empty());
 }
+
+#[test]
+fn how_the_words_sit_and_how_big_they_are_are_fields_like_any_other() {
+    let board = blank().changed(&create("a")).unwrap();
+    let shape = &board.shapes["a"].shape;
+    assert_eq!(
+        (shape.align, shape.text_size),
+        (Align::Middle, TextSize::Medium),
+        "a card written with no opinion is centred at the middle size"
+    );
+    // They compose with each other and with everything else, because each
+    // carries only its own field forward.
+    let edits = [
+        Change::Align {
+            id: "a".into(),
+            align: Align::End,
+        },
+        Change::TextSize {
+            id: "a".into(),
+            text_size: TextSize::Huge,
+        },
+        Change::Text {
+            id: "a".into(),
+            text: "flush right".into(),
+        },
+    ];
+    let forwards = edits
+        .iter()
+        .try_fold(board.clone(), |b, c| b.changed(c))
+        .unwrap();
+    let backwards = edits
+        .iter()
+        .rev()
+        .try_fold(board.clone(), |b, c| b.changed(c))
+        .unwrap();
+    assert_eq!(forwards.shapes["a"].shape, backwards.shapes["a"].shape);
+    let written = &forwards.shapes["a"].shape;
+    assert_eq!(
+        (written.align, written.text_size, written.text.as_str()),
+        (Align::End, TextSize::Huge, "flush right")
+    );
+    // And naming a shape that is not there is the no-op every other field op
+    // is, not a rejection that would take a whole batch down with it.
+    let missing = board
+        .changed(&Change::Align {
+            id: "gone".into(),
+            align: Align::Start,
+        })
+        .unwrap();
+    assert_eq!(missing.shapes.len(), 1);
+}

@@ -3,7 +3,7 @@
 mod host;
 mod interaction;
 mod presentation;
-use boards::{Board, Change, Kind, Operation, Shape};
+use boards::{Align, Board, Change, Kind, Operation, Shape, TextSize};
 use ducktape_view_guest::{Editor, wire};
 use ducktape_view_guest::{Subscription, Task};
 use serde::{Deserialize, Serialize};
@@ -270,6 +270,8 @@ pub enum Message {
     Fit,
     Size(f32, f32),
     Color(u8),
+    Align(Align),
+    Lettering(TextSize),
     Delete,
     Undo,
     Redo,
@@ -394,6 +396,8 @@ impl BoardsView {
             Message::Fit => self.on_fit(),
             Message::Size(w, h) => self.on_size(w, h),
             Message::Color(color) => self.on_color(color),
+            Message::Align(align) => self.on_align(align),
+            Message::Lettering(text_size) => self.on_lettering(text_size),
             Message::Delete => self.on_delete(),
             Message::Undo => self.on_undo(),
             Message::Redo => self.on_redo(),
@@ -814,6 +818,26 @@ fn inverse(board: &Board, change: &Change) -> Vec<Change> {
                     points: r.shape.points.clone(),
                     from: r.shape.from.clone(),
                     to: r.shape.to.clone(),
+                }]
+            })
+            .unwrap_or_default(),
+        Change::Align { id, .. } => board
+            .shapes
+            .get(id)
+            .map(|r| {
+                vec![Change::Align {
+                    id: id.clone(),
+                    align: r.shape.align,
+                }]
+            })
+            .unwrap_or_default(),
+        Change::TextSize { id, .. } => board
+            .shapes
+            .get(id)
+            .map(|r| {
+                vec![Change::TextSize {
+                    id: id.clone(),
+                    text_size: r.shape.text_size,
                 }]
             })
             .unwrap_or_default(),
