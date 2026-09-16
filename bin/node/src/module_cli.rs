@@ -506,6 +506,18 @@ fn registry_holds(modules: &[modules::ModuleCode], id: &str, code_hash: &[u8; 32
     already_active.then_some(Held::Active)
 }
 
+/// The chain height, which is what tells a pending swap still in flight from
+/// one whose activation passed without it.
+fn read_height(rpc_addr: &str) -> Result<u64, String> {
+    let reply = rpc_call(rpc_addr, &serde_json::json!({ "cmd": "status" }))?;
+    if reply["ok"] != true {
+        return Err(format!("status: {}", reply["error"]));
+    }
+    reply["status"]["height"]
+        .as_u64()
+        .ok_or_else(|| "node status carries no height".to_owned())
+}
+
 /// The running host determines which ids are occupied, including modules
 /// with no code-registry record. A default build catalog says nothing about
 /// the module set of this network.
@@ -543,7 +555,7 @@ fn cmd_status(args: StatusArgs) -> CommandResult {
         return Ok(());
     }
     let proposed = read_open_code_proposals(&rpc_addr)?;
-    print!("{}", render_status(&modules));
+    print!("{}", render_status(&modules, read_height(&rpc_addr)?));
     print!("{}", render_proposed(&proposed));
     Ok(())
 }
@@ -790,8 +802,10 @@ fn digest_matches(reply: &StageReply, bytes: &[u8]) -> Result<[u8; 32], String> 
 const SHORT_HASH: usize = 12;
 
 /// one row per module: `id  active  pending`. Either column is `—` when there
-/// is nothing to show; pending is otherwise `<hash> ready <k|✓> activation <h>`.
-fn render_status(modules: &[modules::ModuleCode]) -> String {
+/// is nothing to show; pending is otherwise `<hash> ready <k|✓> activation <h>`,
+/// or `<hash> DEAD activation <h>` for a swap whose height came and went with
+/// readiness never latched — it can only be replaced or cancelled now.
+fn render_status(modules: &[modules::ModuleCode], height: u64) -> String {
     let id_width = modules
         .iter()
         .map(|m| m.module_id.len())
@@ -815,9 +829,9 @@ fn render_status(modules: &[modules::ModuleCode]) -> String {
         let pending = match &m.pending {
             None => "—".to_string(),
             Some(swap) => format!(
-                "{}  ready {}  activation {}",
+                "{}  {}  activation {}",
                 short(&swap.code_hash),
-                readiness_word(swap),
+                readiness_word(swap, height),
                 swap.activation_height
             ),
         };
@@ -864,12 +878,18 @@ fn kind_word(kind: modules::Kind) -> &'static str {
 }
 
 /// how far a pending swap's readiness has come: the count of validators that
-/// signalled, or `✓` once the latch covered the whole set.
-fn readiness_word(swap: &modules::ScheduledSwap) -> String {
-    if swap.ready_at.is_some() {
-        return "✓".into();
+/// signalled, or `✓` once the latch covered the whole set — and `DEAD` once
+/// its activation height has passed without that latch. A dead pending never
+/// arms, so an operator reading `ready 1` forever has to be told the swap is
+/// over and has to be re-proposed, not waited on.
+fn readiness_word(swap: &modules::ScheduledSwap, height: u64) -> String {
+    if swap.stale_at(height) {
+        return "DEAD".into();
     }
-    swap.readiness.len().to_string()
+    if swap.ready_at.is_some() {
+        return "ready ✓".into();
+    }
+    format!("ready {}", swap.readiness.len())
 }
 
 fn short(hash: &[u8]) -> String {
@@ -1209,7 +1229,7 @@ mod tests {
                 history: Vec::new(),
             },
         ];
-        let out = render_status(&modules);
+        let out = render_status(&modules, 100);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "id     kind    active        pending");
         assert_eq!(lines[1], "acl    module  abababababab  —");
@@ -1226,6 +1246,34 @@ mod tests {
         assert_eq!(
             lines[4],
             "home   view    —             cdcdcdcdcdcd  ready 0  activation 120"
+        );
+    }
+
+    #[test]
+    fn a_pending_swap_past_its_height_reads_dead() {
+        let modules = vec![ModuleCode {
+            module_id: "pages".into(),
+            kind: modules::Kind::Module,
+            active_code_hash: vec![0xabu8; 32],
+            pending: Some(ScheduledSwap {
+                name: "pages-2".into(),
+                activation_height: 120,
+                code_hash: vec![0xcdu8; 32],
+                readiness: vec![vec![1]],
+                ready_at: None,
+            }),
+            history: Vec::new(),
+        }];
+        // at the height itself the readiness never latched, so the swap can
+        // no longer arm — an operator waiting on `ready 1` waits forever.
+        let out = render_status(&modules, 120);
+        assert!(
+            out.contains("cdcdcdcdcdcd  DEAD  activation 120"),
+            "{out}"
+        );
+        assert!(
+            render_status(&modules, 119).contains("ready 1"),
+            "a swap still short of its height is in flight"
         );
     }
 }
