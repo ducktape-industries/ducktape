@@ -256,7 +256,10 @@ impl BoardsView {
             (false, "h" | "2") if !repeat => self.on_tool(Tool::Hand),
             (false, "n" | "3") if !repeat => self.on_tool(Tool::Note),
             (false, "r" | "4") if !repeat => self.on_tool(Tool::Rectangle),
-            (false, "o" | "5") if !repeat => self.on_tool(Tool::Ellipse),
+            // tldraw and excalidraw both answer to O for the oval, and the
+            // toolbar prints that one. C is what a hand reaches for anyway —
+            // it is the word, and nothing else on the board wants the key.
+            (false, "o" | "c" | "5") if !repeat => self.on_tool(Tool::Ellipse),
             (false, "d" | "6") if !repeat => self.on_tool(Tool::Diamond),
             (false, "a" | "7") if !repeat => self.on_tool(Tool::Arrow),
             (false, "l" | "8") if !repeat => self.on_tool(Tool::Line),

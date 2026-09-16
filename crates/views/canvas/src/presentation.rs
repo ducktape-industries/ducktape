@@ -1545,10 +1545,19 @@ impl BoardsView {
                 // the gesture, not of the shape, and it tells you nothing
                 // about what you are about to put on the board.
                 self.paint(board, &shape, 0.8, PREVIEW, out);
-                // Over it, the ring a selection wears — this one is still in
-                // hand — but no wash: a tint over the body would report the
-                // wrong colour for the card you are about to make, and the
-                // ring is the only thing a text box has to show its extent by.
+                // And nothing else. A shape that draws its own outline needs
+                // no box drawn around it: over an ellipse that box is a second
+                // outline belonging to no shape, and while the ellipse is
+                // small the two read as one rounded rectangle that turns into
+                // a circle as it grows — which is the jump this preview was
+                // put here to remove.
+                let its_own_outline = shape.kind != Kind::Text;
+                if its_own_outline {
+                    return;
+                }
+                // A text shape has no body: the ring is the only thing that
+                // says how much room it is taking. No wash under it either —
+                // a tint would report a colour the words will not be in.
                 out.push(rectangle(
                     self.screen(shape.x as f32, shape.y as f32),
                     [

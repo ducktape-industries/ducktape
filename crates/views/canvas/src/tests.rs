@@ -2411,11 +2411,12 @@ fn a_card_being_drawn_is_drawn_as_the_card_it_will_be() {
         marks.iter().any(an_ellipse),
         "an ellipse in hand was previewed as a box: {marks:?}"
     );
-    // And the box is still drawn over it, because that ring is the only thing
-    // saying how much room the shape will take.
+    // And nothing around it. A box over an ellipse is a second outline that
+    // belongs to no shape, and a small ellipse inside it reads as one rounded
+    // rectangle that turns into a circle as it grows.
     assert!(
-        marks.iter().any(|mark| rings(mark, [100., 100.])),
-        "the shape in hand wore no ring: {marks:?}"
+        !marks.iter().any(|mark| rings(mark, [100., 100.])),
+        "an ellipse in hand was boxed as well as drawn: {marks:?}"
     );
     let drawn = view
         .drawn_shape(Kind::Ellipse, [100., 100.], [300., 240.])
@@ -2424,6 +2425,57 @@ fn a_card_being_drawn_is_drawn_as_the_card_it_will_be() {
         (drawn.kind, drawn.width, drawn.height),
         (Kind::Ellipse, 200, 140),
         "what was previewed is not what the drag leaves behind"
+    );
+    // A text shape has no body of its own, so the ring is all it has to say
+    // how much room it is taking.
+    view.on_release();
+    view.tool = Tool::Text;
+    view.on_press(600., 100.);
+    view.on_move(800., 240.);
+    let mut marks = Vec::new();
+    view.paint_marks(&board, 3600, &mut marks);
+    assert!(
+        marks.iter().any(|mark| rings(mark, [600., 100.])),
+        "a text box in hand showed nothing at all: {marks:?}"
+    );
+}
+#[test]
+fn the_oval_answers_to_the_letter_it_is_printed_with_and_to_its_name() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    for letter in ["o", "c"] {
+        view.tool = Tool::Select;
+        key(
+            &mut view,
+            wire::keyboard::Key::Character(letter.into()),
+            wire::keyboard::Modifiers::default(),
+            false,
+        );
+        assert_eq!(
+            view.tool,
+            Tool::Ellipse,
+            "{letter} did not reach for the oval"
+        );
+    }
+    // And the letter that copies still copies: a bare C is the oval, a held
+    // one is not. Which modifier holds it is the host's answer, ⌘ or Ctrl, so
+    // both are down here and the view reads whichever one this build calls
+    // the command key.
+    view.tool = Tool::Select;
+    key(
+        &mut view,
+        wire::keyboard::Key::Character("c".into()),
+        wire::keyboard::Modifiers {
+            control: true,
+            logo: true,
+            ..Default::default()
+        },
+        false,
+    );
+    assert_eq!(
+        view.tool,
+        Tool::Select,
+        "the copy chord reached for a tool instead of the clipboard"
     );
 }
 #[test]
