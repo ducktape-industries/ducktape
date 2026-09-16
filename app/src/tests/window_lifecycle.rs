@@ -182,11 +182,11 @@ fn closing_a_window_exits_only_where_no_status_item_lives() {
                 let syn::Expr::Path(path) = call.func.as_ref() else {
                     continue;
                 };
-                if !path
+                if path
                     .path
                     .segments
                     .last()
-                    .is_some_and(|part| part.ident == "quit")
+                    .is_none_or(|part| part.ident != "quit")
                 {
                     continue;
                 }
