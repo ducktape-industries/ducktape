@@ -562,7 +562,7 @@ pub fn view<M: Clone + 'static>(
         mark(format!("{key}/bold"), "B", "Bold", press("bold".into())),
         mark(format!("{key}/italic"), "I", "Italic", press("italic".into())),
         // Latin punctuation only: the product face carries it. A dingbat
-        // quote mark (❞) or an angle-quote pair (‹›) falls out of Geist and
+        // quote mark (❞) or an angle-quote pair (‹›) falls out of Inter and
         // lands in whatever the system has, which is a tofu box on a host
         // with no fallback and an emoji on one that has too much.
         mark(format!("{key}/code"), "<>", "Code", press("code".into())),

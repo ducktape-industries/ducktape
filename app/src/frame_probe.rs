@@ -168,7 +168,7 @@ pub(crate) fn headless_context() -> HeadlessAppContext {
         // set cannot see what the app draws — a single variable face passed
         // every weight test in this context while the app drew them all at
         // regular.
-        let mut fonts: Vec<Cow<'static, [u8]>> = crate::shell::LATIN_FACES
+        let mut fonts: Vec<Cow<'static, [u8]>> = crate::shell::BUNDLED_FACES
             .iter()
             .copied()
             .map(Cow::Borrowed)
