@@ -29,9 +29,9 @@ pub struct ButtonRecipe {
 }
 
 impl ButtonRecipe {
-    pub(super) fn sanitize(&mut self, text_budget: &mut usize) {
+    pub(super) fn sanitize(&mut self, budgets: &mut Budgets) {
         if let Some(font) = &mut self.font {
-            font.sanitize(text_budget);
+            font.sanitize(budgets);
         }
         for color in [
             &mut self.base.background,

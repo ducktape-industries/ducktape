@@ -817,16 +817,9 @@ fn text_amounts(root: &Node) -> Result<(usize, usize), &'static str> {
 
 fn sanitize_tree(root: &mut Node) -> Result<SanitizeReport, &'static str> {
     let (documents, before) = text_amounts(root)?;
-    let mut budget = MAX_NODES;
-    let mut budgets = Budgets {
-        text: MAX_TEXT_BYTES_PER_FRAME,
-        pictures: MAX_PICTURE_BYTES_PER_FRAME,
-        surface_values: MAX_SURFACE_VALUES,
-        canvas_parts: MAX_CANVAS_PARTS,
-        qr_codes: MAX_QR_CODES,
-    };
+    let mut budgets = Budgets::frame();
     let mut taken = Taken::new();
-    sanitize_node(root, 0, &mut budget, &mut budgets, &mut taken);
+    sanitize_node(root, 0, &mut budgets, &mut taken);
     let (after_documents, after) = text_amounts(root)?;
     if after_documents != documents {
         return Err("frame budget would remove an editor document projection");
@@ -865,42 +858,50 @@ fn claim(key: &mut String, taken: &mut Taken) {
     taken.insert(unique, 2);
 }
 
-/// What is left of a frame's per-frame byte budgets while its tree is walked.
-struct Budgets {
-    qr_codes: usize,
-    canvas_parts: usize,
-    surface_values: usize,
-    text: usize,
-    pictures: usize,
+/// What is left of a frame's per-frame budgets while its tree is walked.
+pub(crate) struct Budgets {
+    pub(crate) nodes: usize,
+    pub(crate) qr_codes: usize,
+    pub(crate) canvas_parts: usize,
+    pub(crate) surface_values: usize,
+    pub(crate) text: usize,
+    pub(crate) pictures: usize,
+}
+
+impl Budgets {
+    pub(crate) fn frame() -> Self {
+        Self {
+            nodes: MAX_NODES,
+            text: MAX_TEXT_BYTES_PER_FRAME,
+            pictures: MAX_PICTURE_BYTES_PER_FRAME,
+            surface_values: MAX_SURFACE_VALUES,
+            canvas_parts: MAX_CANVAS_PARTS,
+            qr_codes: MAX_QR_CODES,
+        }
+    }
 }
 
 /// Truncates one shaped string to what is left of the frame's text budget
 /// and spends what survives. Nodes are walked in tree order, so a frame past
 /// the budget keeps its head and loses its tail.
-fn spend_text(text: &mut String, text_budget: &mut usize) {
-    truncate_to(text, (*text_budget).min(MAX_STRING_BYTES));
-    *text_budget -= text.len();
+fn spend_text(text: &mut String, budgets: &mut Budgets) {
+    truncate_to(text, budgets.text.min(MAX_STRING_BYTES));
+    budgets.text -= text.len();
 }
 
 /// Spends a picture's bytes from the frame's picture budget, or drops them
 /// whole when they do not fit.
-fn spend_svg(bytes: &mut Option<Vec<u8>>, svg_budget: &mut usize) {
+fn spend_svg(bytes: &mut Option<Vec<u8>>, budgets: &mut Budgets) {
     match bytes {
-        Some(picture) if picture.len() <= *svg_budget => *svg_budget -= picture.len(),
+        Some(picture) if picture.len() <= budgets.pictures => budgets.pictures -= picture.len(),
         _ => *bytes = None,
     }
 }
 
-fn sanitize_node(
-    node: &mut Node,
-    depth: usize,
-    budget: &mut usize,
-    budgets: &mut Budgets,
-    taken: &mut Taken,
-) {
+fn sanitize_node(node: &mut Node, depth: usize, budgets: &mut Budgets, taken: &mut Taken) {
     // The caller guarantees one node of budget; a node too deep spends it
     // on the empty node that stands in for it.
-    *budget -= 1;
+    budgets.nodes -= 1;
     if depth >= MAX_DEPTH {
         *node = Node::empty();
         return;
@@ -1021,7 +1022,7 @@ fn sanitize_node(
         } => {
             claim(key, taken);
             if let Some(value) = reset
-                && !value.bound(0, &mut budgets.surface_values, &mut budgets.text, false)
+                && !value.bound(0, budgets, false)
             {
                 *reset = None;
             }
@@ -1120,7 +1121,7 @@ fn sanitize_node(
 
         Node::Canvas { key, commands, .. } => {
             claim(key, taken);
-            canvas::sanitize(commands, &mut budgets.canvas_parts);
+            canvas::sanitize(commands, budgets);
         }
         Node::When { key, condition, .. } => {
             claim(key, taken);
@@ -1145,7 +1146,7 @@ fn sanitize_node(
         }
         Node::Qr { key, code } => {
             claim(key, taken);
-            code.sanitize(&mut budgets.text, &mut budgets.qr_codes);
+            code.sanitize(budgets);
         }
         Node::RichText {
             key,
@@ -1156,8 +1157,8 @@ fn sanitize_node(
             ..
         } => {
             claim(key, taken);
-            options.sanitize(&mut budgets.text);
-            rich_text::sanitize(spans, &mut budgets.text, budget);
+            options.sanitize(budgets);
+            rich_text::sanitize(spans, budgets);
             if let Some(size) = size {
                 *size = bounded(*size).min(MAX_TEXT_PIXELS);
             }
@@ -1172,15 +1173,15 @@ fn sanitize_node(
             ..
         } => {
             claim(key, taken);
-            options.sanitize(&mut budgets.text);
-            spend_text(content, &mut budgets.text);
+            options.sanitize(budgets);
+            spend_text(content, budgets);
             // Tracking expands graphemes into native widgets. Charge a conservative
             // scalar count against the same host node budget before rendering.
             if options.tracking > 0.0 {
-                if let Some((end, _)) = content.char_indices().nth(*budget) {
+                if let Some((end, _)) = content.char_indices().nth(budgets.nodes) {
                     content.truncate(end);
                 }
-                *budget = budget.saturating_sub(content.chars().count());
+                budgets.nodes = budgets.nodes.saturating_sub(content.chars().count());
             }
             if let Some(size) = size {
                 *size = bounded(*size).min(MAX_TEXT_PIXELS);
@@ -1195,7 +1196,7 @@ fn sanitize_node(
             ..
         } => {
             claim(key, taken);
-            ImageData::sanitize(data, &mut budgets.pictures);
+            ImageData::sanitize(data, budgets);
             if let Some(label) = label {
                 truncate_string(label);
             }
@@ -1210,7 +1211,7 @@ fn sanitize_node(
             ..
         } => {
             claim(key, taken);
-            ImageData::sanitize(data, &mut budgets.pictures);
+            ImageData::sanitize(data, budgets);
             if let Some(label) = label {
                 truncate_string(label);
             }
@@ -1232,7 +1233,7 @@ fn sanitize_node(
             ..
         } => {
             claim(key, taken);
-            spend_svg(bytes, &mut budgets.pictures);
+            spend_svg(bytes, budgets);
             if let Some(label) = label {
                 truncate_string(label);
             }
@@ -1256,11 +1257,11 @@ fn sanitize_node(
             ..
         } => {
             claim(key, taken);
-            spend_text(placeholder, &mut budgets.text);
-            spend_text(value, &mut budgets.text);
-            spend_text(&mut options.label, &mut budgets.text);
+            spend_text(placeholder, budgets);
+            spend_text(value, budgets);
+            spend_text(&mut options.label, budgets);
             if let Some(description) = &mut options.description {
-                spend_text(description, &mut budgets.text);
+                spend_text(description, budgets);
             }
             bound_edges(&mut options.padding);
             if let Some(size) = &mut options.text_size {
@@ -1270,7 +1271,7 @@ fn sanitize_node(
                 *height = bounded(*height).clamp(f32::EPSILON, MAX_PIXELS / MAX_TEXT_PIXELS);
             }
             if let Some(font) = &mut options.font {
-                font.sanitize(&mut budgets.text);
+                font.sanitize(budgets);
             }
 
             style.sanitize();
@@ -1285,11 +1286,11 @@ fn sanitize_node(
             ..
         } => {
             if let Some(presentation) = &mut options.presentation {
-                presentation.sanitize(&mut budgets.text);
+                presentation.sanitize(budgets);
             }
             if let Some(rich) = &mut options.rich {
                 for item in &mut rich.toolbar {
-                    spend_text(&mut item.label, &mut budgets.text);
+                    spend_text(&mut item.label, budgets);
                 }
             }
             bound_optional(&mut options.size);
@@ -1302,9 +1303,9 @@ fn sanitize_node(
             }
             options.style.sanitize();
             claim(key, taken);
-            spend_text(placeholder, &mut budgets.text);
+            spend_text(placeholder, budgets);
             if let Some(font) = &mut options.font {
-                font.sanitize(&mut budgets.text);
+                font.sanitize(budgets);
             }
             bound_optional(width);
             bound_optional(min_height);
@@ -1321,16 +1322,16 @@ fn sanitize_node(
         } => {
             claim(key, taken);
             if let ButtonContent::Label(label) = content {
-                spend_text(label, &mut budgets.text);
+                spend_text(label, budgets);
             }
             if let Some(label) = label {
                 truncate_string(label);
             }
             if let Some(description) = description {
-                spend_text(description, &mut budgets.text);
+                spend_text(description, budgets);
             }
             if let Some(recipe) = &mut style.recipe {
-                recipe.sanitize(&mut budgets.text);
+                recipe.sanitize(budgets);
             }
             bound_edges(padding);
             for face in [
@@ -1368,7 +1369,7 @@ fn sanitize_node(
             key, label, style, ..
         } => {
             claim(key, taken);
-            spend_text(label, &mut budgets.text);
+            spend_text(label, budgets);
             for face in [
                 &mut style.active_on,
                 &mut style.active_off,
@@ -1387,7 +1388,7 @@ fn sanitize_node(
             key, label, style, ..
         } => {
             claim(key, taken);
-            spend_text(label, &mut budgets.text);
+            spend_text(label, budgets);
             for face in [
                 &mut style.active_on,
                 &mut style.active_off,
@@ -1444,13 +1445,13 @@ fn sanitize_node(
             ..
         } => {
             claim(key, taken);
-            spend_text(state_key, &mut budgets.text);
-            settings.sanitize(&mut budgets.text);
+            spend_text(state_key, budgets);
+            settings.sanitize(budgets);
             options.truncate(MAX_OPTIONS);
             for option in options.iter_mut() {
-                spend_text(option, &mut budgets.text);
+                spend_text(option, budgets);
             }
-            spend_text(placeholder, &mut budgets.text);
+            spend_text(placeholder, budgets);
             if selected.is_some_and(|index| index as usize >= options.len()) {
                 *selected = None;
             }
@@ -1465,7 +1466,7 @@ fn sanitize_node(
             ..
         } => {
             claim(key, taken);
-            settings.sanitize(&mut budgets.text);
+            settings.sanitize(budgets);
             for face in [
                 &mut style.active,
                 &mut style.hovered,
@@ -1491,10 +1492,10 @@ fn sanitize_node(
             }
             options.truncate(MAX_OPTIONS);
             for option in options.iter_mut() {
-                spend_text(option, &mut budgets.text);
+                spend_text(option, budgets);
             }
             if let Some(placeholder) = placeholder {
-                spend_text(placeholder, &mut budgets.text);
+                spend_text(placeholder, budgets);
             }
             if selected.is_some_and(|index| index as usize >= options.len()) {
                 *selected = None;
@@ -1522,14 +1523,14 @@ fn sanitize_node(
             key, name, args, ..
         } => {
             claim(key, taken);
-            spend_text(name, &mut budgets.text);
+            spend_text(name, budgets);
             args.truncate(MAX_SURFACE_ARGS);
             let mut kept = 0;
             for value in args.iter_mut() {
                 if budgets.surface_values == 0 {
                     break;
                 }
-                if !value.bound(0, &mut budgets.surface_values, &mut budgets.text, false) {
+                if !value.bound(0, budgets, false) {
                     *value = SurfaceValue::Unit;
                 }
                 kept += 1;
@@ -1554,10 +1555,10 @@ fn sanitize_node(
     {
         let mut kept = 0;
         for child in children.iter_mut() {
-            if *budget == 0 {
+            if budgets.nodes == 0 {
                 break;
             }
-            sanitize_node(child, depth + 1, budget, budgets, taken);
+            sanitize_node(child, depth + 1, budgets, taken);
             kept += 1;
         }
         children.truncate(kept);
@@ -1573,11 +1574,11 @@ fn sanitize_node(
         return;
     }
     for child in node.children_mut() {
-        if *budget == 0 {
+        if budgets.nodes == 0 {
             *child = Node::empty();
             continue;
         }
-        sanitize_node(child, depth + 1, budget, budgets, taken);
+        sanitize_node(child, depth + 1, budgets, taken);
     }
 }
 

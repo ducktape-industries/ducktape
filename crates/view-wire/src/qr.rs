@@ -35,7 +35,7 @@ pub struct Qr {
 }
 
 impl Qr {
-    pub(super) fn sanitize(&mut self, bytes: &mut usize, codes: &mut usize) {
+    pub(super) fn sanitize(&mut self, budgets: &mut Budgets) {
         let version_valid = match self.version {
             Some(QrVersion::Normal(value)) => (1..=40).contains(&value),
             Some(QrVersion::Micro(value)) => (1..=4).contains(&value),
@@ -44,13 +44,13 @@ impl Qr {
         if let Some(payload) = &self.payload {
             if !version_valid
                 || payload.len() > MAX_QR_PAYLOAD_BYTES
-                || payload.len() > *bytes
-                || *codes == 0
+                || payload.len() > budgets.text
+                || budgets.qr_codes == 0
             {
                 self.payload = None;
             } else {
-                *bytes -= payload.len();
-                *codes -= 1;
+                budgets.text -= payload.len();
+                budgets.qr_codes -= 1;
             }
         }
         if let Some(size) = &mut self.size {
@@ -74,20 +74,22 @@ mod tests {
             size: Some(QrSize::Cell(f32::INFINITY)),
             ..Default::default()
         };
-        let (mut bytes, mut codes) = (2, 1);
-        code.sanitize(&mut bytes, &mut codes);
+        let mut b = Budgets::frame();
+        (b.text, b.qr_codes) = (2, 1);
+        code.sanitize(&mut b);
         assert_eq!(code.payload, None, "never encode a truncated payload");
-        assert_eq!((bytes, codes), (2, 1));
+        assert_eq!((b.text, b.qr_codes), (2, 1));
         assert_eq!(code.size, Some(QrSize::Cell(MAX_PIXELS / 182.0)));
         code.payload = Some(vec![]);
-        code.sanitize(&mut bytes, &mut codes);
+        code.sanitize(&mut b);
         assert_eq!(code.payload, Some(vec![]));
-        assert_eq!(codes, 0, "even empty codes spend encoding work");
-        code.sanitize(&mut bytes, &mut codes);
+        assert_eq!(b.qr_codes, 0, "even empty codes spend encoding work");
+        code.sanitize(&mut b);
         assert_eq!(code.payload, None);
         code.payload = Some(vec![0; MAX_QR_PAYLOAD_BYTES + 1]);
-        let (mut bytes, mut codes) = (usize::MAX, 1);
-        code.sanitize(&mut bytes, &mut codes);
+        let mut b = Budgets::frame();
+        (b.text, b.qr_codes) = (usize::MAX, 1);
+        code.sanitize(&mut b);
         assert_eq!(code.payload, None);
         for version in [
             QrVersion::Normal(0),
@@ -97,7 +99,7 @@ mod tests {
         ] {
             code.payload = Some(b"data".to_vec());
             code.version = Some(version);
-            code.sanitize(&mut bytes, &mut codes);
+            code.sanitize(&mut b);
             assert_eq!(code.payload, None, "{version:?}");
         }
     }
