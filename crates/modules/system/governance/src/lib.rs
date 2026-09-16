@@ -1207,6 +1207,7 @@ impl Governance {
                     kind,
                     activation_lead,
                     code_hash,
+                    lanes,
                 } => match &self.code_registry_id {
                     Some(registry) => {
                         let activation_height = ctx.env().height.saturating_add(*activation_lead);
@@ -1218,6 +1219,7 @@ impl Governance {
                                 kind: *kind,
                                 activation_height,
                                 code_hash: code_hash.clone(),
+                                lanes: lanes.clone(),
                             }),
                         })
                     }

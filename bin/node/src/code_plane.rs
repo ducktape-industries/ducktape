@@ -1054,6 +1054,7 @@ mod tests {
             kind: modules::Kind::Module,
             activation_lead: 50,
             code_hash: hash.to_vec(),
+            lanes: Vec::new(),
         };
         let proposals = vec![
             proposal(ProposalStatus::Open, action(register)),

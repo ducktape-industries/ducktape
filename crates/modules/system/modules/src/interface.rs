@@ -48,6 +48,12 @@ pub struct Seed {
     pub kind: Kind,
     /// the 32-byte sha256 of the deployment frame.
     pub code_hash: Vec<u8>,
+    /// the data-plane lanes this module founds the network with. Defaulted
+    /// because most modules declare none and spelling `lanes: []` for every
+    /// one of them is noise — not a compat shim: an absent list and an empty
+    /// list mean the same thing, today and always.
+    #[serde(default)]
+    pub lanes: Vec<LaneDecl>,
 }
 
 // ---- the module-code path shapes --------------------------------------------
@@ -162,6 +168,84 @@ pub struct ArmedSwap {
     pub code_hash: Vec<u8>,
 }
 
+// ---- data-plane lanes -------------------------------------------------------
+
+/// Lane ids the registry never admits: the node's own kernel planes. They are
+/// fixed in the binary because a node must serve them BEFORE it can read any
+/// registry — state sync is how it catches up, and the code plane is how it
+/// fetches the very module that would declare a lane. Nothing bootstraps them.
+pub const RESERVED_LANE_IDS: &[u8] = &[1, 6];
+
+/// The highest declarable lane id, and the reason is arithmetic rather than
+/// taste. A lane's two overlay ports are `45800 + id` (stream) and
+/// `45900 + id` (datagram) — ranges only 100 apart. At id 100 a lane's STREAM
+/// port IS lane 0's DATAGRAM port, so two lanes would silently share a socket
+/// instead of failing a bind. 99 is where the ranges stay disjoint. Six
+/// compile-time variants could never reach it; a declared id can.
+pub const MAX_LANE_ID: u8 = 99;
+
+/// Whether a lane owns its stream budget or shares the process-wide link
+/// budget. Mirrors the host's `StreamPacing` minus the live pacer handle,
+/// which is the host's to supply.
+#[derive(
+    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum LanePacing {
+    /// participate in the process-wide bulk budget
+    Shared,
+    /// own a budget: the bulk ceiling and the largest instantaneous burst
+    Local {
+        bulk_bytes_per_sec: u64,
+        bulk_burst_bytes: u64,
+    },
+}
+
+/// A lane's STREAM half, when it has one.
+///
+/// Both overlay sockets are bound for every lane — datagram-vs-stream is a
+/// per-SEND choice, not a property of the lane. What differs is whether a
+/// stream PLANE (queues, pacing, an accept backlog) is bound over them. The
+/// media lanes carry none: they bind sockets and speak datagrams only, which
+/// is why they have no budget to declare.
+#[derive(
+    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq,
+)]
+#[serde(deny_unknown_fields)]
+pub struct LaneStream {
+    pub pacing: LanePacing,
+    /// max accepted-but-unclaimed inbound streams before further opens are
+    /// refused — the host's `StreamPolicy::accept_backlog`.
+    pub accept_backlog: u32,
+}
+
+/// What a module declares it needs. The id is CHOSEN, not allocated: the
+/// registry refuses a collision rather than renumbering, because a renumber
+/// would make the same lane mean different ports on nodes that read the
+/// registry at different heights.
+#[derive(
+    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq,
+)]
+#[serde(deny_unknown_fields)]
+pub struct LaneDecl {
+    pub id: u8,
+    /// `None` is datagram-only — sockets, no stream plane.
+    pub stream: Option<LaneStream>,
+}
+
+/// The lane table's readable entry: a declaration plus who owns it. The table
+/// is the ONE place a lane's fields live; a module's record does not repeat
+/// them, so there is no second copy to disagree.
+#[derive(
+    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq,
+)]
+#[serde(deny_unknown_fields)]
+pub struct LaneRecord {
+    pub id: u8,
+    pub module_id: String,
+    pub stream: Option<LaneStream>,
+}
+
 // ---- the wire surface -------------------------------------------------------
 
 /// what an ingested op DOES to the modules registry. the ORIGIN is the
@@ -178,6 +262,9 @@ pub enum ModulesMsg {
         module_id: String,
         kind: Kind,
         code_hash: Vec<u8>,
+        /// the data-plane lanes this module brings. Empty for a module that
+        /// needs none, which is most of them.
+        lanes: Vec<LaneDecl>,
     },
     /// schedule a height-gated code swap for a registered module.
     /// `Origin::Module | System` only.
@@ -199,6 +286,9 @@ pub enum ModulesMsg {
         kind: Kind,
         activation_height: u64,
         code_hash: Vec<u8>,
+        /// declared with the admission, so a cancel before the boundary takes
+        /// the lanes with the entry and frees their ids again.
+        lanes: Vec<LaneDecl>,
     },
     /// clear a pending swap before its boundary. `Origin::Module | System` only.
     CancelSwap { name: String, module_id: String },
@@ -229,6 +319,10 @@ pub enum ModulesQuery {
     /// before `height` AND the activation floor reached). the host reads this at
     /// the boundary to know which registry modules to swap and to which code hash.
     ArmedAt { height: u64 },
+    /// every declared data-plane lane, ascending by id. the host reads this to
+    /// know which lanes to bind and with what pacing and backlog — it does not
+    /// learn that from its own binary.
+    Lanes,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -236,6 +330,7 @@ pub enum ModulesQuery {
 pub enum ModulesReply {
     ModuleStatus { modules: Vec<ModuleCode> },
     ArmedAt { swaps: Vec<ArmedSwap> },
+    Lanes { lanes: Vec<LaneRecord> },
 }
 
 pub fn encode_msg(m: &ModulesMsg) -> Vec<u8> {
@@ -271,6 +366,7 @@ mod tests {
             module_id: "hello".into(),
             kind: Kind::Module,
             code_hash: vec![1u8; CODE_HASH_LEN],
+            lanes: Vec::new(),
         });
         rt_msg(ModulesMsg::ScheduleSwap {
             name: "swap-hello".into(),
@@ -284,6 +380,14 @@ mod tests {
             kind: Kind::Module,
             activation_height: 10,
             code_hash: vec![5u8; CODE_HASH_LEN],
+            // a lane rides the admission that brings it
+            lanes: vec![LaneDecl {
+                id: 7,
+                stream: Some(LaneStream {
+                    pacing: LanePacing::Shared,
+                    accept_backlog: 32,
+                }),
+            }],
         });
         rt_msg(ModulesMsg::ScheduleRegister {
             name: "admit-home".into(),
@@ -291,6 +395,7 @@ mod tests {
             kind: Kind::View,
             activation_height: 10,
             code_hash: vec![6u8; CODE_HASH_LEN],
+            lanes: Vec::new(),
         });
         rt_msg(ModulesMsg::CancelSwap {
             name: "swap-hello".into(),
@@ -306,9 +411,33 @@ mod tests {
         for q in [
             ModulesQuery::ModuleStatus,
             ModulesQuery::ArmedAt { height: 9 },
+            ModulesQuery::Lanes,
         ] {
             assert_eq!(decode_query(&encode_query(&q)).unwrap(), q);
         }
+
+        let lanes = ModulesReply::Lanes {
+            lanes: vec![
+                // the media shape: no stream half at all
+                LaneRecord {
+                    id: 2,
+                    module_id: "chat".into(),
+                    stream: None,
+                },
+                LaneRecord {
+                    id: 5,
+                    module_id: "agent".into(),
+                    stream: Some(LaneStream {
+                        pacing: LanePacing::Local {
+                            bulk_bytes_per_sec: 24 * 1024 * 1024,
+                            bulk_burst_bytes: 512 * 1024,
+                        },
+                        accept_backlog: 16,
+                    }),
+                },
+            ],
+        };
+        assert_eq!(decode_reply(&encode_reply(&lanes)).unwrap(), lanes);
 
         let r = ModulesReply::ModuleStatus {
             modules: vec![ModuleCode {
@@ -334,10 +463,15 @@ mod tests {
         let seed = Seed {
             kind: Kind::View,
             code_hash: vec![7u8; CODE_HASH_LEN],
+            lanes: Vec::new(),
         };
         assert_eq!(
             sdk::wire::decode::<Seed>(&sdk::wire::encode(&seed)).unwrap(),
             seed
         );
+        // a seed that omits `lanes` entirely still decodes, and means none —
+        // the genesis table spells the field only for a module that has one.
+        let bare: Seed = sdk::wire::decode(br#"{"kind":"view","code_hash":[]}"#).unwrap();
+        assert!(bare.lanes.is_empty());
     }
 }

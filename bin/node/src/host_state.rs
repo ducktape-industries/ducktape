@@ -1020,6 +1020,7 @@ mod tests {
                     module_id: "hello".into(),
                     kind: modules::Kind::Module,
                     code_hash: first.to_vec(),
+                    lanes: Vec::new(),
                 },
             ),
             (

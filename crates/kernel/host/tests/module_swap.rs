@@ -100,6 +100,7 @@ fn host_with_wasm() -> Host {
             module_id: "hello".into(),
             kind: modules::Kind::Module,
             code_hash: sha(HELLO_V1),
+            lanes: Vec::new(),
         }),
     );
     host
@@ -344,6 +345,7 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
             module_id: "hello".into(),
             kind: modules::Kind::Module,
             code_hash: sha(HELLO_V1),
+            lanes: Vec::new(),
         }),
     );
     submit(
@@ -670,6 +672,7 @@ fn a_missing_second_module_realizes_neither() {
             module_id: "zz-hello".into(),
             kind: modules::Kind::Module,
             code_hash: sha(HELLO_V1),
+            lanes: Vec::new(),
         }),
     );
     // hello -> the replacement (bytes present); zz-hello -> a hash whose bytes

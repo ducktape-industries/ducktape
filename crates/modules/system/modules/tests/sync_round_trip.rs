@@ -89,8 +89,12 @@ fn synced_store_reconstructs_source_root_registry_and_swaps() {
         // exactly the production genesis seam.
         let src_store = QmdbStore::init(context.child("src"), "src").await;
         let mut src = modules_over(Box::new(src_store));
-        src.seed("hello", Kind::Module, hash(1)).await.unwrap();
-        src.seed("directory", Kind::View, hash(2)).await.unwrap();
+        src.seed("hello", Kind::Module, hash(1), Vec::new())
+            .await
+            .unwrap();
+        src.seed("directory", Kind::View, hash(2), Vec::new())
+            .await
+            .unwrap();
         src.finish_seed().await.unwrap();
         let seeded_root = src.root();
         assert_ne!(seeded_root, StateRoot::ZERO, "seeds alone move the root");
@@ -133,6 +137,7 @@ fn synced_store_reconstructs_source_root_registry_and_swaps() {
                 kind: Kind::Module,
                 activation_height: 30,
                 code_hash: hash(5),
+                lanes: Vec::new(),
             }),
         )
         .await;

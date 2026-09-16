@@ -84,6 +84,12 @@ pub enum GovAction {
         activation_lead: u64,
         /// sha256 of the initial component bytes (32 bytes).
         code_hash: Vec<u8>,
+        /// the data-plane lanes the admitted module brings. Authorized by the
+        /// same ballot as the code, because a lane id is network-wide state:
+        /// the registry owns the collision and range gates, this only decides
+        /// that the network wants them at all.
+        #[serde(default)]
+        lanes: Vec<modules::LaneDecl>,
     },
     /// AUTHORIZE clearing a pending module code swap before its boundary: emits
     /// `ModulesMsg::CancelSwap { name, module_id }` on execution.

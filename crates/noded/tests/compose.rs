@@ -534,7 +534,8 @@ fn a_view_entry_composes_no_module_and_the_boundary_leaves_it_alone() {
                 }])["home"],
                 modules::Seed {
                     kind: modules::Kind::View,
-                    code_hash: home.to_vec()
+                    code_hash: home.to_vec(),
+                    lanes: Vec::new()
                 }
             );
 
@@ -597,6 +598,7 @@ fn a_view_entry_composes_no_module_and_the_boundary_leaves_it_alone() {
                     kind: modules::Kind::View,
                     activation_height: 10,
                     code_hash: dashboard.to_vec(),
+                    lanes: Vec::new(),
                 },
             )
             .await;
@@ -748,6 +750,7 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
                     kind: modules::Kind::Module,
                     activation_height: 10,
                     code_hash: indexed.to_vec(),
+                    lanes: Vec::new(),
                 },
             )
             .await;
@@ -1154,6 +1157,7 @@ fn wasm_registry_activates_view_assets_and_reopens_after_view_removal() {
                     kind: modules::Kind::Module,
                     activation_height: 10,
                     code_hash: hashes[0].to_vec(),
+                    lanes: Vec::new(),
                 },
             )
             .await;
