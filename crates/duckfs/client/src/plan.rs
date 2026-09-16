@@ -21,7 +21,7 @@ use duckfs_core::{
     CHUNK_SIZE, Change, Content, MAX_CHANGES_PER_COMMIT, MAX_INLINE_COMMIT_BYTES, to_hex,
 };
 
-use crate::chunk::chunk_ids;
+use crate::chunk::{chunk_ids, file_object_id};
 use crate::scan::{ScanKind, disk_path};
 use crate::status::Status;
 
@@ -32,6 +32,33 @@ use crate::status::Status;
 pub struct Plan {
     pub changes: Vec<Change>,
     pub blobs: BTreeMap<String, Vec<u8>>,
+    /// what each put path COMMITS, keyed by duckfs path. the index is written
+    /// from this rather than from a second look at the file: between the submit
+    /// and the receipt the working copy is live, and re-reading it there would
+    /// record bytes the cluster never accepted (#1975).
+    pub objects: BTreeMap<String, PlannedObject>,
+}
+
+/// the content one planned path carries into the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedObject {
+    /// the file object id (hex) the snapshot will hold.
+    pub id: String,
+    /// the byte length behind it — a file's bytes, a symlink's target.
+    pub size: u64,
+}
+
+/// the object a put commits. meta is empty because the plan commits client
+/// edits without meta, and meta is part of the file id's preimage.
+fn planned_object(bytes: &[u8]) -> PlannedObject {
+    PlannedObject {
+        id: to_hex(&file_object_id(
+            bytes.len() as u64,
+            &chunk_ids(bytes),
+            &BTreeMap::new(),
+        )),
+        size: bytes.len() as u64,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +93,7 @@ pub fn plan(status: &Status, root: &Path, prefix: &str) -> Result<Plan, PlanErro
 
     let mut changes = Vec::with_capacity(count);
     let mut blobs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut objects: BTreeMap<String, PlannedObject> = BTreeMap::new();
     let mut inline_total: usize = 0;
 
     // removals first — independent of the puts, and it keeps a replaced subtree
@@ -81,13 +109,18 @@ pub fn plan(status: &Status, root: &Path, prefix: &str) -> Result<Plan, PlanErro
             ScanKind::Dir => changes.push(Change::Mkdir {
                 path: entry.path.clone(),
             }),
-            ScanKind::Symlink => changes.push(Change::Symlink {
-                path: entry.path.clone(),
-                target: entry.target.clone().unwrap_or_default(),
-            }),
+            ScanKind::Symlink => {
+                let target = entry.target.clone().unwrap_or_default();
+                objects.insert(entry.path.clone(), planned_object(target.as_bytes()));
+                changes.push(Change::Symlink {
+                    path: entry.path.clone(),
+                    target,
+                });
+            }
             ScanKind::File => {
                 let disk = disk_path(root, prefix, &entry.path);
                 let bytes = std::fs::read(&disk).map_err(|e| PlanError::Io(e.to_string()))?;
+                objects.insert(entry.path.clone(), planned_object(&bytes));
                 // a file rides inline while the running inline total stays within
                 // the module's per-commit inline budget; otherwise it is chunked.
                 let fits_inline = inline_total
@@ -119,7 +152,11 @@ pub fn plan(status: &Status, root: &Path, prefix: &str) -> Result<Plan, PlanErro
         }
     }
 
-    Ok(Plan { changes, blobs })
+    Ok(Plan {
+        changes,
+        blobs,
+        objects,
+    })
 }
 
 /// canonicalize a duckfs path locally (NFC + name/path/depth caps), naming the
