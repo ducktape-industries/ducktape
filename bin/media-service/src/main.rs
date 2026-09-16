@@ -94,6 +94,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let router = ducktape_media::router(config, token)?;
     let listener = tokio::net::TcpListener::from_std(inherited_listener()?)?;
     notify_ready()?;
-    axum::serve(listener, router).await?;
+    axum::serve(ducktape_media::realtime_listener(listener), router).await?;
     Ok(())
 }

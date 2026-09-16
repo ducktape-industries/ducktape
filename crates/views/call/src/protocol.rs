@@ -255,6 +255,70 @@ mod tests {
             matches!(machine.step(Event::LocalImage { timestamp_ms: 7, jpeg: vec![9] }).as_slice(), [Effect::SendBinary(bytes)] if bytes == &[2,1,0,0,0,7,9])
         );
     }
+    /// The view-framing stage of #2237's latency decomposition. Every event a
+    /// live call turns on runs through `step`, so this is the whole cost the
+    /// guest adds between a captured frame and the byte handed to the host.
+    /// The payload is rebuilt each round, so the same construction is timed
+    /// alone and subtracted: what is left is the step.
+    ///
+    /// Program output: the harness is run by hand and the numbers ARE the
+    /// result.
+    #[test]
+    #[ignore = "measurement harness"]
+    fn framing_cost_per_event() {
+        const ROUNDS: u32 = 20_000;
+        let mut machine = Machine::default();
+        machine.step(Event::Properties(Props {
+            channel: "room".into(),
+            muted: false,
+            source: "camera".into(),
+        }));
+        for index in 0..4u32 {
+            machine.step(Event::Peer {
+                peer: format!("{index:064x}"),
+                beacon: Beacon {
+                    camera_on: true,
+                    ..Beacon::default()
+                },
+            });
+        }
+        let speaker = machine.peers.keys().next().expect("a seated peer").clone();
+        let jpeg = vec![7u8; 16 * 1024];
+        let sources: [(&str, &dyn Fn() -> Event); 5] = [
+            ("local_audio", &|| Event::LocalAudio(vec![1200; SAMPLES])),
+            ("local_image", &|| Event::LocalImage {
+                timestamp_ms: 7,
+                jpeg: vec![7u8; 16 * 1024],
+            }),
+            ("remote_audio", &|| Event::RemoteAudio {
+                peer: format!("{:064x}", 0),
+                samples: vec![900; SAMPLES],
+            }),
+            ("remote_image", &|| Event::RemoteImage {
+                peer: format!("{:064x}", 0),
+                jpeg: vec![7u8; 16 * 1024],
+            }),
+            ("tick", &|| Event::Tick),
+        ];
+        assert_eq!(speaker, format!("{:064x}", 0), "the peer the sources name");
+        assert_eq!(jpeg.len(), 16 * 1024);
+        println!("== view framing, {ROUNDS} rounds, 4 seated peers ==");
+        println!("event\tstep_ns\tbuild_ns");
+        for (name, build) in sources {
+            let idle = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                std::hint::black_box(build());
+            }
+            let idle = idle.elapsed().as_nanos() / u128::from(ROUNDS);
+            let busy = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                machine.step(build());
+            }
+            let busy = busy.elapsed().as_nanos() / u128::from(ROUNDS);
+            println!("{name}\t{}\t{idle}", busy.saturating_sub(idle));
+        }
+    }
+
     #[test]
     fn sound_hangover_and_bounded_jitter_mix_are_owned_by_the_guest() {
         let mut machine = Machine::default();

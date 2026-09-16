@@ -320,6 +320,9 @@ mod tests {
         guest: ducktape_view_guest::Driver<CallView>,
         streams: BTreeMap<String, u64>,
         effects: Vec<(String, Value)>,
+        /// What a congested writer does to a control frame: the host's stream
+        /// send queue is one frame deep and refuses rather than blocking.
+        refuse_beacon: bool,
     }
 
     impl Host {
@@ -328,6 +331,7 @@ mod tests {
                 guest: ducktape_view_guest::Driver::new(),
                 streams: BTreeMap::new(),
                 effects: Vec::new(),
+                refuse_beacon: false,
             }
         }
         fn response(id: u64, value: Value, done: bool) -> wire::Event {
@@ -373,11 +377,22 @@ mod tests {
                             true,
                         )),
                         _ => {
-                            let payload: Value = serde_json::from_slice(&request.payload).unwrap();
+                            // `host.finish` carries no payload, and a test that
+                            // panics on parsing it cannot report which
+                            // assertion the session ending actually broke.
+                            let payload: Value = serde_json::from_slice(&request.payload)
+                                .unwrap_or(Value::Null);
+                            let beacon = request.kind == "net.send"
+                                && payload["frame"]["text"].is_string();
+                            let refused = beacon && self.refuse_beacon;
+                            let result = match refused {
+                                true => Err("stream send queue is full".to_owned()),
+                                false => Ok(Vec::new()),
+                            };
                             self.effects.push((request.kind, payload));
                             events.push(wire::Event::Response {
                                 id: request.id,
-                                result: Ok(Vec::new()),
+                                result,
                                 done: true,
                             });
                         }
@@ -469,6 +484,78 @@ mod tests {
                     && body["peers"][0]["image"] == "opaque-image")
         );
     }
+    /// A congested writer refuses a queued frame; the host's stream send queue
+    /// is one frame deep, so a beacon lands on that refusal whenever the
+    /// socket is behind. Losing the room over it would turn every impaired
+    /// network into a dropped call, and the beacon is absolute state that the
+    /// next turn can carry just as well.
+    #[test]
+    fn a_refused_beacon_is_retried_and_does_not_end_the_call() {
+        fn beacons(host: &Host) -> usize {
+            host.effects
+                .iter()
+                .filter(|(kind, body)| kind == "net.send" && body["frame"]["text"].is_string())
+                .count()
+        }
+        let mut host = Host::new();
+        host.step(Vec::new());
+        host.item(
+            "call.props",
+            json!({"channel": "room", "muted": false, "source": "off"}),
+        );
+        let connected = beacons(&host);
+        assert!(connected > 0, "joining publishes this side's state");
+
+        // The writer backs up. The next speaking transition's beacon is
+        // refused, and the room must survive it.
+        host.refuse_beacon = true;
+        host.item(
+            "media.audio",
+            json!({"samples": vec![1200; protocol::SAMPLES]}),
+        );
+        assert!(
+            beacons(&host) > connected,
+            "the refused beacon was actually attempted"
+        );
+        assert!(
+            !host
+                .effects
+                .iter()
+                .any(|(kind, body)| kind == "host.emit" && body["kind"] == "error"),
+            "a refused control frame must not end the call"
+        );
+        assert!(
+            !host.effects.iter().any(|(kind, _)| kind == "host.finish"),
+            "a refused control frame must not finish the session"
+        );
+        // Voice keeps flowing while the control frame is outstanding.
+        let before = host.effects.len();
+        host.item(
+            "media.audio",
+            json!({"samples": vec![1200; protocol::SAMPLES]}),
+        );
+        assert!(
+            host.effects[before..]
+                .iter()
+                .any(|(kind, body)| kind == "net.send" && body["frame"]["binary"][0] == 1),
+            "audio keeps being sent while a beacon is outstanding"
+        );
+
+        // The writer drains; the newest state reaches the room on the next
+        // playout tick without the guest being asked again.
+        host.refuse_beacon = false;
+        let before = beacons(&host);
+        host.step(vec![wire::Event::Response {
+            id: host.streams["clock.ticks"],
+            result: Ok(Vec::new()),
+            done: false,
+        }]);
+        assert!(
+            beacons(&host) > before,
+            "the retained beacon is offered again once the transport accepts"
+        );
+    }
+
     #[test]
     fn guest_selects_the_stage_and_emits_only_presentation_changes() {
         fn shown(host: &Host) -> Value {

@@ -394,6 +394,29 @@ pub fn router(config: Config, token: [u8; 64]) -> Result<axum::Router, String> {
     })))
 }
 
+/// Every socket this service accepts carries paced real-time call frames, and
+/// each frame is already a whole application message. Nagle's algorithm has
+/// nothing to coalesce here, but it still holds a frame until the previous
+/// one is acknowledged — which on a long link adds a whole round trip to
+/// every frame and delivers them in clumps a receiver's jitter buffer cannot
+/// absorb. The listener is where this belongs: it is a property of the
+/// transport, not of the call protocol riding it.
+pub fn realtime_listener(
+    listener: tokio::net::TcpListener,
+) -> impl axum::serve::Listener<Addr = std::net::SocketAddr, Io = tokio::net::TcpStream> {
+    use axum::serve::ListenerExt as _;
+    listener.tap_io(|socket| {
+        if let Err(error) = socket.set_nodelay(true) {
+            tracing::warn!(
+                target: "ducktape::call",
+                reason = "nodelay_refused",
+                %error,
+                "accepted socket kept Nagle batching"
+            );
+        }
+    })
+}
+
 fn service_router(service: Arc<Service>) -> axum::Router {
     axum::Router::new()
         .route("/", axum::routing::get(upgrade))
@@ -497,9 +520,33 @@ async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio_tungstenite::tungstenite::{
         Message as ClientMessage, client::IntoClientRequest as _,
     };
+
+    /// The socket option `realtime_listener` exists to set, read back off a
+    /// real accepted socket. `tap_io` swallows a failing option silently
+    /// enough that only the accepted socket can say whether it took, and
+    /// "verified by inspection" is not verification.
+    #[tokio::test]
+    async fn an_accepted_call_socket_has_nagle_disabled() {
+        use axum::serve::Listener as _;
+
+        let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = bound.local_addr().unwrap();
+        let mut listener = realtime_listener(bound);
+        let dial = tokio::spawn(async move { tokio::net::TcpStream::connect(address).await });
+
+        let (accepted, _) = listener.accept().await;
+        let client = dial.await.unwrap().expect("client connects");
+
+        assert!(
+            accepted.nodelay().expect("read the accepted socket's option"),
+            "an accepted call socket must not batch frames behind Nagle"
+        );
+        drop(client);
+    }
 
     fn config() -> Config {
         Config {
@@ -596,10 +643,28 @@ mod tests {
     struct TestAuthority {
         roster: Arc<Mutex<Roster>>,
         changes: tokio::sync::broadcast::Sender<()>,
+        /// The canonical roster becoming unreachable, which is a different
+        /// answer from "you were removed" and must end the session just the
+        /// same: forwarding under a roster nobody can confirm is the one
+        /// outcome the admission rule exists to prevent.
+        unreachable: Arc<AtomicBool>,
+    }
+
+    impl TestAuthority {
+        fn seating(roster: Roster) -> Arc<Self> {
+            Arc::new(Self {
+                roster: Arc::new(Mutex::new(roster)),
+                changes: tokio::sync::broadcast::channel(8).0,
+                unreachable: Arc::new(AtomicBool::new(false)),
+            })
+        }
     }
 
     impl Authority for TestAuthority {
         fn refresh(&self, _: String) -> BoxFuture<'static, Result<Roster, String>> {
+            if self.unreachable.load(Ordering::Acquire) {
+                return Box::pin(async { Err("room unavailable".into()) });
+            }
             let roster = self.roster.lock().unwrap().clone();
             Box::pin(async move { Ok(roster) })
         }
@@ -626,12 +691,8 @@ mod tests {
             account: 43,
             node: [2; 32],
         };
-        let authority = Arc::new(TestAuthority {
-            roster: Arc::new(Mutex::new(
-                [first.clone(), second.clone()].into_iter().collect(),
-            )),
-            changes: tokio::sync::broadcast::channel(8).0,
-        });
+        let authority =
+            TestAuthority::seating([first.clone(), second.clone()].into_iter().collect());
         let service = Arc::new(Service {
             config: config(),
             token: [b'a'; 64],
@@ -957,5 +1018,573 @@ mod tests {
             hub.relay("room", &second, second_id, &roster, spoof)
                 .is_err()
         );
+    }
+
+    /// The #2237 membership and lifetime rows that need no capture device:
+    /// what a seat's CONTROL state permits the service to forward, and that a
+    /// second seat for the same person is refused outright so no call can open
+    /// a duplicate transport.
+    #[test]
+    fn control_state_gates_forwarded_media_and_a_seat_is_never_opened_twice() {
+        let talker = Caller {
+            account: 1,
+            node: [1; 32],
+        };
+        let listener = Caller {
+            account: 2,
+            node: [2; 32],
+        };
+        let roster: Roster = [talker.clone(), listener.clone()].into_iter().collect();
+        let mut hub = Hub::default();
+        let (id, _talker_queue) = hub.join("room", talker.clone(), &roster).expect("seat");
+        let (_, mut heard) = hub.join("room", listener.clone(), &roster).expect("seat");
+        assert!(
+            matches!(heard.try_recv(), Ok(Message::Text(_))),
+            "admission sends the roster before any media"
+        );
+
+        let beacon = |muted: bool, camera_on: bool| {
+            Message::Text(
+                serde_json::json!({"type": "beacon", "muted": muted, "camera_on": camera_on,
+                "sharing": false, "speaking": true})
+                .to_string()
+                .into(),
+            )
+        };
+
+        // Muted: the control frame is forwarded, the voice behind it is not,
+        // and the service refuses to describe a muted seat as speaking.
+        hub.relay("room", &talker, id, &roster, beacon(true, false))
+            .expect("beacon");
+        let Ok(Message::Text(forwarded)) = heard.try_recv() else {
+            panic!("a beacon is forwarded");
+        };
+        let forwarded: serde_json::Value = serde_json::from_str(&forwarded).unwrap();
+        assert_eq!(forwarded["muted"], true);
+        assert_eq!(
+            forwarded["speaking"], false,
+            "a muted seat is never forwarded as speaking"
+        );
+        hub.relay("room", &talker, id, &roster, audio_frame())
+            .expect("accepted and dropped");
+        assert!(
+            heard.try_recv().is_err(),
+            "a muted seat's voice is not forwarded"
+        );
+
+        // Camera off: a picture frame is accepted from the socket and dropped
+        // rather than forwarded, so nothing from the old source lingers.
+        hub.relay("room", &talker, id, &roster, video_frame(64, true))
+            .expect("accepted and dropped");
+        assert!(
+            heard.try_recv().is_err(),
+            "a seat that is not capturing publishes no picture"
+        );
+
+        // Unmuted with the camera on: both planes flow again.
+        hub.relay("room", &talker, id, &roster, beacon(false, true))
+            .expect("beacon");
+        assert!(matches!(heard.try_recv(), Ok(Message::Text(_))));
+        hub.relay("room", &talker, id, &roster, audio_frame())
+            .expect("relay");
+        assert!(matches!(heard.try_recv(), Ok(Message::Binary(_))));
+        hub.relay("room", &talker, id, &roster, video_frame(64, true))
+            .expect("relay");
+        assert!(matches!(heard.try_recv(), Ok(Message::Binary(_))));
+
+        // Turning it back off stops the picture plane on the very next frame.
+        hub.relay("room", &talker, id, &roster, beacon(false, false))
+            .expect("beacon");
+        assert!(matches!(heard.try_recv(), Ok(Message::Text(_))));
+        hub.relay("room", &talker, id, &roster, video_frame(64, true))
+            .expect("accepted and dropped");
+        assert!(
+            heard.try_recv().is_err(),
+            "the previous source's picture does not outlive the beacon that ended it"
+        );
+
+        // A seat is one account AND one node, and neither half may be reused
+        // while the seat is held: a second panel or a second transport for the
+        // same person is refused rather than seated alongside the first.
+        assert!(hub.join("room", talker.clone(), &roster).is_err());
+        assert!(
+            hub.join(
+                "room",
+                Caller {
+                    account: 99,
+                    node: talker.node,
+                },
+                &roster
+            )
+            .is_err(),
+            "the seated node cannot be re-seated under another account"
+        );
+        assert!(
+            hub.join(
+                "room",
+                Caller {
+                    account: talker.account,
+                    node: [9; 32],
+                },
+                &roster
+            )
+            .is_err(),
+            "the seated account cannot be re-seated from another node"
+        );
+    }
+
+    /// The canonical roster becoming UNREADABLE is a different answer from
+    /// "you were removed", and it ends the session just the same. Forwarding
+    /// under a membership nobody can confirm is the one outcome the admission
+    /// rule exists to prevent.
+    #[tokio::test]
+    async fn a_canonical_roster_that_cannot_be_read_ends_the_session() {
+        let seated = Caller {
+            account: 42,
+            node: [1; 32],
+        };
+        let authority = TestAuthority::seating([seated.clone()].into_iter().collect());
+        let service = Arc::new(Service {
+            config: config(),
+            token: [b'a'; 64],
+            authority: authority.clone(),
+            hub: Mutex::default(),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/?channel=room", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, service_router(service)).await;
+        });
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().extend(headers());
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let ready = socket.next().await.unwrap().unwrap().into_text().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ready).unwrap()["type"],
+            "ready"
+        );
+
+        // The seat is still in the roster. Only the ability to READ it is lost.
+        authority.unreachable.store(true, Ordering::Release);
+        authority.changes.send(()).unwrap();
+        assert!(matches!(
+            socket.next().await,
+            None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_)))
+        ));
+        assert!(
+            authority.roster.lock().unwrap().contains(&seated),
+            "the session ended because the roster was unreadable, not because it changed"
+        );
+        server.abort();
+    }
+
+    // ---- #2237: the reliable transport under impairment ----------------
+    //
+    // ONE LEG, ONE CLOCK. A sequence number and the send instant ride inside
+    // the PCM payload the service forwards verbatim, so both ends are timed by
+    // the same monotonic clock and the clock-synchronisation error is zero by
+    // construction. This is the guest-to-guest TRANSPORT delay and it is not
+    // mouth-to-ear: no capture device and no playout device is opened here,
+    // and no loopback or virtual device stands in for one.
+    //
+    // The impairment is applied OUTSIDE this process, by `tc netem` on the
+    // loopback of a dedicated network namespace that holds both endpoints. The
+    // harness only measures; it never reaches for `sudo`.
+
+    /// Sequence and send-nanos, as the first twelve bytes of a PCM frame.
+    const STAMP_BYTES: usize = 12;
+
+    fn stamp(seq: u32, nanos: u64) -> [u8; STAMP_BYTES] {
+        let mut bytes = [0; STAMP_BYTES];
+        bytes[..4].copy_from_slice(&seq.to_le_bytes());
+        bytes[4..].copy_from_slice(&nanos.to_le_bytes());
+        bytes
+    }
+
+    fn stamped(bytes: &[u8]) -> (u32, u64) {
+        let seq = u32::from_le_bytes(bytes[..4].try_into().expect("stamped sequence"));
+        let nanos = u64::from_le_bytes(bytes[4..STAMP_BYTES].try_into().expect("stamped instant"));
+        (seq, nanos)
+    }
+
+    fn stamped_audio(seq: u32, nanos: u64) -> Vec<u8> {
+        let mut pcm = vec![0i16; media_service::voice::FRAME_SAMPLES];
+        for (word, pair) in pcm.iter_mut().zip(stamp(seq, nanos).chunks_exact(2)) {
+            *word = i16::from_le_bytes([pair[0], pair[1]]);
+        }
+        media_service::call_wire::encode_audio(&pcm)
+    }
+
+    fn stamped_video(seq: u32, nanos: u64, bytes: usize) -> Vec<u8> {
+        let mut data = vec![7; bytes.max(STAMP_BYTES)];
+        data[..STAMP_BYTES].copy_from_slice(&stamp(seq, nanos));
+        media_service::call_wire::encode_captured(&media_service::call_wire::CapturedFrame {
+            keyframe: seq.is_multiple_of(50),
+            ts_ms: 0,
+            data,
+        })
+    }
+
+    /// One frame's transport leg, in nanoseconds on the single shared clock.
+    struct Delivery {
+        seq: u32,
+        sent: u64,
+        received: u64,
+    }
+
+    /// What one impairment cell produced. Every field is a count, a byte sum,
+    /// or a duration on that one clock.
+    #[derive(Default)]
+    struct Cell {
+        sent: u64,
+        deliveries: Vec<Delivery>,
+        ended_early: Option<String>,
+    }
+
+    fn percentile(sorted: &[u64], percent: usize) -> u64 {
+        if sorted.is_empty() {
+            return 0;
+        }
+        sorted[(sorted.len() * percent / 100).min(sorted.len() - 1)]
+    }
+
+    const MILLIS: u64 = 1_000_000;
+    /// One audio frame period. The shipped guest pops exactly one frame per
+    /// `clock.ticks` at this period, so it is the natural unit of excess.
+    const FRAME_PERIOD_NS: u64 = 20 * MILLIS;
+    /// The deployed guest's jitter buffer, `protocol::JITTER_FRAMES` = 3
+    /// frames. It lives in the views workspace, which this crate cannot depend
+    /// on, so it is restated here — change it there and this goes stale.
+    ///
+    /// An inter-arrival gap longer than this starves playout by the
+    /// difference. That is a LOWER bound: it assumes the buffer was full when
+    /// the gap began, which holds right after a burst (the queue caps at three
+    /// and drops the oldest) and overstates the buffer in steady flow, where it
+    /// hovers nearer one frame. Reported as a bound, never as a mouth-to-ear
+    /// silence.
+    const JITTER_DEPTH_NS: u64 = 3 * FRAME_PERIOD_NS;
+    /// How long a reader waits on a 50 fps source before calling it finished.
+    /// Far above any delay measured here, so it ends a run rather than
+    /// truncating one.
+    const QUIET: std::time::Duration = std::time::Duration::from_secs(5);
+
+    impl Cell {
+        /// Delay, head-of-line excess, and the arrival gaps that would starve
+        /// the guest's jitter buffer. Ordered by sequence, because excess is a
+        /// statement about frames queued BEHIND an earlier one.
+        fn report(&mut self, label: &str, kind: &str) {
+            self.deliveries.sort_unstable_by_key(|item| item.seq);
+            let delays: Vec<u64> = self
+                .deliveries
+                .iter()
+                .map(|item| item.received.saturating_sub(item.sent))
+                .collect();
+            let mut sorted = delays.clone();
+            sorted.sort_unstable();
+            let floor = sorted.first().copied().unwrap_or_default();
+            let mut longest_run = 0u64;
+            let mut longest_run_excess = 0u64;
+            let mut run = 0u64;
+            let mut run_excess = 0u64;
+            let mut max_excess = 0u64;
+            for delay in &delays {
+                let excess = delay.saturating_sub(floor);
+                max_excess = max_excess.max(excess);
+                if excess > FRAME_PERIOD_NS {
+                    run += 1;
+                    run_excess += excess;
+                    if run > longest_run {
+                        longest_run = run;
+                        longest_run_excess = run_excess;
+                    }
+                    continue;
+                }
+                run = 0;
+                run_excess = 0;
+            }
+            // How fast the backlog GROWS. A reliable transport with no rate
+            // control of its own cannot shed a source that outruns it, so the
+            // delay does not settle at a plateau — it climbs for as long as
+            // the trial runs. Least squares over (send instant, delay) states
+            // that climb as milliseconds of added delay per second of call,
+            // which is the figure a fixed p99 taken over one trial length
+            // hides.
+            let samples = self.deliveries.len() as f64;
+            let mean_sent = self
+                .deliveries
+                .iter()
+                .map(|item| item.sent as f64)
+                .sum::<f64>()
+                / samples.max(1.0);
+            let mean_delay = delays.iter().map(|delay| *delay as f64).sum::<f64>() / samples.max(1.0);
+            let mut covariance = 0.0;
+            let mut variance = 0.0;
+            for (item, delay) in self.deliveries.iter().zip(&delays) {
+                let offset = item.sent as f64 - mean_sent;
+                covariance += offset * (*delay as f64 - mean_delay);
+                variance += offset * offset;
+            }
+            let growth_ms_per_s = match variance > 0.0 {
+                true => covariance / variance * 1_000.0,
+                false => 0.0,
+            };
+            let mut starved_gaps = 0u64;
+            let mut starved_ns = 0u64;
+            let mut worst_gap = 0u64;
+            for pair in self.deliveries.windows(2) {
+                let gap = pair[1].received.saturating_sub(pair[0].received);
+                worst_gap = worst_gap.max(gap);
+                if gap > JITTER_DEPTH_NS {
+                    starved_gaps += 1;
+                    starved_ns += gap - JITTER_DEPTH_NS;
+                }
+            }
+            let millis = |nanos: u64| nanos as f64 / MILLIS as f64;
+            let received = self.deliveries.len() as u64;
+            println!(
+                "{label}\t{kind}\t{}\t{received}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{longest_run}\t{:.2}\t{growth_ms_per_s:.1}\t{starved_gaps}\t{:.2}\t{:.2}\t{}",
+                self.sent,
+                self.sent.saturating_sub(received),
+                millis(percentile(&sorted, 50)),
+                millis(percentile(&sorted, 95)),
+                millis(percentile(&sorted, 99)),
+                millis(sorted.last().copied().unwrap_or_default()),
+                millis(max_excess),
+                millis(longest_run_excess),
+                millis(starved_ns),
+                millis(worst_gap),
+                self.ended_early.as_deref().unwrap_or("-"),
+            );
+        }
+    }
+
+    fn env_number(name: &str, fallback: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(fallback)
+    }
+
+    /// Delivery delay and head-of-line accumulation over the real reliable
+    /// WebSocket, through the shipped `Hub`. Impairment comes from `tc netem`
+    /// in the namespace this process runs in; the label names the cell.
+    ///
+    /// Synthetic sources throughout. This is NOT a call-quality verdict — the
+    /// capture and playout stages are absent, and #2237's device half stays
+    /// unverified for want of a microphone and a camera.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "measurement harness"]
+    async fn impaired_transport_delivery_and_head_of_line_accumulation() {
+        let label = std::env::var("DUCKTAPE_CALL_CELL").unwrap_or_else(|_| "unlabelled".into());
+        let trial = std::time::Duration::from_millis(env_number("DUCKTAPE_CALL_TRIAL_MS", 20_000));
+        let video_bytes = env_number("DUCKTAPE_CALL_VIDEO_BYTES", 0) as usize;
+        let stalled_peer = env_number("DUCKTAPE_CALL_STALLED_PEER", 0) == 1;
+        let warmup = std::time::Duration::from_secs(1);
+
+        let sender = Caller {
+            account: 42,
+            node: [1; 32],
+        };
+        let reader = Caller {
+            account: 43,
+            node: [2; 32],
+        };
+        let stalled = Caller {
+            account: 44,
+            node: [3; 32],
+        };
+        let mut seats = vec![sender.clone(), reader.clone()];
+        if stalled_peer {
+            seats.push(stalled.clone());
+        }
+        let authority = TestAuthority::seating(seats.iter().cloned().collect());
+        let service = Arc::new(Service {
+            config: config(),
+            token: [b'a'; 64],
+            authority,
+            hub: Mutex::default(),
+        });
+        // `DUCKTAPE_CALL_NAGLE=1` restores the batching both legs had before
+        // `realtime_listener`, so a cell can be measured before and after the
+        // fix on one binary under one impairment. The default is the shipped
+        // path.
+        let nagle = env_number("DUCKTAPE_CALL_NAGLE", 0) == 1;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/?channel=room", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let router = service_router(service);
+            let _ = match nagle {
+                true => axum::serve(listener, router).await,
+                false => axum::serve(realtime_listener(listener), router).await,
+            };
+        });
+        let connect = |caller: Caller| {
+            let url = url.clone();
+            async move {
+                use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+                let mut request = url.into_client_request().unwrap();
+                request.headers_mut().extend(headers());
+                request.headers_mut().insert(
+                    "x-duck-caller-account",
+                    caller.account.to_string().parse().unwrap(),
+                );
+                request
+                    .headers_mut()
+                    .insert("x-duck-caller-node", peer(&caller.node).parse().unwrap());
+                let (socket, _) =
+                    tokio_tungstenite::connect_async_with_config(request, None, !nagle)
+                        .await
+                        .unwrap();
+                socket
+            }
+        };
+        let mut publisher = connect(sender).await;
+        let listening = connect(reader).await;
+        let _stalled = match stalled_peer {
+            true => Some(connect(stalled).await),
+            false => None,
+        };
+
+        // A camera beacon: the shipped `relay` refuses picture frames from a
+        // seat that is not capturing, so the video cells need it before the
+        // first frame and the audio cells are unaffected by it.
+        publisher
+            .send(ClientMessage::Text(
+                r#"{"type":"beacon","muted":false,"camera_on":true,"sharing":false,"speaking":true}"#
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        println!(
+            "cell\tkind\tsent\treceived\tlost\tp50_ms\tp95_ms\tp99_ms\tmax_ms\tmax_excess_ms\thol_run_frames\thol_run_excess_ms\tgrowth_ms_per_s\tstarved_gaps\tstarved_ms\tworst_gap_ms\tended_early"
+        );
+        let clock = std::time::Instant::now();
+        let receiving = tokio::spawn(async move {
+            let mut audio = Cell::default();
+            let mut video = Cell::default();
+            let mut socket = listening;
+            loop {
+                // Two terminal conditions, and the harness needs both.
+                //
+                // `peer_left` is the clean one: it rides the SAME FIFO queue
+                // the relayed frames went through, so every frame a
+                // head-of-line stall was still holding has landed by the time
+                // it does.
+                //
+                // QUIESCENCE is the backstop, and it is not a disguised
+                // timeout on a result. `netem` can wedge a loopback connection
+                // outright — observed with 58,950 bytes sent, never acked, and
+                // no retransmission for twelve minutes — and then the clean
+                // event never arrives at all. The source is a real-time paced
+                // stream, so silence this long IS its end; whatever never
+                // arrived is counted as lost, with the reason recorded.
+                let Ok(frame) = tokio::time::timeout(QUIET, socket.next()).await else {
+                    audio.ended_early = Some("reader_quiesced".into());
+                    break;
+                };
+                let Some(frame) = frame else { break };
+                let now = clock.elapsed().as_nanos() as u64;
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        audio.ended_early = Some(error.to_string());
+                        break;
+                    }
+                };
+                // The publisher's seat leaving is this reader's terminal event.
+                // `leave` pushes `peer_left` onto the SAME FIFO queue the
+                // relayed frames went through, so every frame a head-of-line
+                // stall was still holding has already arrived when it lands —
+                // which is why this harness never waits on a clock to decide
+                // the tail is in.
+                let bytes = match frame {
+                    ClientMessage::Binary(bytes) => bytes,
+                    ClientMessage::Text(text) if text.contains("peer_left") => break,
+                    _ => continue,
+                };
+                let payload = match bytes.first() {
+                    Some(4) if bytes.len() >= 41 + STAMP_BYTES => &bytes[41..],
+                    Some(3) if bytes.len() >= 38 + STAMP_BYTES => &bytes[38..],
+                    _ => continue,
+                };
+                let cell = match bytes[0] {
+                    4 => &mut audio,
+                    _ => &mut video,
+                };
+                let (seq, sent) = stamped(payload);
+                cell.deliveries.push(Delivery {
+                    seq,
+                    sent,
+                    received: now,
+                });
+            }
+            (audio, video)
+        });
+
+        // Paced against a monotonic deadline schedule, so the source does not
+        // drift and the impairment is what the delay measures. The pacing IS
+        // the workload here; no assertion below waits on a clock.
+        let mut audio_seq = 0u32;
+        let mut video_seq = 0u32;
+        let mut audio_sent_live = 0u64;
+        let mut video_sent_live = 0u64;
+        let mut failure = None;
+        let deadline = clock + warmup + trial;
+        while std::time::Instant::now() < deadline {
+            let due = clock
+                + std::time::Duration::from_nanos(FRAME_PERIOD_NS * u64::from(audio_seq));
+            tokio::time::sleep_until(due.into()).await;
+            let counted = clock.elapsed() >= warmup;
+            let now = clock.elapsed().as_nanos() as u64;
+            if let Err(error) = publisher
+                .send(ClientMessage::Binary(stamped_audio(audio_seq, now)))
+                .await
+            {
+                failure = Some(error.to_string());
+                break;
+            }
+            if counted {
+                audio_sent_live += 1;
+            }
+            audio_seq += 1;
+            // 10 fps video on the same socket, when the cell asks for it.
+            let video_due = video_bytes > 0 && audio_seq.is_multiple_of(5);
+            if video_due {
+                if let Err(error) = publisher
+                    .send(ClientMessage::Binary(
+                        stamped_video(video_seq, now, video_bytes),
+                    ))
+                    .await
+                {
+                    failure = Some(error.to_string());
+                    break;
+                }
+                if counted {
+                    video_sent_live += 1;
+                }
+                video_seq += 1;
+            }
+        }
+        drop(publisher);
+        let (mut audio, mut video) = receiving.await.expect("reader task");
+        audio.sent = audio_sent_live;
+        video.sent = video_sent_live;
+        if audio.ended_early.is_none() {
+            audio.ended_early = failure;
+        }
+        // Frames sent during warm-up are excluded from both sides of the
+        // ledger, so a warm-up delivery is not counted as an extra arrival.
+        audio
+            .deliveries
+            .retain(|item| item.sent >= warmup.as_nanos() as u64);
+        video
+            .deliveries
+            .retain(|item| item.sent >= warmup.as_nanos() as u64);
+        audio.report(&label, "audio");
+        if video_bytes > 0 {
+            video.report(&label, "video");
+        }
+        server.abort();
     }
 }

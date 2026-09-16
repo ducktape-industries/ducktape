@@ -35,6 +35,9 @@ struct Session {
     images: BTreeMap<String, (u64, String)>,
     preview: String,
     presentation: Option<Presentation>,
+    /// The newest peer state the transport has not accepted yet. Beacons are
+    /// absolute and last-write-wins, so only the newest one is worth keeping.
+    unsent_beacon: Option<Value>,
 }
 
 #[derive(PartialEq, Eq, Serialize)]
@@ -192,6 +195,7 @@ impl Session {
             images: BTreeMap::new(),
             preview: String::new(),
             presentation: None,
+            unsent_beacon: None,
         };
         let initial = session.machine.step(Event::Properties(props));
         session.execute(initial).await?;
@@ -308,11 +312,13 @@ impl Session {
     }
 
     async fn execute(&mut self, effects: Vec<Effect>) -> Result<(), String> {
+        // A beacon an earlier turn could not hand over goes out ahead of this
+        // turn's effects, so peer state still reaches the room in the order
+        // the machine decided it.
+        self.flush_beacon().await;
         for effect in effects {
             match effect {
-                Effect::SendText(text) => {
-                    host::request("net.send", &bytes(&json!({"stream": self.network.id(), "frame": {"text": text.to_string()}}))).await?;
-                }
+                Effect::SendText(text) => self.send_beacon(text).await,
                 Effect::SendBinary(binary) => notify(
                     "net.send",
                     json!({"stream": self.network.id(), "frame": {"binary": binary}}),
@@ -335,6 +341,34 @@ impl Session {
         }
         self.present();
         Ok(())
+    }
+
+    async fn send_beacon(&mut self, text: Value) {
+        self.unsent_beacon = Some(text);
+        self.flush_beacon().await;
+    }
+
+    /// Peer state is absolute and last-write-wins, so a transport that REFUSES
+    /// to queue a beacon keeps the newest one and offers it again on the next
+    /// turn rather than ending the call. A congested writer refuses exactly
+    /// this way, and losing the room because a control frame arrived a tick
+    /// late is a worse outcome than the late tick.
+    ///
+    /// A transport that is genuinely gone still ends the session: the network
+    /// subscription delivers its own terminal item and `received` fails on it.
+    /// Every turn emits `Effect::Play`, so the retry runs at the playout tick.
+    async fn flush_beacon(&mut self) {
+        let Some(text) = self.unsent_beacon.take() else {
+            return;
+        };
+        let queued = host::request(
+            "net.send",
+            &bytes(&json!({"stream": self.network.id(), "frame": {"text": text.to_string()}})),
+        )
+        .await;
+        if queued.is_err() {
+            self.unsent_beacon = Some(text);
+        }
     }
 
     fn present(&mut self) {
