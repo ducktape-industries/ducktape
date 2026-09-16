@@ -1,8 +1,9 @@
 //! Real-validator agent loop: issue mention, sandboxed work, host commit and
 //! push, program-authored progress and final replies, then a Forge PR.
 //!
-//! The scripted provider calls `ducktape_action` (`reply`) through the real MCP server
-//! inside Firecracker. It records the MCP receipt and its detached Git HEAD
+//! The scripted provider calls `ducktape_action` (`reply`) through the real tool
+//! plane from inside Firecracker — over the run's node lane, which is the only
+//! reach the guest has. It records the MCP receipt and its detached Git HEAD
 //! in the workspace; the test reads both from the host-pushed commit.
 //! Subsequent runs in the PR channel prove branch continuation and PR reuse.
 //! Host-side concurrent push/rebase behavior is covered by the provisioner's
@@ -47,8 +48,8 @@ const ISSUE_TITLE: &str = "prove the dogfood loop";
 
 /// one script-backed provider standing in for a coding agent.
 ///
-/// It runs inside the microVM and calls the real `ducktape mcp` tool through
-/// the scoped action tunnel before returning its final result. Its writable
+/// It runs inside the microVM and calls the real tool plane — the MCP endpoint
+/// its own node lane serves — before returning its final result. Its writable
 /// surface is the workspace it was handed. It records `pwd|HEAD` into
 /// [`HEAD_FILE`], which the host commits, and answers on stdout.
 ///
@@ -104,9 +105,15 @@ impl DogfoodProvider {
     /// detached: a branch checkout would hold `ref: refs/…` instead, and the
     /// assertions below would name it.
     fn argv() -> String {
+        // The tool plane is an HTTP endpoint on this run's OWN node lane, so
+        // the script needs no ducktape binary and no credential — only the url
+        // every run is handed. `curl` ships in the guest rootfs.
+        //
+        // `-f` under `set -e` is what makes the run's REPLY itself evidence: a
+        // tool plane that answered anything but 2xx kills the script before it
+        // prints, so a run that replies at all is a run whose MCP calls landed.
         let requests = [
             serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}),
-            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
             serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
                 "name":"ducktape_action","arguments":{
                     "operation":"reply",
@@ -118,7 +125,17 @@ impl DogfoodProvider {
         .map(|request| request.to_string())
         .join("\n");
         let script = format!(
-            "set -e\ncat > /dev/null\nprintf '%s\\n' '{requests}' | ducktape mcp > {MCP_FILE}\nprintf '%s|%s\\n' \"$(pwd)\" \"$(cat .git/HEAD)\" > {HEAD_FILE}\nprintf '%s\\n' '{REPLY_TITLE}'"
+            "set -e\n\
+             cat > /dev/null\n\
+             : > {MCP_FILE}\n\
+             printf '%s\\n' '{requests}' | while read -r frame; do\n\
+             printf '%s' \"$frame\" | curl -fsS -X POST \
+             -H 'content-type: application/json' --data-binary @- \
+             \"$DUCKTAPE_NODE/mcp\" >> {MCP_FILE}\n\
+             printf '\\n' >> {MCP_FILE}\n\
+             done\n\
+             printf '%s|%s\\n' \"$(pwd)\" \"$(cat .git/HEAD)\" > {HEAD_FILE}\n\
+             printf '%s\\n' '{REPLY_TITLE}'"
         );
         serde_json::to_string(&["-c", &script]).expect("provider argv")
     }

@@ -218,8 +218,6 @@ pub trait ProvisionedWorkspace: Send + Sync {
     fn workdir(&self) -> PathBuf;
     /// run-scoped tool/workspace env vars → additive `ctx.env`.
     fn env(&self) -> BTreeMap<String, String>;
-    /// tool bin dirs prepended to `PATH` (populated in phase 4).
-    fn path_entries(&self) -> Vec<PathBuf>;
     /// the run's SOUL: its curated skills assembled into one document
     /// ([`crate::assemble_context_doc`]) by whoever materialized the ro mounts
     /// — the only layer that can read them. `None` = the agent curated no
@@ -255,13 +253,18 @@ pub trait ProvisionedWorkspace: Send + Sync {
 pub type SharedProvisioner = Arc<dyn WorkspaceProvisioner>;
 
 /// the ONE place a materialized workspace is bound onto the run context: the
-/// mount becomes the child's cwd, its env is layered additively, its tool bin
-/// dirs feed `PATH`, and its assembled soul rides into the run — the provider
-/// decides the door (the executor's auto-load path, or the stdin prompt).
+/// mount becomes the child's cwd, its env is layered additively, and its
+/// assembled soul rides into the run — the provider decides the door (the
+/// executor's auto-load path, or the stdin prompt).
+///
+/// It contributes no `PATH` entry. It used to contribute one — the directory
+/// the node binary runs from, so a run's CLI could exec `ducktape mcp` — and
+/// that meant copying the node's whole binary into every run's image. The tool
+/// plane is served by the run's node lane now, so the run needs no host command
+/// at all.
 pub fn bind_workspace(ws: &dyn ProvisionedWorkspace, ctx: &mut RunContext) {
     ctx.workdir_override = Some(ws.workdir());
     ctx.env.extend(ws.env());
-    ctx.path_entries = ws.path_entries();
     if let Some(mut conversation) = ws.native_conversation() {
         conversation.system_prompt = [ws.context_doc(), ctx.context_doc.take()]
             .into_iter()

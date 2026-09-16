@@ -373,40 +373,52 @@ vsock. The CLI dials the localhost URL its env names and never knows.
 
 ---
 
-## Tools — argv injected into every argv the file produces
+## Tools — which MCP syntax this CLI takes its tool plane in
 
-`[tools]` names the flags that wire a tool plane in — in the built-ins, the
-Ducktape MCP server — without making every argv in the file repeat them:
+`[tools]` names the DIALECT, and nothing else:
 
 ```toml
 [tools]
-args = ["-c", 'mcp_servers.ducktape.command="ducktape"', "-c", 'mcp_servers.ducktape.args=["mcp"]']
+mcp = "codex"   # or "claude"
 ```
 
-- **Insertion is immediately after `args[0]`, never at the end.** An argv
-  like codex's ends in a bare `-` (the stdin marker) that must stay LAST;
-  `args[0]` is always the mode/subcommand selector (`exec`, `-p`), so the
-  slot after it is legal for every executor and stable across variants.
-- It applies to the `[invoke] args` and to **every** `[[variants]]` `args`
-  list (variants inherit `[tools]` like everything else — they never repeat
-  it). No `[tools]` section, or an argv with fewer than one arg, means no
-  insertion.
-- Injection happens once, at load time: a spec in hand already has its
-  tools, and one tag still means one fixed, fully literal argv.
-- Override is still wholesale, by tag: an operator spec that replaces a
-  built-in replaces its `[tools]` too. A `[tools]` section with no `args` is
-  a hard error, like every other section that would do nothing.
+The Ducktape tool plane is a **streamable-HTTP MCP endpoint on the run's own
+node lane** — `{DUCKTAPE_NODE}/mcp`, served by the compute daemon rather than
+forwarded to the node. So the address is per RUN, drawn when that run's lane
+binds a loopback port, and a spec cannot write it down. The host composes the
+argv instead, per run, exactly the way the credential broker's `-c` overrides
+are composed:
 
-The binary a `[tools]` argv names (`ducktape`, with `mcp` as its argument) is resolved
-from the **run's `PATH`** — the provisioner puts its directory there — so specs
-name no absolute path and stay portable across hosts. Claude's built-in also
-passes `--allowedTools mcp__ducktape`: in `-p` print mode there is no human to
-approve a tool call, so an unapproved MCP call is a denial and a merely
-*configured* server would be dead weight. Headless Claude invocation also allows
-shell and file tools inside the microVM, so builds need no permission prompt.
-Interactive and restricted invocation keep their separate arguments. Claude streams verbose
-JSON events and the provider extracts its terminal result. Events refresh the
-idle budget and count toward the same 4 MiB output bound as other providers.
+- `claude` → `--mcp-config {"mcpServers":{"ducktape":{"type":"http","url":…}}}`
+  plus `--allowedTools mcp__ducktape`. In `-p` print mode there is no human to
+  approve a tool call, so an unapproved MCP call is a denial and a merely
+  *configured* server would be dead weight.
+- `codex` → `-c mcp_servers.ducktape.url=…` plus
+  `-c mcp_servers.ducktape.default_tools_approval_mode="approve"`, which is the
+  same requirement in codex's words: without it `exec` cancels every call.
+
+- **It lands after a leading subcommand if there is one, otherwise at the
+  front.** Never at the end — an argv like codex's ends in a bare `-` (the
+  stdin marker) that must stay LAST — and never blindly after `args[0]`, since
+  a restricted Claude session opens `--permission-mode plan` and splitting a
+  flag from its value is an argv the CLI rejects.
+- It reaches the `[invoke] args`, **every** `[[variants]]` `args` list, and the
+  `[interactive]` argv, because the host wires it where the run boots rather
+  than where the file is parsed. No `[tools]` section means no wiring.
+- Override is still wholesale, by tag: an operator spec that replaces a
+  built-in replaces its `[tools]` too. A `[tools]` with no `mcp`, or an unknown
+  dialect, is a hard error, like every other section that would do nothing.
+
+Nothing about the tool plane enters the guest: no server command, no `ducktape`
+binary on the run's `PATH`, and no run-scoped write token in its environment.
+The run reaches the catalog over the one tunnel it already has, and the node
+knows which run is calling because that lane *is* that run.
+
+Headless Claude invocation also allows shell and file tools inside the microVM,
+so builds need no permission prompt. Interactive and restricted invocation keep
+their separate arguments. Claude streams verbose JSON events and the provider
+extracts its terminal result. Events refresh the idle budget and count toward
+the same 4 MiB output bound as other providers.
 
 ---
 

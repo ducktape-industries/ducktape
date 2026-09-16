@@ -180,6 +180,7 @@ members = [
     "crates/services/airlock",
     "crates/services/broker",
     "crates/services/compute",
+    "crates/services/mcp",
     "crates/services/media",
     "crates/services/provider",
     "crates/services/sandbox",
@@ -401,6 +402,7 @@ agent-service = { path = "crates/services/agent" }
 airlock-service = { path = "crates/services/airlock" }
 broker-host = { path = "crates/services/broker" }
 compute-service = { path = "crates/services/compute" }
+mcp-host = { path = "crates/services/mcp" }
 media-service = { path = "crates/services/media" }
 provider-host = { path = "crates/services/provider" }
 sandbox-host = { path = "crates/services/sandbox" }

@@ -22,6 +22,10 @@ runs = { workspace = true }
 # the shared capability-tag shape rule: a tag that validates at spec-parse
 # time can never bounce off the consensus registry's Announce validation.
 capability = { workspace = true }
+# the agent tool plane's catalog, which each run's node lane serves as a
+# streamable-HTTP MCP endpoint (src/read_lane.rs). Serving it HERE is what keeps
+# it out of the guest entirely.
+mcp-host = { workspace = true }
 # the sandbox muscle: SandboxBackend + its boot probe, the microVM lifecycle
 # (guest manifest, workspace image, vsock frames) and the tap's egress
 # firewall. carved out of this crate; re-exported from src/lib.rs so callers

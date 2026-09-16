@@ -86,7 +86,6 @@ mod join_gate;
 mod known_nodes;
 #[cfg(test)]
 mod main_tests;
-mod mcp;
 mod mesh_book;
 mod mesh_lanes;
 mod mesh_window;
@@ -305,7 +304,7 @@ enum Family {
     /// the desktop app's release: manifest sign/verify, bundle signing through the airlock gateway
     #[command(subcommand)]
     Release(release_cli::ReleaseCmd),
-    /// the stdio MCP server an agent runner spawns
+    /// the agent tool plane over stdio, for driving it by hand
     Mcp,
 }
 
@@ -313,8 +312,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = <Cli as clap::Parser>::parse();
     match cli.family {
         // `fs` owns a 0/1/2 exit-code contract, so it exits directly (after
-        // flushing the stream `cat` wrote to); `mcp` is the stdio server the
-        // agent runner spawns and holds until its stdin closes.
+        // flushing the stream `cat` wrote to); `mcp` serves the tool plane over
+        // stdio until its stdin closes. A sandboxed RUN does not use this: its
+        // CLI reaches the same catalog as a streamable-HTTP MCP endpoint on the
+        // run's own node lane, so no ducktape binary is inside the guest.
         Family::Fs(cmd) => {
             let code = fs_cli::run(cmd);
             use std::io::Write as _;
@@ -322,7 +323,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(code.into());
         }
         Family::Mcp => {
-            mcp::serve();
+            mcp_host::serve_stdio();
             Ok(())
         }
         // The `__egress-hook` subcommand lived here: an OCI createRuntime hook

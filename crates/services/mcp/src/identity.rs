@@ -27,7 +27,7 @@ use std::time::Duration;
 use runs::ModelRecord;
 use serde_json::json;
 
-use crate::mcp::node::{Node, NodeError, Result};
+use crate::node::{Node, NodeError, Result};
 
 pub const ENV_NODE: &str = "DUCKTAPE_NODE";
 pub const ENV_AGENT: &str = "DUCKTAPE_RUN_AGENT";
@@ -75,19 +75,35 @@ pub struct Run {
 }
 
 impl Run {
-    /// read the run out of the environment. never fails: a missing variable
-    /// degrades the affected tools, it does not stop the server. a runner whose
-    /// MCP server dies at launch is a worse failure than one whose tools say,
-    /// in words the model can read, that they are unbound.
+    /// read the run out of the PROCESS environment — how `ducktape mcp` sees
+    /// itself.
     pub fn from_env() -> Self {
+        Self::from_vars(&|key| std::env::var(key).ok())
+    }
+
+    /// read the run out of an explicit environment — how the compute daemon's
+    /// per-run http host sees it.
+    ///
+    /// `var` answers from the run's OWN host-side env, built before any of it
+    /// was rewritten for the guest, so the node url and the action endpoint are
+    /// the host's real ones. The guest names none of this: it reaches the tool
+    /// plane over its run's lane and nothing else, so it can neither choose the
+    /// agent it writes as nor the endpoint it writes through.
+    ///
+    /// never fails: a missing variable degrades the affected tools, it does not
+    /// stop the server. a runner whose MCP server dies at launch is a worse
+    /// failure than one whose tools say, in words the model can read, that they
+    /// are unbound.
+    pub fn from_vars(var: &dyn Fn(&str) -> Option<String>) -> Self {
+        let present = |key: &str| var(key).filter(|value| !value.is_empty());
         Self {
-            node: Node::new(std::env::var(ENV_NODE).ok().filter(|s| !s.is_empty())),
-            agent_id: std::env::var(ENV_AGENT).ok().filter(|s| !s.is_empty()),
-            workspace: std::env::var(ENV_WORKSPACE).ok().filter(|s| !s.is_empty()),
-            skills: std::env::var(ENV_SKILLS).ok().filter(|s| !s.is_empty()),
-            run_id: std::env::var(ENV_RUN_ID).ok().filter(|s| !s.is_empty()),
-            action: ActionControl::from_env(),
-            provider_control: ProviderControl::from_env(),
+            node: Node::new(present(ENV_NODE)),
+            agent_id: present(ENV_AGENT),
+            workspace: present(ENV_WORKSPACE),
+            skills: present(ENV_SKILLS),
+            run_id: present(ENV_RUN_ID),
+            action: ActionControl::from_vars(&present),
+            provider_control: ProviderControl::from_vars(&present),
         }
     }
 
@@ -178,18 +194,12 @@ impl Run {
 const ACTION_HEADER: &str = "x-ducktape-run-action";
 
 impl ActionControl {
-    fn from_env() -> Option<Self> {
-        let url = std::env::var(ENV_ACTION_URL)
-            .ok()
-            .filter(|value| action_url_allowed(value))?;
-        let token = std::env::var(ENV_ACTION_TOKEN)
-            .ok()
-            .filter(|value| provider_control_token_allowed(value))?;
+    fn from_vars(var: &dyn Fn(&str) -> Option<String>) -> Option<Self> {
+        let url = var(ENV_ACTION_URL).filter(|value| action_url_allowed(value))?;
+        let token = var(ENV_ACTION_TOKEN).filter(|value| provider_control_token_allowed(value))?;
         // the signer is scoped to ONE run and every message it signs names it,
         // so a session with no run id can sign nothing.
-        std::env::var(ENV_RUN_ID)
-            .ok()
-            .filter(|value| !value.is_empty())?;
+        var(ENV_RUN_ID)?;
         let client = reqwest::blocking::Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(2))
@@ -246,13 +256,9 @@ struct ProviderControl {
 }
 
 impl ProviderControl {
-    fn from_env() -> Option<Self> {
-        let url = std::env::var(ENV_PROVIDER_CONTROL_URL)
-            .ok()
-            .filter(|value| !value.is_empty())?;
-        let token = std::env::var(ENV_PROVIDER_CONTROL_TOKEN)
-            .ok()
-            .filter(|value| !value.is_empty())?;
+    fn from_vars(var: &dyn Fn(&str) -> Option<String>) -> Option<Self> {
+        let url = var(ENV_PROVIDER_CONTROL_URL)?;
+        let token = var(ENV_PROVIDER_CONTROL_TOKEN)?;
         if !provider_control_url_allowed(&url) || !provider_control_token_allowed(&token) {
             return None;
         }

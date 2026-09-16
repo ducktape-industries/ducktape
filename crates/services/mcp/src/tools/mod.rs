@@ -16,8 +16,8 @@
 
 use serde_json::{Value, json};
 
-use crate::mcp::identity::Run;
-use crate::mcp::node::Result;
+use crate::identity::Run;
+use crate::node::Result;
 
 mod control;
 mod read;
@@ -91,7 +91,7 @@ pub fn arg_str(args: &Value, name: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| {
-            crate::mcp::node::NodeError::Rejected(format!(
+            crate::node::NodeError::Rejected(format!(
                 "this tool needs a string {name:?} argument"
             ))
         })

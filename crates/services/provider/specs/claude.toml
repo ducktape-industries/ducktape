@@ -119,25 +119,27 @@ broker = "anthropic-messages"
 path = "workspace-parent:CLAUDE.md"
 
 [tools]
-# Wires the Ducktape MCP server into every argv this file produces — the base
-# tag and every [[variants]] tag — spliced in at load time IMMEDIATELY AFTER
-# args[0] (the `-p` print-mode selector).
+# WHICH MCP SYNTAX this CLI is handed the run's tool plane in — not an argv.
+# The endpoint is a loopback address on the run's OWN node tunnel, drawn when
+# its lane binds, so it cannot be written down in a file: the host composes
+# `--mcp-config {"mcpServers":{"ducktape":{"type":"http","url":…}}}` per run
+# (provider_host::mcp_argv), and the --allowedTools prefix rides with it.
 #
-# --allowedTools is NOT optional here: in -p print mode an unapproved MCP tool
-# call is a DENIAL (there is no human to approve it), so a server that is
-# merely configured would be dead weight. This prefix pre-allows the server
-# in interactive invocations too. Headless [invoke] args also allow shell and file tools.
+# --allowedTools is NOT optional: in -p print mode an unapproved MCP tool call
+# is a DENIAL (there is no human to approve it), so a server that is merely
+# configured would be dead weight. Headless [invoke] args also allow shell and
+# file tools.
 #
-# `ducktape` is resolved from the RUN's PATH — the provisioner puts its
-# directory there — so this spec names no absolute path and stays portable
-# across hosts. The config value is literal JSON; argv goes straight to exec,
-# no shell ever sees it.
-args = [
-    "--mcp-config",
-    '{"mcpServers":{"ducktape":{"command":"ducktape","args":["mcp"]}}}',
-    "--allowedTools",
-    "mcp__ducktape",
-]
+# This reaches EVERY argv this file produces: the base tag, every [[variants]]
+# tag, and the [interactive] TUI argv above — which is what gives an
+# interactive SESSION the ducktape tools, since the host wires it where the run
+# boots rather than where the file is parsed.
+#
+# Nothing about the tool plane enters the guest — no server command, no
+# `ducktape` binary on its PATH, no run-scoped token in its environment. The
+# run reaches the catalog over the one tunnel it already has, and the node
+# knows which run is calling because the lane IS that run.
+mcp = "claude"
 
 # ---- curated model/effort matrix -------------------------------------------
 # Base args plus an explicit --model and --effort per variant.

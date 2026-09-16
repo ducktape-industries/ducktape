@@ -181,10 +181,6 @@ impl ProvisionedWorkspace for NodedWorkspace {
         self.env.clone()
     }
 
-    fn path_entries(&self) -> Vec<PathBuf> {
-        super::tool_path_entries()
-    }
-
     fn context_doc(&self) -> Option<String> {
         self.context_doc.clone()
     }

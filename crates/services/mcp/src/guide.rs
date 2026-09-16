@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn the_guide_names_every_tool_and_the_two_generic_operations() {
-        for tool in crate::mcp::tools::all() {
+        for tool in crate::tools::all() {
             let control_tool = tool.name == "ducktape_extend_provider_idle";
             if control_tool {
                 continue;

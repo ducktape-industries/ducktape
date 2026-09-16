@@ -1,6 +1,6 @@
-//! the agent TOOL PLANE both lanes hand every run: the node base its tools
-//! dial (`DUCKTAPE_NODE`), the identity they act under (`DUCKTAPE_RUN_AGENT`),
-//! and the bin dir on PATH where `ducktape mcp` is found.
+//! the agent TOOL PLANE both lanes hand every run: the node base its lane
+//! serves the MCP catalog on (`DUCKTAPE_NODE`), the identity it acts under
+//! (`DUCKTAPE_RUN_AGENT`), and the run-scoped endpoint its writes go through.
 //!
 //! the duckfs-lane cases here run the REAL `checkout_with` engine against a
 //! stand-in files actor on the `NodeCommand` lane ([`spawn_files_actor`], which
@@ -357,15 +357,6 @@ async fn a_run_gets_the_node_base_its_agent_id_and_the_tool_bin_dir_on_path() {
         SKILL_BODY
     );
 
-    // PATH: the dir holding the RUNNING binary — `ducktape mcp` ships beside
-    // it, and the runner CLI resolves the server by bare command name.
-    let exe_dir = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    assert_eq!(ws.path_entries(), vec![exe_dir]);
-
     ws.cleanup().await;
     assert!(
         !dir.exists() && !ro.exists(),
@@ -396,10 +387,6 @@ async fn an_unreachable_node_or_an_anonymous_run_omits_the_var_rather_than_guess
     );
     // the run still runs — only the tool plane is missing, never the workspace.
     assert!(env.contains_key("DUCKTAPE_RUN_WORKSPACE"));
-    assert!(
-        !ws.path_entries().is_empty(),
-        "the bin dir is unconditional"
-    );
     ws.cleanup().await;
 }
 

@@ -34,8 +34,8 @@ use runs::{ModelQuery, RunsQuery};
 use tasks::{JobsQuery, TaskQuery, WorkQuery};
 
 use super::{Tool, arg_str, opt_u64, schema};
-use crate::mcp::identity::{Run, TARGET_MODEL, TARGET_RUNS};
-use crate::mcp::node::{NodeError, Result};
+use crate::identity::{Run, TARGET_MODEL, TARGET_RUNS};
+use crate::node::{NodeError, Result};
 
 const TARGET_CHAT: &str = "chat";
 const TARGET_TASKS: &str = "tasks";

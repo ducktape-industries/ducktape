@@ -1,0 +1,30 @@
+[package]
+name = "mcp-host"
+edition.workspace = true
+version.workspace = true
+
+# the agent tool plane: the MCP server a Ducktape run's CLI talks to.
+#
+# its own crate rather than a module of the node binary because TWO hosts serve
+# it from the same code — the compute daemon's per-run node lane (streamable
+# HTTP, `provider_host::read_lane`) and `ducktape mcp` (stdio). a second
+# implementation of the tool catalog is a tool plane that drifts.
+[dependencies]
+# the module wire types every read tool encodes its query as. TYPES only: the
+# tools reach state over the node's `/v1` http routes, never in process.
+forge = { workspace = true }
+pages = { workspace = true }
+runs = { workspace = true }
+tasks = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# blocking, and deliberately: a tool call is one request and one answer, and
+# the stdio loop has no runtime to await on. the http host wraps a call in
+# `spawn_blocking`.
+reqwest = { workspace = true }
+
+[dev-dependencies]
+# a test decodes a chat view query it hand-writes, so the module's own type is
+# what says whether the shape is real.
+chat = { workspace = true }
