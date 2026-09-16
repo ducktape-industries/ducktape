@@ -819,6 +819,7 @@ impl BoardsView {
     /// — it takes one again only where it is let go, which `held` names.
     fn routed(
         &self,
+        board: &Board,
         id: &str,
         end: usize,
         point: [f32; 2],
@@ -830,15 +831,17 @@ impl BoardsView {
         let sample = run.get_mut(end)?;
         *sample = point;
         let run = self.straightened(run);
-        let next = self.path_shape(shape.kind, &run);
-        let carried = |mine: bool, standing: &Option<String>| {
-            if mine { held.clone() } else { standing.clone() }
+        let carried = |mine: bool, kept: &Option<String>| {
+            if mine { held.clone() } else { kept.clone() }
         };
         let from = carried(end == 0, &shape.from);
         let to = carried(end == last, &shape.to);
         // both ends on one card is a loop the board cannot draw, so the end in
         // hand stands on its own point rather than stealing the other's card
         let looped = from.is_some() && from == to;
+        let from = if looped && end == 0 { None } else { from };
+        let to = if looped && end != 0 { None } else { to };
+        let next = self.path_shape(shape.kind, &standing(board, &run, &from, &to));
         Some(Change::Route {
             id: id.to_owned(),
             x: next.x,
@@ -846,8 +849,8 @@ impl BoardsView {
             width: next.width,
             height: next.height,
             points: next.points,
-            from: if looped && end == 0 { None } else { from },
-            to: if looped && end != 0 { None } else { to },
+            from,
+            to,
         })
     }
     pub(super) fn gesture_changes(&self) -> Vec<Change> {
@@ -1075,6 +1078,8 @@ impl BoardsView {
             shape.from = None;
             shape.to = None;
         }
+        let run = standing(&board, &path_points(shape), &shape.from, &shape.to);
+        *shape = self.reboxed(shape, &run);
     }
     /// A bend put back on the line between its neighbours is not a bend. The
     /// run straightens rather than keep a sample nobody can see and nobody
@@ -1130,20 +1135,28 @@ impl BoardsView {
         if !s.text.is_empty() && contains(plate(drawn), middle) {
             return None;
         }
-        let mut bent = s.clone();
-        // The run it gets is the one on the board, ends included. A bound end's
-        // STORED sample is wherever the arrow was last dragged and the cards
-        // have overridden it ever since, so a bend measured against that would
-        // be measured against a line nobody can see — and would never read as
-        // straight again once put back.
-        let run = vec![first, middle, last];
-        let boxed = self.path_shape(s.kind, &run);
-        bent.x = boxed.x;
-        bent.y = boxed.y;
-        bent.width = boxed.width;
-        bent.height = boxed.height;
-        bent.points = boxed.points;
-        Some((bent, 1, middle))
+        // The run it gets is the one on the board, ends included. A bound end
+        // STANDS at its card's centre and is DRAWN at its card's border, and a
+        // bend measured against the centres would be measured against a line
+        // nobody can see — it would never read as straight again once put
+        // back. The ends are put back where they stand by [`standing`] when
+        // the drag commits.
+        Some((self.reboxed(s, &[first, middle, last]), 1, middle))
+    }
+    /// A connector given a different run, keeping everything about it that is
+    /// not its shape. The box and the samples are one fact stated twice — the
+    /// samples are stored against the box — so they are always replaced
+    /// together.
+    fn reboxed(&self, s: &Shape, run: &[[f32; 2]]) -> Shape {
+        let boxed = self.path_shape(s.kind, run);
+        Shape {
+            x: boxed.x,
+            y: boxed.y,
+            width: boxed.width,
+            height: boxed.height,
+            points: boxed.points,
+            ..s.clone()
+        }
     }
     /// The card an endpoint over this point would take: a card for an arrow,
     /// nothing for a line or a stroke, which never bind.
@@ -1168,7 +1181,7 @@ impl BoardsView {
         let held = reaches_for_a_card(shape, end)
             .then(|| self.holding(&board, shape.kind, point))
             .flatten();
-        self.routed(id, end, point, shape, held)
+        self.routed(&board, id, end, point, shape, held)
     }
     /// Where an endpoint is let go decides what it holds: dropped on a card an
     /// arrow takes it, dropped on the board it stands on its own point. A line
@@ -2305,6 +2318,60 @@ pub(super) fn path_points(s: &Shape) -> Vec<[f32; 2]> {
         .map(|p| [s.x as f32 + p[0] as f32 * sx, s.y as f32 + p[1] as f32 * sy])
         .collect()
 }
+/// A connector's run with every bound end put where that end STANDS: the
+/// centre of the card it holds. Where the pointer touched inside a card says
+/// nothing about where the line will meet it — the card decides that, and
+/// decides it again every time either of them moves. Storing the centre
+/// instead makes the sample a record of where the card WAS, which is the only
+/// thing that lets a bend still be a bend of this line once the card moves.
+///
+/// Every write of a connector's run goes through here, so the sample and the
+/// card agree at rest and differ afterwards by exactly the drag between them.
+pub(super) fn standing(
+    board: &Board,
+    run: &[[f32; 2]],
+    from: &Option<String>,
+    to: &Option<String>,
+) -> Vec<[f32; 2]> {
+    let mut run = run.to_vec();
+    let Some(last) = run.len().checked_sub(1) else {
+        return run;
+    };
+    let at = |key: &Option<String>| {
+        key.as_ref()
+            .and_then(|k| board.shapes.get(k))
+            .map(|r| center(&r.shape))
+    };
+    if let Some(p) = at(from) {
+        run[0] = p;
+    }
+    if let Some(p) = at(to) {
+        run[last] = p;
+    }
+    run
+}
+/// A point carried from one chord onto another: the same place in the chord's
+/// own frame — how far along it lies and how far off it stands, both as
+/// fractions of the chord — read back off the chord that replaced it. Two
+/// pairs of points name one turn and one stretch, so what is carried keeps its
+/// shape instead of its coordinates.
+fn reframed(stood: [[f32; 2]; 2], anchor: [[f32; 2]; 2], point: [f32; 2]) -> [f32; 2] {
+    let axis = [stood[1][0] - stood[0][0], stood[1][1] - stood[0][1]];
+    let span = axis[0] * axis[0] + axis[1] * axis[1];
+    // A chord of no length is not a frame: there is nothing to measure against
+    // and nothing to carry onto.
+    if span < 0.001 {
+        return point;
+    }
+    let off = [point[0] - stood[0][0], point[1] - stood[0][1]];
+    let along = (off[0] * axis[0] + off[1] * axis[1]) / span;
+    let across = (off[0] * -axis[1] + off[1] * axis[0]) / span;
+    let next = [anchor[1][0] - anchor[0][0], anchor[1][1] - anchor[0][1]];
+    [
+        anchor[0][0] + next[0] * along - next[1] * across,
+        anchor[0][1] + next[1] * along + next[0] * across,
+    ]
+}
 /// The polyline a connector actually draws: its samples, with a bound end
 /// pulled onto the border of the card it names.
 pub(super) fn stroke(board: &Board, s: &Shape) -> Vec<[f32; 2]> {
@@ -2319,22 +2386,32 @@ pub(super) fn stroke(board: &Board, s: &Shape) -> Vec<[f32; 2]> {
     };
     let (from, to) = (card(&s.from), card(&s.to));
     let last = path.len() - 1;
+    // Where the ends stood when the run was written, and where they stand now.
+    // For a free end those are the same point. For a bound end they differ by
+    // however far the card has been dragged since — see [`standing`].
+    let stood = [path[0], path[last]];
+    let anchor = [
+        from.as_ref().map_or(stood[0], center),
+        to.as_ref().map_or(stood[1], center),
+    ];
+    // A bend belongs to the line and not to the board. Left at its stored
+    // point it stops being a bend of this arrow the moment a card moves: the
+    // ends swing away and the arc is left behind as a hook across the gap.
+    // Carried in the chord's own frame it turns and stretches with the cards,
+    // which is the only reading under which moving a card leaves the drawing
+    // you made recognisable.
+    if path.len() == 3 {
+        path[1] = reframed(stood, anchor, path[1]);
+    }
+    [path[0], path[last]] = anchor;
     // A bound end leaves toward the next place the run actually goes: the bend
     // beside it, not the far end past it. A bent arrow used to leave its card
     // aimed at where it finishes, which on a curved run is not the way the
     // line goes at all — it left through one side and kinked back across the
-    // card to reach its own bend.
-    //
-    // With no bend the next place IS the far end, and a far end that has taken
-    // a card stands at that card's centre rather than at its own sample: the
-    // sample is wherever it was dropped, which is inside the card and says
-    // nothing about where the arrow now meets it.
-    let toward = |neighbour: usize, far: usize, beyond: &Option<Shape>| match neighbour == far {
-        true => beyond.as_ref().map_or(path[far], center),
-        false => path[neighbour],
-    };
-    let toward_start = toward(1, last, &to);
-    let toward_end = toward(last - 1, 0, &from);
+    // card to reach its own bend. With no bend the next place IS the far end,
+    // which now stands where it stands rather than where it was dropped.
+    let toward_start = path[1];
+    let toward_end = path[last - 1];
     if let Some(card) = &from {
         path[0] = border_point(card, toward_start);
     }
