@@ -1468,9 +1468,11 @@ fn files_cost_by_object_size_and_query_result_size() {
     println!("entries\tlimit\twasm_ls_ms\tls_reply_bytes\treturned");
     let dir = tempfile::tempdir().unwrap();
     let mut wasm = wasm_host(&dir);
-    // 256 entries take two commits: one op gets MAX_OBJECT_READS_PER_OP reads
-    // and each distinct document costs two of them (chunk + fileobj).
-    let per_commit = MAX_OBJECT_READS_PER_OP / 2;
+    // 256 entries take several commits: one op gets MAX_OBJECT_READS_PER_OP
+    // reads, each distinct document costs two of them (chunk + fileobj), and a
+    // commit onto an existing head also re-reads the path it writes through —
+    // so a batch of cap/2 documents fits only for the FIRST commit.
+    let per_commit = MAX_OBJECT_READS_PER_OP / 4;
     let mut base: Option<String> = None;
     for (batch, first) in (0..256usize).step_by(per_commit).enumerate() {
         let changes = (first..first + per_commit)

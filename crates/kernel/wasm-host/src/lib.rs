@@ -19,7 +19,10 @@
 //!     wrapper resolves it through `Ctx`, and the pure guest re-runs with the
 //!     answer memoized — every round re-treads the identical prefix, so the
 //!     replay converges in (distinct reads + 1) rounds, bounded by
-//!     [`MAX_SIBLING_READS`].
+//!     [`MAX_SIBLING_READS`]. Only reads the host cannot answer WITHOUT an await
+//!     ride it: the object plane is a synchronous substrate ([`HostOdb`]), so a
+//!     round holds a handle to it and object reads answer IN PLACE — an op that
+//!     walks K objects still runs the guest once, not K+1 times.
 //!
 //! COMMITTED state has three backings ([`StateBacking`]):
 //!   * `Map` — the original host-KV `BTreeMap`, whose root is sha256 over the
@@ -40,8 +43,10 @@
 //!     machinery as sibling reads (bounded by [`MAX_STORE_READS`]); the staged
 //!     overlay and the commit/abort boundary are identical in both backings.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 use module_artifact::Artifact;
@@ -72,8 +77,9 @@ mod bindings {
             "ducktape:module/host.state-prefetch": trappable,
             "ducktape:module/host.module-root": trappable,
             "ducktape:module/host.query-module": trappable,
-            // object reads pause on a memo miss exactly like the sibling reads:
-            // the driver resolves them against the odb backing and replays.
+            // object reads NEVER pause: the odb backing is synchronous, so the
+            // round answers them in place. they trap on one thing only — the
+            // read budgets ([`MAX_OBJECT_READS`], the memo byte ceiling).
             "ducktape:module/host.object-stat": trappable,
             "ducktape:module/host.object-get": trappable,
             "ducktape:module/host.git-object-read": trappable,
@@ -184,14 +190,15 @@ impl Shape {
 /// runs out traps like any single-round fuel exhaustion. Replay re-treads the
 /// pure prefix and that repetition is the GUEST'S cost — otherwise a guest
 /// could buy a fresh full budget per forced replay, up to
-/// [`MAX_SIBLING_READS`] + [`MAX_STORE_READS`] + [`MAX_OBJECT_READS`] times in
-/// one op.
+/// [`MAX_SIBLING_READS`] + [`MAX_STORE_READS`] times in one op.
 ///
-/// The number covers the replay overhead the read budgets imply: an op that
-/// spends its whole [`MAX_OBJECT_READS`] / [`MAX_STORE_READS`] budget re-treads
-/// a prefix growing by one read per round, so its rounds cost ~n²/2 read calls
-/// — just under 4e9 fuel for a full object-read budget with no guest logic at
-/// all. Half of this is that floor; the other half is the op's own work.
+/// The number covers the replay overhead those two budgets imply: an op that
+/// pauses n times re-treads a prefix growing by one read per round, so its
+/// rounds cost ~n²/2 read calls. Only the reads the host cannot answer without
+/// an await pause — a sibling read (async `Ctx`) and a store-backed `state-get`
+/// miss (async [`MerkleStore`], and `state-prefetch` collapses a whole frontier
+/// into ONE pause). Object reads resolve against a synchronous substrate and
+/// never replay at all, so [`MAX_OBJECT_READS`] costs one read call each.
 pub const DEFAULT_FUEL: u64 = 8_000_000_000;
 
 /// per-dispatch bound on DISTINCT sibling reads (`module-root` + `query-module`).
@@ -214,8 +221,10 @@ pub const MAX_STORE_READS: usize = 4096;
 /// [`MAX_STORE_READS`]: a content-addressed op walks many objects (a file's
 /// chunks, a tree's entries), so object reads carry the same larger budget as
 /// own-state reads. a protocol constant — an op that needs more is rejected
-/// identically on every validator. only tenants that call the object imports
-/// (the files guest) ever accrue against it; every other tenant leaves it at 0.
+/// identically on every validator, at the read that breaches it, because the
+/// count is a pure function of the guest's own calls. only tenants that call the
+/// object imports (the files guest) ever accrue against it; every other tenant
+/// leaves it at 0.
 pub const MAX_OBJECT_READS: usize = 4096;
 
 /// hard cap on the bytes a guest may hand the HOST: the running total across
@@ -438,6 +447,15 @@ pub trait OdbBacking: HostOdb {
     fn durable_commit_height(&self) -> Option<u64>;
 }
 
+/// the odb substrate a RUN reads through. wasmtime's `Store<T>` owns its data
+/// outright — no borrows, so `T` stays `'static` — which is why a paused read
+/// plus replay is the only way an async resolver can answer a sync guest. The
+/// object plane needs none of that: it is synchronous, so a round holds a
+/// HANDLE to the very substrate the module holds and answers a read in place.
+/// `host::Host` is single-threaded by design, so the handle costs a refcount
+/// and a borrow flag — never a lock.
+type OdbHandle = Rc<RefCell<Box<dyn OdbBacking>>>;
+
 /// the single reserved state-lane key an ODB-backed tenant (files, forge)
 /// reads and writes its whole refs image under. the guest loads the committed
 /// image via `state-get(REFS_KEY)` and stages a new one via
@@ -476,7 +494,10 @@ const PENDING_READ_TRAP: &str = "pending host read (host resolves and replays)";
 // after, mirroring the host's own remove-execute-reinsert dispatch trick.
 // ============================================================================
 
-/// one host read the guest attempted that the memo could not answer yet.
+/// one host read the guest attempted that the memo could not answer yet and the
+/// host cannot answer without an await. Object reads are absent on purpose: the
+/// odb backing is synchronous, so they resolve inside the import instead of
+/// pausing the run.
 enum PendingRead {
     Root(String),
     Query(String, Vec<u8>),
@@ -484,15 +505,6 @@ enum PendingRead {
     /// the driver resolves it against the injected [`MerkleStore`] — no ctx
     /// needed, so even the ctx-less [`Module::query`] path replays these.
     States(Vec<Vec<u8>>),
-    /// an `object-stat` miss of the same-dispatch put overlay: the driver
-    /// resolves it against the odb backing (`None` until Task 2 wires one) and
-    /// replays. own-state-shaped, so it resolves without a ctx like `State`.
-    ObjectStat(Vec<u8>),
-    /// an `object-get` miss of the same-dispatch put overlay: resolved against
-    /// the odb backing, exactly like [`PendingRead::ObjectStat`].
-    ObjectGet(Vec<u8>),
-    GitObject(GitObjectKey),
-    GitDiff(GitDiffKey),
 }
 
 /// resolved read answers, accumulated across the replay rounds of ONE
@@ -558,24 +570,22 @@ impl SiblingMemo {
             + self.git_diffs.len()
     }
 
-    /// every replay budget still holds — the loop guard every driver shares.
+    /// every REPLAY budget still holds — the loop guard every driver shares.
+    /// [`MAX_OBJECT_READS`] is not here: an object read never replays, so the
+    /// import that issues it refuses AT the cap ([`object_budget_error`]).
     fn within_budgets(&self) -> bool {
-        self.len() <= MAX_SIBLING_READS
-            && self.states.len() <= MAX_STORE_READS
-            && self.object_len() <= MAX_OBJECT_READS
+        self.len() <= MAX_SIBLING_READS && self.states.len() <= MAX_STORE_READS
     }
 
     /// the deterministic rejection for a blown replay budget.
     fn budget_error(&self) -> SdkError {
-        if self.len() > MAX_SIBLING_READS {
-            SdkError::Module(format!(
+        let siblings_blown = self.len() > MAX_SIBLING_READS;
+        if siblings_blown {
+            return SdkError::Module(format!(
                 "sibling-read budget exceeded ({MAX_SIBLING_READS})"
-            ))
-        } else if self.states.len() > MAX_STORE_READS {
-            SdkError::Module(format!("store-read budget exceeded ({MAX_STORE_READS})"))
-        } else {
-            SdkError::Module(format!("object-read budget exceeded ({MAX_OBJECT_READS})"))
+            ));
         }
+        SdkError::Module(format!("store-read budget exceeded ({MAX_STORE_READS})"))
     }
 
     /// resolve one pending SIBLING read against the host ctx and memoize the
@@ -612,15 +622,16 @@ impl SiblingMemo {
             PendingRead::States(_) => {
                 unreachable!("state reads resolve against the injected store, never the ctx")
             }
-            PendingRead::ObjectStat(_)
-            | PendingRead::ObjectGet(_)
-            | PendingRead::GitObject(_)
-            | PendingRead::GitDiff(_) => {
-                unreachable!("object reads resolve against the odb backing, never the ctx")
-            }
         }
         Ok(())
     }
+}
+
+/// the deterministic rejection for an op reaching past [`MAX_OBJECT_READS`]. it
+/// refuses the read that breaches the cap, so it lands at the same call on every
+/// validator — the count is a pure function of the guest's own calls.
+fn object_budget_error() -> SdkError {
+    SdkError::Module(format!("object-read budget exceeded ({MAX_OBJECT_READS})"))
 }
 
 #[derive(Default)]
@@ -651,6 +662,12 @@ struct HostData {
     /// within the block). a clean dispatch promotes it back to the block
     /// accumulator; an aborted dispatch drops it.
     object_puts: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// the substrate this round's object reads resolve against — `None` for a
+    /// Map/Store tenant, which never calls the object imports (and whose reads
+    /// would answer "absent" if it did, exactly as before). It is SYNCHRONOUS,
+    /// so the import answers in place: the guest never pauses on an object read,
+    /// and an op that walks K objects runs the guest ONCE instead of K+1 times.
+    odb: Option<OdbHandle>,
     out_msgs: Vec<(String, Vec<u8>)>,
     out_events: Vec<(String, Vec<u8>)>,
     /// the op's declared output ([`sdk::Ctx::set_output`]): last write wins,
@@ -699,6 +716,125 @@ impl HostData {
         }
         Ok(())
     }
+
+    /// admit one more DISTINCT object-plane read, or refuse it at the cap —
+    /// before the substrate is touched, so a refused op costs no read at all.
+    fn admit_object_read(&self) -> Result<(), SdkError> {
+        let within_budget = self.memo.object_len() < MAX_OBJECT_READS;
+        if within_budget {
+            return Ok(());
+        }
+        Err(object_budget_error())
+    }
+
+    /// resolve one `object-stat` against this round's backing and memoize it.
+    /// A Map/Store tenant has no backing and reads "absent"; the memo makes a
+    /// repeated read free and is what the byte ceiling meters.
+    fn read_object_stat(&mut self, id: Vec<u8>) -> Result<Option<(u8, u64)>, SdkError> {
+        self.admit_object_read()?;
+        self.memo.check_capacity(id.len())?;
+        let answer = self.odb.as_ref().and_then(|odb| odb.borrow().stat(&id));
+        // Metadata is the one-byte tag and eight-byte body length.
+        self.memo.charge(id.len() + answer.map_or(0, |_| 9))?;
+        self.memo.object_stats.insert(id, answer);
+        Ok(answer)
+    }
+
+    /// resolve one `object-get`. The body is metered BEFORE it is materialized:
+    /// the stat says how big it is, so an oversized object is refused without
+    /// ever being loaded.
+    fn read_object_get(&mut self, id: Vec<u8>) -> Result<Option<Vec<u8>>, SdkError> {
+        self.admit_object_read()?;
+        self.memo.check_capacity(id.len())?;
+        if let Some((_, size)) = self.odb.as_ref().and_then(|odb| odb.borrow().stat(&id)) {
+            let body_bytes = usize::try_from(size).map_err(|_| object_budget_error())?;
+            self.memo
+                .check_capacity(id.len().saturating_add(body_bytes).saturating_add(1))?;
+        }
+        let answer = self.odb.as_ref().and_then(|odb| odb.borrow().get(&id));
+        self.memo
+            .charge(id.len() + answer.as_ref().map_or(0, Vec::len))?;
+        let reply = answer.clone();
+        self.memo.object_gets.insert(id, answer);
+        Ok(reply)
+    }
+
+    /// resolve one local-git object read. A missing backing answers the same
+    /// deterministic `unsupported` the [`OdbBacking`] default does.
+    fn read_git_object(
+        &mut self,
+        key: GitObjectKey,
+    ) -> Result<Result<GitObject, WitError>, SdkError> {
+        self.admit_object_read()?;
+        let key_bytes = key.0.len() + key.1.len() + 8;
+        self.memo.check_capacity(key_bytes)?;
+        let answer = self
+            .odb
+            .as_ref()
+            .ok_or(SdkError::QueryUnsupported)
+            .and_then(|odb| odb.borrow().git_object_read(&key.0, &key.1, key.2))
+            .map_err(to_wit_error);
+        let bytes = match &answer {
+            Ok(object) => {
+                9 + match &object.data {
+                    None => 0,
+                    Some(GitObjectData::Blob(bytes) | GitObjectData::Tag(bytes)) => bytes.len(),
+                    Some(GitObjectData::Commit(commit)) => {
+                        commit.tree.len()
+                            + commit
+                                .parents
+                                .iter()
+                                .map(|parent| parent.len() + HOST_ENTRY_BYTES)
+                                .sum::<usize>()
+                    }
+                    Some(GitObjectData::Tree(entries)) => entries
+                        .iter()
+                        .map(|entry| entry.name.len() + entry.oid.len() + HOST_ENTRY_BYTES)
+                        .sum(),
+                }
+            }
+            Err(WitError::Rejected(message)) => message.len(),
+            Err(_) => 0,
+        };
+        self.memo.charge(key_bytes + bytes)?;
+        let reply = answer.clone();
+        self.memo.git_objects.insert(key, answer);
+        Ok(reply)
+    }
+
+    /// resolve one local-git diff read, metered like [`HostData::read_git_object`].
+    fn read_git_diff(
+        &mut self,
+        key: GitDiffKey,
+    ) -> Result<Result<GitDiff, GitDiffError>, SdkError> {
+        self.admit_object_read()?;
+        let key_bytes = key.0.len() + key.1.len() + key.2.len() + 24;
+        self.memo.check_capacity(key_bytes)?;
+        let answer = self
+            .odb
+            .as_ref()
+            .ok_or(GitDiffError::Unsupported)
+            .and_then(|odb| {
+                odb.borrow()
+                    .git_diff_read(&key.0, &key.1, &key.2, key.3, key.4, key.5)
+            });
+        let bytes = match &answer {
+            Ok(diff) => diff.patch.len() + 25,
+            Err(GitDiffError::Unavailable(message) | GitDiffError::Limit(message)) => message.len(),
+            Err(_) => 0,
+        };
+        self.memo.charge(key_bytes + bytes)?;
+        let reply = answer.clone();
+        self.memo.git_diffs.insert(key, answer);
+        Ok(reply)
+    }
+}
+
+/// a read the host REFUSED (a budget, never a substrate failure) becomes a trap:
+/// it rejects the whole op, deterministically, at the same call on every
+/// validator — the same shape `state-prefetch` uses for its own budget.
+fn read_refusal(error: SdkError) -> wasmtime::Error {
+    wasmtime::Error::msg(error.to_string())
 }
 
 impl host::Host for HostData {
@@ -790,9 +926,9 @@ impl host::Host for HostData {
         Err(wasmtime::Error::msg(PENDING_READ_TRAP))
     }
     /// overlay-over-backing metadata read: this dispatch's staged puts first
-    /// (kind = tag byte, len = body length), then the memo, else pause for the
-    /// driver to resolve against the odb backing. never sealed — the object
-    /// store is this module's own state, resolvable ctx or not, like `state`.
+    /// (kind = tag byte, len = body length), then the memo, else the backing
+    /// itself — synchronously, in place. never sealed — the object store is this
+    /// module's own state, resolvable ctx or not, like `state`.
     fn object_stat(&mut self, id: Vec<u8>) -> wasmtime::Result<Option<(u8, u64)>> {
         if let Some(tagged) = self.object_puts.get(&id) {
             // a staged put always carries at least its kind tag byte.
@@ -801,11 +937,10 @@ impl host::Host for HostData {
         if let Some(answer) = self.memo.object_stats.get(&id) {
             return Ok(*answer);
         }
-        self.pending = Some(PendingRead::ObjectStat(id));
-        Err(wasmtime::Error::msg(PENDING_READ_TRAP))
+        self.read_object_stat(id).map_err(read_refusal)
     }
     /// overlay-over-backing full read: staged puts (the tagged body verbatim)
-    /// first, then the memo, else pause for the driver.
+    /// first, then the memo, else the backing.
     fn git_object_read(
         &mut self,
         repository: String,
@@ -824,8 +959,7 @@ impl host::Host for HostData {
         if let Some(answer) = self.memo.git_objects.get(&key) {
             return Ok(answer.clone());
         }
-        self.pending = Some(PendingRead::GitObject(key));
-        Err(wasmtime::Error::msg(PENDING_READ_TRAP))
+        self.read_git_object(key).map_err(read_refusal)
     }
     fn git_diff_read(
         &mut self,
@@ -859,8 +993,7 @@ impl host::Host for HostData {
         if let Some(answer) = self.memo.git_diffs.get(&key) {
             return Ok(answer.clone());
         }
-        self.pending = Some(PendingRead::GitDiff(key));
-        Err(wasmtime::Error::msg(PENDING_READ_TRAP))
+        self.read_git_diff(key).map_err(read_refusal)
     }
     fn object_get(&mut self, id: Vec<u8>) -> wasmtime::Result<Option<Vec<u8>>> {
         if let Some(tagged) = self.object_puts.get(&id) {
@@ -869,8 +1002,7 @@ impl host::Host for HostData {
         if let Some(answer) = self.memo.object_gets.get(&id) {
             return Ok(answer.clone());
         }
-        self.pending = Some(PendingRead::ObjectGet(id));
-        Err(wasmtime::Error::msg(PENDING_READ_TRAP))
+        self.read_object_get(id).map_err(read_refusal)
     }
     /// stage a put: the host computes `id = sha256(kind ‖ body)` and returns it
     /// (a hash mismatch is impossible here — the fail-closed publish check
@@ -958,9 +1090,11 @@ enum StateBacking {
     /// state is a single refs image the guest sees through the [`REFS_KEY`]
     /// state lane, and the object plane + queries + sync all delegate to the
     /// backing. this is the ROOT-CONTINUOUS files port shape (native files'
-    /// `sha256(encode_refs)` root, verbatim). the boxed backing IS this tenant's
-    /// [`HostOdb`] too (`OdbBacking: HostOdb`), so object reads resolve against it.
-    Odb { backing: Box<dyn OdbBacking> },
+    /// `sha256(encode_refs)` root, verbatim). the backing IS this tenant's
+    /// [`HostOdb`] too (`OdbBacking: HostOdb`), so object reads resolve against
+    /// it — through an [`OdbHandle`], which is how a running guest reaches the
+    /// same substrate the module owns.
+    Odb { backing: OdbHandle },
 }
 
 impl StateBacking {
@@ -968,7 +1102,7 @@ impl StateBacking {
         match self {
             StateBacking::Map { .. } => Backing::Map,
             StateBacking::Store { .. } => Backing::Store,
-            StateBacking::Odb { backing } => backing.kind(),
+            StateBacking::Odb { backing } => backing.borrow().kind(),
         }
     }
 }
@@ -1073,7 +1207,14 @@ impl CompiledModule {
         backing: Box<dyn OdbBacking>,
         config: Option<Vec<u8>>,
     ) -> Result<WasmModule, SdkError> {
-        WasmModule::load(id.into(), self, StateBacking::Odb { backing }, config)
+        WasmModule::load(
+            id.into(),
+            self,
+            StateBacking::Odb {
+                backing: Rc::new(RefCell::new(backing)),
+            },
+            config,
+        )
     }
 }
 
@@ -1293,95 +1434,15 @@ impl WasmModule {
         Ok(())
     }
 
-    /// resolve one paused object-plane read against the odb backing and memoize
-    /// the answer. only an [`StateBacking::Odb`] tenant has a backing; Map/Store
-    /// tenants never call the object imports, so they never pause here and their
-    /// `None` backing answers the (never-produced) read. the answers serve
-    /// COMMITTED objects only — the same-block staged puts are shadowed earlier,
-    /// by the [`HostData::object_puts`] overlay. synchronous (no ctx, no await),
-    /// like a map-backed state read.
-    fn resolve_object_read(
-        &self,
-        read: PendingRead,
-        memo: &mut SiblingMemo,
-    ) -> Result<(), SdkError> {
-        let backing = match &self.backing {
-            StateBacking::Odb { backing } => Some(backing),
+    /// the substrate a round's object reads resolve through — `None` for a
+    /// Map/Store tenant, which has no object plane at all. The answers serve
+    /// COMMITTED objects only: the same-block staged puts are shadowed earlier,
+    /// by the [`HostData::object_puts`] overlay.
+    fn odb_handle(&self) -> Option<OdbHandle> {
+        match &self.backing {
+            StateBacking::Odb { backing } => Some(Rc::clone(backing)),
             StateBacking::Map { .. } | StateBacking::Store { .. } => None,
-        };
-        match read {
-            PendingRead::ObjectStat(id) => {
-                memo.check_capacity(id.len())?;
-                let answer = backing.and_then(|b| b.stat(&id));
-                // Metadata is the one-byte tag and eight-byte body length.
-                memo.charge(id.len() + answer.map_or(0, |_| 9))?;
-                memo.object_stats.insert(id, answer);
-            }
-            PendingRead::ObjectGet(id) => {
-                memo.check_capacity(id.len())?;
-                if let Some((_, size)) = backing.and_then(|b| b.stat(&id)) {
-                    let body_bytes = usize::try_from(size).map_err(|_| memo.budget_error())?;
-                    memo.check_capacity(id.len().saturating_add(body_bytes).saturating_add(1))?;
-                }
-                let answer = backing.and_then(|b| b.get(&id));
-                memo.charge(id.len() + answer.as_ref().map_or(0, Vec::len))?;
-                memo.object_gets.insert(id, answer);
-            }
-            PendingRead::GitObject(key) => {
-                let key_bytes = key.0.len() + key.1.len() + 8;
-                memo.check_capacity(key_bytes)?;
-                let answer = backing
-                    .ok_or(SdkError::QueryUnsupported)
-                    .and_then(|b| b.git_object_read(&key.0, &key.1, key.2))
-                    .map_err(to_wit_error);
-                let bytes = match &answer {
-                    Ok(object) => {
-                        9 + match &object.data {
-                            None => 0,
-                            Some(GitObjectData::Blob(bytes) | GitObjectData::Tag(bytes)) => {
-                                bytes.len()
-                            }
-                            Some(GitObjectData::Commit(commit)) => {
-                                commit.tree.len()
-                                    + commit
-                                        .parents
-                                        .iter()
-                                        .map(|parent| parent.len() + HOST_ENTRY_BYTES)
-                                        .sum::<usize>()
-                            }
-                            Some(GitObjectData::Tree(entries)) => entries
-                                .iter()
-                                .map(|entry| entry.name.len() + entry.oid.len() + HOST_ENTRY_BYTES)
-                                .sum(),
-                        }
-                    }
-                    Err(WitError::Rejected(message)) => message.len(),
-                    Err(_) => 0,
-                };
-                memo.charge(key_bytes + bytes)?;
-                memo.git_objects.insert(key, answer);
-            }
-            PendingRead::GitDiff(key) => {
-                let key_bytes = key.0.len() + key.1.len() + key.2.len() + 24;
-                memo.check_capacity(key_bytes)?;
-                let answer = backing
-                    .ok_or(GitDiffError::Unsupported)
-                    .and_then(|b| b.git_diff_read(&key.0, &key.1, &key.2, key.3, key.4, key.5));
-                let bytes = match &answer {
-                    Ok(diff) => diff.patch.len() + 25,
-                    Err(GitDiffError::Unavailable(message) | GitDiffError::Limit(message)) => {
-                        message.len()
-                    }
-                    Err(_) => 0,
-                };
-                memo.charge(key_bytes + bytes)?;
-                memo.git_diffs.insert(key, answer);
-            }
-            PendingRead::Root(_) | PendingRead::Query(_, _) | PendingRead::States(_) => {
-                unreachable!("resolve_object_read only handles object-plane reads")
-            }
         }
-        Ok(())
     }
 
     /// Canonical bytes of a store: count + length-prefixed sorted `(key, value)`
@@ -1416,7 +1477,7 @@ impl WasmModule {
             }
             // the refs image IS the snapshot — the exact `root()` preimage; how
             // it ships is the backing's `state_sync_handle`.
-            StateBacking::Odb { backing } => backing.refs_bytes(),
+            StateBacking::Odb { backing } => backing.borrow().refs_bytes(),
         }
     }
 
@@ -1446,7 +1507,7 @@ impl WasmModule {
             // checks `sha256(bytes)` against the refs image; a container-shaped
             // substrate parses and verifies its own composition).
             StateBacking::Odb { backing } => {
-                backing.install(bytes, expected)?;
+                backing.borrow_mut().install(bytes, expected)?;
                 self.staged.clear();
                 Ok(())
             }
@@ -1462,7 +1523,9 @@ impl WasmModule {
             StateBacking::Store { .. } => BTreeMap::new(),
             // the refs image is the whole committed state, served under the one
             // reserved key; the guest reads it staged-over via the state lane.
-            StateBacking::Odb { backing } => odb_committed(backing.as_ref(), &self.odb_config),
+            StateBacking::Odb { backing } => {
+                odb_committed(backing.borrow().as_ref(), &self.odb_config)
+            }
         }
     }
 
@@ -1513,7 +1576,9 @@ impl WasmModule {
                 // staged-over via the state lane. the backing keeps ownership of
                 // the committed refs (unlike Map's move-in/reclaim), so this
                 // round's copy is discarded after the call.
-                StateBacking::Odb { backing } => odb_committed(backing.as_ref(), &self.odb_config),
+                StateBacking::Odb { backing } => {
+                    odb_committed(backing.borrow().as_ref(), &self.odb_config)
+                }
             };
             let round_staged = staged0.clone();
             let round_objects = staged_objects0.clone();
@@ -1530,6 +1595,7 @@ impl WasmModule {
                 sealed: ctx.is_none(),
                 store_backed: self.is_store_backed(),
                 object_puts: round_objects,
+                odb: self.odb_handle(),
                 out_msgs: Vec::new(),
                 out_events: Vec::new(),
                 out_output: sdk::Declared::Nothing,
@@ -1559,15 +1625,10 @@ impl WasmModule {
             }
             memo = data.memo;
 
-            // a paused run: resolve the read (own store, odb backing, or host
-            // ctx) and replay.
+            // a paused run: resolve the read (own store or host ctx) and replay.
             if let Some(read) = data.pending {
                 let resolved = match read {
                     PendingRead::States(keys) => self.resolve_state_reads(keys, &mut memo).await,
-                    read @ (PendingRead::ObjectStat(_)
-                    | PendingRead::ObjectGet(_)
-                    | PendingRead::GitObject(_)
-                    | PendingRead::GitDiff(_)) => self.resolve_object_read(read, &mut memo),
                     read @ (PendingRead::Root(_) | PendingRead::Query(_, _)) => {
                         memo.resolve(
                             ctx.as_deref().expect("unsealed mutation has a context"),
@@ -1689,6 +1750,7 @@ impl WasmModule {
                 // 1. flush the block's staged objects into the backing (native
                 //    `store.put` per object). `staged_objects` is id → tagged
                 //    body (`kind ‖ body`); split the tag back off for the put.
+                let mut backing = backing.borrow_mut();
                 for tagged in std::mem::take(&mut self.staged_objects).into_values() {
                     let (&kind, body) = tagged
                         .split_first()
@@ -1819,6 +1881,7 @@ impl WasmModule {
             // a query never stages puts; its object reads answer from the
             // committed backing alone, excluding the open block's objects.
             object_puts: BTreeMap::new(),
+            odb: self.odb_handle(),
             out_msgs: Vec::new(),
             out_events: Vec::new(),
             out_output: sdk::Declared::Nothing,
@@ -2221,7 +2284,7 @@ impl Module for WasmModule {
             // the ROOT-CONTINUITY crux: the backing's own fold of the canonical
             // refs image, byte-identical to the native module's root. moves only
             // when the backing adopts a new image (commit/install).
-            StateBacking::Odb { backing } => backing.root(),
+            StateBacking::Odb { backing } => backing.borrow().root(),
         }
     }
 
@@ -2265,7 +2328,7 @@ impl Module for WasmModule {
     fn durable_commit_height(&self) -> Option<u64> {
         match &self.backing {
             StateBacking::Map { .. } | StateBacking::Store { .. } => None,
-            StateBacking::Odb { backing } => backing.durable_commit_height(),
+            StateBacking::Odb { backing } => backing.borrow().durable_commit_height(),
         }
     }
 
@@ -2283,7 +2346,7 @@ impl Module for WasmModule {
             // joiner fetches the refs image then walks `missing_objects` ->
             // `GetObjects` -> ingest over `serve_sync` to full possession; a
             // container-shaped substrate ships its snapshot bytes instead.
-            StateBacking::Odb { backing } => backing.state_sync_handle(),
+            StateBacking::Odb { backing } => backing.borrow().state_sync_handle(),
         }
     }
 
@@ -2297,7 +2360,7 @@ impl Module for WasmModule {
             StateBacking::Store { store } => store.serve_sync(req).await,
             // the duckfs object-possession serve lane (native `Fs::serve_sync`),
             // committed-only, off the execute path.
-            StateBacking::Odb { backing } => backing.serve_sync(req),
+            StateBacking::Odb { backing } => backing.borrow().serve_sync(req),
         }
     }
 
@@ -2368,14 +2431,6 @@ impl Module for WasmModule {
                 Some(PendingRead::States(keys)) => {
                     self.resolve_state_reads(keys, &mut memo).await?;
                 }
-                Some(
-                    read @ (PendingRead::ObjectStat(_)
-                    | PendingRead::ObjectGet(_)
-                    | PendingRead::GitObject(_)
-                    | PendingRead::GitDiff(_)),
-                ) => {
-                    self.resolve_object_read(read, &mut memo)?;
-                }
                 Some(PendingRead::Root(_) | PendingRead::Query(_, _)) => {
                     unreachable!("sealed runs never pause on sibling reads")
                 }
@@ -2409,16 +2464,6 @@ impl Module for WasmModule {
                 Some(PendingRead::States(keys)) => {
                     self.resolve_state_reads(keys, &mut memo).await?;
                 }
-                // object reads are the module's own state (not sibling reads),
-                // so they resolve against the backing even ctx-less, like State.
-                Some(
-                    read @ (PendingRead::ObjectStat(_)
-                    | PendingRead::ObjectGet(_)
-                    | PendingRead::GitObject(_)
-                    | PendingRead::GitDiff(_)),
-                ) => {
-                    self.resolve_object_read(read, &mut memo)?;
-                }
                 Some(PendingRead::Root(_) | PendingRead::Query(_, _)) => {
                     unreachable!("sealed runs never pause on sibling reads")
                 }
@@ -2438,14 +2483,6 @@ impl Module for WasmModule {
                 None => return round.outcome,
                 Some(PendingRead::States(keys)) => {
                     self.resolve_state_reads(keys, &mut memo).await?;
-                }
-                Some(
-                    read @ (PendingRead::ObjectStat(_)
-                    | PendingRead::ObjectGet(_)
-                    | PendingRead::GitObject(_)
-                    | PendingRead::GitDiff(_)),
-                ) => {
-                    self.resolve_object_read(read, &mut memo)?;
                 }
                 Some(read @ (PendingRead::Root(_) | PendingRead::Query(_, _))) => {
                     memo.resolve(ctx, read).await?;
@@ -2472,7 +2509,7 @@ impl Module for WasmModule {
         // the fatal-or-complete commit model the backing has no pending here
         // unless a commit failed partway.
         match &mut self.backing {
-            StateBacking::Odb { backing } => backing.discard_block(),
+            StateBacking::Odb { backing } => backing.borrow_mut().discard_block(),
             StateBacking::Map { .. } | StateBacking::Store { .. } => {}
         }
         Ok(())
@@ -2596,12 +2633,10 @@ mod bounds {
         ] {
             assert!(data.memo.resolve(&ctx, read).await.is_err());
         }
-        for read in [
-            PendingRead::ObjectStat(vec![1; ROOT_LEN]),
-            PendingRead::ObjectGet(vec![1; ROOT_LEN]),
-        ] {
-            assert!(module.resolve_object_read(read, &mut data.memo).is_err());
-        }
+        // the object imports resolve in place, so the ceiling refuses them at
+        // the import itself — the same full memo, the same refusal.
+        assert!(host::Host::object_stat(&mut data, vec![1; ROOT_LEN]).is_err());
+        assert!(host::Host::object_get(&mut data, vec![1; ROOT_LEN]).is_err());
         assert!(data.memo.roots.is_empty());
         assert!(data.memo.queries.is_empty());
         assert!(data.memo.object_stats.is_empty());
@@ -2708,13 +2743,20 @@ mod bounds {
                     .unwrap()
                     .is_err()
             );
-            assert!(data.pending.is_none());
+            assert_eq!(data.memo.object_len(), 0, "refused before any resolution");
         }
-        assert!(host::Host::git_object_read(&mut data, "repo".into(), vec![0; 20], 1024).is_err());
+        // a VALID read reaches the substrate instead of pausing: this probe has
+        // no backing, so it answers the `unsupported` an absent one gives — and
+        // it is memoized, i.e. charged against the object-read budget.
         assert!(matches!(
-            data.pending.take(),
-            Some(PendingRead::GitObject(_))
+            host::Host::git_object_read(&mut data, "repo".into(), vec![0; 20], 1024).unwrap(),
+            Err(WitError::Unsupported)
         ));
+        assert!(
+            data.pending.is_none(),
+            "an object read never pauses the run"
+        );
+        assert_eq!(data.memo.object_len(), 1);
         assert!(
             host::Host::git_diff_read(
                 &mut data,
@@ -2728,7 +2770,7 @@ mod bounds {
             .unwrap()
             .is_err()
         );
-        assert!(data.pending.is_none());
+        assert_eq!(data.memo.object_len(), 1, "refused before any resolution");
     }
 
     #[test]
