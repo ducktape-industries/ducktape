@@ -1126,6 +1126,11 @@ impl ValidatorRuntime<'_> {
         // saga crank, conversation timers, dispatch delivery nudge.
         self.pump_heartbeat().await;
         self.pump_code_readiness().await;
+        // the committed lane table, into the watch every declared plane
+        // binds off. A no-op when the table did not move, so a lane a swap
+        // declares binds on the block that declared it and nothing else
+        // wakes a waiting plane.
+        crate::lane_table::pump(self.node.host()).await;
         self.pump_saga_crank().await;
         self.pump_conversation_inputs().await;
         self.pump_dispatch_nudge().await;

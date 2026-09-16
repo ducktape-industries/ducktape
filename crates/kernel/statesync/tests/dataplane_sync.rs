@@ -117,18 +117,18 @@ async fn joiner_syncs_a_snapshot_over_the_data_plane() {
     let flow = statesync_flow();
     let admission = Arc::new(TestAdmission::default());
     for p in [server_peer, joiner_peer] {
-        admission.allow(p, Service::StateSync, flow);
+        admission.allow(p, Service::STATE_SYNC, flow);
     }
 
     let server_plane = DataPlane::new(server_end, admission.clone(), config());
     let joiner_plane = DataPlane::new(joiner_end, admission.clone(), config());
 
     let server_svc = server_plane
-        .stream_service(Service::StateSync, StreamPolicy { accept_backlog: 8 })
+        .stream_service(Service::STATE_SYNC, StreamPolicy { accept_backlog: 8 })
         .expect("server registers statesync service");
     let joiner_svc = Arc::new(
         joiner_plane
-            .stream_service(Service::StateSync, StreamPolicy { accept_backlog: 8 })
+            .stream_service(Service::STATE_SYNC, StreamPolicy { accept_backlog: 8 })
             .expect("joiner registers statesync service"),
     );
 

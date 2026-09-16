@@ -379,6 +379,7 @@ pub(super) async fn park(
             std::sync::Arc::clone(&tracked),
             me,
             planes.clone(),
+            label.clone(),
         );
         crate::agent_plane::spawn(
             label.clone(),
@@ -1565,6 +1566,10 @@ pub(super) async fn park(
                 code_pull
                     .pump(&label, *served_height, node_r.host(), &blobs, &client)
                     .await;
+                // and so does the lane table: a swap that declares a lane
+                // must bind it without a restart, which means re-reading the
+                // table on the same block that moved it.
+                crate::lane_table::pump(node_r.host()).await;
             }
             // the boundary this pass folded is visible NOW on /v1/status.
             if !drained.is_empty() {

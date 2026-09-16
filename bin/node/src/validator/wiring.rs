@@ -718,6 +718,7 @@ pub(super) async fn wire(
                 std::sync::Arc::clone(&peers),
                 me,
                 planes,
+                label.clone(),
             );
             Some(peers)
         } else {

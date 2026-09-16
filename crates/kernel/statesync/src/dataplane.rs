@@ -30,7 +30,7 @@ use crate::{SyncClient, SyncError, SyncRequest, SyncResponse, decode_response, e
 
 /// the well-known flow every statesync stream rides. both ends derive it from
 /// this fixed label — no signaling — and a node's admission policy names this
-/// exact `(Service::StateSync, flow)` triple to permit a joiner's pull.
+/// exact `(Service::STATE_SYNC, flow)` triple to permit a joiner's pull.
 pub fn statesync_flow() -> FlowId {
     FlowId::derive(b"statesync")
 }
@@ -98,14 +98,14 @@ impl<T: DataPlaneTransport> Clone for DataPlaneSyncClient<T> {
 
 impl<T: DataPlaneTransport> DataPlaneSyncClient<T> {
     /// bind a client to `server` over a registered [`StreamService`] for
-    /// [`Service::StateSync`]. the caller registers the service (it owns the
+    /// [`Service::STATE_SYNC`]. the caller registers the service (it owns the
     /// plane); the client only ever opens streams on it.
     pub fn new(service: Arc<StreamService<T>>, server: PeerId) -> Self {
         Self { service, server }
     }
 
     /// the service id every statesync stream is opened on.
-    pub const SERVICE: Service = Service::StateSync;
+    pub const SERVICE: Service = Service::STATE_SYNC;
 }
 
 impl<T: DataPlaneTransport> SyncClient for DataPlaneSyncClient<T> {

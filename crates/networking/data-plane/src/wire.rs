@@ -52,8 +52,6 @@ pub enum WireError {
     MetaTooLarge { len: usize },
     #[error("frame truncated")]
     Truncated,
-    #[error("unknown service id {0}")]
-    UnknownService(u8),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -67,7 +65,7 @@ pub fn encode_datagram(
         return Err(WireError::PayloadTooLarge { len: payload.len() });
     }
     let mut frame = Vec::with_capacity(DATAGRAM_HEADER_LEN + payload.len());
-    frame.push(service as u8);
+    frame.push(service.lane_id());
     frame.extend_from_slice(&flow.as_u64().to_be_bytes());
     frame.extend_from_slice(payload);
     Ok(frame)
@@ -77,7 +75,7 @@ pub fn decode_datagram(frame: &[u8]) -> Result<(Service, FlowId, &[u8]), WireErr
     if frame.len() < DATAGRAM_HEADER_LEN {
         return Err(WireError::Truncated);
     }
-    let service = Service::try_from(frame[0]).map_err(WireError::UnknownService)?;
+    let service = Service::from_lane_id(frame[0]);
     let flow = FlowId::from_raw(u64::from_be_bytes(frame[1..9].try_into().expect("8 bytes")));
     Ok((service, flow, &frame[DATAGRAM_HEADER_LEN..]))
 }
@@ -103,7 +101,7 @@ pub async fn write_hello<W: AsyncWrite + Unpin>(
     let len = HELLO_FIXED_LEN + hello.meta.len();
     let mut frame = Vec::with_capacity(2 + len);
     frame.extend_from_slice(&(len as u16).to_be_bytes());
-    frame.push(hello.service as u8);
+    frame.push(hello.service.lane_id());
     frame.extend_from_slice(&hello.flow.as_u64().to_be_bytes());
     frame.push(hello.intent);
     frame.extend_from_slice(&hello.meta);
@@ -126,7 +124,7 @@ pub async fn read_hello<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Hello, W
     }
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
-    let service = Service::try_from(body[0]).map_err(WireError::UnknownService)?;
+    let service = Service::from_lane_id(body[0]);
     let flow = FlowId::from_raw(u64::from_be_bytes(body[1..9].try_into().expect("8 bytes")));
     Ok(Hello {
         service,
@@ -140,40 +138,45 @@ pub async fn read_hello<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Hello, W
 mod tests {
     use super::*;
 
+    /// a declared lane, as the registry would hand it over.
+    const VOICE: Service = Service::from_lane_id(2);
+
     #[test]
     fn datagram_round_trip() {
         let flow = FlowId::derive(b"voice-channel:general");
-        let frame = encode_datagram(Service::Voice, flow, b"opus bytes").unwrap();
+        let frame = encode_datagram(VOICE, flow, b"opus bytes").unwrap();
         let (service, decoded_flow, payload) = decode_datagram(&frame).unwrap();
-        assert_eq!(service, Service::Voice);
+        assert_eq!(service, VOICE);
         assert_eq!(decoded_flow, flow);
         assert_eq!(payload, b"opus bytes");
     }
 
     #[test]
-    fn datagram_rejects_oversize_and_garbage() {
+    fn datagram_rejects_oversize_and_truncation_but_not_an_unbound_lane() {
         let flow = FlowId::from_raw(7);
         let big = vec![0u8; MAX_DATAGRAM_PAYLOAD + 1];
         assert!(matches!(
-            encode_datagram(Service::Voice, flow, &big),
+            encode_datagram(VOICE, flow, &big),
             Err(WireError::PayloadTooLarge { .. })
         ));
         assert!(matches!(
             decode_datagram(&[1, 2, 3]),
             Err(WireError::Truncated)
         ));
-        let mut frame = encode_datagram(Service::Voice, flow, b"x").unwrap();
+        // the lane id is DATA, not a closed set: a byte no plane registered
+        // decodes fine and is dropped by the flow lookup that finds nothing.
+        // Refusing it here would make the decoder a second registry, and the
+        // decoder has no lane table to be right about.
+        let mut frame = encode_datagram(VOICE, flow, b"x").unwrap();
         frame[0] = 250;
-        assert!(matches!(
-            decode_datagram(&frame),
-            Err(WireError::UnknownService(250))
-        ));
+        let (service, _, _) = decode_datagram(&frame).unwrap();
+        assert_eq!(service, Service::from_lane_id(250));
     }
 
     #[tokio::test]
     async fn hello_round_trip() {
         let hello = Hello {
-            service: Service::StateSync,
+            service: Service::STATE_SYNC,
             flow: FlowId::derive(b"snapshot:abc"),
             intent: 3,
             meta: b"range=0..100".to_vec(),
@@ -185,22 +188,18 @@ mod tests {
     }
 
     #[test]
-    fn service_ids_are_contiguous_and_ports_derive_from_them() {
-        // the registry is contiguous from 1; the well-known ports derive from
-        // the id, so both ends compute the same dial port with no signaling.
-        for (service, id) in [
-            (Service::StateSync, 1u8),
-            (Service::Voice, 2u8),
-            (Service::Video, 3u8),
-            (Service::Gateway, 4u8),
-            (Service::AgentTelemetry, 5u8),
-            (Service::ModuleCode, 6u8),
-        ] {
-            assert_eq!(service as u8, id);
-            assert_eq!(Service::try_from(id), Ok(service));
+    fn the_well_known_ports_derive_from_the_lane_id() {
+        // both ends compute the same dial port from the id alone, with no
+        // signaling — which is why the id, not a name, is the wire fact.
+        for id in [1u8, 2, 6, 99] {
+            let service = Service::from_lane_id(id);
+            assert_eq!(service.lane_id(), id);
             assert_eq!(service.overlay_stream_port(), 45800 + id as u16);
             assert_eq!(service.overlay_datagram_port(), 45900 + id as u16);
         }
-        assert_eq!(Service::try_from(7u8), Err(7u8));
+        // the two kernel lanes are the ids `modules::RESERVED_LANE_IDS`
+        // refuses to declare, so a declared lane can never take their ports.
+        assert_eq!(Service::STATE_SYNC.lane_id(), 1);
+        assert_eq!(Service::MODULE_CODE.lane_id(), 6);
     }
 }

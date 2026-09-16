@@ -276,18 +276,18 @@ async fn run_plane_leg(suite: Vec<(&'static str, SyncRequest)>) -> (LegResults, 
 
     let flow = statesync_flow();
     let admission = Arc::new(PlaneAdmission::default());
-    admission.allow(server_peer, Service::StateSync, flow);
-    admission.allow(joiner_peer, Service::StateSync, flow);
+    admission.allow(server_peer, Service::STATE_SYNC, flow);
+    admission.allow(joiner_peer, Service::STATE_SYNC, flow);
 
     let server_plane = DataPlane::new(server_end, admission.clone(), plane_config());
     let joiner_plane = DataPlane::new(joiner_end, admission, plane_config());
 
     let server_svc = server_plane
-        .stream_service(Service::StateSync, StreamPolicy { accept_backlog: 8 })
+        .stream_service(Service::STATE_SYNC, StreamPolicy { accept_backlog: 8 })
         .expect("server registers statesync service");
     let joiner_svc = Arc::new(
         joiner_plane
-            .stream_service(Service::StateSync, StreamPolicy { accept_backlog: 8 })
+            .stream_service(Service::STATE_SYNC, StreamPolicy { accept_backlog: 8 })
             .expect("joiner registers statesync service"),
     );
 

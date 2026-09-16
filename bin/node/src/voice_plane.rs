@@ -7,7 +7,8 @@ use data_plane::{
     host::bind_overlay_sockets,
 };
 
-use crate::overlay_book::{BIND_RETRY, OverlayBook, OverlayPeers, Plane};
+use crate::lane_table::lane_table;
+use crate::overlay_book::{BIND_RETRY, LaneKey, LaneSource, OverlayBook, OverlayPeers, Plane};
 
 /// Media runs no stream class, so the plane's bulk-pacing budget is inert —
 /// these values only need to exist. (The stream listeners the sockets bind are
@@ -22,37 +23,58 @@ const MEDIA_PLANE_CONFIG: PlaneConfig = PlaneConfig {
 /// tag is a [`Plane`], never a stream plane.
 struct VoicePlane;
 
+/// the lane this plane serves, re-exported so the hub that owns the sessions
+/// can watch the same key for a withdrawal.
+pub(crate) const VOICE_LANE: LaneSource = LaneSource::Declared(LaneKey {
+    module_id: "chat",
+    name: "voice",
+});
+
 impl Plane for VoicePlane {
-    const SERVICE: Service = Service::Voice;
+    const LANE: LaneSource = VOICE_LANE;
 }
 
-/// Bind presence on the runtime that owns its session pumps.
+/// Bind presence on the runtime that owns its session pumps, answering with
+/// the lane the registry resolved: every flow this plane registers is keyed
+/// on that id, so the caller needs it as much as the sockets.
 pub async fn bind_presence_plane(
     factory: Arc<dyn SocketFactory>,
     peers: Arc<OverlayPeers>,
     me: [u8; 32],
     admission: Arc<dyn AdmissionPolicy>,
-) -> DataPlane<OverlaySockets> {
-    let voice_sockets = bind_service::<VoicePlane>(&factory, &peers, me).await;
-    DataPlane::new(voice_sockets, admission, MEDIA_PLANE_CONFIG)
+    node: &str,
+) -> (DataPlane<OverlaySockets>, Service) {
+    let (voice_sockets, service) = bind_service::<VoicePlane>(&factory, &peers, me, node).await;
+    (
+        DataPlane::new(voice_sockets, admission, MEDIA_PLANE_CONFIG),
+        service,
+    )
 }
 
-/// Bind one media service's overlay sockets on this node's `/128`, retrying
-/// the seconds the reachability plane needs to bring it up. The per-service
-/// [`OverlayBook`] stamps this service's ports on egress so datagrams land on
-/// the peer's matching socket.
+/// Bind one media lane's overlay sockets on this node's `/128`.
+///
+/// TWO waits, in order, and neither is a timeout: first the committed lane
+/// table has to name `P::LANE` (before that there is no port to bind), then
+/// the reachability plane has to bring the `/128` up. The per-lane
+/// [`OverlayBook`] stamps the resolved lane's ports on egress so datagrams
+/// land on the peer's matching socket.
 async fn bind_service<P: Plane>(
     factory: &Arc<dyn SocketFactory>,
     peers: &Arc<OverlayPeers>,
     me: [u8; 32],
-) -> OverlaySockets {
-    let book: Arc<dyn AddressBook> = OverlayBook::<P>::new(Arc::clone(peers));
-    bind_overlay_sockets(
+    node: &str,
+) -> (OverlaySockets, Service) {
+    let binding = lane_table().resolve(P::LANE, node).await;
+    let book = OverlayBook::<P>::new(Arc::clone(peers));
+    book.bind_lane(binding.service)
+        .expect("a book built here latches its lane once");
+    let sockets = bind_overlay_sockets(
         factory.clone(),
         peers.own_ip(&me),
-        P::SERVICE,
-        book,
+        binding.service,
+        book as Arc<dyn AddressBook>,
         BIND_RETRY,
     )
-    .await
+    .await;
+    (sockets, binding.service)
 }
