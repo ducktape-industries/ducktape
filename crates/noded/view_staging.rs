@@ -47,32 +47,81 @@ pub fn sync_view(
         remove(&pending)?;
         return Ok(());
     }
-    write_owned(
-        &pending,
-        b"declared view is not ready; run make views and prepare the founding set\n",
-    )?;
+    // ONE DISPATCH over what the source turned out to be, and the marker is
+    // written ONLY in the arms that mean "not ready". A pass that stages a good
+    // view never creates one at all — see [`Ready`].
+    match classify(source) {
+        Ready::Bytes(bytes) => stage_ready(&view, &bytes, assets, &owned_assets, &pending),
+        Ready::NotBuilt => mark_pending(&pending),
+        Ready::Unusable(reason) => mark_pending(&pending).and(Err(reason)),
+    }
+}
+
+/// What the source turned out to be for a DECLARED view.
+///
+/// THE FOUNDING SET IS SHARED, AND THE MARKER IS A REFUSAL. Every reader of a
+/// staged set treats `<id>.view.pending` as "this deployment is not ready", so
+/// a marker that exists for even a moment is a set that refuses for that
+/// moment — and on a box where several worktrees share one `CARGO_TARGET_DIR`,
+/// "a moment" is long enough for another session's test run to copy the
+/// directory, take the marker with it, and fail. This split is what keeps the
+/// marker out of the path that is about to succeed: only `NotBuilt` and
+/// `Unusable` write one, and `Bytes` clears whatever an earlier pass left.
+enum Ready {
+    /// the view, ready to stage
+    Bytes(Vec<u8>),
+    /// declared but not built yet, or built empty — pending, and no error: the
+    /// next pass takes it, and `make views` is the thing that was missed
+    NotBuilt,
+    /// declared, and what is on disk cannot be staged — pending, AND the build
+    /// fails, because a set that silently kept the last good view would hide it
+    Unusable(String),
+}
+
+fn classify(source: &Path) -> Ready {
     match std::fs::metadata(source) {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return Err(format!("view is not a regular file: {}", source.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("inspect {}: {error}", source.display())),
+        Ok(metadata) if !metadata.is_file() => {
+            return Ready::Unusable(format!("view is not a regular file: {}", source.display()));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ready::NotBuilt,
+        Err(error) => return Ready::Unusable(format!("inspect {}: {error}", source.display())),
     }
-    let bytes = match std::fs::read(source) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("read {}: {error}", source.display())),
-    };
-    if bytes.is_empty() {
-        return Ok(());
+    match std::fs::read(source) {
+        // An empty file is a build that has not finished writing it, not a
+        // view: the set stays pending rather than accepting nothing.
+        Ok(bytes) if bytes.is_empty() => Ready::NotBuilt,
+        Ok(bytes) => Ready::Bytes(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ready::NotBuilt,
+        Err(error) => Ready::Unusable(format!("read {}: {error}", source.display())),
     }
-    write_owned(&view, &bytes)?;
-    remove(&owned_assets)?;
+}
+
+fn mark_pending(pending: &Path) -> Result<(), String> {
+    write_owned(
+        pending,
+        b"declared view is not ready; run make views and prepare the founding set\n",
+    )
+}
+
+/// Put the view and its assets in place, then clear the marker. A correct pass
+/// never wrote one, so the removal only ever clears what an earlier failed pass
+/// left behind — including a stale marker this pass must not be stopped by.
+fn stage_ready(
+    view: &Path,
+    bytes: &[u8],
+    assets: &Path,
+    owned_assets: &Path,
+    pending: &Path,
+) -> Result<(), String> {
+    write_owned(view, bytes)?;
+    remove(owned_assets)?;
     match std::fs::symlink_metadata(assets) {
-        Ok(_) => copy_assets(assets, &owned_assets)?,
+        Ok(_) => copy_assets(assets, owned_assets)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
-    remove(&pending)
+    remove(pending)
 }
 
 fn remove(path: &Path) -> Result<(), String> {
