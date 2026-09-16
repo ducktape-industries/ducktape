@@ -591,6 +591,80 @@ fn inset(node: wire::Node, sides: f32) -> wire::Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every node under `node`, itself first.
+    fn walk(node: &wire::Node, seen: &mut impl FnMut(&wire::Node)) {
+        seen(node);
+        match node {
+            wire::Node::Linear { children, .. } => {
+                for child in children {
+                    walk(child, seen);
+                }
+            }
+            wire::Node::Container { content, .. } => walk(content, seen),
+            wire::Node::Button {
+                content: wire::ButtonContent::Child(child),
+                ..
+            } => walk(child, seen),
+            _ => {}
+        }
+    }
+
+    fn drawn(draft: &Draft) -> wire::Node {
+        view(draft, "c", "Message #general", true, &[], |_: Event<()>| ())
+    }
+
+    /// The composer's shape is a claim a reader can see at a glance: ONE
+    /// action is the action, and it is dead until there is something to
+    /// send. Six identical buttons in a row is the shape this replaced.
+    #[test]
+    fn the_send_is_the_only_primary_and_is_dead_on_an_empty_draft() {
+        let primaries = |draft: &Draft| {
+            let mut found: Vec<(String, Option<u32>)> = Vec::new();
+            walk(&drawn(draft), &mut |node| {
+                if let wire::Node::Button {
+                    key,
+                    style,
+                    on_press,
+                    ..
+                } = node
+                {
+                    if style.preset == wire::ButtonPreset::Primary {
+                        found.push((key.clone(), *on_press));
+                    }
+                }
+            });
+            found
+        };
+        let empty = primaries(&Draft::default());
+        assert_eq!(empty.len(), 1, "one primary action, not six: {empty:?}");
+        assert_eq!(empty[0].0, "c/send");
+        assert!(empty[0].1.is_none(), "an empty draft cannot be sent");
+        let typed = primaries(&Draft::from_body("hello", &[]));
+        assert!(typed[0].1.is_some(), "a draft with words can be sent");
+    }
+
+    /// The marks are squares of one size. A mark that takes its size from
+    /// its glyph gives a toolbar of five different boxes.
+    #[test]
+    fn every_mark_is_the_same_square_and_the_field_writes_at_body_size() {
+        let mut squares = 0;
+        let mut body_size = None;
+        walk(&drawn(&Draft::default()), &mut |node| match node {
+            wire::Node::Button { width, height, .. }
+                if *width == Some(wire::Length::Fixed(MARK))
+                    && *height == Some(wire::Length::Fixed(MARK)) =>
+            {
+                squares += 1;
+            }
+            wire::Node::Editor { options, .. } => body_size = options.size,
+            _ => {}
+        });
+        // attach, bold, italic, code, quote
+        assert_eq!(squares, 5, "five marks, all one square");
+        assert_eq!(body_size, Some(kit::type_scale::BODY as f32));
+    }
+
     #[test]
     fn menu_navigation_commits_before_enter_chooses_a_stable_identity() {
         let choices = vec![
