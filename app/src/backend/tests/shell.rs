@@ -279,27 +279,3 @@ checkpoint_blocks = 32
     );
 }
 
-#[test]
-fn bell_renders_attribution_relation_and_change_actor() {
-    let item = BellItem {
-        seq: 1,
-        change_seq: 4,
-        source: "chat/message/general:2".into(),
-        reason: "mention".into(),
-        kind: "transferred_in:7".into(),
-        actor: "account:9".into(),
-        height: 3,
-        read: false,
-    };
-    assert_eq!(bell_title(&item.reason), "Mention");
-    let context = BellPresentation {
-        seq: item.seq,
-        title: "Mention changed · Alice".into(),
-        detail: "Please review the launch checklist.".into(),
-        ..BellPresentation::default()
-    };
-    assert_eq!(
-        bell_presentation(&item, std::slice::from_ref(&context)),
-        context
-    );
-}

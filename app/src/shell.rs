@@ -336,6 +336,8 @@ impl Desktop {
                     module: None,
                     module_route: None,
                     route: None,
+                    overlay_module: None,
+                    overlay_route: None,
                     inputs: HashMap::new(),
                     input_step: None,
                     qr: None,
@@ -474,6 +476,11 @@ pub(crate) struct DesktopWindow {
     module: Option<(&'static str, Entity<crate::module_view::NativeModuleView>)>,
     module_route: Option<fn(crate::module_view::ModuleViewEvent) -> Message>,
     route: Option<gpui_kit::Subscription>,
+    /// The overlay's own seat. The bell draws the deployed `inbox` view, and
+    /// the tab underneath must keep its seat while it does — one slot cannot
+    /// hold both.
+    overlay_module: Option<Entity<crate::module_view::NativeModuleView>>,
+    overlay_route: Option<gpui_kit::Subscription>,
     inputs: HashMap<&'static str, NativeInput>,
     input_step: Option<crate::HubStep>,
     qr: Option<(String, Entity<crate::view_tree::ViewTree>)>,
@@ -554,7 +561,60 @@ impl DesktopWindow {
 
     fn released(&mut self, cx: &mut gpui_kit::App) {
         self.hide_module(cx);
+        self.unseat_inbox(cx);
         self.observe_module_window(view_wire::events::Window::Closed, cx);
+    }
+    /// The bell's body IS the deployed `inbox` view. It takes the session
+    /// facts every view gets and nothing else: what the rows say, which of
+    /// them are unread, and where each one's door leads are its reads, not
+    /// the app's. The chrome around it — the card, the heading, the dismiss
+    /// — stays the shell's.
+    fn seat_inbox(&mut self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        use gpui_kit::IntoElement as _;
+        let spec = {
+            let state = &self.model.read(cx).state;
+            crate::module_view::inbox_view(
+                state.is_dark(),
+                state.connected,
+                &state.network_chain_id,
+                &state.account_number,
+            )
+        };
+        if self.overlay_module.is_none() {
+            let view = cx.new(|_| crate::module_view::NativeModuleView::new(spec.module));
+            let model = self.model.clone();
+            self.overlay_route = Some(cx.subscribe(&view, move |_, _, event, cx| {
+                model.update(cx, |model, cx| {
+                    model.dispatch(Message::RegisteredViewEvent(event.clone()), cx)
+                });
+            }));
+            self.overlay_module = Some(view);
+        }
+        let view = self
+            .overlay_module
+            .as_ref()
+            .expect("inbox view seated")
+            .clone();
+        view.update(cx, |view, cx| view.set_props(spec.props, cx));
+        view.into_any_element()
+    }
+    /// A closed bell returns its seat: nothing is drawn, so nothing keeps
+    /// re-reading the queue. The headless errand behind the rail's number is
+    /// the only inbox read a closed bell pays for.
+    fn unseat_inbox(&mut self, cx: &mut gpui_kit::App) {
+        let Some(view) = self.overlay_module.take() else {
+            return;
+        };
+        self.overlay_route = None;
+        let intents = view.update(cx, |view, _| view.hide());
+        let model = self.model.clone();
+        cx.defer(move |cx| {
+            for intent in intents {
+                model.update(cx, |model, cx| {
+                    model.dispatch(Message::RegisteredViewEvent(intent), cx)
+                });
+            }
+        });
     }
     fn hide_module(&mut self, cx: &mut gpui_kit::App) {
         let (Some((_, module)), Some(route)) = (&self.module, self.module_route) else {
@@ -591,6 +651,15 @@ impl DesktopWindow {
     #[cfg(test)]
     pub(crate) fn test_state<'a>(&self, cx: &'a gpui_kit::App) -> &'a Ducktape {
         &self.model.read(cx).state
+    }
+
+    /// The two seats: the tab's module id, and whether the overlay holds one.
+    #[cfg(test)]
+    pub(crate) fn test_seats(&self) -> (Option<&'static str>, bool) {
+        (
+            self.module.as_ref().map(|(module, _)| *module),
+            self.overlay_module.is_some(),
+        )
     }
 
     #[cfg(test)]
@@ -1983,8 +2052,21 @@ impl DesktopWindow {
         cx: &mut Context<Self>,
     ) -> Option<gpui_kit::AnyElement> {
         use gpui_kit::*;
+        let topmost = {
+            let state = &self.model.read(cx).state;
+            crate::backend::topmost_overlay(state.palette_open, state.bell_open)
+        };
+        // The seat is taken before the card is drawn — it needs the window,
+        // and everything below borrows the model. A bell that is not the
+        // topmost overlay gives its seat back.
+        let inbox = match topmost.as_str() {
+            "bell" => Some(self.seat_inbox(cx)),
+            _ => {
+                self.unseat_inbox(cx);
+                None
+            }
+        };
         let state = &self.model.read(cx).state;
-        let topmost = crate::backend::topmost_overlay(state.palette_open, state.bell_open);
         use gpui_kit::component::button::ButtonVariants as _;
         use gpui_kit::component::ActiveTheme as _;
         let colors = cx.theme().color_tokens();
@@ -2105,63 +2187,18 @@ impl DesktopWindow {
                 }
                 ("Search this workspace", Message::ClosePalette)
             }
+            // The body is the guest's frame and nothing else: no rows, no
+            // empty state, no mark-read button and no retry drawn here. All
+            // of those are inbox content, and the view words them. The
+            // height is the chrome's cap on the guest, which draws no
+            // popover of its own.
             "bell" => {
-                let generation = state.connect_generation;
-                let account = state.account_number.clone();
-                let items = crate::backend::bell_visible_items(
-                    &state.bell_items,
-                    &account,
-                    &state.settings_user_key,
+                body = body.child(
+                    div()
+                        .h(px(420.))
+                        .w_full()
+                        .child(inbox.expect("the bell overlay seats the inbox view")),
                 );
-                let presentations = state.bell_presentations.clone();
-                let mut actions = div().flex().items_center().gap_2().px_1().pb_1().child(
-                    self.action(
-                        "bell-mark-read",
-                        "Mark all read",
-                        Message::MarkBellReadSubmit,
-                        state.bell_marking,
-                    )
-                    .outline()
-                    .h_7(),
-                );
-                if !state.bell_error.is_empty() {
-                    actions = actions
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(12.5))
-                                .text_color(colors.destructive)
-                                .child(state.bell_error.clone()),
-                        )
-                        .child(
-                            self.action("bell-retry", "Retry", Message::ReloadBell, false)
-                                .ghost()
-                                .h_7(),
-                        );
-                }
-                body = body.child(actions);
-                if items.is_empty() {
-                    body = body.child(
-                        div()
-                            .px_2()
-                            .py_2()
-                            .text_size(px(12.5))
-                            .text_color(muted)
-                            .child("Nothing new. Mentions and direct messages land here."),
-                    );
-                }
-                for item in items {
-                    let presentation = crate::backend::bell_presentation(&item, &presentations);
-                    let unavailable = !crate::backend::bell_openable(&item, &presentations);
-                    body = body.child(row(
-                        self,
-                        format!("notification/{}", presentation.seq),
-                        presentation.title.clone(),
-                        presentation.detail.clone(),
-                        Message::BellOpenItem(generation, account.clone(), presentation),
-                        unavailable,
-                    ));
-                }
                 ("Notifications", Message::CloseBell)
             }
             _ => return None,
@@ -2288,6 +2325,8 @@ pub(crate) fn test_window(
             module: None,
             module_route: None,
             route: None,
+            overlay_module: None,
+            overlay_route: None,
             inputs: HashMap::new(),
             input_step: None,
             qr: None,
@@ -2551,7 +2590,7 @@ mod close_tests {
     }
 
     #[test]
-    fn native_error_dismiss_and_bell_retry_reach_domain_handlers() {
+    fn native_error_dismiss_reaches_its_domain_handler() {
         use gpui_kit::test::TestWindowExt as _;
         use gpui_kit::{px, size};
         assert!(tokio::runtime::Handle::try_current().is_err());
@@ -2579,26 +2618,6 @@ mod close_tests {
         .unwrap();
         view.read_with(&cx, |view, cx| {
             assert!(view.test_state(cx).error.is_empty())
-        });
-        view.update(&mut cx, |view, cx| {
-            view.model.update(cx, |model, cx| {
-                model.state.bell_open = true;
-                model.state.bell_error = "Could not load notifications".into();
-                cx.notify();
-            });
-        });
-        let generation = view.read_with(&cx, |view, cx| view.test_state(cx).bell_load_generation);
-        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
-            .unwrap();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.click("bell-retry", cx)
-        })
-        .unwrap();
-        view.read_with(&cx, |view, cx| {
-            assert_eq!(
-                view.test_state(cx).bell_load_generation,
-                generation.wrapping_add(1)
-            );
         });
     }
 

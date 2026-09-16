@@ -1688,6 +1688,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "inbox-view"
+version = "0.1.0"
+dependencies = [
+ "ducktape-view-guest",
+ "futures",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "view-wire",
+]
+
+[[package]]
 name = "index-guest"
 version = "0.1.0"
 dependencies = [

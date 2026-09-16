@@ -1,137 +1,97 @@
+//! What the APP still owns of the bell: a number on its own chrome, and the
+//! surface the `inbox` view is seated in. The rows, their wording and the
+//! unread rule are the view's — those are proved in `crates/views/inbox`.
+
 use super::*;
 
-fn row(seq: i64) -> backend::BellItem {
-    backend::BellItem {
-        seq,
-        reason: "mention".into(),
-        actor: "account:9".into(),
-        kind: "added".into(),
-        ..Default::default()
-    }
-}
-
 #[test]
-fn bell_acknowledgement_reads_only_the_admitted_watermark() {
+fn a_late_count_cannot_land_on_a_connection_or_account_it_was_not_asked_for() {
     let (mut app, _) = Ducktape::boot();
     app.connect_generation = 7;
     app.account_number = "4".into();
-    app.bell_items = vec![row(3), row(2), row(1)];
     app.bell_unread = 3;
-    app.bell_marking = true;
-    let _ = app.update(AppMessage::BellMarked(
-        7,
-        "4".into(),
-        backend::BellDelta {
-            kind: "read".into(),
-            up_to_seq: 2,
-            ..Default::default()
-        },
-    ));
-    assert!(!app.bell_marking);
-    assert_eq!(app.bell_unread, 1);
-    assert!(!app.bell_items[0].read);
-    assert!(app.bell_items[1].read);
-    let _ = app.update(AppMessage::BellLoaded(
-        7,
-        "4".into(),
-        backend::BellData {
-            unread: 2,
-            items: vec![row(2), row(1)],
-            presentations: vec![],
-        },
-    ));
-    assert_eq!(app.bell_items[0].seq, 3);
-    assert_eq!(app.bell_unread, 1);
+    let _ = app.update(AppMessage::BellUnreadLoaded(6, "4".into(), Some(0)));
+    assert_eq!(app.bell_unread, 3, "a previous connection's count");
+    let _ = app.update(AppMessage::BellUnreadLoaded(7, "5".into(), Some(0)));
+    assert_eq!(app.bell_unread, 3, "another account's count");
+    let _ = app.update(AppMessage::BellUnreadLoaded(7, "4".into(), Some(9)));
+    assert_eq!(app.bell_unread, 9);
 }
 
 #[test]
-fn bell_failed_read_is_visible_and_stale_accounts_cannot_finish_it() {
-    let (mut app, _) = Ducktape::boot();
-    app.connect_generation = 7;
-    app.account_number = "4".into();
-    app.bell_items = vec![row(1)];
-    app.bell_unread = 1;
-    app.bell_marking = true;
-    let delta = backend::BellDelta {
-        kind: "read".into(),
-        up_to_seq: 1,
-        ..Default::default()
-    };
-    let _ = app.update(AppMessage::BellMarked(6, "4".into(), delta.clone()));
-    let _ = app.update(AppMessage::BellMarked(7, "5".into(), delta));
-    assert!(app.bell_marking);
-    assert_eq!(app.bell_unread, 1);
-    let _ = app.update(AppMessage::BellMarkFailed(
-        7,
-        "4".into(),
-        backend::AppError {
+fn an_unanswered_count_keeps_the_number_the_rail_has() {
+    assert_eq!(backend::bell_count(Ok(4)), Some(4));
+    assert_eq!(
+        backend::bell_count(Err(backend::AppError {
             message: "Cannot reach the node".into(),
             committed: false,
-        },
-    ));
-    assert!(!app.bell_marking);
-    assert_eq!(app.bell_error, "Cannot reach the node");
-    assert_eq!(app.bell_unread, 1);
-    assert!(!app.bell_items[0].read);
+        })),
+        None,
+        "a badge that blinks to zero on a dropped socket says everything is read"
+    );
+    let (mut app, _) = Ducktape::boot();
+    app.connect_generation = 7;
+    app.account_number = "4".into();
+    app.bell_unread = 3;
+    let _ = app.update(AppMessage::BellUnreadLoaded(7, "4".into(), None));
+    assert_eq!(app.bell_unread, 3);
 }
 
 #[test]
-fn bell_page_navigation_cannot_outlive_its_connection_or_account() {
-    use futures::StreamExt as _;
-    for change in ["none", "connection", "account"] {
-        let (mut app, _) = Ducktape::boot();
-        app.connect_generation = 7;
-        app.account_generation = 1;
-        app.account_number = "4".into();
-        app.shell_tab = ShellTab::Chat;
-        app.loading = false;
-        let task = app.update(AppMessage::BellOpenItem(
-            7,
-            "4".into(),
-            backend::BellPresentation {
-                target: BellTarget::Page,
-                object: "page-a".into(),
-                anchor: "block-a".into(),
-                ..Default::default()
-            },
-        ));
-        let queued = futures::executor::block_on(task.into_stream().collect::<Vec<_>>());
-        assert_eq!(
-            queued.len(),
-            1,
-            "hold the actual queued navigation, not an invented message"
-        );
-        match change {
-            "connection" => {
-                let _ = app.update(AppMessage::ConnectFailed(backend::HydrationError {
-                    generation: 7,
-                    message: "disconnected".into(),
-                }));
-            }
-            "account" => {
-                let _ = app.update(AppMessage::AccountLoaded(backend::AccountData {
-                    generation: 1,
-                    exists: true,
-                    number: "5".into(),
-                    name: "Bob".into(),
-                    bio: String::new(),
-                }));
-            }
-            _ => {}
+fn opening_a_row_s_address_leaves_the_overlay_behind() {
+    let (mut app, _) = Ducktape::boot();
+    app.bell_open = true;
+    app.network_chain_id = "dognet#0000".into();
+    let _ = app.update(AppMessage::OpenMessageLink(
+        "duck://page/page-a?net=0000".into(),
+    ));
+    assert!(!app.bell_open);
+}
+
+/// THE APP FOLDS NO INBOX. Which notifications exist, which of them are
+/// noise, how each is worded and where its door leads are the `inbox`
+/// view's, and a view swap must be able to change every one of them. The
+/// only thing `app/src/backend` may do with the inbox is ask that view for
+/// its own count — so the backend tree is parsed for every name the deleted
+/// host fold was built out of.
+#[test]
+fn the_backend_builds_no_inbox_fold() {
+    let backend = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backend");
+    let mut files = Vec::new();
+    super::rooms::collect_rust_files(&backend, &mut files);
+    assert!(!files.is_empty(), "the walk found no backend source at all");
+    for file in files {
+        let source = std::fs::read_to_string(&file).expect("read a backend source");
+        for folded in [
+            "BellItem",
+            "BellDelta",
+            "BellPresentation",
+            "BellData",
+            "bell_visible_items",
+            "bell_unread_count",
+            "bell_missing_items",
+            "bell_presentation",
+            "bell_openable",
+            "apply_bell",
+            "merge_bell_loaded",
+            "merge_bell_presentations",
+            "load_bell_presentations",
+        ] {
+            assert!(
+                !source.contains(folded),
+                "{} folds the inbox: {folded}",
+                file.display()
+            );
         }
-        for message in queued {
-            let _ = app.update(message);
-        }
-        assert_eq!(
-            app.shell_tab == ShellTab::Pages,
-            change == "none",
-            "queued page navigation after {change}"
-        );
     }
+    assert!(
+        !backend.join("bell.rs").exists(),
+        "the host fold's file is back"
+    );
 }
 
 #[gpui_kit::test]
-async fn bell_controls_render_context_and_admit_read_from_the_real_button(
+async fn the_bell_overlay_seats_the_inbox_view_and_keeps_the_tab_s_own_seat(
     cx: &mut gpui_kit::TestAppContext,
 ) {
     use gpui_kit::test::TestWindowExt as _;
@@ -140,18 +100,8 @@ async fn bell_controls_render_context_and_admit_read_from_the_real_button(
     let (mut app, _) = Ducktape::boot();
     app.console_win = Some(crate::shell::WindowKey::unique());
     app.account_number = "4".into();
+    app.shell_tab = ShellTab::Chat;
     app.bell_open = true;
-    app.bell_unread = 1;
-    app.bell_items = vec![row(17)];
-    app.bell_presentations = vec![backend::BellPresentation {
-        seq: 17,
-        title: "Alice mentioned you".into(),
-        detail: "Please review the launch checklist.".into(),
-        target: BellTarget::Message,
-        object: "general".into(),
-        number: 42,
-        ..Default::default()
-    }];
     cx.update(gpui_kit::init);
     let mut view = None;
     let handle = cx.open_window(size(px(1120.), px(720.)), |window, cx| {
@@ -162,84 +112,19 @@ async fn bell_controls_render_context_and_admit_read_from_the_real_button(
     let view = view.unwrap();
     let mut native = VisualTestContext::from_window(handle.into(), cx);
     native.update(|window, cx| window.render_frame(cx));
-    native.update(|window, _| {
-        let row = window.find("notification/17");
-        assert!(row.visible());
-        let label = row
-            .label()
-            .expect("the native button exposes its actual context");
-        assert!(label.contains("Alice mentioned you") && label.contains("launch checklist"));
+    view.read_with(&native, |view, _| {
+        let (tab, overlay) = view.test_seats();
+        assert_eq!(tab, Some("chat"), "the tab underneath keeps its seat");
+        assert!(overlay, "the bell overlay seats the inbox view");
     });
-    let click = |native: &mut VisualTestContext, key: &str| {
-        native.update(|window, cx| {
-            let position = window.find(key.to_owned()).bounds().center();
-            window.dispatch_event(
-                gpui_kit::PlatformInput::MouseDown(gpui_kit::MouseDownEvent {
-                    position,
-                    button: gpui_kit::MouseButton::Left,
-                    modifiers: Default::default(),
-                    click_count: 1,
-                    first_mouse: false,
-                }),
-                cx,
-            );
-            window.dispatch_event(
-                gpui_kit::PlatformInput::MouseUp(gpui_kit::MouseUpEvent {
-                    position,
-                    button: gpui_kit::MouseButton::Left,
-                    modifiers: Default::default(),
-                    click_count: 1,
-                }),
-                cx,
-            );
-        });
-    };
-    click(&mut native, "bell-mark-read");
-    view.read_with(&native, |view, cx| {
-        assert!(
-            view.test_state(cx).bell_marking,
-            "real native button admits the read"
-        )
-    });
+    // Closing returns the overlay's seat; the tab's is untouched.
     view.update(&mut native, |view, cx| {
-        let generation = view.test_state(cx).bell_head_generation;
-        // Deliver through the actual completion boundary: it retires the
-        // admitted request before this UI-only test yields to its executor.
-        // Injecting the inner BellMarked alone leaves a live RPC behind.
-        view.test_dispatch(
-            AppMessage::BellHeadReply(
-                generation,
-                Box::new(AppMessage::BellMarked(
-                    0,
-                    "4".into(),
-                    backend::BellDelta {
-                        kind: "read".into(),
-                        up_to_seq: 17,
-                        ..Default::default()
-                    },
-                )),
-            ),
-            cx,
-        )
-    });
-    view.read_with(&native, |view, cx| {
-        assert_eq!(view.test_state(cx).bell_unread, 0);
-        assert!(view.test_state(cx).bell_items[0].read);
-        assert!(view.test_state(cx).bell_head_task.is_none());
+        view.test_dispatch(AppMessage::CloseBell, cx)
     });
     native.update(|window, cx| window.render_frame(cx));
-    click(&mut native, "notification/17");
-    cx.condition(&view, |view, cx| {
-        view.test_state(cx).active_channel == "general"
-    })
-    .await;
-    view.read_with(&native, |view, cx| {
-        let app = view.test_state(cx);
-        assert!(!app.bell_open);
-        assert_eq!(app.active_channel, "general");
-        assert_eq!(
-            app.chat_land_seq, 42,
-            "navigate to source message, not inbox sequence 17"
-        );
+    view.read_with(&native, |view, _| {
+        let (tab, overlay) = view.test_seats();
+        assert_eq!(tab, Some("chat"));
+        assert!(!overlay);
     });
 }

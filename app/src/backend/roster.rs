@@ -136,15 +136,6 @@ impl ReaderFacts {
         }
     }
 
-    /// The update thread's reading — it cannot await, so it takes the cached
-    /// key (warm by the time anyone sends) and the directory as last read.
-    pub(crate) fn cached() -> Self {
-        Self {
-            key: rpc::cached_user_key(),
-            names: names(),
-        }
-    }
-
     pub(crate) fn reader(&self) -> ChatReader<'_> {
         ChatReader::new(self.key.as_deref(), &self.names)
     }

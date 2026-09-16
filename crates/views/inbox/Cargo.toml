@@ -1,0 +1,25 @@
+[package]
+name = "inbox-view"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# A Rust-authored view, exported as a dynamically loaded WASM component by
+# `export_app!`; `unsafe_code` is not forbidden only because the component
+# exports need `#[unsafe(export_name)]`.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ducktape-view-guest.workspace = true
+# a run's `duck://` address is its dispatch id: the sha256 of the run id,
+# which is how every other surface addresses a run.
+sha2 = "0.10"
+
+[dev-dependencies]
+# the snapshot tag is a digest of this view's own state layout; the tracer
+# that derives it is host-only and never reaches the built component
+view-wire = { workspace = true, features = ["schema"] }

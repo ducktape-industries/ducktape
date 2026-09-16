@@ -29,9 +29,6 @@ impl Ducktape {
             AppMessage::LiveResyncReply(request_generation, reply_message) => {
                 self.on_live_resync_reply(request_generation, reply_message)
             }
-            AppMessage::BellPresentationsReply(request_generation, reply_message) => {
-                self.on_bell_presentations_reply(request_generation, reply_message)
-            }
             AppMessage::AccountQrAuthReply(request_generation, reply_message) => {
                 self.on_account_qr_auth_reply(request_generation, reply_message)
             }
@@ -40,12 +37,6 @@ impl Ducktape {
             }
             AppMessage::NotificationsSaveReply(request_generation, reply_message) => {
                 self.on_notifications_save_reply(request_generation, reply_message)
-            }
-            AppMessage::BellHeadReply(request_generation, reply_message) => {
-                self.on_bell_head_reply(request_generation, reply_message)
-            }
-            AppMessage::BellNavigationReply(request_generation, reply_message) => {
-                self.on_bell_navigation_reply(request_generation, reply_message)
             }
             AppMessage::PaletteSearchReply(request_generation, reply_message) => {
                 self.on_palette_search_reply(request_generation, reply_message)
@@ -157,26 +148,9 @@ impl Ducktape {
             AppMessage::ExplorerViewEvent(event) => self.on_explorer_view_event(event),
             AppMessage::ClosePalette => self.on_close_palette(),
             AppMessage::ToggleBell => self.on_toggle_bell(),
-            AppMessage::ReloadBell => self.on_reload_bell(),
             AppMessage::CloseBell => self.on_close_bell(),
-            AppMessage::MarkBellReadSubmit => self.on_mark_bell_read_submit(),
-            AppMessage::BellLoaded(generation, account, next) => {
-                self.on_bell_loaded(generation, account, next)
-            }
-            AppMessage::BellContextLoaded(generation, account, next) => {
-                self.on_bell_context_loaded(generation, account, next)
-            }
-            AppMessage::BellFailed(generation, account, cause) => {
-                self.on_bell_failed(generation, account, cause)
-            }
-            AppMessage::BellMarked(generation, account, delta) => {
-                self.on_bell_marked(generation, account, delta)
-            }
-            AppMessage::BellMarkFailed(generation, account, cause) => {
-                self.on_bell_mark_failed(generation, account, cause)
-            }
-            AppMessage::BellOpenItem(generation, account, context) => {
-                self.on_bell_open_item(generation, account, context)
+            AppMessage::BellUnreadLoaded(generation, account, unread) => {
+                self.on_bell_unread_loaded(generation, account, unread)
             }
             AppMessage::GlobalKeyPressed(event) => self.on_global_key_pressed(event),
             AppMessage::PaletteChanged(next) => self.on_palette_changed(next),
@@ -379,17 +353,6 @@ impl Ducktape {
         }
         Task::none()
     }
-    fn on_bell_presentations_reply(
-        &mut self,
-        request_generation: u64,
-        reply_message: Box<AppMessage>,
-    ) -> Task<AppMessage> {
-        if self.bell_presentations_generation == request_generation {
-            self.bell_presentations_task = None;
-            return self.update(*reply_message);
-        }
-        Task::none()
-    }
     fn on_account_qr_auth_reply(
         &mut self,
         request_generation: u64,
@@ -421,28 +384,6 @@ impl Ducktape {
     ) -> Task<AppMessage> {
         if self.notifications_save_generation == request_generation {
             self.notifications_save_task = None;
-            return self.update(*reply_message);
-        }
-        Task::none()
-    }
-    fn on_bell_head_reply(
-        &mut self,
-        request_generation: u64,
-        reply_message: Box<AppMessage>,
-    ) -> Task<AppMessage> {
-        if self.bell_head_generation == request_generation {
-            self.bell_head_task = None;
-            return self.update(*reply_message);
-        }
-        Task::none()
-    }
-    fn on_bell_navigation_reply(
-        &mut self,
-        request_generation: u64,
-        reply_message: Box<AppMessage>,
-    ) -> Task<AppMessage> {
-        if self.bell_navigation_generation == request_generation {
-            self.bell_navigation_task = None;
             return self.update(*reply_message);
         }
         Task::none()
@@ -666,29 +607,11 @@ impl Ducktape {
         self.palette_search_phase = SearchPhase::Idle;
         self.error = "".to_owned();
         self.status = "Connecting…".to_owned();
-        self.bell_marking = false;
-        self.bell_error = "".to_owned();
-        self.bell_head_generation = self.bell_head_generation.wrapping_add(1);
-        if let Some(previous_handle) = self.bell_head_task.take() {
-            previous_handle.abort();
-        }
-        self.bell_navigation_generation = self.bell_navigation_generation.wrapping_add(1);
-        if let Some(previous_handle) = self.bell_navigation_task.take() {
-            previous_handle.abort();
-        }
         self.bell_load_generation = self.bell_load_generation.wrapping_add(1);
         if let Some(previous_handle) = self.bell_load_task.take() {
             previous_handle.abort();
         }
-        self.bell_presentations_generation = self.bell_presentations_generation.wrapping_add(1);
-        if let Some(previous_handle) = self.bell_presentations_task.take() {
-            previous_handle.abort();
-        }
-        self.bell_items = Vec::new();
-        self.bell_presentations = Vec::new();
         self.bell_unread = 0;
-        self.bell_read_through = 0;
-        self.bell_clear_through = 0;
         self.connect_generation += 1;
         let pending_task = crate::backend::connect(
             self.connected_rpc.to_owned(),
@@ -805,41 +728,7 @@ impl Ducktape {
                     AppMessage::NodeFactsLoadReply(request_generation, Box::new(reply_message))
                 })
             },
-            {
-                let pending_task = {
-                    let reply_generation = self.connect_generation;
-                    let reply_account = self.account_number.to_owned();
-                    Task::perform(
-                        crate::backend::load_bell(
-                            self.connected_rpc.to_owned(),
-                            self.account_number.to_owned(),
-                        ),
-                        move |result| match result {
-                            Ok(value) => AppMessage::BellLoaded(
-                                reply_generation,
-                                reply_account.clone(),
-                                value,
-                            ),
-                            Err(error) => AppMessage::BellFailed(
-                                reply_generation,
-                                reply_account.clone(),
-                                error,
-                            ),
-                        },
-                    )
-                };
-                self.bell_load_generation = self.bell_load_generation.wrapping_add(1);
-                let request_generation = self.bell_load_generation;
-                let (pending_task, request_handle) = pending_task.abortable();
-                if let Some(previous_handle) =
-                    self.bell_load_task.replace(request_handle.abort_on_drop())
-                {
-                    previous_handle.abort();
-                }
-                pending_task.map(move |reply_message| {
-                    AppMessage::BellLoadReply(request_generation, Box::new(reply_message))
-                })
-            },
+            self.reload_bell_unread(),
             {
                 let pending_task = Task::perform(
                     crate::backend::load_settings_facts(
@@ -994,90 +883,21 @@ impl Ducktape {
                     AppMessage::LiveResyncReply(request_generation, Box::new(reply_message))
                 })
             }
-            LiveKind::Bell => {
-                self.bell_read_through = crate::backend::keep_i64(
-                    (next.bell.kind == "read") && (next.bell.up_to_seq > self.bell_read_through),
-                    next.bell.up_to_seq,
-                    self.bell_read_through,
-                );
-                self.bell_clear_through = crate::backend::keep_i64(
-                    (next.bell.kind == "cleared")
-                        && (next.bell.up_to_seq > self.bell_clear_through),
-                    next.bell.up_to_seq,
-                    self.bell_clear_through,
-                );
-                self.bell_items = crate::backend::merge_bell_loaded(
-                    crate::backend::apply_bell(
-                        ::std::mem::take(&mut self.bell_items),
-                        next.bell.clone(),
-                    ),
-                    Vec::new(),
-                    self.bell_read_through,
-                    self.bell_clear_through,
-                );
-                self.bell_unread = crate::backend::bell_unread_count(
-                    &self.bell_items,
-                    &self.account_number,
-                    &self.settings_user_key,
-                );
-                self.bell_presentations = crate::backend::merge_bell_presentations(
-                    crate::backend::bell_visible_items(
-                        &self.bell_items,
-                        &self.account_number,
-                        &self.settings_user_key,
-                    ),
-                    ::std::mem::take(&mut self.bell_presentations),
-                    Vec::new(),
-                );
-                if next.bell.kind != "delivered" {
-                    return Task::none();
-                }
-                let pending_task = {
-                    let reply_generation = self.connect_generation;
-                    let reply_account = self.account_number.to_owned();
-                    Task::perform(
-                        crate::backend::load_bell_presentations(
-                            self.connected_rpc.to_owned(),
-                            crate::backend::bell_missing_items(
-                                crate::backend::bell_visible_items(
-                                    &self.bell_items,
-                                    &self.account_number,
-                                    &(self.settings_user_key),
-                                ),
-                                &self.bell_presentations,
-                            ),
-                        ),
-                        move |result| match result {
-                            Ok(value) => AppMessage::BellContextLoaded(
-                                reply_generation,
-                                reply_account.clone(),
-                                value,
-                            ),
-                            Err(error) => AppMessage::BellFailed(
-                                reply_generation,
-                                reply_account.clone(),
-                                error,
-                            ),
-                        },
-                    )
-                };
-                self.bell_presentations_generation =
-                    self.bell_presentations_generation.wrapping_add(1);
-                let request_generation = self.bell_presentations_generation;
-                let (pending_task, request_handle) = pending_task.abortable();
-                if let Some(previous_handle) = self
-                    .bell_presentations_task
-                    .replace(request_handle.abort_on_drop())
-                {
-                    previous_handle.abort();
-                }
-                pending_task.map(move |reply_message| {
-                    AppMessage::BellPresentationsReply(request_generation, Box::new(reply_message))
-                })
-            }
             LiveKind::Plane => {
                 self.views_live_serial =
                     crate::module_view::view_live_hit(&(next.module), self.views_live_serial);
+                // The seated inbox view re-reads its own plane through
+                // `rpc.live`; the rail's number is the app's own chrome, so
+                // the app asks the same view for it again.
+                let inbox_moved = crate::backend::plane_live_hit(
+                    next.kind,
+                    next.module.to_owned(),
+                    "inbox".to_owned(),
+                );
+                let unread_task = match inbox_moved {
+                    true => self.reload_bell_unread(),
+                    false => Task::none(),
+                };
                 self.account_generation = crate::backend::keep_i64(
                     crate::backend::plane_live_hit(
                         next.kind,
@@ -1097,6 +917,7 @@ impl Ducktape {
                     self.dm_peers_generation,
                 );
                 Task::batch([
+                    unread_task,
                     Task::done(crate::backend::load_request(
                         crate::backend::plane_live_hit(
                             next.kind,
@@ -1761,29 +1582,11 @@ impl Ducktape {
             return Task::none();
         }
         self.hydration_generation += 1;
-        self.bell_marking = false;
-        self.bell_error = "".to_owned();
-        self.bell_head_generation = self.bell_head_generation.wrapping_add(1);
-        if let Some(previous_handle) = self.bell_head_task.take() {
-            previous_handle.abort();
-        }
-        self.bell_navigation_generation = self.bell_navigation_generation.wrapping_add(1);
-        if let Some(previous_handle) = self.bell_navigation_task.take() {
-            previous_handle.abort();
-        }
         self.bell_load_generation = self.bell_load_generation.wrapping_add(1);
         if let Some(previous_handle) = self.bell_load_task.take() {
             previous_handle.abort();
         }
-        self.bell_presentations_generation = self.bell_presentations_generation.wrapping_add(1);
-        if let Some(previous_handle) = self.bell_presentations_task.take() {
-            previous_handle.abort();
-        }
-        self.bell_items = Vec::new();
-        self.bell_presentations = Vec::new();
         self.bell_unread = 0;
-        self.bell_read_through = 0;
-        self.bell_clear_through = 0;
         self.connect_generation += 1;
         self.hydration_retry_attempt += 1;
         let retry_seconds = crate::backend::retry_delay(
@@ -1859,80 +1662,15 @@ impl Ducktape {
             return Task::none();
         }
         self.account_exists = next.exists;
-        self.bell_marking = self.bell_marking && (self.account_number == next.number);
-        self.bell_items = crate::backend::bell_account_items(
-            ::std::mem::take(&mut self.bell_items),
-            &self.account_number,
-            &(next.number),
-        );
-        self.bell_presentations = crate::backend::merge_bell_presentations(
-            crate::backend::bell_visible_items(
-                &self.bell_items,
-                &(next.number),
-                &self.settings_user_key,
-            ),
-            ::std::mem::take(&mut self.bell_presentations),
-            Vec::new(),
-        );
-        self.bell_unread = crate::backend::bell_unread_count(
-            &self.bell_items,
-            &(next.number),
-            &self.settings_user_key,
-        );
-        self.bell_error = "".to_owned();
-        self.bell_read_through = crate::backend::keep_i64(
-            self.account_number == next.number,
-            self.bell_read_through,
-            0,
-        );
-        self.bell_clear_through = crate::backend::keep_i64(
-            self.account_number == next.number,
-            self.bell_clear_through,
-            0,
-        );
-        self.bell_presentations_generation = self.bell_presentations_generation.wrapping_add(1);
-        if let Some(previous_handle) = self.bell_presentations_task.take() {
-            previous_handle.abort();
-        }
-        self.bell_head_generation = self.bell_head_generation.wrapping_add(1);
-        if let Some(previous_handle) = self.bell_head_task.take() {
-            previous_handle.abort();
-        }
-        self.bell_navigation_generation = self.bell_navigation_generation.wrapping_add(1);
-        if let Some(previous_handle) = self.bell_navigation_task.take() {
-            previous_handle.abort();
-        }
-        self.bell_marking = false;
+        // A number counted for one account says nothing about the next one,
+        // and it is chrome, not state a view keeps: it goes to zero until
+        // the seated view answers for whoever is seated now.
+        let account_moved = self.account_number != next.number;
+        self.bell_unread = crate::backend::keep_i64(account_moved, 0, self.bell_unread);
         self.account_number = next.number.to_owned();
         self.account_name = next.name.to_owned();
         self.account_bio = next.bio.to_owned();
-        let pending_task = {
-            let reply_generation = self.connect_generation;
-            let reply_account = next.number.to_owned();
-            Task::perform(
-                crate::backend::load_bell(
-                    self.connected_rpc.to_owned(),
-                    self.account_number.to_owned(),
-                ),
-                move |result| match result {
-                    Ok(value) => {
-                        AppMessage::BellLoaded(reply_generation, reply_account.clone(), value)
-                    }
-                    Err(error) => {
-                        AppMessage::BellFailed(reply_generation, reply_account.clone(), error)
-                    }
-                },
-            )
-        };
-        self.bell_load_generation = self.bell_load_generation.wrapping_add(1);
-        let request_generation = self.bell_load_generation;
-        let (pending_task, request_handle) = pending_task.abortable();
-        if let Some(previous_handle) = self.bell_load_task.replace(request_handle.abort_on_drop()) {
-            previous_handle.abort();
-        }
-        pending_task.map(move |reply_message| {
-            AppMessage::BellLoadReply(request_generation, Box::new(reply_message))
-        })
+        self.reload_bell_unread()
     }
     fn on_account_failed(&mut self, cause: crate::backend::HydrationError) -> Task<AppMessage> {
         if cause.generation != self.account_generation {
@@ -2647,260 +2385,65 @@ impl Ducktape {
         self.palette_open = false;
         Task::none()
     }
+    /// The bell opens the seated `inbox` view and asks it for a fresh count;
+    /// the view re-reads its own queue on the same block the rail does.
     fn on_toggle_bell(&mut self) -> Task<AppMessage> {
         self.bell_open = !self.bell_open;
         if !self.bell_open {
             return Task::none();
         }
-        self.bell_error = "".to_owned();
-        let pending_task = {
-            let reply_generation = self.connect_generation;
-            let reply_account = self.account_number.to_owned();
-            Task::perform(
-                crate::backend::load_bell(
-                    self.connected_rpc.to_owned(),
-                    self.account_number.to_owned(),
-                ),
-                move |result| match result {
-                    Ok(value) => {
-                        AppMessage::BellLoaded(reply_generation, reply_account.clone(), value)
-                    }
-                    Err(error) => {
-                        AppMessage::BellFailed(reply_generation, reply_account.clone(), error)
-                    }
-                },
-            )
-        };
-        self.bell_load_generation = self.bell_load_generation.wrapping_add(1);
-        let request_generation = self.bell_load_generation;
-        let (pending_task, request_handle) = pending_task.abortable();
-        if let Some(previous_handle) = self.bell_load_task.replace(request_handle.abort_on_drop()) {
-            previous_handle.abort();
-        }
-        pending_task.map(move |reply_message| {
-            AppMessage::BellLoadReply(request_generation, Box::new(reply_message))
-        })
-    }
-    fn on_reload_bell(&mut self) -> Task<AppMessage> {
-        self.bell_error = "".to_owned();
-        let pending_task = {
-            let reply_generation = self.connect_generation;
-            let reply_account = self.account_number.to_owned();
-            Task::perform(
-                crate::backend::load_bell(
-                    self.connected_rpc.to_owned(),
-                    self.account_number.to_owned(),
-                ),
-                move |result| match result {
-                    Ok(value) => {
-                        AppMessage::BellLoaded(reply_generation, reply_account.clone(), value)
-                    }
-                    Err(error) => {
-                        AppMessage::BellFailed(reply_generation, reply_account.clone(), error)
-                    }
-                },
-            )
-        };
-        self.bell_load_generation = self.bell_load_generation.wrapping_add(1);
-        let request_generation = self.bell_load_generation;
-        let (pending_task, request_handle) = pending_task.abortable();
-        if let Some(previous_handle) = self.bell_load_task.replace(request_handle.abort_on_drop()) {
-            previous_handle.abort();
-        }
-        pending_task.map(move |reply_message| {
-            AppMessage::BellLoadReply(request_generation, Box::new(reply_message))
-        })
+        self.reload_bell_unread()
     }
     fn on_close_bell(&mut self) -> Task<AppMessage> {
         self.bell_open = false;
         Task::none()
     }
-    fn on_mark_bell_read_submit(&mut self) -> Task<AppMessage> {
-        if (self.bell_unread <= 0) || self.bell_marking {
-            return Task::none();
-        }
-        self.bell_marking = true;
-        self.bell_error = "".to_owned();
+    /// One errand, one number. A failed read keeps the number the rail has:
+    /// a count that blinks to zero on a dropped socket is worse than a stale
+    /// one, and the next block asks again.
+    fn reload_bell_unread(&mut self) -> Task<AppMessage> {
         let pending_task = {
             let reply_generation = self.connect_generation;
             let reply_account = self.account_number.to_owned();
             Task::perform(
-                crate::backend::mark_bell_read(
+                crate::backend::load_bell_unread(
                     self.connected_rpc.to_owned(),
-                    self.password.to_owned(),
                     self.account_number.to_owned(),
-                    crate::backend::bell_head(self.bell_items.clone()),
                 ),
-                move |result| match result {
-                    Ok(value) => {
-                        AppMessage::BellMarked(reply_generation, reply_account.clone(), value)
-                    }
-                    Err(error) => {
-                        AppMessage::BellMarkFailed(reply_generation, reply_account.clone(), error)
-                    }
+                move |result| {
+                    AppMessage::BellUnreadLoaded(
+                        reply_generation,
+                        reply_account.clone(),
+                        crate::backend::bell_count(result),
+                    )
                 },
             )
         };
-        self.bell_head_generation = self.bell_head_generation.wrapping_add(1);
-        let request_generation = self.bell_head_generation;
+        self.bell_load_generation = self.bell_load_generation.wrapping_add(1);
+        let request_generation = self.bell_load_generation;
         let (pending_task, request_handle) = pending_task.abortable();
-        if let Some(previous_handle) = self.bell_head_task.replace(request_handle.abort_on_drop()) {
+        if let Some(previous_handle) = self.bell_load_task.replace(request_handle.abort_on_drop()) {
             previous_handle.abort();
         }
         pending_task.map(move |reply_message| {
-            AppMessage::BellHeadReply(request_generation, Box::new(reply_message))
+            AppMessage::BellLoadReply(request_generation, Box::new(reply_message))
         })
     }
-    fn on_bell_loaded(
+    fn on_bell_unread_loaded(
         &mut self,
         generation: i64,
         account: String,
-        next: crate::backend::BellData,
+        unread: Option<i64>,
     ) -> Task<AppMessage> {
-        if (generation != self.connect_generation) || (account != self.account_number) {
+        let answered_this_connection =
+            (generation == self.connect_generation) && (account == self.account_number);
+        if !answered_this_connection {
             return Task::none();
         }
-        self.bell_error = "".to_owned();
-        self.bell_items = crate::backend::merge_bell_loaded(
-            ::std::mem::take(&mut self.bell_items),
-            next.items.clone(),
-            self.bell_read_through,
-            self.bell_clear_through,
-        );
-        self.bell_presentations = crate::backend::merge_bell_presentations(
-            crate::backend::bell_visible_items(
-                &self.bell_items,
-                &self.account_number,
-                &self.settings_user_key,
-            ),
-            ::std::mem::take(&mut self.bell_presentations),
-            next.presentations.clone(),
-        );
-        self.bell_unread = crate::backend::bell_unread_count(
-            &self.bell_items,
-            &self.account_number,
-            &self.settings_user_key,
-        );
+        if let Some(unread) = unread {
+            self.bell_unread = unread;
+        }
         Task::none()
-    }
-    fn on_bell_context_loaded(
-        &mut self,
-        generation: i64,
-        account: String,
-        next: Vec<crate::backend::BellPresentation>,
-    ) -> Task<AppMessage> {
-        if (generation != self.connect_generation) || (account != self.account_number) {
-            return Task::none();
-        }
-        self.bell_presentations = crate::backend::merge_bell_presentations(
-            crate::backend::bell_visible_items(
-                &self.bell_items,
-                &self.account_number,
-                &self.settings_user_key,
-            ),
-            ::std::mem::take(&mut self.bell_presentations),
-            next.clone(),
-        );
-        self.bell_error = "".to_owned();
-        Task::none()
-    }
-    fn on_bell_failed(
-        &mut self,
-        generation: i64,
-        account: String,
-        cause: crate::backend::AppError,
-    ) -> Task<AppMessage> {
-        if (generation != self.connect_generation) || (account != self.account_number) {
-            return Task::none();
-        }
-        self.bell_error = cause.message.to_owned();
-        Task::none()
-    }
-    fn on_bell_marked(
-        &mut self,
-        generation: i64,
-        account: String,
-        delta: crate::backend::BellDelta,
-    ) -> Task<AppMessage> {
-        if (generation != self.connect_generation) || (account != self.account_number) {
-            return Task::none();
-        }
-        self.bell_marking = false;
-        self.bell_read_through = crate::backend::keep_i64(
-            delta.up_to_seq > self.bell_read_through,
-            delta.up_to_seq,
-            self.bell_read_through,
-        );
-        self.bell_items =
-            crate::backend::apply_bell(::std::mem::take(&mut self.bell_items), delta.clone());
-        self.bell_unread = crate::backend::bell_unread_count(
-            &self.bell_items,
-            &self.account_number,
-            &self.settings_user_key,
-        );
-        Task::none()
-    }
-    fn on_bell_mark_failed(
-        &mut self,
-        generation: i64,
-        account: String,
-        cause: crate::backend::AppError,
-    ) -> Task<AppMessage> {
-        if (generation != self.connect_generation) || (account != self.account_number) {
-            return Task::none();
-        }
-        self.bell_marking = false;
-        self.bell_error = cause.message.to_owned();
-        Task::none()
-    }
-    fn on_bell_open_item(
-        &mut self,
-        generation: i64,
-        account: String,
-        context: crate::backend::BellPresentation,
-    ) -> Task<AppMessage> {
-        if (generation != self.connect_generation) || (account != self.account_number) {
-            return Task::none();
-        }
-        if (context.target == BellTarget::Unavailable) || (context.object).is_empty() {
-            return Task::none();
-        }
-        self.bell_open = false;
-        match context.target {
-            BellTarget::Run => Task::done(AppMessage::OpenRunPanel(context.object.to_owned())),
-            BellTarget::Page => {
-                let pending_task = {
-                    let target_anchor = context.anchor.to_owned();
-                    Task::done(AppMessage::OpenPageSearchHit(
-                        context.object.to_owned(),
-                        target_anchor.clone(),
-                    ))
-                };
-                self.bell_navigation_generation = self.bell_navigation_generation.wrapping_add(1);
-                let request_generation = self.bell_navigation_generation;
-                let (pending_task, request_handle) = pending_task.abortable();
-                if let Some(previous_handle) = self
-                    .bell_navigation_task
-                    .replace(request_handle.abort_on_drop())
-                {
-                    previous_handle.abort();
-                }
-                pending_task.map(move |reply_message| {
-                    AppMessage::BellNavigationReply(request_generation, Box::new(reply_message))
-                })
-            }
-            BellTarget::Message => Task::done(AppMessage::OpenMessageLink(
-                crate::backend::bell_link(&(context), self.network_chain_id.to_owned()),
-            )),
-            BellTarget::Forge => Task::done(AppMessage::OpenMessageLink(
-                crate::backend::bell_link(&(context), self.network_chain_id.to_owned()),
-            )),
-            BellTarget::Repo => Task::done(AppMessage::OpenMessageLink(crate::backend::bell_link(
-                &(context),
-                self.network_chain_id.to_owned(),
-            ))),
-            BellTarget::Unavailable => Task::none(),
-        }
     }
     fn on_global_key_pressed(&mut self, event: crate::shell::KeyPress) -> Task<AppMessage> {
         let escape_key =
@@ -3281,6 +2824,9 @@ impl Ducktape {
         if (url).is_empty() {
             return Task::none();
         }
+        // Opening an address is leaving for somewhere: the overlay a row was
+        // pressed in does not survive the trip.
+        self.bell_open = false;
         let link =
             crate::backend::resolve_duck_link(url.to_owned(), self.network_chain_id.to_owned());
         match link.kind {

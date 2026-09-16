@@ -94,6 +94,26 @@ pub fn governance_view(dark: bool, connected: bool) -> ViewSpec {
     )
 }
 
+/// The bell overlay's body, drawn by the `inbox` view over the KERNEL
+/// CONTRACT. THE APP FOLDS NO INBOX: which notifications exist, which of
+/// them are noise, how each is worded and where its `duck://` door leads
+/// are the view's own reads off the inbox queue, the identity directory and
+/// each source module's read lane. "Mark all read" leaves as `op.submit`,
+/// signed here with the seated key. Session facts are all that go in, and
+/// the two generic doors are all that come back.
+///
+/// The number the app paints beside its bell is the same view's count,
+/// answered headless through [`background::request`] — never a second fold.
+pub fn inbox_view(dark: bool, connected: bool, chain: &str, account: &str) -> ViewSpec {
+    let props = serde_json::json!({
+        "connected": connected,
+        "dark": dark,
+        "chain": chain,
+        "account": account,
+    });
+    module_view("inbox", serde_json::to_vec(&props).expect("props encode"))
+}
+
 // ---------- the roster seats ----------
 
 /// The Members tab, on the KERNEL CONTRACT: session facts go in, the view

@@ -5,10 +5,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ::chat::index::{ChatViewQuery, ChatViewReply};
 // No `ChatQuery`/`ChatReply` here on purpose: every chat read in this app goes
 // through `/v1/index/chat/view`, off the node's select loop. A dispatch query
 // import reappearing is the signal that one crawled back onto it.
+//
+// The shipping binary reads no chat rows of its own any more — the chat view
+// does — so what is left of the module's vocabulary here is what the app's
+// own tests build rows with.
+#[cfg(test)]
+use ::chat::index::{ChatViewQuery, ChatViewReply};
+#[cfg(test)]
 use ::chat::{ChatMsg, PostPolicy};
 // this device's signing key, opened in-process by `keystore` and signing op
 // frames through `::node::encode_frame` — see `rpc::Signer`.
@@ -21,14 +27,11 @@ use zeroize::Zeroizing;
 // chat's client view model is module-owned (`chat::client`) — the rendered
 // row types, the composer parsing, the optimistic merges, and the op-delta
 // splices. Re-exported here for app state handlers.
-pub use ::chat::client::{
-    ChatChannel, ChatReader, HuddleSeat, NameDirectory, author_display, short_label,
-};
+pub use ::chat::client::{ChatChannel, ChatReader, HuddleSeat, NameDirectory, short_label};
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.
 #[cfg(test)]
-pub use ::chat::client::{ChatMessage, author_name, paragraph_blocks};
-pub use inbox::client::{BellDelta, BellItem};
+pub use ::chat::client::{ChatMessage, author_display, author_name, paragraph_blocks};
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 /// How many one-second polls the provisioning screen waits before it says the
 /// node is not running and names the command that starts it.
@@ -136,7 +139,6 @@ pub struct LiveUpdate {
     /// published together so one network burst costs one reducer pass and one
     /// view rebuild per bounded batch, not one of each per operation.
     pub chat: Vec<ChatDelta>,
-    pub bell: BellDelta,
     /// Subscription backpressure, not UI state. The next socket publication
     /// cannot be read until the app message carrying this token has
     /// finished its update and all of its clones have been dropped.
@@ -184,7 +186,6 @@ impl Default for LiveUpdate {
             load_chat: false,
             debounce: false,
             chat: Vec::new(),
-            bell: BellDelta::default(),
             permit: LivePermit::default(),
         }
     }
@@ -192,12 +193,12 @@ impl Default for LiveUpdate {
 
 mod agent;
 mod app_dirs;
-mod bell;
 mod chat;
 mod duck_uri;
 mod explorer;
 mod forge;
 mod hub;
+mod inbox;
 mod live;
 mod load;
 mod model;
@@ -217,12 +218,12 @@ pub mod view_source;
 pub use agent::*;
 pub use app_dirs::app_log_path;
 pub(crate) use app_dirs::cache_dir;
-pub use bell::*;
 pub use chat::*;
 pub use duck_uri::*;
 pub use explorer::*;
 pub use forge::*;
 pub use hub::*;
+pub use inbox::*;
 pub use live::*;
 pub(crate) use load::*;
 pub use model::*;
