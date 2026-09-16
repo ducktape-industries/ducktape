@@ -526,7 +526,7 @@ impl BoardsView {
                             // matters, so it says what to do about it.
                             if length > boards::MAX_TEXT {
                                 format!(
-                                    "{} too long · Escape leaves the card as it was",
+                                    "{} too long · shorten it, or Escape to leave it behind",
                                     length - boards::MAX_TEXT
                                 )
                             } else {
@@ -2741,10 +2741,11 @@ impl BoardsView {
                 },
             ],
             |_| wire::EditorDecision::Noop,
-            // Both claimed keys leave the card, and they are not the same
-            // answer: ⌘Enter keeps what you wrote, Escape is the way out when
-            // the board will not take it. The commit says which key asked, so
-            // this is where they part.
+            // Both claimed keys leave the card keeping what you wrote, and
+            // they still part here: ⌘Enter is only ever a way out of the
+            // writing, while Escape also answers for everything else the board
+            // is holding — a tool, a selection, a menu — so it goes through
+            // the one path that knows about all of them.
             |event| match event {
                 EditorTransactionEvent::Commit { origin, .. } => match origin {
                     Some(wire::EditorRequestInput::Key { key, .. })

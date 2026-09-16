@@ -1875,7 +1875,7 @@ fn the_two_keys_that_leave_a_card_are_not_the_same_answer() {
 }
 
 #[test]
-fn escape_keeps_nothing_and_every_other_way_out_keeps_everything() {
+fn every_way_out_of_a_card_keeps_what_you_wrote() {
     let mut view = view();
     view.on_size(1400., 900.);
     view.edit(Change::Create {
@@ -1886,39 +1886,67 @@ fn escape_keeps_nothing_and_every_other_way_out_keeps_everything() {
         },
     });
     view.selected = ["a".into()].into();
+    // Escape stops the writing, it does not throw it away. What you type lives
+    // in the editor until a door commits it, so a door that discarded would
+    // take a paragraph with no undo standing behind it to get it back.
     view.begin_text();
-    view.inline.as_mut().unwrap().document = Editor::new("thrown away");
+    view.inline.as_mut().unwrap().document = Editor::new("written under escape");
     view.on_cancel();
     assert!(view.inline.is_none(), "Escape left the editor open");
     assert_eq!(
         view.visible().unwrap().shapes["a"].shape.text,
-        "kept",
-        "Escape saved the card it was supposed to leave alone"
+        "written under escape",
+        "Escape threw away what was written on the card"
     );
 
-    // Clicking away is the other answer, and it keeps what was typed.
+    // And so does clicking away.
     view.begin_text();
     view.inline.as_mut().unwrap().document = Editor::new("written");
     view.finish_text();
     assert_eq!(view.visible().unwrap().shapes["a"].shape.text, "written");
 
-    // A text shape that was never written on goes back to not existing, the
-    // same rule that governs leaving one empty.
-    view.edit(Change::Create {
-        id: "t".into(),
-        shape: Shape {
-            kind: Kind::Text,
-            ..Default::default()
-        },
-    });
-    view.selected = ["t".into()].into();
+    // Opening a card and leaving it alone writes nothing to it either.
     view.begin_text();
-    view.inline.as_mut().unwrap().document = Editor::new("second thoughts");
     view.on_cancel();
-    assert!(
-        !view.visible().unwrap().shapes.contains_key("t"),
-        "an abandoned text shape was left behind as an invisible hit box"
+    assert_eq!(view.visible().unwrap().shapes["a"].shape.text, "written");
+
+    // The one exception is a card the board will not take at all: every door
+    // ends in the same save and that save refuses, so Escape has to leave
+    // anyway or the writer is shut inside an editor that answers nothing.
+    view.begin_text();
+    view.inline.as_mut().unwrap().document = Editor::new("x".repeat(boards::MAX_TEXT + 10));
+    view.finish_text();
+    assert!(view.inline.is_some(), "the board refuses text this long");
+    view.on_cancel();
+    assert!(view.inline.is_none(), "an unsaveable card could not be left");
+    assert_eq!(
+        view.visible().unwrap().shapes["a"].shape.text,
+        "written",
+        "leaving an unsaveable card wrote the words it refused"
     );
+
+    // A text shape IS its words, so one abandoned with none goes back to not
+    // existing rather than staying as an invisible hit box — but one you
+    // WROTE in stays, whichever door you leave by.
+    for (id, written, survives) in [("t", "second thoughts", true), ("u", "   ", false)] {
+        view.edit(Change::Create {
+            id: id.into(),
+            shape: Shape {
+                kind: Kind::Text,
+                ..Default::default()
+            },
+        });
+        view.selected = [id.into()].into();
+        view.begin_text();
+        view.inline.as_mut().unwrap().document = Editor::new(written);
+        view.on_cancel();
+        assert_eq!(
+            view.visible().unwrap().shapes.contains_key(id),
+            survives,
+            "a text shape left holding {written:?} should{} still be there",
+            if survives { "" } else { " not" }
+        );
+    }
 }
 
 #[test]
