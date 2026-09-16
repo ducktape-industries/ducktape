@@ -76,7 +76,7 @@ impl ForgeView {
         native::empty_state(
             format!("{key}/state"),
             "No issues",
-            "This app reads the tracker but cannot open one yet.",
+            "Open the first one above.",
         )
     }
     pub(super) fn empty_pulls(&self, key: String) -> wire::Node {

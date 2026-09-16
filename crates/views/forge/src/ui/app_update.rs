@@ -25,6 +25,9 @@ impl super::ForgeView {
             Message::SelectTrackerSide(side) => self.on_select_tracker_side(side),
             Message::TrackerFilterChanged(text) => self.on_tracker_filter_changed(text),
             Message::Key(event, captured) => self.on_key(event, captured),
+            Message::IssueTitleChanged(value) => self.on_issue_title_changed(value),
+            Message::IssueBodyChanged(value) => self.on_issue_body_changed(value),
+            Message::ForgeIssueOpen => self.on_forge_issue_open(),
             Message::ForgeReviewPick(verdict) => self.on_forge_review_pick(verdict),
             Message::ForgeReviewSubmit(body) => self.on_forge_review_submit(body),
             Message::ForgeMergeSubmit => self.on_forge_merge_submit(),
@@ -318,6 +321,14 @@ impl super::ForgeView {
     fn on_act_done(&mut self, next: crate::host::ActItem) -> ducktape_view_guest::Task<Message> {
         self.host_error = next.error.to_owned();
         match crate::host::act_of(::std::convert::AsRef::as_ref(&(next.kind))) {
+            Act::Issue => {
+                self.issue_busy = false;
+                if (next.error).is_empty() {
+                    self.issue_title = "".to_owned();
+                    self.issue_body = "".to_owned();
+                }
+                ::ducktape_view_guest::Task::none()
+            }
             Act::Review => (|| {
                 self.review_busy = false;
                 if !(next.error).is_empty() {
@@ -586,9 +597,18 @@ impl super::ForgeView {
             _ => ::ducktape_view_guest::Task::none(),
         }
     }
-    /// Escape leaves whatever is open, one step at a time: the item, then
-    /// the repository, and it does nothing at the namespace.
+    /// Escape leaves whatever is open, one step at a time: a started issue,
+    /// then the item, then the repository, and it does nothing at the
+    /// namespace. The draft goes first because it is the only step that
+    /// throws work away — leaving the repository under a half-written issue
+    /// would take it with no way back.
     fn on_walk_back(&mut self) -> ducktape_view_guest::Task<Message> {
+        let drafting = !self.issue_title.trim().is_empty() || !self.issue_body.trim().is_empty();
+        if drafting {
+            self.issue_title.clear();
+            self.issue_body.clear();
+            return ::ducktape_view_guest::Task::none();
+        }
         let item_open = self.forge_item_number > 0;
         if item_open {
             return self.on_forge_close_item();
@@ -624,6 +644,29 @@ impl super::ForgeView {
                 target: crate::TRACKER_FILTER_KEY.to_owned(),
             },
         )
+    }
+    fn on_issue_title_changed(&mut self, value: String) -> ducktape_view_guest::Task<Message> {
+        self.issue_title = value;
+        ::ducktape_view_guest::Task::none()
+    }
+    fn on_issue_body_changed(&mut self, value: String) -> ducktape_view_guest::Task<Message> {
+        self.issue_body = value;
+        ::ducktape_view_guest::Task::none()
+    }
+    /// The module refuses an empty title, so the composer never sends one;
+    /// every other refusal (the repo's open-item cap, the author's share of
+    /// it, a body over the wire's cap) comes back on the act.
+    fn on_forge_issue_open(&mut self) -> ducktape_view_guest::Task<Message> {
+        if !self.can_open_issue() {
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.issue_busy = true;
+        self.sent = crate::host::issue_open(
+            self.open_repo.to_owned(),
+            self.issue_title.to_owned(),
+            self.issue_body.to_owned(),
+        );
+        ::ducktape_view_guest::Task::none()
     }
     fn on_forge_review_pick(&mut self, verdict: String) -> ducktape_view_guest::Task<Message> {
         self.review_verdict = verdict.to_owned();
