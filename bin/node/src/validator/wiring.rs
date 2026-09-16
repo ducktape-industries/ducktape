@@ -65,10 +65,10 @@ pub(super) struct RuntimeWiring {
         futures::channel::mpsc::Receiver<crate::sync::serve::SyncStateRequest>,
     /// the send half of that seam, for this node's own root divergence watch.
     pub(super) sync_state_tx: futures::channel::mpsc::Sender<SyncStateRequest>,
-    /// unix seconds of the last served state-sync request — the drain reads it
-    /// to defer oplog pruning while a syncer is actively pulling (the sync
-    /// retention lease, see sync/serve.rs).
-    pub(super) sync_lease: Arc<std::sync::atomic::AtomicU64>,
+    /// what syncers this node is serving still need retained — the drain
+    /// reads it to hold its oplog prune off their history (see
+    /// `sync::serve::SyncRetention`).
+    pub(super) sync_retention: Arc<crate::sync::serve::SyncRetention>,
     pub(super) relay_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
 }
 
@@ -184,7 +184,7 @@ pub(super) async fn finish(
         blob_client,
         sync_state_rx,
         sync_state_tx,
-        sync_lease,
+        sync_retention,
     } = wire_serve_lanes(
         context,
         &signer,
@@ -234,7 +234,7 @@ pub(super) async fn finish(
         blob_client,
         sync_state_rx,
         sync_state_tx,
-        sync_lease,
+        sync_retention,
         relay_ingress,
     }
 }
@@ -251,7 +251,7 @@ pub(super) struct ServeLanes {
     /// divergence watch asks this node for its own tip coordinates exactly as
     /// a peer would (see `sync::divergence`).
     pub(super) sync_state_tx: futures::channel::mpsc::Sender<SyncStateRequest>,
-    pub(super) sync_lease: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) sync_retention: Arc<crate::sync::serve::SyncRetention>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -320,10 +320,10 @@ pub(super) fn wire_serve_lanes(
         blob_requester,
         blob_proof,
     );
-    let sync_lease = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sync_retention = Arc::new(crate::sync::serve::SyncRetention::default());
     let watch_state_tx = sync_state_tx.clone();
     let state_tx = sync_state_tx;
-    let sync_lease_serve = sync_lease.clone();
+    let sync_retention_serve = sync_retention.clone();
     let mut sync_tx = sync_tx;
     let mut ingress = sync_ingress;
     // the genesis namespace the standing proof is bound to.
@@ -541,18 +541,14 @@ pub(super) fn wire_serve_lanes(
                         )
                     }
                     req => {
-                        // renew the sync retention lease: this node is
-                        // actively serving a syncer, so the drain defers
-                        // oplog pruning until the lease lapses. only the
-                        // state-bearing lanes renew it (see
-                        // `sync::serve::renews_sync_lease`) — the
-                        // coordinates-only TipCoords poll and the
-                        // never-pruned IndexOps backfill must not.
-                        if crate::sync::serve::renews_sync_lease(&req) {
-                            sync_lease_serve.store(
-                                crate::sync::serve::unix_now_secs(),
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
+                        // record the claim on history this request makes —
+                        // BEFORE it is served, so a checkpoint that lands
+                        // mid-serve already holds its prune off the height
+                        // being read. a lane that claims nothing (a tip
+                        // query, the never-pruned index backfill) leaves the
+                        // lease to lapse; see `sync::serve::SyncRetention`.
+                        if let Some(needed_from) = crate::sync::serve::sync_retention_need(&req) {
+                            sync_retention_serve.claim(needed_from);
                         }
                         drive_sync_request(&mut server, &mut pager, &state_tx, req).await
                     }
@@ -579,7 +575,7 @@ pub(super) fn wire_serve_lanes(
         blob_client,
         sync_state_rx,
         sync_state_tx: watch_state_tx,
-        sync_lease,
+        sync_retention,
     }
 }
 

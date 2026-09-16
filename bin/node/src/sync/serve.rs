@@ -507,13 +507,10 @@ where
     pos
 }
 
-/// how long after the last served state-sync request the source keeps
-/// deferring oplog pruning (sliding — every request renews it). generous vs
-/// the 32-block checkpoint cadence so one slow module fetch cannot lose the
-/// race; bounded so a dead syncer cannot wedge retention forever. this is the
-/// anti-treadmill: without it a busy chain prunes a slow syncer's boundary out
-/// from under it on every attempt, and a rebootstrapping replica can NEVER
-/// converge (observed: boundary 297→318→340→… forever).
+/// how long after the last served state-sync request the source keeps holding
+/// its oplog prune for that syncer (sliding — every declaring request renews
+/// it). generous vs the checkpoint cadence so one slow module fetch cannot
+/// lose the race; bounded so a dead syncer cannot wedge retention forever.
 pub(crate) const SYNC_LEASE_SECS: u64 = 60;
 
 pub(crate) fn unix_now_secs() -> u64 {
@@ -523,25 +520,73 @@ pub(crate) fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn sync_lease_active(lease: &std::sync::atomic::AtomicU64) -> bool {
-    let last_served = lease.load(std::sync::atomic::Ordering::Relaxed);
-    unix_now_secs().saturating_sub(last_served) < SYNC_LEASE_SECS
+/// the height a served request declares it still needs retained frames from,
+/// or `None` for a lane an oplog prune cannot invalidate.
+///
+/// THIS IS THE WHOLE ANTI-TREADMILL SIGNAL, and it is a CLAIM ON HISTORY, not
+/// "a syncer said something". Chunk and Module name the boundary they are
+/// rebuilding; Frames names the height it is folding from. Manifest names
+/// nothing: it is a TIP QUERY, and `catch_up_suffix_frames` re-fetches it on
+/// every fold iteration just to learn where the head is — reading the served
+/// tip as a retention need would hand the source a floor AT the tip and let
+/// the very next checkpoint prune the boundary the syncer is still installing.
+/// TipCoords (polled every `ROOT_POLL_TICK` by every peer) and IndexOps
+/// (node-local derived rows the prune never touches) name nothing either.
+///
+/// A lane that declares nothing also does not renew the lease, so a peer that
+/// only polls can never pin retention open.
+pub(crate) fn sync_retention_need(req: &statesync::SyncRequest) -> Option<u64> {
+    match req {
+        statesync::SyncRequest::Chunk { boundary, .. }
+        | statesync::SyncRequest::Module { boundary, .. } => Some(boundary.height),
+        statesync::SyncRequest::Frames { after_height, .. } => Some(*after_height),
+        statesync::SyncRequest::Manifest
+        | statesync::SyncRequest::IndexOps { .. }
+        | statesync::SyncRequest::TipCoords
+        | statesync::SyncRequest::Blob { .. }
+        | statesync::SyncRequest::BlobInfo { .. }
+        | statesync::SyncRequest::BlobRange { .. }
+        | statesync::SyncRequest::ForgeObjects { .. } => None,
+    }
 }
 
-/// whether serving `req` should renew the retention lease above. only the
-/// lanes that read a boundary the oplog prune can invalidate need it:
-/// Manifest/Chunk/Module capture one, and Frames reads the oplog journal
-/// directly. TipCoords (the coordinates-only detection lane, polled every
-/// `ROOT_POLL_TICK` by every peer) and IndexOps (node-local derived index
-/// rows the oplog prune never touches — see `SyncRequest::IndexOps`) carry
-/// no such risk, so they must NOT renew it: a fleet's routine TipCoords
-/// polling alone would otherwise keep the lease permanently active and the
-/// drain's oplog prune would never fire.
-pub(crate) fn renews_sync_lease(req: &statesync::SyncRequest) -> bool {
-    !matches!(
-        req,
-        statesync::SyncRequest::TipCoords | statesync::SyncRequest::IndexOps { .. }
-    )
+/// the source side of the retention contract, shared between the serve task
+/// (which records what syncers ask for) and the consensus loop (whose
+/// checkpoint prunes the oplog).
+///
+/// One pair of facts, written together: WHEN a syncer last claimed history,
+/// and the HEIGHT it claimed from. The drain reads them as one
+/// [`SyncRetention::floor`] — the height its prune must not pass.
+///
+/// Scoped to ONE sync in flight: the floor is the most recent claim, so two
+/// bootstraps running at once can cut the older one's boundary and cost it a
+/// re-bootstrap. Bounding both at once needs a claim per requester, which
+/// nothing has asked for.
+#[derive(Default)]
+pub(crate) struct SyncRetention {
+    claimed_at_secs: std::sync::atomic::AtomicU64,
+    needed_from: std::sync::atomic::AtomicU64,
+}
+
+impl SyncRetention {
+    /// record one served request's claim on history (see
+    /// [`sync_retention_need`]), renewing the lease.
+    pub(crate) fn claim(&self, needed_from: u64) {
+        self.needed_from
+            .store(needed_from, std::sync::atomic::Ordering::Relaxed);
+        self.claimed_at_secs
+            .store(unix_now_secs(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// the height the checkpoint's oplog prune must not pass, or `None` when
+    /// no syncer has claimed history recently enough to hold it.
+    pub(crate) fn floor(&self) -> Option<u64> {
+        let claimed_at = self
+            .claimed_at_secs
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let warm = unix_now_secs().saturating_sub(claimed_at) < SYNC_LEASE_SECS;
+        warm.then(|| self.needed_from.load(std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 pub(crate) fn to_node_disposition(disposition: statesync::FrameDisposition) -> node::Disposition {
@@ -1183,39 +1228,76 @@ mod tests {
         assert!(e.starts_with("manifest_participants_duplicated:"), "{e}");
     }
 
+    /// a tip query is not a claim on history. Manifest above all: the suffix
+    /// fold re-fetches it every iteration, so reading the served tip as a
+    /// retention need would raise the floor to the head and let the next
+    /// checkpoint prune the boundary the syncer is still installing.
     #[test]
-    fn tip_coords_and_index_ops_do_not_renew_the_lease() {
-        assert!(!renews_sync_lease(&statesync::SyncRequest::TipCoords));
-        assert!(!renews_sync_lease(&statesync::SyncRequest::IndexOps {
-            boundary: 1,
-            module: "m".to_string(),
-            after: None,
-        }));
+    fn tip_queries_claim_no_history() {
+        assert_eq!(sync_retention_need(&statesync::SyncRequest::Manifest), None);
+        assert_eq!(
+            sync_retention_need(&statesync::SyncRequest::TipCoords),
+            None
+        );
+        assert_eq!(
+            sync_retention_need(&statesync::SyncRequest::IndexOps {
+                boundary: 1,
+                module: "m".to_string(),
+                after: None,
+            }),
+            None
+        );
+        assert_eq!(
+            sync_retention_need(&statesync::SyncRequest::Blob { digest: [0u8; 32] }),
+            None
+        );
     }
 
+    /// the lanes an oplog prune can invalidate each name the height they are
+    /// working from — the boundary being rebuilt, or the fold's own cursor.
     #[test]
-    fn state_bearing_lanes_renew_the_lease() {
-        assert!(renews_sync_lease(&statesync::SyncRequest::Manifest));
-        assert!(renews_sync_lease(&statesync::SyncRequest::Chunk {
-            boundary: statesync::BoundaryId {
-                height: 1,
-                root_hash: StateRoot::ZERO,
-            },
-            module_id: "m".to_string(),
-            offset: 0,
-        }));
-        assert!(renews_sync_lease(&statesync::SyncRequest::Module {
-            boundary: statesync::BoundaryId {
-                height: 1,
-                root_hash: StateRoot::ZERO,
-            },
-            module_id: "m".to_string(),
-            body: Vec::new(),
-        }));
-        assert!(renews_sync_lease(&statesync::SyncRequest::Frames {
-            after_height: 0,
-            up_to_height: 1,
-        }));
+    fn the_prunable_lanes_claim_the_height_they_work_from() {
+        assert_eq!(
+            sync_retention_need(&statesync::SyncRequest::Chunk {
+                boundary: statesync::BoundaryId {
+                    height: 4491,
+                    root_hash: StateRoot::ZERO,
+                },
+                module_id: "m".to_string(),
+                offset: 0,
+            }),
+            Some(4491)
+        );
+        assert_eq!(
+            sync_retention_need(&statesync::SyncRequest::Module {
+                boundary: statesync::BoundaryId {
+                    height: 4491,
+                    root_hash: StateRoot::ZERO,
+                },
+                module_id: "m".to_string(),
+                body: Vec::new(),
+            }),
+            Some(4491)
+        );
+        assert_eq!(
+            sync_retention_need(&statesync::SyncRequest::Frames {
+                after_height: 4555,
+                up_to_height: 4619,
+            }),
+            Some(4555)
+        );
+    }
+
+    /// the floor is nothing until a syncer claims history, and it is that
+    /// claim while the lease stays warm.
+    #[test]
+    fn the_floor_follows_the_latest_claim() {
+        let retention = SyncRetention::default();
+        assert_eq!(retention.floor(), None);
+        retention.claim(4491);
+        assert_eq!(retention.floor(), Some(4491));
+        retention.claim(4619);
+        assert_eq!(retention.floor(), Some(4619));
     }
 
     fn frame(height: u64, payload_len: usize) -> statesync::FinalizedFrame {
