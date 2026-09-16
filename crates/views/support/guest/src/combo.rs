@@ -24,9 +24,6 @@ impl<T> Combo<T> {
     pub fn push(&mut self, value: T) {
         self.options.push(value);
     }
-    pub fn into_options(self) -> Vec<T> {
-        self.options
-    }
     pub fn restore(options: Vec<T>, reset: u64) -> Self {
         Self { options, reset }
     }

@@ -270,16 +270,6 @@ impl DocumentHighlighter {
         self.current_line = 0;
     }
 
-    pub fn change_line(&mut self, line: usize) {
-        if line >= self.fences.len() {
-            self.fences.truncate(1);
-            self.current_line = 0;
-            return;
-        }
-        self.fences.truncate(line + 1);
-        self.current_line = line;
-    }
-
     pub fn highlight_line(&mut self, line: &str) -> std::vec::IntoIter<(Range<usize>, Mark)> {
         let index = self.current_line;
         let inside_code = self.fences[index];
