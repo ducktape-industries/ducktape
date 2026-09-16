@@ -278,10 +278,12 @@ pub fn editor<M: 'static>(
             presentation: Some(Box::new(presentation)),
             // the body size every view writes at, not a size of its own
             size: Some(kit::type_scale::BODY as f32),
-            // NO padding here: this one is painted OUTSIDE the field's own
-            // border, so any of it floats the box off the row around it.
-            // The field pads its own text (10px) — that is TEXT_INSET.
-            padding: Some(0.),
+            // This IS the draft's text inset — the host pads the field's box
+            // by it and the text control adds nothing of its own, so at 0 the
+            // first letter sits on the plate's border (seen on a live app,
+            // 2026-09-16). Vertically it is also the air above the first row,
+            // which is why `min_height` is exactly one row plus twice this.
+            padding: Some(TEXT_INSET),
             wrapping: Some(wire::Wrapping::Word),
             ..Default::default()
         }),
@@ -291,12 +293,14 @@ pub fn editor<M: 'static>(
 /// Where the draft's text starts, from the field's left edge: the native
 /// field pads its own text this far, and every row under it lines up there.
 const TEXT_INSET: f32 = 10.;
-/// A row of controls stops short of that line — a button carries the rest
-/// of the distance inside its own box.
-const CONTROL_INSET: f32 = 6.;
+/// A row of controls stops short of that line, because a square control
+/// centres its sign and so carries the rest of the distance inside its own
+/// box. Aligning the BOXES would push every sign a glyph's width to the
+/// right of the draft's first letter.
+const CONTROL_INSET: f32 = 4.;
 /// A mark button is a square holding one sign, and tall enough that the
 /// host's button does not clip the sign to its line box.
-const MARK: f32 = 26.;
+const MARK: f32 = 24.;
 
 /// One mark a draft can carry: a quiet square holding a single typographic
 /// sign. The sign is what a reader sees; `name` is what a screen reader
@@ -307,7 +311,7 @@ fn mark(key: String, sign: &str, name: &str, on_press: Option<u32>) -> wire::Nod
         kit::nowrap(kit::text_options(
             kit::text_size(
                 kit::text(format!("{key}/sign"), sign),
-                kit::type_scale::SECONDARY as f32,
+                kit::type_scale::BODY as f32,
             ),
             wire::TextOptions {
                 line_height: Some(wire::LineHeight::Absolute(MARK)),
@@ -398,11 +402,13 @@ fn chip(key: &str, name: &str, note: &str, tone: kit::Tone, remove: Option<u32>)
 }
 
 /// The draft, everything it carries, and the row that sends it — one
-/// column reading down to a single action on the right.
+/// plate reading down to a single action on the right.
 ///
-/// The native field draws its own box and focus ring, so nothing here
-/// draws a second one around it: the rows beneath simply line up on the
-/// field's own text inset.
+/// The plate is drawn HERE. The host mounts the field as a bare text
+/// surface with no border and no fill of its own (verified on a live app,
+/// 2026-09-16), so a composer that draws nothing is a placeholder and a
+/// row of controls floating loose on the timeline's own background, which
+/// is what this replaced.
 pub fn view<M: Clone + 'static>(
     draft: &Draft,
     key: &str,
@@ -555,8 +561,12 @@ pub fn view<M: Clone + 'static>(
         mark(format!("{key}/attach"), "+", "Attach a file", press("attach".into())),
         mark(format!("{key}/bold"), "B", "Bold", press("bold".into())),
         mark(format!("{key}/italic"), "I", "Italic", press("italic".into())),
-        mark(format!("{key}/code"), "‹›", "Code", press("code".into())),
-        mark(format!("{key}/quote"), "❞", "Quote", press("quote".into())),
+        // Latin punctuation only: the product face carries it. A dingbat
+        // quote mark (❞) or an angle-quote pair (‹›) falls out of Geist and
+        // lands in whatever the system has, which is a tofu box on a host
+        // with no fallback and an emoji on one that has too much.
+        mark(format!("{key}/code"), "<>", "Code", press("code".into())),
+        mark(format!("{key}/quote"), "”", "Quote", press("quote".into())),
         kit::spacer(),
     ];
     controls.push(kit::button(
@@ -569,7 +579,37 @@ pub fn view<M: Clone + 'static>(
         kit::spaced(kit::centered_row(format!("{key}/toolbar"), controls), 2.),
         CONTROL_INSET,
     ));
-    kit::spaced(kit::column(key, rows), 6.)
+    plate(key, kit::spaced(kit::column(format!("{key}/rows"), rows), 6.))
+}
+
+/// The box the whole draft lives in: the window's own colour inside a
+/// control's hairline. It pads nothing — the field pads its own text and
+/// every other row reaches that line itself, so one inset governs.
+fn plate(key: &str, child: wire::Node) -> wire::Node {
+    let p = kit::palette();
+    let mut node = kit::container(key, child);
+    let wire::Node::Container {
+        border,
+        background,
+        padding,
+        ..
+    } = &mut node
+    else {
+        unreachable!()
+    };
+    *border = Some(wire::Border {
+        color: Some(kit::rgba(p.border_strong)),
+        width: Some(1.),
+        radius: Some([kit::radius::CARD as f32; 4]),
+    });
+    *background = Some(wire::Background::Color(kit::rgba(p.background)));
+    *padding = Some(wire::Edges {
+        top: 0.,
+        right: 0.,
+        bottom: CONTROL_INSET,
+        left: 0.,
+    });
+    node
 }
 
 /// A row under the field, moved in to the line the draft's own text sits
@@ -628,10 +668,9 @@ mod tests {
                     on_press,
                     ..
                 } = node
+                    && style.preset == wire::ButtonPreset::Primary
                 {
-                    if style.preset == wire::ButtonPreset::Primary {
-                        found.push((key.clone(), *on_press));
-                    }
+                    found.push((key.clone(), *on_press));
                 }
             });
             found
