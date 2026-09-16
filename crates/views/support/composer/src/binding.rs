@@ -238,9 +238,11 @@ pub fn editor<M: 'static>(
         move |change| on_committed(Event::Committed(change)),
         move |transaction| on_transaction(Event::Transaction(transaction)),
     );
+    // a mention wears the product's accent, the same one a chosen row and a
+    // live dot wear — not a colour of this module's own
     let mut presentation = wire::editor_presentation::EditorPresentation {
         formats: vec![wire::editor_presentation::EditorFormat {
-            color: Some(wire::Rgba([0.25, 0.55, 0.95, 1.])),
+            color: Some(kit::rgba(kit::palette().accent)),
             ..Default::default()
         }],
         ..Default::default()
@@ -267,19 +269,140 @@ pub fn editor<M: 'static>(
         placeholder: placeholder.into(),
         width: None,
         height: None,
-        min_height: Some(64.),
-        max_height: Some(240.),
+        // one row of body text, and room to grow to about eight before the
+        // field scrolls instead of eating the timeline
+        min_height: Some(40.),
+        max_height: Some(200.),
         options: Box::new(wire::EditorOptions {
             binding: Some(Box::new(binding)),
             presentation: Some(Box::new(presentation)),
-            size: Some(14.),
-            padding: Some(8.),
+            // the body size every view writes at, not a size of its own
+            size: Some(kit::type_scale::BODY as f32),
+            // NO padding here: this one is painted OUTSIDE the field's own
+            // border, so any of it floats the box off the row around it.
+            // The field pads its own text (10px) — that is TEXT_INSET.
+            padding: Some(0.),
             wrapping: Some(wire::Wrapping::Word),
             ..Default::default()
         }),
     }
 }
 
+/// Where the draft's text starts, from the field's left edge: the native
+/// field pads its own text this far, and every row under it lines up there.
+const TEXT_INSET: f32 = 10.;
+/// A row of controls stops short of that line — a button carries the rest
+/// of the distance inside its own box.
+const CONTROL_INSET: f32 = 6.;
+/// A mark button is a square holding one sign, and tall enough that the
+/// host's button does not clip the sign to its line box.
+const MARK: f32 = 26.;
+
+/// One mark a draft can carry: a quiet square holding a single typographic
+/// sign. The sign is what a reader sees; `name` is what a screen reader
+/// hears, since a sign is not a word.
+fn mark(key: String, sign: &str, name: &str, on_press: Option<u32>) -> wire::Node {
+    let mut button = kit::button_child(
+        key.clone(),
+        kit::nowrap(kit::text_options(
+            kit::text_size(
+                kit::text(format!("{key}/sign"), sign),
+                kit::type_scale::SECONDARY as f32,
+            ),
+            wire::TextOptions {
+                line_height: Some(wire::LineHeight::Absolute(MARK)),
+                ..Default::default()
+            },
+        )),
+        on_press,
+        wire::ButtonPreset::Subtle,
+    );
+    let wire::Node::Button {
+        label,
+        width,
+        height,
+        padding,
+        ..
+    } = &mut button
+    else {
+        unreachable!()
+    };
+    *label = Some(name.into());
+    *width = Some(wire::Length::Fixed(MARK));
+    *height = Some(wire::Length::Fixed(MARK));
+    *padding = Some(wire::Edges::all(0.));
+    button
+}
+
+/// A file the draft is carrying: its name over what became of it, and the
+/// way to take it back out — one chip, not three loose lines.
+fn chip(key: &str, name: &str, note: &str, tone: kit::Tone, remove: Option<u32>) -> wire::Node {
+    let p = kit::palette();
+    let mut body = kit::spaced(
+        kit::column(
+            format!("{key}/body"),
+            [
+                kit::nowrap(kit::weighted(
+                    kit::text_size(
+                        kit::text(format!("{key}/name"), name),
+                        kit::type_scale::SECONDARY as f32,
+                    ),
+                    wire::Weight::Medium,
+                )),
+                kit::nowrap(kit::colored(
+                    kit::text_size(
+                        kit::text(format!("{key}/note"), note),
+                        kit::type_scale::CAPTION as f32,
+                    ),
+                    tone.color(p),
+                )),
+            ],
+        ),
+        1.,
+    );
+    body = kit::sized(body, Some(wire::Length::Shrink), None);
+    let mut chip = kit::container(
+        format!("{key}/chip"),
+        kit::spaced(
+            kit::centered_row(
+                format!("{key}/row"),
+                [body, mark(format!("{key}/remove"), "×", "Remove", remove)],
+            ),
+            4.,
+        ),
+    );
+    let wire::Node::Container {
+        border,
+        background,
+        padding,
+        width,
+        ..
+    } = &mut chip
+    else {
+        unreachable!()
+    };
+    *border = Some(wire::Border {
+        color: Some(kit::rgba(p.border)),
+        width: Some(1.),
+        radius: Some([kit::radius::CONTROL as f32; 4]),
+    });
+    *background = Some(wire::Background::Color(kit::rgba(p.surface)));
+    *padding = Some(wire::Edges {
+        top: 4.,
+        right: 4.,
+        bottom: 4.,
+        left: 8.,
+    });
+    *width = Some(wire::Length::Shrink);
+    chip
+}
+
+/// The draft, everything it carries, and the row that sends it — one
+/// column reading down to a single action on the right.
+///
+/// The native field draws its own box and focus ring, so nothing here
+/// draws a second one around it: the rows beneath simply line up on the
+/// field's own text inset.
 pub fn view<M: Clone + 'static>(
     draft: &Draft,
     key: &str,
@@ -289,88 +412,180 @@ pub fn view<M: Clone + 'static>(
     wrap: impl Fn(Event<M>) -> M + Clone + 'static,
 ) -> wire::Node {
     let editor_key = format!("{key}/editor");
-    let mut controls = Vec::new();
-    for (tag, label) in [
-        ("bold", "Bold"),
-        ("italic", "Italic"),
-        ("code", "Code"),
-        ("quote", "Quote"),
-        ("attach", "Attach"),
-        ("send", "Send"),
-    ] {
-        controls.push(kit::button(
-            format!("{key}/{tag}"),
-            label,
-            editable.then(|| slots::message(wrap(Event::Action(tag.into())))),
-            wire::ButtonPreset::Text,
-        ));
-    }
-    let mut children = vec![
-        editor(draft, &editor_key, hint, editable, choices, wrap.clone()),
-        kit::row(format!("{key}/toolbar"), controls),
-    ];
+    let press = |tag: String| -> Option<u32> {
+        let wrap = wrap.clone();
+        editable.then(|| slots::message(wrap(Event::Action(tag))))
+    };
+    let text = draft.editor.state_view().text;
+    let carries_file = draft
+        .attachments
+        .iter()
+        .any(|held| matches!(held.state, super::AttachmentState::Ready { .. }));
+    let waits_on_upload = draft
+        .attachments
+        .iter()
+        .any(|held| held.state == super::AttachmentState::Uploading);
+    // a send needs something to say, and waits for its files to land
+    let sendable = editable && (!text.trim().is_empty() || carries_file) && !waits_on_upload;
+
+    let mut rows = Vec::new();
+    // The choices sit ABOVE the draft: picking one must not slide the row
+    // of controls out from under the reader's pointer.
     if let Some((_, partial)) = draft.query(draft.editor.state_view()) {
-        let choices = matching_choices(choices, &partial);
-        let selected = draft.menu_index.min(choices.len().saturating_sub(1));
-        for (index, choice) in choices.into_iter().enumerate() {
-            children.push(kit::button(
-                format!("{key}/mention/{}", choice.token),
-                &choice.label,
-                editable.then(|| {
-                    slots::message(wrap(Event::Action(format!("mention:{}", choice.token))))
-                }),
-                if index == selected {
-                    wire::ButtonPreset::Primary
-                } else {
-                    wire::ButtonPreset::Text
-                },
+        let matches = matching_choices(choices, &partial);
+        let selected = draft.menu_index.min(matches.len().saturating_sub(1));
+        let picks: Vec<wire::Node> = matches
+            .into_iter()
+            .enumerate()
+            .map(|(index, choice)| {
+                let row = format!("{key}/mention/{}", choice.token);
+                // a handle reads from the left; the host centres a button's
+                // child, so a spacer after the name pushes it back over
+                kit::list_row(
+                    row.clone(),
+                    kit::row(
+                        format!("{row}/row"),
+                        [
+                            kit::nowrap(kit::text(
+                                format!("{row}/name"),
+                                format!("@{}", choice.label),
+                            )),
+                            kit::spacer(),
+                        ],
+                    ),
+                    index == selected,
+                    press(format!("mention:{}", choice.token)),
+                )
+            })
+            .collect();
+        if !picks.is_empty() {
+            rows.push(kit::spaced(
+                kit::column(format!("{key}/mentions"), picks),
+                1.,
             ));
         }
     }
-    for attachment in &draft.attachments {
-        let status = match &attachment.state {
-            super::AttachmentState::Uploading => "Uploading".to_owned(),
-            super::AttachmentState::Ready { .. } => "Ready".to_owned(),
-            super::AttachmentState::Failed { reason } => reason.clone(),
-            super::AttachmentState::Unavailable => "Select the file again to upload".into(),
-        };
-        children.push(kit::text(
-            format!("{key}/attachment/{}", attachment.token),
-            format!("{} — {status}", attachment.name),
-        ));
-        children.push(kit::button(
-            format!("{key}/remove/{}", attachment.token),
-            "Remove",
-            Some(slots::message(wrap(Event::Action(format!(
-                "remove:{}",
-                attachment.token
-            ))))),
-            wire::ButtonPreset::Text,
-        ));
-        if matches!(attachment.state, super::AttachmentState::Failed { .. }) {
-            children.push(kit::button(
-                format!("{key}/retry/{}", attachment.token),
-                "Retry",
-                Some(slots::message(wrap(Event::Action(format!(
-                    "retry:{}",
-                    attachment.token
-                ))))),
-                wire::ButtonPreset::Text,
-            ));
-        }
-    }
-    if draft.failed_send.is_some() {
-        children.push(kit::button(
-            format!("{key}/restore"),
-            "Restore unsent message",
-            Some(slots::message(wrap(Event::Action("restore".into())))),
-            wire::ButtonPreset::Text,
+    rows.push(editor(
+        draft,
+        &editor_key,
+        hint,
+        editable,
+        choices,
+        wrap.clone(),
+    ));
+    if !draft.attachments.is_empty() {
+        let chips: Vec<wire::Node> = draft
+            .attachments
+            .iter()
+            .map(|held| {
+                let at = format!("{key}/attachment/{}", held.token);
+                let (note, tone) = match &held.state {
+                    super::AttachmentState::Uploading => ("Uploading…".to_owned(), kit::Tone::Neutral),
+                    super::AttachmentState::Ready { uri } => (uri.clone(), kit::Tone::Neutral),
+                    super::AttachmentState::Failed { reason } => (reason.clone(), kit::Tone::Danger),
+                    super::AttachmentState::Unavailable => {
+                        ("Select the file again".to_owned(), kit::Tone::Warning)
+                    }
+                };
+                let mut carried = vec![chip(
+                    &at,
+                    &held.name,
+                    &note,
+                    tone,
+                    press(format!("remove:{}", held.token)),
+                )];
+                // a failure is the one state with a way out of it
+                if matches!(held.state, super::AttachmentState::Failed { .. }) {
+                    carried.push(kit::button(
+                        format!("{at}/retry"),
+                        "Retry",
+                        press(format!("retry:{}", held.token)),
+                        wire::ButtonPreset::Subtle,
+                    ));
+                }
+                kit::spaced(kit::centered_row(format!("{at}/held"), carried), 4.)
+            })
+            .collect();
+        rows.push(inset(
+            kit::spaced(kit::wrapped_row(format!("{key}/attachments"), chips), 6.),
+            TEXT_INSET,
         ));
     }
     if !draft.note.is_empty() {
-        children.push(kit::text(format!("{key}/note"), &draft.note));
+        rows.push(inset(
+            kit::row(
+                format!("{key}/note-row"),
+                [kit::wrapping(kit::text_size(
+                    kit::tone_text(format!("{key}/note"), &draft.note, kit::Tone::Danger),
+                    kit::type_scale::SECONDARY as f32,
+                ))],
+            ),
+            TEXT_INSET,
+        ));
     }
-    kit::column(key, children)
+    if draft.failed_send.is_some() {
+        rows.push(inset(
+            kit::notice(
+                format!("{key}/failed"),
+                kit::spaced(
+                    kit::centered_row(
+                        format!("{key}/failed/row"),
+                        [
+                            kit::text(format!("{key}/failed/note"), "An earlier message wasn’t sent"),
+                            kit::spacer(),
+                            kit::button(
+                                format!("{key}/restore"),
+                                "Restore",
+                                press("restore".into()),
+                                wire::ButtonPreset::Subtle,
+                            ),
+                        ],
+                    ),
+                    8.,
+                ),
+                kit::Tone::Danger,
+            ),
+            0.,
+        ));
+    }
+    // What the draft can carry, then the one action that sends it. Each
+    // mark is a sign rather than a word: five words in a row read as a
+    // sentence, five signs read as a toolbar.
+    let mut controls = vec![
+        mark(format!("{key}/attach"), "+", "Attach a file", press("attach".into())),
+        mark(format!("{key}/bold"), "B", "Bold", press("bold".into())),
+        mark(format!("{key}/italic"), "I", "Italic", press("italic".into())),
+        mark(format!("{key}/code"), "‹›", "Code", press("code".into())),
+        mark(format!("{key}/quote"), "❞", "Quote", press("quote".into())),
+        kit::spacer(),
+    ];
+    controls.push(kit::button(
+        format!("{key}/send"),
+        "Send",
+        sendable.then(|| slots::message(wrap(Event::Action("send".into())))),
+        wire::ButtonPreset::Primary,
+    ));
+    rows.push(inset(
+        kit::spaced(kit::centered_row(format!("{key}/toolbar"), controls), 2.),
+        CONTROL_INSET,
+    ));
+    kit::spaced(kit::column(key, rows), 6.)
+}
+
+/// A row under the field, moved in to the line the draft's own text sits
+/// on. The column's spacing owns the air between rows, so nothing here
+/// pads its own top or bottom — two sources of vertical rhythm is how a
+/// stack ends up with three different gaps in it.
+fn inset(node: wire::Node, sides: f32) -> wire::Node {
+    kit::padded(
+        node,
+        wire::Edges {
+            top: 0.,
+            right: sides,
+            bottom: 0.,
+            left: sides,
+        },
+    )
 }
 
 #[cfg(test)]
