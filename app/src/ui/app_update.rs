@@ -4902,18 +4902,18 @@ impl Ducktape {
             self.share_picker = offered;
             return Task::none();
         };
-        self.start_sharing(only.target)
+        let only = only.clone();
+        self.start_sharing(&only)
     }
 
     fn on_pick_share_target(&mut self, index: usize) -> Task<AppMessage> {
         // A row for a target no longer offered is a picker that outlived its
         // enumeration — closing it is the whole answer.
-        let Some(choice) = self.share_picker.get(index) else {
+        let Some(choice) = self.share_picker.get(index).cloned() else {
             return self.on_close_share_picker();
         };
-        let target = choice.target;
         self.share_picker.clear();
-        self.start_sharing(target)
+        self.start_sharing(&choice)
     }
 
     fn on_close_share_picker(&mut self) -> Task<AppMessage> {
@@ -4921,10 +4921,15 @@ impl Ducktape {
         Task::none()
     }
 
-    fn start_sharing(&mut self, target: crate::video::ShareTarget) -> Task<AppMessage> {
-        let source = crate::video::call_use_screen(Some(target));
+    fn start_sharing(&mut self, choice: &crate::video::ShareChoice) -> Task<AppMessage> {
+        let source = crate::video::call_use_screen(Some(choice.target));
         self.call_camera = source.camera;
         self.call_sharing = source.sharing;
+        // WHAT was picked, kept so the huddle can say it. A share of the wrong
+        // window is otherwise invisible to the person sharing it — their own
+        // stage shows the share, and a desktop looks much like a maximised
+        // window at tile size.
+        self.sharing_label = choice.label.clone();
         Task::none()
     }
 

@@ -402,6 +402,10 @@ pub struct Ducktape {
     /// open, because a picker with nothing in it has nothing to show and the
     /// refusal reason belongs on `call_status` instead.
     pub(crate) share_picker: Vec<crate::video::ShareChoice>,
+    /// The label of the target last picked. READ ONLY WHILE SHARING — the props
+    /// boundary gates it on `call_sharing`, so it needs clearing nowhere and
+    /// cannot go stale on any of the paths that end a share.
+    pub(crate) sharing_label: String,
     pub(crate) call_video_live: bool,
     pub(crate) huddle_stage: String,
     pub(crate) huddle_tiles: Vec<String>,
@@ -840,6 +844,7 @@ impl Ducktape {
             call_camera: false,
             call_sharing: false,
             share_picker: Vec::new(),
+            sharing_label: String::new(),
             call_video_live: false,
             huddle_stage: "".to_owned(),
             huddle_tiles: Vec::new(),

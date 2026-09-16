@@ -24,6 +24,11 @@ pub struct Panel {
     /// picker being open; the view answers with a row index, because only the
     /// host can enumerate a display or a window.
     pub share_targets: Vec<String>,
+    /// What is being shared, named. Non-empty only while `sharing`, so the
+    /// huddle can say WHICH screen or window is on the wire — at tile size a
+    /// desktop and a maximised window look much alike, and the person sharing
+    /// is the one who cannot tell.
+    pub sharing_label: String,
     pub speaking: bool,
     pub stage: String,
     pub tiles: Vec<String>,
@@ -360,6 +365,15 @@ impl Panel {
             return self.share_picker(header);
         }
         let mut body = Vec::new();
+        // Above the stage, because the stage while you share IS your share:
+        // saying which one it is turns "that looks like my screen" into "that
+        // is the window I meant".
+        if self.sharing && !self.sharing_label.is_empty() {
+            body.push(kit::caption(
+                "huddle/sharing",
+                format!("Sharing {}", self.sharing_label),
+            ));
+        }
         if !self.stage.is_empty() {
             body.push(kit::image_resource("huddle/stage", &self.stage));
         }
@@ -699,5 +713,52 @@ mod tests {
         });
         assert!(rows.iter().any(|key| key == "huddle/screen"));
         assert!(!rows.iter().any(|key| key.starts_with("huddle/share/")));
+    }
+
+    /// While sharing, the huddle names WHAT is on the wire. The sharer's own
+    /// stage is their share, and at tile size a desktop and a maximised window
+    /// look alike — so "Stop sharing" alone leaves the one person who cannot
+    /// check unable to tell they picked the wrong thing.
+    #[test]
+    fn a_share_in_progress_names_what_is_on_the_wire() {
+        let room = Room {
+            title: "Engineering".into(),
+            members: Vec::new(),
+            roster: Vec::new(),
+        };
+        let sharing: Panel = serde_json::from_value(serde_json::json!({
+            "sharing": true, "sharing_label": "src/video.rs — Neovim",
+        }))
+        .unwrap();
+        let mut tree = sharing.view(&room, &Default::default(), "");
+        let mut text = Vec::new();
+        tree.for_each_mut(&mut |node| {
+            if let wire::Node::Text { content, .. } = node {
+                text.push(content.clone());
+            }
+        });
+        assert!(
+            text.iter().any(|line| line == "Sharing src/video.rs — Neovim"),
+            "{text:?}"
+        );
+
+        // Not sharing is not a place to name one, however stale the label. The
+        // host gates the prop on `call_sharing`, and the view agrees — so
+        // neither side alone can leave the last share's name on screen.
+        let camera_instead = Panel {
+            sharing: false,
+            ..sharing.clone()
+        };
+        let mut tree = camera_instead.view(&room, &Default::default(), "");
+        let mut text = Vec::new();
+        tree.for_each_mut(&mut |node| {
+            if let wire::Node::Text { content, .. } = node {
+                text.push(content.clone());
+            }
+        });
+        assert!(
+            !text.iter().any(|line| line.starts_with("Sharing ")),
+            "{text:?}"
+        );
     }
 }

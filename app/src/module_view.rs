@@ -4513,6 +4513,25 @@ pub(crate) mod tests {
                 detail: "null".to_owned(),
             }]
         );
+
+        // And once a share is running, the huddle NAMES it — the sharer's own
+        // stage is their share, so without this the one person who cannot check
+        // what they picked is the one who picked it.
+        let sharing = Some(
+            serde_json::to_vec(&serde_json::json!({"panel": {
+                "joined": true, "sharing": true,
+                "sharing_label": "src/video.rs — Neovim",
+            }}))
+            .expect("props encode"),
+        );
+        while guest.redraw(&sharing) {}
+        let shown = texts(&guest);
+        assert!(
+            shown
+                .iter()
+                .any(|text| text == "Sharing src/video.rs — Neovim"),
+            "{shown:?}"
+        );
     }
 
     /// The bundled Members view through the host, on the kernel contract:
