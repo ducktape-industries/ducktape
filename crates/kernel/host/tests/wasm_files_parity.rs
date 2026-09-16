@@ -21,8 +21,8 @@ use futures::executor::block_on;
 use files::objects::object_id;
 use files::{
     CHUNK_SIZE, Change, Content, Files, FilesMsg, FilesOdbBacking, FilesQuery, FilesReply,
-    FilesSyncReq, Kind, MAX_CHANGES_PER_COMMIT, MAX_OBJECT_READS_PER_OP, MAX_READ_BYTES,
-    encode_msg, encode_putblob, encode_query, encode_sync_req, to_hex,
+    FilesSyncReq, Kind, MAX_CHANGES_PER_COMMIT, MAX_INLINE_COMMIT_BYTES, MAX_OBJECT_READS_PER_OP,
+    MAX_READ_BYTES, encode_msg, encode_putblob, encode_query, encode_sync_req, to_hex,
 };
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
@@ -1095,4 +1095,337 @@ fn reopen_preserves_equal_roots() {
         replies(&wasm2),
         "post-reopen replies diverge"
     );
+}
+
+// ============================================================================
+// MEASUREMENT HARNESS (issue #2238) — ignored by default
+// ============================================================================
+//
+// These print a table instead of asserting a budget: they measure the cost of
+// NORMAL Files work and the shape of the curve up to the rejection boundary.
+// A correctness run stays a correctness run.
+//
+// `cargo test -p host --test wasm_files_parity -- --ignored --nocapture`
+//
+// Not measured here: guest fuel and the per-op object-read counter. Neither
+// crosses the `Host` API, and instrumenting the kernel to export them is a
+// change to the execution engine, not a measurement of it. The relation is
+// documented on `wasm_host::DEFAULT_FUEL`: one dispatch replays the pure guest
+// once per DISTINCT unresolved read, so an op that spends the whole
+// `MAX_OBJECT_READS_PER_OP` budget re-treads a prefix growing by one read per
+// round and costs ~n²/2 read calls. Wall time below is that curve, observed.
+
+/// Resident and peak-resident kibibytes, or zeroes where procfs is absent.
+fn measured_memory() -> (u64, u64) {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return (0, 0);
+    };
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default()
+    };
+    (field("VmRSS:"), field("VmHWM:"))
+}
+
+fn documents(count: usize, bytes: usize) -> Vec<Vec<u8>> {
+    (0..count)
+        .map(|index| {
+            let mut body = format!("document {index:06}\n").into_bytes();
+            body.resize(bytes, b'x');
+            body
+        })
+        .collect()
+}
+
+fn import_changes(bodies: &[Vec<u8>]) -> Vec<Change> {
+    bodies
+        .iter()
+        .enumerate()
+        .map(|(index, body)| put_inline(&format!("/shared/project/docs/{index:06}.txt"), body))
+        .collect()
+}
+
+/// The three phases the issue separates: component load and compile, the warm
+/// dispatches that do the work, and the first query after a durable reopen.
+#[test]
+#[ignore = "measurement harness"]
+fn files_cold_load_warm_dispatch_and_reopen_first_query() {
+    println!("== baseline production workload: 128 documents of 1 KiB + one 2 MiB asset ==");
+    println!("phase\truntime\tms\tdetail");
+    for repeat in 0..3 {
+        let dir = tempfile::tempdir().unwrap();
+        let cold = std::time::Instant::now();
+        let mut wasm = wasm_host(&dir);
+        let cold = cold.elapsed();
+        println!("cold_load\twasm\t{:.1}\trepeat {repeat}", cold.as_secs_f64() * 1000.0);
+
+        let chunks = [
+            vec![0x41; CHUNK_SIZE as usize],
+            vec![0x42; CHUNK_SIZE as usize],
+        ];
+        let staged = std::time::Instant::now();
+        for (index, chunk) in chunks.iter().enumerate() {
+            block_on(wasm.submit_at(block(index as u64 + 1, Origin::System), putblob_op(chunk)))
+                .unwrap();
+        }
+        println!(
+            "putblob_2x1MiB\twasm\t{:.1}\trepeat {repeat}",
+            staged.elapsed().as_secs_f64() * 1000.0
+        );
+
+        let bodies = documents(128, 1024);
+        let mut changes = import_changes(&bodies);
+        changes.push(put_chunks(
+            "/shared/project/asset.bin",
+            2 * CHUNK_SIZE,
+            &chunks.iter().map(|chunk| chunk_hex(chunk)).collect::<Vec<_>>(),
+        ));
+        let import = std::time::Instant::now();
+        block_on(wasm.submit_at(block(3, Origin::System), commit_op(None, "import", changes))).unwrap();
+        println!(
+            "commit_import_129\twasm\t{:.1}\trepeat {repeat}",
+            import.elapsed().as_secs_f64() * 1000.0
+        );
+
+        let snapshot = head(&wasm);
+        let edit = std::time::Instant::now();
+        block_on(wasm.submit_at(
+            block(4, Origin::System),
+            commit_op(
+                Some(&snapshot),
+                "edit 32",
+                (0..32)
+                    .map(|index| put_inline(&format!("/shared/project/docs/{index:06}.txt"), b"edited"))
+                    .collect(),
+            ),
+        ))
+        .unwrap();
+        println!(
+            "commit_edit_32\twasm\t{:.1}\trepeat {repeat}",
+            edit.elapsed().as_secs_f64() * 1000.0
+        );
+
+        let root = files_root(&wasm);
+        drop(wasm);
+        let reopen = std::time::Instant::now();
+        let wasm = wasm_host(&dir);
+        let reopen = reopen.elapsed();
+        assert_eq!(files_root(&wasm), root, "durable reopen preserves the root");
+        println!("reopen\twasm\t{:.1}\trepeat {repeat}", reopen.as_secs_f64() * 1000.0);
+
+        let first = std::time::Instant::now();
+        let query = FilesQuery::Read {
+            path: "/shared/project/docs/000000.txt".into(),
+            snapshot: None,
+            offset: 0,
+            len: MAX_READ_BYTES,
+        };
+        block_on(wasm.query(FILES, &encode_query(&query))).unwrap();
+        println!(
+            "first_read_after_reopen\twasm\t{:.3}\trepeat {repeat}",
+            first.elapsed().as_secs_f64() * 1000.0
+        );
+        let warm = std::time::Instant::now();
+        for _ in 0..128 {
+            block_on(wasm.query(FILES, &encode_query(&query))).unwrap();
+        }
+        println!(
+            "warm_read_mean\twasm\t{:.3}\trepeat {repeat}",
+            warm.elapsed().as_secs_f64() * 1000.0 / 128.0
+        );
+        let (rss, peak) = measured_memory();
+        println!("memory\twasm\t0.0\trss_kib={rss} peak_kib={peak}");
+    }
+}
+
+/// Document count in ONE commit, held against everything else. Each distinct
+/// inline body stages a chunk and a fileobj, so the op accrues two distinct
+/// object reads per document against `MAX_OBJECT_READS_PER_OP`, and the guest
+/// replays once per read. This is the curve that decides the practical
+/// documents-per-commit ceiling, which sits well below the hard rejection.
+#[test]
+#[ignore = "measurement harness"]
+fn files_commit_cost_by_document_count() {
+    // 64-byte bodies keep the whole sweep inside MAX_INLINE_COMMIT_BYTES, so
+    // the object-read cap is the constraint the curve runs into, not the
+    // unrelated inline-bytes budget.
+    println!(
+        "== one import commit, 64-byte documents, scaling document count (inline budget {} KiB, object-read cap {MAX_OBJECT_READS_PER_OP}) ==",
+        MAX_INLINE_COMMIT_BYTES / 1024
+    );
+    println!(
+        "documents\tobject_reads\tcap_used_pct\tnative_ms\twasm_ms\twasm_over_native\tms_per_doc\trss_kib\toutcome"
+    );
+    for count in [16usize, 32, 64, 128, 256, 512, 1024, 2048, 2080] {
+        let dir_n = tempfile::tempdir().unwrap();
+        let dir_w = tempfile::tempdir().unwrap();
+        let mut native = native_host(&dir_n);
+        let mut wasm = wasm_host(&dir_w);
+        let genesis = all_roots(&wasm);
+        let bodies = documents(count, 64);
+        let operation = commit_op(None, "import", import_changes(&bodies));
+
+        let start = std::time::Instant::now();
+        let native_outcome = block_on(native.submit_at(block(1, Origin::System), operation.clone()));
+        let native_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let start = std::time::Instant::now();
+        let wasm_outcome = block_on(wasm.submit_at(block(1, Origin::System), operation));
+        let wasm_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        // Each runtime's refusal must leave its own roots where they were; that
+        // safety invariant is asserted. Whether the two AGREE is a measurement
+        // at this scale, so it is reported as a column rather than asserted —
+        // the fixed-workload parity proofs above still assert agreement.
+        if native_outcome.is_err() {
+            assert_eq!(all_roots(&native), genesis, "native root moved on reject");
+        }
+        if wasm_outcome.is_err() {
+            assert_eq!(all_roots(&wasm), genesis, "wasm root moved on reject");
+        }
+        let reason = |outcome: &Result<host::BlockOutcome, SubmitError>| match outcome {
+            Ok(_) => "accepted".to_string(),
+            Err(error) => format!("{error:?}")
+                .replace('\n', " ")
+                .chars()
+                .take(48)
+                .collect(),
+        };
+        let agreed = native_outcome.is_ok() == wasm_outcome.is_ok();
+        let roots_equal = all_roots(&native) == all_roots(&wasm);
+        let outcome = format!(
+            "native={} wasm={} agree={agreed} roots_equal={roots_equal}",
+            reason(&native_outcome),
+            reason(&wasm_outcome)
+        );
+        let (rss, _) = measured_memory();
+        println!(
+            "{count}\t{}\t{}\t{native_ms:.1}\t{wasm_ms:.1}\t{:.2}\t{:.3}\t{rss}\t{outcome}",
+            count * 2,
+            count * 200 / MAX_OBJECT_READS_PER_OP,
+            wasm_ms / native_ms.max(0.001),
+            wasm_ms / count as f64
+        );
+    }
+}
+
+/// Individual object size and query result size, each moved alone against a
+/// fixed document count — the dimensions that grow bytes rather than reads.
+#[test]
+#[ignore = "measurement harness"]
+fn files_cost_by_object_size_and_query_result_size() {
+    println!(
+        "== 64 inline documents, scaling the bytes in each (inline budget {} KiB per commit) ==",
+        MAX_INLINE_COMMIT_BYTES / 1024
+    );
+    println!("doc_bytes\ttotal_kib\twasm_commit_ms\twasm_read_ms\tread_reply_bytes\trss_kib\toutcome");
+    for doc_bytes in [256usize, 1024, 4096, 8192] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wasm = wasm_host(&dir);
+        let genesis = all_roots(&wasm);
+        let bodies = documents(64, doc_bytes);
+        let start = std::time::Instant::now();
+        let committed = block_on(wasm.submit_at(
+            block(1, Origin::System),
+            commit_op(None, "import", import_changes(&bodies)),
+        ));
+        let commit_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let Ok(_) = committed else {
+            // The budget refusal must leave the committed root exactly as it was.
+            assert_eq!(all_roots(&wasm), genesis, "root moved on an inline refusal");
+            println!(
+                "{doc_bytes}\t{}\t{commit_ms:.1}\t0.000\t0\t{}\trejected:inline_commit_budget",
+                64 * doc_bytes / 1024,
+                measured_memory().0
+            );
+            continue;
+        };
+        let query = FilesQuery::Read {
+            path: "/shared/project/docs/000000.txt".into(),
+            snapshot: None,
+            offset: 0,
+            len: MAX_READ_BYTES,
+        };
+        let start = std::time::Instant::now();
+        let reply = block_on(wasm.query(FILES, &encode_query(&query))).unwrap();
+        let read_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let (rss, _) = measured_memory();
+        println!(
+            "{doc_bytes}\t{}\t{commit_ms:.1}\t{read_ms:.3}\t{}\t{rss}\taccepted",
+            64 * doc_bytes / 1024,
+            reply.len()
+        );
+    }
+
+    // Large objects take the chunked path, which is what carries real assets
+    // past the inline budget: one putblob per chunk, then one referencing commit.
+    println!("== one chunked asset, scaling its size ==");
+    println!("asset_mib\tchunks\tputblob_ms\tcommit_ms\tread_1mib_ms\trss_kib");
+    for chunk_count in [1usize, 2, 4, 8] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wasm = wasm_host(&dir);
+        let chunks: Vec<Vec<u8>> = (0..chunk_count)
+            .map(|index| vec![0x41 + index as u8; CHUNK_SIZE as usize])
+            .collect();
+        let start = std::time::Instant::now();
+        for (index, chunk) in chunks.iter().enumerate() {
+            block_on(wasm.submit_at(block(index as u64 + 1, Origin::System), putblob_op(chunk)))
+                .unwrap();
+        }
+        let putblob_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let change = put_chunks(
+            "/shared/project/asset.bin",
+            chunk_count as u64 * CHUNK_SIZE,
+            &chunks.iter().map(|chunk| chunk_hex(chunk)).collect::<Vec<_>>(),
+        );
+        let start = std::time::Instant::now();
+        block_on(wasm.submit_at(
+            block(chunk_count as u64 + 1, Origin::System),
+            commit_op(None, "import asset", vec![change]),
+        ))
+        .unwrap();
+        let commit_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let query = FilesQuery::Read {
+            path: "/shared/project/asset.bin".into(),
+            snapshot: None,
+            offset: 0,
+            len: CHUNK_SIZE,
+        };
+        let start = std::time::Instant::now();
+        block_on(wasm.query(FILES, &encode_query(&query))).unwrap();
+        let read_ms = start.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "{chunk_count}\t{chunk_count}\t{putblob_ms:.1}\t{commit_ms:.1}\t{read_ms:.3}\t{}",
+            measured_memory().0
+        );
+    }
+
+    println!("== one listing, scaling the entries it returns ==");
+    println!("entries\tlimit\twasm_ls_ms\tls_reply_bytes\treturned");
+    let dir = tempfile::tempdir().unwrap();
+    let mut wasm = wasm_host(&dir);
+    let bodies = documents(256, 256);
+    block_on(wasm.submit_at(
+        block(1, Origin::System),
+        commit_op(None, "import", import_changes(&bodies)),
+    ))
+    .unwrap();
+    for limit in [16u64, 64, 128, 256] {
+        let query = FilesQuery::Ls {
+            path: "/shared/project/docs".into(),
+            snapshot: None,
+            after: None,
+            limit,
+        };
+        let start = std::time::Instant::now();
+        let reply = block_on(wasm.query(FILES, &encode_query(&query))).unwrap();
+        let ls_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let FilesReply::Ls { entries, .. } = files::decode_reply(&reply).unwrap() else {
+            panic!("listing reply");
+        };
+        println!("256\t{limit}\t{ls_ms:.3}\t{}\t{}", reply.len(), entries.len());
+    }
 }

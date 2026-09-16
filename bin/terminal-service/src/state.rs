@@ -314,6 +314,14 @@ impl Sessions {
         if ahead {
             return Err("resume cursor is ahead of this session".into());
         }
+        // Both queues are append-only with strictly increasing sequence
+        // numbers, so a resume point is a binary search. Scanning for it
+        // instead costs the whole retained stream on every reader wake-up,
+        // which is quadratic over the life of a streaming session.
+        let resume_chunk = record.chunks.partition_point(|chunk| chunk.seq <= after);
+        let resume_command = record
+            .commands
+            .partition_point(|command| command.seq <= after_command);
         Ok(Replay {
             command_first: record
                 .commands
@@ -322,23 +330,13 @@ impl Sessions {
                     command.seq
                 }),
             command_head: record.command_cursor,
-            commands: record
-                .commands
-                .iter()
-                .filter(|command| command.seq > after_command)
-                .cloned()
-                .collect(),
+            commands: record.commands.range(resume_command..).cloned().collect(),
             first: record
                 .chunks
                 .front()
                 .map_or(record.head + 1, |chunk| chunk.seq),
             head: record.head,
-            chunks: record
-                .chunks
-                .iter()
-                .filter(|chunk| chunk.seq > after)
-                .cloned()
-                .collect(),
+            chunks: record.chunks.range(resume_chunk..).cloned().collect(),
             ended: record.phase == Phase::Ended,
         })
     }
@@ -693,6 +691,74 @@ mod tests {
         let replay = sessions.replay(&session, &owner, 0, 0).unwrap();
         assert!(replay.ended);
         assert_eq!(replay.chunks[0].bytes, b"hi");
+    }
+
+    /// The resume point is found by binary search, which is only correct while
+    /// both queues stay sorted by a strictly increasing sequence. Resuming from
+    /// every cursor a reader can hold must return exactly the tail after it.
+    #[test]
+    fn every_resume_cursor_returns_exactly_the_tail_after_it() {
+        let owner = caller(7, 1);
+        let author = chat::Party::Account(7);
+        let mut sessions = Sessions::default();
+        let id = "0000000000000001";
+        sessions
+            .insert(id.into(), owner.clone(), Mode::Shared)
+            .unwrap();
+        sessions.created(id);
+        for _ in 0..512 {
+            sessions.output(id, vec![7]).unwrap();
+        }
+        // Committed pages advance the command cursor in three batches, so the
+        // command queue is built the way a live shared session builds it.
+        for page in 0..3u64 {
+            let views: Vec<_> = (1..=4)
+                .map(|offset| command_view(page * 4 + offset, &author))
+                .collect();
+            sessions.commands(id, &owner, &author, &views).unwrap();
+        }
+        let full = sessions.replay(id, &owner, 0, 0).unwrap();
+        assert_eq!(full.chunks.len(), 512);
+        assert_eq!(full.head, 512);
+        assert_eq!(full.commands.len(), 12);
+        assert_eq!(full.command_head, 12);
+        for after in 0..=512u64 {
+            let page = sessions.replay(id, &owner, after, 0).unwrap();
+            let expected: Vec<u64> = (after + 1..=512).collect();
+            let seqs: Vec<u64> = page.chunks.iter().map(|chunk| chunk.seq).collect();
+            assert_eq!(seqs, expected, "output resume from {after}");
+        }
+        for after_command in 0..=12u64 {
+            let page = sessions.replay(id, &owner, 0, after_command).unwrap();
+            let expected: Vec<u64> = (after_command + 1..=12).collect();
+            let seqs: Vec<u64> = page.commands.iter().map(|command| command.seq).collect();
+            assert_eq!(seqs, expected, "command resume from {after_command}");
+        }
+        assert!(sessions.replay(id, &owner, 513, 0).is_err());
+        assert!(sessions.replay(id, &owner, 0, 13).is_err());
+    }
+
+    fn command_view(seq: u64, author: &chat::Party) -> chat::MessageView {
+        chat::MessageView {
+            channel_id: crate::consensus::session_channel("0000000000000001"),
+            seq,
+            head: chat::MessageHead {
+                message_id: format!("m{seq}"),
+                origin: sdk::Origin::Program(7),
+                content_origin: sdk::Origin::Program(7),
+                author: author.clone(),
+                revision: 1,
+                blocks: vec![chat::Block::Paragraph(vec![chat::Span::plain("echo hi")])],
+                created_at: 0,
+                rev: 0,
+                edited_at: None,
+                base_rev: None,
+                deleted: false,
+                thread: None,
+                reply_count: 0,
+                last_reply_seq: None,
+            },
+        }
     }
 
     #[test]

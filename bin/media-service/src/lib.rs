@@ -739,6 +739,187 @@ mod tests {
         server.abort();
     }
 
+    type Receiver = mpsc::UnboundedReceiver<Message>;
+
+    /// Resident and peak-resident kibibytes, or zeroes where procfs is absent.
+    fn memory() -> (u64, u64) {
+        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+            return (0, 0);
+        };
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_default()
+        };
+        (field("VmRSS:"), field("VmHWM:"))
+    }
+
+    fn seated(hub: &mut Hub, peers: usize) -> (Roster, Vec<Caller>, Vec<u64>, Vec<Receiver>) {
+        let callers: Vec<Caller> = (0..peers)
+            .map(|index| Caller {
+                account: index as u64 + 1,
+                node: [index as u8 + 1; 32],
+            })
+            .collect();
+        let roster: Roster = callers.iter().cloned().collect();
+        let mut ids = Vec::new();
+        let mut queues = Vec::new();
+        for caller in &callers {
+            let (id, queue) = hub.join("room", caller.clone(), &roster).expect("seat");
+            ids.push(id);
+            queues.push(queue);
+        }
+        (roster, callers, ids, queues)
+    }
+
+    fn audio_frame() -> Message {
+        Message::Binary(
+            media_service::call_wire::encode_audio(&vec![1200; media_service::voice::FRAME_SAMPLES])
+                .into(),
+        )
+    }
+
+    fn video_frame(bytes: usize, keyframe: bool) -> Message {
+        Message::Binary(
+            media_service::call_wire::encode_captured(&media_service::call_wire::CapturedFrame {
+                keyframe,
+                ts_ms: 0,
+                data: vec![7; bytes],
+            })
+            .into(),
+        )
+    }
+
+    fn queued_bytes(queue: &mut Receiver) -> u64 {
+        let mut total = 0;
+        let mut held = Vec::new();
+        while let Ok(message) = queue.try_recv() {
+            total += match &message {
+                Message::Text(text) => text.len() as u64,
+                Message::Binary(bytes) => bytes.len() as u64,
+                _ => 0,
+            };
+            held.push(message);
+        }
+        total
+    }
+
+    /// Per-peer queue growth while exactly one peer stops reading. Frames are
+    /// synthetic: this measures service fanout and retention only. It is not a
+    /// call-quality result and no real capture device is involved.
+    #[test]
+    #[ignore = "measurement harness"]
+    fn stalled_peer_queue_growth_by_frame_profile() {
+        println!("== one peer stops reading, the rest drain ==");
+        println!(
+            "profile\tpeers\tstall_s\tframes\tstalled_depth\tstalled_kib\trss_delta_kib\toldest_age_s\tegress_kbit_s"
+        );
+        for (profile, fps, video_bytes) in [
+            ("audio_only", 50u64, 0usize),
+            ("audio_video_8k", 50, 8 * 1024),
+            ("audio_video_64k", 50, 64 * 1024),
+        ] {
+            for peers in [2usize, 5] {
+                for stall_s in [1u64, 10, 60] {
+                    let base = memory().0;
+                    let mut hub = Hub::default();
+                    let (roster, callers, ids, mut queues) = seated(&mut hub, peers);
+                    // The stalled peer is index 0; the sender is the last seat.
+                    let sender = peers - 1;
+                    hub.relay(
+                        "room",
+                        &callers[sender],
+                        ids[sender],
+                        &roster,
+                        Message::Text(
+                            r#"{"type":"beacon","muted":false,"camera_on":true,"sharing":false,"speaking":true}"#
+                                .into(),
+                        ),
+                    )
+                    .expect("beacon");
+                    let frames = fps * stall_s;
+                    let video = (video_bytes > 0).then(|| video_frame(video_bytes, false));
+                    let audio = audio_frame();
+                    let mut relayed_bytes = 0u64;
+                    for _ in 0..frames {
+                        for frame in [Some(audio.clone()), video.clone()].into_iter().flatten() {
+                            hub.relay("room", &callers[sender], ids[sender], &roster, frame)
+                                .expect("relay");
+                        }
+                        // Everyone except the stalled seat keeps up.
+                        for queue in queues.iter_mut().skip(1) {
+                            relayed_bytes += queued_bytes(queue);
+                        }
+                    }
+                    // Read residency before draining: the drain is what frees it.
+                    let depth = queues[0].len();
+                    let rss = memory().0;
+                    let stalled = queued_bytes(&mut queues[0]);
+                    let egress = relayed_bytes * 8 / stall_s.max(1) / 1000;
+                    println!(
+                        "{profile}\t{peers}\t{stall_s}\t{frames}\t{depth}\t{}\t{}\t{stall_s}\t{egress}",
+                        stalled / 1024,
+                        rss.saturating_sub(base)
+                    );
+                    drop(hub);
+                }
+            }
+        }
+    }
+
+    /// Fanout cost per frame against participant count, and whether a queued
+    /// frame costs memory once or once per recipient.
+    #[test]
+    #[ignore = "measurement harness"]
+    fn fanout_cost_and_frame_sharing_by_participant_count() {
+        const FRAMES: u64 = 2_000;
+        const FRAME_BYTES: usize = 64 * 1024;
+        println!("== fanout with every peer stalled ==");
+        println!("peers\tframes\trelay_p50_ns\trelay_p99_ns\tdistinct_mib\tsum_of_queues_mib\trss_delta_kib");
+        for peers in [2usize, 4, 8, 16] {
+            let base = memory().0;
+            let mut hub = Hub::default();
+            let (roster, callers, ids, mut queues) = seated(&mut hub, peers);
+            let sender = peers - 1;
+            hub.relay(
+                "room",
+                &callers[sender],
+                ids[sender],
+                &roster,
+                Message::Text(
+                    r#"{"type":"beacon","muted":false,"camera_on":true,"sharing":false,"speaking":true}"#
+                        .into(),
+                ),
+            )
+            .expect("beacon");
+            let mut samples = Vec::with_capacity(FRAMES as usize);
+            for _ in 0..FRAMES {
+                let frame = video_frame(FRAME_BYTES, false);
+                let start = std::time::Instant::now();
+                hub.relay("room", &callers[sender], ids[sender], &roster, frame)
+                    .expect("relay");
+                samples.push(start.elapsed().as_nanos() as u64);
+            }
+            let rss = memory().0;
+            samples.sort_unstable();
+            let percentile = |percent: usize| samples[(samples.len() * percent / 100).min(samples.len() - 1)];
+            let queued: u64 = queues.iter_mut().map(queued_bytes).sum();
+            println!(
+                "{peers}\t{FRAMES}\t{}\t{}\t{:.1}\t{:.1}\t{}",
+                percentile(50),
+                percentile(99),
+                (FRAMES as f64 * (FRAME_BYTES + media_service::call_wire::WS_VIDEO_PEER_HEADER) as f64)
+                    / (1024.0 * 1024.0),
+                queued as f64 / (1024.0 * 1024.0),
+                rss.saturating_sub(base)
+            );
+            drop(hub);
+        }
+    }
+
     #[tokio::test]
     async fn queued_output_is_preserved_and_old_teardown_cannot_remove_a_new_seat() {
         let first = Caller {
