@@ -501,10 +501,16 @@ impl BoardsView {
             Some(record) => kind_name(record.shape.kind).to_owned(),
             None => format!("{count} selected"),
         };
-        // a connector has no box to write in; the inspector does not offer one
-        let writable = only
-            .map(|record| &record.shape)
-            .filter(|s| !s.kind.is_path());
+        // Every shape on the board can be written in, a connector included:
+        // its words ride the run on a plate instead of sitting in a box, which
+        // changes where they are DRAWN and not whether they exist. The panel
+        // is the only place that says a shape can be labelled at all, so
+        // leaving a connector out of it left `Enter` as the one way to find
+        // out — and left its text size, which the painter honours, with no
+        // control anywhere that could change it. What a connector genuinely
+        // has no room for is an alignment, and `inspector` withholds that row
+        // on its own.
+        let writable = only.map(|record| &record.shape);
         Some(kit::sized(
             self.inspector(name, count, writable),
             Some(Length::Fixed(204.)),
