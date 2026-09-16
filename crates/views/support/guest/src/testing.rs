@@ -309,15 +309,6 @@ pub fn toggle(frame: &Frame, name: &str, on: bool) -> Vec<Event> {
     }]
 }
 
-/// The events the host sends when the user selects the radio with key or
-/// label `name`.
-pub fn select_radio(frame: &Frame, name: &str) -> Vec<Event> {
-    let Some(Node::Radio { on_select, .. }) = control(frame, name) else {
-        panic!("no radio {name:?} in {:?}", texts(frame));
-    };
-    vec![Event::Message(*on_select)]
-}
-
 /// The events the host sends when the user drags the slider with key
 /// `name` to `value`.
 pub fn slide(frame: &Frame, name: &str, value: f32) -> Vec<Event> {

@@ -2439,17 +2439,6 @@ pub struct Copy {
     pub label: String,
 }
 
-/// `chat.begin_edit` — seed the app's edit composer for one message. The
-/// editor is a host surface (IME + a retained document), so the body it opens
-/// on has to be handed over; the view never sees a keystroke afterwards.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EditSeed {
-    pub scope: String,
-    pub body: String,
-    pub seq: i64,
-    pub rev: i64,
-}
-
 /// The editable markdown of one row, or "" when it may not be edited: a
 /// deleted row has none, a pending one has no sequence yet, and a row whose
 /// revision moved under the open menu would be saved over blind.
@@ -2555,13 +2544,6 @@ pub(crate) fn copy_range_after_press(
         head: seq,
         surface: surface_name(pressed_in),
     }
-}
-
-pub fn connection_degraded(status: &str) -> bool {
-    status == "Offline"
-        || status == "Sync delayed"
-        || status == "Reconnecting…"
-        || status == "Live · resyncing"
 }
 
 pub(crate) fn message_plate(deleted: bool, selected: bool, in_range: bool) -> crate::RowPlate {
@@ -2806,16 +2788,6 @@ pub fn menu_origin(press: (f64, f64), size: (f64, f64), viewport: (f64, f64)) ->
     let x = if fits_right { px } else { px - w };
     let y = if fits_below { py + 4.0 } else { py - h - 4.0 };
     (x.max(GUTTER), y.max(GUTTER))
-}
-
-pub fn block_action_menu_y(pointer_y: f64, viewport_height: f64) -> f64 {
-    let below = (pointer_y - 4.0).max(0.0);
-    let below_fits = below + 190.0 <= viewport_height;
-    if below_fits {
-        below
-    } else {
-        (pointer_y - 190.0).max(0.0)
-    }
 }
 
 /// The line over a search's hits: how many, for what.

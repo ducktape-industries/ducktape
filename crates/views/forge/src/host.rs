@@ -1897,11 +1897,6 @@ pub fn routed_link(fresh: bool, url: &str) -> String {
     }
 }
 
-/// The seq a fresh landing names, or 0 when nothing new landed.
-pub fn landed_seq_of(fresh: bool, seq: i64) -> i64 {
-    if fresh { seq } else { 0 }
-}
-
 /// A read's phase from what it answered: a refusal is `failed`, an answer
 /// is `ready`.
 pub fn phase_of(error: &str) -> String {
