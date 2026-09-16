@@ -2394,18 +2394,6 @@ impl ViewTree {
         else {
             unreachable!()
         };
-        let bounds = self.bounds.get(key).copied().unwrap_or_default();
-        let viewport = window.viewport_size();
-        let geometry = [
-            f32::from(bounds.origin.x) as f64,
-            f32::from(bounds.origin.y) as f64,
-            f32::from(bounds.size.width) as f64,
-            f32::from(bounds.size.height) as f64,
-            0.0,
-            0.0,
-            f32::from(viewport.width) as f64,
-            f32::from(viewport.height) as f64,
-        ];
         let mut element = shadows(
             div()
                 .relative()
@@ -2417,8 +2405,8 @@ impl ViewTree {
                         .color_tokens()
                         .surface_foreground,
                 )
-                .left(px(x.evaluate(geometry)))
-                .top(px(y.evaluate(geometry))),
+                .left(px(*x))
+                .top(px(*y)),
             *shadow,
         );
         if let Some(radius) = radius {
@@ -4774,7 +4762,6 @@ mod tests {
             color: None,
             hover: None,
             fit: Some(wire::ContentFit::Contain),
-            rotation: None,
             opacity: None,
             width: Some(wire::Length::Fixed(24.)),
             height: Some(wire::Length::Fixed(24.)),

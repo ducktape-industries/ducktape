@@ -59,7 +59,6 @@ pub(super) fn navigation(
         color: None,
         hover: None,
         fit: None,
-        rotation: None,
         opacity: message.is_none().then_some(0.35),
         width: Some(wire::Length::Fixed(16.)),
         height: Some(wire::Length::Fixed(16.)),

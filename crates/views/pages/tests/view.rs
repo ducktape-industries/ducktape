@@ -735,24 +735,14 @@ fn float_in(node: &Node) -> Option<&Node> {
     node.children().iter().find_map(float_in)
 }
 
-/// Where the card's float puts it in a pane `pane` wide, given the card's own
-/// laid-out width: the same arithmetic the host runs on the float's program,
-/// from the card's natural place at the pane's top-left corner.
-fn card_placed(frame: &Frame, pane: f32, card: f32) -> (f32, f32) {
+/// Where the card's float puts it: the guest decides the offset from the pane
+/// width it already knows, so the node carries the answer and the host only
+/// places it.
+fn card_placed(frame: &Frame) -> (f32, f32) {
     let Some(Node::Float { x, y, .. }) = float_in(frame.root.as_ref().expect("a root")) else {
         panic!("no floating comment card in {:?}", texts(frame));
     };
-    let geometry = [
-        0.0,
-        0.0,
-        f64::from(card),
-        300.0,
-        0.0,
-        0.0,
-        f64::from(pane),
-        700.0,
-    ];
-    (x.evaluate(geometry), y.evaluate(geometry))
+    (*x, *y)
 }
 
 /// THE THREE PLACEMENTS, each read off the pane the card was opened in.
@@ -764,7 +754,7 @@ fn the_comment_card_answers_the_pane_it_is_opened_in() {
     let beside = at_pane(1200.0);
     assert_eq!(max_widths(beside.root.as_ref().unwrap()), vec![766.0]);
     assert_eq!(card_width(&beside), 320.0);
-    assert_eq!(card_placed(&beside, 1200.0, 320.0), (1200.0 - 332.0, 12.0));
+    assert_eq!(card_placed(&beside), (1200.0 - 332.0, 12.0));
 
     // TIGHTER: no margin to float in, so the document gives up exactly the card
     // and its two gutters and the text reflows left of it.
@@ -772,7 +762,7 @@ fn the_comment_card_answers_the_pane_it_is_opened_in() {
     let document = 1000.0 - 320.0 - 24.0;
     assert_eq!(max_widths(squeeze.root.as_ref().unwrap()), vec![document]);
     assert_eq!(card_width(&squeeze), 320.0);
-    let (left, top) = card_placed(&squeeze, 1000.0, 320.0);
+    let (left, top) = card_placed(&squeeze);
     assert_eq!((left, top), (1000.0 - 332.0, 12.0));
     assert!(
         left >= document,
@@ -785,7 +775,7 @@ fn the_comment_card_answers_the_pane_it_is_opened_in() {
     let inline = at_pane(800.0);
     assert_eq!(max_widths(inline.root.as_ref().unwrap()), vec![766.0]);
     assert_eq!(card_width(&inline), 766.0 - 96.0);
-    assert_eq!(card_placed(&inline, 800.0, 670.0), (56.0, 65.3));
+    assert_eq!(card_placed(&inline), (56.0, 65.3));
 }
 
 /// A PLACEMENT IS VIEW-LOCAL: crossing a threshold moves the card and nothing

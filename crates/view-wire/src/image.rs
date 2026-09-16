@@ -15,13 +15,6 @@ pub enum ImageData {
     Resource(String),
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ImageFilter {
-    #[default]
-    Linear,
-    Nearest,
-}
-
 impl ImageData {
     pub fn byte_len(&self) -> usize {
         match self {

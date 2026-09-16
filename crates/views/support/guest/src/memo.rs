@@ -248,7 +248,6 @@ mod tests {
                             color: None,
                             hover: None,
                             fit: None,
-                            rotation: None,
                             opacity: None,
                             width: None,
                             height: None,

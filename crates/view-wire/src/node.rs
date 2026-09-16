@@ -53,11 +53,11 @@ pub enum Node {
         #[serde(deserialize_with = "decode_child")]
         content: Box<Node>,
     },
-    /// Floating content whose translation is evaluated only by the host.
+    /// Floating content the host offsets from its own origin.
     Float {
         key: String,
-        x: FloatExpression,
-        y: FloatExpression,
+        x: f32,
+        y: f32,
         scale: f32,
         shadow: Shadow,
         radius: Option<[f32; 4]>,
@@ -265,9 +265,7 @@ pub enum Node {
         data: Option<ImageData>,
         label: Option<String>,
         fit: Option<ContentFit>,
-        rotation: Option<Rotation>,
         opacity: Option<f32>,
-        filter: ImageFilter,
         width: Option<Length>,
         height: Option<Length>,
     },
@@ -278,7 +276,6 @@ pub enum Node {
         data: Option<ImageData>,
         label: Option<String>,
         fit: Option<ContentFit>,
-        filter: ImageFilter,
         width: Option<Length>,
         height: Option<Length>,
         options: ViewerOptions,
@@ -305,7 +302,6 @@ pub enum Node {
         /// the tint, `Some(Some(_))` is another one.
         hover: Option<Option<Rgba>>,
         fit: Option<ContentFit>,
-        rotation: Option<Rotation>,
         /// `0.0..=1.0`; `None` is opaque.
         opacity: Option<f32>,
         width: Option<Length>,

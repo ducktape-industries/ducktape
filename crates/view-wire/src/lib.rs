@@ -53,18 +53,16 @@ pub use editor_transaction::{
 pub use editor::{EditorCursor, EditorPosition, EditorState, editor_lines};
 
 mod image;
-pub use image::{ImageData, ImageFilter, ViewerOptions, viewer_scale_bounds};
+pub use image::{ImageData, ViewerOptions, viewer_scale_bounds};
 
 mod snapshot;
 pub use snapshot::{MAX_SNAPSHOT_BYTES, Snapshot, SnapshotValue};
 
 mod flex;
-mod float;
 pub use flex::{
     FlexBasis, FlexContentAlignment, FlexDirection, FlexItem, FlexItemAlignment, FlexLayout,
     FlexMargin, FlexMargins, FlexWrap,
 };
-pub use float::{FloatExpression, FloatOp, MAX_FLOAT_OPS};
 
 mod combo;
 pub use combo::{ComboIcon, ComboOptions};
@@ -601,14 +599,6 @@ pub enum ContentFit {
     ScaleDown,
 }
 
-/// A rotation in radians: `Floating` keeps the layout the picture had
-/// before it turned, `Solid` lays out the turned bounds.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub enum Rotation {
-    Floating(f32),
-    Solid(f32),
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ToggleKind {
     Checkbox,
@@ -1069,12 +1059,16 @@ fn sanitize_node(node: &mut Node, depth: usize, budgets: &mut Budgets, taken: &m
         }
         Node::Float {
             key,
+            x,
+            y,
             scale,
             shadow,
             radius,
             ..
         } => {
             claim(key, taken);
+            *x = finite(*x).clamp(-MAX_PIXELS, MAX_PIXELS);
+            *y = finite(*y).clamp(-MAX_PIXELS, MAX_PIXELS);
             *scale = finite(*scale).clamp(f32::EPSILON, MAX_PIXELS);
             shadow.sanitize();
             if let Some(corners) = radius {
@@ -1206,7 +1200,6 @@ fn sanitize_node(node: &mut Node, depth: usize, budgets: &mut Budgets, taken: &m
             key,
             data,
             label,
-            rotation,
             opacity,
             ..
         } => {
@@ -1214,9 +1207,6 @@ fn sanitize_node(node: &mut Node, depth: usize, budgets: &mut Budgets, taken: &m
             ImageData::sanitize(data, budgets);
             if let Some(label) = label {
                 truncate_string(label);
-            }
-            if let Some(Rotation::Floating(radians) | Rotation::Solid(radians)) = rotation {
-                *radians = finite(*radians);
             }
             if let Some(opacity) = opacity {
                 *opacity = finite(*opacity).clamp(0.0, 1.0);
@@ -1228,7 +1218,6 @@ fn sanitize_node(node: &mut Node, depth: usize, budgets: &mut Budgets, taken: &m
             label,
             color,
             hover,
-            rotation,
             opacity,
             ..
         } => {
@@ -1240,9 +1229,6 @@ fn sanitize_node(node: &mut Node, depth: usize, budgets: &mut Budgets, taken: &m
             bound_color(color);
             if let Some(hover) = hover {
                 bound_color(hover);
-            }
-            if let Some(Rotation::Floating(radians) | Rotation::Solid(radians)) = rotation {
-                *radians = finite(*radians);
             }
             if let Some(opacity) = opacity {
                 *opacity = bounded(*opacity).min(1.0);
@@ -3143,7 +3129,6 @@ mod tests {
             color: None,
             hover: None,
             fit: None,
-            rotation: None,
             opacity: None,
             width: Some(Length::Fixed(24.0)),
             height: Some(Length::Fixed(24.0)),
@@ -3161,9 +3146,7 @@ mod tests {
             ])),
             label: None,
             fit: None,
-            rotation: None,
             opacity: None,
-            filter: ImageFilter::Linear,
             width: None,
             height: None,
         };
