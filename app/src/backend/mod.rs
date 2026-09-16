@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -231,7 +231,7 @@ pub use model::*;
 pub use node::*;
 pub use notify::*;
 pub use picture::*;
-pub use roster::*;
+use roster::*;
 pub use rpc::*;
 pub use search::*;
 pub use shell::*;

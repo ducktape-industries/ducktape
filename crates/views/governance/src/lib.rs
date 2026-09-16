@@ -3,9 +3,10 @@
 //! wasm component the desktop app loads from a file.
 //!
 //! The kernel pushes session facts only (`governance.props`: connected,
-//! admin, dark). The view reads its own register through the kernel's
-//! `rpc.query` / `rpc.blocks`, re-reads it on every `rpc.live` hit for the
-//! governance plane, and a vote or a settle leaves as `op.submit` — the
+//! dark, the taste set). The view reads its own register through the
+//! kernel's `rpc.query` / `rpc.blocks`, re-reads it on every `rpc.live` hit
+//! for the governance plane, reads whether THIS node votes off `rpc.status`
+//! and the valset, and a vote or a settle leaves as `op.submit` — the
 //! governance message the kernel signs with the seated key. Signing secrets
 //! and passwords stay in the host; public proposal data belongs to the guest.
 pub mod host;
@@ -41,6 +42,7 @@ impl ::std::fmt::Debug for GovernanceView {
 #[derive(Clone)]
 pub enum Message {
     SessionArrived(crate::host::SessionItem),
+    SeatArrived(crate::host::SeatItem),
     RegisterArrived(crate::host::RegisterItem),
     ActDone(crate::host::ActItem),
     GovVote(String, bool),
@@ -101,10 +103,10 @@ impl GovernanceView {
         ::ducktape_view_guest::Subscription::batch([
             crate::host::session().map(Message::SessionArrived),
             if self.connected {
-                ::ducktape_view_guest::Subscription::batch([crate::host::register(
-                    self.connection_serial,
-                )
-                .map(Message::RegisterArrived)])
+                ::ducktape_view_guest::Subscription::batch([
+                    crate::host::register(self.connection_serial).map(Message::RegisterArrived),
+                    crate::host::seat(self.connection_serial).map(Message::SeatArrived),
+                ])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },
@@ -188,6 +190,7 @@ impl GovernanceView {
     pub(crate) fn update(&mut self, message: Message) -> ::ducktape_view_guest::Task<Message> {
         match message {
             Message::SessionArrived(item) => self.on_session_arrived(item),
+            Message::SeatArrived(item) => self.on_seat_arrived(item),
             Message::RegisterArrived(item) => self.on_register_arrived(item),
             Message::ActDone(item) => self.on_act_done(item),
             Message::GovVote(proposal_id, approve) => self.on_gov_vote(proposal_id, approve),
@@ -219,12 +222,23 @@ impl GovernanceView {
                 next.connected,
                 self.connection_serial,
             );
-            self.admin = next.admin;
             self.connected = next.connected;
             self.dark = next.dark;
             self.tasting = next.tasting;
             ::ducktape_view_guest::Task::none()
         }
+    }
+    fn on_seat_arrived(
+        &mut self,
+        item: crate::host::SeatItem,
+    ) -> ::ducktape_view_guest::Task<Message> {
+        let refused = !(item.error).is_empty();
+        if refused {
+            self.host_error = host::sentence("Could not read this node's seat", &item.error);
+            return ::ducktape_view_guest::Task::none();
+        }
+        self.admin = item.admin;
+        ::ducktape_view_guest::Task::none()
     }
     fn on_register_arrived(
         &mut self,

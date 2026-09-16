@@ -1,10 +1,11 @@
 //! What the view asks of the host kernel, and the readings the screen folds
 //! off the roster it reads for itself.
 //!
-//! The kernel pushes only session facts (`members.props`: connected, admin,
-//! dark). The roster is the view's own: it asks the node through
-//! `rpc.status`, `rpc.peers` and `rpc.query`, re-reads on every `rpc.live`
-//! hit for the valset plane, and folds the members into rows here. A pause
+//! The kernel pushes only session facts (`members.props`: connected, dark).
+//! The roster is the view's own, and so is this node's authority over it:
+//! the view asks the node through `rpc.status`, `rpc.peers` and `rpc.query`,
+//! re-reads on every `rpc.live` hit for the valset plane, folds the members
+//! into rows here, and reads its own quorum seat off those rows. A pause
 //! and a membership ballot leave as `op.submit` carrying the module message
 //! the kernel signs with the seated key — the view never sees the key, the
 //! endpoint or the password. A key copy is still an intent: the clipboard is
@@ -45,11 +46,12 @@ pub struct MemberRow {
 
 // ---------- the session ----------
 
-/// The session facts the kernel pushes, one item per change.
+/// The session facts the kernel pushes, one item per change. This node's
+/// authority is NOT among them: the view folds it off the roster it reads
+/// for itself ([`roster_is_admin`]).
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub connected: bool,
-    pub admin: bool,
     pub dark: bool,
 }
 
@@ -454,6 +456,15 @@ pub(crate) fn empty_words(filter: crate::MembersFilter) -> (&'static str, &'stat
             "A resident becomes a validator when a ballot to promote it passes.",
         ),
     }
+}
+
+/// This node holds a quorum seat — the ONE authority predicate behind the
+/// Invite button and every ballot this screen opens. It is folded off the
+/// roster the view read itself, so a view swap that re-labels a seat
+/// re-decides who may act; no host prop carries it.
+pub fn roster_is_admin(rows: &[MemberRow]) -> bool {
+    rows.iter()
+        .any(|row| row.is_this_node && row.role == "validator")
 }
 
 /// The All / Humans / Agents / Validators strip.

@@ -9,9 +9,9 @@ use super::*;
 /// commits (`live.rs`), which is both cheaper and earlier. So a tab move only
 /// needs the plane its destination screen is about to draw.
 ///
-/// The titlebar chips (tier, approvals, agent dot, account name) read all four
-/// from state, and state is what the connect load and the live-plane lane fill
-/// — no chip depends on a tab click.
+/// The titlebar chips (approvals, agent dot, account name) read from state,
+/// and state is what the connect load and the live-plane lane fill — no chip
+/// depends on a tab click.
 pub fn tab_reads_plane(tab: crate::ShellTab, plane: String) -> bool {
     // a registry-listed view reads its own planes through `rpc.live`; no
     // app-side load is on its screen's path
@@ -19,16 +19,6 @@ pub fn tab_reads_plane(tab: crate::ShellTab, plane: String) -> bool {
         return false;
     }
     match plane.as_str() {
-        // the tier badge, the admin gate and the forge write gate all read the
-        // roster, so five panes draw it.
-        "members" => matches!(
-            tab,
-            crate::ShellTab::Members
-                | crate::ShellTab::Governance
-                | crate::ShellTab::Forge
-                | crate::ShellTab::Node
-                | crate::ShellTab::Settings
-        ),
         "governance" => tab == crate::ShellTab::Governance,
         "agents" => tab == crate::ShellTab::Agents,
         // Settings draws the account card; Forge draws the org "about".
@@ -476,19 +466,6 @@ pub(crate) fn now_seconds() -> i64 {
 
 pub fn current_wall_seconds() -> i64 {
     now_seconds()
-}
-
-/// A serde `Vec<u8>` as it arrives over JSON: an array of numbers.
-pub(crate) fn json_bytes(value: &serde_json::Value) -> Vec<u8> {
-    value
-        .as_array()
-        .map(|bytes| {
-            bytes
-                .iter()
-                .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// The account controlled by the actual local signer, read at the write edge.

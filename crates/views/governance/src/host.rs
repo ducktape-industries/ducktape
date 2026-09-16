@@ -2,9 +2,11 @@
 //! off the register it reads for itself.
 //!
 //! The kernel pushes only session facts (`governance.props`: connected,
-//! admin, dark). The register is the view's own: it asks the node through
-//! `rpc.query` and `rpc.blocks`, re-reads on every `rpc.live` hit for the
-//! governance plane, and folds the proposals into rows here. A vote or a
+//! dark, the taste set). The register is the view's own, and so is this
+//! node's authority over it: it asks the node through `rpc.query` and
+//! `rpc.blocks`, re-reads on every `rpc.live` hit for the governance plane,
+//! folds the proposals into rows here, and reads its own quorum seat off
+//! `rpc.status` and the valset. A vote or a
 //! settle leaves as `op.submit` carrying the governance message the kernel
 //! signs with the seated key — the view never sees the key, the endpoint or
 //! the password.
@@ -146,7 +148,6 @@ impl Field {
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub connected: bool,
-    pub admin: bool,
     pub dark: bool,
     /// The taste set: what a member may try before the ballot settles.
     pub tasting: Vec<TasteRow>,
@@ -188,6 +189,70 @@ pub fn connection_serial_after(was_connected: bool, connected: bool, serial: i64
         true => serial + 1,
         false => serial,
     }
+}
+
+// ---------- this node's seat ----------
+
+/// One item of the seat subscription: whether this node holds a quorum
+/// seat, or why the valset could not say.
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
+pub struct SeatItem {
+    pub admin: bool,
+    pub error: String,
+}
+
+/// Whether this node votes, now and after every valset block. THE ONE
+/// authority predicate on this screen: a ballot's buttons and the rule the
+/// rest of the network reads instead both hang off it, and it is the view's
+/// own read of `rpc.status` against the valset — no host prop carries it.
+pub fn seat(connection: i64) -> ducktape_view_guest::Subscription<SeatItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
+        let live = host::subscribe("rpc.live", b"valset");
+        stream::once(load_seat()).chain(live.then(|_| load_seat()))
+    })
+}
+
+async fn load_seat() -> SeatItem {
+    match read_seat().await {
+        Ok(admin) => SeatItem {
+            admin,
+            error: String::new(),
+        },
+        Err(error) => SeatItem {
+            admin: false,
+            error,
+        },
+    }
+}
+
+async fn read_seat() -> Result<bool, String> {
+    let status = ask("rpc.status", &serde_json::json!({})).await?;
+    let node_key = status["public_key"].as_str().unwrap_or_default().to_owned();
+    let reply = ask(
+        "rpc.query",
+        &serde_json::json!({ "target": "valset", "query": "validators" }),
+    )
+    .await?;
+    Ok(holds_a_seat(&node_key, &reply))
+}
+
+/// This node's key among the valset's validators. An empty key never
+/// matches, so a node that has not said who it is does not vote.
+pub fn holds_a_seat(node_key: &str, reply: &serde_json::Value) -> bool {
+    if node_key.is_empty() {
+        return false;
+    }
+    reply["validators"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .any(|key| hex_encode(&json_bytes(key)) == node_key)
+}
+
+async fn ask(kind: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let bytes = host::request(kind, &serde_json::to_vec(body).expect("a request encodes")).await?;
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
 // ---------- the register ----------

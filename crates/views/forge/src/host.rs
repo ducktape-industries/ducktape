@@ -3,7 +3,8 @@
 //!
 //! The kernel pushes only session facts (`forge.props`: connected, dark, the
 //! network's name and chain id, the connected endpoint, and the `duck://`
-//! link the app last routed here). Everything else is the view's own: the
+//! link the app last routed here). Everything else is the view's own: this
+//! node's standing off `rpc.status` and the valset, the
 //! repo namespace, one repo's branches and tracker, one item with its patch
 //! and reviews, the code browse's listing and file, and the item's
 //! discussion all come from `rpc.query` / `rpc.view`, re-read on every
@@ -164,8 +165,6 @@ pub struct Session {
     pub org: String,
     /// this account's bio, as the empty state introduces the network
     pub about: String,
-    /// this account's seat word on the network
-    pub tier: String,
     pub network_chain_id: String,
     pub connected_rpc: String,
     /// the `duck://forge/...` address the app's open plane last routed here
@@ -267,6 +266,94 @@ where
 {
     let live = host::subscribe("rpc.live", FORGE.as_bytes());
     stream::once(load()).chain(live.then(move |_| load()))
+}
+
+// ---------- this node's seat ----------
+
+/// One item of the seat subscription: this node's standing word, or why
+/// the valset could not say.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SeatItem {
+    /// `validator` | `resident` | `guest`, or "" while the valset is silent
+    pub tier: String,
+    pub error: String,
+}
+
+/// This node's standing now and after every valset block — the word the
+/// org head wears. The view folds it off `rpc.status` and the valset
+/// itself; no session prop carries it, so swapping this view changes what
+/// the badge calls this device.
+pub fn seat(connection: i64) -> ducktape_view_guest::Subscription<SeatItem> {
+    ducktape_view_guest::Subscription::run_with(connection, |_| {
+        let live = host::subscribe("rpc.live", b"valset");
+        stream::once(load_seat()).chain(live.then(|_| load_seat()))
+    })
+}
+
+async fn load_seat() -> SeatItem {
+    match read_seat().await {
+        Ok(tier) => SeatItem {
+            tier,
+            error: String::new(),
+        },
+        Err(error) => SeatItem {
+            tier: String::new(),
+            error: failure("Could not read this node's standing", &error),
+        },
+    }
+}
+
+async fn read_seat() -> Result<String, String> {
+    let status = host::request("rpc.status", b"{}").await?;
+    let status: serde_json::Value =
+        serde_json::from_slice(&status).map_err(|error| error.to_string())?;
+    let node_key = status["public_key"].as_str().unwrap_or_default().to_owned();
+    let validators = query("valset", serde_json::json!("validators")).await?;
+    let residents = query("valset", serde_json::json!("residents")).await?;
+    Ok(fold_tier(
+        &node_key,
+        &seat_keys(&validators, "validators"),
+        &seat_keys(&residents, "residents"),
+    ))
+}
+
+/// A valset key list — `{"validators": [[byte, …], …]}` — as hex.
+fn seat_keys(reply: &serde_json::Value, seat: &str) -> Vec<String> {
+    reply[seat]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|key| {
+            key.as_array()
+                .map(|bytes| {
+                    bytes
+                        .iter()
+                        .filter_map(|byte| byte.as_u64())
+                        .map(|byte| format!("{:02x}", byte as u8))
+                        .collect::<String>()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// This node's seat word, as the two valset lists name it.
+///
+/// AN UNANSWERED VALSET IS NOT A GUEST: an answered valset always carries
+/// the chain's own validators, so an empty pair of lists is silence and
+/// reads `""` — which is what keeps the badge off the head entirely rather
+/// than calling a validator's device a guest.
+pub fn fold_tier(node_key: &str, validators: &[String], residents: &[String]) -> String {
+    let silent = validators.is_empty() && residents.is_empty();
+    let seated = validators.iter().any(|key| key == node_key);
+    let resident = residents.iter().any(|key| key == node_key);
+    match (silent, seated, resident) {
+        (true, _, _) => String::new(),
+        (false, true, _) => "validator".into(),
+        (false, false, true) => "resident".into(),
+        (false, false, false) => "guest".into(),
+    }
 }
 
 // ---------- the repo namespace ----------

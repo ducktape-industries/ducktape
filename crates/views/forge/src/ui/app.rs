@@ -104,6 +104,7 @@ impl ::std::fmt::Debug for ForgeView {
 pub enum Message {
     Composer(Box<composer::ComposerMessage>),
     SessionArrived(crate::host::SessionItem),
+    SeatArrived(crate::host::SeatItem),
     ForgeLandLink(String),
     ReposArrived(crate::host::RepoListItem),
     RepoArrived(crate::host::RepoItem),
@@ -274,10 +275,10 @@ impl ForgeView {
         ::ducktape_view_guest::Subscription::batch([
             crate::host::session().map(Message::SessionArrived),
             if self.connected {
-                ::ducktape_view_guest::Subscription::batch([crate::host::repos(
-                    self.connection_serial,
-                )
-                .map(Message::ReposArrived)])
+                ::ducktape_view_guest::Subscription::batch([
+                    crate::host::repos(self.connection_serial).map(Message::ReposArrived),
+                    crate::host::seat(self.connection_serial).map(Message::SeatArrived),
+                ])
             } else {
                 ::ducktape_view_guest::Subscription::none()
             },

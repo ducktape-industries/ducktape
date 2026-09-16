@@ -1,9 +1,11 @@
 //! The Members roster as a module-owned view: who may act on this network.
 //!
-//! The kernel pushes session facts only (`members.props`: connected, admin,
-//! dark). The view reads the roster itself through the kernel's
+//! The kernel pushes session facts only (`members.props`: connected, dark).
+//! The view reads the roster itself through the kernel's
 //! `rpc.status` / `rpc.peers` / `rpc.query`, re-reads it on every `rpc.live`
-//! hit for the valset plane, and a row opens its record. Pausing an agent
+//! hit for the valset plane, and a row opens its record. Whether THIS node
+//! may act is folded off those same rows, so the labelling and the gate can
+//! never disagree. Pausing an agent
 //! and opening a membership ballot leave as `op.submit` — the module
 //! message the kernel signs with the seated key; copying a key stays an
 //! intent, because the clipboard is an OS door the kernel has not opened.
@@ -246,7 +248,6 @@ impl MembersView {
                 next.connected,
                 self.connection_serial,
             );
-            self.admin = next.admin;
             self.connected = next.connected;
             self.dark = next.dark;
             ::ducktape_view_guest::Task::none()
@@ -263,6 +264,7 @@ impl MembersView {
                 return ::ducktape_view_guest::Task::none();
             }
             self.rows = item.rows.clone();
+            self.admin = crate::host::roster_is_admin(&self.rows);
             self.height = item.height;
             ::ducktape_view_guest::Task::none()
         }
