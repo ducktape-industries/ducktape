@@ -3393,6 +3393,64 @@ fn a_cards_words_sit_where_the_alignment_says_and_the_caret_goes_with_them() {
     );
 }
 
+/// A connector keeps its plate under the caret, because the plate IS the label.
+///
+/// The painter draws nothing for the shape being written in, which is right for
+/// a card — its own body is still underneath — and wrong for a connector, whose
+/// wash went away the moment you clicked into it and came back when you left.
+#[test]
+fn a_connector_keeps_its_plate_while_its_label_is_being_typed() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "edge".into(),
+        shape: Shape {
+            text: "saved".into(),
+            ..segment(Kind::Arrow)
+        },
+    });
+    view.selected = ["edge".into()].into();
+    view.begin_text();
+    view.inline.as_mut().unwrap().document = Editor::new("being typed");
+    let json = serde_json::to_string(&view.view()).unwrap();
+    assert!(
+        json.contains("boards/plate/edge"),
+        "the plate went out from under the words being written on it"
+    );
+    // Sized to what is being TYPED, not to what was last saved, or the wash is
+    // the shape of the label you started with.
+    assert!(
+        json.contains("being typed"),
+        "the plate is still the size of the saved words"
+    );
+    // And drawn in nothing: the editor lays the visible words over it, so ink
+    // here would double every glyph.
+    let plate = json.split("boards/plate/edge").nth(1).unwrap();
+    let plate = plate.split("boards/editor").next().unwrap();
+    let ink = plate.split("\"color\":[").nth(1).unwrap();
+    assert!(
+        ink.split(']').next().unwrap().ends_with("0.0"),
+        "the plate's words are drawn in ink, not in nothing"
+    );
+
+    // A card still draws nothing: its body is under the caret already.
+    view.inline = None;
+    view.edit(Change::Create {
+        id: "card".into(),
+        shape: Shape {
+            text: "saved".into(),
+            ..Default::default()
+        },
+    });
+    view.selected = ["card".into()].into();
+    view.begin_text();
+    let json = serde_json::to_string(&view.view()).unwrap();
+    assert!(
+        !json.contains("boards/pin/card"),
+        "a card drew its painted label under its own caret"
+    );
+}
+
 /// An arrow's label wraps in the same column whether it is being written or
 /// being read, and starts at the same place.
 ///
