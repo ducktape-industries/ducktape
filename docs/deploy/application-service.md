@@ -276,21 +276,26 @@ label. The CLI POSTs the create and opens the attachment through its own node's
 that credential never leaves the node. The node hosts no terminal sessions of
 its own — there is no `/v1/term` route and no `term:` stream topic.
 
-Terminal attachments use `/sessions/{session}?after=<output-seq>&after_command=<chat-seq>`.
-Both cursors default to zero. Replay metadata gives `first`, `head`,
-`command_first`, and `command_head`; following `command` frames carry `seq`,
-`origin`, and `text`, while `output` frames carry `seq` and `data_b64`.
+Terminal attachments use `/sessions/{session}?after=<output-seq>`, which
+defaults to zero. Replay metadata gives `first` and `head`; following `output`
+frames carry `seq` and `data_b64`.
 Resume from frames actually consumed, not a snapshot head announced before those
-frames: `agent pty` advances its cursors on the frames it wrote to the terminal,
-reconnects at those cursors, replays no input, and reports a retained `first`
-past its cursor as a visible gap. Command sequence gaps include refused or
-deleted Chat posts. Command
-history records accepted execution requests, not proof that the program executed
-them. Output and command history remain in process memory without a configured
+frames: `agent pty` advances its cursor on the frames it wrote to the terminal,
+reconnects at that cursor, replays no input, and reports a retained `first`
+past its cursor as a visible gap. A session answers exactly one caller — the
+operator that created it drives and reads it, and nobody else does either.
+Output remains in process memory without a configured
 retention ceiling; process restart does not restore terminal sessions. Each
 attachment queues output independently, so a slow reader does not block its
 input or close commands. There is no configured attachment count, WebSocket
 frame size, output queue, or send deadline ceiling.
+
+A create the service refuses answers the caller with a stable token only
+(`spawn_failed`, `unknown_provider`, `at_capacity`). The sentence that says why
+is this host's own diagnosis and stays here: read it in the unit's journal,
+where the terminal service writes its `tracing` events to stderr at an `info`
+floor. `RUST_LOG` adds to that floor rather than replacing it, so
+`RUST_LOG=ducktape::term=debug` turns one plane up without silencing the rest.
 
 An application may bind up to 16 explicit read-only directories through
 `readonly_paths`, for example

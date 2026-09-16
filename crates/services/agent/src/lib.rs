@@ -360,11 +360,16 @@ impl Sessions {
                 wire::Event::TermCreated { session }
             }
             Err((reason, detail)) => {
+                // `detail` is the sentence that says WHY — the missing limit,
+                // the absent artifact, the spawn's own error. The token alone
+                // is unactionable, and this event is the only place the detail
+                // is ever readable: it does not cross back to the caller.
                 tracing::warn!(
                     target: "ducktape::term",
                     session = %session,
                     provider,
                     reason = reason.token(),
+                    detail = %detail,
                     "session create refused"
                 );
                 wire::Event::TermRefused {

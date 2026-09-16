@@ -3885,7 +3885,6 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
- "chat",
  "ducktape-rpc",
  "futures",
  "gateway",
@@ -3893,13 +3892,14 @@ dependencies = [
  "provider-host",
  "rand 0.8.6",
  "reqwest 0.12.28",
- "sdk",
  "serde",
  "serde_json",
  "subtle",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.24.0",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

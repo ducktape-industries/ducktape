@@ -1,11 +1,8 @@
 //! Bounded service requests and executor events, with independent spawn jobs.
-use crate::state::{Caller, Effect, Mode, Replay, Sessions, Status, Write};
+use crate::state::{Caller, Effect, Replay, Sessions, Write};
 use agent_service::wire;
 use base64::Engine as _;
-use std::{
-    collections::{BTreeMap, VecDeque},
-    path::PathBuf,
-};
+use std::{collections::BTreeMap, path::PathBuf};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
@@ -22,21 +19,8 @@ pub struct Runtime {
 }
 
 enum Request {
-    Status {
-        session: String,
-        caller: Caller,
-        reply: oneshot::Sender<Result<Status, String>>,
-    },
-    Committed {
-        session: String,
-        caller: Caller,
-        owner: chat::Party,
-        views: Vec<chat::MessageView>,
-        reply: Reply,
-    },
     Create {
         caller: Caller,
-        mode: Mode,
         spec: wire::Create,
         reply: CreateReply,
     },
@@ -51,22 +35,12 @@ enum Request {
         session: String,
         caller: Caller,
         after: u64,
-        after_command: u64,
         reply: oneshot::Sender<Result<Replay, String>>,
     },
     Stop,
 }
 
 enum Action {
-    Status(
-        oneshot::Sender<Result<Status, String>>,
-        Result<Status, String>,
-    ),
-    Committed {
-        session: String,
-        commands: Vec<crate::consensus::Projected>,
-        reply: Reply,
-    },
     Create(wire::Create),
     Drive {
         command: wire::Command,
@@ -99,24 +73,11 @@ struct Machine {
 impl Machine {
     fn request(&mut self, request: Request) -> Vec<Action> {
         match request {
-            Request::Status {
-                session,
-                caller,
-                reply,
-            } => self.status(session, caller, reply),
-            Request::Committed {
-                session,
-                caller,
-                owner,
-                views,
-                reply,
-            } => self.committed(session, caller, owner, views, reply),
             Request::Create {
                 caller,
-                mode,
                 spec,
                 reply,
-            } => self.create(caller, mode, spec, reply),
+            } => self.create(caller, spec, reply),
             Request::Drive {
                 session,
                 caller,
@@ -128,68 +89,17 @@ impl Machine {
                 session,
                 caller,
                 after,
-                after_command,
                 reply,
-            } => self.replay(session, caller, after, after_command, reply),
+            } => self.replay(session, caller, after, reply),
             Request::Stop => Self::stop(),
         }
     }
 
-    fn status(
-        &self,
-        session: String,
-        caller: Caller,
-        reply: oneshot::Sender<Result<Status, String>>,
-    ) -> Vec<Action> {
-        vec![Action::Status(
-            reply,
-            self.sessions.status(&session, &caller),
-        )]
-    }
-
-    fn committed(
-        &mut self,
-        session: String,
-        caller: Caller,
-        owner: chat::Party,
-        views: Vec<chat::MessageView>,
-        reply: Reply,
-    ) -> Vec<Action> {
-        let previous = self
-            .sessions
-            .status(&session, &caller)
-            .map(|status| status.command_cursor);
-        match self.sessions.commands(&session, &caller, &owner, &views) {
-            Ok(commands) => {
-                let current = self
-                    .sessions
-                    .status(&session, &caller)
-                    .map(|status| status.command_cursor);
-                let unchanged = previous == current;
-                if unchanged {
-                    return vec![Action::Reply(reply, Ok(()))];
-                }
-                vec![Action::Committed {
-                    session,
-                    commands,
-                    reply,
-                }]
-            }
-            Err(error) => vec![Action::Reply(reply, Err(error))],
-        }
-    }
-
-    fn create(
-        &mut self,
-        caller: Caller,
-        mode: Mode,
-        spec: wire::Create,
-        reply: CreateReply,
-    ) -> Vec<Action> {
+    fn create(&mut self, caller: Caller, spec: wire::Create, reply: CreateReply) -> Vec<Action> {
         if reply.is_closed() {
             return Vec::new();
         }
-        if let Err(error) = self.sessions.insert(spec.session.clone(), caller, mode) {
+        if let Err(error) = self.sessions.insert(spec.session.clone(), caller) {
             return vec![Action::CreateFailed(reply, error)];
         }
         self.pending.insert(spec.session.clone(), reply);
@@ -204,11 +114,11 @@ impl Machine {
         command: wire::Command,
         reply: Reply,
     ) -> Vec<Action> {
-        if let Err(error) = self.sessions.write(&session, &caller, kind) {
+        if let Err(error) = self.sessions.write(&session, &caller) {
             return vec![Action::Reply(reply, Err(error))];
         }
         match kind {
-            Write::Input | Write::Committed | Write::Resize => {
+            Write::Input | Write::Resize => {
                 vec![Action::Drive { command, reply }]
             }
             Write::Close => {
@@ -226,13 +136,11 @@ impl Machine {
         session: String,
         caller: Caller,
         after: u64,
-        after_command: u64,
         reply: oneshot::Sender<Result<Replay, String>>,
     ) -> Vec<Action> {
         vec![Action::Replay(
             reply,
-            self.sessions
-                .replay(&session, &caller, after, after_command),
+            self.sessions.replay(&session, &caller, after),
         )]
     }
 
@@ -320,16 +228,10 @@ impl Runtime {
     /// Accepts an already-admitted executor specification, never raw client
     /// credentials. Request cancellation does not cancel the spawn job: its
     /// eventual completion is observed and compensated with a close.
-    pub async fn create(
-        &self,
-        caller: Caller,
-        mode: Mode,
-        spec: wire::Create,
-    ) -> Result<(), String> {
+    pub async fn create(&self, caller: Caller, spec: wire::Create) -> Result<(), String> {
         let (reply, result) = oneshot::channel();
         self.send(Request::Create {
             caller,
-            mode,
             spec,
             reply,
         })
@@ -352,27 +254,6 @@ impl Runtime {
             data_b64,
         };
         self.drive(session, caller, Write::Input, command).await
-    }
-
-    /// Submit canonical Chat messages after resolving the session channel's
-    /// owner. This is a service-internal lane, never a raw WebSocket command.
-    pub async fn committed(
-        &self,
-        session: String,
-        caller: Caller,
-        owner: chat::Party,
-        views: Vec<chat::MessageView>,
-    ) -> Result<(), String> {
-        let (reply, result) = oneshot::channel();
-        self.send(Request::Committed {
-            session,
-            caller,
-            owner,
-            views,
-            reply,
-        })
-        .await?;
-        result.await.map_err(|_| "terminal runtime stopped")?
     }
 
     pub async fn resize(
@@ -420,30 +301,17 @@ impl Runtime {
         result.await.map_err(|_| "terminal runtime stopped")?
     }
 
-    pub async fn status(&self, session: String, caller: Caller) -> Result<Status, String> {
-        let (reply, result) = oneshot::channel();
-        self.send(Request::Status {
-            session,
-            caller,
-            reply,
-        })
-        .await?;
-        result.await.map_err(|_| "terminal runtime stopped")?
-    }
-
     pub async fn replay(
         &self,
         session: String,
         caller: Caller,
         after: u64,
-        after_command: u64,
     ) -> Result<Replay, String> {
         let (reply, result) = oneshot::channel();
         self.send(Request::Replay {
             session,
             caller,
             after,
-            after_command,
             reply,
         })
         .await?;
@@ -481,57 +349,15 @@ fn dispatch(
     });
 }
 
-async fn committed(
-    engine: &agent_service::Sessions,
-    session: &str,
-    commands: Vec<crate::consensus::Projected>,
-) -> Result<(), String> {
-    if commands.is_empty() {
-        return Ok(());
-    }
-    // One page occupies one lane item. Byte limits were checked before the
-    // cursor advanced; a valid page cannot overflow the frame-count budget.
-    let mut bytes = Vec::new();
-    for command in commands {
-        bytes.extend_from_slice(command.text.as_bytes());
-        bytes.push(b'\r');
-    }
-    let input = wire::Command::TermInput {
-        session: session.into(),
-        data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
-    };
-    match engine.dispatch(input).await {
-        Some(refusal) => Err(format!("executor refused committed command: {refusal:?}")),
-        None => Ok(()),
-    }
-}
-
 async fn execute(
     actions: Vec<Action>,
     engine: &agent_service::Sessions,
     creates: &mut JoinSet<Option<String>>,
     closes: &mut JoinSet<Option<String>>,
     changes: &watch::Sender<()>,
-    machine: &mut Machine,
 ) -> bool {
-    let mut actions = VecDeque::from(actions);
-    while let Some(action) = actions.pop_front() {
+    for action in actions {
         match action {
-            Action::Status(reply, result) => {
-                let _ = reply.send(result);
-            }
-            Action::Committed {
-                session,
-                commands,
-                reply,
-            } => {
-                changes.send_replace(());
-                let result = committed(engine, &session, commands).await;
-                if result.is_err() {
-                    actions.extend(machine.close(session));
-                }
-                let _ = reply.send(result);
-            }
             Action::Create(spec) => {
                 dispatch(engine, creates, wire::Command::TermCreate(spec), None)
             }
@@ -606,16 +432,7 @@ async fn run(
                 Vec::new()
             }
         };
-        if !execute(
-            actions,
-            &engine,
-            &mut creates,
-            &mut closes,
-            &changes,
-            &mut machine,
-        )
-        .await
-        {
+        if !execute(actions, &engine, &mut creates, &mut closes, &changes).await {
             break Ok(());
         }
     };
@@ -648,65 +465,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn refused_committed_input_marks_closing_before_another_request() {
-        let directory = tempfile::tempdir().unwrap();
-        let (events, _receiver) = mpsc::channel(8);
-        let engine = agent_service::Sessions::new(
-            provider_host::ProviderSet::empty(),
-            "test".into(),
-            directory.path().into(),
-            events,
-        );
-        let mut machine = Machine::default();
-        let owner = Caller::Account {
-            account: 7,
-            node: [1; 32],
-        };
-        let session = "0000000000000001".to_string();
-        machine
-            .sessions
-            .insert(session.clone(), owner.clone(), Mode::Shared)
-            .unwrap();
-        machine.sessions.created(&session);
-        let (reply, result) = oneshot::channel();
-        let (changes, _) = watch::channel(());
-        let mut creates = JoinSet::new();
-        let mut closes = JoinSet::new();
-        execute(
-            vec![Action::Committed {
-                session: session.clone(),
-                commands: vec![crate::consensus::Projected {
-                    seq: 1,
-                    origin: "acct:7".into(),
-                    text: "test".into(),
-                }],
-                reply,
-            }],
-            &engine,
-            &mut creates,
-            &mut closes,
-            &changes,
-            &mut machine,
-        )
-        .await;
-        assert!(result.await.unwrap().is_err());
-        assert!(
-            machine
-                .sessions
-                .write(&session, &owner, Write::Resize)
-                .is_err()
-        );
-        assert!(
-            machine
-                .sessions
-                .write(&session, &owner, Write::Close)
-                .is_err()
-        );
-        assert_eq!(closes.len(), 1);
-        closes.join_next().await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
     async fn successful_reply_send_keeps_ownership_until_the_caller_acknowledges() {
         let directory = tempfile::tempdir().unwrap();
         let (events, _rx) = mpsc::channel(1);
@@ -729,7 +487,6 @@ mod tests {
             &mut creates,
             &mut closes,
             &changes,
-            &mut Machine::default(),
         )
         .await;
         assert!(

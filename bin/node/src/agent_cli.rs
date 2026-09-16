@@ -344,9 +344,7 @@ fn resolve_destination(
     };
     let published = record
         .filter(|record| record.statement.route.is_some())
-        .ok_or_else(|| {
-            format!("account {account} publishes no live gateway route {label:?}")
-        })?;
+        .ok_or_else(|| format!("account {account} publishes no live gateway route {label:?}"))?;
     Ok(Destination {
         account,
         name,
@@ -414,8 +412,8 @@ fn create_session(
         false,
     );
     let text = operator_proxy(base, operator, &head, &payload)?;
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|_| format!("create reply is not JSON: {text}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| format!("create reply is not JSON: {text}"))?;
     Ok(value["session_id"]
         .as_str()
         .ok_or_else(|| format!("create reply missing session_id: {text}"))?
@@ -457,12 +455,15 @@ fn operator_proxy(
     let upstream = reply["head"]["status"]
         .as_u64()
         .ok_or_else(|| format!("gateway reply missing an upstream status: {text}"))?;
-    let served = String::from_utf8(
-        STANDARD.decode(reply["body_b64"].as_str().unwrap_or_default())?,
-    )?;
+    let served =
+        String::from_utf8(STANDARD.decode(reply["body_b64"].as_str().unwrap_or_default())?)?;
     let refused = !(200..300).contains(&upstream);
     if refused {
-        return Err(format!("the terminal service refused ({upstream}): {}", error_field(&served)).into());
+        return Err(format!(
+            "the terminal service refused ({upstream}): {}",
+            error_field(&served)
+        )
+        .into());
     }
     Ok(served)
 }
@@ -475,35 +476,6 @@ fn with_operator(
     match operator {
         Some(token) => request.header(noded::admin::ADMIN_TOKEN_HEADER, token),
         None => request,
-    }
-}
-
-/// What this attachment has actually CONSUMED — the resume position, and the
-/// only thing a reconnect may present.
-///
-/// The two sequences are independent: `output` counts raw pty chunks, `command`
-/// counts the committed command log a shared session carries. A snapshot's
-/// `head`/`command_head` are BOUNDS it announces, never receipts — this cursor
-/// advances on the frame that was written to the terminal, so a socket that dies
-/// between the bound and its frames resumes at the byte the operator last saw.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-struct Cursor {
-    output: u64,
-    command: u64,
-}
-
-/// The bound an ENDED snapshot announced. The session is over once the cursor
-/// has consumed every frame up to it — reading `ended` is not the same as having
-/// read the final screen the service already queued behind it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Complete {
-    output: u64,
-    command: u64,
-}
-
-impl Complete {
-    fn reached(self, cursor: Cursor) -> bool {
-        cursor.output >= self.output && cursor.command >= self.command
     }
 }
 
@@ -556,7 +528,12 @@ async fn attach(
     let mut hup = signal(SignalKind::hangup()).map_err(|e| format!("SIGHUP: {e}"))?;
 
     let _raw = crate::tty::RawGuard::enter();
-    let mut cursor = Cursor::default();
+    // What this attachment has actually CONSUMED — the resume position, and the
+    // only thing a reconnect may present. A snapshot's `head` is a BOUND it
+    // announces, never a receipt: this advances on the frame that was written
+    // to the terminal, so a socket that dies between the bound and its frames
+    // resumes at the byte the operator last saw.
+    let mut cursor = 0u64;
     let outcome = loop {
         let detached = attached(
             base,
@@ -575,7 +552,9 @@ async fn attach(
             // a redial that consumed nothing consumed nothing the next one
             // would either: report the loss instead of looping on it.
             Detached::Dropped { served: 0 } => {
-                break Err("the terminal attachment dropped before the service served a frame".into());
+                break Err(
+                    "the terminal attachment dropped before the service served a frame".into(),
+                );
             }
             Detached::Dropped { .. } => continue,
         }
@@ -610,7 +589,7 @@ async fn attached(
     operator: Option<&str>,
     destination: &Destination,
     session: &str,
-    cursor: &mut Cursor,
+    cursor: &mut u64,
     typed: &mut Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     winch: &mut tokio::signal::unix::Signal,
     term: &mut tokio::signal::unix::Signal,
@@ -623,10 +602,7 @@ async fn attached(
     let head = operator_head(
         destination,
         gateway::RouteMethod::Get,
-        format!(
-            "/sessions/{session}?after={}&after_command={}",
-            cursor.output, cursor.command
-        ),
+        format!("/sessions/{session}?after={cursor}"),
         Vec::new(),
         0,
         true,
@@ -644,7 +620,7 @@ async fn attached(
     let mut served = 0u64;
     // `Some` once a snapshot reported the session over; the loop still drains
     // that snapshot's frames before it agrees.
-    let mut complete: Option<Complete> = None;
+    let mut complete: Option<u64> = None;
     loop {
         tokio::select! {
             frame = socket.1.next() => {
@@ -663,7 +639,7 @@ async fn attached(
                     Served::Snapshot(bound) => complete = bound,
                     Served::Nothing => {}
                 }
-                if complete.is_some_and(|bound| bound.reached(*cursor)) {
+                if complete.is_some_and(|bound| *cursor >= bound) {
                     return Ok(Detached::Ended);
                 }
             }
@@ -682,7 +658,10 @@ async fn attached(
     }
     // the operator ended it: ask the service to close the session rather than
     // leaving a pty running behind a socket this process is about to drop.
-    let _ = socket.0.send(Message::text(CLOSE_COMMAND.to_string())).await;
+    let _ = socket
+        .0
+        .send(Message::text(CLOSE_COMMAND.to_string()))
+        .await;
     let _ = socket.0.close().await;
     Ok(Detached::Ended)
 }
@@ -697,9 +676,10 @@ async fn open_attachment(
     base: &str,
     operator: Option<&str>,
     head: &gateway::ProxyRequestHead,
-) -> Result<tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->, Box<dyn std::error::Error>> {
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Box<dyn std::error::Error>,
+> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
     let encoded = gateway::encode_proxy_request_head(head)?;
@@ -731,10 +711,12 @@ async fn open_attachment(
 enum Served {
     /// raw pty bytes to write.
     Output(Vec<u8>),
-    /// a replay snapshot: `Some` when it reported the session over.
-    Snapshot(Option<Complete>),
-    /// a command log entry, a command result, or anything else this client does
-    /// not draw.
+    /// a replay snapshot: `Some(head)` when it reported the session over. The
+    /// session is over once the cursor has consumed every frame up to that
+    /// head — reading `ended` is not the same as having read the final screen
+    /// the service already queued behind it.
+    Snapshot(Option<u64>),
+    /// a command result, or anything else this client does not draw.
     Nothing,
 }
 
@@ -743,7 +725,7 @@ enum Served {
 /// A refused command (`result` with an `Err`) is reported and does NOT end the
 /// attachment: a resize the service declined is not a dead session, and the
 /// `ended` bound is the one thing that says a session is over.
-fn serve_frame(text: &str, cursor: &mut Cursor) -> Result<Served, Box<dyn std::error::Error>> {
+fn serve_frame(text: &str, cursor: &mut u64) -> Result<Served, Box<dyn std::error::Error>> {
     let frame: serde_json::Value = match serde_json::from_str(text) {
         Ok(frame) => frame,
         Err(_) => return Ok(Served::Nothing),
@@ -754,14 +736,8 @@ fn serve_frame(text: &str, cursor: &mut Cursor) -> Result<Served, Box<dyn std::e
                 return Ok(Served::Nothing);
             };
             let bytes = STANDARD.decode(frame["data_b64"].as_str().unwrap_or_default())?;
-            cursor.output = cursor.output.max(seq);
+            *cursor = (*cursor).max(seq);
             Ok(Served::Output(bytes))
-        }
-        Some("command") => {
-            if let Some(seq) = frame["seq"].as_u64() {
-                cursor.command = cursor.command.max(seq);
-            }
-            Ok(Served::Nothing)
         }
         Some("replay") => Ok(Served::Snapshot(snapshot_bound(&frame, *cursor))),
         Some("result") => {
@@ -781,20 +757,20 @@ fn serve_frame(text: &str, cursor: &mut Cursor) -> Result<Served, Box<dyn std::e
 /// cursor means the frames between them are gone, which is a visible hole in the
 /// terminal — say so once, where it happened, rather than printing bytes that
 /// silently skip.
-fn snapshot_bound(frame: &serde_json::Value, cursor: Cursor) -> Option<Complete> {
-    let first = frame["first"].as_u64().unwrap_or(cursor.output + 1);
-    let lost = first > cursor.output + 1;
+fn snapshot_bound(frame: &serde_json::Value, cursor: u64) -> Option<u64> {
+    let first = frame["first"].as_u64().unwrap_or(cursor + 1);
+    let lost = first > cursor + 1;
     if lost {
         eprint!(
             "\r\n-- output {}..{} was dropped by the terminal service\r\n",
-            cursor.output + 1,
+            cursor + 1,
             first - 1
         );
     }
-    frame["ended"].as_bool().unwrap_or(false).then(|| Complete {
-        output: frame["head"].as_u64().unwrap_or(cursor.output),
-        command: frame["command_head"].as_u64().unwrap_or(cursor.command),
-    })
+    frame["ended"]
+        .as_bool()
+        .unwrap_or(false)
+        .then(|| frame["head"].as_u64().unwrap_or(cursor))
 }
 
 /// the tty window size (cols, rows), or an 80x24 fallback when the ioctl fails.
@@ -1324,7 +1300,14 @@ mod tests {
         use clap::{Args as _, FromArgMatches as _};
         let pty = PtyArgs::augment_args(clap::Command::new("pty"))
             .try_get_matches_from([
-                "pty", "pi", "--account", "12", "--route", "terminal", "--cred", "work",
+                "pty",
+                "pi",
+                "--account",
+                "12",
+                "--route",
+                "terminal",
+                "--cred",
+                "work",
             ])
             .unwrap();
         assert_eq!(
@@ -1426,27 +1409,18 @@ mod tests {
     /// signed uri query carries, so the whole path is what the operator
     /// credential covers.
     #[test]
-    fn an_attachment_head_is_a_bodyless_upgrade_carrying_both_cursors() {
-        let cursor = Cursor {
-            output: 41,
-            command: 3,
-        };
+    fn an_attachment_head_is_a_bodyless_upgrade_carrying_its_cursor() {
+        let cursor = 41u64;
         let head = operator_head(
             &destination(),
             gateway::RouteMethod::Get,
-            format!(
-                "/sessions/{}?after={}&after_command={}",
-                "0000000000000001", cursor.output, cursor.command
-            ),
+            format!("/sessions/{}?after={cursor}", "0000000000000001"),
             Vec::new(),
             0,
             true,
         );
         gateway::validate_proxy_request_head(&head).unwrap();
-        assert_eq!(
-            head.path_and_query,
-            "/sessions/0000000000000001?after=41&after_command=3"
-        );
+        assert_eq!(head.path_and_query, "/sessions/0000000000000001?after=41");
         assert_eq!(head.body_len, 0);
         assert!(head.upgrade);
     }
@@ -1456,17 +1430,16 @@ mod tests {
     /// `replay` head and its chunks must resume at the last byte SHOWN.
     #[test]
     fn the_cursor_advances_only_past_frames_this_terminal_consumed() {
-        let mut cursor = Cursor::default();
+        let mut cursor = 0u64;
         let snapshot = serde_json::json!({
             "event": "replay", "first": 1, "head": 3, "ended": false,
-            "command_first": 1, "command_head": 0,
         })
         .to_string();
         assert!(matches!(
             serve_frame(&snapshot, &mut cursor).unwrap(),
             Served::Snapshot(None)
         ));
-        assert_eq!(cursor, Cursor::default(), "a head is a bound, not a receipt");
+        assert_eq!(cursor, 0, "a head is a bound, not a receipt");
 
         let chunk = serde_json::json!({
             "event": "output", "seq": 1, "data_b64": STANDARD.encode(b"hi"),
@@ -1476,21 +1449,7 @@ mod tests {
             panic!("output frame");
         };
         assert_eq!(bytes, b"hi");
-        assert_eq!(cursor.output, 1);
-        assert_eq!(cursor.command, 0, "command seq is independent of output seq");
-
-        let command = serde_json::json!({
-            "event": "command", "seq": 4, "origin": "acct:12", "text": "ls",
-        })
-        .to_string();
-        assert!(matches!(
-            serve_frame(&command, &mut cursor).unwrap(),
-            Served::Nothing
-        ));
-        assert_eq!(cursor, Cursor {
-            output: 1,
-            command: 4
-        });
+        assert_eq!(cursor, 1);
     }
 
     /// An `ended` snapshot is a bound too: the final screen the service already
@@ -1498,16 +1457,15 @@ mod tests {
     /// when the cursor REACHES the bound, not when it reads it.
     #[test]
     fn an_ended_snapshot_ends_the_attachment_only_once_its_frames_are_drained() {
-        let mut cursor = Cursor::default();
+        let mut cursor = 0u64;
         let ended = serde_json::json!({
             "event": "replay", "first": 1, "head": 2, "ended": true,
-            "command_first": 1, "command_head": 0,
         })
         .to_string();
         let Served::Snapshot(Some(bound)) = serve_frame(&ended, &mut cursor).unwrap() else {
             panic!("ended snapshot");
         };
-        assert!(!bound.reached(cursor));
+        assert!(cursor < bound);
         for seq in 1..=2 {
             let chunk = serde_json::json!({
                 "event": "output", "seq": seq, "data_b64": STANDARD.encode(b"x"),
@@ -1515,24 +1473,21 @@ mod tests {
             .to_string();
             serve_frame(&chunk, &mut cursor).unwrap();
         }
-        assert!(bound.reached(cursor));
+        assert!(cursor >= bound);
 
         // an already-drained ended snapshot ends the attachment immediately.
-        let mut drained = Cursor {
-            output: 2,
-            command: 0,
-        };
+        let mut drained = 2u64;
         let Served::Snapshot(Some(bound)) = serve_frame(&ended, &mut drained).unwrap() else {
             panic!("ended snapshot");
         };
-        assert!(bound.reached(drained));
+        assert!(drained >= bound);
     }
 
     /// A refused command is reported, never mistaken for the session ending —
     /// and an unknown frame is ignored rather than breaking the pump.
     #[test]
     fn a_refused_command_and_an_unknown_frame_both_keep_the_attachment() {
-        let mut cursor = Cursor::default();
+        let mut cursor = 0u64;
         for frame in [
             serde_json::json!({"event":"result","result":{"Err":"session is not running"}})
                 .to_string(),
@@ -1545,7 +1500,7 @@ mod tests {
                 Served::Nothing
             ));
         }
-        assert_eq!(cursor, Cursor::default());
+        assert_eq!(cursor, 0);
     }
 
     #[test]
@@ -1577,7 +1532,10 @@ mod tests {
             vec!["pty", "claude", "--route", "terminal"],
         ] {
             assert!(
-                command.clone().try_get_matches_from(missing.clone()).is_err(),
+                command
+                    .clone()
+                    .try_get_matches_from(missing.clone())
+                    .is_err(),
                 "{missing:?} must be refused"
             );
         }
