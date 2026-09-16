@@ -64,7 +64,7 @@ pub struct Fs<S: ObjectStore> {
     /// per-op DISTINCT committed-store read cap — [`MAX_OBJECT_READS_PER_OP`] in
     /// production, lowered only by the `#[doc(hidden)]` test override so the
     /// object-read budget boundary is exercised with a handful of pre-existing
-    /// directories instead of 4096. `commit` reads it into the per-op
+    /// directories instead of the whole cap. `commit` reads it into the per-op
     /// [`ReadBudget`]; the guest inherits it (same core) so both runtimes reject
     /// the identical oversized commit.
     pub(crate) object_read_cap: usize,
@@ -1876,7 +1876,8 @@ mod consensus_uniformity {
 // the wasm files tenant (which runs THIS core) reject the identical oversized
 // commit. driven at the shrunk cap through the `#[doc(hidden)]` test seam — the
 // same pattern the staging-quota / window / entry-cap boundary tests use — so a
-// handful of pre-existing directories exercises the boundary instead of 4096.
+// handful of pre-existing directories exercises the boundary instead of a cap's
+// worth of them.
 #[cfg(test)]
 mod object_read_budget {
     use base64::Engine as _;
