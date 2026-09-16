@@ -79,6 +79,27 @@ fi
 bash "$SCRIPT_DIR/demo-clear.sh" || die "could not clear the previous '$ID' workspace"
 log "creating a fresh '$ID' workspace at $WSDIR"
 mkdir -p "$WSDIR"
+
+# ── 2b. the network's OWN binary ───────────────────────────────
+# `cargo build` writes into a target directory every worktree on this box
+# shares, so the binary a named network runs is one sibling rebuild away from
+# being replaced under it — the same shared-state class as a poisoned founding
+# set. Copy the binary AND the founding set the build staged beside it into
+# the workspace, and run everything below from that copy: it lives and dies
+# with the network like every other file the network owns
+# (`make demo-clear` takes it with the rest), and the node resolves its
+# founding set as `<exe dir>/modules`, which is now the copy too.
+# $DUCKTAPE_NODE_BIN set explicitly keeps pointing wherever the operator aimed it.
+if [ -z "${DUCKTAPE_NODE_BIN:-}" ]; then
+  STAGED_MODULES="${DUCKTAPE_MODULES_DIR:-$(dirname "$NODE_BIN")/modules}"
+  [ -d "$STAGED_MODULES" ] || die "no founding set at $STAGED_MODULES — run cargo build -p node-bin"
+  mkdir -p "$WSDIR/bin" || die "cannot create $WSDIR/bin"
+  cp "$NODE_BIN" "$WSDIR/bin/ducktape" || die "cannot copy the node binary into $WSDIR/bin"
+  cp -R "$STAGED_MODULES" "$WSDIR/bin/modules" || die "cannot copy the founding set into $WSDIR/bin"
+  NODE_BIN="$WSDIR/bin/ducktape"
+  export DUCKTAPE_MODULES_DIR="$WSDIR/bin/modules"
+  log "this network runs its own copy of the binary: $NODE_BIN"
+fi
 # Free-port probe only — always loopback regardless of DEV_LISTEN, since it
 # never binds anything the node itself serves from.
 read -r P1 P2 P3 < <(bun -e 'const l=Array.from({length:3},()=>Bun.listen({hostname:"127.0.0.1",port:0,socket:{data(){}}}));process.stdout.write(l.map(x=>x.port).join(" ")+"\n");l.forEach(x=>x.stop())')

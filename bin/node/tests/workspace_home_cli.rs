@@ -62,6 +62,32 @@ fn init_defaults_into_the_home_and_n_selects_it() {
     assert!(err.contains("no workspace"), "run -n stderr: {err:?}");
 }
 
+/// `init` records the binary that founded the workspace, and `run` refuses a
+/// binary whose module WIT world is not that one — up front, naming both
+/// builds, instead of dying inside component instantiation once booted.
+#[test]
+fn run_refuses_a_binary_whose_module_world_is_not_the_founding_one() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let chain_id = init(home.path(), "wornet");
+    let record = home.path().join(&chain_id).join("founding.toml");
+    let founded = std::fs::read_to_string(&record).expect("init records the founding binary");
+    assert!(founded.contains("module_world"), "record: {founded:?}");
+
+    // the same workspace, founded by a binary that spoke another module world.
+    let foreign = format!("build = \"fc4ad8d5a\"\nmodule_world = \"{}\"\n", "0".repeat(64));
+    std::fs::write(&record, foreign).expect("rewrite the founding record");
+
+    let out = ducktape(home.path(), &["run", "-n", &chain_id]);
+    assert!(!out.status.success(), "run booted a foreign module world");
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        err.contains(&format!("refusing to boot {chain_id}"))
+            && err.contains("founded by fc4ad8d5a")
+            && err.contains("module world differs"),
+        "run stderr: {err:?}"
+    );
+}
+
 #[test]
 fn same_name_founds_two_distinct_workspaces() {
     let home = tempfile::tempdir().expect("tempdir");

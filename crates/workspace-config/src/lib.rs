@@ -1065,6 +1065,84 @@ pub fn sync_source_candidates<A>(
 }
 
 // ============================================================================
+// the founding record — `founding.toml`, the binary identity a workspace was
+// founded with. Node-local: never shared with a peer, never in the genesis
+// fingerprint, read by nothing but this node's own boot.
+// ============================================================================
+
+/// the founding record's file name inside a workspace.
+pub const FOUNDING_FILE: &str = "founding.toml";
+
+/// what the binary that materialized this workspace (`node init`, `node join`)
+/// wrote down about itself.
+///
+/// `module_world` is the whole comparison. A module component is compiled
+/// against the `ducktape:module` WIT world, and a host binding a different one
+/// cannot instantiate it — the failure lands deep in component instantiation
+/// ("type-checking export func `shape`"), reading like a compose bug rather
+/// than the binary skew it is. `build` is DISPLAY only: a different commit is
+/// fine, a different module world is not.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FoundingBinary {
+    /// the founding binary's build identity (`noded::services::build_identity`)
+    /// or `unknown` — named in the refusal, never compared.
+    pub build: String,
+    /// sha256 (hex) of the `ducktape:module` WIT world that binary speaks
+    /// (`wasm_host::module_world_digest`).
+    pub module_world: String,
+}
+
+impl FoundingBinary {
+    /// write the record into `dir`, atomically like every other workspace
+    /// identity file.
+    pub fn save(&self, dir: &Path) -> Result<(), String> {
+        let text = toml::to_string_pretty(self).expect("founding record serializes");
+        genesis::write_atomic(&dir.join(FOUNDING_FILE), text.as_bytes())
+    }
+
+    /// the record in `dir`, or `None` where there is none — the dev-seed
+    /// harness shape, which no `init`/`join` ever wrote one for.
+    pub fn load(dir: &Path) -> Result<Option<Self>, String> {
+        let path = dir.join(FOUNDING_FILE);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("read {path:?}: {e}")),
+        };
+        toml::from_str(&text)
+            .map(Some)
+            .map_err(|e| format!("{path:?}: {e}"))
+    }
+}
+
+/// refuse a boot whose module world is not the one `dir` was founded with.
+///
+/// Up front and by name, because the alternative is a node that comes up,
+/// replays, and dies inside component instantiation naming a `shape` export.
+/// There is no tolerance window and no migration: the operator rebuilds the
+/// binary from the founding commit, or re-founds the network.
+pub fn guard_founding_binary(
+    dir: &Path,
+    chain_id: &str,
+    build: &str,
+    module_world: &str,
+) -> Result<(), String> {
+    let Some(founding) = FoundingBinary::load(dir)? else {
+        return Ok(());
+    };
+    let speaks_the_founding_world = founding.module_world == module_world;
+    if speaks_the_founding_world {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to boot {chain_id}: founded by {}, running {build} (module world differs) — \
+         rebuild this binary from the founding commit, or re-found the network",
+        founding.build
+    ))
+}
+
+// ============================================================================
 // the ducktape home — one directory per network, `~/.ducktape/<id>/`, and
 // nothing else. A workspace is a network's WHOLE node home: node.toml,
 // network.toml, identity.key, keys/, guest/, executors/, capabilities/ and

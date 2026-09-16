@@ -621,6 +621,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     descriptor.save(&descriptor_path)?;
     config::write_node_toml(&dir, &plumbing)?;
+    record_founding_binary(&dir)?;
     eprintln!(
         "{} identity {}",
         if generated { "generated" } else { "reusing" },
@@ -648,6 +649,18 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("invite: ducktape node invite {selector}");
     println!("{chain_id}");
     Ok(())
+}
+
+/// stamp the binary that just materialized `dir` into the workspace's founding
+/// record — the identity `node run` refuses a disagreeing binary against
+/// (`config::guard_founding_binary`). Written by the two verbs that BRING a
+/// workspace into existence, `init` and `join`, and by nothing else.
+fn record_founding_binary(dir: &std::path::Path) -> Result<(), String> {
+    config::FoundingBinary {
+        build: noded::services::build_identity_or_unknown().to_string(),
+        module_world: wasm_host::module_world_digest().to_string(),
+    }
+    .save(dir)
 }
 
 /// install the genesis file a joiner was handed (`join --genesis <file>`) into
@@ -1952,6 +1965,7 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     };
     let overrides = args.plumbing.overrides();
     let joined = config::join_workspace(&blob, args.dir.clone(), &overrides)?;
+    record_founding_binary(&joined.dir)?;
     match (&genesis_bytes, joined.is_member) {
         (Some(bytes), _) => install_joiner_genesis(&joined.dir, bytes)?,
         (None, true) => {
