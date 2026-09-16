@@ -1,17 +1,17 @@
 //! Gateway-attested attachment to service-owned terminal sessions.
 use crate::{
     runtime::Runtime,
-    state::{Caller, Replay},
+    state::{Caller, Mode, Replay},
 };
 use axum::{
-    Router,
+    Json, Router,
     extract::{
         Path, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode},
     response::Response,
-    routing::get,
+    routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
@@ -22,6 +22,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, watch};
 
 pub struct Route {
+    pub node: [u8; 32],
     pub account: u64,
     pub label: String,
 }
@@ -41,6 +42,7 @@ pub fn router(route: Route, token: [u8; 64], runtime: Runtime) -> Result<Router,
         runtime,
     });
     Ok(Router::new()
+        .route("/sessions", post(create))
         .route("/sessions/{session}", get(upgrade))
         .with_state(service))
 }
@@ -84,6 +86,49 @@ fn caller(headers: &HeaderMap, token: &[u8; 64], config: &Route) -> Option<Calle
     }
     let account = field("x-duck-caller-account")?.parse().ok()?;
     Some(Caller::Account { account, node })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Create {
+    agent: String,
+    cpu: Option<u64>,
+    mem_gb: Option<u64>,
+}
+
+async fn create(
+    State(service): State<Arc<Service>>,
+    headers: HeaderMap,
+    Json(request): Json<Create>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let refuse = |status, error: &str| (status, Json(json!({"error":error})));
+    let owner = caller(&headers, &service.token, &service.route)
+        .ok_or_else(|| refuse(StatusCode::UNAUTHORIZED, "invalid_gateway_caller"))?;
+    let local_operator = owner
+        == Caller::Operator {
+            node: service.route.node,
+        };
+    if !local_operator {
+        return Err(refuse(StatusCode::FORBIDDEN, "not_local_operator"));
+    }
+    let session = format!("{:016x}", rand::random::<u64>());
+    let limits = crate::credential::build_limits(request.cpu, request.mem_gb);
+    service
+        .runtime
+        .create(
+            owner,
+            Mode::Single,
+            agent_service::wire::Create {
+                session: session.clone(),
+                provider: request.agent,
+                restricted: false,
+                limits,
+                credential: None,
+            },
+        )
+        .await
+        .map_err(|error| refuse(StatusCode::SERVICE_UNAVAILABLE, &error))?;
+    Ok(Json(json!({"session_id":session})))
 }
 
 #[derive(Default, Deserialize)]
@@ -239,6 +284,7 @@ mod tests {
     #[test]
     fn operator_identity_requires_the_installed_gateway_attestation() {
         let route = Route {
+            node: [1; 32],
             account: 7,
             label: "terminal".into(),
         };

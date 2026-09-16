@@ -172,6 +172,13 @@ executor. It runs the actual terminal executable through inherited-listener
 activation, readiness notification, token replacement, and signal shutdown.
 It does not boot an interactive guest session or install systemd units.
 
+The terminal service accepts `POST /sessions` with `agent` and optional `cpu`
+and `mem_gb` fields. The request must carry a Gateway-attested operator whose
+calling node equals the service's configured `identity`. It creates a local
+single-user terminal and returns `session_id` after the executor starts. The
+same node operator owns attachment input, resize, and close commands. Provider
+startup failures return an error instead of a session receipt.
+
 Terminal attachments use `/sessions/{session}?after=<output-seq>&after_command=<chat-seq>`.
 Both cursors default to zero. Replay metadata gives `first`, `head`,
 `command_first`, and `command_head`; following `command` frames carry `seq`,

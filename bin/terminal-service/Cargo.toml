@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+rand.workspace = true
 agent-service.workspace = true
 gateway.workspace = true
 ducktape-rpc.workspace = true
@@ -21,6 +22,7 @@ provider-host.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "net", "time", "signal", "rt-multi-thread"] }
 
 [dev-dependencies]
+reqwest.workspace = true
 tokio = { workspace = true, features = ["process"] }
 tempfile.workspace = true
 async-trait.workspace = true

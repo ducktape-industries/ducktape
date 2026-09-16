@@ -168,7 +168,14 @@ async fn main() -> Result<(), Error> {
     supervise(
         runtime.clone(),
         driver,
-        serve(listener, config.account, config.label, token, runtime),
+        serve(
+            listener,
+            config.identity,
+            config.account,
+            config.label,
+            token,
+            runtime,
+        ),
     )
     .await
 }
@@ -199,6 +206,7 @@ async fn supervise(
 #[cfg(unix)]
 async fn serve(
     listener: tokio::net::TcpListener,
+    node: [u8; 32],
     account: u64,
     label: String,
     token: [u8; 64],
@@ -211,7 +219,11 @@ async fn serve(
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
     let router = ducktape_terminal::http::router(
-        ducktape_terminal::http::Route { account, label },
+        ducktape_terminal::http::Route {
+            node,
+            account,
+            label,
+        },
         token,
         runtime,
     )?;
@@ -229,6 +241,7 @@ async fn serve(
 #[cfg(not(unix))]
 async fn serve(
     _: tokio::net::TcpListener,
+    _: [u8; 32],
     _: u64,
     _: String,
     _: [u8; 64],

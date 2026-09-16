@@ -14,6 +14,7 @@ async fn session_upgrade_requires_the_installed_gateway_route_and_caller() {
     );
     let app = router(
         Route {
+            node: [1; 32],
             account: 7,
             label: "terminal".into(),
         },
@@ -91,8 +92,7 @@ impl provider_host::Provider for Echo {
     }
 }
 
-#[tokio::test]
-async fn gateway_attachment_replays_after_disconnect_and_explicit_close_ends_the_pty() {
+fn providers() -> provider_host::ProviderSet {
     let spec = provider_host::CapabilitySpec::parse(
         r#"
         spec = 1
@@ -110,10 +110,15 @@ async fn gateway_attachment_replays_after_disconnect_and_explicit_close_ends_the
         "test",
     )
     .unwrap();
-    let providers = provider_host::ProviderSet::assemble(
+    provider_host::ProviderSet::assemble(
         provider_host::SpecSet::from_specs(vec![spec]),
         vec![Box::new(Echo)],
-    );
+    )
+}
+
+#[tokio::test]
+async fn gateway_attachment_replays_after_disconnect_and_explicit_close_ends_the_pty() {
+    let providers = providers();
     let directory = tempfile::tempdir().unwrap();
     let (runtime, driver) = Runtime::start(providers, "test".into(), directory.path().into());
     let owner = Caller::Account {
@@ -137,6 +142,7 @@ async fn gateway_attachment_replays_after_disconnect_and_explicit_close_ends_the
         .unwrap();
     let app = router(
         Route {
+            node: [1; 32],
             account: 7,
             label: "terminal".into(),
         },
@@ -252,4 +258,128 @@ async fn gateway_attachment_replays_after_disconnect_and_explicit_close_ends_the
     server.abort();
     let _ = server.await;
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn local_operator_creates_and_drives_a_service_owned_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, driver) = Runtime::start(providers(), "test".into(), directory.path().into());
+    let app = router(
+        Route {
+            node: [1; 32],
+            account: 7,
+            label: "terminal".into(),
+        },
+        [b'a'; 64],
+        runtime.clone(),
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut headers = request(address, 0).headers().clone();
+    headers.remove("x-duck-caller-account");
+    headers.insert("x-duck-caller-operator", "true".parse().unwrap());
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/sessions");
+    for (name, value, status) in [
+        ("x-duck-upstream-token", "b".repeat(64), 401),
+        ("x-duck-caller-node", "02".repeat(32), 403),
+        ("x-duck-caller-operator", "false".into(), 401),
+    ] {
+        let mut denied = headers.clone();
+        denied.insert(name, value.parse().unwrap());
+        let response = client
+            .post(&url)
+            .headers(denied)
+            .json(&json!({"agent":"echo"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status);
+    }
+    let mut account = headers.clone();
+    account.remove("x-duck-caller-operator");
+    account.insert("x-duck-caller-account", "7".parse().unwrap());
+    assert_eq!(
+        client
+            .post(&url)
+            .headers(account)
+            .json(&json!({"agent":"echo"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let response = client
+        .post(&url)
+        .headers(headers.clone())
+        .json(&json!({"agent":"echo","cpu":2,"mem_gb":4}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let reply: Value = response.json().await.unwrap();
+    let session = reply["session_id"].as_str().unwrap();
+    assert_eq!(session.len(), 16);
+    let mut attach = format!("ws://{address}/sessions/{session}")
+        .into_client_request()
+        .unwrap();
+    for name in [
+        "x-duck-upstream-token",
+        "x-duck-route-account",
+        "x-duck-route-label",
+        "x-duck-route-revision",
+        "x-duck-caller-node",
+        "x-duck-caller-operator",
+    ] {
+        attach.headers_mut().insert(name, headers[name].clone());
+    }
+    let (mut socket, _) = tokio_tungstenite::connect_async(attach).await.unwrap();
+    assert_eq!(receive(&mut socket).await["event"], "replay");
+    socket
+        .send(Message::Text(
+            json!({"op":"input", "data_b64":STANDARD.encode(b"created-over-http\n")}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let mut output = Vec::new();
+    loop {
+        let frame = receive(&mut socket).await;
+        if frame["event"] == "output" {
+            output.extend(
+                STANDARD
+                    .decode(frame["data_b64"].as_str().unwrap())
+                    .unwrap(),
+            );
+            if String::from_utf8_lossy(&output).contains("created-over-http") {
+                break;
+            }
+        }
+    }
+    socket
+        .send(Message::Text(json!({"op":"close"}).to_string()))
+        .await
+        .unwrap();
+    loop {
+        let frame = receive(&mut socket).await;
+        if frame["event"] == "replay" && frame["ended"] == true {
+            break;
+        }
+    }
+    assert!(
+        runtime
+            .replay(session.into(), Caller::Operator { node: [1; 32] }, 0, 0)
+            .await
+            .unwrap()
+            .ended
+    );
+    drop(socket);
+    runtime.stop().await.unwrap();
+    driver.await.unwrap().unwrap();
+    server.abort();
+    let _ = server.await;
 }

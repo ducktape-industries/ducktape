@@ -117,7 +117,7 @@ fn provider_contradicts_kind(provider: &str, kind: gateway::CredentialKind) -> b
 }
 
 /// `--cpu`/`--mem` → the container limit keys the sandbox backend enforces.
-fn build_limits(cpu: Option<u64>, mem_gb: Option<u64>) -> std::collections::BTreeMap<String, u64> {
+pub(crate) fn build_limits(cpu: Option<u64>, mem_gb: Option<u64>) -> std::collections::BTreeMap<String, u64> {
     let mut limits = std::collections::BTreeMap::new();
     if let Some(cores) = cpu {
         limits.insert("cores".to_string(), cores);
