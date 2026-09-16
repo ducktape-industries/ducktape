@@ -863,7 +863,7 @@ impl BoardsView {
             kit::spaced(kit::column("boards/help-body", rows), 6.),
         )
     }
-    fn canvas_color(&self) -> [f32; 4] {
+    pub(super) fn canvas_color(&self) -> [f32; 4] {
         kit::palette().background
     }
     fn status(&self) -> String {
@@ -1437,7 +1437,19 @@ impl BoardsView {
         };
         let (pos, size) = self.writing_box(board, s, box_);
         let body = match riding_a_line {
-            true => plate(id, label, &letters, alpha(p.surface, opacity), size),
+            // The plate's whole job is to rub the run out from under the
+            // words, and only the paper's own colour does that. A washed
+            // surface is a chip printed OVER the line instead — eight points
+            // of grey on a white board, which is a piece of UI sitting among
+            // the drawing. It comes from `canvas_color` so the wash and what
+            // it washes over can never be two decisions.
+            true => plate(
+                id,
+                label,
+                &letters,
+                alpha(self.canvas_color(), opacity),
+                size,
+            ),
             false => card_words(
                 id,
                 label,

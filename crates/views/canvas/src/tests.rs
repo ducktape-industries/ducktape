@@ -3664,3 +3664,45 @@ fn the_panel_offers_a_label_to_everything_that_can_carry_one() {
         "the panel's own button did not open the connector's label"
     );
 }
+
+/// The first node under `key` anywhere in the tree, so a test can ask what the
+/// painter actually built rather than what its serialisation reads like.
+fn node_at<'a>(node: &'a wire::Node, key: &str) -> Option<&'a wire::Node> {
+    if node.key() == Some(key) {
+        return Some(node);
+    }
+    node.children().iter().find_map(|child| node_at(child, key))
+}
+
+/// A connector's plate exists to rub the run out from under its words, and only
+/// the paper's own colour does that. Anything else is a chip printed over the
+/// line — which is what a canvas must never look like, and what a second colour
+/// token would drift into on its own.
+#[test]
+fn a_connectors_plate_is_the_paper_it_rubs_the_line_out_with() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "line".into(),
+        shape: Shape {
+            kind: Kind::Arrow,
+            points: vec![[0, 0], [300, 200]],
+            text: "routes to".into(),
+            ..Default::default()
+        },
+    });
+    let tree = view.view();
+    let plate = node_at(&tree, "boards/plate/line").expect("a labelled connector draws a plate");
+    let wire::Node::Container { background, .. } = plate else {
+        panic!("the plate is the container that carries the wash");
+    };
+    let Some(wire::Background::Color(wire::Rgba(wash))) = background else {
+        panic!("the plate was drawn with no wash at all: {background:?}");
+    };
+    assert_eq!(
+        *wash,
+        view.canvas_color(),
+        "the plate washed in something other than the board's own paper, so it \
+         printed a chip over the run instead of rubbing it out"
+    );
+}
