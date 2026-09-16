@@ -212,24 +212,24 @@ fn drain_editor(store: &crate::editor::wire::EditorStore, cx: &mut Context<ViewT
     }
 }
 
-/// The two editors a `Node::Editor` can mount: the line editor every view
-/// gets, or gpui-notion for the pages document.
+/// The two editors a `Node::Editor` can mount: the plain text field every
+/// view gets, or gpui-notion for the pages document.
 enum EditorView {
-    Wire(Entity<crate::editor::wire::WireEditor>),
+    Text(Entity<crate::editor::wire::TextEditor>),
     Notion(Entity<crate::editor::wire::NotionWireEditor>),
 }
 
 impl EditorView {
     fn sync(&self, window: &mut Window, cx: &mut App) {
         match self {
-            Self::Wire(view) => view.update(cx, |editor, cx| editor.sync(window, cx)),
+            Self::Text(view) => view.update(cx, |editor, cx| editor.sync(window, cx)),
             Self::Notion(view) => view.update(cx, |editor, cx| editor.sync(window, cx)),
         }
     }
 
     fn widget_command(&self, command: &wire::WidgetCommand, window: &mut Window, cx: &mut App) {
         match self {
-            Self::Wire(view) => view.update(cx, |editor, cx| {
+            Self::Text(view) => view.update(cx, |editor, cx| {
                 editor.widget_command(command, window, cx);
             }),
             Self::Notion(view) => view.update(cx, |editor, cx| {
@@ -238,12 +238,12 @@ impl EditorView {
         }
     }
 
-    /// The guest echoes which editor held focus when the frame was built,
-    /// so a rebuilt line editor can put its caret back. The notion editor is
-    /// one persistent entity: it keeps its own focus, and re-focusing it here
+    /// The guest echoes which editor held focus when the frame was built, so
+    /// the field it named takes the caret back. The notion editor is one
+    /// persistent entity: it keeps its own focus, and re-focusing it here
     /// would steal the caret from whatever the guest focused this frame.
     fn restore_focus(&self, key: &str, window: &mut Window, cx: &mut App) {
-        let Self::Wire(view) = self else {
+        let Self::Text(view) = self else {
             return;
         };
         let focus = wire::WidgetCommand::Focus {
@@ -256,14 +256,14 @@ impl EditorView {
 
     fn is_focused(&self, window: &Window, cx: &App) -> bool {
         match self {
-            Self::Wire(view) => view.read(cx).is_focused(window, cx),
+            Self::Text(view) => view.read(cx).is_focused(window, cx),
             Self::Notion(view) => view.read(cx).is_focused(window, cx),
         }
     }
 
     fn element(&self) -> AnyElement {
         match self {
-            Self::Wire(view) => view.clone().into_any_element(),
+            Self::Text(view) => view.clone().into_any_element(),
             Self::Notion(view) => view.clone().into_any_element(),
         }
     }
@@ -2743,11 +2743,11 @@ impl ViewTree {
                 }
                 false => {
                     let view = cx.new(|cx| {
-                        crate::editor::wire::WireEditor::new(key.clone(), store, window, cx)
+                        crate::editor::wire::TextEditor::new(key.clone(), store, window, cx)
                     });
                     let subscription =
                         cx.subscribe(&view, move |_, _, _: &(), cx| drain_editor(&events, cx));
-                    (EditorView::Wire(view), subscription)
+                    (EditorView::Text(view), subscription)
                 }
             };
             self.editors.insert(

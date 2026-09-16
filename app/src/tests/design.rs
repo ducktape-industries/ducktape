@@ -98,12 +98,17 @@ fn a_tree_at_the_wire_depth_cap_renders_on_the_main_thread_stack() {
         .join()
         .unwrap();
 }
+/// A guest editor with no block furniture is ONE native field, not a stack of
+/// one-line fields: selecting across two lines, joining them with Backspace
+/// and walking by word are the editing engine's, and a mount that splits the
+/// document across fields cannot hand any of them back.
 #[test]
-fn native_editor_projects_document_lines_without_losing_source_positions() {
-    let host = rust_tokens(include_str!("../editor/blocks.rs"));
-    assert!(host.contains("line_projections("));
-    assert!(host.contains("format.size"));
-    assert!(host.contains("source_at("));
+fn a_plain_guest_editor_is_one_field_over_the_whole_document() {
+    let editor = rust_tokens(include_str!("../editor/text.rs"));
+    assert!(editor.contains("input:Entity<TextareaState>"));
+    assert!(editor.contains("Textarea::new(&self.input)"));
+    assert!(editor.contains("input.set_value(text.to_string(),window,cx);"));
+    assert!(!editor.contains("Vec<LineInput>"));
 }
 #[test]
 fn shell_keeps_opaque_window_and_alpha_authored_content() {
@@ -115,62 +120,17 @@ fn shell_keeps_opaque_window_and_alpha_authored_content() {
     assert!(renderer.contains("wire::Background::Color"));
     assert!(renderer.contains("let[r,g,b,a]=color.0"));
 }
-/// The editor's floating menu hangs below its row, over the rows that
-/// follow; those paint later, so the menu must paint last (deferred), take
-/// the clicks that land on it (occlude), and show the item the keys walked.
-#[test]
-fn the_editor_menu_paints_over_the_rows_below_it_and_shows_the_walked_item() {
-    let editor = rust_tokens(include_str!("../editor/blocks.rs"));
-    assert!(editor.contains("deferred(menu_view).with_priority(1)"));
-    assert!(editor.contains(".rounded(theme.radius_tokens().md).occlude()"));
-    assert!(editor.contains("letwalked=item_indexasu32==menu.selected;"));
-    assert!(editor.contains(".when(walked,|row|row.bg(raised))"));
-    assert!(editor.contains(".hover(move|style|style.bg(raised))"));
-}
 /// The shell's keystroke interceptor runs before the guest editor's and cannot
-/// be stopped by it, so the editor's rows sit in a key context the shell reads
-/// off the stack to yield the chords a guest claims: Ctrl+K is a link in the
+/// be stopped by it, so the field sits in a key context the shell reads off
+/// the stack to yield the chords a guest claims: Ctrl+K is a link in the
 /// editor, and the search palette must not open over it.
 #[test]
 fn the_shell_yields_the_palette_chord_inside_a_guest_editor() {
-    let editor = rust_tokens(include_str!("../editor/blocks.rs"));
+    let editor = rust_tokens(include_str!("../editor/text.rs"));
     assert!(editor.contains(".key_context(GUEST_EDITOR_CONTEXT)"));
     let shell = rust_tokens(include_str!("../shell.rs"));
     assert!(shell.contains("context.contains(crate::editor::wire::GUEST_EDITOR_CONTEXT)"));
     assert!(shell.contains("leteditor_claims_the_chord=in_guest_editor&&palette==\"open\";"));
-}
-/// A row's gutter — the `+` and the handle — paints only while the pointer is
-/// over that row, Notion's way; a page never shows every row's handles at once.
-#[test]
-fn the_row_gutter_shows_on_hover_only() {
-    let editor = rust_tokens(include_str!("../editor/blocks.rs"));
-    assert!(editor.contains(".group(format!(\"row-{index}\"))"));
-    assert!(editor.contains(".opacity(0.).group_hover(format!(\"row-{index}\"),|style|style.opacity(1.))"));
-}
-/// A block's furniture is the host's widget, read off the line's prefix — a
-/// real checkbox that toggles, a bullet dot, a quote bar — and a code block
-/// is one plate: only the fences round corners, and no line draws an edge
-/// between two lines of the same plate.
-#[test]
-fn block_furniture_is_drawn_by_the_host_not_spelled_in_glyphs() {
-    let editor = rust_tokens(include_str!("../editor/blocks.rs"));
-    assert!(editor.contains("Shape::Todo{done}=>"));
-    assert!(editor.contains("EditorInteraction::LinePress{tag:1,"));
-    assert!(editor.contains("Shape::Bullet=>column.w(px(MARKER_COLUMN)).child(div().size(px(6.)).rounded_full()"));
-    assert!(editor.contains(".w(px(QUOTE_BAR))"));
-    assert!(editor.contains("Shape::Code=>body.border_l(width).border_r(width),"));
-    assert!(editor.contains("Shape::CodeOpen=>body.border_t(width).border_l(width).border_r(width).rounded_tl(radius).rounded_tr(radius),"));
-}
-/// The comment badge sits on its row's LAST line, above the reserve the row
-/// carries for an inline card: the guest hangs the card half a line under the
-/// pointer that pressed the badge, so a top-aligned badge on a wrapped row
-/// would put the card over the row's own remaining lines.
-#[test]
-fn the_comment_badge_sits_on_the_last_line_of_its_row() {
-    let editor = rust_tokens(include_str!("../editor/blocks.rs"));
-    let badge = editor.find("Button::new((\"comments\",index))").expect("the badge");
-    let before = &editor[badge.saturating_sub(400)..badge];
-    assert!(before.contains(".absolute().right(px(0.)).bottom(px(layout.padding.bottom))"), "{before}");
 }
 #[test]
 fn persistent_split_panes_have_native_resize_handles_and_cursor_feedback() {
@@ -213,7 +173,7 @@ fn native_sources_hold_to_the_design_system() {
     for source in [
         include_str!("../shell.rs"),
         include_str!("../view_tree.rs"),
-        include_str!("../editor/blocks.rs"),
+        include_str!("../editor/text.rs"),
     ] {
         let source = rust_tokens(source);
         assert!(!source.contains("ui_lang_runtime"));

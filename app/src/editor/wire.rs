@@ -585,9 +585,41 @@ fn native_key(text: &str, cursor: wire::EditorCursor, key: &wire::keyboard::KeyS
     Ok((vec![wire::EditorPatch { start_byte: start as u32, end_byte: end as u32, replacement: replacement.into() }], cursor))
 }
 
-#[path = "blocks.rs"]
-mod blocks;
+/// One native keystroke as the guest's key state. Both mounts read the same
+/// description: a chord a guest claimed is the same chord in either.
+pub(super) fn key_state(key: &gpui_kit::Keystroke) -> wire::keyboard::KeyState {
+    use wire::keyboard::{Key, Named};
+    let logical = match key.key.as_str() {
+        "enter" => Key::Named(Named::Enter),
+        "tab" => Key::Named(Named::Tab),
+        "backspace" => Key::Named(Named::Backspace),
+        "delete" => Key::Named(Named::Delete),
+        "escape" => Key::Named(Named::Escape),
+        "up" => Key::Named(Named::ArrowUp),
+        "down" => Key::Named(Named::ArrowDown),
+        "left" => Key::Named(Named::ArrowLeft),
+        "right" => Key::Named(Named::ArrowRight),
+        _ => Key::Character(key.key.clone()),
+    };
+    wire::keyboard::KeyState {
+        key: logical.clone(),
+        modified_key: logical,
+        physical_key: wire::keyboard::Physical::Unidentified(
+            wire::keyboard::NativeCode::Unidentified,
+        ),
+        location: wire::keyboard::Location::Standard,
+        modifiers: wire::keyboard::Modifiers {
+            shift: key.modifiers.shift,
+            control: key.modifiers.control,
+            alt: key.modifiers.alt,
+            logo: key.modifiers.platform,
+        },
+    }
+}
+
 #[path = "notion.rs"]
 mod notion;
-pub use blocks::{GUEST_EDITOR_CONTEXT, WireEditor};
+#[path = "text.rs"]
+mod text;
 pub use notion::{NOTION_DOCUMENT_KEY, NotionWireEditor, init as init_notion};
+pub use text::{GUEST_EDITOR_CONTEXT, TextEditor};
