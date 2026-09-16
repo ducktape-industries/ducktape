@@ -564,7 +564,7 @@ fn emptying_the_buffer_leaves_an_empty_title_and_no_blocks() {
 }
 
 #[test]
-fn line_spans_mirror_the_rendered_document_and_skip_subpages() {
+fn line_spans_mirror_the_rendered_document_and_count_subpages() {
     let blocks = [
         block("Heading 1", "title-ish", 0),
         block("Text", "para", 0),
@@ -578,28 +578,118 @@ fn line_spans_mirror_the_rendered_document_and_skip_subpages() {
         vec![
             ("title-ish".into(), 1, 1),
             ("para".into(), 2, 1),
-            ("a\nb".into(), 3, 4),
-            ("ship".into(), 7, 1),
+            ("a subpage".into(), 3, 1),
+            ("a\nb".into(), 4, 4),
+            ("ship".into(), 8, 1),
         ]
     );
     assert_eq!(block_at_line(&blocks, 0), "");
     assert_eq!(block_at_line(&blocks, 2), "para");
-    assert_eq!(block_at_line(&blocks, 5), "a\nb");
-    assert_eq!(block_at_line(&blocks, 7), "ship");
-    assert_eq!(block_at_line(&blocks, 8), "");
+    assert_eq!(block_at_line(&blocks, 3), "a subpage");
+    assert_eq!(block_at_line(&blocks, 6), "a\nb");
+    assert_eq!(block_at_line(&blocks, 8), "ship");
+    assert_eq!(block_at_line(&blocks, 9), "");
 }
 
+/// A subpage is a line of the document, where the writer made it — Notion's
+/// `/page`, not a list bolted under the body. It round-trips through the
+/// dialect like every other block, and the screen learns which line to mark
+/// as a link into that page.
 #[test]
-fn subpages_are_not_prose_and_never_reach_the_document() {
-    assert!(!is_prose(&block("Page", "a child page", 0)));
-    assert!(is_prose(&block("Text", "prose", 0)));
+fn a_subpage_is_a_line_of_the_document() {
     let blocks = [
         block("Text", "before", 0),
         block("Page", "a child page", 0),
         block("Text", "after", 0),
     ];
-    assert_eq!(page_markdown(&blocks), "before\nafter");
-    assert_eq!(stored_lines(&blocks).len(), 2);
+    assert_eq!(page_markdown(&blocks), "before\n>> a child page\nafter");
+    assert_eq!(stored_lines(&blocks).len(), 3);
+    assert_eq!(subpage_ids(&blocks), vec!["a child page".to_string()]);
+    assert_eq!(
+        document_body("title\nbefore\n>> a child page\nafter"),
+        vec![
+            line("Text", "before"),
+            line("Page", "a child page"),
+            line("Text", "after"),
+        ],
+        "and the buffer reads back as the same three blocks"
+    );
+}
+
+/// The module has no op that turns a paragraph into a page row, or a page
+/// into a paragraph: the plan refuses instead of writing something the node
+/// will reject, and the buffer resyncs.
+#[test]
+fn a_page_line_cannot_be_turned_into_another_block() {
+    let have = [
+        stored("b1", "Text", "before"),
+        StoredLine {
+            id: "b2".into(),
+            has_children: false,
+            line: line("Page", "a child page"),
+        },
+    ];
+    let plan = document_plan(&have, &document_body("title\nbefore\n- a child page"));
+    assert!(plan.ops.is_empty());
+    assert!(
+        plan.refusal.contains("is a page"),
+        "refusal was {:?}",
+        plan.refusal
+    );
+}
+
+/// `/` → "New page" turns the line it was typed on into a page line. No op
+/// turns a paragraph into a page, so the plan removes the line and inserts
+/// the page where it stood — unnamed, because the writer names it next.
+#[test]
+fn a_line_that_became_a_page_is_removed_and_inserted_as_one() {
+    let have = [
+        stored("b1", "Text", "Everything a new member needs."),
+        stored("b2", "Text", "/"),
+        stored("b3", "Page", "Onboarding"),
+    ];
+    let plan = document_plan(
+        &have,
+        &document_body("Handbook\nEverything a new member needs.\n>> \n>> Onboarding"),
+    );
+    assert_eq!(plan.refusal, "");
+    assert_eq!(
+        plan.ops,
+        vec![
+            BlockOp::Remove { id: "b2".into() },
+            BlockOp::Insert {
+                after: "b1".into(),
+                kind: "Page".into(),
+                text: String::new(),
+            },
+        ]
+    );
+}
+
+/// The page keeps its own row once it exists: naming it is a text edit, and
+/// the page line below it is never re-cut.
+#[test]
+fn naming_a_fresh_page_line_is_an_ordinary_text_edit() {
+    let have = [
+        stored("b1", "Text", "Everything a new member needs."),
+        StoredLine {
+            id: "p1".into(),
+            has_children: false,
+            line: line("Page", ""),
+        },
+    ];
+    let plan = document_plan(
+        &have,
+        &document_body("Handbook\nEverything a new member needs.\n>> Onboarding"),
+    );
+    assert_eq!(plan.refusal, "");
+    assert_eq!(
+        plan.ops,
+        vec![BlockOp::SetText {
+            id: "p1".into(),
+            text: "Onboarding".into(),
+        }]
+    );
 }
 
 #[test]

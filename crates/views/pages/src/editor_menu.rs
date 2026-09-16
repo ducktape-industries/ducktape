@@ -107,6 +107,27 @@ fn turned(document: &Doc, line: usize, tag: &str) -> Doc {
     next
 }
 
+/// The line becomes a fresh page line, and the caret lands in its title —
+/// what the writer types next is the page's name. A page is nobody's list
+/// item, so whatever marker the line wore goes with the slash text.
+fn paged(document: &Doc, line: usize) -> Doc {
+    let Some(text) = document.line(line) else {
+        return document.clone();
+    };
+    let trimmed = text.trim_start_matches([' ', '\t']);
+    if trimmed.starts_with("```") {
+        return document.clone();
+    }
+    let indent = &text[..text.len() - trimmed.len()];
+    let title = strip_marker(trimmed);
+    let marker = crate::document_sync::PAGE_MARKER;
+    let replacement = format!("{indent}{marker}{title}");
+    let start = document.offset(EditorPosition::new(line, 0));
+    let mut next = replace(document, start..start + text.len(), &replacement);
+    next.cursor = EditorCursor::at(line, indent.len() + marker.len() + title.len());
+    next
+}
+
 pub fn turn_from_slash(
     document: &Doc,
     line: usize,
@@ -327,6 +348,14 @@ const SLASH_EXTRAS: &[(&str, &str, &str)] = &[("mention", "Mention", "@"), ("emo
 /// that reopens the menu: picking it asks the host for a file, and the line
 /// it was typed on holds the picture once that file is on the network.
 const SLASH_UPLOADS: &[(&str, &str)] = &[(PICTURE, "Picture")];
+
+/// THE FIRST ROW OF THE PALETTE, as in Notion: a page inside this one. It is
+/// not a block turn — no `SetKind` reaches a page row — so the pick writes a
+/// fresh page line and the save path inserts the page it names.
+const SLASH_PAGE: &[(&str, &str)] = &[(NEW_PAGE, "New page")];
+
+/// The tag of the new-page pick.
+pub const NEW_PAGE: &str = "page";
 
 /// The tag of the picture pick, and the field of [`Intent`] it fills.
 pub const PICTURE: &str = "image";
@@ -881,6 +910,23 @@ impl Menu {
         slashed: bool,
         tag: &str,
     ) -> (EditorDecision, Self) {
+        // A page is made where it is named: the line becomes a page line, the
+        // caret lands in its empty title, and the save path inserts the page.
+        if tag == NEW_PAGE {
+            let Some(row) = document.line(line) else {
+                return (EditorDecision::Noop, self.closed());
+            };
+            let end = document.cursor.position.column as usize;
+            let picked_here = document.cursor.position.line as usize == line
+                && row.get(strip..end).is_some()
+                && (!slashed || row[strip..end].starts_with('/'));
+            if !picked_here {
+                return (EditorDecision::Noop, self.clone());
+            }
+            let offset = document.offset(EditorPosition::new(line, 0));
+            let stripped = replace(document, offset + strip..offset + end, "");
+            return (finish(document, paged(&stripped, line)), self.closed());
+        }
         // The picture's own line is cleared of what was typed to ask for it;
         // the file picker the intent opens fills it.
         if tag == PICTURE {
@@ -1167,7 +1213,12 @@ fn turn_items(filter: &str) -> Vec<(String, String)> {
 /// The slash palette: every block turn, then the two pickers.
 fn slash_items(filter: &str) -> Vec<(String, String)> {
     let lowered = filter.to_ascii_lowercase();
-    let mut items = turn_items(filter);
+    let mut items: Vec<(String, String)> = SLASH_PAGE
+        .iter()
+        .filter(|(tag, label)| matches_filter(tag, label, &lowered))
+        .map(|(tag, label)| ((*tag).to_owned(), (*label).to_owned()))
+        .collect();
+    items.extend(turn_items(filter));
     items.extend(
         SLASH_EXTRAS
             .iter()
@@ -1184,15 +1235,16 @@ fn slash_items(filter: &str) -> Vec<(String, String)> {
 }
 
 fn block_items(document: &Doc, line: usize) -> Option<Vec<(String, String)>> {
-    let on_fence = document
-        .line(line)?
-        .trim_start_matches([' ', '\t'])
-        .starts_with("```");
+    let row = document.line(line)?.trim_start_matches([' ', '\t']);
+    let on_fence = row.starts_with("```");
+    // A page is a row of its own on the node: nothing turns one into a
+    // paragraph, and "Reset formatting" is a turn by another name.
+    let on_page = row.starts_with(crate::document_sync::PAGE_MARKER);
     Some(
         BLOCK_ITEMS
             .iter()
             .copied()
-            .filter(|(tag, _)| !(on_fence && ["turn", "clear"].contains(tag)))
+            .filter(|(tag, _)| !((on_fence || on_page) && ["turn", "clear"].contains(tag)))
             .map(|(tag, label)| (tag.to_owned(), label.to_owned()))
             .collect(),
     )

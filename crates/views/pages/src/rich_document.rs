@@ -16,6 +16,8 @@ mod types {
     pub const CALLOUT: &str = "callout";
     pub const TOGGLE: &str = "details";
     pub const IMAGE: &str = "image";
+    /// A page inside this one, drawn where the writer made it.
+    pub const PAGE: &str = "page";
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MarkKind {
@@ -152,9 +154,22 @@ fn block_starts(text: &str) -> Vec<usize> {
     starts
 }
 
+/// A PAGE LINE IS WRITTEN FROM ITS PLAIN TITLE. The whole-line link the
+/// projection paints over it ([`link_page_blocks`]) is drawn, never spelled —
+/// so the line, its width and its columns must all read the title as it is.
+/// Let one of them spell the mark and the marker width
+/// (`line_of(…).len() - inline_of(…).len()`) disagrees with itself: it goes
+/// negative, and the caret lands past the end of the document.
+fn written_plain(block: &BlockContent) -> bool {
+    block.ty == types::PAGE
+}
+
 /// A byte offset in a block's plain text as the byte column of the same
 /// character in the block's fenced line, marker excluded.
 fn fenced_column(block: &BlockContent, plain: usize) -> usize {
+    if written_plain(block) {
+        return plain;
+    }
     let text = block.text.as_str();
     let mut out = 0;
     let mut at = 0;
@@ -252,7 +267,13 @@ fn block_of(rest: &str, indent: usize) -> BlockContent {
             })
             .with_indent(indent);
     }
-    // Longest first: `### ` must not be read as `# ` plus prose.
+    // A subpage's title is plain: no inline pass, so `*` and `_` in a page
+    // name stay in the name instead of italicising it.
+    if let Some(title) = rest.strip_prefix(crate::document_sync::PAGE_MARKER) {
+        return BlockContent::new(types::PAGE, title).with_indent(indent);
+    }
+    // Longest first: `### ` must not be read as `# ` plus prose, and `>> `
+    // must not be read as a quote of `> `.
     let markers: [(&str, &str, BlockAttrs); 11] = [
         ("### ", types::HEADING, BlockAttrs::level(3)),
         ("## ", types::HEADING, BlockAttrs::level(2)),
@@ -469,6 +490,11 @@ fn line_of(block: &BlockContent, ordinal: usize) -> String {
         types::BLOCKQUOTE => "> ".into(),
         types::CALLOUT => "!> ".into(),
         types::HORIZONTAL_RULE => return format!("{indent}---"),
+        // A subpage keeps its title exactly as it is typed — see
+        // [`written_plain`], which is what keeps `text` plain here.
+        types::PAGE => {
+            return format!("{indent}{}{text}", crate::document_sync::PAGE_MARKER);
+        }
         // A picture is its address and the words that stand in for it, in
         // Markdown's own shape: `![alt](src)`. Without a line of its own an
         // image block wrote an empty marker over empty text and the picture
@@ -501,6 +527,9 @@ fn line_of(block: &BlockContent, ordinal: usize) -> String {
 /// The block text with one fence per marked run. The dialect nests nothing,
 /// so a run wearing several marks keeps the one that reads strongest.
 fn inline_of(block: &BlockContent) -> String {
+    if written_plain(block) {
+        return block.text.clone();
+    }
     let text = block.text.as_str();
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
@@ -711,6 +740,9 @@ fn rich_position(blocks: &[BlockContent], at: wire::EditorPosition) -> wire::Edi
 }
 
 fn unfenced_column(block: &BlockContent, source: usize) -> usize {
+    if written_plain(block) {
+        return source;
+    }
     let mut plain = 0;
     let mut written = 0;
     for (range, kinds) in block.marks.runs() {
@@ -779,11 +811,93 @@ pub fn block_index(text: &str, line: u32) -> u32 {
         .unwrap_or(0) as u32
 }
 
+/// Each page block's whole title becomes a link into the page it names, in
+/// document order: `addresses` is the open page's children as the node last
+/// gave them. The mark is the projection's alone — [`line_of`] writes a page
+/// line from its plain text — so it never reaches the buffer as
+/// `[title](address)`.
+///
+/// ORDER, NOT LINE NUMBER. A line number is stale the moment the writer
+/// presses Enter above it, and a mark that outruns the block it lands on
+/// stops the view ("rich mark range"). A page line that has no address yet —
+/// one just typed, not yet saved — simply carries no link.
+pub fn link_page_blocks(document: &mut RichDocument, addresses: &[String]) {
+    let pages = document
+        .blocks
+        .iter_mut()
+        .filter(|block| block.kind == types::PAGE);
+    for (block, href) in pages.zip(addresses) {
+        if block.text.is_empty() {
+            continue;
+        }
+        block.marks = vec![RichMark {
+            start: 0,
+            end: block.text.len() as u32,
+            kind: "link".into(),
+            value: href.clone(),
+        }];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const DOCUMENT: &str = "Welcome\n# Heading\nPlain **bold** and *it* and `code`\n- one\n  - [x] nested\n1. first\n2. second\n> quote\n!> callout\n+ toggle\n---\n```rust\nfn main() {}\n```\nSee [docs](https://x.y) or https://a.b and @ada\n";
+
+    /// The nth page line wears the nth address the node gave, and a page line
+    /// the node has not seen yet — one just typed — wears none. Pairing by
+    /// order is what keeps a mark inside the block it lands on: a line number
+    /// is stale as soon as the writer presses Enter above it.
+    #[test]
+    fn a_page_line_takes_its_address_by_order_and_a_fresh_one_takes_none() {
+        let text = "Title\n>> Saved\nprose\n>> Just typed";
+        let mut document = presentation(text, wire::EditorCursor::default()).document;
+        link_page_blocks(&mut document, &["duck://page/saved".to_string()]);
+        let linked: Vec<(&str, usize)> = document
+            .blocks
+            .iter()
+            .map(|block| (block.text.as_str(), block.marks.len()))
+            .collect();
+        assert_eq!(
+            linked,
+            [("Title", 0), ("Saved", 1), ("prose", 0), ("Just typed", 0)]
+        );
+        assert_eq!(document.blocks[1].marks[0].end, "Saved".len() as u32);
+        // and the buffer is untouched by the mark: it is drawn, never typed
+        assert_eq!(canonical(&document).expect("round trip").0, text);
+    }
+
+    /// The link a page line wears is DRAWN, so the caret must measure the
+    /// `>> ` marker and nothing else. Spelling the mark made the marker width
+    /// negative and put the caret past the end of the document.
+    #[test]
+    fn a_linked_page_line_measures_only_its_marker() {
+        let text = "Title\n>> Release checklist\ntail";
+        let at = wire::EditorPosition {
+            line: 1,
+            column: ">> Release".len() as u32,
+        };
+        let mut document = presentation(
+            text,
+            wire::EditorCursor {
+                position: at,
+                selection: None,
+            },
+        )
+        .document;
+        link_page_blocks(&mut document, &["duck://page/release?net=d0cdf950".into()]);
+        assert_eq!(
+            document.cursor.position,
+            wire::EditorPosition {
+                line: 1,
+                column: "Release".len() as u32
+            }
+        );
+        let (source, cursor) = canonical(&document).expect("round trip");
+        assert_eq!(source, text);
+        assert_eq!(cursor.position, at);
+    }
 
     #[test]
     fn rich_wire_round_trip_preserves_code_and_marked_selection_coordinates() {

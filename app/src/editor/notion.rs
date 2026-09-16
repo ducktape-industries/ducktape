@@ -39,6 +39,88 @@ pub fn init(cx: &mut App) {
     // Over the library's own image block, which draws its `src` with `img` —
     // and no image loader can fetch a `duck://` address.
     BlockRegistry::register(cx, DocumentImage);
+    // A block the library has no notion of: a page inside this one.
+    BlockRegistry::register(cx, DocumentPage);
+}
+
+/// A subpage, on the line the writer made it on. Its text is the page's own
+/// title — editing it renames the page — and the guest marks the whole line
+/// as a link into that page, so pressing it opens the page through the same
+/// plane every other document link uses.
+struct DocumentPage;
+
+impl BlockSpec for DocumentPage {
+    fn type_name(&self) -> &'static str {
+        "page"
+    }
+
+    fn label(&self, _: &BlockAttrs) -> SharedString {
+        "Page".into()
+    }
+
+    fn caps(&self) -> BlockCaps {
+        BlockCaps {
+            // A page title is a name, not prose: no bold, no input rules
+            // turning "1. " into a list inside it. The link the guest puts
+            // over the whole line survives regardless — it is drawn, never
+            // typed.
+            marks: false,
+            input_rules: false,
+            ..BlockCaps::default()
+        }
+    }
+
+    /// A marker slot of its own, or `render_leading` draws into nothing.
+    fn layout(&self, _: &BlockAttrs, theme: &EditorTheme) -> BlockLayout {
+        BlockLayout {
+            leading_width: theme.marker_width,
+            ..BlockLayout::new(theme)
+        }
+    }
+
+    fn placeholder(&self, _: &BlockAttrs) -> SharedString {
+        "Untitled".into()
+    }
+
+    /// A page with no name still reads as a page, focused or not.
+    fn placeholder_always(&self) -> bool {
+        true
+    }
+
+    fn render_leading(
+        &self,
+        ctx: &BlockContext,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        // Drawn, not a glyph: the bundled font carries no page character, and
+        // one that falls back renders as an empty box or nothing at all. Two
+        // ruled lines inside, or a bare outline reads as an unticked to-do.
+        let ink = cx.theme().muted_foreground;
+        let rule = || div().w(px(5.)).h(px(1.)).bg(ink);
+        let sheet = div()
+            .w(px(10.))
+            .h(px(13.))
+            .rounded(px(2.))
+            .border_1()
+            .border_color(ink)
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(2.))
+            .child(rule())
+            .child(rule());
+        Some(
+            div()
+                .w(ctx.leading_width)
+                .h(ctx.line_height)
+                .flex()
+                .items_center()
+                .child(sheet)
+                .into_any_element(),
+        )
+    }
 }
 
 /// How tall a picture may draw. A page is read top to bottom, so a portrait
@@ -670,7 +752,9 @@ pub(super) fn validate_rich(
 fn supported_block(kind: &str) -> Result<(), &'static str> {
     match kind {
         "paragraph" | "heading" | "bulletList" | "orderedList" | "taskList" | "blockquote"
-        | "codeBlock" | "horizontalRule" | "callout" | "details" | "image" | "table" => Ok(()),
+        | "codeBlock" | "horizontalRule" | "callout" | "details" | "image" | "page" | "table" => {
+            Ok(())
+        }
         _ => Err("unsupported rich block kind"),
     }
 }

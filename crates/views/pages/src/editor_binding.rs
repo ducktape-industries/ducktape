@@ -985,6 +985,57 @@ mod rich_tests {
         }
     }
 
+    /// `/` → "New page" over the WIRE the app sends it on: the app's `before`
+    /// is the projection it was handed, page links and all, and its
+    /// `document` is the snapshot it took of its own editor.
+    #[test]
+    fn a_new_page_pick_applies_on_a_document_that_already_links_a_page() {
+        let text = "Handbook\nEverything a new member needs.\n/\n![duck](duck://files/shared/p/duck.png)\n>> Onboarding";
+        let cursor = wire::EditorCursor {
+            position: wire::EditorPosition { line: 2, column: 1 },
+            selection: None,
+        };
+        let doc = document(text, cursor);
+        let mut menu = crate::editor_menu::Menu::default();
+        menu.after_edit(&doc, Some('/'));
+        assert!(menu.is_open(), "the slash palette opens on the typed /");
+        let state = ducktape_view_guest::EditorStateView {
+            text,
+            cursor,
+            reset: 1,
+            revision: 1,
+            text_revision: 1,
+        };
+        let mut rich = crate::rich_document::presentation(text, cursor).document;
+        crate::rich_document::link_page_blocks(
+            &mut rich,
+            &["duck://page/pg-onboarding?net=d0cdf950".into()],
+        );
+        let edit = wire::editor_rich::RichEdit {
+            before: Some(rich.clone()),
+            document: rich,
+            interaction: Some(wire::editor_presentation::EditorInteraction::MenuPick {
+                tag: crate::editor_menu::NEW_PAGE.into(),
+            }),
+            ..Default::default()
+        };
+        let EditorDecision::Apply {
+            patches, cursor, ..
+        } = rich_decision(state, &edit, menu)
+        else {
+            panic!("the pick decided nothing");
+        };
+        assert_eq!(
+            wire::patched_editor_text(text, &patches, cursor).unwrap(),
+            "Handbook\nEverything a new member needs.\n>> \n![duck](duck://files/shared/p/duck.png)\n>> Onboarding"
+        );
+        assert_eq!(
+            cursor.position,
+            wire::EditorPosition { line: 2, column: 3 },
+            "the caret lands in the new page's title"
+        );
+    }
+
     #[test]
     fn rich_typography_is_guest_owned_and_leaves_code_literal() {
         for (text, typed, expected) in [
