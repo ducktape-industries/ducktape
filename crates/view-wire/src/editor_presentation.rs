@@ -252,7 +252,7 @@ pub enum PresentationError {
 }
 
 impl EditorPresentation {
-    pub(super) fn sanitize(&mut self, text_budget: &mut usize) {
+    pub(super) fn sanitize(&mut self, budgets: &mut crate::Budgets) {
         crate::bound_edges(&mut self.padding);
         for format in &mut self.formats {
             for color in [
@@ -274,7 +274,7 @@ impl EditorPresentation {
                 height.sanitize();
             }
             if let Some(font) = &mut format.font {
-                font.sanitize(text_budget);
+                font.sanitize(budgets);
             }
             // `line_padding` moves layout, so it stays non-negative. A span's
             // `padding` only grows or shrinks its highlight quad around the
@@ -432,7 +432,8 @@ mod tests {
                 .collect(),
             selected: 0,
         });
-        let mut budget = crate::MAX_STRING_BYTES;
+        let mut budget = crate::Budgets::frame();
+        budget.text = crate::MAX_STRING_BYTES;
         value.sanitize(&mut budget);
         assert!(
             crate::decode::<EditorPresentation>(&crate::encode(&value)).is_err(),
@@ -458,7 +459,8 @@ mod tests {
             },
             ..Default::default()
         });
-        let mut budget = crate::MAX_STRING_BYTES;
+        let mut budget = crate::Budgets::frame();
+        budget.text = crate::MAX_STRING_BYTES;
         value.sanitize(&mut budget);
         let format = &value.formats[0];
         assert_eq!(

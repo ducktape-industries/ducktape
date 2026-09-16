@@ -26,7 +26,7 @@ pub struct ComboIcon {
     pub right: bool,
 }
 impl ComboOptions {
-    pub(super) fn sanitize(&mut self, text: &mut usize) {
+    pub(super) fn sanitize(&mut self, budgets: &mut Budgets) {
         if let Some(Length::Fixed(value)) = &mut self.menu_height {
             *value = bounded(*value);
         }
@@ -34,13 +34,13 @@ impl ComboOptions {
         pick::text_size(&mut self.text_size);
         pick::line_height(&mut self.line_height);
         if let Some(font) = &mut self.font {
-            font.sanitize(text);
+            font.sanitize(budgets);
         }
         if let Some(icon) = &mut self.icon {
             pick::text_size(&mut icon.size);
             icon.spacing = bounded(icon.spacing);
             if let Some(font) = &mut icon.font {
-                font.sanitize(text);
+                font.sanitize(budgets);
             }
         }
         self.style.sanitize();

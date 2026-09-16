@@ -1,5 +1,5 @@
 //! The one literal shared by guest and host binding generators.
-/// Passes the canonical Ice WIT literal to a local callback macro.
+/// Passes the canonical view WIT literal to a local callback macro.
 ///
 /// ```
 /// macro_rules! inspect { ($wit:literal) => { const TEXT: &str = $wit; }; }

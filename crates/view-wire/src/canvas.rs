@@ -1,5 +1,5 @@
 //! Declarative geometry. Commands contain copied values, never host callbacks.
-use crate::Rgba;
+use crate::{Budgets, Rgba};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 
@@ -142,8 +142,8 @@ pub(super) fn decode_parts<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>
     deserializer.deserialize_seq(Parts(std::marker::PhantomData))
 }
 
-pub(super) fn sanitize(commands: &mut Vec<CanvasCommand>, budget: &mut usize) {
-    commands.truncate((*budget).min(MAX_CANVAS_PARTS));
+pub(super) fn sanitize(commands: &mut Vec<CanvasCommand>, budgets: &mut Budgets) {
+    commands.truncate(budgets.canvas_parts.min(MAX_CANVAS_PARTS));
     let mut scales = vec![1.0_f32];
     let mut skipped = 0usize;
     commands.retain_mut(|command| {
@@ -155,10 +155,10 @@ pub(super) fn sanitize(commands: &mut Vec<CanvasCommand>, budget: &mut usize) {
             }
             return false;
         }
-        if *budget == 0 {
+        if budgets.canvas_parts == 0 {
             return false;
         }
-        *budget -= 1;
+        budgets.canvas_parts -= 1;
         match command {
             CanvasCommand::Push {
                 translate,
@@ -206,8 +206,8 @@ pub(super) fn sanitize(commands: &mut Vec<CanvasCommand>, budget: &mut usize) {
                 if let Some(stroke) = stroke {
                     rgba(&mut stroke.color);
                     size(&mut stroke.width);
-                    stroke.dash.truncate((*budget).min(256));
-                    *budget -= stroke.dash.len();
+                    stroke.dash.truncate(budgets.canvas_parts.min(256));
+                    budgets.canvas_parts -= stroke.dash.len();
                     for value in &mut stroke.dash {
                         *value = finite(*value).clamp(0.01, 8192.0);
                     }
@@ -234,8 +234,8 @@ pub(super) fn sanitize(commands: &mut Vec<CanvasCommand>, budget: &mut usize) {
                         point(to);
                     }
                     CanvasShape::Path(segments) => {
-                        segments.truncate(*budget);
-                        *budget -= segments.len();
+                        segments.truncate(budgets.canvas_parts);
+                        budgets.canvas_parts -= segments.len();
                         for segment in segments {
                             match segment {
                                 CanvasSegment::Rectangle {
@@ -324,7 +324,7 @@ fn rgba(value: &mut Rgba) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Node, decode, encode};
+    use crate::{Budgets, Node, decode, encode};
 
     fn node(commands: Vec<CanvasCommand>) -> Node {
         Node::Canvas {
@@ -356,7 +356,7 @@ mod tests {
             CanvasCommand::Pop,
         ];
         let original = commands.clone();
-        let mut budget = MAX_CANVAS_PARTS;
+        let mut budget = Budgets::frame();
         sanitize(&mut commands, &mut budget);
         assert_eq!(
             commands, original,
@@ -385,7 +385,7 @@ mod tests {
 
     #[test]
     fn sanitizer_shares_parts_budget_and_bounds_numbers() {
-        let mut budget = MAX_CANVAS_PARTS;
+        let mut budget = Budgets::frame();
         let mut first = vec![path(MAX_CANVAS_PARTS - 2)];
         sanitize(&mut first, &mut budget);
         let mut second = vec![
@@ -401,7 +401,7 @@ mod tests {
             path(10),
         ];
         sanitize(&mut second, &mut budget);
-        assert_eq!(budget, 0);
+        assert_eq!(budget.canvas_parts, 0);
         assert_eq!(
             second,
             vec![CanvasCommand::Draw {
@@ -429,7 +429,7 @@ mod tests {
         commands.push(path(1));
         commands.extend(vec![CanvasCommand::Pop; 40]);
         commands.push(path(1));
-        sanitize(&mut commands, &mut MAX_CANVAS_PARTS.clone());
+        sanitize(&mut commands, &mut Budgets::frame());
         let mut depth = 0;
         let mut scale = 1.0;
         for command in &commands {
@@ -452,7 +452,7 @@ mod tests {
         assert_eq!(depth, 0);
         assert!(matches!(commands.last(), Some(CanvasCommand::Draw { .. })));
         let mut again = commands.clone();
-        sanitize(&mut again, &mut MAX_CANVAS_PARTS.clone());
+        sanitize(&mut again, &mut Budgets::frame());
         assert_eq!(commands, again);
     }
 }

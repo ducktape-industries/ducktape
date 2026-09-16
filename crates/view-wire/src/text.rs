@@ -73,7 +73,7 @@ pub struct TextOptions {
     pub font: Option<NamedFont>,
 }
 impl TextOptions {
-    pub(super) fn sanitize(&mut self, text_budget: &mut usize) {
+    pub(super) fn sanitize(&mut self, budgets: &mut Budgets) {
         if let Some(Length::Fixed(height)) = &mut self.height {
             *height = bounded(*height);
         }
@@ -82,7 +82,7 @@ impl TextOptions {
         }
         self.tracking = bounded(self.tracking).min(MAX_TEXT_PIXELS);
         if let Some(font) = &mut self.font {
-            font.sanitize(text_budget);
+            font.sanitize(budgets);
         }
     }
 }
@@ -99,9 +99,9 @@ impl LineHeight {
 }
 
 impl NamedFont {
-    pub(super) fn sanitize(&mut self, text_budget: &mut usize) {
+    pub(super) fn sanitize(&mut self, budgets: &mut Budgets) {
         if let FontFamily::Named(name) = &mut self.family {
-            spend_text(name, text_budget);
+            spend_text(name, budgets);
         }
     }
 }
@@ -124,7 +124,8 @@ mod tests {
             }),
             ..TextOptions::default()
         };
-        let mut budget = 7;
+        let mut budget = Budgets::frame();
+        budget.text = 7;
         options.sanitize(&mut budget);
         assert_eq!(options.line_height, Some(LineHeight::Relative(16.0)));
         assert_eq!(options.tracking, 0.0);
@@ -135,7 +136,7 @@ mod tests {
             panic!()
         };
         assert_eq!(name, "ééé");
-        assert_eq!(budget, 1);
+        assert_eq!(budget.text, 1);
     }
 
     #[test]

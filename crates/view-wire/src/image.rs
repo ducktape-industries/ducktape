@@ -50,12 +50,12 @@ impl ImageData {
         }
     }
 
-    pub(crate) fn sanitize(data: &mut Option<Self>, remaining: &mut usize) {
+    pub(crate) fn sanitize(data: &mut Option<Self>, budgets: &mut crate::Budgets) {
         if let Some(value) = data {
-            if !value.valid_rgba() || value.byte_len() > *remaining {
+            if !value.valid_rgba() || value.byte_len() > budgets.pictures {
                 *data = None;
             } else {
-                *remaining -= value.byte_len();
+                budgets.pictures -= value.byte_len();
             }
         }
     }
@@ -123,7 +123,8 @@ mod tests {
     }
     #[test]
     fn invalid_rgba_is_dropped_without_spending_valid_picture_budget() {
-        let mut budget = 4;
+        let mut budget = crate::Budgets::frame();
+        budget.pictures = 4;
         let mut invalid = Some(ImageData::Rgba {
             width: u32::MAX,
             height: u32::MAX,
@@ -131,7 +132,7 @@ mod tests {
         });
         ImageData::sanitize(&mut invalid, &mut budget);
         assert_eq!(invalid, None);
-        assert_eq!(budget, 4);
+        assert_eq!(budget.pictures, 4);
         let mut valid = Some(ImageData::Rgba {
             width: 1,
             height: 1,
@@ -139,14 +140,14 @@ mod tests {
         });
         ImageData::sanitize(&mut valid, &mut budget);
         assert!(valid.is_some());
-        assert_eq!(budget, 0);
+        assert_eq!(budget.pictures, 0);
         let mut excess = Some(ImageData::Encoded(vec![1]));
         ImageData::sanitize(&mut excess, &mut budget);
         assert_eq!(excess, None);
     }
 }
 
-/// Copied native viewer settings; absent values retain Iced defaults.
+/// Copied native viewer settings; absent values retain the host's defaults.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ViewerOptions {
     pub padding: Option<f32>,

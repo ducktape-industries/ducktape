@@ -16,20 +16,20 @@ pub struct RichSpan {
     pub strikethrough: bool,
 }
 
-pub(super) fn sanitize(spans: &mut Vec<RichSpan>, text: &mut usize, nodes: &mut usize) {
-    spans.truncate(*nodes);
-    *nodes = nodes.saturating_sub(spans.len());
+pub(super) fn sanitize(spans: &mut Vec<RichSpan>, budgets: &mut Budgets) {
+    spans.truncate(budgets.nodes);
+    budgets.nodes = budgets.nodes.saturating_sub(spans.len());
     for span in spans {
-        spend_text(&mut span.content, text);
+        spend_text(&mut span.content, budgets);
         if let Some(link) = &mut span.link {
-            spend_text(link, text);
+            spend_text(link, budgets);
         }
         let mut options = TextOptions {
             line_height: span.line_height,
             font: span.font.take(),
             ..Default::default()
         };
-        options.sanitize(text);
+        options.sanitize(budgets);
         span.line_height = options.line_height;
         span.font = options.font;
         if let Some(size) = &mut span.size {
@@ -103,11 +103,12 @@ mod tests {
             };
             3
         ];
-        let (mut text, mut nodes) = (5, 2);
-        sanitize(&mut spans, &mut text, &mut nodes);
+        let mut b = Budgets::frame();
+        (b.text, b.nodes) = (5, 2);
+        sanitize(&mut spans, &mut b);
         assert_eq!(spans.len(), 2);
-        assert_eq!(nodes, 0);
-        assert_eq!(text, 0);
+        assert_eq!(b.nodes, 0);
+        assert_eq!(b.text, 0);
         assert_eq!(spans[0].content, "éé");
         assert_eq!(spans[0].link.as_deref(), Some("t"));
         assert!(spans[1].content.is_empty());

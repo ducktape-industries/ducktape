@@ -42,16 +42,16 @@ pub(super) fn line_height(value: &mut Option<f32>) {
     }
 }
 impl PickIcon {
-    fn sanitize(&mut self, text: &mut usize) {
+    fn sanitize(&mut self, budgets: &mut Budgets) {
         text_size(&mut self.size);
         line_height(&mut self.line_height);
         if let Some(font) = &mut self.font {
-            font.sanitize(text);
+            font.sanitize(budgets);
         }
     }
 }
 impl PickOptions {
-    pub(super) fn sanitize(&mut self, text: &mut usize) {
+    pub(super) fn sanitize(&mut self, budgets: &mut Budgets) {
         if let Some(Length::Fixed(value)) = &mut self.menu_height {
             *value = bounded(*value);
         }
@@ -59,14 +59,14 @@ impl PickOptions {
         text_size(&mut self.text_size);
         line_height(&mut self.line_height);
         if let Some(font) = &mut self.font {
-            font.sanitize(text);
+            font.sanitize(budgets);
         }
         match &mut self.handle {
             Some(PickHandle::Arrow { size }) => text_size(size),
-            Some(PickHandle::Static(icon)) => icon.sanitize(text),
+            Some(PickHandle::Static(icon)) => icon.sanitize(budgets),
             Some(PickHandle::Dynamic { closed, open }) => {
-                closed.sanitize(text);
-                open.sanitize(text);
+                closed.sanitize(budgets);
+                open.sanitize(budgets);
             }
             _ => {}
         }
@@ -103,7 +103,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut budget = 9;
+        let mut budget = Budgets::frame();
+        budget.text = 9;
         options.sanitize(&mut budget);
         assert_eq!(options.menu_height, Some(Length::Fixed(MAX_PIXELS)));
         assert_eq!(options.padding, Some(0.0));
@@ -116,6 +117,6 @@ mod tests {
         assert_eq!(closed.line_height, Some(MAX_PIXELS / MAX_TEXT_PIXELS));
         assert_eq!(closed.font.unwrap().family, FontFamily::Named("é".into()));
         assert_eq!(open.font.unwrap().family, FontFamily::Named(String::new()));
-        assert_eq!(budget, 1);
+        assert_eq!(budget.text, 1);
     }
 }

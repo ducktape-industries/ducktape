@@ -1,4 +1,4 @@
-//! The wire between a host and an Ice app running in wasm.
+//! The wire between a host and a view running in wasm.
 //!
 //! The guest ships a WIDGET TREE, not a picture: every tick it returns the
 //! [`Node`] its view built, with every value inlined — text, colours, sizes —
@@ -21,14 +21,11 @@
 //! drop silently. A host that reads a frame from an untrusted module runs
 //! [`sanitize`] first.
 
-#[cfg(feature = "authored-tests")]
-pub mod authored;
 /// Exact bincode protocol implemented by this build. Bump on serialized shape changes.
 /// This is independent of WIT signatures and the manifest text format.
 pub const WIRE_EPOCH: u32 = 7;
 
 pub mod manifest;
-pub mod native;
 #[cfg(feature = "schema")]
 pub mod schema;
 mod wit;
@@ -97,8 +94,6 @@ pub use list::ListKey;
 mod query;
 pub use query::{ContainerQuery, MAX_QUERY_OPS, QueryOp};
 
-mod markdown;
-pub use markdown::MarkdownDocument;
 mod window;
 pub use window::WindowCommand;
 
@@ -108,19 +103,14 @@ pub use widget::WidgetCommand;
 mod surface;
 pub use surface::{MAX_SURFACE_DEPTH, MAX_SURFACE_VALUES, SurfaceValue, sanitize_surface_event};
 
-/// Clipboard addressed by `clipboard.read` (this value as payload) and
-/// `clipboard.write` (`(ClipboardTarget, String)` as payload). Reads return
-/// an encoded `Option<String>`; writes return an empty successful response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ClipboardTarget {
-    Standard,
-    Primary,
-}
+mod node;
+pub use node::{ButtonContent, Node};
+mod patch;
+pub use patch::{MAX_PATCHES, Patch, apply, diff};
 
 pub mod events;
 pub mod keyboard;
 pub mod mouse;
-pub mod system;
 
 /// Something the host tells the guest.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -278,30 +268,6 @@ pub struct Frame {
     /// yields more than one tick runs, a handler chain longer than one
     /// round — and wants the next tick now, not at the next event or answer.
     pub busy: bool,
-}
-
-/// One edit to the tree the host holds. `path` is the child index at every
-/// level from the root down (`[]` is the root itself); children are
-/// addressed by index at the moment the patch is applied, so a sequence
-/// reads like edits to a live document. The vocabulary is a virtual DOM's
-/// mutation list: replace, re-prop, insert, remove, move.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum Patch {
-    /// The subtree at `path` becomes `node`.
-    Replace { path: Vec<u32>, node: Node },
-    /// The node at `path` takes `node`'s own fields and keeps its children:
-    /// `node` carries none (an empty list, or an empty stand-in per slot).
-    Props { path: Vec<u32>, node: Node },
-    /// `node` becomes child `index` of the list at `path`.
-    Insert {
-        path: Vec<u32>,
-        index: u32,
-        node: Node,
-    },
-    /// Child `index` of the list at `path` goes away.
-    Remove { path: Vec<u32>, index: u32 },
-    /// Child `from` of the list at `path` is taken out and put back at `to`.
-    Move { path: Vec<u32>, from: u32, to: u32 },
 }
 
 /// Red, green, blue, alpha in `0.0..=1.0`. The guest resolves its own
@@ -649,781 +615,6 @@ pub enum ToggleKind {
     Switch,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum ButtonContent {
-    Label(String),
-    #[serde(deserialize_with = "decode_child")]
-    Child(Box<Node>),
-}
-
-/// One widget. `key` is the node's identity across frames — the
-/// accessibility path the compiler already computes (`App/content/count`)
-/// — which the host uses for widget state (focus, caret, scroll) and for
-/// the accessibility tree.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum Node {
-    /// A payload encoded and painted by the host.
-    Qr { key: String, code: Qr },
-    /// Styled spans form one native paragraph; link clicks carry a String handler payload.
-    RichText {
-        key: String,
-        #[serde(deserialize_with = "rich_text::decode_spans")]
-        spans: Vec<RichSpan>,
-        size: Option<f32>,
-        color: Option<Rgba>,
-        font: Font,
-        width: Option<Length>,
-        align_x: Option<AlignX>,
-        options: TextOptions,
-        on_link: Option<u32>,
-    },
-    /// Flex rules and item metadata, interpreted by the host's native layout engine.
-    Flex {
-        key: String,
-        layout: FlexLayout,
-        background: Option<Rgba>,
-        border: Option<Border>,
-        #[serde(deserialize_with = "flex::decode_items")]
-        items: Vec<FlexItem>,
-        #[serde(deserialize_with = "decode_children")]
-        children: Vec<Node>,
-    },
-    /// A child positioned in this widget's local coordinates. The host lays it out.
-    Pin {
-        key: String,
-        x: f32,
-        y: f32,
-        width: Option<Length>,
-        height: Option<Length>,
-        #[serde(deserialize_with = "decode_child")]
-        content: Box<Node>,
-    },
-    /// Floating content whose translation is evaluated only by the host.
-    Float {
-        key: String,
-        x: FloatExpression,
-        y: FloatExpression,
-        scale: f32,
-        shadow: Shadow,
-        radius: Option<[f32; 4]>,
-        #[serde(deserialize_with = "decode_child")]
-        content: Box<Node>,
-    },
-    /// Copied keyed rows; the host owns widget state and optional virtualization.
-    KeyedColumn {
-        key: String,
-        #[serde(deserialize_with = "list::decode_optional_keys")]
-        keys: Option<Vec<ListKey>>,
-        background: Option<Rgba>,
-        border: Option<Border>,
-        spacing: Option<f32>,
-        padding: Option<Edges>,
-        width: Option<Length>,
-        height: Option<Length>,
-        max_width: Option<f32>,
-        align: Option<AlignX>,
-        virtual_row: Option<f32>,
-        #[serde(deserialize_with = "decode_children")]
-        children: Vec<Node>,
-    },
-    Container {
-        shadow: Shadow,
-        max_width: Option<f32>,
-        max_height: Option<f32>,
-        clip: bool,
-        key: String,
-        width: Option<Length>,
-        height: Option<Length>,
-        padding: Option<Edges>,
-        align_x: Option<AlignX>,
-        align_y: Option<AlignY>,
-        background: Option<Background>,
-        border: Option<Border>,
-        /// Round the box to whole pixels; `None` is the host's default.
-        snap: Option<bool>,
-        #[serde(deserialize_with = "decode_child")]
-        content: Box<Node>,
-    },
-    /// A grabbed divider: local movement deltas and native cursor; one child.
-    ResizeHandle {
-        key: String,
-        on_press: Option<u32>,
-        on_release: Option<u32>,
-        on_drag: Option<u32>,
-        cursor: Option<mouse::Cursor>,
-        #[serde(deserialize_with = "decode_child")]
-        content: Box<Node>,
-    },
-    /// A region that reports what the pointer does over its one child. The
-    /// discrete routes carry per-frame message indices like a button's
-    /// `on_press`; `on_move` and `on_press_at` carry a handler index the
-    /// host answers with [`Event::Pointer`], `on_scroll` one it answers
-    /// with [`Event::Scroll`]. The node paints nothing of its own.
-    MouseArea {
-        key: String,
-        on_press: Option<u32>,
-        on_release: Option<u32>,
-        on_double_click: Option<u32>,
-        on_right_press: Option<u32>,
-        on_right_release: Option<u32>,
-        on_middle_press: Option<u32>,
-        on_middle_release: Option<u32>,
-        on_enter: Option<u32>,
-        on_exit: Option<u32>,
-        on_move: Option<u32>,
-        /// Fires for a left press even when the child took it — a button
-        /// inside the area — where `on_press` does not.
-        on_press_at: Option<u32>,
-        on_scroll: Option<u32>,
-        #[serde(deserialize_with = "decode_child")]
-        content: Box<Node>,
-    },
-    Tooltip {
-        key: String,
-        position: TooltipPosition,
-        gap: f32,
-        padding: f32,
-        delay_ms: u64,
-        snap: bool,
-        style: TooltipStyle,
-        /// Content followed by tip; extra children are discarded by sanitization.
-        #[serde(deserialize_with = "decode_children")]
-        children: Vec<Node>,
-    },
-    Linear {
-        max_width: Option<f32>,
-        clip: bool,
-        key: String,
-        wrap: Option<Wrap>,
-        axis: Axis,
-        spacing: Option<f32>,
-        padding: Option<Edges>,
-        width: Option<Length>,
-        height: Option<Length>,
-        /// Cross-axis alignment of the children.
-        align: Option<AlignX>,
-        /// The surface behind the children: a layout paints nothing of its
-        /// own, so this is a box drawn around it.
-        background: Option<Rgba>,
-        border: Option<Border>,
-        #[serde(deserialize_with = "decode_children")]
-        children: Vec<Node>,
-    },
-    /// Equal cells in rows of `columns`, or of as many as fit at `fluid`
-    /// pixels each. A cell is `aspect` times as wide as it is tall unless
-    /// `height` gives the rows a length to share; without either the host
-    /// draws squares.
-    Grid {
-        key: String,
-        columns: Option<u32>,
-        /// The widest a cell may be; the column count follows the width.
-        /// Wins over `columns`.
-        fluid: Option<f32>,
-        spacing: Option<f32>,
-        padding: Option<Edges>,
-        width: Option<Length>,
-        height: Option<Length>,
-        /// Horizontal pixels per vertical pixel of a cell.
-        aspect: Option<f32>,
-        background: Option<Rgba>,
-        border: Option<Border>,
-        #[serde(deserialize_with = "decode_children")]
-        children: Vec<Node>,
-    },
-    /// Supplies widget-local dimensions to descendant container conditions.
-    Responsive {
-        key: String,
-        width: Option<Length>,
-        height: Option<Length>,
-        #[serde(deserialize_with = "decode_child")]
-        content: Box<Node>,
-    },
-    /// A guest-memoized subtree. Generation changes whenever cached content or
-    /// its callable routes are rebuilt, including a rebuild after eviction.
-    Lazy {
-        key: String,
-        generation: u64,
-        #[serde(deserialize_with = "decode_child")]
-        content: Box<Node>,
-    },
-    /// Splices selected children into the surrounding layout. It adds no box.
-    When {
-        key: String,
-        condition: ContainerQuery,
-        #[serde(deserialize_with = "decode_children")]
-        children: Vec<Node>,
-    },
-    /// Watches its child's laid-out size. `on_show` hears the size when the
-    /// child first comes into view (within `anticipate` pixels of it),
-    /// `on_resize` every change after, both as [`Event::Size`]; `on_hide`
-    /// is the message for leaving view. `delay` is milliseconds a size
-    /// must hold before it is reported.
-    Sensor {
-        key: String,
-        /// Copied continuity value for `key=`, independent of widget identity.
-        reset: Option<SurfaceValue>,
-        on_show: Option<u32>,
-        on_resize: Option<u32>,
-        on_hide: Option<u32>,
-        anticipate: Option<f32>,
-        delay: Option<f32>,
-        #[serde(deserialize_with = "decode_child")]
-        child: Box<Node>,
-    },
-    Scroll {
-        on_scroll: Option<u32>,
-        virtual_rows: bool,
-        key: String,
-        direction: ScrollDirection,
-        width: Option<Length>,
-        height: Option<Length>,
-        /// No scroll bar is drawn; the content still scrolls.
-        bar_hidden: bool,
-        bar_width: Option<f32>,
-        bar_margin: Option<f32>,
-        scroller_width: Option<f32>,
-        /// Space between the bar and the content, which shrinks the content.
-        bar_spacing: Option<f32>,
-        anchor_x: ScrollAnchor,
-        anchor_y: ScrollAnchor,
-        /// Follow content that grows while the reader sits at the end.
-        auto_scroll: bool,
-        background: Option<Rgba>,
-        border: Option<Border>,
-        #[serde(deserialize_with = "decode_child")]
-        content: Box<Node>,
-    },
-    Text {
-        options: TextOptions,
-        key: String,
-        content: String,
-        size: Option<f32>,
-        color: Option<Rgba>,
-        font: Font,
-        width: Option<Length>,
-        align_x: Option<AlignX>,
-    },
-    /// A raster picture sent once per typed content hash.
-    Image {
-        key: String,
-        hash: u64,
-        data: Option<ImageData>,
-        label: Option<String>,
-        fit: Option<ContentFit>,
-        rotation: Option<Rotation>,
-        opacity: Option<f32>,
-        filter: ImageFilter,
-        width: Option<Length>,
-        height: Option<Length>,
-    },
-    /// A native zoom/pan viewer sharing the raster picture cache and budgets.
-    ImageViewer {
-        key: String,
-        hash: u64,
-        data: Option<ImageData>,
-        label: Option<String>,
-        fit: Option<ContentFit>,
-        filter: ImageFilter,
-        width: Option<Length>,
-        height: Option<Length>,
-        options: ViewerOptions,
-    },
-    /// A vector picture. Its bytes cross ONCE: the frame that first shows a
-    /// picture carries them under `hash`, and every frame after — a changed
-    /// tree re-sends every node — names the hash alone. The host keeps what
-    /// it decoded by hash for as long as the guest runs; a hash it has not
-    /// seen draws as empty space of the node's size.
-    Svg {
-        key: String,
-        /// Use the nearest button's final status text color at draw time.
-        inherit_button_ink: bool,
-        /// The guest's content hash of the picture: an opaque cache key,
-        /// not something the host recomputes.
-        hash: u64,
-        /// The picture, on the first frame it is shown.
-        bytes: Option<Vec<u8>>,
-        /// The accessible name of the picture.
-        label: Option<String>,
-        /// A tint for the whole picture, over its own colours.
-        color: Option<Rgba>,
-        /// The tint while hovered: `None` keeps `color`, `Some(None)` drops
-        /// the tint, `Some(Some(_))` is another one.
-        hover: Option<Option<Rgba>>,
-        fit: Option<ContentFit>,
-        rotation: Option<Rotation>,
-        /// `0.0..=1.0`; `None` is opaque.
-        opacity: Option<f32>,
-        width: Option<Length>,
-        height: Option<Length>,
-    },
-    Input {
-        options: InputOptions,
-        key: String,
-        placeholder: String,
-        /// Copied document state, adopted by reset and host observation revision.
-        value: String,
-        on_input: u32,
-        on_submit: Option<u32>,
-        width: Option<Length>,
-        secure: bool,
-        style: Box<InputStyle>,
-    },
-    /// A multiline text editor. The host owns the `text_editor::Content` —
-    /// native widget interaction — and the guest sees document state, unlike
-    /// [`Node::Input`]. Presentation crosses as copied data.
-    Editor {
-        options: Box<EditorOptions>,
-        key: String,
-        placeholder: String,
-        /// A shared logical document; its bytes travel only through a requested transfer.
-        document: editor_document::EditorDocumentRef,
-        /// Mutable guest state route, present even while editing is disabled.
-        on_document: u32,
-        editable: bool,
-        /// Pixels; the editor fills its parent otherwise.
-        width: Option<f32>,
-        height: Option<Length>,
-        min_height: Option<f32>,
-        max_height: Option<f32>,
-    },
-    Button {
-        key: String,
-        content: ButtonContent,
-        /// The accessible name of a button whose content is not a plain
-        /// label.
-        label: Option<String>,
-        checked: Option<bool>,
-        expanded: Option<bool>,
-        description: Option<String>,
-        /// `None` is a disabled button.
-        on_press: Option<u32>,
-        width: Option<Length>,
-        height: Option<Length>,
-        padding: Option<Edges>,
-        style: ButtonStyle,
-    },
-    Space {
-        width: Option<Length>,
-        height: Option<Length>,
-    },
-    Rule {
-        key: String,
-        axis: Axis,
-        thickness: f32,
-        color: Option<Rgba>,
-        /// The theme's weak rule colour instead of its strong one, under
-        /// `color` when both are given.
-        weak: bool,
-        /// top-left, top-right, bottom-right, bottom-left.
-        radius: Option<[f32; 4]>,
-        /// Round the rule to whole pixels; `None` is the host's default.
-        snap: Option<bool>,
-    },
-    /// A checkbox or a toggler: a labelled bool.
-    Toggle {
-        key: String,
-        kind: ToggleKind,
-        label: String,
-        checked: bool,
-        /// `None` is a disabled control.
-        on_toggle: Option<u32>,
-        width: Option<Length>,
-        style: ToggleStyle,
-    },
-    /// One radio button. Its value is the guest's business: selecting it
-    /// sends the message the guest queued for it.
-    Radio {
-        key: String,
-        label: String,
-        selected: bool,
-        on_select: u32,
-        width: Option<Length>,
-        style: RadioStyle,
-    },
-    Slider {
-        key: String,
-        value: f32,
-        min: f32,
-        max: f32,
-        step: f32,
-        on_change: u32,
-        on_release: Option<u32>,
-        axis: Axis,
-        width: Option<Length>,
-        height: Option<Length>,
-        style: SliderStyle,
-    },
-    ComboBox {
-        key: String,
-        state_key: String,
-        options: Vec<String>,
-        selected: Option<u32>,
-        reset: u64,
-        placeholder: String,
-        on_select: u32,
-        width: Option<Length>,
-        settings: Box<ComboOptions>,
-    },
-    PickList {
-        settings: Box<PickOptions>,
-        key: String,
-        /// Every option as the guest shows it; the host answers with an
-        /// index into this list.
-        options: Vec<String>,
-        selected: Option<u32>,
-        placeholder: Option<String>,
-        on_select: u32,
-        width: Option<Length>,
-        style: PickListStyle,
-    },
-    Progress {
-        key: String,
-        value: f32,
-        min: f32,
-        max: f32,
-        axis: Axis,
-        length: Option<Length>,
-        girth: Option<Length>,
-        /// The theme role the bar is painted in; `background`, `bar` and
-        /// `border` paint over it.
-        tone: Option<Tone>,
-        background: Option<Rgba>,
-        bar: Option<Rgba>,
-        border: Option<Border>,
-    },
-    /// Union-sized layers, or native base/under layering when `under` is nonzero.
-    Stack {
-        key: String,
-        width: Option<Length>,
-        height: Option<Length>,
-        padding: Option<Edges>,
-        background: Option<Rgba>,
-        border: Option<Border>,
-        clip: bool,
-        under: u32,
-        #[serde(deserialize_with = "decode_children")]
-        children: Vec<Node>,
-    },
-    /// The host's draw-time base/reveal pair; `open` can hold the reveal visible.
-    Hover {
-        key: String,
-        width: Option<Length>,
-        height: Option<Length>,
-        padding: Option<Edges>,
-        background: Option<Rgba>,
-        border: Option<Border>,
-        tint: Option<Rgba>,
-        radius: f32,
-        open: bool,
-        #[serde(deserialize_with = "decode_children")]
-        children: Vec<Node>,
-    },
-    /// A base plus an optional modal layer. Closing removes the second child.
-    Overlay {
-        key: String,
-        padding: f32,
-        backdrop: Rgba,
-        align_x: AlignX,
-        align_y: AlignY,
-        on_dismiss: Option<u32>,
-        #[serde(deserialize_with = "decode_children")]
-        children: Vec<Node>,
-    },
-    /// Bounded geometry painted by the host, in widget-local coordinates.
-    Canvas {
-        key: String,
-        width: Option<Length>,
-        height: Option<Length>,
-        #[serde(deserialize_with = "canvas::decode_parts")]
-        commands: Vec<CanvasCommand>,
-    },
-    /// A region the host paints itself: `name` picks a surface the
-    /// embedding host registered, `args` are the typed values the guest
-    /// hands it; `on_event` routes a returned value to its handler. The guest
-    /// never sees what is drawn there, and the host repaints it on its own clock — a live video tile, a sweeping hand —
-    /// without a guest tick. A name the host has not registered renders as
-    /// a visible placeholder. It takes the size its parent gives it: an Ice
-    /// `box w= h=` around the `extern` call sets it.
-    Surface {
-        key: String,
-        name: String,
-        args: Vec<SurfaceValue>,
-        on_event: Option<u32>,
-    },
-}
-
-/// Spends generic parameters on nothing: `<(&'a (), M, T) as Erase>::Node`
-/// is [`Node`] for every `'a`, `M` and `T`. Generated code names its element
-/// type `__IceElement<'a, Message, Theme>` for both targets, and a type
-/// alias may not drop a parameter, so the tree target's alias projects
-/// through this instead.
-pub trait Erase {
-    type Node;
-}
-
-impl<T: ?Sized> Erase for T {
-    type Node = Node;
-}
-
-impl Node {
-    /// The node an empty view renders as.
-    pub fn empty() -> Self {
-        Self::Space {
-            width: None,
-            height: None,
-        }
-    }
-
-    /// Hashes the current copied subtree without allocating an encoded buffer.
-    /// A host uses this after sanitization: shared frame budgets may change
-    /// content even when a guest memo generation stays the same.
-    pub fn fingerprint(&self) -> u64 {
-        use std::hash::Hasher;
-        struct Sink(std::hash::DefaultHasher);
-        impl std::io::Write for Sink {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.write(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut sink = Sink(std::hash::DefaultHasher::new());
-        bincode::serialize_into(&mut sink, self).expect("node fingerprint sink cannot fail");
-        sink.0.finish()
-    }
-
-    pub fn key(&self) -> Option<&str> {
-        match self {
-            Self::Container { key, .. }
-            | Self::ResizeHandle { key, .. }
-            | Self::MouseArea { key, .. }
-            | Self::Linear { key, .. }
-            | Self::Grid { key, .. }
-            | Self::KeyedColumn { key, .. }
-            | Self::Flex { key, .. }
-            | Self::Pin { key, .. }
-            | Self::Float { key, .. }
-            | Self::Responsive { key, .. }
-            | Self::Lazy { key, .. }
-            | Self::When { key, .. }
-            | Self::Sensor { key, .. }
-            | Self::Scroll { key, .. }
-            | Self::Qr { key, .. }
-            | Self::RichText { key, .. }
-            | Self::Text { key, .. }
-            | Self::Svg { key, .. }
-            | Self::Image { key, .. }
-            | Self::ImageViewer { key, .. }
-            | Self::Input { key, .. }
-            | Self::Editor { key, .. }
-            | Self::Button { key, .. }
-            | Self::Rule { key, .. }
-            | Self::Toggle { key, .. }
-            | Self::Radio { key, .. }
-            | Self::Slider { key, .. }
-            | Self::PickList { key, .. }
-            | Self::ComboBox { key, .. }
-            | Self::Progress { key, .. }
-            | Self::Stack { key, .. }
-            | Self::Hover { key, .. }
-            | Self::Overlay { key, .. }
-            | Self::Tooltip { key, .. }
-            | Self::Canvas { key, .. }
-            | Self::Surface { key, .. } => Some(key),
-            Self::Space { .. } => None,
-        }
-    }
-
-    /// The node's children in order. One arm per variant, here and in
-    /// [`Node::children_mut`] and [`Node::child_list_mut`]: everything that
-    /// walks, diffs or patches a tree goes through these three, so a new
-    /// variant is a new arm in each and nothing else.
-    pub fn children(&self) -> &[Node] {
-        match self {
-            Self::Container { content, .. }
-            | Self::Pin { content, .. }
-            | Self::Float { content, .. }
-            | Self::Responsive { content, .. }
-            | Self::Lazy { content, .. }
-            | Self::Sensor { child: content, .. }
-            | Self::ResizeHandle { content, .. }
-            | Self::MouseArea { content, .. }
-            | Self::Scroll { content, .. } => std::slice::from_ref(content),
-            Self::Linear { children, .. }
-            | Self::Grid { children, .. }
-            | Self::Stack { children, .. }
-            | Self::Hover { children, .. }
-            | Self::Tooltip { children, .. }
-            | Self::Overlay { children, .. }
-            | Self::KeyedColumn { children, .. }
-            | Self::Flex { children, .. }
-            | Self::When { children, .. } => children,
-
-            Self::Button {
-                content: ButtonContent::Child(child),
-                ..
-            } => std::slice::from_ref(child),
-            Self::Button { .. }
-            | Self::Qr { .. }
-            | Self::RichText { .. }
-            | Self::Text { .. }
-            | Self::Svg { .. }
-            | Self::Image { .. }
-            | Self::ImageViewer { .. }
-            | Self::Input { .. }
-            | Self::Editor { .. }
-            | Self::Space { .. }
-            | Self::Rule { .. }
-            | Self::Toggle { .. }
-            | Self::Radio { .. }
-            | Self::Slider { .. }
-            | Self::PickList { .. }
-            | Self::ComboBox { .. }
-            | Self::Progress { .. }
-            | Self::Canvas { .. }
-            | Self::Surface { .. } => &[],
-        }
-    }
-
-    /// Runs `visit` on every node in the tree, depth first, this one first.
-    pub fn for_each_mut(&mut self, visit: &mut impl FnMut(&mut Node)) {
-        visit(self);
-        for child in self.children_mut() {
-            child.for_each_mut(visit);
-        }
-    }
-
-    pub fn children_mut(&mut self) -> &mut [Node] {
-        match self {
-            Self::Container { content, .. }
-            | Self::Pin { content, .. }
-            | Self::Float { content, .. }
-            | Self::Responsive { content, .. }
-            | Self::Lazy { content, .. }
-            | Self::Sensor { child: content, .. }
-            | Self::ResizeHandle { content, .. }
-            | Self::MouseArea { content, .. }
-            | Self::Scroll { content, .. } => std::slice::from_mut(content),
-            Self::Linear { children, .. }
-            | Self::Grid { children, .. }
-            | Self::Stack { children, .. }
-            | Self::Hover { children, .. }
-            | Self::Tooltip { children, .. }
-            | Self::Overlay { children, .. }
-            | Self::KeyedColumn { children, .. }
-            | Self::Flex { children, .. }
-            | Self::When { children, .. } => children,
-
-            Self::Button {
-                content: ButtonContent::Child(child),
-                ..
-            } => std::slice::from_mut(child),
-            Self::Button { .. }
-            | Self::Qr { .. }
-            | Self::RichText { .. }
-            | Self::Text { .. }
-            | Self::Input { .. }
-            | Self::Editor { .. }
-            | Self::Space { .. }
-            | Self::Rule { .. }
-            | Self::Toggle { .. }
-            | Self::Radio { .. }
-            | Self::Slider { .. }
-            | Self::PickList { .. }
-            | Self::ComboBox { .. }
-            | Self::Progress { .. }
-            | Self::Svg { .. }
-            | Self::Image { .. }
-            | Self::ImageViewer { .. }
-            | Self::Canvas { .. }
-            | Self::Surface { .. } => &mut [],
-        }
-    }
-
-    /// The children as a list that can grow and shrink, for the variants
-    /// that hold one; a fixed-arity node (a container's one content) has
-    /// none, and no patch may insert into, remove from or move within it.
-    pub fn child_list_mut(&mut self) -> Option<&mut Vec<Node>> {
-        match self {
-            Self::Linear { children, .. }
-            | Self::Grid { children, .. }
-            | Self::KeyedColumn { children, .. }
-            | Self::Flex { children, .. }
-            | Self::Stack { children, .. }
-            | Self::When { children, .. }
-            | Self::Hover { children, .. }
-            | Self::Tooltip { children, .. }
-            | Self::Overlay { children, .. } => Some(children),
-            Self::Container { .. }
-            | Self::Pin { .. }
-            | Self::Float { .. }
-            | Self::Responsive { .. }
-            | Self::Lazy { .. }
-            | Self::Sensor { .. }
-            | Self::ResizeHandle { .. }
-            | Self::MouseArea { .. }
-            | Self::Scroll { .. }
-            | Self::Button { .. }
-            | Self::Qr { .. }
-            | Self::RichText { .. }
-            | Self::Text { .. }
-            | Self::Input { .. }
-            | Self::Editor { .. }
-            | Self::Space { .. }
-            | Self::Rule { .. }
-            | Self::Toggle { .. }
-            | Self::Radio { .. }
-            | Self::Slider { .. }
-            | Self::PickList { .. }
-            | Self::ComboBox { .. }
-            | Self::Progress { .. }
-            | Self::Svg { .. }
-            | Self::Image { .. }
-            | Self::ImageViewer { .. }
-            | Self::Canvas { .. }
-            | Self::Surface { .. } => None,
-        }
-    }
-
-    /// Takes the children out, leaving an empty list or an empty stand-in
-    /// per slot: what is left is the node's own fields, which is what a
-    /// [`Patch::Props`] carries and what two nodes are compared by.
-    fn detach(&mut self) -> Vec<Node> {
-        match self.child_list_mut() {
-            Some(list) => std::mem::take(list),
-            None => self
-                .children_mut()
-                .iter_mut()
-                .map(|slot| std::mem::replace(slot, Node::empty()))
-                .collect(),
-        }
-    }
-
-    /// Puts [`Node::detach`]ed children back. `None` when the arity does
-    /// not fit, in which case nothing was moved.
-    fn attach(&mut self, children: Vec<Node>) -> Option<()> {
-        if let Some(list) = self.child_list_mut() {
-            *list = children;
-            return Some(());
-        }
-        let slots = self.children_mut();
-        if slots.len() != children.len() {
-            return None;
-        }
-        for (slot, child) in slots.iter_mut().zip(children) {
-            *slot = child;
-        }
-        Some(())
-    }
-
-    /// Every node in the tree, depth first, this one included.
-    pub fn count(&self) -> usize {
-        1 + self.children().iter().map(Node::count).sum::<usize>()
-    }
-}
-
 /// A tree deeper than this is cut off: a guest cannot make the host's
 /// layout recurse without bound.
 pub const MAX_DEPTH: usize = 64;
@@ -1626,16 +817,9 @@ fn text_amounts(root: &Node) -> Result<(usize, usize), &'static str> {
 
 fn sanitize_tree(root: &mut Node) -> Result<SanitizeReport, &'static str> {
     let (documents, before) = text_amounts(root)?;
-    let mut budget = MAX_NODES;
-    let mut budgets = Budgets {
-        text: MAX_TEXT_BYTES_PER_FRAME,
-        pictures: MAX_PICTURE_BYTES_PER_FRAME,
-        surface_values: MAX_SURFACE_VALUES,
-        canvas_parts: MAX_CANVAS_PARTS,
-        qr_codes: MAX_QR_CODES,
-    };
+    let mut budgets = Budgets::frame();
     let mut taken = Taken::new();
-    sanitize_node(root, 0, &mut budget, &mut budgets, &mut taken);
+    sanitize_node(root, 0, &mut budgets, &mut taken);
     let (after_documents, after) = text_amounts(root)?;
     if after_documents != documents {
         return Err("frame budget would remove an editor document projection");
@@ -1643,226 +827,6 @@ fn sanitize_tree(root: &mut Node) -> Result<SanitizeReport, &'static str> {
     Ok(SanitizeReport {
         display_text_truncated: after < before,
     })
-}
-
-/// The most patches one frame may carry. A diff of a tree the host holds
-/// needs at most one patch per node it keeps, and a guest past that sends
-/// the tree whole; a host applying more would spend, per patch, a walk of
-/// a path and a shift of a child list, which is a frame's worth of work at
-/// this count already.
-pub const MAX_PATCHES: usize = 1024;
-
-/// Applies a patch frame to the tree the host holds, then pulls the result
-/// inside every bound [`sanitize`] promises — a patch is the guest's, so an
-/// inserted subtree can push the tree past [`MAX_NODES`] or [`MAX_DEPTH`]
-/// or reuse a key the tree already has, and the bounds are on the whole.
-///
-/// `Err` names a patch the tree cannot take: a path to no node, an index
-/// past a list, a list operation on a node with no list, a [`Patch::Props`]
-/// whose arity is not the node's, or more patches than [`MAX_PATCHES`]. The
-/// tree is then part-way through the sequence and not one the guest ever
-/// sent: the host drops it and asks for a whole one with [`Event::Resync`].
-pub fn apply(root: &mut Node, patches: Vec<Patch>) -> Result<SanitizeReport, &'static str> {
-    if patches.len() > MAX_PATCHES {
-        return Err("more patches than the host applies");
-    }
-    for patch in patches {
-        apply_one(root, patch)?;
-    }
-    sanitize_tree(root)
-}
-
-fn apply_one(root: &mut Node, patch: Patch) -> Result<(), &'static str> {
-    let (path, edit) = match patch {
-        Patch::Replace { path, node } => (path, Edit::Replace(node)),
-        Patch::Props { path, node } => (path, Edit::Props(node)),
-        Patch::Insert { path, index, node } => (path, Edit::Insert(index, node)),
-        Patch::Remove { path, index } => (path, Edit::Remove(index)),
-        Patch::Move { path, from, to } => (path, Edit::Move(from, to)),
-    };
-    let mut target = root;
-    for index in path {
-        target = target
-            .children_mut()
-            .get_mut(index as usize)
-            .ok_or("a path to no node")?;
-    }
-    match edit {
-        Edit::Replace(node) => *target = node,
-        Edit::Props(mut node) => {
-            let children = target.detach();
-            node.attach(children).ok_or("props of another arity")?;
-            *target = node;
-        }
-        Edit::Insert(index, node) => {
-            let list = target.child_list_mut().ok_or("a list edit on no list")?;
-            if index as usize > list.len() {
-                return Err("an index past the list");
-            }
-            list.insert(index as usize, node);
-        }
-        Edit::Remove(index) => {
-            let list = target.child_list_mut().ok_or("a list edit on no list")?;
-            if index as usize >= list.len() {
-                return Err("an index past the list");
-            }
-            list.remove(index as usize);
-        }
-        Edit::Move(from, to) => {
-            let list = target.child_list_mut().ok_or("a list edit on no list")?;
-            if from as usize >= list.len() || to as usize >= list.len() {
-                return Err("an index past the list");
-            }
-            let node = list.remove(from as usize);
-            list.insert(to as usize, node);
-        }
-    }
-    Ok(())
-}
-
-/// A [`Patch`] with its path taken off.
-enum Edit {
-    Replace(Node),
-    Props(Node),
-    Insert(u32, Node),
-    Remove(u32),
-    Move(u32, u32),
-}
-
-/// The patches that turn `old` into `new`: `apply(old, diff(old, new))`
-/// leaves `old == new`. Both are borrowed mutably only to compare a node's
-/// own fields with its children set aside; each is put back as it was.
-///
-/// A list of children is matched by key — a keyed child that moved is a
-/// [`Patch::Move`], one that left a [`Patch::Remove`], a new one a
-/// [`Patch::Insert`] — and two lists of the same shape are matched by
-/// position. Keys are what [`sanitize`] already makes unique on the host.
-pub fn diff(old: &mut Node, new: &mut Node) -> Vec<Patch> {
-    let mut patches = Vec::new();
-    diff_node(old, new, &mut Vec::new(), &mut patches);
-    patches
-}
-
-fn diff_node(old: &mut Node, new: &mut Node, path: &mut Vec<u32>, out: &mut Vec<Patch>) {
-    if old == new {
-        return;
-    }
-    let same_kind = std::mem::discriminant(old) == std::mem::discriminant(new);
-    let same_arity = new.child_list_mut().is_some() || old.children().len() == new.children().len();
-    if !(same_kind && same_arity) {
-        out.push(Patch::Replace {
-            path: path.clone(),
-            node: new.clone(),
-        });
-        return;
-    }
-    let old_children = old.detach();
-    let new_children = new.detach();
-    if old != new {
-        out.push(Patch::Props {
-            path: path.clone(),
-            node: new.clone(),
-        });
-    }
-    let mut old_children = old_children;
-    let mut new_children = new_children;
-    match old.child_list_mut().is_some() {
-        true => diff_list(&mut old_children, &mut new_children, path, out),
-        false => {
-            for (index, (old_child, new_child)) in
-                old_children.iter_mut().zip(&mut new_children).enumerate()
-            {
-                path.push(index as u32);
-                diff_node(old_child, new_child, path, out);
-                path.pop();
-            }
-        }
-    }
-    old.attach(old_children).expect("its own children");
-    new.attach(new_children).expect("its own children");
-}
-
-fn diff_list(old: &mut [Node], new: &mut [Node], path: &mut Vec<u32>, out: &mut Vec<Patch>) {
-    let positional = old.len() == new.len()
-        && old
-            .iter()
-            .zip(new.iter())
-            .all(|(a, b)| match (a.key(), b.key()) {
-                (Some(a), Some(b)) => a == b,
-                (None, None) => std::mem::discriminant(a) == std::mem::discriminant(b),
-                _ => false,
-            });
-    if positional {
-        for (index, (old_child, new_child)) in old.iter_mut().zip(new.iter_mut()).enumerate() {
-            path.push(index as u32);
-            diff_node(old_child, new_child, path, out);
-            path.pop();
-        }
-        return;
-    }
-    // A key that appears once on each side is a child that survives; every
-    // other child — unkeyed, or a duplicate the host would rename — is
-    // removed and inserted afresh.
-    let unique = |nodes: &[Node]| -> std::collections::HashMap<String, usize> {
-        let mut seen = std::collections::HashMap::new();
-        for (index, node) in nodes.iter().enumerate() {
-            if let Some(key) = node.key() {
-                seen.entry(key.to_owned())
-                    .and_modify(|at| *at = usize::MAX)
-                    .or_insert(index);
-            }
-        }
-        seen.retain(|_, at| *at != usize::MAX);
-        seen
-    };
-    let old_keys = unique(old);
-    let new_keys = unique(new);
-    // The list as the host has it after the patches so far: old indices.
-    let mut live: Vec<usize> = Vec::with_capacity(new.len());
-    for (index, node) in old.iter().enumerate() {
-        let survives = node
-            .key()
-            .is_some_and(|key| old_keys.contains_key(key) && new_keys.contains_key(key));
-        match survives {
-            true => live.push(index),
-            false => out.push(Patch::Remove {
-                path: path.clone(),
-                index: live.len() as u32,
-            }),
-        }
-    }
-    for (index, new_child) in new.iter_mut().enumerate() {
-        let wanted = new_child
-            .key()
-            .filter(|key| new_keys.contains_key(*key))
-            .and_then(|key| old_keys.get(key).copied());
-        let Some(wanted) = wanted else {
-            out.push(Patch::Insert {
-                path: path.clone(),
-                index: index as u32,
-                node: new_child.clone(),
-            });
-            live.insert(index, usize::MAX);
-            continue;
-        };
-        let at = live[index..]
-            .iter()
-            .position(|old_index| *old_index == wanted)
-            .expect("a surviving child is still live")
-            + index;
-        if at != index {
-            out.push(Patch::Move {
-                path: path.clone(),
-                from: at as u32,
-                to: index as u32,
-            });
-            live.remove(at);
-            live.insert(index, wanted);
-        }
-        path.push(index as u32);
-        diff_node(&mut old[wanted], new_child, path, out);
-        path.pop();
-    }
 }
 
 /// Every key claimed in one tree, each with the suffix its next duplicate
@@ -1894,42 +858,50 @@ fn claim(key: &mut String, taken: &mut Taken) {
     taken.insert(unique, 2);
 }
 
-/// What is left of a frame's per-frame byte budgets while its tree is walked.
-struct Budgets {
-    qr_codes: usize,
-    canvas_parts: usize,
-    surface_values: usize,
-    text: usize,
-    pictures: usize,
+/// What is left of a frame's per-frame budgets while its tree is walked.
+pub(crate) struct Budgets {
+    pub(crate) nodes: usize,
+    pub(crate) qr_codes: usize,
+    pub(crate) canvas_parts: usize,
+    pub(crate) surface_values: usize,
+    pub(crate) text: usize,
+    pub(crate) pictures: usize,
+}
+
+impl Budgets {
+    pub(crate) fn frame() -> Self {
+        Self {
+            nodes: MAX_NODES,
+            text: MAX_TEXT_BYTES_PER_FRAME,
+            pictures: MAX_PICTURE_BYTES_PER_FRAME,
+            surface_values: MAX_SURFACE_VALUES,
+            canvas_parts: MAX_CANVAS_PARTS,
+            qr_codes: MAX_QR_CODES,
+        }
+    }
 }
 
 /// Truncates one shaped string to what is left of the frame's text budget
 /// and spends what survives. Nodes are walked in tree order, so a frame past
 /// the budget keeps its head and loses its tail.
-fn spend_text(text: &mut String, text_budget: &mut usize) {
-    truncate_to(text, (*text_budget).min(MAX_STRING_BYTES));
-    *text_budget -= text.len();
+fn spend_text(text: &mut String, budgets: &mut Budgets) {
+    truncate_to(text, budgets.text.min(MAX_STRING_BYTES));
+    budgets.text -= text.len();
 }
 
 /// Spends a picture's bytes from the frame's picture budget, or drops them
 /// whole when they do not fit.
-fn spend_svg(bytes: &mut Option<Vec<u8>>, svg_budget: &mut usize) {
+fn spend_svg(bytes: &mut Option<Vec<u8>>, budgets: &mut Budgets) {
     match bytes {
-        Some(picture) if picture.len() <= *svg_budget => *svg_budget -= picture.len(),
+        Some(picture) if picture.len() <= budgets.pictures => budgets.pictures -= picture.len(),
         _ => *bytes = None,
     }
 }
 
-fn sanitize_node(
-    node: &mut Node,
-    depth: usize,
-    budget: &mut usize,
-    budgets: &mut Budgets,
-    taken: &mut Taken,
-) {
+fn sanitize_node(node: &mut Node, depth: usize, budgets: &mut Budgets, taken: &mut Taken) {
     // The caller guarantees one node of budget; a node too deep spends it
     // on the empty node that stands in for it.
-    *budget -= 1;
+    budgets.nodes -= 1;
     if depth >= MAX_DEPTH {
         *node = Node::empty();
         return;
@@ -2050,7 +1022,7 @@ fn sanitize_node(
         } => {
             claim(key, taken);
             if let Some(value) = reset
-                && !value.bound(0, &mut budgets.surface_values, &mut budgets.text, false)
+                && !value.bound(0, budgets, false)
             {
                 *reset = None;
             }
@@ -2149,7 +1121,7 @@ fn sanitize_node(
 
         Node::Canvas { key, commands, .. } => {
             claim(key, taken);
-            canvas::sanitize(commands, &mut budgets.canvas_parts);
+            canvas::sanitize(commands, budgets);
         }
         Node::When { key, condition, .. } => {
             claim(key, taken);
@@ -2174,7 +1146,7 @@ fn sanitize_node(
         }
         Node::Qr { key, code } => {
             claim(key, taken);
-            code.sanitize(&mut budgets.text, &mut budgets.qr_codes);
+            code.sanitize(budgets);
         }
         Node::RichText {
             key,
@@ -2185,8 +1157,8 @@ fn sanitize_node(
             ..
         } => {
             claim(key, taken);
-            options.sanitize(&mut budgets.text);
-            rich_text::sanitize(spans, &mut budgets.text, budget);
+            options.sanitize(budgets);
+            rich_text::sanitize(spans, budgets);
             if let Some(size) = size {
                 *size = bounded(*size).min(MAX_TEXT_PIXELS);
             }
@@ -2201,15 +1173,15 @@ fn sanitize_node(
             ..
         } => {
             claim(key, taken);
-            options.sanitize(&mut budgets.text);
-            spend_text(content, &mut budgets.text);
+            options.sanitize(budgets);
+            spend_text(content, budgets);
             // Tracking expands graphemes into native widgets. Charge a conservative
             // scalar count against the same host node budget before rendering.
             if options.tracking > 0.0 {
-                if let Some((end, _)) = content.char_indices().nth(*budget) {
+                if let Some((end, _)) = content.char_indices().nth(budgets.nodes) {
                     content.truncate(end);
                 }
-                *budget = budget.saturating_sub(content.chars().count());
+                budgets.nodes = budgets.nodes.saturating_sub(content.chars().count());
             }
             if let Some(size) = size {
                 *size = bounded(*size).min(MAX_TEXT_PIXELS);
@@ -2224,7 +1196,7 @@ fn sanitize_node(
             ..
         } => {
             claim(key, taken);
-            ImageData::sanitize(data, &mut budgets.pictures);
+            ImageData::sanitize(data, budgets);
             if let Some(label) = label {
                 truncate_string(label);
             }
@@ -2239,7 +1211,7 @@ fn sanitize_node(
             ..
         } => {
             claim(key, taken);
-            ImageData::sanitize(data, &mut budgets.pictures);
+            ImageData::sanitize(data, budgets);
             if let Some(label) = label {
                 truncate_string(label);
             }
@@ -2261,7 +1233,7 @@ fn sanitize_node(
             ..
         } => {
             claim(key, taken);
-            spend_svg(bytes, &mut budgets.pictures);
+            spend_svg(bytes, budgets);
             if let Some(label) = label {
                 truncate_string(label);
             }
@@ -2285,11 +1257,11 @@ fn sanitize_node(
             ..
         } => {
             claim(key, taken);
-            spend_text(placeholder, &mut budgets.text);
-            spend_text(value, &mut budgets.text);
-            spend_text(&mut options.label, &mut budgets.text);
+            spend_text(placeholder, budgets);
+            spend_text(value, budgets);
+            spend_text(&mut options.label, budgets);
             if let Some(description) = &mut options.description {
-                spend_text(description, &mut budgets.text);
+                spend_text(description, budgets);
             }
             bound_edges(&mut options.padding);
             if let Some(size) = &mut options.text_size {
@@ -2299,7 +1271,7 @@ fn sanitize_node(
                 *height = bounded(*height).clamp(f32::EPSILON, MAX_PIXELS / MAX_TEXT_PIXELS);
             }
             if let Some(font) = &mut options.font {
-                font.sanitize(&mut budgets.text);
+                font.sanitize(budgets);
             }
 
             style.sanitize();
@@ -2314,11 +1286,11 @@ fn sanitize_node(
             ..
         } => {
             if let Some(presentation) = &mut options.presentation {
-                presentation.sanitize(&mut budgets.text);
+                presentation.sanitize(budgets);
             }
             if let Some(rich) = &mut options.rich {
                 for item in &mut rich.toolbar {
-                    spend_text(&mut item.label, &mut budgets.text);
+                    spend_text(&mut item.label, budgets);
                 }
             }
             bound_optional(&mut options.size);
@@ -2331,9 +1303,9 @@ fn sanitize_node(
             }
             options.style.sanitize();
             claim(key, taken);
-            spend_text(placeholder, &mut budgets.text);
+            spend_text(placeholder, budgets);
             if let Some(font) = &mut options.font {
-                font.sanitize(&mut budgets.text);
+                font.sanitize(budgets);
             }
             bound_optional(width);
             bound_optional(min_height);
@@ -2350,16 +1322,16 @@ fn sanitize_node(
         } => {
             claim(key, taken);
             if let ButtonContent::Label(label) = content {
-                spend_text(label, &mut budgets.text);
+                spend_text(label, budgets);
             }
             if let Some(label) = label {
                 truncate_string(label);
             }
             if let Some(description) = description {
-                spend_text(description, &mut budgets.text);
+                spend_text(description, budgets);
             }
             if let Some(recipe) = &mut style.recipe {
-                recipe.sanitize(&mut budgets.text);
+                recipe.sanitize(budgets);
             }
             bound_edges(padding);
             for face in [
@@ -2397,7 +1369,7 @@ fn sanitize_node(
             key, label, style, ..
         } => {
             claim(key, taken);
-            spend_text(label, &mut budgets.text);
+            spend_text(label, budgets);
             for face in [
                 &mut style.active_on,
                 &mut style.active_off,
@@ -2416,7 +1388,7 @@ fn sanitize_node(
             key, label, style, ..
         } => {
             claim(key, taken);
-            spend_text(label, &mut budgets.text);
+            spend_text(label, budgets);
             for face in [
                 &mut style.active_on,
                 &mut style.active_off,
@@ -2473,13 +1445,13 @@ fn sanitize_node(
             ..
         } => {
             claim(key, taken);
-            spend_text(state_key, &mut budgets.text);
-            settings.sanitize(&mut budgets.text);
+            spend_text(state_key, budgets);
+            settings.sanitize(budgets);
             options.truncate(MAX_OPTIONS);
             for option in options.iter_mut() {
-                spend_text(option, &mut budgets.text);
+                spend_text(option, budgets);
             }
-            spend_text(placeholder, &mut budgets.text);
+            spend_text(placeholder, budgets);
             if selected.is_some_and(|index| index as usize >= options.len()) {
                 *selected = None;
             }
@@ -2494,7 +1466,7 @@ fn sanitize_node(
             ..
         } => {
             claim(key, taken);
-            settings.sanitize(&mut budgets.text);
+            settings.sanitize(budgets);
             for face in [
                 &mut style.active,
                 &mut style.hovered,
@@ -2520,10 +1492,10 @@ fn sanitize_node(
             }
             options.truncate(MAX_OPTIONS);
             for option in options.iter_mut() {
-                spend_text(option, &mut budgets.text);
+                spend_text(option, budgets);
             }
             if let Some(placeholder) = placeholder {
-                spend_text(placeholder, &mut budgets.text);
+                spend_text(placeholder, budgets);
             }
             if selected.is_some_and(|index| index as usize >= options.len()) {
                 *selected = None;
@@ -2551,14 +1523,14 @@ fn sanitize_node(
             key, name, args, ..
         } => {
             claim(key, taken);
-            spend_text(name, &mut budgets.text);
+            spend_text(name, budgets);
             args.truncate(MAX_SURFACE_ARGS);
             let mut kept = 0;
             for value in args.iter_mut() {
                 if budgets.surface_values == 0 {
                     break;
                 }
-                if !value.bound(0, &mut budgets.surface_values, &mut budgets.text, false) {
+                if !value.bound(0, budgets, false) {
                     *value = SurfaceValue::Unit;
                 }
                 kept += 1;
@@ -2583,10 +1555,10 @@ fn sanitize_node(
     {
         let mut kept = 0;
         for child in children.iter_mut() {
-            if *budget == 0 {
+            if budgets.nodes == 0 {
                 break;
             }
-            sanitize_node(child, depth + 1, budget, budgets, taken);
+            sanitize_node(child, depth + 1, budgets, taken);
             kept += 1;
         }
         children.truncate(kept);
@@ -2602,11 +1574,11 @@ fn sanitize_node(
         return;
     }
     for child in node.children_mut() {
-        if *budget == 0 {
+        if budgets.nodes == 0 {
             *child = Node::empty();
             continue;
         }
-        sanitize_node(child, depth + 1, budget, budgets, taken);
+        sanitize_node(child, depth + 1, budgets, taken);
     }
 }
 
@@ -3048,6 +2020,25 @@ mod tests {
         }
     }
 
+    /// The tree a host is left holding. Most tests here want only that —
+    /// the `Frame` around it is scaffolding, and the report is the business
+    /// of the few tests that read it.
+    fn sanitized_root(root: Node) -> Node {
+        let mut frame = Frame {
+            root: Some(root),
+            ..Frame::default()
+        };
+        sanitize(&mut frame).unwrap();
+        frame.root.unwrap()
+    }
+
+    fn sanitized_children(root: Node) -> Vec<Node> {
+        let Node::Linear { children, .. } = sanitized_root(root) else {
+            panic!("a sanitized column is still a column")
+        };
+        children
+    }
+
     fn column(children: Vec<Node>) -> Node {
         Node::Linear {
             max_width: None,
@@ -3116,22 +2107,17 @@ mod tests {
         let mut applied = node;
         apply(&mut applied, patches).unwrap();
         assert_eq!(applied, changed);
-        let mut frame = Frame {
-            root: Some(Node::Surface {
-                key: "view".into(),
-                name: "preview".into(),
-                args: std::iter::once(V::F64(f64::NAN))
-                    .chain(std::iter::repeat_n(
-                        V::Str("é".repeat(MAX_STRING_BYTES)),
-                        MAX_SURFACE_ARGS + 1,
-                    ))
-                    .collect(),
-                on_event: None,
-            }),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Node::Surface { name, args, .. } = frame.root.unwrap() else {
+        let Node::Surface { name, args, .. } = sanitized_root(Node::Surface {
+            key: "view".into(),
+            name: "preview".into(),
+            args: std::iter::once(V::F64(f64::NAN))
+                .chain(std::iter::repeat_n(
+                    V::Str("é".repeat(MAX_STRING_BYTES)),
+                    MAX_SURFACE_ARGS + 1,
+                ))
+                .collect(),
+            on_event: None,
+        }) else {
             unreachable!()
         };
         assert_eq!(args.len(), MAX_SURFACE_ARGS);
@@ -3508,16 +2494,9 @@ mod tests {
         const NODES: usize = 8;
         const EACH: usize = MAX_TEXT_BYTES_PER_FRAME / 4;
 
-        let mut frame = Frame {
-            root: Some(column(
-                (0..NODES).map(|_| text(&"é".repeat(EACH / 2))).collect(),
-            )),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Linear { children, .. }) = &frame.root else {
-            panic!()
-        };
+        let children = sanitized_children(column(
+            (0..NODES).map(|_| text(&"é".repeat(EACH / 2))).collect(),
+        ));
         let shaped: Vec<usize> = children
             .iter()
             .map(|child| match child {
@@ -3625,40 +2604,33 @@ mod tests {
     #[test]
     fn every_shaped_string_spends_the_same_budget() {
         let long = "x".repeat(MAX_TEXT_BYTES_PER_FRAME);
-        let mut frame = Frame {
-            root: Some(column(vec![
-                Node::Input {
-                    options: Default::default(),
-                    key: "App/i".into(),
-                    placeholder: long.clone(),
-                    value: long.clone(),
-                    on_input: 0,
-                    on_submit: None,
-                    width: None,
-                    secure: false,
-                    style: Box::default(),
-                },
-                Node::Button {
-                    checked: None,
-                    expanded: None,
-                    description: Some("Details".into()),
-                    key: "App/b".into(),
-                    content: ButtonContent::Label(long.clone()),
-                    label: Some(long),
-                    on_press: None,
-                    width: None,
-                    height: None,
-                    padding: None,
-                    style: ButtonStyle::default(),
-                },
-                text("tail"),
-            ])),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Linear { children, .. }) = &frame.root else {
-            panic!()
-        };
+        let children = sanitized_children(column(vec![
+            Node::Input {
+                options: Default::default(),
+                key: "App/i".into(),
+                placeholder: long.clone(),
+                value: long.clone(),
+                on_input: 0,
+                on_submit: None,
+                width: None,
+                secure: false,
+                style: Box::default(),
+            },
+            Node::Button {
+                checked: None,
+                expanded: None,
+                description: Some("Details".into()),
+                key: "App/b".into(),
+                content: ButtonContent::Label(long.clone()),
+                label: Some(long),
+                on_press: None,
+                width: None,
+                height: None,
+                padding: None,
+                style: ButtonStyle::default(),
+            },
+            text("tail"),
+        ]));
         let Node::Input {
             placeholder, value, ..
         } = &children[0]
@@ -3692,25 +2664,20 @@ mod tests {
             deep = column(vec![deep]);
         }
         let wide = column((0..MAX_NODES + 5).map(|_| text("x")).collect());
-        let mut frame = Frame {
-            root: Some(column(vec![
-                Node::Text {
-                    options: Default::default(),
-                    key: "k".repeat(MAX_STRING_BYTES + 3),
-                    content: "é".repeat(MAX_STRING_BYTES),
-                    size: Some(f32::NAN),
-                    color: Some(Rgba([2.0, -1.0, f32::INFINITY, 0.5])),
-                    font: Font::default(),
-                    width: Some(Length::Fixed(-5.0)),
-                    align_x: None,
-                },
-                deep,
-                wide,
-            ])),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let root = frame.root.unwrap();
+        let root = sanitized_root(column(vec![
+            Node::Text {
+                options: Default::default(),
+                key: "k".repeat(MAX_STRING_BYTES + 3),
+                content: "é".repeat(MAX_STRING_BYTES),
+                size: Some(f32::NAN),
+                color: Some(Rgba([2.0, -1.0, f32::INFINITY, 0.5])),
+                font: Font::default(),
+                width: Some(Length::Fixed(-5.0)),
+                align_x: None,
+            },
+            deep,
+            wide,
+        ]));
         // A container whose child fell past the budget keeps an empty
         // stand-in, one per level at most.
         assert!(root.count() <= MAX_NODES + MAX_DEPTH, "{}", root.count());
@@ -3741,13 +2708,9 @@ mod tests {
         for _ in 0..MAX_DEPTH * 2 {
             deep = column(vec![deep]);
         }
-        let mut frame = Frame {
-            root: Some(deep),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
+        let root = sanitized_root(deep);
         let mut depth = 0;
-        let mut node = frame.root.as_ref().unwrap();
+        let mut node = &root;
         while let Node::Linear { children, .. } = node {
             depth += 1;
             node = &children[0];
@@ -3834,17 +2797,10 @@ mod tests {
         assert_eq!(old, new);
 
         // Two areas on one key: the second is moved off it, its child kept.
-        let mut frame = Frame {
-            root: Some(column(vec![
-                mouse_area("App/m", None, text("a")),
-                mouse_area("App/m", None, text("b")),
-            ])),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Linear { children, .. }) = &frame.root else {
-            panic!()
-        };
+        let children = sanitized_children(column(vec![
+            mouse_area("App/m", None, text("a")),
+            mouse_area("App/m", None, text("b")),
+        ]));
         assert_eq!(children[1].key(), Some("App/m#2"));
         assert_eq!(children[1].children().len(), 1);
     }
@@ -3944,14 +2900,7 @@ mod tests {
 
     #[test]
     fn a_key_used_twice_is_moved_off_the_one_already_taken() {
-        let mut frame = Frame {
-            root: Some(column(vec![text("one"), text("two"), text("three")])),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Linear { children, .. }) = &frame.root else {
-            panic!()
-        };
+        let children = sanitized_children(column(vec![text("one"), text("two"), text("three")]));
         let keys: Vec<&str> = children.iter().filter_map(Node::key).collect();
         assert_eq!(keys, ["App/t", "App/t#2", "App/t#3"]);
     }
@@ -4007,6 +2956,7 @@ mod tests {
             delay: None,
             child: Box::new(text("child")),
         };
+        // Not `sanitized_children`: the frame itself is asserted on below.
         let mut frame = Frame {
             root: Some(column(vec![sensor("first"), sensor("second")])),
             ..Frame::default()
@@ -4043,33 +2993,29 @@ mod tests {
 
     #[test]
     fn a_sensor_is_pulled_into_range_and_keeps_its_child() {
-        let mut frame = Frame {
-            root: Some(Node::Sensor {
-                key: "App/watch".into(),
-                reset: None,
-                on_show: Some(0),
-                on_resize: Some(0),
-                on_hide: Some(1),
-                anticipate: Some(f32::INFINITY),
-                delay: Some(-5.0),
-                child: Box::new(text("a")),
-            }),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Sensor {
+        let root = sanitized_root(Node::Sensor {
+            key: "App/watch".into(),
+            reset: None,
+            on_show: Some(0),
+            on_resize: Some(0),
+            on_hide: Some(1),
+            anticipate: Some(f32::INFINITY),
+            delay: Some(-5.0),
+            child: Box::new(text("a")),
+        });
+        let Node::Sensor {
             anticipate,
             delay,
             child,
             ..
-        }) = &frame.root
+        } = &root
         else {
-            panic!("{:?}", frame.root)
+            panic!("{root:?}")
         };
         assert_eq!(*anticipate, Some(MAX_PIXELS));
         assert_eq!(*delay, Some(0.0));
         assert_eq!(**child, text("a"));
-        assert_eq!(frame.root.as_ref().unwrap().count(), 2);
+        assert_eq!(root.count(), 2);
     }
 
     /// The form controls: a menu is cut to `MAX_OPTIONS` with a selection
@@ -4077,47 +3023,40 @@ mod tests {
     /// clamped like a size — a value of a million is the app's to send.
     #[test]
     fn form_controls_are_pulled_into_range() {
-        let mut frame = Frame {
-            root: Some(column(vec![
-                Node::PickList {
-                    settings: Default::default(),
-                    key: "App/pick".into(),
-                    options: (0..MAX_OPTIONS + 3).map(|i| i.to_string()).collect(),
-                    selected: Some((MAX_OPTIONS + 1) as u32),
-                    placeholder: Some("é".repeat(MAX_STRING_BYTES)),
-                    on_select: 0,
-                    width: Some(Length::Fixed(f32::INFINITY)),
-                    style: PickListStyle::default(),
-                },
-                Node::Slider {
-                    key: "App/slide".into(),
-                    value: f32::NAN,
-                    min: f32::NEG_INFINITY,
-                    max: 1_000_000.0,
-                    step: f32::INFINITY,
-                    on_change: 1,
-                    on_release: None,
-                    axis: Axis::Row,
-                    width: None,
-                    height: None,
-                    style: SliderStyle::default(),
-                },
-                Node::Toggle {
-                    key: "App/pick".into(),
-                    kind: ToggleKind::Switch,
-                    label: "x".repeat(MAX_STRING_BYTES + 1),
-                    checked: true,
-                    on_toggle: None,
-                    width: None,
-                    style: ToggleStyle::default(),
-                },
-            ])),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Linear { children, .. }) = &frame.root else {
-            panic!()
-        };
+        let children = sanitized_children(column(vec![
+            Node::PickList {
+                settings: Default::default(),
+                key: "App/pick".into(),
+                options: (0..MAX_OPTIONS + 3).map(|i| i.to_string()).collect(),
+                selected: Some((MAX_OPTIONS + 1) as u32),
+                placeholder: Some("é".repeat(MAX_STRING_BYTES)),
+                on_select: 0,
+                width: Some(Length::Fixed(f32::INFINITY)),
+                style: PickListStyle::default(),
+            },
+            Node::Slider {
+                key: "App/slide".into(),
+                value: f32::NAN,
+                min: f32::NEG_INFINITY,
+                max: 1_000_000.0,
+                step: f32::INFINITY,
+                on_change: 1,
+                on_release: None,
+                axis: Axis::Row,
+                width: None,
+                height: None,
+                style: SliderStyle::default(),
+            },
+            Node::Toggle {
+                key: "App/pick".into(),
+                kind: ToggleKind::Switch,
+                label: "x".repeat(MAX_STRING_BYTES + 1),
+                checked: true,
+                on_toggle: None,
+                width: None,
+                style: ToggleStyle::default(),
+            },
+        ]));
         let Node::PickList {
             options,
             selected,
@@ -4158,24 +3097,20 @@ mod tests {
     /// stood in for.
     #[test]
     fn a_grid_is_pulled_into_range_and_cut_like_a_linear_layout() {
-        let mut frame = Frame {
-            root: Some(Node::Grid {
-                key: "App/cells".into(),
-                columns: Some(u32::MAX),
-                fluid: Some(f32::NAN),
-                spacing: Some(-3.0),
-                padding: Some(Edges::all(f32::INFINITY)),
-                width: Some(Length::Fixed(f32::MAX)),
-                height: None,
-                aspect: Some(f32::NEG_INFINITY),
-                background: None,
-                border: None,
-                children: (0..MAX_NODES + 5).map(|_| text("x")).collect(),
-            }),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Grid {
+        let root = sanitized_root(Node::Grid {
+            key: "App/cells".into(),
+            columns: Some(u32::MAX),
+            fluid: Some(f32::NAN),
+            spacing: Some(-3.0),
+            padding: Some(Edges::all(f32::INFINITY)),
+            width: Some(Length::Fixed(f32::MAX)),
+            height: None,
+            aspect: Some(f32::NEG_INFINITY),
+            background: None,
+            border: None,
+            children: (0..MAX_NODES + 5).map(|_| text("x")).collect(),
+        });
+        let Node::Grid {
             columns,
             fluid,
             spacing,
@@ -4184,7 +3119,7 @@ mod tests {
             aspect,
             children,
             ..
-        }) = &frame.root
+        } = &root
         else {
             panic!()
         };
@@ -4195,7 +3130,7 @@ mod tests {
         assert_eq!(*width, Some(Length::Fixed(MAX_PIXELS)));
         assert_eq!(*aspect, Some(0.0));
         assert_eq!(children.len(), MAX_NODES - 1);
-        assert_eq!(frame.root.as_ref().unwrap().count(), MAX_NODES);
+        assert_eq!(root.count(), MAX_NODES);
     }
 
     fn picture(bytes: Option<Vec<u8>>) -> Node {
@@ -4255,19 +3190,12 @@ mod tests {
     #[test]
     fn a_frame_past_the_picture_budget_drops_whole_pictures_from_its_tail() {
         const EACH: usize = MAX_PICTURE_BYTES_PER_FRAME / 4 * 3;
-        let mut frame = Frame {
-            root: Some(column(vec![
-                picture(Some(vec![b'<'; EACH])),
-                picture(Some(vec![b'<'; EACH])),
-                picture(None),
-                picture(Some(vec![b'<'; MAX_PICTURE_BYTES_PER_FRAME / 4])),
-            ])),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Linear { children, .. }) = &frame.root else {
-            panic!()
-        };
+        let children = sanitized_children(column(vec![
+            picture(Some(vec![b'<'; EACH])),
+            picture(Some(vec![b'<'; EACH])),
+            picture(None),
+            picture(Some(vec![b'<'; MAX_PICTURE_BYTES_PER_FRAME / 4])),
+        ]));
         let carried: Vec<Option<usize>> = children
             .iter()
             .map(|child| match child {
@@ -4294,15 +3222,10 @@ mod tests {
         };
         *size = Some(f32::MAX);
         *width = Some(Length::Fixed(f32::MAX));
-        let mut frame = Frame {
-            root: Some(huge),
-            ..Frame::default()
-        };
-        sanitize(&mut frame).unwrap();
-        let Some(Node::Text { size, width, .. }) = &frame.root else {
+        let Node::Text { size, width, .. } = sanitized_root(huge) else {
             panic!()
         };
-        assert_eq!(*size, Some(MAX_TEXT_PIXELS));
-        assert_eq!(*width, Some(Length::Fixed(MAX_PIXELS)));
+        assert_eq!(size, Some(MAX_TEXT_PIXELS));
+        assert_eq!(width, Some(Length::Fixed(MAX_PIXELS)));
     }
 }

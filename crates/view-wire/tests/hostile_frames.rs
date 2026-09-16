@@ -1009,24 +1009,30 @@ fn gen_patch_tree(rng: &mut Rng) -> Node {
 /// a node with no list, and its `Props` sometimes a whole subtree; the
 /// other kind of sender is what a real diff emits, so a whole sequence of
 /// its patches applies and the invariant is checked on the result.
+/// A node whose children are a list the host can insert into, remove from
+/// and reorder — as opposed to a fixed set of slots. Written out here rather
+/// than routed through `Node::child_list_mut`, so a variant that gains or
+/// loses its list fails a test instead of agreeing with itself.
+fn is_list_node(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::Linear { .. }
+            | Node::Grid { .. }
+            | Node::KeyedColumn { .. }
+            | Node::Flex { .. }
+            | Node::Stack { .. }
+            | Node::Hover { .. }
+            | Node::Overlay { .. }
+    )
+}
+
 fn gen_patch(rng: &mut Rng, root: &Node, hostile: bool) -> Patch {
     let path = gen_path(rng, root, hostile);
     let mut node = Some(root);
     for index in &path {
         node = node.and_then(|node| node.children().get(*index as usize));
     }
-    let is_list = node.is_some_and(|node| {
-        matches!(
-            node,
-            Node::Linear { .. }
-                | Node::Grid { .. }
-                | Node::KeyedColumn { .. }
-                | Node::Flex { .. }
-                | Node::Stack { .. }
-                | Node::Hover { .. }
-                | Node::Overlay { .. }
-        )
-    });
+    let is_list = node.is_some_and(is_list_node);
     let len = node.map_or(0, |node| node.children().len());
     let index = |rng: &mut Rng, bound: usize| match rng.next_range(8) {
         0 if hostile => rng.next_range(bound + 3) as u32,
@@ -1048,47 +1054,15 @@ fn gen_patch(rng: &mut Rng, root: &Node, hostile: bool) -> Patch {
             // the arity the node at the path has — or, from a hostile
             // sender, any node at all.
             let mut fresh = gen_patch_tree(rng);
-            let same_arity = |fresh: &Node| match (node, fresh) {
-                (
-                    Some(
-                        Node::Linear { .. }
-                        | Node::Grid { .. }
-                        | Node::KeyedColumn { .. }
-                        | Node::Flex { .. }
-                        | Node::Stack { .. }
-                        | Node::Hover { .. }
-                        | Node::Overlay { .. },
-                    ),
-                    Node::Linear { .. }
-                    | Node::Grid { .. }
-                    | Node::KeyedColumn { .. }
-                    | Node::Flex { .. }
-                    | Node::Stack { .. }
-                    | Node::Hover { .. }
-                    | Node::Overlay { .. },
-                ) => true,
-                (Some(at), fresh) => {
-                    !matches!(
-                        at,
-                        Node::Linear { .. }
-                            | Node::Grid { .. }
-                            | Node::KeyedColumn { .. }
-                            | Node::Flex { .. }
-                            | Node::Stack { .. }
-                            | Node::Hover { .. }
-                            | Node::Overlay { .. }
-                    ) && !matches!(
-                        fresh,
-                        Node::Linear { .. }
-                            | Node::Grid { .. }
-                            | Node::KeyedColumn { .. }
-                            | Node::Flex { .. }
-                            | Node::Stack { .. }
-                            | Node::Hover { .. }
-                            | Node::Overlay { .. }
-                    ) && at.children().len() == fresh.children().len()
-                }
-                (None, _) => false,
+            let same_arity = |fresh: &Node| match node {
+                // Two list nodes take each other's children whatever the
+                // count; two fixed-slot nodes only at the same count.
+                Some(at) => match (is_list_node(at), is_list_node(fresh)) {
+                    (true, true) => true,
+                    (false, false) => at.children().len() == fresh.children().len(),
+                    _ => false,
+                },
+                None => false,
             };
             if !hostile {
                 while !same_arity(&fresh) {
@@ -1300,6 +1274,30 @@ fn check_pixels(value: &Option<f32>, ctx: &str, field: &str) {
     }
 }
 
+/// Every face an input-shaped widget can paint: the two it always has, and
+/// the four it may. `icon` is checked on all of them — a face's `Rgba` is
+/// sanitized whether or not the widget draws one.
+fn check_input_style(style: &InputStyle, ctx: &str) {
+    for face in [
+        Some(&style.utility),
+        Some(&style.active),
+        style.hovered.as_ref(),
+        style.focused.as_ref(),
+        style.focused_hovered.as_ref(),
+        style.disabled.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        check_color(&face.background, ctx);
+        check_border(&face.border, ctx);
+        check_color(&face.value, ctx);
+        check_color(&face.placeholder, ctx);
+        check_color(&face.selection, ctx);
+        check_color(&face.icon, ctx);
+    }
+}
+
 fn check_control_face(face: &Option<ControlFace>, ctx: &str) {
     let Some(face) = face else { return };
     check_color(&face.background, ctx);
@@ -1486,21 +1484,11 @@ fn check_bounds(
             children,
             ..
         } => {
-            if let Some(value) = max_width {
-                assert!(value.is_finite() && (0.0..=PIXEL_BOUND).contains(value));
+            check_pixels(max_width, ctx, "linear max width");
+            if let Some(Wrap { spacing: gap, .. }) = wrap {
+                check_pixels(gap, ctx, "linear wrap spacing");
             }
-            if let Some(Wrap {
-                spacing: Some(gap), ..
-            }) = wrap
-            {
-                assert!(gap.is_finite() && (0.0..=PIXEL_BOUND).contains(gap));
-            }
-            if let Some(spacing) = spacing {
-                assert!(
-                    spacing.is_finite() && (0.0..=PIXEL_BOUND).contains(spacing),
-                    "{ctx}: spacing {spacing} outside 0..={PIXEL_BOUND}"
-                );
-            }
+            check_pixels(spacing, ctx, "spacing");
             check_edges(padding, ctx);
             check_length(width, ctx);
             check_length(height, ctx);
@@ -1574,13 +1562,12 @@ fn check_bounds(
             children,
             ..
         } => {
-            for (name, value) in [("fluid", fluid), ("spacing", spacing), ("aspect", aspect)] {
-                if let Some(value) = value {
-                    assert!(
-                        value.is_finite() && (0.0..=PIXEL_BOUND).contains(value),
-                        "{ctx}: grid {name} {value} outside 0..={PIXEL_BOUND}"
-                    );
-                }
+            for (name, value) in [
+                ("grid fluid", fluid),
+                ("grid spacing", spacing),
+                ("grid aspect", aspect),
+            ] {
+                check_pixels(value, ctx, name);
             }
             check_edges(padding, ctx);
             check_length(width, ctx);
@@ -1597,12 +1584,7 @@ fn check_bounds(
             child,
             ..
         } => {
-            if let Some(anticipate) = anticipate {
-                assert!(
-                    anticipate.is_finite() && (0.0..=PIXEL_BOUND).contains(anticipate),
-                    "{ctx}: sensor anticipate {anticipate} outside 0..={PIXEL_BOUND}"
-                );
-            }
+            check_pixels(anticipate, ctx, "sensor anticipate");
             if let Some(delay) = delay {
                 assert!(
                     delay.is_finite() && *delay >= 0.0,
@@ -1708,9 +1690,7 @@ fn check_bounds(
             }
             check_length(width, ctx);
             check_length(height, ctx);
-            if let Some(padding) = options.padding {
-                assert!(padding.is_finite() && (0.0..=PIXEL_BOUND).contains(&padding));
-            }
+            check_pixels(&options.padding, ctx, "viewer padding");
             if let Some((min, max)) = options.scale_bounds {
                 assert!(min.is_finite() && max.is_finite() && min > 0.0 && max >= min);
             }
@@ -1804,23 +1784,7 @@ fn check_bounds(
                 check_string(name, ctx, "input font");
             }
             check_color(&style.focus_border, ctx);
-            for face in [
-                Some(&style.utility),
-                Some(&style.active),
-                style.hovered.as_ref(),
-                style.focused.as_ref(),
-                style.focused_hovered.as_ref(),
-                style.disabled.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                check_color(&face.background, ctx);
-                check_border(&face.border, ctx);
-                check_color(&face.value, ctx);
-                check_color(&face.placeholder, ctx);
-                check_color(&face.selection, ctx);
-            }
+            check_input_style(style, ctx);
         }
         Node::Button {
             content,
@@ -1899,10 +1863,7 @@ fn check_bounds(
             radius,
             ..
         } => {
-            assert!(
-                thickness.is_finite() && (0.0..=PIXEL_BOUND).contains(thickness),
-                "{ctx}: rule thickness {thickness} outside 0..={PIXEL_BOUND}"
-            );
+            check_pixels(&Some(*thickness), ctx, "rule thickness");
             check_color(color, ctx);
             for corner in radius.iter().flatten() {
                 check_pixels(&Some(*corner), ctx, "rule radius");
@@ -1983,33 +1944,13 @@ fn check_bounds(
             }
             check_length(width, ctx);
             check_length(&settings.menu_height, ctx);
-            for value in [
-                settings.padding,
-                settings.icon.as_ref().map(|icon| icon.spacing),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                assert!(value.is_finite() && (0.0..=PIXEL_BOUND).contains(&value));
-            }
-            for face in [
-                Some(&settings.style.utility),
-                Some(&settings.style.active),
-                settings.style.hovered.as_ref(),
-                settings.style.focused.as_ref(),
-                settings.style.focused_hovered.as_ref(),
-                settings.style.disabled.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                check_color(&face.background, ctx);
-                check_border(&face.border, ctx);
-                check_color(&face.value, ctx);
-                check_color(&face.placeholder, ctx);
-                check_color(&face.selection, ctx);
-                check_color(&face.icon, ctx);
-            }
+            check_pixels(&settings.padding, ctx, "combo padding");
+            check_pixels(
+                &settings.icon.as_ref().map(|icon| icon.spacing),
+                ctx,
+                "combo icon spacing",
+            );
+            check_input_style(&settings.style, ctx);
         }
         Node::PickList {
             options,
@@ -2111,10 +2052,7 @@ fn check_bounds(
             check_color(background, ctx);
             check_border(border, ctx);
             check_color(tint, ctx);
-            assert!(
-                radius.is_finite() && (0.0..=PIXEL_BOUND).contains(radius),
-                "{ctx}: hover radius"
-            );
+            check_pixels(&Some(*radius), ctx, "hover radius");
             assert!(children.len() <= 2, "{ctx}: hover child count");
             for child in children {
                 check_bounds(child, depth + 1, keys, svg_bytes, ctx);
@@ -2126,10 +2064,7 @@ fn check_bounds(
             children,
             ..
         } => {
-            assert!(
-                padding.is_finite() && (0.0..=PIXEL_BOUND).contains(padding),
-                "{ctx}: overlay padding"
-            );
+            check_pixels(&Some(*padding), ctx, "overlay padding");
             check_color(&Some(*backdrop), ctx);
             assert!(children.len() <= 2, "{ctx}: overlay child count");
             for child in children {
@@ -2198,23 +2133,7 @@ fn check_bounds(
             {
                 check_string(name, ctx, "editor font");
             }
-            for face in [
-                Some(&options.style.utility),
-                Some(&options.style.active),
-                options.style.hovered.as_ref(),
-                options.style.focused.as_ref(),
-                options.style.focused_hovered.as_ref(),
-                options.style.disabled.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                check_color(&face.background, ctx);
-                check_border(&face.border, ctx);
-                check_color(&face.value, ctx);
-                check_color(&face.placeholder, ctx);
-                check_color(&face.selection, ctx);
-            }
+            check_input_style(&options.style, ctx);
             check_string(placeholder, ctx, "editor placeholder");
             // A document is metadata: sanitize keeps a valid reference whole,
             // and never spends the display budget on the bytes it names.
@@ -2224,11 +2143,8 @@ fn check_bounds(
                 "{ctx}: sanitize kept an invalid editor document reference"
             );
             check_length(height, ctx);
-            for value in [width, min_height, max_height].into_iter().flatten() {
-                assert!(
-                    value.is_finite() && (0.0..=PIXEL_BOUND).contains(value),
-                    "{ctx}: editor size {value} outside 0..={PIXEL_BOUND}"
-                );
+            for value in [width, min_height, max_height] {
+                check_pixels(value, ctx, "editor size");
             }
         }
     }

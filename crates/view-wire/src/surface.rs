@@ -5,7 +5,7 @@ use std::cell::Cell;
 pub const MAX_SURFACE_DEPTH: usize = 32;
 pub const MAX_SURFACE_VALUES: usize = 4096;
 
-/// An owned, tagged value. Records carry the Ice declaration name and named
+/// An owned, tagged value. Records carry the guest's declaration name and named
 /// fields; native resources and pointers are not wire values.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum SurfaceValue {
@@ -106,11 +106,11 @@ where
     deserializer.deserialize_seq(Values(std::marker::PhantomData))
 }
 
-fn spend_name(name: &str, text: &mut usize) -> bool {
-    if name.len() > (*text).min(super::MAX_STRING_BYTES) {
+fn spend_name(name: &str, budgets: &mut super::Budgets) -> bool {
+    if name.len() > budgets.text.min(super::MAX_STRING_BYTES) {
         return false;
     }
-    *text -= name.len();
+    budgets.text -= name.len();
     true
 }
 
@@ -118,9 +118,7 @@ fn spend_name(name: &str, text: &mut usize) -> bool {
 /// structural limits reject the whole event; strings retain the scalar
 /// contract's UTF-8 truncation and share one total text budget.
 pub fn sanitize_surface_event(value: &mut SurfaceValue) -> bool {
-    let mut values = MAX_SURFACE_VALUES;
-    let mut text = super::MAX_TEXT_BYTES_PER_FRAME;
-    value.bound(0, &mut values, &mut text, true)
+    value.bound(0, &mut super::Budgets::frame(), true)
 }
 
 impl SurfaceValue {
@@ -130,14 +128,13 @@ impl SurfaceValue {
     pub(super) fn bound(
         &mut self,
         depth: usize,
-        values: &mut usize,
-        text: &mut usize,
+        budgets: &mut super::Budgets,
         event: bool,
     ) -> bool {
-        if depth >= MAX_SURFACE_DEPTH || *values == 0 {
+        if depth >= MAX_SURFACE_DEPTH || budgets.surface_values == 0 {
             return false;
         }
-        *values -= 1;
+        budgets.surface_values -= 1;
         match self {
             Self::F64(v) if !v.is_finite() => {
                 if event {
@@ -145,24 +142,24 @@ impl SurfaceValue {
                 }
                 *v = 0.0;
             }
-            Self::Str(v) => super::spend_text(v, text),
+            Self::Str(v) => super::spend_text(v, budgets),
             Self::List(items) => {
                 for item in items {
-                    if !item.bound(depth + 1, values, text, event) {
+                    if !item.bound(depth + 1, budgets, event) {
                         return false;
                     }
                 }
             }
-            Self::Option(Some(item)) => return item.bound(depth + 1, values, text, event),
+            Self::Option(Some(item)) => return item.bound(depth + 1, budgets, event),
             Self::Record { name, fields } => {
-                if !spend_name(name, text) {
+                if !spend_name(name, budgets) {
                     return false;
                 }
                 for (name, item) in fields {
-                    if !spend_name(name, text) {
+                    if !spend_name(name, budgets) {
                         return false;
                     }
-                    if !item.bound(depth + 1, values, text, event) {
+                    if !item.bound(depth + 1, budgets, event) {
                         return false;
                     }
                 }
