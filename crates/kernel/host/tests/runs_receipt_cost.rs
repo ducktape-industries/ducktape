@@ -121,10 +121,10 @@ fn seeded_store(history: usize) -> MemStore {
 }
 
 /// one block's read path against a tenant carrying `history` completed
-/// receipts: the pending-item sweep `Host::prepare_work` runs on every module
-/// every block, a point query, and the root the block folds into the global
-/// one.
-fn block_cost(history: usize) -> BlockCost {
+/// receipts, measured per step: the pending-item sweep `Host::prepare_work`
+/// runs on every module every block, a point query, and the root the block
+/// folds into the global one.
+fn block_cost(history: usize) -> [BlockCost; 3] {
     let counters = Counters::default();
     let store = Box::new(Counting {
         inner: seeded_store(history),
@@ -135,12 +135,20 @@ fn block_cost(history: usize) -> BlockCost {
     // loading is not part of a block: start counting at the block path.
     counters.zero();
     futures::executor::block_on(module.pending_items()).expect("the pending sweep");
+    let sweep = counters.cost();
+
+    counters.zero();
     let query = runs::encode_query(&runs::RunsQuery::Conversation {
         conversation_id: "absent".into(),
     });
     let _ = futures::executor::block_on(module.query(&query));
+    let point_query = counters.cost();
+
+    counters.zero();
     let _ = module.root();
-    counters.cost()
+    let root = counters.cost();
+
+    [sweep, point_query, root]
 }
 
 /// A block reads what it names. Two receipts or two hundred, the sweep, the
@@ -150,8 +158,38 @@ fn block_cost(history: usize) -> BlockCost {
 fn a_blocks_cost_is_its_own_receipts_not_the_history() {
     let small = block_cost(2);
     let large = block_cost(200);
+    println!(
+        "2 receipts:   sweep {:?} query {:?} root {:?}",
+        small[0], small[1], small[2]
+    );
+    println!(
+        "200 receipts: sweep {:?} query {:?} root {:?}",
+        large[0], large[1], large[2]
+    );
     assert_eq!(
         small, large,
         "the block path grew with a history it never named"
+    );
+    // The load path asks for its four records (`__config`, `__state`,
+    // `__root`, `__history`) in ONE prefetch, so an entry point resolves them
+    // in a single pause and reads each once; the sweep then reads the action
+    // queue it is there to drain, and the query the record it was asked for.
+    // Exact, like the native twin: a read per record replayed, or a history
+    // walked, shows up here as a bigger number.
+    assert_eq!(
+        small[0].reads, 6,
+        "the pending sweep: four records + its queue"
+    );
+    assert_eq!(
+        small[1].reads, 5,
+        "the point query: four records + its answer"
+    );
+    assert_eq!(
+        small[2],
+        BlockCost {
+            reads: 0,
+            read_bytes: 0
+        },
+        "a store tenant's root is the store's own — the host reads nothing to fold it"
     );
 }
