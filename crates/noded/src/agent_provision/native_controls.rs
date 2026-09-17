@@ -284,7 +284,7 @@ async fn acknowledgement_result(
         .ok_or_else(|| "native job control disappeared".to_string())?;
     let complete = acknowledged(control, current.job_attempt);
     let exhausted =
-        !complete && control.acknowledgements.len() >= tasks_module::MAX_CONTROL_ACKNOWLEDGEMENTS;
+        !complete && control.acknowledgements.len() >= tasks::MAX_CONTROL_ACKNOWLEDGEMENTS;
     if exhausted {
         return Err("native job control acknowledgement cap reached".into());
     }
