@@ -76,8 +76,7 @@
 //! caps.
 
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
+pub use capability_wire::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 

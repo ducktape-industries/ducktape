@@ -41,27 +41,31 @@ statesync = { workspace = true }
 # the production module set: system infrastructure + every product module.
 # (acl composes as a wasm tenant: its component rides in the genesis, and the
 # crate is linked only for its native types.)
-valset = { workspace = true }
-governance = { workspace = true }
+# system modules are CORE-RESIDENT: the node links the module crates by path
+# (a workspace name resolves to a module's wire crate).
+valset = { path = "../../crates/modules/system/valset" }
+governance = { path = "../../crates/modules/system/governance" }
 # the resident-accept verb drives governance ops through the local rpc.
 # the network module-code registry. Height-gated live code swaps are realized
 # through the blobstore-backed CodeSource.
-modules = { workspace = true }
+modules = { path = "../../crates/modules/system/modules" }
 wasm-host = { workspace = true }
-saga = { workspace = true }
+saga = { path = "../../crates/modules/system/saga" }
 # the network-wide node-capability registry + its wire surface; the host-side
 # provider discovery announces this node's installed executor CLIs into it.
-capability = { workspace = true }
+capability = { path = "../../crates/modules/system/capability" }
 provider-host = { workspace = true }
 # the agent tool plane's catalog. `ducktape mcp` is its stdio transport; the
 # compute daemon serves the SAME `handle` over each run's node lane.
 mcp-host = { workspace = true }
 # the task plane: recipe manifests + capability dispatch + its host worker.
-dispatch = { workspace = true }
-attribution = { workspace = true }
+dispatch = { path = "../../crates/modules/system/dispatch" }
+attribution = { path = "../../crates/modules/system/attribution" }
 agent-service = { workspace = true }
 compute-service = { workspace = true }
-forge = { workspace = true }
+# forge is core-resident (the git substrate is a node service): the module
+# crate, not its wire.
+forge = { path = "../../crates/modules/apps/forge" }
 pages = { workspace = true }
 chat = { workspace = true }
 # the huddle media planes the voice hub runs: Opus engine, video wire, call-socket framing.
@@ -69,13 +73,13 @@ tasks = { workspace = true }
 # `ducktape collab` constructs the module's own ops, so a shape change is a
 # compile error here rather than a hand-rolled json payload that drifts.
 collaboration = { workspace = true }
-identity = { workspace = true }
+identity = { path = "../../crates/modules/system/identity" }
 # the passkey enrollment challenge — the same bytes `KeyScheme::Secp256r1` verifies.
 keyscheme = { workspace = true }
 # the desktop app's release manifest + signature: `ducktape release sign`.
 app-update = { workspace = true }
 authpage = { workspace = true }
-gateway = { workspace = true }
+gateway = { path = "../../crates/modules/system/gateway" }
 # the airlock contract: `server` supplies the GrantCheck type the lender daemon
 # injects (src/airlock.rs); `client` is the enclave-facing credential machinery
 # (session token handshake). Real quote verification (`user cred inspect|seal`,
@@ -86,7 +90,11 @@ airlock = { path = "../../crates/airlock", features = ["client", "server"] }
 # the lender's disk-backed credential store: opened by the `service run airlock`
 # daemon, and written by `user cred add`.
 airlock-service = { workspace = true }
-files = { workspace = true }
+# THE NATIVE MODULE, by path: a joiner installs and ingests the duckfs
+# possession set through `Files` itself (install / missing_objects / ingest /
+# possession_complete live on the module, not the pure `Fs`). The workspace
+# key is the wire; `crates/topology/tests/sdk_shaped.rs` names this exception.
+files = { path = "../../crates/modules/apps/files" }
 # duckfs reusable core and disk scratch helpers; the `files` crate above remains
 # the consensus module adapter.
 duckfs-core = { workspace = true }
@@ -242,7 +250,7 @@ sandbox-host = { workspace = true }
 # a joiner must rebuild EVERY module shape, example ones included. (The test
 # moved here from bin/demo when that walkthrough crate was deleted.)
 greeter = { workspace = true }
-kv = { workspace = true }
+kv = { path = "../../crates/modules/system/kv" }
 # `directory` left the production genesis set; the example crate survives only
 # as a test tenant (the cfg(test) query codec in main.rs, network_joiner_full).
 directory = { workspace = true }
@@ -252,14 +260,14 @@ directory = { workspace = true }
 noded = { path = "../../crates/noded", features = ["testkit"] }
 # the ed25519 bind-auth builder, shared from identity (was: a per-suite copy).
 # dev-only feature keeps it out of the production binary build.
-identity = { workspace = true, features = ["testkit"] }
+identity = { path = "../../crates/modules/system/identity", features = ["testkit"] }
 # the passkey/wallet signers the `account login` and auth-page tests fake a
 # browser ceremony with.
 keyscheme = { workspace = true, features = ["testkit"] }
 # the git-history/packfile builder. the forge e2e needs REAL objects in the
 # node's store for a PR diff to be computable, and consensus has no
 # commit-building op — this is how production gets them too (a stock git push).
-forge = { workspace = true, features = ["testkit"] }
+forge = { path = "../../crates/modules/apps/forge", features = ["testkit"] }
 async-trait = { workspace = true }
 # `lane_key_lint.rs` parses `bin/node/src` rather than matching text in it: the
 # `#[cfg(test)]` half is shared with topology's `wasm_embed.rs` (source-lint),

@@ -120,12 +120,11 @@
 //!   cutover moves no committed state.
 
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
-mod tracker_iface;
-pub use tracker_iface::*;
+pub use forge_wire::*;
+// the wire crate under the two names the module's own files reach it by.
+pub(crate) use forge_wire as interface;
+pub(crate) use forge_wire as tracker_iface;
 
-pub mod client;
 mod codec;
 #[cfg(feature = "native")]
 mod git;

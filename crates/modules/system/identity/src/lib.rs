@@ -111,8 +111,7 @@
 //! state-sync like any other record. this module never writes that key.
 //!
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
+pub use identity_wire::*;
 
 // the one verifier every consent rides — shared with the kernel frame codec,
 // so an account key and a frame origin are verified identically.

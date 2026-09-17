@@ -124,17 +124,17 @@ members = [
     "crates/networking/data-plane",
     "crates/networking/overlay-net",
     # modules/system — system modules. every entry implements `sdk::Module`.
-    "crates/modules/system/acl",
-    "crates/modules/system/kv",
-    "crates/modules/system/valset",
-    "crates/modules/system/governance",
-    "crates/modules/system/identity",
-    "crates/modules/system/modules",
-    "crates/modules/system/saga",
-    "crates/modules/system/capability",
-    "crates/modules/system/dispatch",
-    "crates/modules/system/attribution",
-    "crates/modules/system/gateway",
+    "crates/modules/system/acl", "crates/modules/system/acl/wire",
+    "crates/modules/system/kv", "crates/modules/system/kv/wire",
+    "crates/modules/system/valset", "crates/modules/system/valset/wire",
+    "crates/modules/system/governance", "crates/modules/system/governance/wire",
+    "crates/modules/system/identity", "crates/modules/system/identity/wire",
+    "crates/modules/system/modules", "crates/modules/system/modules/wire",
+    "crates/modules/system/saga", "crates/modules/system/saga/wire",
+    "crates/modules/system/capability", "crates/modules/system/capability/wire",
+    "crates/modules/system/dispatch", "crates/modules/system/dispatch/wire",
+    "crates/modules/system/attribution", "crates/modules/system/attribution/wire",
+    "crates/modules/system/gateway", "crates/modules/system/gateway/wire",
     # airlock — the two-party execution/auth contract. NOT a consensus module
     # (no MODULE_ID, no guest wasm): a protocol shared by the lender service,
     # the borrower broker and the enclave binary, so it sits beside the other
@@ -182,21 +182,21 @@ members = [
     # upstream to pull from and nothing to re-sync.
     "crates/gpui-notion",
     # apps — product feature modules
-    "crates/modules/apps/forge",
-    "crates/modules/apps/pages",
-    "crates/modules/apps/chat",
+    "crates/modules/apps/forge", "crates/modules/apps/forge/wire",
+    "crates/modules/apps/pages", "crates/modules/apps/pages/wire",
+    "crates/modules/apps/chat", "crates/modules/apps/chat/wire",
     "crates/modules/apps/chat/message",
     "crates/modules/apps/agent",
     "crates/modules/apps/agent/wire",
     "crates/modules/apps/runs",
     "crates/modules/apps/runs/wire",
-    "crates/modules/apps/tasks",
+    "crates/modules/apps/tasks", "crates/modules/apps/tasks/wire",
     "crates/modules/apps/boards",
     "crates/modules/apps/boards/wire",
-    "crates/modules/apps/automations",
-    "crates/modules/apps/inbox",
-    "crates/modules/apps/files",
-    "crates/modules/apps/collaboration",
+    "crates/modules/apps/automations", "crates/modules/apps/automations/wire",
+    "crates/modules/apps/inbox", "crates/modules/apps/inbox/wire",
+    "crates/modules/apps/files", "crates/modules/apps/files/wire",
+    "crates/modules/apps/collaboration", "crates/modules/apps/collaboration/wire",
     # services — off-chain host-side executors
     "crates/services/agent",
     "crates/services/airlock",
@@ -403,30 +403,59 @@ node-work = { path = "crates/kernel/node-work" }
 # per-module materialized views on the derived tier (indexer + the module's
 # types-only interface crate — never the module impl).
 # internal — module impl crates
-kv = { path = "crates/modules/system/kv" }
-acl = { path = "crates/modules/system/acl" }
-valset = { path = "crates/modules/system/valset" }
-governance = { path = "crates/modules/system/governance" }
-identity = { path = "crates/modules/system/identity" }
-modules = { path = "crates/modules/system/modules" }
-saga = { path = "crates/modules/system/saga" }
-capability = { path = "crates/modules/system/capability" }
-dispatch = { path = "crates/modules/system/dispatch" }
-attribution = { path = "crates/modules/system/attribution" }
-gateway = { path = "crates/modules/system/gateway" }
-forge = { path = "crates/modules/apps/forge" }
+# A MODULE'S NAME RESOLVES TO ITS WIRE CRATE. `identity = { workspace = true }`
+# links `identity-wire` — the types and codecs — under the name `identity`, so
+# the kernel, the daemon, a service, a view and a sibling module all speak a
+# module's format without linking the module. Nothing outside `crates/modules`
+# links a module crate itself except a test that runs the native module (a
+# parity suite), and that names it by path, never through this table:
+# `crates/topology/tests/sdk_shaped.rs` holds the line.
+kv = { package = "kv-wire", path = "crates/modules/system/kv/wire" }
+kv-wire = { path = "crates/modules/system/kv/wire" }
+acl = { package = "acl-wire", path = "crates/modules/system/acl/wire" }
+acl-wire = { path = "crates/modules/system/acl/wire" }
+valset = { package = "valset-wire", path = "crates/modules/system/valset/wire" }
+valset-wire = { path = "crates/modules/system/valset/wire" }
+governance = { package = "governance-wire", path = "crates/modules/system/governance/wire" }
+governance-wire = { path = "crates/modules/system/governance/wire" }
+identity = { package = "identity-wire", path = "crates/modules/system/identity/wire" }
+identity-wire = { path = "crates/modules/system/identity/wire" }
+modules = { package = "modules-wire", path = "crates/modules/system/modules/wire" }
+modules-wire = { path = "crates/modules/system/modules/wire" }
+saga = { package = "saga-wire", path = "crates/modules/system/saga/wire" }
+saga-wire = { path = "crates/modules/system/saga/wire" }
+capability = { package = "capability-wire", path = "crates/modules/system/capability/wire" }
+capability-wire = { path = "crates/modules/system/capability/wire" }
+dispatch = { package = "dispatch-wire", path = "crates/modules/system/dispatch/wire" }
+dispatch-wire = { path = "crates/modules/system/dispatch/wire" }
+attribution = { package = "attribution-wire", path = "crates/modules/system/attribution/wire" }
+attribution-wire = { path = "crates/modules/system/attribution/wire" }
+gateway = { package = "gateway-wire", path = "crates/modules/system/gateway/wire" }
+gateway-wire = { path = "crates/modules/system/gateway/wire" }
+forge = { package = "forge-wire", path = "crates/modules/apps/forge/wire" }
+forge-wire = { path = "crates/modules/apps/forge/wire" }
 design = { path = "crates/design" }
-pages = { path = "crates/modules/apps/pages" }
-chat = { path = "crates/modules/apps/chat" }
-agent = { path = "crates/modules/apps/agent" }
+pages = { package = "pages-wire", path = "crates/modules/apps/pages/wire" }
+pages-wire = { path = "crates/modules/apps/pages/wire" }
+chat = { package = "chat-wire", path = "crates/modules/apps/chat/wire" }
+chat-wire = { path = "crates/modules/apps/chat/wire" }
+chat-message = { path = "crates/modules/apps/chat/message" }
+agent = { package = "agent-wire", path = "crates/modules/apps/agent/wire" }
 agent-wire = { path = "crates/modules/apps/agent/wire" }
-runs = { path = "crates/modules/apps/runs" }
+runs = { package = "runs-wire", path = "crates/modules/apps/runs/wire" }
 runs-wire = { path = "crates/modules/apps/runs/wire" }
-tasks = { path = "crates/modules/apps/tasks" }
-automations = { path = "crates/modules/apps/automations" }
-inbox = { path = "crates/modules/apps/inbox" }
-files = { path = "crates/modules/apps/files" }
-collaboration = { path = "crates/modules/apps/collaboration" }
+tasks = { package = "tasks-wire", path = "crates/modules/apps/tasks/wire" }
+tasks-wire = { path = "crates/modules/apps/tasks/wire" }
+boards = { package = "boards-wire", path = "crates/modules/apps/boards/wire" }
+boards-wire = { path = "crates/modules/apps/boards/wire" }
+automations = { package = "automations-wire", path = "crates/modules/apps/automations/wire" }
+automations-wire = { path = "crates/modules/apps/automations/wire" }
+inbox = { package = "inbox-wire", path = "crates/modules/apps/inbox/wire" }
+inbox-wire = { path = "crates/modules/apps/inbox/wire" }
+files = { package = "files-wire", path = "crates/modules/apps/files/wire" }
+files-wire = { path = "crates/modules/apps/files/wire" }
+collaboration = { package = "collaboration-wire", path = "crates/modules/apps/collaboration/wire" }
+collaboration-wire = { path = "crates/modules/apps/collaboration/wire" }
 # internal — off-chain service crates
 agent-service = { path = "crates/services/agent" }
 airlock-service = { path = "crates/services/airlock" }

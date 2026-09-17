@@ -52,13 +52,7 @@
 //! straight to the store.
 
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
-// the derived-tier materialized view: the PURE decision core (fold + view
-// over index_guest::StateRead), compiled everywhere and unit-tested
-// natively. the engine shell that runs it inside the module's index
-// database is `index_guest` below.
-pub mod index;
+pub use pages_wire::*;
 
 // the CLIENT view model: applied-op classification for feed followers —
 // module-owned beside the index fold, pure, ui.wasm-portable.
@@ -79,15 +73,11 @@ use sdk::{
 
 mod block_ops;
 mod comment_ops;
-mod error;
 mod module_impl;
 mod ops;
 mod page_ops;
-mod record_ops;
+mod records;
 mod store;
-mod text_ranges;
-
-use error::{PageError, to_page_err};
 
 /// write-time cap on ONE serialized block record (and on the enumeration
 /// index value — both stage through the same guard). the concrete store's
@@ -98,20 +88,6 @@ use error::{PageError, to_page_err};
 /// record carries its text plus its ordered child-id list, so this also
 /// bounds a single parent to tens of thousands of children.
 pub const MAX_BLOCK_LEN: usize = 768 * 1024;
-
-/// write-time cap on a page TITLE — the text of a `Page` block. a page title
-/// is one sidebar line, and the page list serves up to `MAX_PAGE_LIMIT` (256)
-/// rows carrying it in a single reply; capping it here keeps a full list far
-/// below [`MAX_PAGE_QUERY_BYTES`] instead of letting one client-chosen title
-/// refuse the whole sidebar read. rejected deterministically at write time,
-/// like every other bound the store guard enforces.
-pub const MAX_PAGE_TITLE_LEN: usize = 512;
-
-/// Maximum number of block edges below one page root. Nested `Page` blocks
-/// are leaves in the containing document and start their own depth budget.
-/// This keeps every valid preorder cursor page comfortably below the wasm
-/// host's store-read ceiling while leaving far more nesting than the UI uses.
-pub const MAX_PAGE_DEPTH: usize = 64;
 
 /// client-minted id length cap (consensus constant) for a page id
 /// (`CreatePage`) or any block id (`InsertBlock`) — the same wedge class the
@@ -142,11 +118,6 @@ pub const MAX_PAGES: usize = 2048;
 /// block id (clients mint uuids), and every op that names it is rejected
 /// ([`PageError::ReservedId`]) before it can reach storage.
 const PAGE_INDEX_KEY: &str = "\u{0}page-index";
-
-/// Local ceiling for tree walks and the record work they schedule. The wasm
-/// host permits 4096 reads per dispatch; the headroom covers records touched
-/// before and after the walk while making native and wasm reject at one point.
-const MAX_TRAVERSAL_WORK: usize = 3_500;
 
 /// Leaves room for the moved block, both page-depth walks, and parent writes
 /// below the wasm host's 4096 store-read ceiling.

@@ -1,0 +1,13 @@
+# The saga module's wire surface: origins, messages, queries, replies and
+# their codecs, no module — the kernel node, the compute service, the CLI and
+# a sibling module link THIS and not the module behind it. No `native`
+# feature, no kernel host, no disk.
+[package]
+name = "saga-wire"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+borsh = { workspace = true }
+serde = { workspace = true }

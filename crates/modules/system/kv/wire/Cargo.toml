@@ -1,0 +1,11 @@
+# The kv module's wire surface: its messages, queries and replies, no module —
+# the kernel node, consensus and a sibling module link THIS and not the module
+# behind it. No `native` feature, no kernel host, no disk.
+[package]
+name = "kv-wire"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+serde = { workspace = true }

@@ -87,11 +87,7 @@
 //! rides state-sync like any other record. this module never writes that key.
 
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
-// the invite capability: token types + verification, shared by the node's
-// mint/lobby paths and the in-consensus `Redeem` handler below.
-pub mod invite;
+pub use governance_wire::*;
 
 use std::collections::BTreeMap;
 
@@ -124,18 +120,6 @@ const MAX_VOTING_PERIOD: u64 = 1_000_000_000;
 /// `deadline + EXECUTION_GRACE` the proposal is dead: refused on `Execute`
 /// and settled `Rejected` on the spot, same as any other reap.
 const EXECUTION_GRACE: u64 = 100_000;
-
-/// floor on `activation_lead` (`UpdateModule`/`RegisterModule`), validated at
-/// Propose: the lead is blocks after the EXECUTE height, and the modules
-/// registry itself refuses any `activation_height <= execute_height +
-/// modules::MIN_SWAP_LEAD` — so a lead this small can NEVER execute
-/// successfully. strictly above [`modules::MIN_SWAP_LEAD`] guarantees the
-/// registry's own floor is cleared whatever height Execute lands at.
-pub const MIN_ACTIVATION_LEAD: u64 = modules::MIN_SWAP_LEAD + 1;
-/// ceiling on `activation_lead` — a fat-fingered or hostile lead must not
-/// arm a swap so far in the future it is effectively unreachable. generous,
-/// same order as [`MAX_VOTING_PERIOD`].
-pub const MAX_ACTIVATION_LEAD: u64 = 1_000_000_000;
 
 /// Keep every share value and total exact in the JavaScript operator client.
 const MAX_SAFE_SHARES: u64 = 9_007_199_254_740_991;

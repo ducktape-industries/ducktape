@@ -1,0 +1,16 @@
+# The gateway module's wire surface: its route, credential and content types
+# with their codecs, the proxy request contract and the proxy stream framing,
+# no module — the daemon, the CLI, the service bins and a view link THIS and
+# not the module behind it. No `native` feature, no kernel host, no disk.
+[package]
+name = "gateway-wire"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+duckdns = { workspace = true }
+borsh = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

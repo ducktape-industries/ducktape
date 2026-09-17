@@ -17,6 +17,7 @@ guest = ["dep:ducktape-module-sdk"]
 index-guest = ["index_guest/guest"]
 
 [dependencies]
+pages-wire = { workspace = true }
 # wasm-only, behind `guest`: the port harness. a standalone-workspace path
 # crate, pulled only when the guest build compiles this crate for wasm32.
 ducktape-module-sdk = { workspace = true, optional = true }
@@ -29,7 +30,7 @@ attribution = { workspace = true }
 # mention is validated against it (see `Pages::party_of_origin`).
 identity = { workspace = true }
 # Import Files' public wire API without its native disk/runtime features.
-files = { path = "../files", default-features = false }
+files = { workspace = true }
 serde = { workspace = true }
 # the index CONTRACT (op-row envelope + the pure StateRead/Writes kit) — not
 # the engine: the default surface is pure types, wasm32-clean, and is all the
@@ -41,7 +42,7 @@ serde_json = "1"
 sha2 = { workspace = true }
 
 [dev-dependencies]
-files = { path = "../files", features = ["native"] }
+files-module = { package = "files", path = "../files", features = ["native"] }
 host = { workspace = true }
 sdk-testkit = { workspace = true }
 tempfile = "3"

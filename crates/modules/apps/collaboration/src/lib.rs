@@ -38,8 +38,9 @@
 //! verifies that the caller IS that party or holds its binding.
 
 // the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
+pub use collaboration_wire::*;
+// the wire crate under the name the module's own files reach it by.
+pub(crate) use collaboration_wire as interface;
 
 // the wasm-guest port: the dispatch shell that adapts this module to the
 // ducktape:module world. compiled only by the guest-builder's synthesized
@@ -59,16 +60,6 @@ use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
     StateRoot, StateSyncHandle,
 };
-
-/// lowercase hex — the one rendering keys take on this wire.
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    use core::fmt::Write as _;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
 
 /// the collaboration module over one store.
 pub struct Collaboration {

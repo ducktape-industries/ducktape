@@ -1,0 +1,14 @@
+# The identity module's wire surface: accounts, keys, controls and their
+# codecs, no module — the kernel host, the daemon, the auth page, the app and
+# every sibling module link THIS and not the module behind it. No `native`
+# feature, no kernel host, no disk.
+[package]
+name = "identity-wire"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+keyscheme = { workspace = true }
+borsh = { workspace = true }
+serde = { workspace = true }

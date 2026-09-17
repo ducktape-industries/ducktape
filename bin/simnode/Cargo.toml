@@ -89,7 +89,7 @@ tasks = { workspace = true }
 # the shared raw-http/port/poll harness helpers (was a local copy in harness/).
 nettest = { path = "../../crates/testing/nettest" }
 # the ed25519 bind-auth builder, shared from identity (was: a per-suite copy).
-identity = { workspace = true, features = ["testkit"] }
+identity = { path = "../../crates/modules/system/identity", features = ["testkit"] }
 # sim_e2e spawns the real binary and needs isolated storage roots.
 tempfile = "3"
 # core_scenarios signs identity member-consent certificates.

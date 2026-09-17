@@ -23,6 +23,7 @@ guest = ["dep:ducktape-module-sdk"]
 index-guest = ["index_guest/guest"]
 
 [dependencies]
+chat-wire = { path = "wire" }
 chat-message = { path = "message" }
 sdk = { workspace = true }
 # wasm-only, behind `guest`: the port harness (WitStore / WitCtx / host

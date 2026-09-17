@@ -3,8 +3,7 @@
 //! channel chat hooks this module into and posts wherever it names. Actions
 //! publish source-owned attribution, posts or tasks in the originating atomic
 //! unit. Structurally refused actions remain visible in run history.
-mod interface;
-pub use interface::*;
+pub use automations_wire::*;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use chat::{

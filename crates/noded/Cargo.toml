@@ -46,10 +46,11 @@ sdk = { workspace = true }
 # supply wire types and host-side services; files/forge provide ODB substrates.
 topology = { workspace = true }
 wasm-host = { workspace = true }
-valset = { workspace = true }
-modules = { workspace = true }
-kv = { workspace = true }
-files = { workspace = true }
+# system modules are CORE-RESIDENT: the daemon links the module crates by
+# path (a workspace name resolves to a module's wire crate).
+valset = { path = "../modules/system/valset" }
+modules = { path = "../modules/system/modules" }
+kv = { path = "../modules/system/kv" }
 # the disk odb `open_odb` hands a wasm files tenant. a service crate, not the
 # module: `files` names no kernel host.
 files-odb = { workspace = true }
@@ -58,12 +59,12 @@ forge-odb = { workspace = true }
 chat = { workspace = true }
 # the `/v1/call/ws` framing (the webview leg of a huddle) and the voice frame size.
 tasks = { workspace = true }
-identity = { workspace = true }
-gateway = { workspace = true }
+identity = { path = "../modules/system/identity" }
+gateway = { path = "../modules/system/gateway" }
 agent-wire = { workspace = true }
 runs-wire = { workspace = true }
-dispatch = { workspace = true }
-attribution = { workspace = true }
+dispatch = { path = "../modules/system/dispatch" }
+attribution = { path = "../modules/system/attribution" }
 compute-service = { workspace = true }
 # the agent-daemon wire: the messaging bus this node's service link carries.
 # Linking the crate is how both sides agree on the protocol.
@@ -71,9 +72,10 @@ agent-service = { workspace = true }
 # host-side provider discovery: the dispatch worker runs the operator's locally
 # installed executor CLIs (BYO), never any credential file.
 provider-host = { workspace = true }
-saga = { workspace = true }
-# Forge wire types and native automation object storage primitives.
-forge = { workspace = true }
+saga = { path = "../modules/system/saga" }
+# Forge wire types and native automation object storage primitives (forge is
+# core-resident: the git substrate is a node service).
+forge = { path = "../modules/apps/forge" }
 # Generic signed request verification.
 keyscheme = { workspace = true }
 # duckfs wire/path/object helpers used by the daemon's HTTP and workspace
@@ -143,18 +145,20 @@ topology = { workspace = true }
 # `#[cfg(test)]` files). The daemon itself speaks to them over the wire and
 # links `runs-wire`/`agent-wire` alone — which is the point of the split, and
 # what these two lines being DEV-only proves.
-agent = { workspace = true }
-runs = { workspace = true }
-pages = { workspace = true }
+agent = { path = "../modules/apps/agent" }
+runs = { path = "../modules/apps/runs" }
+pages = { path = "../modules/apps/pages" }
 run-envelope = { workspace = true }
 wat = "1"
+# the native files module: the provisioning suites stand a native `Files` up.
+files = { path = "../modules/apps/files" }
 # MemStore: the in-memory MerkleStore double behind store-backed modules in
 # the in-crate provision tests.
 sdk-testkit = { workspace = true }
 # the capability registry: the session-boundary test wires saga with
 # `with_assignment`, so `Accept`'s capability gate needs a real registry to
 # announce a provider into.
-capability = { workspace = true }
+capability = { path = "../modules/system/capability" }
 # the shared raw-http/port/poll harness helpers (daemon_e2e was a local copy).
 nettest = { path = "../testing/nettest" }
 tower = { version = "0.5", features = ["util"] }

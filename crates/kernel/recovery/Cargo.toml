@@ -19,5 +19,5 @@ futures = "0.3"
 [dev-dependencies]
 directory = { workspace = true }
 commonware-cryptography = { workspace = true }
-modules = { workspace = true }
+modules = { path = "../../modules/system/modules" }
 sha2 = { workspace = true }

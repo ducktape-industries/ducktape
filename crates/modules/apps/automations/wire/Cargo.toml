@@ -1,0 +1,12 @@
+# The automations module's wire surface: rules, messages, queries and replies,
+# no module — a view and a sibling module link THIS and not the module behind
+# it. No `native` feature, no kernel host, no disk.
+[package]
+name = "automations-wire"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+borsh = { workspace = true }
+serde = { workspace = true }

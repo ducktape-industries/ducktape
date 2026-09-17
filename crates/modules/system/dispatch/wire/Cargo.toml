@@ -1,0 +1,15 @@
+# The dispatch module's wire surface: types and codecs, no module — the kernel
+# host, the daemon, a service and a sibling module link THIS and not the module
+# behind it. It names `saga` (a call's origin IS a saga origin) — that key
+# resolves to `saga-wire`. No `native` feature, no kernel host, no disk.
+[package]
+name = "dispatch-wire"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+saga = { workspace = true }
+borsh = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }

@@ -31,4 +31,4 @@ reqwest = { workspace = true }
 [dev-dependencies]
 # a test decodes a chat view query it hand-writes, so the module's own type is
 # what says whether the shape is real.
-chat = { workspace = true }
+chat = { path = "../../modules/apps/chat" }

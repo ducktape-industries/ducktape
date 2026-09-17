@@ -17,6 +17,7 @@ guest = ["dep:ducktape-module-sdk"]
 index-guest = ["index_guest/guest"]
 
 [dependencies]
+tasks-wire = { workspace = true }
 sdk = { workspace = true }
 identity = { workspace = true }
 attribution = { workspace = true }

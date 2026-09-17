@@ -1,0 +1,13 @@
+# The files module's wire surface IS duckfs-core, re-exported whole: the
+# messages, queries, replies and object types of the versioned filesystem the
+# module wraps. A crate of its own so `files = { workspace = true }` names a
+# package distinct from `duckfs-core` — cargo refuses one package under two
+# names — while every type is the same type. No `native` feature, no kernel
+# host, no disk.
+[package]
+name = "files-wire"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+duckfs-core = { workspace = true }

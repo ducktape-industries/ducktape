@@ -55,10 +55,8 @@
 #[cfg(all(feature = "guest", target_arch = "wasm32"))]
 mod guest;
 
-mod interface;
-pub use interface::*;
+pub use valset_wire::*;
 
-use std::collections::BTreeSet;
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;
@@ -70,10 +68,6 @@ use sdk::{
 /// a 32-byte ed25519 public key encoding.
 const KEY_LEN: usize = 32;
 
-/// members retained per tier (the count cap). membership is genesis- and
-/// governance-authored, so this sits far above any real set; a join/grant
-/// past it refuses loudly at execute.
-pub const MAX_MEMBERS: usize = 1024;
 /// serialized tier-record byte bound — the uniform poison backstop on top of
 /// the count cap.
 const MAX_TIER_RECORD_BYTES: usize = 512 * 1024;
@@ -423,59 +417,6 @@ impl Valset {
         residents.remove(position);
         self.store_tier(RESIDENTS_KEY, &residents)
     }
-}
-
-/// the CURRENT member set of the valset module at `valset`: its
-/// staged-over-committed Validators projection, via the host-routed read lane.
-/// the one shared read every membership-gated module (governance, upgrade, …)
-/// funnels through.
-pub async fn members(ctx: &dyn Ctx, valset: &str) -> Result<Vec<Vec<u8>>, Error> {
-    let reply = ctx
-        .query(valset, &encode_query(&ValsetQuery::Validators))
-        .await?;
-    match decode_reply(&reply).map_err(Error::Module)? {
-        ValsetReply::Validators(members) => Ok(members),
-        other => Err(Error::Module(format!(
-            "valset answered a Validators query with {other:?}"
-        ))),
-    }
-}
-
-/// the CURRENT validator set UNION resident set of the valset module at
-/// `valset`, both queried live from its staged-over-committed projection — an
-/// op is admitted for EITHER standing, so a joined (not-yet-promoted) resident
-/// still passes. the shared read behind identity's and capability's bind gates.
-pub async fn members_and_residents(
-    ctx: &dyn Ctx,
-    valset: &str,
-) -> Result<BTreeSet<Vec<u8>>, Error> {
-    let validators = match decode_reply(
-        &ctx.query(valset, &encode_query(&ValsetQuery::Validators))
-            .await?,
-    )
-    .map_err(Error::Module)?
-    {
-        ValsetReply::Validators(v) => v,
-        other => {
-            return Err(Error::Module(format!(
-                "valset answered a Validators query with {other:?}"
-            )));
-        }
-    };
-    let residents = match decode_reply(
-        &ctx.query(valset, &encode_query(&ValsetQuery::Residents))
-            .await?,
-    )
-    .map_err(Error::Module)?
-    {
-        ValsetReply::Residents(o) => o,
-        other => {
-            return Err(Error::Module(format!(
-                "valset answered a Residents query with {other:?}"
-            )));
-        }
-    };
-    Ok(validators.into_iter().chain(residents).collect())
 }
 
 #[async_trait::async_trait(?Send)]
