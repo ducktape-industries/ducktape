@@ -20,6 +20,16 @@ make demo-clear  # ops/demo-clear.sh — stop and delete the demo workspace
 `demo-gateway.mjs` and `demo-kanban.mjs` publish the demo's gateway web-app
 routes (a network-hosted DuckFS site and a user-hosted loopback app).
 
+## Replacing a network
+
+`refound-net.sh` runs the whole re-found: it stops what is running, archives the
+workspaces, founds a validator and joins a resident from this checkout's binary
+and founding set under `ducktape-node-launcher`, installs the agent executors,
+mints the workspace wallet and founds its account, grants the service daemons,
+and mirrors a repo into the new forge. The target is `--root` and has no default; workspaces are moved
+aside, never deleted. `docs/refound-a-network.md` is the recipe and says why
+each step is ordered the way it is.
+
 ## Running a node as a service
 
 - `node/` — `ducktape-node@.service` (instance = workspace selector for
