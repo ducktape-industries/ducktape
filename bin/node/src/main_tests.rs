@@ -19,6 +19,30 @@ fn gateway_requires_a_running_node_and_a_real_overlay() {
     }
 }
 
+/// The founding-set preflight fires for exactly one shape: a joined workspace
+/// whose genesis has not landed yet. It is what stops the boot BEFORE the
+/// listeners bind, so a node that runs perfectly well without a set beside its
+/// binary — every workspace that already holds its genesis — must not be
+/// refused for one.
+#[test]
+fn only_a_workspace_missing_its_genesis_needs_the_founding_set_to_boot() {
+    let dir = tempfile::tempdir().expect("scratch workspace");
+    let file = dir.path().join("genesis");
+    let absent = config::GenesisSource::Workspace {
+        file: file.clone(),
+        hash: [0u8; 32],
+    };
+    assert!(fetches_genesis_off_the_mesh(&absent));
+
+    std::fs::write(&file, b"genesis bytes").expect("write the genesis");
+    assert!(!fetches_genesis_off_the_mesh(&absent));
+
+    // the dev-seed shape composes from files it already resolved.
+    assert!(!fetches_genesis_off_the_mesh(
+        &config::GenesisSource::FoundingSet(dir.path().to_path_buf())
+    ));
+}
+
 fn test_root(byte: u8) -> StateRoot {
     StateRoot([byte; sdk::ROOT_LEN])
 }

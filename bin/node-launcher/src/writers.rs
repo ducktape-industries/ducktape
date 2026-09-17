@@ -201,6 +201,15 @@ fn extract(archive: &Path, release_dir: &Path) -> Result<(), Refusal> {
                 format!("{} is a {kind:?} entry", path.display()),
             ));
         }
+        // A release carries the founding set in `modules/`, so entries are
+        // nested. `unpack` writes a file but never makes its parent, and
+        // whether a directory entry precedes its files is up to whichever tar
+        // wrote the archive — so the directory is made here, from a path every
+        // component of which `destination` has already checked is a plain name.
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| Refusal::io("extract_failed", parent, &error))?;
+        }
         entry
             .unpack(&destination)
             .map_err(|error| Refusal::io("extract_failed", &destination, &error))?;
@@ -327,6 +336,30 @@ mod tests {
         assert_eq!(mode & 0o222, 0, "a sealed release is unwritable");
         // and re-staging over the sealed directory replaces it whole.
         stage(&archive, sha, &release).unwrap();
+    }
+
+    /// A node release is THREE things, not one: the binary, this launcher, and
+    /// the founding set the binary founds and joins from (no binary carries
+    /// wasm). All of them land in the release directory, so the flipped
+    /// release is complete on a host that has nothing else.
+    #[test]
+    fn a_release_carries_the_launcher_and_the_founding_set_beside_the_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("release.tar.zst");
+        let bytes = tar_zst(&[
+            ("ducktape", b"#!/bin/sh\nexit 0\n", 0o755),
+            ("ducktape-node-launcher", b"#!/bin/sh\nexit 0\n", 0o755),
+            ("modules/netstack.component.wasm", b"\0asm", 0o644),
+            ("modules/.staged-by", b"abc1234", 0o644),
+        ]);
+        fs::write(&archive, &bytes).unwrap();
+        let release = dir.path().join("r");
+        stage(&archive, Sha::digest(&bytes), &release).unwrap();
+        assert!(release.join("ducktape-node-launcher").exists());
+        assert!(release.join("modules/netstack.component.wasm").exists());
+        // the set's owner record rides along: the binary beside it refuses a
+        // set another build staged, so a release without it refuses itself.
+        assert!(release.join("modules/.staged-by").exists());
     }
 
     #[test]
