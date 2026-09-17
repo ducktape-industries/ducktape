@@ -606,6 +606,19 @@ fn workspace_manifest(guests: &[GuestKind], source: &str) -> String {
 members = [{members}]
 resolver = "2"
 
+# a guest is optimized as ONE unit. without this the shell inherits cargo's
+# release defaults — lto = false, codegen-units = 16 — and every crate boundary
+# inside a module's own graph becomes an optimization barrier, so splitting a
+# module's wire types into their own crate costs the component real bytes for
+# no change in behaviour. the module set is shipped, hashed and consensus-
+# pinned, so it is compiled like something shipped rather than something built
+# in a loop. panic and debug settings are deliberately NOT set here: a trap's
+# function name is what makes a guest failure readable in a host log.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
 # the uniform wasm32 patch set (crates/module-sdk/stubs in the platform
 # repository, at the module's own revision): applied to every guest; cargo's
 # "unused patch" warning on a module whose graph never pulls one of these
