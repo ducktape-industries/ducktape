@@ -221,12 +221,9 @@ impl Selector {
                     .into(),
             ),
             _ => Err(format!(
-                "no workspace selected and several are registered — pick one with -n:\n{}",
-                workspaces
-                    .iter()
-                    .map(|(chain_id, _)| format!("  {chain_id}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                "no workspace selected and several are registered — pick one with -n, or \
+                 --config <path> when two share a chain id:\n{}",
+                config::workspace_choices(&workspaces)
             )),
         }
     }
@@ -298,12 +295,9 @@ impl WorkspaceArgs {
                     .into(),
             ),
             _ => Err(format!(
-                "several workspaces exist — pick one with -n:\n{}",
-                workspaces
-                    .iter()
-                    .map(|(chain_id, _)| format!("  {chain_id}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                "several workspaces exist — pick one with -n, or --config <path> when two \
+                 share a chain id:\n{}",
+                config::workspace_choices(&workspaces)
             )),
         }
     }
@@ -406,13 +400,12 @@ fn lone_workspace_id() -> Result<String, String> {
     match workspaces.len() {
         1 => Ok(workspaces.swap_remove(0).0),
         0 => Err(NO_NODE_ADDRESS.into()),
+        // this rung answers with a URL, so `--config` is not its escape: the
+        // path beside each id is what an operator reads the right
+        // `http_listen` out of to pass as `--node`.
         _ => Err(format!(
             "{NO_NODE_ADDRESS}\nseveral workspaces are registered — pick one with -n:\n{}",
-            workspaces
-                .iter()
-                .map(|(chain_id, _)| format!("  {chain_id}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+            config::workspace_choices(&workspaces)
         )),
     }
 }
@@ -548,13 +541,16 @@ fn workspace_of_matches(base: &str, matches: Vec<(String, PathBuf)>) -> Result<P
         // ordered. Taking the first would read the WRONG node's 0600 secret
         // under an id the operator never chose — so refuse, the way every other
         // ambiguous selection on this ladder does.
+        // this list holds workspace DIRECTORIES; the choice list names the
+        // config inside each, because that is the string an operator retypes.
         several => Err(format!(
             "several workspaces serve {base} — pick one with -n:\n{}",
-            several
-                .iter()
-                .map(|(chain_id, _)| format!("  {chain_id}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+            config::workspace_choices(
+                &several
+                    .iter()
+                    .map(|(chain_id, dir)| (chain_id.clone(), dir.join("node.toml")))
+                    .collect::<Vec<_>>()
+            )
         )),
     }
 }
@@ -1235,6 +1231,48 @@ mod tests {
             readers,
             vec!["cli_args.rs".to_string()],
             "DUCKTAPE_NODE must be read only by the one node-addressing ladder"
+        );
+    }
+
+    /// Every rung of the ladder that refuses with a CHOICE renders it through
+    /// [`config::workspace_choices`], so no two of them can disagree about
+    /// order or content — four hand-rolled lists printed the bare chain id,
+    /// and on a box with a founder and its joiner that is the same string
+    /// twice, which names neither.
+    // ponytail: matches the literal line a hand-rolled list formats. A fifth
+    // one built some other way slips past; escalate to a parse if that happens.
+    #[test]
+    fn every_pick_one_list_is_rendered_by_one_function() {
+        // composed, never spelled out: a literal needle would match THIS file.
+        let hand_rolled_line = format!("format!(\"  {}\")", "{chain_id}");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hand_rolled = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("read source");
+                if text.contains(&hand_rolled_line) {
+                    hand_rolled.push(
+                        path.strip_prefix(&src)
+                            .expect("under src")
+                            .display()
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        assert!(
+            hand_rolled.is_empty(),
+            "a chain-id-only choice list cannot be acted on — render it with \
+             config::workspace_choices: {hand_rolled:?}"
         );
     }
 }
