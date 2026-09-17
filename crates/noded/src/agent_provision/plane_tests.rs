@@ -8,6 +8,7 @@
 //! without booting a node.
 
 use crate::NodeHandle;
+use runs_wire as runs;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 

@@ -26,7 +26,7 @@ use saga::{
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
-use valset::Valset;
+use valset_module::Valset;
 
 /// a minimal REQUESTER module: it records every `SagaCallback` it is
 /// dispatched, with the same staging discipline as any other module (staged

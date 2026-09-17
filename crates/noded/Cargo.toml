@@ -59,6 +59,9 @@ forge-odb = { workspace = true }
 chat = { workspace = true }
 # the `/v1/call/ws` framing (the webview leg of a huddle) and the voice frame size.
 tasks = { workspace = true }
+# the job-board bounds the native agent lane pre-validates against. They are the
+# module's, not the wire's, so the module crate enters under its own name.
+tasks-module = { workspace = true }
 identity = { path = "../modules/system/identity" }
 gateway = { path = "../modules/system/gateway" }
 agent-wire = { workspace = true }
@@ -140,10 +143,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 topology = { workspace = true }
 
 [dev-dependencies]
-# the run wire surface the in-crate provision tests speak under its bare name
-# (the daemon itself links `runs-wire`). The native module behind it ships from
-# ducktape-modules, so no suite here composes one.
-runs = { workspace = true }
+# the run wire surface. The native module behind it ships from
+# ducktape-modules, so no suite here composes one; the tests that speak the
+# wire under the bare name `runs` alias it (`use runs_wire as runs;`).
 run-envelope = { workspace = true }
 wat = "1"
 # the native files module: the provisioning suites stand a native `Files` up.

@@ -1399,6 +1399,9 @@ mod tests {
     use super::*;
     use collab::{DeliveryEligibility as Verdict, DeliveryState as State};
 
+    /// the channel every fixture in here is scoped to.
+    const CONVERSATION: &str = "standup";
+
     fn eligible(state: State) -> Verdict {
         Verdict::Eligible {
             state,

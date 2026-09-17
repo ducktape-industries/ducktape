@@ -19,11 +19,11 @@ use governance::{
 use host::{BlockContext, Host, SubmitError};
 use sdk::{Error, Msg, Origin};
 use sdk_testkit::MemStore;
-use valset::Valset;
 use valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode,
     encode_msg as valset_encode, encode_query as valset_query,
 };
+use valset_module::Valset;
 
 fn member_key(seed: u8) -> Vec<u8> {
     let seed = [seed; 32];

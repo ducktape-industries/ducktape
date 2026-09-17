@@ -17,12 +17,13 @@ use governance::{
 };
 use host::{BlockContext, Host, SubmitError};
 use modules::{
-    Modules, ModulesMsg, ModulesQuery, ModulesReply, decode_reply as modules_decode,
+    ModulesMsg, ModulesQuery, ModulesReply, decode_reply as modules_decode,
     encode_msg as modules_encode, encode_query as modules_query,
 };
+use modules_module::Modules;
 use sdk::{Error, Msg, Origin};
 use sdk_testkit::MemStore;
-use valset::Valset;
+use valset_module::Valset;
 
 fn member_key(seed: u8) -> Vec<u8> {
     let seed = [seed; 32];

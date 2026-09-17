@@ -38,6 +38,9 @@ async-trait = { workspace = true }
 index_guest = { workspace = true }
 
 [dev-dependencies]
+# `valset` is a shipping dep of this crate (its wire), so the native module the
+# host-callback suite composes enters under its own name.
+valset-module = { path = "../valset", package = "valset" }
 futures = { workspace = true }
 host = { workspace = true }
 sdk-testkit = { workspace = true }
