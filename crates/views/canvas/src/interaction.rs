@@ -1646,7 +1646,7 @@ impl BoardsView {
         Task::none()
     }
     pub(super) fn finish_text(&mut self) -> Task<Message> {
-        let Some(inline) = self.inline.take() else {
+        let Some(mut inline) = self.inline.take() else {
             return Task::none();
         };
         let text = inline.document.text();
@@ -1669,13 +1669,39 @@ impl BoardsView {
         // to clipping the moment you clicked away would have been lying the
         // whole time you were typing. `self.inline` is already taken, so this
         // reads the board as it will be without the editor over it.
-        let grow = self
-            .visible()
-            .and_then(|board| self.grown_change(&board, &inline));
+        let board = self.visible();
+        let grow = board
+            .as_ref()
+            .and_then(|board| self.grown_change(board, &inline));
         let changed = text != inline.original;
         if (changed || grow.is_some()) && self.pending.len() >= 64 {
             self.error =
                 "Waiting for earlier edits to save. Retry saving before closing this card.".into();
+            self.inline = Some(inline);
+            return Task::none();
+        }
+        // What the card says on the board NOW, which need not be what this
+        // editor opened on: anybody else can have finished their own sitting in
+        // it while ours stood open, and a card gone from under us is nobody's
+        // words to keep.
+        let standing = board
+            .as_ref()
+            .and_then(|board| board.shapes.get(&inline.id))
+            .map_or_else(|| inline.original.clone(), |r| r.shape.text.clone());
+        // Saving writes the card's WHOLE text, so those words go with no trace
+        // and no undo of ours standing behind them — they are not ours to undo.
+        // Refuse the first close and quote what is there. Taking it as the new
+        // baseline is what makes the second close the writer saying they have
+        // read it and mean to replace it anyway, and is also what keeps them
+        // from being shut inside a card that answers nothing.
+        let erases_their_words = changed && standing != inline.original && standing != text;
+        if erases_their_words {
+            self.error = format!(
+                "Somebody else changed this card while you had it open — {}. Close it again to \
+                 replace their words with yours.",
+                now_reading(&standing)
+            );
+            inline.original = standing;
             self.inline = Some(inline);
             return Task::none();
         }
@@ -2285,8 +2311,8 @@ impl BoardsView {
         let ids = match how {
             Stacking::Front => order.iter().filter(|id| mine(id)).cloned().collect(),
             Stacking::Back => order.iter().filter(|id| !mine(id)).cloned().collect(),
-            Stacking::Forward => stepped(&order, &mine, true),
-            Stacking::Backward => stepped(&order, &mine, false),
+            Stacking::Forward => stepped(&order, &mine, Toward::Top),
+            Stacking::Backward => stepped(&order, &mine, Toward::Bottom),
         };
         let moved = ids != order && !ids.is_empty();
         if !moved {
@@ -2602,32 +2628,53 @@ pub(super) fn plate(run: &[[f32; 2]]) -> [f32; 4] {
         middle[1] + reach[1],
     ]
 }
+/// What a card says now, short enough to read in a banner. The card itself is
+/// behind the editor and cannot be read around it, so the banner is the only
+/// place the writer can see the words they are about to replace.
+fn now_reading(text: &str) -> String {
+    // Long enough for a sticky's first line, short enough not to bury the
+    // sentence that says what to do about it.
+    const ROOM: usize = 80;
+    if text.trim().is_empty() {
+        return "it is empty now".to_owned();
+    }
+    let mut shown: String = text.chars().take(ROOM).collect();
+    if text.chars().nth(ROOM).is_some() {
+        shown.push('…');
+    }
+    format!("it now reads “{shown}”")
+}
+/// Which end of the stack a single step travels towards.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Toward {
+    Top,
+    Bottom,
+}
 /// The stack with the selection moved one place, bottom-to-top the way
 /// `Board::ordered` gives it.
 ///
-/// Going up walks from the top down and going down walks from the bottom up,
-/// so a shape this pass has already moved is never carried a second time by
-/// the same pass. A run of selected shapes therefore travels together and
-/// keeps its own order, and a selection already at that end comes back
-/// unchanged — which the caller reads as nothing to send.
-fn stepped(order: &[String], mine: &dyn Fn(&String) -> bool, up: bool) -> Vec<String> {
-    let mut next = order.to_vec();
-    let walk: Vec<usize> = match up {
-        true => (0..next.len()).rev().collect(),
-        false => (0..next.len()).collect(),
+/// Sinking is raising through the stack read the other way round, so one pass
+/// serves both: turn the stack over, raise, turn it back. The raise walks from
+/// the top down, so a shape this pass has already moved is never carried a
+/// second time by the same pass — a run of selected shapes therefore travels
+/// together and keeps its own order, and a selection already at that end comes
+/// back unchanged, which the caller reads as nothing to send.
+fn stepped(order: &[String], mine: &dyn Fn(&String) -> bool, toward: Toward) -> Vec<String> {
+    let facing = |mut stack: Vec<String>| {
+        if toward == Toward::Bottom {
+            stack.reverse();
+        }
+        stack
     };
-    for i in walk {
-        // usize::MAX out of the bottom, which the bound below refuses.
-        let neighbour = match up {
-            true => i + 1,
-            false => i.wrapping_sub(1),
-        };
-        let swappable = neighbour < next.len() && mine(&next[i]) && !mine(&next[neighbour]);
+    let mut next = facing(order.to_vec());
+    for i in (0..next.len()).rev() {
+        let above = i + 1;
+        let swappable = above < next.len() && mine(&next[i]) && !mine(&next[above]);
         if swappable {
-            next.swap(i, neighbour);
+            next.swap(i, above);
         }
     }
-    next
+    facing(next)
 }
 /// A shape the pointer moves and resizes on its own. A bound connector has no
 /// geometry of its own to drag: it follows the cards its ends name.
