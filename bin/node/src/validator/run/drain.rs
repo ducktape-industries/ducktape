@@ -14,7 +14,8 @@ use tasks::{TaskQuery, TaskReply, decode_task_reply, encode_task_query};
 use super::ValidatorRuntime;
 use crate::constants::{DRAIN_TICK, NOP_TARGET, VALSET_READ_WARN_EVERY, WORKSPACE_CHECK_INTERVAL};
 use crate::drain_actions::{
-    CutoverTrigger, EpochActions, capture_breakdown, checkpoint_due, cooldown_until,
+    CutoverTrigger, EpochActions, StallVoice, capture_breakdown, checkpoint_due, cooldown_until,
+    observe_block_beat,
 };
 use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
 use crate::util::{Presence, fatal, hex, participant_bytes, resident_bytes, unix_ms};
@@ -263,27 +264,29 @@ impl ValidatorRuntime<'_> {
         // names which wedge it is (#1766). the heartbeat is what guarantees a
         // block per beat, so a node with it disabled (`make dev`) has no floor
         // to measure against and is not watched.
-        let sealed_something = sealed_heights > 0;
-        if sealed_something {
-            *last_seal = context.current();
-            *stall_windows = 0;
-        } else {
-            let stalled_for = context
-                .current()
-                .duration_since(*last_seal)
-                .unwrap_or_default();
-            let stall_due = !*heartbeat_disabled && stalled_for >= stall_window(cadence);
-            if stall_due {
-                *stall_windows += 1;
-                // re-arm: the next warn is one full window later, so a wedge
-                // that never clears narrates itself at a bounded rate.
-                *last_seal = context.current();
-                tracing::warn!(
+        let beat = observe_block_beat(
+            last_seal,
+            stall_windows,
+            context.current(),
+            sealed_heights > 0,
+            stall_window(cadence),
+            *heartbeat_disabled,
+        );
+        // the gauge every turn, not only on a report: a dashboard's whole job
+        // is to show the silence RISING, and a value that only appears once a
+        // window has elapsed is a value that appears after the outage matters.
+        metrics.record_block_beat(beat.stalled_for);
+        macro_rules! block_beat_stalled {
+            ($emit:ident, $message:literal) => {
+                tracing::$emit!(
                     target: "ducktape::consensus",
                     node = %label,
-                    reason = "block_beat_stalled",
-                    windows = *stall_windows,
-                    stalled_ms = stalled_for.as_millis() as u64,
+                    // `event`, not `reason`: this is an operational-contract
+                    // name the status projection and the metrics key on, not a
+                    // token for something we refused (AGENTS.md, Logging).
+                    event = "block_beat_stalled",
+                    windows = beat.windows,
+                    stalled_ms = beat.stalled_for.as_millis() as u64,
                     epoch = orchestrator.epoch(),
                     validators = orchestrator.current_members().len(),
                     height = node.finalized().map_or(0, |f| f.height),
@@ -291,9 +294,20 @@ impl ValidatorRuntime<'_> {
                     orderer_pending = node.orderer().pending_len(),
                     gate_awaiting = node.orderer().min_unreleased_view().is_some(),
                     gate_min_view = node.orderer().min_unreleased_view().unwrap_or(0),
-                    "no block sealed for a full stall window — the chain is not beating"
-                );
-            }
+                    $message
+                )
+            };
+        }
+        match beat.voice {
+            StallVoice::Quiet => {}
+            StallVoice::Warn => block_beat_stalled!(
+                warn,
+                "no block sealed for a full stall window — the chain is not beating"
+            ),
+            StallVoice::Error => block_beat_stalled!(
+                error,
+                "the chain has been silent past the point it recovers on its own"
+            ),
         }
         // The orderer-independent projection keeps member/System order,
         // explorer rows, and discard handling identical to the replica.

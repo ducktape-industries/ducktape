@@ -278,6 +278,12 @@ residents.
 - `curl 127.0.0.1:8844/v1/status | jq .operations.consensus` shows
   `reachable_validators` below `quorum`; the same pair is on `/metrics` as
   `ducktape_consensus_reachable_validators` and `ducktape_consensus_quorum`.
+- The same object carries `block_beat_stalled_seconds` — how long this node has
+  gone without sealing a height, 0 while the chain beats — and `/metrics` has it
+  as `ducktape_block_beat_stalled_seconds`. That is the number to alert on: it
+  rises continuously rather than only when a log line happens to fire, and the
+  node's own `block_beat_stalled` event escalates from `warn` to `error` once it
+  passes a minute.
 - `dt node peers` names the seat that stopped talking (`connected=no`, or no
   row at all).
 

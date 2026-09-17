@@ -480,6 +480,11 @@ pub struct ConsensusOperationalStatus {
     /// member. This makes the number directly comparable with `quorum`.
     pub reachable_validators: u64,
     pub pending_ops: u64,
+    /// Seconds since this node last sealed a height, 0 while the chain is
+    /// beating or where no heartbeat sets a floor to measure against. It is
+    /// written by the drain on every turn, not by the throttled operations
+    /// refresh, so a wedge shows here at once rather than at the next refresh.
+    pub block_beat_stalled_seconds: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
