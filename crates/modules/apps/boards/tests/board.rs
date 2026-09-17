@@ -437,35 +437,6 @@ fn board_creator_uses_the_shared_actor_convention_for_passkeys() {
 }
 
 #[test]
-fn the_consensus_reducer_has_one_exhaustive_delegating_dispatch() {
-    let file = syn::parse_file(include_str!("../src/interface.rs")).unwrap();
-    let reducer = file
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            syn::Item::Impl(item) => Some(item),
-            _ => None,
-        })
-        .flat_map(|item| &item.items)
-        .find_map(|item| match item {
-            syn::ImplItem::Fn(method) if method.sig.ident == "apply" => Some(method),
-            _ => None,
-        })
-        .unwrap();
-    let [syn::Stmt::Expr(syn::Expr::Match(dispatch), None)] = reducer.block.stmts.as_slice() else {
-        panic!("one dispatch only")
-    };
-    for arm in &dispatch.arms {
-        assert!(arm.guard.is_none());
-        assert!(!matches!(arm.pat, syn::Pat::Wild(_)));
-        assert!(
-            matches!(*arm.body, syn::Expr::MethodCall(_)),
-            "each event delegates to a named pure handler"
-        );
-    }
-}
-
-#[test]
 fn batch_is_atomic_and_editing_does_not_change_stacking_order() {
     let original = Board::new("Board".into(), "owner".into()).unwrap();
     let board = original

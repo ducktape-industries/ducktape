@@ -9,6 +9,8 @@ native = ["dep:sdk", "dep:async-trait"]
 guest = ["native", "dep:ducktape-module-sdk"]
 
 [dependencies]
+# the format: shapes, bonds, bounds and the fold that applies a change
+boards-wire = { path = "wire" }
 serde.workspace = true
 serde_json.workspace = true
 sdk = { workspace = true, optional = true }
@@ -16,6 +18,5 @@ async-trait = { workspace = true, optional = true }
 ducktape-module-sdk = { workspace = true, optional = true }
 
 [dev-dependencies]
-syn = { version = "2", features = ["full"] }
 sdk-testkit.workspace = true
 futures = "0.3"
