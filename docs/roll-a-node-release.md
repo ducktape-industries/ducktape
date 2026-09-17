@@ -34,14 +34,24 @@ ducktape-node-launcher install --workspace <workspace> --config <workspace>/node
 `--from` names the release the workspace is already running, so nothing is
 copied and `current` does not move; the only new file is the pin. The key is
 read once per node life, so the node child is restarted afterwards — stop it
-and its supervisor boots it again:
+and its supervisor boots it again.
+
+Find it by what it is EXECUTING, never by a pattern over command lines: a
+`-f` match hits the editor, the grep and the shell that happen to name the
+same path.
 
 ```
-kill $(pgrep -f "<workspace>/updates/releases/.*/ducktape")   # or find it by /proc/<pid>/exe
+for p in /proc/[0-9]*; do
+    case "$(readlink "$p/exe" 2>/dev/null)" in
+        <workspace>/updates/releases/*/ducktape) echo "stopping ${p#/proc/}"; kill "${p#/proc/}";;
+    esac
+done
 ```
 
 `/proc/<pid>/exe` resolves THROUGH the `current` symlink, so a node child's
-executable path names its release directory, never `current/`.
+executable path names its release directory, never `current/` — a scan looking
+for `current/` matches nothing at all and looks exactly like "nothing is
+running".
 
 ## 1. Archive the binary
 
