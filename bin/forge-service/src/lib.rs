@@ -44,11 +44,15 @@ struct ServiceState {
 }
 
 impl ServiceState {
+    /// `blob_bytes` sizes the wait, not the frame: the node cannot commit a
+    /// blob-bearing op until it has fanned those bytes out to every other
+    /// validator, so a repository-sized pack is a long — not a failed — submit.
     async fn submit(
         &self,
         payload: Vec<u8>,
         required_blob: Option<[u8; 32]>,
-    ) -> Result<u64, String> {
+        blob_bytes: u64,
+    ) -> Result<u64, ducktape_rpc::SubmitFailure> {
         let frame = node::encode_frame_with_blob(
             &self.signer,
             self.sequence.fetch_add(1, Ordering::Relaxed),
@@ -58,10 +62,7 @@ impl ServiceState {
             },
             required_blob,
         );
-        self.client
-            .submit_frame(frame)
-            .await
-            .map_err(|error| error.to_string())
+        self.client.submit_frame(frame, blob_bytes).await
     }
 }
 
