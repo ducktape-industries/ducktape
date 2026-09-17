@@ -78,9 +78,11 @@
 //! `commit_block`; the module root IS the store's merkle root, and sync
 //! belongs to the store.
 
-// the wire surface: this module's shared types, flattened at the crate root.
-mod interface;
-pub use interface::*;
+// the wire surface: this module's shared types, flattened at the crate root
+// so every `crate::`/`agent::` path reads exactly as it did when the types
+// lived here. they live in `agent-wire` now, which a view or the daemon may
+// link without taking the executor below.
+pub use agent_wire::*;
 
 // the pure interpreter: program validation and invocation evaluation.
 mod program;
