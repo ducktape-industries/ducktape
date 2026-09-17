@@ -4,9 +4,7 @@ mod host;
 mod interaction;
 mod markdown;
 mod presentation;
-use boards_wire::{
-    Align, Board, Change, Dash, Fill, Kind, Operation, Shape, TextSize, Weight,
-};
+use boards_wire::{Align, Board, Change, Dash, Fill, Kind, Operation, Shape, TextSize, Weight};
 use ducktape_view_guest::{Editor, wire};
 use ducktape_view_guest::{Subscription, Task};
 use serde::{Deserialize, Serialize};
@@ -275,6 +273,11 @@ pub enum Message {
     FocusResult(String, Result<(), String>),
     MiddleDown,
     FinishText,
+    /// ⌘Enter out of the editor: finish, and if it was a sticky, open the next
+    /// one. Its own message and not a flag on `FinishText`, because the two
+    /// doors out of the editor are told apart where the editor reports which
+    /// key closed it, and that is the only place that knows.
+    FinishNote,
     TextTransaction(ducktape_view_guest::EditorTransaction<Message>),
     TextDocument(ducktape_view_guest::EditorDocumentUpdate),
     Duplicate,
@@ -409,6 +412,7 @@ impl BoardsView {
             Message::FocusResult(id, result) => self.on_focus_result(id, result),
             Message::MiddleDown => self.on_middle_down(),
             Message::FinishText => self.finish_text(),
+            Message::FinishNote => self.finish_note(),
             Message::TextTransaction(transaction) => self.on_text_transaction(transaction),
             Message::TextDocument(document) => self.on_text_document(document),
             Message::Duplicate => self.on_duplicate(),

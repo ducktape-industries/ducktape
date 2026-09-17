@@ -3047,17 +3047,24 @@ impl BoardsView {
                 },
             ],
             |_| wire::EditorDecision::Noop,
-            // Both claimed keys leave the card keeping what you wrote, and
-            // they still part here: ⌘Enter is only ever a way out of the
-            // writing, while Escape also answers for everything else the board
-            // is holding — a tool, a selection, a menu — so it goes through
-            // the one path that knows about all of them.
+            // Three ways out, told apart here because this is the only place
+            // that knows WHICH key closed the editor. Escape answers for
+            // everything else the board is holding — a tool, a selection, a
+            // menu — so it goes through the one path that knows about all of
+            // them. ⌘Enter means "next note", which out of a sticky is finish
+            // AND open the next one. Anything else that commits — a click
+            // away, a blur — is a plain finish and asks for nothing more.
             |event| match event {
                 EditorTransactionEvent::Commit { origin, .. } => match origin {
                     Some(wire::EditorRequestInput::Key { key, .. })
                         if key.key == Key::Named(Named::Escape) =>
                     {
                         Some(Message::Cancel)
+                    }
+                    Some(wire::EditorRequestInput::Key { key, .. })
+                        if key.key == Key::Named(Named::Enter) =>
+                    {
+                        Some(Message::FinishNote)
                     }
                     Some(_) => Some(Message::FinishText),
                     None => None,

@@ -1600,6 +1600,39 @@ impl BoardsView {
         changes.extend(grow);
         Task::batch([self.edit_many(changes), self.hand_back_focus()])
     }
+    /// ⌘Enter out of a sticky: finish it and open the next one.
+    ///
+    /// The chord has always meant "next note" — pressed on the canvas it mints
+    /// one beside the selection — but pressed inside the editor it only ever
+    /// finished the writing, so reaching the next note took the same chord
+    /// twice with nothing to say so. Writing a column of stickies is the whole
+    /// reason the tool exists, and its rhythm is type-chord-type-chord; a
+    /// doubled chord whose first press appears to do nothing is not a rhythm
+    /// anybody builds muscle memory for.
+    ///
+    /// Only out of a NOTE. A chord that quietly spawned a sticky when you were
+    /// labelling a rectangle would be worse than the friction it replaces.
+    pub(super) fn finish_note(&mut self) -> Task<Message> {
+        let Some(id) = self.inline.as_ref().map(|inline| inline.id.clone()) else {
+            return Task::none();
+        };
+        let finish = self.finish_text();
+        match self.chains_to_the_next_note(&id) {
+            false => finish,
+            true => Task::batch([finish, self.on_quick_note()]),
+        }
+    }
+    /// Whether the finish just performed should open the next sticky: only out
+    /// of a sticky, and only when the finish actually LET GO of the editor.
+    /// A card too long to save, or one waiting on earlier edits, puts the
+    /// editor back and says why — minting a note over that would throw the
+    /// message away along with the place the caret was.
+    ///
+    /// Read after the finish, not before, because "did it let go" is the
+    /// question and only the finish can answer it.
+    pub(super) fn chains_to_the_next_note(&self, finished: &str) -> bool {
+        self.inline.is_none() && self.kind_of(finished) == Some(Kind::Note)
+    }
     /// The canvas takes the keyboard back, so the next key is a shortcut
     /// rather than a character nothing is listening for.
     fn hand_back_focus(&self) -> Task<Message> {

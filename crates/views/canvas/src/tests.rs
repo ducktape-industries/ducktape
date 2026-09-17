@@ -3996,12 +3996,82 @@ fn the_weight_row_is_offered_to_everything_that_draws_a_line() {
 
     for id in ["card", "line"] {
         view.selected = [id.to_string()].into();
-        assert!(offered(&view), "a {id} draws a line but was offered no weight");
+        assert!(
+            offered(&view),
+            "a {id} draws a line but was offered no weight"
+        );
     }
 
     view.selected = ["words".into()].into();
     assert!(
         !offered(&view),
         "a text shape draws no line, so a weight row on it sets nothing"
+    );
+}
+/// ⌘Enter out of a sticky finishes it AND opens the next one, in one press. It
+/// used to take the chord twice — once to finish, once to mint — with nothing
+/// to say so, which is the same as not having it: writing a column of stickies
+/// wants type-chord-type-chord, and a first press that appears to do nothing is
+/// not a rhythm anybody builds.
+///
+/// The next note is minted off-thread, so what is asserted here is the decision
+/// rather than the shape: whether the finish chained, which is the whole of
+/// what this chord had to learn.
+#[test]
+fn the_chord_chains_out_of_a_sticky_and_out_of_nothing_else() {
+    let mut view = view();
+    view.on_size(1400., 900.);
+    view.edit(Change::Create {
+        id: "note".into(),
+        shape: Shape {
+            kind: Kind::Note,
+            ..Default::default()
+        },
+    });
+    view.edit(Change::Create {
+        id: "card".into(),
+        shape: Shape {
+            kind: Kind::Rectangle,
+            x: 600,
+            ..Default::default()
+        },
+    });
+
+    view.selected = ["note".into()].into();
+    view.begin_text();
+    view.finish_note();
+    assert!(view.inline.is_none(), "the sticky did not finish");
+    assert!(
+        view.chains_to_the_next_note("note"),
+        "finishing a sticky with the chord left no next note, so the chord \
+         still needs pressing twice"
+    );
+
+    // Not out of a card: a chord that quietly spawned a sticky while you were
+    // labelling a rectangle would be worse than the friction it replaces.
+    view.selected = ["card".into()].into();
+    view.begin_text();
+    view.finish_note();
+    assert!(view.inline.is_none(), "the card's label did not finish");
+    assert!(
+        !view.chains_to_the_next_note("card"),
+        "the chord minted a sticky out of a rectangle's label"
+    );
+
+    // And not when the finish was refused. The editor comes back holding what
+    // you wrote and says why; a note minted over that would take the message
+    // and the caret's place with it.
+    view.selected = ["note".into()].into();
+    view.begin_text();
+    view.inline.as_mut().unwrap().document = Editor::new("x".repeat(boards_wire::MAX_TEXT + 10));
+    view.finish_note();
+    assert!(
+        view.inline.is_some(),
+        "a sticky too long to save was closed anyway"
+    );
+    assert!(
+        !view.chains_to_the_next_note("note"),
+        "a refused finish still opened the next note, over the message saying \
+         why this one could not be saved"
     );
 }
