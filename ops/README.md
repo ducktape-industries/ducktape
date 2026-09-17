@@ -323,13 +323,11 @@ node ops/proxmox-view-observe-test.mjs
 
 ## Wasm guests
 
-- `wasm-embed-check.sh` (`make wasm-embed-check`) — refuses an
-  `include_bytes!`/`include_str!` of a `.wasm` outside a test, so a binary can
-  never carry a second copy of a module. Pure text, no toolchain, part of the
-  offline `test` gate. It is item-aware: `#[cfg(test)]` governs one item, not
-  the rest of the file, and an invocation may span lines. The scanner proves
-  itself against six fixtures before it scans;
-  `bash ops/wasm-embed-check.sh --self-test` runs those alone.
+- `make wasm-embed-check` — refuses an `include_bytes!`/`include_str!` of a
+  `.wasm` outside a test, so a binary can never carry a second copy of a module.
+  No script here: it is a source-parsing lint,
+  `crates/topology/tests/wasm_embed.rs`, beside `sdk_shaped` and
+  `tracing_plane_lint`.
 - `wasm-repro-check.sh` (`make wasm-repro-check`) — builds one guest component
   twice, in two scratch directories, and asserts the bytes are identical and
   carry no host path, so a committed artifact never depends on the builder's
