@@ -4641,6 +4641,7 @@ dependencies = [
  "ducktape-module-sdk",
  "forge",
  "futures",
+ "git-primitives",
  "git2",
  "host",
  "identity",
@@ -4651,6 +4652,17 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tracing",
+]
+
+[[package]]
+name = "forge-odb"
+version = "0.1.0"
+dependencies = [
+ "blobstore",
+ "forge",
+ "git-primitives",
+ "sdk",
+ "sha2 0.10.9",
  "wasm-host",
 ]
 
@@ -4988,6 +5000,10 @@ dependencies = [
  "indexmap",
  "stable_deref_trait",
 ]
+
+[[package]]
+name = "git-primitives"
+version = "0.1.0"
 
 [[package]]
 name = "git2"
@@ -6162,6 +6178,7 @@ dependencies = [
  "files",
  "files-odb",
  "forge",
+ "forge-odb",
  "futures",
  "gateway",
  "governance",
@@ -8094,6 +8111,7 @@ dependencies = [
  "files",
  "files-odb",
  "forge",
+ "forge-odb",
  "futures",
  "gateway",
  "git2",
@@ -14000,6 +14018,7 @@ name = "wasm-host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "git-primitives",
  "module-artifact",
  "sdk",
  "sdk-testkit",

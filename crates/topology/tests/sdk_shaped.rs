@@ -10,7 +10,9 @@
 //! of this repository, and the dependency arrives quietly: a host-side substrate
 //! written beside the module it serves, behind a `native` feature that is also
 //! the DEFAULT feature, so every consumer takes the kernel without asking for it.
-//! That is what wave 7e moved out as `files-odb`.
+//! That is what `crates/services/files-odb` and `crates/services/forge-odb` are.
+//! A module may still name the SHAPE a substrate answers in — the plain git
+//! types live in `git-primitives`, a zero-dep leaf, for exactly that reason.
 //!
 //! **A `-wire` crate declares no `native` feature and reaches no kernel crate.**
 //! A wire crate exists so a view or the daemon can link a module's FORMAT without
@@ -27,18 +29,10 @@ use std::path::{Path, PathBuf};
 
 /// Module crates that still name the kernel host, each with why and what
 /// unblocks it. `<package> -- <issue>`.
-const HOST_NAMING_MODULES: &[&str] = &[
-    // forge's read policy is ONE implementation that both the native module and
-    // the deployed guest run (`forge/src/query.rs`), and its native arm binds
-    // four WIT-GENERATED git types -- GitObject, GitDiff, GitDiffError,
-    // GitObjectData -- out of wasm-host. `Forge::query_committed` calls it, so
-    // the policy does not travel with `ForgeOdbBacking` the way files' did.
-    // A second bindgen elsewhere makes types that will not unify with the ones
-    // `WasmModule` hands a backing, so this needs wasm-host re-bindgen'd with
-    // `with:` mappings onto a crate a module may name. Until then forge cannot
-    // be lifted out, and `forge-odb` cannot be carved out either.
-    "forge -- #2412",
-];
+///
+/// EMPTY, and the assertion below fails on a stale entry as well as a new
+/// dependency, so it stays empty unless someone writes down why it cannot.
+const HOST_NAMING_MODULES: &[&str] = &[];
 
 /// Crates under `crates/modules` whose name ends in `-wire`, plus the two that
 /// predate the convention and are wire crates by every other measure.
@@ -73,10 +67,10 @@ fn no_module_crate_names_the_kernel_host() {
     let mut found = BTreeSet::new();
     for manifest in manifests_under(&modules) {
         let text = read(&manifest);
-        // the DEPENDENCY, never the word: forge's manifest explains in a comment
-        // why its host dep is there, and a `contains` would keep flagging forge
-        // after someone deleted the dep and left the paragraph — an exception
-        // that reads live while the thing it excuses is gone.
+        // the DEPENDENCY, never the word: a manifest that explains in a comment
+        // why it does NOT name the host would trip a `contains`, and a comment
+        // left behind after the dep went away would keep the crate flagged —
+        // an exception that reads live while the thing it excuses is gone.
         if !names_dependency(&text, "wasm-host") {
             continue;
         }

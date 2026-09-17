@@ -14,7 +14,7 @@ use ducktape_module_sdk::host::{
     GitDiff, GitDiffError as DiffError, GitObject as Object, GitObjectData,
 };
 #[cfg(feature = "native")]
-use wasm_host::{GitDiff, GitDiffError as DiffError, GitObject as Object, GitObjectData};
+use git_primitives::{GitDiff, GitDiffError as DiffError, GitObject as Object, GitObjectData};
 
 pub(crate) trait GitRead {
     fn object(&self, repo: &str, oid: Oid, cap: usize) -> Result<Object, Error>;
@@ -445,7 +445,7 @@ pub(crate) fn read_object(
     repository: &str,
     oid: &[u8],
     max_bytes: u64,
-) -> Result<wasm_host::GitObject, Error> {
+) -> Result<git_primitives::GitObject, Error> {
     let name = norm_repo(repository)?;
     let repo = git::open(&base.join(name)).map_err(|error| Error::Module(error.to_string()))?;
     let oid = git2::Oid::from_bytes(oid).map_err(|error| Error::Module(error.to_string()))?;
@@ -469,7 +469,7 @@ pub(crate) fn read_object(
                 let commit = repo
                     .find_commit(oid)
                     .map_err(|error| Error::Module(error.to_string()))?;
-                GitObjectData::Commit(wasm_host::GitCommit {
+                GitObjectData::Commit(git_primitives::GitCommit {
                     tree: commit.tree_id().as_bytes().to_vec(),
                     parents: commit
                         .parent_ids()
@@ -483,7 +483,7 @@ pub(crate) fn read_object(
                     .map_err(|error| Error::Module(error.to_string()))?;
                 GitObjectData::Tree(
                     tree.iter()
-                        .map(|entry| wasm_host::GitTreeEntry {
+                        .map(|entry| git_primitives::GitTreeEntry {
                             kind: match entry.kind() {
                                 Some(git2::ObjectType::Tree) => 2,
                                 Some(git2::ObjectType::Blob) => 3,
@@ -519,7 +519,7 @@ pub(crate) fn read_object(
         git2::ObjectType::Tag => 4,
         git2::ObjectType::Any => 0,
     };
-    Ok(wasm_host::GitObject {
+    Ok(git_primitives::GitObject {
         kind,
         size: size as u64,
         data,
@@ -535,15 +535,15 @@ pub(crate) fn read_diff(
     max_bytes: u64,
     max_files: u64,
     max_blob_bytes: u64,
-) -> Result<wasm_host::GitDiff, wasm_host::GitDiffError> {
+) -> Result<git_primitives::GitDiff, git_primitives::GitDiffError> {
     let name = norm_repo(repository)
-        .map_err(|error| wasm_host::GitDiffError::Unavailable(error.to_string()))?;
+        .map_err(|error| git_primitives::GitDiffError::Unavailable(error.to_string()))?;
     let repo = git::open(&base.join(name))
-        .map_err(|error| wasm_host::GitDiffError::Unavailable(error.to_string()))?;
+        .map_err(|error| git_primitives::GitDiffError::Unavailable(error.to_string()))?;
     let target = git2::Oid::from_bytes(target)
-        .map_err(|error| wasm_host::GitDiffError::Unavailable(error.to_string()))?;
+        .map_err(|error| git_primitives::GitDiffError::Unavailable(error.to_string()))?;
     let source = git2::Oid::from_bytes(source)
-        .map_err(|error| wasm_host::GitDiffError::Unavailable(error.to_string()))?;
+        .map_err(|error| git_primitives::GitDiffError::Unavailable(error.to_string()))?;
     let (patch, truncated, files_changed, additions, deletions) = git::bounded_diff(
         &repo,
         target,
@@ -554,13 +554,13 @@ pub(crate) fn read_diff(
     )
     .map_err(|error| match error {
         git::BoundedDiffError::Git(error) => {
-            wasm_host::GitDiffError::Unavailable(error.to_string())
+            git_primitives::GitDiffError::Unavailable(error.to_string())
         }
         error @ git::BoundedDiffError::TooLarge { .. } => {
-            wasm_host::GitDiffError::Limit(error.to_string())
+            git_primitives::GitDiffError::Limit(error.to_string())
         }
     })?;
-    Ok(wasm_host::GitDiff {
+    Ok(git_primitives::GitDiff {
         patch,
         truncated,
         files_changed: files_changed as u64,

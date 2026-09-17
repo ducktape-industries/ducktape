@@ -523,7 +523,7 @@ fn open_odb(
         Backing::Odb => files_odb::FilesOdbBacking::open(id, path)
             .map(|backing| Box::new(backing) as Box<dyn wasm_host::OdbBacking>)
             .map_err(|error| format!("object storage open: {error}")),
-        Backing::Git => forge::ForgeOdbBacking::open(id, path, substrates.blobs.clone())
+        Backing::Git => forge_odb::ForgeOdbBacking::open(id, path, substrates.blobs.clone())
             .map(|backing| Box::new(backing) as Box<dyn wasm_host::OdbBacking>)
             .map_err(|error| format!("git storage open: {error}")),
         Backing::Map | Backing::Store => Err("component does not declare object storage".into()),

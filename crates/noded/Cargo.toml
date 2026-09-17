@@ -53,6 +53,8 @@ files = { workspace = true }
 # the disk odb `open_odb` hands a wasm files tenant. a service crate, not the
 # module: `files` names no kernel host.
 files-odb = { workspace = true }
+# the git substrate `open_odb` hands a wasm forge tenant, on the same grounds.
+forge-odb = { workspace = true }
 chat = { workspace = true }
 # the `/v1/call/ws` framing (the webview leg of a huddle) and the voice frame size.
 tasks = { workspace = true }

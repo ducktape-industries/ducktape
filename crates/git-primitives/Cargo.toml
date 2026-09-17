@@ -1,0 +1,11 @@
+# the bounded local-git read surface, as plain Rust data with NO dependencies.
+# the kernel host speaks these across `wasm_host::OdbBacking` and converts them
+# to its own WIT-generated twins at the import boundary; `forge`'s read policy
+# names them directly. that is how a module reaches the shape of a git read
+# without naming the kernel host it is supposed to be separable from.
+[package]
+name = "git-primitives"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]

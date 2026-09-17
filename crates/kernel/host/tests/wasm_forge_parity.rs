@@ -16,10 +16,8 @@
 use futures::executor::block_on;
 
 use forge::testkit::{PackedCommit, history};
-use forge::{
-    Forge, ForgeMsg, ForgeOdbBacking, ForgeQuery, RefUpdate, ReviewVerdict, encode_msg,
-    encode_query,
-};
+use forge::{Forge, ForgeMsg, ForgeQuery, RefUpdate, ReviewVerdict, encode_msg, encode_query};
+use forge_odb::ForgeOdbBacking;
 use host::{BlockContext, CapturePayloads, Host, MemberOutcome};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest as _, Sha256};

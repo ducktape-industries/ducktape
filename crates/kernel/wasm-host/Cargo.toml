@@ -11,6 +11,10 @@ edition.workspace = true
 [dependencies]
 module-artifact = { workspace = true }
 sdk = { workspace = true }
+# the plain git read types `OdbBacking` speaks. they live outside this crate so
+# a substrate and a module's read policy can name them without naming wasmtime;
+# `git_wit` converts them to the bindgen twins at the import boundary.
+git-primitives = { workspace = true }
 wasmtime = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
