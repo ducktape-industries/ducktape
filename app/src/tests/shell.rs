@@ -58,9 +58,9 @@ fn a_pushed_status_moves_every_fact_it_carries() {
 #[test]
 fn shell_tab_is_app_state_and_an_opened_message_switches_panes() {
     let (mut app, _) = Ducktape::boot();
-    assert_eq!(app.shell_tab, ShellTab::Chat);
-    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Pages));
-    assert_eq!(app.shell_tab, ShellTab::Pages);
+    assert_eq!(app.shell_tab, ShellTab::View("chat"));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::View("pages")));
+    assert_eq!(app.shell_tab, ShellTab::View("pages"));
 
     // a `duck://` message address lands on the chat pane, whichever view
     // handed it to the open plane
@@ -68,7 +68,7 @@ fn shell_tab_is_app_state_and_an_opened_message_switches_panes() {
     app.mutation_phase = MutationPhase::Idle;
     app.connected_rpc = "http://node".into();
     let _ = app.update(AppMessage::OpenChatSearchHit("general".into(), 7));
-    assert_eq!(app.shell_tab, ShellTab::Chat);
+    assert_eq!(app.shell_tab, ShellTab::View("chat"));
 }
 
 /// Node operations are an operator surface, not a tail appended to device
@@ -80,7 +80,7 @@ fn switching_panes_retires_a_stale_error_banner_on_every_tab() {
     // the disconnected path returns first, and must still clear.
     let (mut app, _) = Ducktape::boot();
     app.error = "could not reach the node".into();
-    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Files));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::View("files")));
     assert_eq!(
         app.error, "",
         "the !connected early return must still clear"
@@ -90,7 +90,7 @@ fn switching_panes_retires_a_stale_error_banner_on_every_tab() {
     let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.error = "files: path not found".into();
-    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Pages));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::View("pages")));
     assert_eq!(
         app.error, "",
         "the chat/pages early return must still clear"
@@ -100,9 +100,9 @@ fn switching_panes_retires_a_stale_error_banner_on_every_tab() {
     let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.error = "explorer hydration failed".into();
-    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Members));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::View("members")));
     assert_eq!(app.error, "");
-    assert_eq!(app.shell_tab, ShellTab::Members);
+    assert_eq!(app.shell_tab, ShellTab::View("members"));
 }
 
 /// THE RAIL'S ACCOUNT ROW NEVER SENDS A SIGNED-IN USER TO THE SIGN-IN.
@@ -118,13 +118,13 @@ fn the_rail_account_row_opens_settings_when_signed_in_and_the_welcome_when_not()
     let (mut app, _) = Ducktape::boot();
     app.connected = true;
     app.account_exists = true;
-    app.shell_tab = ShellTab::Chat;
+    app.shell_tab = ShellTab::View("chat");
     let task = app.update(AppMessage::OpenAccount);
     let queued = futures::executor::block_on(task.into_stream().collect::<Vec<_>>());
     assert!(
         matches!(
             queued.as_slice(),
-            [AppMessage::SelectShellTab(ShellTab::Settings)]
+            [AppMessage::SelectShellTab(ShellTab::View("settings"))]
         ),
         "a signed-in press goes to the account card in Settings"
     );
@@ -169,7 +169,7 @@ fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load
     app.connected = true;
     let in_flight = app.settings_generation;
 
-    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Members));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::View("members")));
     let _ = app.update(AppMessage::SettingsLoaded(crate::backend::SettingsFacts {
         generation: in_flight,
         key_path: "/w/user.key".into(),
@@ -183,7 +183,7 @@ fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load
     );
 
     // and the tab that DOES draw them still re-reads on entry.
-    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Settings));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::View("settings")));
     assert_ne!(
         app.settings_generation, in_flight,
         "entering Settings must issue a fresh read"
@@ -264,22 +264,22 @@ fn ready_events_rehydrate_without_rewinding_the_tip() {
 fn a_tab_move_retires_the_banner_of_the_screen_it_left() {
     let (mut app, _) = Ducktape::boot();
     app.connected = true;
-    app.shell_tab = ShellTab::Chat;
+    app.shell_tab = ShellTab::View("chat");
     app.error = "the room would not load".into();
 
-    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Node));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::View("node")));
 
     assert_eq!(app.error, "", "a banner never rides a tab move");
-    assert_eq!(app.shell_tab, ShellTab::Node);
+    assert_eq!(app.shell_tab, ShellTab::View("node"));
 
     // The chat/pages return and the disconnected return each skip the
     // generation bumps below, and neither may keep a stale banner alive.
     let (mut app, _) = Ducktape::boot();
-    app.shell_tab = ShellTab::Pages;
+    app.shell_tab = ShellTab::View("pages");
     app.error = "the page would not load".into();
-    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Chat));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::View("chat")));
     assert_eq!(app.error, "");
-    assert_eq!(app.shell_tab, ShellTab::Chat);
+    assert_eq!(app.shell_tab, ShellTab::View("chat"));
 }
 
 /// THE FIVE IDENTITY OPS LAND IN ONE PLACE. `account_changed` is the only
@@ -333,7 +333,7 @@ fn a_minted_ticket_is_shown_without_a_reread() {
 #[test]
 fn the_explorer_is_handed_the_live_head_and_the_phase() {
     let mut app = Ducktape::initial_state();
-    app.shell_tab = ShellTab::Explorer;
+    app.shell_tab = ShellTab::View("explorer");
     app.block_height = 1234;
     app.node_phase = "syncing".into();
     app.node_sync_applied = 30;
@@ -347,7 +347,7 @@ fn the_explorer_is_handed_the_live_head_and_the_phase() {
 #[test]
 fn no_seat_prints_a_checkpoint_beside_the_live_head() {
     let mut app = Ducktape::initial_state();
-    app.shell_tab = ShellTab::Node;
+    app.shell_tab = ShellTab::View("node");
     app.node_height = 100;
     app.node_checkpoint = 90;
     app.block_height = 200;
@@ -382,9 +382,9 @@ fn the_node_streams_carry_the_gates_their_costs_require() {
 #[test]
 fn node_operations_are_a_first_class_screen() {
     let mut app = Ducktape::initial_state();
-    app.shell_tab = ShellTab::Node;
+    app.shell_tab = ShellTab::View("node");
     assert_eq!(app.native_view().0.module, "node");
-    app.shell_tab = ShellTab::Settings;
+    app.shell_tab = ShellTab::View("settings");
     assert_eq!(app.native_view().0.module, "settings");
 }
 #[test]
@@ -426,12 +426,12 @@ fn a_failed_huddle_leave_keeps_the_retained_roster_visible() {
 fn interaction_state_stays_with_the_screen_that_owns_it() {
     let mut app = Ducktape::initial_state();
     for (tab, module) in [
-        (ShellTab::Pages, "pages"),
-        (ShellTab::Chat, "chat"),
-        (ShellTab::Files, "files"),
-        (ShellTab::Agents, "agents"),
-        (ShellTab::Forge, "forge"),
-        (ShellTab::Explorer, "explorer"),
+        (ShellTab::View("pages"), "pages"),
+        (ShellTab::View("chat"), "chat"),
+        (ShellTab::View("files"), "files"),
+        (ShellTab::View("agents"), "agents"),
+        (ShellTab::View("forge"), "forge"),
+        (ShellTab::View("explorer"), "explorer"),
     ] {
         app.shell_tab = tab;
         let (view, _) = app.native_view();
@@ -454,7 +454,7 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
 #[test]
 fn passkey_ceremony_props_reach_settings_without_exposing_secrets() {
     let mut app = Ducktape::initial_state();
-    app.shell_tab = ShellTab::Settings;
+    app.shell_tab = ShellTab::View("settings");
     app.password = "never-in-props".into();
     app.account_ceremony_phase = "working".into();
     let (view, _) = app.native_view();
@@ -479,7 +479,7 @@ fn update_facts_reach_settings_and_each_intent_is_one_action() {
     use commonware_cryptography::{Signer as _, ed25519};
 
     let mut app = Ducktape::initial_state();
-    app.shell_tab = ShellTab::Settings;
+    app.shell_tab = ShellTab::View("settings");
     let (view, _) = app.native_view();
     let props: serde_json::Value = serde_json::from_slice(&view.props).unwrap();
     assert_eq!(

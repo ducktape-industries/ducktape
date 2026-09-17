@@ -89,21 +89,19 @@ pub(crate) enum DuckKind {
     Account,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// WHICH VIEW THE SHELL IS SHOWING, BY ID — never a name the app compiled in.
+///
+/// A tab is a seated view and nothing else, so this carries an id and has no
+/// arm per view: ten arms meant a view the connected node's registry listed
+/// but this build had never heard of could not BE a tab, which is the whole
+/// point of a registry. The strip's rows come from the registry plus the ids
+/// whose bytes ship with the app (`backend::view_source::DESKTOP_OWNED`), and
+/// an id no arm anywhere names still seats, draws and routes
+/// (`ui::native_view`, `shell::navigation_rows`).
+///
+/// `tests::design::no_shell_tab_arm_names_a_view` keeps it that way.
 pub(crate) enum ShellTab {
-    Chat,
-    Pages,
-    Forge,
-    Agents,
-    Files,
-    Explorer,
-    Node,
-    Members,
-    Governance,
-    Settings,
-    /// A view the connected node's registry lists as a `Kind::View` entry,
-    /// by its id: drawn after the built-in tabs, gone when the id leaves
-    /// the registry.
-    Registered(&'static str),
+    View(&'static str),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SettingsIntent {
@@ -651,7 +649,7 @@ impl Ducktape {
             dm_peers_generation: 0,
             chat_dm_peer: String::new(),
             chat_dm_serial: 0,
-            shell_tab: ShellTab::Chat,
+            shell_tab: ShellTab::View("chat"),
             gov_open: 0,
             agents_open_run: "".to_owned(),
             agents_opened: 0,
@@ -814,7 +812,7 @@ impl Ducktape {
         state.network_chain_id = "testnet#abcd".to_owned();
         state.connect_generation = 7;
         state.signer_key = "aa11".to_owned();
-        state.shell_tab = ShellTab::Chat;
+        state.shell_tab = ShellTab::View("chat");
         (state, Task::none())
     }
     #[cfg(test)]
@@ -825,7 +823,7 @@ impl Ducktape {
         state.network_chain_id = "testnet#abcd".to_owned();
         state.connect_generation = 7;
         state.signer_key = "aa11".to_owned();
-        state.shell_tab = ShellTab::Settings;
+        state.shell_tab = ShellTab::View("settings");
         state.account_ceremony_phase = "qr".to_owned();
         state.account_ceremony_qr = "otpauth://totp/demo".to_owned();
         (state, Task::none())
@@ -893,15 +891,15 @@ mod state_tests {
     #[tokio::test]
     async fn a_chat_address_opened_from_another_tab_lands_on_the_chat_tab() {
         let (mut state, _) = Ducktape::fixture_seated_chat_session();
-        let reply_message = AppMessage::SelectShellTab(ShellTab::Agents);
+        let reply_message = AppMessage::SelectShellTab(ShellTab::View("agents"));
         dispatch(&mut state, reply_message);
         let actual = state.shell_tab;
-        let expected = ShellTab::Agents;
+        let expected = ShellTab::View("agents");
         assert_eq!(actual, expected);
         let reply_message = AppMessage::OpenMessageLink("duck://channel/general".to_owned());
         dispatch(&mut state, reply_message);
         let actual = state.shell_tab;
-        let expected = ShellTab::Chat;
+        let expected = ShellTab::View("chat");
         assert_eq!(actual, expected);
     }
     #[test]
@@ -912,7 +910,7 @@ mod state_tests {
         let reply_message = AppMessage::OpenRunPanel("dispatch-1".to_owned());
         dispatch(&mut state, reply_message);
         let actual = state.shell_tab;
-        let expected = ShellTab::Agents;
+        let expected = ShellTab::View("agents");
         assert_eq!(actual, expected);
         let actual = state.agents_open_run.to_owned();
         let expected = "dispatch-1".to_owned();

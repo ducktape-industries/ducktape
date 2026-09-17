@@ -12,17 +12,18 @@ use super::*;
 /// The titlebar chips (approvals, agent dot, account name) read from state,
 /// and state is what the connect load and the live-plane lane fill — no chip
 /// depends on a tab click.
+/// The list is keyed by view id and stays HOST-SIDE by ruling: a view
+/// declaring which planes it reads would be widening its own read surface,
+/// which is a policy call and not a tab's to make. An id named nowhere here —
+/// every registry-listed view, which reads its own planes through `rpc.live` —
+/// puts no app-side load on its screen's path.
 pub fn tab_reads_plane(tab: crate::ShellTab, plane: String) -> bool {
-    // a registry-listed view reads its own planes through `rpc.live`; no
-    // app-side load is on its screen's path
-    if let crate::ShellTab::Registered(_) = tab {
-        return false;
-    }
+    let crate::ShellTab::View(view) = tab;
     match plane.as_str() {
-        "governance" => tab == crate::ShellTab::Governance,
-        "agents" => tab == crate::ShellTab::Agents,
+        "governance" => view == "governance",
+        "agents" => view == "agents",
         // Settings draws the account card; Forge draws the org "about".
-        "account" => matches!(tab, crate::ShellTab::Settings | crate::ShellTab::Forge),
+        "account" => matches!(view, "settings" | "forge"),
         _ => false,
     }
 }

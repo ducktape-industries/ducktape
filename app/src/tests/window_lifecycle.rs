@@ -88,14 +88,14 @@ fn the_last_close_leaves_exactly_where_there_is_no_status_item() {
 #[test]
 fn leaving_settings_clears_authentication_but_reselecting_keeps_it() {
     let (mut app, _) = Ducktape::boot();
-    app.shell_tab = ShellTab::Settings;
+    app.shell_tab = ShellTab::View("settings");
     app.account_busy = true;
     app.account_ceremony_phase = "working".into();
     app.account_ceremony_detail = "Continue in the browser…".into();
-    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Settings));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::View("settings")));
     assert!(app.account_busy);
     assert_eq!(app.account_ceremony_phase, "working");
-    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Chat));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::View("chat")));
     assert!(!app.account_busy);
     assert!(app.account_ceremony_phase.is_empty());
     assert!(app.account_ceremony_detail.is_empty());
@@ -103,11 +103,11 @@ fn leaving_settings_clears_authentication_but_reselecting_keeps_it() {
 #[test]
 fn reselecting_settings_without_authentication_still_refreshes() {
     let (mut app, _) = Ducktape::boot();
-    app.shell_tab = ShellTab::Settings;
+    app.shell_tab = ShellTab::View("settings");
     app.connected = true;
     app.settings_generation = 10;
     app.error = "old error".into();
-    let _ = app.update(AppMessage::SelectShellTab(ShellTab::Settings));
+    let _ = app.update(AppMessage::SelectShellTab(ShellTab::View("settings")));
     assert_eq!(app.settings_generation, 11);
     assert!(app.error.is_empty());
 }
@@ -351,7 +351,7 @@ fn phone_and_desktop_account_authentication_retire_together() {
 #[test]
 fn passkey_login_shows_its_cancellation_plate_without_an_account() {
     let mut app = Ducktape::initial_state();
-    app.shell_tab = ShellTab::Settings;
+    app.shell_tab = ShellTab::View("settings");
     app.account_exists = false;
     app.account_ceremony_phase = "working".into();
     let (view, _) = app.native_view();

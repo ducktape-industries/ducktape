@@ -1066,7 +1066,7 @@ impl Ducktape {
     }
     fn on_select_shell_tab(&mut self, next: ShellTab) -> Task<AppMessage> {
         let staying_on_settings =
-            (self.shell_tab == ShellTab::Settings) && (next == ShellTab::Settings);
+            (self.shell_tab == ShellTab::View("settings")) && (next == ShellTab::View("settings"));
         let keeping_authentication =
             staying_on_settings && (!(self.account_ceremony_phase).is_empty());
         if keeping_authentication {
@@ -1090,17 +1090,17 @@ impl Ducktape {
         if !self.connected {
             return Task::none();
         }
-        if (self.shell_tab == ShellTab::Chat) || (self.shell_tab == ShellTab::Pages) {
+        if (self.shell_tab == ShellTab::View("chat")) || (self.shell_tab == ShellTab::View("pages")) {
             return Task::none();
         }
         self.settings_generation = crate::backend::keep_i64(
-            self.shell_tab == ShellTab::Settings,
+            self.shell_tab == ShellTab::View("settings"),
             self.settings_generation + 1,
             self.settings_generation,
         );
         Task::batch([
             Task::done(crate::backend::load_request(
-                self.shell_tab == ShellTab::Settings,
+                self.shell_tab == ShellTab::View("settings"),
                 self.connected_rpc.to_owned(),
                 "".to_owned(),
                 self.settings_generation,
@@ -1123,7 +1123,7 @@ impl Ducktape {
     ) -> Task<AppMessage> {
         let obsolete_request =
             (request.rpc != self.connected_rpc) || (request.generation != self.settings_generation);
-        let unmounted = self.shell_tab != ShellTab::Settings;
+        let unmounted = self.shell_tab != ShellTab::View("settings");
         if obsolete_request || unmounted {
             return Task::none();
         }
@@ -1471,7 +1471,7 @@ impl Ducktape {
         }
         Task::batch([
             crate::shell::raise::<AppMessage>(crate::backend::window_target(self.console_win)),
-            Task::done(AppMessage::SelectShellTab(ShellTab::Chat)),
+            Task::done(AppMessage::SelectShellTab(ShellTab::View("chat"))),
         ])
     }
     fn on_tray_go_pages(&mut self) -> Task<AppMessage> {
@@ -1480,7 +1480,7 @@ impl Ducktape {
         }
         Task::batch([
             crate::shell::raise::<AppMessage>(crate::backend::window_target(self.console_win)),
-            Task::done(AppMessage::SelectShellTab(ShellTab::Pages)),
+            Task::done(AppMessage::SelectShellTab(ShellTab::View("pages"))),
         ])
     }
     fn on_tray_go_node(&mut self) -> Task<AppMessage> {
@@ -1489,7 +1489,7 @@ impl Ducktape {
         }
         Task::batch([
             crate::shell::raise::<AppMessage>(crate::backend::window_target(self.console_win)),
-            Task::done(AppMessage::SelectShellTab(ShellTab::Node)),
+            Task::done(AppMessage::SelectShellTab(ShellTab::View("node"))),
         ])
     }
     fn on_tray_go_settings(&mut self) -> Task<AppMessage> {
@@ -1498,7 +1498,7 @@ impl Ducktape {
         }
         Task::batch([
             crate::shell::raise::<AppMessage>(crate::backend::window_target(self.console_win)),
-            Task::done(AppMessage::SelectShellTab(ShellTab::Settings)),
+            Task::done(AppMessage::SelectShellTab(ShellTab::View("settings"))),
         ])
     }
     fn on_tray_reconnect(&mut self) -> Task<AppMessage> {
@@ -1781,7 +1781,7 @@ impl Ducktape {
         self.account_ceremony_qr = "".to_owned();
         self.account_ceremony_detail = "".to_owned();
         self.account_ceremony_left = "".to_owned();
-        self.shell_tab = ShellTab::Agents;
+        self.shell_tab = ShellTab::View("agents");
         self.agents_open_run = dispatch_id.to_owned();
         self.agents_opened += 1;
         Task::none()
@@ -2432,7 +2432,7 @@ impl Ducktape {
         self.account_ceremony_qr = "".to_owned();
         self.account_ceremony_detail = "".to_owned();
         self.account_ceremony_left = "".to_owned();
-        self.shell_tab = ShellTab::Chat;
+        self.shell_tab = ShellTab::View("chat");
         self.hydration_generation += 1;
         self.hydration_retry_attempt = 0;
         self.loading = true;
@@ -2747,7 +2747,7 @@ impl Ducktape {
                 self.account_ceremony_qr = "".to_owned();
                 self.account_ceremony_detail = "".to_owned();
                 self.account_ceremony_left = "".to_owned();
-                self.shell_tab = ShellTab::Files;
+                self.shell_tab = ShellTab::View("files");
                 Task::none()
             }
             DuckKind::ForgeRepo => {
@@ -2767,7 +2767,7 @@ impl Ducktape {
                 self.account_ceremony_qr = "".to_owned();
                 self.account_ceremony_detail = "".to_owned();
                 self.account_ceremony_left = "".to_owned();
-                self.shell_tab = ShellTab::Forge;
+                self.shell_tab = ShellTab::View("forge");
                 Task::none()
             }
             DuckKind::ForgeItem => {
@@ -2787,7 +2787,7 @@ impl Ducktape {
                 self.account_ceremony_qr = "".to_owned();
                 self.account_ceremony_detail = "".to_owned();
                 self.account_ceremony_left = "".to_owned();
-                self.shell_tab = ShellTab::Forge;
+                self.shell_tab = ShellTab::View("forge");
                 Task::none()
             }
             DuckKind::ForgeBlob => {
@@ -2807,7 +2807,7 @@ impl Ducktape {
                 self.account_ceremony_qr = "".to_owned();
                 self.account_ceremony_detail = "".to_owned();
                 self.account_ceremony_left = "".to_owned();
-                self.shell_tab = ShellTab::Forge;
+                self.shell_tab = ShellTab::View("forge");
                 Task::none()
             }
             DuckKind::Channel => {
@@ -2825,7 +2825,7 @@ impl Ducktape {
                 self.account_ceremony_qr = "".to_owned();
                 self.account_ceremony_detail = "".to_owned();
                 self.account_ceremony_left = "".to_owned();
-                self.shell_tab = ShellTab::Chat;
+                self.shell_tab = ShellTab::View("chat");
                 Task::done(AppMessage::ChooseChannel(link.channel.to_owned()))
             }
             DuckKind::ChannelMessage => {
@@ -2850,7 +2850,7 @@ impl Ducktape {
                 self.account_ceremony_qr = "".to_owned();
                 self.account_ceremony_detail = "".to_owned();
                 self.account_ceremony_left = "".to_owned();
-                self.shell_tab = ShellTab::Chat;
+                self.shell_tab = ShellTab::View("chat");
                 Task::done(AppMessage::ChooseDm(link.account.to_owned()))
             }
         }
@@ -2859,7 +2859,7 @@ impl Ducktape {
         if !crate::backend::is_copy_chord(event.key.clone(), event.modifiers) {
             return Task::none();
         }
-        if self.shell_tab != ShellTab::Chat {
+        if self.shell_tab != ShellTab::View("chat") {
             return Task::none();
         }
         self.chat_copy_chord_serial += 1;
@@ -2909,7 +2909,7 @@ impl Ducktape {
         if (page_id).is_empty() {
             return Task::none();
         }
-        self.shell_tab = ShellTab::Pages;
+        self.shell_tab = ShellTab::View("pages");
         self.page_route = page_id.to_owned();
         self.page_route_serial += 1;
         Task::none()
@@ -4050,7 +4050,7 @@ impl Ducktape {
     fn on_open_account(&mut self) -> Task<AppMessage> {
         let signed_in = crate::backend::account_probe(self.account_exists);
         match signed_in {
-            AccountProbe::Found => Task::done(AppMessage::SelectShellTab(ShellTab::Settings)),
+            AccountProbe::Found => Task::done(AppMessage::SelectShellTab(ShellTab::View("settings"))),
             AccountProbe::Missing => self.on_open_account_welcome(),
         }
     }
@@ -4230,7 +4230,7 @@ impl Ducktape {
         self.account_ceremony_qr = "".to_owned();
         self.account_ceremony_detail = "".to_owned();
         self.account_ceremony_left = "".to_owned();
-        self.shell_tab = ShellTab::Chat;
+        self.shell_tab = ShellTab::View("chat");
         Task::done(AppMessage::ChooseChannel(self.huddle_channel.to_owned()))
     }
     fn on_leave_huddle_here(&mut self) -> Task<AppMessage> {

@@ -120,6 +120,46 @@ fn shell_keeps_opaque_window_and_alpha_authored_content() {
     assert!(renderer.contains("wire::Background::Color"));
     assert!(renderer.contains("let[r,g,b,a]=color.0"));
 }
+/// A TAB IS AN ID, NOT A NAME THIS BUILD COMPILED IN.
+///
+/// `ShellTab` carried one arm per view, so the strip could only draw the ten
+/// the app knew and a view the connected node's registry listed had to be a
+/// second-class `Registered(_)` case. One arm, carrying an id, is what lets
+/// an unknown id seat, draw and route with no app change — and the ways back
+/// are quiet ones: an arm per view again, or a `ShellTab::` constant per view,
+/// which reads like data and is the same hardcoding.
+#[test]
+fn no_shell_tab_arm_names_a_view() {
+    let state = rust_tokens(include_str!("../ui/app.rs"));
+    let enum_start = state
+        .find("pub(crate)enumShellTab{")
+        .expect("ShellTab is declared in ui/app.rs");
+    let body = &state[enum_start..];
+    let body = &body[..body.find('}').expect("the enum closes")];
+    assert!(
+        body.contains("View(&'staticstr)"),
+        "a tab carries its view's id: {body}"
+    );
+    for view in crate::backend::view_source::DESKTOP_OWNED
+        .iter()
+        .chain(&["chat", "pages", "forge", "files", "governance", "home"])
+    {
+        let arm = format!("{}{}", view[..1].to_uppercase(), &view[1..]);
+        assert!(
+            !body.contains(&arm),
+            "no arm names a view, and this one names {view}: {body}"
+        );
+    }
+    // and nothing hands the ids back as constants on the type
+    let shell = rust_tokens(include_str!("../shell.rs"));
+    assert!(
+        !shell.contains("constCHAT:ShellTab") && !shell.contains("ShellTab::CHAT"),
+        "a per-view constant is the same hardcoding, spelled as data"
+    );
+    // the strip's rows come from the registry plus the app-served ids
+    assert!(shell.contains("crate::module_view::registered_views()"));
+    assert!(shell.contains("crate::backend::view_source::desktop_owned(view)"));
+}
 /// GPUI dispatches a modifier change to its OWN listener list, never to key
 /// listeners, so the guest's modifier state has to be registered with
 /// `on_modifiers_changed`. Registered as a key listener it is never called at
@@ -196,16 +236,16 @@ fn native_sources_hold_to_the_design_system() {
         assert!(!source.contains("iced::"));
     }
     for tab in [
-        ShellTab::Chat,
-        ShellTab::Pages,
-        ShellTab::Forge,
-        ShellTab::Agents,
-        ShellTab::Files,
-        ShellTab::Explorer,
-        ShellTab::Node,
-        ShellTab::Members,
-        ShellTab::Governance,
-        ShellTab::Settings,
+        ShellTab::View("chat"),
+        ShellTab::View("pages"),
+        ShellTab::View("forge"),
+        ShellTab::View("agents"),
+        ShellTab::View("files"),
+        ShellTab::View("explorer"),
+        ShellTab::View("node"),
+        ShellTab::View("members"),
+        ShellTab::View("governance"),
+        ShellTab::View("settings"),
     ] {
         let mut state = Ducktape::initial_state();
         state.shell_tab = tab;

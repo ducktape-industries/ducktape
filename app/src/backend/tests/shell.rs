@@ -171,16 +171,16 @@ fn files_base64_round_trips() {
 #[test]
 fn a_tab_move_only_refetches_what_its_destination_draws() {
     let tabs = [
-        ShellTab::Chat,
-        ShellTab::Pages,
-        ShellTab::Forge,
-        ShellTab::Agents,
-        ShellTab::Files,
-        ShellTab::Explorer,
-        ShellTab::Node,
-        ShellTab::Members,
-        ShellTab::Governance,
-        ShellTab::Settings,
+        ShellTab::View("chat"),
+        ShellTab::View("pages"),
+        ShellTab::View("forge"),
+        ShellTab::View("agents"),
+        ShellTab::View("files"),
+        ShellTab::View("explorer"),
+        ShellTab::View("node"),
+        ShellTab::View("members"),
+        ShellTab::View("governance"),
+        ShellTab::View("settings"),
     ];
 
     // every plane left is one pane's: Settings draws the account card, Forge
@@ -190,9 +190,9 @@ fn a_tab_move_only_refetches_what_its_destination_draws() {
     // click loads one.
     for (plane, drawn) in [
         ("members", &[][..]),
-        ("governance", &[ShellTab::Governance][..]),
-        ("agents", &[ShellTab::Agents][..]),
-        ("account", &[ShellTab::Forge, ShellTab::Settings][..]),
+        ("governance", &[ShellTab::View("governance")][..]),
+        ("agents", &[ShellTab::View("agents")][..]),
+        ("account", &[ShellTab::View("forge"), ShellTab::View("settings")][..]),
         // an unknown plane name is nobody's — a typo must not silently reopen
         // the storm by answering true.
         ("explorer", &[][..]),

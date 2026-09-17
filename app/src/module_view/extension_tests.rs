@@ -182,7 +182,7 @@ fn registry_discovers_and_replaces_a_live_view() {
     desktop.read_with(&native, |desktop, cx| {
         assert_eq!(
             desktop.test_state(cx).shell_tab,
-            crate::ShellTab::Registered(VIEW)
+            crate::ShellTab::View(VIEW)
         );
     });
     native
