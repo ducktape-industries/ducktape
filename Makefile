@@ -333,6 +333,10 @@ SYNC_MODULES := chat pages agent runs tasks boards automations inbox collaborati
 SYNC_EXAMPLES := directory greeter
 # the standalone kernel test guests, built in ducktape-sdk under crates/guests.
 SYNC_FIXTURE_GUESTS := hello:hello-wasm hello-replacement:hello-wasm-replacement noop:noop-wasm
+# the object-storage test tenant noded's compose suite founds: the sdk commits
+# its build beside its own wasm-host tests, and noded keeps a copy because the
+# kernel fixture directory is pinned to the set the host composes.
+SYNC_NODED_FIXTURES := object
 
 ## copy the guests core does not build from the repositories that do: each app
 ## module's component.wasm / index.wasm / guest.lock into
@@ -360,6 +364,11 @@ modules-sync:
 	  src="$(SDK_DIR)/crates/guests/$$dir/component.wasm"; \
 	  test -f "$$src" || { echo "modules-sync: no $$src (set SDK_DIR)"; exit 1; }; \
 	  cp "$$src" crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
+	done
+	@for id in $(SYNC_NODED_FIXTURES); do \
+	  src="$(SDK_DIR)/crates/kernel/wasm-host/tests/fixtures/$$id.component.wasm"; \
+	  test -f "$$src" || { echo "modules-sync: no $$src (set SDK_DIR)"; exit 1; }; \
+	  cp "$$src" crates/noded/tests/fixtures/$$id.component.wasm || exit 1; \
 	done
 	@echo "synced the guests core does not build"
 
