@@ -427,17 +427,36 @@ INDEX_MODULES := \
 # the netstack-wasm scenario lane reads it from the crate directory.
 NETSTACK_GUEST := crates/networking/netstack-machine
 
+# guest-builder is built and run out of THIS CHECKOUT'S OWN target directory,
+# never the one a host config shares between worktrees.
+#
+# The binary bakes its platform root in at compile time, so the one sitting in
+# a shared target belongs to whichever worktree built it last. Run that one and
+# it refuses every module you own — "<module> is outside the platform checkout
+# <someone else's worktree>" — and it does so MID-SWEEP, because a sibling's
+# build can land between two guests of yours. `touch bin/guest-builder/src/main.rs`
+# only wins the race until the next session builds; a target directory of our
+# own ends it. It is a sibling of `target/guest-builder/<id>/`, where the
+# builder puts each module's ephemeral build tree, and never the same path.
+#
+# `ops/build-guest-rootfs.sh` and `ops/wasm-repro-check.sh` take the same
+# precaution for the same reason.
+GUEST_BUILDER_DIR := $(CURDIR)/target/guest-builder-bin
+GUEST_BUILDER := $(CARGO) run -q $(LOCKED) --target-dir $(GUEST_BUILDER_DIR) -p guest-builder --
+# the same command as a person would type it, for the advice a failing gate prints.
+GUEST_BUILDER_SHOWN := $(CARGO) run --target-dir $(GUEST_BUILDER_DIR) -p guest-builder --
+
 wasm-modules:
 	@for m in $(BUILDER_MODULES); do \
 	  id=$$(basename $$m) && \
-	  $(CARGO) run -q $(LOCKED) -p guest-builder -- $$m && \
+	  $(GUEST_BUILDER) $$m && \
 	  cp $$m/component.wasm \
 	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
 	done
 	@for m in $(INDEX_MODULES); do \
-	  $(CARGO) run -q $(LOCKED) -p guest-builder -- --index $$m || exit 1; \
+	  $(GUEST_BUILDER) --index $$m || exit 1; \
 	done
-	$(CARGO) run -q $(LOCKED) -p guest-builder -- $(NETSTACK_GUEST)
+	$(GUEST_BUILDER) $(NETSTACK_GUEST)
 	# hello mirrors its component into BOTH fixture homes; sibling/object write
 	# straight to the wasm-host fixture with no guest copy; hello-replacement
 	# builds the replacement crate directly into the host fixture. Each shape is
@@ -445,7 +464,7 @@ wasm-modules:
 	# committed lock, so $(LOCKED) applies same as everywhere else) — their
 	# components are kernel test fixtures, nothing the genesis hash pins.
 	cd crates/guests/hello-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	$(CARGO) run -q $(LOCKED) -p guest-builder -- componentize \
+	$(GUEST_BUILDER) componentize \
 	  crates/guests/hello-wasm/target/wasm32-unknown-unknown/release/hello_wasm.wasm \
 	  --out crates/guests/hello-wasm/component.wasm
 	cp crates/guests/hello-wasm/component.wasm \
@@ -456,25 +475,25 @@ wasm-modules:
 	# nothing. Its component is committed beside the crate and pinned in the
 	# host fixtures, the hello shape.
 	cd crates/guests/noop-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	$(CARGO) run -q $(LOCKED) -p guest-builder -- componentize \
+	$(GUEST_BUILDER) componentize \
 	  crates/guests/noop-wasm/target/wasm32-unknown-unknown/release/noop_wasm.wasm \
 	  --out crates/guests/noop-wasm/component.wasm
 	cp crates/guests/noop-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/noop.component.wasm
 	cd crates/guests/hello-wasm-replacement && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	$(CARGO) run -q $(LOCKED) -p guest-builder -- componentize \
+	$(GUEST_BUILDER) componentize \
 	  crates/guests/hello-wasm-replacement/target/wasm32-unknown-unknown/release/hello_wasm_replacement.wasm \
 	  --out crates/kernel/host/tests/fixtures/hello-replacement.component.wasm
 	cd crates/guests/sibling-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	$(CARGO) run -q $(LOCKED) -p guest-builder -- componentize \
+	$(GUEST_BUILDER) componentize \
 	  crates/guests/sibling-wasm/target/wasm32-unknown-unknown/release/sibling_wasm.wasm \
 	  --out crates/kernel/wasm-host/tests/fixtures/sibling.component.wasm
 	cd crates/guests/object-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	$(CARGO) run -q $(LOCKED) -p guest-builder -- componentize \
+	$(GUEST_BUILDER) componentize \
 	  crates/guests/object-wasm/target/wasm32-unknown-unknown/release/object_wasm.wasm \
 	  --out crates/kernel/wasm-host/tests/fixtures/object.component.wasm
 	cd crates/guests/object-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release --features replacement
-	$(CARGO) run -q $(LOCKED) -p guest-builder -- componentize \
+	$(GUEST_BUILDER) componentize \
 	  crates/guests/object-wasm/target/wasm32-unknown-unknown/release/object_wasm.wasm \
 	  --out crates/kernel/wasm-host/tests/fixtures/object-replacement.component.wasm
 
@@ -556,19 +575,51 @@ REBUILD_CHECK_DIR := $(CURDIR)/target/wasm-rebuild-check
 # was hiding behind it, and a guest whose dependency moved is rarely alone.
 # A build that cannot run at all still stops the target, because after it
 # nothing downstream would be comparing anything.
+#
+# SCOPE IT TO WHAT YOU CHANGED. The full sweep is 31 guest builds; on a loaded
+# box that is most of an hour, and a PR that moved one crate does not owe the
+# other twenty-eight. `CRATES` names the crates the change touched and the run
+# covers exactly the guests that compile them:
+#
+#     make wasm-rebuild-check CRATES="files duckfs-core"
+#
+# The guest list comes from each module's OWN `guest.lock`, which records what
+# it actually compiled, so the scope cannot drift from the graph the way a
+# hand-kept table would. One lock covers both members of a module that ships an
+# index guest — the builder's shell workspace holds every guest the module
+# declares, so the lock is their union. A crate no lock names is refused rather than quietly
+# checking nothing — a typo that reports success is worse than no gate. Omit
+# `CRATES` and every guest is swept, which is what a module-SDK or toolchain
+# move owes.
 wasm-rebuild-check:
 	@mkdir -p "$(REBUILD_CHECK_DIR)"
 	@stale=""; \
+	compiles() { \
+	  [ -z "$(CRATES)" ] && return 0; \
+	  for c in $(CRATES); do \
+	    grep -sqx "name = \"$$c\"" "$$1/guest.lock" && return 0; \
+	  done; \
+	  return 1; \
+	}; \
+	for c in $(CRATES); do \
+	  grep -sqx "name = \"$$c\"" \
+	    $(addsuffix /guest.lock,$(BUILDER_MODULES) $(NETSTACK_GUEST) $(INDEX_MODULES)) || { \
+	      echo "wasm-rebuild-check: no guest.lock names the crate \"$$c\" — check the spelling."; \
+	      echo "  A guest compiles what its lock records; nothing here compiles that."; \
+	      exit 1; }; \
+	done; \
 	for m in $(BUILDER_MODULES) $(NETSTACK_GUEST); do \
+	  compiles $$m || continue; \
 	  id=$$(basename $$m) && \
-	  $(CARGO) run -q $(LOCKED) -p guest-builder -- $$m \
+	  $(GUEST_BUILDER) $$m \
 	    --out "$(REBUILD_CHECK_DIR)/$$id.component.wasm" >/dev/null || exit 1; \
 	  cmp -s $$m/component.wasm "$(REBUILD_CHECK_DIR)/$$id.component.wasm" || \
 	    stale="$$stale $$m"; \
 	done; \
 	for m in $(INDEX_MODULES); do \
+	  compiles $$m || continue; \
 	  id=$$(basename $$m) && \
-	  $(CARGO) run -q $(LOCKED) -p guest-builder -- --index $$m \
+	  $(GUEST_BUILDER) --index $$m \
 	    --out "$(REBUILD_CHECK_DIR)/$$id.index.wasm" >/dev/null || exit 1; \
 	  cmp -s $$m/index.wasm "$(REBUILD_CHECK_DIR)/$$id.index.wasm" || \
 	    stale="$$stale --index $$m"; \
@@ -580,9 +631,9 @@ wasm-rebuild-check:
 	set -- $$stale; \
 	while [ $$# -gt 0 ]; do \
 	  if [ "$$1" = "--index" ]; then \
-	    echo "    $(CARGO) run -p guest-builder -- --index $$2"; shift 2; \
+	    echo "    $(GUEST_BUILDER_SHOWN) --index $$2"; shift 2; \
 	  else \
-	    echo "    $(CARGO) run -p guest-builder -- $$1"; shift; \
+	    echo "    $(GUEST_BUILDER_SHOWN) $$1"; shift; \
 	  fi; \
 	done; \
 	echo "  Run each, and commit the result with its kernel fixture copy."; \
