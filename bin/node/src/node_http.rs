@@ -374,15 +374,6 @@ impl std::fmt::Display for NotRunning {
     }
 }
 
-/// The launcher's own state file. `install` writes it and `run` refuses
-/// without it, so its presence IS the launcher saying it owns this workspace.
-///
-/// Spelled here because this binary does not link the launcher; the path it
-/// must agree with is `Layout::state_path` in `bin/node-launcher/src/layout.rs`,
-/// which its own test pins. A move there without a move here costs nothing
-/// worse than this sentence falling back to the unsupervised one.
-const LAUNCHER_STATE: &str = "updates/state.json";
-
 /// Where an operator conventionally tees the launcher's stderr. The launcher
 /// does not open this file itself, which is why its existence is checked and
 /// never assumed: naming a path that is not there sends a reader to an empty
@@ -390,7 +381,8 @@ const LAUNCHER_STATE: &str = "updates/state.json";
 const LAUNCHER_LOG: &str = "launcher.log";
 
 /// Classify a node that did not answer, by reading the launcher's OWN state on
-/// disk.
+/// disk — [`app_update::workspace::launcher_state_path`], the same function the
+/// launcher composes that path with, so the two cannot drift apart.
 ///
 /// Never a process scan: a pattern match over the process table finds an
 /// editor with the word in its command line, and finds NOTHING at all in the
@@ -404,7 +396,7 @@ pub(crate) fn not_running_in(workspace: Option<&std::path::Path>) -> NotRunning 
     let Some(workspace) = workspace else {
         return NotRunning::Unsupervised;
     };
-    let supervised = workspace.join(LAUNCHER_STATE).is_file();
+    let supervised = app_update::workspace::launcher_state_path(workspace).is_file();
     if !supervised {
         return NotRunning::Unsupervised;
     }
@@ -615,14 +607,23 @@ mod tests {
         );
     }
 
+    /// What `ducktape-node-launcher install` leaves behind, built through the
+    /// same composer the launcher writes it with — so a test cannot keep
+    /// passing against a tree the launcher has stopped using.
+    fn install_launcher_state(workspace: &std::path::Path) {
+        let state = app_update::workspace::launcher_state_path(workspace);
+        std::fs::create_dir_all(state.parent().expect("the state file is in a directory"))
+            .expect("updates dir");
+        std::fs::write(&state, "{}").expect("state.json");
+    }
+
     /// THE BUG (#2531). A launcher is already restarting this node in a loop,
     /// so `node run` is a second process racing it for the port — and the
     /// reason its own attempts keep failing is in a file nothing used to name.
     #[test]
     fn a_launcher_managed_workspace_is_never_told_to_run_a_second_node() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join("updates")).expect("updates dir");
-        std::fs::write(dir.path().join(LAUNCHER_STATE), "{}").expect("state.json");
+        install_launcher_state(dir.path());
         std::fs::write(dir.path().join(LAUNCHER_LOG), "FATAL: nope\n").expect("launcher.log");
 
         let said = not_running_in(Some(dir.path())).to_string();
@@ -642,8 +643,7 @@ mod tests {
     #[test]
     fn a_launcher_whose_output_went_elsewhere_names_no_file_at_all() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join("updates")).expect("updates dir");
-        std::fs::write(dir.path().join(LAUNCHER_STATE), "{}").expect("state.json");
+        install_launcher_state(dir.path());
 
         let said = not_running_in(Some(dir.path())).to_string();
         assert!(

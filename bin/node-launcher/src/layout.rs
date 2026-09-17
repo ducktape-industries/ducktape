@@ -21,15 +21,17 @@
 use std::path::PathBuf;
 
 use app_update::Sha;
+// the tree's NAMES live in app-update, the one crate this binary and the node
+// binary both link: `ducktape` reads `state.json` to tell a node an operator
+// should start from one a launcher is already restarting, and a name spelled
+// twice would let this side move it while that side kept looking where it was.
+use app_update::workspace;
 
 /// The one executable a node release archive carries.
 pub const NODE_EXE: &str = "ducktape";
 
-const UPDATES_DIR: &str = "updates";
-const RELEASES_DIR: &str = "releases";
-const STATE_FILE: &str = "state.json";
-const CURRENT_LINK: &str = "current";
-const PREVIOUS_LINK: &str = "previous";
+/// The node's own config, which is this launcher's alone — the update tree is
+/// shared, a config file name is not.
 const CONFIG_FILE: &str = "node.toml";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,26 +67,26 @@ impl Layout {
     }
 
     pub fn updates(&self) -> PathBuf {
-        self.workspace.join(UPDATES_DIR)
+        workspace::updates_dir(&self.workspace)
     }
 
     pub fn state_path(&self) -> PathBuf {
-        self.updates().join(STATE_FILE)
+        workspace::launcher_state_path(&self.workspace)
     }
 
     /// The pinned release key, hex. Its absence is what "this node does not
     /// self-update" looks like.
     pub fn release_key_path(&self) -> PathBuf {
-        self.updates().join("keys").join("release.pub")
+        workspace::keys_dir(&self.workspace).join(workspace::RELEASE_KEY_FILE)
     }
 
     /// A successor key a verified manifest announced.
     pub fn successor_key_path(&self) -> PathBuf {
-        self.updates().join("keys").join("successor.json")
+        workspace::keys_dir(&self.workspace).join(workspace::SUCCESSOR_KEY_FILE)
     }
 
     pub fn releases_dir(&self) -> PathBuf {
-        self.updates().join(RELEASES_DIR)
+        workspace::releases_dir(&self.workspace)
     }
 
     pub fn release_dir(&self, sha: Sha) -> PathBuf {
@@ -103,17 +105,17 @@ impl Layout {
 
     /// The install path: what every unit file names.
     pub fn current_link(&self) -> PathBuf {
-        self.workspace.join(CURRENT_LINK)
+        workspace::current_link(&self.workspace)
     }
 
     pub fn previous_link(&self) -> PathBuf {
-        self.workspace.join(PREVIOUS_LINK)
+        workspace::previous_link(&self.workspace)
     }
 
     /// What `current`/`previous` point at: relative, so the workspace can move.
     pub fn link_target(sha: Sha) -> PathBuf {
-        PathBuf::from(UPDATES_DIR)
-            .join(RELEASES_DIR)
+        PathBuf::from(workspace::UPDATES_DIR)
+            .join(workspace::RELEASES_DIR)
             .join(sha.to_string())
     }
 
