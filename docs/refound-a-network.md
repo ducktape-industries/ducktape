@@ -24,6 +24,12 @@ needs.
 the directories named on the command line, and the script refuses to stop or
 archive anything without `--yes`.
 
+The root IS the workspace: after a run, `<root>/node.toml` is the founder and
+`<root>-joiner/node.toml` the resident. That places both one level under the
+ducktape home, which is the only depth `list_workspaces` and `-n` resolution
+look at — a workspace nested any deeper exists but cannot be named by anything
+except `--config`.
+
 Processes are found three ways, never by a `pkill -f` pattern — which also
 matches an editor, a grep, or another network's node. An executable under the
 workspace is the node itself. The workspace path in argv catches the launcher
@@ -35,8 +41,16 @@ that. The cwd match is narrowed to a `ducktape` executable, so a shell or a
 `tail` sitting in the workspace is not stopped with the network.
 
 Workspaces are ARCHIVED, never deleted: each is moved to
-`<path>.archived-<timestamp>` and every archived path is printed in the final
-report. A re-found resets content by design, so that copy is the only one.
+`<parent>/archived-networks/<basename>-<timestamp>/`, and the report prints
+the archive path beside the new workspace path. A re-found resets content by
+design, so that copy is the only one.
+
+The archive deliberately does NOT sit beside the root. A workspace is
+`<home>/<dir>/network.toml` and the ducktape home is scanned exactly one level
+deep, so an archive left as a sibling of the root is still a workspace to
+every scan — the app's picker and `-n` would offer the dead network. One level
+further down, inside a directory holding no `network.toml` of its own, nothing
+enumerates it and the printed path is the only way back to it.
 
 ## What each flag is for
 
