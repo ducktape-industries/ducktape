@@ -996,6 +996,12 @@ impl ProvisionedWorkspace for ForgeWorkspace {
         Some(super::operator_credential(&self.node))
     }
 
+    /// the pinned repo, and nothing wider: this run's lane lends the operator
+    /// credential to a push on THIS repo only, whatever repo the guest names.
+    fn forge_repo(&self) -> Option<String> {
+        Some(self.repo.clone())
+    }
+
     async fn commit(
         &self,
         _audit_message: &str,

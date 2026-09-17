@@ -1566,6 +1566,22 @@ async fn cleanup_after_a_successful_push_leaves_only_the_branch_ref() {
     assert_eq!(ref_oid(&bed.repo_dir, BRANCH), None);
 }
 
+/// What the run's node lane gates its push on: the repo the COMMITTED spec
+/// pinned, and nothing wider. A run's authority over repositories is exactly
+/// the one it was provisioned for, so a guest naming any other repo on the
+/// lane draws no credential at all.
+#[tokio::test]
+async fn a_forge_workspace_offers_only_its_pinned_repo_to_the_push_gate() {
+    let bed = bed();
+    let prov = bed.provisioner().await;
+    let ws = prov
+        .provision(&bed.spec("s1:0", &bed.head, false))
+        .await
+        .expect("provision");
+    assert_eq!(ws.forge_repo().as_deref(), Some(REPO));
+    ws.cleanup().await;
+}
+
 // ---- push credential is resolved at push time, never latched at provision --
 
 /// A generic module/blob endpoint captures the credential used at upload time.

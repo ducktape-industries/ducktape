@@ -11,9 +11,16 @@
 //! * a git push under `/forge/{repo}/…` (`git-receive-pack`, and the ref
 //!   advertisement that asks for it) is forwarded carrying this node's
 //!   operator credential — the proof forge's receive-pack asks for, which the
-//!   guest never holds — so a stock `git push` from inside the run lands. A
-//!   guest-supplied copy of that header is dropped on every route: the lane is
-//!   the only thing that may speak with the operator's authority.
+//!   guest never holds — so a stock `git push` from inside the run lands. It is
+//!   lent for ONE repo: the one the run's COMMITTED workspace pinned
+//!   (`WorkspaceSource::Forge.repo`), which is the whole of a run's authority
+//!   over repositories. A push on any other repo — and every push by a run
+//!   whose workspace pinned no repo at all — is refused here, because the
+//!   credential is this node's operator token and the repo is the guest's to
+//!   name. Without that gate a run delegated by one account, with one repo,
+//!   would draw the executing operator's authority over EVERY repo the node
+//!   serves. A guest-supplied copy of the header is dropped on every route:
+//!   the lane is the only thing that may speak with the operator's authority.
 //! * everything else passes through byte-for-byte: every `/v1/*` read
 //!   (`query`, `status`, `peers`, `blocks`, `index/*`, the duckfs `files/*`
 //!   routes), a git fetch, `/metrics`, the self-authenticating
@@ -87,6 +94,10 @@ struct Lane {
     /// this node's operator credential, lent to a push; `None` refuses every
     /// push (there is no proof to lend).
     credential: Option<OperatorCredential>,
+    /// the ONE repo this run's committed workspace pinned — the only repo the
+    /// credential above is lent to. `None` (a duckfs run, which pinned no
+    /// repo) refuses every push.
+    forge_repo: Option<String>,
     /// the run's own host-side environment, which is what the tool plane is
     /// built FROM ([`mcp_host::Run::from_vars`]).
     ///
@@ -113,6 +124,7 @@ impl ReadLane {
         envs: &mut [(String, String)],
         agent_id: Option<String>,
         credential: Option<OperatorCredential>,
+        forge_repo: Option<String>,
     ) -> Result<Option<Self>, String> {
         // SNAPSHOT BEFORE the url below is rewritten to this lane's own
         // address: the tool plane runs on the host and dials the node directly,
@@ -134,6 +146,7 @@ impl ReadLane {
             upstream: node.1.trim_end_matches('/').to_string(),
             agent_id,
             credential,
+            forge_repo,
             mcp_env,
             client: reqwest::Client::builder()
                 // a loopback daemon is never behind a corporate proxy.
@@ -162,7 +175,11 @@ impl ReadLane {
 /// ONE dispatch: the request's path decides its route, and each arm is one
 /// delegation. Nothing before it, nothing after it.
 async fn handle(State(lane): State<Arc<Lane>>, req: Request) -> Response {
-    match classify(req.uri().path(), req.uri().query().unwrap_or_default()) {
+    match classify(
+        req.uri().path(),
+        req.uri().query().unwrap_or_default(),
+        lane.forge_repo.as_deref(),
+    ) {
         Route::Pass => lane.forward(req).await,
         Route::Refuse(reason) => lane.refuse(reason),
         Route::ForgePush => lane.forge_push(req).await,
@@ -170,10 +187,11 @@ async fn handle(State(lane): State<Arc<Lane>>, req: Request) -> Response {
     }
 }
 
-/// the lane's whole policy, as a function of the request path and query.
-fn classify(path: &str, query: &str) -> Route {
+/// the lane's whole policy, as a function of the request path and query and
+/// the one repo this run may push (`None` = it may push none).
+fn classify(path: &str, query: &str, pushable: Option<&str>) -> Route {
     if let Some(rest) = path.strip_prefix("/forge/") {
-        return classify_forge(rest, query);
+        return classify_forge(rest, query, pushable);
     }
     match path {
         // no credential of any kind, and it carries the `logs` topic: this
@@ -187,8 +205,15 @@ fn classify(path: &str, query: &str) -> Route {
 /// the git smart-HTTP routes under `/forge/{repo}/…`: a push — the
 /// `git-receive-pack` POST, and the ref advertisement that asks for that
 /// service — needs the operator's proof; everything else passes.
-fn classify_forge(rest: &str, query: &str) -> Route {
-    let Some((_, tail)) = rest.split_once('/') else {
+///
+/// The repo in the path is the GUEST's to name and the proof is the node
+/// operator's, so the two are compared here: a push is credentialed only for
+/// `pushable`, the repo the run's committed workspace pinned. The comparison
+/// is on the raw path segment, so any spelling of another repo — percent
+/// encoded, empty (which upstream reads as the default repo), anything —
+/// simply is not it and is refused.
+fn classify_forge(rest: &str, query: &str, pushable: Option<&str>) -> Route {
+    let Some((repo, tail)) = rest.split_once('/') else {
         return Route::Pass;
     };
     let is_push = match tail {
@@ -196,10 +221,14 @@ fn classify_forge(rest: &str, query: &str) -> Route {
         "info/refs" => advertised_service(query) == Some("git-receive-pack"),
         _ => false,
     };
-    if is_push {
-        return Route::ForgePush;
+    if !is_push {
+        return Route::Pass;
     }
-    Route::Pass
+    let pushes_its_own_repo = pushable == Some(repo);
+    match pushes_its_own_repo {
+        true => Route::ForgePush,
+        false => Route::Refuse("forge_push_outside_run_authority"),
+    }
 }
 
 /// the service a smart-HTTP ref advertisement asks for, from its query.
@@ -412,19 +441,33 @@ mod tests {
         base
     }
 
-    /// the lane in front of that node on a node lending `credential`, plus
-    /// the url the guest would be handed.
-    async fn lane_with(credential: Option<OperatorCredential>) -> (ReadLane, String) {
+    /// the lane in front of that node on a node lending `credential`, for a run
+    /// whose committed workspace pinned `forge_repo`, plus the url the guest
+    /// would be handed.
+    async fn lane_for(
+        credential: Option<OperatorCredential>,
+        forge_repo: Option<&str>,
+    ) -> (ReadLane, String) {
         let node = fake_node().await;
         let mut envs = vec![
             (crate::NODE_URL_ENV.to_string(), node),
             ("DUCKTAPE_RUN_ID".into(), "run-a".into()),
         ];
-        let lane = ReadLane::start(&mut envs, Some("bot".into()), credential)
-            .await
-            .unwrap()
-            .expect("a lane for a node url");
+        let lane = ReadLane::start(
+            &mut envs,
+            Some("bot".into()),
+            credential,
+            forge_repo.map(str::to_string),
+        )
+        .await
+        .unwrap()
+        .expect("a lane for a node url");
         (lane, envs[0].1.clone())
+    }
+
+    /// the common case: a forge run pinned to `app`.
+    async fn lane_with(credential: Option<OperatorCredential>) -> (ReadLane, String) {
+        lane_for(credential, Some("app")).await
     }
 
     /// one request through the lane with the guest's own headers.
@@ -598,8 +641,56 @@ mod tests {
     /// calls to the node, which has no such route and no idea which run asked.
     #[test]
     fn the_tool_plane_is_served_here_and_never_forwarded() {
-        assert!(matches!(classify(MCP_PATH, ""), Route::Mcp));
-        assert!(matches!(classify("/v1/query", ""), Route::Pass));
+        assert!(matches!(classify(MCP_PATH, "", Some("app")), Route::Mcp));
+        assert!(matches!(classify("/v1/query", "", Some("app")), Route::Pass));
+    }
+
+    /// THE credential-scope gate: a run delegated with one repo draws the
+    /// executing operator's authority for THAT repo and no other. Without it a
+    /// run — of any account, on any node — pushes to every repo the node
+    /// serves, because the repo is a path segment the guest writes.
+    #[tokio::test]
+    async fn a_push_outside_the_runs_own_repo_lends_nothing() {
+        // the run this lane fronts pinned `app`; `other` is a repo its
+        // committed workspace never named.
+        let (_lane, base) = lane_with(operator(Some("node-secret"))).await;
+        for path in [
+            "/forge/other/git-receive-pack",
+            "/forge/other/info/refs?service=git-receive-pack",
+            // no spelling of another repo gets in: the segment is compared raw,
+            // and an empty one is the DEFAULT repo upstream.
+            "/forge/%61pp/git-receive-pack",
+            "/forge//git-receive-pack",
+        ] {
+            let (status, _) = send(&base, reqwest::Method::POST, path, &[]).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+
+    /// a duckfs run pinned no repo at all, so it has no repo to push: the
+    /// credential is held (a guest's claimed header is still dropped) and lent
+    /// to nothing.
+    #[tokio::test]
+    async fn a_run_that_pinned_no_repo_may_push_none() {
+        let (_lane, base) = lane_for(operator(Some("node-secret")), None).await;
+        let (status, _) = send(
+            &base,
+            reqwest::Method::POST,
+            "/forge/app/git-receive-pack",
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // a FETCH is unchanged: it needs no proof, so it never draws one.
+        let (status, body) = send(
+            &base,
+            reqwest::Method::POST,
+            "/forge/app/git-upload-pack",
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["operator"], Value::Null);
     }
 
     #[tokio::test]

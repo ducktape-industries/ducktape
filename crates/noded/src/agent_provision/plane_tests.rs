@@ -372,6 +372,25 @@ async fn a_run_gets_the_node_base_its_agent_id_and_the_tool_bin_dir_on_path() {
     );
 }
 
+/// a duckfs run pinned no repo, so it has authority over NONE: its lane lends
+/// the operator credential to no push at all. The credential is still held —
+/// that is how the lane knows which header name to strip off a guest's own
+/// request.
+#[tokio::test]
+async fn a_duckfs_run_offers_no_pushable_repo_to_the_push_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (handle, rx, _hub) = NodeHandle::channel();
+    let _actor = spawn_files_actor(rx, skill_tree(), false);
+    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
+        .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
+        .await
+        .expect("provision");
+
+    assert_eq!(ws.forge_repo(), None);
+    assert!(ws.operator_credential().is_some());
+    ws.cleanup().await;
+}
+
 #[tokio::test]
 async fn an_unreachable_node_or_an_anonymous_run_omits_the_var_rather_than_guessing() {
     let tmp = tempfile::tempdir().unwrap();
