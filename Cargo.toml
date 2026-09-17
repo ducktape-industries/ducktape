@@ -176,6 +176,7 @@ members = [
     "crates/modules/apps/chat",
     "crates/modules/apps/chat/message",
     "crates/modules/apps/agent",
+    "crates/modules/apps/agent/wire",
     "crates/modules/apps/runs",
     "crates/modules/apps/tasks",
     "crates/modules/apps/boards",
@@ -404,6 +405,7 @@ design = { path = "crates/design" }
 pages = { path = "crates/modules/apps/pages" }
 chat = { path = "crates/modules/apps/chat" }
 agent = { path = "crates/modules/apps/agent" }
+agent-wire = { path = "crates/modules/apps/agent/wire" }
 runs = { path = "crates/modules/apps/runs" }
 tasks = { path = "crates/modules/apps/tasks" }
 automations = { path = "crates/modules/apps/automations" }
