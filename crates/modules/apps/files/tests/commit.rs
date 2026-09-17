@@ -242,7 +242,8 @@ fn case4_cas_conflict_rejects() {
     )
     .expect_err("stale base must conflict");
     assert!(
-        matches!(&err, sdk::Error::Module(m) if m.contains("conflict")),
+        matches!(&err, sdk::Error::Module { reason, sentence }
+            if reason == "files_commit" && sentence.contains("conflict")),
         "got {err:?}"
     );
     abort_block(&mut f);
@@ -344,7 +345,7 @@ fn case6_rm_mv_mkdir_symlink() {
         }],
     )
     .expect_err("rm absent rejects");
-    assert!(matches!(err, sdk::Error::Module(_)));
+    assert!(matches!(err, sdk::Error::Module { ref reason, .. } if reason == "files_commit"));
     abort_block(&mut f);
 
     // Mv happy: /shared/src → /shared/dst.
@@ -383,7 +384,7 @@ fn case6_rm_mv_mkdir_symlink() {
         }],
     )
     .expect_err("mv onto existing rejects");
-    assert!(matches!(err, sdk::Error::Module(_)));
+    assert!(matches!(err, sdk::Error::Module { ref reason, .. } if reason == "files_commit"));
     abort_block(&mut f);
 
     // Mkdir → stat kind Dir (a fresh path, so `base None` is fine here).
@@ -451,7 +452,7 @@ fn case7_authority() {
         vec![put_inline("/etc/passwd", b"x")],
     )
     .expect_err("bob cannot write outside the namespaces");
-    assert!(matches!(err, sdk::Error::Module(_)));
+    assert!(matches!(err, sdk::Error::Module { ref reason, .. } if reason == "files_commit"));
     abort_block(&mut f);
     // system writes anywhere (bypasses /home + /shared authority).
     commit(
@@ -482,7 +483,8 @@ fn case8_duplicate_path_in_commit_rejects() {
     )
     .expect_err("duplicate path rejects");
     assert!(
-        matches!(&err, sdk::Error::Module(m) if m.contains("duplicate path")),
+        matches!(&err, sdk::Error::Module { reason, sentence }
+            if reason == "files_commit" && sentence.contains("duplicate path")),
         "got {err:?}"
     );
     abort_block(&mut f);
@@ -502,7 +504,8 @@ fn case9_unknown_chunk_digest_rejects() {
     )
     .expect_err("unknown chunk rejects");
     assert!(
-        matches!(&err, sdk::Error::Module(m) if m.contains("chunk not available")),
+        matches!(&err, sdk::Error::Module { reason, sentence }
+            if reason == "files_commit" && sentence.contains("chunk not available")),
         "got {err:?}"
     );
     abort_block(&mut f);
@@ -522,7 +525,8 @@ fn case10_base_unresolvable_rejects() {
     )
     .expect_err("unresolvable base rejects");
     assert!(
-        matches!(&err, sdk::Error::Module(m) if m.contains("base snapshot not resolvable")),
+        matches!(&err, sdk::Error::Module { reason, sentence }
+            if reason == "files_commit" && sentence.contains("base snapshot not resolvable")),
         "got {err:?}"
     );
     abort_block(&mut f);
@@ -638,7 +642,7 @@ fn case13_rejected_ops_never_move_the_root() {
         vec![put_inline("/shared//bad", b"x")],
     )
     .expect_err("empty segment rejects");
-    assert!(matches!(err, sdk::Error::Module(_)));
+    assert!(matches!(err, sdk::Error::Module { ref reason, .. } if reason == "files_commit"));
     abort_block(&mut f);
     assert_eq!(f.root(), root0, "empty-segment reject leaves the root put");
 
@@ -653,7 +657,7 @@ fn case13_rejected_ops_never_move_the_root() {
         vec![put_inline("/shared/x", b"x")],
     )
     .expect_err("oversized message rejects");
-    assert!(matches!(err, sdk::Error::Module(_)));
+    assert!(matches!(err, sdk::Error::Module { ref reason, .. } if reason == "files_commit"));
     abort_block(&mut f);
     assert_eq!(
         f.root(),
@@ -667,7 +671,7 @@ fn case13_rejected_ops_never_move_the_root() {
         .collect();
     let err =
         commit(&mut f, sdk::Origin::System, 1, None, many).expect_err("too many changes rejects");
-    assert!(matches!(err, sdk::Error::Module(_)));
+    assert!(matches!(err, sdk::Error::Module { ref reason, .. } if reason == "files_commit"));
     abort_block(&mut f);
     assert_eq!(f.root(), root0, "change-cap reject leaves the root put");
 }
@@ -780,7 +784,8 @@ fn stat_by_snapshot_resolves_root_none_and_bad_snapshot_errs() {
     let bad = "cc".repeat(32);
     let reply = stat_query(&f, "/shared/x", Some(&bad));
     assert!(
-        matches!(&reply, Err(sdk::Error::Module(m)) if m.contains("snapshot not resolvable")),
+        matches!(&reply, Err(sdk::Error::Module { reason, sentence })
+            if reason == "files_query" && sentence.contains("snapshot not resolvable")),
         "got {reply:?}"
     );
 }
@@ -809,7 +814,8 @@ fn chunk_length_must_match_the_size_rule_at_commit() {
     )
     .expect_err("short size vs a longer stored chunk rejects");
     assert!(
-        matches!(&err, sdk::Error::Module(m) if m.contains("chunk length")),
+        matches!(&err, sdk::Error::Module { reason, sentence }
+            if reason == "files_commit" && sentence.contains("chunk length")),
         "got {err:?}"
     );
 
@@ -827,7 +833,8 @@ fn chunk_length_must_match_the_size_rule_at_commit() {
     )
     .expect_err("a short interior chunk rejects");
     assert!(
-        matches!(&err, sdk::Error::Module(m) if m.contains("chunk length")),
+        matches!(&err, sdk::Error::Module { reason, sentence }
+            if reason == "files_commit" && sentence.contains("chunk length")),
         "got {err:?}"
     );
 
@@ -882,7 +889,8 @@ fn a_non_chunk_object_cannot_pose_as_a_chunk() {
     )
     .expect_err("a File object under a chunk reference rejects");
     assert!(
-        matches!(&err, sdk::Error::Module(m) if m.contains("not a chunk")),
+        matches!(&err, sdk::Error::Module { reason, sentence }
+            if reason == "files_commit" && sentence.contains("not a chunk")),
         "got {err:?}"
     );
     abort_block(&mut f);

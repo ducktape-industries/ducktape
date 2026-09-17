@@ -12,9 +12,7 @@
 
 use commonware_runtime::{Runner as _, deterministic};
 use directory::Directory;
-use directory::{
-    DirMsg, DirQuery, DirReply, decode_reply, encode_msg as dir_encode, encode_query,
-};
+use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg as dir_encode, encode_query};
 use host::Host;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, StateRoot};
 use statesync::qmdb::QmdbStore;
@@ -40,7 +38,7 @@ impl Module for Boom {
         StateRoot::ZERO
     }
     async fn execute(&mut self, _c: &mut dyn Ctx, _m: &Msg) -> Result<(), Error> {
-        Err(Error::Module("boom".into()))
+        Err(Error::module("boom", "boom"))
     }
 }
 
@@ -106,7 +104,7 @@ fn failed_block_rolls_back_every_module() {
             .expect_err("the boom follow-up must fail the block");
         assert_eq!(
             err,
-            host::SubmitError::Rejected(Error::Module("boom".into()))
+            host::SubmitError::Rejected(Error::module("boom", "boom"))
         );
 
         // no trace: every root and the root-hash are byte-identical to pre-block.
@@ -278,7 +276,7 @@ impl Module for RywProbe {
                 let reply = ctx
                     .query(DIR, &encode_query(&DirQuery::Get { key: "ryw".into() }))
                     .await?;
-                let seen = match decode_reply(&reply).map_err(Error::Module)? {
+                let seen = match decode_reply(&reply).map_err(|e| Error::module("codec", e))? {
                     DirReply::Value(Some(v)) => v == "staged",
                     _ => false,
                 };
@@ -332,7 +330,7 @@ impl Module for KvRywProbe {
                     )
                     .await?;
                 let seen = matches!(
-                    kv::decode_reply(&reply).map_err(Error::Module)?,
+                    kv::decode_reply(&reply).map_err(|e| Error::module("codec", e))?,
                     kv::KvReply::Value(Some(v)) if v == b"staged"
                 );
                 ctx.emit_event(Event {

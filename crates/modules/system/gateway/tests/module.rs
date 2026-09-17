@@ -59,12 +59,14 @@ impl Ctx for TestCtx {
 
     async fn query(&self, target: &str, request: &[u8]) -> Result<Vec<u8>, Error> {
         match target {
-            "identity" => match identity::decode_query(request).map_err(Error::Module)? {
-                IdentityQuery::OfKey { key } => Ok(identity::encode_reply(
-                    &IdentityReply::Account(self.accounts.get(&key).cloned()),
-                )),
-                _ => Err(Error::QueryUnsupported),
-            },
+            "identity" => {
+                match identity::decode_query(request).map_err(|e| Error::module("codec", e))? {
+                    IdentityQuery::OfKey { key } => Ok(identity::encode_reply(
+                        &IdentityReply::Account(self.accounts.get(&key).cloned()),
+                    )),
+                    _ => Err(Error::QueryUnsupported),
+                }
+            }
             _ => Err(Error::UnknownModule(target.into())),
         }
     }

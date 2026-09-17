@@ -54,33 +54,38 @@ pub fn full_ref(short: &str) -> String {
 /// suffix. strict enough to be a safe refname and an unambiguous map key.
 pub fn norm_branch(name: &str) -> Result<(), Error> {
     if name.is_empty() || name.len() > MAX_BRANCH_BYTES {
-        return Err(Error::Module(format!(
-            "forge: branch name must be 1..={MAX_BRANCH_BYTES} bytes"
-        )));
+        return Err(Error::module(
+            "bad_branch_name",
+            format!("forge: branch name must be 1..={MAX_BRANCH_BYTES} bytes"),
+        ));
     }
     if !name
         .bytes()
         .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-' | b'/'))
     {
-        return Err(Error::Module(format!(
-            "forge: branch name {name:?} must match [a-zA-Z0-9._/-]"
-        )));
+        return Err(Error::module(
+            "bad_branch_name",
+            format!("forge: branch name {name:?} must match [a-zA-Z0-9._/-]"),
+        ));
     }
     for seg in name.split('/') {
         if seg.is_empty() {
-            return Err(Error::Module(format!(
-                "forge: branch name {name:?} has an empty path segment"
-            )));
+            return Err(Error::module(
+                "bad_branch_name",
+                format!("forge: branch name {name:?} has an empty path segment"),
+            ));
         }
         if seg.starts_with('.') || seg.starts_with('-') {
-            return Err(Error::Module(format!(
-                "forge: branch segment {seg:?} may not start with '.' or '-'"
-            )));
+            return Err(Error::module(
+                "bad_branch_name",
+                format!("forge: branch segment {seg:?} may not start with '.' or '-'"),
+            ));
         }
         if seg.ends_with(".lock") {
-            return Err(Error::Module(format!(
-                "forge: branch segment {seg:?} may not end with '.lock'"
-            )));
+            return Err(Error::module(
+                "bad_branch_name",
+                format!("forge: branch segment {seg:?} may not end with '.lock'"),
+            ));
         }
     }
     Ok(())
@@ -150,17 +155,19 @@ pub fn take_pending(r: &mut Reader) -> Result<PendingMap, Error> {
         norm_branch(&branch)?;
         let oid = Oid::from_bytes(r.take(OID_RAW_LEN)?)?;
         if oid.is_zero() {
-            return Err(Error::Module(format!(
-                "forge pending: branch {branch} carries a zero oid"
-            )));
+            return Err(Error::module(
+                "bad_pending_record",
+                format!("forge pending: branch {branch} carries a zero oid"),
+            ));
         }
         let digest: [u8; 32] = r
             .take(32)?
             .try_into()
             .expect("take(32) yields exactly 32 bytes");
         if out.insert(branch, (oid, digest)).is_some() {
-            return Err(Error::Module(
-                "forge pending: duplicate branch in the catch-up map".into(),
+            return Err(Error::module(
+                "bad_pending_record",
+                "forge pending: duplicate branch in the catch-up map",
             ));
         }
     }
@@ -255,33 +262,40 @@ impl RepoState {
         digest: Option<[u8; 32]>,
     ) -> Result<(), Error> {
         if self.staged.contains_key(branch) {
-            return Err(Error::Module(format!(
-                "forge: branch {branch:?} already has a staged update this block"
-            )));
+            return Err(Error::module(
+                "branch_already_staged",
+                format!("forge: branch {branch:?} already has a staged update this block"),
+            ));
         }
         if self.refs.get(branch).copied() != prev {
-            return Err(Error::Module(
-                "non-fast-forward: forge HEAD moved; fetch and retry".into(),
+            return Err(Error::module(
+                "non_fast_forward",
+                "forge HEAD moved; fetch and retry",
             ));
         }
         let fate = match new {
             None => {
                 if is_protected_branch(branch) {
-                    return Err(Error::Module(format!(
-                        "forge: protected branch {branch:?} cannot be deleted"
-                    )));
+                    return Err(Error::module(
+                        "protected_branch",
+                        format!("forge: protected branch {branch:?} cannot be deleted"),
+                    ));
                 }
                 if prev.is_none() {
-                    return Err(Error::Module(format!(
-                        "forge: cannot delete unborn branch {branch:?}"
-                    )));
+                    return Err(Error::module(
+                        "unborn_branch",
+                        format!("forge: cannot delete unborn branch {branch:?}"),
+                    ));
                 }
                 StagedRef::Delete
             }
             Some(oid) => StagedRef::Packed(
                 oid,
                 digest.ok_or_else(|| {
-                    Error::Module("forge: a head update needs a pack digest".into())
+                    Error::module(
+                        "missing_pack_digest",
+                        "forge: a head update needs a pack digest",
+                    )
                 })?,
             ),
         };
@@ -311,7 +325,7 @@ impl RepoState {
                 StagedRef::Delete => {
                     let repo = open_or_init_repo(base, name)?;
                     git::delete_ref(&repo, &full_ref(&branch))
-                        .map_err(|e| Error::Module(e.to_string()))?;
+                        .map_err(|e| Error::module("git_delete_ref", e.to_string()))?;
                     self.refs.remove(&branch);
                     self.pending.remove(&branch);
                     self.warned.remove(&branch);
@@ -349,7 +363,7 @@ impl RepoState {
         for (branch, (head, digest)) in &self.pending {
             let refname = full_ref(branch);
             let prior = git::resolve_ref(&repo, &refname)
-                .map_err(|e| Error::Module(e.to_string()))?
+                .map_err(|e| Error::module("git_resolve_ref", e.to_string()))?
                 .map(Oid::from);
             if prior == Some(*head) {
                 done.push((branch.clone(), *digest));
@@ -452,17 +466,20 @@ fn advance_ref(
     prior: Option<Oid>,
     require_ff: bool,
 ) -> Result<(), Error> {
-    git::verify_closure(repo, head.into()).map_err(|e| Error::Module(e.to_string()))?;
+    git::verify_closure(repo, head.into())
+        .map_err(|e| Error::module("git_verify_closure", e.to_string()))?;
     if require_ff && let Some(prior) = prior {
         let ff = git::is_descendant(repo, head.into(), prior.into())
-            .map_err(|e| Error::Module(e.to_string()))?;
+            .map_err(|e| Error::module("git_is_descendant", e.to_string()))?;
         if !ff {
-            return Err(Error::Module(format!(
-                "head does not fast-forward on-disk ref {prior}"
-            )));
+            return Err(Error::module(
+                "non_fast_forward",
+                format!("head does not fast-forward on-disk ref {prior}"),
+            ));
         }
     }
-    git::update_ref(repo, refname, head.into()).map_err(|e| Error::Module(e.to_string()))?;
+    git::update_ref(repo, refname, head.into())
+        .map_err(|e| Error::module("git_update_ref", e.to_string()))?;
     Ok(())
 }
 
@@ -477,7 +494,7 @@ pub fn open_or_init_repo(base: &Path, name: &str) -> Result<Repository, Error> {
     } else {
         git::init(&dir)
     };
-    repo.map_err(|e| Error::Module(e.to_string()))
+    repo.map_err(|e| Error::module("git_open_repo", e.to_string()))
 }
 
 #[cfg(test)]

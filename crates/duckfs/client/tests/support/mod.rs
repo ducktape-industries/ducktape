@@ -155,9 +155,10 @@ impl ModuleNode {
 
 fn map_err(e: Error) -> ApiError {
     match e {
-        // a module rejection passes through verbatim — the conflict taxonomy
-        // depends on the exact string.
-        Error::Module(m) => ApiError::Rejected(m),
+        // the module's sentence, verbatim — exactly what the real http lane
+        // hands back (the node's `error` field; its `reason` token travels
+        // beside it and this double has nowhere to put it yet).
+        Error::Module { sentence, .. } => ApiError::Rejected(sentence),
         other => ApiError::Transport(format!("{other:?}")),
     }
 }

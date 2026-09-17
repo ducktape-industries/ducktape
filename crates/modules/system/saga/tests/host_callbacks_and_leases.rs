@@ -66,9 +66,12 @@ impl Module for Recorder {
     }
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         if self.poisoned {
-            return Err(Error::Module("recorder callback arm failed".into()));
+            return Err(Error::module(
+                "injected_fault",
+                "recorder callback arm failed",
+            ));
         }
-        let cb = decode_callback(&msg.payload).map_err(Error::Module)?;
+        let cb = decode_callback(&msg.payload).map_err(|e| Error::module("codec", e))?;
         self.staged.push(cb);
         Ok(())
     }
@@ -244,7 +247,9 @@ fn a_trigger_with_an_unknown_reply_to_is_rejected_up_front() {
             )
             .await
             .expect_err("unknown reply_to must reject");
-        assert!(matches!(err, host::SubmitError::Rejected(Error::Module(_))));
+        assert!(
+            matches!(err, host::SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "bad_reply_to")
+        );
         assert_eq!(
             saga_view(&host, &sid(b"alice", "s1")).await,
             None,
@@ -292,7 +297,9 @@ fn a_failing_callback_arm_aborts_the_whole_block_and_the_saga_stays_pending() {
             )
             .await
             .expect_err("the poisoned callback aborts the block");
-        assert!(matches!(err, host::SubmitError::Rejected(Error::Module(_))));
+        assert!(
+            matches!(err, host::SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "injected_fault")
+        );
 
         // no trace: the saga did NOT advance and no root moved.
         assert_eq!(

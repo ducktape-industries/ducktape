@@ -267,12 +267,14 @@ struct Delta {
     detail: Vec<u8>,
 }
 
-fn module_error(text: impl Into<String>) -> Error {
-    Error::Module(text.into())
+/// a refusal this module authors: its own snake_case failure-class token and
+/// the sentence a reader gets.
+fn module_error(reason: &str, text: impl Into<String>) -> Error {
+    Error::module(reason, text)
 }
 
 fn decode_record<T: BorshDeserialize>(bytes: &[u8]) -> Result<T, Error> {
-    borsh::from_slice(bytes).map_err(|e| module_error(e.to_string()))
+    borsh::from_slice(bytes).map_err(|e| module_error("record_decode", e.to_string()))
 }
 
 fn encode_record<T: BorshSerialize>(value: &T) -> Vec<u8> {
@@ -286,12 +288,16 @@ fn encode_record<T: BorshSerialize>(value: &T) -> Vec<u8> {
 /// it is stored ([`MAX_STORE_VALUE_BYTES`]).
 fn validate_ident(field: &str, value: &str) -> Result<(), Error> {
     if value.is_empty() {
-        return Err(module_error(format!("{field} must be non-empty")));
+        return Err(module_error(
+            "bad_ident",
+            format!("{field} must be non-empty"),
+        ));
     }
     if value.contains(SEP) {
-        return Err(module_error(format!(
-            "{field} must not contain the reserved separator"
-        )));
+        return Err(module_error(
+            "bad_ident",
+            format!("{field} must not contain the reserved separator"),
+        ));
     }
     Ok(())
 }
@@ -300,9 +306,10 @@ fn validate_ident(field: &str, value: &str) -> Result<(), Error> {
 fn validate_account(field: &str, account: AccountNumber) -> Result<(), Error> {
     let is_no_account = account == 0;
     if is_no_account {
-        return Err(module_error(format!(
-            "{field} names account 0, which no account holds"
-        )));
+        return Err(module_error(
+            "bad_account",
+            format!("{field} names account 0, which no account holds"),
+        ));
     }
     Ok(())
 }
@@ -325,7 +332,7 @@ fn validate_actor(actor: &Actor) -> Result<(), Error> {
         Actor::Account(account) => validate_account("actor", *account),
         Actor::Key(key) => {
             if key.is_empty() {
-                return Err(module_error("actor key must be non-empty"));
+                return Err(module_error("bad_ident", "actor key must be non-empty"));
             }
             Ok(())
         }
@@ -344,10 +351,13 @@ fn relation_map(relations: &[Relation]) -> Result<RelationMap, Error> {
         let key = (relation.recipient, relation.reason.clone());
         let duplicate = map.insert(key, relation.detail.clone()).is_some();
         if duplicate {
-            return Err(module_error(format!(
-                "relation ({}, {:?}) is reported twice",
-                relation.recipient, relation.reason
-            )));
+            return Err(module_error(
+                "duplicate_relation",
+                format!(
+                    "relation ({}, {:?}) is reported twice",
+                    relation.recipient, relation.reason
+                ),
+            ));
         }
     }
     Ok(map)
@@ -413,27 +423,36 @@ fn diff(
     for transfer in transfers {
         let same_account = transfer.from == transfer.to;
         if same_account {
-            return Err(module_error(format!(
-                "transfer of {:?} names account {} on both sides",
-                transfer.reason, transfer.from
-            )));
+            return Err(module_error(
+                "bad_transfer",
+                format!(
+                    "transfer of {:?} names account {} on both sides",
+                    transfer.reason, transfer.from
+                ),
+            ));
         }
         let out_key = (transfer.from, transfer.reason.clone());
         let in_key = (transfer.to, transfer.reason.clone());
         let matches_diff = withdrawn.contains(&out_key) && added.contains(&in_key);
         if !matches_diff {
-            return Err(module_error(format!(
-                "transfer of {:?} from {} to {} does not match a withdrawal and an addition",
-                transfer.reason, transfer.from, transfer.to
-            )));
+            return Err(module_error(
+                "bad_transfer",
+                format!(
+                    "transfer of {:?} from {} to {} does not match a withdrawal and an addition",
+                    transfer.reason, transfer.from, transfer.to
+                ),
+            ));
         }
         let out_twice = transferred_out.insert(out_key, transfer.to).is_some();
         let in_twice = transferred_in.insert(in_key, transfer.from).is_some();
         if out_twice || in_twice {
-            return Err(module_error(format!(
-                "transfer of {:?} from {} to {} repeats a side of another transfer",
-                transfer.reason, transfer.from, transfer.to
-            )));
+            return Err(module_error(
+                "bad_transfer",
+                format!(
+                    "transfer of {:?} from {} to {} repeats a side of another transfer",
+                    transfer.reason, transfer.from, transfer.to
+                ),
+            ));
         }
     }
 
@@ -480,9 +499,10 @@ struct WritePlan {
 }
 
 fn exhausted(numbering: &str) -> Error {
-    module_error(format!(
-        "the attribution {numbering} is exhausted; this report cannot be recorded"
-    ))
+    module_error(
+        "numbering_exhausted",
+        format!("the attribution {numbering} is exhausted; this report cannot be recorded"),
+    )
 }
 
 /// add one value to the plan, or refuse the report: a value the backing
@@ -494,10 +514,13 @@ fn plan_write(
 ) -> Result<(), Error> {
     let fits_the_store = value.len() <= MAX_STORE_VALUE_BYTES;
     if !fits_the_store {
-        return Err(module_error(format!(
-            "a record of {} bytes exceeds the store's value bound of {MAX_STORE_VALUE_BYTES}",
-            value.len()
-        )));
+        return Err(module_error(
+            "record_too_large",
+            format!(
+                "a record of {} bytes exceeds the store's value bound of {MAX_STORE_VALUE_BYTES}",
+                value.len()
+            ),
+        ));
     }
     plan.push((key, value));
     Ok(())
@@ -522,10 +545,14 @@ fn plan_delivery(
 ) -> Result<(), Error> {
     let retirement_fits = reserved_bytes(record) <= MAX_STORE_VALUE_BYTES;
     if !retirement_fits {
-        return Err(module_error(format!(
-            "a delivery to {} could not be retired within the store's value bound of {MAX_STORE_VALUE_BYTES}",
-            record.subscriber
-        )));
+        return Err(module_error(
+            "record_too_large",
+            format!(
+                "a delivery to {} could not be retired within the store's value bound \
+                 of {MAX_STORE_VALUE_BYTES}",
+                record.subscriber
+            ),
+        ));
     }
     plan_write(plan, item_key(item), encode_record(record))
 }
@@ -564,10 +591,13 @@ fn decide(
         .is_some_and(|record| report.revision <= record.revision);
     if revision_is_stale {
         let last = loaded.current.as_ref().map_or(0, |record| record.revision);
-        return Err(module_error(format!(
-            "revision {} of {}/{}/{} is not after its last reported revision {last}",
-            report.revision, report.source.module, report.source.kind, report.source.object
-        )));
+        return Err(module_error(
+            "stale_revision",
+            format!(
+                "revision {} of {}/{}/{} is not after its last reported revision {last}",
+                report.revision, report.source.module, report.source.kind, report.source.object
+            ),
+        ));
     }
     let deltas = diff(&prev, &report.next, &report.transfers)?;
 
@@ -588,7 +618,9 @@ fn decide(
             .ok_or_else(|| exhausted("object change count"))?;
         let recipient_at = recipient_counts
             .get(&delta.recipient)
-            .ok_or_else(|| module_error("recipient change count was not loaded"))?
+            .ok_or_else(|| {
+                module_error("count_not_loaded", "recipient change count was not loaded")
+            })?
             .checked_add(1)
             .ok_or_else(|| exhausted("recipient change count"))?;
         let change = Change {
@@ -723,35 +755,47 @@ fn decide_ack(
 ) -> Result<AckVerdict, Error> {
     let correlated = record.subscriber == ack.target;
     if !correlated {
-        return Err(module_error(format!(
-            "acknowledgment of item {} names {:?}; the item is addressed to {:?}",
-            ack.item, ack.target, record.subscriber
-        )));
+        return Err(module_error(
+            "ack_target_mismatch",
+            format!(
+                "acknowledgment of item {} names {:?}; the item is addressed to {:?}",
+                ack.item, ack.target, record.subscriber
+            ),
+        ));
     }
     let retired = ack.item < queue.head;
     if retired {
         let same_outcome = record.state == DeliveryState::Retired(ack.outcome.clone());
         if !same_outcome {
-            return Err(module_error(format!(
-                "item {} is already retired as {:?}; the acknowledgment says {:?}",
-                ack.item, record.state, ack.outcome
-            )));
+            return Err(module_error(
+                "already_retired",
+                format!(
+                    "item {} is already retired as {:?}; the acknowledgment says {:?}",
+                    ack.item, record.state, ack.outcome
+                ),
+            ));
         }
         return Ok(AckVerdict::AlreadyRetired);
     }
     let at_head = ack.item == queue.head;
     if !at_head {
-        return Err(module_error(format!(
-            "acknowledgment of item {} is out of order: the head is {}",
-            ack.item, queue.head
-        )));
+        return Err(module_error(
+            "ack_out_of_order",
+            format!(
+                "acknowledgment of item {} is out of order: the head is {}",
+                ack.item, queue.head
+            ),
+        ));
     }
     let queued = record.state == DeliveryState::Queued;
     if !queued {
-        return Err(module_error(format!(
-            "item {} at the head is not queued: {:?}",
-            ack.item, record.state
-        )));
+        return Err(module_error(
+            "item_not_queued",
+            format!(
+                "item {} at the head is not queued: {:?}",
+                ack.item, record.state
+            ),
+        ));
     }
     let head = queue
         .head
@@ -850,18 +894,20 @@ impl AttributionModule {
     }
 
     async fn change(&self, seq: u64) -> Result<Change, Error> {
-        self.record(&change_key(seq))
-            .await?
-            .ok_or_else(|| module_error(format!("attribution index names missing change {seq}")))
+        self.record(&change_key(seq)).await?.ok_or_else(|| {
+            module_error(
+                "missing_change_record",
+                format!("attribution index names missing change {seq}"),
+            )
+        })
     }
 
     /// the change an index entry points at; a dangling entry is a corrupt
     /// store, never a quiet gap.
     async fn indexed_change(&self, entry_key: &[u8]) -> Result<Change, Error> {
-        let seq: u64 = self
-            .record(entry_key)
-            .await?
-            .ok_or_else(|| module_error("attribution index entry is missing"))?;
+        let seq: u64 = self.record(entry_key).await?.ok_or_else(|| {
+            module_error("missing_index_entry", "attribution index entry is missing")
+        })?;
         self.change(seq).await
     }
 
@@ -896,17 +942,22 @@ impl AttributionModule {
     /// a delivery record the queue or an index names; a missing one is a
     /// corrupt store, never a quiet gap.
     async fn delivery_record(&self, item: u64) -> Result<DeliveryRecord, Error> {
-        self.record(&item_key(item))
-            .await?
-            .ok_or_else(|| module_error(format!("delivery item {item} has no record")))
+        self.record(&item_key(item)).await?.ok_or_else(|| {
+            module_error(
+                "missing_delivery_record",
+                format!("delivery item {item} has no record"),
+            )
+        })
     }
 
     /// the delivery an index entry points at.
     async fn indexed_delivery(&self, entry_key: &[u8]) -> Result<Delivery, Error> {
-        let item: u64 = self
-            .record(entry_key)
-            .await?
-            .ok_or_else(|| module_error("attribution delivery index entry is missing"))?;
+        let item: u64 = self.record(entry_key).await?.ok_or_else(|| {
+            module_error(
+                "missing_index_entry",
+                "attribution delivery index entry is missing",
+            )
+        })?;
         Ok(self.delivery_record(item).await?.view(item))
     }
 
@@ -962,7 +1013,9 @@ impl AttributionModule {
         match origin {
             Origin::Module(module) => Ok(module.clone()),
             Origin::External(_) | Origin::Program(_) | Origin::System => Err(module_error(
-                "attribution ops are module-origin only (the emitting module is the source or the subscriber)",
+                "module_origin_required",
+                "attribution ops are module-origin only \
+                 (the emitting module is the source or the subscriber)",
             )),
         }
     }
@@ -1196,7 +1249,7 @@ impl Module for AttributionModule {
     /// the origin, because a report that cannot be read cannot be recorded,
     /// and a source write without its record must not commit.
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let decoded = decode_msg(&msg.payload).map_err(Error::Module)?;
+        let decoded = decode_msg(&msg.payload).map_err(|e| Error::module("codec", e))?;
         self.dispatch(ctx, decoded).await
     }
 
@@ -1214,23 +1267,32 @@ impl Module for AttributionModule {
         for item in queue.head..end {
             let record: DeliveryRecord =
                 self.committed(&item_key(item)).await?.ok_or_else(|| {
-                    module_error(format!("queued delivery item {item} has no record"))
+                    module_error(
+                        "missing_delivery_record",
+                        format!("queued delivery item {item} has no record"),
+                    )
                 })?;
             let queued = record.state == DeliveryState::Queued;
             if !queued {
-                return Err(module_error(format!(
-                    "delivery item {item} above the head is not queued: {:?}",
-                    record.state
-                )));
+                return Err(module_error(
+                    "item_not_queued",
+                    format!(
+                        "delivery item {item} above the head is not queued: {:?}",
+                        record.state
+                    ),
+                ));
             }
             let change: Change =
                 self.committed(&change_key(record.seq))
                     .await?
                     .ok_or_else(|| {
-                        module_error(format!(
-                            "queued delivery item {item} names missing change {}",
-                            record.seq
-                        ))
+                        module_error(
+                            "missing_change_record",
+                            format!(
+                                "queued delivery item {item} names missing change {}",
+                                record.seq
+                            ),
+                        )
                     })?;
             items.push(PendingItem {
                 item,
@@ -1257,16 +1319,20 @@ impl Module for AttributionModule {
         let from_host = matches!(ctx.env().origin, Origin::System);
         if !from_host {
             return Err(module_error(
+                "system_origin_required",
                 "delivery acknowledgments are system-origin only (the host retires what it ran)",
             ));
         }
         let queue = self.queue().await?;
         let known = ack.item >= 1 && ack.item < queue.next;
         if !known {
-            return Err(module_error(format!(
-                "acknowledgment names unknown delivery item {} (the queue ends at {})",
-                ack.item, queue.next
-            )));
+            return Err(module_error(
+                "unknown_delivery_item",
+                format!(
+                    "acknowledgment names unknown delivery item {} (the queue ends at {})",
+                    ack.item, queue.next
+                ),
+            ));
         }
         let record = self.delivery_record(ack.item).await?;
         let AckVerdict::Retire { record, head } = decide_ack(&queue, &record, ack)? else {
@@ -1290,7 +1356,7 @@ impl Module for AttributionModule {
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let reply = match decode_query(req).map_err(Error::Module)? {
+        let reply = match decode_query(req).map_err(|e| Error::module("codec", e))? {
             AttributionQuery::Relations { source } => {
                 AttributionReply::Relations(self.relations_view(&source).await?)
             }

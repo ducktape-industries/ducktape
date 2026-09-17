@@ -775,7 +775,7 @@ fn decode_git_body(headers: &HeaderMap, body: &[u8], cap: usize) -> Result<Vec<u
 /// one refused push, on the forge plane. the http funnel already records the
 /// status at `debug`; this is the plane's own line, with a `reason` an
 /// operator greps and counts. never the pack, never a path.
-fn push_refused(_repo: &str, reason: &'static str, _detail: &str) {
+fn push_refused(_repo: &str, reason: &str, _detail: &str) {
     tracing::warn!(
         target: "ducktape::forge",
         event = "forge_push_refused",
@@ -1028,16 +1028,17 @@ pub(crate) async fn git_receive_pack(
             push_refused(&repo, "unresolved", &detail);
             error_response(StatusCode::BAD_GATEWAY, &detail)
         }
-        Err(ducktape_rpc::SubmitFailure::Refused(reason)) => {
-            push_refused(&repo, push_refusal_reason(&reason), &reason);
-            // a CAS mismatch's rejection carries "non-fast-forward" — surface
-            // exactly that token so git prints its standard "fetch first" hint.
-            // any other rejection passes through as a single-line reason. the
+        Err(ducktape_rpc::SubmitFailure::Refused(refusal)) => {
+            // the refusing module named its own class: log THAT, never a guess
+            // read back out of its sentence.
+            push_refused(&repo, refusal.reason(), refusal.message());
+            // a CAS mismatch refuses with `non_fast_forward` — surface git's
+            // own spelling of it so it prints its standard "fetch first" hint.
+            // any other rejection passes through as a single-line sentence. the
             // op is atomic, so every ref shares the fate.
-            let reason = if reason.contains("non-fast-forward") {
-                "non-fast-forward".to_string()
-            } else {
-                reason.replace('\n', " ")
+            let reason = match refusal.reason() {
+                "non_fast_forward" => "non-fast-forward".to_string(),
+                _ => refusal.message().replace('\n', " "),
             };
             let results: Vec<(String, Option<String>)> = refnames
                 .into_iter()
@@ -1361,8 +1362,8 @@ AAAAQLVICk0pyrHLcnEsEQ7c85Iz5LgrayYKAnmGYodzvOfoIE8zBAYc02eReGWJiWfDBK\n\
         assert!(unoffered.contains("offered no push-cert"), "{unoffered}");
         let mut cut = signed_commands();
         cut.pop();
-        let cut = parse_push_commands(&cut, Some(&forge::pushcert::nonce("chain-a", "lab")))
-            .unwrap_err();
+        let cut =
+            parse_push_commands(&cut, Some(&forge::pushcert::nonce("chain-a", "lab"))).unwrap_err();
         assert!(cut.contains("push-cert-end"), "{cut}");
     }
 

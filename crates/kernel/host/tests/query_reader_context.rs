@@ -70,7 +70,7 @@ impl Module for CommitFails {
     }
 
     async fn commit_block(&mut self) -> Result<(), Error> {
-        Err(Error::Module("this module never commits".into()))
+        Err(Error::module("never_commits", "this module never commits"))
     }
 }
 

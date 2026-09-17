@@ -146,7 +146,7 @@ impl Module for TestDiskModule {
         let value = *msg
             .payload
             .first()
-            .ok_or_else(|| Error::Module("missing test value".into()))?;
+            .ok_or_else(|| Error::module("missing_test_value", "missing test value"))?;
         self.staged = Some(value);
         ctx.emit_msg(Msg {
             target: "mem".into(),
@@ -183,10 +183,16 @@ impl TestMemoryModule {
 
     fn install(&mut self, bytes: &[u8], root: StateRoot) -> Result<(), Error> {
         let [value] = bytes else {
-            return Err(Error::Module("bad test memory snapshot".into()));
+            return Err(Error::module(
+                "bad_test_snapshot",
+                "bad test memory snapshot",
+            ));
         };
         if test_root(*value) != root {
-            return Err(Error::Module("test memory root mismatch".into()));
+            return Err(Error::module(
+                "test_root_mismatch",
+                "test memory root mismatch",
+            ));
         }
         self.value = *value;
         self.staged = None;
@@ -212,7 +218,7 @@ impl Module for TestMemoryModule {
         let value = *msg
             .payload
             .first()
-            .ok_or_else(|| Error::Module("missing test value".into()))?;
+            .ok_or_else(|| Error::module("missing_test_value", "missing test value"))?;
         self.staged = Some(value);
         Ok(())
     }

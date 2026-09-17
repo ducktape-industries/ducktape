@@ -175,7 +175,8 @@ impl Forge {
             .filter(|(branch, _)| !state.pending().contains_key(*branch))
             .map(|(_, oid)| git2::Oid::from(*oid))
             .collect();
-        git::pack_closure_many(&repo, &heads).map_err(|error| Error::Module(error.to_string()))
+        git::pack_closure_many(&repo, &heads)
+            .map_err(|error| Error::module("git_pack_closure", error.to_string()))
     }
 
     /// Re-adopt one cache file written by [`Self::persist_snapshot_cache`].
@@ -304,7 +305,10 @@ impl Forge {
         let body = bytes
             .strip_prefix(FORGE_SNAPSHOT_MAGIC.as_slice())
             .ok_or_else(|| {
-                Error::Module("forge snapshot: missing the FGv1 container magic".into())
+                Error::module(
+                    "snapshot_decode",
+                    "forge snapshot: missing the FGv1 container magic",
+                )
             })?;
         // ---- PHASE 1: parse (no writes) -------------------------------------
         let mut r = Reader::new(body);
@@ -314,10 +318,13 @@ impl Forge {
             let name = norm_repo(&r.str_()?)?;
             let ref_count = r.u32()?;
             if ref_count == 0 {
-                return Err(Error::Module(format!(
-                    "forge snapshot: repo {name} carries no branches \
-                     (unborn repos are not serialized)"
-                )));
+                return Err(Error::module(
+                    "snapshot_decode",
+                    format!(
+                        "forge snapshot: repo {name} carries no branches \
+                         (unborn repos are not serialized)"
+                    ),
+                ));
             }
             let mut refs = BTreeMap::new();
             for _ in 0..ref_count {
@@ -325,14 +332,16 @@ impl Forge {
                 norm_branch(&branch)?;
                 let oid = Oid::from_bytes(r.take(OID_RAW_LEN)?)?;
                 if oid.is_zero() {
-                    return Err(Error::Module(format!(
-                        "forge snapshot: branch {branch} of {name} carries a zero oid"
-                    )));
+                    return Err(Error::module(
+                        "snapshot_decode",
+                        format!("forge snapshot: branch {branch} of {name} carries a zero oid"),
+                    ));
                 }
                 if refs.insert(branch, oid).is_some() {
-                    return Err(Error::Module(format!(
-                        "forge snapshot: duplicate branch in repo {name}"
-                    )));
+                    return Err(Error::module(
+                        "snapshot_decode",
+                        format!("forge snapshot: duplicate branch in repo {name}"),
+                    ));
                 }
             }
             let pending = crate::refs::take_pending(&mut r)?;
@@ -341,10 +350,13 @@ impl Forge {
             // materializing toward state no root ever gated.
             for (branch, (head, _)) in &pending {
                 if refs.get(branch) != Some(head) {
-                    return Err(Error::Module(format!(
-                        "forge snapshot: pending branch {branch} of {name} does not \
-                         match the committed head"
-                    )));
+                    return Err(Error::module(
+                        "snapshot_decode",
+                        format!(
+                            "forge snapshot: pending branch {branch} of {name} does not \
+                             match the committed head"
+                        ),
+                    ));
                 }
             }
             let pack_len = r.u32()? as usize;
@@ -355,16 +367,18 @@ impl Forge {
                 pack,
             };
             if parsed.insert(name.clone(), repo).is_some() {
-                return Err(Error::Module(format!(
-                    "forge snapshot: duplicate repo {name}"
-                )));
+                return Err(Error::module(
+                    "snapshot_decode",
+                    format!("forge snapshot: duplicate repo {name}"),
+                ));
             }
         }
         let tracker_len = r.u32()? as usize;
         let tracker = Tracker::decode(r.take(tracker_len)?)?;
         if !r.done() {
-            return Err(Error::Module(
-                "forge snapshot: trailing bytes after the container".into(),
+            return Err(Error::module(
+                "snapshot_decode",
+                "forge snapshot: trailing bytes after the container",
             ));
         }
 
@@ -372,22 +386,23 @@ impl Forge {
         let entries = parsed.iter().map(|(n, repo)| (n.as_str(), &repo.refs));
         let composed = compose_state_root(entries, &tracker);
         if composed != expected {
-            return Err(Error::Module(
-                "snapshot root mismatch: composed state does not rehash to the expected root"
-                    .into(),
+            return Err(Error::module(
+                "snapshot_root_mismatch",
+                "snapshot root mismatch: composed state does not rehash to the expected root",
             ));
         }
 
         // ---- PHASE 3: index packs + require closures, moving NO ref ---------
         for (name, parsed_repo) in &parsed {
             let repo = open_or_init_repo(&self.base, name)?;
-            git::install_pack(&repo, parsed_repo.pack).map_err(|e| Error::Module(e.to_string()))?;
+            git::install_pack(&repo, parsed_repo.pack)
+                .map_err(|e| Error::module("git_install_pack", e.to_string()))?;
             for (branch, oid) in &parsed_repo.refs {
                 if parsed_repo.pending.contains_key(branch) {
                     continue;
                 }
                 git::verify_closure(&repo, (*oid).into())
-                    .map_err(|e| Error::Module(e.to_string()))?;
+                    .map_err(|e| Error::module("git_verify_closure", e.to_string()))?;
             }
         }
 
@@ -404,7 +419,7 @@ impl Forge {
             for branch in state.refs.keys() {
                 if keep.is_none_or(|refs| !refs.contains_key(branch)) {
                     git::delete_ref(&repo, &full_ref(branch))
-                        .map_err(|e| Error::Module(e.to_string()))?;
+                        .map_err(|e| Error::module("git_delete_ref", e.to_string()))?;
                 }
             }
         }
@@ -419,7 +434,7 @@ impl Forge {
                     continue;
                 }
                 git::update_ref(&repo, &full_ref(branch), (*oid).into())
-                    .map_err(|e| Error::Module(e.to_string()))?;
+                    .map_err(|e| Error::module("git_update_ref", e.to_string()))?;
             }
             let mut state = RepoState::with_refs(parsed_repo.refs);
             state.adopt_pending(parsed_repo.pending);

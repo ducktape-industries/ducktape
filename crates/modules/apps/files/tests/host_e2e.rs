@@ -562,7 +562,7 @@ fn assert_rejected(host: &mut Host, height: u64, origin: Origin, msg: Msg, label
         "{label}: must be a deterministic rejection, got {err:?}"
     );
     assert!(
-        matches!(err.rejected(), Some(Error::Module(_))),
+        matches!(err.rejected(), Some(Error::Module { .. })),
         "{label}: module-level rejection, got {err:?}"
     );
     assert_eq!(

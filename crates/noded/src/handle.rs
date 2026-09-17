@@ -28,18 +28,19 @@ pub(crate) const EVENT_BUFFER: usize = 64;
 ///
 /// they are separate because they are BOUNDED separately — a client that clips
 /// a long message must never clip the token with it — and because a screen that
-/// keys its behaviour off prose keys it off nothing. the token is a literal, so
-/// it is greppable and countable like every other `reason` in this tree.
+/// keys its behaviour off prose keys it off nothing. a module's refusal brings
+/// its OWN token, so this carries a `String` rather than a literal; it stays
+/// greppable and countable like every other `reason` in this tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refused {
-    pub reason: &'static str,
+    pub reason: String,
     pub message: String,
 }
 
 impl Refused {
-    pub fn new(reason: &'static str, message: impl Into<String>) -> Self {
+    pub fn new(reason: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            reason,
+            reason: reason.into(),
             message: message.into(),
         }
     }
@@ -51,39 +52,55 @@ impl Refused {
     /// every module guest, and what a screen says is not its business.
     ///
     /// the sentence deliberately drops the variant's NAME. `sdk::Error`'s
-    /// `Display` is its `Debug`, so `to_string()` yields `Module(forge: …)` —
-    /// an envelope that then reaches a person, and that every reader
-    /// downstream has to peel back off.
+    /// `Display` is its `Debug`, so `to_string()` yields
+    /// `Module(<reason>: <sentence>)` — an envelope that then reaches a person,
+    /// and that every reader downstream has to peel back off.
     pub fn of(error: &sdk::Error) -> Self {
-        let (reason, message) = match error {
-            sdk::Error::UnknownModule(id) => {
-                ("unknown_module", format!("no module is registered as {id}"))
-            }
+        let (reason, message): (String, String) = match error {
+            sdk::Error::UnknownModule(id) => (
+                "unknown_module".into(),
+                format!("no module is registered as {id}"),
+            ),
             sdk::Error::SelfQuery => (
-                "self_query",
+                "self_query".into(),
                 "a module reads its own state through itself, not through a query".to_owned(),
             ),
             sdk::Error::QueryUnsupported => (
-                "query_unsupported",
+                "query_unsupported".into(),
                 "this module answers no queries".to_owned(),
             ),
             sdk::Error::SyncUnsupported => (
-                "sync_unsupported",
+                "sync_unsupported".into(),
                 "this module serves no state sync".to_owned(),
             ),
             sdk::Error::SwapUnsupported => (
-                "swap_unsupported",
+                "swap_unsupported".into(),
                 "this module's code is the node binary itself, so it cannot be swapped".to_owned(),
             ),
             sdk::Error::BudgetExceeded => (
-                "budget_exceeded",
+                "budget_exceeded".into(),
                 "the follow-up drain exceeded its dispatch budget".to_owned(),
             ),
-            // the module's own words, whole: nothing here paraphrases a
-            // refusal it did not write.
-            sdk::Error::Module(said) => ("module", said.clone()),
+            // the module's own words, whole — and its own TOKEN: nothing here
+            // paraphrases a refusal it did not write, and nothing re-classifies
+            // one it did.
+            sdk::Error::Module { reason, sentence } => (reason.clone(), sentence.clone()),
         };
         Self { reason, message }
+    }
+
+    /// a refusal that reached this node as ONE framed string
+    /// (`<reason>: <sentence>`) rather than as an [`sdk::Error`]: a drained
+    /// frame's captured reason, or a custodian's relayed rejection.
+    ///
+    /// a string that named no class stays UNCLASSIFIED — a token is never
+    /// invented for one here, because a made-up word is one every consumer
+    /// would then have to tell apart from a word a module actually chose.
+    pub fn framed(said: &str) -> Self {
+        match sdk::refusal::decode(said) {
+            Some((reason, sentence)) => Self::new(reason, sentence),
+            None => Self::new("unframed_refusal", said),
+        }
     }
 
     /// a write's refusal. a deterministic rejection is the module's own, whole;
@@ -730,6 +747,52 @@ pub(crate) async fn account_of_key(
         return Err("unexpected identity reply".into());
     };
     Ok(account.map(|account| account.number))
+}
+
+#[cfg(test)]
+mod refused_tests {
+    use super::*;
+
+    /// A module refusal reaches the receipt as the module's OWN token. The
+    /// receipt's `reason` is what a caller branches on, so a stamp naming only
+    /// the layer ("module") would tell it nothing it did not already know.
+    #[test]
+    fn a_module_refusal_carries_its_own_token_into_the_receipt() {
+        let refused = Refused::of(&sdk::Error::module(
+            "non_fast_forward",
+            "forge HEAD moved; fetch and retry",
+        ));
+        assert_eq!(refused.reason, "non_fast_forward");
+        assert_eq!(refused.message, "forge HEAD moved; fetch and retry");
+
+        // a kernel refusal keeps its own class, unchanged by the module lane.
+        let unknown = Refused::of(&sdk::Error::UnknownModule("nope".into()));
+        assert_eq!(unknown.reason, "unknown_module");
+    }
+
+    /// The same refusal, but arriving as the ONE framed string a drained frame
+    /// or a relayed rejection carries. It splits back into the same two halves,
+    /// and a sentence that itself contains `": "` survives whole.
+    #[test]
+    fn a_framed_refusal_splits_back_into_its_token_and_sentence() {
+        let sentence = "store-backed state keys: got 7 bytes";
+        let framed = sdk::refusal::encode("state_key_shape", sentence);
+        let refused = Refused::framed(&framed);
+        assert_eq!(refused.reason, "state_key_shape");
+        assert_eq!(refused.message, sentence);
+    }
+
+    /// A refusal that named no class is NOT given one. Inventing a token here
+    /// would mint a word no module chose, which every consumer downstream would
+    /// then have to tell apart from a real one.
+    #[test]
+    fn an_unframed_refusal_is_not_given_a_token() {
+        for unframed in ["nobody framed this", "Not_Snake_Case: sentence"] {
+            let refused = Refused::framed(unframed);
+            assert_eq!(refused.reason, "unframed_refusal", "{unframed:?}");
+            assert_eq!(refused.message, unframed);
+        }
+    }
 }
 
 #[cfg(test)]

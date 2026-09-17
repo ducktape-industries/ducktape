@@ -333,13 +333,13 @@ fn stale_prev_oid_is_rejected_and_head_is_unchanged() {
 
     // (a) prev = None but the head is born -> non-fast-forward.
     let err = try_push(&mut dst, None, &c2.head, &d2).unwrap_err();
-    assert!(matches!(err, Error::Module(m) if m.contains("non-fast-forward")));
+    assert!(matches!(err, Error::Module { ref reason, .. } if reason == "non_fast_forward"));
     assert_eq!(dst.root(), pinned, "a rejected push must not move the head");
 
     // (b) prev = a wrong 20-byte oid -> also non-fast-forward.
     let bogus = [0x11u8; OID_LEN];
     let err = try_push(&mut dst, Some(&bogus), &c2.head, &d2).unwrap_err();
-    assert!(matches!(err, Error::Module(m) if m.contains("non-fast-forward")));
+    assert!(matches!(err, Error::Module { ref reason, .. } if reason == "non_fast_forward"));
     assert_eq!(dst.root(), pinned);
     assert_eq!(
         on_disk_head(&dst_dir),
@@ -445,19 +445,25 @@ fn malformed_push_fields_are_rejected_deterministically() {
 
     // new_oid too short.
     let err = try_push(&mut dst, None, &[0u8; 19], &ok_digest).unwrap_err();
-    assert!(matches!(err, Error::Module(m) if m.contains("new_oid")));
+    assert!(
+        matches!(err, Error::Module { ref reason, ref sentence } if reason == "bad_oid" && sentence.contains("new_oid"))
+    );
 
     // new_oid too long.
     let err = try_push(&mut dst, None, &[0u8; 21], &ok_digest).unwrap_err();
-    assert!(matches!(err, Error::Module(m) if m.contains("new_oid")));
+    assert!(
+        matches!(err, Error::Module { ref reason, ref sentence } if reason == "bad_oid" && sentence.contains("new_oid"))
+    );
 
     // pack_digest not 32 bytes.
     let err = try_push(&mut dst, None, &ok_oid, &[0u8; 31]).unwrap_err();
-    assert!(matches!(err, Error::Module(m) if m.contains("pack_digest")));
+    assert!(matches!(err, Error::Module { ref reason, .. } if reason == "bad_pack_digest"));
 
     // prev_oid present but wrong length.
     let err = try_push(&mut dst, Some(&[0u8; 10]), &ok_oid, &ok_digest).unwrap_err();
-    assert!(matches!(err, Error::Module(m) if m.contains("prev_oid")));
+    assert!(
+        matches!(err, Error::Module { ref reason, ref sentence } if reason == "bad_oid" && sentence.contains("prev_oid"))
+    );
 
     // every rejection left the module untouched (still unborn, never staged).
     assert_eq!(dst.root(), StateRoot::ZERO);

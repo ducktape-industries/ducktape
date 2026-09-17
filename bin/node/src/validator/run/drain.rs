@@ -508,8 +508,7 @@ impl ValidatorRuntime<'_> {
             // A refusal reaches the person who typed the verb, carrying the
             // module's own reason token — the one the warn above logs.
             if let Some((rpc_replies, _)) = pending_rpc_submits.remove(&d.id) {
-                let settled =
-                    crate::drain_actions::settled_submit(rejected, d.reason.as_deref());
+                let settled = crate::drain_actions::settled_submit(rejected, d.reason.as_deref());
                 for rpc_reply in rpc_replies {
                     let line = match &settled {
                         Ok(()) => crate::rpc::RpcReply::ok(),
@@ -532,11 +531,11 @@ impl ValidatorRuntime<'_> {
                 // the two rejections were one string and are now two
                 // tokens, which is the difference between "the module
                 // said no" and "nothing was there to apply".
-                node::Disposition::Rejected => Err(match d.reason.clone() {
-                    // the module's VERBATIM reason when the drain
-                    // captured one (duckfs-client keys on the
-                    // "files: conflict:" prefix).
-                    Some(said) => noded::Refused::new("module", said),
+                node::Disposition::Rejected => Err(match d.reason.as_deref() {
+                    // the drain captured the refusal FRAMED
+                    // (`<reason>: <sentence>`): split it so the receipt
+                    // carries the refusing module's own token.
+                    Some(said) => noded::Refused::framed(said),
                     None => noded::Refused::new(
                         "deterministic_no_op",
                         "op finalized but rejected (deterministic no-op)",
@@ -1596,14 +1595,15 @@ impl ValidatorRuntime<'_> {
             // module's bytes must instantiate here AND replace the running
             // module's state shape; a view's bytes must speak the view ABI,
             // and no running module is asked about them.
-            let realizable =
-                noded::compose::validate_deployment(module_id, entry.kind, &bytes, index)
-                    .and_then(|()| match entry.kind {
-                        modules::Kind::Module => node
-                            .check_module_replacement(module_id, &bytes)
-                            .map_err(|error| error.to_string()),
-                        modules::Kind::View => Ok(()),
-                    });
+            let realizable = noded::compose::validate_deployment(
+                module_id, entry.kind, &bytes, index,
+            )
+            .and_then(|()| match entry.kind {
+                modules::Kind::Module => node
+                    .check_module_replacement(module_id, &bytes)
+                    .map_err(|error| error.to_string()),
+                modules::Kind::View => Ok(()),
+            });
             match realizable {
                 Ok(()) => CodeVerdict::Loadable,
                 // the first line only: a wasmtime error carries a multi-line
@@ -1908,7 +1908,10 @@ pub(crate) async fn saga_next_expiry(host: &host::Host) -> Option<u64> {
 /// Earliest durable timer; absence of the Runs module requires no host work.
 async fn conversation_next_input_due(host: &host::Host) -> Option<u64> {
     let reply = host
-        .query("runs", &runs::encode_query(&runs::RunsQuery::NextConversationInputDue))
+        .query(
+            "runs",
+            &runs::encode_query(&runs::RunsQuery::NextConversationInputDue),
+        )
         .await
         .ok()?;
     let runs::RunsReply::NextConversationInputDue(due) = runs::decode_reply(&reply).ok()? else {

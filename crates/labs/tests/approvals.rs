@@ -21,7 +21,7 @@ use sdk_testkit::TestCtx;
 /// a valset-query responder: Validators from the given set, Residents empty —
 /// the only host-routed read the multisig member gate makes.
 fn valset_reads(validators: Vec<Vec<u8>>) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
-    move |req| match valset::decode_query(req).map_err(Error::Module)? {
+    move |req| match valset::decode_query(req).map_err(|e| Error::module("codec", e))? {
         ValsetQuery::Validators => Ok(valset::encode_reply(&ValsetReply::Validators(
             validators.clone(),
         ))),
@@ -72,11 +72,7 @@ fn safe_addr() -> Address {
     Address::from([0x5au8; 20])
 }
 
-async fn exec(
-    m: &mut Multisig,
-    c: &mut TestCtx,
-    msg: MultisigMsg,
-) -> Result<(), Error> {
+async fn exec(m: &mut Multisig, c: &mut TestCtx, msg: MultisigMsg) -> Result<(), Error> {
     m.execute(
         c,
         &Msg {

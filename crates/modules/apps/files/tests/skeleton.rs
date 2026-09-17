@@ -35,7 +35,7 @@ fn unknown_json_op_rejects_and_putblob_frame_routes() {
             )
             .await
             .expect_err("unknown json must reject");
-        assert!(matches!(err, sdk::Error::Module(_)));
+        assert!(matches!(err, sdk::Error::Module { ref reason, .. } if reason == "codec"));
 
         // the frame tag must route to the binary putblob lane, not the json
         // decoder: a well-formed chunk stages cleanly (task 7) — the json decoder

@@ -680,9 +680,10 @@ impl host::ModuleFactory for Admissions {
         let artifact = match artifact {
             module_artifact::ArtifactRef::Module(module) => module,
             module_artifact::ArtifactRef::View(_) => {
-                return Err(sdk::Error::Module(format!(
-                    "artifact_kind_mismatch: {id} is a module entry, but the artifact is a view-only frame"
-                )));
+                return Err(sdk::Error::module(
+                    "artifact_kind_mismatch",
+                    format!("{id} is a module entry, but the artifact is a view-only frame"),
+                ));
             }
         };
         let bindings = Bindings {
@@ -714,7 +715,7 @@ impl host::ModuleFactory for Admissions {
         // paid on the refusal path alone, and the host latches the answer.
         let is_a_module = wasm_host::speaks_module_abi(artifact.component);
         match is_a_module {
-            true => Err(sdk::Error::Module(refusal)),
+            true => Err(sdk::Error::module("module_seat", refusal)),
             false => Ok(host::Admitted::ForeignAbi),
         }
     }

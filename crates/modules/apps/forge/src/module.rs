@@ -75,7 +75,12 @@ pub(crate) const FORGE_SNAPSHOT_MAGIC: &[u8; 4] = b"FGv1";
 fn decode_pending(bytes: &[u8]) -> Result<BTreeMap<String, refs::PendingMap>, Error> {
     let body = bytes
         .strip_prefix(FORGE_PENDING_MAGIC.as_slice())
-        .ok_or_else(|| Error::Module("forge pending file: missing the FGP1 magic".into()))?;
+        .ok_or_else(|| {
+            Error::module(
+                "pending_decode",
+                "forge pending file: missing the FGP1 magic",
+            )
+        })?;
     let mut r = codec::Reader::new(body);
     let count = r.u32()?;
     let mut out = BTreeMap::new();
@@ -85,14 +90,16 @@ fn decode_pending(bytes: &[u8]) -> Result<BTreeMap<String, refs::PendingMap>, Er
             .insert(name.clone(), refs::take_pending(&mut r)?)
             .is_some()
         {
-            return Err(Error::Module(format!(
-                "forge pending file: duplicate repo {name}"
-            )));
+            return Err(Error::module(
+                "pending_decode",
+                format!("forge pending file: duplicate repo {name}"),
+            ));
         }
     }
     if !r.done() {
-        return Err(Error::Module(
-            "forge pending file: trailing bytes after the map".into(),
+        return Err(Error::module(
+            "pending_decode",
+            "forge pending file: trailing bytes after the map",
         ));
     }
     Ok(out)
@@ -105,7 +112,12 @@ fn read_pending(base: &std::path::Path) -> Result<BTreeMap<String, refs::Pending
     let bytes = match std::fs::read(base.join(PENDING_FILE)) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(Error::Module(format!("forge: read pending file: {e}"))),
+        Err(e) => {
+            return Err(Error::module(
+                "pending_file_read",
+                format!("forge: read pending file: {e}"),
+            ));
+        }
     };
     decode_pending(&bytes)
 }
@@ -154,12 +166,17 @@ pub fn compact_repos(base: &std::path::Path, min_packs: usize) -> Result<usize, 
     let entries = match std::fs::read_dir(base) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(Error::Module(format!("forge: read repo base: {e}"))),
+        Err(e) => {
+            return Err(Error::module(
+                "repo_base_read",
+                format!("forge: read repo base: {e}"),
+            ));
+        }
     };
     let mut reclaimed = 0;
     for entry in entries {
         let dir = entry
-            .map_err(|e| Error::Module(format!("forge: read repo base: {e}")))?
+            .map_err(|e| Error::module("repo_base_read", format!("forge: read repo base: {e}")))?
             .path();
         let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -173,10 +190,12 @@ pub fn compact_repos(base: &std::path::Path, min_packs: usize) -> Result<usize, 
         if !is_repo || waiting {
             continue;
         }
-        let repo = git::open(&dir)
-            .map_err(|e| Error::Module(format!("forge: open repo {name:?}: {e}")))?;
-        let packs = git::compact(&repo, min_packs)
-            .map_err(|e| Error::Module(format!("forge: compact repo {name:?}: {e}")))?;
+        let repo = git::open(&dir).map_err(|e| {
+            Error::module("git_open_repo", format!("forge: open repo {name:?}: {e}"))
+        })?;
+        let packs = git::compact(&repo, min_packs).map_err(|e| {
+            Error::module("git_compact", format!("forge: compact repo {name:?}: {e}"))
+        })?;
         if packs == 0 {
             continue;
         }
@@ -211,10 +230,16 @@ pub fn build_objects(
     if !dir.join(".git").exists() {
         return Ok(None);
     }
-    let repo = git::open(&dir).map_err(|e| Error::Module(format!("forge: open {name:?}: {e}")))?;
+    let repo = git::open(&dir)
+        .map_err(|e| Error::module("git_open_repo", format!("forge: open {name:?}: {e}")))?;
     let want: git2::Oid = head.into();
     let serves_head = git::list_branches(&repo)
-        .map_err(|e| Error::Module(format!("forge: read refs of {name:?}: {e}")))?
+        .map_err(|e| {
+            Error::module(
+                "git_list_branches",
+                format!("forge: read refs of {name:?}: {e}"),
+            )
+        })?
         .iter()
         .any(|(_, oid)| *oid == want);
     if !serves_head {
@@ -232,7 +257,7 @@ pub fn build_objects(
         false => git::pack_delta(&repo, &[want], &known),
     };
     pack.map(Some)
-        .map_err(|e| Error::Module(format!("forge: pack {name:?}: {e}")))
+        .map_err(|e| Error::module("git_pack_closure", format!("forge: pack {name:?}: {e}")))
 }
 
 /// this node's own branch heads for `repo` — what a catch-up request sends as
@@ -244,9 +269,15 @@ pub fn on_disk_heads(base: &std::path::Path, repo: &str) -> Result<Vec<Oid>, Err
     if !dir.join(".git").exists() {
         return Ok(Vec::new());
     }
-    let repo = git::open(&dir).map_err(|e| Error::Module(format!("forge: open {name:?}: {e}")))?;
+    let repo = git::open(&dir)
+        .map_err(|e| Error::module("git_open_repo", format!("forge: open {name:?}: {e}")))?;
     Ok(git::list_branches(&repo)
-        .map_err(|e| Error::Module(format!("forge: read refs of {name:?}: {e}")))?
+        .map_err(|e| {
+            Error::module(
+                "git_list_branches",
+                format!("forge: read refs of {name:?}: {e}"),
+            )
+        })?
         .into_iter()
         .map(|(_, oid)| Oid::from(oid))
         .collect())
@@ -267,10 +298,18 @@ pub fn install_objects(
 ) -> Result<(), Error> {
     let name = norm_repo(repo)?;
     let repo = refs::open_or_init_repo(base, &name)?;
-    git::install_pack(&repo, pack)
-        .map_err(|e| Error::Module(format!("forge: install objects for {name:?}: {e}")))?;
-    git::verify_closure(&repo, head.into())
-        .map_err(|e| Error::Module(format!("forge: objects do not close {head}: {e}")))
+    git::install_pack(&repo, pack).map_err(|e| {
+        Error::module(
+            "git_install_pack",
+            format!("forge: install objects for {name:?}: {e}"),
+        )
+    })?;
+    git::verify_closure(&repo, head.into()).map_err(|e| {
+        Error::module(
+            "git_verify_closure",
+            format!("forge: objects do not close {head}: {e}"),
+        )
+    })
 }
 
 /// one branch a forge workspace is still waiting on.
@@ -396,17 +435,18 @@ impl Forge {
         blobs: blobstore::BlobHandle,
     ) -> Result<Self, Error> {
         let base = base_dir.into();
-        std::fs::create_dir_all(&base)
-            .map_err(|e| Error::Module(format!("forge: create base dir: {e}")))?;
+        std::fs::create_dir_all(&base).map_err(|e| {
+            Error::module("base_dir_create", format!("forge: create base dir: {e}"))
+        })?;
 
         let mut repos = BTreeMap::new();
         for entry in std::fs::read_dir(&base)
-            .map_err(|e| Error::Module(format!("forge: scan base dir: {e}")))?
+            .map_err(|e| Error::module("base_dir_read", format!("forge: scan base dir: {e}")))?
         {
-            let entry = entry.map_err(|e| Error::Module(e.to_string()))?;
+            let entry = entry.map_err(|e| Error::module("base_dir_read", e.to_string()))?;
             if !entry
                 .file_type()
-                .map_err(|e| Error::Module(e.to_string()))?
+                .map_err(|e| Error::module("base_dir_read", e.to_string()))?
                 .is_dir()
             {
                 continue;
@@ -423,8 +463,10 @@ impl Forge {
             if !dir.join(".git").exists() {
                 continue;
             }
-            let repo = git::open(&dir).map_err(|e| Error::Module(e.to_string()))?;
-            let branches = git::list_branches(&repo).map_err(|e| Error::Module(e.to_string()))?;
+            let repo =
+                git::open(&dir).map_err(|e| Error::module("git_open_repo", e.to_string()))?;
+            let branches = git::list_branches(&repo)
+                .map_err(|e| Error::module("git_list_branches", e.to_string()))?;
             let refs = branches
                 .into_iter()
                 .map(|(branch, oid)| (branch, Oid::from(oid)))
@@ -446,8 +488,12 @@ impl Forge {
         // wrong root and fork this node at its first root-hash check anyway.
         let tracker_path = base.join(TRACKER_FILE);
         let tracker = if tracker_path.exists() {
-            let bytes = std::fs::read(&tracker_path)
-                .map_err(|e| Error::Module(format!("forge: read tracker file: {e}")))?;
+            let bytes = std::fs::read(&tracker_path).map_err(|e| {
+                Error::module(
+                    "tracker_file_read",
+                    format!("forge: read tracker file: {e}"),
+                )
+            })?;
             Tracker::decode(&bytes)?
         } else {
             Tracker::default()
@@ -507,10 +553,18 @@ impl Forge {
     pub(crate) fn persist_tracker(&self) -> Result<(), Error> {
         let path = self.base.join(TRACKER_FILE);
         let tmp = self.base.join(".tracker.bin.tmp");
-        std::fs::write(&tmp, self.state.tracker.canonical_bytes())
-            .map_err(|e| Error::Module(format!("forge: write tracker file: {e}")))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| Error::Module(format!("forge: publish tracker file: {e}")))?;
+        std::fs::write(&tmp, self.state.tracker.canonical_bytes()).map_err(|e| {
+            Error::module(
+                "tracker_file_write",
+                format!("forge: write tracker file: {e}"),
+            )
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            Error::module(
+                "tracker_file_write",
+                format!("forge: publish tracker file: {e}"),
+            )
+        })?;
         Ok(())
     }
 
@@ -531,14 +585,22 @@ impl Forge {
             return match std::fs::remove_file(&path) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(Error::Module(format!("forge: clear stuck file: {e}"))),
+                Err(e) => Err(Error::module(
+                    "stuck_file_write",
+                    format!("forge: clear stuck file: {e}"),
+                )),
             };
         }
         let tmp = self.base.join(".stuck.txt.tmp");
-        std::fs::write(&tmp, &out)
-            .map_err(|e| Error::Module(format!("forge: write stuck file: {e}")))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| Error::Module(format!("forge: publish stuck file: {e}")))?;
+        std::fs::write(&tmp, &out).map_err(|e| {
+            Error::module("stuck_file_write", format!("forge: write stuck file: {e}"))
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            Error::module(
+                "stuck_file_write",
+                format!("forge: publish stuck file: {e}"),
+            )
+        })?;
         Ok(())
     }
 
@@ -559,7 +621,10 @@ impl Forge {
             return match std::fs::remove_file(&path) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(Error::Module(format!("forge: clear pending file: {e}"))),
+                Err(e) => Err(Error::module(
+                    "pending_file_write",
+                    format!("forge: clear pending file: {e}"),
+                )),
             };
         }
         let mut out = FORGE_PENDING_MAGIC.to_vec();
@@ -569,10 +634,18 @@ impl Forge {
             refs::put_pending(&mut out, pending);
         }
         let tmp = self.base.join(".pending.bin.tmp");
-        std::fs::write(&tmp, &out)
-            .map_err(|e| Error::Module(format!("forge: write pending file: {e}")))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| Error::Module(format!("forge: publish pending file: {e}")))?;
+        std::fs::write(&tmp, &out).map_err(|e| {
+            Error::module(
+                "pending_file_write",
+                format!("forge: write pending file: {e}"),
+            )
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            Error::module(
+                "pending_file_write",
+                format!("forge: publish pending file: {e}"),
+            )
+        })?;
         Ok(())
     }
 
@@ -784,7 +857,7 @@ mod tests {
 
     fn query_reply(forge: &Forge, query: ForgeQuery) -> Result<ForgeReply, Error> {
         let bytes = futures::executor::block_on(forge.query(&encode_query(&query)))?;
-        decode_reply(&bytes).map_err(Error::Module)
+        decode_reply(&bytes).map_err(|e| Error::module("codec", e))
     }
 
     /// Test-fixture plumbing only: put real objects and a ref directly on disk
@@ -1009,7 +1082,10 @@ mod tests {
         .unwrap();
         assert_eq!(result.patch, "");
         assert!(!result.truncated);
-        assert_eq!((result.files_changed, result.additions, result.deletions), (0, 0, 0));
+        assert_eq!(
+            (result.files_changed, result.additions, result.deletions),
+            (0, 0, 0)
+        );
         assert!(result.files.is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1103,7 +1179,10 @@ mod tests {
         // the index carries every one of them, ordered by path, and the
         // preflight's shapes survive into it.
         assert_eq!(
-            diff.files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            diff.files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
             paths
         );
         let status_of = |path: &str| {
@@ -1112,7 +1191,10 @@ mod tests {
                 .find(|file| file.path == path)
                 .map(|file| file.status)
         };
-        assert_eq!(status_of("added.txt"), Some(git_primitives::GitFileStatus::Added));
+        assert_eq!(
+            status_of("added.txt"),
+            Some(git_primitives::GitFileStatus::Added)
+        );
         assert_eq!(
             status_of("removed.txt"),
             Some(git_primitives::GitFileStatus::Deleted)
@@ -1313,7 +1395,10 @@ mod tests {
         };
         // the index is COMPLETE: both paths, ordered by path.
         assert_eq!(
-            diff.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            diff.files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
             ["huge.bin", "small.txt"]
         );
         assert_eq!(diff.files_changed, 2);
@@ -1417,16 +1502,15 @@ mod tests {
     }
 
     fn history_of(forge: &Forge, path: &str, after: &str, limit: u64) -> CommitPage {
-        let bytes = futures::executor::block_on(forge.query(&encode_query(
-            &ForgeQuery::ListCommits {
+        let bytes =
+            futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::ListCommits {
                 repo: "demo".into(),
                 rev: String::new(),
                 path: path.into(),
                 after: after.into(),
                 limit,
-            },
-        )))
-        .expect("a history page");
+            })))
+            .expect("a history page");
         let ForgeReply::Commits(page) = decode_reply(&bytes).unwrap() else {
             panic!("expected a Commits reply");
         };
@@ -1522,18 +1606,17 @@ mod tests {
     fn a_cursor_off_the_walked_chain_is_refused_rather_than_read() {
         let base = tmp_base("history-bad-cursor");
         let forge = five_commits(&base);
-        let err = futures::executor::block_on(forge.query(&encode_query(
-            &ForgeQuery::ListCommits {
+        let err =
+            futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::ListCommits {
                 repo: "demo".into(),
                 rev: String::new(),
                 path: String::new(),
                 // a syntactically valid oid that is not on this history.
                 after: "0".repeat(40),
                 limit: 2,
-            },
-        )))
-        .unwrap_err()
-        .to_string();
+            })))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("is not on the first-parent chain"), "{err}");
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1567,7 +1650,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["shared.txt"]
         );
-        assert!(commit.diff.patch.contains("body 5"), "{}", commit.diff.patch);
+        assert!(
+            commit.diff.patch.contains("body 5"),
+            "{}",
+            commit.diff.patch
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1607,7 +1694,10 @@ mod tests {
             .commits
             .pop()
             .expect("the oldest commit on the page");
-        assert!(root.parents.is_empty(), "the fixture's only commit is a root");
+        assert!(
+            root.parents.is_empty(),
+            "the fixture's only commit is a root"
+        );
 
         let bytes = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::Commit {
             repo: "demo".into(),
@@ -1619,12 +1709,21 @@ mod tests {
         };
 
         assert_eq!(
-            commit.diff.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            commit
+                .diff
+                .files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
             ["a.txt", "b.txt"],
             "the root commit's whole tree, not an empty diff"
         );
         assert!(
-            commit.diff.files.iter().all(|f| f.status == FileStatus::Added),
+            commit
+                .diff
+                .files
+                .iter()
+                .all(|f| f.status == FileStatus::Added),
             "against nothing, every path is an addition: {:?}",
             commit.diff.files,
         );
@@ -1807,7 +1906,8 @@ mod tests {
             &signed(ALICE, vec![main_to(Some('b'), 'c')]),
         );
         let refused_stale = signed(ALICE, vec![main_to(Some('b'), 'd')]);
-        assert!(refused(&mut forge, 9, &refused_stale).contains("non-fast-forward"));
+        // the CAS names its own class: the token, not a prefix on the sentence.
+        assert!(refused(&mut forge, 9, &refused_stale).contains("non_fast_forward"));
     }
 
     // #1773: forge learns its own chain id through the genesis-config seam

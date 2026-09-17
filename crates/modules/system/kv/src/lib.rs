@@ -95,16 +95,22 @@ impl Kv {
     /// (see [`MAX_KEY_LEN`] / [`MAX_VALUE_LEN`] for the cap rationale).
     fn check_write_caps(key: &[u8], value: &[u8]) -> Result<(), Error> {
         if key.len() > MAX_KEY_LEN {
-            return Err(Error::Module(format!(
-                "key too large: {} bytes exceeds the {MAX_KEY_LEN}-byte cap",
-                key.len()
-            )));
+            return Err(Error::module(
+                "key_too_large",
+                format!(
+                    "key too large: {} bytes exceeds the {MAX_KEY_LEN}-byte cap",
+                    key.len()
+                ),
+            ));
         }
         if value.len() > MAX_VALUE_LEN {
-            return Err(Error::Module(format!(
-                "value too large: {} bytes exceeds the {MAX_VALUE_LEN}-byte cap",
-                value.len()
-            )));
+            return Err(Error::module(
+                "value_too_large",
+                format!(
+                    "value too large: {} bytes exceeds the {MAX_VALUE_LEN}-byte cap",
+                    value.len()
+                ),
+            ));
         }
         Ok(())
     }
@@ -160,7 +166,7 @@ impl Module for Kv {
     /// this is replay-safe across validators. an over-cap key/value is rejected
     /// here (write time), never staged, never committed — see [`MAX_VALUE_LEN`].
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        match crate::decode(&msg.payload).map_err(Error::Module)? {
+        match crate::decode(&msg.payload).map_err(|e| Error::module("codec", e))? {
             crate::KvMsg::Set { key, value } => self.stage(key, value),
         }
     }
@@ -169,7 +175,7 @@ impl Module for Kv {
     /// serves STAGED-over-committed via `get`, so cross-module reads within a
     /// block observe this block's staged writes.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        match crate::decode_query(req).map_err(Error::Module)? {
+        match crate::decode_query(req).map_err(|e| Error::module("codec", e))? {
             crate::KvQuery::Get { key } => Ok(crate::encode_reply(&crate::KvReply::Value(
                 self.get(&key).await,
             ))),
@@ -319,7 +325,7 @@ mod tests {
                 .await
                 .expect_err("over-cap value must be rejected");
             assert!(
-                matches!(err, Error::Module(ref m) if m.contains("value too large")),
+                matches!(err, Error::Module { ref reason, .. } if reason == "value_too_large"),
                 "unexpected error: {err:?}"
             );
 
@@ -339,16 +345,13 @@ mod tests {
                 .await
                 .expect_err("over-cap key must be rejected");
             assert!(
-                matches!(err, Error::Module(ref m) if m.contains("key too large")),
+                matches!(err, Error::Module { ref reason, .. } if reason == "key_too_large"),
                 "unexpected error: {err:?}"
             );
 
             // the rejects happened BEFORE staging: no overlay entry, and a commit
             // is a no-op that leaves the root byte-identical.
-            assert!(
-                kv.staged.is_empty(),
-                "a rejected write must not be staged"
-            );
+            assert!(kv.staged.is_empty(), "a rejected write must not be staged");
             kv.commit_block().await.expect("commit");
             assert_eq!(kv.root(), r0, "a rejected write must not move the root");
 
@@ -359,7 +362,7 @@ mod tests {
                 .await
                 .expect_err("over-cap set must be rejected");
             assert!(
-                matches!(err, Error::Module(ref m) if m.contains("value too large")),
+                matches!(err, Error::Module { ref reason, .. } if reason == "value_too_large"),
                 "unexpected error: {err:?}"
             );
             assert_eq!(kv.root(), r0, "a rejected set must not move the root");

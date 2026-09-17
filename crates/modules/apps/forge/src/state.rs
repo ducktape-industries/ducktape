@@ -116,10 +116,13 @@ pub fn compose_state_root<'a>(
 /// deterministic module error naming the field on any other length.
 fn parse_oid(bytes: &[u8], field: &str) -> Result<Oid, Error> {
     if bytes.len() != OID_RAW_LEN {
-        return Err(Error::Module(format!(
-            "forge: {field} must be {OID_RAW_LEN} bytes, got {}",
-            bytes.len()
-        )));
+        return Err(Error::module(
+            "bad_oid",
+            format!(
+                "forge: {field} must be {OID_RAW_LEN} bytes, got {}",
+                bytes.len()
+            ),
+        ));
     }
     Oid::from_bytes(bytes)
 }
@@ -127,24 +130,25 @@ fn parse_oid(bytes: &[u8], field: &str) -> Result<Oid, Error> {
 /// parse a 32-byte pack digest from raw wire bytes.
 fn parse_digest(bytes: &[u8]) -> Result<[u8; 32], Error> {
     bytes.try_into().map_err(|_| {
-        Error::Module(format!(
-            "forge: pack_digest must be 32 bytes, got {}",
-            bytes.len()
-        ))
+        Error::module(
+            "bad_pack_digest",
+            format!("forge: pack_digest must be 32 bytes, got {}", bytes.len()),
+        )
     })
 }
 
 /// parse a 64-char sha256 hex digest (the app-facing MergePr lane).
 fn parse_hex_digest(s: &str) -> Result<[u8; 32], Error> {
     if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(Error::Module(
-            "forge: pack_digest must be 64 hex chars".into(),
+        return Err(Error::module(
+            "bad_pack_digest",
+            "forge: pack_digest must be 64 hex chars",
         ));
     }
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
-            .map_err(|e| Error::Module(e.to_string()))?;
+            .map_err(|e| Error::module("bad_pack_digest", e.to_string()))?;
     }
     Ok(out)
 }
@@ -179,9 +183,13 @@ fn stage_updates(
     // net effect. the branch map IS the count — no counter to persist.
     let live_branches = state.published_refs().len();
     if live_branches > MAX_BRANCHES_PER_REPO {
-        return Err(Error::Module(format!(
-            "forge: repo is at its branch cap ({MAX_BRANCHES_PER_REPO}); delete a branch first"
-        )));
+        return Err(Error::module(
+            "branch_cap",
+            format!(
+                "forge: repo is at its branch cap ({MAX_BRANCHES_PER_REPO}); \
+                 delete a branch first"
+            ),
+        ));
     }
     Ok(())
 }
@@ -272,7 +280,7 @@ impl ForgeState {
         attribution_target: Option<&str>,
         chain_id: &str,
     ) -> Result<(), Error> {
-        let msg = decode_msg(payload).map_err(Error::Module)?;
+        let msg = decode_msg(payload).map_err(|e| Error::module("codec", e))?;
         let party = match &msg {
             ForgeMsg::PushRefs {
                 repo,
@@ -354,22 +362,25 @@ impl ForgeState {
                 norm_branch(&source_branch)?;
                 norm_branch(&target)?;
                 if source_branch == target {
-                    return Err(Error::Module(
-                        "forge: a pull request needs distinct source and target branches".into(),
+                    return Err(Error::module(
+                        "bad_pull_request",
+                        "forge: a pull request needs distinct source and target branches",
                     ));
                 }
                 // both branches must be BORN in committed state — a PR from a
                 // branch nobody pushed is meaningless, and the checks read
                 // agreed state only.
-                let state = self
-                    .repos
-                    .get(&name)
-                    .ok_or_else(|| Error::Module(format!("forge: no repo {name:?}")))?;
+                let state = self.repos.get(&name).ok_or_else(|| {
+                    Error::module("unknown_repo", format!("forge: no repo {name:?}"))
+                })?;
                 for (label, branch) in [("source", &source_branch), ("target", &target)] {
                     if !state.refs.contains_key(branch.as_str()) {
-                        return Err(Error::Module(format!(
-                            "forge: {label} branch {branch:?} is not born in repo {name:?}"
-                        )));
+                        return Err(Error::module(
+                            "unborn_branch",
+                            format!(
+                                "forge: {label} branch {branch:?} is not born in repo {name:?}"
+                            ),
+                        ));
                     }
                 }
                 let number = self.staged_tracker_mut().open_item(
@@ -441,13 +452,13 @@ impl ForgeState {
                 // under the merger, and the merge must have been computed
                 // against the CURRENT source head (a force-push between compute
                 // and submit rejects deterministically).
-                let state = self
-                    .repos
-                    .get_mut(&name)
-                    .ok_or_else(|| Error::Module(format!("forge: no repo {name:?}")))?;
+                let state = self.repos.get_mut(&name).ok_or_else(|| {
+                    Error::module("unknown_repo", format!("forge: no repo {name:?}"))
+                })?;
                 if state.refs.get(&source).copied() != Some(expected_source) {
-                    return Err(Error::Module(
-                        "forge: pull request source branch moved; recompute the merge".into(),
+                    return Err(Error::module(
+                        "source_branch_moved",
+                        "forge: pull request source branch moved; recompute the merge",
                     ));
                 }
                 state.stage_update(&target, Some(prev_target), Some(merge), Some(digest))?;
@@ -527,18 +538,22 @@ impl ForgeState {
             Err(Error::UnknownModule(_) | Error::QueryUnsupported) => return Ok(None),
             Err(other) => return Err(other),
         };
-        match identity::decode_reply(&reply).map_err(Error::Module)? {
+        match identity::decode_reply(&reply)
+            .map_err(|e| Error::module("identity_reply_decode", e))?
+        {
             IdentityReply::Account(account) => Ok(account.map(|a| a.number)),
-            other => Err(Error::Module(format!(
-                "forge: identity answered an account query with {other:?}"
-            ))),
+            other => Err(Error::module(
+                "unexpected_identity_reply",
+                format!("forge: identity answered an account query with {other:?}"),
+            )),
         }
     }
 
     async fn party_of_key(ctx: &dyn Ctx, key: Vec<u8>) -> Result<Party, Error> {
         if key.is_empty() {
-            return Err(Error::Module(
-                "forge: operations require an authenticated origin".into(),
+            return Err(Error::module(
+                "external_origin_required",
+                "forge: operations require an authenticated origin",
             ));
         }
         let account = Self::identity_account(ctx, &key).await?;
@@ -551,8 +566,9 @@ impl ForgeState {
             Origin::External(key) => Self::party_of_key(ctx, key.clone()).await,
             Origin::Program(account) => Ok(Party::Account(*account)),
             Origin::Module(module) => Ok(Party::Module(module.clone())),
-            Origin::System => Err(Error::Module(
-                "forge: tracker ops require an authenticated origin".into(),
+            Origin::System => Err(Error::module(
+                "external_origin_required",
+                "forge: tracker ops require an authenticated origin",
             )),
         }
     }
@@ -560,8 +576,9 @@ impl ForgeState {
     async fn ref_party(ctx: &dyn Ctx) -> Result<Party, Error> {
         match &ctx.env().origin {
             Origin::External(_) | Origin::Program(_) => Self::party_of_origin(ctx).await,
-            Origin::Module(_) | Origin::System => Err(Error::Module(
-                "forge: a ref-moving op requires an authenticated person".into(),
+            Origin::Module(_) | Origin::System => Err(Error::module(
+                "external_origin_required",
+                "forge: a ref-moving op requires an authenticated person",
             )),
         }
     }
@@ -579,7 +596,7 @@ impl ForgeState {
             return Self::ref_party(ctx).await;
         };
         let signer = crate::pushcert::signer(cert, chain_id, repo, updates)
-            .map_err(|reason| Error::Module(format!("forge: {reason}")))?;
+            .map_err(|reason| Error::module("bad_push_cert", format!("forge: {reason}")))?;
         Self::party_of_key(ctx, signer).await
     }
 
@@ -600,28 +617,35 @@ impl ForgeState {
         pack_digest: Option<Vec<u8>>,
     ) -> Result<(), Error> {
         if updates.is_empty() {
-            return Err(Error::Module("forge: push carries no ref updates".into()));
+            return Err(Error::module(
+                "empty_push",
+                "forge: push carries no ref updates",
+            ));
         }
         if updates.len() > MAX_REFS_PER_PUSH {
-            return Err(Error::Module(format!(
-                "forge: too many ref updates ({}, max {MAX_REFS_PER_PUSH})",
-                updates.len()
-            )));
+            return Err(Error::module(
+                "push_cap",
+                format!(
+                    "forge: too many ref updates ({}, max {MAX_REFS_PER_PUSH})",
+                    updates.len()
+                ),
+            ));
         }
         let mut seen = BTreeSet::new();
         for u in &updates {
             norm_branch(&u.ref_name)?;
             if !seen.insert(u.ref_name.as_str()) {
-                return Err(Error::Module(format!(
-                    "forge: duplicate ref update for branch {:?}",
-                    u.ref_name
-                )));
+                return Err(Error::module(
+                    "duplicate_ref_update",
+                    format!("forge: duplicate ref update for branch {:?}", u.ref_name),
+                ));
             }
         }
         let digest = pack_digest.as_deref().map(parse_digest).transpose()?;
         if updates.iter().any(|u| u.new_oid.is_some()) && digest.is_none() {
-            return Err(Error::Module(
-                "forge: a push that sets heads needs a pack_digest".into(),
+            return Err(Error::module(
+                "missing_pack_digest",
+                "forge: a push that sets heads needs a pack_digest",
             ));
         }
 
@@ -721,7 +745,9 @@ impl ForgeState {
             .tracker_view()
             .source_revision
             .checked_add(1)
-            .ok_or_else(|| Error::Module("forge: source revision exhausted".into()))?;
+            .ok_or_else(|| {
+                Error::module("revision_exhausted", "forge: source revision exhausted")
+            })?;
         self.staged_tracker_mut().source_revision = revision;
         let updates = reports
             .into_iter()
@@ -871,10 +897,13 @@ impl ForgeState {
                 .and_then(|refs| refs.get(&target.branch))
                 .copied();
             if image_head != Some(target.head) {
-                return Err(Error::Module(format!(
-                    "forge: ref target {}/{} names head {} but the image commits {:?}",
-                    target.repo, target.branch, target.head, image_head
-                )));
+                return Err(Error::module(
+                    "ref_target_mismatch",
+                    format!(
+                        "forge: ref target {}/{} names head {} but the image commits {:?}",
+                        target.repo, target.branch, target.head, image_head
+                    ),
+                ));
             }
             fates
                 .entry(target.repo)
@@ -899,9 +928,10 @@ impl ForgeState {
                         .get(name)
                         .is_some_and(|repo| repo.contains_key(branch));
                 if moved_without_target {
-                    return Err(Error::Module(format!(
-                        "forge: image moves {name}/{branch} without a ref target"
-                    )));
+                    return Err(Error::module(
+                        "missing_ref_target",
+                        format!("forge: image moves {name}/{branch} without a ref target"),
+                    ));
                 }
             }
         }
@@ -915,9 +945,10 @@ impl ForgeState {
                         .get(name)
                         .is_some_and(|repo| repo.contains_key(branch));
                 if born_without_target {
-                    return Err(Error::Module(format!(
-                        "forge: image births {name}/{branch} without a ref target"
-                    )));
+                    return Err(Error::module(
+                        "missing_ref_target",
+                        format!("forge: image births {name}/{branch} without a ref target"),
+                    ));
                 }
             }
         }
@@ -973,7 +1004,7 @@ pub fn encode_image<'a>(
 pub fn decode_image(bytes: &[u8]) -> Result<Image, Error> {
     let body = bytes
         .strip_prefix(IMAGE_MAGIC.as_slice())
-        .ok_or_else(|| Error::Module("forge image: missing the FGI1 magic".into()))?;
+        .ok_or_else(|| Error::module("image_decode", "forge image: missing the FGI1 magic"))?;
     let mut r = Reader::new(body);
     let count = r.u32()?;
     let mut repos = BTreeMap::new();
@@ -981,9 +1012,10 @@ pub fn decode_image(bytes: &[u8]) -> Result<Image, Error> {
         let name = norm_repo(&r.str_()?)?;
         let ref_count = r.u32()?;
         if ref_count == 0 {
-            return Err(Error::Module(format!(
-                "forge image: repo {name} carries no branches"
-            )));
+            return Err(Error::module(
+                "image_decode",
+                format!("forge image: repo {name} carries no branches"),
+            ));
         }
         let mut refs = BTreeMap::new();
         for _ in 0..ref_count {
@@ -991,25 +1023,31 @@ pub fn decode_image(bytes: &[u8]) -> Result<Image, Error> {
             norm_branch(&branch)?;
             let oid = Oid::from_bytes(r.take(OID_RAW_LEN)?)?;
             if oid.is_zero() {
-                return Err(Error::Module(format!(
-                    "forge image: branch {branch} of {name} carries a zero oid"
-                )));
+                return Err(Error::module(
+                    "image_decode",
+                    format!("forge image: branch {branch} of {name} carries a zero oid"),
+                ));
             }
             if refs.insert(branch, oid).is_some() {
-                return Err(Error::Module(format!(
-                    "forge image: duplicate branch in repo {name}"
-                )));
+                return Err(Error::module(
+                    "image_decode",
+                    format!("forge image: duplicate branch in repo {name}"),
+                ));
             }
         }
         if repos.insert(name.clone(), refs).is_some() {
-            return Err(Error::Module(format!("forge image: duplicate repo {name}")));
+            return Err(Error::module(
+                "image_decode",
+                format!("forge image: duplicate repo {name}"),
+            ));
         }
     }
     let tracker_len = r.u32()? as usize;
     let tracker = Tracker::decode(r.take(tracker_len)?)?;
     if !r.done() {
-        return Err(Error::Module(
-            "forge image: trailing bytes after the container".into(),
+        return Err(Error::module(
+            "image_decode",
+            "forge image: trailing bytes after the container",
         ));
     }
     Ok(Image { repos, tracker })
@@ -1058,7 +1096,12 @@ pub fn encode_block_scratch(scratch: &BlockScratch) -> Vec<u8> {
 pub fn decode_block_scratch(bytes: &[u8]) -> Result<BlockScratch, Error> {
     let body = bytes
         .strip_prefix(BLOCK_SCRATCH_MAGIC.as_slice())
-        .ok_or_else(|| Error::Module("forge block scratch: missing the FGB1 magic".into()))?;
+        .ok_or_else(|| {
+            Error::module(
+                "scratch_decode",
+                "forge block scratch: missing the FGB1 magic",
+            )
+        })?;
     let mut r = Reader::new(body);
     let count = r.u32()?;
     let mut scratch = BlockScratch::new();
@@ -1073,9 +1116,10 @@ pub fn decode_block_scratch(bytes: &[u8]) -> Result<BlockScratch, Error> {
                 0 => None,
                 1 => Some(Oid::from_bytes(r.take(OID_RAW_LEN)?)?),
                 t => {
-                    return Err(Error::Module(format!(
-                        "forge block scratch: bad prev tag {t}"
-                    )));
+                    return Err(Error::module(
+                        "scratch_decode",
+                        format!("forge block scratch: bad prev tag {t}"),
+                    ));
                 }
             };
             let fate = match r.u8()? {
@@ -1089,26 +1133,30 @@ pub fn decode_block_scratch(bytes: &[u8]) -> Result<BlockScratch, Error> {
                     StagedRef::Packed(oid, digest)
                 }
                 t => {
-                    return Err(Error::Module(format!(
-                        "forge block scratch: bad fate tag {t}"
-                    )));
+                    return Err(Error::module(
+                        "scratch_decode",
+                        format!("forge block scratch: bad fate tag {t}"),
+                    ));
                 }
             };
             if fates.insert(branch, (prev, fate)).is_some() {
-                return Err(Error::Module(format!(
-                    "forge block scratch: duplicate branch in repo {name}"
-                )));
+                return Err(Error::module(
+                    "scratch_decode",
+                    format!("forge block scratch: duplicate branch in repo {name}"),
+                ));
             }
         }
         if scratch.insert(name.clone(), fates).is_some() {
-            return Err(Error::Module(format!(
-                "forge block scratch: duplicate repo {name}"
-            )));
+            return Err(Error::module(
+                "scratch_decode",
+                format!("forge block scratch: duplicate repo {name}"),
+            ));
         }
     }
     if !r.done() {
-        return Err(Error::Module(
-            "forge block scratch: trailing bytes after the container".into(),
+        return Err(Error::module(
+            "scratch_decode",
+            "forge block scratch: trailing bytes after the container",
         ));
     }
     Ok(scratch)
@@ -1148,8 +1196,9 @@ pub fn decode_ref_target(bytes: &[u8]) -> Result<RefTarget, Error> {
         .try_into()
         .expect("take(32) yields exactly 32 bytes");
     if !r.done() {
-        return Err(Error::Module(
-            "forge ref target: trailing bytes after the record".into(),
+        return Err(Error::module(
+            "ref_target_decode",
+            "forge ref target: trailing bytes after the record",
         ));
     }
     Ok(RefTarget {

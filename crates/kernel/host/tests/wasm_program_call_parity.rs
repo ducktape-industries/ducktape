@@ -46,7 +46,9 @@ impl Module for Executor {
                 });
                 Ok(())
             }
-            Origin::Program(_) | Origin::System => Err(Error::Module("unexpected origin".into())),
+            Origin::Program(_) | Origin::System => {
+                Err(Error::module("unexpected_origin", "unexpected origin"))
+            }
         }
     }
 }
@@ -76,7 +78,7 @@ impl Module for Native {
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         assert_eq!(ctx.env().origin, Origin::Program(PROGRAM));
         match msg.payload.as_slice() {
-            b"module-error" => return Err(Error::Module("explicit refusal".into())),
+            b"module-error" => return Err(Error::module("explicit_refusal", "explicit refusal")),
             b"self-query" => return ctx.query("hello", b"").await.map(|_| ()),
             b"missing-query" => return ctx.query("missing", b"").await.map(|_| ()),
             _ => {}
@@ -92,7 +94,7 @@ impl Module for Native {
             }
             b"output-cap-then-error" => {
                 ctx.set_output(vec![0; sdk::MAX_OUTPUT_BYTES + 1]);
-                return Err(Error::Module("explicit refusal".into()));
+                return Err(Error::module("explicit_refusal", "explicit refusal"));
             }
             b"assigned-cap" => ctx.set_assigned(vec![0; sdk::MAX_ASSIGNED_BYTES + 1]),
             b"declarations-valid" => {

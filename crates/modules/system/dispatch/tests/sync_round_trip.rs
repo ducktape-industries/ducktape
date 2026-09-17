@@ -59,9 +59,10 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
 /// executed by `runs`, which a `Call` is admitted against.
 fn requester_ctx(height: u64) -> TestCtx {
     ctx(height, Origin::Module(RUNS.into())).on_query(IDENTITY, |req| {
-        let IdentityQuery::Get { number } = identity::decode_query(req).map_err(Error::Module)?
+        let IdentityQuery::Get { number } =
+            identity::decode_query(req).map_err(|e| Error::module("codec", e))?
         else {
-            return Err(Error::Module("only Get is served here".into()));
+            return Err(Error::module("only_get_served", "only Get is served here"));
         };
         let account = (number == PROGRAM).then(|| AccountView {
             number,

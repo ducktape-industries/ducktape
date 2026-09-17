@@ -404,7 +404,7 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
         .await
         .expect_err("a 3-byte code_hash must be refused at the door");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("code_hash")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "bad_code_hash"),
             "got {err:?}"
         );
         assert_eq!(proposal_status(&host, "mod-short").await, None);
@@ -441,7 +441,7 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
         .await
         .expect_err("no code registry wired: refused at the door");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("registry")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "no_code_registry"),
             "got {err:?}"
         );
     });
@@ -474,7 +474,7 @@ fn door_check_refuses_a_lead_too_short_to_ever_schedule() {
         .await
         .expect_err("a lead at the registry's own floor can never schedule");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("activation_lead")),
+            matches!(err, SubmitError::Rejected(Error::Module { ref reason, .. }) if reason == "bad_activation_lead"),
             "got {err:?}"
         );
         assert_eq!(proposal_status(&host, "mod-short-lead").await, None);

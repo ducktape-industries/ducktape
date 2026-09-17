@@ -404,13 +404,22 @@ async fn reject_roundtrip(
         .submit_at(block(height, origin), m)
         .await
         .expect_err("wasm must reject");
-    let SubmitError::Rejected(Error::Module(n_msg)) = n_err else {
+    let SubmitError::Rejected(Error::Module {
+        reason: n_reason,
+        sentence: n_msg,
+    }) = n_err
+    else {
         panic!("native rejection shape: {n_err:?}");
     };
-    let SubmitError::Rejected(Error::Module(w_msg)) = w_err else {
+    let SubmitError::Rejected(Error::Module {
+        reason: w_reason,
+        sentence: w_msg,
+    }) = w_err
+    else {
         panic!("wasm rejection shape: {w_err:?}");
     };
     assert!(n_msg.contains(needle), "native reason: {n_msg}");
+    assert_eq!(n_reason, w_reason, "wasm token must match the native token");
     assert!(
         w_msg.contains(needle),
         "wasm reason must carry the native reason: {w_msg}"

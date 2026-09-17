@@ -125,17 +125,20 @@ pub struct Tracker {
 
 fn check_len(field: &str, s: &str, max: usize) -> Result<(), Error> {
     if s.len() > max {
-        return Err(Error::Module(format!(
-            "forge: {field} too long ({} bytes, max {max})",
-            s.len()
-        )));
+        return Err(Error::module(
+            "too_long",
+            format!("forge: {field} too long ({} bytes, max {max})", s.len()),
+        ));
     }
     Ok(())
 }
 
 fn check_title(title: &str) -> Result<(), Error> {
     if title.trim().is_empty() {
-        return Err(Error::Module("forge: title must not be empty".into()));
+        return Err(Error::module(
+            "empty_title",
+            "forge: title must not be empty",
+        ));
     }
     check_len("title", title, MAX_TITLE_BYTES)
 }
@@ -144,10 +147,10 @@ fn check_title(title: &str) -> Result<(), Error> {
 /// deterministically.
 pub fn parse_hex_oid(s: &str, field: &str) -> Result<Oid, Error> {
     if s.len() != 40 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(Error::Module(format!(
-            "forge: {field} must be 40 hex chars, got {:?}",
-            s.len()
-        )));
+        return Err(Error::module(
+            "bad_oid",
+            format!("forge: {field} must be 40 hex chars, got {:?}", s.len()),
+        ));
     }
     Oid::from_hex(&s.to_ascii_lowercase())
 }
@@ -157,17 +160,23 @@ pub fn parse_hex_oid(s: &str, field: &str) -> Result<Oid, Error> {
 /// author's share of it) read as one decision at every call site.
 fn require_open_slot(rt: &RepoTracker, author: &Party, repo: &str) -> Result<(), Error> {
     if rt.open_count as usize >= MAX_OPEN_ITEMS_PER_REPO {
-        return Err(Error::Module(format!(
-            "forge: repo {repo:?} is at its open-item cap ({MAX_OPEN_ITEMS_PER_REPO}); close or \
-             merge one first"
-        )));
+        return Err(Error::module(
+            "repo_open_item_cap",
+            format!(
+                "forge: repo {repo:?} is at its open-item cap ({MAX_OPEN_ITEMS_PER_REPO}); close \
+                 or merge one first"
+            ),
+        ));
     }
     let actor_open = rt.open_by_author.get(author).copied().unwrap_or(0);
     if actor_open as usize >= MAX_OPEN_ITEMS_PER_ACTOR {
-        return Err(Error::Module(format!(
-            "forge: you already have {MAX_OPEN_ITEMS_PER_ACTOR} open items in repo {repo:?}; \
-             close or merge one first"
-        )));
+        return Err(Error::module(
+            "author_open_item_cap",
+            format!(
+                "forge: you already have {MAX_OPEN_ITEMS_PER_ACTOR} open items in repo {repo:?}; \
+                 close or merge one first"
+            ),
+        ));
     }
     Ok(())
 }
@@ -205,14 +214,24 @@ impl Tracker {
         self.repos
             .get(repo)
             .and_then(|r| r.items.get(&number))
-            .ok_or_else(|| Error::Module(format!("forge: no item #{number} in repo {repo}")))
+            .ok_or_else(|| {
+                Error::module(
+                    "no_such_item",
+                    format!("forge: no item #{number} in repo {repo}"),
+                )
+            })
     }
 
     fn item_mut(&mut self, repo: &str, number: u64) -> Result<&mut Item, Error> {
         self.repos
             .get_mut(repo)
             .and_then(|r| r.items.get_mut(&number))
-            .ok_or_else(|| Error::Module(format!("forge: no item #{number} in repo {repo}")))
+            .ok_or_else(|| {
+                Error::module(
+                    "no_such_item",
+                    format!("forge: no item #{number} in repo {repo}"),
+                )
+            })
     }
 
     /// open an issue or PR: assign the next number in the repo's shared space
@@ -295,20 +314,25 @@ impl Tracker {
         open: bool,
         now: u64,
     ) -> Result<Option<&'static str>, Error> {
-        let rt = self
-            .repos
-            .get_mut(repo)
-            .ok_or_else(|| Error::Module(format!("forge: no item #{number} in repo {repo}")))?;
+        let rt = self.repos.get_mut(repo).ok_or_else(|| {
+            Error::module(
+                "no_such_item",
+                format!("forge: no item #{number} in repo {repo}"),
+            )
+        })?;
         let (current_state, author) = {
-            let item = rt
-                .items
-                .get(&number)
-                .ok_or_else(|| Error::Module(format!("forge: no item #{number} in repo {repo}")))?;
+            let item = rt.items.get(&number).ok_or_else(|| {
+                Error::module(
+                    "no_such_item",
+                    format!("forge: no item #{number} in repo {repo}"),
+                )
+            })?;
             (item.state, item.author.clone())
         };
         if current_state == ItemState::Merged {
-            return Err(Error::Module(
-                "forge: a merged pull request cannot change state".into(),
+            return Err(Error::module(
+                "pr_already_merged",
+                "forge: a merged pull request cannot change state",
             ));
         }
         let target = if open {
@@ -341,23 +365,29 @@ impl Tracker {
     /// mark an open PR merged, recording the merge commit. the ref CAS (target
     /// and source head checks) is the caller's job — it owns the refs.
     pub fn merge_pr(&mut self, repo: &str, number: u64, merge: Oid, now: u64) -> Result<(), Error> {
-        let rt = self
-            .repos
-            .get_mut(repo)
-            .ok_or_else(|| Error::Module(format!("forge: no item #{number} in repo {repo}")))?;
-        let item = rt
-            .items
-            .get_mut(&number)
-            .ok_or_else(|| Error::Module(format!("forge: no item #{number} in repo {repo}")))?;
+        let rt = self.repos.get_mut(repo).ok_or_else(|| {
+            Error::module(
+                "no_such_item",
+                format!("forge: no item #{number} in repo {repo}"),
+            )
+        })?;
+        let item = rt.items.get_mut(&number).ok_or_else(|| {
+            Error::module(
+                "no_such_item",
+                format!("forge: no item #{number} in repo {repo}"),
+            )
+        })?;
         if item.kind != ItemKind::Pr {
-            return Err(Error::Module(format!(
-                "forge: item #{number} is an issue, not a pull request"
-            )));
+            return Err(Error::module(
+                "not_a_pull_request",
+                format!("forge: item #{number} is an issue, not a pull request"),
+            ));
         }
         if item.state != ItemState::Open {
-            return Err(Error::Module(format!(
-                "forge: pull request #{number} is not open"
-            )));
+            return Err(Error::module(
+                "pr_not_open",
+                format!("forge: pull request #{number} is not open"),
+            ));
         }
         item.state = ItemState::Merged;
         item.merge_oid = Some(merge);
@@ -386,36 +416,43 @@ impl Tracker {
     ) -> Result<(), Error> {
         check_len("review body", &body, MAX_BODY_BYTES)?;
         if comments.len() > MAX_REVIEW_COMMENTS {
-            return Err(Error::Module(format!(
-                "forge: too many review comments ({}, max {MAX_REVIEW_COMMENTS})",
-                comments.len()
-            )));
+            return Err(Error::module(
+                "review_comment_cap",
+                format!(
+                    "forge: too many review comments ({}, max {MAX_REVIEW_COMMENTS})",
+                    comments.len()
+                ),
+            ));
         }
         for c in &comments {
             check_len("comment path", &c.path, MAX_PATH_BYTES)?;
             check_len("comment body", &c.body, MAX_REVIEW_COMMENT_BYTES)?;
             if c.body.trim().is_empty() {
-                return Err(Error::Module(
-                    "forge: a review comment body must not be empty".into(),
+                return Err(Error::module(
+                    "empty_review_comment",
+                    "forge: a review comment body must not be empty",
                 ));
             }
         }
         if body.trim().is_empty() && comments.is_empty() {
-            return Err(Error::Module(
-                "forge: a review needs a body or at least one comment".into(),
+            return Err(Error::module(
+                "empty_review",
+                "forge: a review needs a body or at least one comment",
             ));
         }
         let commit = parse_hex_oid(commit_oid, "commit_oid")?;
         let item = self.item_mut(repo, number)?;
         if item.kind != ItemKind::Pr {
-            return Err(Error::Module(format!(
-                "forge: item #{number} is an issue, not a pull request"
-            )));
+            return Err(Error::module(
+                "not_a_pull_request",
+                format!("forge: item #{number} is an issue, not a pull request"),
+            ));
         }
         if item.reviews.len() >= MAX_REVIEWS_PER_ITEM {
-            return Err(Error::Module(format!(
-                "forge: review cap reached ({MAX_REVIEWS_PER_ITEM})"
-            )));
+            return Err(Error::module(
+                "review_cap",
+                format!("forge: review cap reached ({MAX_REVIEWS_PER_ITEM})"),
+            ));
         }
         item.reviews.push(ReviewView {
             author,
@@ -434,14 +471,16 @@ impl Tracker {
     pub fn pr_branches(&self, repo: &str, number: u64) -> Result<(String, String), Error> {
         let item = self.item(repo, number)?;
         if item.kind != ItemKind::Pr {
-            return Err(Error::Module(format!(
-                "forge: item #{number} is an issue, not a pull request"
-            )));
+            return Err(Error::module(
+                "not_a_pull_request",
+                format!("forge: item #{number} is an issue, not a pull request"),
+            ));
         }
         if item.state != ItemState::Open {
-            return Err(Error::Module(format!(
-                "forge: pull request #{number} is not open"
-            )));
+            return Err(Error::module(
+                "pr_not_open",
+                format!("forge: pull request #{number} is not open"),
+            ));
         }
         Ok((
             item.source_branch.clone().unwrap_or_default(),
@@ -496,7 +535,10 @@ impl Tracker {
         let body = bytes
             .strip_prefix(TRACKER_MAGIC.as_slice())
             .ok_or_else(|| {
-                Error::Module("forge tracker: bad magic (not a TRK1 container)".into())
+                Error::module(
+                    "tracker_decode",
+                    "forge tracker: bad magic (not a TRK1 container)",
+                )
             })?;
         let mut r = Reader::new(body);
         let source_revision = r.u64()?;
@@ -510,12 +552,16 @@ impl Tracker {
             for _ in 0..item_count {
                 let item = decode_item(&mut r)?;
                 if item.number > last_number {
-                    return Err(Error::Module(
-                        "forge tracker: item numbered past the counter".into(),
+                    return Err(Error::module(
+                        "tracker_decode",
+                        "forge tracker: item numbered past the counter",
                     ));
                 }
                 if items.insert(item.number, item).is_some() {
-                    return Err(Error::Module("forge tracker: duplicate item number".into()));
+                    return Err(Error::module(
+                        "tracker_decode",
+                        "forge tracker: duplicate item number",
+                    ));
                 }
             }
             // `open_count`/`open_by_author` are not wire fields: they are a
@@ -541,12 +587,16 @@ impl Tracker {
                 )
                 .is_some()
             {
-                return Err(Error::Module("forge tracker: duplicate repo".into()));
+                return Err(Error::module(
+                    "tracker_decode",
+                    "forge tracker: duplicate repo",
+                ));
             }
         }
         if !r.done() {
-            return Err(Error::Module(
-                "forge tracker: trailing bytes after the container".into(),
+            return Err(Error::module(
+                "tracker_decode",
+                "forge tracker: trailing bytes after the container",
             ));
         }
         Ok(Self {
@@ -583,7 +633,12 @@ fn decode_author(r: &mut Reader) -> Result<Party, Error> {
         1 => Party::Account(r.u64()?),
         2 => Party::Module(r.str_()?),
         3 => Party::System,
-        t => return Err(Error::Module(format!("forge tracker: bad author tag {t}"))),
+        t => {
+            return Err(Error::module(
+                "tracker_decode",
+                format!("forge tracker: bad author tag {t}"),
+            ));
+        }
     })
 }
 
@@ -658,7 +713,12 @@ fn decode_item(r: &mut Reader) -> Result<Item, Error> {
     let kind = match r.u8()? {
         0 => ItemKind::Issue,
         1 => ItemKind::Pr,
-        t => return Err(Error::Module(format!("forge tracker: bad kind tag {t}"))),
+        t => {
+            return Err(Error::module(
+                "tracker_decode",
+                format!("forge tracker: bad kind tag {t}"),
+            ));
+        }
     };
     let title = r.str_()?;
     let body = r.str_()?;
@@ -667,7 +727,12 @@ fn decode_item(r: &mut Reader) -> Result<Item, Error> {
         0 => ItemState::Open,
         1 => ItemState::Closed,
         2 => ItemState::Merged,
-        t => return Err(Error::Module(format!("forge tracker: bad state tag {t}"))),
+        t => {
+            return Err(Error::module(
+                "tracker_decode",
+                format!("forge tracker: bad state tag {t}"),
+            ));
+        }
     };
     let created_at = r.u64()?;
     let updated_at = r.u64()?;
@@ -693,7 +758,12 @@ fn decode_item(r: &mut Reader) -> Result<Item, Error> {
         item.merge_oid = match r.u8()? {
             0 => None,
             1 => Some(Oid::from_bytes(r.take(OID_RAW_LEN)?)?),
-            t => return Err(Error::Module(format!("forge tracker: bad merge tag {t}"))),
+            t => {
+                return Err(Error::module(
+                    "tracker_decode",
+                    format!("forge tracker: bad merge tag {t}"),
+                ));
+            }
         };
         let n_reviews = r.u32()?;
         for _ in 0..n_reviews {
@@ -702,7 +772,12 @@ fn decode_item(r: &mut Reader) -> Result<Item, Error> {
                 0 => ReviewVerdict::Approve,
                 1 => ReviewVerdict::RequestChanges,
                 2 => ReviewVerdict::Comment,
-                t => return Err(Error::Module(format!("forge tracker: bad verdict tag {t}"))),
+                t => {
+                    return Err(Error::module(
+                        "tracker_decode",
+                        format!("forge tracker: bad verdict tag {t}"),
+                    ));
+                }
             };
             let body = r.str_()?;
             let commit = Oid::from_bytes(r.take(OID_RAW_LEN)?)?;
@@ -715,7 +790,12 @@ fn decode_item(r: &mut Reader) -> Result<Item, Error> {
                 let side = match r.u8()? {
                     0 => DiffSide::Old,
                     1 => DiffSide::New,
-                    t => return Err(Error::Module(format!("forge tracker: bad side tag {t}"))),
+                    t => {
+                        return Err(Error::module(
+                            "tracker_decode",
+                            format!("forge tracker: bad side tag {t}"),
+                        ));
+                    }
                 };
                 let body = r.str_()?;
                 comments.push(ReviewComment {

@@ -342,14 +342,15 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
 /// Unknown tags, missing metadata, truncated digests and surplus proof bytes
 /// are rejected. The ordinary decoder uses this same codec and drops metadata.
 pub fn decode_frame_with_blob(bytes: &[u8]) -> Result<(Origin, Msg, Option<[u8; 32]>), Error> {
-    let parse_err = || Error::Host(sdk::Error::Module("frame does not parse".into()));
+    let parse_err = || Error::Host(sdk::Error::module("frame_decode", "frame does not parse"));
     let mut buf = bytes;
     let (tag, rest) = buf.split_first().ok_or_else(parse_err)?;
     buf = rest;
     let scheme = KeyScheme::from_tag(*tag).ok_or_else(|| {
-        Error::Host(sdk::Error::Module(format!(
-            "frame scheme tag {tag} is unknown"
-        )))
+        Error::Host(sdk::Error::module(
+            "frame_decode",
+            format!("frame scheme tag {tag} is unknown"),
+        ))
     })?;
     let origin = take_slice(&mut buf).ok_or_else(parse_err)?;
     // seq is ordering/replay metadata, consumed but not surfaced.
@@ -372,13 +373,15 @@ pub fn decode_frame_with_blob(bytes: &[u8]) -> Result<(Origin, Msg, Option<[u8; 
     };
     let preimage_len = bytes.len() - buf.len();
     if !scheme.pubkey_wellformed(origin) {
-        return Err(Error::Host(sdk::Error::Module(
-            "frame origin is malformed for its scheme".into(),
+        return Err(Error::Host(sdk::Error::module(
+            "frame_origin_malformed",
+            "frame origin is malformed for its scheme",
         )));
     }
     if !scheme.verify(origin, FRAME_NS, &bytes[..preimage_len], buf) {
-        return Err(Error::Host(sdk::Error::Module(
-            "frame proof does not bind this op to its origin".into(),
+        return Err(Error::Host(sdk::Error::module(
+            "frame_proof_unverified",
+            "frame proof does not bind this op to its origin",
         )));
     }
     Ok((
@@ -546,8 +549,9 @@ pub fn encode_batch(members: &[Vec<u8>]) -> Vec<u8> {
 /// `Err` — the drain treats a whole undecodable batch as one Rejected block.
 pub fn decode_batch(bytes: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     let corrupt = || {
-        Error::Host(sdk::Error::Module(
-            "batch super-frame does not parse".into(),
+        Error::Host(sdk::Error::module(
+            "batch_decode",
+            "batch super-frame does not parse",
         ))
     };
     let mut buf = bytes;
@@ -904,15 +908,17 @@ fn hex_root(root: &StateRoot) -> String {
     root.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// a mempool-cap refusal. the stable snake_case reason token leads the string
-/// so a submitter and a log line key on the same greppable name, and the bound
-/// it hit follows for the human reading it.
+/// a mempool-cap refusal: the stable snake_case token a submitter and a log
+/// line both key on, plus the bound it hit for the human reading it.
 fn custody_refused(reason: &str, bound: usize) -> Error {
-    Error::Host(sdk::Error::Module(format!(
-        "{reason}: this node's op mempool is at its {bound} bound — retry shortly"
-    )))
+    Error::Host(sdk::Error::module(
+        reason,
+        format!("this node's op mempool is at its {bound} bound — retry shortly"),
+    ))
 }
 
+/// unwrap the host's `Module(<reason>: <sentence>)` Display back to the FRAMED
+/// refusal, so the receipt lane can split it into a token and a sentence.
 fn member_reason(reason: String) -> String {
     match reason
         .strip_prefix("Module(")
@@ -1576,10 +1582,13 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         // journaled, proposed, or held in custody for it. guards the relay
         // entry too — a resident's over-cap frame must not panic its relay.
         if frame.len() > MAX_FRAME_BYTES {
-            return Err(Error::Host(sdk::Error::Module(format!(
-                "op frame is {} bytes, over the {MAX_FRAME_BYTES}-byte cap — split the payload",
-                frame.len()
-            ))));
+            return Err(Error::Host(sdk::Error::module(
+                "frame_too_large",
+                format!(
+                    "op frame is {} bytes, over the {MAX_FRAME_BYTES}-byte cap — split the payload",
+                    frame.len()
+                ),
+            )));
         }
         decode_member(&frame)?;
         let id = frame_id(&frame);
@@ -1992,10 +2001,12 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         });
                         ops.push(op);
                     }
-                    // keep the codec's verbatim reason — a submitter's held
-                    // reply surfaces it. node-local observability only.
-                    Err(Error::Host(sdk::Error::Module(reason))) => {
-                        decode_fail.push((mid, reason));
+                    // keep the codec's refusal FRAMED (`<reason>: <sentence>`)
+                    // — a submitter's held reply surfaces it and the receipt
+                    // lane splits it back into its token. node-local
+                    // observability only.
+                    Err(Error::Host(sdk::Error::Module { reason, sentence })) => {
+                        decode_fail.push((mid, sdk::refusal::encode(&reason, &sentence)));
                     }
                     Err(e) => decode_fail.push((mid, e.to_string())),
                 }
@@ -2106,9 +2117,9 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         (Disposition::Applied, dispatches, None)
                     }
                     // the host stringifies the reject error with its WRAPPED
-                    // Display (`Module(<verbatim>)`); unwrap it so a submitter's
-                    // held reply keeps matching the module's own prefix (duckfs-
-                    // client keys on "files: conflict:"). node-local only.
+                    // Display (`Module(<reason>: <sentence>)`); unwrap it to the
+                    // framed refusal so the receipt lane can split it into the
+                    // module's own token and sentence. node-local only.
                     MemberOutcome::Rejected { reason } => {
                         rejected_count += 1;
                         (

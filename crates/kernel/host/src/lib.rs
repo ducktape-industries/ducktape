@@ -459,7 +459,7 @@ pub fn encode_trace(trace: &Trace) -> Vec<u8> {
 }
 
 pub fn decode_trace(bytes: &[u8]) -> Result<Trace, Error> {
-    borsh::from_slice(bytes).map_err(|e| Error::Module(format!("trace: {e}")))
+    borsh::from_slice(bytes).map_err(|e| Error::module("trace_decode", format!("trace: {e}")))
 }
 
 /// the pre-commit witness: the node's chance to make a block's observations
@@ -514,7 +514,8 @@ pub fn encode_prepared_advance(advance: &Option<Msg>) -> Vec<u8> {
 }
 
 pub fn decode_prepared_advance(bytes: &[u8]) -> Result<Option<Msg>, Error> {
-    borsh::from_slice(bytes).map_err(|e| Error::Module(format!("prepared advance: {e}")))
+    borsh::from_slice(bytes)
+        .map_err(|e| Error::module("prepared_advance_decode", format!("prepared advance: {e}")))
 }
 
 pub fn encode_prepared_call(call: &PreparedCall) -> Vec<u8> {
@@ -522,7 +523,8 @@ pub fn encode_prepared_call(call: &PreparedCall) -> Vec<u8> {
 }
 
 pub fn decode_prepared_call(bytes: &[u8]) -> Result<PreparedCall, Error> {
-    borsh::from_slice(bytes).map_err(|e| Error::Module(format!("prepared call: {e}")))
+    borsh::from_slice(bytes)
+        .map_err(|e| Error::module("prepared_call_decode", format!("prepared call: {e}")))
 }
 
 pub fn encode_prepared_delivery(delivery: &PreparedDelivery) -> Vec<u8> {
@@ -530,7 +532,12 @@ pub fn encode_prepared_delivery(delivery: &PreparedDelivery) -> Vec<u8> {
 }
 
 pub fn decode_prepared_delivery(bytes: &[u8]) -> Result<PreparedDelivery, Error> {
-    borsh::from_slice(bytes).map_err(|e| Error::Module(format!("prepared delivery: {e}")))
+    borsh::from_slice(bytes).map_err(|e| {
+        Error::module(
+            "prepared_delivery_decode",
+            format!("prepared delivery: {e}"),
+        )
+    })
 }
 
 /// the result of applying a BATCH of ops as ONE block ([`Host::submit_block`]).
@@ -921,7 +928,10 @@ impl Observer {
             Ok(answer) => Serve::Served(answer),
             Err(reason) => {
                 o.diverge(module, reason.clone());
-                Serve::Served(Err(Error::Module(format!("witness divergence: {reason}"))))
+                Serve::Served(Err(Error::module(
+                    "witness_divergence",
+                    format!("witness divergence: {reason}"),
+                )))
             }
         }
     }
@@ -1540,7 +1550,10 @@ impl Host {
         for m in modules {
             let id = m.id();
             if host.registry.contains_key(&id) {
-                return Err(Error::Module(format!("duplicate module id: {id}")));
+                return Err(Error::module(
+                    "duplicate_module_id",
+                    format!("duplicate module id: {id}"),
+                ));
             }
             host.registry.insert(id, m);
         }
@@ -1682,10 +1695,9 @@ impl Host {
         }
         let mut deliveries = Vec::new();
         for (source, module) in &self.registry {
-            let items = module
-                .pending_items()
-                .await
-                .map_err(|e| Error::Module(format!("{source}: pending items: {e}")))?;
+            let items = module.pending_items().await.map_err(|e| {
+                Error::module("pending_items", format!("{source}: pending items: {e}"))
+            })?;
             // one queue's per-block batch: the source bounds it, and the host
             // holds it to the same bound.
             for item in items.into_iter().take(sdk::MAX_DELIVERIES_PER_BLOCK) {
@@ -1717,10 +1729,9 @@ impl Host {
             return Ok(true);
         }
         for (source, module) in &self.registry {
-            let items = module
-                .pending_items()
-                .await
-                .map_err(|e| Error::Module(format!("{source}: pending items: {e}")))?;
+            let items = module.pending_items().await.map_err(|e| {
+                Error::module("pending_items", format!("{source}: pending items: {e}"))
+            })?;
             if !items.is_empty() {
                 return Ok(true);
             }
@@ -1736,14 +1747,23 @@ impl Host {
         let bytes = match self.query(DISPATCH_MODULE_ID, &req).await {
             Ok(bytes) => bytes,
             Err(Error::UnknownModule(_)) => return Ok(Vec::new()),
-            Err(e) => return Err(Error::Module(format!("dispatch: pending calls: {e}"))),
+            Err(e) => {
+                return Err(Error::module(
+                    "pending_calls",
+                    format!("dispatch: pending calls: {e}"),
+                ));
+            }
         };
         match dispatch::decode_reply(&bytes) {
             Ok(dispatch::DispatchReply::PendingCalls(calls)) => Ok(calls),
-            Ok(other) => Err(Error::Module(format!(
-                "dispatch: pending calls answered {other:?}"
-            ))),
-            Err(e) => Err(Error::Module(format!("dispatch: pending calls: {e}"))),
+            Ok(other) => Err(Error::module(
+                "unexpected_dispatch_reply",
+                format!("dispatch: pending calls answered {other:?}"),
+            )),
+            Err(e) => Err(Error::module(
+                "pending_calls",
+                format!("dispatch: pending calls: {e}"),
+            )),
         }
     }
 
@@ -1777,16 +1797,27 @@ impl Host {
             Err(Error::UnknownModule(_)) => {
                 return Ok(Verdict::Refused(dispatch::Refusal::NotAProgram));
             }
-            Err(e) => return Err(Error::Module(format!("identity: account read: {e}"))),
+            Err(e) => {
+                return Err(Error::module(
+                    "identity_account_read",
+                    format!("identity: account read: {e}"),
+                ));
+            }
         };
         let view = match identity::decode_reply(&bytes) {
             Ok(identity::IdentityReply::Account(view)) => view,
             Ok(other) => {
-                return Err(Error::Module(format!(
-                    "identity: account read answered {other:?}"
-                )));
+                return Err(Error::module(
+                    "unexpected_identity_reply",
+                    format!("identity: account read answered {other:?}"),
+                ));
             }
-            Err(e) => return Err(Error::Module(format!("identity: account read: {e}"))),
+            Err(e) => {
+                return Err(Error::module(
+                    "identity_account_read",
+                    format!("identity: account read: {e}"),
+                ));
+            }
         };
         let Some(view) = view else {
             return Ok(Verdict::Refused(dispatch::Refusal::NotAProgram));
@@ -1872,14 +1903,19 @@ impl Host {
             Err(Error::UnknownModule(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let reply = modules::decode_reply(&bytes)
-            .map_err(|e| Error::Module(format!("modules registry reply is unreadable: {e}")))?;
+        let reply = modules::decode_reply(&bytes).map_err(|e| {
+            Error::module(
+                "modules_reply_decode",
+                format!("modules registry reply is unreadable: {e}"),
+            )
+        })?;
         let modules = match reply {
             modules::ModulesReply::ModuleStatus { modules } => modules,
             other => {
-                return Err(Error::Module(format!(
-                    "modules registry answered ModuleStatus with {other:?}"
-                )));
+                return Err(Error::module(
+                    "unexpected_modules_reply",
+                    format!("modules registry answered ModuleStatus with {other:?}"),
+                ));
             }
         };
         *self.status_cache.lock().expect("status cache") = Some((identity, modules.clone()));
@@ -2009,18 +2045,24 @@ impl Host {
                     source = src.origin(),
                     "committed module code is unavailable — the boundary fails closed"
                 );
-                return Err(Error::Module(format!(
-                    "code bytes absent for module {} (hash {}) — fail-closed",
-                    m.module_id,
-                    hex32(target),
-                )));
+                return Err(Error::module(
+                    "code_bytes_absent",
+                    format!(
+                        "code bytes absent for module {} (hash {}) — fail-closed",
+                        m.module_id,
+                        hex32(target),
+                    ),
+                ));
             };
             if sha256(&bytes) != target {
-                return Err(Error::Module(format!(
-                    "code bytes for module {} do not match committed hash {} — fail-closed",
-                    m.module_id,
-                    hex32(target),
-                )));
+                return Err(Error::module(
+                    "code_hash_mismatch",
+                    format!(
+                        "code bytes for module {} do not match committed hash {} — fail-closed",
+                        m.module_id,
+                        hex32(target),
+                    ),
+                ));
             }
             match current {
                 Some(_) => realizations.push(Realization::Swap {
@@ -2034,10 +2076,13 @@ impl Host {
                     // readiness/height gate as a swap and realizes at one
                     // deterministic boundary on every validator.
                     let Some(factory) = &self.module_factory else {
-                        return Err(Error::Module(format!(
-                            "module {} admitted but no module factory is wired — fail-closed",
-                            m.module_id,
-                        )));
+                        return Err(Error::module(
+                            "no_module_factory",
+                            format!(
+                                "module {} admitted but no module factory is wired — fail-closed",
+                                m.module_id,
+                            ),
+                        ));
                     };
                     let Admitted::Module(module) =
                         factory.instantiate(&m.module_id, &bytes).await?
@@ -2049,11 +2094,14 @@ impl Host {
                         continue;
                     };
                     if module.id() != m.module_id {
-                        return Err(Error::Module(format!(
-                            "module factory instantiated `{}` for admission `{}` — fail-closed",
-                            module.id(),
-                            m.module_id,
-                        )));
+                        return Err(Error::module(
+                            "module_factory_mismatch",
+                            format!(
+                                "module factory instantiated `{}` for admission `{}` — fail-closed",
+                                module.id(),
+                                m.module_id,
+                            ),
+                        ));
                     }
                     realizations.push(Realization::Seat(module));
                 }
@@ -2731,7 +2779,7 @@ impl Host {
             return Err(SubmitError::Fatal(FatalError {
                 module: DISPATCH_MODULE_ID.into(),
                 phase: BoundaryPhase::Witness,
-                source: Error::Module(reason),
+                source: Error::module("witness_record", reason),
             }));
         }
 
@@ -3317,10 +3365,13 @@ impl Host {
                 return Err(SubmitError::Fatal(FatalError {
                     module,
                     phase: BoundaryPhase::Abort,
-                    source: Error::Module(format!(
-                        "non-deterministic reject replaying accepted unit during \
-                         per-unit isolation: {re}"
-                    )),
+                    source: Error::module(
+                        "nondeterministic_reject",
+                        format!(
+                            "non-deterministic reject replaying accepted unit during \
+                             per-unit isolation: {re}"
+                        ),
+                    ),
                 }));
             }
             unit.events = events;
@@ -3385,10 +3436,13 @@ impl Host {
         if holds {
             return Ok(());
         }
-        Err(Error::Module(format!(
-            "acl: target {target} requires {} standing — the submitting origin holds none",
-            required.as_str()
-        )))
+        Err(Error::module(
+            "acl_standing",
+            format!(
+                "acl: target {target} requires {} standing — the submitting origin holds none",
+                required.as_str()
+            ),
+        ))
     }
 
     /// is `submitter` in valset's validator tier (`with_residents: false`) or
@@ -3501,13 +3555,15 @@ impl Host {
                     dispatched
                 }
                 Plan::Substitute(recorded) => *recorded,
-                Plan::Diverged(reason) => return Err(Error::Module(reason)),
+                Plan::Diverged(reason) => {
+                    return Err(Error::module("replay_divergence", reason));
+                }
             };
             // a replay that departed from the witness ends the drain here,
             // whatever the module made of the answers: nothing further may
             // act on it.
             if let Some(divergence) = observer.divergence() {
-                return Err(Error::Module(divergence.reason));
+                return Err(Error::module("replay_divergence", divergence.reason));
             }
             let Dispatched {
                 module,
@@ -3684,10 +3740,10 @@ impl Host {
                 dispatched
             }
             Plan::Substitute(recorded) => *recorded,
-            Plan::Diverged(reason) => return Err(Error::Module(reason)),
+            Plan::Diverged(reason) => return Err(Error::module("replay_divergence", reason)),
         };
         if let Some(divergence) = observer.divergence() {
-            return Err(Error::Module(divergence.reason));
+            return Err(Error::module("replay_divergence", divergence.reason));
         }
         let effects = dispatched.result?;
         dispatches.push(DispatchRecord {
@@ -3754,10 +3810,13 @@ impl Host {
         self.registry.insert(source.clone(), me);
         res?;
         if !out_msgs.is_empty() {
-            return Err(Error::Module(format!(
-                "{source}: an acknowledgment emitted {} follow-up intents; none are allowed",
-                out_msgs.len()
-            )));
+            return Err(Error::module(
+                "ack_emitted_intents",
+                format!(
+                    "{source}: an acknowledgment emitted {} follow-up intents; none are allowed",
+                    out_msgs.len()
+                ),
+            ));
         }
         let assigned = out_assigned
             .into_value("acknowledgment assigned stamp")?
@@ -3787,7 +3846,10 @@ fn witness_fault(divergence: Divergence) -> SubmitError {
     SubmitError::Fatal(FatalError {
         module: divergence.module,
         phase: BoundaryPhase::Witness,
-        source: Error::Module(format!("witness divergence: {}", divergence.reason)),
+        source: Error::module(
+            "witness_divergence",
+            format!("witness divergence: {}", divergence.reason),
+        ),
     })
 }
 
@@ -3959,7 +4021,10 @@ impl Ctx for ReadOnlyQueryCtx<'_> {
             return Err(Error::SelfQuery);
         }
         if self.active.contains(target) {
-            return Err(Error::Module(format!("query cycle: {target}")));
+            return Err(Error::module(
+                "query_cycle",
+                format!("query cycle: {target}"),
+            ));
         }
         match self.registry.get(target) {
             Some(m) => {

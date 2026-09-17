@@ -10,8 +10,8 @@ use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_que
 use greeter::Greeter;
 use host::Host;
 use sdk::{Ctx, Error, Module, Msg, StateRoot};
-use wasm_host::WasmModule;
 use statesync::qmdb::QmdbStore;
+use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `directory` module's guest port by
 /// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
@@ -153,6 +153,8 @@ fn query_cycles_are_rejected() {
             .await
             .expect_err("query cycle must fail instead of recursing");
 
-        assert!(matches!(err, Error::Module(msg) if msg == "query cycle: a"));
+        assert!(
+            matches!(err, Error::Module { ref reason, ref sentence } if reason == "query_cycle" && sentence == "query cycle: a")
+        );
     });
 }

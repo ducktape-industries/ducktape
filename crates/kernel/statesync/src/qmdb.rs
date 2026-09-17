@@ -150,26 +150,31 @@ where
         let (resp, _feedback) = db
             .serve(req)
             .await
-            .map_err(|e| sdk::Error::Module(format!("serve failed: {e}")))?;
+            .map_err(|e| sdk::Error::module("qmdb_serve", format!("serve failed: {e}")))?;
         let encoded = encode_qmdb_resp(&resp);
         let fits_budget = encoded.len() <= MAX_MODULE_REPLY_BYTES;
         if fits_budget {
             return Ok(encoded);
         }
         let Response::Operations { operations, .. } = &resp else {
-            return Err(sdk::Error::Module(format!(
-                "one op exceeds the {MAX_MODULE_REPLY_BYTES}-byte module reply budget"
-            )));
+            return Err(sdk::Error::module(
+                "reply_budget",
+                format!("one op exceeds the {MAX_MODULE_REPLY_BYTES}-byte module reply budget"),
+            ));
         };
         let Some(shorter) = NonZeroU64::new(fitting_op_prefix(operations, encoded.len())) else {
-            return Err(sdk::Error::Module(format!(
-                "one op exceeds the {MAX_MODULE_REPLY_BYTES}-byte module reply budget"
-            )));
+            return Err(sdk::Error::module(
+                "reply_budget",
+                format!("one op exceeds the {MAX_MODULE_REPLY_BYTES}-byte module reply budget"),
+            ));
         };
         let Request::Operations { max_ops, .. } = &mut req else {
             unreachable!("an Operations reply answers an Operations request");
         };
-        debug_assert!(shorter < *max_ops, "an over-budget batch shrinks every round");
+        debug_assert!(
+            shorter < *max_ops,
+            "an over-budget batch shrinks every round"
+        );
         *max_ops = shorter;
     }
 }
@@ -203,8 +208,12 @@ where
 {
     let end = db.bounds().end;
     let start = db.sync_boundary();
-    let range = commonware_utils::range::NonEmptyRange::new(start..end)
-        .map_err(|_| sdk::Error::Module("store has no committed operations to sync".into()))?;
+    let range = commonware_utils::range::NonEmptyRange::new(start..end).map_err(|_| {
+        sdk::Error::module(
+            "nothing_committed",
+            "store has no committed operations to sync",
+        )
+    })?;
     Ok(sdk::ResolverSyncTarget {
         root: sdk::StateRoot(db.root().0),
         start: range.start().as_u64(),
@@ -217,7 +226,7 @@ pub async fn serve_bytes<E>(db: &SyncDb<E>, req: &[u8]) -> Result<Vec<u8>, sdk::
 where
     E: Context + Spawner,
 {
-    let req = decode_qmdb_req(req).map_err(|e| sdk::Error::Module(e.to_string()))?;
+    let req = decode_qmdb_req(req).map_err(|e| sdk::Error::module("codec", e.to_string()))?;
     serve(db, &req).await
 }
 
@@ -370,7 +379,7 @@ where
     fn db(&self) -> Result<&SyncDb<E>, sdk::Error> {
         self.db
             .as_ref()
-            .ok_or_else(|| sdk::Error::Module("qmdb store lost to a failed commit".into()))
+            .ok_or_else(|| sdk::Error::module("store_lost", "qmdb store lost to a failed commit"))
     }
 
     /// the engine-native [`SyncTarget`] for this store: its qmdb merkle root
@@ -410,7 +419,7 @@ where
         self.db()?
             .get(&SyncDigest::from(*key))
             .await
-            .map_err(|e| sdk::Error::Module(format!("qmdb get failed: {e}")))
+            .map_err(|e| sdk::Error::module("qmdb_get", format!("qmdb get failed: {e}")))
     }
 
     /// apply ONE ordered batch: write every hashed key, merkleize, apply,
@@ -421,10 +430,9 @@ where
         &mut self,
         writes: Vec<([u8; sdk::ROOT_LEN], Option<Vec<u8>>)>,
     ) -> Result<(), sdk::Error> {
-        let db = self
-            .db
-            .take()
-            .ok_or_else(|| sdk::Error::Module("qmdb store lost to a failed commit".into()))?;
+        let db = self.db.take().ok_or_else(|| {
+            sdk::Error::module("store_lost", "qmdb store lost to a failed commit")
+        })?;
         let mut batch = db.new_batch();
         for (key, value) in writes {
             batch = batch.write(SyncDigest::from(key), value);
@@ -433,17 +441,19 @@ where
             Ok(batch) => batch,
             Err(e) => {
                 self.db = Some(db);
-                return Err(sdk::Error::Module(format!("merkleize failed: {e}")));
+                return Err(sdk::Error::module(
+                    "qmdb_merkleize",
+                    format!("merkleize failed: {e}"),
+                ));
             }
         };
-        let (db, _applied) = db
-            .apply_batch(batch)
-            .await
-            .map_err(|e| sdk::Error::Module(format!("apply_batch failed: {e}")))?;
+        let (db, _applied) = db.apply_batch(batch).await.map_err(|e| {
+            sdk::Error::module("qmdb_apply_batch", format!("apply_batch failed: {e}"))
+        })?;
         let db = db
             .commit()
             .await
-            .map_err(|e| sdk::Error::Module(format!("commit failed: {e}")))?;
+            .map_err(|e| sdk::Error::module("qmdb_commit", format!("commit failed: {e}")))?;
         self.db = Some(db);
         Ok(())
     }

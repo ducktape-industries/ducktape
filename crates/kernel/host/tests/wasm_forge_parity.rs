@@ -257,7 +257,7 @@ fn submit_both(native: &mut Host, wasm: &mut Host, height: u64, origin: Origin, 
 
 fn reason_of(err: host::SubmitError) -> String {
     match err {
-        host::SubmitError::Rejected(Error::Module(reason)) => reason,
+        host::SubmitError::Rejected(Error::Module { sentence, .. }) => sentence,
         other => panic!("expected a module rejection, got {other:?}"),
     }
 }

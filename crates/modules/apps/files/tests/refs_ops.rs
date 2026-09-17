@@ -139,11 +139,17 @@ fn ext(who: &[u8]) -> sdk::Origin {
 
 fn assert_module_err(err: &sdk::Error, needle: &str) {
     match err {
-        sdk::Error::Module(m) => assert!(
-            m.contains(needle),
-            "expected error to contain {needle:?}, got {m:?}"
-        ),
-        other => panic!("expected Error::Module({needle:?}), got {other:?}"),
+        sdk::Error::Module { reason, sentence } => {
+            assert!(
+                reason.starts_with("files_"),
+                "expected a files step token, got {reason:?}"
+            );
+            assert!(
+                sentence.contains(needle),
+                "expected error to contain {needle:?}, got {sentence:?}"
+            );
+        }
+        other => panic!("expected a module refusal carrying {needle:?}, got {other:?}"),
     }
 }
 

@@ -39,20 +39,24 @@ pub(crate) trait GitRead {
 /// one sentence for a refused diff read, shaped so the DIAGNOSIS leads and the
 /// `pins` trail.
 ///
-/// A module refusal reaches a view as one flat string clipped from the END
-/// (#2471), so the ceiling that fired has to be in the first clause; the oid
-/// pair is the part a caller that asked for this diff already knows. Both diff
-/// readers route through here because #2471 is about to key on these sentences,
-/// and a second copy is a second thing to keep in step with it.
+/// A module refusal reaches a view as one flat sentence clipped from the END,
+/// so the ceiling that fired has to be in the first clause; the oid pair is the
+/// part a caller that asked for this diff already knows. The failure class a
+/// caller branches on rides the refusal's token instead, and both diff readers
+/// route through here so the two stay one decision.
 fn diff_refusal(error: DiffError, pins: &str) -> Error {
-    let detail = match error {
-        DiffError::Unavailable(reason) => {
-            format!("{reason} -- objects are not fully materialized ({pins})")
-        }
-        DiffError::Unsupported => "git diff unsupported".into(),
-        DiffError::Limit(reason) => format!("{reason} -- diff is too large to serve ({pins})"),
+    let (token, detail) = match error {
+        DiffError::Unavailable(reason) => (
+            "diff_unavailable",
+            format!("{reason} -- objects are not fully materialized ({pins})"),
+        ),
+        DiffError::Unsupported => ("diff_unsupported", "git diff unsupported".to_string()),
+        DiffError::Limit(reason) => (
+            "diff_too_large",
+            format!("{reason} -- diff is too large to serve ({pins})"),
+        ),
     };
-    Error::Module(format!("forge: {detail}"))
+    Error::module(token, format!("forge: {detail}"))
 }
 
 /// a host diff wearing the oid pair it was taken at.
@@ -210,8 +214,9 @@ impl<G: GitRead> Reader<'_, G> {
         let object = self.git.object(repo, oid, cap)?;
         let valid = object.kind == kind && object.size <= cap as u64 && object.data.is_some();
         if !valid {
-            return Err(Error::Module(
-                "forge: object exceeds the read bound or has the wrong type".into(),
+            return Err(Error::module(
+                "object_read_bound",
+                "forge: object exceeds the read bound or has the wrong type",
             ));
         }
         Ok(object)
@@ -220,7 +225,7 @@ impl<G: GitRead> Reader<'_, G> {
     fn commit(&self, repo: &str, oid: Oid) -> Result<(Commit, usize), Error> {
         let object = self.object(repo, oid, 1, MAX_PR_DIFF_COMMIT_BYTES)?;
         let Some(GitObjectData::Commit(commit)) = object.data else {
-            return Err(Error::Module("forge: expected a commit".into()));
+            return Err(Error::module("not_a_commit", "forge: expected a commit"));
         };
         let tree = Oid::from_bytes(&commit.tree)?;
         let parents = commit
@@ -248,12 +253,15 @@ impl<G: GitRead> Reader<'_, G> {
     fn path_oid(&self, repo: &str, root: Oid, path: &str) -> Result<Option<Oid>, Error> {
         let mut oid = root;
         let mut total = 0usize;
-        let mut segments = path.split('/').filter(|segment| !segment.is_empty()).peekable();
+        let mut segments = path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .peekable();
         while let Some(segment) = segments.next() {
             let object = self.object(repo, oid, KIND_TREE, MAX_TREE_BYTES.saturating_sub(total))?;
             total += object.size as usize;
             let Some(GitObjectData::Tree(entries)) = object.data else {
-                return Err(Error::Module("forge: expected a tree".into()));
+                return Err(Error::module("not_a_tree", "forge: expected a tree"));
             };
             let Some(entry) = entries
                 .into_iter()
@@ -300,8 +308,9 @@ impl<G: GitRead> Reader<'_, G> {
             let (commit, bytes) = self.commit(repo, oid)?;
             total = total.saturating_add(bytes);
             if total > MAX_BROWSE_COMMIT_BYTES {
-                return Err(Error::Module(
-                    "forge: integration history exceeds the browser's read bound".into(),
+                return Err(Error::module(
+                    "browse_read_bound",
+                    "forge: integration history exceeds the browser's read bound",
                 ));
             }
             if commit.parents.contains(&requested) {
@@ -312,46 +321,72 @@ impl<G: GitRead> Reader<'_, G> {
                     continue;
                 }
                 if scheduled.len() >= MAX_BROWSE_COMMITS {
-                    return Err(Error::Module(
-                        "forge: pinned revision is too far behind every branch head".into(),
+                    return Err(Error::module(
+                        "revision_too_far_behind",
+                        "forge: pinned revision is too far behind every branch head",
                     ));
                 }
                 scheduled.insert(parent);
                 pending.push_back(parent);
             }
         }
-        Err(Error::Module(format!(
-            "forge: revision {requested} is not reachable from any branch of repo {repo:?}"
-        )))
+        Err(Error::module(
+            "revision_unreachable",
+            format!(
+                "forge: revision {requested} is not reachable from any branch of repo {repo:?}"
+            ),
+        ))
     }
 
     /// the committed (target, source) heads a pull request compares, pinned.
     fn pr_endpoints(&self, repo: &str, number: u64) -> Result<(Oid, Oid), Error> {
         let item = self.image.tracker.get(repo, number).ok_or_else(|| {
-            Error::Module(format!("forge: no item #{number} in repo {repo:?}"))
+            Error::module(
+                "no_such_item",
+                format!("forge: no item #{number} in repo {repo:?}"),
+            )
         })?;
         if item.summary.kind != ItemKind::Pr {
-            return Err(Error::Module(format!(
-                "forge: item #{number} is an issue, not a pull request"
-            )));
+            return Err(Error::module(
+                "not_a_pull_request",
+                format!("forge: item #{number} is an issue, not a pull request"),
+            ));
         }
         let source_branch = item.source_branch.ok_or_else(|| {
-            Error::Module(format!(
-                "forge: pull request #{number} has no source branch"
-            ))
+            Error::module(
+                "pr_without_source_branch",
+                format!("forge: pull request #{number} has no source branch"),
+            )
         })?;
         let target_branch = item.target_branch.ok_or_else(|| {
-            Error::Module(format!(
-                "forge: pull request #{number} has no target branch"
-            ))
+            Error::module(
+                "pr_without_target_branch",
+                format!("forge: pull request #{number} has no target branch"),
+            )
         })?;
         let refs = self
             .image
             .repos
             .get(repo)
-            .ok_or_else(|| Error::Module(format!("forge: no repo {repo:?}")))?;
-        let source = refs.get(&source_branch).copied().ok_or_else(|| Error::Module(format!("forge: pull request #{number} source branch {source_branch:?} is not materialized")))?;
-        let target = refs.get(&target_branch).copied().ok_or_else(|| Error::Module(format!("forge: pull request #{number} target branch {target_branch:?} is not materialized")))?;
+            .ok_or_else(|| Error::module("unknown_repo", format!("forge: no repo {repo:?}")))?;
+        let source = refs.get(&source_branch).copied().ok_or_else(|| {
+            Error::module(
+                "branch_not_materialized",
+                format!(
+                    "forge: pull request #{number} source branch {source_branch:?} is not \
+                     materialized"
+                ),
+            )
+        })?;
+        let target = refs.get(&target_branch).copied().ok_or_else(|| {
+            Error::module(
+                "branch_not_materialized",
+                format!(
+                    "forge: pull request #{number} target branch {target_branch:?} is not \
+                     materialized"
+                ),
+            )
+        })?;
         Ok((target, source))
     }
 
@@ -453,15 +488,19 @@ impl<G: GitRead> Reader<'_, G> {
                 // was already handed, so returning it would duplicate rows and
                 // never converge. Refuse instead.
                 Skipped::OutOfBudget => {
-                    return Err(Error::Module(format!(
-                        "forge: {head} is too far ahead of cursor {after} to page from \
-                         within {MAX_HISTORY_OBJECT_READS} object reads"
-                    )));
+                    return Err(Error::module(
+                        "cursor_out_of_budget",
+                        format!(
+                            "forge: {head} is too far ahead of cursor {after} to page from \
+                             within {MAX_HISTORY_OBJECT_READS} object reads"
+                        ),
+                    ));
                 }
                 Skipped::NotOnTheChain => {
-                    return Err(Error::Module(format!(
-                        "forge: cursor {after} is not on the first-parent chain of {head}"
-                    )));
+                    return Err(Error::module(
+                        "cursor_off_chain",
+                        format!("forge: cursor {after} is not on the first-parent chain of {head}"),
+                    ));
                 }
             },
         };
@@ -482,7 +521,12 @@ impl<G: GitRead> Reader<'_, G> {
                     oid: oid.to_string(),
                     author: commit.author,
                     committed_at: commit.committed_at,
-                    summary: commit.message.lines().next().unwrap_or_default().to_string(),
+                    summary: commit
+                        .message
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string(),
                     parents: commit.parents.iter().map(ToString::to_string).collect(),
                 });
                 if commits.len() == page {
@@ -498,10 +542,13 @@ impl<G: GitRead> Reader<'_, G> {
         // name the reason. This is the depth at which first-parent paging ends.
         let collection_never_ran = budget.reads == spent_skipping;
         if collection_never_ran && next.is_some() {
-            return Err(Error::Module(format!(
-                "forge: {head} is too far ahead of cursor {after} to page from \
-                 within {MAX_HISTORY_OBJECT_READS} object reads"
-            )));
+            return Err(Error::module(
+                "cursor_out_of_budget",
+                format!(
+                    "forge: {head} is too far ahead of cursor {after} to page from \
+                     within {MAX_HISTORY_OBJECT_READS} object reads"
+                ),
+            ));
         }
         Ok(CommitPage {
             rev: head.to_string(),
@@ -563,7 +610,7 @@ impl<G: GitRead> Reader<'_, G> {
             let object = self.object(repo, oid, KIND_TREE, MAX_TREE_BYTES.saturating_sub(total))?;
             total += object.size as usize;
             let Some(GitObjectData::Tree(entries)) = object.data else {
-                return Err(Error::Module("forge: expected a tree".into()));
+                return Err(Error::module("not_a_tree", "forge: expected a tree"));
             };
             let entries = entries
                 .into_iter()
@@ -582,12 +629,16 @@ impl<G: GitRead> Reader<'_, G> {
                 .into_iter()
                 .find(|entry| entry.name == segment.as_bytes())
                 .ok_or_else(|| {
-                    Error::Module(format!("forge: no directory {path:?} at this revision"))
+                    Error::module(
+                        "no_such_directory",
+                        format!("forge: no directory {path:?} at this revision"),
+                    )
                 })?;
             if entry.kind != KIND_TREE {
-                return Err(Error::Module(format!(
-                    "forge: path {path:?} is not a directory"
-                )));
+                return Err(Error::module(
+                    "not_a_directory",
+                    format!("forge: path {path:?} is not a directory"),
+                ));
             }
             oid = entry.oid;
         }
@@ -595,7 +646,10 @@ impl<G: GitRead> Reader<'_, G> {
 
     fn blob(&self, repo: &str, rev: &str, path: &str, cap: usize) -> Result<(Oid, Object), Error> {
         let Some(oid) = self.revision(repo, rev)? else {
-            return Err(Error::Module(format!("forge: repo {repo:?} is unborn")));
+            return Err(Error::module(
+                "unborn_repo",
+                format!("forge: repo {repo:?} is unborn"),
+            ));
         };
         let (commit, _) = self.commit(repo, oid)?;
         let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
@@ -603,19 +657,30 @@ impl<G: GitRead> Reader<'_, G> {
             .tree(repo, commit.tree, parent)?
             .into_iter()
             .find(|entry| entry.name == name.as_bytes())
-            .ok_or_else(|| Error::Module(format!("forge: no file {path:?} at revision {oid}")))?;
+            .ok_or_else(|| {
+                Error::module(
+                    "no_such_file",
+                    format!("forge: no file {path:?} at revision {oid}"),
+                )
+            })?;
         if entry.kind != KIND_BLOB {
-            return Err(Error::Module(format!("forge: path {path:?} is not a file")));
+            return Err(Error::module(
+                "not_a_file",
+                format!("forge: path {path:?} is not a file"),
+            ));
         }
         let object = self.git.object(repo, entry.oid, cap)?;
         if object.kind != KIND_BLOB {
-            return Err(Error::Module(format!("forge: path {path:?} is not a blob")));
+            return Err(Error::module(
+                "not_a_blob",
+                format!("forge: path {path:?} is not a blob"),
+            ));
         }
         Ok((oid, object))
     }
 
     pub fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let reply = match decode_query(req).map_err(Error::Module)? {
+        let reply = match decode_query(req).map_err(|e| Error::module("codec", e))? {
             ForgeQuery::Head => ForgeReply::Head(
                 self.image
                     .repos
@@ -694,8 +759,9 @@ impl<G: GitRead> Reader<'_, G> {
             ForgeQuery::Commit { repo, rev } => {
                 let name = norm_repo(&repo)?;
                 if rev.is_empty() {
-                    return Err(Error::Module(
-                        "forge: a commit query names an exact revision".into(),
+                    return Err(Error::module(
+                        "empty_revision",
+                        "forge: a commit query names an exact revision",
                     ));
                 }
                 let Some(oid) = self.revision(&name, &rev)? else {
@@ -717,8 +783,13 @@ impl<G: GitRead> Reader<'_, G> {
                 let (commit, _) = self.commit(&name, oid)?;
                 let tree = self.tree(&name, commit.tree, &path)?;
                 let mut entries = Vec::new();
-                let mut truncated = tree.iter().any(|entry| !matches!(entry.kind, KIND_TREE | KIND_BLOB));
-                for (kind, entry_kind) in [(KIND_TREE, TreeEntryKind::Dir), (KIND_BLOB, TreeEntryKind::File)] {
+                let mut truncated = tree
+                    .iter()
+                    .any(|entry| !matches!(entry.kind, KIND_TREE | KIND_BLOB));
+                for (kind, entry_kind) in [
+                    (KIND_TREE, TreeEntryKind::Dir),
+                    (KIND_BLOB, TreeEntryKind::File),
+                ] {
                     for entry in tree.iter().filter(|entry| entry.kind == kind) {
                         let Ok(name) = std::str::from_utf8(&entry.name) else {
                             truncated = true;
@@ -749,8 +820,9 @@ impl<G: GitRead> Reader<'_, G> {
             ForgeQuery::Blob { repo, rev, path } => {
                 let path = browse_path(&path, false)?;
                 let (oid, object) = self.blob(&norm_repo(&repo)?, &rev, &path, MAX_BLOB_BYTES)?;
-                let size = i64::try_from(object.size)
-                    .map_err(|_| Error::Module("forge: object size exceeds i64".into()))?;
+                let size = i64::try_from(object.size).map_err(|_| {
+                    Error::module("object_size_overflow", "forge: object size exceeds i64")
+                })?;
                 let truncated = object.size > MAX_BLOB_BYTES as u64;
                 let (text, binary) = match object.data {
                     Some(GitObjectData::Blob(bytes)) => match String::from_utf8(bytes)
@@ -761,7 +833,7 @@ impl<G: GitRead> Reader<'_, G> {
                         None => (String::new(), true),
                     },
                     None => (String::new(), false),
-                    Some(_) => return Err(Error::Module("forge: expected a blob".into())),
+                    Some(_) => return Err(Error::module("not_a_blob", "forge: expected a blob")),
                 };
                 ForgeReply::Blob(BlobReply {
                     rev: oid.to_string(),
@@ -783,12 +855,13 @@ impl<G: GitRead> Reader<'_, G> {
                 let path = browse_path(&path, false)?;
                 let (oid, object) =
                     self.blob(&norm_repo(&repo)?, &rev, &path, MAX_BLOB_BYTES_PAGED)?;
-                let size = i64::try_from(object.size)
-                    .map_err(|_| Error::Module("forge: object size exceeds i64".into()))?;
+                let size = i64::try_from(object.size).map_err(|_| {
+                    Error::module("object_size_overflow", "forge: object size exceeds i64")
+                })?;
                 let data = match object.data {
                     Some(GitObjectData::Blob(bytes)) => bytes,
                     None => Vec::new(),
-                    Some(_) => return Err(Error::Module("forge: expected a blob".into())),
+                    Some(_) => return Err(Error::module("not_a_blob", "forge: expected a blob")),
                 };
                 let start = usize::try_from(offset)
                     .unwrap_or(usize::MAX)
@@ -813,8 +886,9 @@ impl<G: GitRead> Reader<'_, G> {
 fn parse_browse_oid(rev: &str) -> Result<Oid, Error> {
     let exact_hex = rev.len() == 40 && rev.bytes().all(|byte| byte.is_ascii_hexdigit());
     if !exact_hex {
-        return Err(Error::Module(
-            "forge: browse revision must be an exact 40-character oid".into(),
+        return Err(Error::module(
+            "bad_browse_revision",
+            "forge: browse revision must be an exact 40-character oid",
         ));
     }
     Oid::from_hex(rev)
@@ -822,12 +896,18 @@ fn parse_browse_oid(rev: &str) -> Result<Oid, Error> {
 
 pub(crate) fn browse_path(path: &str, allow_empty: bool) -> Result<String, Error> {
     if path.len() > tracker_iface::MAX_PATH_BYTES {
-        return Err(Error::Module("forge: browse path is too long".into()));
+        return Err(Error::module(
+            "bad_browse_path",
+            "forge: browse path is too long",
+        ));
     }
     if path.is_empty() {
         return match allow_empty {
             true => Ok(String::new()),
-            false => Err(Error::Module("forge: file path may not be empty".into())),
+            false => Err(Error::module(
+                "bad_browse_path",
+                "forge: file path may not be empty",
+            )),
         };
     }
     let canonical = !path.starts_with('/')
@@ -839,9 +919,10 @@ pub(crate) fn browse_path(path: &str, allow_empty: bool) -> Result<String, Error
             .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
     let bounded_depth = path.split('/').count() <= MAX_BROWSE_TREE_DEPTH;
     if !canonical || !bounded_depth {
-        return Err(Error::Module(format!(
-            "forge: invalid repository path {path:?}"
-        )));
+        return Err(Error::module(
+            "bad_browse_path",
+            format!("forge: invalid repository path {path:?}"),
+        ));
     }
     Ok(path.to_string())
 }
@@ -900,14 +981,16 @@ pub(crate) fn read_object(
     max_bytes: u64,
 ) -> Result<git_primitives::GitObject, Error> {
     let name = norm_repo(repository)?;
-    let repo = git::open(&base.join(name)).map_err(|error| Error::Module(error.to_string()))?;
-    let oid = git2::Oid::from_bytes(oid).map_err(|error| Error::Module(error.to_string()))?;
+    let repo = git::open(&base.join(name))
+        .map_err(|error| Error::module("git_open_repo", error.to_string()))?;
+    let oid =
+        git2::Oid::from_bytes(oid).map_err(|error| Error::module("bad_oid", error.to_string()))?;
     let odb = repo
         .odb()
-        .map_err(|error| Error::Module(error.to_string()))?;
+        .map_err(|error| Error::module("git_odb_open", error.to_string()))?;
     let (size, kind) = odb
         .read_header(oid)
-        .map_err(|error| Error::Module(error.to_string()))?;
+        .map_err(|error| Error::module("git_read_header", error.to_string()))?;
     let engine_cap = match kind {
         git2::ObjectType::Commit => 256 * 1024,
         git2::ObjectType::Tree => 4 * 1024 * 1024,
@@ -921,7 +1004,7 @@ pub(crate) fn read_object(
             git2::ObjectType::Commit => {
                 let commit = repo
                     .find_commit(oid)
-                    .map_err(|error| Error::Module(error.to_string()))?;
+                    .map_err(|error| Error::module("git_find_commit", error.to_string()))?;
                 let committer = commit.committer();
                 GitObjectData::Commit(git_primitives::GitCommit {
                     tree: commit.tree_id().as_bytes().to_vec(),
@@ -943,7 +1026,7 @@ pub(crate) fn read_object(
             git2::ObjectType::Tree => {
                 let tree = repo
                     .find_tree(oid)
-                    .map_err(|error| Error::Module(error.to_string()))?;
+                    .map_err(|error| Error::module("git_find_tree", error.to_string()))?;
                 GitObjectData::Tree(
                     tree.iter()
                         .map(|entry| git_primitives::GitTreeEntry {
@@ -960,18 +1043,21 @@ pub(crate) fn read_object(
             }
             git2::ObjectType::Blob => GitObjectData::Blob(
                 odb.read(oid)
-                    .map_err(|error| Error::Module(error.to_string()))?
+                    .map_err(|error| Error::module("git_odb_read", error.to_string()))?
                     .data()
                     .to_vec(),
             ),
             git2::ObjectType::Tag => GitObjectData::Tag(
                 odb.read(oid)
-                    .map_err(|error| Error::Module(error.to_string()))?
+                    .map_err(|error| Error::module("git_odb_read", error.to_string()))?
                     .data()
                     .to_vec(),
             ),
             git2::ObjectType::Any => {
-                return Err(Error::Module("unsupported_git_object_type".into()));
+                return Err(Error::module(
+                    "unsupported_object_type",
+                    "forge: the odb holds no concrete type for this object",
+                ));
             }
         })
     };
@@ -1015,7 +1101,9 @@ pub(crate) fn read_diff(
     let max_bytes = budget.max_bytes.min(1024 * 1024) as usize;
     let max_blob_bytes = budget.max_blob_bytes.min(16 * 1024 * 1024) as usize;
     let scoped = match path {
-        Some(path) => git::bounded_file_diff(&repo, target, source, path, max_bytes, max_blob_bytes),
+        Some(path) => {
+            git::bounded_file_diff(&repo, target, source, path, max_bytes, max_blob_bytes)
+        }
         None => git::bounded_diff(
             &repo,
             target,
