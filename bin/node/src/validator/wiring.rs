@@ -254,6 +254,45 @@ pub(super) struct ServeLanes {
     pub(super) sync_retention: Arc<crate::sync::serve::SyncRetention>,
 }
 
+/// answer one `ForgeObjects` request on its OWN task, so the serve loop is
+/// free while the pack builds. The whole reply path moves with it — bounded
+/// encode, the serve-lane observation, the mesh send — because a reply that
+/// outlives its turn on the loop has to carry its own `rpc_id` and peer.
+/// Ordering is not owed here: every answer is addressed by rpc id, and the
+/// requester's `pending` map completes whichever lands.
+#[allow(clippy::too_many_arguments)]
+fn spawn_forge_answer(
+    context: &commonware_runtime::tokio::Context,
+    forge_repo: std::path::PathBuf,
+    blobs: noded::blobs::BlobHandle,
+    served: blob_fetch::ServedPacks,
+    monitor: statesync::monitor::ServeMonitor,
+    mut sync_tx: super::MeshSender,
+    peer: ed25519::PublicKey,
+    rpc_id: u64,
+    req_kind: &'static str,
+    repo: String,
+    head: [u8; statesync::FORGE_OID_LEN],
+    bases: Vec<[u8; statesync::FORGE_OID_LEN]>,
+) {
+    context
+        .child("statesync_forge")
+        .spawn(move |_ctx| async move {
+            let resp =
+                blob_fetch::serve_forge_objects(&forge_repo, &blobs, &served, &repo, head, &bases)
+                    .await;
+            let (resp, body) = crate::sync::serve::encode_bounded_response(resp);
+            let framed = statesync::encode_rpc(&[0u8; 32], &[0u8; 64], rpc_id, &body);
+            monitor.record(
+                &config::hex_bytes(peer.as_ref()),
+                req_kind,
+                &resp,
+                framed.len() as u64,
+            );
+            let _ = sync_tx.send(Recipients::One(peer), IoBuf::from(framed), false);
+        });
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn wire_serve_lanes(
     context: &commonware_runtime::tokio::Context,
@@ -330,7 +369,7 @@ pub(super) fn wire_serve_lanes(
     let serve_namespace = namespace.to_vec();
     context
         .child("statesync_serve")
-        .spawn(move |_ctx| async move {
+        .spawn(move |ctx| async move {
             let mut server = SyncServer::new();
             // the joiner backfill lane's read-ahead: one loop touch reads a
             // budget of wire pages, and this hands the surplus out.
@@ -530,15 +569,26 @@ pub(super) fn wire_serve_lanes(
                     } => blob_fetch::serve_blob_range(&sync_blobs, &digest, offset, len),
                     // forge object catch-up: also host state, built off this
                     // node's own git substrate — SyncServer cannot see it.
+                    // Answered OFF this loop: a joiner sends no bases, so the
+                    // build is a whole-repo pack, and every other kind a peer
+                    // is waiting on (tip_coords, frames, blob_info) would
+                    // queue behind it (#2481).
                     statesync::SyncRequest::ForgeObjects { repo, head, bases } => {
-                        blob_fetch::serve_forge_objects(
-                            &forge_repo,
-                            &sync_blobs,
-                            &served_packs,
-                            &repo,
+                        spawn_forge_answer(
+                            &ctx,
+                            forge_repo.clone(),
+                            sync_blobs.clone(),
+                            served_packs.clone(),
+                            sync_monitor.clone(),
+                            sync_tx.clone(),
+                            peer,
+                            rpc_id,
+                            req_kind,
+                            repo,
                             head,
-                            &bases,
-                        )
+                            bases,
+                        );
+                        continue;
                     }
                     req => {
                         // record the claim on history this request makes —
