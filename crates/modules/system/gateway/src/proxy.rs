@@ -22,7 +22,6 @@ pub const MAX_HEADERS: usize = 32;
 pub const MAX_HEADER_NAME_BYTES: usize = 64;
 pub const MAX_HEADER_VALUE_BYTES: usize = 4096;
 pub const MAX_HEADER_BYTES: usize = 16384;
-pub const MAX_RESPONSE_HEAD_BYTES: usize = 8192;
 
 /// Request headers stripped before the publisher forwards to its upstream:
 /// hop-by-hop, forwarding/identity spoofables, and every `x-duck-*` (the proxy

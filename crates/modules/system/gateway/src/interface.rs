@@ -16,7 +16,6 @@ pub const GATEWAY_CREDENTIAL_NS: &[u8] = b"ducktape-gateway-credential-v1";
 pub const GATEWAY_CALLER_NS: &[u8] = b"ducktape-gateway-caller-v1";
 pub const MAX_CREDENTIAL_NAME_BYTES: usize = 64;
 pub const MAX_CREDENTIAL_GRANTS: usize = 64;
-pub const SEAL_PK_BYTES: usize = 32;
 pub const MAX_CHAIN_ID_BYTES: usize = 256;
 pub const NODE_KEY_BYTES: usize = 32;
 /// The largest public key any [`identity::KeyScheme`] carries (SEC1
@@ -32,7 +31,6 @@ pub const MAX_RESPONSE_BODY_BYTES: u64 = 4 * 1024 * 1024;
 /// A statement now carries only scalars plus (at most) a 32-byte manifest hash,
 /// so it is tiny; the manifest and file table live off consensus.
 pub const MAX_ROUTE_STATEMENT_JSON_BYTES: usize = 4 * 1024;
-pub const SHA256_HEX_BYTES: usize = 64;
 
 /// The account apex (`None`) or one DNS-shaped label below it. The account is
 /// carried separately so a route name can never cross authority boundaries.
