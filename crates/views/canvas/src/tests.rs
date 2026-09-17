@@ -4013,7 +4013,11 @@ fn menu_rows(view: &BoardsView) -> Vec<String> {
     let tree = view.view();
     let mut keys = Vec::new();
     fn walk(node: &wire::Node, keys: &mut Vec<String>) {
-        if let Some(key) = node.key().and_then(|key| key.strip_prefix("boards/menu/")) {
+        // The row itself, not the words inside it: a row's label is a child
+        // keyed under the row.
+        if let Some(key) = node.key().and_then(|key| key.strip_prefix("boards/menu/"))
+            && !key.contains('/')
+        {
             keys.push(key.to_owned());
         }
         for child in node.children() {

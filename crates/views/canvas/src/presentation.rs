@@ -456,24 +456,32 @@ impl BoardsView {
                 on_scroll: None,
                 content: Box::new(kit::space(Some(Length::Fill), Some(Length::Fill))),
             },
-            Node::Float {
-                key: "boards/menu-card".into(),
-                x: at[0],
-                y: at[1],
-                scale: 1.,
-                shadow: wire::Shadow {
-                    color: Some(Rgba([0., 0., 0., self.menu_shade()])),
-                    x: Some(0.),
-                    y: Some(4.),
-                    blur: Some(16.),
-                },
-                radius: Some([10.; 4]),
-                content: Box::new(kit::sized(
-                    card,
-                    Some(Length::Fixed(MENU_WIDTH)),
-                    Some(Length::Fixed(height)),
-                )),
-            },
+            // The box around the float, not the card inside it: a float takes
+            // the width of the box it is laid out in, and the box a stage
+            // layer hands it is the whole stage — which paints its surface
+            // from the cursor to the right edge. Sizing the card within it
+            // does not help; the sheet is the float's own.
+            kit::sized(
+                kit::container(
+                    "boards/menu-box",
+                    Node::Float {
+                        key: "boards/menu-card".into(),
+                        x: at[0],
+                        y: at[1],
+                        scale: 1.,
+                        shadow: wire::Shadow {
+                            color: Some(Rgba([0., 0., 0., self.menu_shade()])),
+                            x: Some(0.),
+                            y: Some(4.),
+                            blur: Some(16.),
+                        },
+                        radius: Some([10.; 4]),
+                        content: Box::new(card),
+                    },
+                ),
+                Some(Length::Fixed(MENU_WIDTH)),
+                Some(Length::Fixed(height)),
+            ),
         ]
     }
     /// A dropped shadow lifts the card off the board; deeper on a dark one,
@@ -505,14 +513,7 @@ impl BoardsView {
                 rows.push(kit::divider("boards/menu-rule"));
                 height += RULE + GAP;
             }
-            let (label, hint) = menu_row(*item);
-            rows.push(wide(action(
-                &format!("boards/menu/{}", menu_key(*item)),
-                label,
-                hint,
-                Message::Menu(*item),
-                true,
-            )));
+            rows.push(menu_button(*item));
             height += ROW + GAP;
         }
         let card = kit::padded(
@@ -2564,6 +2565,44 @@ pub(super) fn menu_origin(press: [f32; 2], size: [f32; 2], viewport: [f32; 2]) -
         false => press[1] - size[1] - 4.,
     };
     [x.max(GUTTER), y.max(GUTTER)]
+}
+/// One row of the menu. Its words start at the left edge and the button fills
+/// the card, because a menu is read down its left margin — a column of centred
+/// labels is a toolbar stood on its side, and the eye has to find each one.
+fn menu_button(item: MenuItem) -> Node {
+    let key = format!("boards/menu/{}", menu_key(item));
+    let (label, hint) = menu_row(item);
+    let mut words = kit::nowrap(kit::text(format!("{key}/label"), label));
+    if let Node::Text { align_x, .. } = &mut words {
+        *align_x = Some(AlignX::Left);
+    }
+    let mut node = kit::button_child(
+        &key,
+        kit::sized(words, Some(Length::Fill), None),
+        Some(slots::message(Message::Menu(item))),
+        ButtonPreset::Subtle,
+    );
+    if let Node::Button {
+        label: accessible,
+        description,
+        width,
+        height,
+        padding,
+        ..
+    } = &mut node
+    {
+        *accessible = Some(label.into());
+        *description = Some(hint.into());
+        *width = Some(Length::Fill);
+        *height = Some(Length::Fixed(28.));
+        *padding = Some(wire::Edges {
+            top: 0.,
+            right: 8.,
+            bottom: 0.,
+            left: 8.,
+        });
+    }
+    node
 }
 /// What a menu row says, and the keys that do the same thing. The shortcut is
 /// the row's description rather than a second column: a menu whose rows each
