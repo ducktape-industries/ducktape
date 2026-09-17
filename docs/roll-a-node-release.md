@@ -8,6 +8,34 @@ qualifies and flips on its own. Nothing is copied onto a host by hand.
 This is for the node binary. A module's bytes move through the code registry
 instead (`modules.update`), and the desktop app through its own channel.
 
+## Order: a release that moves the module WIT ships AFTER the swap
+
+A node binary carries the host half of the module WIT world
+(`ducktape:module/host`); the components the network runs carry the other
+half, and only the code registry moves those. A binary whose world moved
+cannot link the components the network is running — and nothing about
+publishing or designating it says so. Every launcher stages it, arms it at the
+activation height, STOPS its node, and only then hears the qualify refuse:
+
+```
+checkpoint_unrestorable: restore compose: forge component loads: Module(component
+imports instance `ducktape:module/host@0.1.0`, but a matching implementation was
+not found in the linker: instance export `git-object-read` has the wrong type…)
+node_update_refused      reason=qualify_refused
+```
+
+Every node comes back on the release it was already running, so the network
+keeps producing — but each one paid a stop for an answer that could never be
+yes, and the refused designation stays the network's designation until another
+one replaces it.
+
+So a release that moves the module WIT ships AFTER the module swap that
+matches it, never before: swap each affected module first
+(`ducktape module update <id> <component.wasm> --after <blocks>`), wait for the
+activation height to pass (`ducktape module status` names each module's active
+code), and designate the binary after that. A release that leaves the WIT alone
+has no order to keep.
+
 ## Before anything: the node must follow the channel
 
 A workspace pins the release key it trusts at
