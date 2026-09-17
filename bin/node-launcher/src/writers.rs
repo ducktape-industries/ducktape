@@ -9,6 +9,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -29,6 +30,57 @@ pub fn refuse_symlink(path: &Path) -> Result<(), Refusal> {
             format!("{} is a symlink", path.display()),
         )),
         false => Ok(()),
+    }
+}
+
+/// One supervisor's exclusive hold on a workspace, kept for as long as it
+/// supervises. Dropping it releases the lock, and so does the process dying
+/// however it died — which is why this is `flock` and not a pid file a killed
+/// launcher leaves behind for nobody to clear.
+#[derive(Debug)]
+pub struct Claim(fs::File);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        // SAFETY: our own descriptor, open until this struct is gone.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+/// Claim the workspace for this `run`, or refuse because another one holds it.
+///
+/// ONE `run` PER WORKSPACE. `run` owns `state.json` and the install path, and
+/// a second one decides from the same files with its own memory of what it has
+/// already answered for: it re-stages a release the first rolled back from,
+/// and a qualify it passes flips `current` out from under the first's live
+/// node. Its own child cannot bind the node's listeners either, so besides
+/// that it does nothing but restart a node that dies on every boot. `service`
+/// mode claims nothing — several daemons share one workspace on purpose, and
+/// none of them writes.
+pub fn claim(path: &Path) -> Result<Claim, Refusal> {
+    refuse_symlink(path)?;
+    let parent = path.parent().ok_or_else(|| {
+        Refusal::new("claim_failed", format!("{} has no parent", path.display()))
+    })?;
+    fs::create_dir_all(parent).map_err(|error| Refusal::io("claim_failed", parent, &error))?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| Refusal::io("claim_failed", path, &error))?;
+    // SAFETY: `file` outlives the call; `flock` only takes a lock on its fd.
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    match taken {
+        true => Ok(Claim(file)),
+        false => Err(Refusal::new(
+            "workspace_locked",
+            format!(
+                "{} is held by another ducktape-node-launcher — one supervises a workspace",
+                path.display()
+            ),
+        )),
     }
 }
 
@@ -405,6 +457,26 @@ mod tests {
                 .reason,
             "release_incomplete"
         );
+    }
+
+    /// ONE `run` per workspace. The second claim is refused by name and takes
+    /// nothing with it; the workspace is claimable again the moment the first
+    /// is released. (`flock` is per open file description, so two claims in
+    /// one process contend exactly as two launchers do.)
+    #[test]
+    fn a_workspace_holds_one_supervisor_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::of(dir.path());
+        let path = layout.lock_path();
+
+        let held = claim(&path).expect("the first run claims the workspace");
+        assert_eq!(
+            claim(&path).unwrap_err().reason,
+            "workspace_locked",
+            "a second run on a claimed workspace is refused"
+        );
+        drop(held);
+        claim(&path).expect("a released workspace is claimable again");
     }
 
     #[test]
