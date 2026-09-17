@@ -573,7 +573,15 @@ impl BoardsView {
                         .as_ref()
                         .is_none_or(|old| board.revision >= old.revision);
                     if newer {
+                        // First sight of this board, as opposed to another
+                        // read of one already on screen: only then does the
+                        // rename box take its name, or a live update arriving
+                        // mid-word would stomp what is being typed.
+                        let arriving = self.confirmed.is_none();
                         self.confirmed = Some(board);
+                        if arriving {
+                            self.name_the_board_we_are_on();
+                        }
                         if first_visit {
                             self.on_fit();
                         }
@@ -866,6 +874,7 @@ impl BoardsView {
         self.selected.clear();
         self.catalog.insert(id.clone(), title.clone());
         self.title.clear();
+        self.name_the_board_we_are_on();
         self.undo.clear();
         self.redo.clear();
         self.pending.push_back(Operation::Create { id, title });
@@ -957,6 +966,7 @@ impl BoardsView {
         self.current = id;
         self.board_picker = false;
         self.confirmed = None;
+        self.name_the_board_we_are_on();
         self.selected.clear();
         self.error.clear();
 

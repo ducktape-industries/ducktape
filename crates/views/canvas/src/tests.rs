@@ -4360,6 +4360,13 @@ fn pressable(view: &BoardsView, key: &str) -> Option<bool> {
     }
     walk(&view.view(), key)
 }
+/// What a receipt does: the edits waiting to be saved become the board everyone
+/// agrees on. Anything that asks about the CONFIRMED board — the removal rule
+/// does — reads nothing until this has happened.
+fn settle(view: &mut BoardsView) {
+    view.confirmed = view.visible();
+    view.pending.clear();
+}
 /// A board holding one card, live on a connected session, with the picker open.
 fn with_the_picker_open() -> BoardsView {
     let mut view = view();
@@ -4422,6 +4429,93 @@ fn a_board_is_renamed_from_the_picker_and_the_list_says_so_at_once() {
     view.on_board_picker();
     assert_eq!(view.rename, "Design room");
 }
+/// The board menu used to open straight over a card you were writing on. A
+/// card's editor holds the keyboard, so the letters typed into the menu's own
+/// name box went into the CARD — over the whole of what it said, because a card
+/// opens with its words selected — while every row that would have got you out
+/// sat dark. Opening the menu leaves the card first.
+#[test]
+fn opening_the_board_menu_leaves_the_card_you_were_writing_on() {
+    let mut view = with_the_picker_open();
+    view.catalog.insert("other".into(), "Elsewhere".into());
+    view.on_board_picker();
+    assert!(!view.board_picker, "the menu did not shut");
+
+    card(&mut view, "a", 0);
+    settle(&mut view);
+    view.selected = ["a".into()].into();
+    view.begin_text();
+    view.inline.as_mut().unwrap().document = Editor::new("what the card says");
+
+    view.on_board_picker();
+    assert!(view.inline.is_none(), "the menu opened over a live editor");
+    assert!(view.board_picker, "the menu did not open");
+    assert_eq!(
+        view.visible().unwrap().shapes["a"].shape.text,
+        "what the card says",
+        "the card's words were left behind on the way into the menu"
+    );
+    // The rows stay dark only while that edit is in flight, which is the rule
+    // every row already followed; saved, the menu is a menu again.
+    settle(&mut view);
+    assert_eq!(pressable(&view, "boards/open/other"), Some(true));
+    assert_eq!(
+        pressable(&view, "boards/remove"),
+        Some(false),
+        "a card is on it"
+    );
+}
+/// The rename box names the board the view is ON, however it got there. Seeding
+/// it only where the menu opens left it holding the last board's name when a
+/// board was made FROM the menu, which stays open: the chip said one name, the
+/// box under it said another, and Rename was live and would have taken the
+/// wrong one.
+#[test]
+fn the_rename_box_names_the_board_the_view_is_on_however_it_got_there() {
+    let mut view = with_the_picker_open();
+    assert_eq!(view.rename, "Planning");
+
+    // made from the open menu, which stays open behind the new board
+    view.on_board_minted(view.epoch, "Elsewhere".into(), Ok("other".into()));
+    assert!(view.board_picker, "the menu shut, so this proves nothing");
+    assert_eq!(view.current, "other");
+    assert_eq!(
+        view.rename, "Elsewhere",
+        "the box kept the name of a board the view has left"
+    );
+    assert_eq!(
+        pressable(&view, "boards/rename"),
+        Some(false),
+        "a board was offered a rename to another board's name"
+    );
+
+    // and arriving at one the ordinary way, where the board lands after the open
+    view.pending.clear();
+    view.on_open("room".into());
+    assert!(view.confirmed.is_none());
+    assert_eq!(view.rename, "", "a board we have left named the box");
+    view.on_read(
+        view.epoch,
+        "room".into(),
+        Ok(host::Reading {
+            catalog: view.catalog.clone(),
+            board: Some(Board::new("Planning".into(), "owner".into()).unwrap()),
+        }),
+    );
+    assert_eq!(view.rename, "Planning");
+
+    // A later read of the SAME board must not stomp what is being typed.
+    view.on_rename_title("half a name".into());
+    view.on_read(
+        view.epoch,
+        "room".into(),
+        Ok(host::Reading {
+            catalog: view.catalog.clone(),
+            board: Some(Board::new("Planning".into(), "owner".into()).unwrap()),
+        }),
+    );
+    assert_eq!(view.rename, "half a name", "a live update stomped the box");
+}
 /// A board made by accident goes; a board somebody has drawn on stays. The rule
 /// is the whole design: an empty board holds nobody's work, so removing one can
 /// take nothing from anyone — and this module has no ownership rule that could
@@ -4432,6 +4526,7 @@ fn only_a_board_nobody_has_drawn_on_can_be_removed() {
     assert_eq!(pressable(&view, "boards/remove"), Some(true));
 
     card(&mut view, "a", 0);
+    settle(&mut view);
     assert_eq!(
         pressable(&view, "boards/remove"),
         Some(false),
@@ -4439,7 +4534,7 @@ fn only_a_board_nobody_has_drawn_on_can_be_removed() {
     );
 
     view.edit(Change::Delete { id: "a".into() });
-    view.pending.clear();
+    settle(&mut view);
     assert_eq!(pressable(&view, "boards/remove"), Some(true));
 
     view.on_remove_board();
