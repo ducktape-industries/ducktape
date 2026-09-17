@@ -8,16 +8,13 @@
 # wasm target is pinned to /usr/bin/false so any attempt to compile C for
 # wasm32 fails loudly rather than silently succeeding via a toolchain the
 # runner happens to carry.
+#
+# On demand only (`gh workflow run guest-wasm-mac-smoke.yml --ref <branch>`):
+# a push to any branch that touches the SDK must not spend a macOS runner.
 name: guest-wasm-mac-smoke
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - ".github/workflows/guest-wasm-mac-smoke.yml"
-      - "bin/guest-builder/**"
-      - "crates/module-sdk/**"
-      - "crates/modules/system/identity/**"
 
 concurrency:
   group: guest-wasm-mac-smoke-${{ github.ref }}
