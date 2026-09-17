@@ -310,8 +310,8 @@ fn cmd_show(
             key: active_pubkey(ctx)?,
         },
     };
-    let account =
-        account_reply(query_identity(&base, &query)?)?.ok_or("no such account on this node")?;
+    let account = account_reply(query_identity(&base, &query)?)?
+        .ok_or("no such account — found one with `ducktape account create --name <you>`")?;
     print_account(&account);
     Ok(())
 }
