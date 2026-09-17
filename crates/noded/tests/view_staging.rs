@@ -4,6 +4,14 @@ mod build_script;
 
 use build_script::view_staging as staging;
 
+/// the desktop's own views — the other half of the split, staged beside the
+/// app and asked for at boot, never in a founding set. noded cannot read the
+/// list where it is authoritative (`view_source::DESKTOP_OWNED`, in the app
+/// crate), so it is named here, ONCE, for the two tests that need it.
+const DESKTOP_OWNED: [&str; 6] = [
+    "members", "agents", "node", "explorer", "settings", "palette",
+];
+
 /// the founding ids whose view crate stages into the founding set: the
 /// module-owned views (a module id with a `crates/views/<id>` crate) and the
 /// view-only entries (`topology::VIEWS`).
@@ -16,16 +24,35 @@ fn network_views() -> Vec<&'static str> {
     module_owned.chain(topology::VIEWS.iter().copied()).collect()
 }
 
+/// Every id whose view crate stages into the founding set is one a founding
+/// set may carry a view for, and the desktop's own views are not.
+///
+/// The network's list is DERIVED on both sides here, never written down: a
+/// module joins it by growing a `crates/views/<id>` crate, and a
+/// hand-written expectation goes stale the day one does — which is exactly
+/// what happened to `inbox`, unnoticed because a red in another test binary
+/// stopped `cargo test -p noded` before this one ran.
+///
+/// The other half of the split is [`DESKTOP_OWNED`], which this file has to
+/// name because noded cannot read the app crate. That naming can only ever
+/// test FEWER ids than it should: a desktop view missing from it cannot make
+/// this pass wrongly, because `founding_id` answers from the topology alone
+/// and a desktop view is not in it.
 #[test]
-fn the_network_views_are_the_five_module_owned_and_the_founding_views() {
-    assert_eq!(
-        network_views(),
-        ["pages", "chat", "forge", "governance", "files", "home", "canvas"]
+fn a_founding_view_belongs_to_a_module_or_a_view_only_entry() {
+    let views = network_views();
+    assert!(
+        views.iter().any(|id| topology::TOPOLOGY.spec(id).is_some()),
+        "no module-owned view was found — the crates/views scan is broken"
     );
-    for id in network_views() {
+    assert!(
+        topology::VIEWS.iter().all(|id| views.contains(id)),
+        "every view-only entry stages: {views:?}"
+    );
+    for id in views {
         assert!(staging::founding_id(id), "{id}");
     }
-    for id in ["members", "agents", "node", "explorer", "settings"] {
+    for id in DESKTOP_OWNED {
         assert!(!staging::founding_id(id), "{id} is the desktop's own");
     }
 }
@@ -130,9 +157,8 @@ fn a_view_less_checkout_cannot_poison_another_checkouts_staged_set() {
     let built = fake_checkout(&scratch.path().join("has-views"), true);
     let bare = fake_checkout(&scratch.path().join("no-views"), false);
 
-    let staged = |checkout: &std::path::Path| {
-        build_script::staged_dir(&profile, "modules", checkout)
-    };
+    let staged =
+        |checkout: &std::path::Path| build_script::staged_dir(&profile, "modules", checkout);
     build_script::stage_preset(&built, &staged(&built), &["chat"], &["home"]);
     // the view-less checkout builds LAST: this is the poisoning order
     build_script::stage_preset(&bare, &staged(&bare), &["chat"], &["home"]);
@@ -198,16 +224,13 @@ fn fake_checkout(checkout: &std::path::Path, with_views: bool) -> std::path::Pat
 /// reads the build script.
 #[test]
 fn a_staging_destination_is_always_keyed_to_the_checkout() {
-    let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("build.rs"),
-    )
-    .unwrap();
+    let source =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("build.rs"))
+            .unwrap();
     let bare_joins: Vec<&str> = source
         .lines()
         .filter(|line| !line.trim_start().starts_with("//"))
-        .filter(|line| {
-            line.contains("join(\"modules\")") || line.contains("join(\"sim-modules\")")
-        })
+        .filter(|line| line.contains("join(\"modules\")") || line.contains("join(\"sim-modules\")"))
         .collect();
     assert!(
         bare_joins.is_empty(),
@@ -225,7 +248,7 @@ fn a_staging_destination_is_always_keyed_to_the_checkout() {
 #[test]
 fn desktop_globals_are_never_module_views() {
     let scratch = tempfile::tempdir().unwrap();
-    for id in ["members", "agents", "node", "explorer", "settings"] {
+    for id in DESKTOP_OWNED {
         let package = scratch.path().join("crates/views").join(id);
         std::fs::create_dir_all(&package).unwrap();
         std::fs::write(package.join("Cargo.toml"), "[package]\n").unwrap();
