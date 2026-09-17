@@ -918,7 +918,12 @@ mod tests {
     /// (`topology::VIEWS`, staged out of `make views`), read and hashed at
     /// test time, never embedded. The same set `node init` composes.
     fn fixture_genesis() -> GenesisModules {
-        let dir = noded::services::founding_set().expect("the build stages the founding set");
+        // `{why}`, not `expect`: the refusal carries its remedy on its own
+        // lines, and `expect`'s `{:?}` would hand the reader `\n` escapes in
+        // the one place the remedy is most needed — a sibling checkout built
+        // between this executable's link and its run.
+        let dir = noded::services::founding_set()
+            .unwrap_or_else(|why| panic!("the build stages the founding set:\n{why}"));
         let mut ids = topology::TOPOLOGY.wasm_ids(PRODUCTION);
         ids.extend(topology::VIEWS);
         let hashes = noded::bundle::hash_bundle(&dir, &ids).expect("founding set");
