@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Re-found a ducktape network from nothing: tear down what is running, archive
 # its workspaces, found a validator, join a resident, install the executors,
-# enable the services, mirror a git repo into the forge, and print what an
-# operator needs to reach it.
+# enable the services, mirror a git repo into the forge, prove a mention still
+# reaches an agent, and print what an operator needs to reach it.
 #
 # This is a ROUTINE, not a one-time ceremony. A network is re-founded whenever
 # a wire moves — no compat, no migration — so this script is written to be run
@@ -23,6 +23,7 @@ GUEST_SRC=""
 MIRROR_REPO=""
 ASSUME_YES=0
 SKIP_APP=0
+SKIP_SMOKE=0
 WALLET_NAME="operator"
 WALLET_PASSWORD="ducktape"
 
@@ -47,7 +48,8 @@ die() {
     printf '\nrefound-net: %s\n' "$*" >&2
     if [ -n "${ARCHIVED:-}" ]; then
         printf '\n  the previous network was NOT deleted. it is at:\n' >&2
-        # shellcheck disable=SC2086 -- ARCHIVED is a space-separated path list
+        # ARCHIVED is a space-separated path list, and the split is the point.
+        # shellcheck disable=SC2086
         printf '    %s\n' $ARCHIVED >&2
         printf '  to put it back: stop anything under the roots, then move each\n' >&2
         printf '  archive back to the root it came from.\n' >&2
@@ -81,6 +83,9 @@ usage: ops/refound-net.sh --root DIR [options]
   --wallet-password P its password (default: ducktape). the mnemonic is written
                       to a 0600 file in the workspace, never to stdout.
   --skip-app          do not rebuild the desktop app.
+  --no-smoke          do not seed an agent and mention it at the end. the smoke
+                      is the only step that crosses the WHOLE chain, and it
+                      costs one real agent run; this is how you decline it.
   --yes               proceed past the teardown/archive of an existing root.
 USAGE
     exit 1
@@ -98,6 +103,7 @@ while [ $# -gt 0 ]; do
         --wallet-name) WALLET_NAME=${2:-}; shift 2;;
         --wallet-password) WALLET_PASSWORD=${2:-}; shift 2;;
         --skip-app) SKIP_APP=1; shift;;
+        --no-smoke) SKIP_SMOKE=1; shift;;
         --yes|-y) ASSUME_YES=1; shift;;
         -h|--help) usage;;
         *) die "unknown flag $1 (try --help)";;
@@ -695,7 +701,42 @@ if [ "$SKIP_APP" = 0 ]; then
 fi
 
 # --------------------------------------------------------------------------
-# 10. what the operator needs.
+# 10. the assertion.
+#
+# Every step above proves one part: the node serves, the services read back
+# enabled, the set is staged, the forge has the repo. A mention crosses all of
+# them at once — attribution, model registration, the capability announcement,
+# the sandbox, the executor credential and the reply — so it is the only check
+# that fails when a re-found quietly breaks the chain rather than a part.
+#
+# It runs last because it needs everything, and its result is reported rather
+# than thrown: by now the network exists, and the operator needs the ports and
+# the archive paths whether or not a mention got through. The exit code carries
+# the verdict.
+# --------------------------------------------------------------------------
+SMOKE="skipped (--no-smoke)"
+if [ "$SKIP_SMOKE" = 1 ]; then
+    :
+elif [ -z "$GUEST_SRC" ]; then
+    # compute and agent are not even started without a guest image, so nothing
+    # would ever announce the capability and the run would sit pending for
+    # hours. That is not a red; it is a network with no executor.
+    SMOKE="skipped (no --guest: no agent service to run it)"
+else
+    say "mention smoke"
+    if printf '%s\n' "$WALLET_PASSWORD" | python3 "$CHECKOUT/ops/refound-smoke.py" \
+        --node "http://127.0.0.1:$F_HTTP" \
+        --workspace "$FOUNDER_WS" \
+        --binary "$WS_BIN" \
+        --key "$FOUNDER_WS/keys/$WALLET_NAME.key"; then
+        SMOKE="green — a mention reached the agent and it replied"
+    else
+        SMOKE="RED"
+    fi
+fi
+
+# --------------------------------------------------------------------------
+# 11. what the operator needs.
 # --------------------------------------------------------------------------
 say "up"
 # `|| CONTRACT="?"`: this is the LAST step, after everything worked. A hiccup
@@ -712,6 +753,7 @@ cat <<REPORT
   resident    http 127.0.0.1:$J_HTTP   rpc :$J_RPC   config $JOINER_CFG
   binary      $VOUCH
   set         $MODULES_SRC
+  smoke       $SMOKE
 
   the old content is not gone, it moved. these two lines are the whole story:
   archived   ${ARCHIVED:- (nothing)}
@@ -721,3 +763,10 @@ cat <<REPORT
   through the release plane. Use --config, never -n: two workspaces now share
   this chain id and -n resolves to whichever it finds first.
 REPORT
+
+# The network is founded either way — this is the verdict on whether it WORKS.
+[ "$SMOKE" != "RED" ] || {
+    printf '\nrefound-net: the network is up, but a mention does not reach an agent.\n' >&2
+    printf '  the smoke output above says which link of the chain broke.\n' >&2
+    exit 1
+}
