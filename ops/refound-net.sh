@@ -508,14 +508,11 @@ else
 fi
 
 # ONE AT A TIME, each grant confirmed before the next daemon starts.
-# `commit_enable` is a read-modify-write of `<workspace>/services.toml` with no
-# lock, so three daemons granting themselves at once clobber one another: the
-# first one's record is read by the second, which writes back a file without
-# it. The loser announces nothing, `service status` reads `· compute signaling`
-# with `instance -`, and every saga accept is refused
-# `accept_not_capability_provider` — with the daemon alive and its own log
-# saying it enabled. Starting them in sequence is the operator-side fix; the
-# missing lock is a node defect either way.
+#
+# Not for the lost-grant race any more: `commit_enable` holds an exclusive lock
+# across the whole read-modify-write of `<workspace>/services.toml`, so three
+# daemons granting themselves at once all keep their records. Sequence is kept
+# for the reason below, which no lock addresses.
 #
 # The grant line is also NOT proof the daemon lives: it enables, prints
 # `announced at height N`, and can still exit on the next line. So each one
