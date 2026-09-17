@@ -3855,3 +3855,32 @@ fn the_save_chip_counts_one_change_in_the_singular() {
     let two = view.status();
     assert!(two.contains("2 changes"), "{two}");
 }
+/// The zoom readout is a fixed-width box, so what it has to hold is a fact
+/// about the zoom's own limits rather than about the labels that happened to be
+/// on screen when it was measured. Walking the zoom to both ends is what keeps
+/// `ZOOM_READOUT` and the clamp from drifting apart: widen the box when this
+/// starts failing, do not widen the clamp and leave the box.
+#[test]
+fn the_zoom_readout_never_has_to_hold_more_than_four_digits() {
+    let mut view = view();
+
+    for _ in 0..40 {
+        view.on_zoom(1.25);
+    }
+    assert_eq!(view.zoom, 8., "zoom-in should settle at the clamp");
+    assert_eq!(view.zoom_label(), "800%");
+
+    for _ in 0..80 {
+        view.on_zoom(0.8);
+    }
+    assert_eq!(view.zoom, 0.1, "zoom-out should settle at the clamp");
+    assert_eq!(view.zoom_label(), "10%");
+
+    // Fitting has a clamp of its own, and it is the gesture that reaches the
+    // wider of the two readings in one keystroke.
+    card(&mut view, "a", 0);
+    view.on_press(view.screen(10., 10.)[0], view.screen(10., 10.)[1]);
+    view.on_release();
+    view.on_fit_selection();
+    assert_eq!(view.zoom_label(), "200%");
+}
