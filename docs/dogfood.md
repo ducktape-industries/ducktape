@@ -283,6 +283,16 @@ ducktape module register hello crates/kernel/host/tests/fixtures/hello.component
   --after 50 --config "$WORKSPACE/node.toml"
 ```
 
+Read its counter with the raw route rather than the `query` helper above: a
+module's reply is bytes, and `hello` answers eight little-endian ones, so
+`/v1/query` types the response `application/octet-stream` and there is nothing
+for `jq` to parse.
+
+```sh
+curl -fsS "$BASE/v1/query" -H 'content-type: application/json' \
+  -d '{"target":"hello","query":""}' | xxd
+```
+
 Commit an artifact containing the replacement component to the run's repository.
 The guest builds it with the compiler its image carries, against the vendored
 registry the image also carries: `/.cargo/config.toml` replaces crates.io with
