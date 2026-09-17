@@ -1,6 +1,6 @@
 //! Device files granted by an OS picker or clipboard gesture, scoped to one guest.
-use super::kernel::spawn_device as spawn;
-use super::{Guest, NativeModuleView};
+use super::kernel::spawn_device;
+use super::{Guest, NativeModuleView, wire};
 use gpui_kit::{ClipboardEntry, Context};
 use std::{
     collections::HashMap,
@@ -12,6 +12,22 @@ use std::{
 
 const MAX_CHUNK: usize = 256 << 10;
 const MAX_HANDLES: usize = 128;
+
+/// The host's own device work did not complete — a picker, a clipboard, a read
+/// off the disk. Every future in this file fails that one way, so the token is
+/// stamped here once and each future keeps writing its own sentence.
+fn device_failed(error: String) -> wire::Refusal {
+    wire::Refusal::new("device_failed", error)
+}
+
+/// [`spawn_device`] for this file's futures, which speak sentences.
+fn spawn(
+    guest: &mut Guest,
+    id: u64,
+    future: impl std::future::Future<Output = Result<Vec<u8>, String>> + Send + 'static,
+) {
+    spawn_device(guest, id, async move { future.await.map_err(device_failed) });
+}
 
 #[derive(serde::Serialize)]
 struct FileInfo {
@@ -164,7 +180,7 @@ pub(super) fn answer(
             let text = match String::from_utf8(payload.to_vec()) {
                 Ok(text) => text,
                 Err(_) => {
-                    guest.refuse(id, "clipboard text is not UTF-8".into());
+                    guest.refuse(id, "malformed_request", "clipboard text is not UTF-8");
                     return true;
                 }
             };
@@ -188,7 +204,7 @@ pub(super) fn answer(
                     .await
                     .map_err(|error| error.to_string())?
                 }),
-                Err(error) => guest.refuse(id, error),
+                Err(error) => guest.refuse(id, "malformed_request", error),
             }
         }
         ("fs", "release") => {
@@ -217,7 +233,8 @@ pub(super) fn observe_drop(guest: &mut Guest, event: &super::wire::Event) -> boo
         return false;
     };
     let result = grant_path(&guest.filesystem.state, PathBuf::from(path))
-        .and_then(|file| serde_json::to_vec(&vec![file]).map_err(|error| error.to_string()));
+        .and_then(|file| serde_json::to_vec(&vec![file]).map_err(|error| error.to_string()))
+        .map_err(device_failed);
     guest.pending.push(super::wire::Event::Response {
         id,
         result,
@@ -228,7 +245,7 @@ pub(super) fn observe_drop(guest: &mut Guest, event: &super::wire::Event) -> boo
 
 fn device(guest: &mut Guest, id: u64, request: DeviceRequest) {
     if guest.filesystem.pending.len() >= 16 {
-        guest.refuse(id, "too many pending device requests".into());
+        guest.refuse(id, "in_flight_limit", "too many pending device requests");
         return;
     }
     guest.filesystem.pending.push((id, request));
@@ -300,7 +317,7 @@ pub(super) fn mount(guest: &mut Guest, cx: &mut Context<NativeModuleView>) {
                     None => serde_json::to_vec(&serde_json::json!({"text":text,"files":files}))
                         .map_err(|error| error.to_string()),
                 };
-                guest.reply(id, result);
+                guest.reply(id, result.map_err(device_failed));
             }
             DeviceRequest::ClipboardWrite(text) => {
                 cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));

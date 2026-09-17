@@ -1606,7 +1606,8 @@ impl BoardsView {
                 id,
                 ducktape_view_guest::host::request("host.widget", &wire::encode(&command))
                     .await
-                    .map(|_| ()),
+                    .map(|_| ())
+                    .map_err(ducktape_view_guest::host::said),
             )
         })
     }

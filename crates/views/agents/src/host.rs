@@ -194,7 +194,7 @@ pub struct SessionItem {
 pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     ducktape_view_guest::Subscription::run(|| {
         host::subscribe("agents.props", &[]).map(|answer| {
-            let read = answer.and_then(|bytes| {
+            let read = answer.map_err(host::said).and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
             });
             match read {
@@ -224,7 +224,9 @@ pub fn connection_serial_after(was_connected: bool, connected: bool, serial: i64
 // ---------- what the kernel is asked ----------
 
 async fn ask(kind: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let bytes = host::request(kind, &serde_json::to_vec(body).expect("a request encodes")).await?;
+    let bytes = host::request(kind, &serde_json::to_vec(body).expect("a request encodes"))
+        .await
+        .map_err(host::said)?;
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
@@ -1961,11 +1963,12 @@ pub fn live_run(open_run: String, connection: i64) -> ducktape_view_guest::Subsc
 /// One frame of the node's output stream, folded into the panel's reading.
 /// A frame this view cannot read — another topic, a refusal, a line that is
 /// not a provider event — leaves the reading as it was.
-fn fold_output(run: &mut LiveRun, topic: &str, frame: Result<Vec<u8>, String>) {
+fn fold_output(run: &mut LiveRun, topic: &str, frame: host::Answer) {
     let bytes = match frame {
         Ok(bytes) => bytes,
-        Err(error) => {
-            run.connection = OutputConnection::Failed(clip(&error, MAX_TRACE_EVENT_BYTES));
+        Err(refusal) => {
+            run.connection =
+                OutputConnection::Failed(clip(&refusal.sentence, MAX_TRACE_EVENT_BYTES));
             run.control = None;
             return;
         }
@@ -2323,7 +2326,7 @@ impl Stream for ActStream {
             };
             acts.pending.remove(index);
             Poll::Ready(Some(ActItem {
-                error: answer.err().unwrap_or_default(),
+                error: answer.err().map(host::said).unwrap_or_default(),
             }))
         })
     }
@@ -2807,7 +2810,14 @@ mod process_tests {
     fn output_failures_are_visible_and_never_leave_stale_controls_enabled() {
         let mut run = LiveRun::default();
         let topic = "run-output:test";
-        fold_output(&mut run, topic, Err("HTTP error: 403 Forbidden".into()));
+        fold_output(
+            &mut run,
+            topic,
+            Err(host::Refusal::new(
+                "unauthorized",
+                "HTTP error: 403 Forbidden",
+            )),
+        );
         assert_eq!(
             run.connection,
             OutputConnection::Failed("HTTP error: 403 Forbidden".into())

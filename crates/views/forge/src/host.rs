@@ -185,7 +185,7 @@ pub struct SessionItem {
 pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     ducktape_view_guest::Subscription::run(|| {
         host::subscribe("forge.props", &[]).map(|answer| {
-            let read = answer.and_then(|bytes| {
+            let read = answer.map_err(host::said).and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
             });
             match read {
@@ -209,35 +209,6 @@ fn failure(doing: &str, error: &str) -> String {
     format!("{doing}: {error}")
 }
 
-/// The sentence a refusal actually says, out of the transport envelope the
-/// kernel hands back: `RPC returned 400 Bad Request: {"error":"Module(<the
-/// module's words>)"}`. A reader needs the words, not the status line, not
-/// the JSON, and not the two object ids the module names for an operator —
-/// nothing on the screen lets them act on an oid, and a message long enough
-/// to be clipped loses its own ending.
-///
-/// Whatever is left of the module's own text is kept verbatim: the view does
-/// not paraphrase a refusal it did not write.
-pub fn refusal_reason(error: &str) -> String {
-    let body = match error.split_once("{\"error\":\"") {
-        Some((_, rest)) => rest.trim_end_matches('}').trim_end_matches('"'),
-        None => error,
-    };
-    let inner = match body.strip_prefix("Module(") {
-        Some(rest) => rest.strip_suffix(')').unwrap_or(rest),
-        None => body,
-    };
-    // the operator's parenthetical: `(target <oid>, source <oid>)`
-    let said = match inner.split_once(" (target ") {
-        Some((head, rest)) => match rest.split_once(')') {
-            Some((_, tail)) => format!("{head}{tail}"),
-            None => head.to_owned(),
-        },
-        None => inner.to_owned(),
-    };
-    said.replace("\\\"", "\"").trim().to_owned()
-}
-
 /// The serial every read subscription is keyed by: it moves when the
 /// session comes up, so a reconnect reads the forge afresh.
 pub fn connection_serial_after(was_connected: bool, connected: bool, serial: i64) -> i64 {
@@ -252,13 +223,17 @@ pub fn connection_serial_after(was_connected: bool, connected: bool, serial: i64
 
 async fn query(target: &str, query: serde_json::Value) -> Result<serde_json::Value, String> {
     let ask = serde_json::json!({ "target": target, "query": query });
-    let reply = host::request("rpc.query", &serde_json::to_vec(&ask).expect("encodes")).await?;
+    let reply = host::request("rpc.query", &serde_json::to_vec(&ask).expect("encodes"))
+        .await
+        .map_err(host::said)?;
     serde_json::from_slice(&reply).map_err(|error| error.to_string())
 }
 
 async fn view(target: &str, query: serde_json::Value) -> Result<serde_json::Value, String> {
     let ask = serde_json::json!({ "target": target, "query": query });
-    let reply = host::request("rpc.view", &serde_json::to_vec(&ask).expect("encodes")).await?;
+    let reply = host::request("rpc.view", &serde_json::to_vec(&ask).expect("encodes"))
+        .await
+        .map_err(host::said)?;
     serde_json::from_slice(&reply).map_err(|error| error.to_string())
 }
 
@@ -334,7 +309,7 @@ async fn load_seat() -> SeatItem {
 }
 
 async fn read_seat() -> Result<String, String> {
-    let status = host::request("rpc.status", b"{}").await?;
+    let status = host::request("rpc.status", b"{}").await.map_err(host::said)?;
     let status: serde_json::Value =
         serde_json::from_slice(&status).map_err(|error| error.to_string())?;
     let node_key = status["public_key"].as_str().unwrap_or_default().to_owned();
@@ -595,7 +570,10 @@ async fn read_item(repo: &str, number: i64) -> Result<ItemItem, String> {
             let ask = serde_json::json!({ "pr_diff": { "repo": repo, "number": number } });
             match query(FORGE, ask).await {
                 Ok(reply) => (reply["pr_diff"].clone(), String::new()),
-                Err(error) => (serde_json::Value::Null, refusal_reason(&error)),
+                // The module's own sentence, verbatim: the host split the
+                // transport envelope off it, so there is nothing to peel and
+                // nothing here paraphrases a refusal it did not write.
+                Err(said) => (serde_json::Value::Null, said),
             }
         }
     };
@@ -1076,7 +1054,7 @@ async fn read_picture(repo: &str, rev: &str, path: &str) -> Result<BlobItem, Str
     };
     let ask = serde_json::json!({ "surface": PICTURE_SURFACE, "path": path, "pages": pages });
     let parked = host::request("picture.put", &serde_json::to_vec(&ask).expect("encodes")).await;
-    let parked = parked.and_then(|reply| {
+    let parked = parked.map_err(host::said).and_then(|reply| {
         serde_json::from_slice::<serde_json::Value>(&reply).map_err(|error| error.to_string())
     });
     match parked {
@@ -1236,6 +1214,7 @@ async fn submit_with_blob(
     host::request("op.submit", &serde_json::to_vec(&op).expect("encodes"))
         .await
         .map(|_| ())
+        .map_err(host::said)
 }
 
 /// Open an issue on `repo` as the seated key: the module numbers it, opens
@@ -1388,7 +1367,8 @@ async fn merge_pr(
         "net.request",
         &serde_json::to_vec(&request).expect("application request"),
     )
-    .await?;
+    .await
+    .map_err(host::said)?;
     let reply: serde_json::Value =
         serde_json::from_slice(&reply).map_err(|error| error.to_string())?;
     use base64::Engine as _;
@@ -1430,7 +1410,7 @@ async fn merge_pr(
                 .ok_or("merge service returned no pack")?,
         )
         .map_err(|error| error.to_string())?;
-    let digest = host::request("blob.put", &pack).await?;
+    let digest = host::request("blob.put", &pack).await.map_err(host::said)?;
     let digest = String::from_utf8(digest).map_err(|error| error.to_string())?;
     let message = serde_json::json!({ "merge_pr": {
         "repo": repo,

@@ -73,7 +73,8 @@ pub use gateway_http::{
 // the node-actor command lane and the router's shared state handle.
 mod handle;
 pub use handle::{
-    NetstackSwapRequest, NetstackSwapper, NodeCommand, NodeHandle, PeersStanding, StatusCell,
+    NetstackSwapRequest, NetstackSwapper, NodeCommand, NodeHandle, PeersStanding, Refused,
+    StatusCell,
 };
 
 mod module_code;
@@ -701,6 +702,28 @@ pub(crate) fn error_response(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
+/// A refusal that came back from the actor, with the token beside the
+/// sentence: `{"error": "<what it says>", "reason": "<what it is>"}`.
+///
+/// The two fields exist so nothing downstream has to parse one out of the
+/// other. `error` is the sentence and NOTHING else — no status line, no
+/// variant name wrapped around it — because that string is shown to a person,
+/// and every character of framing inside it is a character of the sentence a
+/// bounded client cuts off the end.
+pub(crate) fn refused_response(status: StatusCode, refused: &crate::handle::Refused) -> Response {
+    tracing::debug!(
+        target: "ducktape::http",
+        status = status.as_u16(),
+        reason = refused.reason,
+        "request refused"
+    );
+    (
+        status,
+        Json(serde_json::json!({ "error": refused.message, "reason": refused.reason })),
+    )
+        .into_response()
+}
+
 /// the actor dropped the reply oneshot — it panicked or shut down mid-request.
 fn actor_gone() -> Response {
     error_response(
@@ -954,7 +977,7 @@ async fn submit_payload(
             })
             .into_response()
         }
-        Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
+        Ok(Err(refused)) => refused_response(StatusCode::BAD_REQUEST, &refused),
         Err(_) => actor_gone(),
     }
 }
@@ -1026,7 +1049,7 @@ async fn submit_frame(
             })
             .into_response()
         }
-        Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
+        Ok(Err(refused)) => refused_response(StatusCode::BAD_REQUEST, &refused),
         Err(_) => actor_gone(),
     }
 }
@@ -1066,7 +1089,7 @@ async fn query(State(handle): State<NodeHandle>, Json(req): Json<QueryRequest>) 
     }
     match rx.await {
         Ok(Ok(bytes)) => module_reply(bytes),
-        Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
+        Ok(Err(refused)) => refused_response(StatusCode::BAD_REQUEST, &refused),
         Err(_) => actor_gone(),
     }
 }
@@ -1140,7 +1163,7 @@ async fn query_as_reader(
     }
     match rx.await {
         Ok(Ok(bytes)) => module_reply(bytes),
-        Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
+        Ok(Err(refused)) => refused_response(StatusCode::BAD_REQUEST, &refused),
         Err(_) => actor_gone(),
     }
 }

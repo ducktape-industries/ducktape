@@ -69,7 +69,7 @@ pub struct SessionItem {
 pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     ducktape_view_guest::Subscription::run(|| {
         host::subscribe("home.props", &[]).map(|answer| {
-            let read = answer.and_then(|bytes| {
+            let read = answer.map_err(host::said).and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
             });
             match read {
@@ -99,7 +99,9 @@ pub fn connection_serial_after(was_connected: bool, connected: bool, serial: i64
 // ---------- what the kernel is asked ----------
 
 async fn ask(kind: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let bytes = host::request(kind, &serde_json::to_vec(body).expect("a request encodes")).await?;
+    let bytes = host::request(kind, &serde_json::to_vec(body).expect("a request encodes"))
+        .await
+        .map_err(host::said)?;
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 

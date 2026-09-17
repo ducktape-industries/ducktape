@@ -20,7 +20,42 @@ pub(crate) async fn signed_write(
         ));
     }
     let frame = sign_frame(target, &payload, password).await?;
-    submit_raw_frame(rpc, target, frame).await
+    submit_raw_frame(rpc, target, frame)
+        .await
+        .map_err(|failure| failure.to_string())
+}
+
+/// A refusal the NODE authored, in the shape a view gets it. The rpc client
+/// already split the token from the sentence, so nothing here parses text:
+/// this is the one place the two names line up.
+pub(crate) fn refused(error: ducktape_rpc::Error) -> view_wire::Refusal {
+    view_wire::Refusal::new(error.reason(), error.message())
+}
+
+/// The write lane's own two answers, which are NOT the same answer: a node
+/// that said no has decided, and re-sending the same op cannot change it; an
+/// exchange that never completed leaves the op's fate unknown, so the view
+/// must re-read before it retries. That difference is the reason a token
+/// exists, so it is the token.
+fn submit_refused(failure: ducktape_rpc::SubmitFailure) -> view_wire::Refusal {
+    match failure {
+        ducktape_rpc::SubmitFailure::Refused(detail) => {
+            view_wire::Refusal::new("rejected", detail)
+        }
+        ducktape_rpc::SubmitFailure::Unresolved(detail) => {
+            view_wire::Refusal::new("unresolved", detail)
+        }
+    }
+}
+
+/// The seat is locked, as a view is told: its own token, because "come back
+/// after you unlock" and "this will never work" are different answers and a
+/// view decides what to draw on that difference.
+pub(crate) fn locked_seat() -> view_wire::Refusal {
+    view_wire::Refusal::new(
+        "session_locked",
+        "the local user key is locked; enter its password",
+    )
 }
 
 /// Sign and submit one module op WITH THE KEY ALREADY SEATED — the seat a
@@ -32,21 +67,24 @@ pub(crate) async fn seated_write(
     target: &str,
     payload: Vec<u8>,
     required_blob: Option<[u8; 32]>,
-) -> Result<u64, String> {
+) -> Result<u64, view_wire::Refusal> {
     let limit = ::node::MAX_PAYLOAD_BYTES - required_blob.map_or(0, |_| 32);
     if payload.is_empty() || payload.len() > limit {
-        return Err(format!(
-            "{target} transaction exceeds the signed payload limit"
+        return Err(view_wire::Refusal::new(
+            "too_large",
+            format!("{target} transaction exceeds the signed payload limit"),
         ));
     }
     let frame = {
         let session = SIGNER.lock().await;
         let Some(signer) = session.as_ref() else {
-            return Err("the local user key is locked; enter its password".into());
+            return Err(locked_seat());
         };
         signer.sign_with_blob(target, next_sequence(), &payload, required_blob)
     };
-    submit_raw_frame(rpc, target, frame).await
+    submit_raw_frame(rpc, target, frame)
+        .await
+        .map_err(submit_refused)
 }
 
 /// A data-plane signer over the key ALREADY SEATED, or the locked refusal:
@@ -54,12 +92,14 @@ pub(crate) async fn seated_write(
 /// carries no password of its own.
 pub(crate) async fn seated_data_plane_signer(
     rpc: &RpcClient,
-) -> Result<ducktape_rpc::WriteAuth, String> {
-    let node_key = hex_decode(&rpc.status().await?.public_key)?;
+) -> Result<ducktape_rpc::WriteAuth, view_wire::Refusal> {
+    let status = rpc.status().await.map_err(refused)?;
+    let node_key = hex_decode(&status.public_key)
+        .map_err(|error| view_wire::Refusal::new("malformed_reply", error))?;
     let key = {
         let session = SIGNER.lock().await;
         let Some(signer) = session.as_ref() else {
-            return Err("the local user key is locked; enter its password".into());
+            return Err(locked_seat());
         };
         signer.key.clone()
     };
@@ -80,13 +120,10 @@ pub(crate) async fn submit_raw_frame(
     rpc: &RpcClient,
     target: &str,
     frame: Vec<u8>,
-) -> Result<u64, String> {
+) -> Result<u64, ducktape_rpc::SubmitFailure> {
     // no blob: an app frame carries its payload inline, so the wait is an
     // ordinary RPC's. Only a pack-bearing push needs a budget sized by bytes.
-    let height = rpc
-        .submit_frame(frame, 0)
-        .await
-        .map_err(|failure| failure.to_string())?;
+    let height = rpc.submit_frame(frame, 0).await?;
     note_module_block(rpc, target, height);
     Ok(height)
 }

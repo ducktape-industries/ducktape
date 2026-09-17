@@ -315,7 +315,7 @@ async fn gateway_query(
             .map_err(|_| GatewayFailure::Unavailable("node actor is gone".into()))?;
         rx.await
             .map_err(|_| GatewayFailure::Unavailable("node actor dropped the query".into()))?
-            .map_err(GatewayFailure::Unavailable)
+            .map_err(|refused| GatewayFailure::Unavailable(refused.message))
     })
     .await
     .map_err(|_| GatewayFailure::Unavailable("gateway authorization query timed out".into()))?
@@ -764,7 +764,7 @@ async fn resolve_duck_authority(
         .await
         .map_err(|_| GatewayFailure::Unavailable("gateway resolve timed out".into()))?
         .map_err(|_| GatewayFailure::Unavailable("node actor dropped the query".into()))?
-        .map_err(GatewayFailure::Unavailable)?;
+        .map_err(|refused| GatewayFailure::Unavailable(refused.message))?;
     match gateway::decode_reply(&bytes) {
         Ok(gateway::GatewayReply::Resolved(Some(account))) => Ok((account.account_id, name)),
         Ok(gateway::GatewayReply::Resolved(None)) => Err(GatewayFailure::NotFound(format!(

@@ -34,7 +34,7 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                     reply,
                 } => {
                     let result = match submit_err {
-                        Some(err) => Err(err.to_string()),
+                        Some(said) => Err(noded::Refused::new("module", said)),
                         None => {
                             // echo enough back to prove the request crossed intact.
                             // the wire casing is the interface crates' serde
@@ -67,8 +67,11 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                                 root_hash: noded::hex_bytes(&key),
                             })
                         }
-                        Ok((origin, ..)) => Err(format!("a frame cannot carry {origin:?}")),
-                        Err(err) => Err(err.to_string()),
+                        Ok((origin, ..)) => Err(noded::Refused::new(
+                            "unsigned_frame",
+                            format!("a frame cannot carry {origin:?}"),
+                        )),
+                        Err(err) => Err(noded::Refused::new("malformed_frame", err.to_string())),
                     };
                     let _ = reply.send(result);
                 }
@@ -2662,7 +2665,7 @@ fn spawn_files_actor(
                 NodeCommand::Submit { target, reply, .. } => {
                     assert_eq!(target, "files");
                     let result = match submit_err {
-                        Some(err) => Err(err.to_string()),
+                        Some(said) => Err(noded::Refused::new("module", said)),
                         None => Ok(BlockSummary {
                             height: 9,
                             root_hash: "ab".repeat(32),

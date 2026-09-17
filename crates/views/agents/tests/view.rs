@@ -6,7 +6,9 @@
 
 use agents_view::host::Session;
 use agents_view::{boot_native, tick_native};
-use ducktape_view_guest::testing::{answer, has_text, item, pick, press, texts, toggle, type_into};
+use ducktape_view_guest::testing::{
+    answer, has_text, item, pick, press, refuse, texts, toggle, type_into,
+};
 use ducktape_view_guest::wire::{Event, Frame, Node, Request};
 use serde_json::{Value, json};
 
@@ -1119,7 +1121,10 @@ fn stream_errors_show_outside_the_disclosure_and_reconnect_the_same_run() {
     assert!(!has_text(&frame, "Connecting to the run output…"));
     let frame = tick_native(vec![Event::Response {
         id: stream.id,
-        result: Err("HTTP error: 403 Forbidden".into()),
+        result: Err(ducktape_view_guest::wire::Refusal::new(
+            "unauthorized",
+            "HTTP error: 403 Forbidden",
+        )),
         done: true,
     }]);
     assert!(has_text(&frame, "HTTP error: 403 Forbidden"));
@@ -1237,11 +1242,7 @@ fn registration_does_not_continue_after_account_change_or_disconnect() {
 fn registration_stops_on_provision_refusal_and_keeps_the_form_retryable() {
     let (frame, _) = begin_registration();
     let provision = request(&frame, "op.submit").id;
-    let frame = tick_native(vec![Event::Response {
-        id: provision,
-        result: Err("provision refused".into()),
-        done: true,
-    }]);
+    let frame = tick_native(vec![refuse(provision, "provision refused")]);
     assert!(
         !frame
             .requests

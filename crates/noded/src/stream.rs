@@ -1780,7 +1780,10 @@ async fn program_run_reader(handle: &NodeHandle, number: u64, key: &[u8]) -> Res
         })
         .await
         .map_err(|_| "actor gone".to_string())?;
-    let bytes = rx.await.map_err(|_| "reply dropped".to_string())??;
+    let bytes = rx
+        .await
+        .map_err(|_| "reply dropped".to_string())?
+        .map_err(|refused| refused.message)?;
     let identity::IdentityReply::Account(account) = identity::decode_reply(&bytes)? else {
         return Err("unexpected identity reply".into());
     };
@@ -1929,7 +1932,10 @@ pub(crate) async fn pending_runs(handle: &NodeHandle) -> Result<Vec<runs_wire::P
         })
         .await
         .map_err(|_| "actor gone".to_string())?;
-    let bytes = rx.await.map_err(|_| "reply dropped".to_string())??;
+    let bytes = rx
+        .await
+        .map_err(|_| "reply dropped".to_string())?
+        .map_err(|refused| refused.message)?;
     match runs_wire::decode_reply(&bytes)? {
         runs_wire::RunsReply::PendingRuns(runs) => Ok(runs),
         _ => Err("unexpected runs reply".to_string()),

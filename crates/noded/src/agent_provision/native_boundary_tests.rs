@@ -145,7 +145,7 @@ async fn provision_native(
                 let crate::NodeCommand::Query { target, req, reply, .. } = command.expect("native query actor remains live") else {
                     panic!("fresh native materialization only reads committed state");
                 };
-                let result = host.query(&target, &req).await.map_err(|error| format!("{error:?}"));
+                let result = host.query(&target, &req).await.map_err(|error| crate::Refused::of(&error));
                 let _ = reply.send(result);
             }
         }

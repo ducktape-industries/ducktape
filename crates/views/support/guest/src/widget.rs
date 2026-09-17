@@ -17,7 +17,7 @@ pub fn is_focused(target: String) -> crate::Task<bool> {
         let command = wire::WidgetCommand::Focused { target };
         match host::request("host.widget", &wire::encode(&command))
             .await
-            .and_then(|bytes| wire::decode(&bytes))
+            .and_then(|bytes| wire::decode(&bytes).map_err(host::malformed))
         {
             Ok(focused) => focused,
             Err(error) => {

@@ -611,13 +611,12 @@ fn the_live_tracing_filter_leaves_as_one_admin_post() {
     );
 
     // a refusal is one sentence beside the control, not the page's error
-    // strip and not the kernel's envelope
+    // strip. the kernel's envelope never gets this far: the boundary already
+    // split it into a token and the node's own words, so the view shows the
+    // words as the node wrote them and peels nothing.
     let frame = tick_native(press(&frame, "Retune"));
     let post = request(&frame, "rpc.admin");
-    let frame = tick_native(vec![refuse(
-        post.id,
-        r#"/v1/log-filter rejected (400 Bad Request): {"error":"invalid filter directive"}"#,
-    )]);
+    let frame = tick_native(vec![refuse(post.id, "invalid filter directive")]);
     let shown = texts(&frame);
     assert!(
         shown

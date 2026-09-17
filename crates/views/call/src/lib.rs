@@ -386,7 +386,10 @@ mod tests {
                                 && payload["frame"]["text"].is_string();
                             let refused = beacon && self.refuse_beacon;
                             let result = match refused {
-                                true => Err("stream send queue is full".to_owned()),
+                                true => Err(wire::Refusal::new(
+                                    "stream_queue_full",
+                                    "stream send queue is full",
+                                )),
                                 false => Ok(Vec::new()),
                             };
                             self.effects.push((request.kind, payload));

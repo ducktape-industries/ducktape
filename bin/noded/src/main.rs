@@ -385,7 +385,7 @@ fn run_node(
                         // junk never reaches the store: the http gate already
                         // refused it, and this is the second wall for any
                         // embedder-side producer on the command lane.
-                        Err(err) => Err(err.to_string()),
+                        Err(err) => Err(noded::Refused::new("malformed_frame", err.to_string())),
                     };
                     publish_status(&status, &metrics, &index, &host, height);
                     let _ = reply.send(result);
@@ -394,7 +394,7 @@ fn run_node(
                     let result = host
                         .query(&target, &req)
                         .await
-                        .map_err(|err| err.to_string());
+                        .map_err(|err| noded::Refused::of(&err));
                     let _ = reply.send(result);
                 }
                 NodeCommand::QueryAs {
@@ -406,7 +406,7 @@ fn run_node(
                     let result = host
                         .query_as(&target, &req, sdk::Origin::External(reader))
                         .await
-                        .map_err(|err| err.to_string());
+                        .map_err(|err| noded::Refused::of(&err));
                     let _ = reply.send(result);
                 }
             }
@@ -437,7 +437,7 @@ async fn submit_and_drain(
     metrics: &NodeMetrics,
     origin: Origin,
     msg: Msg,
-) -> Result<BlockSummary, String> {
+) -> Result<BlockSummary, noded::Refused> {
     let (included, events) =
         match submit_one(host, height, index, blobs, stream_hub, metrics, origin, msg).await {
             Ok(out) => out,
@@ -445,7 +445,9 @@ async fn submit_and_drain(
                 tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
                 std::process::exit(1);
             }
-            Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
+            Err(err @ SubmitError::Rejected(_)) => {
+                return Err(noded::Refused::of_submit(&err))
+            }
         };
 
     // The reactor nudges committed delivery and call queues through this
@@ -464,7 +466,7 @@ async fn submit_and_drain(
             tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
             std::process::exit(1);
         }
-        Err(err) => return Err(err.to_string()),
+        Err(err) => return Err(noded::Refused::new("queue_drain_failed", err.to_string())),
     };
 
     // an unclaimed event is a module's ONLY diagnostic channel (a wasm guest

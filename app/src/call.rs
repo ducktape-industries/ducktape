@@ -93,7 +93,7 @@ pub fn call_session(rpc: String, channel_id: String) -> BoxStream<'static, CallE
                         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
                             CallEvent::failed("error", format!("session output: {error}"))
                         }),
-                        Err(error) => CallEvent::failed("error", error),
+                        Err(refusal) => CallEvent::failed("error", refusal.sentence),
                     };
                     if event.kind == "self" {
                         session.input.send_if_modified(|bytes| {

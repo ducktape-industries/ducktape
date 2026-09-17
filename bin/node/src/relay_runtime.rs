@@ -37,17 +37,19 @@ const BLOB_WINDOW_MAX_REWINDS: u32 = 20;
 
 pub(crate) enum ResidentHold {
     Rpc(std::sync::mpsc::Sender<RpcReply>),
-    Http(oneshot::Sender<Result<noded::BlockSummary, String>>),
+    Http(oneshot::Sender<Result<noded::BlockSummary, noded::Refused>>),
 }
 
 impl ResidentHold {
-    pub(crate) fn fail(self, detail: String) {
+    pub(crate) fn fail(self, refused: noded::Refused) {
         match self {
+            // the local rpc lane prints to a terminal: a person there wants the
+            // sentence, and the token is already in the node's own log line.
             Self::Rpc(tx) => {
-                let _ = tx.send(RpcReply::err(detail));
+                let _ = tx.send(RpcReply::err(refused.message));
             }
             Self::Http(tx) => {
-                let _ = tx.send(Err(detail));
+                let _ = tx.send(Err(refused));
             }
         }
     }
@@ -223,7 +225,7 @@ impl ResidentRelay {
                     Instant::now(),
                 ) {
                     let fanout = self.fanouts.remove(&frame_id).expect("fanout exists");
-                    fanout.hold.fail(detail);
+                    fanout.hold.fail(noded::Refused::new("blob_fanout", detail));
                 }
                 None
             }
@@ -242,7 +244,7 @@ impl ResidentRelay {
                     Instant::now(),
                 ) {
                     let fanout = self.fanouts.remove(&frame_id).expect("fanout exists");
-                    fanout.hold.fail(detail);
+                    fanout.hold.fail(noded::Refused::new("blob_fanout", detail));
                 }
                 None
             }
@@ -257,7 +259,7 @@ impl ResidentRelay {
                 }
                 if let Some(detail) = error {
                     let fanout = self.fanouts.remove(&frame_id).expect("fanout exists");
-                    fanout.hold.fail(detail);
+                    fanout.hold.fail(noded::Refused::new("blob_fanout", detail));
                     return None;
                 }
                 if !fanout.transfer.on_complete(&peer) {
@@ -274,9 +276,10 @@ impl ResidentRelay {
                         frame: fanout.frame,
                     },
                 ) {
-                    fanout
-                        .hold
-                        .fail("validator unreachable after required blob fanout".into());
+                    fanout.hold.fail(noded::Refused::new(
+                        "validator_unreachable",
+                        "validator unreachable after required blob fanout",
+                    ));
                 } else {
                     self.pending
                         .insert(frame_id, (fanout.hold, fanout.deadline));
@@ -311,7 +314,7 @@ impl ResidentRelay {
             .collect();
         for (id, detail) in stalled {
             if let Some(fanout) = self.fanouts.remove(&id) {
-                fanout.hold.fail(detail);
+                fanout.hold.fail(noded::Refused::new("blob_fanout", detail));
             }
         }
 
@@ -333,9 +336,10 @@ impl ResidentRelay {
                     reason = "blob_fanout_expired",
                     "required blob fanout expired before every validator acked; the push fails and can be retried"
                 );
-                fanout
-                    .hold
-                    .fail("timed out distributing the required blob to validators".into());
+                fanout.hold.fail(noded::Refused::new(
+                    "blob_fanout_timeout",
+                    "timed out distributing the required blob to validators",
+                ));
             }
         }
 
@@ -347,9 +351,10 @@ impl ResidentRelay {
             .collect();
         for id in expired_pending {
             if let Some((hold, _)) = self.pending.remove(&id) {
-                hold.fail(
-                    "timed out awaiting the relay answer - re-query on the next block".into(),
-                );
+                hold.fail(noded::Refused::new(
+                    "relay_timeout",
+                    "timed out awaiting the relay answer - re-query on the next block",
+                ));
             }
         }
     }
@@ -397,14 +402,20 @@ fn resolve_resident_hold(hold: ResidentHold, outcome: relay::RelayOutcome) {
         (ResidentHold::Http(tx), relay::RelayOutcome::Applied { height, root_hash }) => {
             let _ = tx.send(Ok(noded::BlockSummary { height, root_hash }));
         }
-        (ResidentHold::Http(tx), relay::RelayOutcome::Rejected { detail })
-        | (ResidentHold::Http(tx), relay::RelayOutcome::Refused { detail }) => {
-            let _ = tx.send(Err(detail));
+        // two outcomes, two tokens: the custodian's consensus REJECTED the op
+        // (the module's own answer, relayed) or REFUSED to take it at all (the
+        // courier lane's), and a caller that must tell them apart no longer has
+        // to read the sentence to do it.
+        (ResidentHold::Http(tx), relay::RelayOutcome::Rejected { detail }) => {
+            let _ = tx.send(Err(noded::Refused::new("module", detail)));
+        }
+        (ResidentHold::Http(tx), relay::RelayOutcome::Refused { detail }) => {
+            let _ = tx.send(Err(noded::Refused::new("relay_refused", detail)));
         }
     }
 }
 
-type HttpReply = oneshot::Sender<Result<noded::BlockSummary, String>>;
+type HttpReply = oneshot::Sender<Result<noded::BlockSummary, noded::Refused>>;
 
 struct LocalFanout {
     reply: HttpReply,
@@ -685,7 +696,9 @@ impl ValidatorRelay {
                         .local_fanouts
                         .remove(&frame_id)
                         .expect("local fanout exists");
-                    let _ = fanout.reply.send(Err(detail));
+                    let _ = fanout
+                        .reply
+                        .send(Err(noded::Refused::new("blob_fanout", detail)));
                 }
                 None
             }
@@ -707,7 +720,9 @@ impl ValidatorRelay {
                         .local_fanouts
                         .remove(&frame_id)
                         .expect("local fanout exists");
-                    let _ = fanout.reply.send(Err(detail));
+                    let _ = fanout
+                        .reply
+                        .send(Err(noded::Refused::new("blob_fanout", detail)));
                 }
                 None
             }
@@ -725,7 +740,9 @@ impl ValidatorRelay {
                         .local_fanouts
                         .remove(&frame_id)
                         .expect("local fanout exists");
-                    let _ = fanout.reply.send(Err(detail));
+                    let _ = fanout
+                        .reply
+                        .send(Err(noded::Refused::new("blob_fanout", detail)));
                     return None;
                 }
                 if !fanout.transfer.on_complete(&peer) {
@@ -799,7 +816,9 @@ impl ValidatorRelay {
             .collect();
         for (id, detail) in stalled {
             if let Some(fanout) = self.local_fanouts.remove(&id) {
-                let _ = fanout.reply.send(Err(detail));
+                let _ = fanout
+                        .reply
+                        .send(Err(noded::Refused::new("blob_fanout", detail)));
             }
         }
 
@@ -818,9 +837,10 @@ impl ValidatorRelay {
                     reason = "blob_fanout_expired",
                     "required blob fanout expired before every peer acked; the push fails and can be retried"
                 );
-                let _ = fanout.reply.send(Err(
-                    "timed out distributing the required blob to validators".into(),
-                ));
+                let _ = fanout.reply.send(Err(noded::Refused::new(
+                    "blob_fanout_timeout",
+                    "timed out distributing the required blob to validators",
+                )));
             }
         }
 

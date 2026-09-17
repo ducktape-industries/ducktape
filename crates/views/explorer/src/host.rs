@@ -58,7 +58,7 @@ pub struct SessionItem {
 pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     ducktape_view_guest::Subscription::run(|| {
         host::subscribe("explorer.props", &[]).map(|answer| {
-            let read = answer.and_then(|bytes| {
+            let read = answer.map_err(host::said).and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
             });
             match read {
@@ -197,9 +197,9 @@ async fn read_ledger() -> LedgerItem {
     let ask = json!({ "limit": LEDGER_BLOCKS });
     let reply = match host::request("rpc.blocks", &encode(&ask)).await {
         Ok(reply) => reply,
-        Err(error) => {
+        Err(refusal) => {
             return LedgerItem {
-                error: format!("Could not read the blocks: {error}"),
+                error: format!("Could not read the blocks: {refusal}"),
                 ..LedgerItem::default()
             };
         }

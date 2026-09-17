@@ -57,8 +57,8 @@ impl ActorNodeApi {
                 .map_err(|_| ApiError::Transport("node actor is gone".into()))?;
             match rx.await {
                 Ok(Ok(block)) => Ok(block),
-                // the module rejection string passes through untouched.
-                Ok(Err(err)) => Err(ApiError::Rejected(err)),
+                // the module's own sentence passes through untouched.
+                Ok(Err(refused)) => Err(ApiError::Rejected(refused.message)),
                 Err(_) => Err(ApiError::Transport("node actor dropped the reply".into())),
             }
         })
@@ -78,7 +78,7 @@ impl ActorNodeApi {
                 .map_err(|_| ApiError::Transport("node actor is gone".into()))?;
             let bytes = match rx.await {
                 Ok(Ok(bytes)) => bytes,
-                Ok(Err(err)) => return Err(map_query_error(err)),
+                Ok(Err(refused)) => return Err(map_query_error(refused.message)),
                 Err(_) => return Err(ApiError::Transport("node actor dropped the reply".into())),
             };
             decode_reply(&bytes).map_err(ApiError::Transport)

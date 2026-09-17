@@ -164,7 +164,7 @@ pub struct SessionItem {
 pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     ducktape_view_guest::Subscription::run(|| {
         host::subscribe("governance.props", &[]).map(|answer| {
-            let read = answer.and_then(|bytes| {
+            let read = answer.map_err(host::said).and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
             });
             match read {
@@ -251,7 +251,9 @@ pub fn holds_a_seat(node_key: &str, reply: &serde_json::Value) -> bool {
 }
 
 async fn ask(kind: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let bytes = host::request(kind, &serde_json::to_vec(body).expect("a request encodes")).await?;
+    let bytes = host::request(kind, &serde_json::to_vec(body).expect("a request encodes"))
+        .await
+        .map_err(host::said)?;
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
@@ -288,7 +290,9 @@ async fn load() -> RegisterItem {
 
 async fn read_register() -> Result<Vec<ProposalRow>, String> {
     let query = serde_json::json!({ "target": "governance", "query": "proposals" });
-    let reply = host::request("rpc.query", &serde_json::to_vec(&query).expect("encodes")).await?;
+    let reply = host::request("rpc.query", &serde_json::to_vec(&query).expect("encodes"))
+        .await
+        .map_err(host::said)?;
     let reply: serde_json::Value =
         serde_json::from_slice(&reply).map_err(|error| error.to_string())?;
     let mut rows = fold_proposals(&reply);
@@ -708,7 +712,7 @@ impl Stream for ActStream {
             let (proposal_id, _) = acts.pending.remove(index);
             Poll::Ready(Some(ActItem {
                 proposal_id,
-                error: answer.err().unwrap_or_default(),
+                error: answer.err().map(host::said).unwrap_or_default(),
             }))
         })
     }

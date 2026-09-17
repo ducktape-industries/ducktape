@@ -33,7 +33,7 @@ pub(super) type ValidatorNode = node::OrderedNode<
 type PendingSubmits = std::collections::HashMap<
     node::FrameId,
     (
-        Vec<futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>>,
+        Vec<futures::channel::oneshot::Sender<Result<noded::BlockSummary, noded::Refused>>>,
         std::time::SystemTime,
     ),
 >;

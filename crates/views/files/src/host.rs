@@ -101,7 +101,7 @@ pub struct SessionItem {
 pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     ducktape_view_guest::Subscription::run(|| {
         host::subscribe("files.props", &[]).map(|answer| {
-            let read = answer.and_then(|bytes| {
+            let read = answer.map_err(host::said).and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
             });
             match read {
@@ -739,7 +739,9 @@ async fn submit_commit(
             "changes": [change],
         }},
     });
-    host::request("op.submit", &serde_json::to_vec(&op).expect("encodes")).await?;
+    host::request("op.submit", &serde_json::to_vec(&op).expect("encodes"))
+        .await
+        .map_err(host::said)?;
     Ok(())
 }
 
@@ -787,7 +789,9 @@ pub fn open_link(url: &str) -> bool {
 // ---------- the kernel calls ----------
 
 async fn request(kind: &str, ask: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let bytes = host::request(kind, &serde_json::to_vec(ask).expect("encodes")).await?;
+    let bytes = host::request(kind, &serde_json::to_vec(ask).expect("encodes"))
+        .await
+        .map_err(host::said)?;
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
@@ -974,6 +978,7 @@ pub fn drops()
     ducktape_view_guest::Subscription::run(|| {
         host::subscribe("fs.drops", b"{}").map(|reply| {
             reply
+                .map_err(host::said)
                 .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
         })
     })
@@ -1006,7 +1011,7 @@ pub async fn upload_files(
             for pending in files {
                 ducktape_view_files::release(&pending.token).await;
             }
-            return Err(error);
+            return Err(host::said(error));
         }
     }
     Ok(())

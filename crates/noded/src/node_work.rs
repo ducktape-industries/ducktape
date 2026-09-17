@@ -30,7 +30,8 @@ async fn query(
         .map_err(|_| "node command lane closed".to_string())?;
     let bytes = rx
         .await
-        .map_err(|_| "node dropped work query".to_string())??;
+        .map_err(|_| "node dropped work query".to_string())?
+        .map_err(|refused| refused.message)?;
     let Reply::NodeWork(directive) = sdk::wire::decode(&bytes)?;
     Ok(directive)
 }
@@ -56,7 +57,8 @@ async fn submit(handle: &NodeHandle, message: Submission) -> Result<(), String> 
         .await
         .map_err(|_| "node command lane closed".to_string())?;
     rx.await
-        .map_err(|_| "node dropped work submission".to_string())??;
+        .map_err(|_| "node dropped work submission".to_string())?
+        .map_err(|refused| refused.message)?;
     Ok(())
 }
 

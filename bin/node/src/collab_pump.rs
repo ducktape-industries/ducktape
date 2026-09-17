@@ -1064,7 +1064,7 @@ impl Pump {
         let bytes = match answer.await {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(error)) => {
-                self.refuse("read_refused", &error);
+                self.refuse("read_refused", &error.message);
                 return None;
             }
             Err(_) => {
@@ -1110,7 +1110,7 @@ impl Pump {
         let bytes = match answer.await {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(error)) => {
-                self.refuse("chat_read_refused", &error);
+                self.refuse("chat_read_refused", &error.message);
                 return None;
             }
             Err(_) => {
@@ -1157,7 +1157,7 @@ impl Pump {
             .map_err(|_| "the node actor is not accepting submissions".to_string())?;
         match answer.await {
             Ok(Ok(block)) => Ok(block.height),
-            Ok(Err(error)) => Err(error),
+            Ok(Err(refused)) => Err(refused.message),
             Err(_) => Err("the node actor dropped a submission".to_string()),
         }
     }
@@ -1829,6 +1829,7 @@ mod tests {
                 .await
                 .expect("the actor answers")
                 .map(|block| block.height)
+                .map_err(|refused| refused.to_string())
         }
 
         async fn read(
@@ -2042,16 +2043,22 @@ mod tests {
         fn refuse(self, command: noded::NodeCommand) {
             match command {
                 noded::NodeCommand::QueryAs { reply, .. } => {
-                    let _ = reply.send(Err("the actor is busy".to_string()));
+                    let _ = reply.send(Err(noded::Refused::new("busy", "the actor is busy")));
                 }
                 noded::NodeCommand::Query { reply, .. } => {
-                    let _ = reply.send(Err("the actor is busy".to_string()));
+                    let _ = reply.send(Err(noded::Refused::new("busy", "the actor is busy")));
                 }
                 noded::NodeCommand::SubmitFrame { reply, .. } => {
-                    let _ = reply.send(Err("the block was not produced".to_string()));
+                    let _ = reply.send(Err(noded::Refused::new(
+                        "no_block",
+                        "the block was not produced",
+                    )));
                 }
                 noded::NodeCommand::Submit { reply, .. } => {
-                    let _ = reply.send(Err("the block was not produced".to_string()));
+                    let _ = reply.send(Err(noded::Refused::new(
+                        "no_block",
+                        "the block was not produced",
+                    )));
                 }
             }
         }

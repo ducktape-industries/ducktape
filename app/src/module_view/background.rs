@@ -6,12 +6,12 @@ use std::sync::{Arc, Mutex};
 use futures::{StreamExt as _, stream::BoxStream};
 use tokio::sync::{mpsc, watch};
 
-use super::{Guest, Mounted, Slot, connection, intern, kernel, mounted, runtime, spawn_load};
+use super::{Guest, Mounted, Slot, connection, intern, kernel, mounted, runtime, spawn_load, wire};
 
 pub(crate) struct Session {
     revision: u64,
     pub input: watch::Sender<Vec<u8>>,
-    pub events: BoxStream<'static, Result<Vec<u8>, String>>,
+    pub events: BoxStream<'static, kernel::Answer>,
 }
 
 impl Session {
@@ -24,7 +24,7 @@ impl Session {
 
 pub(super) struct Attachment {
     id: u64,
-    output: Option<mpsc::UnboundedSender<Result<Vec<u8>, String>>>,
+    output: Option<mpsc::UnboundedSender<kernel::Answer>>,
     pub media: kernel::media::Devices,
 }
 
@@ -40,22 +40,29 @@ pub(super) fn emit(guest: &mut Guest, id: u64, payload: Vec<u8>) {
         .as_ref()
         .and_then(|session| session.output.as_ref())
     {
-        None => Err("host.emit requires an active user-started session".into()),
+        None => Err(wire::Refusal::new(
+            "needs_session",
+            "host.emit requires an active user-started session",
+        )),
         Some(output) => output
             .send(Ok(payload))
             .map(|()| Vec::new())
-            .map_err(|_| "session output is closed".into()),
+            .map_err(|_| wire::Refusal::new("session_closed", "session output is closed")),
     };
     guest.reply(id, result);
 }
 
 pub(super) fn finish(guest: &mut Guest, id: u64, payload: &[u8]) {
     if !payload.is_empty() {
-        guest.refuse(id, "host.finish takes no payload".into());
+        guest.refuse(id, "malformed_request", "host.finish takes no payload");
         return;
     }
     let Some(session) = guest.session.as_mut() else {
-        guest.refuse(id, "host.finish requires a running session".into());
+        guest.refuse(
+            id,
+            "needs_session",
+            "host.finish requires a running session",
+        );
         return;
     };
     session.output.take();
@@ -85,7 +92,9 @@ pub(crate) fn start(module: &str, props: Vec<u8>, origin: &str) -> Result<Sessio
         }
         connection.rev
     };
-    start_at(module, props, revision)
+    // The app's own callers read a sentence, not a token: they show it or log
+    // it. A guest gets the refusal whole, through [`start_at`].
+    start_at(module, props, revision).map_err(|refusal| refusal.sentence)
 }
 
 /// Collect one background response; dropping the caller retires its session.
@@ -93,27 +102,37 @@ pub(crate) async fn request(module: &str, props: Vec<u8>, origin: &str) -> Resul
     let mut session = start(module, props, origin)?;
     let mut bytes = Vec::new();
     while let Some(chunk) = session.events.next().await {
-        let chunk = chunk?;
+        let chunk = chunk.map_err(|refusal| refusal.sentence)?;
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
 }
 
-pub(super) fn start_at(module: &str, props: Vec<u8>, revision: u64) -> Result<Session, String> {
+pub(super) fn start_at(
+    module: &str,
+    props: Vec<u8>,
+    revision: u64,
+) -> Result<Session, wire::Refusal> {
     let valid_name = !module.is_empty()
         && module.len() <= 64
         && module
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
     if !valid_name {
-        return Err("invalid session view or properties".into());
+        return Err(wire::Refusal::new(
+            "malformed_request",
+            "invalid session view or properties",
+        ));
     }
     let connection = connection().lock().expect("views rpc").clone();
     if connection.client.is_none() {
-        return Err("not connected".into());
+        return Err(wire::Refusal::new("not_connected", "not connected"));
     }
     if connection.rev != revision {
-        return Err("session belongs to a previous connection".into());
+        return Err(wire::Refusal::new(
+            "stale_connection",
+            "session belongs to a previous connection",
+        ));
     }
     let module = module.to_owned();
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -152,10 +171,13 @@ pub(super) fn start_at(module: &str, props: Vec<u8>, revision: u64) -> Result<Se
 fn session_source(
     module: &str,
     revision: u64,
-) -> Result<(Arc<Mutex<Mounted>>, watch::Receiver<()>), String> {
+) -> Result<(Arc<Mutex<Mounted>>, watch::Receiver<()>), wire::Refusal> {
     let connection = connection().lock().expect("views rpc").clone();
     if connection.rev != revision || connection.client.is_none() {
-        return Err("session belongs to a previous connection".into());
+        return Err(wire::Refusal::new(
+            "stale_connection",
+            "session belongs to a previous connection",
+        ));
     }
     let module = intern(module);
     let source = mounted(module);
@@ -215,7 +237,7 @@ async fn run(
     revision: u64,
     mut changes: watch::Receiver<()>,
     mut properties: watch::Receiver<Vec<u8>>,
-    output: mpsc::UnboundedSender<Result<Vec<u8>, String>>,
+    output: mpsc::UnboundedSender<kernel::Answer>,
 ) {
     let mut live = kernel::isolated_live_events();
     let code = loop {
@@ -227,8 +249,11 @@ async fn run(
             let state = source.lock().expect("session source");
             match &state.slot {
                 Slot::Loading => Ok(None),
-                Slot::Empty => Err("session view was removed".into()),
-                Slot::Failed(error) => Err(error.clone()),
+                Slot::Empty => Err(wire::Refusal::new(
+                    "session_view_removed",
+                    "session view was removed",
+                )),
+                Slot::Failed(error) => Err(wire::Refusal::new("session_load_failed", error.clone())),
                 Slot::Ready(guest) => {
                     let current = guest.connection_rev == revision;
                     if current {
@@ -239,7 +264,10 @@ async fn run(
                         // for the instance belonging to its own connection.
                         Ok(None)
                     } else {
-                        Err("session view belongs to a previous connection".into())
+                        Err(wire::Refusal::new(
+                            "stale_connection",
+                            "session view belongs to a previous connection",
+                        ))
                     }
                 }
             }
@@ -259,7 +287,7 @@ async fn run(
     let (mut guest, source_identity) = match code.instantiate() {
         Ok(instance) => instance,
         Err(error) => {
-            let _ = output.send(Err(error));
+            let _ = output.send(Err(wire::Refusal::new("session_load_failed", error)));
             return;
         }
     };
@@ -321,9 +349,9 @@ async fn run(
 fn turn(
     guest: &mut Guest,
     id: u64,
-    output: &mpsc::UnboundedSender<Result<Vec<u8>, String>>,
+    output: &mpsc::UnboundedSender<kernel::Answer>,
     props: &[u8],
-) -> Result<(watch::Receiver<()>, Option<std::time::Instant>, bool), String> {
+) -> Result<(watch::Receiver<()>, Option<std::time::Instant>, bool), wire::Refusal> {
     if guest.session.is_none() {
         guest.session = Some(Attachment {
             id,
@@ -336,14 +364,17 @@ fn turn(
         .as_ref()
         .is_none_or(|session| session.id != id)
     {
-        return Err("view belongs to another session".into());
+        return Err(wire::Refusal::new(
+            "wrong_session",
+            "view belongs to another session",
+        ));
     }
     // Subscribe before draining: a completion during redraw must still wake
     // this runner after it releases the guest lock.
     let changes = guest.replies.changes();
     let again = guest.redraw(&Some(props.to_vec()));
     if let Some(error) = &guest.fault {
-        return Err(error.clone());
+        return Err(wire::Refusal::new("view_fault", error.clone()));
     }
     Ok((changes, kernel::next_tick(&guest.clocks), again))
 }
@@ -371,11 +402,14 @@ mod tests {
         let error = start_at("arbitrary-companion", b"{}".to_vec(), revision)
             .err()
             .expect("stale source refused");
-        assert!(error.contains("previous connection"));
+        assert_eq!(error.reason, "stale_connection", "{}", error.sentence);
         let source_error = session_source("queued-before-network-switch", revision)
             .err()
             .expect("queued stale session refused before mounting");
-        assert!(source_error.contains("previous connection"));
+        assert_eq!(
+            source_error.reason, "stale_connection",
+            "{}", source_error.sentence
+        );
         assert!(
             !super::super::registry()
                 .lock()

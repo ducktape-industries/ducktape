@@ -79,7 +79,7 @@ pub struct SessionItem {
 pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     ducktape_view_guest::Subscription::run(|| {
         host::subscribe("node.props", &[]).map(|answer| {
-            let read = answer.and_then(|bytes| {
+            let read = answer.map_err(host::said).and_then(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())
             });
             match read {
@@ -109,7 +109,9 @@ pub fn connection_serial_after(was_connected: bool, connected: bool, serial: i64
 // ---------- what the kernel is asked ----------
 
 async fn ask(kind: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let bytes = host::request(kind, &serde_json::to_vec(body).expect("a request encodes")).await?;
+    let bytes = host::request(kind, &serde_json::to_vec(body).expect("a request encodes"))
+        .await
+        .map_err(host::said)?;
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
@@ -585,7 +587,7 @@ fn log_item(frames: &[host::Answer]) -> LogItem {
         let bytes = match frame {
             Ok(bytes) => bytes,
             Err(refusal) => {
-                error = refusal.clone();
+                error = refusal.sentence.clone();
                 continue;
             }
         };
@@ -774,30 +776,15 @@ impl Stream for ActStream {
                     reply: String::from_utf8_lossy(&bytes).trim().to_owned(),
                     error: String::new(),
                 },
-                Err(error) => ActItem {
+                // the node's own sentence: the host split its envelope off, so
+                // what a person reads is what the node said.
+                Err(refusal) => ActItem {
                     reply: String::new(),
-                    error: refusal_message(&error),
+                    error: refusal.sentence,
                 },
             };
             Poll::Ready(Some(item))
         })
-    }
-}
-
-/// What a refused write says to a person. The kernel relays the node's
-/// refusal as `<route> rejected (<code>): {"error":"<message>"}`; the
-/// message is the sentence, the rest is the envelope. Any other refusal
-/// passes through whole.
-fn refusal_message(error: &str) -> String {
-    let Some(at) = error.find('{') else {
-        return error.to_owned();
-    };
-    let Ok(body) = serde_json::from_str::<serde_json::Value>(&error[at..]) else {
-        return error.to_owned();
-    };
-    match body["error"].as_str() {
-        Some(message) => message.to_owned(),
-        None => error.to_owned(),
     }
 }
 

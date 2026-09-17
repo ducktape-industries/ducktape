@@ -488,7 +488,9 @@ impl ValidatorRuntime<'_> {
                         .push(reply);
                 }
                 Err(e) => {
-                    let _ = reply.send(Err(format!("submit failed: {e}")));
+                    // the "submit failed" framing IS the token now, so the
+                    // sentence carries the cause and nothing else.
+                    let _ = reply.send(Err(noded::Refused::new("submit_failed", e.to_string())));
                 }
             },
         }
@@ -507,7 +509,7 @@ impl ValidatorRuntime<'_> {
     async fn submit_local_frame(
         &mut self,
         frame: Vec<u8>,
-        reply: futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>,
+        reply: futures::channel::oneshot::Sender<Result<noded::BlockSummary, noded::Refused>>,
     ) {
         let Self {
             context,
@@ -549,7 +551,9 @@ impl ValidatorRuntime<'_> {
                         .push(reply);
                 }
                 Err(e) => {
-                    let _ = reply.send(Err(format!("submit failed: {e}")));
+                    // the "submit failed" framing IS the token now, so the
+                    // sentence carries the cause and nothing else.
+                    let _ = reply.send(Err(noded::Refused::new("submit_failed", e.to_string())));
                 }
             },
             Ok(Some(relay_runtime::ValidatorAction::SubmitResident { .. })) => {
@@ -557,7 +561,7 @@ impl ValidatorRuntime<'_> {
             }
             Ok(None) => {}
             Err((reply, detail)) => {
-                let _ = reply.send(Err(detail));
+                let _ = reply.send(Err(noded::Refused::new("blob_fanout", detail)));
             }
         }
     }
@@ -605,7 +609,7 @@ impl ValidatorRuntime<'_> {
                     .host()
                     .query(&target, &req)
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|error| noded::Refused::of(&error));
                 let _ = reply.send(result);
             }
             noded::NodeCommand::QueryAs {
@@ -619,7 +623,7 @@ impl ValidatorRuntime<'_> {
                     .host()
                     .query_as(&target, &req, sdk::Origin::External(reader))
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|error| noded::Refused::of(&error));
                 let _ = reply.send(result);
             }
         }

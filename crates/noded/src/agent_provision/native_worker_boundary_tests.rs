@@ -23,21 +23,21 @@ impl Actor {
         height: &mut u64,
         origin: Origin,
         message: Msg,
-    ) -> Result<crate::BlockSummary, String> {
+    ) -> Result<crate::BlockSummary, crate::Refused> {
         *height += 1;
         let committed_height = *height;
         host.submit_at(at(*height, origin), message)
             .await
-            .map_err(|error| format!("{error:?}"))?;
+            .map_err(|error| crate::Refused::of_submit(&error))?;
         while host
             .has_pending_work()
             .await
-            .map_err(|error| format!("{error:?}"))?
+            .map_err(|error| crate::Refused::of(&error))?
         {
             *height += 1;
             host.submit_block(at(*height, Origin::System), vec![])
                 .await
-                .map_err(|error| format!("{error:?}"))?;
+                .map_err(|error| crate::Refused::of_submit(&error))?;
         }
         self.hub
             .publish_block(*height, "ab".repeat(32), crate::stream::BlockWake::TipOnly);
@@ -68,7 +68,7 @@ impl Actor {
                 response = &mut request => return response.unwrap(),
                 command = self.commands.next() => match command.expect("the real host actor remains live") {
                     crate::NodeCommand::Query { target, req, reply, .. } => {
-                        let _ = reply.send(host.query(&target, &req).await.map_err(|error| format!("{error:?}")));
+                        let _ = reply.send(host.query(&target, &req).await.map_err(|error| crate::Refused::of(&error)));
                     }
                     crate::NodeCommand::SubmitFrame { frame, reply } => {
                         let (origin, message) = node::decode_frame(&frame).unwrap();

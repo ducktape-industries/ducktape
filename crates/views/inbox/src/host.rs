@@ -80,7 +80,7 @@ pub struct SessionItem {
 pub fn session() -> ducktape_view_guest::Subscription<SessionItem> {
     ducktape_view_guest::Subscription::run(|| {
         host::subscribe("inbox.props", &[]).map(|answer| {
-            let read = answer.and_then(|bytes| {
+            let read = answer.map_err(host::said).and_then(|bytes| {
                 serde_json::from_slice::<serde_json::Value>(&bytes)
                     .map_err(|error| error.to_string())
             });
@@ -144,7 +144,9 @@ pub async fn run_background(request: BackgroundRequest) {
 // ---------- what the kernel is asked ----------
 
 async fn ask(kind: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let bytes = host::request(kind, &serde_json::to_vec(body).expect("a request encodes")).await?;
+    let bytes = host::request(kind, &serde_json::to_vec(body).expect("a request encodes"))
+        .await
+        .map_err(host::said)?;
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
@@ -841,6 +843,7 @@ pub async fn mark_read(account: String, up_to_seq: i64) -> Result<(), String> {
     host::request("op.submit", &serde_json::to_vec(&op).expect("the op encodes"))
         .await
         .map(|_reply| ())
+        .map_err(host::said)
 }
 
 // ---------- the addresses a row opens ----------
