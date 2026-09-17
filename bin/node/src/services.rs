@@ -956,19 +956,26 @@ struct Catalog {
 /// The services signaling to the workspace's own node, or why the node could
 /// not be asked. `list` renders the grants off disk either way; what neither
 /// verb may do is turn "I could not ask" into "nothing is signaling".
-fn catalog_now(base: &str) -> (Catalog, Option<String>) {
+fn catalog_now(base: &str, workspace: &std::path::Path) -> (Catalog, Option<String>) {
     match read_catalog(base) {
         Ok(catalog) => (catalog, None),
         // A node that is not running is the ordinary case — `list` must still
         // render the grants — so it stays quiet on stderr. It is NOT silent in
         // the answer: the caller is told the catalog is unknown rather than
         // empty, because those render differently and exit differently.
-        Err(crate::node_http::ReadFailure::Unreachable) => (
+        //
+        // The DIRECTORY is what says whether a launcher owns this node, and
+        // this verb already opened it. `ReadFailure` renders the same sentence
+        // from the url instead, by asking the registry which workspace serves
+        // it — an answer two networks left on the default `http_listen` make
+        // ambiguous. Same renderer either way; this one just has the better
+        // input, so it hands it over rather than throwing it away.
+        Err(crate::node_http::ReadFailure::Unreachable(_)) => (
             Catalog::default(),
-            Some("the node is not running, so nothing could be asked what is signaling".into()),
+            Some(crate::node_http::not_running_in(Some(workspace)).to_string()),
         ),
-        // No warning printed here any more: the caller ends on this reason,
-        // and printing it twice made the second line read like a second fault.
+        // No warning printed here: the caller ends on this reason, and printing
+        // it twice made the second line read like a second fault.
         Err(error) => (Catalog::default(), Some(error.to_string())),
     }
 }
@@ -981,7 +988,7 @@ fn catalog_now(base: &str) -> (Catalog, Option<String>) {
 /// read verbs must NOT use this — for them the difference between an empty
 /// catalog and an unread one is the whole answer.
 fn signaling_now(base: &str) -> Vec<noded::services::Signaling> {
-    catalog_now(base).0.signaling
+    read_catalog(base).unwrap_or_default().signaling
 }
 
 fn read_catalog(base: &str) -> Result<Catalog, crate::node_http::ReadFailure> {
@@ -1004,11 +1011,10 @@ fn read_catalog(base: &str) -> Result<Catalog, crate::node_http::ReadFailure> {
 struct View {
     rows: Vec<ServiceRow>,
     node_build: Option<String>,
+    /// why the catalog is unknown, already carrying what to do about it —
+    /// `ReadFailure` renders that, so this verb neither reconstructs the
+    /// sentence nor guesses at a launcher it cannot see.
     unread: Option<String>,
-    /// where the node writes its own reason. Carried because the refusal
-    /// points at it, and a path the reader has to reconstruct is one they will
-    /// not open.
-    launcher_log: std::path::PathBuf,
 }
 
 fn view(args: &ReadArgs) -> Result<View, Box<dyn std::error::Error>> {
@@ -1016,7 +1022,7 @@ fn view(args: &ReadArgs) -> Result<View, Box<dyn std::error::Error>> {
     let grants = load(&workspace)?;
     let service = config::resolve_service(&args.workspace.config_file()?)?;
     let (catalog, unread) = match service.http_listen.as_deref() {
-        Some(listen) => catalog_now(&config::http_base_of(listen)),
+        Some(listen) => catalog_now(&config::http_base_of(listen), &workspace),
         None => (
             Catalog::default(),
             Some("this workspace's config names no http address to ask".into()),
@@ -1027,7 +1033,6 @@ fn view(args: &ReadArgs) -> Result<View, Box<dyn std::error::Error>> {
         rows: only_kind(all, args.kind.as_deref())?,
         node_build: catalog.node_build,
         unread,
-        launcher_log: workspace.join("launcher.log"),
     })
 }
 
@@ -1073,7 +1078,7 @@ fn list(args: ReadArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     match view.unread {
         None => Ok(()),
-        Some(reason) => Err(unread_refusal(&reason, has_rows, &view.launcher_log).into()),
+        Some(reason) => Err(unread_refusal(&reason, has_rows).into()),
     }
 }
 
@@ -1093,25 +1098,21 @@ fn status(args: ReadArgs) -> Result<(), Box<dyn std::error::Error>> {
     // verb that could not ask must not exit as though it had.
     match view.unread {
         None => Ok(()),
-        Some(reason) => Err(unread_refusal(&reason, has_rows, &view.launcher_log).into()),
+        Some(reason) => Err(unread_refusal(&reason, has_rows).into()),
     }
 }
 
-/// The sentence a read verb ends on when the node never answered. Names what
-/// is still true (whatever is on disk), what is not known (what is signaling
-/// right now), and where the node's own reason lives — it writes an exact one,
-/// into a file rather than in front of anyone.
-fn unread_refusal(reason: &str, printed_grants: bool, launcher_log: &std::path::Path) -> String {
+/// The sentence a read verb ends on when the node never answered: what is
+/// still true (whatever is on disk), what is not known (what is signaling
+/// right now), and then `reason` on its own line — which already carries the
+/// next step, whether that is starting the node or reading the log of the
+/// launcher that is starting it.
+fn unread_refusal(reason: &str, printed_grants: bool) -> String {
     let disk = match printed_grants {
         true => "the grants above are what this workspace holds on disk",
         false => "this workspace holds no grants on disk",
     };
-    format!(
-        "{disk}; what is SIGNALING could not be read — {reason}.\n\
-         if a launcher is supervising this node, its own reason is the last \
-         FATAL line in {}",
-        launcher_log.display()
-    )
+    format!("{disk}; what is SIGNALING could not be read.\n{reason}")
 }
 
 fn join_or_dash(items: &[String]) -> String {
@@ -3547,19 +3548,19 @@ mod tests {
     /// signaling, which is exactly what went unread.
     #[test]
     fn the_unread_refusal_never_claims_the_catalog_was_empty() {
-        let reason = "the node is not running";
-        let log = std::path::Path::new("/home/duck/.ducktape/dognet/launcher.log");
+        // what a live `Unreachable` renders: the sentence arrives WITH its next
+        // step already in it, which is why this verb no longer appends one.
+        let reason = crate::node_http::not_running_in(Some(std::path::Path::new(
+            "/home/duck/.ducktape/dognet",
+        )))
+        .to_string();
         for (printed_grants, expected) in [
             (true, "the grants above are what this workspace holds on disk"),
             (false, "this workspace holds no grants on disk"),
         ] {
-            let said = unread_refusal(reason, printed_grants, log);
+            let said = unread_refusal(&reason, printed_grants);
             assert!(said.starts_with(expected), "{said}");
-            assert!(said.contains(reason), "the reason must survive: {said}");
-            assert!(
-                said.contains("/home/duck/.ducktape/dognet/launcher.log"),
-                "the log it points at must be a path the reader can open: {said}"
-            );
+            assert!(said.contains(&reason), "the reason must survive: {said}");
             assert!(
                 said.contains("could not be read"),
                 "it must say the catalog went UNREAD, never that it was empty: {said}"

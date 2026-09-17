@@ -692,7 +692,7 @@ fn stage_component(
         .header("content-type", "application/octet-stream")
         .body(bytes.to_vec())
         .send()
-        .map_err(|error| crate::node_http::transport_failure(PATH, &error).to_string())?;
+        .map_err(|error| crate::node_http::transport_failure(http_base, PATH, &error).to_string())?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     let refused = !status.is_success();
