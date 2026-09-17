@@ -7630,6 +7630,7 @@ name = "module-artifact"
 version = "0.1.0"
 dependencies = [
  "borsh",
+ "serde",
  "sha2 0.10.9",
 ]
 
@@ -7642,6 +7643,7 @@ dependencies = [
  "commonware-runtime",
  "ducktape-module-sdk",
  "futures",
+ "module-artifact",
  "sdk",
  "sdk-testkit",
  "serde",

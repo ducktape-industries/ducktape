@@ -5,4 +5,8 @@ edition.workspace = true
 
 [dependencies]
 borsh = { workspace = true }
+# the lane declaration this frame carries is ALSO committed state and a
+# governance wire shape, so it derives serde beside borsh. The frame's own
+# payloads stay borsh-only and hand-decoded.
+serde = { workspace = true }
 sha2 = { workspace = true }

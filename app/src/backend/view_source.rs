@@ -858,6 +858,7 @@ pub(crate) mod tests {
                 component: vec![4, 5, 6],
                 assets: [("icons/action.svg".to_owned(), b"<svg/>".to_vec())].into(),
             }),
+            lanes: Vec::new(),
         })
     }
 

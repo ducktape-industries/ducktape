@@ -163,7 +163,7 @@ fn deploy(cluster: &Cluster, artifacts: &Path, replacement: bool) {
     let suffix = if replacement { "-replacement" } else { "" };
     let component = artifacts.join(format!("module{suffix}.component.wasm"));
     let artifact =
-        workspace_config::read_deployment_files(Some(&component), None, None, None).unwrap();
+        workspace_config::read_deployment_files(Some(&component), None, None, None, None).unwrap();
     let expected = format!("{:x}", Sha256::digest(artifact.encode()));
     let verb = if replacement { "update" } else { "register" };
     for (ok, out) in run_on_each(
@@ -188,7 +188,8 @@ fn deploy(cluster: &Cluster, artifacts: &Path, replacement: bool) {
 fn deploy_view(cluster: &Cluster, artifacts: &Path, replacement: bool) {
     let suffix = if replacement { "-replacement" } else { "" };
     let view = artifacts.join(format!("view{suffix}.component.wasm"));
-    let artifact = workspace_config::read_deployment_files(None, None, Some(&view), None).unwrap();
+    let artifact =
+        workspace_config::read_deployment_files(None, None, Some(&view), None, None).unwrap();
     let expected = format!("{:x}", Sha256::digest(artifact.encode()));
     let verb = if replacement { "update" } else { "register" };
     for (ok, out) in run_on_each(

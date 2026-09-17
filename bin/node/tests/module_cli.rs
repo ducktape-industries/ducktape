@@ -336,6 +336,7 @@ fn register_carries_a_mapper_and_update_can_remove_it() {
         view: None,
         component: std::fs::read(&component).unwrap(),
         index: Some(std::fs::read(mapper).unwrap()),
+        lanes: Vec::new(),
     });
     let indexed = common::hex(&artifact.hash());
     let runs = run_on_each(

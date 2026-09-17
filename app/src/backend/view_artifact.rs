@@ -92,6 +92,10 @@ fn verified_frame(bytes: &[u8], expected_hash: [u8; 32]) -> Result<Frame, Error>
                 component: module.component.to_vec(),
                 index: module.index.map(<[u8]>::to_vec),
                 view: None,
+                // the lanes are the CORE's, not the view's: a view has no
+                // sockets, and a deployment that asks for different lanes is
+                // a different core even when its component bytes match.
+                lanes: module.lanes,
             });
             Frame {
                 kind: Kind::Module,
@@ -129,6 +133,7 @@ mod tests {
             component: vec![1, 2, 3],
             index: None,
             view: Some(view.clone()),
+            lanes: Vec::new(),
         });
         assert_eq!(
             verified_view(&artifact.encode(), artifact.hash()).unwrap(),
@@ -138,6 +143,7 @@ mod tests {
             component: vec![1, 2, 3],
             index: None,
             view: None,
+            lanes: Vec::new(),
         });
         assert_eq!(
             verified_view(&removed.encode(), removed.hash()).unwrap(),
@@ -160,16 +166,19 @@ mod tests {
             component: vec![1, 2, 3],
             index: Some(vec![9]),
             view: None,
+            lanes: Vec::new(),
         });
         let with = Artifact::Module(ModuleArtifact {
             component: vec![1, 2, 3],
             index: Some(vec![9]),
             view: Some(view.clone()),
+            lanes: Vec::new(),
         });
         let other_core = Artifact::Module(ModuleArtifact {
             component: vec![1, 2, 3, 4],
             index: Some(vec![9]),
             view: Some(view.clone()),
+            lanes: Vec::new(),
         });
         let frame =
             |artifact: &Artifact| verified_frame(&artifact.encode(), artifact.hash()).unwrap();

@@ -46,6 +46,10 @@ pub struct PackArgs {
     /// View assets rooted here, using canonical relative paths.
     #[arg(long, value_name = "ASSETS", requires = "view")]
     pub assets: Option<PathBuf>,
+    /// The module's data-plane lane declaration (JSON). A module that needs
+    /// no lane passes none, which is most of them.
+    #[arg(long, value_name = "LANES.JSON")]
+    pub lanes: Option<PathBuf>,
     /// Write the canonical deployment artifact here.
     #[arg(long, value_name = "ARTIFACT")]
     pub out: PathBuf,
@@ -73,6 +77,11 @@ pub struct StageArgs {
     /// View assets rooted here, using canonical relative paths.
     #[arg(long, value_name = "ASSETS", requires = "view")]
     pub assets: Option<PathBuf>,
+    /// The module's data-plane lane declaration (JSON): the lanes this
+    /// deployment asks the network for. It rides the artifact frame, so the
+    /// hash governance votes on covers the lanes as well as the code.
+    #[arg(long, value_name = "LANES.JSON")]
+    pub lanes: Option<PathBuf>,
     /// blocks after the proposal's EXECUTE height (not this node's height
     /// right now) at which the swap activates — the same value for every
     /// member co-signing the same proposal, whatever height each one is at
@@ -99,6 +108,7 @@ fn cmd_pack(args: PackArgs) -> CommandResult {
         args.index.as_deref(),
         args.view.as_deref(),
         args.assets.as_deref(),
+        args.lanes.as_deref(),
     )?;
     std::fs::write(&args.out, artifact.encode())?;
     println!("{}", hex_bytes(&artifact.hash()));
@@ -130,6 +140,7 @@ impl Verb {
         kind: modules::Kind,
         activation_lead: u64,
         code_hash: [u8; 32],
+        lanes: Vec<modules::LaneDecl>,
     ) -> governance::GovAction {
         let name = format!("{module_id}@{}", short(&code_hash));
         let module_id = module_id.to_string();
@@ -148,11 +159,11 @@ impl Verb {
                 kind,
                 activation_lead,
                 code_hash,
-                // a lane belongs to the module, so it is read off the artifact
-                // frame rather than typed at the command line. Until the frame
-                // carries one, a post-genesis admission declares no lanes and
-                // the registry's genesis seeding is the only declarer.
-                lanes: Vec::new(),
+                // read off the ARTIFACT FRAME, never typed at the command
+                // line: the hash governance votes on covers the declaration,
+                // so what a member approves and what the registry admits are
+                // the same bytes.
+                lanes,
             },
         }
     }
@@ -228,10 +239,13 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         args.index.as_deref(),
         args.view.as_deref(),
         args.assets.as_deref(),
+        args.lanes.as_deref(),
     )?;
     // the frame says what the entry is: a component makes a module frame, a
     // view alone a view frame — and the registry entry is registered as that.
     let kind = noded::compose::artifact_kind(&artifact.encode())?;
+    // and it says which lanes the deployment asks for, for the same reason.
+    let declared_lanes = noded::compose::artifact_lanes(&artifact.encode())?;
     let bytes = artifact.encode();
     let cfg_path = args.selector.config_path()?;
     let resolved = config::resolve(&cfg_path)?;
@@ -290,7 +304,7 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         &pubkey_hex,
         verb.name(),
         "module:",
-        verb.action(&args.id, kind, args.after, code_hash),
+        verb.action(&args.id, kind, args.after, code_hash, declared_lanes),
         &matches,
     );
     let outcome = match ceremony {
@@ -1130,25 +1144,31 @@ mod tests {
     fn the_matcher_checks_verb_id_code_and_lead() {
         let hash = [0xabu8; 32];
         let module = modules::Kind::Module;
-        let update = Verb::Update.action("hello", module, 100, hash);
-        let register = Verb::Register.action("hello", module, 100, hash);
+        let no_lanes = Vec::new();
+        let update = Verb::Update.action("hello", module, 100, hash, no_lanes.clone());
+        let register = Verb::Register.action("hello", module, 100, hash, no_lanes.clone());
         let same_update = matches_module_action(Verb::Update, "hello", &hash, 100);
         assert!(same_update(&update));
         assert!(!same_update(&register), "register is not update");
-        assert!(!same_update(
-            &Verb::Update.action("other", module, 100, hash)
-        ));
+        assert!(!same_update(&Verb::Update.action(
+            "other",
+            module,
+            100,
+            hash,
+            no_lanes.clone()
+        )));
         assert!(!same_update(&Verb::Update.action(
             "hello",
             module,
             100,
-            [0xcdu8; 32]
+            [0xcdu8; 32],
+            no_lanes.clone()
         )));
         // activation_lead is now a fixed part of the action's identity (it is
         // relative to the EXECUTE height, so it never goes stale): a
         // different lead is a DIFFERENT proposal, not one to join.
         assert!(!same_update(
-            &Verb::Update.action("hello", module, 999, hash)
+            &Verb::Update.action("hello", module, 999, hash, no_lanes)
         ));
         let same_register = matches_module_action(Verb::Register, "hello", &hash, 100);
         assert!(same_register(&register));

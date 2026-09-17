@@ -76,6 +76,7 @@ fn deployment() -> Arc<FakeDeployment> {
         component: vec![0],
         index: None,
         view: None,
+        lanes: Vec::new(),
     });
     FakeDeployment::serving("noop", &artifact)
 }
