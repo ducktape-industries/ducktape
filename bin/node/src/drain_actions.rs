@@ -148,6 +148,106 @@ impl<'a> EpochActions<'a> {
     }
 }
 
+// ============================================================================
+// the halt detector — how long this node has been silent, and how loudly to
+// say so.
+// ============================================================================
+
+/// How long a chain may be silent before the stall is an `error` rather than a
+/// `warn`.
+///
+/// ABSOLUTE, not a multiple of the stall window. A window is `block_time * 30`,
+/// so a window multiple would mean something different on every cadence — and
+/// the operator's question is not "how many windows" but "is this chain dead".
+/// `AGENTS.md` reserves `error` for "stopped and will not self-heal"; a minute
+/// with no block, on a heartbeat that promises one per second, is that.
+pub(crate) const STALL_IS_AN_ERROR_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// How loudly a drain turn owes the log a word about the block beat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StallVoice {
+    /// the chain is beating, or this turn falls inside a window already
+    /// reported — the detector stays quiet so a wedge cannot flood the ring.
+    Quiet,
+    Warn,
+    Error,
+}
+
+/// What the halt detector concluded this turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlockBeat {
+    pub(crate) voice: StallVoice,
+    /// time since the last SEALED height — the whole outage, not the time since
+    /// the last report.
+    pub(crate) stalled_for: std::time::Duration,
+    /// how many stall windows have been reported for this outage; it is the
+    /// `attempts` counter of a forever-retry loop, and it resets on a seal.
+    pub(crate) windows: u64,
+}
+
+/// Advance the halt detector by one drain turn.
+///
+/// `last_seal` means the last time a height actually sealed, and NOTHING but a
+/// seal moves it. The rate limit — one report per stall window, so a wedge that
+/// never clears cannot evict the ring — comes from `windows` instead: the nth
+/// report is due once the silence reaches n windows.
+///
+/// That split is the fix for a real defect. The report used to re-stamp
+/// `last_seal` to rate-limit itself, and `last_seal` is also what the reported
+/// duration was measured from — so every report after the first measured from
+/// the previous REPORT. On the default one-second cadence a ten-minute outage
+/// narrated itself as twenty separate thirty-second stalls, no level could ever
+/// escalate because the measured value could not exceed one window, and nothing
+/// in the log ever said ten minutes.
+pub(crate) fn observe_block_beat(
+    last_seal: &mut std::time::SystemTime,
+    windows: &mut u64,
+    now: std::time::SystemTime,
+    sealed_something: bool,
+    window: std::time::Duration,
+    heartbeat_disabled: bool,
+) -> BlockBeat {
+    if sealed_something {
+        *last_seal = now;
+        *windows = 0;
+        return BlockBeat {
+            voice: StallVoice::Quiet,
+            stalled_for: std::time::Duration::ZERO,
+            windows: 0,
+        };
+    }
+    // the heartbeat is what guarantees a block per beat, so a node with it
+    // disabled (`make dev`) has no floor to measure against. report zero rather
+    // than a rising number no one should read as an outage.
+    if heartbeat_disabled {
+        return BlockBeat {
+            voice: StallVoice::Quiet,
+            stalled_for: std::time::Duration::ZERO,
+            windows: *windows,
+        };
+    }
+    let stalled_for = now.duration_since(*last_seal).unwrap_or_default();
+    let nth_report_due_at = window.saturating_mul(u32::try_from(*windows + 1).unwrap_or(u32::MAX));
+    if stalled_for < nth_report_due_at {
+        return BlockBeat {
+            voice: StallVoice::Quiet,
+            stalled_for,
+            windows: *windows,
+        };
+    }
+    *windows += 1;
+    let voice = match stalled_for >= STALL_IS_AN_ERROR_AFTER {
+        true => StallVoice::Error,
+        false => StallVoice::Warn,
+    };
+    BlockBeat {
+        voice,
+        stalled_for,
+        windows: *windows,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use commonware_cryptography::{Signer as _, ed25519};
@@ -204,6 +304,137 @@ mod tests {
             checkpoint_due(32, 32, quiet, quiet, root, None),
             "no manifest written by this loop yet: a fresh boot re-anchors"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // the halt detector
+    // ------------------------------------------------------------------
+
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+    const TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// run the detector over `seconds` of silence, one tick a second, and
+    /// return every report it made.
+    fn silence_for(seconds: u64) -> Vec<BlockBeat> {
+        let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let mut last_seal = start;
+        let mut windows = 0;
+        (1..=seconds)
+            .filter_map(|elapsed| {
+                let beat = observe_block_beat(
+                    &mut last_seal,
+                    &mut windows,
+                    start + TICK * elapsed as u32,
+                    false,
+                    WINDOW,
+                    false,
+                );
+                (beat.voice != StallVoice::Quiet).then_some(beat)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_beating_chain_says_nothing_and_keeps_no_debt() {
+        let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let mut last_seal = start;
+        let mut windows = 7;
+        let beat = observe_block_beat(
+            &mut last_seal,
+            &mut windows,
+            start + WINDOW * 4,
+            true,
+            WINDOW,
+            false,
+        );
+        assert_eq!(beat.voice, StallVoice::Quiet);
+        assert_eq!(beat.stalled_for, std::time::Duration::ZERO);
+        assert_eq!(windows, 0, "a seal clears the outage");
+        assert_eq!(last_seal, start + WINDOW * 4);
+    }
+
+    #[test]
+    fn the_first_report_waits_one_full_window_and_no_longer() {
+        assert!(silence_for(29).is_empty(), "29s is inside the first window");
+        let reports = silence_for(30);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].voice, StallVoice::Warn);
+        assert_eq!(reports[0].windows, 1);
+        assert_eq!(reports[0].stalled_for, WINDOW);
+    }
+
+    #[test]
+    fn reports_come_one_per_window_never_per_tick() {
+        // 600 ticks of silence, not 600 reports: the ring holds 4096 lines and
+        // a wedge that narrated itself every second would evict the evidence
+        // around it in seven minutes.
+        let reports = silence_for(600);
+        assert_eq!(reports.len(), 20, "600s / 30s window");
+        for (nth, report) in reports.iter().enumerate() {
+            assert_eq!(report.windows, nth as u64 + 1);
+        }
+    }
+
+    /// THE REGRESSION. The report used to re-stamp `last_seal`, which is also
+    /// what it measured from, so every report after the first said one window
+    /// no matter how long the chain had really been down.
+    #[test]
+    fn a_ten_minute_outage_says_ten_minutes() {
+        let reports = silence_for(600);
+        let last = reports.last().expect("a ten-minute silence reports");
+        assert_eq!(
+            last.stalled_for,
+            std::time::Duration::from_secs(600),
+            "the reported duration is the whole outage, not the time since the previous report"
+        );
+        for (nth, report) in reports.iter().enumerate() {
+            assert_eq!(
+                report.stalled_for,
+                WINDOW * (nth as u32 + 1),
+                "every report measures from the last SEAL"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stall_past_the_threshold_is_an_error_and_stays_one() {
+        let reports = silence_for(600);
+        let (warns, errors): (Vec<&BlockBeat>, Vec<&BlockBeat>) = reports
+            .iter()
+            .partition(|r| r.voice == StallVoice::Warn);
+        assert_eq!(
+            warns.len(),
+            1,
+            "only the 30s report is under the 60s threshold"
+        );
+        assert!(
+            errors.iter().all(|r| r.stalled_for >= STALL_IS_AN_ERROR_AFTER),
+            "nothing is an error before the threshold"
+        );
+        assert_eq!(errors.len(), 19, "a dead chain keeps saying so, once a window");
+    }
+
+    #[test]
+    fn a_disabled_heartbeat_is_not_watched_at_all() {
+        let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let mut last_seal = start;
+        let mut windows = 0;
+        for elapsed in 1..=600u64 {
+            let beat = observe_block_beat(
+                &mut last_seal,
+                &mut windows,
+                start + TICK * elapsed as u32,
+                false,
+                WINDOW,
+                true,
+            );
+            assert_eq!(beat.voice, StallVoice::Quiet);
+            assert_eq!(
+                beat.stalled_for,
+                std::time::Duration::ZERO,
+                "with no heartbeat there is no floor to measure against"
+            );
+        }
     }
 
     #[test]

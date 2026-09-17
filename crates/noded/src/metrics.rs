@@ -154,6 +154,7 @@ pub struct NodeMetrics {
     consensus_quorum: Registered<raw::Gauge>,
     consensus_reachable: Registered<raw::Gauge>,
     consensus_pending: Registered<raw::Gauge>,
+    block_beat_stalled: Registered<raw::Gauge>,
     last_finalized_at: Registered<raw::Gauge>,
     sync_target_height: Registered<raw::Gauge>,
     sync_applied_height: Registered<raw::Gauge>,
@@ -247,6 +248,10 @@ impl NodeMetrics {
             consensus_pending: context.gauge(
                 "ducktape_consensus_pending_ops",
                 "operations staged locally or waiting in the consensus orderer",
+            ),
+            block_beat_stalled: context.gauge(
+                "ducktape_block_beat_stalled_seconds",
+                "seconds since this node last sealed a height, 0 while the chain is beating",
             ),
             last_finalized_at: context.gauge(
                 "ducktape_last_finalized_timestamp_seconds",
@@ -422,6 +427,14 @@ impl NodeMetrics {
         self.consensus_reachable.set(reachable_validators as i64);
         self.consensus_pending.set(pending_ops as i64);
         let mut status = self.operations.write().expect("operations lock poisoned");
+        // the stall is the drain's to write and this refresh is throttled, so
+        // carry the live value across rather than rebuilding it to zero — a
+        // wedge that ONLY this projection could show must not be erased by the
+        // refresh that is supposed to publish it.
+        let block_beat_stalled_seconds = status
+            .consensus
+            .as_ref()
+            .map_or(0, |c| c.block_beat_stalled_seconds);
         status.consensus = Some(ConsensusOperationalStatus {
             epoch,
             view,
@@ -429,7 +442,28 @@ impl NodeMetrics {
             quorum,
             reachable_validators,
             pending_ops,
+            block_beat_stalled_seconds,
         });
+    }
+
+    /// the halt detector's reading, every drain turn.
+    ///
+    /// Separate from [`Self::update_consensus`] because the cadences differ:
+    /// operations refresh on a throttle, the block beat is observed on every
+    /// turn, and a stall that is only visible between two refreshes is exactly
+    /// the one worth seeing.
+    pub fn record_block_beat(&self, stalled_for: std::time::Duration) {
+        let seconds = stalled_for.as_secs();
+        self.block_beat_stalled.set(seconds as i64);
+        let mut status = self.operations.write().expect("operations lock poisoned");
+        // only into a projection that already exists. Minting one here would
+        // publish zeros for epoch, view, validators and quorum — a status body
+        // that reads as a node with no consensus at all, which is a worse lie
+        // than a missing field. The gauge above is unconditional, so a wedge in
+        // the seconds before the first operations refresh is still on /metrics.
+        if let Some(consensus) = status.consensus.as_mut() {
+            consensus.block_beat_stalled_seconds = seconds;
+        }
     }
 
     pub fn begin_sync(&self, source: Option<String>, target_height: u64) {
@@ -760,6 +794,60 @@ mod tests {
             assert!(
                 !scrape.contains("peer-a"),
                 "sync source leaked into an unbounded metric label:\n{scrape}"
+            );
+        });
+    }
+
+    /// the halt detector writes on every drain turn and the operations refresh
+    /// is throttled, so the two race on one projection. The refresh REBUILDS
+    /// the consensus block, so it has to carry the stall across — otherwise the
+    /// refresh that exists to publish a wedge is what erases it.
+    #[test]
+    fn an_operations_refresh_does_not_erase_the_stall_under_it() {
+        use commonware_runtime::{Metrics as _, Runner as _};
+
+        commonware_runtime::deterministic::Runner::default().start(|context| async move {
+            let metrics = NodeMetrics::register(&context);
+            metrics.update_consensus(3, 9, 4, 3, 2);
+            metrics.record_block_beat(std::time::Duration::from_secs(600));
+            assert_eq!(
+                metrics
+                    .operational_status()
+                    .consensus
+                    .unwrap()
+                    .block_beat_stalled_seconds,
+                600
+            );
+
+            // the throttled refresh lands mid-wedge
+            metrics.update_consensus(3, 9, 4, 3, 2);
+            assert_eq!(
+                metrics
+                    .operational_status()
+                    .consensus
+                    .unwrap()
+                    .block_beat_stalled_seconds,
+                600,
+                "the refresh rebuilt the projection and dropped the outage"
+            );
+
+            assert!(
+                context.encode().contains("ducktape_block_beat_stalled_seconds 600"),
+                "the gauge a dashboard draws the outage from"
+            );
+
+            // and a beating chain clears it on both surfaces
+            metrics.record_block_beat(std::time::Duration::ZERO);
+            assert_eq!(
+                metrics
+                    .operational_status()
+                    .consensus
+                    .unwrap()
+                    .block_beat_stalled_seconds,
+                0
+            );
+            assert!(
+                context.encode().contains("ducktape_block_beat_stalled_seconds 0")
             );
         });
     }
