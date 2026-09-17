@@ -151,6 +151,61 @@ pub fn build_identity_or_unknown() -> &'static str {
     build_identity().unwrap_or(UNKNOWN_BUILD)
 }
 
+/// The founding set THIS binary's build staged, refusing any other.
+///
+/// `workspace_config::modules_dir` resolves a directory; this says whether it
+/// is ours. The distinction matters because a profile directory is shared by
+/// every checkout that shares the target: the pointer beside the binaries
+/// names one set, and a sibling's `cargo check -p noded` can move that pointer
+/// without relinking any binary. The set then belongs to a build this one is
+/// not, and founding from it means founding from another checkout's wasm —
+/// which reads as a stale guest three weeks after the fact, not as a mistake
+/// anyone made today.
+///
+/// It is a HARD refusal with no second door. `$DUCKTAPE_MODULES_DIR` is the
+/// one way to name a set deliberately, it is checked first and is not subject
+/// to this, and it is what an operator composing from someone else's artifacts
+/// already uses.
+pub fn founding_set() -> Result<std::path::PathBuf, String> {
+    let dir = workspace_config::modules_dir()?;
+    let named = std::env::var_os("DUCKTAPE_MODULES_DIR").is_some();
+    let staged_by = workspace_config::staged_by(&dir);
+    staged_set_verdict(&dir, named, staged_by.as_deref(), build_identity())?;
+    Ok(dir)
+}
+
+/// Whether `dir` is a set this binary may found from. Pure, so the refusal is
+/// testable without a profile directory: the inputs ARE the question.
+///
+/// Both sides are read through [`UNKNOWN_BUILD`] on purpose. A build with no
+/// git to identify itself with — a source tarball, a vendored build, Docker
+/// without `.git` — stages a set stamped `unknown` and reports itself as
+/// `unknown`, so it founds from its own set exactly as it always did. Two such
+/// builds sharing a target directory cannot be told apart by anything, and
+/// this does not pretend otherwise: the guard separates identifiable builds,
+/// and refusing every unidentifiable one would break the case
+/// `no_admission_path_reads_this_node_s_build_stamp` exists to protect.
+fn staged_set_verdict(
+    dir: &std::path::Path,
+    named_by_operator: bool,
+    staged_by: Option<&str>,
+    build: Option<&str>,
+) -> Result<(), String> {
+    let same_build = staged_by.unwrap_or(UNKNOWN_BUILD) == build.unwrap_or(UNKNOWN_BUILD);
+    if named_by_operator || same_build {
+        return Ok(());
+    }
+    Err(format!(
+        "reason=foreign_founding_set {} was staged by build {}, and this binary is build {} — \
+         every checkout sharing a target directory writes into that one profile directory, so \
+         the set beside a binary is whichever build passed through last. Rebuild here, or name \
+         the set you mean with $DUCKTAPE_MODULES_DIR.",
+        dir.display(),
+        staged_by.unwrap_or(UNKNOWN_BUILD),
+        build.unwrap_or(UNKNOWN_BUILD),
+    ))
+}
+
 /// the file a node writes its service-link secret into, next to `node.toml`.
 pub const LINK_TOKEN_FILE: &str = "service-link.token";
 
@@ -563,6 +618,40 @@ pub async fn list(
 mod tests {
     use super::*;
 
+    /// A set a DIFFERENT build staged is refused, with both stamps in the
+    /// message so the remedy is obvious, and an operator naming a directory is
+    /// not subject to it. There is no third answer: a set that cannot say who
+    /// staged it is not this binary's either, which is what stops a set left
+    /// behind by a deleted worktree from being adopted in silence.
+    #[test]
+    fn a_set_another_build_staged_is_refused() {
+        let dir = std::path::Path::new("/t/modules%elsewhere");
+        assert!(staged_set_verdict(dir, false, Some("abc1234"), Some("abc1234")).is_ok());
+
+        let refused = staged_set_verdict(dir, false, Some("abc1234"), Some("def5678"))
+            .expect_err("a stranger's set");
+        assert!(refused.contains("reason=foreign_founding_set"), "{refused}");
+        assert!(
+            refused.contains("abc1234") && refused.contains("def5678"),
+            "{refused}"
+        );
+
+        let unrecorded = staged_set_verdict(dir, false, None, Some("def5678"))
+            .expect_err("a set with no record is not ours either");
+        assert!(unrecorded.contains(UNKNOWN_BUILD), "{unrecorded}");
+
+        // a build with no git stages `unknown` and reports `unknown`: it must
+        // still found from its own set, which is the case
+        // `no_admission_path_reads_this_node_s_build_stamp` guards.
+        assert!(staged_set_verdict(dir, false, Some(UNKNOWN_BUILD), None).is_ok());
+        assert!(staged_set_verdict(dir, false, None, None).is_ok());
+
+        assert!(
+            staged_set_verdict(dir, true, Some("abc1234"), Some("def5678")).is_ok(),
+            "$DUCKTAPE_MODULES_DIR is the operator saying which set they mean"
+        );
+    }
+
     fn hello(kind: &str) -> Hello {
         Hello {
             kind: kind.into(),
@@ -820,6 +909,14 @@ mod build_is_metadata_not_a_gate {
         // `service status` did exactly that, and named the wrong build). It
         // reads only the shipping half, which is also what keeps the literals
         // below from matching themselves.
+        //
+        // `founding_set` is the one READER, and it is on the allowlist because
+        // what it decides is which directory of wasm on THIS box this binary
+        // reads — a set is staged beside a binary by a build, so "did this
+        // build stage it" is the only question that can be asked about one.
+        // Nothing about a peer, a link or a caller is decided here, and a
+        // git-absent build compares `unknown` to `unknown` and founds from its
+        // own set exactly as before (`staged_set_verdict`).
         assert_eq!(
             lines_naming_the_stamp(&shipping_half(file!())),
             [
@@ -827,10 +924,12 @@ mod build_is_metadata_not_a_gate {
                 r#"option_env!("DUCKTAPE_BUILD").filter(|id| !id.is_empty())"#,
                 "pub fn build_identity_or_unknown() -> &'static str {",
                 "build_identity().unwrap_or(UNKNOWN_BUILD)",
+                "staged_set_verdict(&dir, named, staged_by.as_deref(), build_identity())?;",
                 r#""build": build_identity_or_unknown(),"#,
                 r#""build": build_identity_or_unknown(),"#,
             ],
-            "the stamp is DEFINED and RENDERED here and read nowhere else — a new \
+            "the stamp is DEFINED and RENDERED here, and read only where a set \
+             beside this binary is matched to the build that staged it — a new \
              mention is a new reader, and `admit` in particular must never become \
              one"
         );

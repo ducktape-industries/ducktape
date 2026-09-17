@@ -108,9 +108,10 @@ pub fn modules_dir() -> Result<PathBuf, String> {
     staged_modules_dir(&exe).ok_or_else(|| {
         format!(
             "no founding set beside {} — `cargo build` stages this checkout's own \
-             (target/<profile>/{STAGED_MODULES}), `make install-node` installs one beside the \
-             binary as `modules`, or set $DUCKTAPE_MODULES_DIR",
-            exe.display()
+             (target/<profile>/modules%<checkout>, named by its `{}`), `make install-node` \
+             installs one beside the binary as `modules`, or set $DUCKTAPE_MODULES_DIR",
+            exe.display(),
+            staged_key::STAGED_POINTER,
         )
     })
 }
@@ -130,9 +131,9 @@ pub fn sim_modules_dir() -> Result<PathBuf, String> {
 /// pair (`modules` -> `sim-modules`).
 fn sim_twin(modules: &Path) -> PathBuf {
     let resolved = modules.file_name().and_then(|name| name.to_str());
-    let sim = match resolved {
-        Some(name) if name == STAGED_MODULES => STAGED_SIM_MODULES,
-        _ => "sim-modules",
+    let sim = match resolved.and_then(|name| name.strip_prefix("modules")) {
+        Some(key) => format!("sim-modules{key}"),
+        None => "sim-modules".to_owned(),
     };
     modules.with_file_name(sim)
 }
@@ -142,17 +143,21 @@ fn sim_twin(modules: &Path) -> PathBuf {
 /// `<exe dir>/../modules` (a test executable cargo runs from
 /// `target/<profile>/deps/`). `None` when neither directory exists.
 pub fn staged_modules_dir(exe: &Path) -> Option<PathBuf> {
-    // THIS CHECKOUT'S set first, then the unkeyed one. A profile directory is
-    // shared by every checkout that shares the target, so `modules` alone is
-    // whichever build ran last — `STAGED_MODULES` is the one this binary's own
-    // build staged (`staged_key.rs`). Unkeyed is the INSTALLED layout, which
-    // `make install-node` and the pinned dognet binaries use, and where
-    // nothing else writes.
+    // The set the LAST build staged, named by the pointer that build wrote
+    // beside the binaries — then the unkeyed one. The pointer is read at
+    // RUNTIME and never baked: several checkouts share a profile directory
+    // because their source is identical, which is exactly why cargo shares the
+    // compiled unit a baked key would live in (see `STAGED_POINTER`). Unkeyed
+    // is the INSTALLED layout, which `make install-node` and the pinned dognet
+    // binaries use, and where nothing else writes.
     let exe_dir = exe.parent()?;
     let deps_parent = exe_dir.parent();
+    let staged = [Some(exe_dir), deps_parent]
+        .into_iter()
+        .flatten()
+        .find_map(|dir| Some(dir.join(staged_pointer_target(dir)?)));
     let candidates = [
-        Some(exe_dir.join(STAGED_MODULES)),
-        deps_parent.map(|dir| dir.join(STAGED_MODULES)),
+        staged,
         Some(exe_dir.join("modules")),
         deps_parent.map(|dir| dir.join("modules")),
     ];
@@ -162,13 +167,27 @@ pub fn staged_modules_dir(exe: &Path) -> Option<PathBuf> {
         .find(|candidate| candidate.is_dir())
 }
 
-/// the name of the founding set this build's own `cargo build` staged, and of
-/// its simulation twin: `modules-<checkout>` / `sim-modules-<checkout>`
-/// ([`staged_key`]). Stamped by this crate's build script from its own
-/// manifest directory, so it names the same directory `crates/noded/build.rs`
-/// wrote from that checkout.
-pub const STAGED_MODULES: &str = env!("DUCKTAPE_STAGED_MODULES");
-pub const STAGED_SIM_MODULES: &str = env!("DUCKTAPE_STAGED_SIM_MODULES");
+/// The set name `dir`'s pointer names, if it has one.
+fn staged_pointer_target(dir: &Path) -> Option<String> {
+    let name = std::fs::read_to_string(dir.join(staged_key::STAGED_POINTER)).ok()?;
+    let name = name.trim();
+    // a pointer naming anything but a plain directory name is not one this
+    // build wrote; refuse it rather than following it out of the profile dir.
+    let names_one_directory =
+        !name.is_empty() && !name.contains('/') && name != ".." && name != ".";
+    names_one_directory.then(|| name.to_owned())
+}
+
+/// The build that staged `set`, as `crates/noded/build.rs` recorded it, or
+/// `None` for a set with no record (an installed layout, or one staged before
+/// this file existed).
+///
+/// A set is not a shared thing, and a profile directory is shared, so the
+/// record is what lets a reader tell its own set from a stranger's.
+pub fn staged_by(set: &Path) -> Option<String> {
+    let recorded = std::fs::read_to_string(set.join(staged_key::STAGED_OWNER)).ok()?;
+    Some(recorded.trim().to_owned())
+}
 
 /// default recovery checkpoint cadence: small enough that boot replay stays
 /// cheap, large enough that snapshotting the in-memory cohort is amortized.
@@ -1377,13 +1396,13 @@ pub fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String>
 mod tests {
     use super::*;
 
-    /// A binary resolves THIS CHECKOUT's staged set before the unkeyed one,
-    /// from the profile directory and from `deps/` where cargo runs tests —
-    /// and an installed layout (a plain `modules` beside the binary, which is
-    /// what `make install-node` and the pinned dognet binaries have) resolves
-    /// exactly as it did before the keying.
+    /// A binary resolves the set THE POINTER BESIDE IT names, before the
+    /// unkeyed one, from the profile directory and from `deps/` where cargo
+    /// runs tests — and an installed layout (a plain `modules` beside the
+    /// binary, which is what `make install-node` and the pinned dognet
+    /// binaries have) resolves exactly as it did before any keying.
     #[test]
-    fn a_binary_resolves_its_own_staged_set_before_the_installed_one() {
+    fn a_binary_resolves_the_set_its_pointer_names_before_the_installed_one() {
         let scratch = tempfile::tempdir().unwrap();
         let profile = scratch.path().join("debug");
         let exe = profile.join("ducktape");
@@ -1391,16 +1410,19 @@ mod tests {
 
         std::fs::create_dir(profile.join("modules")).unwrap();
         assert_eq!(staged_modules_dir(&exe).unwrap(), profile.join("modules"));
-        std::fs::create_dir(profile.join(STAGED_MODULES)).unwrap();
+
+        let ours = "modules%home%someone%checkout";
+        std::fs::create_dir(profile.join(ours)).unwrap();
+        std::fs::write(profile.join(staged_key::STAGED_POINTER), ours).unwrap();
         assert_eq!(
             staged_modules_dir(&exe).unwrap(),
-            profile.join(STAGED_MODULES),
-            "another checkout's `modules` must not outrank our own set"
+            profile.join(ours),
+            "another checkout's `modules` must not outrank the one we were pointed at"
         );
         let test_exe = profile.join("deps/noded-1234");
         assert_eq!(
             staged_modules_dir(&test_exe).unwrap(),
-            profile.join(STAGED_MODULES),
+            profile.join(ours),
             "a test binary runs from deps/"
         );
 
@@ -1416,13 +1438,56 @@ mod tests {
             installed.join("sim-modules")
         );
         assert_eq!(
-            sim_twin(&profile.join(STAGED_MODULES)),
-            profile.join(STAGED_SIM_MODULES)
+            sim_twin(&profile.join(ours)),
+            profile.join("sim-modules%home%someone%checkout")
         );
-        assert!(
-            STAGED_MODULES.starts_with("modules") && STAGED_SIM_MODULES.starts_with("sim-modules"),
-            "{STAGED_MODULES} / {STAGED_SIM_MODULES}"
+    }
+
+    /// A pointer is a NAME, never a path: a profile directory is written by
+    /// every checkout sharing the target, so one that could carry `..` would
+    /// be a way to aim a node at any directory on the box.
+    #[test]
+    fn a_pointer_that_is_not_a_plain_name_is_refused() {
+        let scratch = tempfile::tempdir().unwrap();
+        let profile = scratch.path().join("debug");
+        let exe = profile.join("ducktape");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::create_dir(profile.join("modules")).unwrap();
+
+        for refused in ["../elsewhere", "/etc", "..", ".", "", "  "] {
+            std::fs::write(profile.join(staged_key::STAGED_POINTER), refused).unwrap();
+            assert_eq!(
+                staged_modules_dir(&exe).unwrap(),
+                profile.join("modules"),
+                "{refused:?} must not resolve"
+            );
+        }
+    }
+
+    /// The record inside a set says which build wrote it. Reading it back is
+    /// what lets `noded::services::founding_set` refuse a stranger's.
+    #[test]
+    fn a_set_reports_the_build_that_staged_it() {
+        let scratch = tempfile::tempdir().unwrap();
+        let set = scratch.path().join("modules%somewhere");
+        std::fs::create_dir_all(&set).unwrap();
+        assert_eq!(staged_by(&set), None, "a set with no record claims nothing");
+        std::fs::write(set.join(staged_key::STAGED_OWNER), "abc1234\n").unwrap();
+        assert_eq!(staged_by(&set).as_deref(), Some("abc1234"));
+    }
+
+    /// A set name encodes its checkout, and the encoding round-trips — which
+    /// is how the stager tells a set whose worktree is gone from a live one.
+    #[test]
+    fn a_set_name_names_the_checkout_it_belongs_to() {
+        let checkout = Path::new("/home/eddy/dev/ducktape/ducktape");
+        let name = staged_key::staged_set_name("modules", checkout);
+        assert_eq!(name, "modules%home%eddy%dev%ducktape%ducktape");
+        assert_eq!(
+            staged_key::checkout_of_set_name(&name).as_deref(),
+            Some(checkout)
         );
+        assert_eq!(staged_key::checkout_of_set_name("modules"), None);
     }
 
     fn tmp(name: &str) -> PathBuf {

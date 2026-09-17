@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (a path and a hash table) then rides into the actor.
     let modules_dir = match modules {
         Some(dir) => dir,
-        None => workspace_config::modules_dir()?,
+        None => noded::services::founding_set()?,
     };
     let wasm_ids = TOPOLOGY.wasm_ids(MODULE_IDS);
     let (code, code_hashes) = DirCodeSource::open(&modules_dir, &wasm_ids).map_err(|err| {

@@ -918,7 +918,7 @@ mod tests {
     /// (`topology::VIEWS`, staged out of `make views`), read and hashed at
     /// test time, never embedded. The same set `node init` composes.
     fn fixture_genesis() -> GenesisModules {
-        let dir = workspace_config::modules_dir().expect("the build stages the founding set");
+        let dir = noded::services::founding_set().expect("the build stages the founding set");
         let mut ids = topology::TOPOLOGY.wasm_ids(PRODUCTION);
         ids.extend(topology::VIEWS);
         let hashes = noded::bundle::hash_bundle(&dir, &ids).expect("founding set");

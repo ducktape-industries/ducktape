@@ -125,14 +125,29 @@ fn pinned_build() -> &'static PinnedBuild {
 
         let staged = workspace_config::modules_dir()
             .expect("cargo build stages the founding set beside the test executable");
-        let modules = dir.join(workspace_config::STAGED_MODULES);
+        // keep the set's OWN name: `staged_modules_dir` reads the pointer the
+        // build wrote, and the pin copies the set that pointer named.
+        let staged_name = staged
+            .file_name()
+            .expect("a resolved founding set has a directory name");
+        let modules = dir.join(staged_name);
         link_tree(&staged, &modules);
+        // and the pointer that names it, because that is what a spawned node
+        // reads. Without one the pin would hold a set nothing resolves and the
+        // node would walk back out to the live profile directory — the very
+        // set being pinned away from.
+        std::fs::write(
+            dir.join(workspace_config::staged_key::STAGED_POINTER),
+            staged_name.to_str().expect("utf-8 founding set name"),
+        )
+        .expect("name the pinned founding set");
         // the simulator's twin rides along when the build staged one. No node
         // e2e composes from it today; a pin that silently dropped it would be a
         // trap for the first one that does.
-        let sim = staged.with_file_name(workspace_config::STAGED_SIM_MODULES);
+        let sim = workspace_config::sim_modules_dir().expect("the twin of a resolved set");
         if sim.is_dir() {
-            link_tree(&sim, &dir.join(workspace_config::STAGED_SIM_MODULES));
+            let sim_name = sim.file_name().expect("a twin has a directory name");
+            link_tree(&sim, &dir.join(sim_name));
         }
 
         PinnedBuild {
