@@ -9,7 +9,7 @@ question it answers. Load the document that answers the question, never the
 tree. It covers the operator runbooks (`docs/deploy/`, `docs/dogfood.md`,
 `docs/sandbox-macos.md`), the references code cites by path (`docs/records/`),
 the per-area READMEs (`ops/`, `app/`, `crates/airlock/`) and the agent runbooks
-in `skills/` (`qa`, `sim-lane`, `module-dev`).
+in `skills/` (`qa`, `sim-lane`, `module-dev`, `graft`).
 
 ## No Legacy, No Compat (until a live network exists)
 
@@ -54,7 +54,7 @@ in `skills/` (`qa`, `sim-lane`, `module-dev`).
 ## Internal Skills
 
 - Keep repo-specific operational runbooks in `skills/` (`qa`, `sim-lane`,
-  `module-dev`). Nothing else lives there: a prompt for an agent running
+  `module-dev`, `graft`). Nothing else lives there: a prompt for an agent running
   inside a network is product, not a runbook.
 - `.claude/skills` and `.codex/skills` both point to the shared `skills/` directory.
 - Keep assistant-facing repository guidance in this file; `CLAUDE.md` links here so both assistants read the same instructions.

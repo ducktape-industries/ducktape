@@ -98,6 +98,12 @@ manifest, process contract, and install/activate/stop/restart commands.
   silently ignored; `use`, `help` and `cgroup` need no node and never read it.
 - `completions/` — shell completions for the `ducktape` CLI.
 
+## Code graph for agents
+
+- `graft` — the `graft` CLI (`npm i -g @nanonets/graft`) with telemetry off,
+  no `.ignore` written, and its tokens-saved banner stripped; `skills/graft`
+  says when to reach for it. Its cache is `graft/`, gitignored.
+
 ## Networking and media harnesses
 
 - `coordinator/` — systemd unit, env example, and Dockerfile for the UDP

@@ -43,3 +43,6 @@ HANDOFF.md
 
 # wrangler local state (ops/auth-page)
 .wrangler/
+
+# graft's local graph cache — regenerable (`ops/graft build`), never committed
+/graft/

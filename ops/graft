@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# graft (https://github.com/trailhq/Graft) with the repo's settings applied:
+# no telemetry, no `.ignore` that re-admits the 140 MB card cache to ripgrep,
+# and the "[graft] tokens saved … tell the user" banner stripped from every
+# output — it is a sales prompt aimed at the agent, not information.
+# Install once: npm i -g @nanonets/graft
+set -o pipefail
+export DO_NOT_TRACK=1 GRAFT_NO_IGNORE=1
+graft "$@" | sed -E '/^\[graft\] tokens saved ≈/d'
