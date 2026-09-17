@@ -31,21 +31,43 @@ pub struct ConflictReport {
     pub remedy: String,
 }
 
-/// a node-side failure. the engine's conflict taxonomy keys on the exact module
-/// string inside `Rejected` (the `"files: conflict:"` / `"files: base snapshot
-/// not resolvable"` / `"files: chunk not available"` contracts), so it must pass
-/// through verbatim — never reworded.
+/// a node-side failure.
+///
+/// a refusal arrives in the two halves the node's `/v1` envelope carries and
+/// keeps them apart all the way to the screen: `reason` is the stable
+/// snake_case class the refuser chose, `sentence` is the words it wrote. a
+/// caller branches on the class; a person reads the sentence. flattening them
+/// into one string is what put a Rust type name (`Module(..)`) in front of an
+/// operator, and what leaves every consumer matching prose.
+///
+/// the sentence passes through verbatim — never reworded — because the engine's
+/// conflict taxonomy still keys on it: the commit lane's three classes
+/// (`"files: conflict:"`, `"files: base snapshot not resolvable"`,
+/// `"files: chunk not available"`) all reach here under the module's single
+/// `files_commit` class, so the class alone cannot tell them apart yet.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ApiError {
-    /// a module rejection — the verbatim `"files: ..."` string.
-    #[error("{0}")]
-    Rejected(String),
+    /// a refusal: the class token beside the sentence.
+    #[error("{reason}: {sentence}")]
+    Rejected { reason: String, sentence: String },
     /// a 404 (absent path / unresolvable snapshot over http).
     #[error("not found")]
     NotFound,
     /// a transport-layer failure (connection, decode, non-error non-2xx).
     #[error("transport: {0}")]
     Transport(String),
+}
+
+impl ApiError {
+    /// a refusal this CLIENT is making, not one the node sent back. the class is
+    /// the client's own — nothing here ever borrows a module's token for words
+    /// no module said.
+    pub fn refused(reason: impl Into<String>, sentence: impl Into<String>) -> Self {
+        ApiError::Rejected {
+            reason: reason.into(),
+            sentence: sentence.into(),
+        }
+    }
 }
 
 /// every node interaction the engine needs. all reads take an optional snapshot

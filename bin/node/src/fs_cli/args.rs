@@ -2,6 +2,7 @@
 //! address to. The addressing flags and the resolution ladder itself are
 //! [`crate::cli_args::NodeAddr`] — ONE ladder for every family.
 
+use duckfs_client::api::ApiError;
 use unicode_normalization::UnicodeNormalization as _;
 
 pub use crate::cli_args::NodeAddr;
@@ -47,6 +48,15 @@ impl CliError {
         }
     }
 
+    /// a refusal (exit 1), printed as `<reason>: <sentence>` — the class token
+    /// beside the words whoever refused wrote. every `ducktape fs` verb refuses
+    /// in this ONE shape, so `cat`, `ls` and `stat` cannot disagree about what a
+    /// missing path looks like, and nothing has to peel a Rust type name off the
+    /// front of a sentence a person is reading.
+    pub fn refused(reason: impl AsRef<str>, sentence: impl AsRef<str>) -> Self {
+        CliError::failed(format!("{}: {}", reason.as_ref(), sentence.as_ref()))
+    }
+
     /// exit with `code` and print NOTHING — the verb already wrote its output
     /// (a dirty `status` prints its A/M/D lines, then exits 1 silently; a commit
     /// conflict prints its report, then exits 2).
@@ -55,6 +65,18 @@ impl CliError {
             code,
             message: String::new(),
         }
+    }
+}
+
+/// map a transport failure to a CLI failure — the ONE mapping every `ducktape
+/// fs` verb uses. a refusal keeps both halves it arrived in; a connection
+/// failure is THIS side's and says so, because the two are not the caller's to
+/// fix in the same way.
+pub fn api_err(e: ApiError) -> CliError {
+    match e {
+        ApiError::Rejected { reason, sentence } => CliError::refused(reason, sentence),
+        ApiError::NotFound => CliError::refused("not_found", "the node has no such route"),
+        ApiError::Transport(m) => CliError::failed(format!("cannot reach the node: {m}")),
     }
 }
 

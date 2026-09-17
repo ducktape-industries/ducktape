@@ -6,13 +6,13 @@
 
 use std::io::Write as _;
 
-use duckfs_client::api::{ApiError, NodeApi};
+use duckfs_client::api::NodeApi;
 use duckfs_client::http::HttpNode;
 use duckfs_core::{
     DiffEntry, DiffKind, EntryInfo, EntryKindWire, MAX_PAGE, MAX_READ_BYTES, SnapshotInfo,
 };
 
-use crate::fs_cli::args::{CliError, NodeAddr, resolve_node};
+use crate::fs_cli::args::{CliError, NodeAddr, api_err, resolve_node};
 use crate::fs_cli::{CatArgs, DiffArgs, HistoryArgs, LsArgs, StatArgs};
 
 // --- `--json` row shapes: each mirrors exactly the columns the prose form
@@ -93,13 +93,11 @@ fn node(addr: &NodeAddr) -> Result<HttpNode, CliError> {
     Ok(HttpNode::new(resolve_node(addr)?))
 }
 
-/// map a transport failure to a CLI failure (exit 1).
-fn api_err(e: ApiError) -> CliError {
-    match e {
-        ApiError::NotFound => CliError::failed("not found"),
-        ApiError::Rejected(m) => CliError::failed(m),
-        ApiError::Transport(m) => CliError::failed(format!("cannot reach the node: {m}")),
-    }
+/// nothing is at `path`. the module answers an absent `stat` with a successful
+/// `None` rather than a refusal, so THIS side is the one refusing and names its
+/// own class — it never borrows the module's for words the module never said.
+fn no_entry(path: &str) -> CliError {
+    CliError::refused("no_entry", format!("no entry at {path}"))
 }
 
 fn kind_tag(kind: &EntryKindWire) -> &'static str {
@@ -189,7 +187,7 @@ pub fn stat(args: StatArgs) -> Result<(), CliError> {
     let want_json = args.json;
 
     let Some(e) = node.stat(path, snapshot).map_err(api_err)? else {
-        return Err(CliError::failed(format!("no entry at {path}")));
+        return Err(no_entry(path));
     };
     if want_json {
         print_json(&stat_row(&e));
@@ -257,6 +255,34 @@ mod tests {
             exec: true,
             object: "abc123".into(),
             meta: BTreeMap::new(),
+        }
+    }
+
+    /// every read verb refuses in ONE shape: `<reason>: <sentence>`, with no
+    /// Rust type name wrapped around the words. `cat` and `ls` get the module's
+    /// refusal; `stat` gets a successful `None` and refuses for itself — and the
+    /// two must not read differently.
+    #[test]
+    fn every_refusal_is_a_class_then_a_sentence() {
+        let from_module = api_err(duckfs_client::api::ApiError::Rejected {
+            reason: "files_query".to_string(),
+            sentence: "files: path not found".to_string(),
+        });
+        let from_cli = no_entry("/nope");
+        assert_eq!(from_module.message, "files_query: files: path not found");
+        assert_eq!(from_cli.message, "no_entry: no entry at /nope");
+
+        let refusals = [&from_module, &from_cli];
+        for refusal in refusals {
+            assert_eq!(refusal.code, 1);
+            assert!(!refusal.message.contains("Module("), "{}", refusal.message);
+            let (reason, sentence) = refusal.message.split_once(": ").expect("framed");
+            let is_class_token = !reason.is_empty()
+                && reason
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+            assert!(is_class_token, "{reason:?} is not a class token");
+            assert!(!sentence.is_empty(), "{}", refusal.message);
         }
     }
 

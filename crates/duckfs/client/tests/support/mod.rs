@@ -155,10 +155,9 @@ impl ModuleNode {
 
 fn map_err(e: Error) -> ApiError {
     match e {
-        // the module's sentence, verbatim — exactly what the real http lane
-        // hands back (the node's `error` field; its `reason` token travels
-        // beside it and this double has nowhere to put it yet).
-        Error::Module { sentence, .. } => ApiError::Rejected(sentence),
+        // both halves, verbatim — exactly what the real http lane hands back
+        // (the node's `error` sentence and the `reason` class beside it).
+        Error::Module { reason, sentence } => ApiError::Rejected { reason, sentence },
         other => ApiError::Transport(format!("{other:?}")),
     }
 }
