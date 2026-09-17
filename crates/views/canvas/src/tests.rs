@@ -3829,3 +3829,29 @@ fn picking_a_shape_takes_up_the_whole_pen_it_was_drawn_with() {
         (3, Fill::None, Dash::Dashed)
     );
 }
+/// The chip beside the board's name is the one piece of chrome whose whole job
+/// is to say the work is being kept, and one change is the case it shows most
+/// often. It said "1 changes".
+#[test]
+fn the_save_chip_counts_one_change_in_the_singular() {
+    let mut view = view();
+    card(&mut view, "a", 0);
+    view.pending.clear();
+
+    view.edit(Change::Text {
+        id: "a".into(),
+        text: "one".into(),
+    });
+    assert_eq!(view.pending.len(), 1);
+    let one = view.status();
+    assert!(one.contains("1 change"), "{one}");
+    assert!(!one.contains("1 changes"), "{one}");
+
+    view.edit(Change::Text {
+        id: "a".into(),
+        text: "two".into(),
+    });
+    assert_eq!(view.pending.len(), 2);
+    let two = view.status();
+    assert!(two.contains("2 changes"), "{two}");
+}
