@@ -786,14 +786,6 @@ fn decode_stamp(assigned: Option<&serde_json::Value>) -> Result<ChatAssigned, St
 // delta that raced a resync applies as a no-op instead of double-counting.
 // ============================================================================
 
-pub fn insert_channel(mut channels: Vec<ChatChannel>, channel: ChatChannel) -> Vec<ChatChannel> {
-    let exists = channels.iter().any(|current| current.id == channel.id);
-    if !exists {
-        channels.push(channel);
-    }
-    channels
-}
-
 pub fn replace_channel(
     mut channels: Vec<ChatChannel>,
     channel_id: &str,
@@ -817,17 +809,6 @@ pub fn rename_channel(
     channels
 }
 
-pub fn archive_channel(
-    mut channels: Vec<ChatChannel>,
-    channel_id: &str,
-    archived: bool,
-) -> Vec<ChatChannel> {
-    if let Some(channel) = channels.iter_mut().find(|channel| channel.id == channel_id) {
-        channel.archived = archived;
-    }
-    channels
-}
-
 pub fn advance_channel_head(
     mut channels: Vec<ChatChannel>,
     channel_id: &str,
@@ -837,52 +818,6 @@ pub fn advance_channel_head(
         channel.head_seq = channel.head_seq.max(seq);
     }
     channels
-}
-
-pub fn apply_membership(
-    mut members: Vec<ChatMember>,
-    added: bool,
-    member: ChatMember,
-) -> Vec<ChatMember> {
-    members.retain(|current| current.key != member.key);
-    if added {
-        members.push(member);
-    }
-    members
-}
-
-/// A committed root row lands: remove its matching pending placeholder, then
-/// insert it in canonical seq order while preserving the placeholder's stable
-/// virtual key. Skips replies (the timeline is roots-only) and duplicate rows.
-pub fn merge_posted_message(mut messages: Vec<ChatMessage>, row: ChatMessage) -> Vec<ChatMessage> {
-    if row.thread_seq > 0 {
-        return messages;
-    }
-    let pending_key = messages
-        .iter()
-        .find(|message| message.pending && message.id == row.id)
-        .map(|message| message.view_key);
-    if pending_key.is_some() {
-        messages.retain(|message| !message.pending || message.id != row.id);
-    }
-    let already_present = messages
-        .iter()
-        .any(|message| !message.pending && message.seq == row.seq);
-    if already_present {
-        return messages;
-    }
-    let mut row = row;
-    if let Some(view_key) = pending_key {
-        row.view_key = view_key;
-    }
-    // committed rows stay seq-sorted; pending rows tail the list.
-    let insert_at = messages
-        .iter()
-        .position(|message| message.pending || message.seq > row.seq)
-        .unwrap_or(messages.len());
-    messages.insert(insert_at, row);
-    mark_message_groups(&mut messages);
-    bounded_chat_window(messages)
 }
 
 pub fn bump_reply_summary(mut messages: Vec<ChatMessage>, root_seq: i64) -> Vec<ChatMessage> {
@@ -1139,43 +1074,6 @@ pub fn bounded_thread_window(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage>
     root.into_iter().chain(committed).collect()
 }
 
-fn merge_pending_rows(
-    mut canonical: Vec<ChatMessage>,
-    current: Vec<ChatMessage>,
-    current_channel: String,
-    next_channel: String,
-) -> Vec<ChatMessage> {
-    if current_channel != next_channel {
-        return canonical;
-    }
-    retain_client_row_identity(&mut canonical, &current);
-    let canonical_ids = canonical
-        .iter()
-        .map(|message| message.id.clone())
-        .collect::<BTreeSet<_>>();
-    canonical.extend(
-        current
-            .into_iter()
-            .filter(|message| message.pending && !canonical_ids.contains(&message.id)),
-    );
-    canonical
-}
-
-/// Install one root timeline snapshot and keep its render window bounded.
-pub fn merge_pending_messages(
-    canonical: Vec<ChatMessage>,
-    current: Vec<ChatMessage>,
-    current_channel: String,
-    next_channel: String,
-) -> Vec<ChatMessage> {
-    bounded_chat_window(merge_pending_rows(
-        canonical,
-        current,
-        current_channel,
-        next_channel,
-    ))
-}
-
 /// Install a room window without losing committed rows that arrived after the
 /// read began. Navigation clears the previous room before launching the read,
 /// so any same-room committed row in `current` is newer live traffic, not
@@ -1257,32 +1155,6 @@ fn retain_client_row_identity(canonical: &mut [ChatMessage], current: &[ChatMess
         };
         message.view_key = *view_key;
     }
-}
-
-pub fn rollback_pending_message(
-    mut messages: Vec<ChatMessage>,
-    pending_id: String,
-    committed: bool,
-) -> Vec<ChatMessage> {
-    if !committed {
-        messages.retain(|message| !message.pending || message.id != pending_id);
-    }
-    messages
-}
-
-pub fn contains_pending_message(messages: Vec<ChatMessage>, pending_id: String) -> bool {
-    messages
-        .iter()
-        .any(|message| message.pending && message.id == pending_id)
-}
-
-pub fn append_thread_page(messages: Vec<ChatMessage>, next: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    bounded_thread_window(merge_message_send_result(
-        next,
-        messages,
-        String::new(),
-        String::new(),
-    ))
 }
 
 pub fn merge_thread_reply(
