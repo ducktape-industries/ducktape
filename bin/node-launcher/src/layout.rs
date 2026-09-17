@@ -31,6 +31,12 @@ use app_update::workspace;
 /// The one executable a node release archive carries.
 pub const NODE_EXE: &str = "ducktape";
 
+/// The founding set that rides beside it — `<id>.component.wasm` and the
+/// netstack guest, which a node resolves next to its own executable. No
+/// binary carries wasm, so a release without this directory starts a node
+/// that cannot reach the mesh at all.
+pub const MODULES_DIR: &str = "modules";
+
 /// The node's own config, which is this launcher's alone — the update tree is
 /// shared, a config file name is not.
 const CONFIG_FILE: &str = "node.toml";
