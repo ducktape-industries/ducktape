@@ -31,10 +31,11 @@ const ALLOWED: &[&str] = &[
     // about what the product looks like.
     "workspace.dependencies design -> crates/design",
     // module wire surfaces — types and codecs only, no module logic and no host
-    // sdk. `boards` is the one of the three with a native default feature, and
-    // `canvas` names `default-features = false` on it so the sdk graph stays out
-    // of the component.
-    "dependencies boards -> crates/modules/apps/boards",
+    // sdk. Each is its own crate beside the module that runs it, so linking a
+    // format never links a module: `canvas` takes the board format without the
+    // `Boards` module, and the sdk graph cannot reach the component through a
+    // feature nobody turned off.
+    "dependencies boards-wire -> crates/modules/apps/boards/wire",
     "dependencies chat-message -> crates/modules/apps/chat/message",
     "dependencies duckfs-core -> crates/duckfs/core",
     // DEV ONLY, and that is load-bearing: these two carry the whole module graph

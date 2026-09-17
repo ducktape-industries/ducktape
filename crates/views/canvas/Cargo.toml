@@ -6,7 +6,8 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 [dependencies]
-boards = { path = "../../modules/apps/boards", default-features = false }
+# the board FORMAT, not the module that runs one
+boards-wire = { path = "../../modules/apps/boards/wire" }
 ducktape-view-guest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1317,10 +1317,19 @@ name = "boards"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "boards-wire",
  "ducktape-module-sdk",
  "futures",
  "sdk",
  "sdk-testkit",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "boards-wire"
+version = "0.1.0"
+dependencies = [
  "serde",
  "serde_json",
  "syn 2.0.119",

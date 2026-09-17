@@ -177,6 +177,7 @@ members = [
     "crates/modules/apps/runs",
     "crates/modules/apps/tasks",
     "crates/modules/apps/boards",
+    "crates/modules/apps/boards/wire",
     "crates/modules/apps/automations",
     "crates/modules/apps/inbox",
     "crates/modules/apps/files",

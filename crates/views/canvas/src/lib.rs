@@ -4,7 +4,7 @@ mod host;
 mod interaction;
 mod markdown;
 mod presentation;
-use boards::{Align, Board, Change, Dash, Fill, Kind, Operation, Shape, TextSize};
+use boards_wire::{Align, Board, Change, Dash, Fill, Kind, Operation, Shape, TextSize};
 use ducktape_view_guest::{Editor, wire};
 use ducktape_view_guest::{Subscription, Task};
 use serde::{Deserialize, Serialize};
@@ -651,7 +651,7 @@ impl BoardsView {
         // at all rather than fitted as far as the floor.
         let needed = grown
             .ceil()
-            .clamp(presentation::MIN_CARD[1] as f32, boards::MAX_SIZE as f32)
+            .clamp(presentation::MIN_CARD[1] as f32, boards_wire::MAX_SIZE as f32)
             as i32;
         let hugging = shape.kind == Kind::Text;
         let height = match hugging {
@@ -829,7 +829,7 @@ impl BoardsView {
 fn coordinate(value: f32) -> i32 {
     value
         .round()
-        .clamp(-(boards::MAX_COORD as f32), boards::MAX_COORD as f32) as i32
+        .clamp(-(boards_wire::MAX_COORD as f32), boards_wire::MAX_COORD as f32) as i32
 }
 fn inverse(board: &Board, change: &Change) -> Vec<Change> {
     match change {
@@ -975,7 +975,7 @@ fn inverse(board: &Board, change: &Change) -> Vec<Change> {
                     .shapes
                     .iter()
                     .filter(|(_, r)| {
-                        let holds = |end| boards::held(end) == Some(id.as_str());
+                        let holds = |end| boards_wire::held(end) == Some(id.as_str());
                         holds(&r.shape.from) || holds(&r.shape.to)
                     })
                     .map(|(id, r)| Change::Create {
