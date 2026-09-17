@@ -2021,7 +2021,10 @@ fn a_card_too_long_to_save_can_still_be_left() {
     // Done keeps the words and says what is wrong, by how much, and the way out
     view.finish_text();
     assert!(view.inline.is_some(), "Done must not lose what you wrote");
-    assert!(view.error.contains(&format!("{}", boards_wire::MAX_TEXT + 10)));
+    assert!(
+        view.error
+            .contains(&format!("{}", boards_wire::MAX_TEXT + 10))
+    );
     assert!(view.error.contains("Escape"));
     // and Escape is that way out: the card goes back to what it held
     view.on_cancel();

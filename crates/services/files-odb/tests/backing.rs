@@ -13,19 +13,55 @@
 //!     envelope, and a reopen-after-drop recovers refs + H (the height the kernel
 //!     threads through `publish_block`).
 
-mod harness;
-use harness::*;
-
 use std::collections::BTreeMap;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use files::{
-    Change, Content, FilesMsg, FilesOdbBacking, FilesQuery, Kind, Refs, encode_msg, encode_query,
-    encode_refs, to_hex,
+    Change, Content, FilesMsg, FilesQuery, Kind, Refs, encode_msg, encode_query, encode_refs,
+    to_hex,
 };
+use files_odb::FilesOdbBacking;
 use sdk::Module as _;
+use sha2::{Digest as _, Sha256};
 use wasm_host::{HostOdb as _, OdbBacking};
+
+// ---- harness ----------------------------------------------------------------
+// the three helpers this suite uses out of the duckfs test harness that stayed
+// behind in `files/tests/harness`. inlined rather than shared: a `#[path]` into
+// another crate's test tree would drag in the other sixty lines, all dead here.
+
+/// a `files`-scoped ctx at block `height`, answering the identity query the
+/// native `Files` makes while it builds the committed dir the backing opens on.
+fn test_ctx(origin: sdk::Origin, height: u64) -> sdk_testkit::TestCtx {
+    sdk_testkit::TestCtx::with_env(sdk::Env {
+        height,
+        consensus_time: height,
+        origin,
+        me: "files".into(),
+        cause: sdk::Cause::Direct,
+    })
+    .on_query("identity", |req| {
+        let identity::IdentityQuery::OfKey { .. } =
+            identity::decode_query(req).map_err(sdk::Error::Module)?
+        else {
+            return Err(sdk::Error::QueryUnsupported);
+        };
+        Ok(identity::encode_reply(&identity::IdentityReply::Account(
+            None,
+        )))
+    })
+}
+
+fn open_files(dir: &tempfile::TempDir) -> files::Files {
+    files::Files::open("files", dir.path().to_path_buf()).expect("open")
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().into()
+}
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -121,7 +157,7 @@ fn query_matches_native_files_on_the_same_dir() {
 
     let guest = wasm_host::WasmModule::with_odb(
         "files",
-        include_bytes!("../component.wasm"),
+        include_bytes!("../../../modules/apps/files/component.wasm"),
         Box::new(backing),
     )
     .expect("load files guest");

@@ -13,7 +13,6 @@ native = [
   "dep:sdk",
   "dep:async-trait",
   "dep:serde_json",
-  "dep:wasm-host",
   "dep:tracing",
   "dep:identity",
   "dep:attribution",
@@ -27,10 +26,6 @@ guest = ["dep:ducktape-module-sdk", "dep:sdk", "dep:serde_json", "dep:identity",
 [dependencies]
 duckfs-core = { workspace = true }
 duckfs-disk = { workspace = true, optional = true }
-# the kernel host: `FilesOdbBacking` implements its `OdbBacking` trait. native
-# feature only (the disk-backed odb substrate); no cycle — wasm-host has no files
-# dep. the pure `--no-default-features` core never pulls it.
-wasm-host = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sdk = { workspace = true, optional = true }
 identity = { workspace = true, optional = true }

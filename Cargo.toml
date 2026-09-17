@@ -45,7 +45,9 @@
 #                      the run-scoped credential loopback + airlock client;
 #                      provider — the executor spec layer + CliProvider run loop;
 #                      agent — the pty session daemon; airlock — the lender;
-#                      media — the huddle voice/video planes + call-socket wire)
+#                      media — the huddle voice/video planes + call-socket wire;
+#                      files-odb — the disk odb a wasm files tenant commits
+#                      through, so the `files` module names no kernel host)
 #   crates/topology/ — the module composition catalog: the id universe, its
 #                      shape/config schema and the named genesis selections
 #                      every composer draws from (pure data, no deps)
@@ -187,6 +189,7 @@ members = [
     "crates/services/airlock",
     "crates/services/broker",
     "crates/services/compute",
+    "crates/services/files-odb",
     "crates/services/mcp",
     "crates/services/media",
     "crates/services/provider",
@@ -412,6 +415,7 @@ agent-service = { path = "crates/services/agent" }
 airlock-service = { path = "crates/services/airlock" }
 broker-host = { path = "crates/services/broker" }
 compute-service = { path = "crates/services/compute" }
+files-odb = { path = "crates/services/files-odb" }
 mcp-host = { path = "crates/services/mcp" }
 media-service = { path = "crates/services/media" }
 provider-host = { path = "crates/services/provider" }

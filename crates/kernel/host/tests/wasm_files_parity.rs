@@ -20,10 +20,11 @@ use futures::executor::block_on;
 
 use files::objects::object_id;
 use files::{
-    CHUNK_SIZE, Change, Content, Files, FilesMsg, FilesOdbBacking, FilesQuery, FilesReply,
-    FilesSyncReq, Kind, MAX_CHANGES_PER_COMMIT, MAX_INLINE_COMMIT_BYTES, MAX_OBJECT_READS_PER_OP,
-    MAX_READ_BYTES, encode_msg, encode_putblob, encode_query, encode_sync_req, to_hex,
+    CHUNK_SIZE, Change, Content, Files, FilesMsg, FilesQuery, FilesReply, FilesSyncReq, Kind,
+    MAX_CHANGES_PER_COMMIT, MAX_INLINE_COMMIT_BYTES, MAX_OBJECT_READS_PER_OP, MAX_READ_BYTES,
+    encode_msg, encode_putblob, encode_query, encode_sync_req, to_hex,
 };
+use files_odb::FilesOdbBacking;
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest as _, Sha256};

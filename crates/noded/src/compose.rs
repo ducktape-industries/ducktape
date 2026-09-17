@@ -546,7 +546,7 @@ fn open_odb(
 ) -> Result<Box<dyn wasm_host::OdbBacking>, String> {
     let path = substrates.path(id)?;
     match engine {
-        Backing::Odb => files::FilesOdbBacking::open(id, path)
+        Backing::Odb => files_odb::FilesOdbBacking::open(id, path)
             .map(|backing| Box::new(backing) as Box<dyn wasm_host::OdbBacking>)
             .map_err(|error| format!("object storage open: {error}")),
         Backing::Git => forge::ForgeOdbBacking::open(id, path, substrates.blobs.clone())
