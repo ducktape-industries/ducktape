@@ -685,9 +685,13 @@ async fn rejections_inner(context: &deterministic::Context) {
     // seed three proposals: a long-lived Open one, one whose deadline will
     // lapse un-executed, and one settled at its deadline.
     for host in [&mut native, &mut wasm] {
+        // `p` only has to be a long-lived OPEN proposal — the dup-id and
+        // electorate refusals below are what it is for. It carried an
+        // AddValidator until a promotion had to name a resident (#2507); a
+        // Signal keeps it open with nothing else to arrange.
         host.submit_at(
             block(1, Origin::External(a_pub.clone())),
-            propose("p", GovAction::AddValidator { key: d_pub.clone() }, 500),
+            propose("p", GovAction::Signal { text: "p".into() }, 500),
         )
         .await
         .expect("seed p");
@@ -729,6 +733,14 @@ async fn rejections_inner(context: &deterministic::Context) {
             Origin::External(a_pub.clone()),
             propose("p2", GovAction::AddValidator { key: vec![1; 8] }, 5),
             "32-byte ed25519",
+        ),
+        // a promotion is proposable only OUT of the resident tier (#2507):
+        // `d_pub` is a well-shaped key that nobody has met, and seating one
+        // would grow the quorum by a seat that never votes.
+        (
+            Origin::External(a_pub.clone()),
+            propose("p2", GovAction::AddValidator { key: d_pub.clone() }, 5),
+            "not_a_resident",
         ),
         (
             Origin::External(a_pub.clone()),

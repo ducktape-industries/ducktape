@@ -110,6 +110,58 @@ async fn open_proposal_count(host: &Host) -> usize {
     }
 }
 
+/// grant `key` resident standing through the full ceremony, at heights
+/// `at..at+2`. A validator is promoted OUT of the resident tier — valset's
+/// header: "the tier a joiner syncs in before promotion, so the consensus set
+/// only ever gains a caught-up validator" — so any test that admits a
+/// validator starts here, the way a real joiner does.
+async fn grant_standing(host: &mut Host, key: &[u8], voters: &[&[u8]], at: u64) {
+    let id = format!("stand-{at}");
+    let proposer = voters.first().expect("at least one voter");
+    submit_as(
+        host,
+        proposer,
+        at,
+        "governance",
+        gov_encode(&GovMsg::Propose {
+            proposal_id: id.clone(),
+            action: GovAction::AddResident { key: key.to_vec() },
+            voting_period: 1_000_000,
+        }),
+    )
+    .await
+    .expect("propose AddResident");
+    for who in voters {
+        submit_as(
+            host,
+            who,
+            at,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: id.clone(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("vote AddResident");
+    }
+    submit_as(
+        host,
+        proposer,
+        at,
+        "governance",
+        gov_encode(&GovMsg::Execute {
+            proposal_id: id.clone(),
+        }),
+    )
+    .await
+    .expect("execute AddResident");
+    assert!(
+        residents(host).await.iter().any(|r| r == key),
+        "standing granted before the promotion under test"
+    );
+}
+
 async fn proposal_status(host: &Host, id: &str) -> Option<ProposalStatus> {
     let reply = host
         .query(
@@ -148,6 +200,8 @@ fn a_passing_proposal_admits_the_validator_and_direct_writes_are_refused() {
             "got {err:?}"
         );
         assert_eq!(validators(&host).await.len(), 2, "membership untouched");
+
+        grant_standing(&mut host, &newcomer, &[&m1, &m2], 1).await;
 
         // propose + both members vote yes -> early-decidable majority.
         submit_as(
@@ -293,6 +347,11 @@ fn an_add_resident_proposal_settles_cleanly_when_its_subject_is_already_a_valida
     block_on(async {
         let mut host = gov_host().await;
         let (m1, m2, key) = (member_key(1), member_key(2), member_key(9));
+
+        // the key stands as a resident first — a promotion is only proposable
+        // out of that tier — and `p1-resident` below is the SECOND mandate,
+        // the one that goes stale when the promotion seats the key.
+        grant_standing(&mut host, &key, &[&m1, &m2], 1).await;
 
         submit_as(
             &mut host,
@@ -584,6 +643,8 @@ fn a_single_member_ballot_is_a_deciding_majority() {
             )),
         ])
         .expect("genesis");
+
+        grant_standing(&mut host, &friend, &[&founder], 1).await;
 
         submit_as(
             &mut host,
@@ -1265,6 +1326,8 @@ fn a_passed_proposal_past_execution_grace_is_refused_and_reaped_rejected() {
         let mut host = gov_host().await;
         let (m1, m2, newcomer) = (member_key(1), member_key(2), member_key(9));
 
+        grant_standing(&mut host, &newcomer, &[&m1, &m2], 1).await;
+
         submit_as(
             &mut host,
             &m1,
@@ -1342,6 +1405,8 @@ fn a_passed_proposal_inside_execution_grace_still_executes() {
     block_on(async {
         let mut host = gov_host().await;
         let (m1, m2, newcomer) = (member_key(1), member_key(2), member_key(9));
+
+        grant_standing(&mut host, &newcomer, &[&m1, &m2], 1).await;
 
         submit_as(
             &mut host,
@@ -1489,5 +1554,206 @@ fn an_expired_proposal_is_reaped_by_a_later_vote_or_execute_on_another_proposal(
             Some(ProposalStatus::Rejected),
             "Vote's own reap_roster call caught the unrelated expired proposal"
         );
+    });
+}
+
+/// #2507: `ducktape node member promote <any 64-hex>` seated a key nobody had
+/// ever met. The CLI checked only "is it already a validator", and valset is
+/// deliberately permissionless ("no authorization, no gating", its own
+/// header), so nothing between the terminal and the quorum asked whether a
+/// node stood behind the key. The next epoch cutover grew the quorum to
+/// 2-of-2 with one seat that would never vote, and the chain stopped. The undo
+/// is itself a proposal, so it then needed the phantom's ballot: the network
+/// was gone.
+///
+/// Governance is the layer that decides who may be seated, so the refusal
+/// lands at the door, where the proposer is still reading the answer.
+#[test]
+fn a_promotion_of_a_key_that_holds_no_resident_standing_is_refused_at_the_door() {
+    block_on(async {
+        let mut host = gov_host().await;
+        let (m1, stranger) = (member_key(1), member_key(9));
+
+        let refusal = submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "promote-a-stranger".into(),
+                action: GovAction::AddValidator {
+                    key: stranger.clone(),
+                },
+                voting_period: 100,
+            }),
+        )
+        .await
+        .expect_err("a key with no resident record cannot be proposed for a seat");
+        assert!(
+            format!("{refusal:?}").contains("not_a_resident"),
+            "the refusal carries its token: {refusal:?}"
+        );
+
+        assert_eq!(
+            proposal_status(&host, "promote-a-stranger").await,
+            None,
+            "nothing was opened, so there is no ballot to carry"
+        );
+        assert_eq!(validators(&host).await.len(), 2, "the quorum is untouched");
+    });
+}
+
+/// The door is not the last word. Standing can be revoked while the ballot is
+/// open, and a proposal can arrive from a peer's synced store minted before
+/// this rule — either way the Execute must not seat it. Settle `Rejected`, the
+/// way the capacity and set-emptying cases beside it already do.
+#[test]
+fn a_promotion_whose_subject_loses_its_standing_before_execute_settles_rejected() {
+    block_on(async {
+        let mut host = gov_host().await;
+        let (m1, m2, friend) = (member_key(1), member_key(2), member_key(9));
+
+        // grant standing, so the promotion is legal to propose at all.
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "stand-9".into(),
+                action: GovAction::AddResident {
+                    key: friend.clone(),
+                },
+                voting_period: 1000,
+            }),
+        )
+        .await
+        .expect("propose AddResident");
+        for (who, at) in [(&m1, 2u64), (&m2, 3u64)] {
+            submit_as(
+                &mut host,
+                who,
+                at,
+                "governance",
+                gov_encode(&GovMsg::Vote {
+                    proposal_id: "stand-9".into(),
+                    approve: true,
+                }),
+            )
+            .await
+            .expect("vote");
+        }
+        submit_as(
+            &mut host,
+            &m2,
+            4,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "stand-9".into(),
+            }),
+        )
+        .await
+        .expect("execute AddResident");
+        assert_eq!(residents(&host).await, vec![friend.clone()]);
+
+        // open the promotion and carry it to executable, but do not execute.
+        submit_as(
+            &mut host,
+            &m1,
+            10,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "promote-9".into(),
+                action: GovAction::AddValidator {
+                    key: friend.clone(),
+                },
+                voting_period: 1000,
+            }),
+        )
+        .await
+        .expect("a resident may be proposed for a seat");
+        for (who, at) in [(&m1, 11u64), (&m2, 12u64)] {
+            submit_as(
+                &mut host,
+                who,
+                at,
+                "governance",
+                gov_encode(&GovMsg::Vote {
+                    proposal_id: "promote-9".into(),
+                    approve: true,
+                }),
+            )
+            .await
+            .expect("vote");
+        }
+
+        // standing is revoked underneath the open ballot.
+        submit_as(
+            &mut host,
+            &m1,
+            20,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "unstand-9".into(),
+                action: GovAction::RemoveResident {
+                    key: friend.clone(),
+                },
+                voting_period: 1000,
+            }),
+        )
+        .await
+        .expect("propose RemoveResident");
+        for (who, at) in [(&m1, 21u64), (&m2, 22u64)] {
+            submit_as(
+                &mut host,
+                who,
+                at,
+                "governance",
+                gov_encode(&GovMsg::Vote {
+                    proposal_id: "unstand-9".into(),
+                    approve: true,
+                }),
+            )
+            .await
+            .expect("vote");
+        }
+        submit_as(
+            &mut host,
+            &m2,
+            23,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "unstand-9".into(),
+            }),
+        )
+        .await
+        .expect("execute RemoveResident");
+        assert!(
+            residents(&host).await.is_empty(),
+            "standing is gone before the promotion executes"
+        );
+
+        submit_as(
+            &mut host,
+            &m2,
+            30,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "promote-9".into(),
+            }),
+        )
+        .await
+        .expect("a mandate that can no longer apply settles, it does not error the unit");
+
+        assert_eq!(
+            proposal_status(&host, "promote-9").await,
+            Some(ProposalStatus::Rejected),
+            "the seat is refused rather than granted to a key that stands for nothing"
+        );
+        assert!(
+            !validators(&host).await.contains(&friend),
+            "the phantom never reaches the quorum"
+        );
+        assert_eq!(validators(&host).await.len(), 2, "the quorum is unchanged");
     });
 }

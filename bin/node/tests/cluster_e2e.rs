@@ -182,6 +182,45 @@ fn cluster_lifecycle() {
     // 6. governance: node 0 proposes admitting node 3's key, nodes 0+1 vote
     // yes (2 of 3 = strict majority), node 1 executes; the passing proposal
     // emits the valset Join follow-up governance alone is authorized to make.
+    //
+    // A promotion names a key the network has already met (#2507), so node 3
+    // is staged into the resident tier first — the standing a live joiner gets
+    // by redeeming its invite, granted here by ballot because this cluster
+    // seats node 3 without one.
+    cluster.submit(
+        0,
+        "governance",
+        &governance::encode_msg(&GovMsg::Propose {
+            proposal_id: "stand-node3".into(),
+            action: GovAction::AddResident {
+                key: Cluster::identity(3),
+            },
+            voting_period: 600_000,
+        }),
+    );
+    cluster.await_committed(1, "resident proposal to open on node 1", FINALIZE, || {
+        proposal_status(&cluster, 1, "stand-node3").filter(|(s, _)| *s == ProposalStatus::Open)
+    });
+    let stand_vote = governance::encode_msg(&GovMsg::Vote {
+        proposal_id: "stand-node3".into(),
+        approve: true,
+    });
+    cluster.submit(0, "governance", &stand_vote);
+    cluster.submit(1, "governance", &stand_vote);
+    cluster.await_committed(1, "both resident ballots to land", FINALIZE, || {
+        proposal_status(&cluster, 1, "stand-node3").filter(|(_, votes)| *votes == 2)
+    });
+    cluster.submit(
+        1,
+        "governance",
+        &governance::encode_msg(&GovMsg::Execute {
+            proposal_id: "stand-node3".into(),
+        }),
+    );
+    cluster.await_committed(0, "resident standing to settle", FINALIZE, || {
+        proposal_status(&cluster, 0, "stand-node3").filter(|(s, _)| *s == ProposalStatus::Passed)
+    });
+
     cluster.submit(
         0,
         "governance",

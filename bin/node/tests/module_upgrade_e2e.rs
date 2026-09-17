@@ -86,42 +86,54 @@ fn proposal_status(cluster: &Cluster, idx: usize, id: &str) -> Option<(ProposalS
     }
 }
 
-/// node 0 proposes seating `key`, nodes 0+1 vote (2 of 3 = majority), node 1
-/// executes; the passing proposal emits the valset Join, and the founders
-/// cross the epoch-1 cutover on their own idle blocks.
-fn admit_validator(cluster: &Cluster, key: Vec<u8>) {
-    const ID: &str = "admit-joiner";
+/// node 0 proposes `action`, nodes 0+1 vote (2 of 3 = majority), node 1
+/// executes; returns once the proposal has settled Passed on node 0.
+fn pass_proposal(cluster: &Cluster, id: &str, action: GovAction) {
     cluster.submit(
         0,
         "governance",
         &encode_msg(&GovMsg::Propose {
-            proposal_id: ID.into(),
-            action: GovAction::AddValidator { key },
+            proposal_id: id.into(),
+            action,
             voting_period: 600_000,
         }),
     );
-    cluster.await_committed(1, "admission proposal to open", FINALIZE, || {
-        proposal_status(cluster, 1, ID).filter(|(s, _)| *s == ProposalStatus::Open)
+    cluster.await_committed(1, "proposal to open", FINALIZE, || {
+        proposal_status(cluster, 1, id).filter(|(s, _)| *s == ProposalStatus::Open)
     });
     let vote = encode_msg(&GovMsg::Vote {
-        proposal_id: ID.into(),
+        proposal_id: id.into(),
         approve: true,
     });
     cluster.submit(0, "governance", &vote);
     cluster.submit(1, "governance", &vote);
     cluster.await_committed(1, "both ballots to land", FINALIZE, || {
-        proposal_status(cluster, 1, ID).filter(|(_, votes)| *votes == 2)
+        proposal_status(cluster, 1, id).filter(|(_, votes)| *votes == 2)
     });
     cluster.submit(
         1,
         "governance",
         &encode_msg(&GovMsg::Execute {
-            proposal_id: ID.into(),
+            proposal_id: id.into(),
         }),
     );
-    cluster.await_committed(0, "admission to settle as Passed", FINALIZE, || {
-        proposal_status(cluster, 0, ID).filter(|(s, _)| *s == ProposalStatus::Passed)
+    cluster.await_committed(0, "the proposal to settle as Passed", FINALIZE, || {
+        proposal_status(cluster, 0, id).filter(|(s, _)| *s == ProposalStatus::Passed)
     });
+}
+
+/// stage `key` in as a resident and then seat it, the way a live network does:
+/// a joiner redeems its invite into RESIDENT standing and is promoted out of
+/// that tier, so a promotion names a key the network has already met (#2507).
+/// The passing promotion emits the valset Join, and the founders cross the
+/// epoch-1 cutover on their own idle blocks.
+fn admit_validator(cluster: &Cluster, key: Vec<u8>) {
+    pass_proposal(
+        cluster,
+        "stand-joiner",
+        GovAction::AddResident { key: key.clone() },
+    );
+    pass_proposal(cluster, "admit-joiner", GovAction::AddValidator { key });
     cluster.await_committed(0, "the epoch-1 cutover on every founder", ACTIVATE, || {
         let every_founder_cut_over =
             (0..3).all(|idx| cluster.marker(idx, "cutover complete: epoch 1").is_some());
