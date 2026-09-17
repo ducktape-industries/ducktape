@@ -2115,6 +2115,12 @@ pub(super) async fn park(
                 continue;
             }
         };
+        // THE LAG, off the poll this loop was already making: a resident that
+        // stopped folding keeps answering `/v1` from state the network left
+        // behind, and `serving` alone cannot tell a user why their screen is
+        // stale. the tip is what a peer answered; the gap and the phase are
+        // the projection's to decide (#2498).
+        metrics.record_peer_tip(tip.height);
         // the source's own build stamp rode along with the coordinates.
         // record it for the peers surface and name a disagreement once.
         note_source_build(

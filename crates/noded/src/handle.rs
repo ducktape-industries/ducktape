@@ -269,6 +269,25 @@ impl StatusCell {
             .expect("status snapshot lock poisoned") = status;
     }
 
+    /// publish the boundary this node RECOVERED off local disk, before any
+    /// consensus boundary exists to publish a whole snapshot from.
+    ///
+    /// A restarting node holds its whole chain on disk for the length of the
+    /// recovery window, and the boot publish leaves `height` 0 and `root_hash`
+    /// empty — an answer indistinguishable from a brand-new empty node, on the
+    /// two numbers a human and every operator script read first. This is the
+    /// same pair a boundary publish carries, written together under one lock,
+    /// so a read still sees one boundary and never a torn one.
+    pub fn publish_recovered(&self, height: u64, root_hash: String) {
+        let mut snapshot = self
+            .inner
+            .snapshot
+            .write()
+            .expect("status snapshot lock poisoned");
+        snapshot.height = height;
+        snapshot.root_hash = root_hash;
+    }
+
     /// wire the chain id this daemon serves — once, at boot; a second call is
     /// ignored (the first boot fact wins, like every other `OnceLock` here).
     pub fn wire_chain_id(&self, chain_id: String) {
@@ -734,5 +753,36 @@ mod status_cell_tests {
         // the first boot fact wins.
         cell.wire_chain_id("other".into());
         assert_eq!(cell.current().chain_id, "mynet#d0cdf950");
+    }
+
+    /// A recovering node answers with the floor it recovered, not with zero.
+    ///
+    /// The boot publish is everything a node knows before it has read its own
+    /// disk: build version and identity, and a zeroed boundary. The moment
+    /// recovery names a floor, the two numbers a reader looks at first say so —
+    /// otherwise a restart is indistinguishable from an empty network for the
+    /// whole window, which on a release flip is every node in the fleet.
+    #[test]
+    fn a_recovered_floor_replaces_the_zeroed_boundary_before_consensus_resumes() {
+        let cell = StatusCell::default();
+        cell.publish(NodeStatus {
+            contract: crate::NODE_CONTRACT,
+            version: "0.1.0+97b4ef7bc".into(),
+            public_key: "aa".into(),
+            ..Default::default()
+        });
+        let booted = cell.current();
+        assert_eq!((booted.height, booted.root_hash.as_str()), (0, ""));
+
+        cell.publish_recovered(6546, "a411ddb91c18f309".into());
+
+        let recovered = cell.current();
+        assert_eq!(recovered.height, 6546);
+        assert_eq!(recovered.root_hash, "a411ddb91c18f309");
+        assert_eq!(
+            recovered.version, "0.1.0+97b4ef7bc",
+            "the recovered pair moves alone; the boot facts stand"
+        );
+        assert_eq!(recovered.public_key, "aa");
     }
 }
