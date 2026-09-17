@@ -434,6 +434,29 @@ pub(super) async fn wire(
                                     reason,
                                 } => {
                                     if !restart_with_standing {
+                                        // THE INVITE IS THE LAST THING TO SUSPECT. A
+                                        // plane that never started took every offered
+                                        // path down with it before any of them was
+                                        // tried, and an operator sent back to the
+                                        // inviter spends a credential that was never
+                                        // the problem — then fails identically.
+                                        if let Some((reason, detail)) =
+                                            crate::reachability_plane::plane_failure()
+                                        {
+                                            tracing::error!(
+                                                target: "ducktape::join",
+                                                node = %race_label,
+                                                tried,
+                                                reason,
+                                                detail = %detail,
+                                                "FATAL: no overlay to reach the mesh \
+                                                 with — the reachability plane never \
+                                                 started, so every offered path was \
+                                                 dead before it was tried. A fresh \
+                                                 invite cannot help."
+                                            );
+                                            std::process::exit(3);
+                                        }
                                         // NOT `fatal!`: this path exits 3, not 1 — a
                                         // join that ran out of paths is distinct from a
                                         // node that broke, and callers read the code.
